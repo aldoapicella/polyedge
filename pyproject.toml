@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-btc15-bot"
+version = "0.1.0"
+description = "BTC 15-minute Polymarket fair-value trading bot, paper-first with gated live CLOB execution."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    "uvicorn[standard]>=0.30",
+    "websockets>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+live = [
+    "py-clob-client-v2>=1.0.1",
+]
+research = [
+    "pandas>=2.2",
+    "pyarrow>=16.0",
+]
+
+[project.scripts]
+polymarket-btc15-bot = "polymarket_btc15_bot.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
