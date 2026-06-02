@@ -101,6 +101,18 @@ class _FakeLiveClient:
         return {"status": "ok"}
 
 
+class _FlakyHeartbeatClient(_FakeLiveClient):
+    def __init__(self, outcomes: list[bool]) -> None:
+        super().__init__()
+        self.outcomes = outcomes
+
+    def postHeartbeat(self):
+        self.heartbeat_calls += 1
+        if not self.outcomes.pop(0):
+            raise RuntimeError("heartbeat failed")
+        return {"status": "ok"}
+
+
 def _live_client(fake: _FakeLiveClient, allow_account_cancel: bool = False) -> LiveClobExecutionClient:
     client = LiveClobExecutionClient.__new__(LiveClobExecutionClient)
     client.settings = Settings(_env_file=None, allow_emergency_account_cancel=allow_account_cancel)
@@ -109,6 +121,7 @@ def _live_client(fake: _FakeLiveClient, allow_account_cancel: bool = False) -> L
     client._tracked_order_ids_by_token = defaultdict(set)
     client.heartbeat_ok_count = 0
     client.heartbeat_failure_count = 0
+    client.heartbeat_consecutive_failure_count = 0
     client.last_heartbeat_ts = None
     client.last_heartbeat_error = None
     return client
@@ -183,3 +196,20 @@ async def test_live_heartbeat_records_success() -> None:
     assert status["status"] == "ok"
     assert fake.heartbeat_calls == 1
     assert client.heartbeat_status()["ok_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_heartbeat_tracks_consecutive_failures_separately() -> None:
+    fake = _FlakyHeartbeatClient([False, True, False])
+    client = _live_client(fake)
+
+    first = await client.heartbeat_once()
+    second = await client.heartbeat_once()
+    third = await client.heartbeat_once()
+
+    assert first["consecutive_failure_count"] == 1
+    assert second["consecutive_failure_count"] == 0
+    assert third["total_failure_count"] == 2
+    assert third["consecutive_failure_count"] == 1
+    assert client.heartbeat_status()["total_failure_count"] == 2
+    assert client.heartbeat_status()["consecutive_failure_count"] == 1

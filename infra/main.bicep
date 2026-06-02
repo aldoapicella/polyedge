@@ -165,6 +165,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: storageTableName
             }
             {
+              name: 'AZURE_EVENT_INDEX_TYPES'
+              value: 'market,market_start_price,paper_settlement,fair_value,decision,execution_report,feed_error,reference,live_heartbeat'
+            }
+            {
               name: 'ENABLE_TAKER_ORDERS'
               value: 'false'
             }

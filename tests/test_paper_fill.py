@@ -158,3 +158,28 @@ async def test_paper_fill_engine_does_not_fill_untracked_cancelled_order(tmp_pat
     assert reports == []
     assert len(client.open_orders) == 1
     assert engine.status(client)["paper_fill_prevented_after_cancel"] == 1
+
+
+@pytest.mark.asyncio
+async def test_paper_fill_engine_blocks_stale_book_by_current_time(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        kill_switch_file=tmp_path / "KILL_SWITCH",
+        paper_order_live_after_ms=0,
+        max_book_age_ms=1,
+    )
+    client = PaperExecutionClient()
+    engine = PaperFillEngine(settings)
+    report = await client.submit(_decision())
+    stale_book_ts = utc_now() - timedelta(seconds=1)
+
+    reports = engine.on_book(
+        _book(stale_book_ts),
+        {"up": _market(stale_book_ts)},
+        client,
+        {report.order_id or ""},
+    )
+
+    assert reports == []
+    assert len(client.open_orders) == 1
+    assert engine.status(client)["paper_fill_prevented_stale_book"] == 1

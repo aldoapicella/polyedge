@@ -56,6 +56,21 @@ touches or crosses the quote after the configured live delay, provided the
 book is fresh, the market is active, the order TTL has not expired, and the bot
 is not inside the final no-trade window.
 
+Runtime staleness checks use the current receive time, not the book timestamp
+itself. This prevents old book objects from appearing fresh merely because the
+fill engine is evaluating them against their own `local_ts`.
+
+Reports also include a `runtime_vs_replay` block:
+
+```text
+runtime_filled_reports
+replay_filled_orders
+runtime_minus_replay_fills
+runtime_net_pnl
+replay_net_pnl
+runtime_minus_replay_pnl
+```
+
 Live CLOB FAK/FOK BUY orders use quote-dollar `amount = price * size`, but the
 recorded decision and replay engine keep `size` as share quantity. The optional
 `quote_amount` field is recorded to audit that live conversion.

@@ -304,7 +304,10 @@ class PolymarketBtc15Bot:
             if status.get("ok"):
                 self._live_heartbeat_paused = False
             else:
-                if self.execution.heartbeat_failure_count >= self.settings.live_heartbeat_failure_threshold:
+                if (
+                    self.execution.heartbeat_consecutive_failure_count
+                    >= self.settings.live_heartbeat_failure_threshold
+                ):
                     self._live_heartbeat_paused = True
                     await self._cancel_active_markets("live heartbeat failure")
             await asyncio.sleep(self.settings.live_heartbeat_interval_seconds)

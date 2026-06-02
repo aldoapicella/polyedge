@@ -78,3 +78,7 @@ def test_pnl_report_separates_actual_paper_from_replay_estimate(tmp_path) -> Non
     assert Decimal(report["replay_estimate"]["net_pnl"]) == Decimal("2.50")
     assert report["replay_estimate"]["replay_metrics"]["open_orders_remaining"] == 0
     assert report["summary"]["replay_estimate_state"] == "winning"
+    assert report["runtime_vs_replay"]["runtime_filled_reports"] == 0
+    assert report["runtime_vs_replay"]["replay_filled_orders"] == 1
+    assert report["runtime_vs_replay"]["runtime_minus_replay_fills"] == -1
+    assert report["runtime_vs_replay"]["runtime_minus_replay_pnl"] == "-2.50"

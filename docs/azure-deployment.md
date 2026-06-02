@@ -126,6 +126,10 @@ Use `POST /reports/build` to create a report job, then read it with
 `GET /reports/{job_id}`, `GET /reports/latest`, or
 `GET /reports/daily/YYYY-MM-DD`.
 
+Report jobs include `partial_day`, `as_of_ts`, `prefix_start_ts`, and
+`prefix_end_ts`. Completed past-day reports are reused when `force=false`;
+set `force=true` to rebuild an existing cached daily report.
+
 Azure writes are queued and batched in a background recorder thread. The bot
 hot path records local JSONL immediately, then enqueues cloud writes so Azure
 latency does not block feed processing. Batching also keeps append operations
@@ -171,12 +175,17 @@ The table index stores selected event types for faster querying:
 ```text
 market
 market_start_price
+paper_settlement
 fair_value
 decision
 execution_report
 feed_error
 reference
+live_heartbeat
 ```
+
+`paper_settlement` and `live_heartbeat` are indexed by default so settlement
+clearing and heartbeat behavior can be queried without downloading raw blobs.
 
 Table partition keys use:
 
@@ -219,7 +228,9 @@ for safer future use:
 - account-wide `cancel_all` is blocked unless
   `ALLOW_EMERGENCY_ACCOUNT_CANCEL=true`;
 - heartbeat is live-only and records `live_heartbeat` events when live mode is
-  explicitly enabled.
+  explicitly enabled;
+- heartbeat pauses placements only after consecutive failures reach the
+  configured threshold. Total failures remain visible for observability.
 
 ## Query Examples
 

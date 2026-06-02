@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -43,6 +43,10 @@ class ReportJobManager:
             if self._running_task is not None and not self._running_task.done():
                 current = self._jobs.get(self._running_job_id or "")
                 raise ReportJobAlreadyRunning(current or {"status": "running"})
+
+            cached = await self._cached_report_for_request(request)
+            if cached is not None:
+                return cached["job"]
 
             job = self._new_job(request)
             self._jobs[job["job_id"]] = job
@@ -97,16 +101,19 @@ class ReportJobManager:
                 **job,
                 "status": "failed",
                 "finished_ts": _now_iso(),
+                "as_of_ts": _now_iso(),
                 "error": str(exc),
             }
             await self._persist_job(failed_job, None)
             job.update(failed_job)
             return
 
+        finished_ts = _now_iso()
         completed_job = {
             **job,
             "status": "completed",
-            "finished_ts": _now_iso(),
+            "finished_ts": finished_ts,
+            "as_of_ts": finished_ts,
             "error": None,
         }
         report = {
@@ -116,9 +123,26 @@ class ReportJobManager:
                 for key, value in completed_job.items()
                 if key not in {"report", "markdown"}
             },
+            "report_metadata": _report_metadata(completed_job),
         }
         await self._persist_job(completed_job, report)
         job.update(completed_job)
+
+    async def _cached_report_for_request(
+        self,
+        request: ReportBuildRequest,
+    ) -> dict[str, Any] | None:
+        if request.force or request.report_date is None or request.prefix is not None:
+            return None
+        if request.report_date >= datetime.now(timezone.utc).date():
+            return None
+        cached = await asyncio.to_thread(self.store.read_json, f"reports/{request.report_date:%Y/%m/%d}/report.json")
+        if not cached:
+            return None
+        job = cached.get("job")
+        if isinstance(job, dict) and job.get("status") == "completed":
+            return cached
+        return None
 
     def _build_report(
         self,
@@ -169,12 +193,19 @@ class ReportJobManager:
         source = _resolved_source(request.source, self.settings)
         prefix = _resolved_prefix(request.prefix, request.report_date, source)
         job_id = f"report-{uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        prefix_start_ts, prefix_end_ts = _prefix_window(prefix)
+        report_day = request.report_date or _day_from_prefix(prefix)
         return {
             "job_id": job_id,
             "status": "queued",
             "source": source,
             "prefix": prefix,
             "date": request.report_date.isoformat() if request.report_date else None,
+            "partial_day": _partial_day(report_day, now),
+            "as_of_ts": now.isoformat(),
+            "prefix_start_ts": prefix_start_ts.isoformat() if prefix_start_ts else None,
+            "prefix_end_ts": prefix_end_ts.isoformat() if prefix_end_ts else None,
             "settlement_window_seconds": request.settlement_window_seconds,
             "runtime_fill_policy": self.settings.paper_maker_fill_policy,
             "created_ts": _now_iso(),
@@ -309,6 +340,40 @@ def _date_from_string(value: Any) -> date | None:
         return None
 
 
+def _prefix_window(prefix: str | None) -> tuple[datetime | None, datetime | None]:
+    if not prefix:
+        return None, None
+    parts = prefix.strip("/").split("/")
+    if len(parts) < 4 or parts[0] != "events":
+        return None, None
+    try:
+        year, month, day = int(parts[1]), int(parts[2]), int(parts[3])
+        if len(parts) >= 6:
+            start = datetime(year, month, day, int(parts[4]), int(parts[5]), tzinfo=timezone.utc)
+            return start, start + timedelta(minutes=1)
+        if len(parts) >= 5:
+            start = datetime(year, month, day, int(parts[4]), tzinfo=timezone.utc)
+            return start, start + timedelta(hours=1)
+        start = datetime(year, month, day, tzinfo=timezone.utc)
+        return start, start + timedelta(days=1)
+    except ValueError:
+        return None, None
+
+
+def _partial_day(report_day: date | None, now: datetime) -> bool:
+    return report_day is not None and report_day >= now.date()
+
+
+def _report_metadata(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "partial_day": job.get("partial_day"),
+        "as_of_ts": job.get("as_of_ts"),
+        "prefix_start_ts": job.get("prefix_start_ts"),
+        "prefix_end_ts": job.get("prefix_end_ts"),
+        "runtime_fill_policy": job.get("runtime_fill_policy"),
+    }
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -325,6 +390,8 @@ def _report_markdown(report: dict[str, Any]) -> str:
         f"- Source: {source.get('type')}",
         f"- Prefix: {source.get('prefix') or source.get('path')}",
         f"- Runtime fill policy: {actual.get('runtime_fill_policy')}",
+        f"- Partial day: {(report.get('report_metadata') or {}).get('partial_day')}",
+        f"- As of: {(report.get('report_metadata') or {}).get('as_of_ts')}",
         f"- Actual paper state: {summary.get('actual_paper_state')}",
         f"- Actual paper net PnL: {summary.get('actual_paper_net_pnl')}",
         f"- Replay estimate state: {summary.get('replay_estimate_state')}",
@@ -357,6 +424,21 @@ def _report_markdown(report: dict[str, Any]) -> str:
                 f"- Orders cancelled: {metrics.get('orders_cancelled')}",
                 f"- Open orders remaining: {metrics.get('open_orders_remaining')}",
                 f"- Fills after cancel prevented: {metrics.get('fills_after_cancel_prevented')}",
+            ]
+        )
+    comparison = report.get("runtime_vs_replay")
+    if isinstance(comparison, dict):
+        lines.extend(
+            [
+                "",
+                "## Runtime vs Replay",
+                "",
+                f"- Runtime filled reports: {comparison.get('runtime_filled_reports')}",
+                f"- Replay filled orders: {comparison.get('replay_filled_orders')}",
+                f"- Runtime minus replay fills: {comparison.get('runtime_minus_replay_fills')}",
+                f"- Runtime net PnL: {comparison.get('runtime_net_pnl')}",
+                f"- Replay net PnL: {comparison.get('replay_net_pnl')}",
+                f"- Runtime minus replay PnL: {comparison.get('runtime_minus_replay_pnl')}",
             ]
         )
     return "\n".join(lines) + "\n"

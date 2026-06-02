@@ -88,6 +88,8 @@ files reset across deployments.
   `cancel_decisions_seen`, `cancel_execution_reports_seen`,
   `orders_cancelled`, `open_orders_remaining`, and
   `fills_after_cancel_prevented`.
+- `runtime_vs_replay` compares runtime filled reports and net PnL against the
+  offline replay estimate.
 
 Useful query parameters:
 
@@ -157,6 +159,20 @@ Build a short prefix:
 
 Only one report job can run at a time. If another job is active, the API
 returns `409` with the running job metadata.
+
+Report payloads include:
+
+```text
+report_metadata.partial_day
+report_metadata.as_of_ts
+report_metadata.prefix_start_ts
+report_metadata.prefix_end_ts
+runtime_vs_replay.runtime_minus_replay_fills
+runtime_vs_replay.runtime_minus_replay_pnl
+```
+
+For `force=false`, completed non-current-day daily reports are reused. Use
+`force=true` to rebuild and overwrite a cached past daily report.
 
 ## Quick Check
 

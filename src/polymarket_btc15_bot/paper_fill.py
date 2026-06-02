@@ -43,12 +43,14 @@ class PaperFillEngine:
         if not resting_orders:
             return []
 
-        now = book.local_ts or utc_now()
+        current_time = utc_now()
+        book_time = book.local_ts or current_time
+        now = _later(current_time, book_time)
         best_ask = book.best_ask
         if best_ask is None:
             return []
 
-        if book.is_stale(self.settings.max_book_age_ms, now):
+        if book.is_stale(self.settings.max_book_age_ms, current_time):
             self.stats.prevented_stale_book += len(resting_orders)
             return []
 
@@ -122,3 +124,7 @@ def _order_is_expired(placed_ts: datetime, ttl_ms: int | None, now: datetime) ->
     if ttl_ms is None:
         return False
     return now >= placed_ts + timedelta(milliseconds=ttl_ms)
+
+
+def _later(left: datetime, right: datetime) -> datetime:
+    return left if left >= right else right

@@ -141,6 +141,7 @@ class LiveClobExecutionClient:
         self._tracked_order_ids_by_token: dict[str, set[str]] = defaultdict(set)
         self.heartbeat_ok_count = 0
         self.heartbeat_failure_count = 0
+        self.heartbeat_consecutive_failure_count = 0
         self.last_heartbeat_ts: datetime | None = None
         self.last_heartbeat_error: str | None = None
 
@@ -281,6 +282,7 @@ class LiveClobExecutionClient:
                 )
             except Exception as exc:
                 self.heartbeat_failure_count += 1
+                self.heartbeat_consecutive_failure_count += 1
                 self.last_heartbeat_error = str(exc)
                 return {
                     "ok": False,
@@ -288,9 +290,12 @@ class LiveClobExecutionClient:
                     "error": str(exc),
                     "ok_count": self.heartbeat_ok_count,
                     "failure_count": self.heartbeat_failure_count,
+                    "total_failure_count": self.heartbeat_failure_count,
+                    "consecutive_failure_count": self.heartbeat_consecutive_failure_count,
                 }
         except Exception as exc:
             self.heartbeat_failure_count += 1
+            self.heartbeat_consecutive_failure_count += 1
             self.last_heartbeat_error = str(exc)
             return {
                 "ok": False,
@@ -298,9 +303,12 @@ class LiveClobExecutionClient:
                 "error": str(exc),
                 "ok_count": self.heartbeat_ok_count,
                 "failure_count": self.heartbeat_failure_count,
+                "total_failure_count": self.heartbeat_failure_count,
+                "consecutive_failure_count": self.heartbeat_consecutive_failure_count,
             }
         now = utc_now()
         self.heartbeat_ok_count += 1
+        self.heartbeat_consecutive_failure_count = 0
         self.last_heartbeat_ts = now
         self.last_heartbeat_error = None
         return {
@@ -309,6 +317,8 @@ class LiveClobExecutionClient:
             "last_heartbeat_ts": now.isoformat(),
             "ok_count": self.heartbeat_ok_count,
             "failure_count": self.heartbeat_failure_count,
+            "total_failure_count": self.heartbeat_failure_count,
+            "consecutive_failure_count": self.heartbeat_consecutive_failure_count,
             "raw": response if isinstance(response, dict) else {"response": str(response)},
         }
 
@@ -319,6 +329,8 @@ class LiveClobExecutionClient:
             "failure_threshold": self.settings.live_heartbeat_failure_threshold,
             "ok_count": self.heartbeat_ok_count,
             "failure_count": self.heartbeat_failure_count,
+            "total_failure_count": self.heartbeat_failure_count,
+            "consecutive_failure_count": self.heartbeat_consecutive_failure_count,
             "last_heartbeat_ts": self.last_heartbeat_ts.isoformat() if self.last_heartbeat_ts else None,
             "last_heartbeat_error": self.last_heartbeat_error,
         }

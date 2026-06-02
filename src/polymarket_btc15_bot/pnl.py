@@ -70,6 +70,7 @@ def _build_pnl_report_from_events(
     actual = actual_accumulator.summary(replay.market_results)
     replay_cost = _replay_cost(backtester)
     replay_net = replay.net_pnl
+    runtime_vs_replay = _runtime_vs_replay(actual, replay)
 
     return {
         "generated_ts": datetime.now(timezone.utc).isoformat(),
@@ -80,7 +81,10 @@ def _build_pnl_report_from_events(
             "replay_estimate_state": _state(str(replay_net)),
             "replay_estimate_net_pnl": str(replay_net),
             "replay_estimate_roi_on_cost": _ratio(replay_net, replay_cost),
+            "runtime_minus_replay_fills": runtime_vs_replay["runtime_minus_replay_fills"],
+            "runtime_minus_replay_pnl": runtime_vs_replay["runtime_minus_replay_pnl"],
         },
+        "runtime_vs_replay": runtime_vs_replay,
         "actual_paper": {
             "meaning": (
                 "Runtime paper ledger built only from execution_report events with positive filled_size. "
@@ -225,6 +229,21 @@ def _ratio(numerator: Decimal, denominator: Decimal) -> str | None:
     if denominator == 0:
         return None
     return str(numerator / denominator)
+
+
+def _runtime_vs_replay(actual: dict[str, Any], replay: Any) -> dict[str, Any]:
+    runtime_fills = int(actual["filled_reports"])
+    replay_fills = int(replay.filled_orders)
+    runtime_net = Decimal(actual["net_pnl"])
+    replay_net = replay.net_pnl
+    return {
+        "runtime_filled_reports": runtime_fills,
+        "replay_filled_orders": replay_fills,
+        "runtime_minus_replay_fills": runtime_fills - replay_fills,
+        "runtime_net_pnl": str(runtime_net),
+        "replay_net_pnl": str(replay_net),
+        "runtime_minus_replay_pnl": str(runtime_net - replay_net),
+    }
 
 
 def _azure_events(

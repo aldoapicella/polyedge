@@ -110,6 +110,12 @@
               "  pm.expect(body.replay_estimate.replay_metrics).to.have.property('cancel_execution_reports_seen');",
               "  pm.expect(body.replay_estimate.replay_metrics).to.have.property('fills_after_cancel_prevented');",
               "});",
+              "pm.test('Runtime vs replay comparison exists', function () {",
+              "  pm.expect(body).to.have.property('runtime_vs_replay');",
+              "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_fills');",
+              "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_pnl');",
+              "});",
+              "console.log('runtime_vs_replay:', body.runtime_vs_replay);",
               "console.log('actual_paper_net_pnl:', body.summary.actual_paper_net_pnl);",
               "console.log('replay_estimate_net_pnl:', body.summary.replay_estimate_net_pnl);",
               "console.log('replay_metrics:', body.replay_estimate.replay_metrics);"
@@ -167,6 +173,12 @@
               "  pm.expect(body.replay_estimate.replay_metrics).to.have.property('open_orders_remaining');",
               "  pm.expect(body.replay_estimate.replay_metrics).to.have.property('fills_after_cancel_prevented');",
               "});",
+              "pm.test('Runtime vs replay comparison exists', function () {",
+              "  pm.expect(body).to.have.property('runtime_vs_replay');",
+              "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_fills');",
+              "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_pnl');",
+              "});",
+              "console.log('runtime_vs_replay:', body.runtime_vs_replay);",
               "console.log('actual_paper_net_pnl:', body.summary.actual_paper_net_pnl);",
               "console.log('replay_estimate_net_pnl:', body.summary.replay_estimate_net_pnl);",
               "console.log('replay_metrics:', body.replay_estimate.replay_metrics);"
@@ -226,7 +238,7 @@
             "build"
           ]
         },
-        "description": "Starts one cached Azure report job for the current UTC day. The API allows only one active report job; a 409 response means another job is still running."
+        "description": "Starts one cached Azure report job for the current UTC day. The API allows only one active report job; a 409 response means another job is still running. Current-day results are marked partial_day=true until UTC day end."
       },
       "event": [
         {
@@ -274,7 +286,7 @@
             "build"
           ]
         },
-        "description": "Starts one cached report job for the configured Azure event prefix. Use this for hourly investigations."
+        "description": "Starts one cached report job for the configured Azure event prefix. Use this for hourly investigations. Prefix reports include prefix_start_ts and prefix_end_ts metadata."
       },
       "event": [
         {
@@ -321,7 +333,9 @@
               "const job = body.job || body;",
               "pm.test('Job has status', function () { pm.expect(job).to.have.property('status'); });",
               "console.log('report job status:', job.status);",
-              "if (body.report) { console.log('summary:', body.report.summary); }"
+              "if (body.report) { console.log('summary:', body.report.summary); }",
+              "if (body.report) { console.log('report_metadata:', body.report.report_metadata); }",
+              "if (body.report) { console.log('runtime_vs_replay:', body.report.runtime_vs_replay); }"
             ]
           }
         }
@@ -353,7 +367,9 @@
               "pm.test('Latest report is available', function () { pm.response.to.have.status(200); });",
               "const body = pm.response.json();",
               "pm.test('Latest report contains summary', function () { pm.expect(body.report).to.have.property('summary'); });",
-              "console.log('latest summary:', body.report.summary);"
+              "console.log('latest summary:', body.report.summary);",
+              "if (body.report) { console.log('report_metadata:', body.report.report_metadata); }",
+              "if (body.report) { console.log('runtime_vs_replay:', body.report.runtime_vs_replay); }"
             ]
           }
         }
@@ -386,7 +402,9 @@
               "pm.test('Daily report is available', function () { pm.response.to.have.status(200); });",
               "const body = pm.response.json();",
               "pm.test('Daily report contains summary', function () { pm.expect(body.report).to.have.property('summary'); });",
-              "console.log('daily summary:', body.report.summary);"
+              "console.log('daily summary:', body.report.summary);",
+              "if (body.report) { console.log('report_metadata:', body.report.report_metadata); }",
+              "if (body.report) { console.log('runtime_vs_replay:', body.report.runtime_vs_replay); }"
             ]
           }
         }
