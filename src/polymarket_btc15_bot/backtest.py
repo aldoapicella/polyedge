@@ -45,10 +45,17 @@ class ReplayOrder:
     avg_price: Decimal | None = None
     fee: Decimal = Decimal("0")
     fill_ts: datetime | None = None
+    cancel_requested_ts: datetime | None = None
+    cancel_confirmed_ts: datetime | None = None
+    prevented_fill_ts: datetime | None = None
 
     @property
     def is_filled(self) -> bool:
         return self.filled_size > 0
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.cancel_requested_ts is not None
 
 
 @dataclass
@@ -64,6 +71,7 @@ class BacktestResult:
     gross_pnl: Decimal
     fees: Decimal
     net_pnl: Decimal
+    replay_metrics: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     market_results: list[dict[str, Any]] = field(default_factory=list)
 
@@ -80,6 +88,7 @@ class BacktestResult:
             "gross_pnl": str(self.gross_pnl),
             "fees": str(self.fees),
             "net_pnl": str(self.net_pnl),
+            "replay_metrics": self.replay_metrics,
             "notes": self.notes,
             "market_results": self.market_results,
         }
@@ -96,6 +105,10 @@ class ReplayBacktester:
         self.decisions_seen = 0
         self.event_count = 0
         self.notes: list[str] = []
+        self.cancel_decisions_seen = 0
+        self.cancel_execution_reports_seen = 0
+        self.orders_cancelled = 0
+        self.fills_after_cancel_prevented = 0
 
     def run(self) -> BacktestResult:
         return self.run_events(_iter_jsonl(self.config.path))
@@ -120,6 +133,8 @@ class ReplayBacktester:
             self._handle_book(payload, recorded_ts)
         elif event_type == "decision":
             self._handle_decision(payload, recorded_ts)
+        elif event_type == "execution_report":
+            self._handle_execution_report(payload, recorded_ts)
 
     def _handle_market(self, payload: dict[str, Any]) -> None:
         market_id = str(payload.get("market_id") or "")
@@ -168,16 +183,28 @@ class ReplayBacktester:
         best_ask = _best_ask(payload)
         if best_ask is None:
             return
-        for order in list(self._open_orders):
-            if order.token_id != token_id or order.is_filled:
+        for order in self.orders:
+            if order.token_id != token_id or order.is_filled or not order.is_cancelled:
                 continue
-            if order.side == "buy" and best_ask <= order.price:
+            if order.prevented_fill_ts is not None:
+                continue
+            if self._would_fill_on_best_ask(order, best_ask):
+                order.prevented_fill_ts = recorded_ts
+                self.fills_after_cancel_prevented += 1
+        for order in list(self._open_orders):
+            if order.token_id != token_id or order.is_filled or order.is_cancelled:
+                continue
+            if self._would_fill_on_best_ask(order, best_ask):
                 self._fill_order(order, order.price, recorded_ts, maker=True)
                 self._open_orders.remove(order)
 
     def _handle_decision(self, payload: dict[str, Any], recorded_ts: datetime) -> None:
         self.decisions_seen += 1
-        if payload.get("action") != "place":
+        action = str(payload.get("action") or "")
+        if action == "cancel_all":
+            self._handle_cancel_all_decision(payload, recorded_ts)
+            return
+        if action != "place":
             return
         token_id = str(payload.get("token_id") or "")
         market_id = str(payload.get("market_id") or "")
@@ -203,12 +230,53 @@ class ReplayBacktester:
         elif order.order_kind.startswith("post_only"):
             self._open_orders.append(order)
 
+    def _handle_cancel_all_decision(self, payload: dict[str, Any], recorded_ts: datetime) -> None:
+        self.cancel_decisions_seen += 1
+        market_id = str(payload.get("market_id") or "")
+        for order in list(self._open_orders):
+            if market_id and order.market_id != market_id:
+                continue
+            order.cancel_requested_ts = recorded_ts
+            order.cancel_confirmed_ts = recorded_ts
+            self._open_orders.remove(order)
+            self.orders_cancelled += 1
+
+    def _handle_execution_report(self, payload: dict[str, Any], recorded_ts: datetime) -> None:
+        status = str(payload.get("status") or "")
+        if status not in {"paper_cancelled", "live_cancel_all_submitted"}:
+            return
+        self.cancel_execution_reports_seen += 1
+        market_id = str(payload.get("market_id") or "")
+        token_id = str(payload.get("token_id") or "")
+        for order in list(self._open_orders):
+            if market_id and order.market_id != market_id:
+                continue
+            if token_id and order.token_id != token_id:
+                continue
+            order.cancel_requested_ts = order.cancel_requested_ts or recorded_ts
+            order.cancel_confirmed_ts = recorded_ts
+            self._open_orders.remove(order)
+            self.orders_cancelled += 1
+        for order in self.orders:
+            if market_id and order.market_id != market_id:
+                continue
+            if token_id and order.token_id != token_id:
+                continue
+            if order.cancel_requested_ts is None:
+                continue
+            if order.cancel_confirmed_ts is None:
+                order.cancel_confirmed_ts = recorded_ts
+
     def _fill_order(self, order: ReplayOrder, price: Decimal, fill_ts: datetime, maker: bool) -> None:
         order.filled_size = order.size
         order.avg_price = price
         order.fill_ts = fill_ts
         if not maker:
             order.fee = crypto_taker_fee_per_share(price) * order.size
+
+    @staticmethod
+    def _would_fill_on_best_ask(order: ReplayOrder, best_ask: Decimal) -> bool:
+        return order.side == "buy" and best_ask <= order.price
 
     def _result(self) -> BacktestResult:
         market_rows: list[dict[str, Any]] = []
@@ -269,6 +337,14 @@ class ReplayBacktester:
             gross_pnl=gross,
             fees=fees,
             net_pnl=gross - fees,
+            replay_metrics={
+                "placed_orders": len(self.orders),
+                "cancel_decisions_seen": self.cancel_decisions_seen,
+                "cancel_execution_reports_seen": self.cancel_execution_reports_seen,
+                "orders_cancelled": self.orders_cancelled,
+                "open_orders_remaining": len(self._open_orders),
+                "fills_after_cancel_prevented": self.fills_after_cancel_prevented,
+            },
             notes=self.notes,
             market_results=market_rows,
         )

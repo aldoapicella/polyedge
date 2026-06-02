@@ -80,8 +80,9 @@ def _build_pnl_report_from_events(
         "replay_estimate": {
             "assumption": (
                 "Post-only maker orders are treated as filled when the captured "
-                "best ask touches or crosses the quote. Maker fees are modeled as zero; "
-                "unsettled markets are excluded from PnL."
+                "best ask touches or crosses the quote while the replay order is open. "
+                "cancel_all decisions remove eligible open replay orders. Maker fees are "
+                "modeled as zero; unsettled markets are excluded from PnL."
             ),
             "notional_cost": str(replay_cost),
             **replay.as_dict(),
