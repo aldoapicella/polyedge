@@ -18,6 +18,8 @@ class Settings(BaseSettings):
 
     app_name: str = "polymarket-btc15-bot"
     execution_mode: Literal["paper", "live"] = "paper"
+    require_api_auth: bool = False
+    api_bearer_token: str | None = None
 
     allow_live: bool = False
     confirm_non_restricted_location: bool = False
@@ -79,6 +81,10 @@ class Settings(BaseSettings):
 
     kill_switch_file: Path = Path("data/KILL_SWITCH")
     recorder_path: Path = Path("data/events.jsonl")
+    azure_storage_account_name: str | None = None
+    azure_storage_container_name: str = "bot-events"
+    azure_storage_table_name: str = "BotEventIndex"
+    azure_event_index_types: str = "market,market_start_price,fair_value,decision,execution_report,feed_error,reference"
     run_bot_on_startup: bool = False
 
     @field_validator("target_asset")
@@ -102,6 +108,14 @@ class Settings(BaseSettings):
             and self.chainlink_data_streams_api_key
             and self.chainlink_data_streams_api_secret
         )
+
+    @property
+    def azure_event_index_type_set(self) -> set[str]:
+        return {
+            item.strip()
+            for item in self.azure_event_index_types.split(",")
+            if item.strip()
+        }
 
 
 def load_settings() -> Settings:

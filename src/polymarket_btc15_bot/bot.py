@@ -20,7 +20,7 @@ from .models import (
 )
 from .polymarket_feed import PolymarketMarketFeed
 from .polymarket_rtds import PolymarketRtdsFeed, binance_subscription, chainlink_subscription
-from .recorder import JsonlRecorder
+from .recorder import JsonlRecorder, Recorder, build_recorder
 from .resolution_feed import (
     BinanceBookTickerFeed,
     ChainlinkHttpReference,
@@ -36,7 +36,7 @@ class PolymarketBtc15Bot:
         self,
         settings: Settings,
         execution_client: ExecutionClient | None = None,
-        recorder: JsonlRecorder | None = None,
+        recorder: Recorder | None = None,
     ):
         self.settings = settings
         self.discovery = MarketDiscovery(settings)
@@ -50,7 +50,7 @@ class PolymarketBtc15Bot:
         self.strategy = MakerFirstStrategy(settings)
         self.risk = RiskManager(settings)
         self.execution = execution_client or build_execution_client(settings)
-        self.recorder = recorder or JsonlRecorder(settings.recorder_path)
+        self.recorder = recorder or build_recorder(settings)
 
         self.markets: dict[str, MarketSpec] = {}
         self.books: dict[str, BookState] = {}

@@ -9,6 +9,9 @@ description = "BTC 15-minute Polymarket fair-value trading bot, paper-first with
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "azure-data-tables>=12.6",
+    "azure-identity>=1.17",
+    "azure-storage-blob>=12.22",
     "fastapi>=0.115",
     "httpx>=0.27",
     "pydantic>=2.7",
@@ -40,4 +43,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-

@@ -50,6 +50,9 @@ polymarket-btc15-bot backtest --path data/events.jsonl
 
 Replay assumptions are documented in [docs/backtesting.md](docs/backtesting.md).
 
+Azure deployment, authentication, and event-query instructions are documented
+in [docs/azure-deployment.md](docs/azure-deployment.md).
+
 Confirm the Polymarket/Chainlink BTC 15m source:
 
 ```bash

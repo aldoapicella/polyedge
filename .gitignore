@@ -8,4 +8,5 @@ __pycache__/
 data/
 logs/
 *.egg-info/
-
+infra/main.json
+infra/parameters/*.json

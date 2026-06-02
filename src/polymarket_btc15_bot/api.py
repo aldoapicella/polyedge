@@ -4,7 +4,7 @@ import asyncio
 from contextlib import suppress
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, status as http_status
 from pydantic import BaseModel
 
 from .bot import PolymarketBtc15Bot
@@ -23,6 +23,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.bot = bot
     app.state.bot_task = None
 
+    async def require_auth(authorization: str | None = Header(default=None)) -> None:
+        if not config.require_api_auth:
+            return
+        if not config.api_bearer_token:
+            raise HTTPException(
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="API authentication is required but no bearer token is configured.",
+            )
+        expected = f"Bearer {config.api_bearer_token}"
+        if authorization != expected:
+            raise HTTPException(
+                status_code=http_status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing bearer token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     @app.on_event("startup")
     async def startup() -> None:
         if config.run_bot_on_startup:
@@ -37,7 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             with suppress(asyncio.CancelledError):
                 await task
 
-    @app.get("/health")
+    @app.get("/health", dependencies=[Depends(require_auth)])
     async def health() -> dict[str, Any]:
         return {
             "ok": True,
@@ -45,11 +61,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "kill_switch": config.kill_switch_file.exists(),
         }
 
-    @app.get("/status")
+    @app.get("/status", dependencies=[Depends(require_auth)])
     async def status() -> dict[str, object]:
         return bot.status()
 
-    @app.post("/discover")
+    @app.post("/discover", dependencies=[Depends(require_auth)])
     async def discover() -> dict[str, Any]:
         markets = await bot.discover_once()
         return {
@@ -57,12 +73,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "markets": [market.model_dump(mode="json") for market in markets],
         }
 
-    @app.post("/confirm-source")
+    @app.post("/confirm-source", dependencies=[Depends(require_auth)])
     async def confirm_resolution_source() -> dict[str, Any]:
         confirmation = await confirm_source(config)
         return confirmation.as_dict()
 
-    @app.post("/evaluate")
+    @app.post("/evaluate", dependencies=[Depends(require_auth)])
     async def evaluate(execute: bool = False) -> dict[str, Any]:
         decisions = await bot.evaluate_once(execute=execute)
         return {
@@ -70,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "decisions": [decision.model_dump(mode="json") for decision in decisions],
         }
 
-    @app.post("/kill-switch")
+    @app.post("/kill-switch", dependencies=[Depends(require_auth)])
     async def kill_switch(request: KillSwitchRequest) -> dict[str, Any]:
         config.kill_switch_file.parent.mkdir(parents=True, exist_ok=True)
         if request.enabled:
