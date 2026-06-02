@@ -25,10 +25,12 @@ This is a conservative research replay, not a full exchange simulator.
 ```text
 FAK/FOK decisions:
   fill immediately at decision price
+  interpret size as shares
   pay crypto taker fee
 
 Post-only maker decisions:
   rest as open replay orders
+  interpret size as shares
   fill only if a later book ask is less than or equal to the bid price
   pay no taker fee
 ```
@@ -36,6 +38,10 @@ Post-only maker decisions:
 The replay does not yet model exact queue priority, trade prints, partial maker
 fills, or cancellation latency. Add those after enough CLOB book/trade data is
 recorded.
+
+Live CLOB FAK/FOK BUY orders use quote-dollar `amount = price * size`, but the
+recorded decision and replay engine keep `size` as share quantity. The optional
+`quote_amount` field is recorded to audit that live conversion.
 
 ## Settlement Model
 
@@ -80,4 +86,3 @@ notes
 
 Before interpreting profitability, require many settled markets. A single
 market only proves the pipeline works.
-

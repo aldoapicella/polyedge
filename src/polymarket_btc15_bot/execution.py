@@ -41,8 +41,9 @@ class PaperExecutionClient:
                 status=f"paper_{decision.action.value}",
             )
         order_id = f"paper-{uuid.uuid4()}"
-        self.open_orders[order_id] = decision
         filled = decision.size if decision.order_kind in {OrderKind.FAK, OrderKind.FOK} else None
+        if filled is None:
+            self.open_orders[order_id] = decision
         fee = Decimal("0")
         if filled and decision.price is not None:
             fee = crypto_taker_fee_per_share(decision.price) * filled
@@ -185,7 +186,7 @@ class LiveClobExecutionClient:
                 {
                     "tokenID": decision.token_id,
                     "side": side_value,
-                    "amount": float(decision.size),
+                    "amount": float(_market_order_amount(decision)),
                     "price": float(decision.price),
                 },
                 options,
@@ -225,3 +226,14 @@ def _sdk_order_type(order_kind: OrderKind | None, order_type_cls: Any) -> Any:
     if order_kind == OrderKind.POST_ONLY_GTD:
         return order_type_cls.GTD
     return order_type_cls.GTC
+
+
+def _market_order_amount(decision: TradeDecision) -> Decimal:
+    if decision.size is None:
+        return Decimal("0")
+    if decision.side == Side.BUY:
+        if decision.quote_amount is not None:
+            return decision.quote_amount
+        if decision.price is not None:
+            return decision.price * decision.size
+    return decision.size

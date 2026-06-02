@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from .config import Settings
 from .execution import ExecutionClient, build_execution_client
@@ -18,6 +19,7 @@ from .models import (
     TradeDecision,
     utc_now,
 )
+from .order_manager import OrderManager
 from .polymarket_feed import PolymarketMarketFeed
 from .polymarket_rtds import PolymarketRtdsFeed, binance_subscription, chainlink_subscription
 from .recorder import JsonlRecorder, Recorder, build_recorder
@@ -49,6 +51,7 @@ class PolymarketBtc15Bot:
         self.fair_model = LogReturnFairValueModel(settings)
         self.strategy = MakerFirstStrategy(settings)
         self.risk = RiskManager(settings)
+        self.order_manager = OrderManager()
         self.execution = execution_client or build_execution_client(settings)
         self.recorder = recorder or build_recorder(settings)
 
@@ -59,6 +62,7 @@ class PolymarketBtc15Bot:
         self.decisions: list[TradeDecision] = []
         self.execution_reports: list[ExecutionReport] = []
         self.started_at: datetime = utc_now()
+        self._last_volatility_update_key: tuple[str, datetime, Decimal] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._stop_event = asyncio.Event()
 
@@ -81,6 +85,7 @@ class PolymarketBtc15Bot:
 
         emitted: list[TradeDecision] = []
         for market in self._active_markets():
+            self.risk.open_order_count = self.order_manager.open_order_count
             fair_value = self.fair_model.compute(market, self.reference)
             if fair_value is None:
                 continue
@@ -89,7 +94,8 @@ class PolymarketBtc15Bot:
 
             raw_decisions = self.strategy.evaluate(market, fair_value, self.books)
             assessment = self.risk.assess_market(market, self.reference, self.books)
-            decisions = self.risk.filter_decisions(raw_decisions, market, assessment)
+            risk_decisions = self.risk.filter_decisions(raw_decisions, market, assessment)
+            decisions = self.order_manager.reconcile(market.market_id, risk_decisions)
             for decision in decisions:
                 self.decisions.append(decision)
                 emitted.append(decision)
@@ -97,6 +103,8 @@ class PolymarketBtc15Bot:
                 if execute and decision.action in {DecisionAction.PLACE, DecisionAction.CANCEL_ALL}:
                     report = await self.execution.submit(decision)
                     self.execution_reports.append(report)
+                    self.order_manager.on_execution_report(decision, report)
+                    self.risk.open_order_count = self.order_manager.open_order_count
                     self.risk.on_execution_report(report)
                     self.recorder.record("execution_report", report)
         return emitted
@@ -159,6 +167,7 @@ class PolymarketBtc15Bot:
             "markets": len(self.markets),
             "tradeable_markets": len(self._active_markets()),
             "books": len(self.books),
+            "tracked_open_orders": self.order_manager.open_order_count,
             "reference": self.reference.model_dump(mode="json") if self.reference else None,
             "latest_decisions": [item.model_dump(mode="json") for item in self.decisions[-20:]],
             "latest_execution_reports": [
@@ -187,7 +196,7 @@ class PolymarketBtc15Bot:
                     composite = self.reference_aggregator.update(reference)
                     self.reference = composite
                     self._capture_market_start_prices(reference)
-                    self.fair_model.update_volatility(composite)
+                    self._maybe_update_volatility(composite)
                     self.recorder.record("reference", composite)
                     if self._stop_event.is_set():
                         break
@@ -207,7 +216,7 @@ class PolymarketBtc15Bot:
                 if reference is not None:
                     self.reference = self.reference_aggregator.update(reference)
                     self._capture_market_start_prices(self.reference)
-                    self.fair_model.update_volatility(self.reference)
+                    self._maybe_update_volatility(self.reference)
                     self.recorder.record("reference", self.reference)
             await asyncio.sleep(1.0)
 
@@ -228,6 +237,15 @@ class PolymarketBtc15Bot:
                 self.recorder.record("book", book)
                 if self._stop_event.is_set():
                     break
+
+    def _maybe_update_volatility(self, reference: ReferencePrice) -> None:
+        if reference.source != "polymarket_rtds_chainlink_btc_usd":
+            return
+        key = (reference.source, reference.source_ts, reference.price)
+        if key == self._last_volatility_update_key:
+            return
+        self.fair_model.update_volatility(reference)
+        self._last_volatility_update_key = key
 
     async def _strategy_loop(self) -> None:
         while not self._stop_event.is_set():

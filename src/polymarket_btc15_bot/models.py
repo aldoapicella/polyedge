@@ -140,7 +140,10 @@ class TradeDecision(BaseModel):
     outcome: Outcome | None = None
     side: Side | None = None
     price: Decimal | None = None
+    # Share quantity. For CLOB market BUY orders, quote_amount is the dollar
+    # amount sent live.
     size: Decimal | None = None
+    quote_amount: Decimal | None = None
     order_kind: OrderKind | None = None
     reason: str
     ttl_ms: int | None = None

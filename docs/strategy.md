@@ -143,8 +143,11 @@ expiry.
 
 ## Volatility Estimate
 
-The v1 volatility estimator uses exponentially weighted log returns from the
-reference price stream.
+The v1 volatility estimator uses exponentially weighted log returns from fresh
+Polymarket RTDS Chainlink BTC/USD ticks only. Binance/Coinbase proxy updates
+are used for cross-checks, but they must not update sigma. Replaying the same
+Chainlink tick through repeated composite reference updates would add false
+zero-return samples and push volatility toward the floor.
 
 For consecutive prices:
 
@@ -175,6 +178,14 @@ sigma_cap = 3.00 annualized
 
 The floor prevents the model from becoming overconfident during quiet periods.
 The cap prevents one bad tick from exploding the estimate.
+
+The deduplication key is:
+
+```text
+(source, source_ts, price)
+```
+
+where `source` must be `polymarket_rtds_chainlink_btc_usd`.
 
 ## Drift Estimate
 
@@ -284,6 +295,9 @@ Polymarket book is thin
 ## Maker-First Strategy
 
 The default strategy is to quote as a maker with post-only limit orders.
+Implementation uses post-only GTC plus local TTL-managed cancel/replace. It
+does not use GTD unless the execution adapter supplies a valid exchange
+expiration timestamp.
 
 For Up:
 
@@ -317,9 +331,27 @@ maker_min_edge = 0.01
 order_ttl_seconds = 10
 ```
 
-When the fair value changes enough to invalidate an order, the bot cancels and
-replaces it. It must also cancel all open orders on stale feeds, kill switch,
-market close, or risk breach.
+The order manager tracks desired maker quotes by:
+
+```text
+market_id
+token_id
+side
+```
+
+Rules:
+
+```text
+same desired quote already resting -> hold
+price/size/order kind changed -> cancel all market quotes, then place desired quotes
+local TTL expired -> cancel all market quotes, then place desired quotes
+no maker edge while quote is resting -> cancel all market quotes
+stale feed, kill switch, close window, or risk breach -> cancel all market quotes
+```
+
+The current execution adapter exposes market-level `cancel_all`, so
+cancel/replace is deliberately conservative and clears the market's tracked
+quotes before placing replacements.
 
 ## Taker Strategy
 
@@ -354,6 +386,17 @@ FOK for all-or-none execution
 
 The worst-price limit must be the observed ask plus a small slippage allowance
 for buys. The bot must not submit a taker order from stale book data.
+
+Decision `size` is always share quantity in paper and replay. For live CLOB
+FAK/FOK market BUY orders, Polymarket expects `amount` as quote dollars, so the
+execution adapter sends:
+
+```text
+amount = price * share_size
+```
+
+For live CLOB market SELL orders, `amount` remains share quantity. Taker
+decisions record `quote_amount` so the replay log can audit this conversion.
 
 ## Position Sizing
 

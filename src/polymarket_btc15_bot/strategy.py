@@ -91,6 +91,8 @@ class MakerFirstStrategy:
             - self.settings.adverse_selection_buffer
             - model_error
         )
+        order_size = min(self.settings.base_order_size, self.settings.max_order_size)
+
         if (
             maker_price > best_bid
             and maker_price < best_ask
@@ -106,8 +108,8 @@ class MakerFirstStrategy:
                     outcome=outcome,
                     side=Side.BUY,
                     price=maker_price,
-                    size=min(self.settings.base_order_size, self.settings.max_order_size),
-                    order_kind=OrderKind.POST_ONLY_GTD,
+                    size=order_size,
+                    order_kind=OrderKind.POST_ONLY_GTC,
                     reason="maker edge exceeds threshold",
                     ttl_ms=self.settings.order_ttl_seconds * 1000,
                     expected_edge=maker_edge,
@@ -135,7 +137,8 @@ class MakerFirstStrategy:
                         outcome=outcome,
                         side=Side.BUY,
                         price=best_ask,
-                        size=min(self.settings.base_order_size, self.settings.max_order_size),
+                        size=order_size,
+                        quote_amount=best_ask * order_size,
                         order_kind=OrderKind.FAK,
                         reason="taker edge exceeds high threshold",
                         ttl_ms=1000,
