@@ -108,6 +108,36 @@ Every recorded event is written to hourly append blobs:
 bot-events/events/YYYY/MM/DD/HH.jsonl
 ```
 
+Azure writes are queued and batched in a background recorder thread. The bot
+hot path records local JSONL immediately, then enqueues cloud writes so Azure
+latency does not block feed processing. Batching also keeps append operations
+well below Append Blob limits during high-volume soak tests.
+
+Default batching:
+
+```text
+AZURE_RECORDER_BATCH_MAX_EVENTS=1000
+AZURE_RECORDER_BATCH_MAX_BYTES=524288
+AZURE_RECORDER_FLUSH_INTERVAL_SECONDS=2
+AZURE_RECORDER_QUEUE_MAX_EVENTS=100000
+AZURE_RECORDER_FLUSH_RETRIES=3
+```
+
+The worker flushes when any event count, byte count, or time threshold is hit.
+If the Azure queue fills, local JSONL remains the fallback source of truth and
+the Azure recorder increments its dropped-event counter.
+
+The API `/status` response includes recorder health:
+
+```text
+recorder.recorders[].queue_size
+recorder.recorders[].dropped_count
+recorder.recorders[].error_count
+recorder.recorders[].last_error
+recorder.recorders[].worker_alive
+recorder.recorders[].flush_retries
+```
+
 The JSONL envelope is:
 
 ```json

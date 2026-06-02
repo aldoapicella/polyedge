@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     azure_storage_container_name: str = "bot-events"
     azure_storage_table_name: str = "BotEventIndex"
     azure_event_index_types: str = "market,market_start_price,fair_value,decision,execution_report,feed_error,reference"
+    azure_recorder_batch_max_events: int = 1000
+    azure_recorder_batch_max_bytes: int = 524288
+    azure_recorder_flush_interval_seconds: float = 2.0
+    azure_recorder_queue_max_events: int = 100000
+    azure_recorder_flush_retries: int = 3
     run_bot_on_startup: bool = False
 
     @field_validator("target_asset")

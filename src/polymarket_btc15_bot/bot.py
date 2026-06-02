@@ -156,6 +156,10 @@ class PolymarketBtc15Bot:
             with suppress(asyncio.CancelledError):
                 await task
         self._tasks = []
+        close_recorder = getattr(self.recorder, "close", None)
+        if close_recorder is not None:
+            with suppress(Exception):
+                close_recorder()
 
     def status(self) -> dict[str, object]:
         now = utc_now()
@@ -168,6 +172,7 @@ class PolymarketBtc15Bot:
             "tradeable_markets": len(self._active_markets()),
             "books": len(self.books),
             "tracked_open_orders": self.order_manager.open_order_count,
+            "recorder": self.recorder.status() if hasattr(self.recorder, "status") else None,
             "reference": self.reference.model_dump(mode="json") if self.reference else None,
             "latest_decisions": [item.model_dump(mode="json") for item in self.decisions[-20:]],
             "latest_execution_reports": [

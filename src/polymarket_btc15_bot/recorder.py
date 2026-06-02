@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import atexit
 import json
+import queue
+import threading
+import time
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,6 +20,21 @@ from .config import Settings
 class Recorder(Protocol):
     def record(self, event_type: str, payload: BaseModel | dict[str, Any]) -> None:
         ...
+
+    def close(self) -> None:
+        ...
+
+    def status(self) -> dict[str, Any]:
+        ...
+
+
+@dataclass(frozen=True)
+class AzureQueuedEvent:
+    event_type: str
+    recorded_ts: datetime
+    payload: dict[str, Any]
+    blob_name: str
+    line: str
 
 
 class JsonlRecorder:
@@ -36,6 +56,15 @@ class JsonlRecorder:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n")
 
+    def close(self) -> None:
+        return None
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "type": "jsonl",
+            "path": str(self.path),
+        }
+
 
 class CompositeRecorder:
     def __init__(self, recorders: list[Recorder]):
@@ -45,6 +74,23 @@ class CompositeRecorder:
         for recorder in self.recorders:
             with suppress(Exception):
                 recorder.record(event_type, payload)
+
+    def close(self) -> None:
+        for recorder in self.recorders:
+            close = getattr(recorder, "close", None)
+            if close is not None:
+                with suppress(Exception):
+                    close()
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "type": "composite",
+            "recorders": [
+                recorder.status()
+                for recorder in self.recorders
+                if hasattr(recorder, "status")
+            ],
+        }
 
 
 class AzureStorageRecorder:
@@ -58,6 +104,9 @@ class AzureStorageRecorder:
 
         self.settings = settings
         self.index_types = settings.azure_event_index_type_set
+        self.error_count = 0
+        self.dropped_count = 0
+        self.last_error: str | None = None
         credential = DefaultAzureCredential()
         account = settings.azure_storage_account_name
         blob_url = f"https://{account}.blob.core.windows.net"
@@ -71,28 +120,126 @@ class AzureStorageRecorder:
             self.container.create_container()
         with suppress(Exception):
             self.table_service.create_table(settings.azure_storage_table_name)
+        self._queue: queue.Queue[AzureQueuedEvent | None] = queue.Queue(
+            maxsize=settings.azure_recorder_queue_max_events
+        )
+        self._closed = threading.Event()
+        self._worker = threading.Thread(
+            target=self._run_worker,
+            name="azure-recorder",
+            daemon=True,
+        )
+        self._worker.start()
+        atexit.register(self.close)
 
     def record(self, event_type: str, payload: BaseModel | dict[str, Any]) -> None:
+        if self._closed.is_set():
+            self.dropped_count += 1
+            self.last_error = "azure recorder is closed"
+            return
         recorded_ts = datetime.now(timezone.utc)
         data = payload.model_dump(mode="json") if isinstance(payload, BaseModel) else payload
-        envelope = {
-            "recorded_ts": recorded_ts.isoformat(),
-            "event_type": event_type,
-            "payload": data,
+        event = self._queued_event(event_type, recorded_ts, data)
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            self.dropped_count += 1
+            self.last_error = "azure recorder queue full"
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        with suppress(queue.Full):
+            self._queue.put(None, timeout=1.0)
+        self._worker.join(timeout=max(5.0, self.settings.azure_recorder_flush_interval_seconds * 2.0))
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "type": "azure_storage",
+            "queue_size": self._queue.qsize(),
+            "queue_max_events": self.settings.azure_recorder_queue_max_events,
+            "batch_max_events": self.settings.azure_recorder_batch_max_events,
+            "batch_max_bytes": self.settings.azure_recorder_batch_max_bytes,
+            "flush_interval_seconds": self.settings.azure_recorder_flush_interval_seconds,
+            "flush_retries": self.settings.azure_recorder_flush_retries,
+            "dropped_count": self.dropped_count,
+            "error_count": self.error_count,
+            "last_error": self.last_error,
+            "worker_alive": self._worker.is_alive(),
         }
-        line = json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n"
-        blob_name = self._blob_name(recorded_ts)
-        self._append_blob_line(blob_name, line)
 
-        if event_type in self.index_types:
-            self._index_event(event_type, recorded_ts, data, blob_name)
+    def _run_worker(self) -> None:
+        batch: list[AzureQueuedEvent] = []
+        batch_bytes = 0
+        deadline = time.monotonic() + self.settings.azure_recorder_flush_interval_seconds
+        while True:
+            timeout = max(0.0, deadline - time.monotonic()) if batch else self.settings.azure_recorder_flush_interval_seconds
+            item: AzureQueuedEvent | None
+            try:
+                item = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                item = None
 
-    def _append_blob_line(self, blob_name: str, line: str) -> None:
+            should_stop = item is None and self._closed.is_set()
+            if item is not None:
+                batch.append(item)
+                batch_bytes += len(item.line.encode("utf-8"))
+
+            should_flush = bool(batch) and (
+                should_stop
+                or len(batch) >= self.settings.azure_recorder_batch_max_events
+                or batch_bytes >= self.settings.azure_recorder_batch_max_bytes
+                or time.monotonic() >= deadline
+            )
+            if should_flush:
+                self._safe_flush(batch)
+                batch = []
+                batch_bytes = 0
+                deadline = time.monotonic() + self.settings.azure_recorder_flush_interval_seconds
+
+            if should_stop:
+                while True:
+                    with suppress(queue.Empty):
+                        pending = self._queue.get_nowait()
+                        if pending is not None:
+                            batch.append(pending)
+                            continue
+                    break
+                if batch:
+                    self._safe_flush(batch)
+                return
+
+    def _safe_flush(self, events: list[AzureQueuedEvent]) -> None:
+        attempts = max(1, self.settings.azure_recorder_flush_retries + 1)
+        for attempt in range(attempts):
+            try:
+                self._flush_batch(events)
+                return
+            except Exception as exc:
+                self.error_count += 1
+                self.last_error = str(exc)
+                if attempt < attempts - 1:
+                    time.sleep(min(1.0, self.settings.azure_recorder_flush_interval_seconds))
+
+    def _flush_batch(self, events: list[AzureQueuedEvent]) -> None:
+        if not events:
+            return
+        grouped: dict[str, list[str]] = {}
+        for event in events:
+            grouped.setdefault(event.blob_name, []).append(event.line)
+        for blob_name, lines in grouped.items():
+            self._append_blob_lines(blob_name, lines)
+        for event in events:
+            if event.event_type in self.index_types:
+                self._index_event(event.event_type, event.recorded_ts, event.payload, event.blob_name)
+
+    def _append_blob_lines(self, blob_name: str, lines: list[str]) -> None:
         blob = self.container.get_blob_client(blob_name)
         with suppress(Exception):
             if not blob.exists():
                 blob.create_append_blob()
-        blob.append_block(line.encode("utf-8"))
+        blob.append_block("".join(lines).encode("utf-8"))
 
     def _index_event(
         self,
@@ -118,6 +265,26 @@ class AzureStorageRecorder:
     @staticmethod
     def _blob_name(recorded_ts: datetime) -> str:
         return f"events/{recorded_ts:%Y/%m/%d/%H}.jsonl"
+
+    @classmethod
+    def _queued_event(
+        cls,
+        event_type: str,
+        recorded_ts: datetime,
+        payload: dict[str, Any],
+    ) -> AzureQueuedEvent:
+        envelope = {
+            "recorded_ts": recorded_ts.isoformat(),
+            "event_type": event_type,
+            "payload": payload,
+        }
+        return AzureQueuedEvent(
+            event_type=event_type,
+            recorded_ts=recorded_ts,
+            payload=payload,
+            blob_name=cls._blob_name(recorded_ts),
+            line=json.dumps(envelope, separators=(",", ":"), sort_keys=True) + "\n",
+        )
 
 
 class ReplayReader:
