@@ -118,3 +118,40 @@ notes
 
 Before interpreting profitability, require many settled markets. A single
 market only proves the pipeline works.
+
+## Market-Level Statistics
+
+Daily and cached reports include `market_level_statistics` for both
+`actual_paper` and `replay_estimate`. The sample unit is settled market net
+PnL, not raw fills, because multiple fills inside one 15-minute market are
+correlated.
+
+Key fields:
+
+```text
+market_level_mean_pnl
+market_level_std_pnl
+market_level_standard_error
+market_level_95ci_low
+market_level_95ci_high
+required_markets_for_0_05_precision
+required_markets_for_0_10_precision
+required_markets_to_detect_current_mean
+profitability_statistically_proven_95ci
+```
+
+Use `300` settled markets as a pilot checkpoint, not as proof of profitability.
+After that pilot, use the observed `market_level_std_pnl` and mean PnL to decide
+how many markets are needed for a defensible read:
+
+```text
+standard_error = std_pnl / sqrt(n)
+ci_low = mean_pnl - 1.96 * standard_error
+ci_high = mean_pnl + 1.96 * standard_error
+required_n_for_precision = (1.96 * std_pnl / desired_margin)^2
+required_n_to_detect_current_mean = 7.84 * (std_pnl / abs(mean_pnl))^2
+```
+
+If `market_level_95ci_low <= 0`, positive expected value is not statistically
+proven yet. A very negative pilot is enough to pause and investigate; a mildly
+positive or mildly negative pilot is inconclusive.

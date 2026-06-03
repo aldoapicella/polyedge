@@ -435,6 +435,38 @@ def _report_markdown(report: dict[str, Any]) -> str:
                 f"- Fills after cancel prevented: {metrics.get('fills_after_cancel_prevented')}",
             ]
         )
+    market_stats = replay.get("market_level_statistics")
+    if isinstance(market_stats, dict):
+        lines.extend(
+            [
+                "",
+                "## Market-Level Statistics",
+                "",
+                f"- Sample unit: {market_stats.get('sample_unit')}",
+                f"- Markets count: {market_stats.get('markets_count')}",
+                f"- Mean PnL: {market_stats.get('market_level_mean_pnl')}",
+                f"- Std PnL: {market_stats.get('market_level_std_pnl')}",
+                f"- Standard error: {market_stats.get('market_level_standard_error')}",
+                f"- 95% CI low: {market_stats.get('market_level_95ci_low')}",
+                f"- 95% CI high: {market_stats.get('market_level_95ci_high')}",
+                (
+                    "- Profitability proven by 95% CI: "
+                    f"{market_stats.get('profitability_statistically_proven_95ci')}"
+                ),
+                (
+                    "- Required markets for $0.05 precision: "
+                    f"{market_stats.get('required_markets_for_0_05_precision')}"
+                ),
+                (
+                    "- Required markets for $0.10 precision: "
+                    f"{market_stats.get('required_markets_for_0_10_precision')}"
+                ),
+                (
+                    "- Required markets to detect current mean: "
+                    f"{market_stats.get('required_markets_to_detect_current_mean')}"
+                ),
+            ]
+        )
     comparison = report.get("runtime_vs_replay")
     if isinstance(comparison, dict):
         lines.extend(

@@ -115,10 +115,21 @@
               "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_fills');",
               "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_pnl');",
               "});",
+              "pm.test('Replay market-level statistics exist', function () {",
+              "  pm.expect(body.replay_estimate).to.have.property('market_level_statistics');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_mean_pnl');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_std_pnl');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_95ci_low');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_95ci_high');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('required_markets_for_0_05_precision');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('required_markets_for_0_10_precision');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('required_markets_to_detect_current_mean');",
+              "});",
               "console.log('runtime_vs_replay:', body.runtime_vs_replay);",
               "console.log('actual_paper_net_pnl:', body.summary.actual_paper_net_pnl);",
               "console.log('replay_estimate_net_pnl:', body.summary.replay_estimate_net_pnl);",
-              "console.log('replay_metrics:', body.replay_estimate.replay_metrics);"
+              "console.log('replay_metrics:', body.replay_estimate.replay_metrics);",
+              "console.log('market_level_statistics:', body.replay_estimate.market_level_statistics);"
             ]
           }
         }
@@ -178,10 +189,21 @@
               "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_fills');",
               "  pm.expect(body.runtime_vs_replay).to.have.property('runtime_minus_replay_pnl');",
               "});",
+              "pm.test('Replay market-level statistics exist', function () {",
+              "  pm.expect(body.replay_estimate).to.have.property('market_level_statistics');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_mean_pnl');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_std_pnl');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_95ci_low');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('market_level_95ci_high');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('required_markets_for_0_05_precision');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('required_markets_for_0_10_precision');",
+              "  pm.expect(body.replay_estimate.market_level_statistics).to.have.property('required_markets_to_detect_current_mean');",
+              "});",
               "console.log('runtime_vs_replay:', body.runtime_vs_replay);",
               "console.log('actual_paper_net_pnl:', body.summary.actual_paper_net_pnl);",
               "console.log('replay_estimate_net_pnl:', body.summary.replay_estimate_net_pnl);",
-              "console.log('replay_metrics:', body.replay_estimate.replay_metrics);"
+              "console.log('replay_metrics:', body.replay_estimate.replay_metrics);",
+              "console.log('market_level_statistics:', body.replay_estimate.market_level_statistics);"
             ]
           }
         }

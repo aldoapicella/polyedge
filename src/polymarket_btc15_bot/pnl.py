@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -71,6 +71,7 @@ def _build_pnl_report_from_events(
     replay_cost = _replay_cost(backtester)
     replay_net = replay.net_pnl
     runtime_vs_replay = _runtime_vs_replay(actual, replay)
+    replay_market_level = _market_level_statistics(replay.market_results)
 
     return {
         "generated_ts": datetime.now(timezone.utc).isoformat(),
@@ -81,6 +82,12 @@ def _build_pnl_report_from_events(
             "replay_estimate_state": _state(str(replay_net)),
             "replay_estimate_net_pnl": str(replay_net),
             "replay_estimate_roi_on_cost": _ratio(replay_net, replay_cost),
+            "replay_market_level_mean_pnl": replay_market_level["market_level_mean_pnl"],
+            "replay_market_level_95ci_low": replay_market_level["market_level_95ci_low"],
+            "replay_market_level_95ci_high": replay_market_level["market_level_95ci_high"],
+            "replay_profitability_statistically_proven_95ci": replay_market_level[
+                "profitability_statistically_proven_95ci"
+            ],
             "runtime_minus_replay_fills": runtime_vs_replay["runtime_minus_replay_fills"],
             "runtime_minus_replay_pnl": runtime_vs_replay["runtime_minus_replay_pnl"],
         },
@@ -106,6 +113,7 @@ def _build_pnl_report_from_events(
                 "modeled as zero; unsettled markets are excluded from PnL."
             ),
             "notional_cost": str(replay_cost),
+            "market_level_statistics": replay_market_level,
             **replay.as_dict(),
         },
     }
@@ -153,6 +161,7 @@ class _ActualPaperAccumulator:
         notional_cost = Decimal("0")
         gross_pnl = Decimal("0")
         fees = Decimal("0")
+        market_actual: dict[str, dict[str, Decimal]] = {}
 
         for report in self.filled_reports:
             filled_size = report["filled_size"]
@@ -173,9 +182,17 @@ class _ActualPaperAccumulator:
 
             settled_filled_reports += 1
             payout = filled_size if outcome == winning_outcome else Decimal("0")
-            gross_pnl += payout - cost
+            report_gross = payout - cost
+            gross_pnl += report_gross
+            row = market_actual.setdefault(
+                market_id,
+                {"gross_pnl": Decimal("0"), "fees": Decimal("0")},
+            )
+            row["gross_pnl"] += report_gross
+            row["fees"] += fee
 
         net_pnl = gross_pnl - fees
+        actual_market_results = _actual_market_results(market_results, market_actual)
         return {
             "execution_reports_seen": self.reports_seen,
             "status_counts": dict(self.status_counts),
@@ -187,6 +204,7 @@ class _ActualPaperAccumulator:
             "fees": str(fees),
             "net_pnl": str(net_pnl),
             "roi_on_cost": _ratio(net_pnl, notional_cost),
+            "market_level_statistics": _market_level_statistics(actual_market_results),
         }
 
 
@@ -244,6 +262,107 @@ def _runtime_vs_replay(actual: dict[str, Any], replay: Any) -> dict[str, Any]:
         "replay_net_pnl": str(replay_net),
         "runtime_minus_replay_pnl": str(runtime_net - replay_net),
     }
+
+
+def _actual_market_results(
+    replay_market_results: list[dict[str, Any]],
+    market_actual: dict[str, dict[str, Decimal]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for replay_row in replay_market_results:
+        market_id = str(replay_row.get("market_id") or "")
+        actual = market_actual.get(market_id, {})
+        gross = actual.get("gross_pnl", Decimal("0"))
+        fees = actual.get("fees", Decimal("0"))
+        row = dict(replay_row)
+        row["gross_pnl"] = str(gross)
+        row["fees"] = str(fees)
+        row["net_pnl"] = str(gross - fees)
+        rows.append(row)
+    return rows
+
+
+def _market_level_statistics(market_results: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [
+        Decimal(str(row.get("net_pnl") or "0"))
+        for row in market_results
+        if row.get("winning_outcome") is not None
+    ]
+    n = len(values)
+    mean = _mean(values)
+    std = _sample_std(values, mean)
+    standard_error = _standard_error(std, n)
+    ci_low = mean - Decimal("1.96") * standard_error if mean is not None and standard_error is not None else None
+    ci_high = mean + Decimal("1.96") * standard_error if mean is not None and standard_error is not None else None
+
+    return {
+        "sample_unit": "settled_market_net_pnl",
+        "markets_count": n,
+        "market_level_mean_pnl": _decimal_or_none(mean),
+        "market_level_std_pnl": _decimal_or_none(std),
+        "market_level_standard_error": _decimal_or_none(standard_error),
+        "market_level_95ci_low": _decimal_or_none(ci_low),
+        "market_level_95ci_high": _decimal_or_none(ci_high),
+        "confidence_interval_includes_zero": (
+            None if ci_low is None or ci_high is None else ci_low <= Decimal("0") <= ci_high
+        ),
+        "profitability_statistically_proven_95ci": None if ci_low is None else ci_low > 0,
+        "required_markets_for_0_05_precision": _required_markets_for_precision(std, Decimal("0.05")),
+        "required_markets_for_0_10_precision": _required_markets_for_precision(std, Decimal("0.10")),
+        "required_markets_to_detect_current_mean": _required_markets_to_detect_current_mean(std, mean),
+        "required_markets_method": (
+            "precision uses (1.96 * sample_std / desired_margin)^2; "
+            "detect_current_mean uses 7.84 * (sample_std / abs(mean_pnl))^2."
+        ),
+    }
+
+
+def _mean(values: list[Decimal]) -> Decimal | None:
+    if not values:
+        return None
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def _sample_std(values: list[Decimal], mean: Decimal | None) -> Decimal | None:
+    if mean is None or len(values) < 2:
+        return None
+    variance = sum((value - mean) ** 2 for value in values) / Decimal(len(values) - 1)
+    return variance.sqrt()
+
+
+def _standard_error(std: Decimal | None, n: int) -> Decimal | None:
+    if std is None or n <= 0:
+        return None
+    return std / Decimal(n).sqrt()
+
+
+def _required_markets_for_precision(std: Decimal | None, desired_margin: Decimal) -> int | None:
+    if std is None:
+        return None
+    if std == 0:
+        return 1
+    required = (Decimal("1.96") * std / desired_margin) ** 2
+    return _ceil_decimal(required)
+
+
+def _required_markets_to_detect_current_mean(
+    std: Decimal | None,
+    mean: Decimal | None,
+) -> int | None:
+    if std is None or mean is None or mean == 0:
+        return None
+    if std == 0:
+        return 1
+    required = Decimal("7.84") * (std / abs(mean)) ** 2
+    return _ceil_decimal(required)
+
+
+def _decimal_or_none(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _ceil_decimal(value: Decimal) -> int:
+    return int(value.to_integral_value(rounding=ROUND_CEILING))
 
 
 def _azure_events(
