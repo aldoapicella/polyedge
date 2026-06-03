@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import timedelta
 from decimal import Decimal
@@ -88,6 +89,44 @@ async def test_bot_generates_runtime_paper_maker_fill_from_book_touch(tmp_path) 
     assert bot.status()["paper_fill"]["paper_maker_fills"] == 1
 
 
+@pytest.mark.asyncio
+async def test_bot_restarts_market_feed_when_token_set_changes(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    bot = PolymarketBtc15Bot(
+        settings,
+        execution_client=PaperExecutionClient(),
+        recorder=JsonlRecorder(settings.recorder_path),
+    )
+    feed = _BlockingMarketFeed()
+    bot.market_feed = feed
+    market = _market()
+    bot.markets = {market.market_id: market}
+
+    task = asyncio.create_task(bot._market_feed_loop())
+    try:
+        await _wait_for(lambda: len(feed.calls) == 1)
+        next_market = market.model_copy(
+            update={
+                "market_id": "m2",
+                "condition_id": "c2",
+                "up_token_id": "up2",
+                "down_token_id": "down2",
+            }
+        )
+        bot.markets = {next_market.market_id: next_market}
+
+        await _wait_for(lambda: len(feed.calls) == 2)
+    finally:
+        bot._stop_event.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert feed.calls[0] == ["down", "up"]
+    assert feed.calls[1] == ["down2", "up2"]
+    assert feed.cancel_count >= 1
+
+
 def test_bot_clears_active_exposure_after_exact_chainlink_settlement(tmp_path) -> None:
     settings = _settings(tmp_path)
     execution = PaperExecutionClient()
@@ -121,3 +160,27 @@ def test_bot_clears_active_exposure_after_exact_chainlink_settlement(tmp_path) -
     settlement = [event for event in lines if event["event_type"] == "paper_settlement"][0]
     assert settlement["payload"]["winning_outcome"] == "up"
     assert settlement["payload"]["cleared_position"] == "5"
+
+
+class _BlockingMarketFeed:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.cancel_count = 0
+
+    async def stream(self, token_ids: list[str]):
+        self.calls.append(list(token_ids))
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancel_count += 1
+            raise
+        if False:
+            yield None
+
+
+async def _wait_for(predicate) -> None:
+    for _ in range(120):
+        if predicate():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("condition was not reached")

@@ -263,23 +263,46 @@ class PolymarketBtc15Bot:
             await asyncio.sleep(1.0)
 
     async def _market_feed_loop(self) -> None:
-        while not self._stop_event.is_set():
-            token_ids = sorted(
-                {
-                    token
-                    for market in self.markets.values()
-                    for token in (market.up_token_id, market.down_token_id)
-                }
-            )
-            if not token_ids:
+        active_token_ids: list[str] = []
+        feed_task: asyncio.Task[None] | None = None
+        try:
+            while not self._stop_event.is_set():
+                token_ids = self._market_token_ids()
+                if token_ids != active_token_ids:
+                    if feed_task is not None:
+                        feed_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await feed_task
+                        feed_task = None
+                    active_token_ids = token_ids
+                    if token_ids:
+                        feed_task = asyncio.create_task(
+                            self._consume_market_feed(token_ids),
+                            name="polymarket-feed-consumer",
+                        )
                 await asyncio.sleep(2.0)
-                continue
-            async for book in self.market_feed.stream(token_ids):
-                self.books[book.token_id] = book
-                self.recorder.record("book", book)
-                self._handle_paper_fills(book)
-                if self._stop_event.is_set():
-                    break
+        finally:
+            if feed_task is not None:
+                feed_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await feed_task
+
+    async def _consume_market_feed(self, token_ids: list[str]) -> None:
+        async for book in self.market_feed.stream(token_ids):
+            self.books[book.token_id] = book
+            self.recorder.record("book", book)
+            self._handle_paper_fills(book)
+            if self._stop_event.is_set():
+                break
+
+    def _market_token_ids(self) -> list[str]:
+        return sorted(
+            {
+                token
+                for market in self.markets.values()
+                for token in (market.up_token_id, market.down_token_id)
+            }
+        )
 
     def _maybe_update_volatility(self, reference: ReferencePrice) -> None:
         if reference.source != "polymarket_rtds_chainlink_btc_usd":

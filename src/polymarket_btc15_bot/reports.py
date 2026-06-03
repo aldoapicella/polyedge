@@ -433,6 +433,11 @@ def _report_markdown(report: dict[str, Any]) -> str:
                 f"- Orders cancelled: {metrics.get('orders_cancelled')}",
                 f"- Open orders remaining: {metrics.get('open_orders_remaining')}",
                 f"- Fills after cancel prevented: {metrics.get('fills_after_cancel_prevented')}",
+                f"- Fills before live prevented: {metrics.get('fills_prevented_not_live')}",
+                f"- Stale-book fills prevented: {metrics.get('fills_prevented_stale_book')}",
+                f"- Final-window fills prevented: {metrics.get('fills_prevented_final_window')}",
+                f"- Inactive-market fills prevented: {metrics.get('fills_prevented_market_inactive')}",
+                f"- Expired-order fills prevented: {metrics.get('fills_prevented_expired')}",
             ]
         )
     market_stats = replay.get("market_level_statistics")

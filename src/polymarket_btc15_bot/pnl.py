@@ -109,8 +109,10 @@ def _build_pnl_report_from_events(
             "assumption": (
                 "Post-only maker orders are treated as filled when the captured "
                 "best ask touches or crosses the quote while the replay order is open. "
-                "cancel_all decisions remove eligible open replay orders. Maker fees are "
-                "modeled as zero; unsettled markets are excluded from PnL."
+                "cancel_all decisions remove eligible open replay orders. Replay also "
+                "enforces the configured quote-live delay, TTL, active-market window, "
+                "final no-trade window, and stale-book guard. Maker fees are modeled "
+                "as zero; unsettled markets are excluded from PnL."
             ),
             "notional_cost": str(replay_cost),
             "market_level_statistics": replay_market_level,

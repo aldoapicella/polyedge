@@ -15,6 +15,9 @@ class BacktestConfig:
     path: Path
     settlement_window_seconds: int = 15
     maker_fill_policy: str = "touch"
+    max_book_age_ms: int = 1500
+    final_no_trade_seconds: int = 30
+    paper_order_live_after_ms: int = 250
 
 
 @dataclass
@@ -40,6 +43,7 @@ class ReplayOrder:
     size: Decimal
     order_kind: str
     decision_ts: datetime
+    ttl_ms: int | None = None
     expected_edge: Decimal | None = None
     filled_size: Decimal = Decimal("0")
     avg_price: Decimal | None = None
@@ -109,6 +113,11 @@ class ReplayBacktester:
         self.cancel_execution_reports_seen = 0
         self.orders_cancelled = 0
         self.fills_after_cancel_prevented = 0
+        self.fills_prevented_not_live = 0
+        self.fills_prevented_stale_book = 0
+        self.fills_prevented_final_window = 0
+        self.fills_prevented_market_inactive = 0
+        self.fills_prevented_expired = 0
 
     def run(self) -> BacktestResult:
         return self.run_events(_iter_jsonl(self.config.path))
@@ -183,6 +192,10 @@ class ReplayBacktester:
         best_ask = _best_ask(payload)
         if best_ask is None:
             return
+        book_ts = _parse_datetime(payload.get("local_ts")) or recorded_ts
+        if _book_is_stale(book_ts, recorded_ts, self.config.max_book_age_ms):
+            self.fills_prevented_stale_book += sum(1 for order in self._open_orders if order.token_id == token_id)
+            return
         for order in self.orders:
             if order.token_id != token_id or order.is_filled or not order.is_cancelled:
                 continue
@@ -194,9 +207,30 @@ class ReplayBacktester:
         for order in list(self._open_orders):
             if order.token_id != token_id or order.is_filled or order.is_cancelled:
                 continue
+            if not self._order_can_fill(order, recorded_ts):
+                continue
             if self._would_fill_on_best_ask(order, best_ask):
                 self._fill_order(order, order.price, recorded_ts, maker=True)
                 self._open_orders.remove(order)
+
+    def _order_can_fill(self, order: ReplayOrder, recorded_ts: datetime) -> bool:
+        market = self.markets.get(order.market_id)
+        if market is None or not (market.start_ts <= recorded_ts < market.end_ts):
+            self.fills_prevented_market_inactive += 1
+            return False
+        seconds_to_close = (market.end_ts - recorded_ts).total_seconds()
+        if seconds_to_close <= self.config.final_no_trade_seconds:
+            self.fills_prevented_final_window += 1
+            return False
+        live_after = order.decision_ts + timedelta(milliseconds=self.config.paper_order_live_after_ms)
+        if recorded_ts < live_after:
+            self.fills_prevented_not_live += 1
+            return False
+        if order.order_kind.startswith("post_only") and order.size > 0:
+            if order.ttl_ms is not None and recorded_ts >= order.decision_ts + timedelta(milliseconds=order.ttl_ms):
+                self.fills_prevented_expired += 1
+                return False
+        return True
 
     def _handle_decision(self, payload: dict[str, Any], recorded_ts: datetime) -> None:
         self.decisions_seen += 1
@@ -222,6 +256,7 @@ class ReplayBacktester:
             size=size,
             order_kind=str(payload.get("order_kind") or ""),
             decision_ts=recorded_ts,
+            ttl_ms=_int_or_none(payload.get("ttl_ms")),
             expected_edge=_decimal(payload.get("expected_edge")),
         )
         self.orders.append(order)
@@ -344,6 +379,11 @@ class ReplayBacktester:
                 "orders_cancelled": self.orders_cancelled,
                 "open_orders_remaining": len(self._open_orders),
                 "fills_after_cancel_prevented": self.fills_after_cancel_prevented,
+                "fills_prevented_not_live": self.fills_prevented_not_live,
+                "fills_prevented_stale_book": self.fills_prevented_stale_book,
+                "fills_prevented_final_window": self.fills_prevented_final_window,
+                "fills_prevented_market_inactive": self.fills_prevented_market_inactive,
+                "fills_prevented_expired": self.fills_prevented_expired,
             },
             notes=self.notes,
             market_results=market_rows,
@@ -408,6 +448,19 @@ def _decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except InvalidOperation:
         return None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _book_is_stale(book_ts: datetime, recorded_ts: datetime, max_book_age_ms: int) -> bool:
+    return max(0.0, (recorded_ts - book_ts).total_seconds() * 1000.0) > max_book_age_ms
 
 
 def _best_ask(payload: dict[str, Any]) -> Decimal | None:
