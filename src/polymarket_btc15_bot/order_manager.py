@@ -38,6 +38,9 @@ class OrderManager:
             if quote.order_id is not None
         }
 
+    def open_quotes(self) -> list[ManagedQuote]:
+        return list(self._quotes.values())
+
     def reconcile(
         self,
         market_id: str,
