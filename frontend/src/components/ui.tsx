@@ -1,4 +1,5 @@
 import clsx from "clsx";
+import { Info } from "lucide-react";
 
 export function Panel({
   children,
@@ -13,20 +14,37 @@ export function Panel({
 export function PanelHeader({
   title,
   meta,
+  help,
   children
 }: {
   title: string;
   meta?: string;
+  help?: string;
   children?: React.ReactNode;
 }) {
   return (
     <div className="flex min-h-12 items-center justify-between gap-3 border-b border-line px-4 py-3">
       <div className="min-w-0">
-        <h2 className="truncate text-sm font-semibold text-ink">{title}</h2>
+        <div className="flex min-w-0 items-center gap-2">
+          <h2 className="truncate text-sm font-semibold text-ink">{title}</h2>
+          {help ? <InfoHint label={help} /> : null}
+        </div>
         {meta ? <p className="truncate text-xs text-ink/55">{meta}</p> : null}
       </div>
       {children}
     </div>
+  );
+}
+
+export function InfoHint({ label }: { label: string }) {
+  return (
+    <span className="group relative inline-flex h-5 w-5 shrink-0 items-center justify-center text-ink/45 outline-none focus-visible:text-ink" tabIndex={0}>
+      <Info className="h-3.5 w-3.5" aria-hidden />
+      <span className="sr-only">{label}</span>
+      <span className="pointer-events-none absolute left-1/2 top-6 z-30 hidden w-64 -translate-x-1/2 border border-line bg-white p-2 text-xs font-normal leading-snug text-ink/75 shadow-hairline group-hover:block group-focus-within:block">
+        {label}
+      </span>
+    </span>
   );
 }
 

@@ -6,6 +6,7 @@ import type {
   MarketDetail,
   ReportJob,
   ReportPayload,
+  RuntimeEvent,
   RuntimeConfig,
   RuntimeConfigPatch,
   Snapshot
@@ -38,6 +39,22 @@ export function getSnapshot() {
 
 export function getMarketDetail(marketId: string) {
   return backendFetch<MarketDetail>(`markets/${encodeURIComponent(marketId)}`);
+}
+
+export function getRecentEvents(params: { marketId?: string; type?: string; limit?: number } = {}) {
+  const query = new URLSearchParams();
+  if (params.marketId) {
+    query.set("market_id", params.marketId);
+  }
+  if (params.type) {
+    query.set("type", params.type);
+  }
+  if (params.limit) {
+    query.set("limit", String(params.limit));
+  }
+  return backendFetch<{ source?: string; warning?: string; events: RuntimeEvent[] }>(
+    `events/recent${query.size ? `?${query.toString()}` : ""}`
+  );
 }
 
 export function getLatestReport() {

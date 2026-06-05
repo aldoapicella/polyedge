@@ -3,19 +3,66 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import Link from "next/link";
-import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { getMarketDetail } from "@/lib/api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { getMarketDetail, getRecentEvents } from "@/lib/api";
+import {
+  buildMarketSeries,
+  formatChartTime,
+  MARKET_EVENT_BUFFER_LIMIT,
+  normalizeRecentEvents,
+  rangeLabel,
+  type ChartRange,
+  type ChartPoint
+} from "@/lib/charting";
 import { compact, dateTime, numberText, pctText } from "@/lib/format";
-import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
+import type { RuntimeEvent } from "@/lib/types";
+import { EmptyState, IconButton, InfoHint, Panel, PanelHeader, Pill } from "@/components/ui";
+
+const RANGE_FILTERS: ChartRange[] = ["full", "5m", "1m"];
 
 export function MarketDetailPage({ marketId }: { marketId: string }) {
+  const [range, setRange] = useState<ChartRange>("full");
+  const [eventTapeStore, setEventTapeStore] = useState<RuntimeEvent[]>([]);
+  const eventBufferRef = useRef<RuntimeEvent[]>([]);
   const detail = useQuery({
     queryKey: ["markets", marketId],
     queryFn: () => getMarketDetail(marketId),
     refetchInterval: 10000
   });
+  const recentEvents = useQuery({
+    queryKey: ["events", "recent", marketId],
+    queryFn: () => getRecentEvents({ marketId, limit: 1000 }),
+    refetchInterval: 30000
+  });
+
+  useEffect(() => {
+    const stream = new EventSource("/api/realtime");
+    const flush = window.setInterval(() => {
+      setEventTapeStore([...eventBufferRef.current]);
+    }, 1000);
+
+    stream.onmessage = (message) => {
+      const event = JSON.parse(message.data) as RuntimeEvent;
+      eventBufferRef.current = [event, ...eventBufferRef.current].slice(0, MARKET_EVENT_BUFFER_LIMIT);
+    };
+    stream.onerror = () => undefined;
+    return () => {
+      window.clearInterval(flush);
+      stream.close();
+    };
+  }, []);
+
   const data = detail.data;
   const market = data?.market;
+  const eventTape = useMemo(
+    () => [...eventTapeStore, ...normalizeRecentEvents(recentEvents.data).slice().reverse()],
+    [eventTapeStore, recentEvents.data]
+  );
+  const series = useMemo(
+    () => buildMarketSeries({ market, events: eventTape, range }),
+    [eventTape, market, range]
+  );
 
   return (
     <div className="space-y-5">
@@ -42,15 +89,19 @@ export function MarketDetailPage({ marketId }: { marketId: string }) {
       {market ? (
         <>
           <div className="grid gap-3 md:grid-cols-4">
-            <Metric label="Status" value={market.status} tone={market.is_active ? "good" : "neutral"} />
-            <Metric label="Start Price" value={compact(market.start_price)} />
-            <Metric label="q Up" value={pctText(market.fair_value?.q_up)} />
-            <Metric label="q Down" value={pctText(market.fair_value?.q_down)} />
+            <Metric label="Status" value={market.status} tone={market.is_active ? "good" : "neutral"} help="Market lifecycle status from discovery and the backend snapshot." />
+            <Metric label="Start Price" value={compact(market.start_price)} help="Reference price captured at the market window start." />
+            <Metric label="q Up" value={pctText(market.fair_value?.q_up)} help="Model-implied probability that this market resolves Up." />
+            <Metric label="q Down" value={pctText(market.fair_value?.q_down)} help="Model-implied probability that this market resolves Down." />
           </div>
 
           <div className="grid gap-5 xl:grid-cols-[1fr_420px]">
             <Panel>
-              <PanelHeader title="Order Books" meta={`${dateTime(market.start_ts)} → ${dateTime(market.end_ts)}`} />
+              <PanelHeader
+                title="Order Books"
+                meta={`${dateTime(market.start_ts)} -> ${dateTime(market.end_ts)}`}
+                help="Top bid and ask levels for the UP and DOWN outcome tokens."
+              />
               <div className="grid gap-4 p-4 md:grid-cols-2">
                 <BookPanel title="Up Book" book={data.books.up ?? null} />
                 <BookPanel title="Down Book" book={data.books.down ?? null} />
@@ -58,26 +109,26 @@ export function MarketDetailPage({ marketId }: { marketId: string }) {
             </Panel>
 
             <Panel>
-              <PanelHeader title="Fair Value" meta={market.fair_value?.computed_ts ? dateTime(market.fair_value.computed_ts) : "n/a"} />
+              <PanelHeader
+                title="Market Window Chart"
+                meta={`${rangeLabel(range)} · ${series.marketChart.length} samples`}
+                help="Market-specific probability and book samples. Full market pins the x-axis to the market start and end."
+              >
+                <RangeControl range={range} onChange={setRange} />
+              </PanelHeader>
               <div className="h-72 p-4">
-                {market.fair_value ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={[
-                      { outcome: "Up", value: Number(market.fair_value.q_up) },
-                      { outcome: "Down", value: Number(market.fair_value.q_down) }
-                    ]}>
-                      <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
-                      <XAxis dataKey="outcome" tick={{ fontSize: 11 }} />
-                      <YAxis domain={[0, 1]} tick={{ fontSize: 11 }} />
-                      <Tooltip />
-                      <Area type="monotone" dataKey="value" stroke="#18705b" fill="#18705b" fillOpacity={0.16} />
-                    </AreaChart>
-                  </ResponsiveContainer>
+                {series.marketChart.length ? (
+                  <MarketSeriesChart points={series.marketChart} domain={series.domain} />
                 ) : (
-                  <EmptyState label="No fair value for this market" />
+                  <EmptyState label="No live samples for this range yet" />
                 )}
               </div>
             </Panel>
+          </div>
+
+          <div className="grid gap-5 xl:grid-cols-2">
+            <ReferenceDistanceChart points={series.marketChart} domain={series.domain} />
+            <PaperFillChart fills={series.fills} domain={series.domain} />
           </div>
 
           <div className="grid gap-5 xl:grid-cols-2">
@@ -94,13 +145,121 @@ export function MarketDetailPage({ marketId }: { marketId: string }) {
   );
 }
 
-function Metric({ label, value, tone = "neutral" }: { label: string; value: string; tone?: "neutral" | "good" | "warn" | "danger" }) {
+function Metric({
+  label,
+  value,
+  tone = "neutral",
+  help
+}: {
+  label: string;
+  value: string;
+  tone?: "neutral" | "good" | "warn" | "danger";
+  help?: string;
+}) {
   return (
     <Panel className="p-4">
-      <div className="text-xs font-medium uppercase text-ink/50">{label}</div>
+      <div className="flex items-center gap-1 text-xs font-medium uppercase text-ink/50">
+        <span>{label}</span>
+        {help ? <InfoHint label={help} /> : null}
+      </div>
       <div className="mt-1 flex items-center gap-2">
         <span className="truncate text-lg font-semibold text-ink">{value}</span>
         <Pill tone={tone}>{tone}</Pill>
+      </div>
+    </Panel>
+  );
+}
+
+function RangeControl({ range, onChange }: { range: ChartRange; onChange: (range: ChartRange) => void }) {
+  return (
+    <div className="flex shrink-0 flex-wrap gap-1">
+      {RANGE_FILTERS.map((item) => (
+        <button
+          key={item}
+          className={[
+            "h-7 rounded-sm border px-2 text-[11px] font-semibold transition",
+            range === item ? "border-good bg-good text-white" : "border-line bg-white text-ink/65 hover:bg-panel"
+          ].join(" ")}
+          onClick={() => onChange(item)}
+        >
+          {rangeLabel(item)}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MarketSeriesChart({ points, domain }: { points: ChartPoint[]; domain: [number, number] }) {
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={points}>
+        <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
+        <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={20} tickFormatter={formatChartTime} />
+        <YAxis domain={[0, 1]} tick={{ fontSize: 11 }} width={32} />
+        <Tooltip formatter={(value) => numberText(value, 3)} />
+        <Legend />
+        <Line type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2.1} connectNulls isAnimationActive={false} />
+        <Line type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2.1} connectNulls isAnimationActive={false} />
+        <Line type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.3} connectNulls isAnimationActive={false} />
+        <Line type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.3} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
+        <Line type="monotone" dataKey="downBid" name="DOWN bid" stroke="#a45d13" dot={false} strokeWidth={1.3} connectNulls isAnimationActive={false} />
+        <Line type="monotone" dataKey="downAsk" name="DOWN ask" stroke="#d49a4e" dot={false} strokeWidth={1.3} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+function ReferenceDistanceChart({ points, domain }: { points: ChartPoint[]; domain: [number, number] }) {
+  const rows = points.filter((point) => Number.isFinite(point.distanceBps));
+  return (
+    <Panel>
+      <PanelHeader
+        title="Reference Distance"
+        meta={`${rows.length} samples`}
+        help="Reference price move from the market start price, measured in basis points."
+      />
+      <div className="h-64 p-4">
+        {rows.length ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={rows}>
+              <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
+              <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={24} tickFormatter={formatChartTime} />
+              <YAxis tick={{ fontSize: 11 }} width={42} tickFormatter={(value) => `${value}`} />
+              <Tooltip formatter={(value) => `${numberText(value, 1)} bps`} />
+              <ReferenceLine y={0} stroke="#17201b" strokeOpacity={0.35} />
+              <Line type="monotone" dataKey="distanceBps" name="distance" stroke="#18705b" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <EmptyState label="No reference samples for this range" />
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+function PaperFillChart({ fills, domain }: { fills: ChartPoint[]; domain: [number, number] }) {
+  return (
+    <Panel>
+      <PanelHeader
+        title="Paper Fills"
+        meta={`${fills.length} fills`}
+        help="Simulated paper maker fills plotted by fill price inside the selected market range."
+      />
+      <div className="h-64 p-4">
+        {fills.length ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={fills}>
+              <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
+              <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={24} tickFormatter={formatChartTime} />
+              <YAxis domain={[0, 1]} tick={{ fontSize: 11 }} width={32} />
+              <Tooltip formatter={(value) => numberText(value, 2)} />
+              <Line type="monotone" dataKey="fillPrice" name="fill price" stroke="#a45d13" dot={{ r: 3 }} strokeWidth={0} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <EmptyState label="No paper fills for this range" />
+        )}
       </div>
     </Panel>
   );

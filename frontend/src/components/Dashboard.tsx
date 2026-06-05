@@ -35,29 +35,19 @@ import {
 import { buildReport, getLatestReport, getSnapshot, pauseBot, resumeBot, setKillSwitch } from "@/lib/api";
 import type { ExecutionReport, MarketSummary, RuntimeEvent, Snapshot, TradeDecision } from "@/lib/types";
 import { ageText, compact, dateTime, numberText, pctText } from "@/lib/format";
-import { Button, EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
+import {
+  buildMarketSeries,
+  formatChartTime,
+  MARKET_EVENT_BUFFER_LIMIT,
+  type ChartPoint
+} from "@/lib/charting";
+import { Button, EmptyState, IconButton, InfoHint, Panel, PanelHeader, Pill } from "@/components/ui";
 
-const EVENT_BUFFER_LIMIT = 1000;
 const TIMELINE_LIMIT = 160;
-const CHART_WINDOW_MS = 15 * 60 * 1000;
 
 type Tone = "neutral" | "good" | "warn" | "danger";
 type EventTab = "highlights" | "orders" | "market" | "errors" | "raw";
 type ExecutionFilter = "all" | "fills" | "resting" | "cancelled" | "errors";
-
-type ChartPoint = {
-  bucket: number;
-  time: string;
-  qUp?: number;
-  qDown?: number;
-  upBid?: number;
-  upAsk?: number;
-  downBid?: number;
-  downAsk?: number;
-  distanceBps?: number;
-  fillPrice?: number;
-  fillOutcome?: string;
-};
 
 type TimelineRow = {
   key: string;
@@ -114,7 +104,7 @@ export function Dashboard() {
 
     stream.onmessage = (message) => {
       const event = JSON.parse(message.data) as RuntimeEvent;
-      eventBufferRef.current = [event, ...eventBufferRef.current].slice(0, EVENT_BUFFER_LIMIT);
+      eventBufferRef.current = [event, ...eventBufferRef.current].slice(0, MARKET_EVENT_BUFFER_LIMIT);
       if (event.type === "status_snapshot" || event.type === "ui_snapshot") {
         pendingSnapshotRef.current = event.data as unknown as Snapshot;
       }
@@ -148,7 +138,7 @@ export function Dashboard() {
   const paused = Boolean(status?.control?.paused);
   const recorder = recorderSummary(status?.recorder);
   const seriesStore = useMemo(
-    () => buildSeriesStore(snapshotStore, eventTapeStore),
+    () => buildMarketSeries({ snapshot: snapshotStore, events: eventTapeStore }),
     [snapshotStore, eventTapeStore]
   );
 
@@ -186,10 +176,10 @@ export function Dashboard() {
           referenceAge={ageText(reference?.local_ts)}
           isLoading={snapshot.isLoading}
         />
-        <MarketMainChart points={seriesStore.marketChart} />
+        <MarketMainChart points={seriesStore.marketChart} domain={seriesStore.domain} sampleCount={seriesStore.sampleCount} />
       </div>
 
-      <TrendCharts points={seriesStore.marketChart} fills={seriesStore.fills} />
+      <TrendCharts points={seriesStore.marketChart} fills={seriesStore.fills} domain={seriesStore.domain} />
 
       <div className="grid gap-5 xl:grid-cols-12">
         <div className="xl:col-span-5">
@@ -254,6 +244,7 @@ function SystemHealthCards({
         value={killSwitchOn ? "Active" : "Clear"}
         tone={killSwitchOn ? "danger" : "good"}
         sublabel="backend control file"
+        help="Emergency control state. When active, the backend should refuse trading actions."
       />
       <MetricCard
         icon={paused ? <PauseCircle className="h-4 w-4" /> : <PlayCircle className="h-4 w-4" />}
@@ -261,6 +252,7 @@ function SystemHealthCards({
         value={paused ? "Paused" : "Running"}
         tone={paused ? "warn" : "good"}
         sublabel={status?.control?.pause_reason ?? "operator control"}
+        help="Operator pause/resume state for the bot loop. This is separate from the kill switch."
       />
       <MetricCard
         icon={<Radio className="h-4 w-4" />}
@@ -268,6 +260,7 @@ function SystemHealthCards({
         value={status?.reference ? `$${numberText(status.reference.price, 2)}` : "n/a"}
         tone={status?.reference?.stale ? "warn" : "good"}
         sublabel={`${ageText(status?.reference?.local_ts)} · ${compact(status?.reference?.source, "no source")}`}
+        help="Latest reference price used to value the active market, with freshness shown in the subtitle."
       />
       <MetricCard
         icon={<CircleDot className="h-4 w-4" />}
@@ -278,6 +271,7 @@ function SystemHealthCards({
           status?.paper_fill?.paper_maker_fills,
           0
         )} fills`}
+        help="Tracked open orders are known to the order manager. Resting paper orders are simulated maker quotes waiting for eligible fills."
       />
       <MetricCard
         icon={<TrendingUp className="h-4 w-4" />}
@@ -285,6 +279,7 @@ function SystemHealthCards({
         value={moneyText(reportSummary?.actual_paper_net_pnl)}
         tone={Number(reportSummary?.actual_paper_net_pnl ?? 0) < 0 ? "danger" : "neutral"}
         sublabel={`Replay ${moneyText(reportSummary?.replay_estimate_net_pnl)}`}
+        help="Runtime paper PnL comes from simulated fills during operation. Replay PnL is the offline estimate from report generation."
       />
       <MetricCard
         icon={<BarChart3 className="h-4 w-4" />}
@@ -292,6 +287,7 @@ function SystemHealthCards({
         value={recorder.healthy ? "Healthy" : "Issue"}
         tone={recorder.healthy ? "good" : "danger"}
         sublabel={`queue ${recorder.queueSize} · drops ${recorder.droppedCount}`}
+        help="Recorder health reflects event persistence status. Queue and drops indicate whether events are backing up or being lost."
       />
     </div>
   );
@@ -302,20 +298,25 @@ function MetricCard({
   label,
   value,
   sublabel,
-  tone
+  tone,
+  help
 }: {
   icon: React.ReactNode;
   label: string;
   value: string;
   sublabel: string;
   tone: Tone;
+  help?: string;
 }) {
   return (
     <Panel className="p-3">
       <div className="flex items-center gap-3">
         <span className="grid h-9 w-9 shrink-0 place-items-center border border-line bg-panel text-ink/70">{icon}</span>
         <div className="min-w-0">
-          <div className="truncate text-[11px] font-semibold uppercase text-ink/50">{label}</div>
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="truncate text-[11px] font-semibold uppercase text-ink/50">{label}</span>
+            {help ? <InfoHint label={help} /> : null}
+          </div>
           <div className="mt-1 flex min-w-0 items-center gap-2">
             <span className="truncate text-lg font-semibold text-ink">{value}</span>
             <span className={toneDot(tone)} aria-hidden />
@@ -415,7 +416,11 @@ function ActiveMarketPanel({
   const distance = distanceBps(referencePrice, active?.start_price);
   return (
     <Panel className="xl:col-span-4">
-      <PanelHeader title="Active Market" meta={active ? windowMeta(active) : "No active market"} />
+      <PanelHeader
+        title="Active Market"
+        meta={active ? windowMeta(active) : "No active market"}
+        help="The current crypto Up/Down market window selected by discovery and used by the strategy."
+      />
       {active ? (
         <div className="space-y-4 p-4">
           <div className="space-y-2">
@@ -433,10 +438,15 @@ function ActiveMarketPanel({
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
             <Field label="Start Price" value={`$${numberText(active.start_price, 2)}`} />
             <Field label="Chainlink" value={`$${numberText(referencePrice, 2)}`} sublabel={referenceAge} />
-            <Field label="Distance" value={bpsText(distance)} tone={distanceTone(distance)} />
+            <Field
+              label="Distance"
+              value={bpsText(distance)}
+              tone={distanceTone(distance)}
+              help="Reference price move from the market start price, measured in basis points."
+            />
             <Field label="Market Status" value={active.is_tradeable ? "Tradeable" : active.status} />
-            <Field label="q Up" value={pctText(active.fair_value?.q_up)} tone="good" />
-            <Field label="q Down" value={pctText(active.fair_value?.q_down)} tone="danger" />
+            <Field label="q Up" value={pctText(active.fair_value?.q_up)} tone="good" help="Model-implied probability that the market resolves Up." />
+            <Field label="q Down" value={pctText(active.fair_value?.q_down)} tone="danger" help="Model-implied probability that the market resolves Down." />
           </div>
         </div>
       ) : (
@@ -450,26 +460,35 @@ function Field({
   label,
   value,
   sublabel,
-  tone = "neutral"
+  tone = "neutral",
+  help
 }: {
   label: string;
   value: string;
   sublabel?: string;
   tone?: Tone;
+  help?: string;
 }) {
   return (
     <div className="border border-line bg-panel px-3 py-2">
-      <div className="text-[11px] font-semibold uppercase text-ink/50">{label}</div>
+      <div className="flex items-center gap-1 text-[11px] font-semibold uppercase text-ink/50">
+        <span>{label}</span>
+        {help ? <InfoHint label={help} /> : null}
+      </div>
       <div className={["mt-1 truncate text-xl font-semibold", toneText(tone)].join(" ")}>{value}</div>
       {sublabel ? <div className="mt-1 truncate text-xs text-ink/50">{sublabel}</div> : null}
     </div>
   );
 }
 
-function MarketMainChart({ points }: { points: ChartPoint[] }) {
+function MarketMainChart({ points, domain, sampleCount }: { points: ChartPoint[]; domain: [number, number]; sampleCount: number }) {
   return (
     <Panel className="xl:col-span-8">
-      <PanelHeader title="Market Probability & Price" meta={`${points.length} one-second buckets`}>
+      <PanelHeader
+        title="Market Probability & Price"
+        meta={`${points.length} visible · ${sampleCount} market-window samples`}
+        help="Full active-market window. Lines update in place; the x-axis stays pinned to market start and end."
+      >
         <div className="hidden flex-wrap gap-2 md:flex">
           <MiniLegend tone="good" label="q up" />
           <MiniLegend tone="danger" label="q down" />
@@ -481,16 +500,23 @@ function MarketMainChart({ points }: { points: ChartPoint[] }) {
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={points}>
               <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
-              <XAxis dataKey="time" tick={{ fontSize: 11 }} minTickGap={28} />
+              <XAxis
+                dataKey="bucket"
+                type="number"
+                domain={domain}
+                tick={{ fontSize: 11 }}
+                minTickGap={28}
+                tickFormatter={formatChartTime}
+              />
               <YAxis domain={[0, 1]} tick={{ fontSize: 11 }} width={36} />
               <Tooltip formatter={(value) => numberText(value, 3)} />
               <Legend />
-              <Line type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2.4} connectNulls />
-              <Line type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2.4} connectNulls />
-              <Line type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.5} connectNulls />
-              <Line type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls />
-              <Line type="monotone" dataKey="downBid" name="DOWN bid" stroke="#a45d13" dot={false} strokeWidth={1.5} connectNulls />
-              <Line type="monotone" dataKey="downAsk" name="DOWN ask" stroke="#d49a4e" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls />
+              <Line type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.5} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="downBid" name="DOWN bid" stroke="#a45d13" dot={false} strokeWidth={1.5} connectNulls isAnimationActive={false} />
+              <Line type="monotone" dataKey="downAsk" name="DOWN ask" stroke="#d49a4e" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
             </LineChart>
           </ResponsiveContainer>
         ) : (
@@ -501,38 +527,38 @@ function MarketMainChart({ points }: { points: ChartPoint[] }) {
   );
 }
 
-function TrendCharts({ points, fills }: { points: ChartPoint[]; fills: ChartPoint[] }) {
+function TrendCharts({ points, fills, domain }: { points: ChartPoint[]; fills: ChartPoint[]; domain: [number, number] }) {
   return (
     <div className="grid gap-5 xl:grid-cols-3">
-      <ChartPanel title="Probability Trend" meta={`${points.length} buckets`} empty="No probability samples">
+      <ChartPanel title="Probability Trend" meta={`${points.length} buckets`} empty="No probability samples" help="Model probability and UP quote levels over the visible market window.">
         <LineChart data={points}>
           <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
-          <XAxis dataKey="time" tick={{ fontSize: 11 }} minTickGap={24} />
+          <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={24} tickFormatter={formatChartTime} />
           <YAxis domain={[0, 1]} tick={{ fontSize: 11 }} width={32} />
           <Tooltip formatter={(value) => numberText(value, 3)} />
-          <Line type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2} connectNulls />
-          <Line type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2} connectNulls />
-          <Line type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.3} connectNulls />
-          <Line type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.3} strokeDasharray="4 4" connectNulls />
+          <Line type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+          <Line type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
+          <Line type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.3} connectNulls isAnimationActive={false} />
+          <Line type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.3} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
         </LineChart>
       </ChartPanel>
-      <ChartPanel title="Reference Distance" meta="bps from start" empty="No reference samples">
+      <ChartPanel title="Reference Distance" meta="bps from start" empty="No reference samples" help="Reference price move from the market start price. Positive means above start, negative means below start.">
         <LineChart data={points.filter((point) => Number.isFinite(point.distanceBps))}>
           <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
-          <XAxis dataKey="time" tick={{ fontSize: 11 }} minTickGap={24} />
+          <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={24} tickFormatter={formatChartTime} />
           <YAxis tick={{ fontSize: 11 }} width={42} tickFormatter={(value) => `${value}`} />
           <Tooltip formatter={(value) => `${numberText(value, 1)} bps`} />
           <ReferenceLine y={0} stroke="#17201b" strokeOpacity={0.35} />
-          <Line type="monotone" dataKey="distanceBps" name="distance" stroke="#18705b" dot={false} strokeWidth={2} connectNulls />
+          <Line type="monotone" dataKey="distanceBps" name="distance" stroke="#18705b" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
         </LineChart>
       </ChartPanel>
-      <ChartPanel title="Paper Fills" meta={`${fills.length} fills`} empty="No paper fills yet">
+      <ChartPanel title="Paper Fills" meta={`${fills.length} fills`} empty="No paper fills yet" help="Simulated paper maker fills plotted at fill price inside the market window.">
         <ScatterChart data={fills}>
           <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
-          <XAxis dataKey="time" tick={{ fontSize: 11 }} minTickGap={24} />
+          <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={24} tickFormatter={formatChartTime} />
           <YAxis dataKey="fillPrice" domain={[0, 1]} tick={{ fontSize: 11 }} width={32} />
           <Tooltip formatter={(value) => numberText(value, 2)} />
-          <Scatter dataKey="fillPrice" name="fills" fill="#a45d13" />
+          <Scatter dataKey="fillPrice" name="fills" fill="#a45d13" isAnimationActive={false} />
         </ScatterChart>
       </ChartPanel>
     </div>
@@ -543,17 +569,19 @@ function ChartPanel({
   title,
   meta,
   empty,
+  help,
   children
 }: {
   title: string;
   meta: string;
   empty: string;
+  help?: string;
   children: React.ReactElement;
 }) {
   const data = (children.props as { data?: unknown[] }).data ?? [];
   return (
     <Panel>
-      <PanelHeader title={title} meta={meta} />
+      <PanelHeader title={title} meta={meta} help={help} />
       <div className="h-64 p-3">
         {data.length ? <ResponsiveContainer width="100%" height="100%">{children}</ResponsiveContainer> : <EmptyState label={empty} />}
       </div>
@@ -582,7 +610,11 @@ function EventTimeline({ events, active }: { events: RuntimeEvent[]; active?: Ma
 
   return (
     <Panel>
-      <PanelHeader title="Event Timeline" meta={paused ? "paused" : `${rows.length} rows`}>
+      <PanelHeader
+        title="Event Timeline"
+        meta={paused ? "paused" : `${rows.length} rows`}
+        help="Live runtime events from the backend stream. Market Data coalesces book updates to one row per outcome per second."
+      >
         <Button className="h-8 px-2 text-xs" onClick={() => setPaused((value) => !value)}>
           {paused ? <PlayCircle className="h-3.5 w-3.5" /> : <PauseCircle className="h-3.5 w-3.5" />}
           {paused ? "Resume" : "Pause"}
@@ -658,7 +690,11 @@ function DecisionTable({ decisions }: { decisions: TradeDecision[] }) {
   const rows = useMemo(() => collapseDecisions(decisions).slice(0, 14), [decisions]);
   return (
     <Panel>
-      <PanelHeader title="Decisions" meta={`${rows.length} grouped rows`} />
+      <PanelHeader
+        title="Decisions"
+        meta={`${rows.length} grouped rows`}
+        help="Recent strategy decisions. Consecutive HOLD rows with the same reason are collapsed to reduce noise."
+      />
       <div className="overflow-auto">
         <table className="w-full min-w-[760px] text-left text-sm">
           <thead className="border-b border-line bg-panel text-[11px] uppercase text-ink/50">
@@ -704,7 +740,11 @@ function ExecutionReportTable({ reports, active }: { reports: ExecutionReport[];
   const rows = useMemo(() => filterReports(reports, filter).slice(0, 40), [filter, reports]);
   return (
     <Panel>
-      <PanelHeader title="Execution Reports" meta={`${rows.length} shown`}>
+      <PanelHeader
+        title="Execution Reports"
+        meta={`${rows.length} shown`}
+        help="Recent paper/live execution adapter reports. In paper mode these are simulated execution outcomes."
+      >
         <div className="flex flex-wrap gap-2">
           {EXECUTION_FILTERS.map((item) => (
             <button
@@ -775,84 +815,6 @@ const EXECUTION_FILTERS: { value: ExecutionFilter; label: string }[] = [
   { value: "cancelled", label: "Cancelled" },
   { value: "errors", label: "Errors" }
 ];
-
-function buildSeriesStore(snapshot: Snapshot | undefined, events: RuntimeEvent[]) {
-  const market = snapshot?.current_market ?? undefined;
-  const startPrice = Number(market?.start_price);
-  const now = Date.now();
-  const buckets = new Map<number, ChartPoint>();
-  const getBucket = (ts: string) => {
-    const bucket = Math.floor(new Date(ts).getTime() / 1000) * 1000;
-    const existing = buckets.get(bucket);
-    if (existing) {
-      return existing;
-    }
-    const created: ChartPoint = {
-      bucket,
-      time: new Date(bucket).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
-    };
-    buckets.set(bucket, created);
-    return created;
-  };
-
-  for (const event of events.slice().reverse()) {
-    const ts = new Date(event.ts).getTime();
-    if (!Number.isFinite(ts) || now - ts > CHART_WINDOW_MS) {
-      continue;
-    }
-    const bucket = getBucket(event.ts);
-    if (event.type === "fair_value_update") {
-      const marketId = stringValue(event.data.market_id);
-      if (!market || !marketId || marketId === market.market_id) {
-        bucket.qUp = finiteNumber(event.data.q_up);
-        bucket.qDown = finiteNumber(event.data.q_down);
-      }
-    }
-    if (event.type === "reference_update") {
-      const price = finiteNumber(event.data.price);
-      if (price !== undefined && Number.isFinite(startPrice) && startPrice > 0) {
-        bucket.distanceBps = ((price / startPrice) - 1) * 10000;
-      }
-    }
-    if (event.type === "book_update_summary" && market) {
-      const outcome = tokenOutcome(stringValue(event.data.token_id), market);
-      const bid = bookPrice(event.data.best_bid);
-      const ask = bookPrice(event.data.best_ask);
-      if (outcome === "UP") {
-        bucket.upBid = bid;
-        bucket.upAsk = ask;
-      }
-      if (outcome === "DOWN") {
-        bucket.downBid = bid;
-        bucket.downAsk = ask;
-      }
-    }
-    if (event.type === "paper_fill") {
-      const avg = finiteNumber(event.data.avg_price);
-      if (avg !== undefined) {
-        bucket.fillPrice = avg;
-        bucket.fillOutcome = tokenOutcome(stringValue(event.data.token_id), market);
-      }
-    }
-  }
-
-  if (market?.fair_value) {
-    const bucket = getBucket(new Date().toISOString());
-    bucket.qUp = bucket.qUp ?? finiteNumber(market.fair_value.q_up);
-    bucket.qDown = bucket.qDown ?? finiteNumber(market.fair_value.q_down);
-  }
-  const referencePrice = finiteNumber(snapshot?.status.reference?.price);
-  if (referencePrice !== undefined && Number.isFinite(startPrice) && startPrice > 0) {
-    const bucket = getBucket(snapshot?.status.reference?.local_ts ?? new Date().toISOString());
-    bucket.distanceBps = bucket.distanceBps ?? ((referencePrice / startPrice) - 1) * 10000;
-  }
-
-  const points = [...buckets.values()].sort((a, b) => a.bucket - b.bucket);
-  return {
-    marketChart: points,
-    fills: points.filter((point) => point.fillPrice !== undefined)
-  };
-}
 
 function timelineRows(events: RuntimeEvent[], active: MarketSummary | null | undefined, tab: EventTab, search: string) {
   const rows =
