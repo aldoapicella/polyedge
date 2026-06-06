@@ -1,11 +1,11 @@
 using '../main.bicep'
 
 param location = 'eastus'
-param appName = 'polymarket-btc15'
+param appName = 'polyedge'
 param environmentName = 'dev'
 param minReplicas = 1
 param maxReplicas = 1
-param runBotOnStartup = false
+param runBotOnStartup = true
 param cpu = '0.5'
 param memory = '1Gi'
 param frontendCpu = '0.5'

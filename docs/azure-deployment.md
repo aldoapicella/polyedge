@@ -28,7 +28,7 @@ ENABLE_LIVE_HEARTBEAT=true
 
 ## Resources
 
-The active writer currently deploys to:
+The legacy stack is retained for rollback and historical reference:
 
 ```text
 subscription: Visual Studio Professional Subscription
@@ -50,10 +50,11 @@ Container App size: 1 replica, backend 0.5 CPU/1Gi, frontend 0.5 CPU/1Gi
 GitHub deployment identity: id-github-polymarket-btc15-dev
 ```
 
-The old workflow is manual-only. This prevents ordinary pushes from restarting
-the active writer while the migration is staged.
+The old workflow is manual-only, and `infra/parameters/dev.bicepparam` keeps
+`RUN_BOT_ON_STARTUP=false`. This prevents ordinary pushes or legacy redeploys
+from restarting the old writer after cutover.
 
-PolyEdge-named migration resources deploy separately as a standby stack:
+PolyEdge-named resources deploy separately as the active stack:
 
 ```text
 resource group: rg-polyedge-dev
@@ -65,7 +66,7 @@ Storage account: stpolyedge<derived>
 ACR: crpolyedge<derived>
 ```
 
-The standby stack is intentionally configured with:
+During standby validation the stack was configured with:
 
 ```text
 RUN_BOT_ON_STARTUP=false
@@ -77,12 +78,24 @@ That means the PolyEdge frontend can be validated under the new Azure names
 without starting a second market-data writer and without changing the old
 source-of-truth storage account.
 
-While the old writer is active, the old storage account remains authoritative.
-The PolyEdge storage backfill is safe to run repeatedly, but event blob counts
-can differ immediately after a copy because new minute blobs continue landing in
-the old account. A future writer cutover must run a final delta copy or use an
-explicit dual-write/cutover marker before `RUN_BOT_ON_STARTUP=true` is allowed
-on the PolyEdge stack.
+For active cutover use:
+
+```text
+RUN_BOT_ON_STARTUP=true
+BACKEND_API_BASE_URL=http://127.0.0.1:8000/api/v1
+BACKEND_SSE_URL unset
+```
+
+The cutover command is:
+
+```bash
+bash scripts/cutover-polyedge-active.sh
+```
+
+The script disables the legacy writer, runs a final old-to-PolyEdge blob copy
+with exact source-snapshot verification, deploys PolyEdge with
+`infra/parameters/polyedge-active.bicepparam`, verifies the new writer and
+Azure recorder, and writes a state file under `output/cutover/`.
 
 Container Apps use a user-assigned managed identity for ACR pulls and storage
 data access. This avoids the first-revision race where a system-assigned

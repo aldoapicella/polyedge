@@ -195,6 +195,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               secretRef: 'api-bearer-token'
             }
             {
+              name: 'AZURE_CLIENT_ID'
+              value: containerAppIdentity.properties.clientId
+            }
+            {
               name: 'TARGET_ASSET'
               value: 'BTC'
             }
