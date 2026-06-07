@@ -32,11 +32,11 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { buildReport, getLatestReport, getSnapshot, pauseBot, resumeBot, setKillSwitch } from "@/lib/api";
+import { buildReport, getLatestReport, getMarketChart, getSnapshot, pauseBot, resumeBot, setKillSwitch } from "@/lib/api";
 import type { ExecutionReport, MarketSummary, RuntimeEvent, Snapshot, TradeDecision } from "@/lib/types";
 import { ageText, compact, dateTime, numberText, pctText } from "@/lib/format";
 import {
-  buildMarketSeries,
+  emptyMarketSeries,
   formatChartTime,
   MARKET_EVENT_BUFFER_LIMIT,
   type ChartPoint
@@ -137,10 +137,13 @@ export function Dashboard() {
   const killSwitchOn = Boolean(status?.kill_switch);
   const paused = Boolean(status?.control?.paused);
   const recorder = recorderSummary(status?.recorder);
-  const seriesStore = useMemo(
-    () => buildMarketSeries({ snapshot: snapshotStore, events: eventTapeStore }),
-    [snapshotStore, eventTapeStore]
-  );
+  const chartSeries = useQuery({
+    queryKey: ["markets", "chart", active?.market_id ?? "none", "full"],
+    queryFn: () => getMarketChart(active?.market_id ?? "", "full"),
+    enabled: Boolean(active?.market_id),
+    refetchInterval: 3000
+  });
+  const seriesStore = chartSeries.data ?? emptyMarketSeries(active);
 
   return (
     <div className="space-y-5">

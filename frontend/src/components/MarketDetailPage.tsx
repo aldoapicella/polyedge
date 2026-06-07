@@ -3,66 +3,37 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useState } from "react";
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { getMarketDetail, getRecentEvents } from "@/lib/api";
+import { getMarketChart, getMarketDetail } from "@/lib/api";
 import {
-  buildMarketSeries,
+  emptyMarketSeries,
   formatChartTime,
-  MARKET_EVENT_BUFFER_LIMIT,
-  normalizeRecentEvents,
   rangeLabel,
   type ChartRange,
   type ChartPoint
 } from "@/lib/charting";
 import { compact, dateTime, numberText, pctText } from "@/lib/format";
-import type { RuntimeEvent } from "@/lib/types";
 import { EmptyState, IconButton, InfoHint, Panel, PanelHeader, Pill } from "@/components/ui";
 
 const RANGE_FILTERS: ChartRange[] = ["full", "5m", "1m"];
 
 export function MarketDetailPage({ marketId }: { marketId: string }) {
   const [range, setRange] = useState<ChartRange>("full");
-  const [eventTapeStore, setEventTapeStore] = useState<RuntimeEvent[]>([]);
-  const eventBufferRef = useRef<RuntimeEvent[]>([]);
   const detail = useQuery({
     queryKey: ["markets", marketId],
     queryFn: () => getMarketDetail(marketId),
     refetchInterval: 10000
   });
-  const recentEvents = useQuery({
-    queryKey: ["events", "recent", marketId],
-    queryFn: () => getRecentEvents({ marketId, limit: 1000 }),
-    refetchInterval: 30000
+  const chart = useQuery({
+    queryKey: ["markets", "chart", marketId, range],
+    queryFn: () => getMarketChart(marketId, range),
+    refetchInterval: 3000
   });
-
-  useEffect(() => {
-    const stream = new EventSource("/api/realtime");
-    const flush = window.setInterval(() => {
-      setEventTapeStore([...eventBufferRef.current]);
-    }, 1000);
-
-    stream.onmessage = (message) => {
-      const event = JSON.parse(message.data) as RuntimeEvent;
-      eventBufferRef.current = [event, ...eventBufferRef.current].slice(0, MARKET_EVENT_BUFFER_LIMIT);
-    };
-    stream.onerror = () => undefined;
-    return () => {
-      window.clearInterval(flush);
-      stream.close();
-    };
-  }, []);
 
   const data = detail.data;
   const market = data?.market;
-  const eventTape = useMemo(
-    () => [...eventTapeStore, ...normalizeRecentEvents(recentEvents.data).slice().reverse()],
-    [eventTapeStore, recentEvents.data]
-  );
-  const series = useMemo(
-    () => buildMarketSeries({ market, events: eventTape, range }),
-    [eventTape, market, range]
-  );
+  const series = chart.data ?? emptyMarketSeries(market, range);
 
   return (
     <div className="space-y-5">
@@ -111,8 +82,8 @@ export function MarketDetailPage({ marketId }: { marketId: string }) {
             <Panel>
               <PanelHeader
                 title="Market Window Chart"
-                meta={`${rangeLabel(range)} · ${series.marketChart.length} samples`}
-                help="Market-specific probability and book samples. Full market pins the x-axis to the market start and end."
+                meta={`${rangeLabel(range)} · ${series.marketChart.length} visible · ${series.sampleCount} stored`}
+                help="Persisted market-specific probability and book samples. Full market pins the x-axis to the market start and end."
               >
                 <RangeControl range={range} onChange={setRange} />
               </PanelHeader>
@@ -120,7 +91,7 @@ export function MarketDetailPage({ marketId }: { marketId: string }) {
                 {series.marketChart.length ? (
                   <MarketSeriesChart points={series.marketChart} domain={series.domain} />
                 ) : (
-                  <EmptyState label="No live samples for this range yet" />
+                  <EmptyState label={chart.isLoading ? "Loading persisted samples" : "No stored samples for this range yet"} />
                 )}
               </div>
             </Panel>

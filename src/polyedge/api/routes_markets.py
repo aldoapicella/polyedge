@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi import status as http_status
 
 from ..bot import PolyEdgeBot
+from ..services.chart_service import ChartService
 from ..services.event_service import EventService
 from ..services.snapshot import SnapshotService
 from ..source_confirmation import confirm_source
-from .deps import get_bot, get_event_service, get_settings, get_snapshot_service, require_auth
+from .deps import get_bot, get_chart_service, get_event_service, get_settings, get_snapshot_service, require_auth
+from .schemas import ChartBackfillApiRequest
 from ..config import Settings
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -27,18 +30,65 @@ async def current_market(snapshot_service: SnapshotService = Depends(get_snapsho
     return {"market": market}
 
 
+@router.get("/markets/history")
+async def historical_markets(
+    limit: int = 100,
+    chart_service: ChartService = Depends(get_chart_service),
+) -> dict[str, Any]:
+    return {"markets": chart_service.list_markets(limit)}
+
+
 @router.get("/markets/{market_id}")
 async def market_detail(
     market_id: str,
     snapshot_service: SnapshotService = Depends(get_snapshot_service),
+    chart_service: ChartService = Depends(get_chart_service),
 ) -> dict[str, Any]:
     market = snapshot_service.market_detail(market_id)
+    if market is not None:
+        return market
+    historical_market = chart_service.get_market(market_id)
+    if historical_market is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_404_NOT_FOUND,
+            detail=f"Market {market_id} was not found.",
+        )
+    return {
+        "market": historical_market.model_dump(mode="json"),
+        "fair_value": None,
+        "books": {"up": None, "down": None},
+        "decisions": [],
+        "execution_reports": [],
+    }
+
+
+@router.get("/markets/{market_id}/chart")
+async def market_chart(
+    market_id: str,
+    range: Literal["full", "5m", "1m"] = "full",
+    bot: PolyEdgeBot = Depends(get_bot),
+    chart_service: ChartService = Depends(get_chart_service),
+) -> dict[str, Any]:
+    market = bot.markets.get(market_id) or chart_service.get_market(market_id)
     if market is None:
         raise HTTPException(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Market {market_id} was not found.",
         )
-    return market
+    return chart_service.series(market, chart_range=range)
+
+
+@router.post("/charts/backfill")
+async def backfill_charts(
+    request: ChartBackfillApiRequest,
+    chart_service: ChartService = Depends(get_chart_service),
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        chart_service.backfill,
+        source=request.source,
+        prefix=request.prefix,
+        report_date=request.report_date,
+    )
 
 
 @router.get("/orders")

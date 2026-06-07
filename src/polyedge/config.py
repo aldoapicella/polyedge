@@ -92,9 +92,13 @@ class Settings(BaseSettings):
 
     kill_switch_file: Path = Path("data/KILL_SWITCH")
     recorder_path: Path = Path("data/events.jsonl")
+    chart_data_enabled: bool = True
+    chart_data_path: Path = Path("data/chart-points")
     azure_storage_account_name: str | None = None
     azure_storage_container_name: str = "bot-events"
     azure_storage_table_name: str = "BotEventIndex"
+    azure_chart_table_name: str = "BotChartSeries"
+    azure_market_table_name: str = "BotMarketCatalog"
     azure_event_index_types: str = (
         "market,market_start_price,paper_settlement,fair_value,decision,"
         "execution_report,feed_error,reference,live_heartbeat"
@@ -104,6 +108,10 @@ class Settings(BaseSettings):
     azure_recorder_flush_interval_seconds: float = 2.0
     azure_recorder_queue_max_events: int = 100000
     azure_recorder_flush_retries: int = 3
+    chart_data_batch_max_events: int = 1000
+    chart_data_flush_interval_seconds: float = 2.0
+    chart_data_queue_max_events: int = 100000
+    chart_data_flush_retries: int = 3
     run_bot_on_startup: bool = False
 
     @field_validator("target_asset")

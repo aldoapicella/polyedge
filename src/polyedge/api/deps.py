@@ -6,8 +6,10 @@ from fastapi import status as http_status
 from ..bot import PolyEdgeBot
 from ..config import Settings
 from ..reports import ReportJobManager
+from ..runtime.chart_data import ChartDataStore
 from ..runtime.event_bus import RuntimeEventBus
 from ..services.audit import AuditLog
+from ..services.chart_service import ChartService
 from ..services.config_service import RuntimeConfigService
 from ..services.event_service import EventService
 from ..services.snapshot import SnapshotService
@@ -43,6 +45,14 @@ def get_config_service(request: Request) -> RuntimeConfigService:
 
 def get_event_bus(request: Request) -> RuntimeEventBus:
     return request.app.state.event_bus
+
+
+def get_chart_data_store(request: Request) -> ChartDataStore:
+    return request.app.state.chart_data_store
+
+
+def get_chart_service(request: Request) -> ChartService:
+    return request.app.state.chart_service
 
 
 async def require_auth(

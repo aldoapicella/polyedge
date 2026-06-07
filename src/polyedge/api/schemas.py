@@ -40,3 +40,11 @@ class ReportBuildApiRequest(BaseModel):
     report_date: Date | None = Field(default=None, alias="date")
     settlement_window_seconds: int = 15
     force: bool = False
+
+
+class ChartBackfillApiRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    source: Literal["auto", "local", "azure"] = "auto"
+    prefix: str | None = None
+    report_date: Date | None = Field(default=None, alias="date")

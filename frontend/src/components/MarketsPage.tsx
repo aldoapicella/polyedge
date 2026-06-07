@@ -3,7 +3,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, RefreshCw } from "lucide-react";
 import Link from "next/link";
-import { getSnapshot } from "@/lib/api";
+import { useMemo } from "react";
+import { getHistoricalMarkets, getSnapshot } from "@/lib/api";
 import { compact, dateTime, pctText } from "@/lib/format";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
@@ -13,19 +14,41 @@ export function MarketsPage() {
     queryFn: getSnapshot,
     refetchInterval: 10000
   });
-  const markets = snapshot.data?.markets ?? [];
+  const historical = useQuery({
+    queryKey: ["markets", "history"],
+    queryFn: () => getHistoricalMarkets(500),
+    refetchInterval: 30000
+  });
+  const liveMarkets = snapshot.data?.markets ?? [];
+  const historicalMarkets = historical.data?.markets ?? [];
+  const markets = useMemo(() => {
+    const merged = new Map<string, (typeof liveMarkets)[number]>();
+    for (const market of historicalMarkets) {
+      merged.set(market.market_id, market);
+    }
+    for (const market of liveMarkets) {
+      merged.set(market.market_id, market);
+    }
+    return [...merged.values()].sort((a, b) => new Date(b.start_ts).getTime() - new Date(a.start_ts).getTime());
+  }, [historicalMarkets, liveMarkets]);
 
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <h1 className="text-xl font-semibold text-ink">Markets</h1>
-        <IconButton label="Refresh markets" onClick={() => snapshot.refetch()}>
+        <IconButton
+          label="Refresh markets"
+          onClick={() => {
+            snapshot.refetch();
+            historical.refetch();
+          }}
+        >
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
 
       <Panel>
-        <PanelHeader title="Market Windows" meta={`${markets.length} loaded`} />
+        <PanelHeader title="Market Windows" meta={`${markets.length} loaded · ${historicalMarkets.length} historical`} />
         <div className="overflow-auto">
           <table className="w-full min-w-[960px] text-left text-sm">
             <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">

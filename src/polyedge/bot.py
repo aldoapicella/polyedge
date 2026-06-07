@@ -31,6 +31,7 @@ from .resolution_feed import (
     ReferenceAggregator,
 )
 from .risk import RiskManager
+from .runtime.chart_data import ChartDataStore, build_chart_data_store
 from .runtime.event_bus import RuntimeEventBus
 from .strategy import MakerFirstStrategy
 
@@ -42,6 +43,7 @@ class PolyEdgeBot:
         execution_client: ExecutionClient | None = None,
         recorder: Recorder | None = None,
         event_bus: RuntimeEventBus | None = None,
+        chart_store: ChartDataStore | None = None,
     ):
         self.settings = settings
         self.discovery = MarketDiscovery(settings)
@@ -59,6 +61,7 @@ class PolyEdgeBot:
         self.paper_fill_engine = PaperFillEngine(settings)
         self.recorder = recorder or build_recorder(settings)
         self.event_bus = event_bus or RuntimeEventBus()
+        self.chart_store = chart_store or build_chart_data_store(settings)
 
         self.markets: dict[str, MarketSpec] = {}
         self.books: dict[str, BookState] = {}
@@ -86,6 +89,7 @@ class PolyEdgeBot:
             merged[market.market_id] = market
         self.markets = merged
         for market in markets:
+            self.chart_store.record_market(market)
             self._record_event("market", market, publish_type="market_discovered")
         return markets
 
@@ -102,6 +106,7 @@ class PolyEdgeBot:
             if fair_value is None:
                 continue
             self.fair_values[market.market_id] = fair_value
+            self.chart_store.record_fair_value(fair_value)
             self._record_event("fair_value", fair_value, publish_type="fair_value_update")
 
             if self._live_heartbeat_paused:
@@ -195,6 +200,8 @@ class PolyEdgeBot:
         if close_recorder is not None:
             with suppress(Exception):
                 close_recorder()
+        with suppress(Exception):
+            self.chart_store.close()
 
     def status(self) -> dict[str, object]:
         now = utc_now()
@@ -220,6 +227,7 @@ class PolyEdgeBot:
                 else None
             ),
             "recorder": self.recorder.status() if hasattr(self.recorder, "status") else None,
+            "chart_data": self.chart_store.status(),
             "reference": self.reference.model_dump(mode="json") if self.reference else None,
             "latest_decisions": [item.model_dump(mode="json") for item in self.decisions[-20:]],
             "latest_execution_reports": [
@@ -274,6 +282,7 @@ class PolyEdgeBot:
                     self._capture_market_start_prices(reference)
                     self._settle_finished_markets(reference)
                     self._maybe_update_volatility(composite)
+                    self.chart_store.record_reference(composite, self._active_markets())
                     self._record_event("reference", composite, publish_type="reference_update")
                     if self._stop_event.is_set():
                         break
@@ -295,6 +304,7 @@ class PolyEdgeBot:
                     self._capture_market_start_prices(self.reference)
                     self._settle_finished_markets(self.reference)
                     self._maybe_update_volatility(self.reference)
+                    self.chart_store.record_reference(self.reference, self._active_markets())
                     self._record_event("reference", self.reference, publish_type="reference_update")
             await asyncio.sleep(1.0)
 
@@ -326,11 +336,13 @@ class PolyEdgeBot:
     async def _consume_market_feed(self, token_ids: list[str]) -> None:
         async for book in self.market_feed.stream(token_ids):
             self.books[book.token_id] = book
+            market = self._markets_by_token().get(book.token_id)
+            self.chart_store.record_book(market, book)
             self._record_event(
                 "book",
                 book,
                 publish_type="book_update_summary",
-                publish_payload=self._book_summary(book),
+                publish_payload=self._book_summary(book, market),
             )
             self._handle_paper_fills(book)
             if self._stop_event.is_set():
@@ -388,6 +400,7 @@ class PolyEdgeBot:
             if 0 <= seconds_after_start <= grace:
                 updated = market.with_start_price(reference.price)
                 self.markets[market_id] = updated
+                self.chart_store.record_market(updated)
                 self._record_event(
                     "market_start_price",
                     {
@@ -476,13 +489,14 @@ class PolyEdgeBot:
         self.recorder.record(event_type, payload)  # type: ignore[arg-type]
 
     def _record_execution_report(self, report: ExecutionReport) -> None:
+        self.chart_store.record_execution_report(report, self.markets.get(report.market_id))
         self._record_event("execution_report", report)
         if report.status == "paper_filled_maker":
             self.event_bus.publish("paper_fill", report)
 
     @staticmethod
-    def _book_summary(book: BookState) -> dict[str, object]:
-        return {
+    def _book_summary(book: BookState, market: MarketSpec | None = None) -> dict[str, object]:
+        data: dict[str, object] = {
             "token_id": book.token_id,
             "best_bid": book.best_bid.model_dump(mode="json") if book.best_bid else None,
             "best_ask": book.best_ask.model_dump(mode="json") if book.best_ask else None,
@@ -491,6 +505,13 @@ class PolyEdgeBot:
             "local_ts": book.local_ts.isoformat(),
             "book_hash": book.book_hash,
         }
+        if market is not None:
+            data["market_id"] = market.market_id
+            if book.token_id == market.up_token_id:
+                data["outcome"] = "up"
+            elif book.token_id == market.down_token_id:
+                data["outcome"] = "down"
+        return data
 
     def _markets_by_token(self) -> dict[str, MarketSpec]:
         markets_by_token: dict[str, MarketSpec] = {}

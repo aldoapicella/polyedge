@@ -11,6 +11,7 @@ import type {
   RuntimeConfigPatch,
   Snapshot
 } from "@/lib/types";
+import type { ChartRange, MarketSeries } from "@/lib/charting";
 
 type FetchOptions = {
   method?: "GET" | "POST";
@@ -39,6 +40,15 @@ export function getSnapshot() {
 
 export function getMarketDetail(marketId: string) {
   return backendFetch<MarketDetail>(`markets/${encodeURIComponent(marketId)}`);
+}
+
+export function getHistoricalMarkets(limit = 200) {
+  return backendFetch<{ markets: Snapshot["markets"] }>(`markets/history?limit=${limit}`);
+}
+
+export function getMarketChart(marketId: string, range: ChartRange = "full") {
+  const query = new URLSearchParams({ range });
+  return backendFetch<MarketSeries>(`markets/${encodeURIComponent(marketId)}/chart?${query.toString()}`);
 }
 
 export function getRecentEvents(params: { marketId?: string; type?: string; limit?: number } = {}) {
