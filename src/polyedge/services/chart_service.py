@@ -52,6 +52,7 @@ class ChartService:
         state = _MaterializationState(self.chart_store)
         for event in events:
             state.handle(event)
+        self.chart_store.flush(timeout=120.0)
         return state.summary()
 
 

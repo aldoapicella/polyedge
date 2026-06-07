@@ -103,6 +103,9 @@ class ChartSink(Protocol):
     def close(self) -> None:
         ...
 
+    def flush(self, timeout: float = 30.0) -> None:
+        ...
+
     def status(self) -> dict[str, Any]:
         ...
 
@@ -156,6 +159,9 @@ class LocalChartSink:
     def close(self) -> None:
         return None
 
+    def flush(self, timeout: float = 30.0) -> None:
+        return None
+
     def status(self) -> dict[str, Any]:
         return {
             "type": "local_chart_jsonl",
@@ -197,6 +203,8 @@ class AzureTableChartSink:
         self.dropped_count = 0
         self.last_error: str | None = None
         self._update_mode = UpdateMode.MERGE
+        self._pending_lock = threading.Lock()
+        self._pending_count = 0
         table_url = f"https://{settings.azure_storage_account_name}.table.core.windows.net"
         self.table_service = TableServiceClient(
             endpoint=table_url,
@@ -224,11 +232,12 @@ class AzureTableChartSink:
             self.dropped_count += 1
             self.last_error = "azure chart sink is closed"
             return
+        self._increment_pending(1)
         try:
             self._queue.put_nowait(sample)
         except queue.Full:
-            self.dropped_count += 1
-            self.last_error = "azure chart sink queue full"
+            self._safe_flush([sample])
+            self._decrement_pending(1)
 
     def write_market(self, market: MarketSpec) -> None:
         entity = _market_to_entity(market)
@@ -281,10 +290,19 @@ class AzureTableChartSink:
     def close(self) -> None:
         if self._closed.is_set():
             return
+        self.flush(timeout=max(5.0, self.settings.chart_data_flush_interval_seconds * 2.0))
         self._closed.set()
         with suppress(queue.Full):
             self._queue.put(None, timeout=1.0)
         self._worker.join(timeout=max(5.0, self.settings.chart_data_flush_interval_seconds * 2.0))
+
+    def flush(self, timeout: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._pending_lock:
+                if self._pending_count <= 0:
+                    return
+            time.sleep(0.05)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -295,6 +313,7 @@ class AzureTableChartSink:
             "queue_max_events": self.settings.chart_data_queue_max_events,
             "flush_interval_seconds": self.settings.chart_data_flush_interval_seconds,
             "dropped_count": self.dropped_count,
+            "pending_count": self._pending_count,
             "error_count": self.error_count,
             "last_error": self.last_error,
             "worker_alive": self._worker.is_alive(),
@@ -321,6 +340,7 @@ class AzureTableChartSink:
             )
             if should_flush:
                 self._safe_flush(batch)
+                self._decrement_pending(len(batch))
                 batch = []
                 deadline = time.monotonic() + self.settings.chart_data_flush_interval_seconds
 
@@ -334,6 +354,7 @@ class AzureTableChartSink:
                     break
                 if batch:
                     self._safe_flush(batch)
+                    self._decrement_pending(len(batch))
                 return
 
     def _safe_flush(self, samples: list[ChartSample]) -> None:
@@ -357,6 +378,14 @@ class AzureTableChartSink:
             current.update({name: value for name, value in entity.items() if value is not None})
         for entity in merged.values():
             self.table.upsert_entity(entity, mode=self._update_mode)
+
+    def _increment_pending(self, count: int) -> None:
+        with self._pending_lock:
+            self._pending_count += count
+
+    def _decrement_pending(self, count: int) -> None:
+        with self._pending_lock:
+            self._pending_count = max(0, self._pending_count - count)
 
 
 class ChartDataStore:
@@ -482,6 +511,13 @@ class ChartDataStore:
         for sink in self.sinks:
             with suppress(Exception):
                 sink.close()
+
+    def flush(self, timeout: float = 30.0) -> None:
+        deadline = time.monotonic() + timeout
+        for sink in self.sinks:
+            remaining = max(0.0, deadline - time.monotonic())
+            with suppress(Exception):
+                sink.flush(remaining)
 
     def status(self) -> dict[str, Any]:
         return {
