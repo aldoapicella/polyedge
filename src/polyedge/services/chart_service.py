@@ -143,9 +143,10 @@ class ChartService:
 
     def _materialize(self, events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         state = _MaterializationState(self.chart_store)
+        pending_before_backfill = self.chart_store.pending_count()
         for event in events:
             state.handle(event)
-        self.chart_store.flush(timeout=120.0)
+        self.chart_store.flush(timeout=120.0, target_pending=pending_before_backfill)
         return state.summary()
 
 

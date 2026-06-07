@@ -103,7 +103,10 @@ class ChartSink(Protocol):
     def close(self) -> None:
         ...
 
-    def flush(self, timeout: float = 30.0) -> None:
+    def flush(self, timeout: float = 30.0, target_pending: int = 0) -> None:
+        ...
+
+    def pending_count(self) -> int:
         ...
 
     def status(self) -> dict[str, Any]:
@@ -159,8 +162,11 @@ class LocalChartSink:
     def close(self) -> None:
         return None
 
-    def flush(self, timeout: float = 30.0) -> None:
+    def flush(self, timeout: float = 30.0, target_pending: int = 0) -> None:
         return None
+
+    def pending_count(self) -> int:
+        return 0
 
     def status(self) -> dict[str, Any]:
         return {
@@ -290,19 +296,23 @@ class AzureTableChartSink:
     def close(self) -> None:
         if self._closed.is_set():
             return
-        self.flush(timeout=max(5.0, self.settings.chart_data_flush_interval_seconds * 2.0))
+        self.flush(timeout=max(5.0, self.settings.chart_data_flush_interval_seconds * 2.0), target_pending=0)
         self._closed.set()
         with suppress(queue.Full):
             self._queue.put(None, timeout=1.0)
         self._worker.join(timeout=max(5.0, self.settings.chart_data_flush_interval_seconds * 2.0))
 
-    def flush(self, timeout: float = 30.0) -> None:
+    def flush(self, timeout: float = 30.0, target_pending: int = 0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._pending_lock:
-                if self._pending_count <= 0:
+                if self._pending_count <= target_pending:
                     return
             time.sleep(0.05)
+
+    def pending_count(self) -> int:
+        with self._pending_lock:
+            return self._pending_count
 
     def status(self) -> dict[str, Any]:
         return {
@@ -512,12 +522,19 @@ class ChartDataStore:
             with suppress(Exception):
                 sink.close()
 
-    def flush(self, timeout: float = 30.0) -> None:
+    def flush(self, timeout: float = 30.0, target_pending: int = 0) -> None:
         deadline = time.monotonic() + timeout
         for sink in self.sinks:
             remaining = max(0.0, deadline - time.monotonic())
             with suppress(Exception):
-                sink.flush(remaining)
+                sink.flush(remaining, target_pending)
+
+    def pending_count(self) -> int:
+        total = 0
+        for sink in self.sinks:
+            with suppress(Exception):
+                total += sink.pending_count()
+        return total
 
     def status(self) -> dict[str, Any]:
         return {
