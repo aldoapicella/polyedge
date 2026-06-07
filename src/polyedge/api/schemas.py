@@ -48,3 +48,7 @@ class ChartBackfillApiRequest(BaseModel):
     source: Literal["auto", "local", "azure"] = "auto"
     prefix: str | None = None
     report_date: Date | None = Field(default=None, alias="date")
+
+
+class ChartHydrateApiRequest(BaseModel):
+    limit: int = Field(default=1000, ge=1, le=5000)

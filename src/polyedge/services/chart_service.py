@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from ..config import Settings
 from ..models import BookLevel, BookState, ExecutionReport, FairValue, MarketSpec, MarketStatus, ReferencePrice
-from ..runtime.chart_data import ChartDataStore, ChartRange
+from ..runtime.chart_data import ChartDataStore, ChartRange, MarketChartSummary
 
 ChartBackfillSource = Literal["auto", "local", "azure"]
 
@@ -60,6 +60,33 @@ class ChartBackfillJobManager:
             )
             return job
 
+    async def start_hydrate(self, *, limit: int = 1000) -> dict[str, Any]:
+        async with self._lock:
+            if self._running_task is not None and not self._running_task.done():
+                current = self._jobs.get(self._running_job_id or "")
+                raise ChartBackfillJobAlreadyRunning(current or {"status": "running"})
+            job = {
+                "job_id": f"chart-hydrate-{uuid4().hex}",
+                "status": "queued",
+                "source": "chart_store",
+                "prefix": None,
+                "date": None,
+                "created_ts": _now_iso(),
+                "started_ts": None,
+                "finished_ts": None,
+                "error": None,
+                "summary": None,
+                "limit": limit,
+                "job_type": "hydrate",
+            }
+            self._jobs[job["job_id"]] = job
+            self._running_job_id = job["job_id"]
+            self._running_task = asyncio.create_task(
+                self._run_hydrate(job["job_id"], limit),
+                name=f"chart-hydrate-{job['job_id']}",
+            )
+            return job
+
     async def get(self, job_id: str) -> dict[str, Any] | None:
         return self._jobs.get(job_id)
 
@@ -78,6 +105,7 @@ class ChartBackfillJobManager:
         report_date: date | None,
     ) -> None:
         job = self._jobs[job_id]
+        job["job_type"] = "backfill"
         job["status"] = "running"
         job["started_ts"] = _now_iso()
         try:
@@ -87,6 +115,30 @@ class ChartBackfillJobManager:
                 prefix=prefix,
                 report_date=report_date,
             )
+        except Exception as exc:
+            job.update(
+                {
+                    "status": "failed",
+                    "finished_ts": _now_iso(),
+                    "error": str(exc),
+                }
+            )
+            return
+        job.update(
+            {
+                "status": "completed",
+                "finished_ts": _now_iso(),
+                "summary": summary,
+                "error": None,
+            }
+        )
+
+    async def _run_hydrate(self, job_id: str, limit: int) -> None:
+        job = self._jobs[job_id]
+        job["status"] = "running"
+        job["started_ts"] = _now_iso()
+        try:
+            summary = await asyncio.to_thread(self.chart_service.hydrate_market_summaries, limit=limit)
         except Exception as exc:
             job.update(
                 {
@@ -115,10 +167,54 @@ class ChartService:
         return self.chart_store.get_market(market_id)
 
     def list_markets(self, limit: int = 100) -> list[dict[str, Any]]:
-        return [market.model_dump(mode="json") for market in self.chart_store.list_markets(limit)]
+        return [
+            self.market_payload(market)
+            for market in self.chart_store.list_markets(limit)
+        ]
+
+    def market_payload(self, market: MarketSpec) -> dict[str, Any]:
+        summary = self.chart_store.get_market_summary(market.market_id)
+        return _market_payload(market, summary)
 
     def series(self, market: MarketSpec, chart_range: ChartRange = "full") -> dict[str, Any]:
         return self.chart_store.series(market, chart_range=chart_range)
+
+    def hydrate_market_summaries(self, *, limit: int = 1000) -> dict[str, Any]:
+        markets = self.chart_store.list_markets(limit)
+        hydrated = 0
+        without_samples = 0
+        first_sample_ts: str | None = None
+        last_sample_ts: str | None = None
+        for market in markets:
+            summary = self.chart_store.compute_market_summary(market)
+            if summary is None:
+                fallback = _raw_market_summary(market)
+                if fallback is None:
+                    without_samples += 1
+                    continue
+                summary = fallback
+            self.chart_store.record_market_summary(summary)
+            hydrated += 1
+            if summary.first_sample_ts:
+                first_sample_ts = (
+                    summary.first_sample_ts
+                    if first_sample_ts is None
+                    else min(first_sample_ts, summary.first_sample_ts)
+                )
+            if summary.last_sample_ts:
+                last_sample_ts = (
+                    summary.last_sample_ts
+                    if last_sample_ts is None
+                    else max(last_sample_ts, summary.last_sample_ts)
+                )
+        self.chart_store.flush(timeout=120.0)
+        return {
+            "markets_seen": len(markets),
+            "markets_hydrated": hydrated,
+            "markets_without_samples": without_samples,
+            "first_sample_ts": first_sample_ts,
+            "last_sample_ts": last_sample_ts,
+        }
 
     def backfill(
         self,
@@ -147,7 +243,30 @@ class ChartService:
         for event in events:
             state.handle(event)
         self.chart_store.flush(timeout=120.0, target_pending=pending_before_backfill)
-        return state.summary()
+        summary = state.summary()
+        hydrate_summary = self._hydrate_touched_market_summaries(state.markets.values())
+        if hydrate_summary:
+            summary["market_summaries"] = hydrate_summary
+        return summary
+
+    def _hydrate_touched_market_summaries(self, markets: Iterable[MarketSpec]) -> dict[str, Any]:
+        hydrated = 0
+        without_samples = 0
+        for market in markets:
+            summary = self.chart_store.compute_market_summary(market)
+            if summary is None:
+                fallback = _raw_market_summary(market)
+                if fallback is None:
+                    without_samples += 1
+                    continue
+                summary = fallback
+            self.chart_store.record_market_summary(summary)
+            hydrated += 1
+        self.chart_store.flush(timeout=120.0)
+        return {
+            "markets_hydrated": hydrated,
+            "markets_without_samples": without_samples,
+        }
 
 
 class _MaterializationState:
@@ -326,6 +445,92 @@ def _market_from_payload(payload: dict[str, Any]) -> MarketSpec | None:
         )
     except ValueError:
         return None
+
+
+def _market_payload(market: MarketSpec, summary: MarketChartSummary | None) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    data = market.model_dump(mode="json")
+    if data.get("start_price") is None and summary and summary.start_price is not None:
+        data["start_price"] = summary.start_price
+    data["is_active"] = market.start_ts <= now < market.end_ts
+    data["is_tradeable"] = market.status == MarketStatus.TRADEABLE and data.get("start_price") is not None and market.end_ts > now
+    if market.end_ts <= now:
+        data["status"] = MarketStatus.CLOSED.value
+    data["fair_value"] = _fair_value_payload(market, summary)
+    if summary is not None:
+        data["chart_summary"] = summary.to_record()
+    return data
+
+
+def _fair_value_payload(market: MarketSpec, summary: MarketChartSummary | None) -> dict[str, Any] | None:
+    if summary and summary.q_up is not None and summary.q_down is not None:
+        return {
+            "market_id": market.market_id,
+            "q_up": summary.q_up,
+            "q_down": summary.q_down,
+            "sigma": 0,
+            "drift_mu": 0,
+            "model_error": "0",
+            "computed_ts": summary.fair_value_ts or summary.last_sample_ts or market.end_ts.isoformat(),
+        }
+    raw_q = _raw_outcome_prices(market)
+    if raw_q is None:
+        return None
+    q_up, q_down = raw_q
+    return {
+        "market_id": market.market_id,
+        "q_up": q_up,
+        "q_down": q_down,
+        "sigma": 0,
+        "drift_mu": 0,
+        "model_error": "0",
+        "computed_ts": market.end_ts.isoformat(),
+    }
+
+
+def _raw_market_summary(market: MarketSpec) -> MarketChartSummary | None:
+    raw_q = _raw_outcome_prices(market)
+    if raw_q is None:
+        return None
+    q_up, q_down = raw_q
+    return MarketChartSummary(
+        market_id=market.market_id,
+        sample_count=0,
+        first_sample_ts=None,
+        last_sample_ts=None,
+        start_price=str(market.start_price) if market.start_price is not None else None,
+        q_up=q_up,
+        q_down=q_down,
+        fair_value_ts=market.end_ts.isoformat(),
+    )
+
+
+def _raw_outcome_prices(market: MarketSpec) -> tuple[str, str] | None:
+    raw_market = market.raw.get("market") if isinstance(market.raw, dict) else None
+    candidates = []
+    if isinstance(raw_market, dict):
+        candidates.append(raw_market.get("outcomePrices"))
+    candidates.append(market.raw.get("outcomePrices") if isinstance(market.raw, dict) else None)
+    for candidate in candidates:
+        parsed = _parse_price_pair(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_price_pair(value: Any) -> tuple[str, str] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    up = _decimal(value[0])
+    down = _decimal(value[1])
+    if up is None or down is None:
+        return None
+    return str(up), str(down)
 
 
 def _levels(value: Any) -> list[BookLevel]:

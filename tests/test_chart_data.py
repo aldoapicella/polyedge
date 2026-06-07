@@ -228,6 +228,68 @@ def test_historical_market_endpoint_uses_backfilled_catalog(tmp_path) -> None:
     assert response.json()["markets"][0]["market_id"] == "old-m2"
 
 
+def test_historical_market_endpoint_uses_hydrated_chart_summary(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    start = datetime(2026, 6, 6, 20, 0, tzinfo=timezone.utc)
+    market = _market(start).model_copy(update={"market_id": "old-m3"})
+    app.state.chart_data_store.record_market(market)
+    app.state.chart_data_store.record_fair_value(
+        FairValue(
+            market_id=market.market_id,
+            q_up=Decimal("0.62"),
+            q_down=Decimal("0.38"),
+            sigma=0.5,
+            drift_mu=0.0,
+            model_error=Decimal("0.01"),
+            computed_ts=start + timedelta(minutes=10),
+        )
+    )
+    summary = app.state.chart_service.hydrate_market_summaries()
+
+    response = TestClient(app).get("/api/v1/markets/history")
+
+    assert summary["markets_hydrated"] == 1
+    assert response.status_code == 200
+    market_payload = response.json()["markets"][0]
+    assert market_payload["market_id"] == "old-m3"
+    assert market_payload["start_price"] == "100"
+    assert market_payload["fair_value"]["q_up"] == "0.62"
+    assert market_payload["fair_value"]["q_down"] == "0.38"
+    assert market_payload["chart_summary"]["sample_count"] == 1
+
+
+def test_historical_market_endpoint_falls_back_to_raw_outcome_prices(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    start = datetime(2026, 2, 23, 17, 0, tzinfo=timezone.utc)
+    market = MarketSpec(
+        market_id="closed-m1",
+        condition_id="closed-c1",
+        question="Bitcoin Up or Down",
+        up_token_id="closed-up",
+        down_token_id="closed-down",
+        start_ts=start,
+        end_ts=start + timedelta(minutes=15),
+        start_price=None,
+        status=MarketStatus.CLOSED,
+        raw={"market": {"outcomePrices": "[\"0\", \"1\"]"}},
+    )
+    app.state.chart_data_store.record_market(market)
+    summary = app.state.chart_service.hydrate_market_summaries()
+
+    response = TestClient(app).get("/api/v1/markets/history")
+
+    assert summary["markets_hydrated"] == 1
+    assert response.status_code == 200
+    market_payload = response.json()["markets"][0]
+    assert market_payload["market_id"] == "closed-m1"
+    assert market_payload["start_price"] is None
+    assert market_payload["fair_value"]["q_up"] == "0"
+    assert market_payload["fair_value"]["q_down"] == "1"
+    assert market_payload["chart_summary"]["sample_count"] == 0
+
+
 def test_chart_backfill_endpoint_runs_as_job(tmp_path) -> None:
     settings = _settings(tmp_path)
     settings.recorder_path.write_text(
@@ -261,6 +323,38 @@ def test_chart_backfill_endpoint_runs_as_job(tmp_path) -> None:
             time.sleep(0.05)
         assert current["status"] == "completed"
         assert current["summary"]["markets_persisted"] == 1
+
+
+def test_chart_hydrate_endpoint_runs_as_job(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    app = create_app(settings)
+    start = datetime(2026, 6, 6, 20, 0, tzinfo=timezone.utc)
+    market = _market(start).model_copy(update={"market_id": "hydrate-m1"})
+    app.state.chart_data_store.record_market(market)
+    app.state.chart_data_store.record_fair_value(
+        FairValue(
+            market_id=market.market_id,
+            q_up=Decimal("0.55"),
+            q_down=Decimal("0.45"),
+            sigma=0.5,
+            drift_mu=0.0,
+            model_error=Decimal("0.01"),
+            computed_ts=start + timedelta(minutes=1),
+        )
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/v1/charts/hydrate", json={"limit": 50})
+
+        assert response.status_code == 200
+        job = response.json()
+        assert job["job_id"].startswith("chart-hydrate-")
+        for _ in range(20):
+            current = client.get(f"/api/v1/charts/backfill/{job['job_id']}").json()
+            if current["status"] == "completed":
+                break
+            time.sleep(0.05)
+        assert current["status"] == "completed"
+        assert current["summary"]["markets_hydrated"] == 1
 
 
 def _event(recorded_ts: str, event_type: str, payload: dict) -> str:

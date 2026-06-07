@@ -78,6 +78,31 @@ class ChartSample:
 
 
 @dataclass(frozen=True)
+class MarketChartSummary:
+    market_id: str
+    sample_count: int
+    first_sample_ts: str | None = None
+    last_sample_ts: str | None = None
+    start_price: str | None = None
+    q_up: str | None = None
+    q_down: str | None = None
+    fair_value_ts: str | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "market_id": self.market_id,
+            "sample_count": self.sample_count,
+            "first_sample_ts": self.first_sample_ts,
+            "last_sample_ts": self.last_sample_ts,
+            "start_price": self.start_price,
+            "q_up": self.q_up,
+            "q_down": self.q_down,
+            "fair_value_ts": self.fair_value_ts,
+        }
+        return {key: value for key, value in record.items() if value is not None}
+
+
+@dataclass(frozen=True)
 class ChartQueryResult:
     source: str
     records: list[dict[str, Any]]
@@ -91,10 +116,16 @@ class ChartSink(Protocol):
     def write_market(self, market: MarketSpec) -> None:
         ...
 
+    def write_market_summary(self, summary: MarketChartSummary) -> None:
+        ...
+
     def query(self, market_id: str, start: datetime, end: datetime) -> ChartQueryResult:
         ...
 
     def get_market(self, market_id: str) -> MarketSpec | None:
+        ...
+
+    def get_market_summary(self, market_id: str) -> MarketChartSummary | None:
         ...
 
     def list_markets(self, limit: int = 100) -> list[MarketSpec]:
@@ -127,6 +158,10 @@ class LocalChartSink:
         with self._market_path().open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(market.model_dump(mode="json"), separators=(",", ":"), sort_keys=True) + "\n")
 
+    def write_market_summary(self, summary: MarketChartSummary) -> None:
+        with self._market_summary_path().open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(summary.to_record(), separators=(",", ":"), sort_keys=True) + "\n")
+
     def query(self, market_id: str, start: datetime, end: datetime) -> ChartQueryResult:
         path = self._path(market_id)
         if not path.exists():
@@ -151,13 +186,16 @@ class LocalChartSink:
     def get_market(self, market_id: str) -> MarketSpec | None:
         return _market_map(self._read_markets()).get(market_id)
 
+    def get_market_summary(self, market_id: str) -> MarketChartSummary | None:
+        return _summary_map(self._read_market_summaries()).get(market_id)
+
     def list_markets(self, limit: int = 100) -> list[MarketSpec]:
         markets = sorted(
             _market_map(self._read_markets()).values(),
             key=lambda market: market.start_ts,
             reverse=True,
         )
-        return markets[: max(1, min(limit, 1000))]
+        return markets[: max(1, min(limit, 5000))]
 
     def close(self) -> None:
         return None
@@ -181,6 +219,9 @@ class LocalChartSink:
     def _market_path(self) -> Path:
         return self.root / "markets.jsonl"
 
+    def _market_summary_path(self) -> Path:
+        return self.root / "market-summaries.jsonl"
+
     def _read_markets(self) -> list[MarketSpec]:
         path = self._market_path()
         if not path.exists():
@@ -194,6 +235,20 @@ class LocalChartSink:
                 except (json.JSONDecodeError, ValueError):
                     continue
         return markets
+
+    def _read_market_summaries(self) -> list[MarketChartSummary]:
+        path = self._market_summary_path()
+        if not path.exists():
+            return []
+        summaries: list[MarketChartSummary] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    payload = json.loads(line)
+                    summaries.append(_summary_from_record(payload))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return summaries
 
 
 class AzureTableChartSink:
@@ -253,6 +308,14 @@ class AzureTableChartSink:
             self.error_count += 1
             self.last_error = str(exc)
 
+    def write_market_summary(self, summary: MarketChartSummary) -> None:
+        entity = _summary_to_entity(summary)
+        try:
+            self.market_table.upsert_entity(entity, mode=self._update_mode)
+        except Exception as exc:
+            self.error_count += 1
+            self.last_error = str(exc)
+
     def query(self, market_id: str, start: datetime, end: datetime) -> ChartQueryResult:
         partition = _partition_key(market_id)
         start_key = _row_key(_bucket_ms(start))
@@ -282,6 +345,13 @@ class AzureTableChartSink:
             return None
         return _entity_to_market(entity)
 
+    def get_market_summary(self, market_id: str) -> MarketChartSummary | None:
+        try:
+            entity = self.market_table.get_entity("market", _market_row_key(market_id))
+        except Exception:
+            return None
+        return _entity_to_summary(entity)
+
     def list_markets(self, limit: int = 100) -> list[MarketSpec]:
         try:
             entities = self.market_table.query_entities("PartitionKey eq 'market'")
@@ -291,7 +361,7 @@ class AzureTableChartSink:
             self.last_error = str(exc)
             return []
         compacted = _market_map(market for market in markets if market is not None)
-        return sorted(compacted.values(), key=lambda market: market.start_ts, reverse=True)[: max(1, min(limit, 1000))]
+        return sorted(compacted.values(), key=lambda market: market.start_ts, reverse=True)[: max(1, min(limit, 5000))]
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -417,6 +487,11 @@ class ChartDataStore:
             with suppress(Exception):
                 sink.write_market(market)
 
+    def record_market_summary(self, summary: MarketChartSummary) -> None:
+        for sink in self.sinks:
+            with suppress(Exception):
+                sink.write_market_summary(summary)
+
     def record_book(self, market: MarketSpec | None, book: BookState) -> None:
         if market is None:
             return
@@ -495,6 +570,45 @@ class ChartDataStore:
             "sampleCount": len(all_points),
         }
 
+    def compute_market_summary(self, market: MarketSpec) -> MarketChartSummary | None:
+        result = self.query(market.market_id, market.start_ts, market.end_ts)
+        points = _merge_records(result.records, start=market.start_ts, end=market.end_ts)
+        if not points:
+            return None
+        first = points[0]
+        last = points[-1]
+        latest_q = next(
+            (
+                point for point in reversed(points)
+                if point.get("qUp") is not None and point.get("qDown") is not None
+            ),
+            None,
+        )
+        start_price = (
+            str(market.start_price)
+            if market.start_price is not None
+            else _derive_start_price(points)
+        )
+        return MarketChartSummary(
+            market_id=market.market_id,
+            sample_count=len(points),
+            first_sample_ts=_bucket_iso(first.get("bucket")),
+            last_sample_ts=_bucket_iso(last.get("bucket")),
+            start_price=start_price,
+            q_up=_string_number(latest_q.get("qUp")) if latest_q else None,
+            q_down=_string_number(latest_q.get("qDown")) if latest_q else None,
+            fair_value_ts=_bucket_iso(latest_q.get("bucket")) if latest_q else None,
+        )
+
+    def get_market_summary(self, market_id: str) -> MarketChartSummary | None:
+        summaries: list[MarketChartSummary] = []
+        for sink in self.sinks:
+            with suppress(Exception):
+                summary = sink.get_market_summary(market_id)
+                if summary is not None:
+                    summaries.append(summary)
+        return _best_summary(summaries)
+
     def query(self, market_id: str, start: datetime, end: datetime) -> ChartQueryResult:
         results = [sink.query(market_id, start, end) for sink in self.sinks]
         records = [record for result in results for record in result.records]
@@ -515,7 +629,7 @@ class ChartDataStore:
         for sink in self.sinks:
             with suppress(Exception):
                 markets.update(_market_map(sink.list_markets(limit * 2)))
-        return sorted(markets.values(), key=lambda market: market.start_ts, reverse=True)[: max(1, min(limit, 1000))]
+        return sorted(markets.values(), key=lambda market: market.start_ts, reverse=True)[: max(1, min(limit, 5000))]
 
     def close(self) -> None:
         for sink in self.sinks:
@@ -589,6 +703,40 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bucket_iso(value: Any) -> str | None:
+    bucket = _int_or_none(value)
+    if bucket is None:
+        return None
+    return datetime.fromtimestamp(bucket / 1000, tz=timezone.utc).isoformat()
+
+
+def _string_number(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(Decimal(str(value)))
+    except Exception:
+        return None
+
+
+def _derive_start_price(points: Iterable[dict[str, Any]]) -> str | None:
+    for point in points:
+        reference_price = point.get("referencePrice")
+        distance_bps = point.get("distanceBps")
+        if reference_price is None or distance_bps is None:
+            continue
+        try:
+            reference = Decimal(str(reference_price))
+            distance = Decimal(str(distance_bps))
+        except Exception:
+            continue
+        denominator = Decimal("1") + (distance / Decimal("10000"))
+        if denominator <= 0:
+            continue
+        return str(reference / denominator)
+    return None
 
 
 def _token_outcome(token_id: str | None, market: MarketSpec | None) -> str | None:
@@ -687,6 +835,26 @@ def _market_map(markets: Iterable[MarketSpec]) -> dict[str, MarketSpec]:
     return current
 
 
+def _summary_map(summaries: Iterable[MarketChartSummary]) -> dict[str, MarketChartSummary]:
+    current: dict[str, MarketChartSummary] = {}
+    for summary in summaries:
+        existing = current.get(summary.market_id)
+        if existing is None or _summary_rank(summary) >= _summary_rank(existing):
+            current[summary.market_id] = summary
+    return current
+
+
+def _best_summary(summaries: Iterable[MarketChartSummary]) -> MarketChartSummary | None:
+    ranked = list(summaries)
+    if not ranked:
+        return None
+    return max(ranked, key=_summary_rank)
+
+
+def _summary_rank(summary: MarketChartSummary) -> tuple[int, str]:
+    return summary.sample_count, summary.last_sample_ts or ""
+
+
 def _market_row_key(market_id: str) -> str:
     return hashlib.sha256(market_id.encode("utf-8")).hexdigest()
 
@@ -703,6 +871,22 @@ def _market_to_entity(market: MarketSpec) -> dict[str, Any]:
     }
 
 
+def _summary_to_entity(summary: MarketChartSummary) -> dict[str, Any]:
+    entity: dict[str, Any] = {
+        "PartitionKey": "market",
+        "RowKey": _market_row_key(summary.market_id),
+        "marketId": summary.market_id,
+        "chartSampleCount": summary.sample_count,
+    }
+    _set_if_not_none(entity, "chartFirstSampleTs", summary.first_sample_ts)
+    _set_if_not_none(entity, "chartLastSampleTs", summary.last_sample_ts)
+    _set_if_not_none(entity, "chartStartPrice", summary.start_price)
+    _set_if_not_none(entity, "latestQUp", summary.q_up)
+    _set_if_not_none(entity, "latestQDown", summary.q_down)
+    _set_if_not_none(entity, "latestFairValueTs", summary.fair_value_ts)
+    return entity
+
+
 def _entity_to_market(entity: Any) -> MarketSpec | None:
     payload = entity.get("payloadJson")
     if not payload:
@@ -711,6 +895,36 @@ def _entity_to_market(entity: Any) -> MarketSpec | None:
         return MarketSpec.model_validate(json.loads(payload))
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def _entity_to_summary(entity: Any) -> MarketChartSummary | None:
+    market_id = entity.get("marketId")
+    sample_count = _int_or_none(entity.get("chartSampleCount"))
+    if not market_id or sample_count is None:
+        return None
+    return MarketChartSummary(
+        market_id=str(market_id),
+        sample_count=sample_count,
+        first_sample_ts=str(entity.get("chartFirstSampleTs")) if entity.get("chartFirstSampleTs") is not None else None,
+        last_sample_ts=str(entity.get("chartLastSampleTs")) if entity.get("chartLastSampleTs") is not None else None,
+        start_price=str(entity.get("chartStartPrice")) if entity.get("chartStartPrice") is not None else None,
+        q_up=str(entity.get("latestQUp")) if entity.get("latestQUp") is not None else None,
+        q_down=str(entity.get("latestQDown")) if entity.get("latestQDown") is not None else None,
+        fair_value_ts=str(entity.get("latestFairValueTs")) if entity.get("latestFairValueTs") is not None else None,
+    )
+
+
+def _summary_from_record(record: dict[str, Any]) -> MarketChartSummary:
+    return MarketChartSummary(
+        market_id=str(record["market_id"]),
+        sample_count=int(record.get("sample_count") or 0),
+        first_sample_ts=record.get("first_sample_ts"),
+        last_sample_ts=record.get("last_sample_ts"),
+        start_price=record.get("start_price"),
+        q_up=record.get("q_up"),
+        q_down=record.get("q_down"),
+        fair_value_ts=record.get("fair_value_ts"),
+    )
 
 
 def _entity_to_record(entity: Any) -> dict[str, Any]:

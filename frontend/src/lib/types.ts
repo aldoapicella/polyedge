@@ -93,6 +93,16 @@ export type MarketSummary = {
   is_active: boolean;
   is_tradeable: boolean;
   fair_value?: FairValue | null;
+  chart_summary?: {
+    market_id: string;
+    sample_count: number;
+    first_sample_ts?: string | null;
+    last_sample_ts?: string | null;
+    start_price?: string | null;
+    q_up?: string | null;
+    q_down?: string | null;
+    fair_value_ts?: string | null;
+  } | null;
 };
 
 export type FairValue = {

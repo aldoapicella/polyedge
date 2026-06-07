@@ -11,7 +11,7 @@ from ..services.event_service import EventService
 from ..services.snapshot import SnapshotService
 from ..source_confirmation import confirm_source
 from .deps import get_bot, get_chart_backfill_jobs, get_chart_service, get_event_service, get_settings, get_snapshot_service, require_auth
-from .schemas import ChartBackfillApiRequest
+from .schemas import ChartBackfillApiRequest, ChartHydrateApiRequest
 from ..config import Settings
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -52,9 +52,10 @@ async def market_detail(
             status_code=http_status.HTTP_404_NOT_FOUND,
             detail=f"Market {market_id} was not found.",
         )
+    market_payload = chart_service.market_payload(historical_market)
     return {
-        "market": historical_market.model_dump(mode="json"),
-        "fair_value": None,
+        "market": market_payload,
+        "fair_value": market_payload.get("fair_value"),
         "books": {"up": None, "down": None},
         "decisions": [],
         "execution_reports": [],
@@ -114,6 +115,20 @@ async def backfill_chart_status(
     chart_backfill_jobs: ChartBackfillJobManager = Depends(get_chart_backfill_jobs),
 ) -> dict[str, Any]:
     return chart_backfill_jobs.status()
+
+
+@router.post("/charts/hydrate")
+async def hydrate_charts(
+    request: ChartHydrateApiRequest,
+    chart_backfill_jobs: ChartBackfillJobManager = Depends(get_chart_backfill_jobs),
+) -> dict[str, Any]:
+    try:
+        return await chart_backfill_jobs.start_hydrate(limit=request.limit)
+    except ChartBackfillJobAlreadyRunning as exc:
+        raise HTTPException(
+            status_code=http_status.HTTP_409_CONFLICT,
+            detail=exc.status,
+        ) from exc
 
 
 @router.get("/orders")
