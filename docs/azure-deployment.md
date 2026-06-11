@@ -13,6 +13,7 @@ Storage account: stpolyedge6urdjr5nmwx7w
 Blob container: bot-events
 Table: BotEventIndex
 ACR: crpolyedge6urdjr5nmwx7w.azurecr.io
+GitHub deploy identity: id-github-polyedge-dev
 ```
 
 ## Safety Defaults

@@ -11,6 +11,7 @@ env:
   AZURE_RESOURCE_GROUP: rg-polyedge-dev
   AZURE_LOCATION: eastus
   APP_NAME: polyedge
+  GITHUB_DEPLOY_IDENTITY_NAME: id-github-polyedge-dev
 
 jobs:
   deploy:
@@ -94,7 +95,7 @@ jobs:
 
       - name: Grant workflow ACR push
         run: |
-          principal_id=$(az ad sp show --id "${{ secrets.AZURE_CLIENT_ID }}" --query id -o tsv)
+          principal_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query principalId -o tsv)
           acr_id=$(az acr show \
             --name "${{ steps.deploy_outputs.outputs.acr_name }}" \
             --query id \
