@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[test]
-fn backtest_matches_python_cancelled_maker_fixture() {
+fn backtest_matches_cancelled_maker_fixture() {
     let actual = run_backtest(&fixture("events_cancelled_maker_sample.jsonl"))
         .unwrap()
         .as_value();
@@ -15,7 +15,7 @@ fn backtest_matches_python_cancelled_maker_fixture() {
 }
 
 #[test]
-fn pnl_matches_python_fixture_without_generated_timestamp() {
+fn pnl_matches_fixture_without_generated_timestamp() {
     let actual = build_pnl_report(&fixture("events_pnl_sample.jsonl")).unwrap();
     let expected: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/pnl_report_expected.json"

@@ -3,14 +3,16 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC
 use polyedge_domain::RuntimeEvent;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{env, thread};
 use thiserror::Error;
 
 const AZURE_BLOB_API_VERSION: &str = "2023-11-03";
+const AZURE_BLOB_MAX_ATTEMPTS: usize = 5;
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -29,7 +31,9 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("{0} is not implemented in the Rust shadow backend yet")]
+    #[error("Azure Blob error: {0}")]
+    AzureBlob(#[from] AzureBlobError),
+    #[error("{0} is not implemented in the Rust backend yet")]
     Unsupported(&'static str),
 }
 
@@ -61,7 +65,7 @@ impl EventRecorder for JsonlRecorder {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, event)?;
+        serde_json::to_writer(&mut file, &jsonl_event_envelope(event))?;
         file.write_all(b"\n")?;
         Ok(())
     }
@@ -76,12 +80,105 @@ impl EventRecorder for AzureBlobRecorder {
     }
 }
 
+#[derive(Clone)]
+pub struct AzureAppendBlobRecorder {
+    account: String,
+    container: String,
+    agent: ureq::Agent,
+    token: ManagedIdentityToken,
+}
+
+impl AzureAppendBlobRecorder {
+    pub fn new(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            container: container.into(),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(30))
+                .timeout_write(Duration::from_secs(30))
+                .build(),
+            token: ManagedIdentityToken::new(client_id),
+        }
+    }
+
+    fn append_line(&mut self, blob_name: &str, line: &[u8]) -> Result<(), AzureBlobError> {
+        self.ensure_append_blob(blob_name)?;
+        let url = self.blob_url(blob_name, Some("comp=appendblock"));
+        let token = self.token.access_token(&self.agent)?;
+        match self
+            .agent
+            .put(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .set("content-type", "application/octet-stream")
+            .send_bytes(line)
+        {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn ensure_append_blob(&mut self, blob_name: &str) -> Result<(), AzureBlobError> {
+        let url = self.blob_url(blob_name, None);
+        let token = self.token.access_token(&self.agent)?;
+        match self
+            .agent
+            .put(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .set("x-ms-blob-type", "AppendBlob")
+            .send_bytes(&[])
+        {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(409, _)) => Ok(()),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn blob_url(&self, blob_name: &str, query: Option<&str>) -> String {
+        let mut url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(blob_name)
+        );
+        if let Some(query) = query {
+            url.push('?');
+            url.push_str(query);
+        }
+        url
+    }
+}
+
+impl EventRecorder for AzureAppendBlobRecorder {
+    fn record(&mut self, event: &RuntimeEvent) -> Result<(), StorageError> {
+        let envelope = jsonl_event_envelope(event);
+        let mut line = serde_json::to_vec(&envelope)?;
+        line.push(b'\n');
+        let recorded_ts = event.ts;
+        let blob_name = format!("events/{}.jsonl", recorded_ts.format("%Y/%m/%d/%H/%M"));
+        self.append_line(&blob_name, &line)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AzureBlobError {
     #[error("Azure Blob HTTP status {0}")]
     HttpStatus(u16),
-    #[error("Azure Blob HTTP transport error")]
-    Transport,
+    #[error("managed identity token is unavailable: {0}")]
+    ManagedIdentity(String),
+    #[error("Azure Blob HTTP transport error: {0}")]
+    Transport(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("response body was not UTF-8: {0}")]
@@ -90,6 +187,127 @@ pub enum AzureBlobError {
     Xml(#[from] quick_xml::Error),
     #[error("failed to parse Azure blob list XML: {0}")]
     XmlMessage(String),
+}
+
+impl AzureBlobError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            AzureBlobError::HttpStatus(status) => is_retryable_azure_status(*status),
+            AzureBlobError::Transport(_) | AzureBlobError::Io(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ManagedIdentityToken {
+    client_id: Option<String>,
+    access_token: Option<String>,
+    expires_on_epoch: Option<i64>,
+}
+
+impl ManagedIdentityToken {
+    fn new(client_id: Option<String>) -> Self {
+        Self {
+            client_id,
+            access_token: None,
+            expires_on_epoch: None,
+        }
+    }
+
+    fn access_token(&mut self, agent: &ureq::Agent) -> Result<String, AzureBlobError> {
+        let now = Utc::now().timestamp();
+        if let (Some(token), Some(expires_on)) = (&self.access_token, self.expires_on_epoch) {
+            if expires_on - now > 120 {
+                return Ok(token.clone());
+            }
+        }
+        let payload = fetch_managed_identity_token(agent, self.client_id.as_deref())?;
+        let token = payload
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AzureBlobError::ManagedIdentity("missing access_token".to_owned()))?
+            .to_owned();
+        let expires_on = payload
+            .get("expires_on")
+            .and_then(parse_expires_on)
+            .unwrap_or(now + 300);
+        self.access_token = Some(token.clone());
+        self.expires_on_epoch = Some(expires_on);
+        Ok(token)
+    }
+}
+
+fn fetch_managed_identity_token(
+    agent: &ureq::Agent,
+    client_id: Option<&str>,
+) -> Result<Value, AzureBlobError> {
+    let resource = "https%3A%2F%2Fstorage.azure.com%2F";
+    if let (Ok(endpoint), Ok(header)) = (env::var("IDENTITY_ENDPOINT"), env::var("IDENTITY_HEADER"))
+    {
+        let mut url = format!("{endpoint}?api-version=2019-08-01&resource={resource}");
+        if let Some(client_id) = client_id {
+            url.push_str("&client_id=");
+            url.push_str(&utf8_percent_encode(client_id, NON_ALPHANUMERIC).to_string());
+        }
+        let response = agent
+            .get(&url)
+            .set("X-IDENTITY-HEADER", &header)
+            .call()
+            .map_err(identity_error)?;
+        return parse_json_response(response);
+    }
+
+    let mut url = format!(
+        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={resource}"
+    );
+    if let Some(client_id) = client_id {
+        url.push_str("&client_id=");
+        url.push_str(&utf8_percent_encode(client_id, NON_ALPHANUMERIC).to_string());
+    }
+    let response = agent
+        .get(&url)
+        .set("Metadata", "true")
+        .call()
+        .map_err(identity_error)?;
+    parse_json_response(response)
+}
+
+fn identity_error(error: ureq::Error) -> AzureBlobError {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            AzureBlobError::ManagedIdentity(format!("HTTP {status}: {body}"))
+        }
+        ureq::Error::Transport(error) => AzureBlobError::ManagedIdentity(error.to_string()),
+    }
+}
+
+fn parse_json_response(response: ureq::Response) -> Result<Value, AzureBlobError> {
+    let text = response
+        .into_string()
+        .map_err(|error| AzureBlobError::ManagedIdentity(error.to_string()))?;
+    serde_json::from_str(&text).map_err(|error| AzureBlobError::ManagedIdentity(error.to_string()))
+}
+
+fn parse_expires_on(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn jsonl_event_envelope(event: &RuntimeEvent) -> Value {
+    json!({
+        "recorded_ts": event.ts,
+        "event_type": event.event_type,
+        "payload": event.data
+    })
+}
+
+fn rfc1123_now() -> String {
+    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -178,32 +396,70 @@ impl AzureBlobClient {
             ),
             &self.sas,
         );
-        let response = self.get_response(&url)?;
-        let mut reader = response.into_reader();
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        self.get_bytes_with_retry(&url)
     }
 
     fn get_text(&self, url: &str) -> Result<String, AzureBlobError> {
+        Ok(String::from_utf8(self.get_bytes_with_retry(url)?)?)
+    }
+
+    fn get_bytes_with_retry(&self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let result = self.read_response_bytes(url);
+            match result {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob byte retry loop always returns");
+    }
+
+    fn read_response_bytes(&self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
         let response = self.get_response(url)?;
         let mut bytes = Vec::new();
         response.into_reader().read_to_end(&mut bytes)?;
-        Ok(String::from_utf8(bytes)?)
+        Ok(bytes)
     }
 
     fn get_response(&self, url: &str) -> Result<ureq::Response, AzureBlobError> {
-        match self
-            .agent
-            .get(url)
-            .set("x-ms-version", AZURE_BLOB_API_VERSION)
-            .call()
-        {
-            Ok(response) => Ok(response),
-            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
-            Err(ureq::Error::Transport(_)) => Err(AzureBlobError::Transport),
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self
+                .agent
+                .get(url)
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .call()
+            {
+                Ok(response) => return Ok(response),
+                Err(ureq::Error::Status(status, _)) => {
+                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(ureq::Error::Transport(error)) => {
+                    let message = error.to_string();
+                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::Transport(message));
+                }
+            }
         }
+        unreachable!("Azure Blob retry loop always returns");
     }
+}
+
+fn is_retryable_azure_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(250 * 2_u64.pow(attempt.min(4) as u32))
 }
 
 #[derive(Default)]

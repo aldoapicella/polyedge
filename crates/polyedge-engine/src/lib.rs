@@ -514,6 +514,15 @@ impl RiskManager {
             .or_insert(Decimal::ZERO) += report.filled_size;
         self.total_position += report.filled_size;
     }
+
+    pub fn clear_market(&mut self, market_id: &MarketId) -> Decimal {
+        let cleared = self
+            .positions_by_market
+            .remove(market_id)
+            .unwrap_or(Decimal::ZERO);
+        self.total_position = (self.total_position - cleared).max(Decimal::ZERO);
+        cleared
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -548,6 +557,13 @@ impl OrderManager {
 
     pub fn open_quotes(&self) -> Vec<ManagedQuote> {
         self.quotes.values().cloned().collect()
+    }
+
+    pub fn open_order_ids(&self) -> BTreeSet<OrderId> {
+        self.quotes
+            .values()
+            .filter_map(|quote| quote.order_id.clone())
+            .collect()
     }
 
     pub fn reconcile(
@@ -684,6 +700,14 @@ impl OrderManager {
                 order_id: report.order_id.clone(),
             },
         );
+    }
+
+    pub fn on_fill(&mut self, report: &ExecutionReport) {
+        let Some(order_id) = report.order_id.as_ref() else {
+            return;
+        };
+        self.quotes
+            .retain(|_, quote| quote.order_id.as_ref() != Some(order_id));
     }
 
     pub fn clear_market(&mut self, market_id: &MarketId) {

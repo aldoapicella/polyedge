@@ -1,26 +1,33 @@
 # Replay Backtesting
 
-The first replay engine reads `data/events.jsonl` and reconstructs:
+The Rust replay engine streams JSONL event envelopes and reconstructs markets, captured RTDS Chainlink start prices, settlement prices, paper decisions, fills, and estimated PnL.
 
-```text
-markets
-captured RTDS Chainlink start prices
-RTDS Chainlink settlement prices
-fair-value decisions
-paper order fills
-estimated PnL
-```
-
-Run:
+Run a local replay:
 
 ```bash
-source .venv/bin/activate
-polyedge backtest --path data/events.jsonl
+cargo run -p polyedge-cli -- backtest --path data/events.jsonl
 ```
 
-## Current Fill Model
+Run the fixture benchmark:
 
-This is a conservative research replay, not a full exchange simulator.
+```bash
+cargo run --release -p polyedge-cli -- bench-replay --path tests/fixtures/events_pnl_sample.jsonl
+```
+
+Run an Azure replay using the native Rust Azure Blob client:
+
+```bash
+AZURE_STORAGE_SAS=<read-list-sas> target/release/polyedge-rs bench-azure-replay \
+  --account stpolyedge6urdjr5nmwx7w \
+  --container bot-events \
+  --prefix events/2026/06/10/ \
+  --max-bytes 134217728 \
+  --prefetch-blobs 4
+```
+
+## Fill Model
+
+This is a conservative research replay, not a queue-accurate exchange simulator.
 
 ```text
 FAK/FOK decisions:
@@ -35,45 +42,19 @@ Post-only maker decisions:
   pay no taker fee
 ```
 
-The replay does not yet model exact queue priority, trade prints, partial maker
-fills, or cancellation latency. Add those after enough CLOB book/trade data is
-recorded.
+The replay enforces quote-live delay, TTL, market active window, final no-trade window, stale-book guard, and cancellation state.
 
 ## Runtime Paper vs Replay
 
-The API PnL report intentionally separates two ledgers:
-
-- `actual_paper` is the runtime paper ledger from `execution_report` events
-  with positive `filled_size`. Maker fills appear here only when the runtime
-  `PaperFillEngine` emits `paper_filled_maker`.
-- `replay_estimate` is the offline replay ledger. It replays recorded
-  decisions against captured books and removes open replay orders on
-  `cancel_all` decisions or cancellation execution reports.
-
-The default runtime maker fill policy is `touch_after_quote_was_live`. It is
-optimistic: a resting post-only buy is marked filled when the captured best ask
-touches or crosses the quote after the configured live delay, provided the
-book is fresh, the market is active, the order TTL has not expired, and the bot
-is not inside the final no-trade window.
-
-Runtime staleness checks use the current receive time, not the book timestamp
-itself. This prevents old book objects from appearing fresh merely because the
-fill engine is evaluating them against their own `local_ts`.
-
-Reports also include a `runtime_vs_replay` block:
+Reports separate two ledgers:
 
 ```text
-runtime_filled_reports
-replay_filled_orders
-runtime_minus_replay_fills
-runtime_net_pnl
-replay_net_pnl
-runtime_minus_replay_pnl
+actual_paper      runtime paper execution reports with positive filled_size
+replay_estimate   offline cancellation-aware replay over recorded events
+runtime_vs_replay comparison of fills and PnL between both ledgers
 ```
 
-Live CLOB FAK/FOK BUY orders use quote-dollar `amount = price * size`, but the
-recorded decision and replay engine keep `size` as share quantity. The optional
-`quote_amount` field is recorded to audit that live conversion.
+The default runtime paper maker-fill policy is `touch_after_quote_was_live`.
 
 ## Settlement Model
 
@@ -84,10 +65,7 @@ start_price = captured market_start_price from RTDS Chainlink btc/usd
 final_price = first RTDS Chainlink btc/usd tick at or after market end
 ```
 
-If no tick exists at or after market end, replay uses the closest tick inside
-the configured settlement window.
-
-Default:
+Default settlement window:
 
 ```text
 settlement_window_seconds = 15
@@ -100,58 +78,28 @@ Up wins   if final_price >= start_price
 Down wins otherwise
 ```
 
-## Output Fields
+## Latest Full Azure Replay
+
+Validated artifact:
 
 ```text
-markets_seen
-markets_with_start_price
-markets_settled
-decisions_seen
-orders_seen
-filled_orders
-gross_pnl
-fees
-net_pnl
-market_results
-notes
+docs/reports/rust-azure-full-replay-20260611T1540Z.json
 ```
 
-Before interpreting profitability, require many settled markets. A single
-market only proves the pipeline works.
-
-## Market-Level Statistics
-
-Daily and cached reports include `market_level_statistics` for both
-`actual_paper` and `replay_estimate`. The sample unit is settled market net
-PnL, not raw fills, because multiple fills inside one 15-minute market are
-correlated.
-
-Key fields:
+Result:
 
 ```text
-market_level_mean_pnl
-market_level_std_pnl
-market_level_standard_error
-market_level_95ci_low
-market_level_95ci_high
-required_markets_for_0_05_precision
-required_markets_for_0_10_precision
-required_markets_to_detect_current_mean
-profitability_statistically_proven_95ci
+prefix: events/
+transport: native_ureq_persistent_prefetch
+prefetch_blobs: 8
+listed_blobs: 12,728
+replayed_bytes: 132,262,143,189
+replayed_gib: 123.17871971894056
+events: 297,025,142
+elapsed_ms: 4,513,692.556698
+events_per_second: 65,805.35520950264
+mib_per_second: 27.944971308473306
+memory_rss_mb: 372.11328125
+filled_orders: 2,028
+net_pnl: -516.155
 ```
-
-Use `300` settled markets as a pilot checkpoint, not as proof of profitability.
-After that pilot, use the observed `market_level_std_pnl` and mean PnL to decide
-how many markets are needed for a defensible read:
-
-```text
-standard_error = std_pnl / sqrt(n)
-ci_low = mean_pnl - 1.96 * standard_error
-ci_high = mean_pnl + 1.96 * standard_error
-required_n_for_precision = (1.96 * std_pnl / desired_margin)^2
-required_n_to_detect_current_mean = 7.84 * (std_pnl / abs(mean_pnl))^2
-```
-
-If `market_level_95ci_low <= 0`, positive expected value is not statistically
-proven yet. A very negative pilot is enough to pause and investigate; a mildly
-positive or mildly negative pilot is inconclusive.

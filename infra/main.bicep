@@ -22,7 +22,7 @@ param minReplicas int = 1
 @description('Maximum replicas. Keep 1 to avoid duplicate bot collectors.')
 param maxReplicas int = 1
 
-@description('Whether the backend starts the market data writer on startup. Set false for standby migration stacks to avoid duplicate writes.')
+@description('Whether the backend starts the market data writer on startup. Keep true for the active paper-mode stack.')
 param runBotOnStartup bool = true
 
 @description('Container CPU allocation.')
@@ -38,12 +38,12 @@ param frontendCpu string = '0.5'
 param frontendMemory string = '1Gi'
 
 @description('Backend API base URL used by the frontend server proxy.')
-param frontendBackendApiBaseUrl string = 'http://127.0.0.1:8000/api/v1'
+param frontendBackendApiBaseUrl string = 'http://127.0.0.1:8081/api/v1'
 
 @description('Backend WebSocket URL used by the frontend realtime proxy when BACKEND_SSE_URL is not set.')
-param frontendBackendWsUrl string = 'ws://127.0.0.1:8000/api/v1/ws/live'
+param frontendBackendWsUrl string = 'ws://127.0.0.1:8081/api/v1/ws/live'
 
-@description('Optional upstream Server-Sent Events URL used by standby frontends to mirror an existing active stack without running a second bot.')
+@description('Optional upstream Server-Sent Events URL for frontend proxy overrides. Leave empty for the active Rust sidecar.')
 param frontendBackendSseUrl string = ''
 
 @description('Deployment environment tag.')
@@ -147,7 +147,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       activeRevisionsMode: 'Single'
       ingress: {
         external: true
-        targetPort: frontendEnabled ? 3000 : 8000
+        targetPort: frontendEnabled ? 3000 : 8081
         transport: 'http'
         allowInsecure: false
       }

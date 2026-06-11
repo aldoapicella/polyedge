@@ -16,7 +16,7 @@ use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
-#[command(about = "PolyEdge Rust shadow backend CLI")]
+#[command(about = "PolyEdge Rust backend CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -82,24 +82,23 @@ async fn main() -> Result<()> {
     let settings = RuntimeSettings::from_env().context("loading runtime settings")?;
     if settings.live_requested() {
         match settings.validate_live_gates(false) {
-            Ok(()) => bail!("Rust shadow backend refuses live mode even when config gates pass."),
-            Err(error) => bail!("Rust shadow backend refuses live mode: {error}"),
+            Ok(()) => bail!("Rust backend refuses live mode even when config gates pass."),
+            Err(error) => bail!("Rust backend refuses live mode: {error}"),
         }
     }
     match cli.command {
         Command::Api { bind } | Command::Run { bind } => serve(settings, bind).await,
-        Command::Discover => print_json(json!({
-            "count": 0,
-            "markets": [],
-            "backend_impl": "rust",
-            "shadow_only": true
-        })),
-        Command::ConfirmSource => print_json(json!({
-            "ok": false,
-            "backend_impl": "rust",
-            "shadow_only": true,
-            "message": "Source confirmation is not connected in the Rust shadow backend yet."
-        })),
+        Command::Discover => {
+            let markets =
+                polyedge_feeds::discover_markets(&settings).context("discovering markets")?;
+            print_json(json!({
+                "count": markets.len(),
+                "markets": markets,
+                "backend_impl": "rust",
+                "shadow_only": false
+            }))
+        }
+        Command::ConfirmSource => print_json(confirm_source(&settings)?),
         Command::Backtest { path } => print_json(run_backtest(&path)?.as_value()),
         Command::Report { prefix } => print_json(build_pnl_report(&prefix)?),
         Command::BenchIngest { events } => print_json(bench_ingest(events)),
@@ -125,22 +124,72 @@ async fn main() -> Result<()> {
     }
 }
 
+fn confirm_source(settings: &RuntimeSettings) -> Result<serde_json::Value> {
+    let markets = polyedge_feeds::discover_markets(settings).context("discovering markets")?;
+    let symbol = settings.target.chainlink_symbol.to_ascii_lowercase();
+    let asset = settings.target.asset.to_ascii_lowercase();
+    let matched_markets = markets
+        .iter()
+        .filter(|market| {
+            let description = market
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            description.contains("chainlink")
+                && (description.contains(&symbol)
+                    || description.contains(&symbol.replace("/", " / "))
+                    || description.contains(&asset))
+        })
+        .map(|market| {
+            json!({
+                "market_id": market.market_id,
+                "market_slug": market.market_slug,
+                "event_slug": market.event_slug,
+                "question": market.question,
+                "start_ts": market.start_ts,
+                "end_ts": market.end_ts,
+                "resolution_source": market.resolution_source
+            })
+        })
+        .collect::<Vec<_>>();
+    let ok = !matched_markets.is_empty() && settings.target.enable_polymarket_rtds_chainlink;
+    let message = if matched_markets.is_empty() {
+        "No discovered market description mentioned the configured Chainlink source."
+    } else {
+        "Discovered market descriptions mention the configured Chainlink source."
+    };
+    Ok(json!({
+        "ok": ok,
+        "backend_impl": "rust",
+        "shadow_only": false,
+        "target_asset": settings.target.asset,
+        "target_horizon": settings.target.horizon,
+        "configured_rtds_url": settings.target.polymarket_rtds_url,
+        "configured_chainlink_symbol": settings.target.chainlink_symbol,
+        "configured_resolution_source": settings.target.resolution_source,
+        "discovered_markets": markets.len(),
+        "matched_markets": matched_markets,
+        "message": message
+    }))
+}
+
 async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("binding Rust shadow API to {bind}"))?;
+        .with_context(|| format!("binding Rust API to {bind}"))?;
     println!(
         "{}",
         json!({
             "backend_impl": "rust",
-            "shadow_only": true,
+            "shadow_only": false,
             "execution_mode": "paper",
             "bind": bind
         })
     );
     axum::serve(listener, app(settings))
         .await
-        .context("serving Rust shadow API")
+        .context("serving Rust API")
 }
 
 fn bench_ingest(events: usize) -> serde_json::Value {
@@ -288,20 +337,24 @@ fn replay_prefetched_azure_blobs(
     }
     drop(result_tx);
 
-    for (index, blob) in blobs.into_iter().enumerate() {
-        job_tx
-            .send((index, blob))
-            .context("queueing Azure blob download job")?;
-    }
-    drop(job_tx);
-
+    let mut blob_iter = blobs.into_iter().enumerate();
     let mut pending = BTreeMap::new();
     let mut next_index = 0_usize;
+    let mut in_flight = 0_usize;
     let mut replayed_bytes = 0_u64;
+
+    fill_prefetch_window(
+        &job_tx,
+        &mut blob_iter,
+        &pending,
+        &mut in_flight,
+        worker_count,
+    )?;
     while next_index < total_blobs {
         let prefetched = result_rx
             .recv()
             .context("Azure blob download workers stopped before replay completed")??;
+        in_flight = in_flight.saturating_sub(1);
         pending.insert(prefetched.index, prefetched);
         while let Some(prefetched) = pending.remove(&next_index) {
             let bytes_len = prefetched.bytes.len() as u64;
@@ -314,7 +367,15 @@ fn replay_prefetched_azure_blobs(
             replayed_bytes += bytes_len;
             next_index += 1;
         }
+        fill_prefetch_window(
+            &job_tx,
+            &mut blob_iter,
+            &pending,
+            &mut in_flight,
+            worker_count,
+        )?;
     }
+    drop(job_tx);
     while let Ok(prefetched) = result_rx.try_recv() {
         let prefetched = prefetched?;
         pending.insert(prefetched.index, prefetched);
@@ -339,6 +400,28 @@ fn replay_prefetched_azure_blobs(
         bail!("Azure blob prefetch completed with unreplayed out-of-order blobs");
     }
     Ok(replayed_bytes)
+}
+
+fn fill_prefetch_window<I>(
+    job_tx: &mpsc::Sender<(usize, AzureBlobItem)>,
+    blob_iter: &mut I,
+    pending: &BTreeMap<usize, PrefetchedBlob>,
+    in_flight: &mut usize,
+    worker_count: usize,
+) -> Result<()>
+where
+    I: Iterator<Item = (usize, AzureBlobItem)>,
+{
+    while *in_flight + pending.len() < worker_count {
+        let Some((index, blob)) = blob_iter.next() else {
+            break;
+        };
+        job_tx
+            .send((index, blob))
+            .context("queueing Azure blob download job")?;
+        *in_flight += 1;
+    }
+    Ok(())
 }
 
 fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {

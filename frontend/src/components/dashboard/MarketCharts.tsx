@@ -20,7 +20,7 @@ import type { Tone } from "./types";
 
 export function MarketMainChart({ points, domain, sampleCount }: { points: ChartPoint[]; domain: [number, number]; sampleCount: number }) {
   return (
-    <Panel className="xl:col-span-8">
+    <Panel className="min-w-0 xl:col-span-8">
       <PanelHeader
         title="Market Probability & Price"
         meta={`${points.length} visible · ${sampleCount} market-window samples`}
@@ -137,7 +137,7 @@ function ChartPanel({
   children: ReactElement;
 }) {
   return (
-    <Panel>
+    <Panel className="min-w-0">
       <PanelHeader title={title} meta={meta} help={help} />
       <div className="h-64 p-3">
         {hasData ? <ResponsiveContainer width="100%" height="100%">{children}</ResponsiveContainer> : <EmptyState label={empty} />}

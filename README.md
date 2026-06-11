@@ -1,115 +1,109 @@
 # PolyEdge
 
-Python-first, paper-default trading system for crypto Up/Down Polymarket
-markets. The current default target is BTC 15-minute Up/Down, but the runtime
-is structured around configurable asset, horizon, discovery, reference, risk,
-and execution settings. The strategy and math are documented in
-[docs/strategy.md](docs/strategy.md).
+PolyEdge is a Rust-first, paper-default control plane for crypto Up/Down Polymarket markets. The active target is BTC 15-minute Up/Down, with configurable discovery, reference feeds, strategy, risk, execution, recording, replay, and reporting.
 
-The bot is built to observe, record, paper trade, and replay before any live
-orders are enabled. Live international CLOB execution is hard-gated by config,
-jurisdiction confirmation, wallet credentials, risk checks, and exact
-resolution-source checks.
-
-For the default BTC 15-minute target, the primary free reference source is
-Polymarket RTDS Chainlink `btc/usd`:
-
-```text
-wss://ws-live-data.polymarket.com
-topic: crypto_prices_chainlink
-symbol: btc/usd
-```
-
-The CLOB WebSocket remains separate and is used only for Up/Down order books.
+The deployed backend is Rust. Live trading remains disabled by default and is guarded by configuration, location confirmation, wallet credentials, risk checks, and exact source checks.
 
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-pytest
+cargo test --workspace --all-features
+cargo run -p polyedge-cli -- api --bind 127.0.0.1:8081
 ```
 
-Run the API in paper mode:
+Run one market discovery pass:
 
 ```bash
-uvicorn polyedge.api:create_app --factory --host 127.0.0.1 --port 8000
-```
-
-Run one discovery pass:
-
-```bash
-polyedge discover
-```
-
-Replay collected events:
-
-```bash
-polyedge backtest --path data/events.jsonl
-```
-
-Replay assumptions and the difference between runtime paper fills and offline
-replay estimates are documented in [docs/backtesting.md](docs/backtesting.md).
-The default runtime paper maker-fill policy is `touch_after_quote_was_live`.
-
-Azure deployment, authentication, and event-query instructions are documented
-in [docs/azure-deployment.md](docs/azure-deployment.md).
-Postman import and token setup instructions are documented in
-[docs/postman.md](docs/postman.md).
-
-For large Azure replays, prefer cached reports:
-
-```text
-POST /reports/build
-GET  /reports/latest
-GET  /reports/daily/YYYY-MM-DD
+cargo run -p polyedge-cli -- discover
 ```
 
 Confirm the configured Polymarket/Chainlink source:
 
 ```bash
-polyedge confirm-source
+cargo run -p polyedge-cli -- confirm-source
 ```
 
-This confirms the public Polymarket market rules mention the configured
-Chainlink product URL. If `CHAINLINK_DATA_STREAMS_FEED_ID`,
-`CHAINLINK_DATA_STREAMS_API_KEY`, and `CHAINLINK_DATA_STREAMS_API_SECRET` are
-configured, it also validates the authenticated Chainlink latest-report
-response.
+Replay collected JSONL events:
+
+```bash
+cargo run -p polyedge-cli -- backtest --path data/events.jsonl
+```
+
+Benchmark replay over Azure Blob data with a short-lived read/list SAS in `AZURE_STORAGE_SAS`:
+
+```bash
+cargo run --release -p polyedge-cli -- bench-azure-replay \
+  --account stpolyedge6urdjr5nmwx7w \
+  --container bot-events \
+  --prefix events/ \
+  --prefetch-blobs 8
+```
+
+## Deployment
+
+Deploy through GitHub Actions with `.github/workflows/deploy-polyedge-active.yml`. The workflow runs Rust and frontend validations, builds `Dockerfile.rust` and `Dockerfile.frontend`, pushes images to ACR, and applies `infra/main.bicep` to `polyedge-dev`.
+
+```bash
+gh workflow run deploy-polyedge-active.yml --ref <branch-or-sha>
+```
+
+## Frontend
+
+The Next.js frontend remains the public control plane. Browser calls use `/api/backend/*`; the server-side proxy forwards them to the Rust backend `/api/v1/*` with the bearer token kept server-side.
+
+```text
+Public frontend/API: https://polyedge-dev.graypond-7f5d8417.eastus.azurecontainerapps.io
+Backend sidecar:     http://127.0.0.1:8081/api/v1
+WebSocket sidecar:   ws://127.0.0.1:8081/api/v1/ws/live
+```
 
 ## Live Trading Gates
 
-Live trading will not run unless all of these are true:
+The safe defaults are:
+
+```text
+EXECUTION_MODE=paper
+ALLOW_LIVE=false
+ENABLE_TAKER_ORDERS=false
+ALLOW_EMERGENCY_ACCOUNT_CANCEL=false
+PAPER_MAKER_FILL_POLICY=touch_after_quote_was_live
+PAPER_ORDER_LIVE_AFTER_MS=250
+```
+
+Live mode must not be enabled unless all live gates are intentionally satisfied:
 
 ```text
 EXECUTION_MODE=live
 ALLOW_LIVE=true
 CONFIRM_NON_RESTRICTED_LOCATION=true
 POLYMARKET_PRIVATE_KEY is set
-REQUIRE_EXACT_RESOLUTION_SOURCE_FOR_LIVE is satisfied or explicitly disabled
+REQUIRE_EXACT_RESOLUTION_SOURCE_FOR_LIVE is satisfied
 all risk checks pass
-kill switch file is absent
+kill switch is clear
 ```
-
-Do not use live mode from a restricted jurisdiction or through a VPN/proxy to
-bypass platform restrictions.
 
 ## Project Layout
 
 ```text
-docs/strategy.md                  detailed strategy and math
-src/polyedge/config.py
-src/polyedge/models.py
-src/polyedge/market_discovery.py
-src/polyedge/polymarket_feed.py
-src/polyedge/resolution_feed.py
-src/polyedge/fair_value.py
-src/polyedge/strategy.py
-src/polyedge/risk.py
-src/polyedge/execution.py
-src/polyedge/recorder.py
-src/polyedge/api/
-tests/
+crates/polyedge-domain      shared event, market, order, and report models
+crates/polyedge-config      environment and safety-gate configuration
+crates/polyedge-feeds       Polymarket discovery, CLOB books, RTDS, reference feeds
+crates/polyedge-engine      fair value, strategy, risk, order manager, paper fills
+crates/polyedge-execution   execution traits and paper execution client
+crates/polyedge-storage     JSONL recorder and native Azure Blob client/recorder
+crates/polyedge-reporting   streaming replay, backtesting, PnL reports
+crates/polyedge-api         Rust HTTP/WebSocket API and runtime controller
+crates/polyedge-cli         local API, replay, discovery, benchmarks
+frontend/                   Next.js control plane
+infra/                      Azure Container Apps, ACR, Storage, identity
+```
+
+Operational docs:
+
+```text
+docs/azure-deployment.md
+docs/api-access.md
+docs/backtesting.md
+docs/chainlink-source.md
+docs/rust-migration-status.md
 ```

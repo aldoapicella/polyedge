@@ -13,6 +13,7 @@ polyedge-api.workspace = true
 polyedge-config.workspace = true
 polyedge-domain.workspace = true
 polyedge-engine.workspace = true
+polyedge-feeds.workspace = true
 polyedge-reporting.workspace = true
 polyedge-storage.workspace = true
 quick-xml.workspace = true

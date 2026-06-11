@@ -31,6 +31,9 @@ pub struct DeployConfig {
     pub app_name: String,
     pub run_bot_on_startup: bool,
     pub require_api_auth: bool,
+    pub rust_proxy_runtime_api: bool,
+    pub rust_upstream_api_base_url: Option<String>,
+    pub rust_upstream_ws_url: Option<String>,
     #[serde(skip_serializing)]
     pub api_bearer_token: Option<String>,
 }
@@ -41,6 +44,9 @@ impl Default for DeployConfig {
             app_name: "polyedge".to_owned(),
             run_bot_on_startup: false,
             require_api_auth: false,
+            rust_proxy_runtime_api: false,
+            rust_upstream_api_base_url: None,
+            rust_upstream_ws_url: None,
             api_bearer_token: None,
         }
     }
@@ -48,6 +54,13 @@ impl Default for DeployConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TargetConfig {
+    pub polymarket_gamma_url: String,
+    pub polymarket_clob_url: String,
+    pub polymarket_ws_url: String,
+    pub polymarket_rtds_url: String,
+    pub chainlink_reference_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub chainlink_api_key: Option<String>,
     pub asset: String,
     pub asset_name: String,
     pub horizon: String,
@@ -57,11 +70,23 @@ pub struct TargetConfig {
     pub coinbase_product_id: String,
     pub discovery_limit: usize,
     pub discovery_interval_seconds: f64,
+    pub enable_polymarket_rtds_chainlink: bool,
+    pub enable_polymarket_rtds_binance: bool,
+    pub rtds_ping_interval_seconds: f64,
+    pub start_price_capture_grace_seconds: f64,
+    #[serde(with = "decimal_string")]
+    pub reference_divergence_pause_threshold: Decimal,
 }
 
 impl Default for TargetConfig {
     fn default() -> Self {
         Self {
+            polymarket_gamma_url: "https://gamma-api.polymarket.com".to_owned(),
+            polymarket_clob_url: "https://clob.polymarket.com".to_owned(),
+            polymarket_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_owned(),
+            polymarket_rtds_url: "wss://ws-live-data.polymarket.com".to_owned(),
+            chainlink_reference_url: None,
+            chainlink_api_key: None,
             asset: "BTC".to_owned(),
             asset_name: "Bitcoin".to_owned(),
             horizon: "15m".to_owned(),
@@ -71,6 +96,11 @@ impl Default for TargetConfig {
             coinbase_product_id: "BTC-USD".to_owned(),
             discovery_limit: 250,
             discovery_interval_seconds: 20.0,
+            enable_polymarket_rtds_chainlink: true,
+            enable_polymarket_rtds_binance: true,
+            rtds_ping_interval_seconds: 5.0,
+            start_price_capture_grace_seconds: 5.0,
+            reference_divergence_pause_threshold: Decimal::new(15, 4),
         }
     }
 }
@@ -232,6 +262,11 @@ pub struct RuntimeSettings {
 impl RuntimeSettings {
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut settings = Self::default();
+        if let Ok(app_name) = env::var("APP_NAME") {
+            settings.deploy.app_name = app_name;
+        }
+        settings.deploy.run_bot_on_startup =
+            env_bool("RUN_BOT_ON_STARTUP", settings.deploy.run_bot_on_startup);
         if let Ok(mode) = env::var("EXECUTION_MODE") {
             settings.live.execution_mode = if mode.eq_ignore_ascii_case("live") {
                 ExecutionMode::Live
@@ -239,23 +274,148 @@ impl RuntimeSettings {
                 ExecutionMode::Paper
             };
         }
+        settings.target.polymarket_gamma_url =
+            env_string("POLYMARKET_GAMMA_URL", settings.target.polymarket_gamma_url);
+        settings.target.polymarket_clob_url =
+            env_string("POLYMARKET_CLOB_URL", settings.target.polymarket_clob_url);
+        settings.target.polymarket_ws_url =
+            env_string("POLYMARKET_WS_URL", settings.target.polymarket_ws_url);
+        settings.target.polymarket_rtds_url =
+            env_string("POLYMARKET_RTDS_URL", settings.target.polymarket_rtds_url);
+        settings.target.chainlink_reference_url = env_non_empty("CHAINLINK_REFERENCE_URL");
+        settings.target.chainlink_api_key = env_non_empty("CHAINLINK_API_KEY");
+        settings.target.asset = env_string("TARGET_ASSET", settings.target.asset).to_uppercase();
+        settings.target.asset_name = env_string("TARGET_ASSET_NAME", settings.target.asset_name);
+        settings.target.horizon =
+            env_string("TARGET_HORIZON", settings.target.horizon).to_ascii_lowercase();
+        settings.target.resolution_source = env_string(
+            "TARGET_RESOLUTION_SOURCE",
+            settings.target.resolution_source,
+        );
+        settings.target.chainlink_symbol =
+            env_string("TARGET_CHAINLINK_SYMBOL", settings.target.chainlink_symbol)
+                .to_ascii_lowercase();
+        settings.target.binance_symbol =
+            env_string("TARGET_BINANCE_SYMBOL", settings.target.binance_symbol)
+                .to_ascii_lowercase();
+        settings.target.coinbase_product_id = env_string(
+            "TARGET_COINBASE_PRODUCT_ID",
+            settings.target.coinbase_product_id,
+        );
+        settings.target.discovery_limit =
+            env_usize("DISCOVERY_LIMIT", settings.target.discovery_limit);
+        settings.target.discovery_interval_seconds = env_f64(
+            "DISCOVERY_INTERVAL_SECONDS",
+            settings.target.discovery_interval_seconds,
+        );
+        settings.target.enable_polymarket_rtds_chainlink = env_bool(
+            "ENABLE_POLYMARKET_RTDS_CHAINLINK",
+            settings.target.enable_polymarket_rtds_chainlink,
+        );
+        settings.target.enable_polymarket_rtds_binance = env_bool(
+            "ENABLE_POLYMARKET_RTDS_BINANCE",
+            settings.target.enable_polymarket_rtds_binance,
+        );
+        settings.target.rtds_ping_interval_seconds = env_f64(
+            "RTDS_PING_INTERVAL_SECONDS",
+            settings.target.rtds_ping_interval_seconds,
+        );
+        settings.target.start_price_capture_grace_seconds = env_f64(
+            "START_PRICE_CAPTURE_GRACE_SECONDS",
+            settings.target.start_price_capture_grace_seconds,
+        );
+        settings.target.reference_divergence_pause_threshold = env_decimal(
+            "REFERENCE_DIVERGENCE_PAUSE_THRESHOLD",
+            settings.target.reference_divergence_pause_threshold,
+        )?;
         settings.live.allow_live = env_bool("ALLOW_LIVE", settings.live.allow_live);
         settings.live.confirm_non_restricted_location = env_bool(
             "CONFIRM_NON_RESTRICTED_LOCATION",
             settings.live.confirm_non_restricted_location,
         );
+        settings.live.allow_emergency_account_cancel = env_bool(
+            "ALLOW_EMERGENCY_ACCOUNT_CANCEL",
+            settings.live.allow_emergency_account_cancel,
+        );
+        settings.live.enable_heartbeat =
+            env_bool("ENABLE_LIVE_HEARTBEAT", settings.live.enable_heartbeat);
+        settings.live.heartbeat_interval_seconds = env_f64(
+            "LIVE_HEARTBEAT_INTERVAL_SECONDS",
+            settings.live.heartbeat_interval_seconds,
+        );
+        settings.live.heartbeat_failure_threshold = env_usize(
+            "LIVE_HEARTBEAT_FAILURE_THRESHOLD",
+            settings.live.heartbeat_failure_threshold,
+        );
         settings.live.polymarket_private_key = env::var("POLYMARKET_PRIVATE_KEY").ok();
         settings.deploy.api_bearer_token = env::var("API_BEARER_TOKEN").ok();
         settings.deploy.require_api_auth =
             env_bool("REQUIRE_API_AUTH", settings.deploy.require_api_auth);
+        settings.deploy.rust_upstream_api_base_url = env_non_empty("RUST_UPSTREAM_API_BASE_URL");
+        settings.deploy.rust_upstream_ws_url = env_non_empty("RUST_UPSTREAM_WS_URL");
+        settings.deploy.rust_proxy_runtime_api = env_bool(
+            "RUST_PROXY_RUNTIME_API",
+            settings.deploy.rust_upstream_api_base_url.is_some(),
+        );
         settings.azure.storage_account_name = env::var("AZURE_STORAGE_ACCOUNT_NAME").ok();
+        settings.azure.storage_container_name = env_string(
+            "AZURE_STORAGE_CONTAINER_NAME",
+            settings.azure.storage_container_name,
+        );
+        settings.azure.storage_table_name = env_string(
+            "AZURE_STORAGE_TABLE_NAME",
+            settings.azure.storage_table_name,
+        );
+        settings.azure.chart_table_name =
+            env_string("AZURE_CHART_TABLE_NAME", settings.azure.chart_table_name);
+        settings.azure.market_table_name =
+            env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
+        settings.strategy.taker_min_edge =
+            env_decimal("TAKER_MIN_EDGE", settings.strategy.taker_min_edge)?;
+        settings.strategy.enable_taker_orders =
+            env_bool("ENABLE_TAKER_ORDERS", settings.strategy.enable_taker_orders);
         settings.strategy.maker_margin =
             env_decimal("MAKER_MARGIN", settings.strategy.maker_margin)?;
         settings.strategy.maker_min_edge =
             env_decimal("MAKER_MIN_EDGE", settings.strategy.maker_min_edge)?;
+        settings.strategy.adverse_selection_buffer = env_decimal(
+            "ADVERSE_SELECTION_BUFFER",
+            settings.strategy.adverse_selection_buffer,
+        )?;
+        settings.strategy.model_error_buffer =
+            env_decimal("MODEL_ERROR_BUFFER", settings.strategy.model_error_buffer)?;
+        settings.strategy.slippage_buffer =
+            env_decimal("SLIPPAGE_BUFFER", settings.strategy.slippage_buffer)?;
+        settings.strategy.ewma_lambda = env_f64("EWMA_LAMBDA", settings.strategy.ewma_lambda);
+        settings.strategy.sigma_floor = env_f64("SIGMA_FLOOR", settings.strategy.sigma_floor);
+        settings.strategy.sigma_cap = env_f64("SIGMA_CAP", settings.strategy.sigma_cap);
+        settings.strategy.drift_mu = env_f64("DRIFT_MU", settings.strategy.drift_mu);
+        settings.strategy.final_no_trade_seconds = env_i64(
+            "FINAL_NO_TRADE_SECONDS",
+            settings.strategy.final_no_trade_seconds,
+        );
+        settings.strategy.order_ttl_seconds =
+            env_i64("ORDER_TTL_SECONDS", settings.strategy.order_ttl_seconds);
         settings.risk.base_order_size =
             env_decimal("BASE_ORDER_SIZE", settings.risk.base_order_size)?;
         settings.risk.max_order_size = env_decimal("MAX_ORDER_SIZE", settings.risk.max_order_size)?;
+        settings.risk.max_position_per_market = env_decimal(
+            "MAX_POSITION_PER_MARKET",
+            settings.risk.max_position_per_market,
+        )?;
+        settings.risk.max_total_position =
+            env_decimal("MAX_TOTAL_POSITION", settings.risk.max_total_position)?;
+        settings.risk.max_daily_loss = env_decimal("MAX_DAILY_LOSS", settings.risk.max_daily_loss)?;
+        settings.risk.max_open_orders = env_usize("MAX_OPEN_ORDERS", settings.risk.max_open_orders);
+        settings.risk.max_reference_age_ms =
+            env_i64("MAX_REFERENCE_AGE_MS", settings.risk.max_reference_age_ms);
+        settings.risk.max_book_age_ms = env_i64("MAX_BOOK_AGE_MS", settings.risk.max_book_age_ms);
+        settings.paper.maker_fill_policy =
+            env_string("PAPER_MAKER_FILL_POLICY", settings.paper.maker_fill_policy);
+        settings.paper.order_live_after_ms = env_i64(
+            "PAPER_ORDER_LIVE_AFTER_MS",
+            settings.paper.order_live_after_ms,
+        );
         Ok(settings)
     }
 
@@ -320,12 +480,79 @@ impl RuntimeSettings {
                 "enable_taker_orders": self.strategy.enable_taker_orders,
                 "allow_emergency_account_cancel": self.live.allow_emergency_account_cancel,
                 "require_api_auth": self.deploy.require_api_auth,
+                "rust_proxy_runtime_api": self.deploy.rust_proxy_runtime_api,
+                "rust_upstream_api_configured": self.deploy.rust_upstream_api_base_url.is_some(),
+                "rust_upstream_ws_configured": self.deploy.rust_upstream_ws_url.is_some(),
                 "api_bearer_token_configured": self.deploy.api_bearer_token.is_some(),
                 "polymarket_private_key_configured": self.live.polymarket_private_key.is_some(),
                 "azure_storage_configured": self.azure.storage_account_name.is_some()
             }
         })
     }
+
+    pub fn rtds_chainlink_source_name(&self) -> String {
+        format!(
+            "polymarket_rtds_chainlink_{}",
+            normalize_source_symbol(&self.target.chainlink_symbol)
+        )
+    }
+
+    pub fn rtds_binance_source_name(&self) -> String {
+        format!(
+            "polymarket_rtds_binance_{}",
+            normalize_compact_symbol(&self.target.binance_symbol)
+        )
+    }
+
+    pub fn binance_book_ticker_source_name(&self) -> String {
+        format!(
+            "binance_{}_book_ticker",
+            normalize_compact_symbol(&self.target.binance_symbol)
+        )
+    }
+
+    pub fn coinbase_ticker_source_name(&self) -> String {
+        format!(
+            "coinbase_{}_ticker",
+            normalize_source_symbol(&self.target.coinbase_product_id)
+        )
+    }
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn env_string(name: &str, default: String) -> String {
+    env_non_empty(name).unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
 }
 
 fn env_bool(name: &str, default: bool) -> bool {
@@ -337,6 +564,14 @@ fn env_bool(name: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+fn normalize_source_symbol(value: &str) -> String {
+    value.replace(['/', '-'], "_").to_ascii_lowercase()
+}
+
+fn normalize_compact_symbol(value: &str) -> String {
+    value.replace(['/', '-'], "").to_ascii_lowercase()
 }
 
 fn env_decimal(name: &str, default: Decimal) -> Result<Decimal, ConfigError> {

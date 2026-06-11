@@ -18,7 +18,7 @@ export function ActiveMarketPanel({
 }) {
   const distance = distanceBps(referencePrice, active?.start_price);
   return (
-    <Panel className="xl:col-span-4">
+    <Panel className="min-w-0 xl:col-span-4">
       <PanelHeader
         title="Active Market"
         meta={active ? windowMeta(active) : "No active market"}

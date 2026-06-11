@@ -8,7 +8,7 @@ import { collapseDecisions } from "./model";
 export function DecisionTable({ decisions }: { decisions: TradeDecision[] }) {
   const rows = useMemo(() => collapseDecisions(decisions).slice(0, 14), [decisions]);
   return (
-    <Panel>
+    <Panel className="min-w-0">
       <PanelHeader
         title="Decisions"
         meta={`${rows.length} grouped rows`}

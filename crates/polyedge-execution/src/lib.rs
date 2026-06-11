@@ -237,8 +237,7 @@ impl ExecutionClient for LiveClobExecutionClient {
         _decision: &TradeDecision,
     ) -> Result<ExecutionReport, ExecutionError> {
         Err(ExecutionError::LiveTradingBlocked(
-            "live order placement is intentionally not implemented in the Rust shadow backend"
-                .to_owned(),
+            "live order placement is intentionally not implemented in the Rust backend".to_owned(),
         ))
     }
 
@@ -247,8 +246,7 @@ impl ExecutionClient for LiveClobExecutionClient {
         _market_id: Option<&MarketId>,
     ) -> Result<Vec<ExecutionReport>, ExecutionError> {
         Err(ExecutionError::LiveTradingBlocked(
-            "live cancellation is intentionally not implemented in the Rust shadow backend"
-                .to_owned(),
+            "live cancellation is intentionally not implemented in the Rust backend".to_owned(),
         ))
     }
 }

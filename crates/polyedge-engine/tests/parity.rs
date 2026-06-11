@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
-fn fair_value_matches_python_golden_master() {
+fn fair_value_matches_fixture_golden_master() {
     let cases = fixture();
     for case in cases["fair_value_cases"].as_array().unwrap() {
         let settings = settings(&case["settings"]);
@@ -35,7 +35,7 @@ fn fair_value_matches_python_golden_master() {
 }
 
 #[test]
-fn strategy_matches_python_golden_master() {
+fn strategy_matches_fixture_golden_master() {
     let cases = fixture();
     for case in cases["strategy_cases"].as_array().unwrap() {
         let strategy = MakerFirstStrategy::new(settings(&case["settings"]));
@@ -47,7 +47,7 @@ fn strategy_matches_python_golden_master() {
 }
 
 #[test]
-fn risk_matches_python_golden_master() {
+fn risk_matches_fixture_golden_master() {
     let cases = fixture();
     for case in cases["risk_cases"].as_array().unwrap() {
         let risk = RiskManager::new(settings(&case["settings"]));
@@ -65,7 +65,7 @@ fn risk_matches_python_golden_master() {
 }
 
 #[test]
-fn order_manager_matches_python_golden_master() {
+fn order_manager_matches_fixture_golden_master() {
     let cases = fixture();
     for case in cases["order_manager_cases"].as_array().unwrap() {
         let manager = OrderManager::new();
@@ -87,7 +87,7 @@ fn order_manager_matches_python_golden_master() {
 }
 
 #[test]
-fn paper_fill_matches_python_golden_master() {
+fn paper_fill_matches_fixture_golden_master() {
     let cases = fixture();
     for case in cases["paper_fill_cases"].as_array().unwrap() {
         let mut engine = PaperFillEngine::new(settings(&case["settings"]));

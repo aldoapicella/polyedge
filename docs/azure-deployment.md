@@ -1,19 +1,23 @@
 # Azure Deployment
 
-This deployment keeps cost low while preserving continuous paper-mode data
-capture:
+PolyEdge runs as a Rust backend container plus a Next.js frontend sidecar in Azure Container Apps.
 
-- Azure Container Apps: one always-on replica running the bot/API container and
-  the Next.js control-plane frontend sidecar.
-- Azure Container Registry Basic: private image registry for GitHub Actions.
-- Azure Storage Standard LRS: append blobs for raw replay data plus Azure Table
-  Storage for event queries.
-- GitHub Actions OIDC through a user-assigned managed identity: no long-lived
-  Azure password in GitHub.
-- API bearer token: required for all backend API endpoints. The frontend reads
-  it only from server-side environment variables and proxies backend calls.
+```text
+subscription: Visual Studio Professional Subscription
+resource group: rg-polyedge-dev
+region: eastus
+Container App: polyedge-dev
+Container App identity: polyedge-dev-id
+FQDN: polyedge-dev.graypond-7f5d8417.eastus.azurecontainerapps.io
+Storage account: stpolyedge6urdjr5nmwx7w
+Blob container: bot-events
+Table: BotEventIndex
+ACR: crpolyedge6urdjr5nmwx7w.azurecr.io
+```
 
-The bot remains paper-only in Azure:
+## Safety Defaults
+
+The deployed backend remains paper-only:
 
 ```text
 EXECUTION_MODE=paper
@@ -26,196 +30,46 @@ ALLOW_EMERGENCY_ACCOUNT_CANCEL=false
 ENABLE_LIVE_HEARTBEAT=true
 ```
 
-## Resources
+## Deployment Pipeline
 
-The legacy stack is retained for rollback and historical reference:
+Deployments are driven by GitHub Actions. The active workflow is `.github/workflows/deploy-polyedge-active.yml`. It runs Rust checks, frontend typecheck/build, builds `Dockerfile.rust` and `Dockerfile.frontend`, pushes images to ACR, and deploys both images with `infra/main.bicep`.
 
-```text
-subscription: Visual Studio Professional Subscription
-resource group: rg-polymarket-btc15-dev
-region: eastus
-app name: polymarket-btc15
-```
-
-The deployment uses:
-
-```text
-Storage account: st<derived>
-Blob container: bot-events
-Table: BotEventIndex
-ACR: cr<derived>
-Container Apps environment: polymarket-btc15-dev-env
-Container App: polymarket-btc15-dev
-Container App size: 1 replica, backend 0.5 CPU/1Gi, frontend 0.5 CPU/1Gi
-GitHub deployment identity: id-github-polymarket-btc15-dev
-```
-
-The old workflow is manual-only, and `infra/parameters/dev.bicepparam` keeps
-`RUN_BOT_ON_STARTUP=false`. This prevents ordinary pushes or legacy redeploys
-from restarting the old writer after cutover.
-
-PolyEdge-named resources deploy separately as the active stack:
-
-```text
-resource group: rg-polyedge-dev
-app name: polyedge
-Container Apps environment: polyedge-dev-env
-Container App: polyedge-dev
-Container App identity: polyedge-dev-id
-Storage account: stpolyedge<derived>
-ACR: crpolyedge<derived>
-```
-
-During standby validation the stack was configured with:
-
-```text
-RUN_BOT_ON_STARTUP=false
-BACKEND_API_BASE_URL=https://polymarket-btc15-dev.../api/backend
-BACKEND_SSE_URL=https://polymarket-btc15-dev.../api/realtime
-```
-
-That means the PolyEdge frontend can be validated under the new Azure names
-without starting a second market-data writer and without changing the old
-source-of-truth storage account.
-
-For active cutover use:
-
-```text
-RUN_BOT_ON_STARTUP=true
-BACKEND_API_BASE_URL=http://127.0.0.1:8000/api/v1
-BACKEND_SSE_URL unset
-```
-
-The cutover command is:
+Trigger from GitHub Actions or with:
 
 ```bash
-bash scripts/cutover-polyedge-active.sh
+gh workflow run deploy-polyedge-active.yml --ref <branch-or-sha>
 ```
 
-The script disables the legacy writer, runs a final old-to-PolyEdge blob copy
-with exact source-snapshot verification, deploys PolyEdge with
-`infra/parameters/polyedge-active.bicepparam`, verifies the new writer and
-Azure recorder, and writes a state file under `output/cutover/`.
-
-Container Apps use a user-assigned managed identity for ACR pulls and storage
-data access. This avoids the first-revision race where a system-assigned
-identity exists only after the Container App resource has already tried to pull
-from ACR.
-
-Storage public access is disabled. The container app uses its managed identity
-with these scoped data roles:
+The backend image produced by the workflow is:
 
 ```text
-Storage Blob Data Contributor
-Storage Table Data Contributor
+crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend:<git-sha>
 ```
 
-The signed-in Azure user is granted these reader roles on the storage account
-for querying captured data:
+Do not deploy by local `az acr build` or `az containerapp update`; use the workflow so validation and deployment evidence stay attached to the commit.
+
+## Frontend Wiring
+
+The frontend container proxies backend traffic to the Rust sidecar:
 
 ```text
-Storage Blob Data Reader
-Storage Table Data Reader
+BACKEND_API_BASE_URL=http://127.0.0.1:8081/api/v1
+BACKEND_WS_URL=ws://127.0.0.1:8081/api/v1/ws/live
 ```
 
-## GitHub Secrets
-
-The workflow requires these repository secrets:
+The public browser path remains stable:
 
 ```text
-AZURE_CLIENT_ID
-AZURE_TENANT_ID
-AZURE_SUBSCRIPTION_ID
-API_BEARER_TOKEN
+/api/backend/*
+/api/realtime
 ```
-
-`AZURE_CLIENT_ID` is the client ID of the user-assigned managed identity
-`id-github-polymarket-btc15-dev`, with a federated credential for:
-
-```text
-repo:aldoapicella/polyedge:ref:refs/heads/main
-```
-
-That identity has these roles scoped only to `rg-polymarket-btc15-dev`:
-
-```text
-Contributor
-User Access Administrator
-```
-
-`User Access Administrator` is needed because the Bicep template creates
-storage and ACR role assignments for the Container App's managed identity.
-After ACR exists, the workflow also grants the same deployment identity
-`AcrPush` on that registry so Docker can push without enabling ACR admin
-credentials.
-
-`API_BEARER_TOKEN` is saved locally in `data/api-bearer-token.txt`, stored as a
-GitHub secret, and saved as a Container App secret. It is required by the
-FastAPI app through the frontend proxy:
-
-```bash
-curl https://<container-app-fqdn>/api/backend/health
-```
-
-Direct backend requests without the bearer token receive `401`; public browser
-traffic reaches the backend through the Next.js server proxy.
 
 ## Data Layout
 
-Every recorded event is written to minute-segmented append blobs:
+Events are recorded as minute-segmented JSONL append blobs:
 
 ```text
 bot-events/events/YYYY/MM/DD/HH/mm.jsonl
-```
-
-Cached PnL reports are written to:
-
-```text
-bot-events/reports/jobs/<job_id>.json
-bot-events/reports/jobs/<job_id>.md
-bot-events/reports/latest.json
-bot-events/reports/YYYY/MM/DD/report.json
-bot-events/reports/YYYY/MM/DD/report.md
-```
-
-Use `POST /reports/build` to create a report job, then read it with
-`GET /reports/{job_id}`, `GET /reports/latest`, or
-`GET /reports/daily/YYYY-MM-DD`.
-
-Report jobs include `partial_day`, `as_of_ts`, `prefix_start_ts`, and
-`prefix_end_ts`. Completed past-day reports are reused when `force=false`;
-set `force=true` to rebuild an existing cached daily report. Hourly prefix
-reports update `reports/latest.json` and their job blobs, but only day-level or
-date-based builds write `reports/YYYY/MM/DD/report.json`.
-
-Azure writes are queued and batched in a background recorder thread. The bot
-hot path records local JSONL immediately, then enqueues cloud writes so Azure
-latency does not block feed processing. Batching also keeps append operations
-well below Append Blob limits during high-volume soak tests.
-
-Default batching:
-
-```text
-AZURE_RECORDER_BATCH_MAX_EVENTS=1000
-AZURE_RECORDER_BATCH_MAX_BYTES=524288
-AZURE_RECORDER_FLUSH_INTERVAL_SECONDS=2
-AZURE_RECORDER_QUEUE_MAX_EVENTS=100000
-AZURE_RECORDER_FLUSH_RETRIES=3
-```
-
-The worker flushes when any event count, byte count, or time threshold is hit.
-If the Azure queue fills, local JSONL remains the fallback source of truth and
-the Azure recorder increments its dropped-event counter.
-
-The API `/status` response includes recorder health:
-
-```text
-recorder.recorders[].queue_size
-recorder.recorders[].dropped_count
-recorder.recorders[].error_count
-recorder.recorders[].last_error
-recorder.recorders[].worker_alive
-recorder.recorders[].flush_retries
 ```
 
 The JSONL envelope is:
@@ -228,7 +82,13 @@ The JSONL envelope is:
 }
 ```
 
-The table index stores selected event types for faster querying:
+Table index partitions use:
+
+```text
+<event_type>:<YYYYMMDD>
+```
+
+Indexed event types:
 
 ```text
 market
@@ -242,167 +102,65 @@ reference
 live_heartbeat
 ```
 
-`paper_settlement` and `live_heartbeat` are indexed by default so settlement
-clearing and heartbeat behavior can be queried without downloading raw blobs.
+## Replay Validation
 
-Table partition keys use:
-
-```text
-<event_type>:<YYYYMMDD>
-```
-
-Example partition:
-
-```text
-reference:20260602
-```
-
-Each entity includes:
-
-```text
-eventType
-recordedTs
-marketId
-source
-blobName
-payloadJson
-```
-
-`book` events are stored in blob replay files but are not indexed by default to
-avoid noisy table writes. Add `book` to `AZURE_EVENT_INDEX_TYPES` only if the
-extra query convenience is worth the write volume.
-
-This minute segmentation prevents a single high-volume hourly blob from
-reaching Azure Append Blob's committed block limit during soak tests.
-
-## Live-Safety Defaults
-
-Azure is intentionally deployed in paper mode. The live adapter is still coded
-for safer future use:
-
-- cancel decisions prefer tracked order IDs;
-- if no tracked order IDs are available, cancellation falls back to
-  `condition_id` / market-scoped cancel;
-- account-wide `cancel_all` is blocked unless
-  `ALLOW_EMERGENCY_ACCOUNT_CANCEL=true`;
-- heartbeat is live-only and records `live_heartbeat` events when live mode is
-  explicitly enabled;
-- heartbeat pauses placements only after consecutive failures reach the
-  configured threshold. Total failures remain visible for observability.
-
-## Query Examples
-
-Get deployment outputs:
+Generate a short-lived read/list SAS without printing it, then run replay benchmarks:
 
 ```bash
-az deployment group show \
-  --resource-group rg-polymarket-btc15-dev \
-  --name polymarket-btc15-infra \
-  --query properties.outputs
+key="$(az storage account keys list \
+  --resource-group rg-polyedge-dev \
+  --account-name stpolyedge6urdjr5nmwx7w \
+  --query '[0].value' -o tsv)"
+az storage container generate-sas \
+  --account-name stpolyedge6urdjr5nmwx7w \
+  --account-key "$key" \
+  --name bot-events \
+  --permissions rl \
+  --expiry 2026-06-11T23:59Z \
+  --https-only -o tsv > /tmp/polyedge_azure_storage_sas.txt
+unset key
 ```
 
-List raw replay blobs:
-
 ```bash
-storage_account="<storageAccountName>"
-
-az storage blob list \
-  --auth-mode login \
-  --account-name "$storage_account" \
-  --container-name bot-events \
+AZURE_STORAGE_SAS="$(cat /tmp/polyedge_azure_storage_sas.txt)" \
+  target/release/polyedge-rs bench-azure-replay \
+  --account stpolyedge6urdjr5nmwx7w \
+  --container bot-events \
   --prefix events/ \
-  --query "[].name" \
-  -o tsv
+  --prefetch-blobs 8
 ```
 
-Download a minute replay segment:
-
-```bash
-az storage blob download \
-  --auth-mode login \
-  --account-name "$storage_account" \
-  --container-name bot-events \
-  --name events/2026/06/02/15/42.jsonl \
-  --file data/replay-2026-06-02-15-42.jsonl
-```
-
-Query recent reference events:
-
-```bash
-az storage entity query \
-  --auth-mode login \
-  --account-name "$storage_account" \
-  --table-name BotEventIndex \
-  --filter "PartitionKey eq 'reference:20260602'" \
-  --num-results 20 \
-  -o table
-```
-
-Query a market's decisions for a day:
-
-```bash
-market_id="<condition-or-market-id>"
-
-az storage entity query \
-  --auth-mode login \
-  --account-name "$storage_account" \
-  --table-name BotEventIndex \
-  --filter "PartitionKey eq 'decision:20260602' and marketId eq '$market_id'" \
-  -o json
-```
-
-## Deployment Flow
-
-The active writer flow is manual-only:
-
-1. GitHub Actions runs tests and compile checks.
-2. The workflow logs in to Azure through OIDC.
-3. Bicep creates or updates infrastructure.
-4. Docker builds the bot image and pushes it to ACR.
-5. The workflow updates the Container App image.
-6. The Container App starts the bot in paper mode and records events to Azure
-   Storage.
-
-The PolyEdge standby migration flow is also manual-only:
-
-1. Deploy `infra/parameters/polyedge-standby.bicepparam`.
-2. Build backend and frontend images into the PolyEdge ACR.
-3. Deploy those images with `RUN_BOT_ON_STARTUP=false`.
-4. Verify `/api/backend/health` and `/api/realtime` through the new PolyEdge
-   FQDN.
-5. Verify the active writer on `polymarket-btc15-dev` is still running.
-
-Local equivalent:
-
-```bash
-scripts/deploy-polyedge-standby.sh
-```
-
-Backfill old raw blobs and reports into the new storage account without
-stopping or deleting the old source:
-
-```bash
-scripts/backfill-polyedge-storage.sh
-```
-
-The backfill starts server-side copy jobs for these blob prefixes:
+Latest full replay artifact:
 
 ```text
-events/
-reports/
-config/
-control/
+docs/reports/rust-azure-full-replay-20260611T1540Z.json
 ```
 
-Do not run a writer cutover by simply setting `RUN_BOT_ON_STARTUP=true` in the
-PolyEdge stack. That would create two independent market-data writers. A writer
-cutover must be explicit and must either accept a short overlap window or add a
-coordinated dual-write/cutover marker mechanism first.
+## Production Validation
 
-## Cost Notes
+Post-deploy checks validate these fields on the latest active revision:
 
-This avoids PostgreSQL, TimescaleDB, Redis, App Service plans, and paid
-front-door services for the MVP. The main always-on cost is the single
-Container App replica plus small ACR and Storage usage. If cost must go lower,
-set `minReplicas = 0`, but continuous market-boundary capture will stop when
-the app scales to zero.
+```text
+traffic: 100%
+health: Healthy
+backend_impl: rust
+shadow_only: false
+execution_mode: paper
+runtime_loop: running
+reference.stale: false
+RUN_BOT_ON_STARTUP: true
+BACKEND_API_BASE_URL: http://127.0.0.1:8081/api/v1
+```
+
+Validated public paths:
+
+```text
+/api/backend/health      200
+/api/backend/status      200
+/api/backend/snapshot    200
+/api/backend/markets/current 200
+/api/backend/orders      200
+/api/backend/fills       200
+/api/backend/decisions   200
+/dashboard               200
+```
