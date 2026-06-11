@@ -11,7 +11,7 @@ export function ExecutionReportTable({ reports, active }: { reports: ExecutionRe
   const [filter, setFilter] = useState<ExecutionFilter>("all");
   const rows = useMemo(() => filterReports(reports, filter).slice(0, 40), [filter, reports]);
   return (
-    <Panel>
+    <Panel className="min-w-0">
       <PanelHeader
         title="Execution Reports"
         meta={`${rows.length} shown`}

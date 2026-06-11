@@ -1,4 +1,4 @@
-name: Deploy PolyEdge Active to Azure
+name: Deploy PolyEdge to Azure
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ env:
   AZURE_RESOURCE_GROUP: rg-polyedge-dev
   AZURE_LOCATION: eastus
   APP_NAME: polyedge
+  GITHUB_DEPLOY_IDENTITY_NAME: id-github-polyedge-dev
 
 jobs:
   deploy:
@@ -20,17 +21,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.12"
+          components: rustfmt, clippy
 
-      - name: Install and test
+      - name: Test Rust workspace
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-          pytest -q tests
-          python -m compileall -q src tests
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          cargo build --release -p polyedge-cli
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -57,6 +58,20 @@ jobs:
         run: |
           az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
 
+      - name: Resolve current images
+        id: current_images
+        run: |
+          app="$APP_NAME-dev"
+          if az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json > current_containerapp.json 2>/dev/null; then
+            backend_image=$(jq -r ".properties.template.containers[]? | select(.name == \"bot\") | .image // empty" current_containerapp.json)
+            frontend_image=$(jq -r ".properties.template.containers[]? | select(.name == \"frontend\") | .image // empty" current_containerapp.json)
+          else
+            backend_image="mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
+            frontend_image=""
+          fi
+          echo "backend_image=$backend_image" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=$frontend_image" >> "$GITHUB_OUTPUT"
+
       - name: Bootstrap active infrastructure
         run: |
           az deployment group create \
@@ -64,7 +79,7 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/main.bicep \
             --parameters infra/parameters/polyedge-active.bicepparam \
-            --parameters image="mcr.microsoft.com/azuredocs/containerapps-helloworld:latest" minReplicas=0 apiBearerToken="${{ secrets.API_BEARER_TOKEN }}"
+            --parameters image="${{ steps.current_images.outputs.backend_image }}" frontendImage="${{ steps.current_images.outputs.frontend_image }}" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}"
 
       - name: Read deployment outputs
         id: deploy_outputs
@@ -80,7 +95,7 @@ jobs:
 
       - name: Grant workflow ACR push
         run: |
-          principal_id=$(az ad sp show --id "${{ secrets.AZURE_CLIENT_ID }}" --query id -o tsv)
+          principal_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query principalId -o tsv)
           acr_id=$(az acr show \
             --name "${{ steps.deploy_outputs.outputs.acr_name }}" \
             --query id \
@@ -95,9 +110,9 @@ jobs:
       - name: Build and push images
         run: |
           az acr login --name "${{ steps.deploy_outputs.outputs.acr_name }}"
-          backend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-backend:${{ github.sha }}"
+          backend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-rust-backend:${{ github.sha }}"
           frontend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-frontend:${{ github.sha }}"
-          docker build -t "$backend_image" .
+          docker build -f Dockerfile.rust -t "$backend_image" .
           docker build -f Dockerfile.frontend -t "$frontend_image" .
           docker push "$backend_image"
           docker push "$frontend_image"
@@ -125,7 +140,7 @@ jobs:
           backend_base=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' containerapp.json)
           test "$run_on_startup" = "true"
           test -n "$azure_client_id"
-          test "$backend_base" = "http://127.0.0.1:8000/api/v1"
+          test "$backend_base" = "http://127.0.0.1:8081/api/v1"
 
       - name: Print endpoint
         run: |

@@ -85,10 +85,10 @@ export function Dashboard() {
       <TrendCharts points={seriesStore.marketChart} fills={seriesStore.fills} domain={seriesStore.domain} />
 
       <div className="grid gap-5 xl:grid-cols-12">
-        <div className="xl:col-span-5">
+        <div className="min-w-0 xl:col-span-5">
           <DecisionTable decisions={snapshotStore?.latest_decisions ?? []} />
         </div>
-        <div className="xl:col-span-7">
+        <div className="min-w-0 xl:col-span-7">
           <EventTimeline events={eventTape} active={active} />
         </div>
       </div>

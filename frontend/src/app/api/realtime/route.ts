@@ -123,7 +123,7 @@ async function proxySse(sseUrl: string) {
 
 function backendWebSocketUrl() {
   const explicit = process.env.BACKEND_WS_URL;
-  const base = explicit || deriveWsUrl(process.env.BACKEND_API_BASE_URL ?? "http://127.0.0.1:8000/api/v1");
+  const base = explicit || deriveWsUrl(process.env.BACKEND_API_BASE_URL ?? "http://127.0.0.1:8081/api/v1");
   const url = new URL(base);
   const token = process.env.BACKEND_API_BEARER_TOKEN;
   if (token) {

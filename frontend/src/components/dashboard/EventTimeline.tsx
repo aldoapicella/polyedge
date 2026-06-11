@@ -28,7 +28,7 @@ export function EventTimeline({ events, active }: { events: RuntimeEvent[]; acti
   }, [active, paused, search, tab, visibleEvents]);
 
   return (
-    <Panel>
+    <Panel className="min-w-0">
       <PanelHeader
         title="Event Timeline"
         meta={paused ? "paused" : `${rows.length} rows`}

@@ -31,7 +31,7 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
 
 async function proxy(request: NextRequest, context: RouteContext) {
   const params = await context.params;
-  const base = process.env.BACKEND_API_BASE_URL ?? "http://127.0.0.1:8000/api/v1";
+  const base = process.env.BACKEND_API_BASE_URL ?? "http://127.0.0.1:8081/api/v1";
   const upstream = new URL(`${base.replace(/\/$/, "")}/${params.path.join("/")}`);
   upstream.search = request.nextUrl.search;
 

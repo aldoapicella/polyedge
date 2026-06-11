@@ -1,0 +1,22 @@
+{
+  "account": "stpolyedge6urdjr5nmwx7w",
+  "bytes_per_second": 29302426.234753706,
+  "container": "bot-events",
+  "elapsed_ms": 4513692.556698,
+  "events": 297025142,
+  "events_per_second": 65805.35520950264,
+  "filled_orders": 2028,
+  "list_elapsed_ms": 4573.352755,
+  "listed_blobs": 12728,
+  "listed_bytes": 132262143193,
+  "listed_gib": 123.17871972266585,
+  "memory_rss_mb": 372.11328125,
+  "mib_per_second": 27.944971308473306,
+  "net_pnl": "-516.155",
+  "prefetch_blobs": 8,
+  "prefix": "events/",
+  "replayed_bytes": 132262143189,
+  "replayed_gib": 123.17871971894056,
+  "source": "azure_blob",
+  "transport": "native_ureq_persistent_prefetch"
+}
