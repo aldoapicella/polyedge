@@ -58,7 +58,13 @@ pub enum FeedError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>),
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for FeedError {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(error))
+    }
 }
 
 #[derive(Clone, Debug)]
