@@ -318,20 +318,19 @@ fn replay_prefetched_azure_blobs(
         let worker_client = client.clone();
         let worker_job_rx = Arc::clone(&job_rx);
         let worker_result_tx = result_tx.clone();
-        handles.push(thread::spawn(move || loop {
-            let Ok((index, blob)) = worker_job_rx
+        handles.push(thread::spawn(move || {
+            while let Ok((index, blob)) = worker_job_rx
                 .lock()
                 .map_err(|_| ())
                 .and_then(|receiver| receiver.recv().map_err(|_| ()))
-            else {
-                break;
-            };
-            let result = worker_client
-                .download_blob_bytes(&blob.name)
-                .with_context(|| format!("downloading {}", blob.name))
-                .map(|bytes| PrefetchedBlob { index, blob, bytes });
-            if worker_result_tx.send(result).is_err() {
-                break;
+            {
+                let result = worker_client
+                    .download_blob_bytes(&blob.name)
+                    .with_context(|| format!("downloading {}", blob.name))
+                    .map(|bytes| PrefetchedBlob { index, blob, bytes });
+                if worker_result_tx.send(result).is_err() {
+                    break;
+                }
             }
         }));
     }
