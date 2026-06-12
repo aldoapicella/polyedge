@@ -25,6 +25,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -44,7 +45,8 @@ struct RuntimeInner {
     settings: RuntimeSettings,
     data: RwLock<RuntimeData>,
     engine: Mutex<RuntimeEngine>,
-    recorder: StdMutex<RuntimeRecorder>,
+    recorder: Arc<StdMutex<RuntimeRecorder>>,
+    recorder_tx: std_mpsc::Sender<RuntimeEvent>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
 }
@@ -117,13 +119,16 @@ impl RuntimeController {
             reference_aggregator: ReferenceAggregator::default(),
             last_volatility_update_key: None,
         };
-        let recorder = RuntimeRecorder::new(&settings);
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new(&settings)));
+        let (recorder_tx, recorder_rx) = std_mpsc::channel();
+        spawn_recorder_worker(Arc::clone(&recorder), recorder_rx);
         Self {
             inner: Arc::new(RuntimeInner {
                 settings,
                 data: RwLock::new(data),
                 engine: Mutex::new(engine),
-                recorder: StdMutex::new(recorder),
+                recorder,
+                recorder_tx,
                 broadcaster,
                 started: AtomicBool::new(false),
             }),
@@ -842,19 +847,17 @@ impl RuntimeController {
             ts: Utc::now(),
             data: data.clone(),
         };
-        let recorder_inner = self.inner.clone();
-        let recorder_event = event.clone();
-        std::thread::spawn(move || {
-            let Ok(mut recorder) = recorder_inner.recorder.try_lock() else {
-                return;
-            };
-            if let Err(error) = recorder.record(&recorder_event) {
-                warn!("runtime recorder failed: {error}");
-            }
-        });
+        let recorder_queue_failed = self.inner.recorder_tx.send(event.clone()).is_err();
         {
             let mut state = self.inner.data.write().await;
             state.runtime_events += 1;
+            if recorder_queue_failed {
+                *state
+                    .drop_counts
+                    .entry("recorder_queue_send_error".to_owned())
+                    .or_insert(0) += 1;
+                warn!("runtime recorder queue is unavailable; event was not persisted");
+            }
             state.recent_events.push_back(event.clone());
             truncate(&mut state.recent_events, RECENT_LIMIT);
         }
@@ -914,6 +917,31 @@ impl RuntimeController {
             .values()
             .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
             .collect()
+    }
+}
+
+fn spawn_recorder_worker(
+    recorder: Arc<StdMutex<RuntimeRecorder>>,
+    receiver: std_mpsc::Receiver<RuntimeEvent>,
+) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("polyedge-recorder".to_owned())
+        .spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                let result = match recorder.lock() {
+                    Ok(mut recorder) => recorder.record(&event),
+                    Err(error) => {
+                        warn!("runtime recorder lock poisoned: {error}");
+                        break;
+                    }
+                };
+                if let Err(error) = result {
+                    warn!("runtime recorder failed: {error}");
+                }
+            }
+        })
+    {
+        warn!("failed to start runtime recorder worker: {error}");
     }
 }
 
@@ -989,5 +1017,53 @@ fn execution_mode(settings: &RuntimeSettings) -> &'static str {
 fn truncate<T>(values: &mut VecDeque<T>, limit: usize) {
     while values.len() > limit {
         values.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn recorder_worker_serializes_burst_without_try_lock_drops() {
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-recorder-worker-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let path = dir.join("events.jsonl");
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_path(path.clone())));
+        let (sender, receiver) = std_mpsc::channel();
+        spawn_recorder_worker(Arc::clone(&recorder), receiver);
+
+        for index in 0..100 {
+            sender
+                .send(RuntimeEvent {
+                    event_type: "book".to_owned(),
+                    ts: Utc::now(),
+                    data: json!({ "index": index }),
+                })
+                .unwrap();
+        }
+        drop(sender);
+
+        for _ in 0..100 {
+            let lines = fs::read_to_string(&path)
+                .map(|text| text.lines().count())
+                .unwrap_or_default();
+            if lines == 100 {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 100);
+        assert_eq!(recorder.lock().unwrap().status(false)["error_count"], 0);
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -35,6 +35,16 @@ impl RuntimeRecorder {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn new_for_path(path: PathBuf) -> Self {
+        Self {
+            recorders: vec![Box::new(JsonlRecorder::new(path))],
+            error_count: 0,
+            dropped_count: 0,
+            last_error: None,
+        }
+    }
+
     pub(super) fn record(&mut self, event: &RuntimeEvent) -> Result<(), String> {
         let mut last_error = None;
         for recorder in &mut self.recorders {
