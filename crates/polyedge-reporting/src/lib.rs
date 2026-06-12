@@ -603,15 +603,33 @@ pub fn run_backtest(path: &Path) -> Result<BacktestResult, ReportingError> {
 }
 
 pub fn build_pnl_report(path: &Path) -> Result<Value, ReportingError> {
-    let source = json!({"type": "local_jsonl", "path": path.to_string_lossy()});
+    let file = match File::open(path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let source_available = file.is_some();
+    let source = json!({
+        "type": "local_jsonl",
+        "path": path.to_string_lossy(),
+        "available": source_available
+    });
     let mut actual = ActualPaperAccumulator::default();
     let mut backtester = ReplayBacktester::new(BacktestConfig::new(path));
-    let file = File::open(path)?;
-    backtester.run_reader_observing(
-        BufReader::with_capacity(REPLAY_BUFFER_BYTES, file),
-        |event| actual.observe(event),
-    )?;
-    let replay = backtester.result();
+    if let Some(file) = file {
+        backtester.run_reader_observing(
+            BufReader::with_capacity(REPLAY_BUFFER_BYTES, file),
+            |event| actual.observe(event),
+        )?;
+    }
+    let mut replay = backtester.result();
+    if !source_available {
+        replay.notes.insert(
+            0,
+            "event source was not found; returning an empty report until runtime events are available"
+                .to_owned(),
+        );
+    }
     let actual_summary = actual.summary(&replay.market_results);
     let replay_cost = backtester.replay_cost();
     let replay_net = decimal_from_string(&replay.net_pnl);

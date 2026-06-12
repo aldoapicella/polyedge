@@ -125,6 +125,47 @@ async fn latest_report_is_empty_payload_before_first_build() {
 }
 
 #[tokio::test]
+async fn pnl_missing_event_source_returns_empty_report() {
+    let app = app(RuntimeSettings::default());
+    let missing_source = "/tmp/polyedge-definitely-missing-events.jsonl";
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/pnl?prefix={missing_source}"),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["source"]["available"], false);
+    assert_eq!(payload["replay_estimate"]["event_count"], 0);
+    assert!(payload["replay_estimate"]["notes"]
+        .as_array()
+        .is_some_and(|notes| notes.iter().any(|note| note
+            .as_str()
+            .is_some_and(|text| text.contains("event source was not found")))));
+
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/reports/build",
+            Some(json!({ "prefix": missing_source })),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["report"]["source"]["available"], false);
+}
+
+#[tokio::test]
 async fn api_requires_bearer_token_when_enabled() {
     let app = app(auth_settings(Some("secret-token")));
 

@@ -100,6 +100,7 @@
     "runtime_net_pnl": "0"
   },
   "source": {
+    "available": true,
     "path": "/mnt/c/Users/aldoa/OneDrive/Documents/Crypto Research and Execution/tests/fixtures/events_pnl_sample.jsonl",
     "type": "local_jsonl"
   },
