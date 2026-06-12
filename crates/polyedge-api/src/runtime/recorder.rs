@@ -45,10 +45,10 @@ impl RuntimeRecorder {
         }
     }
 
-    pub(super) fn record(&mut self, event: &RuntimeEvent) -> Result<(), String> {
+    pub(super) fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), String> {
         let mut last_error = None;
         for recorder in &mut self.recorders {
-            if let Err(error) = recorder.record(event) {
+            if let Err(error) = recorder.record_batch(events) {
                 self.error_count += 1;
                 last_error = Some(error.to_string());
             }

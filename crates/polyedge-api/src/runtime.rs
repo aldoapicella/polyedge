@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 const RECENT_LIMIT: usize = 1_000;
 const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
+const RECORDER_BATCH_LIMIT: usize = 5_000;
 
 #[derive(Clone)]
 pub struct RuntimeController {
@@ -928,8 +929,16 @@ fn spawn_recorder_worker(
         .name("polyedge-recorder".to_owned())
         .spawn(move || {
             while let Ok(event) = receiver.recv() {
+                let mut batch = vec![event];
+                while batch.len() < RECORDER_BATCH_LIMIT {
+                    match receiver.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(std_mpsc::TryRecvError::Empty) => break,
+                        Err(std_mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
                 let result = match recorder.lock() {
-                    Ok(mut recorder) => recorder.record(&event),
+                    Ok(mut recorder) => recorder.record_batch(&batch),
                     Err(error) => {
                         warn!("runtime recorder lock poisoned: {error}");
                         break;

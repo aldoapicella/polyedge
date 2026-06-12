@@ -7,6 +7,7 @@ use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,13 @@ pub enum StorageError {
 
 pub trait EventRecorder {
     fn record(&mut self, event: &RuntimeEvent) -> Result<(), StorageError>;
+
+    fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), StorageError> {
+        for event in events {
+            self.record(event)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +75,13 @@ impl JsonlRecorder {
 
 impl EventRecorder for JsonlRecorder {
     fn record(&mut self, event: &RuntimeEvent) -> Result<(), StorageError> {
+        self.record_batch(std::slice::from_ref(event))
+    }
+
+    fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -74,8 +89,10 @@ impl EventRecorder for JsonlRecorder {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, &jsonl_event_envelope(event))?;
-        file.write_all(b"\n")?;
+        for event in events {
+            serde_json::to_writer(&mut file, &jsonl_event_envelope(event))?;
+            file.write_all(b"\n")?;
+        }
         Ok(())
     }
 }
@@ -170,14 +187,36 @@ impl AzureAppendBlobRecorder {
 
 impl EventRecorder for AzureAppendBlobRecorder {
     fn record(&mut self, event: &RuntimeEvent) -> Result<(), StorageError> {
-        let envelope = jsonl_event_envelope(event);
-        let mut line = serde_json::to_vec(&envelope)?;
-        line.push(b'\n');
-        let recorded_ts = event.ts;
-        let blob_name = format!("events/{}.jsonl", recorded_ts.format("%Y/%m/%d/%H/%M"));
-        self.append_line(&blob_name, &line)?;
+        self.record_batch(std::slice::from_ref(event))
+    }
+
+    fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut batches = BTreeMap::<String, Vec<u8>>::new();
+        for event in events {
+            batches
+                .entry(event_blob_name(event))
+                .or_default()
+                .extend(jsonl_event_line(event)?);
+        }
+        for (blob_name, lines) in batches {
+            self.append_line(&blob_name, &lines)?;
+        }
         Ok(())
     }
+}
+
+fn event_blob_name(event: &RuntimeEvent) -> String {
+    format!("events/{}.jsonl", event.ts.format("%Y/%m/%d/%H/%M"))
+}
+
+fn jsonl_event_line(event: &RuntimeEvent) -> Result<Vec<u8>, StorageError> {
+    let envelope = jsonl_event_envelope(event);
+    let mut line = serde_json::to_vec(&envelope)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 #[derive(Debug, Error)]
