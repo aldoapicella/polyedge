@@ -282,10 +282,12 @@ async fn latest_report(State(state): State<ApiState>) -> impl IntoResponse {
     match state.latest_report.read().await.clone() {
         Some(report) => (StatusCode::OK, Json(report)),
         None => (
-            StatusCode::NOT_FOUND,
-            Json(
-                json!({ "detail": "No cached report exists yet. Run POST /reports/build first." }),
-            ),
+            StatusCode::OK,
+            Json(json!({
+                "job": Value::Null,
+                "report": Value::Null,
+                "detail": "No cached report exists yet. Run POST /reports/build first."
+            })),
         ),
     }
 }
@@ -435,6 +437,7 @@ pub fn smoke_paths() -> Vec<&'static str> {
         "/api/v1/decisions",
         "/api/v1/events/recent",
         "/api/v1/pnl",
+        "/api/v1/reports/latest",
         "/api/v1/config/current",
     ]
 }

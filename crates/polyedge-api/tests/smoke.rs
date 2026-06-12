@@ -1,4 +1,4 @@
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use polyedge_api::{app, smoke_paths};
 use polyedge_config::RuntimeSettings;
@@ -104,6 +104,24 @@ async fn api_contract_routes_remain_reachable() {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), expected_status, "{path}");
     }
+}
+
+#[tokio::test]
+async fn latest_report_is_empty_payload_before_first_build() {
+    let app = app(RuntimeSettings::default());
+
+    let response = app
+        .oneshot(json_request(Method::GET, "/api/v1/reports/latest", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(payload.get("job").is_some_and(serde_json::Value::is_null));
+    assert!(payload
+        .get("report")
+        .is_some_and(serde_json::Value::is_null));
 }
 
 #[tokio::test]
