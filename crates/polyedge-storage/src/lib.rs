@@ -13,6 +13,9 @@ use thiserror::Error;
 
 const AZURE_BLOB_API_VERSION: &str = "2023-11-03";
 const AZURE_BLOB_MAX_ATTEMPTS: usize = 5;
+const AZURE_TABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
+const AZURE_TABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 type AzureTableContinuation = Option<(String, String)>;
 type AzureTablePage = (Vec<Value>, AzureTableContinuation);
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -257,6 +260,7 @@ fn fetch_managed_identity_token(
         let response = agent
             .get(&url)
             .set("X-IDENTITY-HEADER", &header)
+            .set("Metadata", "true")
             .call()
             .map_err(identity_error)?;
         return parse_json_response(response);
@@ -470,9 +474,9 @@ impl AzureTableClient {
         Self {
             account: account.into(),
             agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout_read(Duration::from_secs(30))
-                .timeout_write(Duration::from_secs(30))
+                .timeout_connect(AZURE_TABLE_CONNECT_TIMEOUT)
+                .timeout_read(AZURE_TABLE_READ_TIMEOUT)
+                .timeout_write(AZURE_TABLE_WRITE_TIMEOUT)
                 .build(),
             token: ManagedIdentityToken::new(client_id),
         }
