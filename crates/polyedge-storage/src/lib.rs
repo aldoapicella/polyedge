@@ -7,7 +7,7 @@ use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -113,6 +113,7 @@ pub struct AzureAppendBlobRecorder {
     container: String,
     agent: ureq::Agent,
     token: ManagedIdentityToken,
+    known_append_blobs: BTreeSet<String>,
 }
 
 impl AzureAppendBlobRecorder {
@@ -130,6 +131,7 @@ impl AzureAppendBlobRecorder {
                 .timeout_write(Duration::from_secs(30))
                 .build(),
             token: ManagedIdentityToken::new(client_id),
+            known_append_blobs: BTreeSet::new(),
         }
     }
 
@@ -153,6 +155,13 @@ impl AzureAppendBlobRecorder {
     }
 
     fn ensure_append_blob(&mut self, blob_name: &str) -> Result<(), AzureBlobError> {
+        if self.known_append_blobs.contains(blob_name) {
+            return Ok(());
+        }
+        if self.append_blob_exists(blob_name)? {
+            self.known_append_blobs.insert(blob_name.to_owned());
+            return Ok(());
+        }
         let url = self.blob_url(blob_name, None);
         let token = self.token.access_token(&self.agent)?;
         match self
@@ -164,8 +173,28 @@ impl AzureAppendBlobRecorder {
             .set("x-ms-blob-type", "AppendBlob")
             .send_bytes(&[])
         {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(409, _)) => Ok(()),
+            Ok(_) | Err(ureq::Error::Status(409, _)) => {
+                self.known_append_blobs.insert(blob_name.to_owned());
+                Ok(())
+            }
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn append_blob_exists(&mut self, blob_name: &str) -> Result<bool, AzureBlobError> {
+        let url = self.blob_url(blob_name, None);
+        let token = self.token.access_token(&self.agent)?;
+        match self
+            .agent
+            .head(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .call()
+        {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(404, _)) => Ok(false),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
