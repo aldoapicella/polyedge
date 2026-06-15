@@ -41,7 +41,7 @@ export function collapseDecisions(decisions: TradeDecision[]): CollapsedDecision
       const action = decision.action.toUpperCase();
       const reason = decision.reason || "n/a";
       const last = output[output.length - 1];
-      const canCollapse = action === "HOLD" && last?.action === "HOLD" && last.reason === reason;
+      const canCollapse = action === "HOLD" && last?.action === "HOLD" && last.rawReason === reason;
       if (canCollapse) {
         last.count += 1;
         return;
@@ -53,11 +53,25 @@ export function collapseDecisions(decisions: TradeDecision[]): CollapsedDecision
         price: sharePriceText(decision.price),
         size: compact(decision.size),
         edge: sharePriceText(decision.expected_edge),
-        reason,
+        reason: summarizeDecisionReason(reason),
+        rawReason: reason,
         count: 1
       });
     });
   return output;
+}
+
+function summarizeDecisionReason(reason: string) {
+  const missingBookMatches = reason.match(/missing book for token \d+/g) ?? [];
+  if (missingBookMatches.length >= 2) {
+    return reason.replace(/missing book for token \d+(;\s*)?/g, "").replace(/^;\s*|\s*;\s*$/g, "").trim()
+      ? `${reason.replace(/missing book for token \d+(;\s*)?/g, "").replace(/^;\s*|\s*;\s*$/g, "").trim()}; missing UP/DOWN book`
+      : "missing UP/DOWN book";
+  }
+  if (missingBookMatches.length === 1) {
+    return reason.replace(/missing book for token \d+/g, "missing book");
+  }
+  return reason;
 }
 
 export function filterReports(reports: ExecutionReport[], filter: ExecutionFilter) {

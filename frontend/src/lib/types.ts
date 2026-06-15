@@ -194,6 +194,12 @@ export type LabArtifact = {
   modified_ts?: string | null;
 };
 
+export type LabArtifactPayload = {
+  path: string;
+  kind: "json" | "markdown" | string;
+  content: unknown;
+};
+
 export type LabReportBundle = {
   date?: string;
   report?: JsonRecord | null;
@@ -243,6 +249,9 @@ export type LabJob = {
   exit_code?: number | null;
   output_artifact?: string | null;
   error?: string | null;
+  running?: boolean;
+  execution_name?: string | null;
+  execution_id?: string | null;
   research_only?: boolean;
   live_trading_enabled?: boolean;
 };

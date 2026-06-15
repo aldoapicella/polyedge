@@ -15,6 +15,7 @@ use std::env;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 
+use crate::azure_jobs::{latest_execution_summary, AzureJobClient, JobStartOptions};
 use crate::ApiState;
 
 const REPORT_ROOT: &str = "reports/research";
@@ -42,6 +43,7 @@ pub fn router() -> Router<ApiState> {
         .route("/jobs/replay-index", post(start_replay_index))
         .route("/jobs/backfill", post(start_backfill))
         .route("/jobs", get(jobs))
+        .route("/jobs/:job_id/start", post(start_job))
         .route("/jobs/:job_id", get(job_detail))
         .route("/prospective", get(prospective))
         .route("/regimes/latest", get(regimes_latest))
@@ -168,10 +170,36 @@ async fn report_artifact(Path(artifact_id): Path<String>) -> impl IntoResponse {
 }
 
 async fn jobs() -> impl IntoResponse {
+    let mut jobs = job_definitions();
+    let mut source = "iac_defined_jobs".to_owned();
+    let mut note = "API does not run long research jobs in-process.".to_owned();
+    match AzureJobClient::from_env() {
+        Ok(Some(client)) => {
+            source = "iac_defined_jobs+azure_arm_executions".to_owned();
+            jobs = match tokio::task::spawn_blocking(move || {
+                enrich_jobs_with_azure(&mut jobs, &client);
+                jobs
+            })
+            .await
+            {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    note.push_str(&format!(" Azure execution enrichment failed: {error}"));
+                    job_definitions()
+                }
+            };
+        }
+        Ok(None) => {
+            note.push_str(" Azure ARM env is not configured, so execution history is unavailable.");
+        }
+        Err(error) => {
+            note.push_str(&format!(" Azure ARM client initialization failed: {error}"));
+        }
+    }
     Json(json!({
-        "jobs": job_definitions(),
-        "source": "iac_defined_jobs",
-        "note": "API does not run long research jobs in-process."
+        "jobs": jobs,
+        "source": source,
+        "note": note
     }))
 }
 
@@ -196,23 +224,30 @@ async fn job_detail(Path(job_id): Path<String>) -> impl IntoResponse {
 }
 
 async fn start_freshness_check() -> impl IntoResponse {
-    job_start_response("freshness-check", "polyedge-data-freshness-job")
+    start_research_job_by_id("freshness-check", None).await
 }
 
 async fn start_daily_report() -> impl IntoResponse {
-    job_start_response("daily-report", "polyedge-daily-research-job")
+    start_research_job_by_id("daily-report", None).await
 }
 
 async fn start_prospective_validation() -> impl IntoResponse {
-    job_start_response("prospective-validation", "polyedge-prospective-job")
+    start_research_job_by_id("prospective-validation", None).await
 }
 
 async fn start_replay_index() -> impl IntoResponse {
-    job_start_response("replay-index", "polyedge-replay-index-job")
+    start_research_job_by_id("replay-index", None).await
 }
 
-async fn start_backfill() -> impl IntoResponse {
-    job_start_response("backfill", "polyedge-backfill-job")
+async fn start_backfill(body: Option<Json<StartJobRequest>>) -> impl IntoResponse {
+    start_research_job_by_id("backfill", body.map(|body| body.0)).await
+}
+
+async fn start_job(
+    Path(job_id): Path<String>,
+    body: Option<Json<StartJobRequest>>,
+) -> impl IntoResponse {
+    start_research_job_by_id(&job_id, body.map(|body| body.0)).await
 }
 
 async fn prospective() -> impl IntoResponse {
@@ -255,20 +290,98 @@ async fn fill_models_latest() -> impl IntoResponse {
     ))
 }
 
-fn job_start_response(job_id: &str, job_name: &str) -> impl IntoResponse {
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "job_id": job_id,
-            "job_name": job_name,
-            "status": "defined_in_iac_not_started_by_api",
-            "created_ts": now_ts(),
-            "research_only": true,
-            "live_trading_enabled": false,
-            "raw_data_mutated": false,
-            "detail": "Azure Container Apps Job execution is defined in IaC. Start it through Azure job execution wiring; the API does not run long research jobs in-process."
-        })),
-    )
+#[derive(Deserialize, Clone, Debug, Default)]
+struct StartJobRequest {
+    start: Option<String>,
+    end: Option<String>,
+    task: Option<String>,
+}
+
+async fn start_research_job_by_id(
+    job_id: &str,
+    body: Option<StartJobRequest>,
+) -> axum::response::Response {
+    let Some(job) = job_definition_by_id(job_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "detail": format!("Job {job_id} was not found.") })),
+        )
+            .into_response();
+    };
+    let Some(job_name) = job["job_name"].as_str().map(str::to_owned) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "detail": format!("Job {job_id} has no job_name.") })),
+        )
+            .into_response();
+    };
+    let options = match start_options(job_id, body.as_ref()) {
+        Ok(options) => options,
+        Err(detail) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "detail": detail }))).into_response()
+        }
+    };
+    let client = match AzureJobClient::from_env() {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "status": "defined_in_iac_not_started_by_api",
+                    "created_ts": now_ts(),
+                    "research_only": true,
+                    "live_trading_enabled": false,
+                    "raw_data_mutated": false,
+                    "detail": "Azure ARM env is not configured. Start the Container Apps Job from Azure or configure AZURE_SUBSCRIPTION_ID and AZURE_RESOURCE_GROUP."
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(
+                    json!({ "detail": format!("Azure job client initialization failed: {error}") }),
+                ),
+            )
+                .into_response();
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || client.start_job(&job_name, options))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+    match result {
+        Ok(result) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "job_id": job_id,
+                "job_name": job["job_name"].as_str(),
+                "status": "start_requested",
+                "created_ts": now_ts(),
+                "research_only": true,
+                "live_trading_enabled": false,
+                "raw_data_mutated": false,
+                "azure": result
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "job_id": job_id,
+                "job_name": job["job_name"].as_str(),
+                "status": "start_failed",
+                "error": error,
+                "research_only": true,
+                "live_trading_enabled": false,
+                "raw_data_mutated": false
+            })),
+        )
+            .into_response(),
+    }
 }
 
 fn read_latest_report_payload() -> Value {
@@ -638,6 +751,96 @@ fn job_definitions() -> Value {
     ])
 }
 
+fn job_definition_by_id(job_id: &str) -> Option<Value> {
+    job_definitions()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|job| {
+            job["job_id"].as_str() == Some(job_id) || job["job_name"].as_str() == Some(job_id)
+        })
+        .cloned()
+}
+
+fn enrich_jobs_with_azure(jobs: &mut Value, client: &AzureJobClient) {
+    let Some(jobs) = jobs.as_array_mut() else {
+        return;
+    };
+    for job in jobs {
+        let Some(job_name) = job["job_name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let latest = client
+            .list_executions(&job_name)
+            .ok()
+            .and_then(|executions| latest_execution_summary(&executions));
+        let Some(latest) = latest else {
+            continue;
+        };
+        let Some(object) = job.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "status".to_owned(),
+            latest["status"].as_str().unwrap_or("unknown").into(),
+        );
+        object.insert("last_start".to_owned(), latest["last_start"].clone());
+        object.insert("last_finish".to_owned(), latest["last_finish"].clone());
+        object.insert("duration".to_owned(), latest["duration"].clone());
+        object.insert("exit_code".to_owned(), latest["exit_code"].clone());
+        object.insert("error".to_owned(), latest["error"].clone());
+        object.insert("running".to_owned(), latest["running"].clone());
+        object.insert(
+            "execution_name".to_owned(),
+            latest["execution_name"].clone(),
+        );
+        object.insert("execution_id".to_owned(), latest["execution_id"].clone());
+    }
+}
+
+fn start_options(
+    job_id: &str,
+    request: Option<&StartJobRequest>,
+) -> Result<Option<JobStartOptions>, String> {
+    if job_id != "backfill" {
+        return Ok(None);
+    }
+    let request = request.ok_or_else(|| "Backfill requires start, end, and task.".to_owned())?;
+    let start = request
+        .start
+        .as_deref()
+        .filter(|value| valid_date(value))
+        .ok_or_else(|| "Backfill start must be YYYY-MM-DD.".to_owned())?;
+    let end = request
+        .end
+        .as_deref()
+        .filter(|value| valid_date(value))
+        .ok_or_else(|| "Backfill end must be YYYY-MM-DD.".to_owned())?;
+    let task = request
+        .task
+        .as_deref()
+        .filter(|value| {
+            matches!(
+                *value,
+                "all" | "audit" | "daily-report" | "replay-index" | "prospective"
+            )
+        })
+        .ok_or_else(|| {
+            "Backfill task must be all, audit, daily-report, replay-index, or prospective."
+                .to_owned()
+        })?;
+    if end < start {
+        return Err("Backfill end must be on or after start.".to_owned());
+    }
+    Ok(Some(JobStartOptions {
+        env: vec![
+            ("BACKFILL_START".to_owned(), start.to_owned()),
+            ("BACKFILL_END".to_owned(), end.to_owned()),
+            ("BACKFILL_TASK".to_owned(), task.to_owned()),
+        ],
+    }))
+}
+
 fn job_definition(job_id: &str, job_name: &str, trigger: &str, cron: impl Into<Value>) -> Value {
     json!({
         "job_id": job_id,
@@ -651,6 +854,7 @@ fn job_definition(job_id: &str, job_name: &str, trigger: &str, cron: impl Into<V
         "exit_code": Value::Null,
         "output_artifact": Value::Null,
         "error": Value::Null,
+        "running": false,
         "research_only": true,
         "live_trading_enabled": false
     })

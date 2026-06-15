@@ -58,6 +58,12 @@ jobs:
         run: |
           az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
 
+      - name: Validate required deployment secrets
+        run: |
+          test -n "${{ secrets.API_BEARER_TOKEN }}"
+          test -n "${{ secrets.DASHBOARD_AUTH_PASSWORD }}"
+          test -n "${{ secrets.DASHBOARD_SESSION_SECRET }}"
+
       - name: Resolve current images
         id: current_images
         run: |
@@ -79,7 +85,7 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/main.bicep \
             --parameters infra/parameters/polyedge-active.bicepparam \
-            --parameters image="${{ steps.current_images.outputs.backend_image }}" frontendImage="${{ steps.current_images.outputs.frontend_image }}" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}"
+            --parameters image="${{ steps.current_images.outputs.backend_image }}" frontendImage="${{ steps.current_images.outputs.frontend_image }}" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}" dashboardAuthPassword="${{ secrets.DASHBOARD_AUTH_PASSWORD }}" dashboardSessionSecret="${{ secrets.DASHBOARD_SESSION_SECRET }}"
 
       - name: Read deployment outputs
         id: deploy_outputs
@@ -126,7 +132,7 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/main.bicep \
             --parameters infra/parameters/polyedge-active.bicepparam \
-            --parameters image="$BACKEND_IMAGE" frontendImage="$FRONTEND_IMAGE" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}"
+            --parameters image="$BACKEND_IMAGE" frontendImage="$FRONTEND_IMAGE" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}" dashboardAuthPassword="${{ secrets.DASHBOARD_AUTH_PASSWORD }}" dashboardSessionSecret="${{ secrets.DASHBOARD_SESSION_SECRET }}"
 
       - name: Verify active writer configuration
         run: |
@@ -138,9 +144,11 @@ jobs:
           run_on_startup=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "RUN_BOT_ON_STARTUP") | .value' containerapp.json)
           azure_client_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_CLIENT_ID") | .value' containerapp.json)
           backend_base=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' containerapp.json)
+          dashboard_secret=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "DASHBOARD_SESSION_SECRET") | .secretRef' containerapp.json)
           test "$run_on_startup" = "true"
           test -n "$azure_client_id"
           test "$backend_base" = "http://127.0.0.1:8081/api/v1"
+          test "$dashboard_secret" = "dashboard-session-secret"
 
       - name: Print endpoint
         run: |

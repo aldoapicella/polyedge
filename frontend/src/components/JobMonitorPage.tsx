@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Play, RefreshCw } from "lucide-react";
+import { useState } from "react";
 import { getLabJobs, startLabJob } from "@/lib/api";
 import type { LabJob } from "@/lib/types";
 import { dateTime, numberText } from "@/lib/format";
@@ -17,11 +18,20 @@ const runnableJobs: { id: "freshness-check" | "daily-report" | "prospective-vali
 
 export function JobMonitorPage() {
   const queryClient = useQueryClient();
+  const [backfillStart, setBackfillStart] = useState("");
+  const [backfillEnd, setBackfillEnd] = useState("");
+  const [backfillTask, setBackfillTask] = useState("all");
   const jobs = useQuery({ queryKey: ["labs", "jobs"], queryFn: getLabJobs, retry: false, refetchInterval: 30000 });
   const run = useMutation({
-    mutationFn: (job: (typeof runnableJobs)[number]["id"]) => startLabJob(job),
+    mutationFn: (job: (typeof runnableJobs)[number]["id"]) => {
+      if (job !== "backfill") {
+        return startLabJob(job);
+      }
+      return startLabJob(job, { start: backfillStart, end: backfillEnd, task: backfillTask });
+    },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["labs", "jobs"] })
   });
+  const backfillReady = Boolean(backfillStart && backfillEnd && backfillTask);
 
   return (
     <div className="space-y-5">
@@ -38,11 +48,52 @@ export function JobMonitorPage() {
         <PanelHeader title="Manual Actions" meta={run.data?.status ?? "ready"} />
         <div className="flex flex-wrap gap-2 p-4">
           {runnableJobs.map((job) => (
-            <Button key={job.id} disabled={run.isPending} onClick={() => confirmAndRun(job.id, () => run.mutate(job.id))}>
+            <Button
+              key={job.id}
+              disabled={run.isPending || (job.id === "backfill" && !backfillReady)}
+              onClick={() => confirmAndRun(job.id, () => run.mutate(job.id))}
+            >
               <Play className="h-4 w-4" />
               {job.label}
             </Button>
           ))}
+        </div>
+        <div className="grid gap-3 border-t border-line bg-panel px-4 py-3 md:grid-cols-[160px_160px_180px_1fr]">
+          <label className="text-xs font-medium uppercase text-ink/55">
+            Backfill Start
+            <input
+              type="date"
+              className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm normal-case text-ink"
+              value={backfillStart}
+              onChange={(event) => setBackfillStart(event.target.value)}
+            />
+          </label>
+          <label className="text-xs font-medium uppercase text-ink/55">
+            Backfill End
+            <input
+              type="date"
+              className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm normal-case text-ink"
+              value={backfillEnd}
+              onChange={(event) => setBackfillEnd(event.target.value)}
+            />
+          </label>
+          <label className="text-xs font-medium uppercase text-ink/55">
+            Backfill Task
+            <select
+              className="mt-1 h-9 w-full border border-line bg-white px-2 text-sm normal-case text-ink"
+              value={backfillTask}
+              onChange={(event) => setBackfillTask(event.target.value)}
+            >
+              <option value="all">all</option>
+              <option value="audit">audit</option>
+              <option value="daily-report">daily-report</option>
+              <option value="replay-index">replay-index</option>
+              <option value="prospective">prospective</option>
+            </select>
+          </label>
+          <div className="self-end text-xs text-ink/55">
+            Backfill is manual-only and requires explicit date bounds before it can start.
+          </div>
         </div>
         {run.error ? <div className="border-t border-line px-4 py-3 text-sm text-danger">{run.error.message}</div> : null}
         {run.data ? <div className="border-t border-line px-4 py-3 text-sm text-ink/70">{run.data.job_name}: {run.data.status}</div> : null}
@@ -78,7 +129,11 @@ function JobTable({ jobs, loading }: { jobs: LabJob[]; loading: boolean }) {
                 <div className="font-mono text-xs text-ink/50">{job.job_id}</div>
               </td>
               <td className="px-3 py-2">{job.trigger ?? "n/a"}{job.cron ? <div className="font-mono text-xs text-ink/50">{job.cron}</div> : null}</td>
-              <td className="px-3 py-2"><Pill tone={job.status.includes("failed") ? "danger" : job.status.includes("defined") ? "neutral" : "good"}>{job.status}</Pill></td>
+              <td className="px-3 py-2">
+                <Pill tone={jobTone(job)}>{job.status}</Pill>
+                {job.running ? <div className="mt-1 text-xs text-good">running</div> : null}
+                {job.execution_name ? <div className="mt-1 font-mono text-xs text-ink/45">{job.execution_name}</div> : null}
+              </td>
               <td className="px-3 py-2">{dateTime(job.last_start)}</td>
               <td className="px-3 py-2">{dateTime(job.last_finish)}</td>
               <td className="px-3 py-2">{numberText(job.duration)}</td>
@@ -97,4 +152,18 @@ function confirmAndRun(job: string, run: () => void) {
   if (window.confirm(`Run ${job}?`)) {
     run();
   }
+}
+
+function jobTone(job: LabJob) {
+  const status = job.status.toLowerCase();
+  if (status.includes("failed") || status.includes("error")) {
+    return "danger" as const;
+  }
+  if (job.running || status.includes("running") || status.includes("succeeded") || status.includes("start_requested")) {
+    return "good" as const;
+  }
+  if (status.includes("defined")) {
+    return "neutral" as const;
+  }
+  return "warn" as const;
 }

@@ -16,6 +16,17 @@ param frontendImage string = ''
 @secure()
 param apiBearerToken string
 
+@description('Owner password required by the frontend dashboard login.')
+@secure()
+param dashboardAuthPassword string
+
+@description('Secret used to sign frontend dashboard session cookies.')
+@secure()
+param dashboardSessionSecret string
+
+@description('Dashboard session TTL in seconds.')
+param dashboardSessionTtlSeconds int = 43200
+
 @description('Minimum replicas. Use 1 for continuous market observation.')
 param minReplicas int = 1
 
@@ -110,6 +121,14 @@ var jobCommonEnv = [
   {
     name: 'AZURE_CLIENT_ID'
     value: containerAppIdentity.properties.clientId
+  }
+  {
+    name: 'AZURE_SUBSCRIPTION_ID'
+    value: subscription().subscriptionId
+  }
+  {
+    name: 'AZURE_RESOURCE_GROUP'
+    value: resourceGroup().name
   }
   {
     name: 'AZURE_STORAGE_ACCOUNT_NAME'
@@ -376,6 +395,14 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           value: apiBearerToken
         }
         {
+          name: 'dashboard-auth-password'
+          value: dashboardAuthPassword
+        }
+        {
+          name: 'dashboard-session-secret'
+          value: dashboardSessionSecret
+        }
+        {
           name: 'storage-account-key'
           value: storage.listKeys().keys[0].value
         }
@@ -420,6 +447,14 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'AZURE_CLIENT_ID'
               value: containerAppIdentity.properties.clientId
+            }
+            {
+              name: 'AZURE_SUBSCRIPTION_ID'
+              value: subscription().subscriptionId
+            }
+            {
+              name: 'AZURE_RESOURCE_GROUP'
+              value: resourceGroup().name
             }
             {
               name: 'TARGET_ASSET'
@@ -523,6 +558,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'BACKEND_API_BEARER_TOKEN'
               secretRef: 'api-bearer-token'
+            }
+            {
+              name: 'DASHBOARD_AUTH_PASSWORD'
+              secretRef: 'dashboard-auth-password'
+            }
+            {
+              name: 'DASHBOARD_SESSION_SECRET'
+              secretRef: 'dashboard-session-secret'
+            }
+            {
+              name: 'DASHBOARD_SESSION_TTL_SECONDS'
+              value: string(dashboardSessionTtlSeconds)
             }
           ], !empty(frontendBackendSseUrl) ? [
             {
@@ -642,6 +689,16 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     principalType: 'ServicePrincipal'
   }
 }
+
+resource researchJobOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (job, index) in researchJobDefinitions: {
+  name: guid(researchJobs[index].id, containerAppIdentity.id, 'research-job-operator')
+  scope: researchJobs[index]
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
 
 resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
   name: '${containerAppName}-research-alerts'

@@ -6,6 +6,7 @@ import type {
   ExclusionRegistry,
   JsonRecord,
   LabArtifact,
+  LabArtifactPayload,
   LabDataQuality,
   LabJob,
   LabReportBundle,
@@ -18,7 +19,7 @@ import type {
   RuntimeConfigPatch,
   Snapshot
 } from "@/lib/types";
-import { thinChartPoints, type ChartPoint, type ChartRange, type MarketSeries } from "@/lib/charting";
+import { thinChartPoints, type ChartPoint, type ChartRange, type ChartSummary, type MarketSeries } from "@/lib/charting";
 
 type FetchOptions = {
   method?: "GET" | "POST";
@@ -93,6 +94,10 @@ export function getLabArtifacts(prefix = "") {
   return backendFetch<{ prefix: string; artifacts: LabArtifact[] }>(`labs/reports/artifacts${query}`);
 }
 
+export function getLabArtifact(artifactId: string) {
+  return backendFetch<LabArtifactPayload>(`labs/reports/artifacts/${encodeURIComponent(artifactId)}`);
+}
+
 export function getLabDataQualityLatest() {
   return backendFetch<LabDataQuality>("labs/data-quality/latest");
 }
@@ -138,8 +143,11 @@ export function getLabJobs() {
   return backendFetch<{ jobs: LabJob[]; source?: string; note?: string }>("labs/jobs");
 }
 
-export function startLabJob(job: "freshness-check" | "daily-report" | "prospective-validation" | "replay-index" | "backfill") {
-  return backendFetch<LabJob>(`labs/jobs/${job}`, { method: "POST" });
+export function startLabJob(
+  job: "freshness-check" | "daily-report" | "prospective-validation" | "replay-index" | "backfill",
+  body?: { start?: string; end?: string; task?: string }
+) {
+  return backendFetch<LabJob>(`labs/jobs/${job}/start`, { method: "POST", body });
 }
 
 export function getDailyReport(date: string) {
@@ -243,6 +251,7 @@ function normalizeMarketSeries(payload: unknown, requestedRange: ChartRange): Ma
     numeric(asRecord(record.summary)?.sample_count) ??
     numeric(asRecord(record.summary)?.sampleCount) ??
     rawMarketChart.length;
+  const summary = chartSummary(asRecord(record.summary), sampleCount, marketChart);
 
   return {
     source: text(record.source),
@@ -252,8 +261,31 @@ function normalizeMarketSeries(payload: unknown, requestedRange: ChartRange): Ma
     marketChart,
     fills,
     domain: domain(record.domain) ?? derivedDomain([...marketChart, ...fills]) ?? defaultDomain(),
-    sampleCount
+    sampleCount,
+    summary
   };
+}
+
+function chartSummary(summary: JsonRecord | undefined, sampleCount: number, points: ChartPoint[]): ChartSummary {
+  const qPoints = points.filter((point) => point.qUp !== undefined || point.qDown !== undefined);
+  const bookPoints = points.filter(
+    (point) => point.upBid !== undefined || point.upAsk !== undefined || point.downBid !== undefined || point.downAsk !== undefined
+  );
+  return {
+    sampleCount,
+    visibleSampleCount: numeric(summary?.visible_sample_count) ?? numeric(summary?.visibleSampleCount) ?? points.length,
+    qSampleCount: numeric(summary?.q_sample_count) ?? numeric(summary?.qSampleCount) ?? qPoints.length,
+    bookSampleCount: numeric(summary?.book_sample_count) ?? numeric(summary?.bookSampleCount) ?? bookPoints.length,
+    firstQTs: text(summary?.first_q_ts) ?? text(summary?.firstQTs) ?? bucketTs(qPoints[0]),
+    lastQTs: text(summary?.last_q_ts) ?? text(summary?.lastQTs) ?? bucketTs(qPoints.at(-1)),
+    firstBookTs: text(summary?.first_book_ts) ?? text(summary?.firstBookTs) ?? bucketTs(bookPoints[0]),
+    lastBookTs: text(summary?.last_book_ts) ?? text(summary?.lastBookTs) ?? bucketTs(bookPoints.at(-1)),
+    warnings: Array.isArray(summary?.warnings) ? summary.warnings.map(String) : []
+  };
+}
+
+function bucketTs(point: ChartPoint | undefined) {
+  return point ? new Date(point.bucket).toISOString() : null;
 }
 
 function chartPoints(value: unknown): ChartPoint[] {

@@ -12,18 +12,28 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { formatChartTime, type ChartPoint } from "@/lib/charting";
-import { numberText } from "@/lib/format";
-import { EmptyState, Panel, PanelHeader } from "@/components/ui";
+import { formatChartTime, type ChartPoint, type ChartSummary } from "@/lib/charting";
+import { dateTime, numberText } from "@/lib/format";
+import { EmptyState, Panel, PanelHeader, Pill } from "@/components/ui";
 import { toneDot } from "./model";
 import type { Tone } from "./types";
 
-export function MarketMainChart({ points, domain, sampleCount }: { points: ChartPoint[]; domain: [number, number]; sampleCount: number }) {
+export function MarketMainChart({
+  points,
+  domain,
+  sampleCount,
+  summary
+}: {
+  points: ChartPoint[];
+  domain: [number, number];
+  sampleCount: number;
+  summary?: ChartSummary;
+}) {
   return (
     <Panel className="min-w-0 xl:col-span-8">
       <PanelHeader
         title="Market Probability & Price"
-        meta={`${points.length} visible · ${sampleCount} market-window samples`}
+        meta={`${points.length} visible · ${sampleCount} market-window samples · q ${summary?.qSampleCount ?? qCount(points)}`}
         help="Full active-market window. Lines update in place; the x-axis stays pinned to market start and end."
       >
         <div className="hidden flex-wrap gap-2 md:flex">
@@ -60,11 +70,22 @@ export function MarketMainChart({ points, domain, sampleCount }: { points: Chart
           <EmptyState label="No probability or book samples yet" />
         )}
       </div>
+      <ChartCoverage summary={summary} points={points} />
     </Panel>
   );
 }
 
-export function TrendCharts({ points, fills, domain }: { points: ChartPoint[]; fills: ChartPoint[]; domain: [number, number] }) {
+export function TrendCharts({
+  points,
+  fills,
+  domain,
+  summary
+}: {
+  points: ChartPoint[];
+  fills: ChartPoint[];
+  domain: [number, number];
+  summary?: ChartSummary;
+}) {
   const distancePoints = points.filter((point) => Number.isFinite(point.distanceBps));
   return (
     <div className="grid gap-5 xl:grid-cols-3">
@@ -73,7 +94,7 @@ export function TrendCharts({ points, fills, domain }: { points: ChartPoint[]; f
         meta={`${points.length} buckets`}
         empty="No probability samples"
         hasData={points.length > 0}
-        help="Model probability and UP quote levels over the visible market window."
+        help="Model probability and UP quote levels over the visible market window. q lines are model-only and are not derived from quotes."
       >
         <LineChart data={points}>
           <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
@@ -84,6 +105,22 @@ export function TrendCharts({ points, fills, domain }: { points: ChartPoint[]; f
           <Line type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2} connectNulls isAnimationActive={false} />
           <Line type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.3} connectNulls isAnimationActive={false} />
           <Line type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.3} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
+        </LineChart>
+      </ChartPanel>
+      <ChartPanel
+        title="q Coverage"
+        meta={`${summary?.qSampleCount ?? qCount(points)} model samples`}
+        empty="No model probability samples"
+        hasData={points.length > 0}
+        help="Coverage diagnostics for model-sourced q Up/q Down samples. Warnings indicate real data gaps, not quote-derived estimates."
+      >
+        <LineChart data={coverageRows(points)}>
+          <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
+          <XAxis dataKey="bucket" type="number" domain={domain} tick={{ fontSize: 11 }} minTickGap={24} tickFormatter={formatChartTime} />
+          <YAxis domain={[0, 1]} tick={{ fontSize: 11 }} width={32} />
+          <Tooltip formatter={(value) => numberText(value, 0)} />
+          <Line type="stepAfter" dataKey="qPresent" name="q present" stroke="#18705b" dot={false} strokeWidth={2} isAnimationActive={false} />
+          <Line type="stepAfter" dataKey="bookPresent" name="book present" stroke="#a45d13" dot={false} strokeWidth={1.5} isAnimationActive={false} />
         </LineChart>
       </ChartPanel>
       <ChartPanel
@@ -119,6 +156,40 @@ export function TrendCharts({ points, fills, domain }: { points: ChartPoint[]; f
       </ChartPanel>
     </div>
   );
+}
+
+function ChartCoverage({ summary, points }: { summary: ChartSummary | undefined; points: ChartPoint[] }) {
+  const warnings = summary?.warnings ?? [];
+  const qSamples = summary?.qSampleCount ?? qCount(points);
+  const bookSamples = summary?.bookSampleCount ?? bookCount(points);
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-t border-line px-4 py-3 text-xs text-ink/60">
+      <Pill tone={qSamples > 0 ? "good" : "warn"}>q {numberText(qSamples, 0)}</Pill>
+      <Pill tone={bookSamples > 0 ? "good" : "warn"}>books {numberText(bookSamples, 0)}</Pill>
+      <span>first q {summary?.firstQTs ? dateTime(summary.firstQTs) : "n/a"}</span>
+      <span>last q {summary?.lastQTs ? dateTime(summary.lastQTs) : "n/a"}</span>
+      {warnings.length ? <span className="text-warn">{warnings.join(", ")}</span> : null}
+    </div>
+  );
+}
+
+function coverageRows(points: ChartPoint[]) {
+  return points.map((point) => ({
+    bucket: point.bucket,
+    qPresent: point.qUp !== undefined || point.qDown !== undefined ? 1 : 0,
+    bookPresent:
+      point.upBid !== undefined || point.upAsk !== undefined || point.downBid !== undefined || point.downAsk !== undefined ? 1 : 0
+  }));
+}
+
+function qCount(points: ChartPoint[]) {
+  return points.filter((point) => point.qUp !== undefined || point.qDown !== undefined).length;
+}
+
+function bookCount(points: ChartPoint[]) {
+  return points.filter(
+    (point) => point.upBid !== undefined || point.upAsk !== undefined || point.downBid !== undefined || point.downAsk !== undefined
+  ).length;
 }
 
 function ChartPanel({

@@ -23,6 +23,18 @@ export type ChartPoint = {
   fillSize?: number;
 };
 
+export type ChartSummary = {
+  sampleCount: number;
+  visibleSampleCount?: number;
+  qSampleCount?: number;
+  bookSampleCount?: number;
+  firstQTs?: string | null;
+  lastQTs?: string | null;
+  firstBookTs?: string | null;
+  lastBookTs?: string | null;
+  warnings?: string[];
+};
+
 export type MarketSeries = {
   source?: string;
   warning?: string | null;
@@ -32,6 +44,7 @@ export type MarketSeries = {
   fills: ChartPoint[];
   domain: [number, number];
   sampleCount: number;
+  summary: ChartSummary;
 };
 
 export function emptyMarketSeries(market?: MarketSummary | null, range: ChartRange = "full"): MarketSeries {
@@ -40,7 +53,8 @@ export function emptyMarketSeries(market?: MarketSummary | null, range: ChartRan
     marketChart: [],
     fills: [],
     domain: marketWindowDomain(market, Date.now()),
-    sampleCount: 0
+    sampleCount: 0,
+    summary: { sampleCount: 0 }
   };
 }
 
@@ -75,10 +89,12 @@ export function mergeRuntimeEventsIntoSeries(
   range: ChartRange = base.range ?? "full"
 ): MarketSeries {
   if (!marketId || events.length === 0) {
+    const visible = thinChartPoints(base.marketChart);
     return {
       ...base,
-      marketChart: thinChartPoints(base.marketChart),
-      fills: base.fills.length ? thinChartPoints(base.fills, 300) : base.marketChart.filter(hasFill)
+      marketChart: visible,
+      fills: base.fills.length ? thinChartPoints(base.fills, 300) : visible.filter(hasFill),
+      summary: mergeChartSummary(base.summary, visible)
     };
   }
   const merged = new Map<number, ChartPoint>();
@@ -104,8 +120,40 @@ export function mergeRuntimeEventsIntoSeries(
     marketChart: visible,
     fills,
     domain: range === "full" ? base.domain ?? marketWindowDomain(market, Date.now()) : derivedDomain(marketChart) ?? base.domain,
-    sampleCount: Math.max(base.sampleCount, marketChart.length)
+    sampleCount: Math.max(base.sampleCount, marketChart.length),
+    summary: mergeChartSummary(base.summary, visible)
   };
+}
+
+function mergeChartSummary(summary: ChartSummary, points: ChartPoint[]): ChartSummary {
+  const qPoints = points.filter((point) => point.qUp !== undefined || point.qDown !== undefined);
+  const bookPoints = points.filter(
+    (point) => point.upBid !== undefined || point.upAsk !== undefined || point.downBid !== undefined || point.downAsk !== undefined
+  );
+  const firstQ = firstTs(qPoints);
+  const lastQ = lastTs(qPoints);
+  const firstBook = firstTs(bookPoints);
+  const lastBook = lastTs(bookPoints);
+  return {
+    ...summary,
+    visibleSampleCount: points.length,
+    qSampleCount: Math.max(summary.qSampleCount ?? 0, qPoints.length),
+    bookSampleCount: Math.max(summary.bookSampleCount ?? 0, bookPoints.length),
+    firstQTs: summary.firstQTs ?? firstQ,
+    lastQTs: summary.lastQTs ?? lastQ,
+    firstBookTs: summary.firstBookTs ?? firstBook,
+    lastBookTs: summary.lastBookTs ?? lastBook
+  };
+}
+
+function firstTs(points: ChartPoint[]) {
+  const bucket = points[0]?.bucket;
+  return bucket === undefined ? null : new Date(bucket).toISOString();
+}
+
+function lastTs(points: ChartPoint[]) {
+  const bucket = points.at(-1)?.bucket;
+  return bucket === undefined ? null : new Date(bucket).toISOString();
 }
 
 export function formatChartTime(value: unknown) {

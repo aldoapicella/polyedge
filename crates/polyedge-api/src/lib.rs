@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+mod azure_jobs;
 mod history;
 mod labs;
 mod runtime;

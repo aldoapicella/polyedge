@@ -24,6 +24,7 @@ export type CollapsedDecision = {
   size: string;
   edge: string;
   reason: string;
+  rawReason?: string;
   count: number;
 };
 

@@ -108,6 +108,7 @@ function ExclusionRow({ window }: { window: ExclusionWindow }) {
         <Pill tone={window.default_exclude ? "warn" : "neutral"}>{window.default_exclude ? "active" : "inactive"}</Pill>
       </div>
       <div className="mt-1 text-xs text-ink/60">{dateTime(window.start)} to {dateTime(window.end)}</div>
+      <div className="mt-1 font-mono text-[11px] text-ink/45">{window.start}..{window.end}</div>
       <div className="mt-1 text-xs text-ink/55">{window.reason}</div>
     </div>
   );

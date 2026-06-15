@@ -99,10 +99,7 @@ impl MarketHistoryStore {
                 "range": range,
                 "points": points,
                 "domain": domain,
-                "summary": {
-                    "sample_count": stored_count,
-                    "catalog_row_key": partition_key
-                }
+                "summary": chart_summary(&points, stored_count, Some(json!(partition_key)))
             })))
         })
         .await
@@ -175,9 +172,7 @@ pub fn empty_chart(market_id: &str, range: &str) -> Value {
         "market_id": market_id,
         "range": range,
         "points": [],
-        "summary": {
-            "sample_count": 0
-        }
+        "summary": chart_summary(&[], 0, None)
     })
 }
 
@@ -214,10 +209,77 @@ pub fn merge_chart_payloads(historical: Value, runtime: Value, range: &str) -> V
         "range": range,
         "points": points,
         "domain": domain,
-        "summary": {
-            "sample_count": sample_count
-        }
+        "summary": chart_summary(&points, sample_count, None)
     })
+}
+
+pub(crate) fn chart_summary(
+    points: &[Value],
+    sample_count: usize,
+    catalog_row_key: Option<Value>,
+) -> Value {
+    let q_points = points
+        .iter()
+        .filter(|point| point_has_any(point, &["qUp", "qDown"]));
+    let book_points = points
+        .iter()
+        .filter(|point| point_has_any(point, &["upBid", "upAsk", "downBid", "downAsk"]));
+    let q_buckets = q_points.filter_map(point_bucket).collect::<Vec<_>>();
+    let book_buckets = book_points.filter_map(point_bucket).collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    if !points.is_empty() && q_buckets.is_empty() {
+        warnings.push("no_model_probability_samples");
+    }
+    if !points.is_empty() && book_buckets.is_empty() {
+        warnings.push("no_book_quote_samples");
+    }
+    let first_point = points.iter().filter_map(point_bucket).min();
+    if let (Some(first), Some(first_q)) = (first_point, q_buckets.iter().min().copied()) {
+        if first_q > first {
+            warnings.push("model_probability_starts_after_first_sample");
+        }
+    }
+    let mut summary = serde_json::Map::new();
+    summary.insert("sample_count".to_owned(), json!(sample_count));
+    summary.insert("visible_sample_count".to_owned(), json!(points.len()));
+    summary.insert("q_sample_count".to_owned(), json!(q_buckets.len()));
+    summary.insert("book_sample_count".to_owned(), json!(book_buckets.len()));
+    summary.insert(
+        "first_q_ts".to_owned(),
+        bucket_to_ts(q_buckets.iter().min().copied()),
+    );
+    summary.insert(
+        "last_q_ts".to_owned(),
+        bucket_to_ts(q_buckets.iter().max().copied()),
+    );
+    summary.insert(
+        "first_book_ts".to_owned(),
+        bucket_to_ts(book_buckets.iter().min().copied()),
+    );
+    summary.insert(
+        "last_book_ts".to_owned(),
+        bucket_to_ts(book_buckets.iter().max().copied()),
+    );
+    summary.insert("warnings".to_owned(), json!(warnings));
+    if let Some(catalog_row_key) = catalog_row_key {
+        summary.insert("catalog_row_key".to_owned(), catalog_row_key);
+    }
+    Value::Object(summary)
+}
+
+fn point_has_any(point: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        point
+            .get(*key)
+            .is_some_and(|value| numeric_value(value).is_some())
+    })
+}
+
+fn bucket_to_ts(bucket: Option<i64>) -> Value {
+    bucket
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|ts| json!(ts.to_rfc3339()))
+        .unwrap_or(Value::Null)
 }
 
 fn load_catalog_entity_sync(
@@ -499,6 +561,14 @@ fn point_bucket(point: &Value) -> Option<i64> {
     })
 }
 
+fn numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64().filter(|value| value.is_finite()),
+        Value::String(text) => text.parse::<f64>().ok().filter(|value| value.is_finite()),
+        _ => None,
+    }
+}
+
 fn value_ts_ms(value: &Value, key: &str) -> Option<i64> {
     value
         .get(key)
@@ -618,5 +688,8 @@ mod tests {
         assert_eq!(points[1]["qUp"], 0.51);
         assert_eq!(points[1]["upBid"], 0.52);
         assert_eq!(merged["summary"]["sample_count"], 3);
+        assert_eq!(merged["summary"]["q_sample_count"], 3);
+        assert_eq!(merged["summary"]["book_sample_count"], 1);
+        assert_eq!(merged["summary"]["first_q_ts"], "1970-01-01T00:00:01+00:00");
     }
 }

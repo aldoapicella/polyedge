@@ -2,6 +2,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, RefreshCw } from "lucide-react";
+import { useState } from "react";
 import {
   Bar,
   BarChart,
@@ -13,8 +14,8 @@ import {
   XAxis,
   YAxis
 } from "recharts";
-import { getLabArtifacts, getLabProspective, getLabSampleSizeLatest, getLatestLabReport } from "@/lib/api";
-import type { JsonRecord, LabArtifact, LabReportBundle, ProspectiveValidationRow } from "@/lib/types";
+import { getLabArtifact, getLabArtifacts, getLabProspective, getLabSampleSizeLatest, getLatestLabReport } from "@/lib/api";
+import type { JsonRecord, LabArtifact, LabArtifactPayload, LabReportBundle, ProspectiveValidationRow } from "@/lib/types";
 import { compact, dateTime, numberText } from "@/lib/format";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
@@ -121,6 +122,13 @@ export function ReportsPage() {
 }
 
 function ArtifactBrowser({ artifacts, loading }: { artifacts: LabArtifact[]; loading: boolean }) {
+  const [selected, setSelected] = useState<LabArtifact | null>(null);
+  const artifact = useQuery({
+    queryKey: ["labs", "artifact", selected?.artifact_id],
+    queryFn: () => getLabArtifact(selected?.artifact_id ?? ""),
+    enabled: Boolean(selected?.artifact_id),
+    retry: false
+  });
   return (
     <Panel>
       <PanelHeader title="Artifacts" meta={`${artifacts.length} files`}>
@@ -140,7 +148,11 @@ function ArtifactBrowser({ artifacts, loading }: { artifacts: LabArtifact[]; loa
             <tbody>
               {artifacts.slice(0, 80).map((artifact) => (
                 <tr key={artifact.artifact_id} className="border-b border-line last:border-b-0">
-                  <td className="px-3 py-2 font-mono text-xs">{artifact.path}</td>
+                  <td className="px-3 py-2 font-mono text-xs">
+                    <button className="text-left text-good hover:underline" onClick={() => setSelected(artifact)}>
+                      {artifact.path}
+                    </button>
+                  </td>
                   <td className="px-3 py-2">{artifact.kind}</td>
                   <td className="px-3 py-2">{numberText(artifact.size_bytes)}</td>
                   <td className="px-3 py-2">{artifact.modified_ts ? dateTime(artifact.modified_ts) : "n/a"}</td>
@@ -152,7 +164,35 @@ function ArtifactBrowser({ artifacts, loading }: { artifacts: LabArtifact[]; loa
       ) : (
         <EmptyState label={loading ? "Loading artifacts" : "No artifacts found"} />
       )}
+      {selected ? (
+        <ArtifactPreview artifact={artifact.data ?? null} loading={artifact.isLoading} error={artifact.error?.message} />
+      ) : null}
     </Panel>
+  );
+}
+
+function ArtifactPreview({
+  artifact,
+  loading,
+  error
+}: {
+  artifact: LabArtifactPayload | null;
+  loading: boolean;
+  error?: string;
+}) {
+  return (
+    <div className="border-t border-line bg-panel p-3">
+      <div className="mb-2 text-xs font-semibold uppercase text-ink/50">
+        {artifact?.path ?? (loading ? "Loading artifact" : "Artifact")}
+      </div>
+      {error ? <div className="text-sm text-danger">{error}</div> : null}
+      {!error && loading ? <div className="text-sm text-ink/55">Loading artifact</div> : null}
+      {!error && artifact ? (
+        <pre className="max-h-72 overflow-auto border border-line bg-white p-3 text-xs leading-relaxed text-ink/75">
+          {artifact.kind === "json" ? JSON.stringify(artifact.content, null, 2) : String(artifact.content ?? "")}
+        </pre>
+      ) : null}
+    </div>
   );
 }
 

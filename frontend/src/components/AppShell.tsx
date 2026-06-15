@@ -8,12 +8,13 @@ import {
   DatabaseZap,
   FileText,
   LayoutDashboard,
+  LogOut,
   PanelsTopLeft,
   Settings,
   ShieldCheck
 } from "lucide-react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -27,6 +28,11 @@ const nav = [
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const loginRoute = pathname === "/login";
+
+  if (loginRoute) {
+    return <>{children}</>;
+  }
 
   return (
     <div className="min-h-screen">
@@ -67,11 +73,30 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <div className="hidden items-center gap-2 text-xs text-ink/60 md:flex">
             <ShieldCheck className="h-4 w-4 text-good" />
             <span>Live gates backend-only</span>
+            <LogoutButton />
           </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-[1440px] px-4 py-5 lg:px-6">{children}</main>
     </div>
+  );
+}
+
+function LogoutButton() {
+  const router = useRouter();
+  return (
+    <button
+      className="ml-2 grid h-8 w-8 place-items-center rounded-sm border border-line bg-white text-ink/60 transition hover:bg-panel hover:text-ink"
+      aria-label="Sign out"
+      title="Sign out"
+      onClick={async () => {
+        await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+        router.replace("/login");
+        router.refresh();
+      }}
+    >
+      <LogOut className="h-3.5 w-3.5" />
+    </button>
   );
 }

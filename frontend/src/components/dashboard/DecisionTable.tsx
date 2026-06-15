@@ -36,7 +36,15 @@ export function DecisionTable({ decisions }: { decisions: TradeDecision[] }) {
                   <td className="px-3 py-2">{row.price}</td>
                   <td className="px-3 py-2">{row.size}</td>
                   <td className="px-3 py-2">{row.edge}</td>
-                  <td className="max-w-[360px] truncate px-3 py-2 text-ink/65">{row.reason}</td>
+                  <td className="max-w-[360px] px-3 py-2 text-ink/65">
+                    <span className="block truncate">{row.reason}</span>
+                    {row.rawReason && row.rawReason !== row.reason ? (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer text-xs text-ink/45">details</summary>
+                        <div className="mt-1 break-words font-mono text-xs text-ink/55">{row.rawReason}</div>
+                      </details>
+                    ) : null}
+                  </td>
                   <td className="px-3 py-2">{row.count > 1 ? `x${row.count}` : "1"}</td>
                 </tr>
               ))

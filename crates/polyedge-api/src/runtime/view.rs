@@ -161,9 +161,7 @@ impl RuntimeController {
                 market.start_ts.timestamp_millis(),
                 market.end_ts.timestamp_millis()
             ],
-            "summary": {
-                "sample_count": stored_count
-            }
+            "summary": crate::history::chart_summary(&points, stored_count, None)
         }))
     }
 
