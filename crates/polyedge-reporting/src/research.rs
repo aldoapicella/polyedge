@@ -371,7 +371,9 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
                 write_error = Some(error.to_string());
             }
         }
-        if write_error.is_none() && processed_events % NORMALIZE_PROGRESS_INTERVAL_EVENTS == 0 {
+        if write_error.is_none()
+            && is_multiple_of(processed_events, NORMALIZE_PROGRESS_INTERVAL_EVENTS)
+        {
             if let Err(error) = write_json_file(
                 &options.out.join("normalize_progress.json"),
                 &normalize_progress(
@@ -1655,7 +1657,7 @@ impl AuditAccumulator {
             if gap > 0 {
                 self.largest_gaps.push((gap, previous, event.recorded_ts));
                 self.largest_gaps
-                    .sort_by(|left, right| right.0.cmp(&left.0));
+                    .sort_by_key(|entry| std::cmp::Reverse(entry.0));
                 self.largest_gaps.truncate(10);
             }
         }
@@ -4707,11 +4709,16 @@ fn median_decimal(values: &[Decimal]) -> Option<Decimal> {
     let mut sorted = values.to_vec();
     sorted.sort();
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if is_multiple_of(sorted.len(), 2) {
         Some((sorted[mid - 1] + sorted[mid]) / Decimal::from(2))
     } else {
         sorted.get(mid).copied()
     }
+}
+
+#[allow(unknown_lints, clippy::manual_is_multiple_of)]
+fn is_multiple_of(value: usize, divisor: usize) -> bool {
+    divisor != 0 && value % divisor == 0
 }
 
 fn std_decimal(values: &[Decimal], mean: Option<Decimal>) -> Option<Decimal> {
