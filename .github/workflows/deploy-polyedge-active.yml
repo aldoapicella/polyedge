@@ -79,6 +79,10 @@ jobs:
           echo "frontend_image=$frontend_image" >> "$GITHUB_OUTPUT"
 
       - name: Bootstrap active infrastructure
+        env:
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          DASHBOARD_AUTH_PASSWORD: ${{ secrets.DASHBOARD_AUTH_PASSWORD }}
+          DASHBOARD_SESSION_SECRET: ${{ secrets.DASHBOARD_SESSION_SECRET }}
         run: |
           az deployment group create \
             --name "$APP_NAME-active-infra" \
@@ -126,6 +130,10 @@ jobs:
           echo "FRONTEND_IMAGE=$frontend_image" >> "$GITHUB_ENV"
 
       - name: Deploy active images
+        env:
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          DASHBOARD_AUTH_PASSWORD: ${{ secrets.DASHBOARD_AUTH_PASSWORD }}
+          DASHBOARD_SESSION_SECRET: ${{ secrets.DASHBOARD_SESSION_SECRET }}
         run: |
           az deployment group create \
             --name "$APP_NAME-active-infra" \
