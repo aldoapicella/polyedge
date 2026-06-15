@@ -8,8 +8,10 @@ use polyedge_reporting::research::{
     load_exclusion_registry, load_frozen_candidate_registry, DEFAULT_EXCLUSION_FILE,
     DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
 };
+use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::env;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 
@@ -150,15 +152,13 @@ async fn report_artifact(Path(artifact_id): Path<String>) -> impl IntoResponse {
             .into_response();
     };
     let path = PathBuf::from(REPORT_ROOT).join(relative);
-    if !path.is_file() {
-        return (
+    match artifact_payload(&path) {
+        Ok(Some(payload)) => Json(payload).into_response(),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "detail": "artifact not found" })),
         )
-            .into_response();
-    }
-    match artifact_payload(&path) {
-        Ok(payload) => Json(payload).into_response(),
+            .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "detail": error })),
@@ -315,6 +315,9 @@ fn latest_named_report(primary: &str, fallback: &str) -> Value {
 }
 
 fn latest_daily_date() -> Option<String> {
+    if let Some(date) = latest_blob_daily_date() {
+        return Some(date);
+    }
     let root = PathBuf::from(REPORT_ROOT).join("daily");
     let mut dates = fs::read_dir(root)
         .ok()?
@@ -357,6 +360,9 @@ fn frozen_candidates_payload() -> Value {
 }
 
 fn list_json_files(root: &FsPath, file_name: &str, limit: usize) -> Vec<Value> {
+    if let Some(values) = list_blob_json_files(root, file_name, limit) {
+        return values;
+    }
     let mut values = Vec::new();
     collect_named_files(root, file_name, &mut values, limit);
     values
@@ -383,6 +389,9 @@ fn collect_named_files(root: &FsPath, file_name: &str, values: &mut Vec<Value>, 
 }
 
 fn artifacts_for_prefix(prefix: &str) -> Vec<Value> {
+    if let Some(artifacts) = blob_artifacts_for_prefix(prefix) {
+        return artifacts;
+    }
     let root = PathBuf::from(REPORT_ROOT).join(prefix);
     let mut artifacts = Vec::new();
     collect_artifacts(&root, &mut artifacts);
@@ -430,28 +439,167 @@ fn collect_artifacts(root: &FsPath, artifacts: &mut Vec<Value>) {
     }
 }
 
-fn artifact_payload(path: &FsPath) -> Result<Value, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let relative = path
-        .strip_prefix(REPORT_ROOT)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .to_owned();
-    if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        let json: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        Ok(json!({ "path": relative, "kind": "json", "content": json }))
+fn artifact_payload(path: &FsPath) -> Result<Option<Value>, String> {
+    let relative = report_relative_path(path);
+    let text = if let Some(bytes) = read_blob_bytes_for_path(path) {
+        String::from_utf8(bytes).map_err(|error| error.to_string())?
     } else {
-        Ok(json!({ "path": relative, "kind": "markdown", "content": text }))
+        match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    if FsPath::new(&relative)
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("json")
+    {
+        let json: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        Ok(Some(
+            json!({ "path": relative, "kind": "json", "content": json }),
+        ))
+    } else {
+        Ok(Some(
+            json!({ "path": relative, "kind": "markdown", "content": text }),
+        ))
     }
 }
 
 fn read_json_or_null(path: impl AsRef<FsPath>) -> Value {
     let path = path.as_ref();
+    if let Some(bytes) = read_blob_bytes_for_path(path) {
+        return serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return Value::Null;
     };
     serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+fn artifact_blob_client() -> Option<AzureBlobClient> {
+    let account = env::var("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let container = env::var("AZURE_STORAGE_CONTAINER_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bot-events".to_owned());
+    let client_id = env::var("AZURE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    Some(AzureBlobClient::with_managed_identity(
+        account, container, client_id,
+    ))
+}
+
+fn read_blob_bytes_for_path(path: &FsPath) -> Option<Vec<u8>> {
+    let blob_name = blob_name_for_path(path)?;
+    read_blob_bytes(&blob_name)
+}
+
+fn read_blob_bytes(blob_name: &str) -> Option<Vec<u8>> {
+    let mut client = artifact_blob_client()?;
+    match client.download_blob_bytes(blob_name) {
+        Ok(bytes) => Some(bytes),
+        Err(AzureBlobError::HttpStatus(404)) => None,
+        Err(_) => None,
+    }
+}
+
+fn list_blob_json_files(root: &FsPath, file_name: &str, limit: usize) -> Option<Vec<Value>> {
+    let mut client = artifact_blob_client()?;
+    let mut prefix = blob_name_for_path(root)?;
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    let blobs = client
+        .list_blobs_by_suffixes(&prefix, &[file_name], Some(limit), Some(32 * 1024 * 1024))
+        .ok()?;
+    let mut values = Vec::new();
+    for blob in blobs {
+        if values.len() >= limit {
+            break;
+        }
+        let bytes = read_blob_bytes(&blob.name)?;
+        values.push(serde_json::from_slice(&bytes).unwrap_or(Value::Null));
+    }
+    Some(values)
+}
+
+fn blob_artifacts_for_prefix(prefix: &str) -> Option<Vec<Value>> {
+    let mut client = artifact_blob_client()?;
+    let mut blob_prefix = REPORT_ROOT.to_owned();
+    let clean_prefix = prefix.trim().trim_start_matches('/').trim_end_matches('/');
+    if !clean_prefix.is_empty() {
+        blob_prefix.push('/');
+        blob_prefix.push_str(clean_prefix);
+    }
+    if !blob_prefix.ends_with('/') {
+        blob_prefix.push('/');
+    }
+    let blobs = client
+        .list_blobs_by_suffixes(&blob_prefix, &[".json", ".md"], Some(1000), None)
+        .ok()?;
+    let mut artifacts = blobs
+        .into_iter()
+        .filter_map(|blob| {
+            let relative = blob.name.strip_prefix(&format!("{REPORT_ROOT}/"))?.to_owned();
+            let extension = FsPath::new(&relative)
+                .extension()
+                .and_then(|value| value.to_str())?;
+            Some(json!({
+                "artifact_id": relative.replace('/', "~"),
+                "path": relative,
+                "kind": extension,
+                "size_bytes": blob.content_length,
+                "modified_ts": blob.last_modified.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
+            }))
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    Some(artifacts)
+}
+
+fn latest_blob_daily_date() -> Option<String> {
+    let mut client = artifact_blob_client()?;
+    let blobs = client
+        .list_blobs_by_suffixes(
+            "reports/research/daily/",
+            &["final_report.json"],
+            Some(1000),
+            None,
+        )
+        .ok()?;
+    let mut dates = blobs
+        .into_iter()
+        .filter_map(|blob| {
+            let relative = blob.name.strip_prefix("reports/research/daily/")?;
+            let date = relative.split('/').next()?.to_owned();
+            valid_date(&date).then_some(date)
+        })
+        .collect::<Vec<_>>();
+    dates.sort();
+    dates.pop()
+}
+
+fn blob_name_for_path(path: &FsPath) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
+    let allowed = ["reports/research/", "data_quality/freshness/"];
+    if allowed.iter().any(|prefix| trimmed.starts_with(prefix)) {
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+fn report_relative_path(path: &FsPath) -> String {
+    path.strip_prefix(REPORT_ROOT)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_owned()
 }
 
 fn job_definitions() -> Value {

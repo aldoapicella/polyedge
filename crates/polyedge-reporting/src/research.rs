@@ -4362,6 +4362,7 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), ResearchError> {
     }
     let file = File::create(path)?;
     serde_json::to_writer_pretty(BufWriter::new(file), value)?;
+    maybe_publish_research_artifact(path)?;
     Ok(())
 }
 
@@ -4375,7 +4376,59 @@ fn write_text_file(path: &Path, text: &str) -> Result<(), ResearchError> {
         .write(true)
         .open(path)?;
     file.write_all(text.as_bytes())?;
+    maybe_publish_research_artifact(path)?;
     Ok(())
+}
+
+fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
+    let Some(blob_name) = research_artifact_blob_name(path) else {
+        return Ok(());
+    };
+    let Some(account) = std::env::var("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let container = std::env::var("AZURE_STORAGE_CONTAINER_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bot-events".to_owned());
+    let client_id = std::env::var("AZURE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let bytes = fs::read(path)?;
+    let mut client = AzureBlobClient::with_managed_identity(account, container, client_id);
+    client
+        .upload_block_blob_bytes(&blob_name, &bytes, artifact_content_type(path))
+        .map_err(|error| {
+            ResearchError::Azure(format!("publishing research artifact {blob_name}: {error}"))
+        })?;
+    Ok(())
+}
+
+fn research_artifact_blob_name(path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let relative = normalized.trim_start_matches("./");
+    if relative.starts_with("reports/research/") || relative.starts_with("data_quality/freshness/")
+    {
+        return Some(relative.to_owned());
+    }
+    if relative.starts_with("data/research/replay-index/")
+        && relative.ends_with("/index_manifest.json")
+        && !relative.contains("/normalized/")
+    {
+        return Some(relative.to_owned());
+    }
+    None
+}
+
+fn artifact_content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("json") => "application/json",
+        Some("md") => "text/markdown; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 fn read_json_file(path: &Path) -> Result<Value, ResearchError> {

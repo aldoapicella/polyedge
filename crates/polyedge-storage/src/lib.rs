@@ -567,6 +567,35 @@ impl AzureBlobClient {
         max_blobs: Option<usize>,
         max_bytes: Option<u64>,
     ) -> Result<Vec<AzureBlobItem>, AzureBlobError> {
+        self.list_blobs_filtered(prefix, Some(&[".jsonl"]), max_blobs, max_bytes)
+    }
+
+    pub fn list_blobs_by_suffixes(
+        &mut self,
+        prefix: &str,
+        suffixes: &[&str],
+        max_blobs: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<AzureBlobItem>, AzureBlobError> {
+        self.list_blobs_filtered(prefix, Some(suffixes), max_blobs, max_bytes)
+    }
+
+    pub fn list_blobs_unfiltered(
+        &mut self,
+        prefix: &str,
+        max_blobs: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<AzureBlobItem>, AzureBlobError> {
+        self.list_blobs_filtered(prefix, None, max_blobs, max_bytes)
+    }
+
+    fn list_blobs_filtered(
+        &mut self,
+        prefix: &str,
+        suffixes: Option<&[&str]>,
+        max_blobs: Option<usize>,
+        max_bytes: Option<u64>,
+    ) -> Result<Vec<AzureBlobItem>, AzureBlobError> {
         let mut marker = String::new();
         let mut blobs = Vec::new();
         let mut selected_bytes = 0_u64;
@@ -584,7 +613,9 @@ impl AzureBlobClient {
             let text = self.get_text(&url)?;
             let page = parse_blob_list(&text)?;
             for blob in page.blobs {
-                if !blob.name.ends_with(".jsonl") {
+                if suffixes.is_some_and(|suffixes| {
+                    !suffixes.iter().any(|suffix| blob.name.ends_with(suffix))
+                }) {
                     continue;
                 }
                 if max_blobs.is_some_and(|limit| blobs.len() >= limit) {
@@ -613,6 +644,21 @@ impl AzureBlobClient {
             encode_blob_path(name)
         );
         self.get_bytes_with_retry(&url)
+    }
+
+    pub fn upload_block_blob_bytes(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        self.put_block_blob_with_retry(&url, bytes, content_type)
     }
 
     fn get_text(&mut self, url: &str) -> Result<String, AzureBlobError> {
@@ -679,6 +725,60 @@ impl AzureBlobClient {
             }
         }
         unreachable!("Azure Blob retry loop always returns");
+    }
+
+    fn put_block_blob_with_retry(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let result = self.put_block_blob(url, bytes, content_type);
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob upload retry loop always returns");
+    }
+
+    fn put_block_blob(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), AzureBlobError> {
+        let date = rfc1123_now();
+        let response = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self
+                .agent
+                .put(&append_sas(url, sas))
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .set("x-ms-date", &date)
+                .set("x-ms-blob-type", "BlockBlob")
+                .set("content-type", content_type)
+                .send_bytes(bytes),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("x-ms-date", &date)
+                    .set("x-ms-blob-type", "BlockBlob")
+                    .set("content-type", content_type)
+                    .send_bytes(bytes)
+            }
+        };
+        match response {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
     }
 }
 
