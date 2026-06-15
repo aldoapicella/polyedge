@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub mod research;
+
 pub const REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]

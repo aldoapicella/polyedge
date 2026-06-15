@@ -1,0 +1,666 @@
+use polyedge_reporting::research::{
+    run_audit, run_baseline, run_build_markets, run_calibration, run_final_report, run_normalize,
+    run_regimes, run_replay, run_sample_size, run_sweep, AuditOptions, BaselineOptions,
+    BuildMarketsOptions, CalibrationOptions, ExcludedTimeWindow, FillModel, FinalReportOptions,
+    NormalizeOptions, RegimesOptions, ReplayOptions, SampleSizeOptions, SweepOptions,
+};
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[test]
+fn audit_counts_fixture_and_malformed_lines() {
+    let dir = test_dir("audit");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!("{}\nnot-json\n", market_line("m1", "up", "down")),
+    );
+
+    let report = run_audit(AuditOptions {
+        input: events,
+        out: dir.join("data_audit.json"),
+        markdown: dir.join("data_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    assert_eq!(report["result"]["markets_seen"], 1);
+    assert_eq!(report["result"]["malformed_lines"], 1);
+}
+
+#[test]
+fn exclude_window_skips_events_and_prevents_contaminated_fills() {
+    let dir = test_dir("exclude_window");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            decision_line("m1", "up", "up", "2026-06-11T10:01:00+00:00"),
+            book_line("up", "0.50", "2026-06-11T10:01:01+00:00"),
+            reference_line("101", "2026-06-11T10:15:01+00:00")
+        ),
+    );
+    let excluded =
+        vec![ExcludedTimeWindow::parse("2026-06-11T10:00:00Z..2026-06-11T11:00:00Z").unwrap()];
+
+    let audit = run_audit(AuditOptions {
+        input: events.clone(),
+        out: dir.join("audit.json"),
+        markdown: dir.join("audit.md"),
+        exclude_windows: excluded.clone(),
+    })
+    .unwrap();
+    assert_eq!(audit["result"]["total_events"], 1);
+    assert_eq!(audit["result"]["excluded_event_count"], 3);
+
+    let replay = run_replay(ReplayOptions {
+        input: events,
+        markets: None,
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: excluded,
+    })
+    .unwrap();
+    assert_eq!(replay["result"]["fills"], 0);
+    assert_eq!(replay["result"]["excluded_event_count"], 3);
+    assert!(replay["result"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("events skipped by 1 excluded"))));
+}
+
+#[test]
+fn normalize_and_build_markets_preserve_incomplete_markets() {
+    let dir = test_dir("normalize_markets");
+    let raw = dir.join("raw.jsonl");
+    write_events(&raw, &market_line("m1", "up", "down"));
+    let normalized = dir.join("normalized");
+
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+    let report = run_build_markets(BuildMarketsOptions {
+        input: normalized,
+        out: dir.join("markets.json"),
+        markdown: dir.join("markets.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    assert_eq!(report["result"]["summary"]["markets"], 1);
+    assert_eq!(report["result"]["summary"]["complete_for_simulation"], 0);
+    assert!(report["result"]["markets"][0]["data_quality_flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "missing_final_price"));
+}
+
+#[test]
+fn gzip_normalized_outputs_feed_build_markets_and_replay() {
+    let dir = test_dir("gzip_normalized");
+    let raw = dir.join("raw.jsonl");
+    write_events(&raw, &filled_touch_fixture("2026-06-01T00:01:01+00:00"));
+    let normalized = dir.join("normalized");
+
+    let manifest = run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed-gzip".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+
+    assert_eq!(manifest["result"]["compression"], "gzip");
+    assert!(normalized.join("events.jsonl.gz").is_file());
+    assert!(!normalized.join("events.jsonl").exists());
+
+    let markets_path = dir.join("markets.json");
+    let markets = run_build_markets(BuildMarketsOptions {
+        input: normalized.clone(),
+        out: markets_path.clone(),
+        markdown: dir.join("markets.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
+
+    let replay = run_replay(ReplayOptions {
+        input: normalized,
+        markets: Some(markets_path),
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(replay["result"]["fills"], 1);
+}
+
+#[test]
+fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
+    let dir = test_dir("sharded_gzip_normalized");
+    let raw = dir.join("raw.jsonl");
+    write_events(&raw, &filled_touch_fixture("2026-06-01T00:01:01+00:00"));
+    let normalized = dir.join("normalized");
+
+    let manifest = run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed-gzip-sharded".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+
+    assert_eq!(manifest["result"]["format"], "jsonl-indexed-gzip-sharded");
+    assert_eq!(manifest["result"]["event_log_written"], false);
+    assert!(!normalized.join("events.jsonl.gz").exists());
+    assert!(normalized.join("markets.jsonl.gz").is_file());
+    assert!(normalized.join("books.jsonl.gz").is_file());
+    let progress: Value = serde_json::from_str(
+        &fs::read_to_string(normalized.join("normalize_progress.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(progress["status"], "completed");
+    assert_eq!(progress["events"], 4);
+
+    let markets_path = dir.join("markets.json");
+    let markets = run_build_markets(BuildMarketsOptions {
+        input: normalized.clone(),
+        out: markets_path.clone(),
+        markdown: dir.join("markets.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
+
+    let replay = run_replay(ReplayOptions {
+        input: normalized,
+        markets: Some(markets_path),
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(replay["result"]["fills"], 1);
+}
+
+#[test]
+fn sharded_gzip_reader_reorders_local_shard_timestamp_inversions() {
+    let dir = test_dir("sharded_gzip_local_reorder");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            book_line("up", "0.55", "2026-06-01T00:05:00+00:00"),
+            book_line("up", "0.50", "2026-06-01T00:01:00+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed-gzip-sharded".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+
+    let audit = run_audit(AuditOptions {
+        input: normalized,
+        out: dir.join("audit.json"),
+        markdown: dir.join("audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    assert_eq!(audit["result"]["out_of_order_timestamps"], 0);
+}
+
+#[test]
+fn normalize_rejects_unknown_format_without_removing_output() {
+    let dir = test_dir("normalize_bad_format");
+    let raw = dir.join("raw.jsonl");
+    write_events(&raw, &market_line("m1", "up", "down"));
+    let normalized = dir.join("normalized");
+    fs::create_dir_all(&normalized).unwrap();
+    fs::write(normalized.join("keep.txt"), "do not remove").unwrap();
+
+    let error = run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "parquet-ish".to_owned(),
+        overwrite: true,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("unsupported normalize format"));
+    assert_eq!(
+        fs::read_to_string(normalized.join("keep.txt")).unwrap(),
+        "do not remove"
+    );
+}
+
+#[test]
+fn touch_fills_but_trade_through_requires_one_tick_better() {
+    let dir = test_dir("touch_vs_trade_through");
+    let events = dir.join("events.jsonl");
+    write_events(&events, &filled_touch_fixture("2026-06-01T00:01:01+00:00"));
+
+    let touch = replay(&dir, &events, FillModel::Touch);
+    let trade_through = replay(&dir, &events, FillModel::TradeThrough);
+
+    assert_eq!(touch["result"]["fills"], 1);
+    assert_eq!(touch["result"]["fees"], "0");
+    assert_eq!(trade_through["result"]["fills"], 0);
+}
+
+#[test]
+fn replay_prevents_fill_after_cancel_close_and_final_window() {
+    let dir = test_dir("fill_guards");
+    let cancelled = dir.join("cancelled.jsonl");
+    write_events(
+        &cancelled,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            cancel_line("m1", "2026-06-01T00:01:01+00:00"),
+            book_line("up", "0.50", "2026-06-01T00:01:02+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    assert_eq!(
+        replay(&dir, &cancelled, FillModel::Touch)["result"]["fills"],
+        0
+    );
+
+    let final_window = dir.join("final_window.jsonl");
+    write_events(
+        &final_window,
+        &format!(
+            "{}\n{}\n{}\n{}",
+            market_line("m2", "up2", "down2"),
+            decision_line("m2", "up2", "up", "2026-06-01T00:14:20+00:00"),
+            book_line("up2", "0.50", "2026-06-01T00:14:40+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    assert_eq!(
+        replay(&dir, &final_window, FillModel::Touch)["result"]["fills"],
+        0
+    );
+
+    let closed = dir.join("closed.jsonl");
+    write_events(
+        &closed,
+        &format!(
+            "{}\n{}\n{}\n{}",
+            market_line("m3", "up3", "down3"),
+            decision_line("m3", "up3", "up", "2026-06-01T00:01:00+00:00"),
+            book_line("up3", "0.50", "2026-06-01T00:15:01+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    assert_eq!(
+        replay(&dir, &closed, FillModel::Touch)["result"]["fills"],
+        0
+    );
+}
+
+#[test]
+fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
+    let dir = test_dir("full_flow");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            fair_value_line("m1", "0.60", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            book_line("up", "0.50", "2026-06-01T00:01:01+00:00"),
+            book_line("down", "0.50", "2026-06-01T00:01:01+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let reports = dir.join("reports");
+
+    run_audit(AuditOptions {
+        input: events.clone(),
+        out: reports.join("data_audit.json"),
+        markdown: reports.join("data_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let baseline = run_baseline(BaselineOptions {
+        input: events.clone(),
+        markets: None,
+        out: reports.join("baseline_static_all_fill_models.json"),
+        markdown: reports.join("baseline_static_all_fill_models.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let calibration = run_calibration(CalibrationOptions {
+        input: events.clone(),
+        markets: None,
+        out: reports.join("calibration.json"),
+        markdown: reports.join("calibration.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let sweep = run_sweep(SweepOptions {
+        input: events.clone(),
+        markets: None,
+        search: None,
+        split: "walk_forward".to_owned(),
+        max_experiments: 2,
+        out: reports.join("parameter_sweep.json"),
+        markdown: reports.join("parameter_sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let sample = run_sample_size(SampleSizeOptions {
+        results: reports.join("baseline_static_all_fill_models.json"),
+        out: reports.join("sample_size.json"),
+        markdown: reports.join("sample_size.md"),
+    })
+    .unwrap();
+    let final_report = run_final_report(FinalReportOptions {
+        reports_dir: reports.clone(),
+        out: reports.join("final_strategy_research_report.json"),
+        markdown: reports.join("final_strategy_research_report.md"),
+    })
+    .unwrap();
+
+    assert!(baseline["result"]["fill_models"].as_array().unwrap().len() >= 6);
+    assert_eq!(
+        calibration["result"]["q_up_buckets"]["0.60-0.70"]["decision_count"],
+        1
+    );
+    assert_eq!(
+        sweep["result"]["split_plan"]["no_future_leakage_rule"],
+        "training days must be strictly earlier than validation/test days"
+    );
+    assert_eq!(sample["result"]["statistics"]["n"], 1);
+    assert_eq!(
+        final_report["result"]["executive_summary"]["live_trading_enabled"],
+        false
+    );
+    assert!(!serde_json::to_string(&final_report)
+        .unwrap()
+        .contains("secret-token"));
+}
+
+#[test]
+fn queue_proxy_remains_skipped_without_validated_depletion_semantics() {
+    let dir = test_dir("queue_proxy");
+    let missing_evidence = dir.join("missing_evidence.jsonl");
+    write_events(
+        &missing_evidence,
+        &filled_touch_fixture("2026-06-01T00:01:01+00:00"),
+    );
+    let missing = replay(&dir, &missing_evidence, FillModel::QueueProxy);
+
+    assert_eq!(missing["result"]["fills"], 0);
+    assert_eq!(
+        missing["result"]["replay_metrics"]["queue_proxy"]["status"],
+        "skipped_missing_queue_depletion_trade_evidence"
+    );
+    assert_eq!(
+        missing["result"]["replay_metrics"]["queue_proxy"]["evidence_complete"],
+        false
+    );
+
+    let with_evidence = dir.join("with_evidence.jsonl");
+    write_events(
+        &with_evidence,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            queue_evidence_book_line("up", "0.50", "2026-06-01T00:01:01+00:00"),
+            book_line("up", "0.50", "2026-06-01T00:01:02+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let present = replay(&dir, &with_evidence, FillModel::QueueProxy);
+
+    assert_eq!(present["result"]["fills"], 0);
+    assert_eq!(
+        present["result"]["replay_metrics"]["queue_proxy"]["status"],
+        "evidence_present_fill_simulation_disabled_until_validated"
+    );
+    assert_eq!(
+        present["result"]["replay_metrics"]["queue_proxy"]["evidence_complete"],
+        true
+    );
+}
+
+#[test]
+fn future_settlement_reference_is_not_a_decision_time_feature() {
+    let dir = test_dir("no_future_leakage");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            reference_line("200", "2026-06-01T00:15:01+00:00"),
+            book_line("up", "0.50", "2026-06-01T00:00:30+00:00"),
+            book_line("down", "0.50", "2026-06-01T00:00:30+00:00"),
+            fair_value_line("m1", "0.60", "2026-06-01T00:00:45+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00")
+        ),
+    );
+
+    let report = run_regimes(RegimesOptions {
+        input: events,
+        markets: None,
+        fill_model: FillModel::Touch,
+        profile_config: None,
+        out: dir.join("regimes.json"),
+        markdown: dir.join("regimes.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let profiles = report["result"]["profiles"].as_array().unwrap();
+    let full = profiles
+        .iter()
+        .find(|profile| profile["profile"] == "full_deterministic_profile")
+        .unwrap();
+    let log = &full["adaptive_decision_log_sample"][0]["features_summary"];
+
+    assert!(log["distance_bps"].is_null());
+    assert!(log["reference_age_ms"].is_null());
+    let serialized_log = serde_json::to_string(log).unwrap();
+    assert!(!serialized_log.contains("final_price"));
+    assert!(!serialized_log.contains("winning_outcome"));
+}
+
+#[test]
+fn normalize_redacts_secret_fields_without_redacting_public_token_ids() {
+    let dir = test_dir("redaction");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        r#"{"event_type":"market","payload":{"market_id":"m1","up_token_id":"public-up","down_token_id":"public-down","api_key":"top-secret","authorization":"Bearer hidden"},"recorded_ts":"2026-06-01T00:00:00+00:00"}"#,
+    );
+    let normalized = dir.join("normalized");
+
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+    let normalized_events = fs::read_to_string(normalized.join("events.jsonl")).unwrap();
+
+    assert!(normalized_events.contains("[redacted]"));
+    assert!(normalized_events.contains("public-up"));
+    assert!(!normalized_events.contains("top-secret"));
+    assert!(!normalized_events.contains("Bearer hidden"));
+}
+
+#[test]
+fn sweep_reports_walk_forward_and_leave_one_day_splits() {
+    let dir = test_dir("sweep_splits");
+    let events = dir.join("events.jsonl");
+    write_events(&events, &five_day_fixture());
+
+    let report = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: None,
+        split: "walk_forward".to_owned(),
+        max_experiments: 1,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let plan = &report["result"]["split_plan"];
+
+    assert_eq!(plan["market_days"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        plan["latest_walk_forward"]["train_days"],
+        serde_json::json!(["2026-06-01", "2026-06-02", "2026-06-03"])
+    );
+    assert_eq!(plan["latest_walk_forward"]["validation_day"], "2026-06-04");
+    assert_eq!(plan["latest_walk_forward"]["test_day"], "2026-06-05");
+    assert_eq!(
+        plan["leave_one_day_out"]["folds"].as_array().unwrap().len(),
+        5
+    );
+    assert!(
+        report["result"]["candidates"][0]["fill_model_results"][0]["split_performance"]["test"]
+            ["markets"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+}
+
+fn replay(dir: &Path, events: &Path, fill_model: FillModel) -> Value {
+    run_replay(ReplayOptions {
+        input: events.to_path_buf(),
+        markets: None,
+        strategy_config: None,
+        fill_model,
+        out: dir.join(format!("replay-{fill_model}.json")),
+        markdown: dir.join(format!("replay-{fill_model}.md")),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("polyedge-research-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write_events(path: &Path, text: &str) {
+    fs::write(path, text).unwrap();
+}
+
+fn market_line(market_id: &str, up: &str, down: &str) -> String {
+    format!(
+        r#"{{"event_type":"market","payload":{{"market_id":"{market_id}","condition_id":"c-{market_id}","market_slug":"slug-{market_id}","question":"BTC Up or Down","asset":"BTC","horizon":"15m","up_token_id":"{up}","down_token_id":"{down}","start_ts":"2026-06-01T00:00:00Z","end_ts":"2026-06-01T00:15:00Z","start_price":"100","tick_size":"0.01"}},"recorded_ts":"2026-06-01T00:00:00+00:00"}}"#
+    )
+}
+
+fn decision_line(market_id: &str, token: &str, outcome: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"decision","payload":{{"action":"place","market_id":"{market_id}","token_id":"{token}","outcome":"{outcome}","side":"buy","price":"0.50","size":"5","order_kind":"post_only_gtc","ttl_ms":10000,"expected_edge":"0.02","tick_size":"0.01"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn cancel_line(market_id: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"decision","payload":{{"action":"cancel_all","market_id":"{market_id}","reason":"cancel test"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn book_line(token: &str, ask: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"book","payload":{{"token_id":"{token}","bids":[{{"price":"0.49","size":"10"}}],"asks":[{{"price":"{ask}","size":"10"}}],"local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn queue_evidence_book_line(token: &str, ask: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"book","payload":{{"token_id":"{token}","bids":[{{"price":"0.49","size":"10"}}],"asks":[{{"price":"{ask}","size":"10"}}],"queue_depth":"3","trade_size":"2","previous_size":"12","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn reference_line(price: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"reference","payload":{{"source":"polymarket_rtds_chainlink_btc_usd","price":"{price}","source_ts":"{ts}","stale":false}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn fair_value_line(market_id: &str, q_up: &str, ts: &str) -> String {
+    let q_down = 1.0 - q_up.parse::<f64>().unwrap();
+    format!(
+        r#"{{"event_type":"fair_value","payload":{{"market_id":"{market_id}","q_up":"{q_up}","q_down":"{q_down:.2}","sigma":0.2}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn filled_touch_fixture(book_ts: &str) -> String {
+    format!(
+        "{}\n{}\n{}\n{}",
+        market_line("m1", "up", "down"),
+        decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+        book_line("up", "0.50", book_ts),
+        reference_line("101", "2026-06-01T00:15:01+00:00")
+    )
+}
+
+fn five_day_fixture() -> String {
+    (1..=5)
+        .map(|day| {
+            let date = format!("2026-06-{day:02}");
+            let market = format!("m{day}");
+            let up = format!("up{day}");
+            let down = format!("down{day}");
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}",
+                market_line_at(&market, &up, &down, &date),
+                fair_value_line(&market, "0.60", &format!("{date}T00:00:30+00:00")),
+                book_line(&up, "0.50", &format!("{date}T00:00:45+00:00")),
+                book_line(&down, "0.50", &format!("{date}T00:00:45+00:00")),
+                decision_line(&market, &up, "up", &format!("{date}T00:01:00+00:00")),
+                reference_line("101", &format!("{date}T00:15:01+00:00"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn market_line_at(market_id: &str, up: &str, down: &str, date: &str) -> String {
+    format!(
+        r#"{{"event_type":"market","payload":{{"market_id":"{market_id}","condition_id":"c-{market_id}","market_slug":"slug-{market_id}","question":"BTC Up or Down","asset":"BTC","horizon":"15m","up_token_id":"{up}","down_token_id":"{down}","start_ts":"{date}T00:00:00Z","end_ts":"{date}T00:15:00Z","start_price":"100","tick_size":"0.01"}},"recorded_ts":"{date}T00:00:00+00:00"}}"#
+    )
+}

@@ -1266,7 +1266,10 @@ name = "polyedge-reporting"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
+ "polyedge-config",
  "polyedge-engine",
+ "polyedge-storage",
  "rust_decimal",
  "serde",
  "serde_json",

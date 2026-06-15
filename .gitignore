@@ -8,4 +8,5 @@ frontend/node_modules/
 frontend/tsconfig.tsbuildinfo
 target/
 output/
+reports/
 .playwright-cli/

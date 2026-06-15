@@ -2,6 +2,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use polyedge_api::{app, benchmark_snapshot};
 use polyedge_config::RuntimeSettings;
+use polyedge_reporting::research::{
+    run_audit, run_baseline, run_build_markets, run_calibration, run_final_report,
+    run_ml_calibrate, run_normalize, run_regimes, run_replay, run_sample_size, run_sweep,
+    AuditOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions, ExcludedTimeWindow,
+    FillModel, FinalReportOptions, MlCalibrateOptions, NormalizeOptions, RegimesOptions,
+    ReplayOptions, SampleSizeOptions, SweepOptions,
+};
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
 };
@@ -70,6 +77,155 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         iterations: usize,
     },
+    Research {
+        #[command(subcommand)]
+        command: ResearchCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResearchCommand {
+    Audit {
+        #[arg(long, default_value = "data/events.jsonl")]
+        input: PathBuf,
+        #[arg(long, default_value = "reports/research/data_audit.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/data_audit.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Normalize {
+        #[arg(long, default_value = "data/events.jsonl")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/normalized")]
+        out: PathBuf,
+        #[arg(long, default_value = "jsonl-indexed")]
+        format: String,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        overwrite: bool,
+    },
+    BuildMarkets {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/markets_summary.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Replay {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        markets: PathBuf,
+        #[arg(long)]
+        strategy_config: Option<PathBuf>,
+        #[arg(long, default_value = "touch_after_250ms")]
+        fill_model: String,
+        #[arg(long, default_value = "reports/research/replay_touch_after_250ms.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/replay_touch_after_250ms.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Baseline {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        markets: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/baseline_static_all_fill_models.json"
+        )]
+        out: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/baseline_static_all_fill_models.md"
+        )]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Regimes {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        markets: PathBuf,
+        #[arg(long, default_value = "touch_after_250ms")]
+        fill_model: String,
+        #[arg(long)]
+        profile_config: Option<PathBuf>,
+        #[arg(long, default_value = "reports/research/regime_profiles.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/regime_profiles.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Sweep {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        markets: PathBuf,
+        #[arg(long)]
+        search: Option<PathBuf>,
+        #[arg(long, default_value = "walk_forward")]
+        split: String,
+        #[arg(long, default_value_t = 500)]
+        max_experiments: usize,
+        #[arg(long, default_value = "reports/research/parameter_sweep.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/parameter_sweep.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Calibration {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        markets: PathBuf,
+        #[arg(long, default_value = "reports/research/calibration.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/calibration.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    SampleSize {
+        #[arg(
+            long,
+            default_value = "reports/research/baseline_static_all_fill_models.json"
+        )]
+        results: PathBuf,
+        #[arg(long, default_value = "reports/research/sample_size.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/sample_size.md")]
+        markdown: PathBuf,
+    },
+    Report {
+        #[arg(long, default_value = "reports/research")]
+        reports_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/final_strategy_research_report.json"
+        )]
+        out: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/final_strategy_research_report.md"
+        )]
+        markdown: PathBuf,
+    },
+    MlCalibrate {
+        #[arg(long, default_value = "reports/research/ml_calibrate.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/ml_calibrate.md")]
+        markdown: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -121,7 +277,154 @@ async fn main() -> Result<()> {
             prefetch_blobs,
         )?),
         Command::BenchApiSnapshot { iterations } => print_json(benchmark_snapshot(iterations)),
+        Command::Research { command } => run_research_command(command),
     }
+}
+
+fn run_research_command(command: ResearchCommand) -> Result<()> {
+    let value = match command {
+        ResearchCommand::Audit {
+            input,
+            out,
+            markdown,
+            exclude_window,
+        } => run_audit(AuditOptions {
+            input,
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::Normalize {
+            input,
+            out,
+            format,
+            overwrite,
+        } => run_normalize(NormalizeOptions {
+            input,
+            out,
+            format,
+            overwrite,
+        })?,
+        ResearchCommand::BuildMarkets {
+            input,
+            out,
+            markdown,
+            exclude_window,
+        } => run_build_markets(BuildMarketsOptions {
+            input,
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::Replay {
+            input,
+            markets,
+            strategy_config,
+            fill_model,
+            out,
+            markdown,
+            exclude_window,
+        } => run_replay(ReplayOptions {
+            input,
+            markets: Some(markets),
+            strategy_config,
+            fill_model: fill_model.parse::<FillModel>()?,
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::Baseline {
+            input,
+            markets,
+            out,
+            markdown,
+            exclude_window,
+        } => run_baseline(BaselineOptions {
+            input,
+            markets: Some(markets),
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::Regimes {
+            input,
+            markets,
+            fill_model,
+            profile_config,
+            out,
+            markdown,
+            exclude_window,
+        } => run_regimes(RegimesOptions {
+            input,
+            markets: Some(markets),
+            fill_model: fill_model.parse::<FillModel>()?,
+            profile_config,
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::Sweep {
+            input,
+            markets,
+            search,
+            split,
+            max_experiments,
+            out,
+            markdown,
+            exclude_window,
+        } => run_sweep(SweepOptions {
+            input,
+            markets: Some(markets),
+            search,
+            split,
+            max_experiments,
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::Calibration {
+            input,
+            markets,
+            out,
+            markdown,
+            exclude_window,
+        } => run_calibration(CalibrationOptions {
+            input,
+            markets: Some(markets),
+            out,
+            markdown,
+            exclude_windows: parse_exclude_windows(exclude_window)?,
+        })?,
+        ResearchCommand::SampleSize {
+            results,
+            out,
+            markdown,
+        } => run_sample_size(SampleSizeOptions {
+            results,
+            out,
+            markdown,
+        })?,
+        ResearchCommand::Report {
+            reports_dir,
+            out,
+            markdown,
+        } => run_final_report(FinalReportOptions {
+            reports_dir,
+            out,
+            markdown,
+        })?,
+        ResearchCommand::MlCalibrate { out, markdown } => {
+            run_ml_calibrate(MlCalibrateOptions { out, markdown })?
+        }
+    };
+    print_json(value)
+}
+
+fn parse_exclude_windows(values: Vec<String>) -> Result<Vec<ExcludedTimeWindow>> {
+    values
+        .into_iter()
+        .map(|value| ExcludedTimeWindow::parse(&value).map_err(anyhow::Error::from))
+        .collect()
 }
 
 fn confirm_source(settings: &RuntimeSettings) -> Result<serde_json::Value> {

@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
+pub mod regime;
+pub use regime::{
+    AdaptiveStrategyResult, ProfiledStrategyConfig, QuoteStyle, RegimeClassifier, RegimeFeatures,
+    RegimeLabel, RegimePolicy, RegimeProfile,
+};
+
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Error)]

@@ -123,6 +123,8 @@ pub struct StrategyConfig {
     pub drift_mu: f64,
     pub final_no_trade_seconds: i64,
     pub order_ttl_seconds: i64,
+    pub adaptive_regime_enabled: bool,
+    pub adaptive_regime_mode: String,
 }
 
 impl Default for StrategyConfig {
@@ -141,6 +143,8 @@ impl Default for StrategyConfig {
             drift_mu: 0.0,
             final_no_trade_seconds: 30,
             order_ttl_seconds: 10,
+            adaptive_regime_enabled: false,
+            adaptive_regime_mode: "paper_only".to_owned(),
         }
     }
 }
@@ -397,6 +401,15 @@ impl RuntimeSettings {
         );
         settings.strategy.order_ttl_seconds =
             env_i64("ORDER_TTL_SECONDS", settings.strategy.order_ttl_seconds);
+        settings.strategy.adaptive_regime_enabled = env_bool(
+            "ADAPTIVE_REGIME_ENABLED",
+            settings.strategy.adaptive_regime_enabled,
+        );
+        settings.strategy.adaptive_regime_mode = env_string(
+            "ADAPTIVE_REGIME_MODE",
+            settings.strategy.adaptive_regime_mode,
+        )
+        .to_ascii_lowercase();
         settings.risk.base_order_size =
             env_decimal("BASE_ORDER_SIZE", settings.risk.base_order_size)?;
         settings.risk.max_order_size = env_decimal("MAX_ORDER_SIZE", settings.risk.max_order_size)?;
@@ -441,6 +454,9 @@ impl RuntimeSettings {
         if self.live.require_exact_resolution_source_for_live && !exact_resolution_source {
             reasons.push("exact Chainlink resolution source unavailable");
         }
+        if self.strategy.adaptive_regime_enabled {
+            reasons.push("adaptive regime profiles are not allowed in live mode");
+        }
         if reasons.is_empty() {
             Ok(())
         } else {
@@ -456,7 +472,9 @@ impl RuntimeSettings {
                 "model_error_buffer": self.strategy.model_error_buffer.to_string(),
                 "slippage_buffer": self.strategy.slippage_buffer.to_string(),
                 "order_ttl_seconds": self.strategy.order_ttl_seconds,
-                "final_no_trade_seconds": self.strategy.final_no_trade_seconds
+                "final_no_trade_seconds": self.strategy.final_no_trade_seconds,
+                "adaptive_regime_enabled": self.strategy.adaptive_regime_enabled,
+                "adaptive_regime_mode": self.strategy.adaptive_regime_mode
             },
             "risk": {
                 "base_order_size": self.risk.base_order_size.to_string(),
