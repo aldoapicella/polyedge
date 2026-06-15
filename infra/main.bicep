@@ -151,6 +151,8 @@ var researchJobDefinitions = [
     triggerType: 'Schedule'
     cron: '*/5 * * * *'
     replicaTimeout: 300
+    cpu: cpu
+    memory: memory
     command: 'polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
   }
   {
@@ -159,6 +161,8 @@ var researchJobDefinitions = [
     triggerType: 'Schedule'
     cron: '10 * * * *'
     replicaTimeout: 1800
+    cpu: cpu
+    memory: memory
     command: 'DAY=$(date -u +%Y/%m/%d); HOUR=$(date -u -d "10 minutes ago" +%H); polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "reports/research/hourly/$DAY/$HOUR/audit.json" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
   }
   {
@@ -167,7 +171,9 @@ var researchJobDefinitions = [
     triggerType: 'Schedule'
     cron: '30 1 * * *'
     replicaTimeout: 10800
-    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --overwrite true; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/daily/$DATE/markets.json" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "data/research/daily/$DATE/markets.json" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "data/research/daily/$DATE/markets.json" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "data/research/daily/$DATE/markets.json" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/regimes.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; cp "reports/research/daily/$DATE/final_report.json" "reports/research/latest_daily_report.json"; cp "reports/research/daily/$DATE/final_report.md" "reports/research/latest_daily_report.md"'
+    cpu: '2'
+    memory: '4Gi'
+    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/daily/$DATE/markets.json" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "data/research/daily/$DATE/markets.json" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "data/research/daily/$DATE/markets.json" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "data/research/daily/$DATE/markets.json" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/regimes.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; cp "reports/research/daily/$DATE/final_report.json" "reports/research/latest_daily_report.json"; cp "reports/research/daily/$DATE/final_report.md" "reports/research/latest_daily_report.md"'
   }
   {
     id: 'prospective-validation'
@@ -175,6 +181,8 @@ var researchJobDefinitions = [
     triggerType: 'Schedule'
     cron: '30 2 * * *'
     replicaTimeout: 1800
+    cpu: cpu
+    memory: memory
     command: 'polyedge-rs research validate-prospective --since "2026-06-14T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
   }
   {
@@ -183,7 +191,9 @@ var researchJobDefinitions = [
     triggerType: 'Schedule'
     cron: '0 3 * * *'
     replicaTimeout: 7200
-    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/replay-index/$DATE/normalized"; mkdir -p "data/research/replay-index/$DATE"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --overwrite true; polyedge-rs research build-replay-index --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
+    cpu: '2'
+    memory: '4Gi'
+    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/replay-index/$DATE/normalized"; mkdir -p "data/research/replay-index/$DATE"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-replay-index --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
   }
   {
     id: 'backfill'
@@ -191,6 +201,8 @@ var researchJobDefinitions = [
     triggerType: 'Manual'
     cron: ''
     replicaTimeout: 10800
+    cpu: cpu
+    memory: memory
     command: 'START=$BACKFILL_START; if [ -z "$START" ]; then START=2026-06-14; fi; END=$BACKFILL_END; if [ -z "$END" ]; then END=$START; fi; TASK=$BACKFILL_TASK; if [ -z "$TASK" ]; then TASK=all; fi; polyedge-rs research backfill --start "$START" --end "$END" --task "$TASK" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/backfill/$START-$END-$TASK.json" --markdown "reports/research/backfill/$START-$END-$TASK.md"'
   }
 ]
@@ -592,8 +604,8 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
           ]
           env: jobCommonEnv
           resources: {
-            cpu: json(cpu)
-            memory: memory
+            cpu: json(job.cpu)
+            memory: job.memory
           }
         }
       ]
