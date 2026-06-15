@@ -77,7 +77,6 @@ var labTableNames = [
 ]
 var frontendEnabled = !empty(frontendImage)
 var containerAppIdentityName = '${containerAppName}-id'
-var alertingEnabled = !empty(alertEmailAddress) || !empty(alertWebhookUri)
 var tags = {
   app: appName
   environment: environmentName
@@ -632,7 +631,7 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
-resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = if (alertingEnabled) {
+resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
   name: '${containerAppName}-research-alerts'
   location: 'global'
   tags: tags
@@ -656,7 +655,7 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = if (alerting
   }
 }
 
-resource storageMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = [for alert in storageMetricAlerts: if (alertingEnabled) {
+resource storageMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = [for alert in storageMetricAlerts: {
   name: '${containerAppName}-${alert.name}'
   location: 'global'
   tags: tags
@@ -700,7 +699,7 @@ resource storageMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = 
   }
 }]
 
-resource logAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = [for alert in logAlerts: if (alertingEnabled) {
+resource logAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = [for alert in logAlerts: {
   name: '${containerAppName}-${alert.name}'
   location: location
   kind: 'LogAlert'
