@@ -301,9 +301,8 @@ fn parse_frozen_candidate_yaml(text: &str) -> Result<FrozenCandidateRegistry, Re
             continue;
         }
         if let Some(value) = yaml_value(line, "enabled_by_default") {
-            if current.is_some() {
-                current.as_mut().expect("checked above").enabled_by_default =
-                    parse_yaml_bool(value);
+            if let Some(candidate) = current.as_mut() {
+                candidate.enabled_by_default = parse_yaml_bool(value);
             } else {
                 enabled_by_default = parse_yaml_bool(value);
             }
