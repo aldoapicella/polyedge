@@ -1,13 +1,17 @@
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use polyedge_api::{app, benchmark_snapshot};
 use polyedge_config::RuntimeSettings;
 use polyedge_reporting::research::{
-    run_audit, run_baseline, run_build_markets, run_calibration, run_final_report,
-    run_ml_calibrate, run_normalize, run_regimes, run_replay, run_sample_size, run_sweep,
-    AuditOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions, ExcludedTimeWindow,
-    FillModel, FinalReportOptions, MlCalibrateOptions, NormalizeOptions, RegimesOptions,
-    ReplayOptions, SampleSizeOptions, SweepOptions,
+    load_default_exclusions, run_audit, run_azure_freshness, run_backfill, run_baseline,
+    run_build_markets, run_build_replay_index, run_calibration, run_final_report, run_ml_calibrate,
+    run_normalize, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
+    AuditOptions, AzureFreshnessOptions, BackfillOptions, BaselineOptions, BuildMarketsOptions,
+    CalibrationOptions, ExcludedTimeWindow, FillModel, FinalReportOptions, MlCalibrateOptions,
+    NormalizeOptions, ProspectiveValidationOptions, RegimesOptions, ReplayIndexOptions,
+    ReplayOptions, SampleSizeOptions, SweepOptions, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -92,6 +96,8 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long, default_value = "reports/research/data_audit.md")]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -112,6 +118,8 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long, default_value = "reports/research/markets_summary.md")]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -128,6 +136,8 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long, default_value = "reports/research/replay_touch_after_250ms.md")]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -146,6 +156,8 @@ enum ResearchCommand {
             default_value = "reports/research/baseline_static_all_fill_models.md"
         )]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -162,6 +174,8 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long, default_value = "reports/research/regime_profiles.md")]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -180,6 +194,8 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long, default_value = "reports/research/parameter_sweep.md")]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -192,6 +208,8 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long, default_value = "reports/research/calibration.md")]
         markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
@@ -224,6 +242,68 @@ enum ResearchCommand {
         #[arg(long, default_value = "reports/research/ml_calibrate.json")]
         out: PathBuf,
         #[arg(long, default_value = "reports/research/ml_calibrate.md")]
+        markdown: PathBuf,
+    },
+    AzureFreshness {
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
+        #[arg(long, default_value = "events/")]
+        prefix: String,
+        #[arg(long, default_value = "data_quality/freshness/latest.json")]
+        out: PathBuf,
+        #[arg(long = "sas-env")]
+        sas_env: Option<String>,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    ValidateProspective {
+        #[arg(long, default_value = DEFAULT_PROSPECTIVE_SINCE)]
+        since: String,
+        #[arg(long, default_value = DEFAULT_FROZEN_CANDIDATES_FILE)]
+        candidates: PathBuf,
+        #[arg(long, default_value = "reports/research/daily")]
+        reports_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/prospective/prospective_validation.json"
+        )]
+        out: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/prospective/prospective_validation.md"
+        )]
+        markdown: PathBuf,
+    },
+    BuildReplayIndex {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/replay-index/latest")]
+        out: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
+    Backfill {
+        #[arg(long)]
+        start: String,
+        #[arg(long)]
+        end: String,
+        #[arg(long, default_value = "all")]
+        task: String,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+        #[arg(long, default_value = "reports/research/backfill/latest.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/backfill/latest.md")]
         markdown: PathBuf,
     },
 }
@@ -287,12 +367,13 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             input,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_audit(AuditOptions {
             input,
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Normalize {
             input,
@@ -309,12 +390,13 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             input,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_build_markets(BuildMarketsOptions {
             input,
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Replay {
             input,
@@ -323,6 +405,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             fill_model,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_replay(ReplayOptions {
             input,
@@ -331,20 +414,21 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             fill_model: fill_model.parse::<FillModel>()?,
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Baseline {
             input,
             markets,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_baseline(BaselineOptions {
             input,
             markets: Some(markets),
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Regimes {
             input,
@@ -353,6 +437,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             profile_config,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_regimes(RegimesOptions {
             input,
@@ -361,7 +446,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             profile_config,
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Sweep {
             input,
@@ -371,6 +456,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             max_experiments,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_sweep(SweepOptions {
             input,
@@ -380,20 +466,21 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             max_experiments,
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Calibration {
             input,
             markets,
             out,
             markdown,
+            exclude_file,
             exclude_window,
         } => run_calibration(CalibrationOptions {
             input,
             markets: Some(markets),
             out,
             markdown,
-            exclude_windows: parse_exclude_windows(exclude_window)?,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::SampleSize {
             results,
@@ -416,8 +503,70 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         ResearchCommand::MlCalibrate { out, markdown } => {
             run_ml_calibrate(MlCalibrateOptions { out, markdown })?
         }
+        ResearchCommand::AzureFreshness {
+            account,
+            container,
+            prefix,
+            out,
+            sas_env,
+            client_id,
+        } => run_azure_freshness(AzureFreshnessOptions {
+            account,
+            container,
+            prefix,
+            out,
+            sas_env,
+            client_id,
+            generated_at: None,
+        })?,
+        ResearchCommand::ValidateProspective {
+            since,
+            candidates,
+            reports_dir,
+            out,
+            markdown,
+        } => run_validate_prospective(ProspectiveValidationOptions {
+            since: parse_datetime_arg(&since)?,
+            reports_dir,
+            candidates,
+            out,
+            markdown,
+        })?,
+        ResearchCommand::BuildReplayIndex {
+            input,
+            out,
+            exclude_file,
+            exclude_window,
+        } => run_build_replay_index(ReplayIndexOptions {
+            input,
+            out,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
+        })?,
+        ResearchCommand::Backfill {
+            start,
+            end,
+            task,
+            exclude_file,
+            exclude_window,
+            out,
+            markdown,
+        } => run_backfill(BackfillOptions {
+            start,
+            end,
+            task,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
+            out,
+            markdown,
+        })?,
     };
     print_json(value)
+}
+
+fn load_exclusions(path: PathBuf, values: Vec<String>) -> Result<Vec<ExcludedTimeWindow>> {
+    let mut windows = load_default_exclusions(&path)
+        .with_context(|| format!("loading exclusion registry {}", path.display()))?;
+    windows.extend(parse_exclude_windows(values)?);
+    Ok(windows)
 }
 
 fn parse_exclude_windows(values: Vec<String>) -> Result<Vec<ExcludedTimeWindow>> {
@@ -425,6 +574,12 @@ fn parse_exclude_windows(values: Vec<String>) -> Result<Vec<ExcludedTimeWindow>>
         .into_iter()
         .map(|value| ExcludedTimeWindow::parse(&value).map_err(anyhow::Error::from))
         .collect()
+}
+
+fn parse_datetime_arg(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid RFC3339 timestamp: {value}"))?
+        .with_timezone(&Utc))
 }
 
 fn confirm_source(settings: &RuntimeSettings) -> Result<serde_json::Value> {
@@ -556,7 +711,7 @@ fn bench_azure_replay(
     let sas = std::env::var(&sas_env).with_context(|| {
         format!("{sas_env} must contain a read/list SAS token for the container")
     })?;
-    let client = AzureBlobClient::new(&account, &container, sas);
+    let mut client = AzureBlobClient::new(&account, &container, sas);
     let list_start = Instant::now();
     let blobs = client
         .list_blobs(&prefix, max_blobs, max_bytes)
@@ -618,7 +773,7 @@ fn replay_prefetched_azure_blobs(
     let job_rx = Arc::new(Mutex::new(job_rx));
     let mut handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
-        let worker_client = client.clone();
+        let mut worker_client = client.clone();
         let worker_job_rx = Arc::clone(&job_rx);
         let worker_result_tx = result_tx.clone();
         handles.push(thread::spawn(move || {

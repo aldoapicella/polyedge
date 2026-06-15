@@ -1,7 +1,17 @@
 "use client";
 
 import clsx from "clsx";
-import { Activity, FileText, LayoutDashboard, PanelsTopLeft, Settings, ShieldCheck } from "lucide-react";
+import {
+  Activity,
+  Beaker,
+  ClipboardList,
+  DatabaseZap,
+  FileText,
+  LayoutDashboard,
+  PanelsTopLeft,
+  Settings,
+  ShieldCheck
+} from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -9,7 +19,10 @@ const nav = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/markets", label: "Markets", icon: PanelsTopLeft },
   { href: "/reports", label: "Reports", icon: FileText },
-  { href: "/config", label: "Config", icon: Settings }
+  { href: "/labs", label: "Labs", icon: Beaker },
+  { href: "/data-quality", label: "Data Quality", icon: DatabaseZap },
+  { href: "/jobs", label: "Jobs", icon: ClipboardList },
+  { href: "/config", label: "Settings", icon: Settings }
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -31,7 +44,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </span>
           </Link>
 
-          <nav className="flex items-center gap-1 rounded border border-line bg-white p-1 shadow-hairline">
+          <nav className="flex max-w-full items-center gap-1 overflow-x-auto rounded border border-line bg-white p-1 shadow-hairline">
             {nav.map((item) => {
               const active = pathname.startsWith(item.href);
               const Icon = item.icon;

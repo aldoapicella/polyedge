@@ -1,8 +1,10 @@
 use polyedge_reporting::research::{
-    run_audit, run_baseline, run_build_markets, run_calibration, run_final_report, run_normalize,
-    run_regimes, run_replay, run_sample_size, run_sweep, AuditOptions, BaselineOptions,
-    BuildMarketsOptions, CalibrationOptions, ExcludedTimeWindow, FillModel, FinalReportOptions,
-    NormalizeOptions, RegimesOptions, ReplayOptions, SampleSizeOptions, SweepOptions,
+    load_default_exclusions, load_frozen_candidate_registry, run_audit, run_backfill, run_baseline,
+    run_build_markets, run_calibration, run_final_report, run_normalize, run_regimes, run_replay,
+    run_sample_size, run_sweep, run_validate_prospective, AuditOptions, BackfillOptions,
+    BaselineOptions, BuildMarketsOptions, CalibrationOptions, ExcludedTimeWindow, FillModel,
+    FinalReportOptions, NormalizeOptions, ProspectiveValidationOptions, RegimesOptions,
+    ReplayOptions, SampleSizeOptions, SweepOptions,
 };
 use serde_json::Value;
 use std::fs;
@@ -27,6 +29,137 @@ fn audit_counts_fixture_and_malformed_lines() {
 
     assert_eq!(report["result"]["markets_seen"], 1);
     assert_eq!(report["result"]["malformed_lines"], 1);
+}
+
+#[test]
+fn exclusion_registry_loads_put_bug_window_by_default() {
+    let dir = test_dir("exclusion_registry");
+    let registry = dir.join("exclusion_windows.yaml");
+    fs::write(
+        &registry,
+        r#"version: 1
+updated_at: "2026-06-14T00:00:00Z"
+windows:
+  - id: "azure-put-bug-2026-06-11"
+    start: "2026-06-11T10:00:00Z"
+    end: "2026-06-12T22:00:00Z"
+    reason: "Azure PUT bug: tiny/incomplete blobs"
+    evidence:
+      - "events/2026/06/11/11 had mostly tiny blobs"
+    default_exclude: true
+"#,
+    )
+    .unwrap();
+
+    let windows = load_default_exclusions(&registry).unwrap();
+
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].start.to_rfc3339(), "2026-06-11T10:00:00+00:00");
+    assert_eq!(windows[0].end.to_rfc3339(), "2026-06-12T22:00:00+00:00");
+}
+
+#[test]
+fn frozen_candidates_must_stay_disabled_and_research_only() {
+    let dir = test_dir("frozen_candidates");
+    let candidates = dir.join("frozen_candidates.yaml");
+    fs::write(
+        &candidates,
+        r#"version: 1
+updated_at: "2026-06-14T00:00:00Z"
+research_only: true
+paper_only: true
+enabled_by_default: false
+selection_rule: "Frozen candidates only."
+candidates:
+  - name: "static_baseline"
+    profile: "static"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_quote_style"
+    profile: "dynamic_quote_style"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "full_deterministic_profile"
+    profile: "full_deterministic_profile"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_safety_only"
+    profile: "dynamic_safety_only"
+    enabled_by_default: false
+    deployment_allowed: false
+"#,
+    )
+    .unwrap();
+
+    let registry = load_frozen_candidate_registry(&candidates).unwrap();
+
+    assert_eq!(registry.candidates.len(), 4);
+    assert!(registry
+        .candidates
+        .iter()
+        .all(|candidate| { !candidate.enabled_by_default && !candidate.deployment_allowed }));
+}
+
+#[test]
+fn prospective_and_backfill_reports_keep_research_safety_flags() {
+    let dir = test_dir("prospective_backfill");
+    let candidates = dir.join("frozen_candidates.yaml");
+    fs::write(
+        &candidates,
+        r#"version: 1
+updated_at: "2026-06-14T00:00:00Z"
+research_only: true
+paper_only: true
+enabled_by_default: false
+selection_rule: "Frozen candidates only."
+candidates:
+  - name: "static_baseline"
+    profile: "static"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_quote_style"
+    profile: "dynamic_quote_style"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "full_deterministic_profile"
+    profile: "full_deterministic_profile"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_safety_only"
+    profile: "dynamic_safety_only"
+    enabled_by_default: false
+    deployment_allowed: false
+"#,
+    )
+    .unwrap();
+
+    let prospective = run_validate_prospective(ProspectiveValidationOptions {
+        since: chrono::DateTime::parse_from_rfc3339("2026-06-14T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        reports_dir: dir.join("daily"),
+        candidates,
+        out: dir.join("prospective.json"),
+        markdown: dir.join("prospective.md"),
+    })
+    .unwrap();
+
+    assert_eq!(prospective["result"]["research_only"], true);
+    assert_eq!(prospective["result"]["live_deployment_allowed"], false);
+    assert_eq!(prospective["result"]["status"], "collecting");
+
+    let backfill = run_backfill(BackfillOptions {
+        start: "2026-06-14".to_owned(),
+        end: "2026-06-14".to_owned(),
+        task: "reports".to_owned(),
+        exclude_windows: Vec::new(),
+        out: dir.join("backfill.json"),
+        markdown: dir.join("backfill.md"),
+    })
+    .unwrap();
+
+    assert_eq!(backfill["result"]["raw_data_mutated"], false);
+    assert_eq!(backfill["result"]["live_trading_enabled"], false);
 }
 
 #[test]

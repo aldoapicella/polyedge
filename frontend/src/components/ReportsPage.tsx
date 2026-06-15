@@ -1,59 +1,35 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, FileJson, RefreshCw, Search } from "lucide-react";
-import { useMemo, useState } from "react";
-import { buildReport, getDailyReport, getLatestReport } from "@/lib/api";
-import type { ReportPayload } from "@/lib/types";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Download, RefreshCw } from "lucide-react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis
+} from "recharts";
+import { getLabArtifacts, getLabProspective, getLabSampleSizeLatest, getLatestLabReport } from "@/lib/api";
+import type { JsonRecord, LabArtifact, LabReportBundle, ProspectiveValidationRow } from "@/lib/types";
 import { compact, dateTime, numberText } from "@/lib/format";
-import { Button, EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
+import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
 export function ReportsPage() {
   const queryClient = useQueryClient();
-  const today = new Date().toISOString().slice(0, 10);
-  const [date, setDate] = useState(today);
-  const [prefix, setPrefix] = useState("");
-  const [force, setForce] = useState(false);
-  const [baselineDate, setBaselineDate] = useState(today);
-  const [candidateDate, setCandidateDate] = useState(today);
-  const latest = useQuery({
-    queryKey: ["reports", "latest"],
-    queryFn: getLatestReport,
-    retry: false
-  });
-  const daily = useQuery({
-    queryKey: ["reports", "daily", date],
-    queryFn: () => getDailyReport(date),
-    enabled: false,
-    retry: false
-  });
-  const baseline = useQuery({
-    queryKey: ["reports", "compare", "baseline", baselineDate],
-    queryFn: () => getDailyReport(baselineDate),
-    enabled: false,
-    retry: false
-  });
-  const candidate = useQuery({
-    queryKey: ["reports", "compare", "candidate", candidateDate],
-    queryFn: () => getDailyReport(candidateDate),
-    enabled: false,
-    retry: false
-  });
-  const build = useMutation({
-    mutationFn: () =>
-      buildReport({
-        source: "auto",
-        date: prefix ? null : date,
-        prefix: prefix || null,
-        force,
-        settlement_window_seconds: 15
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["reports"] });
-    }
-  });
+  const latest = useQuery({ queryKey: ["labs", "reports", "latest"], queryFn: getLatestLabReport, retry: false });
+  const artifacts = useQuery({ queryKey: ["labs", "artifacts", "reports"], queryFn: () => getLabArtifacts(""), retry: false });
+  const prospective = useQuery({ queryKey: ["labs", "prospective"], queryFn: getLabProspective, retry: false });
+  const sampleSize = useQuery({ queryKey: ["labs", "sample-size"], queryFn: getLabSampleSizeLatest, retry: false });
 
-  const selected = build.data ?? daily.data ?? latest.data;
+  const bundle = latest.data;
+  const report = asRecord(bundle?.report);
+  const cards = reportCards(bundle, sampleSize.data?.report);
+  const fillModels = fillModelRows(bundle);
+  const dailyRows = prospective.data?.result?.rows ?? [];
 
   return (
     <div className="space-y-5">
@@ -61,203 +37,244 @@ export function ReportsPage() {
         <div>
           <h1 className="text-xl font-semibold text-ink">Reports</h1>
         </div>
-        <IconButton label="Refresh reports" onClick={() => queryClient.invalidateQueries({ queryKey: ["reports"] })}>
+        <IconButton label="Refresh reports" onClick={() => queryClient.invalidateQueries({ queryKey: ["labs"] })}>
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
 
-      <div className="grid gap-5 xl:grid-cols-[420px_1fr]">
-        <Panel>
-          <PanelHeader title="Build Report" meta="Daily report or Azure prefix" />
-          <div className="space-y-4 p-4">
-            <label className="block">
-              <span className="text-xs font-medium text-ink/60">Report date</span>
-              <input
-                type="date"
-                value={date}
-                onChange={(event) => setDate(event.target.value)}
-                className="mt-1 h-10 w-full rounded-sm border border-line bg-white px-3 text-sm text-ink"
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs font-medium text-ink/60">Azure prefix</span>
-              <input
-                value={prefix}
-                onChange={(event) => setPrefix(event.target.value)}
-                placeholder="events/YYYY/MM/DD/"
-                className="mt-1 h-10 w-full rounded-sm border border-line bg-white px-3 text-sm text-ink"
-              />
-            </label>
-            <label className="flex items-center gap-2 text-sm text-ink/70">
-              <input
-                type="checkbox"
-                checked={force}
-                onChange={(event) => setForce(event.target.checked)}
-                className="h-4 w-4 accent-good"
-              />
-              Force rebuild
-            </label>
-            {build.error ? <p className="text-sm text-danger">{build.error.message}</p> : null}
-            <div className="flex flex-wrap gap-2">
-              <Button disabled={build.isPending} onClick={() => build.mutate()}>
-                <FileJson className="h-4 w-4" />
-                Build
-              </Button>
-              <Button disabled={daily.isFetching} onClick={() => daily.refetch()}>
-                <Search className="h-4 w-4" />
-                View Daily
-              </Button>
-            </div>
+      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        {cards.map((card) => (
+          <div key={card.label} className="border border-line bg-white px-3 py-3 shadow-hairline">
+            <div className="truncate text-xs text-ink/50">{card.label}</div>
+            <div className="mt-1 truncate text-lg font-semibold text-ink">{card.value}</div>
+            {card.tone ? <Pill tone={card.tone}>{card.meta}</Pill> : <div className="mt-1 truncate text-xs text-ink/50">{card.meta}</div>}
           </div>
-        </Panel>
-
-        <ReportSummary report={selected} loading={latest.isLoading || daily.isFetching || build.isPending} />
+        ))}
       </div>
 
-      <Panel>
-        <PanelHeader title="Report Comparison" meta="Daily cached reports" />
-        <div className="grid gap-4 p-4 lg:grid-cols-[360px_1fr]">
-          <div className="space-y-3">
-            <label className="block">
-              <span className="text-xs font-medium text-ink/60">Baseline date</span>
-              <input
-                type="date"
-                value={baselineDate}
-                onChange={(event) => setBaselineDate(event.target.value)}
-                className="mt-1 h-10 w-full rounded-sm border border-line bg-white px-3 text-sm text-ink"
-              />
-            </label>
-            <label className="block">
-              <span className="text-xs font-medium text-ink/60">Candidate date</span>
-              <input
-                type="date"
-                value={candidateDate}
-                onChange={(event) => setCandidateDate(event.target.value)}
-                className="mt-1 h-10 w-full rounded-sm border border-line bg-white px-3 text-sm text-ink"
-              />
-            </label>
-            <Button disabled={baseline.isFetching || candidate.isFetching} onClick={() => { baseline.refetch(); candidate.refetch(); }}>
-              <Search className="h-4 w-4" />
-              Compare
-            </Button>
-          </div>
-          <ComparisonTable baseline={baseline.data} candidate={candidate.data} loading={baseline.isFetching || candidate.isFetching} />
-        </div>
-      </Panel>
+      <div className="grid gap-5 xl:grid-cols-[1fr_420px]">
+        <Panel>
+          <PanelHeader title="Fill-Model Sensitivity" meta={bundle?.date ?? "latest daily research"} />
+          {fillModels.length ? (
+            <div className="h-[320px] p-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={fillModels}>
+                  <CartesianGrid stroke="#d9ddd2" vertical={false} />
+                  <XAxis dataKey="fill_model" tick={{ fontSize: 11 }} interval={0} angle={-20} textAnchor="end" height={70} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip />
+                  <Bar dataKey="net_pnl" fill="#18705b" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <EmptyState label={latest.isLoading ? "Loading report data" : "No fill-model report data"} />
+          )}
+        </Panel>
+
+        <Panel>
+          <PanelHeader title="Latest Summary" meta={report ? "final report" : "no report"} />
+          {report ? (
+            <div className="overflow-auto p-4">
+              <table className="w-full min-w-[360px] text-left text-sm">
+                <tbody>
+                  {summaryRows(report).map(([key, value]) => (
+                    <tr key={key} className="border-b border-line last:border-b-0">
+                      <th className="w-44 bg-panel px-3 py-2 text-xs font-medium uppercase text-ink/50">{key}</th>
+                      <td className="px-3 py-2 text-ink">{compact(value)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState label={latest.isLoading ? "Loading report" : "No daily report loaded"} />
+          )}
+        </Panel>
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-2">
+        <Panel>
+          <PanelHeader title="Prospective Validation" meta={prospective.data?.result?.status ?? "collecting"} />
+          {dailyRows.length ? (
+            <div className="h-[280px] p-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={dailyRows.map(dailyChartRow)}>
+                  <CartesianGrid stroke="#d9ddd2" vertical={false} />
+                  <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip />
+                  <Line type="monotone" dataKey="static" stroke="#17201b" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="dynamic" stroke="#18705b" strokeWidth={2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <EmptyState label={prospective.isLoading ? "Loading prospective rows" : "No prospective rows yet"} />
+          )}
+        </Panel>
+
+        <ArtifactBrowser artifacts={artifacts.data?.artifacts ?? []} loading={artifacts.isLoading} />
+      </div>
     </div>
   );
 }
 
-function ComparisonTable({ baseline, candidate, loading }: { baseline?: ReportPayload; candidate?: ReportPayload; loading: boolean }) {
-  const rows: [string, unknown, unknown][] = [
-    ["Actual paper net", baseline?.report?.summary?.actual_paper_net_pnl, candidate?.report?.summary?.actual_paper_net_pnl],
-    ["Replay net", baseline?.report?.summary?.replay_estimate_net_pnl, candidate?.report?.summary?.replay_estimate_net_pnl],
-    ["Runtime minus replay", baseline?.report?.summary?.runtime_minus_replay_pnl, candidate?.report?.summary?.runtime_minus_replay_pnl],
-    ["Runtime fills", baseline?.report?.runtime_vs_replay?.runtime_filled_reports, candidate?.report?.runtime_vs_replay?.runtime_filled_reports],
-    ["Replay fills", baseline?.report?.runtime_vs_replay?.replay_filled_orders, candidate?.report?.runtime_vs_replay?.replay_filled_orders]
-  ];
-  if (!baseline?.report || !candidate?.report) {
-    return <EmptyState label={loading ? "Loading reports" : "Select reports to compare"} />;
-  }
-  return (
-    <div className="overflow-auto border border-line">
-      <table className="w-full min-w-[640px] text-left text-sm">
-        <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
-          <tr>
-            <th className="px-3 py-2">Metric</th>
-            <th className="px-3 py-2">Baseline</th>
-            <th className="px-3 py-2">Candidate</th>
-            <th className="px-3 py-2">Δ</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map(([label, left, right]) => (
-            <tr key={label} className="border-b border-line last:border-b-0">
-              <td className="px-3 py-2 font-medium">{label}</td>
-              <td className="px-3 py-2">{numberText(left)}</td>
-              <td className="px-3 py-2">{numberText(right)}</td>
-              <td className="px-3 py-2">{numberText(delta(left, right))}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function delta(left: unknown, right: unknown) {
-  const l = Number(left);
-  const r = Number(right);
-  return Number.isFinite(l) && Number.isFinite(r) ? r - l : null;
-}
-
-function ReportSummary({ report, loading }: { report?: ReportPayload; loading: boolean }) {
-  const summary = report?.report?.summary;
-  const comparison = report?.report?.runtime_vs_replay;
-  const job = report?.job ?? report?.report?.report_job;
-  const cards = useMemo<[string, unknown][]>(
-    () => [
-      ["Actual Paper", summary?.actual_paper_net_pnl],
-      ["Replay", summary?.replay_estimate_net_pnl],
-      ["Runtime Δ", summary?.runtime_minus_replay_pnl],
-      ["Filled Reports", comparison?.runtime_filled_reports]
-    ],
-    [summary, comparison]
-  );
-
+function ArtifactBrowser({ artifacts, loading }: { artifacts: LabArtifact[]; loading: boolean }) {
   return (
     <Panel>
-      <PanelHeader title="Cached Report" meta={job ? `${job.job_id} · ${job.status}` : "Latest or selected daily report"}>
-        {report ? (
-          <Button onClick={() => downloadJson(report)}>
-            <Download className="h-4 w-4" />
-            JSON
-          </Button>
-        ) : null}
+      <PanelHeader title="Artifacts" meta={`${artifacts.length} files`}>
+        <Download className="h-4 w-4 text-ink/45" />
       </PanelHeader>
-      {report?.report ? (
-        <div className="space-y-4 p-4">
-          <div className="flex flex-wrap gap-2">
-            <Pill tone={job?.status === "completed" ? "good" : job?.status === "failed" ? "danger" : "warn"}>
-              {job?.status ?? "unknown"}
-            </Pill>
-            <Pill>{job?.source ?? "source n/a"}</Pill>
-            <Pill>{job?.finished_ts ? dateTime(job.finished_ts) : "unfinished"}</Pill>
-          </div>
-          <div className="grid gap-3 md:grid-cols-4">
-            {cards.map(([label, value]) => (
-              <div key={label} className="border border-line bg-panel px-3 py-3">
-                <div className="truncate text-xs text-ink/50">{label}</div>
-                <div className="mt-1 truncate text-lg font-semibold text-ink">{numberText(value)}</div>
-              </div>
-            ))}
-          </div>
-          <div className="overflow-auto border border-line">
-            <table className="w-full min-w-[640px] text-left text-sm">
-              <tbody>
-                {Object.entries(summary ?? {}).slice(0, 12).map(([key, value]) => (
-                  <tr key={key} className="border-b border-line last:border-b-0">
-                    <th className="w-72 bg-panel px-3 py-2 text-xs font-medium uppercase text-ink/50">{key}</th>
-                    <td className="px-3 py-2 text-ink">{compact(value)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+      {artifacts.length ? (
+        <div className="max-h-[320px] overflow-auto">
+          <table className="w-full min-w-[560px] text-left text-sm">
+            <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
+              <tr>
+                <th className="px-3 py-2">Path</th>
+                <th className="px-3 py-2">Kind</th>
+                <th className="px-3 py-2">Size</th>
+                <th className="px-3 py-2">Modified</th>
+              </tr>
+            </thead>
+            <tbody>
+              {artifacts.slice(0, 80).map((artifact) => (
+                <tr key={artifact.artifact_id} className="border-b border-line last:border-b-0">
+                  <td className="px-3 py-2 font-mono text-xs">{artifact.path}</td>
+                  <td className="px-3 py-2">{artifact.kind}</td>
+                  <td className="px-3 py-2">{numberText(artifact.size_bytes)}</td>
+                  <td className="px-3 py-2">{artifact.modified_ts ? dateTime(artifact.modified_ts) : "n/a"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       ) : (
-        <EmptyState label={loading ? "Loading cached report" : "No cached report loaded yet"} />
+        <EmptyState label={loading ? "Loading artifacts" : "No artifacts found"} />
       )}
     </Panel>
   );
 }
 
-function downloadJson(payload: ReportPayload) {
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `polyedge-report-${new Date().toISOString().slice(0, 19)}.json`;
-  anchor.click();
-  URL.revokeObjectURL(url);
+function reportCards(bundle?: LabReportBundle, sampleReport?: JsonRecord | null) {
+  const report = asRecord(bundle?.report);
+  const sample = asRecord(sampleReport ?? bundle?.sample_size);
+  const recommendation =
+    text(findDeep(report, "recommendation")) ??
+    text(pointer(report, "/result/executive_summary/recommendation")) ??
+    "collecting";
+  const fillModels = fillModelRows(bundle);
+  const staticModel = fillModels.find((row) => row.fill_model === "touch_after_250ms") ?? fillModels[0];
+  const dynamic = profileNet(bundle, "dynamic_quote_style");
+  const cleanMarkets = findDeep(report, "complete_for_simulation") ?? findDeep(report, "settled_markets");
+  const ciLow = pointer(sample, "/result/statistics/ci_low") ?? findDeep(sample, "ci_low");
+  const ciHigh = pointer(sample, "/result/statistics/ci_high") ?? findDeep(sample, "ci_high");
+  const quality = text(findDeep(bundle?.audit, "status")) ?? text(findDeep(report, "data_quality_status")) ?? "unknown";
+  return [
+    { label: "Recommendation", value: recommendation, meta: "research", tone: "neutral" as const },
+    { label: "Static Net PnL", value: numberText(staticModel?.net_pnl), meta: "touch_after_250ms" },
+    { label: "Dynamic Quote", value: numberText(dynamic), meta: "frozen candidate" },
+    { label: "Clean Markets", value: numberText(cleanMarkets), meta: "settled sample" },
+    { label: "95% CI", value: `${numberText(ciLow)} / ${numberText(ciHigh)}`, meta: "market-level" },
+    { label: "Data Quality", value: quality, meta: "latest verdict", tone: quality === "healthy" ? ("good" as const) : ("warn" as const) }
+  ];
+}
+
+function fillModelRows(bundle?: LabReportBundle) {
+  const source = bundle?.baseline ?? bundle?.report ?? {};
+  const rows = findRows(asRecord(source), "fill_model");
+  return rows
+    .map((row) => ({
+      fill_model: text(row.fill_model) ?? "unknown",
+      net_pnl: number(row.net_pnl),
+      max_drawdown: number(row.max_drawdown),
+      fills: number(row.fills)
+    }))
+    .filter((row) => row.net_pnl !== null);
+}
+
+function profileNet(bundle: LabReportBundle | undefined, profile: string) {
+  const rows = findRows(asRecord(bundle?.regimes ?? bundle?.report), "profile");
+  return rows.find((row) => text(row.profile) === profile)?.net_pnl ?? null;
+}
+
+function dailyChartRow(row: ProspectiveValidationRow) {
+  return {
+    date: row.date,
+    static: number(row.static_net_pnl),
+    dynamic: number(row.dynamic_quote_style_net_pnl)
+  };
+}
+
+function summaryRows(report: JsonRecord): [string, unknown][] {
+  const executive = asRecord(pointer(report, "/result/executive_summary"));
+  const stats = asRecord(pointer(report, "/result/statistical_evidence/result/statistics"));
+  const rows: [string, unknown][] = [
+    ["recommendation", executive?.recommendation],
+    ["research_only", executive?.research_only],
+    ["live_enabled", executive?.live_trading_enabled],
+    ["ci_low", stats?.ci_low],
+    ["ci_high", stats?.ci_high],
+    ["required_n_0_05", stats?.required_n_for_plus_minus_0_05]
+  ];
+  return rows.filter(([, value]) => value !== undefined);
+}
+
+function findRows(value: JsonRecord | null | undefined, key: string): JsonRecord[] {
+  if (!value) {
+    return [];
+  }
+  const rows: JsonRecord[] = [];
+  visit(value, (record) => {
+    if (record[key] !== undefined) {
+      rows.push(record);
+    }
+  });
+  return rows;
+}
+
+function findDeep(value: unknown, key: string): unknown {
+  let found: unknown;
+  visit(value, (record) => {
+    if (found === undefined && record[key] !== undefined) {
+      found = record[key];
+    }
+  });
+  return found;
+}
+
+function visit(value: unknown, fn: (record: JsonRecord) => void) {
+  if (Array.isArray(value)) {
+    value.forEach((item) => visit(item, fn));
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) {
+    return;
+  }
+  fn(record);
+  Object.values(record).forEach((child) => visit(child, fn));
+}
+
+function pointer(record: JsonRecord | null | undefined, path: string): unknown {
+  if (!record) {
+    return undefined;
+  }
+  return path
+    .split("/")
+    .slice(1)
+    .reduce<unknown>((current, key) => asRecord(current)?.[key], record);
+}
+
+function asRecord(value: unknown): JsonRecord | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : null;
+}
+
+function text(value: unknown) {
+  return typeof value === "string" ? value : undefined;
+}
+
+function number(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }

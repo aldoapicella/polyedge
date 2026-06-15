@@ -3,8 +3,14 @@
 import type {
   ConfigAuditEntry,
   ConfigValidation,
+  ExclusionRegistry,
   JsonRecord,
+  LabArtifact,
+  LabDataQuality,
+  LabJob,
+  LabReportBundle,
   MarketDetail,
+  ProspectiveValidation,
   ReportJob,
   ReportPayload,
   RuntimeEvent,
@@ -72,6 +78,68 @@ export function getRecentEvents(params: { marketId?: string; type?: string; limi
 
 export function getLatestReport() {
   return backendFetch<ReportPayload>("reports/latest");
+}
+
+export function getLatestLabReport() {
+  return backendFetch<LabReportBundle>("labs/reports/latest");
+}
+
+export function getLabDailyReport(date: string) {
+  return backendFetch<LabReportBundle>(`labs/reports/daily/${date}`);
+}
+
+export function getLabArtifacts(prefix = "") {
+  const query = prefix ? `?${new URLSearchParams({ prefix }).toString()}` : "";
+  return backendFetch<{ prefix: string; artifacts: LabArtifact[] }>(`labs/reports/artifacts${query}`);
+}
+
+export function getLabDataQualityLatest() {
+  return backendFetch<LabDataQuality>("labs/data-quality/latest");
+}
+
+export function getLabHourlyQuality(date: string) {
+  return backendFetch<{ date: string; audits: JsonRecord[] }>(
+    `labs/data-quality/hourly?${new URLSearchParams({ date }).toString()}`
+  );
+}
+
+export function getLabExclusions() {
+  return backendFetch<ExclusionRegistry>("labs/data-quality/exclusions");
+}
+
+export function validateLabExclusions() {
+  return backendFetch<{ valid: boolean; issues: string[]; registry: ExclusionRegistry }>(
+    "labs/data-quality/exclusions/validate",
+    { method: "POST" }
+  );
+}
+
+export function getLabProspective() {
+  return backendFetch<ProspectiveValidation>("labs/prospective");
+}
+
+export function getLabRegimesLatest() {
+  return backendFetch<{ date?: string; report?: JsonRecord | null }>("labs/regimes/latest");
+}
+
+export function getLabCalibrationLatest() {
+  return backendFetch<{ date?: string; report?: JsonRecord | null }>("labs/calibration/latest");
+}
+
+export function getLabSampleSizeLatest() {
+  return backendFetch<{ date?: string; report?: JsonRecord | null }>("labs/sample-size/latest");
+}
+
+export function getLabFillModelsLatest() {
+  return backendFetch<{ date?: string; report?: JsonRecord | null }>("labs/fill-models/latest");
+}
+
+export function getLabJobs() {
+  return backendFetch<{ jobs: LabJob[]; source?: string; note?: string }>("labs/jobs");
+}
+
+export function startLabJob(job: "freshness-check" | "daily-report" | "prospective-validation" | "replay-index" | "backfill") {
+  return backendFetch<LabJob>(`labs/jobs/${job}`, { method: "POST" });
 }
 
 export function getDailyReport(date: string) {

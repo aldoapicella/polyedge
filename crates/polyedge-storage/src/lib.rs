@@ -509,14 +509,21 @@ fn rfc1123_now() -> String {
 pub struct AzureBlobItem {
     pub name: String,
     pub content_length: u64,
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
 pub struct AzureBlobClient {
     account: String,
     container: String,
-    sas: String,
+    auth: AzureBlobAuth,
     agent: ureq::Agent,
+}
+
+#[derive(Clone)]
+enum AzureBlobAuth {
+    Sas(String),
+    ManagedIdentity(ManagedIdentityToken),
 }
 
 impl AzureBlobClient {
@@ -528,7 +535,24 @@ impl AzureBlobClient {
         Self {
             account: account.into(),
             container: container.into(),
-            sas: sas.into(),
+            auth: AzureBlobAuth::Sas(sas.into()),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(120))
+                .timeout_write(Duration::from_secs(30))
+                .build(),
+        }
+    }
+
+    pub fn with_managed_identity(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            container: container.into(),
+            auth: AzureBlobAuth::ManagedIdentity(ManagedIdentityToken::new(client_id)),
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
                 .timeout_read(Duration::from_secs(120))
@@ -538,7 +562,7 @@ impl AzureBlobClient {
     }
 
     pub fn list_blobs(
-        &self,
+        &mut self,
         prefix: &str,
         max_blobs: Option<usize>,
         max_bytes: Option<u64>,
@@ -557,7 +581,7 @@ impl AzureBlobClient {
                 url.push_str("&marker=");
                 url.push_str(&utf8_percent_encode(&marker, NON_ALPHANUMERIC).to_string());
             }
-            let text = self.get_text(&append_sas(&url, &self.sas))?;
+            let text = self.get_text(&url)?;
             let page = parse_blob_list(&text)?;
             for blob in page.blobs {
                 if !blob.name.ends_with(".jsonl") {
@@ -581,24 +605,21 @@ impl AzureBlobClient {
         }
     }
 
-    pub fn download_blob_bytes(&self, name: &str) -> Result<Vec<u8>, AzureBlobError> {
-        let url = append_sas(
-            &format!(
-                "https://{}.blob.core.windows.net/{}/{}",
-                self.account,
-                self.container,
-                encode_blob_path(name)
-            ),
-            &self.sas,
+    pub fn download_blob_bytes(&mut self, name: &str) -> Result<Vec<u8>, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
         );
         self.get_bytes_with_retry(&url)
     }
 
-    fn get_text(&self, url: &str) -> Result<String, AzureBlobError> {
+    fn get_text(&mut self, url: &str) -> Result<String, AzureBlobError> {
         Ok(String::from_utf8(self.get_bytes_with_retry(url)?)?)
     }
 
-    fn get_bytes_with_retry(&self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
+    fn get_bytes_with_retry(&mut self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
         for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
             let result = self.read_response_bytes(url);
             match result {
@@ -612,21 +633,33 @@ impl AzureBlobClient {
         unreachable!("Azure Blob byte retry loop always returns");
     }
 
-    fn read_response_bytes(&self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
+    fn read_response_bytes(&mut self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
         let response = self.get_response(url)?;
         let mut bytes = Vec::new();
         response.into_reader().read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 
-    fn get_response(&self, url: &str) -> Result<ureq::Response, AzureBlobError> {
+    fn get_response(&mut self, url: &str) -> Result<ureq::Response, AzureBlobError> {
         for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
-            match self
-                .agent
-                .get(url)
-                .set("x-ms-version", AZURE_BLOB_API_VERSION)
-                .call()
-            {
+            let date = rfc1123_now();
+            let response = match &mut self.auth {
+                AzureBlobAuth::Sas(sas) => self
+                    .agent
+                    .get(&append_sas(url, sas))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .call(),
+                AzureBlobAuth::ManagedIdentity(token) => {
+                    let access_token = token.access_token(&self.agent)?;
+                    self.agent
+                        .get(url)
+                        .set("authorization", &format!("Bearer {access_token}"))
+                        .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                        .set("x-ms-date", &date)
+                        .call()
+                }
+            };
+            match response {
                 Ok(response) => return Ok(response),
                 Err(ureq::Error::Status(status, _)) => {
                     if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
@@ -962,6 +995,7 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
     let mut in_blob = false;
     let mut name = String::new();
     let mut content_length = 0_u64;
+    let mut last_modified = None;
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(event) => {
@@ -970,6 +1004,7 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                     in_blob = true;
                     name.clear();
                     content_length = 0;
+                    last_modified = None;
                 }
             }
             Event::End(event) => {
@@ -978,6 +1013,7 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                     page.blobs.push(AzureBlobItem {
                         name: name.clone(),
                         content_length,
+                        last_modified,
                     });
                     in_blob = false;
                 }
@@ -992,6 +1028,10 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                     name = text;
                 } else if in_blob && current_tag == "Content-Length" {
                     content_length = text.parse().unwrap_or(0);
+                } else if in_blob && current_tag == "Last-Modified" {
+                    last_modified = DateTime::parse_from_rfc2822(&text)
+                        .ok()
+                        .map(|timestamp| timestamp.with_timezone(&Utc));
                 } else if !in_blob && current_tag == "NextMarker" {
                     page.next_marker = text;
                 }

@@ -186,6 +186,95 @@ export type ReportPayload = {
   } | null;
 };
 
+export type LabArtifact = {
+  artifact_id: string;
+  path: string;
+  kind: "json" | "md" | string;
+  size_bytes?: number | null;
+  modified_ts?: string | null;
+};
+
+export type LabReportBundle = {
+  date?: string;
+  report?: JsonRecord | null;
+  audit?: JsonRecord | null;
+  baseline?: JsonRecord | null;
+  regimes?: JsonRecord | null;
+  calibration?: JsonRecord | null;
+  sample_size?: JsonRecord | null;
+  artifacts?: LabArtifact[];
+  detail?: string;
+};
+
+export type LabDataQuality = {
+  generated_ts: string;
+  freshness?: JsonRecord | null;
+  recorder?: JsonRecord | null;
+  exclusions?: ExclusionRegistry;
+  source?: JsonRecord;
+};
+
+export type ExclusionRegistry = {
+  version: number;
+  updated_at?: string | null;
+  windows: ExclusionWindow[];
+  error?: string;
+};
+
+export type ExclusionWindow = {
+  id: string;
+  start: string;
+  end: string;
+  end_exclusive?: string;
+  reason: string;
+  evidence?: string[];
+  default_exclude: boolean;
+};
+
+export type LabJob = {
+  job_id: string;
+  job_name: string;
+  status: string;
+  trigger?: string;
+  cron?: string | null;
+  last_start?: string | null;
+  last_finish?: string | null;
+  duration?: string | number | null;
+  exit_code?: number | null;
+  output_artifact?: string | null;
+  error?: string | null;
+  research_only?: boolean;
+  live_trading_enabled?: boolean;
+};
+
+export type ProspectiveValidationRow = {
+  date: string;
+  settled_markets?: number | string | null;
+  fill_model?: string | null;
+  static_net_pnl?: string | number | null;
+  dynamic_quote_style_net_pnl?: string | number | null;
+  full_deterministic_profile_net_pnl?: string | number | null;
+  dynamic_safety_only_net_pnl?: string | number | null;
+  max_drawdown?: string | number | null;
+  cancel_per_fill?: string | number | null;
+  ci_95_low?: string | number | null;
+  ci_95_high?: string | number | null;
+  data_quality_status?: string | null;
+  recommendation?: string | null;
+};
+
+export type ProspectiveValidation = {
+  generated_at?: string;
+  result?: {
+    status?: string;
+    since?: string;
+    rows?: ProspectiveValidationRow[];
+    frozen_candidates?: JsonRecord;
+    research_only?: boolean;
+    live_deployment_allowed?: boolean;
+  };
+};
+
 export type RuntimeConfigSection = Record<string, string | number>;
 
 export type RuntimeConfig = {

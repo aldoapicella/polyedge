@@ -49,23 +49,194 @@ param frontendBackendSseUrl string = ''
 @description('Deployment environment tag.')
 param environmentName string = 'dev'
 
+@description('Optional email address for PolyEdge Azure Monitor alerts. Leave empty to deploy the action group without email receivers.')
+param alertEmailAddress string = ''
+
+@description('Optional webhook URI for Teams, Slack, or automation alert routing. Leave empty to skip webhook routing.')
+@secure()
+param alertWebhookUri string = ''
+
 var suffix = uniqueString(subscription().id, resourceGroup().id, appName)
 var safeAppName = toLower(replace(appName, '-', ''))
 var storageName = take('st${safeAppName}${suffix}', 24)
 var acrName = take('cr${safeAppName}${suffix}', 50)
+var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix}', 63)
 var managedEnvironmentName = '${appName}-${environmentName}-env'
 var containerAppName = '${appName}-${environmentName}'
 var storageContainerName = 'bot-events'
 var storageTableName = 'BotEventIndex'
 var chartTableName = 'BotChartSeries'
 var marketTableName = 'BotMarketCatalog'
+var labTableNames = [
+  'PolyEdgeDataFreshness'
+  'PolyEdgeResearchRuns'
+  'PolyEdgeProspectiveResults'
+  'PolyEdgeExclusionWindows'
+  'PolyEdgeResearchArtifacts'
+  'PolyEdgeJobStatus'
+]
 var frontendEnabled = !empty(frontendImage)
 var containerAppIdentityName = '${containerAppName}-id'
+var alertingEnabled = !empty(alertEmailAddress) || !empty(alertWebhookUri)
 var tags = {
   app: appName
   environment: environmentName
   managedBy: 'bicep'
 }
+var jobCommonEnv = [
+  {
+    name: 'APP_NAME'
+    value: 'polyedge'
+  }
+  {
+    name: 'EXECUTION_MODE'
+    value: 'paper'
+  }
+  {
+    name: 'ALLOW_LIVE'
+    value: 'false'
+  }
+  {
+    name: 'RUN_BOT_ON_STARTUP'
+    value: 'false'
+  }
+  {
+    name: 'REQUIRE_API_AUTH'
+    value: 'true'
+  }
+  {
+    name: 'API_BEARER_TOKEN'
+    secretRef: 'api-bearer-token'
+  }
+  {
+    name: 'AZURE_CLIENT_ID'
+    value: containerAppIdentity.properties.clientId
+  }
+  {
+    name: 'AZURE_STORAGE_ACCOUNT_NAME'
+    value: storage.name
+  }
+  {
+    name: 'AZURE_STORAGE_CONTAINER_NAME'
+    value: storageContainerName
+  }
+  {
+    name: 'AZURE_STORAGE_TABLE_NAME'
+    value: storageTableName
+  }
+  {
+    name: 'AZURE_STORAGE_ACCOUNT_KEY'
+    secretRef: 'storage-account-key'
+  }
+  {
+    name: 'AZURE_CHART_TABLE_NAME'
+    value: chartTableName
+  }
+  {
+    name: 'AZURE_MARKET_TABLE_NAME'
+    value: marketTableName
+  }
+  {
+    name: 'ENABLE_TAKER_ORDERS'
+    value: 'false'
+  }
+  {
+    name: 'ALLOW_EMERGENCY_ACCOUNT_CANCEL'
+    value: 'false'
+  }
+]
+var researchJobDefinitions = [
+  {
+    id: 'freshness-check'
+    name: 'polyedge-data-freshness-job'
+    triggerType: 'Schedule'
+    cron: '*/5 * * * *'
+    replicaTimeout: 300
+    command: 'polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
+  }
+  {
+    id: 'hourly-quality'
+    name: 'polyedge-hourly-quality-job'
+    triggerType: 'Schedule'
+    cron: '10 * * * *'
+    replicaTimeout: 1800
+    command: 'DAY=$(date -u +%Y/%m/%d); HOUR=$(date -u -d "10 minutes ago" +%H); polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "reports/research/hourly/$DAY/$HOUR/audit.json" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+  }
+  {
+    id: 'daily-report'
+    name: 'polyedge-daily-research-job'
+    triggerType: 'Schedule'
+    cron: '30 1 * * *'
+    replicaTimeout: 10800
+    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research build-markets --input "data/research/normalized" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/daily/$DATE/markets.json" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "data/research/normalized" --markets "data/research/daily/$DATE/markets.json" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "data/research/normalized" --markets "data/research/daily/$DATE/markets.json" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "data/research/normalized" --markets "data/research/daily/$DATE/markets.json" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/regimes.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; cp "reports/research/daily/$DATE/final_report.json" "reports/research/latest_daily_report.json"; cp "reports/research/daily/$DATE/final_report.md" "reports/research/latest_daily_report.md"'
+  }
+  {
+    id: 'prospective-validation'
+    name: 'polyedge-prospective-job'
+    triggerType: 'Schedule'
+    cron: '30 2 * * *'
+    replicaTimeout: 1800
+    command: 'polyedge-rs research validate-prospective --since "2026-06-14T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
+  }
+  {
+    id: 'replay-index'
+    name: 'polyedge-replay-index-job'
+    triggerType: 'Schedule'
+    cron: '0 3 * * *'
+    replicaTimeout: 7200
+    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); polyedge-rs research build-replay-index --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
+  }
+  {
+    id: 'backfill'
+    name: 'polyedge-backfill-job'
+    triggerType: 'Manual'
+    cron: ''
+    replicaTimeout: 10800
+    command: 'START=$BACKFILL_START; if [ -z "$START" ]; then START=2026-06-14; fi; END=$BACKFILL_END; if [ -z "$END" ]; then END=$START; fi; TASK=$BACKFILL_TASK; if [ -z "$TASK" ]; then TASK=all; fi; polyedge-rs research backfill --start "$START" --end "$END" --task "$TASK" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/backfill/$START-$END-$TASK.json" --markdown "reports/research/backfill/$START-$END-$TASK.md"'
+  }
+]
+var storageMetricAlerts = [
+  {
+    name: 'blob-ingress-zero-10m'
+    displayName: 'PolyEdge blob ingress zero for 10 minutes'
+    metricName: 'Ingress'
+    threshold: 0
+    operator: 'LessThanOrEqual'
+  }
+  {
+    name: 'blob-transactions-zero-10m'
+    displayName: 'PolyEdge blob transactions zero for 10 minutes'
+    metricName: 'Transactions'
+    threshold: 0
+    operator: 'LessThanOrEqual'
+  }
+]
+var logAlerts = [
+  {
+    name: 'missing-latest-blob'
+    displayName: 'PolyEdge no new latest blob'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-data-freshness-job" | where (Log_s has "status" and Log_s has "critical") or Log_s has "no new blob"'
+  }
+  {
+    name: 'tiny-blob-anomaly'
+    displayName: 'PolyEdge tiny blob anomaly'
+    severity: 1
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-data-freshness-job" | where Log_s has "tiny blob ratio" or (Log_s has "tiny_blob_ratio" and Log_s has "warning")'
+  }
+  {
+    name: 'recorder-failure'
+    displayName: 'PolyEdge recorder failure'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Log_s has "failed_total" or Log_s has "dropped_count" or Log_s has "worker_alive=false"'
+  }
+  {
+    name: 'research-job-failure'
+    displayName: 'PolyEdge research job failure'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job" | where Log_s has "error" or Log_s has "failed" or Log_s has "panicked"'
+  }
+]
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageName
@@ -118,6 +289,11 @@ resource marketCatalogTable 'Microsoft.Storage/storageAccounts/tableServices/tab
   name: marketTableName
 }
 
+resource labTables 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = [for tableName in labTableNames: {
+  parent: tableService
+  name: tableName
+}]
+
 resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: acrName
   location: location
@@ -130,11 +306,31 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   }
 }
 
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+  name: logAnalyticsWorkspaceName
+  location: location
+  tags: tags
+  properties: {
+    sku: {
+      name: 'PerGB2018'
+    }
+    retentionInDays: 30
+  }
+}
+
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: managedEnvironmentName
   location: location
   tags: tags
-  properties: {}
+  properties: {
+    appLogsConfiguration: {
+      destination: 'log-analytics'
+      logAnalyticsConfiguration: {
+        customerId: logAnalyticsWorkspace.properties.customerId
+        sharedKey: logAnalyticsWorkspace.listKeys().primarySharedKey
+      }
+    }
+  }
 }
 
 resource containerAppIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -337,6 +533,75 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobDefinitions: {
+  name: job.name
+  location: location
+  tags: union(tags, {
+    researchJob: job.id
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${containerAppIdentity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: union({
+      triggerType: job.triggerType
+      replicaRetryLimit: 1
+      replicaTimeout: job.replicaTimeout
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: containerAppIdentity.id
+        }
+      ]
+      secrets: [
+        {
+          name: 'api-bearer-token'
+          value: apiBearerToken
+        }
+        {
+          name: 'storage-account-key'
+          value: storage.listKeys().keys[0].value
+        }
+      ]
+    }, job.triggerType == 'Schedule' ? {
+      scheduleTriggerConfig: {
+        cronExpression: job.cron
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    } : {
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    })
+    template: {
+      containers: [
+        {
+          name: 'research-job'
+          image: image
+          command: [
+            '/bin/sh'
+            '-lc'
+          ]
+          args: [
+            job.command
+          ]
+          env: jobCommonEnv
+          resources: {
+            cpu: json(cpu)
+            memory: memory
+          }
+        }
+      ]
+    }
+  }
+}]
+
 resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, containerAppIdentity.id, 'blob-data-contributor')
   scope: storage
@@ -367,13 +632,132 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = if (alertingEnabled) {
+  name: '${containerAppName}-research-alerts'
+  location: 'global'
+  tags: tags
+  properties: {
+    groupShortName: 'polyedge'
+    enabled: true
+    emailReceivers: !empty(alertEmailAddress) ? [
+      {
+        name: 'polyedge-operator-email'
+        emailAddress: alertEmailAddress
+        useCommonAlertSchema: true
+      }
+    ] : []
+    webhookReceivers: !empty(alertWebhookUri) ? [
+      {
+        name: 'polyedge-automation-webhook'
+        serviceUri: alertWebhookUri
+        useCommonAlertSchema: true
+      }
+    ] : []
+  }
+}
+
+resource storageMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = [for alert in storageMetricAlerts: if (alertingEnabled) {
+  name: '${containerAppName}-${alert.name}'
+  location: 'global'
+  tags: tags
+  properties: {
+    description: alert.displayName
+    severity: 1
+    enabled: true
+    scopes: [
+      storage.id
+    ]
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT10M'
+    autoMitigate: false
+    targetResourceType: 'Microsoft.Storage/storageAccounts'
+    targetResourceRegion: location
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: alert.metricName
+          metricName: alert.metricName
+          metricNamespace: 'Microsoft.Storage/storageAccounts'
+          operator: alert.operator
+          threshold: alert.threshold
+          timeAggregation: 'Total'
+          criterionType: 'StaticThresholdCriterion'
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: actionGroup.id
+        webHookProperties: {
+          environment: environmentName
+          storage_account: storage.name
+          container: storageContainerName
+          recommended_action: 'Check PolyEdge data freshness and recorder status.'
+        }
+      }
+    ]
+  }
+}]
+
+resource logAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = [for alert in logAlerts: if (alertingEnabled) {
+  name: '${containerAppName}-${alert.name}'
+  location: location
+  kind: 'LogAlert'
+  tags: tags
+  properties: {
+    displayName: alert.displayName
+    description: alert.displayName
+    severity: alert.severity
+    enabled: true
+    scopes: [
+      logAnalyticsWorkspace.id
+    ]
+    evaluationFrequency: 'PT5M'
+    windowSize: 'PT10M'
+    autoMitigate: false
+    criteria: {
+      allOf: [
+        {
+          query: alert.query
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        actionGroup.id
+      ]
+      customProperties: {
+        environment: environmentName
+        storage_account: storage.name
+        container: storageContainerName
+        latest_blob: 'see freshness job output'
+        latest_blob_last_modified: 'see freshness job output'
+        latest_blob_size: 'see freshness job output'
+        job_execution_id: 'see Container Apps job execution'
+        recommended_action: 'Open the PolyEdge Data Quality and Job Monitor pages before trusting research output.'
+      }
+    }
+  }
+}]
+
 output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
 output containerAppName string = containerApp.name
 output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
 output containerAppIdentityName string = containerAppIdentity.name
+output logAnalyticsWorkspaceName string = logAnalyticsWorkspace.name
 output storageAccountName string = storage.name
 output storageContainerName string = storageContainerName
 output storageTableName string = storageTableName
 output chartTableName string = chartTableName
 output marketTableName string = marketTableName
+output labTableNames array = labTableNames
+output researchJobNames array = [for job in researchJobDefinitions: job.name]

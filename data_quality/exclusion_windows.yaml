@@ -1,0 +1,12 @@
+version: 1
+updated_at: "2026-06-14T00:00:00Z"
+windows:
+  - id: "azure-put-bug-2026-06-11"
+    start: "2026-06-11T10:00:00Z"
+    end: "2026-06-12T22:00:00Z"
+    reason: "Azure PUT bug: tiny/incomplete blobs"
+    evidence:
+      - "events/2026/06/11/11 had mostly tiny blobs"
+      - "events/2026/06/12/08-21 had many <=600B or <=5000B blobs"
+      - "recovered at 2026-06-12T22:00:00Z"
+    default_exclude: true

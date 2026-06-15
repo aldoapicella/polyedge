@@ -18,6 +18,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 mod history;
+mod labs;
 mod runtime;
 use history::{
     empty_chart, historical_detail, max_historical_markets, merge_chart_payloads,
@@ -74,6 +75,7 @@ pub fn app(settings: RuntimeSettings) -> Router {
         .route("/api/v1/reports/latest", get(latest_report))
         .route("/api/v1/reports/daily/:date", get(daily_report))
         .route("/api/v1/reports/:job_id", get(report_job))
+        .nest("/api/v1/labs", labs::router())
         .route("/api/v1/control/pause", post(pause))
         .route("/api/v1/control/resume", post(resume))
         .route("/api/v1/control/kill-switch", post(kill_switch))
@@ -488,6 +490,11 @@ pub fn smoke_paths() -> Vec<&'static str> {
         "/api/v1/events/recent",
         "/api/v1/pnl",
         "/api/v1/reports/latest",
+        "/api/v1/labs/data-quality/latest",
+        "/api/v1/labs/data-quality/exclusions",
+        "/api/v1/labs/reports/latest",
+        "/api/v1/labs/jobs",
+        "/api/v1/labs/prospective",
         "/api/v1/config/current",
     ]
 }

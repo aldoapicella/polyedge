@@ -22,6 +22,16 @@ use std::thread;
 use std::time::Instant;
 use thiserror::Error;
 
+mod labs;
+pub use labs::{
+    load_default_exclusions, load_exclusion_registry, load_frozen_candidate_registry,
+    run_azure_freshness, run_backfill, run_build_replay_index, run_validate_prospective,
+    AzureFreshnessOptions, BackfillOptions, ExclusionRegistry, ExclusionWindowRecord,
+    FrozenCandidateRecord, FrozenCandidateRegistry, ProspectiveValidationOptions,
+    ReplayIndexOptions, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES,
+};
+
 const SETTLEMENT_WINDOW_SECONDS: i64 = 15;
 const MAX_DUPLICATE_HASHES: usize = 100_000;
 const MAX_STREAM_WARNINGS: usize = 1_000;
@@ -1241,13 +1251,14 @@ fn stream_azure_events<F>(
 where
     F: FnMut(&EventLine),
 {
-    let sas = std::env::var(&source.sas_env).map_err(|_| {
-        ResearchError::Azure(format!(
-            "{} must contain a read/list SAS token for azure input",
-            source.sas_env
-        ))
-    })?;
-    let client = AzureBlobClient::new(&source.account, &source.container, sas);
+    let mut client = match std::env::var(&source.sas_env) {
+        Ok(sas) => AzureBlobClient::new(&source.account, &source.container, sas),
+        Err(_) => AzureBlobClient::with_managed_identity(
+            &source.account,
+            &source.container,
+            std::env::var("AZURE_CLIENT_ID").ok(),
+        ),
+    };
     let blobs = client
         .list_blobs(&source.prefix, source.max_blobs, source.max_bytes)
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
@@ -1310,7 +1321,7 @@ where
     let job_rx = Arc::new(Mutex::new(job_rx));
     let mut handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
-        let worker_client = client.clone();
+        let mut worker_client = client.clone();
         let worker_job_rx = Arc::clone(&job_rx);
         let worker_result_tx = result_tx.clone();
         handles.push(thread::spawn(move || {

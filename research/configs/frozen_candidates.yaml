@@ -1,0 +1,27 @@
+version: 1
+updated_at: "2026-06-14T00:00:00Z"
+research_only: true
+paper_only: true
+enabled_by_default: false
+selection_rule: "Frozen candidates only; no test-day re-ranking, parameter search, or live promotion."
+candidates:
+  - name: "static_baseline"
+    profile: "static"
+    enabled_by_default: false
+    deployment_allowed: false
+    notes: "Current static maker-first baseline; tracked as the control."
+  - name: "dynamic_quote_style"
+    profile: "dynamic_quote_style"
+    enabled_by_default: false
+    deployment_allowed: false
+    notes: "Promising historical research candidate; requires future clean out-of-sample validation."
+  - name: "full_deterministic_profile"
+    profile: "full_deterministic_profile"
+    enabled_by_default: false
+    deployment_allowed: false
+    notes: "Deterministic adaptive profile tracked for comparison only."
+  - name: "dynamic_safety_only"
+    profile: "dynamic_safety_only"
+    enabled_by_default: false
+    deployment_allowed: false
+    notes: "Safety-only dynamic profile tracked for prospective comparison."
