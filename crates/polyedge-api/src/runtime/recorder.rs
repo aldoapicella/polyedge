@@ -61,6 +61,22 @@ impl RuntimeRecorder {
         }
     }
 
+    pub(super) fn flush(&mut self) -> Result<(), String> {
+        let mut last_error = None;
+        for recorder in &mut self.recorders {
+            if let Err(error) = recorder.flush() {
+                self.error_count += 1;
+                last_error = Some(error.to_string());
+            }
+        }
+        if let Some(error) = last_error {
+            self.last_error = Some(error.clone());
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn status(&self, busy: bool) -> Value {
         json!({
             "type": "composite",

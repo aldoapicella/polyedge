@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, thread};
 use thiserror::Error;
+use tracing::warn;
 
 const AZURE_BLOB_API_VERSION: &str = "2023-11-03";
 const AZURE_BLOB_MAX_ATTEMPTS: usize = 5;
@@ -55,6 +56,10 @@ pub trait EventRecorder {
         for event in events {
             self.record(event)?;
         }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
 }
@@ -114,6 +119,7 @@ pub struct AzureAppendBlobRecorder {
     agent: ureq::Agent,
     token: ManagedIdentityToken,
     known_append_blobs: BTreeSet<String>,
+    pending_append_blocks: BufferedAppendBlocks,
 }
 
 impl AzureAppendBlobRecorder {
@@ -132,10 +138,11 @@ impl AzureAppendBlobRecorder {
                 .build(),
             token: ManagedIdentityToken::new(client_id),
             known_append_blobs: BTreeSet::new(),
+            pending_append_blocks: BufferedAppendBlocks::new(AZURE_APPEND_BLOCK_TARGET_BYTES),
         }
     }
 
-    fn append_line(&mut self, blob_name: &str, line: &[u8]) -> Result<(), AzureBlobError> {
+    fn append_block(&mut self, blob_name: &str, block: &[u8]) -> Result<(), AzureBlobError> {
         self.ensure_append_blob(blob_name)?;
         let url = self.blob_url(blob_name, Some("comp=appendblock"));
         let token = self.token.access_token(&self.agent)?;
@@ -146,7 +153,7 @@ impl AzureAppendBlobRecorder {
             .set("x-ms-version", AZURE_BLOB_API_VERSION)
             .set("x-ms-date", &rfc1123_now())
             .set("content-type", "application/octet-stream")
-            .send_bytes(line)
+            .send_bytes(block)
         {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
@@ -213,6 +220,25 @@ impl AzureAppendBlobRecorder {
         }
         url
     }
+
+    fn append_ready_blocks<I>(&mut self, blocks: I) -> Result<(), AzureBlobError>
+    where
+        I: IntoIterator<Item = (String, Vec<u8>)>,
+    {
+        let mut blocks = blocks.into_iter();
+        while let Some((blob_name, block)) = blocks.next() {
+            if let Err(error) = self.append_block(&blob_name, &block) {
+                let remaining: Vec<_> = blocks.collect();
+                for (remaining_blob, remaining_block) in remaining.into_iter().rev() {
+                    self.pending_append_blocks
+                        .prepend_chunk(remaining_blob, remaining_block);
+                }
+                self.pending_append_blocks.prepend_chunk(blob_name, block);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl EventRecorder for AzureAppendBlobRecorder {
@@ -224,37 +250,104 @@ impl EventRecorder for AzureAppendBlobRecorder {
         if events.is_empty() {
             return Ok(());
         }
-        let mut batches = BTreeMap::<String, Vec<Vec<u8>>>::new();
+        let mut ready_blocks = Vec::new();
         for event in events {
-            append_event_line_chunk(
-                batches.entry(event_blob_name(event)).or_default(),
-                jsonl_event_line(event)?,
-                AZURE_APPEND_BLOCK_TARGET_BYTES,
+            ready_blocks.extend(
+                self.pending_append_blocks
+                    .push_line(&event_blob_name(event), jsonl_event_line(event)?),
             );
         }
-        for (blob_name, chunks) in batches {
-            for chunk in chunks {
-                self.append_line(&blob_name, &chunk)?;
-            }
-        }
+        self.append_ready_blocks(ready_blocks)?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), StorageError> {
+        let blocks = self.pending_append_blocks.drain();
+        self.append_ready_blocks(blocks)?;
         Ok(())
     }
 }
 
-fn append_event_line_chunk(chunks: &mut Vec<Vec<u8>>, line: Vec<u8>, max_bytes: usize) {
-    if line.is_empty() {
-        return;
+impl Drop for AzureAppendBlobRecorder {
+    fn drop(&mut self) {
+        if self.pending_append_blocks.pending_bytes() == 0 {
+            return;
+        }
+        if let Err(error) = self.flush() {
+            warn!("failed to flush Azure append blob recorder on drop: {error}");
+        }
     }
-    if chunks
-        .last()
-        .is_none_or(|chunk| !chunk.is_empty() && chunk.len() + line.len() > max_bytes)
-    {
-        chunks.push(Vec::new());
+}
+
+#[derive(Clone, Debug)]
+struct BufferedAppendBlocks {
+    max_bytes: usize,
+    pending: BTreeMap<String, Vec<u8>>,
+}
+
+impl BufferedAppendBlocks {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes: max_bytes.max(1),
+            pending: BTreeMap::new(),
+        }
     }
-    chunks
-        .last_mut()
-        .expect("append chunk is created before use")
-        .extend(line);
+
+    fn push_line(&mut self, blob_name: &str, line: Vec<u8>) -> Vec<(String, Vec<u8>)> {
+        if line.is_empty() {
+            return Vec::new();
+        }
+        let blob_name = blob_name.to_owned();
+        let mut ready = Vec::new();
+
+        if line.len() >= self.max_bytes {
+            self.push_pending_if_any(&blob_name, &mut ready);
+            ready.push((blob_name, line));
+            return ready;
+        }
+
+        let pending_len = self.pending.get(&blob_name).map_or(0, Vec::len);
+        if pending_len > 0 && pending_len + line.len() > self.max_bytes {
+            self.push_pending_if_any(&blob_name, &mut ready);
+        }
+
+        let current = self.pending.entry(blob_name.clone()).or_default();
+        current.extend(line);
+        if current.len() >= self.max_bytes {
+            self.push_pending_if_any(&blob_name, &mut ready);
+        }
+        ready
+    }
+
+    fn drain(&mut self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter(|(_, chunk)| !chunk.is_empty())
+            .collect()
+    }
+
+    fn prepend_chunk(&mut self, blob_name: String, chunk: Vec<u8>) {
+        if chunk.is_empty() {
+            return;
+        }
+        let pending = self.pending.remove(&blob_name).unwrap_or_default();
+        let mut merged = Vec::with_capacity(chunk.len() + pending.len());
+        merged.extend(chunk);
+        merged.extend(pending);
+        self.pending.insert(blob_name, merged);
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending.values().map(Vec::len).sum()
+    }
+
+    fn push_pending_if_any(&mut self, blob_name: &str, ready: &mut Vec<(String, Vec<u8>)>) {
+        if let Some(chunk) = self.pending.remove(blob_name) {
+            if !chunk.is_empty() {
+                ready.push((blob_name.to_owned(), chunk));
+            }
+        }
+    }
 }
 
 fn event_blob_name(event: &RuntimeEvent) -> String {
@@ -1001,7 +1094,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn append_event_line_chunk_preserves_lines_and_caps_chunks() {
+    fn buffered_append_blocks_preserves_lines_and_caps_chunks() {
         let events: Vec<_> = (0..5)
             .map(|index| RuntimeEvent {
                 event_type: "book".to_owned(),
@@ -1012,19 +1105,58 @@ mod tests {
                 }),
             })
             .collect();
+        let mut buffer = BufferedAppendBlocks::new(220);
         let mut chunks = Vec::new();
         for event in &events {
-            append_event_line_chunk(&mut chunks, jsonl_event_line(event).unwrap(), 220);
+            chunks.extend(buffer.push_line(
+                "events/2026/06/14/12/events.jsonl",
+                jsonl_event_line(event).unwrap(),
+            ));
         }
+        chunks.extend(buffer.drain());
 
         assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|chunk| chunk.len() <= 220));
-        let joined = chunks.concat();
+        assert!(chunks.iter().all(|(_, chunk)| chunk.len() <= 220));
+        let joined: Vec<_> = chunks.into_iter().flat_map(|(_, chunk)| chunk).collect();
         let lines = String::from_utf8(joined).unwrap();
         assert_eq!(lines.lines().count(), events.len());
         for line in lines.lines() {
             let value: Value = serde_json::from_str(line).unwrap();
             assert_eq!(value["event_type"], "book");
         }
+    }
+
+    #[test]
+    fn buffered_append_blocks_keeps_blobs_separate_until_flush() {
+        let mut buffer = BufferedAppendBlocks::new(1_024);
+        assert!(buffer
+            .push_line("events/2026/06/14/12/events.jsonl", b"{\"a\":1}\n".to_vec())
+            .is_empty());
+        assert!(buffer
+            .push_line("events/2026/06/14/13/events.jsonl", b"{\"b\":2}\n".to_vec())
+            .is_empty());
+
+        let chunks = buffer.drain();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].0, "events/2026/06/14/12/events.jsonl");
+        assert_eq!(chunks[0].1, b"{\"a\":1}\n");
+        assert_eq!(chunks[1].0, "events/2026/06/14/13/events.jsonl");
+        assert_eq!(chunks[1].1, b"{\"b\":2}\n");
+    }
+
+    #[test]
+    fn buffered_append_blocks_requeues_failed_block_before_pending_data() {
+        let mut buffer = BufferedAppendBlocks::new(1_024);
+        buffer.prepend_chunk(
+            "events/2026/06/14/12/events.jsonl".to_owned(),
+            b"failed\n".to_vec(),
+        );
+        assert!(buffer
+            .push_line("events/2026/06/14/12/events.jsonl", b"pending\n".to_vec())
+            .is_empty());
+
+        let chunks = buffer.drain();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1, b"failed\npending\n");
     }
 }

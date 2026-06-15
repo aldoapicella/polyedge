@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -36,6 +36,7 @@ const RECENT_LIMIT: usize = 1_000;
 const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
 const RECORDER_BATCH_LIMIT: usize = 500;
+const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct RuntimeController {
@@ -974,7 +975,20 @@ fn spawn_recorder_worker(
     if let Err(error) = std::thread::Builder::new()
         .name("polyedge-recorder".to_owned())
         .spawn(move || {
-            while let Ok(event) = receiver.recv() {
+            let mut last_flush = Instant::now();
+            loop {
+                let event = match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
+                    Ok(event) => event,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        flush_runtime_recorder(&recorder);
+                        last_flush = Instant::now();
+                        continue;
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        flush_runtime_recorder(&recorder);
+                        break;
+                    }
+                };
                 let mut batch = vec![event];
                 while batch.len() < RECORDER_BATCH_LIMIT {
                     match receiver.try_recv() {
@@ -1008,10 +1022,25 @@ fn spawn_recorder_worker(
                         warn!("runtime recorder failed: {error}");
                     }
                 }
+                if last_flush.elapsed() >= RECORDER_FLUSH_INTERVAL {
+                    flush_runtime_recorder(&recorder);
+                    last_flush = Instant::now();
+                }
             }
         })
     {
         warn!("failed to start runtime recorder worker: {error}");
+    }
+}
+
+fn flush_runtime_recorder(recorder: &Arc<StdMutex<RuntimeRecorder>>) {
+    match recorder.lock() {
+        Ok(mut recorder) => {
+            if let Err(error) = recorder.flush() {
+                warn!("runtime recorder flush failed: {error}");
+            }
+        }
+        Err(error) => warn!("runtime recorder lock poisoned during flush: {error}"),
     }
 }
 
