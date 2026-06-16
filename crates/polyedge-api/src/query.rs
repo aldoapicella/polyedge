@@ -477,7 +477,7 @@ fn visit_records(value: &Value, visit: &mut impl FnMut(&serde_json::Map<String, 
 fn artifact_rows() -> Vec<Value> {
     let mut rows = Vec::new();
     collect_artifacts(Path::new(REPORT_ROOT), &mut rows);
-    rows.sort_by(|left, right| string_at(left, "path").cmp(&string_at(right, "path")));
+    rows.sort_by_key(|row| string_at(row, "path"));
     rows.truncate(MAX_LIMIT);
     rows
 }
