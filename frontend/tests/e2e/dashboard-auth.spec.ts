@@ -23,19 +23,17 @@ test("owner login unlocks dashboard and q lines draw before midpoint", async ({ 
   await expect(page.getByText("q 4", { exact: true })).toBeVisible();
   await expect(page.getByText("missing UP/DOWN book")).toBeVisible();
 
+  await page.locator('path.recharts-line-curve[name="q Up"]').first().waitFor({ state: "attached" });
   const qPathStartsBeforeMidpoint = await page.evaluate(() => {
-    const chart = document.querySelector(".recharts-wrapper");
-    if (!chart) {
-      return false;
-    }
-    const chartWidth = chart.getBoundingClientRect().width;
-    const qPath = Array.from(chart.querySelectorAll("path.recharts-line-curve")).find(
-      (path) => path.getAttribute("name") === "q Up"
-    );
-    if (!qPath) {
-      return false;
-    }
-    return qPath.getBoundingClientRect().left - chart.getBoundingClientRect().left < chartWidth / 2;
+    return Array.from(document.querySelectorAll('path.recharts-line-curve[name="q Up"]')).some((qPath) => {
+      const chart = qPath.closest(".recharts-wrapper");
+      if (!chart || !qPath.getAttribute("d")?.startsWith("M")) {
+        return false;
+      }
+      const chartWidth = chart.getBoundingClientRect().width;
+      const qPathRect = qPath.getBoundingClientRect();
+      return qPathRect.width > 0 && qPathRect.left - chart.getBoundingClientRect().left < chartWidth / 2;
+    });
   });
   expect(qPathStartsBeforeMidpoint).toBe(true);
   expect(consoleErrors).toEqual([]);
@@ -57,10 +55,16 @@ test("research pages render without console errors", async ({ page }) => {
   }
   await page.goto("/labs");
   await page.getByRole("button", { name: "Regime Profiles" }).click();
-  await expect(page.getByText("normal: 4, volatile: 1")).toBeVisible();
+  await expect(page.getByRole("cell", { name: "static", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "dynamic_safety_only", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "dynamic_quote_style", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "full_deterministic_profile", exact: true })).toBeVisible();
+  await expect(page.getByRole("cell", { name: "normal: 4, volatile: 1", exact: true })).toHaveCount(4);
+  await expect(page.getByText("nested-detail-only")).toHaveCount(0);
+  await expect(page.getByRole("cell", { name: "2156", exact: true })).toHaveCount(2);
   await expect(page.getByText("[object Object]")).toHaveCount(0);
   await page.goto("/jobs");
-  await expect(page.getByRole("button", { name: "Backfill" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Manual Backfill", exact: true })).toBeDisabled();
   expect(consoleErrors).toEqual([]);
 });
 
@@ -195,15 +199,67 @@ async function installApiMocks(page: Page) {
         date: "2026-06-14",
         report: {
           result: {
-            rows: [
+            comparisons: [
               {
                 profile: "static",
                 net_pnl: "-13.35",
                 delta_vs_static: "0.00",
                 regime_frequency: { normal: 4, volatile: 1 },
-                regime_time_share: { normal: "80%", volatile: "20%" },
+                regime_time_share: { normal: "80%", volatile: "20%" }
+              },
+              {
+                profile: "dynamic_safety_only",
+                net_pnl: "-7.10",
+                delta_vs_static: "6.25",
+                regime_frequency: { normal: 4, volatile: 1 },
+                regime_time_share: { normal: "80%", volatile: "20%" }
+              },
+              {
+                profile: "dynamic_quote_style",
+                net_pnl: "1.20",
+                delta_vs_static: "14.55",
+                regime_frequency: { normal: 4, volatile: 1 },
+                regime_time_share: { normal: "80%", volatile: "20%" }
+              },
+              {
+                profile: "full_deterministic_profile",
+                net_pnl: "-2.50",
+                delta_vs_static: "10.85",
+                regime_frequency: { normal: 4, volatile: 1 },
+                regime_time_share: { normal: "80%", volatile: "20%" }
+              }
+            ],
+            profiles: [
+              {
+                profile: "static",
                 fills: 440,
-                cancels: 73
+                cancels: 73,
+                skipped_by_profile: 0,
+                market_results: [
+                  {
+                    market_id: "nested-detail-only",
+                    market_slug: "nested-detail-only",
+                    net_pnl: "999.99"
+                  }
+                ]
+              },
+              {
+                profile: "dynamic_safety_only",
+                fills: 220,
+                cancels: 31,
+                skipped_by_profile: 2156
+              },
+              {
+                profile: "dynamic_quote_style",
+                fills: 218,
+                cancels: 34,
+                skipped_by_profile: 2156
+              },
+              {
+                profile: "full_deterministic_profile",
+                fills: 205,
+                cancels: 29,
+                skipped_by_profile: 2334
               }
             ]
           }

@@ -17,6 +17,7 @@ import {
 import { getLabArtifact, getLabArtifacts, getLabProspective, getLabSampleSizeLatest, getLatestLabReport } from "@/lib/api";
 import type { JsonRecord, LabArtifact, LabArtifactPayload, LabReportBundle, ProspectiveValidationRow } from "@/lib/types";
 import { compact, dateTime, numberText } from "@/lib/format";
+import { selectFillModelSummaryRows, selectRegimeProfileRows } from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
 export function ReportsPage() {
@@ -200,16 +201,40 @@ function reportCards(bundle?: LabReportBundle, sampleReport?: JsonRecord | null)
   const report = asRecord(bundle?.report);
   const sample = asRecord(sampleReport ?? bundle?.sample_size);
   const recommendation =
-    text(findDeep(report, "recommendation")) ??
-    text(pointer(report, "/result/executive_summary/recommendation")) ??
+    text(firstPointer(report, [
+      "/result/executive_summary/recommendation",
+      "/result/recommendation",
+      "/recommendation"
+    ])) ??
     "collecting";
   const fillModels = fillModelRows(bundle);
   const staticModel = fillModels.find((row) => row.fill_model === "touch_after_250ms") ?? fillModels[0];
   const dynamic = profileNet(bundle, "dynamic_quote_style");
-  const cleanMarkets = findDeep(report, "complete_for_simulation") ?? findDeep(report, "settled_markets");
-  const ciLow = pointer(sample, "/result/statistics/ci_low") ?? findDeep(sample, "ci_low");
-  const ciHigh = pointer(sample, "/result/statistics/ci_high") ?? findDeep(sample, "ci_high");
-  const quality = text(findDeep(bundle?.audit, "status")) ?? text(findDeep(report, "data_quality_status")) ?? "unknown";
+  const cleanMarkets = firstPointer(report, [
+    "/result/executive_summary/complete_for_simulation",
+    "/result/executive_summary/settled_markets",
+    "/result/statistical_evidence/result/statistics/n",
+    "/result/statistics/n",
+    "/summary/settled_markets"
+  ]);
+  const ciLow = firstPointer(sample, [
+    "/result/statistics/ci_low",
+    "/statistics/ci_low",
+    "/sample_size/result/statistics/ci_low"
+  ]);
+  const ciHigh = firstPointer(sample, [
+    "/result/statistics/ci_high",
+    "/statistics/ci_high",
+    "/sample_size/result/statistics/ci_high"
+  ]);
+  const quality =
+    text(firstPointer(asRecord(bundle?.audit), ["/status", "/result/status"])) ??
+    text(firstPointer(report, [
+      "/result/executive_summary/data_quality_status",
+      "/result/data_quality_status",
+      "/data_quality_status"
+    ])) ??
+    "unknown";
   return [
     { label: "Recommendation", value: recommendation, meta: "research", tone: "neutral" as const },
     { label: "Static Net PnL", value: numberText(staticModel?.net_pnl), meta: "touch_after_250ms" },
@@ -222,8 +247,7 @@ function reportCards(bundle?: LabReportBundle, sampleReport?: JsonRecord | null)
 
 function fillModelRows(bundle?: LabReportBundle) {
   const source = bundle?.baseline ?? bundle?.report ?? {};
-  const rows = findRows(asRecord(source), "fill_model");
-  return rows
+  return selectFillModelSummaryRows(source)
     .map((row) => ({
       fill_model: text(row.fill_model) ?? "unknown",
       net_pnl: number(row.net_pnl),
@@ -234,7 +258,7 @@ function fillModelRows(bundle?: LabReportBundle) {
 }
 
 function profileNet(bundle: LabReportBundle | undefined, profile: string) {
-  const rows = findRows(asRecord(bundle?.regimes ?? bundle?.report), "profile");
+  const rows = selectRegimeProfileRows(bundle?.regimes ?? bundle?.report);
   return rows.find((row) => text(row.profile) === profile)?.net_pnl ?? null;
 }
 
@@ -260,42 +284,6 @@ function summaryRows(report: JsonRecord): [string, unknown][] {
   return rows.filter(([, value]) => value !== undefined);
 }
 
-function findRows(value: JsonRecord | null | undefined, key: string): JsonRecord[] {
-  if (!value) {
-    return [];
-  }
-  const rows: JsonRecord[] = [];
-  visit(value, (record) => {
-    if (record[key] !== undefined) {
-      rows.push(record);
-    }
-  });
-  return rows;
-}
-
-function findDeep(value: unknown, key: string): unknown {
-  let found: unknown;
-  visit(value, (record) => {
-    if (found === undefined && record[key] !== undefined) {
-      found = record[key];
-    }
-  });
-  return found;
-}
-
-function visit(value: unknown, fn: (record: JsonRecord) => void) {
-  if (Array.isArray(value)) {
-    value.forEach((item) => visit(item, fn));
-    return;
-  }
-  const record = asRecord(value);
-  if (!record) {
-    return;
-  }
-  fn(record);
-  Object.values(record).forEach((child) => visit(child, fn));
-}
-
 function pointer(record: JsonRecord | null | undefined, path: string): unknown {
   if (!record) {
     return undefined;
@@ -304,6 +292,16 @@ function pointer(record: JsonRecord | null | undefined, path: string): unknown {
     .split("/")
     .slice(1)
     .reduce<unknown>((current, key) => asRecord(current)?.[key], record);
+}
+
+function firstPointer(record: JsonRecord | null | undefined, paths: string[]): unknown {
+  for (const path of paths) {
+    const value = pointer(record, path);
+    if (value !== undefined && value !== null && value !== "") {
+      return value;
+    }
+  }
+  return undefined;
 }
 
 function asRecord(value: unknown): JsonRecord | null {

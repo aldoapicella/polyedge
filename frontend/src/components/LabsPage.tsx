@@ -18,6 +18,15 @@ import {
 } from "@/lib/api";
 import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow } from "@/lib/types";
 import { compact, numberText } from "@/lib/format";
+import {
+  CALIBRATION_COLUMNS,
+  FILL_MODEL_COLUMNS,
+  REGIME_PROFILE_COLUMNS,
+  type ReportColumn,
+  selectCalibrationBucketRows,
+  selectFillModelSummaryRows,
+  selectRegimeProfileRows
+} from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
 const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "Sample Size", "Artifacts"] as const;
@@ -72,24 +81,27 @@ export function LabsPage() {
         <ReportWithExplanation
           title="Regime Profiles"
           answer="Shows which regimes lose money, produce fills, trigger cancels, or are skipped before any strategy change is considered."
-          report={regimes.data?.report}
-          keys={["profile", "net_pnl", "delta_vs_static", "regime_frequency", "regime_time_share", "fills", "cancels", "skipped_orders"]}
+          rows={selectRegimeProfileRows(regimes.data?.report)}
+          columns={REGIME_PROFILE_COLUMNS}
+          emptyLabel="No top-level regime comparison/profile summary found. Nested market_results stay in artifact drilldowns instead of the summary table."
         />
       ) : null}
       {tab === "Calibration" ? (
         <ReportWithExplanation
           title="Calibration"
           answer="Compares predicted q_up with observed outcomes, highlighting overconfidence by probability bucket, expiry, and distance when reported."
-          report={calibration.data?.report}
-          keys={["q_bucket", "decision_count", "avg_q_up", "observed_up_frequency", "calibration_error", "brier_score"]}
+          rows={selectCalibrationBucketRows(calibration.data?.report)}
+          columns={CALIBRATION_COLUMNS}
+          emptyLabel="No calibration bucket summary found. Grouped drilldowns may exist in the artifact, but they are not mixed into this top-level table."
         />
       ) : null}
       {tab === "Fill Models" ? (
         <ReportWithExplanation
           title="Fill Models"
           answer="Checks whether candidate PnL survives less optimistic paper fill assumptions before a recommendation is trusted."
-          report={fillModels.data?.report}
-          keys={["fill_model", "net_pnl", "max_drawdown", "fills", "fill_rate", "cancel_fill_ratio", "queue_proxy"]}
+          rows={selectFillModelSummaryRows(fillModels.data?.report)}
+          columns={FILL_MODEL_COLUMNS}
+          emptyLabel="No fill-model summary rows found. Per-market replay rows stay in artifact drilldowns instead of this summary table."
         />
       ) : null}
       {tab === "Sample Size" ? <SampleSizePanel report={sampleSize.data?.report} /> : null}
@@ -201,14 +213,26 @@ function ProspectiveTable({ rows, loading }: { rows: ProspectiveValidationRow[];
   );
 }
 
-function ReportWithExplanation({ title, answer, report, keys }: { title: string; answer: string; report?: JsonRecord | null; keys: string[] }) {
+function ReportWithExplanation({
+  title,
+  answer,
+  rows,
+  columns,
+  emptyLabel
+}: {
+  title: string;
+  answer: string;
+  rows: JsonRecord[];
+  columns: ReportColumn[];
+  emptyLabel: string;
+}) {
   return (
     <div className="space-y-5">
       <Panel>
         <PanelHeader title={`${title} Evidence`} meta="recommendation context" />
         <div className="p-4 text-sm leading-relaxed text-ink/70">{answer}</div>
       </Panel>
-      <GenericReport title={title} report={report} keys={keys} />
+      <GenericReport title={title} rows={rows} columns={columns} emptyLabel={emptyLabel} />
     </div>
   );
 }
@@ -444,8 +468,17 @@ function numeric(value: unknown) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function GenericReport({ title, report, keys }: { title: string; report?: JsonRecord | null; keys: string[] }) {
-  const rows = findRows(report, keys);
+function GenericReport({
+  title,
+  rows,
+  columns,
+  emptyLabel
+}: {
+  title: string;
+  rows: JsonRecord[];
+  columns: ReportColumn[];
+  emptyLabel: string;
+}) {
   return (
     <Panel>
       <PanelHeader title={title} meta={`${rows.length} rows`} />
@@ -453,19 +486,19 @@ function GenericReport({ title, report, keys }: { title: string; report?: JsonRe
         <div className="overflow-auto">
           <table className="w-full min-w-[760px] text-left text-sm">
             <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
-              <tr>{keys.map((key) => <th key={key} className="px-3 py-2">{key}</th>)}</tr>
+              <tr>{columns.map((column) => <th key={column.key} className="px-3 py-2">{column.label}</th>)}</tr>
             </thead>
             <tbody>
               {rows.slice(0, 100).map((row, index) => (
                 <tr key={index} className="border-b border-line last:border-b-0">
-                  {keys.map((key) => <td key={key} className="px-3 py-2">{compact(row[key])}</td>)}
+                  {columns.map((column) => <td key={column.key} className="px-3 py-2">{compact(row[column.key])}</td>)}
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       ) : (
-        <EmptyState label="No report rows found" />
+        <EmptyState label={emptyLabel} />
       )}
     </Panel>
   );
@@ -584,29 +617,6 @@ function candidateRows(value: unknown): JsonRecord[] {
 
 function fallbackCandidates(): JsonRecord[] {
   return ["static_baseline", "dynamic_quote_style", "full_deterministic_profile", "dynamic_safety_only"].map((name) => ({ name, profile: name }));
-}
-
-function findRows(value: unknown, keys: string[]): JsonRecord[] {
-  const rows: JsonRecord[] = [];
-  visit(value, (record) => {
-    if (keys.some((key) => record[key] !== undefined)) {
-      rows.push(record);
-    }
-  });
-  return rows;
-}
-
-function visit(value: unknown, fn: (record: JsonRecord) => void) {
-  if (Array.isArray(value)) {
-    value.forEach((item) => visit(item, fn));
-    return;
-  }
-  const record = asRecord(value);
-  if (!record) {
-    return;
-  }
-  fn(record);
-  Object.values(record).forEach((child) => visit(child, fn));
 }
 
 function pointer(record: unknown, path: string): unknown {
