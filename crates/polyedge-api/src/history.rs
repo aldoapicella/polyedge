@@ -86,20 +86,21 @@ impl MarketHistoryStore {
                 .filter_map(chart_point_from_entity)
                 .collect::<Vec<_>>();
             points.sort_by_key(|point| point_bucket(point).unwrap_or(0));
-            let stored_count = points.len();
-            filter_chart_range(&mut points, &range);
             let market = market_from_catalog_entity(&entity);
-            let domain = market
-                .as_ref()
-                .and_then(market_domain)
-                .or_else(|| point_domain(&points));
+            let market_domain = market.as_ref().and_then(market_domain);
+            if let Some((start_ms, end_ms)) = market_domain.as_ref().and_then(chart_domain_bounds) {
+                filter_chart_market_window(&mut points, start_ms, end_ms);
+            }
+            let sample_count = points.len();
+            filter_chart_range(&mut points, &range);
+            let domain = market_domain.or_else(|| point_domain(&points));
             Ok(Some(json!({
                 "source": "azure_table",
                 "market_id": market_id,
                 "range": range,
                 "points": points,
                 "domain": domain,
-                "summary": chart_summary(&points, stored_count, Some(json!(partition_key)))
+                "summary": chart_summary(&points, sample_count, Some(json!(partition_key)))
             })))
         })
         .await
@@ -193,15 +194,16 @@ pub fn merge_chart_payloads(historical: Value, runtime: Value, range: &str) -> V
         }
     }
     let mut points = points_by_bucket.into_values().collect::<Vec<_>>();
-    filter_chart_range(&mut points, range);
     let domain = runtime
         .get("domain")
         .cloned()
-        .or_else(|| historical.get("domain").cloned())
-        .or_else(|| point_domain(&points));
-    let sample_count = summary_sample_count(&historical)
-        .max(summary_sample_count(&runtime))
-        .max(points.len());
+        .or_else(|| historical.get("domain").cloned());
+    if let Some((start_ms, end_ms)) = domain.as_ref().and_then(chart_domain_bounds) {
+        filter_chart_market_window(&mut points, start_ms, end_ms);
+    }
+    let sample_count = points.len();
+    filter_chart_range(&mut points, range);
+    let domain = domain.or_else(|| point_domain(&points));
     json!({
         "source": "azure_table+rust_runtime_memory",
         "market_id": value_text(&runtime, "market_id")
@@ -470,22 +472,6 @@ fn merge_point_payloads(historical: Value, runtime: Value) -> Value {
     Value::Object(historical)
 }
 
-fn summary_sample_count(payload: &Value) -> usize {
-    payload
-        .get("summary")
-        .and_then(|summary| {
-            summary
-                .get("sample_count")
-                .or_else(|| summary.get("sampleCount"))
-        })
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_u64().map(|value| value as usize),
-            Value::String(text) => text.parse().ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
 fn normalize_historical_market_state(object: &mut serde_json::Map<String, Value>) {
     let Some(end_ts) = object
         .get("end_ts")
@@ -525,6 +511,15 @@ fn filter_chart_range(points: &mut Vec<Value>, range: &str) {
     points.retain(|point| point_bucket(point).is_some_and(|bucket| bucket >= cutoff));
 }
 
+pub(crate) fn filter_chart_market_window(points: &mut Vec<Value>, start_ms: i64, end_ms: i64) {
+    if end_ms <= start_ms {
+        return;
+    }
+    points.retain(|point| {
+        point_bucket(point).is_some_and(|bucket| bucket >= start_ms && bucket <= end_ms)
+    });
+}
+
 fn chart_window_ms(range: &str) -> Option<i64> {
     match range {
         "1m" => Some(60_000),
@@ -551,6 +546,13 @@ fn point_domain(points: &[Value]) -> Option<Value> {
     ]))
 }
 
+fn chart_domain_bounds(domain: &Value) -> Option<(i64, i64)> {
+    let values = domain.as_array()?;
+    let start = values.first().and_then(value_i64)?;
+    let end = values.get(1).and_then(value_i64)?;
+    (end > start).then_some((start, end))
+}
+
 fn point_bucket(point: &Value) -> Option<i64> {
     point.get("bucket").and_then(|value| match value {
         Value::Number(number) => number
@@ -559,6 +561,16 @@ fn point_bucket(point: &Value) -> Option<i64> {
         Value::String(text) => text.parse().ok(),
         _ => None,
     })
+}
+
+fn value_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value as i64)),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
 }
 
 fn numeric_value(value: &Value) -> Option<f64> {
@@ -661,19 +673,38 @@ mod tests {
     }
 
     #[test]
+    fn market_window_filter_removes_pre_start_and_post_end_points() {
+        let mut points = vec![
+            json!({"bucket": 999, "upBid": 0.49}),
+            json!({"bucket": 1000, "upBid": 0.50}),
+            json!({"bucket": 2000, "qUp": 0.51}),
+            json!({"bucket": 3001, "downBid": 0.49}),
+        ];
+
+        filter_chart_market_window(&mut points, 1000, 3000);
+
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0]["bucket"], 1000);
+        assert_eq!(points[1]["bucket"], 2000);
+    }
+
+    #[test]
     fn chart_payload_merge_keeps_persisted_history_and_runtime_tail() {
         let historical = json!({
             "market_id": "m1",
             "range": "full",
+            "domain": [1000, 3000],
             "points": [
+                {"bucket": 500, "time": "1970-01-01T00:00:00.500Z", "upBid": 0.49},
                 {"bucket": 1000, "time": "2026-06-11T10:00:01Z", "qUp": 0.50},
                 {"bucket": 2000, "time": "2026-06-11T10:00:02Z", "qUp": 0.51}
             ],
-            "summary": {"sample_count": 2}
+            "summary": {"sample_count": 3}
         });
         let runtime = json!({
             "market_id": "m1",
             "range": "full",
+            "domain": [1000, 3000],
             "points": [
                 {"bucket": 2000, "time": "2026-06-11T10:00:02Z", "upBid": 0.52},
                 {"bucket": 3000, "time": "2026-06-11T10:00:03Z", "qUp": 0.53}
@@ -685,6 +716,7 @@ mod tests {
         let points = merged["points"].as_array().expect("points");
 
         assert_eq!(points.len(), 3);
+        assert_eq!(points[0]["bucket"], 1000);
         assert_eq!(points[1]["qUp"], 0.51);
         assert_eq!(points[1]["upBid"], 0.52);
         assert_eq!(merged["summary"]["sample_count"], 3);

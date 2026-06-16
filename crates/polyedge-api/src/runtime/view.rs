@@ -150,7 +150,12 @@ impl RuntimeController {
             .get(&market.market_id)
             .map(|samples| samples.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        let stored_count = points.len();
+        crate::history::filter_chart_market_window(
+            &mut points,
+            market.start_ts.timestamp_millis(),
+            market.end_ts.timestamp_millis(),
+        );
+        let sample_count = points.len();
         filter_chart_range(&mut points, range);
         Some(json!({
             "source": "rust_runtime_memory",
@@ -161,7 +166,7 @@ impl RuntimeController {
                 market.start_ts.timestamp_millis(),
                 market.end_ts.timestamp_millis()
             ],
-            "summary": crate::history::chart_summary(&points, stored_count, None)
+            "summary": crate::history::chart_summary(&points, sample_count, None)
         }))
     }
 
