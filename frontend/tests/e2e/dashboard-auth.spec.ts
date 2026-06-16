@@ -55,6 +55,10 @@ test("research pages render without console errors", async ({ page }) => {
     await page.goto(route);
     await expect(page.locator("h1")).toBeVisible();
   }
+  await page.goto("/labs");
+  await page.getByRole("button", { name: "Regime Profiles" }).click();
+  await expect(page.getByText("normal: 4, volatile: 1")).toBeVisible();
+  await expect(page.getByText("[object Object]")).toHaveCount(0);
   await page.goto("/jobs");
   await expect(page.getByRole("button", { name: "Backfill" })).toBeDisabled();
   expect(consoleErrors).toEqual([]);
@@ -180,11 +184,33 @@ async function installApiMocks(page: Page) {
       }
     });
   });
-  for (const endpoint of ["regimes", "calibration", "sample-size", "fill-models"]) {
+  for (const endpoint of ["calibration", "sample-size", "fill-models"]) {
     await page.route(`**/api/backend/labs/${endpoint}/latest`, async (route) => {
       await route.fulfill({ json: { date: "2026-06-14", report: {} } });
     });
   }
+  await page.route("**/api/backend/labs/regimes/latest", async (route) => {
+    await route.fulfill({
+      json: {
+        date: "2026-06-14",
+        report: {
+          result: {
+            rows: [
+              {
+                profile: "static",
+                net_pnl: "-13.35",
+                delta_vs_static: "0.00",
+                regime_frequency: { normal: 4, volatile: 1 },
+                regime_time_share: { normal: "80%", volatile: "20%" },
+                fills: 440,
+                cancels: 73
+              }
+            ]
+          }
+        }
+      }
+    });
+  });
   await page.route("**/api/backend/labs/data-quality/hourly**", async (route) => {
     await route.fulfill({ json: { date: "2026-06-15", audits: [] } });
   });

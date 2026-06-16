@@ -1,6 +1,32 @@
-export function compact(value: unknown, fallback = "n/a") {
+export function compact(value: unknown, fallback = "n/a"): string {
   if (value === null || value === undefined || value === "") {
     return fallback;
+  }
+  if (Array.isArray(value)) {
+    if (!value.length) {
+      return fallback;
+    }
+    const text: string = value
+      .slice(0, 8)
+      .map((item) => compact(item, fallback))
+      .join(", ");
+    return value.length > 8 ? `${text}, +${value.length - 8} more` : text;
+  }
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? fallback : value.toISOString();
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).filter(
+      ([, child]) => child !== null && child !== undefined && child !== ""
+    );
+    if (!entries.length) {
+      return fallback;
+    }
+    const text: string = entries
+      .slice(0, 8)
+      .map(([key, child]) => `${key}: ${compact(child, fallback)}`)
+      .join(", ");
+    return entries.length > 8 ? `${text}, +${entries.length - 8} more` : text;
   }
   return String(value);
 }
@@ -11,7 +37,7 @@ export function numberText(value: unknown, digits = 2) {
   }
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
-    return String(value);
+    return compact(value);
   }
   return numeric.toLocaleString(undefined, {
     maximumFractionDigits: digits,
