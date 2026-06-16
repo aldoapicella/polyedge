@@ -222,7 +222,7 @@ var researchJobDefinitions = [
     replicaTimeout: 7200
     cpu: cpu
     memory: memory
-    command: 'mkdir -p reports/jobs/latest; printf "{\"job_id\":\"chart-backfill\",\"job_type\":\"chart-backfill\",\"status\":\"defined_pending_cli\",\"started_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"finished_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"artifacts\":[],\"warnings\":[\"chart backfill CLI command is not implemented in this image\"],\"errors\":[],\"data_quality\":\"unknown\",\"research_only\":true,\"live_trading_enabled\":false}\n" > reports/jobs/latest/chart-backfill.json'
+    command: 'mkdir -p reports/jobs/latest; printf \'%s\' \'{"job_id":"chart-backfill","job_type":"chart-backfill","status":"defined_pending_cli","started_ts":null,"finished_ts":null,"artifacts":[],"warnings":["chart backfill CLI command is not implemented in this image"],"errors":[],"data_quality":"unknown","research_only":true,"live_trading_enabled":false}\' > reports/jobs/latest/chart-backfill.json'
   }
   {
     id: 'adx-ingestion'
@@ -232,7 +232,7 @@ var researchJobDefinitions = [
     replicaTimeout: 1800
     cpu: cpu
     memory: memory
-    command: 'mkdir -p reports/jobs/latest; printf "{\"job_id\":\"adx-ingestion\",\"job_type\":\"adx-ingestion\",\"status\":\"defined_pending_pipeline\",\"started_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"finished_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"artifacts\":[],\"warnings\":[\"ADX ingestion is defined for Azure visibility but no ingestion endpoint is configured\"],\"errors\":[],\"data_quality\":\"unknown\",\"research_only\":true,\"live_trading_enabled\":false}\n" > reports/jobs/latest/adx-ingestion.json'
+    command: 'mkdir -p reports/jobs/latest; printf \'%s\' \'{"job_id":"adx-ingestion","job_type":"adx-ingestion","status":"defined_pending_pipeline","started_ts":null,"finished_ts":null,"artifacts":[],"warnings":["ADX ingestion is defined for Azure visibility but no ingestion endpoint is configured"],"errors":[],"data_quality":"unknown","research_only":true,"live_trading_enabled":false}\' > reports/jobs/latest/adx-ingestion.json'
   }
   {
     id: 'manual-backfill'
