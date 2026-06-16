@@ -4,10 +4,12 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
+use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -389,9 +391,59 @@ fn exclusion_rows() -> Vec<Value> {
 }
 
 fn report_rows(file_names: &[&str]) -> Vec<Value> {
+    if let Some(rows) = blob_report_rows(file_names) {
+        return rows;
+    }
     let mut rows = Vec::new();
     collect_report_rows(Path::new(REPORT_ROOT), file_names, &mut rows, MAX_LIMIT);
     rows
+}
+
+fn blob_report_rows(file_names: &[&str]) -> Option<Vec<Value>> {
+    let mut client = artifact_blob_client()?;
+    let blobs = client
+        .list_blobs_by_suffixes(
+            &format!("{REPORT_ROOT}/"),
+            file_names,
+            Some(MAX_LIMIT),
+            Some(64 * 1024 * 1024),
+        )
+        .ok()?;
+    let mut rows = Vec::new();
+    for blob in blobs {
+        if rows.len() >= MAX_LIMIT {
+            break;
+        }
+        let Ok(bytes) = client.download_blob_bytes(&blob.name) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if payload.is_null() {
+            continue;
+        }
+        let file_name = Path::new(&blob.name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("report.json");
+        let relative = blob
+            .name
+            .strip_prefix(&format!("{REPORT_ROOT}/"))
+            .unwrap_or(&blob.name)
+            .to_owned();
+        let mut extracted = extract_analytical_rows(&payload);
+        if extracted.is_empty() {
+            extracted.push(payload);
+        }
+        for row in extracted.into_iter().take(100) {
+            rows.push(with_dataset_fields(file_name, &relative, row));
+            if rows.len() >= MAX_LIMIT {
+                return Some(rows);
+            }
+        }
+    }
+    Some(rows)
 }
 
 fn collect_report_rows(root: &Path, file_names: &[&str], rows: &mut Vec<Value>, limit: usize) {
@@ -475,11 +527,47 @@ fn visit_records(value: &Value, visit: &mut impl FnMut(&serde_json::Map<String, 
 }
 
 fn artifact_rows() -> Vec<Value> {
+    if let Some(rows) = blob_artifact_rows() {
+        return rows;
+    }
     let mut rows = Vec::new();
     collect_artifacts(Path::new(REPORT_ROOT), &mut rows);
     rows.sort_by_key(|row| string_at(row, "path"));
     rows.truncate(MAX_LIMIT);
     rows
+}
+
+fn blob_artifact_rows() -> Option<Vec<Value>> {
+    let mut client = artifact_blob_client()?;
+    let blobs = client
+        .list_blobs_by_suffixes(
+            &format!("{REPORT_ROOT}/"),
+            &[".json", ".md", ".csv", ".parquet"],
+            Some(MAX_LIMIT),
+            None,
+        )
+        .ok()?;
+    let mut rows = blobs
+        .into_iter()
+        .filter_map(|blob| {
+            let relative = blob.name.strip_prefix(&format!("{REPORT_ROOT}/"))?.to_owned();
+            let extension = Path::new(&relative)
+                .extension()
+                .and_then(|value| value.to_str())?;
+            Some(json!({
+                "artifact_id": relative.replace('/', "~"),
+                "path": relative,
+                "kind": extension,
+                "date": date_from_path(&relative),
+                "size_bytes": blob.content_length,
+                "modified_ts": blob.last_modified.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                "quality": quality_from_path(&relative),
+                "source_job": source_job_from_path(&relative)
+            }))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| string_at(row, "path"));
+    Some(rows)
 }
 
 fn collect_artifacts(root: &Path, rows: &mut Vec<Value>) {
@@ -830,10 +918,50 @@ fn row_contains(row: &Value, needle: &str) -> bool {
 }
 
 fn read_json_or_null(path: impl AsRef<Path>) -> Value {
+    let path = path.as_ref();
+    if let Some(bytes) = read_blob_bytes_for_path(path) {
+        return serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return Value::Null;
     };
     serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+fn artifact_blob_client() -> Option<AzureBlobClient> {
+    let account = env::var("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let container = env::var("AZURE_STORAGE_CONTAINER_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bot-events".to_owned());
+    let client_id = env::var("AZURE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    Some(AzureBlobClient::with_managed_identity(
+        account, container, client_id,
+    ))
+}
+
+fn read_blob_bytes_for_path(path: &Path) -> Option<Vec<u8>> {
+    let blob_name = blob_name_for_path(path)?;
+    let mut client = artifact_blob_client()?;
+    match client.download_blob_bytes(&blob_name) {
+        Ok(bytes) => Some(bytes),
+        Err(AzureBlobError::HttpStatus(404)) => None,
+        Err(_) => None,
+    }
+}
+
+fn blob_name_for_path(path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let trimmed = normalized.trim_start_matches("./").trim_start_matches('/');
+    let allowed = ["reports/research/", "data_quality/freshness/"];
+    if allowed.iter().any(|prefix| trimmed.starts_with(prefix)) {
+        return Some(trimmed.to_owned());
+    }
+    None
 }
 
 fn parse_scalar(value: &str) -> Value {
