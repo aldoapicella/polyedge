@@ -354,6 +354,18 @@ fn load_daily_prospective_rows(
     reports_dir: &Path,
     since: DateTime<Utc>,
 ) -> Result<Vec<Value>, ResearchError> {
+    let mut rows = load_local_daily_prospective_rows(reports_dir, since)?;
+    if rows.is_empty() {
+        rows = load_azure_daily_prospective_rows(reports_dir, since)?;
+    }
+    rows.sort_by(|left, right| left["date"].as_str().cmp(&right["date"].as_str()));
+    Ok(rows)
+}
+
+fn load_local_daily_prospective_rows(
+    reports_dir: &Path,
+    since: DateTime<Utc>,
+) -> Result<Vec<Value>, ResearchError> {
     if !reports_dir.exists() {
         return Ok(Vec::new());
     }
@@ -373,7 +385,6 @@ fn load_daily_prospective_rows(
         }
         rows.push(daily_prospective_row(&date, &entry.path())?);
     }
-    rows.sort_by(|left, right| left["date"].as_str().cmp(&right["date"].as_str()));
     Ok(rows)
 }
 
@@ -386,11 +397,114 @@ fn daily_prospective_row(date: &str, dir: &Path) -> Result<Value, ResearchError>
     )?);
     let sample_size = read_optional_json(&dir.join("sample_size.json"))?;
     let audit = read_optional_json(&dir.join("data_audit.json"))?;
+    daily_prospective_row_from_reports(date, final_report, regimes, baseline, sample_size, audit)
+}
+
+fn load_azure_daily_prospective_rows(
+    reports_dir: &Path,
+    since: DateTime<Utc>,
+) -> Result<Vec<Value>, ResearchError> {
+    let Some(mut client) = research_blob_client() else {
+        return Ok(Vec::new());
+    };
+    let prefix = report_blob_prefix(reports_dir);
+    let blobs = client
+        .list_blobs_by_suffixes(&prefix, &["final_report.json"], Some(1000), None)
+        .map_err(|error| {
+            ResearchError::Azure(format!("listing prospective daily reports: {error}"))
+        })?;
+    let since_date = since.date_naive();
+    let mut dates = blobs
+        .into_iter()
+        .filter_map(|blob| {
+            let relative = blob.name.strip_prefix(&prefix)?;
+            let date = relative.split('/').next()?.to_owned();
+            let report_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
+            (report_date >= since_date).then_some(date)
+        })
+        .collect::<Vec<_>>();
+    dates.sort();
+    dates.dedup();
+
+    let mut rows = Vec::new();
+    for date in dates {
+        let daily_prefix = format!("{prefix}{date}/");
+        rows.push(daily_prospective_row_from_reports(
+            &date,
+            read_blob_json(&mut client, &format!("{daily_prefix}final_report.json"))?,
+            read_blob_json(&mut client, &format!("{daily_prefix}regimes.json"))?.or(
+                read_blob_json(&mut client, &format!("{daily_prefix}regime_profiles.json"))?,
+            ),
+            read_blob_json(&mut client, &format!("{daily_prefix}baseline.json"))?.or(
+                read_blob_json(
+                    &mut client,
+                    &format!("{daily_prefix}baseline_static_all_fill_models.json"),
+                )?,
+            ),
+            read_blob_json(&mut client, &format!("{daily_prefix}sample_size.json"))?,
+            read_blob_json(&mut client, &format!("{daily_prefix}data_audit.json"))?,
+        )?);
+    }
+    Ok(rows)
+}
+
+fn daily_prospective_row_from_reports(
+    date: &str,
+    final_report: Option<Value>,
+    regimes: Option<Value>,
+    baseline: Option<Value>,
+    sample_size: Option<Value>,
+    audit: Option<Value>,
+) -> Result<Value, ResearchError> {
     let source =
         merge_optional_reports([final_report.as_ref(), regimes.as_ref(), baseline.as_ref()]);
     let fill_model = text_at(&source, &["/result/fill_model"]).unwrap_or("touch_after_250ms");
     let sample = sample_size.as_ref().unwrap_or(&source);
     json_row(date, fill_model, &source, sample, audit.as_ref())
+}
+
+fn research_blob_client() -> Option<AzureBlobClient> {
+    let account = std::env::var("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    let container = std::env::var("AZURE_STORAGE_CONTAINER_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bot-events".to_owned());
+    let client_id = std::env::var("AZURE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    Some(AzureBlobClient::with_managed_identity(
+        account, container, client_id,
+    ))
+}
+
+fn report_blob_prefix(path: &Path) -> String {
+    let mut prefix = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_owned();
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    prefix
+}
+
+fn read_blob_json(
+    client: &mut AzureBlobClient,
+    blob_name: &str,
+) -> Result<Option<Value>, ResearchError> {
+    match client.download_blob_bytes(blob_name) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(ResearchError::Json),
+        Err(AzureBlobError::HttpStatus(404)) => Ok(None),
+        Err(error) => Err(ResearchError::Azure(format!(
+            "reading research artifact {blob_name}: {error}"
+        ))),
+    }
 }
 
 fn merge_optional_reports(values: [Option<&Value>; 3]) -> Value {
@@ -437,7 +551,8 @@ fn json_row(
             "/result/summary/complete_for_simulation",
             "/result/statistics/sample_size",
         ],
-    );
+    )
+    .or_else(|| number_at(sample, &["/result/statistics/n", "/statistics/n"]));
     Ok(json!({
         "date": date,
         "settled_markets": settled_markets,

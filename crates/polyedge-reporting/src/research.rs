@@ -6,7 +6,7 @@ use polyedge_config::RuntimeSettings;
 use polyedge_engine::{
     crypto_taker_fee_per_share, QuoteStyle, RegimeClassifier, RegimeFeatures, RegimePolicy,
 };
-use polyedge_storage::{AzureBlobClient, AzureBlobItem};
+use polyedge_storage::{AzureBlobClient, AzureBlobError, AzureBlobItem};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -763,13 +763,18 @@ pub fn run_final_report(options: FinalReportOptions) -> Result<Value, ResearchEr
     let start = Instant::now();
     fs::create_dir_all(&options.reports_dir)?;
     let audit = read_optional_json(&options.reports_dir.join("data_audit.json"))?;
-    let markets = read_optional_json(&options.reports_dir.join("markets_summary.json"))?;
-    let baseline = read_optional_json(
-        &options
-            .reports_dir
-            .join("baseline_static_all_fill_models.json"),
+    let markets = read_first_optional_json(
+        &options.reports_dir,
+        &["markets_summary.json", "markets.json"],
     )?;
-    let regimes = read_optional_json(&options.reports_dir.join("regime_profiles.json"))?;
+    let baseline = read_first_optional_json(
+        &options.reports_dir,
+        &["baseline.json", "baseline_static_all_fill_models.json"],
+    )?;
+    let regimes = read_first_optional_json(
+        &options.reports_dir,
+        &["regimes.json", "regime_profiles.json"],
+    )?;
     let sweep = read_optional_json(&options.reports_dir.join("parameter_sweep.json"))?;
     let calibration = read_optional_json(&options.reports_dir.join("calibration.json"))?;
     let sample_size = read_optional_json(&options.reports_dir.join("sample_size.json"))?;
@@ -4444,6 +4449,18 @@ fn read_optional_json(path: &Path) -> Result<Option<Value>, ResearchError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ResearchError::Io(error)),
     }
+}
+
+fn read_first_optional_json(
+    dir: &Path,
+    file_names: &[&str],
+) -> Result<Option<Value>, ResearchError> {
+    for file_name in file_names {
+        if let Some(value) = read_optional_json(&dir.join(file_name))? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 fn audit_markdown(report: &Value) -> String {

@@ -488,8 +488,8 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     let baseline = run_baseline(BaselineOptions {
         input: events.clone(),
         markets: None,
-        out: reports.join("baseline_static_all_fill_models.json"),
-        markdown: reports.join("baseline_static_all_fill_models.md"),
+        out: reports.join("baseline.json"),
+        markdown: reports.join("baseline.md"),
         exclude_windows: Vec::new(),
     })
     .unwrap();
@@ -513,7 +513,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     })
     .unwrap();
     let sample = run_sample_size(SampleSizeOptions {
-        results: reports.join("baseline_static_all_fill_models.json"),
+        results: reports.join("baseline.json"),
         out: reports.join("sample_size.json"),
         markdown: reports.join("sample_size.md"),
     })
@@ -538,6 +538,74 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     assert_eq!(
         final_report["result"]["executive_summary"]["live_trading_enabled"],
         false
+    );
+    let daily_root = dir.join("daily");
+    let daily_dir = daily_root.join("2026-06-01");
+    fs::create_dir_all(&daily_dir).unwrap();
+    fs::copy(
+        reports.join("data_audit.json"),
+        daily_dir.join("data_audit.json"),
+    )
+    .unwrap();
+    fs::copy(
+        reports.join("baseline.json"),
+        daily_dir.join("baseline.json"),
+    )
+    .unwrap();
+    fs::copy(
+        reports.join("sample_size.json"),
+        daily_dir.join("sample_size.json"),
+    )
+    .unwrap();
+    fs::copy(
+        reports.join("final_strategy_research_report.json"),
+        daily_dir.join("final_report.json"),
+    )
+    .unwrap();
+    let candidates = dir.join("frozen_candidates.yaml");
+    fs::write(
+        &candidates,
+        r#"version: 1
+updated_at: "2026-06-14T00:00:00Z"
+research_only: true
+paper_only: true
+enabled_by_default: false
+selection_rule: "Frozen candidates only."
+candidates:
+  - name: "static_baseline"
+    profile: "static"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_quote_style"
+    profile: "dynamic_quote_style"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "full_deterministic_profile"
+    profile: "full_deterministic_profile"
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_safety_only"
+    profile: "dynamic_safety_only"
+    enabled_by_default: false
+    deployment_allowed: false
+"#,
+    )
+    .unwrap();
+    let prospective = run_validate_prospective(ProspectiveValidationOptions {
+        since: chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        reports_dir: daily_root,
+        candidates,
+        out: reports.join("prospective_validation.json"),
+        markdown: reports.join("prospective_validation.md"),
+    })
+    .unwrap();
+    assert_eq!(prospective["result"]["status"], "tracking");
+    assert_eq!(prospective["result"]["rows"][0]["settled_markets"], 1);
+    assert_eq!(
+        prospective["result"]["rows"][0]["ci_95_low"],
+        sample["result"]["statistics"]["ci_low"]
     );
     assert!(!serde_json::to_string(&final_report)
         .unwrap()
