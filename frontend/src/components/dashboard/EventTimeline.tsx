@@ -1,6 +1,7 @@
 "use client";
 
-import { PauseCircle, PlayCircle, Search } from "lucide-react";
+import { Copy, ExternalLink, PauseCircle, PlayCircle, Search } from "lucide-react";
+import Link from "next/link";
 import { useMemo, useState } from "react";
 import { dateTime } from "@/lib/format";
 import type { MarketSummary, RuntimeEvent } from "@/lib/types";
@@ -13,6 +14,7 @@ export function EventTimeline({ events, active }: { events: RuntimeEvent[]; acti
   const [paused, setPaused] = useState(false);
   const [clearedAt, setClearedAt] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [severity, setSeverity] = useState<"all" | "good" | "warn" | "danger" | "neutral">("all");
   const visibleEvents = useMemo(() => {
     if (!clearedAt) {
       return events;
@@ -24,8 +26,10 @@ export function EventTimeline({ events, active }: { events: RuntimeEvent[]; acti
     if (paused) {
       return [];
     }
-    return timelineRows(visibleEvents, active, tab, search).slice(0, TIMELINE_LIMIT);
-  }, [active, paused, search, tab, visibleEvents]);
+    return timelineRows(visibleEvents, active, tab, search)
+      .filter((row) => severity === "all" || row.severity === severity)
+      .slice(0, TIMELINE_LIMIT);
+  }, [active, paused, search, severity, tab, visibleEvents]);
 
   return (
     <Panel className="min-w-0">
@@ -64,6 +68,17 @@ export function EventTimeline({ events, active }: { events: RuntimeEvent[]; acti
               onChange={(event) => setSearch(event.target.value)}
             />
           </label>
+          <select
+            className="h-9 border border-line bg-white px-2 text-sm text-ink/70"
+            value={severity}
+            onChange={(event) => setSeverity(event.target.value as typeof severity)}
+          >
+            <option value="all">All severity</option>
+            <option value="good">Good</option>
+            <option value="warn">Warning</option>
+            <option value="danger">Danger</option>
+            <option value="neutral">Neutral</option>
+          </select>
           <Button className="h-9 px-3" onClick={() => setClearedAt(new Date().toISOString())}>
             Clear
           </Button>
@@ -83,6 +98,7 @@ export function EventTimeline({ events, active }: { events: RuntimeEvent[]; acti
 }
 
 function TimelineItem({ row, showRaw }: { row: TimelineRow; showRaw: boolean }) {
+  const marketId = typeof row.raw.data.market_id === "string" ? row.raw.data.market_id : null;
   return (
     <div className="border-b border-line bg-white px-3 py-2 last:border-b-0">
       <div className="flex items-center justify-between gap-3">
@@ -90,10 +106,30 @@ function TimelineItem({ row, showRaw }: { row: TimelineRow; showRaw: boolean }) 
           <span className={toneDot(row.severity)} aria-hidden />
           <span className="truncate text-sm font-semibold text-ink">{row.title}</span>
         </div>
-        <span className="shrink-0 text-xs text-ink/45">{dateTime(row.ts)}</span>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="text-xs text-ink/45">{dateTime(row.ts)}</span>
+          {marketId ? (
+            <Link
+              href={`/markets/${encodeURIComponent(marketId)}`}
+              className="grid h-7 w-7 place-items-center rounded-sm border border-line bg-white text-ink/55 hover:bg-panel hover:text-ink"
+              aria-label="Open related market"
+              title="Open related market"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </Link>
+          ) : null}
+          <button
+            className="grid h-7 w-7 place-items-center rounded-sm border border-line bg-white text-ink/55 hover:bg-panel hover:text-ink"
+            aria-label="Copy event"
+            title="Copy event"
+            onClick={() => navigator.clipboard?.writeText(JSON.stringify(row.raw, null, 2)).catch(() => undefined)}
+          >
+            <Copy className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
       <p className="mt-1 text-sm text-ink/65">{row.message}</p>
-      {showRaw ? (
+      {showRaw || row.severity === "danger" ? (
         <details className="mt-2">
           <summary className="cursor-pointer text-xs font-semibold text-ink/55">Raw JSON</summary>
           <pre className="mt-2 max-h-64 overflow-auto border border-line bg-panel p-2 text-xs text-ink/70">

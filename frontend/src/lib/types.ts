@@ -249,6 +249,7 @@ export type LabJob = {
   exit_code?: number | null;
   output_artifact?: string | null;
   error?: string | null;
+  data_quality?: string | null;
   running?: boolean;
   execution_name?: string | null;
   execution_id?: string | null;
@@ -282,6 +283,90 @@ export type ProspectiveValidation = {
     research_only?: boolean;
     live_deployment_allowed?: boolean;
   };
+};
+
+export type QueryFilter = {
+  field: string;
+  op: "eq" | "ne" | "contains" | "gt" | "gte" | "lt" | "lte" | "in";
+  value: unknown;
+};
+
+export type QuerySort = {
+  field: string;
+  direction: "asc" | "desc";
+};
+
+export type QueryRequest = {
+  dataset: string;
+  filters?: QueryFilter[];
+  group_by?: string[];
+  metrics?: string[];
+  sort?: QuerySort[];
+  limit?: number;
+  offset?: number;
+};
+
+export type QueryColumn = {
+  field: string;
+  label: string;
+  kind: "number" | "boolean" | "datetime" | "text" | string;
+  help?: string;
+};
+
+export type QueryResult = {
+  dataset: string;
+  columns: QueryColumn[];
+  rows: JsonRecord[];
+  total_rows: number;
+  returned_rows: number;
+  offset: number;
+  limit: number;
+  truncated: boolean;
+  warnings?: string[];
+  source?: JsonRecord;
+};
+
+export type QueryDatasetSchema = {
+  id: string;
+  label: string;
+  filters: string[];
+  group_by: string[];
+  metrics: string[];
+  default_limit: number;
+  max_limit: number;
+};
+
+export type QuerySchema = {
+  backend: string;
+  structured_only: boolean;
+  generated_ts: string;
+  datasets: QueryDatasetSchema[];
+  operators: QueryFilter["op"][];
+  output_modes: string[];
+  safety: JsonRecord;
+};
+
+export type QueryTemplate = {
+  id: string;
+  name: string;
+  description?: string;
+  request: QueryRequest;
+};
+
+export type DataQualityTimelineEvent = {
+  ts: string;
+  kind: string;
+  status: string;
+  title: string;
+  detail?: JsonRecord;
+};
+
+export type JobLogPayload = {
+  job_id: string;
+  job_name?: string;
+  logs: string[];
+  artifacts?: string[];
+  detail?: string;
 };
 
 export type RuntimeConfigSection = Record<string, string | number>;

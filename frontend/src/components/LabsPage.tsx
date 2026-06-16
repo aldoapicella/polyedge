@@ -2,7 +2,9 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Beaker, RefreshCw } from "lucide-react";
+import type { ReactElement } from "react";
 import { useState } from "react";
+import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   getLabArtifacts,
   getLabArtifact,
@@ -55,9 +57,30 @@ export function LabsPage() {
 
       {tab === "Overview" ? <Overview rows={rows} candidates={frozenCandidates} /> : null}
       {tab === "Prospective Validation" ? <ProspectiveTable rows={rows} loading={prospective.isLoading} /> : null}
-      {tab === "Regime Profiles" ? <GenericReport title="Regime Profiles" report={regimes.data?.report} keys={["profile", "net_pnl", "delta_vs_static", "regime_frequency", "regime_time_share", "fills", "cancels", "skipped_orders"]} /> : null}
-      {tab === "Calibration" ? <GenericReport title="Calibration" report={calibration.data?.report} keys={["q_bucket", "decision_count", "avg_q_up", "observed_up_frequency", "calibration_error", "brier_score"]} /> : null}
-      {tab === "Fill Models" ? <GenericReport title="Fill Models" report={fillModels.data?.report} keys={["fill_model", "net_pnl", "max_drawdown", "fills", "fill_rate", "cancel_fill_ratio", "queue_proxy"]} /> : null}
+      {tab === "Regime Profiles" ? (
+        <ReportWithExplanation
+          title="Regime Profiles"
+          answer="Shows which regimes lose money, produce fills, trigger cancels, or are skipped before any strategy change is considered."
+          report={regimes.data?.report}
+          keys={["profile", "net_pnl", "delta_vs_static", "regime_frequency", "regime_time_share", "fills", "cancels", "skipped_orders"]}
+        />
+      ) : null}
+      {tab === "Calibration" ? (
+        <ReportWithExplanation
+          title="Calibration"
+          answer="Compares predicted q_up with observed outcomes, highlighting overconfidence by probability bucket, expiry, and distance when reported."
+          report={calibration.data?.report}
+          keys={["q_bucket", "decision_count", "avg_q_up", "observed_up_frequency", "calibration_error", "brier_score"]}
+        />
+      ) : null}
+      {tab === "Fill Models" ? (
+        <ReportWithExplanation
+          title="Fill Models"
+          answer="Checks whether candidate PnL survives less optimistic paper fill assumptions before a recommendation is trusted."
+          report={fillModels.data?.report}
+          keys={["fill_model", "net_pnl", "max_drawdown", "fills", "fill_rate", "cancel_fill_ratio", "queue_proxy"]}
+        />
+      ) : null}
       {tab === "Sample Size" ? <SampleSizePanel report={sampleSize.data?.report} /> : null}
       {tab === "Artifacts" ? <ArtifactsPanel artifacts={artifacts.data?.artifacts ?? []} loading={artifacts.isLoading} /> : null}
     </div>
@@ -66,6 +89,8 @@ export function LabsPage() {
 
 function Overview({ rows, candidates }: { rows: ProspectiveValidationRow[]; candidates: JsonRecord[] }) {
   const latest = rows.at(-1);
+  const [selected, setSelected] = useState<CandidateEvidence | null>(null);
+  const evidence = evidenceRows(rows, candidates);
   return (
     <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
       <Panel>
@@ -83,17 +108,9 @@ function Overview({ rows, candidates }: { rows: ProspectiveValidationRow[]; cand
         </div>
       </Panel>
       <Panel>
-        <PanelHeader title="Prospective Status" meta={latest?.date ?? "collecting"} />
-        {latest ? (
-          <div className="grid gap-3 p-4 md:grid-cols-4">
-            <Metric label="Static" value={latest.static_net_pnl} />
-            <Metric label="Dynamic Quote" value={latest.dynamic_quote_style_net_pnl} />
-            <Metric label="Full Deterministic" value={latest.full_deterministic_profile_net_pnl} />
-            <Metric label="CI" value={`${numberText(latest.ci_95_low)} / ${numberText(latest.ci_95_high)}`} />
-          </div>
-        ) : (
-          <EmptyState label="No prospective validation rows yet" />
-        )}
+        <PanelHeader title="Candidate Evidence Matrix" meta={latest?.date ?? "collecting evidence"} />
+        <EvidenceMatrix rows={evidence} onSelect={setSelected} />
+        {selected ? <CandidateDrawer candidate={selected} onClose={() => setSelected(null)} /> : null}
       </Panel>
     </div>
   );
@@ -104,37 +121,264 @@ function ProspectiveTable({ rows, loading }: { rows: ProspectiveValidationRow[];
     return <Panel><EmptyState label={loading ? "Loading prospective rows" : "No prospective rows yet"} /></Panel>;
   }
   return (
-    <Panel>
-      <PanelHeader title="Prospective Validation" meta={`${rows.length} rows`} />
-      <div className="overflow-auto">
-        <table className="w-full min-w-[1040px] text-left text-sm">
-          <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
-            <tr>
-              {["Date", "Markets", "Static", "Dynamic Quote", "Full Deterministic", "Fill Model", "Drawdown", "Cancel/Fill", "Quality", "Recommendation"].map((header) => (
-                <th key={header} className="px-3 py-2">{header}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr key={row.date} className="border-b border-line last:border-b-0">
-                <td className="px-3 py-2">{row.date}</td>
-                <td className="px-3 py-2">{numberText(row.settled_markets)}</td>
-                <td className="px-3 py-2">{numberText(row.static_net_pnl)}</td>
-                <td className="px-3 py-2">{numberText(row.dynamic_quote_style_net_pnl)}</td>
-                <td className="px-3 py-2">{numberText(row.full_deterministic_profile_net_pnl)}</td>
-                <td className="px-3 py-2">{row.fill_model ?? "n/a"}</td>
-                <td className="px-3 py-2">{numberText(row.max_drawdown)}</td>
-                <td className="px-3 py-2">{numberText(row.cancel_per_fill)}</td>
-                <td className="px-3 py-2"><Pill tone={row.data_quality_status === "healthy" ? "good" : "warn"}>{row.data_quality_status ?? "unknown"}</Pill></td>
-                <td className="px-3 py-2">{row.recommendation ?? "collecting"}</td>
+    <div className="space-y-5">
+      <ProspectiveCharts rows={rows} />
+      <Panel>
+        <PanelHeader title="Prospective Validation" meta={`${rows.length} rows`} />
+        <div className="overflow-auto">
+          <table className="w-full min-w-[1040px] text-left text-sm">
+            <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
+              <tr>
+                {["Date", "Markets", "Static", "Dynamic Quote", "Full Deterministic", "Fill Model", "Drawdown", "Cancel/Fill", "Quality", "Recommendation"].map((header) => (
+                  <th key={header} className="px-3 py-2">{header}</th>
+                ))}
               </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.date} className="border-b border-line last:border-b-0">
+                  <td className="px-3 py-2">{row.date}</td>
+                  <td className="px-3 py-2">{numberText(row.settled_markets)}</td>
+                  <td className="px-3 py-2">{numberText(row.static_net_pnl)}</td>
+                  <td className="px-3 py-2">{numberText(row.dynamic_quote_style_net_pnl)}</td>
+                  <td className="px-3 py-2">{numberText(row.full_deterministic_profile_net_pnl)}</td>
+                  <td className="px-3 py-2">{row.fill_model ?? "not reported"}</td>
+                  <td className="px-3 py-2">{numberText(row.max_drawdown)}</td>
+                  <td className="px-3 py-2">{numberText(row.cancel_per_fill)}</td>
+                  <td className="px-3 py-2"><Pill tone={row.data_quality_status === "healthy" ? "good" : "warn"}>{row.data_quality_status ?? "unknown"}</Pill></td>
+                  <td className="px-3 py-2">{row.recommendation ?? recommendationText(row)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function ReportWithExplanation({ title, answer, report, keys }: { title: string; answer: string; report?: JsonRecord | null; keys: string[] }) {
+  return (
+    <div className="space-y-5">
+      <Panel>
+        <PanelHeader title={`${title} Evidence`} meta="recommendation context" />
+        <div className="p-4 text-sm leading-relaxed text-ink/70">{answer}</div>
+      </Panel>
+      <GenericReport title={title} report={report} keys={keys} />
+    </div>
+  );
+}
+
+type CandidateEvidence = {
+  candidate: string;
+  status: string;
+  latestPnl: unknown;
+  ci: string;
+  maxDrawdown: unknown;
+  fillModelAgreement: string;
+  dataQuality: string;
+  recommendation: string;
+  lastUpdated: string;
+  explanation: string;
+  latest?: ProspectiveValidationRow;
+};
+
+function EvidenceMatrix({ rows, onSelect }: { rows: CandidateEvidence[]; onSelect: (candidate: CandidateEvidence) => void }) {
+  if (!rows.length) {
+    return <EmptyState label="No candidate evidence yet. Run prospective validation or select another report date." />;
+  }
+  return (
+    <div className="overflow-auto">
+      <table className="w-full min-w-[980px] text-left text-sm">
+        <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
+          <tr>
+            {["Candidate", "Status", "Latest PnL", "95% CI", "Drawdown", "Fill Models", "Quality", "Recommendation", "Updated"].map((header) => (
+              <th key={header} className="px-3 py-2">{header}</th>
             ))}
-          </tbody>
-        </table>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.candidate} className="cursor-pointer border-b border-line last:border-b-0 hover:bg-panel" onClick={() => onSelect(row)}>
+              <td className="px-3 py-2 font-medium text-ink">{row.candidate}</td>
+              <td className="px-3 py-2"><Pill tone={row.status === "candidate_leader" ? "good" : row.status === "blocked" ? "danger" : "warn"}>{row.status}</Pill></td>
+              <td className="px-3 py-2">{numberText(row.latestPnl)}</td>
+              <td className="px-3 py-2">{row.ci}</td>
+              <td className="px-3 py-2">{numberText(row.maxDrawdown)}</td>
+              <td className="px-3 py-2">{row.fillModelAgreement}</td>
+              <td className="px-3 py-2"><Pill tone={row.dataQuality === "healthy" ? "good" : "warn"}>{row.dataQuality}</Pill></td>
+              <td className="px-3 py-2">{row.recommendation}</td>
+              <td className="px-3 py-2">{row.lastUpdated}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CandidateDrawer({ candidate, onClose }: { candidate: CandidateEvidence; onClose: () => void }) {
+  return (
+    <div className="border-t border-line bg-panel p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink">{candidate.candidate}</h2>
+          <p className="mt-1 text-sm text-ink/65">{candidate.explanation}</p>
+        </div>
+        <button className="h-8 rounded-sm border border-line bg-white px-3 text-sm text-ink/70 hover:bg-panel" onClick={onClose}>
+          Close
+        </button>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-4">
+        <Metric label="PnL by Day" value={candidate.latestPnl} />
+        <Metric label="PnL by Fill Model" value={candidate.fillModelAgreement} />
+        <Metric label="Market Count" value={candidate.latest?.settled_markets ?? "collecting"} />
+        <Metric label="Known Warnings" value={candidate.dataQuality === "healthy" ? "none reported" : candidate.dataQuality} />
+      </div>
+    </div>
+  );
+}
+
+function ProspectiveCharts({ rows }: { rows: ProspectiveValidationRow[] }) {
+  const chartRows = rows.map((row) => ({
+    date: row.date,
+    static: numeric(row.static_net_pnl),
+    dynamic: numeric(row.dynamic_quote_style_net_pnl),
+    full: numeric(row.full_deterministic_profile_net_pnl),
+    markets: numeric(row.settled_markets),
+    ci_low: numeric(row.ci_95_low),
+    ci_high: numeric(row.ci_95_high)
+  }));
+  return (
+    <div className="grid gap-5 xl:grid-cols-3">
+      <ChartPanel title="Candidate PnL" meta="daily prospective rows" hasData={chartRows.length > 0}>
+        <LineChart data={chartRows}>
+          <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
+          <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+          <YAxis tick={{ fontSize: 11 }} width={42} />
+          <Tooltip formatter={(value) => numberText(value)} />
+          <Line type="monotone" dataKey="static" stroke="#17201b" dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="dynamic" stroke="#18705b" dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="full" stroke="#2f7fcb" dot={false} isAnimationActive={false} />
+        </LineChart>
+      </ChartPanel>
+      <ChartPanel title="Market Count" meta="settled markets by day" hasData={chartRows.length > 0}>
+        <BarChart data={chartRows}>
+          <CartesianGrid stroke="#d9ddd2" vertical={false} />
+          <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+          <YAxis tick={{ fontSize: 11 }} width={42} />
+          <Tooltip formatter={(value) => numberText(value, 0)} />
+          <Bar dataKey="markets" fill="#18705b" isAnimationActive={false} />
+        </BarChart>
+      </ChartPanel>
+      <ChartPanel title="Confidence Interval" meta="95% low/high trend" hasData={chartRows.length > 0}>
+        <LineChart data={chartRows}>
+          <CartesianGrid stroke="#d9ddd2" strokeDasharray="3 3" />
+          <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+          <YAxis tick={{ fontSize: 11 }} width={42} />
+          <Tooltip formatter={(value) => numberText(value)} />
+          <Line type="monotone" dataKey="ci_low" stroke="#b3363a" dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="ci_high" stroke="#18705b" dot={false} isAnimationActive={false} />
+        </LineChart>
+      </ChartPanel>
+    </div>
+  );
+}
+
+function ChartPanel({ title, meta, hasData, children }: { title: string; meta: string; hasData: boolean; children: ReactElement }) {
+  return (
+    <Panel>
+      <PanelHeader title={title} meta={meta} />
+      <div className="h-64 p-3">
+        {hasData ? <ResponsiveContainer width="100%" height="100%">{children}</ResponsiveContainer> : <EmptyState label="No chartable prospective rows yet" />}
       </div>
     </Panel>
   );
+}
+
+function evidenceRows(rows: ProspectiveValidationRow[], candidates: JsonRecord[]): CandidateEvidence[] {
+  const latest = rows.at(-1);
+  return (candidates.length ? candidates : fallbackCandidates()).map((candidate) => {
+    const name = String(candidate.name ?? candidate.profile ?? "candidate");
+    const pnl = candidatePnl(latest, name);
+    const status = statusForCandidate(latest, name, pnl);
+    const recommendation = latest?.recommendation ?? recommendationText(latest);
+    return {
+      candidate: name,
+      status,
+      latestPnl: pnl,
+      ci: latest ? `[${numberText(latest.ci_95_low)}, ${numberText(latest.ci_95_high)}]` : "collecting",
+      maxDrawdown: latest?.max_drawdown ?? "collecting",
+      fillModelAgreement: latest?.fill_model ? String(latest.fill_model) : "pending sensitivity",
+      dataQuality: latest?.data_quality_status ?? "unknown",
+      recommendation,
+      lastUpdated: latest?.date ?? "not run",
+      explanation: explanationForCandidate(name, status, recommendation, latest),
+      latest
+    };
+  });
+}
+
+function candidatePnl(row: ProspectiveValidationRow | undefined, candidate: string) {
+  if (!row) {
+    return "collecting";
+  }
+  if (candidate.includes("dynamic_quote_style")) {
+    return row.dynamic_quote_style_net_pnl;
+  }
+  if (candidate.includes("full_deterministic_profile")) {
+    return row.full_deterministic_profile_net_pnl;
+  }
+  if (candidate.includes("dynamic_safety_only")) {
+    return row.dynamic_safety_only_net_pnl;
+  }
+  return row.static_net_pnl;
+}
+
+function statusForCandidate(row: ProspectiveValidationRow | undefined, candidate: string, pnl: unknown) {
+  if (!row) {
+    return "collecting";
+  }
+  if (row.data_quality_status && row.data_quality_status !== "healthy") {
+    return "blocked";
+  }
+  const best = Math.max(
+    numeric(row.static_net_pnl),
+    numeric(row.dynamic_quote_style_net_pnl),
+    numeric(row.full_deterministic_profile_net_pnl),
+    numeric(row.dynamic_safety_only_net_pnl)
+  );
+  if (Number.isFinite(best) && numeric(pnl) === best) {
+    return "candidate_leader";
+  }
+  return candidate.includes("static") ? "baseline" : "needs_more_evidence";
+}
+
+function explanationForCandidate(name: string, status: string, recommendation: string, row: ProspectiveValidationRow | undefined) {
+  if (!row) {
+    return `${name} has no prospective validation row yet. Run prospective validation before using it for research conclusions.`;
+  }
+  if (status === "blocked") {
+    return `${name} is blocked by ${row.data_quality_status} data quality. The recommendation should not be trusted until the quality issue is resolved.`;
+  }
+  return `${name} is ${status}. Recommendation: ${recommendation}. Evidence uses ${numberText(row.settled_markets, 0)} settled markets, drawdown ${numberText(row.max_drawdown)}, and CI [${numberText(row.ci_95_low)}, ${numberText(row.ci_95_high)}].`;
+}
+
+function recommendationText(row: ProspectiveValidationRow | undefined) {
+  if (!row) {
+    return "collect more settled markets";
+  }
+  const low = numeric(row.ci_95_low);
+  const high = numeric(row.ci_95_high);
+  if (low <= 0 && high >= 0) {
+    return "evidence inconclusive; continue paper validation";
+  }
+  return low > 0 ? "candidate positive under current evidence" : "candidate negative under current evidence";
+}
+
+function numeric(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function GenericReport({ title, report, keys }: { title: string; report?: JsonRecord | null; keys: string[] }) {

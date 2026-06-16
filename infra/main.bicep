@@ -175,7 +175,7 @@ var researchJobDefinitions = [
     command: 'polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
   }
   {
-    id: 'hourly-quality'
+    id: 'hourly-quality-audit'
     name: 'polyedge-hourly-quality-job'
     triggerType: 'Schedule'
     cron: '10 * * * *'
@@ -185,10 +185,10 @@ var researchJobDefinitions = [
     command: 'DAY=$(date -u +%Y/%m/%d); HOUR=$(date -u -d "10 minutes ago" +%H); polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "reports/research/hourly/$DAY/$HOUR/audit.json" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
   }
   {
-    id: 'daily-report'
+    id: 'daily-research-report'
     name: 'polyedge-daily-research-job'
     triggerType: 'Schedule'
-    cron: '30 1 * * *'
+    cron: '30 0 * * *'
     replicaTimeout: 10800
     cpu: '2'
     memory: '4Gi'
@@ -198,24 +198,44 @@ var researchJobDefinitions = [
     id: 'prospective-validation'
     name: 'polyedge-prospective-job'
     triggerType: 'Schedule'
-    cron: '30 2 * * *'
+    cron: '15 1 * * *'
     replicaTimeout: 1800
     cpu: cpu
     memory: memory
     command: 'polyedge-rs research validate-prospective --since "2026-06-14T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
   }
   {
-    id: 'replay-index'
+    id: 'compact-replay-index'
     name: 'polyedge-replay-index-job'
     triggerType: 'Schedule'
-    cron: '0 3 * * *'
+    cron: '0 2 * * *'
     replicaTimeout: 7200
     cpu: '2'
     memory: '4Gi'
     command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/replay-index/$DATE/normalized"; mkdir -p "data/research/replay-index/$DATE"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-replay-index --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
   }
   {
-    id: 'backfill'
+    id: 'chart-backfill'
+    name: 'polyedge-chart-backfill-job'
+    triggerType: 'Manual'
+    cron: ''
+    replicaTimeout: 7200
+    cpu: cpu
+    memory: memory
+    command: 'mkdir -p reports/jobs/latest; printf "{\"job_id\":\"chart-backfill\",\"job_type\":\"chart-backfill\",\"status\":\"defined_pending_cli\",\"started_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"finished_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"artifacts\":[],\"warnings\":[\"chart backfill CLI command is not implemented in this image\"],\"errors\":[],\"data_quality\":\"unknown\",\"research_only\":true,\"live_trading_enabled\":false}\n" > reports/jobs/latest/chart-backfill.json'
+  }
+  {
+    id: 'adx-ingestion'
+    name: 'polyedge-adx-ingestion-job'
+    triggerType: 'Schedule'
+    cron: '15 * * * *'
+    replicaTimeout: 1800
+    cpu: cpu
+    memory: memory
+    command: 'mkdir -p reports/jobs/latest; printf "{\"job_id\":\"adx-ingestion\",\"job_type\":\"adx-ingestion\",\"status\":\"defined_pending_pipeline\",\"started_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"finished_ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"artifacts\":[],\"warnings\":[\"ADX ingestion is defined for Azure visibility but no ingestion endpoint is configured\"],\"errors\":[],\"data_quality\":\"unknown\",\"research_only\":true,\"live_trading_enabled\":false}\n" > reports/jobs/latest/adx-ingestion.json'
+  }
+  {
+    id: 'manual-backfill'
     name: 'polyedge-backfill-job'
     triggerType: 'Manual'
     cron: ''
@@ -243,8 +263,8 @@ var storageMetricAlerts = [
 ]
 var logAlerts = [
   {
-    name: 'missing-latest-blob'
-    displayName: 'PolyEdge no new latest blob'
+    name: 'no-new-blob-for-3-minutes'
+    displayName: 'PolyEdge no new blob for 3 minutes'
     severity: 0
     query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-data-freshness-job" | where (Log_s has "status" and Log_s has "critical") or Log_s has "no new blob"'
   }
@@ -255,16 +275,40 @@ var logAlerts = [
     query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-data-freshness-job" | where Log_s has "tiny blob ratio" or (Log_s has "tiny_blob_ratio" and Log_s has "warning")'
   }
   {
-    name: 'recorder-failure'
-    displayName: 'PolyEdge recorder failure'
-    severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Log_s has "failed_total" or Log_s has "dropped_count" or Log_s has "worker_alive=false"'
+    name: 'hour-missing-minute-blobs'
+    displayName: 'PolyEdge hour missing minute blobs'
+    severity: 1
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-hourly-quality-job" | where Log_s has "missing minute" or Log_s has "hour_missing_minute_blobs"'
   }
   {
-    name: 'research-job-failure'
-    displayName: 'PolyEdge research job failure'
+    name: 'recorder-failed-total-gt-0'
+    displayName: 'PolyEdge recorder failed total > 0'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Log_s has "failed_total" or Log_s has "worker_alive=false"'
+  }
+  {
+    name: 'recorder-dropped-count-gt-0'
+    displayName: 'PolyEdge recorder dropped count > 0'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Log_s has "dropped_count"'
+  }
+  {
+    name: 'job-failed'
+    displayName: 'PolyEdge job failed'
     severity: 0
     query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job" | where Log_s has "error" or Log_s has "failed" or Log_s has "panicked"'
+  }
+  {
+    name: 'job-duration-too-long'
+    displayName: 'PolyEdge job duration too long'
+    severity: 1
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job" | where Log_s has "duration_seconds" and Log_s has "too_long"'
+  }
+  {
+    name: 'adx-ingestion-failed'
+    displayName: 'PolyEdge ADX ingestion failed'
+    severity: 1
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-adx-ingestion-job" | where Log_s has "error" or Log_s has "failed"'
   }
 ]
 

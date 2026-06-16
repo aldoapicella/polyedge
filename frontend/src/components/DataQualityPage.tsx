@@ -3,7 +3,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { getLabDataQualityLatest, getLabExclusions, getLabHourlyQuality, validateLabExclusions } from "@/lib/api";
+import { getDataQualityTimeline, getLabDataQualityLatest, getLabExclusions, getLabHourlyQuality, validateLabExclusions } from "@/lib/api";
 import type { ExclusionWindow, JsonRecord } from "@/lib/types";
 import { ageText, compact, dateTime, numberText, pctText } from "@/lib/format";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
@@ -15,6 +15,7 @@ export function DataQualityPage() {
   const hourly = useQuery({ queryKey: ["labs", "data-quality", "hourly", today], queryFn: () => getLabHourlyQuality(today), retry: false });
   const exclusions = useQuery({ queryKey: ["labs", "data-quality", "exclusions"], queryFn: getLabExclusions, retry: false });
   const validation = useQuery({ queryKey: ["labs", "data-quality", "exclusions", "validate"], queryFn: validateLabExclusions, retry: false });
+  const timeline = useQuery({ queryKey: ["data-quality", "timeline"], queryFn: getDataQualityTimeline, retry: false, refetchInterval: 30000 });
 
   const freshness = asRecord(latest.data?.freshness)?.result ? asRecord(asRecord(latest.data?.freshness)?.result) : asRecord(latest.data?.freshness);
   const recorder = asRecord(latest.data?.recorder);
@@ -86,6 +87,11 @@ export function DataQualityPage() {
           {recorder ? <KeyValueTable value={recorder} /> : <EmptyState label={latest.isLoading ? "Loading recorder" : "No recorder metrics"} />}
         </Panel>
       </div>
+
+      <Panel>
+        <PanelHeader title="Data Quality Timeline" meta={`${timeline.data?.events.length ?? 0} events`} />
+        <QualityTimeline events={timeline.data?.events ?? []} loading={timeline.isLoading} />
+      </Panel>
     </div>
   );
 }
@@ -160,6 +166,29 @@ function KeyValueTable({ value }: { value: JsonRecord }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function QualityTimeline({ events, loading }: { events: { ts: string; kind: string; status: string; title: string; detail?: JsonRecord }[]; loading: boolean }) {
+  if (!events.length) {
+    return <EmptyState label={loading ? "Loading quality timeline" : "No quality timeline events found. Run freshness and hourly audit jobs to populate this view."} />;
+  }
+  return (
+    <div className="max-h-[420px] overflow-auto">
+      {events.slice(0, 120).map((event, index) => (
+        <div key={`${event.ts}-${event.kind}-${index}`} className="grid gap-3 border-b border-line px-4 py-3 last:border-b-0 md:grid-cols-[180px_180px_1fr]">
+          <div className="text-sm font-medium text-ink">{dateTime(event.ts)}</div>
+          <div className="flex items-center gap-2">
+            <Pill tone={event.status === "healthy" || event.status === "ok" ? "good" : event.status === "unknown" ? "neutral" : "warn"}>{event.status}</Pill>
+            <span className="text-xs text-ink/50">{event.kind}</span>
+          </div>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-ink">{event.title}</div>
+            <div className="truncate text-xs text-ink/55">{compact(event.detail)}</div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

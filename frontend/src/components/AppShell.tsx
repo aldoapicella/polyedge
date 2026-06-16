@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   LogOut,
   PanelsTopLeft,
+  Search,
   Settings,
   ShieldCheck
 } from "lucide-react";
@@ -19,8 +20,9 @@ import { usePathname, useRouter } from "next/navigation";
 const nav = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/markets", label: "Markets", icon: PanelsTopLeft },
+  { href: "/labs", label: "Research", icon: Beaker },
+  { href: "/explore", label: "Explore", icon: Search },
   { href: "/reports", label: "Reports", icon: FileText },
-  { href: "/labs", label: "Labs", icon: Beaker },
   { href: "/data-quality", label: "Data Quality", icon: DatabaseZap },
   { href: "/jobs", label: "Jobs", icon: ClipboardList },
   { href: "/config", label: "Settings", icon: Settings }

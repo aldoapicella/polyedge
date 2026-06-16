@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { numberText, pctText } from "@/lib/format";
-import type { MarketSummary } from "@/lib/types";
+import type { MarketSummary, TradeDecision } from "@/lib/types";
 import { EmptyState, InfoHint, Panel, PanelHeader, Pill } from "@/components/ui";
 import { bpsText, distanceBps, distanceTone, timeRemaining, toneText, windowMeta } from "./model";
 import type { Tone } from "./types";
@@ -9,12 +9,14 @@ export function ActiveMarketPanel({
   active,
   referencePrice,
   referenceAge,
-  isLoading
+  isLoading,
+  latestDecision
 }: {
   active?: MarketSummary | null;
   referencePrice?: string;
   referenceAge: string;
   isLoading: boolean;
+  latestDecision?: TradeDecision;
 }) {
   const distance = distanceBps(referencePrice, active?.start_price);
   return (
@@ -50,6 +52,8 @@ export function ActiveMarketPanel({
             <Field label="Market Status" value={active.is_tradeable ? "Tradeable" : active.status} />
             <Field label="q Up" value={pctText(active.fair_value?.q_up)} tone="good" help="Model-implied probability that the market resolves Up." />
             <Field label="q Down" value={pctText(active.fair_value?.q_down)} tone="danger" help="Model-implied probability that the market resolves Down." />
+            <Field label="Bot Action" value={(latestDecision?.action ?? "observing").toUpperCase()} help="Most recent strategy action from the backend snapshot." />
+            <Field label="Latest Reason" value={latestDecision?.reason ?? "Waiting for the next decision event"} help="Human-readable reason attached to the latest decision." />
           </div>
         </div>
       ) : (

@@ -67,6 +67,27 @@ async fn api_contract_routes_remain_reachable() {
             None,
             StatusCode::OK,
         ),
+        (Method::GET, "/api/v1/query/schema", None, StatusCode::OK),
+        (
+            Method::POST,
+            "/api/v1/query/run",
+            Some(json!({"dataset": "markets", "limit": 5})),
+            StatusCode::OK,
+        ),
+        (Method::GET, "/api/v1/query/templates", None, StatusCode::OK),
+        (
+            Method::GET,
+            "/api/v1/data-quality/timeline",
+            None,
+            StatusCode::OK,
+        ),
+        (Method::GET, "/api/v1/jobs", None, StatusCode::OK),
+        (
+            Method::GET,
+            "/api/v1/jobs/freshness-check/logs",
+            None,
+            StatusCode::OK,
+        ),
         (
             Method::POST,
             "/api/v1/control/pause",

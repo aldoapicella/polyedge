@@ -144,7 +144,7 @@ async fn report_artifacts(Query(query): Query<ArtifactsQuery>) -> impl IntoRespo
     }
 }
 
-async fn report_artifact(Path(artifact_id): Path<String>) -> impl IntoResponse {
+pub(crate) async fn report_artifact(Path(artifact_id): Path<String>) -> impl IntoResponse {
     let relative = artifact_id.replace('~', "/");
     let Ok(relative) = sanitize_prefix(&relative) else {
         return (
@@ -169,7 +169,7 @@ async fn report_artifact(Path(artifact_id): Path<String>) -> impl IntoResponse {
     }
 }
 
-async fn jobs() -> impl IntoResponse {
+pub(crate) async fn jobs() -> impl IntoResponse {
     let mut jobs = job_definitions();
     let mut source = "iac_defined_jobs".to_owned();
     let mut note = "API does not run long research jobs in-process.".to_owned();
@@ -203,17 +203,8 @@ async fn jobs() -> impl IntoResponse {
     }))
 }
 
-async fn job_detail(Path(job_id): Path<String>) -> impl IntoResponse {
-    let jobs = job_definitions();
-    let found = jobs
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|job| {
-            job["job_id"].as_str() == Some(&job_id) || job["job_name"].as_str() == Some(&job_id)
-        })
-        .cloned();
-    match found {
+pub(crate) async fn job_detail(Path(job_id): Path<String>) -> impl IntoResponse {
+    match job_definition_by_id(&job_id) {
         Some(job) => (StatusCode::OK, Json(json!({ "job": job }))).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -223,12 +214,68 @@ async fn job_detail(Path(job_id): Path<String>) -> impl IntoResponse {
     }
 }
 
+pub(crate) async fn job_logs(Path(job_id): Path<String>) -> impl IntoResponse {
+    let Some(job) = job_definition_by_id(&job_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "detail": format!("Job {job_id} was not found.") })),
+        )
+            .into_response();
+    };
+    Json(json!({
+        "job_id": job["job_id"],
+        "job_name": job["job_name"],
+        "logs": [],
+        "artifacts": [
+            job["output_artifact"].clone(),
+            format!("reports/jobs/latest/{}.json", job["job_id"].as_str().unwrap_or("job"))
+        ],
+        "detail": "Live Container Apps execution logs are read from Azure Monitor. This endpoint exposes the job identity and artifact paths without exposing credentials."
+    }))
+    .into_response()
+}
+
+pub(crate) async fn data_quality_timeline() -> impl IntoResponse {
+    let latest = read_json_or_null(FRESHNESS_LATEST);
+    let mut events = Vec::new();
+    if !latest.is_null() {
+        let ts = latest["generated_at"]
+            .as_str()
+            .or_else(|| latest["generated_ts"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(now_ts);
+        events.push(json!({
+            "ts": ts,
+            "kind": "freshness",
+            "status": latest["result"]["status"].as_str().or_else(|| latest["status"].as_str()).unwrap_or("unknown"),
+            "title": "Latest freshness check",
+            "detail": latest
+        }));
+    }
+    for audit in list_json_files(&PathBuf::from(REPORT_ROOT), "data_audit.json", 200) {
+        let ts = audit["generated_at"]
+            .as_str()
+            .or_else(|| audit["generated_ts"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(now_ts);
+        events.push(json!({
+            "ts": ts,
+            "kind": "quality_audit",
+            "status": audit["result"]["status"].as_str().or_else(|| audit["status"].as_str()).unwrap_or("unknown"),
+            "title": "Data quality audit",
+            "detail": audit
+        }));
+    }
+    events.sort_by(|left, right| right["ts"].as_str().cmp(&left["ts"].as_str()));
+    Json(json!({ "events": events, "generated_ts": now_ts() })).into_response()
+}
+
 async fn start_freshness_check() -> impl IntoResponse {
     start_research_job_by_id("freshness-check", None).await
 }
 
 async fn start_daily_report() -> impl IntoResponse {
-    start_research_job_by_id("daily-report", None).await
+    start_research_job_by_id("daily-research-report", None).await
 }
 
 async fn start_prospective_validation() -> impl IntoResponse {
@@ -236,11 +283,11 @@ async fn start_prospective_validation() -> impl IntoResponse {
 }
 
 async fn start_replay_index() -> impl IntoResponse {
-    start_research_job_by_id("replay-index", None).await
+    start_research_job_by_id("compact-replay-index", None).await
 }
 
 async fn start_backfill(body: Option<Json<StartJobRequest>>) -> impl IntoResponse {
-    start_research_job_by_id("backfill", body.map(|body| body.0)).await
+    start_research_job_by_id("manual-backfill", body.map(|body| body.0)).await
 }
 
 async fn start_job(
@@ -528,7 +575,7 @@ fn collect_artifacts(root: &FsPath, artifacts: &mut Vec<Value>) {
         let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !matches!(extension, "json" | "md") {
+        if !matches!(extension, "json" | "md" | "csv" | "parquet") {
             continue;
         }
         let relative = path
@@ -563,19 +610,33 @@ fn artifact_payload(path: &FsPath) -> Result<Option<Value>, String> {
             Err(error) => return Err(error.to_string()),
         }
     };
-    if FsPath::new(&relative)
+    match FsPath::new(&relative)
         .extension()
         .and_then(|value| value.to_str())
-        == Some("json")
     {
-        let json: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        Ok(Some(
-            json!({ "path": relative, "kind": "json", "content": json }),
-        ))
-    } else {
-        Ok(Some(
+        Some("json") => {
+            let json: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+            Ok(Some(
+                json!({ "path": relative, "kind": "json", "content": json }),
+            ))
+        }
+        Some("csv") => Ok(Some(json!({
+            "path": relative,
+            "kind": "csv",
+            "content": text.lines().take(200).collect::<Vec<_>>().join("\n"),
+            "truncated": text.lines().count() > 200
+        }))),
+        Some("parquet") => Ok(Some(json!({
+            "path": relative,
+            "kind": "parquet_metadata",
+            "content": {
+                "size_bytes": fs::metadata(path).ok().map(|metadata| metadata.len()),
+                "preview": "Parquet binary preview is metadata-only in the API."
+            }
+        }))),
+        _ => Ok(Some(
             json!({ "path": relative, "kind": "markdown", "content": text }),
-        ))
+        )),
     }
 }
 
@@ -715,7 +776,7 @@ fn report_relative_path(path: &FsPath) -> String {
         .to_owned()
 }
 
-fn job_definitions() -> Value {
+pub(crate) fn job_definitions() -> Value {
     json!([
         job_definition(
             "freshness-check",
@@ -724,40 +785,64 @@ fn job_definitions() -> Value {
             "*/5 * * * *"
         ),
         job_definition(
-            "hourly-quality",
+            "hourly-quality-audit",
             "polyedge-hourly-quality-job",
             "Schedule",
             "10 * * * *"
         ),
         job_definition(
-            "daily-report",
+            "daily-research-report",
             "polyedge-daily-research-job",
             "Schedule",
-            "30 1 * * *"
+            "30 0 * * *"
         ),
         job_definition(
             "prospective-validation",
             "polyedge-prospective-job",
             "Schedule",
-            "30 2 * * *"
+            "15 1 * * *"
         ),
         job_definition(
-            "replay-index",
+            "compact-replay-index",
             "polyedge-replay-index-job",
             "Schedule",
-            "0 3 * * *"
+            "0 2 * * *"
         ),
-        job_definition("backfill", "polyedge-backfill-job", "Manual", Value::Null),
+        job_definition(
+            "chart-backfill",
+            "polyedge-chart-backfill-job",
+            "Manual",
+            Value::Null
+        ),
+        job_definition(
+            "adx-ingestion",
+            "polyedge-adx-ingestion-job",
+            "Schedule",
+            "15 * * * *"
+        ),
+        job_definition(
+            "manual-backfill",
+            "polyedge-backfill-job",
+            "Manual",
+            Value::Null
+        ),
     ])
 }
 
 fn job_definition_by_id(job_id: &str) -> Option<Value> {
+    let canonical = match job_id {
+        "daily-report" => "daily-research-report",
+        "hourly-quality" => "hourly-quality-audit",
+        "replay-index" => "compact-replay-index",
+        "backfill" => "manual-backfill",
+        other => other,
+    };
     job_definitions()
         .as_array()
         .into_iter()
         .flatten()
         .find(|job| {
-            job["job_id"].as_str() == Some(job_id) || job["job_name"].as_str() == Some(job_id)
+            job["job_id"].as_str() == Some(canonical) || job["job_name"].as_str() == Some(canonical)
         })
         .cloned()
 }
@@ -802,7 +887,7 @@ fn start_options(
     job_id: &str,
     request: Option<&StartJobRequest>,
 ) -> Result<Option<JobStartOptions>, String> {
-    if job_id != "backfill" {
+    if job_id != "manual-backfill" && job_id != "backfill" {
         return Ok(None);
     }
     let request = request.ok_or_else(|| "Backfill requires start, end, and task.".to_owned())?;
@@ -844,6 +929,7 @@ fn start_options(
 fn job_definition(job_id: &str, job_name: &str, trigger: &str, cron: impl Into<Value>) -> Value {
     json!({
         "job_id": job_id,
+        "job_type": job_id,
         "job_name": job_name,
         "status": "defined_in_iac",
         "trigger": trigger,
@@ -852,12 +938,27 @@ fn job_definition(job_id: &str, job_name: &str, trigger: &str, cron: impl Into<V
         "last_finish": Value::Null,
         "duration": Value::Null,
         "exit_code": Value::Null,
-        "output_artifact": Value::Null,
+        "output_artifact": job_output_artifact(job_id),
         "error": Value::Null,
         "running": false,
         "research_only": true,
-        "live_trading_enabled": false
+        "live_trading_enabled": false,
+        "data_quality": "unknown"
     })
+}
+
+fn job_output_artifact(job_id: &str) -> &'static str {
+    match job_id {
+        "freshness-check" => FRESHNESS_LATEST,
+        "daily-research-report" => "reports/research/latest_daily_report.json",
+        "prospective-validation" => "reports/research/prospective/prospective_validation.json",
+        "compact-replay-index" => "data/research/replay-index/<date>/index_manifest.json",
+        "manual-backfill" => "reports/research/backfill/<start>-<end>-<task>.json",
+        "chart-backfill" => "reports/jobs/latest/chart-backfill.json",
+        "adx-ingestion" => "reports/jobs/latest/adx-ingestion.json",
+        "hourly-quality-audit" => "reports/research/hourly/<yyyy/mm/dd/hh>/audit.json",
+        _ => "reports/jobs/latest/unknown.json",
+    }
 }
 
 fn sanitize_prefix(value: &str) -> Result<String, &'static str> {

@@ -10,7 +10,7 @@ import { DecisionTable } from "@/components/dashboard/DecisionTable";
 import { EventTimeline } from "@/components/dashboard/EventTimeline";
 import { ExecutionReportTable } from "@/components/dashboard/ExecutionReportTable";
 import { MarketMainChart, TrendCharts } from "@/components/dashboard/MarketCharts";
-import { DashboardHeader, SystemHealthCards } from "@/components/dashboard/SystemStatus";
+import { CurrentVerdictBanner, DashboardHeader, SystemHealthCards } from "@/components/dashboard/SystemStatus";
 import { recorderSummary } from "@/components/dashboard/model";
 import { useRealtimeSnapshot } from "@/components/dashboard/useRealtimeSnapshot";
 import { Panel, PanelHeader, Pill } from "@/components/ui";
@@ -82,6 +82,15 @@ export function Dashboard() {
         onRefresh={() => queryClient.invalidateQueries({ queryKey: ["snapshot"] })}
       />
 
+      <CurrentVerdictBanner
+        status={status}
+        active={active}
+        recorder={recorder}
+        dataQuality={dataQuality.data}
+        jobs={labJobs.data?.jobs ?? []}
+        latestDecision={snapshotStore?.latest_decisions?.[0]}
+      />
+
       <SystemHealthCards
         status={status}
         reportSummary={reportSummary}
@@ -113,12 +122,15 @@ export function Dashboard() {
           referencePrice={reference?.price}
           referenceAge={ageText(reference?.local_ts)}
           isLoading={snapshot.isLoading}
+          latestDecision={snapshotStore?.latest_decisions?.[0]}
         />
         <MarketMainChart
           points={seriesStore.marketChart}
           domain={seriesStore.domain}
           sampleCount={seriesStore.sampleCount}
           summary={seriesStore.summary}
+          active={active}
+          events={timelineEvents}
         />
       </div>
 

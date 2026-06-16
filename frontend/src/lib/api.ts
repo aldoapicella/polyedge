@@ -12,6 +12,10 @@ import type {
   LabReportBundle,
   MarketDetail,
   ProspectiveValidation,
+  QueryRequest,
+  QueryResult,
+  QuerySchema,
+  QueryTemplate,
   ReportJob,
   ReportPayload,
   RuntimeEvent,
@@ -143,8 +147,54 @@ export function getLabJobs() {
   return backendFetch<{ jobs: LabJob[]; source?: string; note?: string }>("labs/jobs");
 }
 
+export function getJobs() {
+  return backendFetch<{ jobs: LabJob[]; source?: string; note?: string }>("jobs");
+}
+
+export function getJobDetail(jobId: string) {
+  return backendFetch<{ job: LabJob }>(`jobs/${encodeURIComponent(jobId)}`);
+}
+
+export function getJobLogs(jobId: string) {
+  return backendFetch<{ job_id: string; job_name?: string; logs: string[]; artifacts?: string[]; detail?: string }>(
+    `jobs/${encodeURIComponent(jobId)}/logs`
+  );
+}
+
+export function getQuerySchema() {
+  return backendFetch<QuerySchema>("query/schema");
+}
+
+export function getQueryTemplates() {
+  return backendFetch<{ templates: QueryTemplate[] }>("query/templates");
+}
+
+export function runQuery(request: QueryRequest) {
+  return backendFetch<QueryResult>("query/run", {
+    method: "POST",
+    body: request
+  });
+}
+
+export function getDataQualityTimeline() {
+  return backendFetch<{ events: { ts: string; kind: string; status: string; title: string; detail?: JsonRecord }[]; generated_ts: string }>(
+    "data-quality/timeline"
+  );
+}
+
 export function startLabJob(
-  job: "freshness-check" | "daily-report" | "prospective-validation" | "replay-index" | "backfill",
+  job:
+    | "freshness-check"
+    | "hourly-quality-audit"
+    | "daily-research-report"
+    | "daily-report"
+    | "prospective-validation"
+    | "compact-replay-index"
+    | "replay-index"
+    | "chart-backfill"
+    | "adx-ingestion"
+    | "manual-backfill"
+    | "backfill",
   body?: { start?: string; end?: string; task?: string }
 ) {
   return backendFetch<LabJob>(`labs/jobs/${job}/start`, { method: "POST", body });
