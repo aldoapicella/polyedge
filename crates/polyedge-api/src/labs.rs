@@ -432,14 +432,6 @@ async fn start_research_job_by_id(
 }
 
 fn read_latest_report_payload() -> Value {
-    let latest = read_json_or_null(PathBuf::from(REPORT_ROOT).join("latest_daily_report.json"));
-    if !latest.is_null() {
-        return json!({
-            "report": latest,
-            "latest": true,
-            "artifacts": artifacts_for_prefix("")
-        });
-    }
     if let Some(date) = latest_daily_date() {
         let dir = PathBuf::from(REPORT_ROOT).join("daily").join(&date);
         return json!({
@@ -451,6 +443,14 @@ fn read_latest_report_payload() -> Value {
             "calibration": read_json_or_null(dir.join("calibration.json")),
             "sample_size": read_json_or_null(dir.join("sample_size.json")),
             "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
+        });
+    }
+    let latest = read_json_or_null(PathBuf::from(REPORT_ROOT).join("latest_daily_report.json"));
+    if !latest.is_null() {
+        return json!({
+            "report": latest,
+            "latest": true,
+            "artifacts": artifacts_for_prefix("")
         });
     }
     json!({
