@@ -9,12 +9,14 @@ import {
   getLabArtifacts,
   getLabArtifact,
   getLabCalibrationLatest,
+  getLabCandidates,
   getLabFillModelsLatest,
   getLabProspective,
   getLabRegimesLatest,
-  getLabSampleSizeLatest
+  getLabSampleSizeLatest,
+  getLabSummary
 } from "@/lib/api";
-import type { JsonRecord, LabArtifactPayload, ProspectiveValidationRow } from "@/lib/types";
+import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow } from "@/lib/types";
 import { compact, numberText } from "@/lib/format";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
@@ -22,6 +24,8 @@ const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibrat
 
 export function LabsPage() {
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
+  const labSummary = useQuery({ queryKey: ["labs", "summary"], queryFn: getLabSummary, retry: false });
+  const candidateEvidence = useQuery({ queryKey: ["labs", "candidates"], queryFn: getLabCandidates, retry: false });
   const prospective = useQuery({ queryKey: ["labs", "prospective"], queryFn: getLabProspective, retry: false });
   const regimes = useQuery({ queryKey: ["labs", "regimes"], queryFn: getLabRegimesLatest, retry: false });
   const calibration = useQuery({ queryKey: ["labs", "calibration"], queryFn: getLabCalibrationLatest, retry: false });
@@ -38,7 +42,7 @@ export function LabsPage() {
         <div>
           <h1 className="text-xl font-semibold text-ink">Labs</h1>
         </div>
-        <IconButton label="Refresh labs" onClick={() => void Promise.all([prospective.refetch(), regimes.refetch(), calibration.refetch(), fillModels.refetch(), sampleSize.refetch(), artifacts.refetch()])}>
+        <IconButton label="Refresh labs" onClick={() => void Promise.all([labSummary.refetch(), candidateEvidence.refetch(), prospective.refetch(), regimes.refetch(), calibration.refetch(), fillModels.refetch(), sampleSize.refetch(), artifacts.refetch()])}>
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
@@ -55,7 +59,14 @@ export function LabsPage() {
         ))}
       </div>
 
-      {tab === "Overview" ? <Overview rows={rows} candidates={frozenCandidates} /> : null}
+      {tab === "Overview" ? (
+        <Overview
+          rows={rows}
+          candidates={frozenCandidates}
+          apiCandidates={candidateEvidence.data?.candidates ?? []}
+          summary={labSummary.data}
+        />
+      ) : null}
       {tab === "Prospective Validation" ? <ProspectiveTable rows={rows} loading={prospective.isLoading} /> : null}
       {tab === "Regime Profiles" ? (
         <ReportWithExplanation
@@ -87,31 +98,64 @@ export function LabsPage() {
   );
 }
 
-function Overview({ rows, candidates }: { rows: ProspectiveValidationRow[]; candidates: JsonRecord[] }) {
+function Overview({
+  rows,
+  candidates,
+  apiCandidates,
+  summary
+}: {
+  rows: ProspectiveValidationRow[];
+  candidates: JsonRecord[];
+  apiCandidates: LabCandidateEvidence[];
+  summary?: LabSummary;
+}) {
   const latest = rows.at(-1);
   const [selected, setSelected] = useState<CandidateEvidence | null>(null);
-  const evidence = evidenceRows(rows, candidates);
+  const evidence = apiCandidates.length ? apiEvidenceRows(apiCandidates, latest) : evidenceRows(rows, candidates);
+  const summaryStats = sampleSizeStats(summary?.sample_size);
+  const candidateList = candidates.length
+    ? candidates
+    : apiCandidates.length
+      ? apiCandidates.map((candidate) => ({
+          name: candidate.candidate,
+          profile: candidate.profile ?? candidate.candidate
+        }))
+      : fallbackCandidates();
   return (
-    <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
+    <div className="space-y-5">
       <Panel>
-        <PanelHeader title="Frozen Candidates" meta={`${candidates.length || 4} tracked`} />
-        <div className="space-y-2 p-4">
-          {(candidates.length ? candidates : fallbackCandidates()).map((candidate) => (
-            <div key={String(candidate.name)} className="border border-line bg-panel px-3 py-2">
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate text-sm font-semibold text-ink">{String(candidate.name)}</span>
-                <Pill tone="neutral">disabled</Pill>
-              </div>
-              <div className="mt-1 truncate text-xs text-ink/55">{String(candidate.profile ?? candidate.name)}</div>
-            </div>
-          ))}
+        <PanelHeader title="Research Status" meta={summary?.status ?? latest?.date ?? "collecting evidence"} />
+        <div className="grid gap-3 p-4 md:grid-cols-4">
+          <Metric label="Settled Sample" value={summaryStats?.n ?? latest?.settled_markets ?? "waiting for research job"} />
+          <Metric label="Prospective Rows" value={summary?.prospective_rows ?? rows.length} />
+          <Metric label="Candidates" value={summary?.candidate_count ?? (apiCandidates.length || candidates.length || 4)} />
+          <Metric label="Data Quality" value={summary?.data_quality ?? latest?.data_quality_status ?? "unknown"} />
+        </div>
+        <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+          {compact(summary?.recommendation ?? latest?.recommendation ?? recommendationText(latest), "collect more evidence")}
         </div>
       </Panel>
-      <Panel>
-        <PanelHeader title="Candidate Evidence Matrix" meta={latest?.date ?? "collecting evidence"} />
-        <EvidenceMatrix rows={evidence} onSelect={setSelected} />
-        {selected ? <CandidateDrawer candidate={selected} onClose={() => setSelected(null)} /> : null}
-      </Panel>
+      <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
+        <Panel>
+          <PanelHeader title="Frozen Candidates" meta={`${candidates.length || apiCandidates.length || 4} tracked`} />
+          <div className="space-y-2 p-4">
+            {candidateList.map((candidate) => (
+              <div key={String(candidate.name)} className="border border-line bg-panel px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-sm font-semibold text-ink">{String(candidate.name)}</span>
+                  <Pill tone="neutral">disabled</Pill>
+                </div>
+                <div className="mt-1 truncate text-xs text-ink/55">{String(candidate.profile ?? candidate.name)}</div>
+              </div>
+            ))}
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHeader title="Candidate Evidence Matrix" meta={latest?.date ?? summary?.status ?? "collecting evidence"} />
+          <EvidenceMatrix rows={evidence} onSelect={setSelected} />
+          {selected ? <CandidateDrawer candidate={selected} onClose={(): void => setSelected(null)} /> : null}
+        </Panel>
+      </div>
     </div>
   );
 }
@@ -319,6 +363,25 @@ function evidenceRows(rows: ProspectiveValidationRow[], candidates: JsonRecord[]
   });
 }
 
+function apiEvidenceRows(candidates: LabCandidateEvidence[], latest?: ProspectiveValidationRow): CandidateEvidence[] {
+  return candidates.map((candidate) => ({
+    candidate: candidate.candidate,
+    status: candidate.status ?? "collecting",
+    latestPnl: candidate.latest_test_pnl ?? "collecting",
+    ci:
+      candidate.ci_95_low !== null && candidate.ci_95_low !== undefined && candidate.ci_95_high !== null && candidate.ci_95_high !== undefined
+        ? `[${numberText(candidate.ci_95_low)}, ${numberText(candidate.ci_95_high)}]`
+        : "collecting",
+    maxDrawdown: candidate.max_drawdown ?? "collecting",
+    fillModelAgreement: candidate.fill_model_agreement ?? "pending sensitivity",
+    dataQuality: candidate.data_quality ?? "unknown",
+    recommendation: candidate.recommendation ?? "collect more settled markets",
+    lastUpdated: candidate.last_updated ?? "not run",
+    explanation: candidate.explanation ?? `${candidate.candidate} is collecting prospective evidence.`,
+    latest
+  }));
+}
+
 function candidatePnl(row: ProspectiveValidationRow | undefined, candidate: string) {
   if (!row) {
     return "collecting";
@@ -409,19 +472,34 @@ function GenericReport({ title, report, keys }: { title: string; report?: JsonRe
 }
 
 function SampleSizePanel({ report }: { report?: JsonRecord | null }) {
-  const stats = asRecord(pointer(report, "/result/statistics"));
+  const stats = sampleSizeStats(report);
+  const ci = confidenceIntervalText(stats);
+  const requiredN = firstDefined(
+    stats?.required_n_to_detect_observed_mean,
+    stats?.required_n_for_plus_minus_0_10,
+    stats?.required_n_for_plus_minus_0_05,
+    stats?.required_n,
+    stats ? "insufficient data" : undefined
+  );
   return (
     <Panel>
       <PanelHeader title="Sample Size" meta="market-level confidence" />
       {stats ? (
-        <div className="grid gap-3 p-4 md:grid-cols-4">
-          <Metric label="N" value={stats.n} />
-          <Metric label="Mean" value={stats.mean} />
-          <Metric label="95% CI" value={`${numberText(stats.ci_low)} / ${numberText(stats.ci_high)}`} />
-          <Metric label="Required N" value={stats.required_n_to_detect_observed_mean} />
-        </div>
+        <>
+          <div className="grid gap-3 p-4 md:grid-cols-4">
+            <Metric label="N" value={firstDefined(stats.n, stats.sample_count, stats.markets, "waiting for report")} />
+            <Metric label="Mean" value={firstDefined(stats.mean, "insufficient data")} />
+            <Metric label="95% CI" value={ci} />
+            <Metric label="Required N" value={requiredN} />
+          </div>
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            {ci === "insufficient data"
+              ? "The sample exists, but there is not enough variance/evidence to compute a stable confidence interval yet."
+              : "Confidence interval is computed from settled market-level research outcomes."}
+          </div>
+        </>
       ) : (
-        <EmptyState label="No sample-size report found" />
+        <EmptyState label="No sample-size statistics found. Run the daily research job or check research artifact access." />
       )}
     </Panel>
   );
@@ -536,6 +614,32 @@ function pointer(record: unknown, path: string): unknown {
     .split("/")
     .slice(1)
     .reduce<unknown>((current, key) => asRecord(current)?.[key], record);
+}
+
+function sampleSizeStats(report: unknown): JsonRecord | undefined {
+  return (
+    asRecord(pointer(report, "/result/statistics")) ??
+    asRecord(pointer(report, "/statistics")) ??
+    asRecord(pointer(report, "/report/result/statistics")) ??
+    asRecord(pointer(report, "/sample_size/result/statistics")) ??
+    asRecord(report)
+  ) ?? undefined;
+}
+
+function confidenceIntervalText(stats: JsonRecord | undefined) {
+  if (!stats) {
+    return "waiting for report";
+  }
+  const low = firstDefined(stats.ci_low, stats.ci_95_low, stats.lower_ci);
+  const high = firstDefined(stats.ci_high, stats.ci_95_high, stats.upper_ci);
+  if (low === undefined || high === undefined || low === null || high === null) {
+    return "insufficient data";
+  }
+  return `${numberText(low)} / ${numberText(high)}`;
+}
+
+function firstDefined(...values: unknown[]) {
+  return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
 function asRecord(value: unknown): JsonRecord | null {

@@ -23,6 +23,9 @@ const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
 
 pub fn router() -> Router<ApiState> {
     Router::new()
+        .route("/summary", get(summary))
+        .route("/candidates", get(candidates))
+        .route("/candidates/:candidate", get(candidate_detail))
         .route("/data-quality/latest", get(data_quality_latest))
         .route("/data-quality/hourly", get(data_quality_hourly))
         .route("/data-quality/exclusions", get(data_quality_exclusions))
@@ -102,6 +105,85 @@ async fn validate_exclusions() -> impl IntoResponse {
         "issues": if has_put_bug_window { Vec::<String>::new() } else { vec!["Required June 11/12 PUT-bug exclusion window is missing or not defaulted.".to_owned()] },
         "registry": payload
     }))
+}
+
+async fn summary() -> impl IntoResponse {
+    let latest = read_latest_report_payload();
+    let prospective = prospective_payload();
+    let sample_size = latest.get("sample_size").cloned().unwrap_or_else(|| {
+        latest_named_report("sample_size.json", "sample_size.json")["report"].clone()
+    });
+    let sample_stats = sample_size
+        .pointer("/result/statistics")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let recommendation = latest
+        .pointer("/report/result/executive_summary/recommendation")
+        .or_else(|| latest.pointer("/report/result/recommendation"))
+        .cloned()
+        .unwrap_or_else(|| json!("Continue collecting data unchanged"));
+    Json(json!({
+        "generated_ts": now_ts(),
+        "date": latest["date"].clone(),
+        "status": prospective["result"]["status"].clone(),
+        "recommendation": recommendation,
+        "sample_size": sample_stats,
+        "data_quality": latest["audit"]["result"]["status"].as_str().unwrap_or("unknown"),
+        "candidate_count": candidate_evidence_rows(&prospective).len(),
+        "prospective_rows": prospective["result"]["rows"].as_array().map(Vec::len).unwrap_or(0),
+        "research_only": true,
+        "live_deployment_allowed": false
+    }))
+}
+
+async fn candidates() -> impl IntoResponse {
+    let prospective = prospective_payload();
+    Json(json!({
+        "generated_ts": now_ts(),
+        "status": prospective["result"]["status"].clone(),
+        "candidates": candidate_evidence_rows(&prospective),
+        "research_only": true,
+        "live_deployment_allowed": false
+    }))
+}
+
+async fn candidate_detail(Path(candidate): Path<String>) -> impl IntoResponse {
+    let prospective = prospective_payload();
+    let candidates = candidate_evidence_rows(&prospective);
+    let Some(summary) = candidates.iter().find(|row| {
+        row["candidate"].as_str() == Some(candidate.as_str())
+            || row["profile"].as_str() == Some(candidate.as_str())
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "detail": format!("Candidate {candidate} was not found.") })),
+        )
+            .into_response();
+    };
+    let history = prospective["result"]["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|row| {
+            json!({
+                "date": row["date"].clone(),
+                "pnl": candidate_pnl(row, &candidate),
+                "settled_markets": row["settled_markets"].clone(),
+                "max_drawdown": row["max_drawdown"].clone(),
+                "data_quality_status": row["data_quality_status"].clone(),
+                "recommendation": row["recommendation"].clone()
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "generated_ts": now_ts(),
+        "candidate": summary,
+        "history": history,
+        "artifacts": candidate_artifacts(),
+        "research_only": true,
+        "live_deployment_allowed": false
+    }))
+    .into_response()
 }
 
 async fn reports_latest() -> impl IntoResponse {
@@ -298,15 +380,19 @@ async fn start_job(
 }
 
 async fn prospective() -> impl IntoResponse {
+    Json(prospective_payload())
+}
+
+fn prospective_payload() -> Value {
     let payload = read_json_or_null(
         PathBuf::from(REPORT_ROOT)
             .join("prospective")
             .join("prospective_validation.json"),
     );
     if !payload.is_null() {
-        return Json(payload);
+        return payload;
     }
-    Json(json!({
+    json!({
         "generated_ts": now_ts(),
         "result": {
             "status": "collecting",
@@ -315,7 +401,7 @@ async fn prospective() -> impl IntoResponse {
             "research_only": true,
             "live_deployment_allowed": false
         }
-    }))
+    })
 }
 
 async fn regimes_latest() -> impl IntoResponse {
@@ -445,6 +531,25 @@ fn read_latest_report_payload() -> Value {
             "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
         });
     }
+    let root = PathBuf::from(REPORT_ROOT);
+    let root_report = json!({
+        "report": read_json_or_null(root.join("final_report.json")),
+        "audit": read_json_or_null(root.join("data_audit.json")),
+        "baseline": read_json_or_null(root.join("baseline.json")),
+        "regimes": read_json_or_null(root.join("regimes.json")),
+        "calibration": read_json_or_null(root.join("calibration.json")),
+        "sample_size": read_json_or_null(root.join("sample_size.json")),
+        "artifacts": artifacts_for_prefix("")
+    });
+    if root_report["report"].is_object()
+        || root_report["audit"].is_object()
+        || root_report["baseline"].is_object()
+        || root_report["regimes"].is_object()
+        || root_report["calibration"].is_object()
+        || root_report["sample_size"].is_object()
+    {
+        return root_report;
+    }
     let latest = read_json_or_null(PathBuf::from(REPORT_ROOT).join("latest_daily_report.json"));
     if !latest.is_null() {
         return json!({
@@ -462,7 +567,21 @@ fn read_latest_report_payload() -> Value {
 
 fn latest_named_report(primary: &str, fallback: &str) -> Value {
     let Some(date) = latest_daily_date() else {
-        return json!({ "report": Value::Null, "detail": "No daily report exists yet." });
+        let root = PathBuf::from(REPORT_ROOT);
+        let report = read_json_or_null(root.join(primary));
+        let report = if report.is_null() {
+            read_json_or_null(root.join(fallback))
+        } else {
+            report
+        };
+        return if report.is_null() {
+            json!({ "report": Value::Null, "detail": "No daily report exists yet." })
+        } else {
+            json!({
+                "report": report,
+                "source": format!("{REPORT_ROOT}/{primary}")
+            })
+        };
     };
     let dir = PathBuf::from(REPORT_ROOT).join("daily").join(&date);
     let report = read_json_or_null(dir.join(primary));
@@ -517,6 +636,183 @@ fn frozen_candidates_payload() -> Value {
                 "enabled_by_default": false
             })
         })
+}
+
+fn candidate_evidence_rows(prospective: &Value) -> Vec<Value> {
+    let candidates = candidate_config_rows();
+    let latest = prospective["result"]["rows"]
+        .as_array()
+        .and_then(|rows| rows.last());
+    candidates
+        .into_iter()
+        .map(|candidate| candidate_evidence_row(candidate, latest))
+        .collect()
+}
+
+fn candidate_config_rows() -> Vec<Value> {
+    let payload = frozen_candidates_payload();
+    let Some(candidates) = payload["candidates"].as_array() else {
+        return FROZEN_CANDIDATE_NAMES
+            .iter()
+            .map(|name| json!({ "name": name, "profile": name }))
+            .collect();
+    };
+    candidates
+        .iter()
+        .map(|candidate| {
+            if candidate.is_object() {
+                candidate.clone()
+            } else {
+                json!({ "name": candidate.as_str().unwrap_or("candidate"), "profile": candidate.as_str().unwrap_or("candidate") })
+            }
+        })
+        .collect()
+}
+
+fn candidate_evidence_row(candidate: Value, latest: Option<&Value>) -> Value {
+    let name = candidate["name"]
+        .as_str()
+        .or_else(|| candidate["profile"].as_str())
+        .unwrap_or("candidate");
+    let pnl = latest
+        .map(|row| candidate_pnl(row, name))
+        .unwrap_or_else(|| json!("collecting"));
+    let status = candidate_status(latest, name, &pnl);
+    let recommendation = latest
+        .and_then(|row| row["recommendation"].as_str())
+        .unwrap_or_else(|| recommendation_for_latest(latest))
+        .to_owned();
+    json!({
+        "candidate": name,
+        "profile": candidate["profile"].clone(),
+        "status": status,
+        "latest_test_pnl": pnl,
+        "ci_95_low": latest.map(|row| row["ci_95_low"].clone()).unwrap_or(Value::Null),
+        "ci_95_high": latest.map(|row| row["ci_95_high"].clone()).unwrap_or(Value::Null),
+        "max_drawdown": latest.map(|row| row["max_drawdown"].clone()).unwrap_or(Value::Null),
+        "fill_model_agreement": latest.and_then(|row| row["fill_model"].as_str()).unwrap_or("pending sensitivity"),
+        "data_quality": latest.and_then(|row| row["data_quality_status"].as_str()).unwrap_or("unknown"),
+        "recommendation": recommendation,
+        "last_updated": latest.and_then(|row| row["date"].as_str()).unwrap_or("not run"),
+        "explanation": candidate_explanation(name, &status, &recommendation, latest),
+        "notes": candidate["notes"].clone(),
+        "research_only": true,
+        "enabled_by_default": false,
+        "deployment_allowed": false,
+        "live_deployment_allowed": false
+    })
+}
+
+fn candidate_pnl(row: &Value, candidate: &str) -> Value {
+    if candidate.contains("dynamic_quote_style") {
+        row["dynamic_quote_style_net_pnl"].clone()
+    } else if candidate.contains("full_deterministic_profile") {
+        row["full_deterministic_profile_net_pnl"].clone()
+    } else if candidate.contains("dynamic_safety_only") {
+        row["dynamic_safety_only_net_pnl"].clone()
+    } else {
+        row["static_net_pnl"].clone()
+    }
+}
+
+fn candidate_status(latest: Option<&Value>, candidate: &str, pnl: &Value) -> String {
+    let Some(row) = latest else {
+        return "collecting".to_owned();
+    };
+    if row["data_quality_status"]
+        .as_str()
+        .is_some_and(|status| status != "healthy")
+    {
+        return "blocked".to_owned();
+    }
+    let best = [
+        "static_net_pnl",
+        "dynamic_quote_style_net_pnl",
+        "full_deterministic_profile_net_pnl",
+        "dynamic_safety_only_net_pnl",
+    ]
+    .iter()
+    .filter_map(|field| number_value(&row[*field]))
+    .fold(f64::NEG_INFINITY, f64::max);
+    if best.is_finite()
+        && number_value(pnl).is_some_and(|value| (value - best).abs() < f64::EPSILON)
+    {
+        "candidate_leader".to_owned()
+    } else if candidate.contains("static") {
+        "baseline".to_owned()
+    } else {
+        "needs_more_evidence".to_owned()
+    }
+}
+
+fn recommendation_for_latest(latest: Option<&Value>) -> &'static str {
+    let Some(row) = latest else {
+        return "collect more settled markets";
+    };
+    let low = number_value(&row["ci_95_low"]);
+    let high = number_value(&row["ci_95_high"]);
+    match (low, high) {
+        (Some(low), Some(high)) if low > 0.0 && high > 0.0 => {
+            "candidate positive under current evidence"
+        }
+        (Some(low), Some(high)) if low < 0.0 && high < 0.0 => {
+            "candidate negative under current evidence"
+        }
+        _ => "evidence inconclusive; continue paper validation",
+    }
+}
+
+fn candidate_explanation(
+    name: &str,
+    status: &str,
+    recommendation: &str,
+    latest: Option<&Value>,
+) -> String {
+    let Some(row) = latest else {
+        return format!("{name} has no prospective validation row yet. Run prospective validation before using it for research conclusions.");
+    };
+    if status == "blocked" {
+        return format!(
+            "{name} is blocked by {} data quality. Do not trust this candidate until quality is resolved.",
+            row["data_quality_status"].as_str().unwrap_or("unknown")
+        );
+    }
+    format!(
+        "{name} is {status}. Recommendation: {recommendation}. Evidence uses {} settled markets, drawdown {}, and CI [{}, {}].",
+        compact_value(&row["settled_markets"]),
+        compact_value(&row["max_drawdown"]),
+        compact_value(&row["ci_95_low"]),
+        compact_value(&row["ci_95_high"])
+    )
+}
+
+fn candidate_artifacts() -> Vec<Value> {
+    artifacts_for_prefix("")
+        .into_iter()
+        .filter(|artifact| {
+            artifact["path"].as_str().is_some_and(|path| {
+                path.contains("prospective")
+                    || path.contains("sample_size")
+                    || path.contains("final_report")
+                    || path.contains("baseline")
+                    || path.contains("regimes")
+            })
+        })
+        .take(50)
+        .collect()
+}
+
+fn number_value(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+}
+
+fn compact_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn list_json_files(root: &FsPath, file_name: &str, limit: usize) -> Vec<Value> {

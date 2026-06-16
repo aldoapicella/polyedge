@@ -7,9 +7,11 @@ import type {
   JsonRecord,
   LabArtifact,
   LabArtifactPayload,
+  LabCandidateEvidence,
   LabDataQuality,
   LabJob,
   LabReportBundle,
+  LabSummary,
   MarketDetail,
   ProspectiveValidation,
   QueryRequest,
@@ -87,6 +89,22 @@ export function getLatestReport() {
 
 export function getLatestLabReport() {
   return backendFetch<LabReportBundle>("labs/reports/latest");
+}
+
+export function getLabSummary() {
+  return backendFetch<LabSummary>("labs/summary");
+}
+
+export function getLabCandidates() {
+  return backendFetch<{ generated_ts: string; status?: string; candidates: LabCandidateEvidence[]; research_only?: boolean; live_deployment_allowed?: boolean }>(
+    "labs/candidates"
+  );
+}
+
+export function getLabCandidateDetail(candidate: string) {
+  return backendFetch<{ candidate: LabCandidateEvidence; history: JsonRecord[]; artifacts: LabArtifact[] }>(
+    `labs/candidates/${encodeURIComponent(candidate)}`
+  );
 }
 
 export function getLabDailyReport(date: string) {

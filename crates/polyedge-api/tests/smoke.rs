@@ -75,6 +75,14 @@ async fn api_contract_routes_remain_reachable() {
             StatusCode::OK,
         ),
         (Method::GET, "/api/v1/query/templates", None, StatusCode::OK),
+        (Method::GET, "/api/v1/labs/summary", None, StatusCode::OK),
+        (Method::GET, "/api/v1/labs/candidates", None, StatusCode::OK),
+        (
+            Method::GET,
+            "/api/v1/labs/candidates/static_baseline",
+            None,
+            StatusCode::OK,
+        ),
         (
             Method::GET,
             "/api/v1/data-quality/timeline",

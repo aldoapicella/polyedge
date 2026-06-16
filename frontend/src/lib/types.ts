@@ -212,6 +212,39 @@ export type LabReportBundle = {
   detail?: string;
 };
 
+export type LabSummary = {
+  generated_ts: string;
+  date?: string | null;
+  status?: string | null;
+  recommendation?: unknown;
+  sample_size?: JsonRecord | null;
+  data_quality?: string | null;
+  candidate_count?: number;
+  prospective_rows?: number;
+  research_only?: boolean;
+  live_deployment_allowed?: boolean;
+};
+
+export type LabCandidateEvidence = {
+  candidate: string;
+  profile?: string | null;
+  status?: string | null;
+  latest_test_pnl?: string | number | null;
+  ci_95_low?: string | number | null;
+  ci_95_high?: string | number | null;
+  max_drawdown?: string | number | null;
+  fill_model_agreement?: string | null;
+  data_quality?: string | null;
+  recommendation?: string | null;
+  last_updated?: string | null;
+  explanation?: string | null;
+  notes?: string | null;
+  research_only?: boolean;
+  enabled_by_default?: boolean;
+  deployment_allowed?: boolean;
+  live_deployment_allowed?: boolean;
+};
+
 export type LabDataQuality = {
   generated_ts: string;
   freshness?: JsonRecord | null;

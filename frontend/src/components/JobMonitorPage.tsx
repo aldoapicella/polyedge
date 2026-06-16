@@ -45,7 +45,7 @@ export function JobMonitorPage() {
         <div>
           <h1 className="text-xl font-semibold text-ink">Job Monitor</h1>
         </div>
-        <IconButton label="Refresh jobs" onClick={() => queryClient.invalidateQueries({ queryKey: ["labs", "jobs"] })}>
+        <IconButton label="Refresh jobs" onClick={() => queryClient.invalidateQueries({ queryKey: ["jobs"] })}>
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
