@@ -97,6 +97,18 @@ async fn api_contract_routes_remain_reachable() {
             StatusCode::OK,
         ),
         (
+            Method::GET,
+            "/api/v1/jobs/freshness-check/executions",
+            None,
+            StatusCode::OK,
+        ),
+        (
+            Method::GET,
+            "/api/v1/jobs/freshness-check/executions/manual-test/logs",
+            None,
+            StatusCode::OK,
+        ),
+        (
             Method::POST,
             "/api/v1/control/pause",
             Some(json!({"reason": "smoke"})),

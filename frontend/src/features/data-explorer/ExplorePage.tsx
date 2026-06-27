@@ -1,10 +1,10 @@
 "use client";
 
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { Download, FileJson, Play, Plus, Search, X } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Download, FileJson, Play, Plus, Save, Search, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from "recharts";
-import { getQuerySchema, getQueryTemplates, runQuery } from "@/lib/api";
+import { getQuerySchema, getQueryTemplates, runQuery, saveQueryTemplate } from "@/lib/api";
 import type { JsonRecord, QueryDatasetSchema, QueryFilter, QueryRequest, QueryResult, QueryTemplate } from "@/lib/types";
 import { compact, numberText } from "@/lib/format";
 import { downloadCsv, rowsToCsv } from "@/shared/query/csv";
@@ -17,6 +17,7 @@ type BuilderFilter = QueryFilter & { id: string };
 const DEFAULT_DATASET = "markets";
 
 export function ExplorePage() {
+  const queryClient = useQueryClient();
   const schema = useQuery({ queryKey: ["query", "schema"], queryFn: getQuerySchema, retry: false });
   const templates = useQuery({ queryKey: ["query", "templates"], queryFn: getQueryTemplates, retry: false });
   const [dataset, setDataset] = useState(DEFAULT_DATASET);
@@ -27,6 +28,10 @@ export function ExplorePage() {
   const [outputMode, setOutputMode] = useState<OutputMode>("table");
   const [selectedRow, setSelectedRow] = useState<JsonRecord | null>(null);
   const query = useMutation({ mutationFn: runQuery });
+  const saveTemplate = useMutation({
+    mutationFn: saveQueryTemplate,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["query", "templates"] })
+  });
   const datasetSchema = schema.data?.datasets.find((item) => item.id === dataset) ?? schema.data?.datasets[0];
 
   useEffect(() => {
@@ -53,6 +58,10 @@ export function ExplorePage() {
         <div className="flex flex-wrap gap-2">
           <Pill tone="good">structured only</Pill>
           <Pill tone="good">live trading disabled</Pill>
+          {templates.data?.persisted ? <Pill tone="good">templates persisted</Pill> : null}
+          <IconButton label="Save query template" onClick={() => promptAndSaveTemplate(request, (name) => saveTemplate.mutate({ name, request, owner: "local", tags: ["workbench"] }))} disabled={saveTemplate.isPending}>
+            <Save className="h-4 w-4" />
+          </IconButton>
           <IconButton label="Run query" onClick={() => query.mutate(request)} disabled={query.isPending}>
             <Play className="h-4 w-4" />
           </IconButton>
@@ -64,6 +73,8 @@ export function ExplorePage() {
           <DatasetPanel datasets={schema.data?.datasets ?? []} dataset={dataset} onChange={setDataset} loading={schema.isLoading} />
           <TemplatePanel
             templates={templates.data?.templates ?? []}
+            persisted={Boolean(templates.data?.persisted)}
+            store={templates.data?.template_store}
             onSelect={(template) => {
               applyTemplate(template, setDataset, setFilters, setGroupBy, setMetrics, setLimit);
               query.mutate({ ...template.request, limit: template.request.limit ?? limit });
@@ -102,6 +113,8 @@ export function ExplorePage() {
             }}
             onRowSelect={setSelectedRow}
           />
+          {saveTemplate.error ? <div className="border border-danger/40 bg-danger/5 px-4 py-3 text-sm text-danger">{saveTemplate.error.message}</div> : null}
+          {saveTemplate.data ? <div className="border border-good/30 bg-good/5 px-4 py-3 text-sm text-good">{saveTemplate.data.template.name} saved.</div> : null}
         </div>
       </div>
 
@@ -146,10 +159,20 @@ function DatasetPanel({
   );
 }
 
-function TemplatePanel({ templates, onSelect }: { templates: QueryTemplate[]; onSelect: (template: QueryTemplate) => void }) {
+function TemplatePanel({
+  templates,
+  persisted,
+  store,
+  onSelect
+}: {
+  templates: QueryTemplate[];
+  persisted: boolean;
+  store?: string;
+  onSelect: (template: QueryTemplate) => void;
+}) {
   return (
     <Panel>
-      <PanelHeader title="Query Templates" meta={`${templates.length} saved views`} />
+      <PanelHeader title="Query Templates" meta={`${templates.length} saved views${persisted ? " · persisted" : ""}`} help={store ? `Template store: ${store}` : undefined} />
       <div className="max-h-[420px] space-y-2 overflow-auto p-3">
         {templates.map((template) => (
           <button key={template.id} className="w-full border border-line bg-white px-3 py-2 text-left hover:bg-panel" onClick={() => onSelect(template)}>
@@ -460,6 +483,14 @@ function parseFilterValue(value: unknown) {
   }
   const numeric = Number(text);
   return Number.isFinite(numeric) && /^-?\d+(\.\d+)?$/.test(text) ? numeric : text;
+}
+
+function promptAndSaveTemplate(request: QueryRequest, save: (name: string) => void) {
+  const name = window.prompt("Template name");
+  if (!name?.trim()) {
+    return;
+  }
+  save(name.trim());
 }
 
 function toggle(values: string[], value: string) {

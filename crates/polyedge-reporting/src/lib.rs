@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use polyedge_engine::crypto_taker_fee_per_share;
 use rust_decimal::prelude::ToPrimitive;

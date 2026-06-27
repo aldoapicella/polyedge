@@ -5,12 +5,13 @@ use polyedge_api::{app, benchmark_snapshot};
 use polyedge_config::RuntimeSettings;
 use polyedge_reporting::research::{
     load_default_exclusions, run_audit, run_azure_freshness, run_backfill, run_baseline,
-    run_build_markets, run_build_replay_index, run_calibration, run_final_report, run_ml_calibrate,
-    run_normalize, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
-    AuditOptions, AzureFreshnessOptions, BackfillOptions, BaselineOptions, BuildMarketsOptions,
-    CalibrationOptions, ExcludedTimeWindow, FillModel, FinalReportOptions, MlCalibrateOptions,
-    NormalizeOptions, ProspectiveValidationOptions, RegimesOptions, ReplayIndexOptions,
-    ReplayOptions, SampleSizeOptions, SweepOptions, DEFAULT_EXCLUSION_FILE,
+    run_build_markets, run_build_replay_index, run_calibration, run_chart_backfill,
+    run_final_report, run_ml_calibrate, run_normalize, run_queue_audit, run_regimes, run_replay,
+    run_sample_size, run_sweep, run_validate_prospective, AuditOptions, AzureFreshnessOptions,
+    BackfillOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions,
+    ChartBackfillOptions, ExcludedTimeWindow, FillModel, FinalReportOptions, MlCalibrateOptions,
+    NormalizeOptions, ProspectiveValidationOptions, QueueAuditOptions, RegimesOptions,
+    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, SweepOptions, DEFAULT_EXCLUSION_FILE,
     DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
@@ -110,6 +111,20 @@ enum ResearchCommand {
         format: String,
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         overwrite: bool,
+    },
+    QueueAudit {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "data/research/markets.json")]
+        markets: PathBuf,
+        #[arg(long, default_value = "reports/research/queue_evidence_audit.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/research/queue_evidence_audit.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
     },
     BuildMarkets {
         #[arg(long, default_value = "data/research/normalized")]
@@ -290,6 +305,18 @@ enum ResearchCommand {
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
     },
+    ChartBackfill {
+        #[arg(long, default_value = "data/research/normalized")]
+        input: PathBuf,
+        #[arg(long, default_value = "reports/jobs/latest/chart-backfill.json")]
+        out: PathBuf,
+        #[arg(long, default_value = "reports/jobs/latest/chart-backfill.md")]
+        markdown: PathBuf,
+        #[arg(long = "exclude-file", default_value = DEFAULT_EXCLUSION_FILE)]
+        exclude_file: PathBuf,
+        #[arg(long = "exclude-window")]
+        exclude_window: Vec<String>,
+    },
     Backfill {
         #[arg(long)]
         start: String,
@@ -385,6 +412,20 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             out,
             format,
             overwrite,
+        })?,
+        ResearchCommand::QueueAudit {
+            input,
+            markets,
+            out,
+            markdown,
+            exclude_file,
+            exclude_window,
+        } => run_queue_audit(QueueAuditOptions {
+            input,
+            markets,
+            out,
+            markdown,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::BuildMarkets {
             input,
@@ -540,6 +581,18 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         } => run_build_replay_index(ReplayIndexOptions {
             input,
             out,
+            exclude_windows: load_exclusions(exclude_file, exclude_window)?,
+        })?,
+        ResearchCommand::ChartBackfill {
+            input,
+            out,
+            markdown,
+            exclude_file,
+            exclude_window,
+        } => run_chart_backfill(ChartBackfillOptions {
+            input,
+            out,
+            markdown,
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Backfill {

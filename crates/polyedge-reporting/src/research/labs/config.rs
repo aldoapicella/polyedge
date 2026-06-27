@@ -84,6 +84,11 @@ pub struct FrozenCandidateRegistry {
 pub struct FrozenCandidateRecord {
     pub name: String,
     pub profile: String,
+    pub candidate_version: String,
+    pub config_hash: String,
+    pub created_at: DateTime<Utc>,
+    pub frozen_since: DateTime<Utc>,
+    pub reason: String,
     #[serde(default)]
     pub enabled_by_default: bool,
     #[serde(default)]
@@ -128,6 +133,23 @@ impl FrozenCandidateRegistry {
                     .to_owned(),
             ));
         }
+        for candidate in &self.candidates {
+            if candidate.candidate_version.trim().is_empty()
+                || candidate.config_hash.trim().is_empty()
+                || candidate.reason.trim().is_empty()
+            {
+                return Err(ResearchError::InvalidInput(format!(
+                    "frozen candidate {} missing immutable version/hash/reason metadata",
+                    candidate.name
+                )));
+            }
+            if candidate.frozen_since < candidate.created_at {
+                return Err(ResearchError::InvalidInput(format!(
+                    "frozen candidate {} frozen_since cannot be before created_at",
+                    candidate.name
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -137,6 +159,11 @@ impl FrozenCandidateRecord {
         json!({
             "name": self.name,
             "profile": self.profile,
+            "candidate_version": self.candidate_version,
+            "config_hash": self.config_hash,
+            "created_at": ts(self.created_at),
+            "frozen_since": ts(self.frozen_since),
+            "reason": self.reason,
             "enabled_by_default": self.enabled_by_default,
             "deployment_allowed": self.deployment_allowed,
             "notes": self.notes
@@ -327,6 +354,16 @@ fn parse_frozen_candidate_yaml(text: &str) -> Result<FrozenCandidateRegistry, Re
         };
         if let Some(value) = yaml_value(line, "profile") {
             builder.profile = Some(unquote(value));
+        } else if let Some(value) = yaml_value(line, "candidate_version") {
+            builder.candidate_version = Some(unquote(value));
+        } else if let Some(value) = yaml_value(line, "config_hash") {
+            builder.config_hash = Some(unquote(value));
+        } else if let Some(value) = yaml_value(line, "created_at") {
+            builder.created_at = parse_rfc3339_utc(&unquote(value));
+        } else if let Some(value) = yaml_value(line, "frozen_since") {
+            builder.frozen_since = parse_rfc3339_utc(&unquote(value));
+        } else if let Some(value) = yaml_value(line, "reason") {
+            builder.reason = Some(unquote(value));
         } else if let Some(value) = yaml_value(line, "deployment_allowed") {
             builder.deployment_allowed = parse_yaml_bool(value);
         } else if let Some(value) = yaml_value(line, "notes") {
@@ -359,6 +396,11 @@ fn parse_frozen_candidate_yaml(text: &str) -> Result<FrozenCandidateRegistry, Re
 struct FrozenCandidateBuilder {
     name: Option<String>,
     profile: Option<String>,
+    candidate_version: Option<String>,
+    config_hash: Option<String>,
+    created_at: Option<DateTime<Utc>>,
+    frozen_since: Option<DateTime<Utc>>,
+    reason: Option<String>,
     enabled_by_default: bool,
     deployment_allowed: bool,
     notes: String,
@@ -372,6 +414,21 @@ impl FrozenCandidateBuilder {
             })?,
             profile: self.profile.ok_or_else(|| {
                 ResearchError::InvalidInput("frozen candidate missing profile".to_owned())
+            })?,
+            candidate_version: self.candidate_version.ok_or_else(|| {
+                ResearchError::InvalidInput("frozen candidate missing candidate_version".to_owned())
+            })?,
+            config_hash: self.config_hash.ok_or_else(|| {
+                ResearchError::InvalidInput("frozen candidate missing config_hash".to_owned())
+            })?,
+            created_at: self.created_at.ok_or_else(|| {
+                ResearchError::InvalidInput("frozen candidate missing created_at".to_owned())
+            })?,
+            frozen_since: self.frozen_since.ok_or_else(|| {
+                ResearchError::InvalidInput("frozen candidate missing frozen_since".to_owned())
+            })?,
+            reason: self.reason.ok_or_else(|| {
+                ResearchError::InvalidInput("frozen candidate missing reason".to_owned())
             })?,
             enabled_by_default: self.enabled_by_default,
             deployment_allowed: self.deployment_allowed,

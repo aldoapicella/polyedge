@@ -5,6 +5,8 @@ import type {
   ConfigValidation,
   ExclusionRegistry,
   JsonRecord,
+  JobExecution,
+  JobExecutionLogPayload,
   LabArtifact,
   LabArtifactPayload,
   LabCandidateEvidence,
@@ -179,18 +181,44 @@ export function getJobLogs(jobId: string) {
   );
 }
 
+export function getJobExecutions(jobId: string) {
+  return backendFetch<{ job_id: string; job_name?: string; executions: JobExecution[]; source?: string; artifacts?: string[]; detail?: string }>(
+    `jobs/${encodeURIComponent(jobId)}/executions`
+  );
+}
+
+export function getJobExecutionLogs(jobId: string, executionId: string) {
+  return backendFetch<JobExecutionLogPayload>(
+    `jobs/${encodeURIComponent(jobId)}/executions/${encodeURIComponent(executionId)}/logs`
+  );
+}
+
 export function getQuerySchema() {
   return backendFetch<QuerySchema>("query/schema");
 }
 
 export function getQueryTemplates() {
-  return backendFetch<{ templates: QueryTemplate[] }>("query/templates");
+  return backendFetch<{ templates: QueryTemplate[]; persisted?: boolean; template_store?: string }>("query/templates");
 }
 
 export function runQuery(request: QueryRequest) {
   return backendFetch<QueryResult>("query/run", {
     method: "POST",
     body: request
+  });
+}
+
+export function saveQueryTemplate(body: {
+  id?: string;
+  name: string;
+  description?: string;
+  request: QueryRequest;
+  owner?: string;
+  tags?: string[];
+}) {
+  return backendFetch<{ persisted: boolean; template: QueryTemplate; detail?: string }>("query/templates", {
+    method: "POST",
+    body
   });
 }
 

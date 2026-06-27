@@ -10,8 +10,10 @@ use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 mod catalog;
 
@@ -24,6 +26,9 @@ const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1_000;
 const REPORT_ROOT: &str = "reports/research";
 const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
+const DEFAULT_QUERY_TEMPLATE_DIR: &str = "reports/query_templates";
+const DEFAULT_QUERY_AUDIT_DIR: &str = "reports/query_audit";
+const DEFAULT_QUERY_DATA_ROOT: &str = "data/research/normalized";
 
 pub(crate) fn router() -> Router<ApiState> {
     Router::new()
@@ -37,11 +42,43 @@ trait QueryBackend {
     async fn run(&self, request: QueryRequest) -> Result<QueryResult, QueryError>;
 }
 
-struct ReportBackedQueryBackend {
-    state: ApiState,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryBackendKind {
+    ReportBacked,
+    NormalizedJsonl,
+    AzureDataExplorer,
 }
 
-#[derive(Debug, Deserialize)]
+impl QueryBackendKind {
+    fn configured() -> Self {
+        match env::var("POLYEDGE_QUERY_BACKEND")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "normalized_jsonl" | "jsonl" | "historical_jsonl" => Self::NormalizedJsonl,
+            "adx" | "azure_data_explorer" => Self::AzureDataExplorer,
+            _ => Self::ReportBacked,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReportBacked => "report_backed",
+            Self::NormalizedJsonl => "normalized_jsonl",
+            Self::AzureDataExplorer => "azure_data_explorer",
+        }
+    }
+}
+
+struct ReportBackedQueryBackend {
+    state: ApiState,
+    kind: QueryBackendKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct QueryRequest {
     dataset: String,
     #[serde(default)]
@@ -56,7 +93,7 @@ pub(crate) struct QueryRequest {
     offset: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct QueryFilter {
     field: String,
     #[serde(default = "default_filter_op")]
@@ -64,7 +101,7 @@ struct QueryFilter {
     value: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct QuerySort {
     field: String,
     #[serde(default = "default_sort_direction")]
@@ -93,6 +130,44 @@ struct QueryColumn {
     help: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SaveQueryTemplateRequest {
+    id: Option<String>,
+    name: String,
+    description: Option<String>,
+    request: QueryRequest,
+    owner: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct QueryTemplateRecord {
+    id: String,
+    name: String,
+    description: String,
+    request: QueryRequest,
+    created_ts: String,
+    updated_ts: String,
+    owner: String,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryAuditEntry {
+    query_id: String,
+    ts: String,
+    dataset: String,
+    filters: Value,
+    group_by: Vec<String>,
+    metrics: Vec<String>,
+    limit: usize,
+    duration_ms: u128,
+    returned_rows: Option<usize>,
+    source: String,
+    error: Option<String>,
+}
+
 #[derive(Debug)]
 struct QueryError {
     status: StatusCode,
@@ -109,32 +184,72 @@ impl QueryError {
 }
 
 async fn schema(State(state): State<ApiState>) -> Json<Value> {
-    Json(ReportBackedQueryBackend { state }.schema())
+    Json(ReportBackedQueryBackend::new(state).schema())
 }
 
 async fn query_templates() -> Json<Value> {
-    Json(json!({ "templates": templates() }))
+    let mut all_templates = templates();
+    all_templates.extend(
+        saved_query_templates()
+            .into_iter()
+            .filter_map(|template| serde_json::to_value(template).ok()),
+    );
+    Json(json!({
+        "templates": all_templates,
+        "persisted": true,
+        "template_store": query_template_dir().to_string_lossy()
+    }))
 }
 
-async fn save_query_template(Json(request): Json<Value>) -> impl IntoResponse {
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "persisted": false,
-            "template": request,
-            "detail": "Server-side saved views are not persisted in this build. The structured query can be reused by the frontend."
-        })),
-    )
+async fn save_query_template(Json(request): Json<SaveQueryTemplateRequest>) -> impl IntoResponse {
+    match persist_query_template(request) {
+        Ok(template) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "persisted": true,
+                "template": template,
+                "template_store": query_template_dir().to_string_lossy(),
+                "detail": "Query template persisted server-side as structured JSON."
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            error.status,
+            Json(json!({
+                "persisted": false,
+                "detail": error.detail
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn run_query(
     State(state): State<ApiState>,
     Json(request): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let backend = ReportBackedQueryBackend { state };
+    let backend = ReportBackedQueryBackend::new(state);
+    let audit_request = request.clone();
+    let started = Instant::now();
     match backend.run(request).await {
-        Ok(result) => (StatusCode::OK, Json(json!(result))).into_response(),
-        Err(error) => (error.status, Json(json!({ "detail": error.detail }))).into_response(),
+        Ok(result) => {
+            append_query_audit(QueryAuditEntry::from_success(
+                &audit_request,
+                &result,
+                backend.kind,
+                started.elapsed().as_millis(),
+            ));
+            (StatusCode::OK, Json(json!(result))).into_response()
+        }
+        Err(error) => {
+            append_query_audit(QueryAuditEntry::from_error(
+                &audit_request,
+                backend.kind,
+                started.elapsed().as_millis(),
+                &error.detail,
+            ));
+            (error.status, Json(json!({ "detail": error.detail }))).into_response()
+        }
     }
 }
 
@@ -142,6 +257,12 @@ impl QueryBackend for ReportBackedQueryBackend {
     fn schema(&self) -> Value {
         json!({
             "backend": "ReportBackedQueryBackend",
+            "backend_kind": self.kind.as_str(),
+            "available_backends": [
+                QueryBackendKind::ReportBacked.as_str(),
+                QueryBackendKind::NormalizedJsonl.as_str(),
+                QueryBackendKind::AzureDataExplorer.as_str()
+            ],
             "structured_only": true,
             "generated_ts": now_ts(),
             "datasets": datasets(),
@@ -150,7 +271,9 @@ impl QueryBackend for ReportBackedQueryBackend {
             "safety": {
                 "live_trading_enabled": false,
                 "arbitrary_sql_or_kql": false,
-                "secrets_exposed": false
+                "secrets_exposed": false,
+                "query_audit_enabled": true,
+                "saved_templates_persisted": true
             }
         })
     }
@@ -161,6 +284,7 @@ impl QueryBackend for ReportBackedQueryBackend {
         let offset = request.offset.unwrap_or(0);
         let mut warnings = Vec::new();
         let mut rows = self.load_dataset(dataset, &mut warnings).await?;
+        rows.extend(self.normalized_jsonl_rows(dataset, &mut warnings));
         rows.retain(|row| {
             request
                 .filters
@@ -193,8 +317,10 @@ impl QueryBackend for ReportBackedQueryBackend {
             warnings,
             source: json!({
                 "backend": "ReportBackedQueryBackend",
+                "backend_kind": self.kind.as_str(),
                 "runtime": "rust_runtime_memory",
                 "reports_root": REPORT_ROOT,
+                "normalized_jsonl_root": normalized_query_data_root().to_string_lossy(),
                 "read_only": true,
                 "live_trading_enabled": false
             }),
@@ -203,6 +329,13 @@ impl QueryBackend for ReportBackedQueryBackend {
 }
 
 impl ReportBackedQueryBackend {
+    fn new(state: ApiState) -> Self {
+        Self {
+            state,
+            kind: QueryBackendKind::configured(),
+        }
+    }
+
     async fn load_dataset(
         &self,
         dataset: &str,
@@ -244,10 +377,73 @@ impl ReportBackedQueryBackend {
                 "baseline_static_all_fill_models.json",
             ])),
             "sample_size" => Ok(report_rows(&["sample_size.json"])),
+            "market_truth" => Ok(report_rows(&["markets_summary.json"])),
+            "decision_features" => Ok(Vec::new()),
+            "fill_candidates" => Ok(Vec::new()),
+            "queue_evidence" => Ok(Vec::new()),
+            "queue_proxy_results" => Ok(report_rows(&[
+                "baseline.json",
+                "baseline_static_all_fill_models.json",
+                "regime_profiles.json",
+            ])),
+            "prospective_daily" => Ok(report_rows(&["prospective_validation.json"])),
+            "candidate_market_pnl" => Ok(report_rows(&[
+                "prospective_validation.json",
+                "regimes.json",
+                "regime_profiles.json",
+            ])),
+            "regime_market_pnl" => Ok(report_rows(&["regimes.json", "regime_profiles.json"])),
+            "calibration_buckets" => Ok(report_rows(&["calibration.json"])),
             _ => Err(QueryError::bad_request(format!(
                 "Unsupported dataset {dataset}."
             ))),
         }
+    }
+
+    fn normalized_jsonl_rows(&self, dataset: &str, warnings: &mut Vec<String>) -> Vec<Value> {
+        let files = match dataset {
+            "markets" | "market_truth" => &["markets.jsonl"][..],
+            "decisions" | "decision_features" => &["decisions.jsonl"][..],
+            "fills" | "fill_candidates" => &["execution_reports.jsonl"][..],
+            "queue_evidence" => &[
+                "raw_market_events.jsonl",
+                "price_changes.jsonl",
+                "last_trades.jsonl",
+                "book_snapshots.jsonl",
+                "level_changes.jsonl",
+            ],
+            _ => return Vec::new(),
+        };
+        let root = normalized_query_data_root();
+        let mut rows = Vec::new();
+        for file in files {
+            let path = root.join(file);
+            if !path.exists() {
+                warnings.push(format!(
+                    "normalized_jsonl_missing:{}",
+                    path.to_string_lossy()
+                ));
+                continue;
+            }
+            let before = rows.len();
+            rows.extend(read_jsonl_rows(&path, MAX_LIMIT.saturating_sub(rows.len())));
+            for row in rows.iter_mut().skip(before) {
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("source".to_owned(), json!("normalized_jsonl"));
+                    object.insert("path".to_owned(), json!(path.to_string_lossy()));
+                    if dataset == "fills" || dataset == "fill_candidates" {
+                        object
+                            .entry("fill_model".to_owned())
+                            .or_insert_with(|| json!("paper_runtime"));
+                    }
+                }
+            }
+            if rows.len() >= MAX_LIMIT {
+                warnings.push("normalized_jsonl_truncated_at_max_limit".to_owned());
+                break;
+            }
+        }
+        rows
     }
 
     async fn market_rows(&self, warnings: &mut Vec<String>) -> Result<Vec<Value>, QueryError> {
@@ -293,6 +489,15 @@ fn canonical_dataset(dataset: &str) -> Result<&'static str, QueryError> {
         "fill_models" | "fill-models" => Ok("fill_models"),
         "sample_size" | "sample-size" => Ok("sample_size"),
         "regimes" | "regime" => Ok("regimes"),
+        "market_truth" | "market-truth" => Ok("market_truth"),
+        "decision_features" | "decision-features" => Ok("decision_features"),
+        "fill_candidates" | "fill-candidates" => Ok("fill_candidates"),
+        "queue_evidence" | "queue-evidence" => Ok("queue_evidence"),
+        "queue_proxy_results" | "queue-proxy-results" => Ok("queue_proxy_results"),
+        "prospective_daily" | "prospective-daily" => Ok("prospective_daily"),
+        "candidate_market_pnl" | "candidate-market-pnl" => Ok("candidate_market_pnl"),
+        "regime_market_pnl" | "regime-market-pnl" => Ok("regime_market_pnl"),
+        "calibration_buckets" | "calibration-buckets" => Ok("calibration_buckets"),
         other => Err(QueryError::bad_request(format!(
             "Unknown dataset {other}. Use /api/v1/query/schema for available datasets."
         ))),
@@ -910,6 +1115,339 @@ fn compact_json(value: &Value) -> String {
     }
 }
 
+fn read_jsonl_rows(path: &Path, limit: usize) -> Vec<Value> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .take(limit)
+        .collect()
+}
+
+fn query_template_dir() -> PathBuf {
+    env::var("POLYEDGE_QUERY_TEMPLATE_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_QUERY_TEMPLATE_DIR))
+}
+
+fn query_audit_dir() -> PathBuf {
+    env::var("POLYEDGE_QUERY_AUDIT_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_QUERY_AUDIT_DIR))
+}
+
+fn normalized_query_data_root() -> PathBuf {
+    env::var("POLYEDGE_QUERY_DATA_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_QUERY_DATA_ROOT))
+}
+
+fn saved_query_templates() -> Vec<QueryTemplateRecord> {
+    let dir = query_template_dir();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut records = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return None;
+            }
+            serde_json::from_value::<QueryTemplateRecord>(read_json_or_null(&path)).ok()
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    records
+}
+
+fn persist_query_template(
+    request: SaveQueryTemplateRequest,
+) -> Result<QueryTemplateRecord, QueryError> {
+    if request.name.trim().is_empty() {
+        return Err(QueryError::bad_request("Query template name is required."));
+    }
+    let dataset = canonical_dataset(&request.request.dataset)?;
+    if contains_disallowed_secret_field(&request.request) {
+        return Err(QueryError::bad_request(
+            "Query templates cannot persist filters or sorts that look like secret fields.",
+        ));
+    }
+    let now = now_ts();
+    let id = request
+        .id
+        .as_deref()
+        .map(safe_id)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{}-{}", safe_id(&request.name), compact_timestamp(&now)));
+    let mut query_request = request.request;
+    query_request.dataset = dataset.to_owned();
+    let record = QueryTemplateRecord {
+        id,
+        name: request.name.trim().to_owned(),
+        description: request
+            .description
+            .unwrap_or_else(|| "Saved structured query template.".to_owned()),
+        request: query_request,
+        created_ts: now.clone(),
+        updated_ts: now,
+        owner: request.owner.unwrap_or_else(|| "local".to_owned()),
+        tags: request
+            .tags
+            .into_iter()
+            .map(|tag| tag.trim().to_owned())
+            .filter(|tag| !tag.is_empty())
+            .take(12)
+            .collect(),
+    };
+    persist_query_template_to_dir(&query_template_dir(), &record)?;
+    Ok(record)
+}
+
+fn persist_query_template_to_dir(
+    dir: &Path,
+    record: &QueryTemplateRecord,
+) -> Result<(), QueryError> {
+    fs::create_dir_all(dir).map_err(|error| {
+        QueryError::bad_request(format!(
+            "Could not create query template directory: {error}"
+        ))
+    })?;
+    let path = dir.join(format!("{}.json", safe_id(&record.id)));
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|error| QueryError::bad_request(format!("Template was not JSON: {error}")))?;
+    fs::write(path, bytes)
+        .map_err(|error| QueryError::bad_request(format!("Could not persist template: {error}")))
+}
+
+fn append_query_audit(entry: QueryAuditEntry) {
+    let dir = query_audit_dir();
+    if let Err(error) = append_query_audit_to_dir(&dir, &entry) {
+        tracing::warn!("query audit append failed: {error}");
+    }
+}
+
+fn append_query_audit_to_dir(dir: &Path, entry: &QueryAuditEntry) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    let day = entry
+        .ts
+        .get(0..10)
+        .unwrap_or("unknown-date")
+        .replace(':', "");
+    let path = dir.join(format!("{day}.jsonl"));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let line = serde_json::to_string(entry).map_err(|error| error.to_string())?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|error| error.to_string())
+}
+
+impl QueryAuditEntry {
+    fn from_success(
+        request: &QueryRequest,
+        result: &QueryResult,
+        backend: QueryBackendKind,
+        duration_ms: u128,
+    ) -> Self {
+        Self {
+            query_id: query_id(),
+            ts: now_ts(),
+            dataset: sanitize_audit_text(&result.dataset),
+            filters: sanitized_filters(request),
+            group_by: sanitized_audit_list(&request.group_by),
+            metrics: sanitized_audit_list(&request.metrics),
+            limit: result.limit,
+            duration_ms,
+            returned_rows: Some(result.returned_rows),
+            source: sanitize_audit_text(backend.as_str()),
+            error: None,
+        }
+    }
+
+    fn from_error(
+        request: &QueryRequest,
+        backend: QueryBackendKind,
+        duration_ms: u128,
+        error: &str,
+    ) -> Self {
+        Self {
+            query_id: query_id(),
+            ts: now_ts(),
+            dataset: sanitize_audit_text(&request.dataset),
+            filters: sanitized_filters(request),
+            group_by: sanitized_audit_list(&request.group_by),
+            metrics: sanitized_audit_list(&request.metrics),
+            limit: request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT),
+            duration_ms,
+            returned_rows: None,
+            source: sanitize_audit_text(backend.as_str()),
+            error: Some(sanitize_audit_text(error)),
+        }
+    }
+}
+
+fn sanitized_filters(request: &QueryRequest) -> Value {
+    Value::Array(
+        request
+            .filters
+            .iter()
+            .map(|filter| {
+                json!({
+                    "field": sanitize_audit_text(&filter.field),
+                    "op": sanitize_audit_text(&filter.op),
+                    "value": if is_secret_like_field(&filter.field) {
+                        json!("[redacted]")
+                    } else {
+                        bounded_value(&filter.value)
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+fn sanitized_audit_list(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| sanitize_audit_text(value))
+        .collect()
+}
+
+fn bounded_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => json!(sanitize_audit_text(text)),
+        Value::Array(items) => Value::Array(items.iter().take(20).map(bounded_value).collect()),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .take(20)
+                .map(|(key, value)| {
+                    (
+                        sanitize_audit_text(key),
+                        if is_secret_like_field(key) {
+                            json!("[redacted]")
+                        } else {
+                            bounded_value(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn sanitize_audit_text(text: &str) -> String {
+    let mut output = Vec::new();
+    let mut redact_next = false;
+    for part in text.split_whitespace() {
+        let lowered = part.to_ascii_lowercase();
+        let redact = redact_next
+            || is_secret_like_field(&lowered)
+            || lowered == "bearer"
+            || lowered.starts_with("bearer=")
+            || lowered.starts_with("sharedaccesssignature")
+            || lowered.contains("sig=")
+            || lowered.contains("se=") && lowered.contains("sp=")
+            || lowered.contains("accountkey=")
+            || lowered.contains("accesskey=")
+            || lowered.contains("password=")
+            || lowered.contains("authorization:")
+            || lowered.contains("private_key")
+            || lowered.contains("-----begin");
+        let mark_next = lowered == "bearer" || lowered.ends_with("bearer");
+        if redact {
+            redact_next = mark_next;
+            output.push("[redacted]".to_owned());
+        } else if part.len() > 128 {
+            redact_next = mark_next;
+            output.push(format!(
+                "{}...[truncated]",
+                part.chars().take(128).collect::<String>()
+            ));
+        } else {
+            redact_next = mark_next;
+            output.push(part.to_owned());
+        }
+    }
+    if output.is_empty() && text.len() > 128 {
+        return format!(
+            "{}...[truncated]",
+            text.chars().take(128).collect::<String>()
+        );
+    }
+    output.join(" ")
+}
+
+fn contains_disallowed_secret_field(request: &QueryRequest) -> bool {
+    request
+        .filters
+        .iter()
+        .any(|filter| is_secret_like_field(&filter.field))
+        || request
+            .sort
+            .iter()
+            .any(|sort| is_secret_like_field(&sort.field))
+}
+
+fn is_secret_like_field(field: &str) -> bool {
+    let lower = field.to_ascii_lowercase();
+    lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("bearer")
+        || lower == "authorization"
+        || lower.ends_with("_authorization")
+}
+
+fn query_id() -> String {
+    format!("query-{}", compact_timestamp(&now_ts()))
+}
+
+fn compact_timestamp(ts: &str) -> String {
+    ts.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+}
+
+fn safe_id(value: &str) -> String {
+    let mut id = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else if matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while id.contains("--") {
+        id = id.replace("--", "-");
+    }
+    id.trim_matches('-').chars().take(96).collect()
+}
+
 fn row_contains(row: &Value, needle: &str) -> bool {
     serde_json::to_string(row)
         .unwrap_or_default()
@@ -1032,4 +1570,116 @@ fn default_sort_direction() -> String {
 
 fn now_ts() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_template_writes_structured_json() {
+        let dir = test_dir("query-template");
+        let request = QueryRequest {
+            dataset: "queue-evidence".to_owned(),
+            filters: vec![QueryFilter {
+                field: "event_type".to_owned(),
+                op: "eq".to_owned(),
+                value: json!("last_trade_price"),
+            }],
+            group_by: vec!["market_id".to_owned()],
+            metrics: vec!["count".to_owned()],
+            sort: Vec::new(),
+            limit: Some(50),
+            offset: None,
+        };
+        let record = QueryTemplateRecord {
+            id: "queue-coverage".to_owned(),
+            name: "Queue coverage".to_owned(),
+            description: "Queue evidence coverage.".to_owned(),
+            request,
+            created_ts: "2026-06-23T00:00:00Z".to_owned(),
+            updated_ts: "2026-06-23T00:00:00Z".to_owned(),
+            owner: "test".to_owned(),
+            tags: vec!["queue".to_owned()],
+        };
+
+        persist_query_template_to_dir(&dir, &record).expect("persist template");
+        let payload = read_json_or_null(dir.join("queue-coverage.json"));
+
+        assert_eq!(payload["id"], "queue-coverage");
+        assert_eq!(payload["request"]["dataset"], "queue-evidence");
+        assert_eq!(
+            payload["request"]["filters"][0]["value"],
+            "last_trade_price"
+        );
+    }
+
+    #[test]
+    fn audit_append_redacts_secret_like_filters() {
+        let dir = test_dir("query-audit");
+        let request = QueryRequest {
+            dataset: "markets password=dataset-secret".to_owned(),
+            filters: vec![QueryFilter {
+                field: "api_key".to_owned(),
+                op: "eq".to_owned(),
+                value: json!("do-not-write"),
+            }],
+            group_by: vec!["authorization".to_owned()],
+            metrics: vec!["bearer token-value".to_owned()],
+            sort: Vec::new(),
+            limit: Some(10),
+            offset: None,
+        };
+        let entry = QueryAuditEntry::from_error(
+            &request,
+            QueryBackendKind::ReportBacked,
+            7,
+            "bad query sig=hidden password=also-hidden",
+        );
+
+        append_query_audit_to_dir(&dir, &entry).expect("audit append");
+        let audit_text = fs::read_to_string(dir.join(format!("{}.jsonl", &entry.ts[0..10])))
+            .expect("audit text");
+
+        assert!(audit_text.contains("\"value\":\"[redacted]\""));
+        assert!(!audit_text.contains("do-not-write"));
+        assert!(!audit_text.contains("dataset-secret"));
+        assert!(!audit_text.contains("token-value"));
+        assert!(!audit_text.contains("also-hidden"));
+        assert!(!audit_text.contains("sig=hidden"));
+        assert!(audit_text.contains("\"source\":\"report_backed\""));
+    }
+
+    #[test]
+    fn new_curated_datasets_are_canonical() {
+        for dataset in [
+            "market_truth",
+            "decision-features",
+            "fill_candidates",
+            "queue-evidence",
+            "queue_proxy_results",
+            "prospective_daily",
+            "candidate-market-pnl",
+            "regime_market_pnl",
+            "calibration_buckets",
+        ] {
+            assert!(canonical_dataset(dataset).is_ok(), "{dataset}");
+        }
+    }
+
+    #[test]
+    fn safe_id_removes_path_and_shell_characters() {
+        assert_eq!(safe_id("../Queue Coverage && Run"), "queue-coverage-run");
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-{name}-{}-{}",
+            std::process::id(),
+            compact_timestamp(&now_ts())
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("test dir");
+        dir
+    }
 }

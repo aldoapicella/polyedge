@@ -7,21 +7,41 @@ selection_rule: "Frozen candidates only; no test-day re-ranking, parameter searc
 candidates:
   - name: "static_baseline"
     profile: "static"
+    candidate_version: "static_baseline@2026-06-14"
+    config_hash: "sha256:static-baseline-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Control profile for paired prospective validation."
     enabled_by_default: false
     deployment_allowed: false
     notes: "Current static maker-first baseline; tracked as the control."
   - name: "dynamic_quote_style"
     profile: "dynamic_quote_style"
+    candidate_version: "dynamic_quote_style@2026-06-14"
+    config_hash: "sha256:dynamic-quote-style-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Promising research candidate frozen for out-of-sample tracking."
     enabled_by_default: false
     deployment_allowed: false
     notes: "Promising historical research candidate; requires future clean out-of-sample validation."
   - name: "full_deterministic_profile"
     profile: "full_deterministic_profile"
+    candidate_version: "full_deterministic_profile@2026-06-14"
+    config_hash: "sha256:full-deterministic-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Full deterministic adaptive profile frozen for comparison only."
     enabled_by_default: false
     deployment_allowed: false
     notes: "Deterministic adaptive profile tracked for comparison only."
   - name: "dynamic_safety_only"
     profile: "dynamic_safety_only"
+    candidate_version: "dynamic_safety_only@2026-06-14"
+    config_hash: "sha256:dynamic-safety-only-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Safety-only profile frozen to isolate safety changes from quote style."
     enabled_by_default: false
     deployment_allowed: false
     notes: "Safety-only dynamic profile tracked for prospective comparison."

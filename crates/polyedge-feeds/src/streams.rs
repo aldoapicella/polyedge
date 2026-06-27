@@ -2,7 +2,7 @@ use crate::util::{
     decimal, levels, parse_datetime, parse_event_ts, parse_ms_timestamp, ureq_error,
     value_opt_text, value_text, websocket_json,
 };
-use crate::{FeedError, FeedEvent, FeedName};
+use crate::{FeedError, FeedEvent, FeedName, MarketChannelEvent};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use polyedge_config::RuntimeSettings;
@@ -93,8 +93,8 @@ pub async fn run_market_feed(
     let mut books = BTreeMap::new();
     while let Some(message) = read.next().await {
         let message = message?;
-        for book in parse_market_message(message, &mut books) {
-            publish(&sender, FeedEvent::Book(book)).await?;
+        for event in parse_market_message(message, &mut books) {
+            publish(&sender, event).await?;
         }
     }
     Ok(())
@@ -239,7 +239,7 @@ fn parse_rtds_message(message: Message, settings: &RuntimeSettings) -> Option<Re
 fn parse_market_message(
     message: Message,
     books: &mut BTreeMap<TokenId, BookState>,
-) -> Vec<BookState> {
+) -> Vec<FeedEvent> {
     let Some(payload) = websocket_json(message) else {
         return Vec::new();
     };
@@ -252,14 +252,18 @@ fn parse_market_message(
     handle_market_event(&payload, books)
 }
 
-fn handle_market_event(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -> Vec<BookState> {
+fn handle_market_event(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -> Vec<FeedEvent> {
     let event_type = event
         .get("event_type")
         .or_else(|| event.get("type"))
         .map(value_text)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match event_type.as_str() {
+    let mut events = vec![FeedEvent::RawMarketEvent(market_channel_event(
+        event,
+        &event_type,
+    ))];
+    let books = match event_type.as_str() {
         "book" | "orderbook" | "snapshot" => {
             let book = book_from_snapshot(event);
             books.insert(book.token_id.clone(), book.clone());
@@ -268,6 +272,78 @@ fn handle_market_event(event: &Value, books: &mut BTreeMap<TokenId, BookState>) 
         "price_change" | "pricechange" => apply_price_change(event, books),
         "last_trade_price" | "trade" | "last_trade" => apply_last_trade(event, books),
         _ => Vec::new(),
+    };
+    events.extend(books.into_iter().map(FeedEvent::Book));
+    events
+}
+
+fn market_channel_event(event: &Value, event_type: &str) -> MarketChannelEvent {
+    let first_change = event
+        .get("price_changes")
+        .or_else(|| event.get("changes"))
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .unwrap_or(event);
+    MarketChannelEvent {
+        event_type: if event_type.is_empty() {
+            "unknown".to_owned()
+        } else {
+            event_type.to_owned()
+        },
+        recorded_ts: Utc::now(),
+        source_ts: parse_event_ts(
+            event
+                .get("timestamp")
+                .or_else(|| event.get("ts"))
+                .or_else(|| first_change.get("timestamp"))
+                .or_else(|| first_change.get("ts")),
+        ),
+        market_id: value_opt_text(
+            event
+                .get("market_id")
+                .or_else(|| first_change.get("market_id")),
+        ),
+        condition_id: value_opt_text(
+            event
+                .get("condition_id")
+                .or_else(|| first_change.get("condition_id")),
+        ),
+        token_id: value_opt_text(
+            event
+                .get("token_id")
+                .or_else(|| first_change.get("token_id")),
+        ),
+        asset_id: value_opt_text(
+            event
+                .get("asset_id")
+                .or_else(|| first_change.get("asset_id")),
+        ),
+        side: value_opt_text(event.get("side").or_else(|| first_change.get("side"))),
+        price: decimal(event.get("price").or_else(|| event.get("last_trade_price")))
+            .or_else(|| decimal(first_change.get("price")))
+            .map(|value| value.to_string()),
+        size: decimal(
+            event
+                .get("size")
+                .or_else(|| event.get("trade_size"))
+                .or_else(|| event.get("last_trade_size")),
+        )
+        .or_else(|| decimal(first_change.get("size")))
+        .map(|value| value.to_string()),
+        best_bid: decimal(
+            event
+                .get("best_bid")
+                .or_else(|| first_change.get("best_bid")),
+        )
+        .map(|value| value.to_string()),
+        best_ask: decimal(
+            event
+                .get("best_ask")
+                .or_else(|| first_change.get("best_ask")),
+        )
+        .map(|value| value.to_string()),
+        book_hash: value_opt_text(event.get("hash").or_else(|| first_change.get("hash"))),
+        raw_payload: event.clone(),
     }
 }
 

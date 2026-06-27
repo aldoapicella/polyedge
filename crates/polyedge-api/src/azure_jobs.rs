@@ -21,6 +21,14 @@ pub struct JobStartOptions {
     pub env: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
+pub struct AzureLogAnalyticsClient {
+    endpoint: String,
+    workspace_id: String,
+    client_id: Option<String>,
+    agent: ureq::Agent,
+}
+
 impl AzureJobClient {
     pub fn from_env() -> Result<Option<Self>, String> {
         let Some(subscription_id) = env::var("AZURE_SUBSCRIPTION_ID")
@@ -118,29 +126,81 @@ impl AzureJobClient {
                 return Ok(token);
             }
         }
-        let mut url = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F".to_owned();
-        if let Some(client_id) = &self.client_id {
-            url.push_str("&client_id=");
-            url.push_str(&query_component(client_id));
-        }
+        managed_identity_token(
+            &self.agent,
+            self.client_id.as_deref(),
+            "https://management.azure.com/",
+        )
+    }
+}
+
+impl AzureLogAnalyticsClient {
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let Some(workspace_id) = env::var("AZURE_LOG_ANALYTICS_WORKSPACE_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            endpoint: env::var("AZURE_LOG_ANALYTICS_ENDPOINT")
+                .unwrap_or_else(|_| "https://api.loganalytics.azure.com".to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
+            workspace_id,
+            client_id: env::var("AZURE_CLIENT_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(3))
+                .timeout_read(Duration::from_secs(15))
+                .timeout_write(Duration::from_secs(8))
+                .build(),
+        }))
+    }
+
+    pub fn execution_logs(&self, job_name: &str, execution_id: &str) -> Result<Value, String> {
+        let query = container_app_job_log_query(job_name, execution_id);
+        let body = json!({
+            "query": query,
+            "timespan": "P7D"
+        });
+        let body_text = serde_json::to_string(&body)
+            .map_err(|error| format!("Log query request was not JSON serializable: {error}"))?;
+        let url = format!(
+            "{}/v1/workspaces/{}/query",
+            self.endpoint,
+            path_segment(&self.workspace_id)
+        );
+        let token = self.access_token()?;
         let response = self
             .agent
-            .get(&url)
-            .set("Metadata", "true")
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/json")
-            .call()
+            .set("Content-Type", "application/json")
+            .set("Prefer", "wait=10")
+            .send_string(&body_text)
             .map_err(|error| {
                 format!(
-                    "managed identity token unavailable: {}",
+                    "Azure Log Analytics query failed: {}",
                     sanitized_error(error)
                 )
             })?;
-        let payload = response_json(response, "managed identity token")?;
-        payload["access_token"]
-            .as_str()
-            .map(str::to_owned)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| "managed identity token response was missing access_token".to_owned())
+        response_json(response, "Azure Log Analytics query")
+    }
+
+    fn access_token(&self) -> Result<String, String> {
+        if let Ok(token) = env::var("AZURE_LOG_ANALYTICS_BEARER_TOKEN") {
+            if !token.trim().is_empty() {
+                return Ok(token);
+            }
+        }
+        managed_identity_token(
+            &self.agent,
+            self.client_id.as_deref(),
+            "https://api.loganalytics.azure.com",
+        )
     }
 }
 
@@ -223,6 +283,78 @@ fn response_json(response: ureq::Response, label: &str) -> Result<Value, String>
     serde_json::from_str(&text).map_err(|error| format!("{label} response was not JSON: {error}"))
 }
 
+fn managed_identity_token(
+    agent: &ureq::Agent,
+    client_id: Option<&str>,
+    resource: &str,
+) -> Result<String, String> {
+    let mut url = format!(
+        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={}",
+        query_component(resource)
+    );
+    if let Some(client_id) = client_id {
+        url.push_str("&client_id=");
+        url.push_str(&query_component(client_id));
+    }
+    let response = agent
+        .get(&url)
+        .set("Metadata", "true")
+        .set("Accept", "application/json")
+        .call()
+        .map_err(|error| {
+            format!(
+                "managed identity token unavailable: {}",
+                sanitized_error(error)
+            )
+        })?;
+    let payload = response_json(response, "managed identity token")?;
+    payload["access_token"]
+        .as_str()
+        .map(str::to_owned)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "managed identity token response was missing access_token".to_owned())
+}
+
+fn container_app_job_log_query(job_name: &str, execution_id: &str) -> String {
+    let job_name = kql_string(job_name);
+    let execution_id = kql_string(execution_id);
+    format!(
+        r#"let targetJob = '{job_name}';
+let targetExecution = '{execution_id}';
+union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL
+| where TimeGenerated > ago(7d)
+| where tostring(JobName_s) == targetJob
+    or tostring(ContainerAppName_s) == targetJob
+    or tostring(ResourceName) == targetJob
+    or tostring(_ResourceId) has strcat('/jobs/', targetJob)
+| where isempty(targetExecution)
+    or tostring(ExecutionName_s) == targetExecution
+    or tostring(ReplicaName_s) has targetExecution
+    or tostring(ContainerName_s) has targetExecution
+    or tostring(Log_s) has targetExecution
+| project TimeGenerated,
+          Level = coalesce(tostring(Level_s), tostring(LogLevel_s), ''),
+          Message = coalesce(tostring(Log_s), tostring(Message), tostring(Reason_s), tostring(Type_s), ''),
+          Replica = tostring(ReplicaName_s),
+          Container = tostring(ContainerName_s)
+| order by TimeGenerated desc
+| take 200"#
+    )
+}
+
+fn kql_string(value: &str) -> String {
+    value
+        .chars()
+        .take(160)
+        .flat_map(|ch| match ch {
+            '\'' => "''".chars().collect::<Vec<_>>(),
+            '\n' | '\r' | '\t' => vec![' '],
+            ch if ch.is_control() => Vec::new(),
+            ch => vec![ch],
+        })
+        .collect()
+}
+
 fn sanitized_error(error: ureq::Error) -> String {
     match error {
         ureq::Error::Status(status, response) => {
@@ -282,5 +414,12 @@ mod tests {
         let summary = execution_summary(&execution);
         assert_eq!(summary["duration"], 125);
         assert_eq!(summary["running"], false);
+    }
+
+    #[test]
+    fn log_query_escapes_execution_id() {
+        let query = container_app_job_log_query("polyedge-job", "exec'bad\nvalue");
+        assert!(query.contains("let targetExecution = 'exec''bad value';"));
+        assert!(!query.contains("exec'bad\nvalue"));
     }
 }

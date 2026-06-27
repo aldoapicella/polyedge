@@ -222,7 +222,7 @@ var researchJobDefinitions = [
     replicaTimeout: 7200
     cpu: cpu
     memory: memory
-    command: 'mkdir -p reports/jobs/latest; printf \'%s\' \'{"job_id":"chart-backfill","job_type":"chart-backfill","status":"defined_pending_cli","started_ts":null,"finished_ts":null,"artifacts":[],"warnings":["chart backfill CLI command is not implemented in this image"],"errors":[],"data_quality":"unknown","research_only":true,"live_trading_enabled":false}\' > reports/jobs/latest/chart-backfill.json'
+    command: 'INPUT=$CHART_BACKFILL_INPUT; if [ -z "$INPUT" ]; then DATE=$(date -u -d "yesterday" +%Y-%m-%d); INPUT="data/research/daily/$DATE/normalized"; fi; polyedge-rs research chart-backfill --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/jobs/latest/chart-backfill.json" --markdown "reports/jobs/latest/chart-backfill.md"'
   }
   {
     id: 'adx-ingestion'

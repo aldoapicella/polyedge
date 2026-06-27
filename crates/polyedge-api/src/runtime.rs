@@ -450,6 +450,7 @@ impl RuntimeController {
         }
         match event {
             FeedEvent::Reference(reference) => self.handle_reference(reference).await,
+            FeedEvent::RawMarketEvent(event) => self.handle_raw_market_event(event).await,
             FeedEvent::Book(book) => self.handle_book(book).await,
             FeedEvent::Error {
                 source, message, ..
@@ -531,6 +532,33 @@ impl RuntimeController {
             self.push_market_chart_sample(&market.market_id).await;
         }
         self.handle_paper_fills(&book).await;
+    }
+
+    async fn handle_raw_market_event(&self, event: polyedge_feeds::MarketChannelEvent) {
+        let mut payload = serde_json::to_value(&event).unwrap_or(Value::Null);
+        let token_id = event.token_id.as_deref().or(event.asset_id.as_deref());
+        if let Some(token_id) = token_id {
+            let token = TokenId::new(token_id.to_owned());
+            let market = {
+                let data = self.inner.data.read().await;
+                markets_by_token_from_data(&data).get(&token).cloned()
+            };
+            if let (Some(market), Value::Object(map)) = (market, &mut payload) {
+                map.entry("market_id".to_owned())
+                    .or_insert_with(|| json!(market.market_id));
+                map.entry("condition_id".to_owned())
+                    .or_insert_with(|| json!(market.condition_id));
+                if token == market.up_token_id {
+                    map.entry("outcome".to_owned())
+                        .or_insert_with(|| json!("up"));
+                } else if token == market.down_token_id {
+                    map.entry("outcome".to_owned())
+                        .or_insert_with(|| json!("down"));
+                }
+            }
+        }
+        self.record_event("raw_market_event", payload, None, None)
+            .await;
     }
 
     async fn handle_paper_fills(&self, book: &BookState) {

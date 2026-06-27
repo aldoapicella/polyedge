@@ -86,6 +86,11 @@ pub fn app(settings: RuntimeSettings) -> Router {
         .route("/api/v1/jobs", get(labs::jobs))
         .route("/api/v1/jobs/:job_id", get(labs::job_detail))
         .route("/api/v1/jobs/:job_id/logs", get(labs::job_logs))
+        .route("/api/v1/jobs/:job_id/executions", get(labs::job_executions))
+        .route(
+            "/api/v1/jobs/:job_id/executions/:execution_id/logs",
+            get(labs::job_execution_logs),
+        )
         .route(
             "/api/v1/artifacts/:artifact_id/preview",
             get(labs::report_artifact),

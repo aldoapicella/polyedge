@@ -3,8 +3,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Play, RefreshCw } from "lucide-react";
 import { useState } from "react";
-import { getJobDetail, getJobLogs, getJobs, startLabJob } from "@/lib/api";
-import type { LabJob } from "@/lib/types";
+import { getJobDetail, getJobExecutionLogs, getJobExecutions, getJobLogs, getJobs, startLabJob } from "@/lib/api";
+import type { JobExecution, LabJob } from "@/lib/types";
 import { compact, dateTime, numberText } from "@/lib/format";
 import { Button, EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
@@ -17,7 +17,6 @@ const runnableJobs: { id: RunnableJob; label: string }[] = [
   { id: "prospective-validation", label: "Prospective" },
   { id: "compact-replay-index", label: "Replay Index" },
   { id: "chart-backfill", label: "Chart Backfill" },
-  { id: "adx-ingestion", label: "ADX Ingestion" },
   { id: "manual-backfill", label: "Manual Backfill" }
 ];
 
@@ -161,10 +160,11 @@ function JobTable({
               <td className="px-3 py-2 font-mono text-xs">{job.output_artifact ?? "reports/jobs/latest pending"}</td>
               <td className="px-3 py-2">{job.error ?? "none reported"}</td>
               <td className="px-3 py-2">
-                <Button className="h-8 px-2 text-xs" disabled={running || job.job_id === "manual-backfill"} onClick={() => onRun(job.job_id as RunnableJob)}>
+                <Button className="h-8 px-2 text-xs" disabled={running || job.job_id === "manual-backfill" || job.runnable === false} onClick={() => onRun(job.job_id as RunnableJob)}>
                   <Play className="h-3.5 w-3.5" />
                   Rerun
                 </Button>
+                {job.runnable === false ? <div className="mt-1 text-xs text-ink/45">not configured</div> : null}
               </td>
             </tr>
           ))}
@@ -175,10 +175,20 @@ function JobTable({
 }
 
 function JobDetailPanel({ jobId }: { jobId: string }) {
+  const [selectedExecution, setSelectedExecution] = useState<string | null>(null);
   const detail = useQuery({ queryKey: ["jobs", jobId], queryFn: () => getJobDetail(jobId), retry: false });
   const logs = useQuery({ queryKey: ["jobs", jobId, "logs"], queryFn: () => getJobLogs(jobId), retry: false });
+  const executions = useQuery({ queryKey: ["jobs", jobId, "executions"], queryFn: () => getJobExecutions(jobId), retry: false, refetchInterval: 30000 });
+  const executionLogs = useQuery({
+    queryKey: ["jobs", jobId, "executions", selectedExecution, "logs"],
+    queryFn: () => getJobExecutionLogs(jobId, selectedExecution ?? ""),
+    retry: false,
+    enabled: Boolean(selectedExecution)
+  });
   const job = detail.data?.job;
-  const artifacts = logs.data?.artifacts ?? [job?.output_artifact].filter((artifact): artifact is string => Boolean(artifact));
+  const artifacts = executionLogs.data?.artifacts ?? logs.data?.artifacts ?? [job?.output_artifact].filter((artifact): artifact is string => Boolean(artifact));
+  const visibleLogs = selectedExecution ? executionLogs.data?.logs ?? [] : logs.data?.logs ?? [];
+  const logDetail = selectedExecution ? executionLogs.data?.detail : logs.data?.detail;
   return (
     <Panel>
       <PanelHeader title="Job Detail" meta={jobId} />
@@ -195,12 +205,25 @@ function JobDetailPanel({ jobId }: { jobId: string }) {
           </div>
           <div className="space-y-3">
             <Panel>
-              <PanelHeader title="Logs" meta={logs.data?.logs.length ? `${logs.data.logs.length} lines` : "Azure Monitor"} />
-              {logs.data?.logs.length ? (
-                <pre className="max-h-72 overflow-auto p-3 text-xs text-ink/70">{logs.data.logs.join("\n")}</pre>
+              <PanelHeader title="Executions" meta={executions.data?.source ?? "Azure ARM"} />
+              <ExecutionTable
+                executions={executions.data?.executions ?? []}
+                loading={executions.isLoading}
+                selected={selectedExecution}
+                onSelect={setSelectedExecution}
+              />
+              {!executions.data?.executions.length && executions.data?.detail ? (
+                <div className="border-t border-line px-3 py-2 text-xs text-ink/55">{executions.data.detail}</div>
+              ) : null}
+            </Panel>
+            <Panel>
+              <PanelHeader title="Logs" meta={selectedExecution ? selectedExecution : "job summary"} />
+              {visibleLogs.length ? (
+                <pre className="max-h-72 overflow-auto p-3 text-xs text-ink/70">{visibleLogs.join("\n")}</pre>
               ) : (
-                <EmptyState label={logs.data?.detail ?? "No inline logs returned. Check Azure Monitor for execution logs."} />
+                <EmptyState label={logDetail ?? "No inline logs returned. Select an execution or check Azure Monitor."} />
               )}
+              {executionLogs.error ? <div className="border-t border-line px-3 py-2 text-xs text-danger">{executionLogs.error.message}</div> : null}
             </Panel>
             <Panel>
               <PanelHeader title="Artifacts" meta={`${logs.data?.artifacts?.length ?? 0} linked`} />
@@ -222,6 +245,52 @@ function JobDetailPanel({ jobId }: { jobId: string }) {
   );
 }
 
+function ExecutionTable({
+  executions,
+  loading,
+  selected,
+  onSelect
+}: {
+  executions: JobExecution[];
+  loading: boolean;
+  selected: string | null;
+  onSelect: (executionId: string) => void;
+}) {
+  if (!executions.length) {
+    return <EmptyState label={loading ? "Loading executions" : "No execution history returned"} />;
+  }
+  return (
+    <div className="max-h-72 overflow-auto">
+      <table className="w-full min-w-[720px] text-left text-xs">
+        <thead className="border-b border-line bg-panel uppercase text-ink/50">
+          <tr>
+            {["Execution", "Status", "Start", "Finish", "Duration", "Exit"].map((header) => (
+              <th key={header} className="px-2 py-2">{header}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {executions.map((execution) => {
+            const id = execution.execution_name ?? execution.execution_id ?? "";
+            return (
+              <tr key={id} className={["border-b border-line last:border-b-0", selected === id ? "bg-good/5" : "hover:bg-panel"].join(" ")}>
+                <td className="px-2 py-2">
+                  <button className="font-mono text-ink hover:underline" onClick={() => onSelect(id)}>{id || "n/a"}</button>
+                </td>
+                <td className="px-2 py-2"><Pill tone={executionTone(execution)}>{execution.status}</Pill></td>
+                <td className="px-2 py-2">{dateTime(execution.last_start)}</td>
+                <td className="px-2 py-2">{dateTime(execution.last_finish)}</td>
+                <td className="px-2 py-2">{numberText(execution.duration)}</td>
+                <td className="px-2 py-2">{numberText(execution.exit_code)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="grid grid-cols-[120px_1fr] gap-3 border-b border-line pb-2 text-sm last:border-b-0">
@@ -229,6 +298,17 @@ function DetailRow({ label, value }: { label: string; value: string }) {
       <div className="min-w-0 truncate text-ink/75">{value}</div>
     </div>
   );
+}
+
+function executionTone(execution: JobExecution) {
+  const status = execution.status.toLowerCase();
+  if (status.includes("failed") || status.includes("error")) {
+    return "danger" as const;
+  }
+  if (execution.running || status.includes("running") || status.includes("succeeded")) {
+    return "good" as const;
+  }
+  return "warn" as const;
 }
 
 function confirmAndRun(job: string, run: () => void) {

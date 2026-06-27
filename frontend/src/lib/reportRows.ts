@@ -42,6 +42,19 @@ export const FILL_MODEL_COLUMNS: ReportColumn[] = [
   { key: "queue_proxy", label: "Queue Proxy" }
 ];
 
+export const QUEUE_PROXY_COLUMNS: ReportColumn[] = [
+  { key: "fill_model", label: "Fill Model" },
+  { key: "queue_proxy_mode", label: "Mode" },
+  { key: "queue_proxy_enabled", label: "Enabled" },
+  { key: "queue_proxy_eligible_markets", label: "Eligible Markets" },
+  { key: "queue_proxy_ineligible_markets", label: "Ineligible Markets" },
+  { key: "queue_proxy_eligibility_rate", label: "Eligibility Rate" },
+  { key: "queue_proxy_fills", label: "Queue Fills" },
+  { key: "queue_proxy_fill_rate", label: "Fill Rate" },
+  { key: "avg_size_ahead", label: "Avg Size Ahead" },
+  { key: "ineligible_reasons", label: "Ineligible Reasons" }
+];
+
 export function selectRegimeProfileRows(report: unknown): JsonRecord[] {
   const comparisons = firstRecordArray(report, ["/result/comparisons", "/comparisons"]);
   const profiles = firstRecordArray(report, ["/result/profiles", "/profiles"]);
@@ -121,6 +134,38 @@ export function selectFillModelSummaryRows(report: unknown): JsonRecord[] {
       queue_proxy: firstDefined(row.queue_proxy, pointer(row, "/replay_metrics/queue_proxy/status"))
     }))
     .filter((row) => row.fill_model !== undefined);
+}
+
+export function selectQueueProxyRows(report: unknown): JsonRecord[] {
+  return selectFillModelRawRows(report)
+    .map((row) => {
+      const queue = asRecord(pointer(row, "/replay_metrics/queue_proxy")) ?? asRecord(row.queue_proxy) ?? {};
+      return {
+        fill_model: firstDefined(row.fill_model, row.name),
+        queue_proxy_mode: firstDefined(row.queue_proxy_mode, queue.queue_proxy_mode),
+        queue_proxy_enabled: firstDefined(row.queue_proxy_enabled, queue.queue_proxy_enabled),
+        queue_proxy_eligible_markets: firstDefined(row.queue_proxy_eligible_markets, queue.queue_proxy_eligible_markets),
+        queue_proxy_ineligible_markets: firstDefined(row.queue_proxy_ineligible_markets, queue.queue_proxy_ineligible_markets),
+        queue_proxy_eligibility_rate: firstDefined(row.queue_proxy_eligibility_rate, queue.queue_proxy_eligibility_rate),
+        queue_proxy_fills: firstDefined(row.queue_proxy_fills, queue.queue_proxy_fills),
+        queue_proxy_fill_rate: firstDefined(row.queue_proxy_fill_rate, queue.queue_proxy_fill_rate),
+        avg_size_ahead: firstDefined(row.avg_size_ahead, queue.avg_size_ahead),
+        ineligible_reasons: firstDefined(row.ineligible_reasons, queue.ineligible_reasons)
+      };
+    })
+    .filter((row) => row.fill_model !== undefined);
+}
+
+function selectFillModelRawRows(report: unknown): JsonRecord[] {
+  return firstRecordArray(report, [
+    "/result/fill_models",
+    "/result/fill_model_sensitivity",
+    "/result/fill_model_results",
+    "/result/results",
+    "/fill_models",
+    "/fill_model_sensitivity",
+    "/fill_model_results"
+  ]).filter((row) => row.market_id === undefined && row.market_slug === undefined);
 }
 
 function pickCalibrationFields(row: JsonRecord | null): JsonRecord {

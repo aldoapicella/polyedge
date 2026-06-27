@@ -228,8 +228,14 @@ export type LabSummary = {
 export type LabCandidateEvidence = {
   candidate: string;
   profile?: string | null;
+  candidate_version?: string | null;
+  config_hash?: string | null;
+  frozen_since?: string | null;
+  reason?: string | null;
   status?: string | null;
   latest_test_pnl?: string | number | null;
+  paired_delta?: string | number | null;
+  decision_gate?: string | null;
   ci_95_low?: string | number | null;
   ci_95_high?: string | number | null;
   max_drawdown?: string | number | null;
@@ -284,10 +290,35 @@ export type LabJob = {
   error?: string | null;
   data_quality?: string | null;
   running?: boolean;
+  runnable?: boolean;
+  detail?: string | null;
   execution_name?: string | null;
   execution_id?: string | null;
   research_only?: boolean;
   live_trading_enabled?: boolean;
+};
+
+export type JobExecution = {
+  execution_name?: string | null;
+  execution_id?: string | null;
+  status: string;
+  last_start?: string | null;
+  last_finish?: string | null;
+  duration?: number | string | null;
+  running?: boolean;
+  exit_code?: number | string | null;
+  error?: string | null;
+};
+
+export type JobExecutionLogPayload = {
+  job_id: string;
+  job_name?: string;
+  execution_id: string;
+  logs: string[];
+  log_rows?: JsonRecord[];
+  artifacts?: string[];
+  source?: string;
+  detail?: string;
 };
 
 export type ProspectiveValidationRow = {
@@ -298,6 +329,14 @@ export type ProspectiveValidationRow = {
   dynamic_quote_style_net_pnl?: string | number | null;
   full_deterministic_profile_net_pnl?: string | number | null;
   dynamic_safety_only_net_pnl?: string | number | null;
+  dynamic_quote_style_paired_delta?: string | number | null;
+  full_deterministic_profile_paired_delta?: string | number | null;
+  dynamic_safety_only_paired_delta?: string | number | null;
+  best_candidate_paired_delta?: string | number | null;
+  decision_gate?: string | null;
+  dynamic_quote_style_decision_gate?: string | null;
+  full_deterministic_profile_decision_gate?: string | null;
+  dynamic_safety_only_decision_gate?: string | null;
   max_drawdown?: string | number | null;
   cancel_per_fill?: string | number | null;
   ci_95_low?: string | number | null;
@@ -384,6 +423,10 @@ export type QueryTemplate = {
   name: string;
   description?: string;
   request: QueryRequest;
+  created_ts?: string;
+  updated_ts?: string;
+  owner?: string;
+  tags?: string[];
 };
 
 export type DataQualityTimelineEvent = {

@@ -15,7 +15,10 @@ use std::env;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 
-use crate::azure_jobs::{latest_execution_summary, AzureJobClient, JobStartOptions};
+use crate::azure_jobs::{
+    execution_summary, latest_execution_summary, AzureJobClient, AzureLogAnalyticsClient,
+    JobStartOptions,
+};
 use crate::ApiState;
 
 const REPORT_ROOT: &str = "reports/research";
@@ -47,6 +50,11 @@ pub fn router() -> Router<ApiState> {
         .route("/jobs/backfill", post(start_backfill))
         .route("/jobs", get(jobs))
         .route("/jobs/:job_id/start", post(start_job))
+        .route("/jobs/:job_id/executions", get(job_executions))
+        .route(
+            "/jobs/:job_id/executions/:execution_id/logs",
+            get(job_execution_logs),
+        )
         .route("/jobs/:job_id", get(job_detail))
         .route("/prospective", get(prospective))
         .route("/regimes/latest", get(regimes_latest))
@@ -317,6 +325,173 @@ pub(crate) async fn job_logs(Path(job_id): Path<String>) -> impl IntoResponse {
     .into_response()
 }
 
+pub(crate) async fn job_executions(Path(job_id): Path<String>) -> impl IntoResponse {
+    let Some(job) = job_definition_by_id(&job_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "detail": format!("Job {job_id} was not found.") })),
+        )
+            .into_response();
+    };
+    let Some(job_name) = job["job_name"].as_str().map(str::to_owned) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "detail": format!("Job {job_id} has no job_name.") })),
+        )
+            .into_response();
+    };
+    let client = match AzureJobClient::from_env() {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return Json(json!({
+                "job_id": job_id,
+                "job_name": job_name,
+                "executions": [],
+                "source": "azure_arm_not_configured",
+                "artifacts": job_artifact_paths(&job),
+                "detail": "Azure ARM env is not configured. Set AZURE_SUBSCRIPTION_ID and AZURE_RESOURCE_GROUP to list Container Apps Job executions."
+            }))
+            .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "executions": [],
+                    "source": "azure_arm_unavailable",
+                    "artifacts": job_artifact_paths(&job),
+                    "detail": error
+                })),
+            )
+                .into_response();
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || client.list_executions(&job_name))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+    match result {
+        Ok(executions) => Json(json!({
+            "job_id": job_id,
+            "job_name": job["job_name"],
+            "executions": executions.iter().map(execution_summary).collect::<Vec<_>>(),
+            "source": "azure_arm_executions",
+            "artifacts": job_artifact_paths(&job),
+            "live_trading_enabled": false,
+            "raw_data_mutated": false
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "job_id": job_id,
+                "job_name": job["job_name"],
+                "executions": [],
+                "source": "azure_arm_error",
+                "artifacts": job_artifact_paths(&job),
+                "detail": error,
+                "live_trading_enabled": false,
+                "raw_data_mutated": false
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn job_execution_logs(
+    Path((job_id, execution_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(job) = job_definition_by_id(&job_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "detail": format!("Job {job_id} was not found.") })),
+        )
+            .into_response();
+    };
+    let Some(job_name) = job["job_name"].as_str().map(str::to_owned) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "detail": format!("Job {job_id} has no job_name.") })),
+        )
+            .into_response();
+    };
+    let client = match AzureLogAnalyticsClient::from_env() {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return Json(json!({
+                "job_id": job_id,
+                "job_name": job_name,
+                "execution_id": execution_id,
+                "logs": [],
+                "log_rows": [],
+                "source": "log_analytics_not_configured",
+                "artifacts": job_artifact_paths(&job),
+                "detail": "Log Analytics workspace is not configured. Set AZURE_LOG_ANALYTICS_WORKSPACE_ID to retrieve Container Apps Job logs."
+            }))
+            .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "job_id": job_id,
+                    "job_name": job_name,
+                    "execution_id": execution_id,
+                    "logs": [],
+                    "log_rows": [],
+                    "source": "log_analytics_unavailable",
+                    "artifacts": job_artifact_paths(&job),
+                    "detail": error
+                })),
+            )
+                .into_response();
+        }
+    };
+    let lookup_execution = execution_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || client.execution_logs(&job_name, &lookup_execution))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+    match result {
+        Ok(payload) => {
+            let safe_payload = redact_sensitive_json(&payload);
+            let rows = log_rows_from_analytics(&safe_payload);
+            Json(json!({
+                "job_id": job_id,
+                "job_name": job["job_name"],
+                "execution_id": execution_id,
+                "logs": rows.iter().filter_map(|row| row["message"].as_str().map(str::to_owned)).collect::<Vec<_>>(),
+                "log_rows": rows,
+                "source": "azure_log_analytics",
+                "artifacts": job_artifact_paths(&job),
+                "raw": safe_payload,
+                "live_trading_enabled": false,
+                "raw_data_mutated": false
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "job_id": job_id,
+                "job_name": job["job_name"],
+                "execution_id": execution_id,
+                "logs": [],
+                "log_rows": [],
+                "source": "azure_log_analytics_error",
+                "artifacts": job_artifact_paths(&job),
+                "detail": error,
+                "live_trading_enabled": false,
+                "raw_data_mutated": false
+            })),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn data_quality_timeline() -> impl IntoResponse {
     let latest = read_json_or_null(FRESHNESS_LATEST);
     let mut events = Vec::new();
@@ -448,6 +623,21 @@ async fn start_research_job_by_id(
         )
             .into_response();
     };
+    if job["runnable"].as_bool() == Some(false) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "job_id": job_id,
+                "job_name": job_name,
+                "status": "not_configured",
+                "research_only": true,
+                "live_trading_enabled": false,
+                "raw_data_mutated": false,
+                "detail": job["detail"].as_str().unwrap_or("Job is not configured to run.")
+            })),
+        )
+            .into_response();
+    }
     let options = match start_options(job_id, body.as_ref()) {
         Ok(options) => options,
         Err(detail) => {
@@ -677,6 +867,9 @@ fn candidate_evidence_row(candidate: Value, latest: Option<&Value>) -> Value {
     let pnl = latest
         .map(|row| candidate_pnl(row, name))
         .unwrap_or_else(|| json!("collecting"));
+    let paired_delta = latest
+        .map(|row| candidate_paired_delta(row, name))
+        .unwrap_or(Value::Null);
     let status = candidate_status(latest, name, &pnl);
     let recommendation = latest
         .and_then(|row| row["recommendation"].as_str())
@@ -685,8 +878,14 @@ fn candidate_evidence_row(candidate: Value, latest: Option<&Value>) -> Value {
     json!({
         "candidate": name,
         "profile": candidate["profile"].clone(),
+        "candidate_version": candidate["candidate_version"].clone(),
+        "config_hash": candidate["config_hash"].clone(),
+        "frozen_since": candidate["frozen_since"].clone(),
+        "reason": candidate["reason"].clone(),
         "status": status,
         "latest_test_pnl": pnl,
+        "paired_delta": paired_delta,
+        "decision_gate": latest.map(|row| candidate_decision_gate(row, name)).unwrap_or(Value::Null),
         "ci_95_low": latest.map(|row| row["ci_95_low"].clone()).unwrap_or(Value::Null),
         "ci_95_high": latest.map(|row| row["ci_95_high"].clone()).unwrap_or(Value::Null),
         "max_drawdown": latest.map(|row| row["max_drawdown"].clone()).unwrap_or(Value::Null),
@@ -715,10 +914,40 @@ fn candidate_pnl(row: &Value, candidate: &str) -> Value {
     }
 }
 
+fn candidate_paired_delta(row: &Value, candidate: &str) -> Value {
+    if candidate.contains("dynamic_quote_style") {
+        row["dynamic_quote_style_paired_delta"].clone()
+    } else if candidate.contains("full_deterministic_profile") {
+        row["full_deterministic_profile_paired_delta"].clone()
+    } else if candidate.contains("dynamic_safety_only") {
+        row["dynamic_safety_only_paired_delta"].clone()
+    } else {
+        json!("baseline")
+    }
+}
+
+fn candidate_decision_gate(row: &Value, candidate: &str) -> Value {
+    if candidate.contains("dynamic_quote_style") {
+        row["dynamic_quote_style_decision_gate"].clone()
+    } else if candidate.contains("full_deterministic_profile") {
+        row["full_deterministic_profile_decision_gate"].clone()
+    } else if candidate.contains("dynamic_safety_only") {
+        row["dynamic_safety_only_decision_gate"].clone()
+    } else {
+        json!("BASELINE_CONTROL")
+    }
+}
+
 fn candidate_status(latest: Option<&Value>, candidate: &str, pnl: &Value) -> String {
     let Some(row) = latest else {
         return "collecting".to_owned();
     };
+    if candidate_decision_gate(row, candidate).as_str() == Some("REJECT")
+        && !candidate.contains("static")
+        && !candidate.contains("baseline")
+    {
+        return "rejected_by_paired_evidence".to_owned();
+    }
     if row["data_quality_status"]
         .as_str()
         .is_some_and(|status| status != "healthy")
@@ -1072,6 +1301,138 @@ fn report_relative_path(path: &FsPath) -> String {
         .to_owned()
 }
 
+fn job_artifact_paths(job: &Value) -> Vec<Value> {
+    vec![
+        job["output_artifact"].clone(),
+        json!(format!(
+            "reports/jobs/latest/{}.json",
+            job["job_id"].as_str().unwrap_or("job")
+        )),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_null())
+    .collect()
+}
+
+fn log_rows_from_analytics(payload: &Value) -> Vec<Value> {
+    let Some(table) = payload["tables"]
+        .as_array()
+        .and_then(|tables| tables.first())
+    else {
+        return Vec::new();
+    };
+    let columns = table["columns"]
+        .as_array()
+        .map(|columns| {
+            columns
+                .iter()
+                .filter_map(|column| column["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    table["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let values = row.as_array()?;
+            let mut record = serde_json::Map::new();
+            for (index, value) in values.iter().enumerate() {
+                let key = columns
+                    .get(index)
+                    .map(|value| value.to_ascii_lowercase())
+                    .unwrap_or_else(|| format!("column_{index}"));
+                record.insert(key, redact_sensitive_json(value));
+            }
+            let ts = record
+                .get("timegenerated")
+                .cloned()
+                .or_else(|| record.get("timestamp").cloned())
+                .unwrap_or(Value::Null);
+            let message = record
+                .get("message")
+                .cloned()
+                .or_else(|| record.get("log").cloned())
+                .unwrap_or(Value::Null);
+            Some(json!({
+                "ts": ts,
+                "level": record.get("level").cloned().unwrap_or(Value::Null),
+                "message": message,
+                "replica": record.get("replica").cloned().unwrap_or(Value::Null),
+                "container": record.get("container").cloned().unwrap_or(Value::Null),
+                "raw": Value::Object(record)
+            }))
+        })
+        .collect()
+}
+
+fn redact_sensitive_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    if is_secret_like_text(key) {
+                        (key.clone(), json!("[redacted]"))
+                    } else {
+                        (key.clone(), redact_sensitive_json(value))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_sensitive_json).collect()),
+        Value::String(text) => json!(redact_sensitive_text(text)),
+        _ => value.clone(),
+    }
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    let mut redact_next = false;
+    text.split_whitespace()
+        .map(|part| {
+            let lowered = part.to_ascii_lowercase();
+            let redact = redact_next
+                || lowered == "bearer"
+                || lowered.starts_with("bearer=")
+                || lowered.starts_with("sharedaccesssignature")
+                || lowered.contains("sig=")
+                || lowered.contains("se=") && lowered.contains("sp=")
+                || lowered.contains("accountkey=")
+                || lowered.contains("accesskey=")
+                || lowered.contains("password=")
+                || lowered.contains("authorization:")
+                || lowered.contains("private_key")
+                || lowered.contains("-----begin")
+                || is_secret_like_text(&lowered);
+            let mark_next = lowered == "bearer" || lowered.ends_with("bearer");
+            if redact {
+                redact_next = mark_next;
+                "[redacted]"
+            } else {
+                redact_next = mark_next;
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_secret_like_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("bearer")
+        || lower.contains("authorization")
+        || lower.contains("private_key")
+        || lower.contains("account_key")
+        || lower.contains("connection_string")
+        || lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("sas_token")
+}
+
 pub(crate) fn job_definitions() -> Value {
     json!([
         job_definition(
@@ -1223,6 +1584,15 @@ fn start_options(
 }
 
 fn job_definition(job_id: &str, job_name: &str, trigger: &str, cron: impl Into<Value>) -> Value {
+    let runnable = job_id != "adx-ingestion" || adx_ingestion_configured();
+    let detail = if job_id == "adx-ingestion" && !runnable {
+        Value::String(
+            "ADX ingestion is hidden from run controls until ADX_CLUSTER_URI and ADX_DATABASE are configured."
+                .to_owned(),
+        )
+    } else {
+        Value::Null
+    };
     json!({
         "job_id": job_id,
         "job_type": job_id,
@@ -1237,10 +1607,23 @@ fn job_definition(job_id: &str, job_name: &str, trigger: &str, cron: impl Into<V
         "output_artifact": job_output_artifact(job_id),
         "error": Value::Null,
         "running": false,
+        "runnable": runnable,
+        "detail": detail,
         "research_only": true,
         "live_trading_enabled": false,
         "data_quality": "unknown"
     })
+}
+
+fn adx_ingestion_configured() -> bool {
+    env::var("ADX_CLUSTER_URI")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+        && env::var("ADX_DATABASE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
 }
 
 fn job_output_artifact(job_id: &str) -> &'static str {
@@ -1281,4 +1664,50 @@ fn today() -> String {
 
 fn now_ts() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_analytics_rows_redact_secret_like_content() {
+        let payload = json!({
+            "tables": [{
+                "columns": [
+                    {"name": "TimeGenerated"},
+                    {"name": "Message"},
+                    {"name": "Authorization"},
+                    {"name": "ConnectionString"}
+                ],
+                "rows": [[
+                    "2026-06-24T00:00:00Z",
+                    "starting Bearer token-value https://example.blob.core.windows.net/c?sp=rl&se=2026&sig=hidden",
+                    "Bearer other-token",
+                    "AccountKey=hidden-key"
+                ]]
+            }]
+        });
+
+        let safe = redact_sensitive_json(&payload);
+        let text = serde_json::to_string(&safe).unwrap();
+
+        assert!(!text.contains("token-value"));
+        assert!(!text.contains("other-token"));
+        assert!(!text.contains("sig=hidden"));
+        assert!(!text.contains("hidden-key"));
+        assert!(text.contains("[redacted]"));
+    }
+
+    #[test]
+    fn adx_job_is_not_runnable_without_config() {
+        std::env::remove_var("ADX_CLUSTER_URI");
+        std::env::remove_var("ADX_DATABASE");
+        let job = job_definition_by_id("adx-ingestion").expect("adx job");
+
+        assert_eq!(job["runnable"], false);
+        assert!(job["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("not configured") || detail.contains("hidden")));
+    }
 }

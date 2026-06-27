@@ -70,6 +70,77 @@ pub(super) fn datasets() -> Vec<Value> {
             &["candidate", "date"],
             &["count", "avg_pnl"],
         ),
+        dataset(
+            "market_truth",
+            "Market Truth",
+            &[
+                "market_id",
+                "asset",
+                "horizon",
+                "winning_outcome",
+                "quality",
+            ],
+            &["count"],
+        ),
+        dataset(
+            "decision_features",
+            "Decision Features",
+            &[
+                "market_id",
+                "action",
+                "outcome",
+                "regime",
+                "time_to_expiry_bucket",
+            ],
+            &["count", "mean_q_up"],
+        ),
+        dataset(
+            "fill_candidates",
+            "Fill Candidates",
+            &["market_id", "status", "outcome", "fill_model", "source"],
+            &["count", "fill_count", "fill_rate"],
+        ),
+        dataset(
+            "queue_evidence",
+            "Queue Evidence",
+            &["market_id", "event_type", "token_id", "side", "source"],
+            &["count"],
+        ),
+        dataset(
+            "queue_proxy_results",
+            "Queue Proxy Results",
+            &["fill_model", "queue_proxy_mode", "candidate", "quality"],
+            &["count", "net_pnl", "fill_count", "fill_rate"],
+        ),
+        dataset(
+            "prospective_daily",
+            "Prospective Daily",
+            &["candidate", "date", "recommendation", "quality"],
+            &["count", "net_pnl", "avg_pnl"],
+        ),
+        dataset(
+            "candidate_market_pnl",
+            "Candidate Market PnL",
+            &["candidate", "market_id", "date", "quality"],
+            &["count", "net_pnl", "avg_pnl"],
+        ),
+        dataset(
+            "regime_market_pnl",
+            "Regime Market PnL",
+            &["regime", "profile", "market_id", "quality"],
+            &["count", "net_pnl", "fill_count"],
+        ),
+        dataset(
+            "calibration_buckets",
+            "Calibration Buckets",
+            &[
+                "q_bucket",
+                "time_to_expiry_bucket",
+                "distance_bucket",
+                "quality",
+            ],
+            &["count", "observed_up_rate", "brier_score"],
+        ),
     ]
 }
 
@@ -161,6 +232,30 @@ pub(super) fn templates() -> Vec<Value> {
             vec![filter("regime_switches", "gte", json!(10))],
             vec!["regime"],
             vec!["count"],
+        ),
+        template(
+            "queue_evidence_coverage",
+            "Queue evidence coverage",
+            "queue_evidence",
+            vec![],
+            vec!["event_type"],
+            vec!["count"],
+        ),
+        template(
+            "queue_proxy_fill_realism",
+            "QueueProxy fill realism",
+            "queue_proxy_results",
+            vec![],
+            vec!["fill_model"],
+            vec!["count", "fill_count", "fill_rate", "net_pnl"],
+        ),
+        template(
+            "prospective_candidate_progress",
+            "Prospective candidate progress",
+            "prospective_daily",
+            vec![],
+            vec!["candidate", "recommendation"],
+            vec!["count", "net_pnl", "avg_pnl"],
         ),
     ]
 }

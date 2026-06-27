@@ -21,15 +21,17 @@ import { compact, numberText } from "@/lib/format";
 import {
   CALIBRATION_COLUMNS,
   FILL_MODEL_COLUMNS,
+  QUEUE_PROXY_COLUMNS,
   REGIME_PROFILE_COLUMNS,
   type ReportColumn,
   selectCalibrationBucketRows,
   selectFillModelSummaryRows,
+  selectQueueProxyRows,
   selectRegimeProfileRows
 } from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
-const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "Sample Size", "Artifacts"] as const;
+const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "QueueProxy / Fill Realism", "Sample Size", "Artifacts"] as const;
 
 export function LabsPage() {
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
@@ -104,6 +106,15 @@ export function LabsPage() {
           emptyLabel="No fill-model summary rows found. Per-market replay rows stay in artifact drilldowns instead of this summary table."
         />
       ) : null}
+      {tab === "QueueProxy / Fill Realism" ? (
+        <ReportWithExplanation
+          title="QueueProxy / Fill Realism"
+          answer="Shows whether QueueProxy shadow models have enough book, level-change, trade-print, and order-lifecycle evidence. Ineligible markets remain skipped with explicit reasons."
+          rows={selectQueueProxyRows(fillModels.data?.report)}
+          columns={QUEUE_PROXY_COLUMNS}
+          emptyLabel="No QueueProxy fill-realism rows found. Run queue-audit or a fill-model report with queue_proxy_conservative/balanced evidence."
+        />
+      ) : null}
       {tab === "Sample Size" ? <SampleSizePanel report={sampleSize.data?.report} /> : null}
       {tab === "Artifacts" ? <ArtifactsPanel artifacts={artifacts.data?.artifacts ?? []} loading={artifacts.isLoading} /> : null}
     </div>
@@ -130,7 +141,9 @@ function Overview({
     : apiCandidates.length
       ? apiCandidates.map((candidate) => ({
           name: candidate.candidate,
-          profile: candidate.profile ?? candidate.candidate
+          profile: candidate.profile ?? candidate.candidate,
+          candidate_version: candidate.candidate_version,
+          frozen_since: candidate.frozen_since
         }))
       : fallbackCandidates();
   return (
@@ -158,6 +171,7 @@ function Overview({
                   <Pill tone="neutral">disabled</Pill>
                 </div>
                 <div className="mt-1 truncate text-xs text-ink/55">{String(candidate.profile ?? candidate.name)}</div>
+                <div className="mt-1 truncate text-xs text-ink/45">{String(candidate.candidate_version ?? candidate.frozen_since ?? "frozen metadata pending")}</div>
               </div>
             ))}
           </div>
@@ -185,7 +199,7 @@ function ProspectiveTable({ rows, loading }: { rows: ProspectiveValidationRow[];
           <table className="w-full min-w-[1040px] text-left text-sm">
             <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
               <tr>
-                {["Date", "Markets", "Static", "Dynamic Quote", "Full Deterministic", "Fill Model", "Drawdown", "Cancel/Fill", "Quality", "Recommendation"].map((header) => (
+                {["Date", "Markets", "Static", "Dynamic Quote", "Dynamic Δ", "Full Deterministic", "Best Δ", "Gate", "Quality", "Recommendation"].map((header) => (
                   <th key={header} className="px-3 py-2">{header}</th>
                 ))}
               </tr>
@@ -197,10 +211,10 @@ function ProspectiveTable({ rows, loading }: { rows: ProspectiveValidationRow[];
                   <td className="px-3 py-2">{numberText(row.settled_markets)}</td>
                   <td className="px-3 py-2">{numberText(row.static_net_pnl)}</td>
                   <td className="px-3 py-2">{numberText(row.dynamic_quote_style_net_pnl)}</td>
+                  <td className="px-3 py-2">{numberText(row.dynamic_quote_style_paired_delta)}</td>
                   <td className="px-3 py-2">{numberText(row.full_deterministic_profile_net_pnl)}</td>
-                  <td className="px-3 py-2">{row.fill_model ?? "not reported"}</td>
-                  <td className="px-3 py-2">{numberText(row.max_drawdown)}</td>
-                  <td className="px-3 py-2">{numberText(row.cancel_per_fill)}</td>
+                  <td className="px-3 py-2">{numberText(row.best_candidate_paired_delta)}</td>
+                  <td className="px-3 py-2"><Pill tone={gateTone(row.decision_gate)}>{row.decision_gate ?? "RESEARCH_ONLY"}</Pill></td>
                   <td className="px-3 py-2"><Pill tone={row.data_quality_status === "healthy" ? "good" : "warn"}>{row.data_quality_status ?? "unknown"}</Pill></td>
                   <td className="px-3 py-2">{row.recommendation ?? recommendationText(row)}</td>
                 </tr>
@@ -239,8 +253,11 @@ function ReportWithExplanation({
 
 type CandidateEvidence = {
   candidate: string;
+  version?: string;
   status: string;
   latestPnl: unknown;
+  pairedDelta: unknown;
+  decisionGate: string;
   ci: string;
   maxDrawdown: unknown;
   fillModelAgreement: string;
@@ -260,7 +277,7 @@ function EvidenceMatrix({ rows, onSelect }: { rows: CandidateEvidence[]; onSelec
       <table className="w-full min-w-[980px] text-left text-sm">
         <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
           <tr>
-            {["Candidate", "Status", "Latest PnL", "95% CI", "Drawdown", "Fill Models", "Quality", "Recommendation", "Updated"].map((header) => (
+            {["Candidate", "Version", "Status", "Latest PnL", "Paired Δ", "Gate", "95% CI", "Quality", "Updated"].map((header) => (
               <th key={header} className="px-3 py-2">{header}</th>
             ))}
           </tr>
@@ -269,13 +286,13 @@ function EvidenceMatrix({ rows, onSelect }: { rows: CandidateEvidence[]; onSelec
           {rows.map((row) => (
             <tr key={row.candidate} className="cursor-pointer border-b border-line last:border-b-0 hover:bg-panel" onClick={() => onSelect(row)}>
               <td className="px-3 py-2 font-medium text-ink">{row.candidate}</td>
-              <td className="px-3 py-2"><Pill tone={row.status === "candidate_leader" ? "good" : row.status === "blocked" ? "danger" : "warn"}>{row.status}</Pill></td>
+              <td className="px-3 py-2 text-xs text-ink/65">{row.version ?? "frozen"}</td>
+              <td className="px-3 py-2"><Pill tone={row.status === "candidate_leader" ? "good" : row.status === "blocked" || row.status.includes("rejected") ? "danger" : "warn"}>{row.status}</Pill></td>
               <td className="px-3 py-2">{numberText(row.latestPnl)}</td>
+              <td className="px-3 py-2">{numberText(row.pairedDelta)}</td>
+              <td className="px-3 py-2"><Pill tone={gateTone(row.decisionGate)}>{row.decisionGate}</Pill></td>
               <td className="px-3 py-2">{row.ci}</td>
-              <td className="px-3 py-2">{numberText(row.maxDrawdown)}</td>
-              <td className="px-3 py-2">{row.fillModelAgreement}</td>
               <td className="px-3 py-2"><Pill tone={row.dataQuality === "healthy" ? "good" : "warn"}>{row.dataQuality}</Pill></td>
-              <td className="px-3 py-2">{row.recommendation}</td>
               <td className="px-3 py-2">{row.lastUpdated}</td>
             </tr>
           ))}
@@ -299,9 +316,9 @@ function CandidateDrawer({ candidate, onClose }: { candidate: CandidateEvidence;
       </div>
       <div className="mt-4 grid gap-3 md:grid-cols-4">
         <Metric label="PnL by Day" value={candidate.latestPnl} />
-        <Metric label="PnL by Fill Model" value={candidate.fillModelAgreement} />
+        <Metric label="Paired Delta" value={candidate.pairedDelta} />
+        <Metric label="Decision Gate" value={candidate.decisionGate} />
         <Metric label="Market Count" value={candidate.latest?.settled_markets ?? "collecting"} />
-        <Metric label="Known Warnings" value={candidate.dataQuality === "healthy" ? "none reported" : candidate.dataQuality} />
       </div>
     </div>
   );
@@ -373,8 +390,11 @@ function evidenceRows(rows: ProspectiveValidationRow[], candidates: JsonRecord[]
     const recommendation = latest?.recommendation ?? recommendationText(latest);
     return {
       candidate: name,
+      version: String(candidate.candidate_version ?? candidate.frozen_since ?? "frozen"),
       status,
       latestPnl: pnl,
+      pairedDelta: candidateDelta(latest, name),
+      decisionGate: decisionGateForCandidate(latest, name),
       ci: latest ? `[${numberText(latest.ci_95_low)}, ${numberText(latest.ci_95_high)}]` : "collecting",
       maxDrawdown: latest?.max_drawdown ?? "collecting",
       fillModelAgreement: latest?.fill_model ? String(latest.fill_model) : "pending sensitivity",
@@ -390,8 +410,11 @@ function evidenceRows(rows: ProspectiveValidationRow[], candidates: JsonRecord[]
 function apiEvidenceRows(candidates: LabCandidateEvidence[], latest?: ProspectiveValidationRow): CandidateEvidence[] {
   return candidates.map((candidate) => ({
     candidate: candidate.candidate,
+    version: candidate.candidate_version ?? candidate.frozen_since ?? "frozen",
     status: candidate.status ?? "collecting",
     latestPnl: candidate.latest_test_pnl ?? "collecting",
+    pairedDelta: candidate.paired_delta ?? "baseline",
+    decisionGate: candidate.decision_gate ?? "RESEARCH_ONLY",
     ci:
       candidate.ci_95_low !== null && candidate.ci_95_low !== undefined && candidate.ci_95_high !== null && candidate.ci_95_high !== undefined
         ? `[${numberText(candidate.ci_95_low)}, ${numberText(candidate.ci_95_high)}]`
@@ -422,9 +445,54 @@ function candidatePnl(row: ProspectiveValidationRow | undefined, candidate: stri
   return row.static_net_pnl;
 }
 
+function candidateDelta(row: ProspectiveValidationRow | undefined, candidate: string) {
+  if (!row) {
+    return "collecting";
+  }
+  if (candidate.includes("dynamic_quote_style")) {
+    return row.dynamic_quote_style_paired_delta;
+  }
+  if (candidate.includes("full_deterministic_profile")) {
+    return row.full_deterministic_profile_paired_delta;
+  }
+  if (candidate.includes("dynamic_safety_only")) {
+    return row.dynamic_safety_only_paired_delta;
+  }
+  return "baseline";
+}
+
+function decisionGateForCandidate(row: ProspectiveValidationRow | undefined, candidate: string) {
+  if (!row) {
+    return "RESEARCH_ONLY";
+  }
+  if (candidate.includes("dynamic_quote_style")) {
+    return row.dynamic_quote_style_decision_gate ?? row.decision_gate ?? "RESEARCH_ONLY";
+  }
+  if (candidate.includes("full_deterministic_profile")) {
+    return row.full_deterministic_profile_decision_gate ?? "RESEARCH_ONLY";
+  }
+  if (candidate.includes("dynamic_safety_only")) {
+    return row.dynamic_safety_only_decision_gate ?? "RESEARCH_ONLY";
+  }
+  return "BASELINE_CONTROL";
+}
+
+function gateTone(gate: string | null | undefined) {
+  if (gate === "PAPER_SHADOW_OK") {
+    return "good";
+  }
+  if (gate === "REJECT") {
+    return "danger";
+  }
+  return "warn";
+}
+
 function statusForCandidate(row: ProspectiveValidationRow | undefined, candidate: string, pnl: unknown) {
   if (!row) {
     return "collecting";
+  }
+  if (decisionGateForCandidate(row, candidate) === "REJECT") {
+    return "rejected_by_paired_evidence";
   }
   if (row.data_quality_status && row.data_quality_status !== "healthy") {
     return "blocked";
@@ -447,6 +515,9 @@ function explanationForCandidate(name: string, status: string, recommendation: s
   }
   if (status === "blocked") {
     return `${name} is blocked by ${row.data_quality_status} data quality. The recommendation should not be trusted until the quality issue is resolved.`;
+  }
+  if (status.includes("rejected")) {
+    return `${name} is rejected by paired prospective evidence for this frozen run. It remains research-only and cannot be used for live deployment.`;
   }
   return `${name} is ${status}. Recommendation: ${recommendation}. Evidence uses ${numberText(row.settled_markets, 0)} settled markets, drawdown ${numberText(row.max_drawdown)}, and CI [${numberText(row.ci_95_low)}, ${numberText(row.ci_95_high)}].`;
 }

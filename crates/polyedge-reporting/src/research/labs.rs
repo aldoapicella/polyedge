@@ -37,6 +37,14 @@ pub struct ReplayIndexOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct ChartBackfillOptions {
+    pub input: PathBuf,
+    pub out: PathBuf,
+    pub markdown: PathBuf,
+    pub exclude_windows: Vec<ExcludedTimeWindow>,
+}
+
+#[derive(Clone, Debug)]
 pub struct BackfillOptions {
     pub start: String,
     pub end: String,
@@ -181,6 +189,7 @@ pub fn run_validate_prospective(
     let start = Instant::now();
     let candidates = load_frozen_candidate_registry(&options.candidates)?;
     let rows = load_daily_prospective_rows(&options.reports_dir, options.since)?;
+    let paired_improvement = paired_improvement_summary(&rows);
     let status = if rows.is_empty() {
         "collecting"
     } else {
@@ -190,6 +199,7 @@ pub fn run_validate_prospective(
         "status": status,
         "since": ts(options.since),
         "rows": rows,
+        "paired_improvement": paired_improvement,
         "frozen_candidates": candidates.as_json(),
         "rules": [
             "No new parameter search.",
@@ -266,6 +276,100 @@ pub fn run_build_replay_index(options: ReplayIndexOptions) -> Result<Value, Rese
     Ok(report)
 }
 
+pub fn run_chart_backfill(options: ChartBackfillOptions) -> Result<Value, ResearchError> {
+    let start = Instant::now();
+    let started_ts = Utc::now();
+    let mut accumulator = ChartBackfillAccumulator::default();
+    let stats = stream_events(
+        &options.input,
+        EventPathMode::ChartBackfill,
+        &options.exclude_windows,
+        |event| accumulator.observe(event),
+    )?;
+    let mut warnings = stats
+        .warnings
+        .into_iter()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let truncated_markets = accumulator.truncated_market_count();
+    if truncated_markets > 0 {
+        warnings.push(json!(format!(
+            "chart samples were downsampled for {} markets",
+            truncated_markets
+        )));
+    }
+    let finished_ts = Utc::now();
+    let first_ts = accumulator.first_ts;
+    let last_ts = accumulator.last_ts;
+    let markets = accumulator.market_rows();
+    let point_count = markets
+        .iter()
+        .filter_map(|market| market["points"].as_array().map(Vec::len))
+        .sum::<usize>();
+    let decision_marker_count = markets
+        .iter()
+        .filter_map(|market| market["decisions"].as_array().map(Vec::len))
+        .sum::<usize>();
+    let fill_marker_count = markets
+        .iter()
+        .filter_map(|market| market["fills"].as_array().map(Vec::len))
+        .sum::<usize>();
+    let result = json!({
+        "job_id": "chart-backfill",
+        "job_type": "chart-backfill",
+        "status": "completed",
+        "started_ts": ts(started_ts),
+        "finished_ts": ts(finished_ts),
+        "duration_seconds": start.elapsed().as_secs_f64(),
+        "input": options.input.to_string_lossy(),
+        "input_window": {
+            "first_recorded_ts": first_ts.map(ts),
+            "last_recorded_ts": last_ts.map(ts)
+        },
+        "chart_store": {
+            "market_count": markets.len(),
+            "point_count": point_count,
+            "decision_marker_count": decision_marker_count,
+            "fill_marker_count": fill_marker_count,
+            "max_points_per_market": MAX_CHART_BACKFILL_POINTS_PER_MARKET
+        },
+        "markets": markets,
+        "artifacts": [
+            {
+                "path": options.out.to_string_lossy(),
+                "kind": "chart_backfill_report"
+            },
+            {
+                "path": options.markdown.to_string_lossy(),
+                "kind": "markdown"
+            }
+        ],
+        "warnings": warnings.clone(),
+        "errors": [],
+        "excluded_event_count": stats.excluded_events,
+        "excluded_time_windows": exclusion_windows_json(&options.exclude_windows),
+        "research_only": true,
+        "raw_data_mutated": false,
+        "live_trading_enabled": false
+    });
+    let report = envelope(
+        "polyedge-rs research chart-backfill",
+        &options.input,
+        "none",
+        "chart_backfill",
+        start.elapsed(),
+        warnings,
+        result,
+    );
+    write_json_and_markdown(
+        &options.out,
+        &options.markdown,
+        &report,
+        &chart_backfill_markdown(&report),
+    )?;
+    Ok(report)
+}
+
 pub fn run_backfill(options: BackfillOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
     validate_backfill_task(&options.task)?;
@@ -300,6 +404,247 @@ pub fn run_backfill(options: BackfillOptions) -> Result<Value, ResearchError> {
         &backfill_markdown(&report),
     )?;
     Ok(report)
+}
+
+const MAX_CHART_BACKFILL_POINTS_PER_MARKET: usize = 2_000;
+const MAX_CHART_BACKFILL_MARKERS_PER_MARKET: usize = 500;
+
+#[derive(Default)]
+struct ChartBackfillAccumulator {
+    markets: BTreeMap<String, ChartMarketBackfill>,
+    token_to_market: BTreeMap<String, String>,
+    first_ts: Option<DateTime<Utc>>,
+    last_ts: Option<DateTime<Utc>>,
+}
+
+impl ChartBackfillAccumulator {
+    fn observe(&mut self, event: &EventLine) {
+        self.first_ts = min_ts(self.first_ts, Some(event.recorded_ts));
+        self.last_ts = max_ts(self.last_ts, Some(event.recorded_ts));
+        match event.event_type.as_str() {
+            "market" => self.observe_market(event),
+            "fair_value" => self.observe_fair_value(event),
+            "book" => self.observe_book(event),
+            "decision" => self.observe_decision(event),
+            "execution_report" => self.observe_execution_report(event),
+            _ => {}
+        }
+    }
+
+    fn observe_market(&mut self, event: &EventLine) {
+        let payload = &event.payload;
+        let market_id = text(payload, "market_id");
+        if market_id.is_empty() {
+            return;
+        }
+        if let Some(token) = optional_text(payload, "up_token_id") {
+            self.token_to_market.insert(token, market_id.clone());
+        }
+        if let Some(token) = optional_text(payload, "down_token_id") {
+            self.token_to_market.insert(token, market_id.clone());
+        }
+        let market = self.market_mut(&market_id);
+        market.question = optional_text(payload, "question").or(market.question.take());
+        market.start_ts = parse_datetime(payload.get("start_ts")).or(market.start_ts);
+        market.end_ts = parse_datetime(payload.get("end_ts")).or(market.end_ts);
+        market.condition_id = optional_text(payload, "condition_id").or(market.condition_id.take());
+        market.slug = optional_text(payload, "market_slug").or(market.slug.take());
+    }
+
+    fn observe_fair_value(&mut self, event: &EventLine) {
+        let payload = &event.payload;
+        let market_id = text(payload, "market_id");
+        if market_id.is_empty() {
+            return;
+        }
+        let point_ts = chart_event_ts(event, payload);
+        let point = json!({
+            "time": ts(point_ts),
+            "bucket": point_ts.timestamp_millis(),
+            "qUp": decimal(payload.get("q_up")).and_then(|value| value.to_f64()),
+            "qDown": decimal(payload.get("q_down")).and_then(|value| value.to_f64()),
+            "eventType": "fair_value"
+        });
+        self.market_mut(&market_id).push_point(point);
+    }
+
+    fn observe_book(&mut self, event: &EventLine) {
+        let payload = &event.payload;
+        let Some(market_id) = self.market_id_for_payload(payload) else {
+            return;
+        };
+        let point_ts = chart_event_ts(event, payload);
+        let point = json!({
+            "time": ts(point_ts),
+            "bucket": point_ts.timestamp_millis(),
+            "token_id": text(payload, "token_id"),
+            "bestBid": best_level_price(payload.get("bids"), true).and_then(|value| value.to_f64()),
+            "bestAsk": best_level_price(payload.get("asks"), false).and_then(|value| value.to_f64()),
+            "bookHash": optional_text(payload, "book_hash"),
+            "eventType": "book"
+        });
+        self.market_mut(&market_id).push_point(point);
+    }
+
+    fn observe_decision(&mut self, event: &EventLine) {
+        let payload = &event.payload;
+        let market_id = text(payload, "market_id");
+        if market_id.is_empty() {
+            return;
+        }
+        let marker_ts = chart_event_ts(event, payload);
+        let marker = json!({
+            "time": ts(marker_ts),
+            "bucket": marker_ts.timestamp_millis(),
+            "action": text(payload, "action"),
+            "outcome": text(payload, "outcome"),
+            "price": decimal(payload.get("price")).and_then(|value| value.to_f64()),
+            "size": decimal(payload.get("size")).and_then(|value| value.to_f64()),
+            "reason": text(payload, "reason")
+        });
+        self.market_mut(&market_id).push_decision(marker);
+    }
+
+    fn observe_execution_report(&mut self, event: &EventLine) {
+        let payload = &event.payload;
+        let market_id = text(payload, "market_id");
+        if market_id.is_empty() {
+            return;
+        }
+        let marker_ts = chart_event_ts(event, payload);
+        let marker = json!({
+            "time": ts(marker_ts),
+            "bucket": marker_ts.timestamp_millis(),
+            "status": text(payload, "status"),
+            "token_id": text(payload, "token_id"),
+            "fillPrice": decimal(payload.get("avg_price")).and_then(|value| value.to_f64()),
+            "filledSize": decimal(payload.get("filled_size")).and_then(|value| value.to_f64())
+        });
+        self.market_mut(&market_id).push_fill(marker);
+    }
+
+    fn market_id_for_payload(&self, payload: &Value) -> Option<String> {
+        optional_text(payload, "market_id")
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                optional_text(payload, "token_id").and_then(|token| {
+                    self.token_to_market
+                        .get(&token)
+                        .filter(|value| !value.is_empty())
+                        .cloned()
+                })
+            })
+    }
+
+    fn market_mut(&mut self, market_id: &str) -> &mut ChartMarketBackfill {
+        self.markets
+            .entry(market_id.to_owned())
+            .or_insert_with(|| ChartMarketBackfill::new(market_id))
+    }
+
+    fn truncated_market_count(&self) -> usize {
+        self.markets
+            .values()
+            .filter(|market| market.truncated_points)
+            .count()
+    }
+
+    fn market_rows(self) -> Vec<Value> {
+        self.markets
+            .into_values()
+            .map(ChartMarketBackfill::into_json)
+            .collect()
+    }
+}
+
+struct ChartMarketBackfill {
+    market_id: String,
+    question: Option<String>,
+    condition_id: Option<String>,
+    slug: Option<String>,
+    start_ts: Option<DateTime<Utc>>,
+    end_ts: Option<DateTime<Utc>>,
+    total_points_seen: usize,
+    points: Vec<Value>,
+    decisions: Vec<Value>,
+    fills: Vec<Value>,
+    truncated_points: bool,
+    truncated_decisions: bool,
+    truncated_fills: bool,
+}
+
+impl ChartMarketBackfill {
+    fn new(market_id: &str) -> Self {
+        Self {
+            market_id: market_id.to_owned(),
+            question: None,
+            condition_id: None,
+            slug: None,
+            start_ts: None,
+            end_ts: None,
+            total_points_seen: 0,
+            points: Vec::new(),
+            decisions: Vec::new(),
+            fills: Vec::new(),
+            truncated_points: false,
+            truncated_decisions: false,
+            truncated_fills: false,
+        }
+    }
+
+    fn push_point(&mut self, point: Value) {
+        self.total_points_seen += 1;
+        if self.points.len() < MAX_CHART_BACKFILL_POINTS_PER_MARKET {
+            self.points.push(point);
+        } else {
+            self.truncated_points = true;
+        }
+    }
+
+    fn push_decision(&mut self, marker: Value) {
+        if self.decisions.len() < MAX_CHART_BACKFILL_MARKERS_PER_MARKET {
+            self.decisions.push(marker);
+        } else {
+            self.truncated_decisions = true;
+        }
+    }
+
+    fn push_fill(&mut self, marker: Value) {
+        if self.fills.len() < MAX_CHART_BACKFILL_MARKERS_PER_MARKET {
+            self.fills.push(marker);
+        } else {
+            self.truncated_fills = true;
+        }
+    }
+
+    fn into_json(self) -> Value {
+        json!({
+            "market_id": self.market_id,
+            "question": self.question,
+            "condition_id": self.condition_id,
+            "market_slug": self.slug,
+            "start_ts": self.start_ts.map(ts),
+            "end_ts": self.end_ts.map(ts),
+            "point_count": self.points.len(),
+            "total_points_seen": self.total_points_seen,
+            "decision_count": self.decisions.len(),
+            "fill_count": self.fills.len(),
+            "truncated_points": self.truncated_points,
+            "truncated_decisions": self.truncated_decisions,
+            "truncated_fills": self.truncated_fills,
+            "points": self.points,
+            "decisions": self.decisions,
+            "fills": self.fills
+        })
+    }
+}
+
+fn chart_event_ts(event: &EventLine, payload: &Value) -> DateTime<Utc> {
+    parse_datetime(payload.get("computed_ts"))
+        .or_else(|| parse_datetime(payload.get("source_ts")))
+        .or_else(|| parse_datetime(payload.get("exchange_ts")))
+        .or_else(|| parse_datetime(payload.get("local_ts")))
+        .unwrap_or(event.recorded_ts)
 }
 
 fn ensure_trailing_slash(value: &str) -> String {
@@ -537,6 +882,13 @@ fn json_row(
     let dynamic_net = find_profile_net(source, "dynamic_quote_style");
     let full_net = find_profile_net(source, "full_deterministic_profile");
     let safety_net = find_profile_net(source, "dynamic_safety_only");
+    let dynamic_delta = paired_delta(dynamic_net.as_deref(), static_net.as_deref());
+    let full_delta = paired_delta(full_net.as_deref(), static_net.as_deref());
+    let safety_delta = paired_delta(safety_net.as_deref(), static_net.as_deref());
+    let best_delta = [dynamic_delta, full_delta, safety_delta]
+        .into_iter()
+        .flatten()
+        .max();
     let ci_low = text_at(sample, &["/result/statistics/ci_low", "/statistics/ci_low"]);
     let ci_high = text_at(
         sample,
@@ -553,6 +905,13 @@ fn json_row(
         ],
     )
     .or_else(|| number_at(sample, &["/result/statistics/n", "/statistics/n"]));
+    let quality = data_quality_status(audit);
+    let recommendation = prospective_recommendation(ci_low, ci_high, dynamic_net.as_deref());
+    let dynamic_gate =
+        prospective_decision_gate(quality, dynamic_net.as_deref(), dynamic_delta, ci_low);
+    let full_gate = prospective_decision_gate(quality, full_net.as_deref(), full_delta, ci_low);
+    let safety_gate =
+        prospective_decision_gate(quality, safety_net.as_deref(), safety_delta, ci_low);
     Ok(json!({
         "date": date,
         "settled_markets": settled_markets,
@@ -561,15 +920,157 @@ fn json_row(
         "dynamic_quote_style_net_pnl": dynamic_net,
         "full_deterministic_profile_net_pnl": full_net,
         "dynamic_safety_only_net_pnl": safety_net,
+        "dynamic_quote_style_paired_delta": dynamic_delta.map(|value| value.to_string()),
+        "full_deterministic_profile_paired_delta": full_delta.map(|value| value.to_string()),
+        "dynamic_safety_only_paired_delta": safety_delta.map(|value| value.to_string()),
+        "best_candidate_paired_delta": best_delta.map(|value| value.to_string()),
         "max_drawdown": find_any_text(source, "max_drawdown"),
         "cancel_per_fill": find_any_text(source, "cancel_fill_ratio"),
         "ci_95_low": ci_low,
         "ci_95_high": ci_high,
-        "data_quality_status": data_quality_status(audit),
-        "recommendation": prospective_recommendation(ci_low, ci_high, dynamic_net),
+        "data_quality_status": quality,
+        "recommendation": recommendation,
+        "decision_gate": dynamic_gate,
+        "dynamic_quote_style_decision_gate": dynamic_gate,
+        "full_deterministic_profile_decision_gate": full_gate,
+        "dynamic_safety_only_decision_gate": safety_gate,
         "research_only": true,
         "live_deployment_allowed": false
     }))
+}
+
+fn paired_delta(candidate_net: Option<&str>, static_net: Option<&str>) -> Option<Decimal> {
+    let candidate = candidate_net.map(decimal_from_str)?;
+    let baseline = static_net.map(decimal_from_str)?;
+    Some(candidate - baseline)
+}
+
+fn paired_improvement_summary(rows: &[Value]) -> Value {
+    let candidates = [
+        (
+            "dynamic_quote_style",
+            "dynamic_quote_style_paired_delta",
+            "dynamic_quote_style_net_pnl",
+        ),
+        (
+            "full_deterministic_profile",
+            "full_deterministic_profile_paired_delta",
+            "full_deterministic_profile_net_pnl",
+        ),
+        (
+            "dynamic_safety_only",
+            "dynamic_safety_only_paired_delta",
+            "dynamic_safety_only_net_pnl",
+        ),
+    ];
+    Value::Object(
+        candidates
+            .into_iter()
+            .map(|(candidate, delta_field, pnl_field)| {
+                (
+                    candidate.to_owned(),
+                    paired_candidate_summary(rows, candidate, delta_field, pnl_field),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn paired_candidate_summary(
+    rows: &[Value],
+    candidate: &str,
+    delta_field: &str,
+    pnl_field: &str,
+) -> Value {
+    let daily = rows
+        .iter()
+        .filter_map(|row| {
+            let date = row["date"].as_str()?.to_owned();
+            let delta = decimal_from_value(&row[delta_field])?;
+            Some(json!({
+                "date": date,
+                "D": delta.to_string(),
+                "candidate_net_pnl": row[pnl_field].clone(),
+                "static_net_pnl": row["static_net_pnl"].clone(),
+                "decision_gate": row["decision_gate"].clone()
+            }))
+        })
+        .collect::<Vec<_>>();
+    let values = daily
+        .iter()
+        .filter_map(|row| decimal_from_value(&row["D"]))
+        .collect::<Vec<_>>();
+    let n = values.len();
+    let mean = mean_decimal(&values);
+    let std = std_decimal(&values, mean);
+    let se = std.and_then(|value| Decimal::from_f64_retain(value.to_f64()? / (n as f64).sqrt()));
+    let ci_low = mean
+        .zip(se)
+        .map(|(mean, se)| mean - Decimal::new(196, 2) * se);
+    let ci_high = mean
+        .zip(se)
+        .map(|(mean, se)| mean + Decimal::new(196, 2) * se);
+    let required_n = match (std, mean) {
+        (Some(std), Some(mean)) if mean != Decimal::ZERO => {
+            let effect = mean.abs();
+            (Decimal::new(196, 2) * std / effect)
+                .to_f64()
+                .and_then(|value| Decimal::from_f64_retain(value.powi(2)))
+                .and_then(|value| value.ceil().to_u64())
+        }
+        _ => None,
+    };
+    json!({
+        "candidate": candidate,
+        "sample_size": n,
+        "mean_D": mean.map(|value| value.to_string()),
+        "std_D": std.map(|value| value.to_string()),
+        "SE_D": se.map(|value| value.to_string()),
+        "ci_95_low": ci_low.map(|value| value.to_string()),
+        "ci_95_high": ci_high.map(|value| value.to_string()),
+        "required_n_to_detect_mean_D": required_n,
+        "daily_paired_delta": daily,
+        "paired_drawdown": paired_drawdown(&values).map(|value| value.to_string()),
+        "recommendation": paired_summary_recommendation(ci_low, mean),
+        "research_only": true,
+        "paper_only": true,
+        "live_deployment_allowed": false
+    })
+}
+
+fn decimal_from_value(value: &Value) -> Option<Decimal> {
+    match value {
+        Value::String(text) => Decimal::from_str_exact(text).ok(),
+        Value::Number(number) => Decimal::from_str_exact(&number.to_string()).ok(),
+        _ => None,
+    }
+}
+
+fn paired_drawdown(values: &[Decimal]) -> Option<Decimal> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut cumulative = Decimal::ZERO;
+    let mut peak = Decimal::ZERO;
+    let mut drawdown = Decimal::ZERO;
+    for value in values {
+        cumulative += *value;
+        peak = peak.max(cumulative);
+        drawdown = drawdown.max(peak - cumulative);
+    }
+    Some(drawdown)
+}
+
+fn paired_summary_recommendation(ci_low: Option<Decimal>, mean: Option<Decimal>) -> &'static str {
+    if ci_low.is_some_and(|value| value > Decimal::ZERO)
+        && mean.is_some_and(|value| value > Decimal::ZERO)
+    {
+        "paper_shadow_ok"
+    } else if mean.is_some_and(|value| value < Decimal::ZERO) {
+        "reject_candidate"
+    } else {
+        "continue_collecting"
+    }
 }
 
 fn data_quality_status(audit: Option<&Value>) -> &'static str {
@@ -590,11 +1091,11 @@ fn data_quality_status(audit: Option<&Value>) -> &'static str {
 fn prospective_recommendation(
     ci_low: Option<&str>,
     ci_high: Option<&str>,
-    dynamic_net: Option<String>,
+    dynamic_net: Option<&str>,
 ) -> &'static str {
     let lower = ci_low.map(decimal_from_str);
     let upper = ci_high.map(decimal_from_str);
-    let dynamic = dynamic_net.as_deref().map(decimal_from_str);
+    let dynamic = dynamic_net.map(decimal_from_str);
     if lower.is_some_and(|value| value > Decimal::ZERO)
         && dynamic.is_some_and(|value| value > Decimal::ZERO)
     {
@@ -604,6 +1105,35 @@ fn prospective_recommendation(
     } else {
         "continue_collecting"
     }
+}
+
+fn prospective_decision_gate(
+    data_quality: &str,
+    candidate_net: Option<&str>,
+    paired_delta: Option<Decimal>,
+    ci_low: Option<&str>,
+) -> &'static str {
+    if !matches!(data_quality, "healthy") {
+        return "RESEARCH_ONLY";
+    }
+    if candidate_net
+        .map(decimal_from_str)
+        .is_some_and(|value| value < Decimal::ZERO)
+        || paired_delta.is_some_and(|value| value < Decimal::ZERO)
+    {
+        return "REJECT";
+    }
+    if candidate_net
+        .map(decimal_from_str)
+        .is_some_and(|value| value > Decimal::ZERO)
+        && paired_delta.is_some_and(|value| value > Decimal::ZERO)
+        && ci_low
+            .map(decimal_from_str)
+            .is_some_and(|value| value > Decimal::ZERO)
+    {
+        return "PAPER_SHADOW_OK";
+    }
+    "RESEARCH_ONLY"
 }
 
 fn text_at<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
@@ -769,5 +1299,27 @@ fn backfill_markdown(report: &Value) -> String {
         report["result"]["start"].as_str().unwrap_or("unknown"),
         report["result"]["end"].as_str().unwrap_or("unknown"),
         report["result"]["task"].as_str().unwrap_or("unknown")
+    )
+}
+
+fn chart_backfill_markdown(report: &Value) -> String {
+    format!(
+        "# Chart Backfill\n\n- Status: `{}`\n- Markets: {}\n- Chart points: {}\n- Decision markers: {}\n- Fill markers: {}\n- Output: `{}`\n\nThis is a derived research/observability artifact. Raw event blobs are not mutated and live trading remains disabled.\n",
+        report["result"]["status"].as_str().unwrap_or("unknown"),
+        report["result"]["chart_store"]["market_count"]
+            .as_u64()
+            .unwrap_or(0),
+        report["result"]["chart_store"]["point_count"]
+            .as_u64()
+            .unwrap_or(0),
+        report["result"]["chart_store"]["decision_marker_count"]
+            .as_u64()
+            .unwrap_or(0),
+        report["result"]["chart_store"]["fill_marker_count"]
+            .as_u64()
+            .unwrap_or(0),
+        report["result"]["artifacts"][0]["path"]
+            .as_str()
+            .unwrap_or("unknown")
     )
 }

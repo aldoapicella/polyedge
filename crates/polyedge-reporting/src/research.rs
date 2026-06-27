@@ -25,11 +25,11 @@ use thiserror::Error;
 mod labs;
 pub use labs::{
     load_default_exclusions, load_exclusion_registry, load_frozen_candidate_registry,
-    run_azure_freshness, run_backfill, run_build_replay_index, run_validate_prospective,
-    AzureFreshnessOptions, BackfillOptions, ExclusionRegistry, ExclusionWindowRecord,
-    FrozenCandidateRecord, FrozenCandidateRegistry, ProspectiveValidationOptions,
-    ReplayIndexOptions, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
-    DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES,
+    run_azure_freshness, run_backfill, run_build_replay_index, run_chart_backfill,
+    run_validate_prospective, AzureFreshnessOptions, BackfillOptions, ChartBackfillOptions,
+    ExclusionRegistry, ExclusionWindowRecord, FrozenCandidateRecord, FrozenCandidateRegistry,
+    ProspectiveValidationOptions, ReplayIndexOptions, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES,
 };
 
 const SETTLEMENT_WINDOW_SECONDS: i64 = 15;
@@ -105,6 +105,8 @@ pub enum FillModel {
     TouchAfter1000Ms,
     TradeThrough,
     QueueProxy,
+    QueueProxyConservative,
+    QueueProxyBalanced,
     AdverseSelectionPenalized,
 }
 
@@ -117,6 +119,8 @@ impl FillModel {
             Self::TouchAfter1000Ms,
             Self::TradeThrough,
             Self::QueueProxy,
+            Self::QueueProxyConservative,
+            Self::QueueProxyBalanced,
             Self::AdverseSelectionPenalized,
         ]
     }
@@ -129,6 +133,8 @@ impl FillModel {
             Self::TouchAfter1000Ms => "touch_after_1000ms",
             Self::TradeThrough => "trade_through",
             Self::QueueProxy => "queue_proxy",
+            Self::QueueProxyConservative => "queue_proxy_conservative",
+            Self::QueueProxyBalanced => "queue_proxy_balanced",
             Self::AdverseSelectionPenalized => "adverse_selection_penalized",
         }
     }
@@ -159,12 +165,27 @@ impl FromStr for FillModel {
             "touch_after_1000ms" | "touch-after-1000ms" => Ok(Self::TouchAfter1000Ms),
             "trade_through" | "trade-through" => Ok(Self::TradeThrough),
             "queue_proxy" | "queue-proxy" => Ok(Self::QueueProxy),
+            "queue_proxy_conservative" | "queue-proxy-conservative" => {
+                Ok(Self::QueueProxyConservative)
+            }
+            "queue_proxy_balanced" | "queue-proxy-balanced" => Ok(Self::QueueProxyBalanced),
             "adverse_selection_penalized" | "adverse-selection-penalized" => {
                 Ok(Self::AdverseSelectionPenalized)
             }
             other => Err(ResearchError::InvalidFillModel(other.to_owned())),
         }
     }
+}
+
+fn is_queue_proxy_shadow_model(fill_model: FillModel) -> bool {
+    matches!(
+        fill_model,
+        FillModel::QueueProxyConservative | FillModel::QueueProxyBalanced
+    )
+}
+
+fn is_queue_proxy_family(fill_model: FillModel) -> bool {
+    fill_model == FillModel::QueueProxy || is_queue_proxy_shadow_model(fill_model)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -220,6 +241,15 @@ pub struct NormalizeOptions {
     pub out: PathBuf,
     pub format: String,
     pub overwrite: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueueAuditOptions {
+    pub input: PathBuf,
+    pub markets: PathBuf,
+    pub out: PathBuf,
+    pub markdown: PathBuf,
+    pub exclude_windows: Vec<ExcludedTimeWindow>,
 }
 
 #[derive(Clone, Debug)]
@@ -439,6 +469,58 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
         stream.warnings.into_iter().map(Value::String).collect(),
         manifest,
     );
+    Ok(report)
+}
+
+pub fn run_queue_audit(options: QueueAuditOptions) -> Result<Value, ResearchError> {
+    let start = Instant::now();
+    let markets = load_market_truth(Some(&options.markets))?;
+    let mut audit = QueueEvidenceAudit::new(markets);
+    let stream = stream_events(
+        &options.input,
+        EventPathMode::QueueAudit,
+        &options.exclude_windows,
+        |event| {
+            audit.observe(event);
+        },
+    )?;
+    let mut result = audit.finish();
+    let stream_warnings = stream
+        .warnings
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let mut warnings = result
+        .get("coverage_warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    warnings.extend(stream_warnings.clone());
+    warnings.extend(exclusion_warnings(&stream, &options.exclude_windows));
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "coverage_warnings".to_owned(),
+            Value::Array(warnings.clone()),
+        );
+        object.insert("stream_warnings".to_owned(), Value::Array(stream_warnings));
+        insert_exclusion_metadata(object, &stream, &options.exclude_windows);
+    }
+    let report = envelope(
+        "polyedge-rs research queue-audit",
+        &options.input,
+        "queue_proxy",
+        "queue_evidence",
+        start.elapsed(),
+        warnings,
+        result,
+    );
+    write_json_and_markdown(
+        &options.out,
+        &options.markdown,
+        &report,
+        &queue_audit_markdown(&report),
+    )?;
     Ok(report)
 }
 
@@ -866,6 +948,8 @@ enum EventPathMode {
     PreferEventsJsonl,
     AllJsonl,
     MarketTruth,
+    QueueAudit,
+    ChartBackfill,
     Calibration,
 }
 
@@ -1559,6 +1643,22 @@ fn filtered_normalized_event_paths(paths: &[PathBuf], mode: EventPathMode) -> Ve
             "feed_errors.jsonl",
             "other.jsonl",
         ][..],
+        EventPathMode::QueueAudit => &[
+            "raw_market_events.jsonl",
+            "price_changes.jsonl",
+            "last_trades.jsonl",
+            "book_snapshots.jsonl",
+            "level_changes.jsonl",
+            "decisions.jsonl",
+            "execution_reports.jsonl",
+        ][..],
+        EventPathMode::ChartBackfill => &[
+            "markets.jsonl",
+            "fair_values.jsonl",
+            "books.jsonl",
+            "decisions.jsonl",
+            "execution_reports.jsonl",
+        ][..],
         EventPathMode::Calibration => &[
             "markets.jsonl",
             "references.jsonl",
@@ -1955,6 +2055,12 @@ impl NormalizedWriters {
             writer.write_row(&row)?;
             *self.counts.entry(target.to_owned()).or_insert(0) += 1;
         }
+        for (queue_target, queue_row) in queue_evidence_rows(event, self.sequence - 1) {
+            if let Some(writer) = self.by_type.get_mut(queue_target) {
+                writer.write_row(&queue_row)?;
+                *self.counts.entry(queue_target.to_owned()).or_insert(0) += 1;
+            }
+        }
         Ok(())
     }
 
@@ -2101,6 +2207,14 @@ fn normalized_files(format: NormalizedFileFormat) -> Vec<(&'static str, String)>
             format.file_name("paper_settlements.jsonl"),
         ),
         ("feed_error", format.file_name("feed_errors.jsonl")),
+        (
+            "raw_market_event",
+            format.file_name("raw_market_events.jsonl"),
+        ),
+        ("price_change", format.file_name("price_changes.jsonl")),
+        ("last_trade", format.file_name("last_trades.jsonl")),
+        ("book_snapshot", format.file_name("book_snapshots.jsonl")),
+        ("level_change", format.file_name("level_changes.jsonl")),
         ("other", format.file_name("other.jsonl")),
     ]
 }
@@ -2148,6 +2262,120 @@ fn normalized_row(event: &EventLine, sequence: u64) -> Value {
         "raw_payload": redact_json(payload),
         "raw_event": redact_json(&event.raw)
     })
+}
+
+fn queue_evidence_rows(event: &EventLine, sequence: u64) -> Vec<(&'static str, Value)> {
+    let payload = &event.payload;
+    let raw_kind = payload
+        .get("event_type")
+        .or_else(|| payload.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or(event.event_type.as_str())
+        .to_ascii_lowercase();
+    let mut rows = Vec::new();
+    if event.event_type == "raw_market_event" {
+        let row = queue_evidence_row(event, sequence, &raw_kind, payload);
+        rows.push(("raw_market_event", row.clone()));
+        match raw_kind.as_str() {
+            "price_change" | "pricechange" => {
+                rows.push(("price_change", row.clone()));
+                rows.push(("level_change", row));
+            }
+            "last_trade_price" | "last_trade" | "trade" => rows.push(("last_trade", row)),
+            "book" | "orderbook" | "snapshot" => rows.push(("book_snapshot", row)),
+            "best_bid_ask" | "bestbidask" => rows.push(("level_change", row)),
+            _ => {}
+        }
+    } else {
+        match raw_kind.as_str() {
+            "price_change" | "pricechange" => {
+                let row = queue_evidence_row(event, sequence, &raw_kind, payload);
+                rows.push(("price_change", row.clone()));
+                rows.push(("level_change", row));
+            }
+            "last_trade_price" | "last_trade" | "trade" => {
+                rows.push((
+                    "last_trade",
+                    queue_evidence_row(event, sequence, &raw_kind, payload),
+                ));
+            }
+            "book" | "orderbook" | "snapshot" => {
+                rows.push((
+                    "book_snapshot",
+                    queue_evidence_row(event, sequence, "book", payload),
+                ));
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn queue_evidence_row(
+    event: &EventLine,
+    sequence: u64,
+    event_type: &str,
+    payload: &Value,
+) -> Value {
+    let raw_payload = payload.get("raw_payload").unwrap_or(payload);
+    json!({
+        "sequence": sequence,
+        "event_type": event_type,
+        "recorded_ts": ts(event.recorded_ts),
+        "source_ts": queue_ts(payload).map(ts),
+        "market_id": text(payload, "market_id"),
+        "condition_id": text(payload, "condition_id"),
+        "token_id": optional_text(payload, "token_id")
+            .or_else(|| optional_text(payload, "asset_id"))
+            .unwrap_or_default(),
+        "asset_id": text(payload, "asset_id"),
+        "side": text(payload, "side"),
+        "price": decimal(payload.get("price")
+            .or_else(|| payload.get("last_trade_price"))
+            .or_else(|| raw_payload.get("price"))
+            .or_else(|| raw_payload.get("last_trade_price")))
+            .map(|value| value.to_string()),
+        "size": decimal(payload.get("size")
+            .or_else(|| payload.get("trade_size"))
+            .or_else(|| payload.get("last_trade_size"))
+            .or_else(|| raw_payload.get("size"))
+            .or_else(|| raw_payload.get("trade_size"))
+            .or_else(|| raw_payload.get("last_trade_size")))
+            .map(|value| value.to_string()),
+        "best_bid": decimal(payload.get("best_bid").or_else(|| raw_payload.get("best_bid")))
+            .or_else(|| best_level_price(payload.get("bids"), true))
+            .or_else(|| best_level_price(raw_payload.get("bids"), true))
+            .map(|value| value.to_string()),
+        "best_ask": decimal(payload.get("best_ask").or_else(|| raw_payload.get("best_ask")))
+            .or_else(|| best_level_price(payload.get("asks"), false))
+            .or_else(|| best_level_price(raw_payload.get("asks"), false))
+            .map(|value| value.to_string()),
+        "book_hash": optional_text(payload, "book_hash")
+            .or_else(|| optional_text(payload, "hash"))
+            .or_else(|| optional_text(raw_payload, "hash")),
+        "raw_payload": redact_json(raw_payload)
+    })
+}
+
+fn queue_ts(payload: &Value) -> Option<DateTime<Utc>> {
+    parse_datetime(payload.get("source_ts"))
+        .or_else(|| parse_datetime(payload.get("exchange_ts")))
+        .or_else(|| parse_datetime(payload.get("timestamp")))
+        .or_else(|| parse_datetime(payload.get("local_ts")))
+}
+
+fn best_level_price(levels: Option<&Value>, bid: bool) -> Option<Decimal> {
+    let levels = levels?.as_array()?;
+    levels
+        .iter()
+        .filter_map(|level| decimal(level.get("price")))
+        .reduce(|left, right| {
+            if bid {
+                left.max(right)
+            } else {
+                left.min(right)
+            }
+        })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2275,6 +2503,262 @@ impl MarketTruth {
             "data_quality_flags": row.flags
         })
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct QueueAuditMarket {
+    book_snapshot_count: usize,
+    price_change_count: usize,
+    last_trade_price_count: usize,
+    best_bid_ask_count: usize,
+    market_resolved_count: usize,
+    level_change_count: usize,
+    order_lifecycle_count: usize,
+    trade_size_count: usize,
+    token_events: BTreeMap<String, usize>,
+}
+
+struct QueueEvidenceAudit {
+    markets: BTreeMap<String, MarketTruth>,
+    token_to_market: BTreeMap<String, String>,
+    by_market: BTreeMap<String, QueueAuditMarket>,
+    events_by_day: BTreeMap<String, usize>,
+    events_by_token: BTreeMap<String, usize>,
+    ineligible_reasons: BTreeMap<String, usize>,
+    total_events: usize,
+    book_snapshot_count: usize,
+    price_change_count: usize,
+    last_trade_price_count: usize,
+    best_bid_ask_count: usize,
+    market_resolved_count: usize,
+    level_change_count: usize,
+}
+
+impl QueueEvidenceAudit {
+    fn new(markets: Vec<MarketTruth>) -> Self {
+        let mut market_map = BTreeMap::new();
+        let mut token_to_market = BTreeMap::new();
+        for market in markets {
+            if !market.up_token_id.is_empty() {
+                token_to_market.insert(market.up_token_id.clone(), market.market_id.clone());
+            }
+            if !market.down_token_id.is_empty() {
+                token_to_market.insert(market.down_token_id.clone(), market.market_id.clone());
+            }
+            market_map.insert(market.market_id.clone(), market);
+        }
+        Self {
+            markets: market_map,
+            token_to_market,
+            by_market: BTreeMap::new(),
+            events_by_day: BTreeMap::new(),
+            events_by_token: BTreeMap::new(),
+            ineligible_reasons: BTreeMap::new(),
+            total_events: 0,
+            book_snapshot_count: 0,
+            price_change_count: 0,
+            last_trade_price_count: 0,
+            best_bid_ask_count: 0,
+            market_resolved_count: 0,
+            level_change_count: 0,
+        }
+    }
+
+    fn observe(&mut self, event: &EventLine) {
+        let kind = queue_audit_event_type(event);
+        let token_id = event_text(event, &["token_id", "asset_id"]);
+        let market_id = event_text(event, &["market_id"]).or_else(|| {
+            token_id
+                .as_ref()
+                .and_then(|token| self.token_to_market.get(token).cloned())
+        });
+        let Some(market_id) = market_id else {
+            return;
+        };
+        self.total_events += 1;
+        *self
+            .events_by_day
+            .entry(day_key(event.recorded_ts))
+            .or_insert(0) += 1;
+        if let Some(token_id) = token_id {
+            *self.events_by_token.entry(token_id.clone()).or_insert(0) += 1;
+            *self
+                .by_market
+                .entry(market_id.clone())
+                .or_default()
+                .token_events
+                .entry(token_id)
+                .or_insert(0) += 1;
+        }
+        let market = self.by_market.entry(market_id).or_default();
+        match kind.as_str() {
+            "book" | "orderbook" | "snapshot" | "book_snapshot" => {
+                self.book_snapshot_count += 1;
+                market.book_snapshot_count += 1;
+            }
+            "price_change" | "pricechange" => {
+                self.price_change_count += 1;
+                self.level_change_count += 1;
+                market.price_change_count += 1;
+                market.level_change_count += 1;
+            }
+            "level_change" => {
+                self.level_change_count += 1;
+                market.level_change_count += 1;
+            }
+            "last_trade_price" | "last_trade" | "trade" => {
+                self.last_trade_price_count += 1;
+                market.last_trade_price_count += 1;
+                if event_decimal(event, &["size", "trade_size", "last_trade_size"])
+                    .is_some_and(|value| value > Decimal::ZERO)
+                {
+                    market.trade_size_count += 1;
+                }
+            }
+            "best_bid_ask" | "bestbidask" => {
+                self.best_bid_ask_count += 1;
+                self.level_change_count += 1;
+                market.best_bid_ask_count += 1;
+                market.level_change_count += 1;
+            }
+            "market_resolved" | "market_resolution" => {
+                self.market_resolved_count += 1;
+                market.market_resolved_count += 1;
+            }
+            "decision" => {
+                if event_text(event, &["action"]).is_some_and(|action| {
+                    matches!(action.as_str(), "place" | "cancel" | "cancel_all")
+                }) {
+                    market.order_lifecycle_count += 1;
+                }
+            }
+            "execution_report"
+                if event_text(event, &["status"]).is_some_and(|status| {
+                    status.starts_with("paper_")
+                        && (status.contains("filled")
+                            || status.contains("resting")
+                            || status.contains("cancel"))
+                }) =>
+            {
+                market.order_lifecycle_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(mut self) -> Value {
+        let mut events_by_market = Map::new();
+        let mut eligible_markets = 0_usize;
+        let mut ineligible_markets = 0_usize;
+        let mut warnings = Vec::new();
+        for (market_id, truth) in &self.markets {
+            let evidence = self.by_market.get(market_id).cloned().unwrap_or_default();
+            let reasons = queue_ineligible_reasons(truth, &evidence);
+            if reasons.is_empty() {
+                eligible_markets += 1;
+            } else {
+                ineligible_markets += 1;
+                for reason in &reasons {
+                    *self.ineligible_reasons.entry(reason.clone()).or_insert(0) += 1;
+                }
+            }
+            events_by_market.insert(
+                market_id.clone(),
+                json!({
+                    "book_snapshot_count": evidence.book_snapshot_count,
+                    "price_change_count": evidence.price_change_count,
+                    "last_trade_price_count": evidence.last_trade_price_count,
+                    "best_bid_ask_count": evidence.best_bid_ask_count,
+                    "market_resolved_count": evidence.market_resolved_count,
+                    "level_change_count": evidence.level_change_count,
+                    "order_lifecycle_count": evidence.order_lifecycle_count,
+                    "trade_size_count": evidence.trade_size_count,
+                    "eligible": reasons.is_empty(),
+                    "ineligible_reasons": reasons
+                }),
+            );
+        }
+        if eligible_markets == 0 {
+            warnings.push(json!(
+                "no markets are QueueProxy eligible under strict evidence rules"
+            ));
+        }
+        json!({
+            "total_markets": self.markets.len(),
+            "queue_proxy_eligible_markets": eligible_markets,
+            "queue_proxy_ineligible_markets": ineligible_markets,
+            "eligibility_rate": ratio_usize(eligible_markets, self.markets.len()),
+            "total_queue_events": self.total_events,
+            "book_snapshot_count": self.book_snapshot_count,
+            "price_change_count": self.price_change_count,
+            "last_trade_price_count": self.last_trade_price_count,
+            "best_bid_ask_count": self.best_bid_ask_count,
+            "market_resolved_count": self.market_resolved_count,
+            "level_change_count": self.level_change_count,
+            "events_by_day": self.events_by_day,
+            "events_by_market": events_by_market,
+            "events_by_token": self.events_by_token,
+            "markets_with_trade_events": self.by_market.values().filter(|row| row.last_trade_price_count > 0).count(),
+            "markets_with_price_change_events": self.by_market.values().filter(|row| row.price_change_count > 0).count(),
+            "markets_with_full_book_snapshots": self.by_market.values().filter(|row| row.book_snapshot_count > 0).count(),
+            "markets_with_usable_order_lifecycle": self.by_market.values().filter(|row| row.order_lifecycle_count > 0).count(),
+            "ineligible_reasons": self.ineligible_reasons,
+            "coverage_warnings": warnings,
+            "research_only": true,
+            "paper_only": true,
+            "live_trading_enabled": false
+        })
+    }
+}
+
+fn queue_ineligible_reasons(truth: &MarketTruth, evidence: &QueueAuditMarket) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !truth.complete_for_simulation() {
+        reasons.push("missing_start_or_final_truth".to_owned());
+    }
+    if evidence.book_snapshot_count == 0 {
+        reasons.push("missing_book_snapshots".to_owned());
+    }
+    if evidence.price_change_count == 0 && evidence.level_change_count == 0 {
+        reasons.push("missing_price_change_or_level_update".to_owned());
+    }
+    if evidence.last_trade_price_count == 0 || evidence.trade_size_count == 0 {
+        reasons.push("missing_last_trade_price_or_trade_size".to_owned());
+    }
+    if evidence.order_lifecycle_count == 0 {
+        reasons.push("missing_order_lifecycle".to_owned());
+    }
+    reasons
+}
+
+fn queue_audit_event_type(event: &EventLine) -> String {
+    event_text(event, &["event_type", "type"])
+        .unwrap_or_else(|| event.event_type.clone())
+        .to_ascii_lowercase()
+}
+
+fn is_queue_trade_event(event: &EventLine) -> bool {
+    matches!(
+        queue_audit_event_type(event).as_str(),
+        "last_trade_price" | "last_trade" | "trade"
+    )
+}
+
+fn event_text(event: &EventLine, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        event
+            .payload
+            .get(*key)
+            .or_else(|| event.raw.get(*key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn event_decimal(event: &EventLine, keys: &[&str]) -> Option<Decimal> {
+    keys.iter()
+        .find_map(|key| decimal(event.payload.get(*key).or_else(|| event.raw.get(*key))))
 }
 
 struct MarketRowsResult {
@@ -2491,6 +2975,10 @@ impl OrderBookState {
         self.asks.iter().next().map(|(price, size)| (*price, *size))
     }
 
+    fn bid_size_at(&self, price: Decimal) -> Option<Decimal> {
+        self.bids.get(&price).copied()
+    }
+
     fn spread_ticks(&self, tick_size: Decimal) -> Option<f64> {
         let (bid, _) = self.best_bid()?;
         let (ask, _) = self.best_ask()?;
@@ -2559,6 +3047,8 @@ struct ReplayOrder {
     fill_ref_price: Option<Decimal>,
     adverse_checked: bool,
     cancel_ts: Option<DateTime<Utc>>,
+    queue_initial_size_ahead: Option<Decimal>,
+    queue_size_ahead: Option<Decimal>,
 }
 
 impl ReplayOrder {
@@ -2569,6 +3059,19 @@ impl ReplayOrder {
     fn is_maker(&self) -> bool {
         self.order_kind.starts_with("post_only")
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct QueueMarketEvidence {
+    book_snapshot_count: usize,
+    price_change_count: usize,
+    level_change_count: usize,
+    trade_event_count: usize,
+    trade_size_count: usize,
+    depletion_event_count: usize,
+    order_lifecycle_count: usize,
+    size_ahead_samples: Vec<Decimal>,
+    ineligible_reasons: BTreeSet<String>,
 }
 
 struct ResearchReplayEngine {
@@ -2601,6 +3104,8 @@ struct ResearchReplayEngine {
     queue_evidence_events: usize,
     trade_evidence_events: usize,
     depletion_evidence_events: usize,
+    queue_partial_fills: usize,
+    queue_market_evidence: BTreeMap<String, QueueMarketEvidence>,
     regime_frequency: BTreeMap<String, usize>,
     regime_time_share: BTreeMap<String, usize>,
     adaptive_logs: Vec<Value>,
@@ -2664,6 +3169,8 @@ impl ResearchReplayEngine {
                 queue_evidence_events: 0,
                 trade_evidence_events: 0,
                 depletion_evidence_events: 0,
+                queue_partial_fills: 0,
+                queue_market_evidence: BTreeMap::new(),
                 regime_frequency: BTreeMap::new(),
                 regime_time_share: BTreeMap::new(),
                 adaptive_logs: Vec::new(),
@@ -2701,6 +3208,8 @@ impl ResearchReplayEngine {
                 queue_evidence_events: 0,
                 trade_evidence_events: 0,
                 depletion_evidence_events: 0,
+                queue_partial_fills: 0,
+                queue_market_evidence: BTreeMap::new(),
                 regime_frequency: BTreeMap::new(),
                 regime_time_share: BTreeMap::new(),
                 adaptive_logs: Vec::new(),
@@ -2712,7 +3221,7 @@ impl ResearchReplayEngine {
 
     fn observe(&mut self, event: &EventLine) {
         self.event_count += 1;
-        if self.request.fill_model == FillModel::QueueProxy {
+        if is_queue_proxy_family(self.request.fill_model) {
             self.observe_queue_proxy_evidence(event);
         }
         self.expire_reference_history(event.recorded_ts);
@@ -2721,6 +3230,12 @@ impl ResearchReplayEngine {
             "market_start_price" => self.handle_market_start(&event.payload),
             "reference" => self.handle_reference(&event.payload, event.recorded_ts),
             "book" => self.handle_book(&event.payload, event.recorded_ts),
+            "raw_market_event" if is_queue_trade_event(event) => {
+                self.handle_queue_trade(&event.payload, event.recorded_ts)
+            }
+            "last_trade_price" | "last_trade" | "trade" => {
+                self.handle_queue_trade(&event.payload, event.recorded_ts)
+            }
             "fair_value" => self.handle_fair_value(&event.payload),
             "decision" => self.handle_decision(&event.payload, event.recorded_ts),
             "execution_report" => self.handle_execution_report(&event.payload, event.recorded_ts),
@@ -2730,7 +3245,7 @@ impl ResearchReplayEngine {
     }
 
     fn observe_queue_proxy_evidence(&mut self, event: &EventLine) {
-        let event_type = event.event_type.to_ascii_lowercase();
+        let event_type = queue_audit_event_type(event);
         if event_type.contains("queue") || has_any_key(&event.payload, QUEUE_EVIDENCE_KEYS) {
             self.queue_evidence_events += 1;
         }
@@ -2739,6 +3254,31 @@ impl ResearchReplayEngine {
         }
         if event_type.contains("deplet") || has_any_key(&event.payload, DEPLETION_EVIDENCE_KEYS) {
             self.depletion_evidence_events += 1;
+        }
+        let market_id = event_text(event, &["market_id"]).or_else(|| {
+            event_text(event, &["token_id", "asset_id", "token"]).and_then(|token| {
+                self.token_to_market
+                    .get(&token)
+                    .map(|(market_id, _)| market_id.clone())
+            })
+        });
+        let Some(market_id) = market_id else {
+            return;
+        };
+        let evidence = self.queue_market_evidence.entry(market_id).or_default();
+        match event_type.as_str() {
+            "price_change" | "pricechange" => {
+                evidence.price_change_count += 1;
+                evidence.level_change_count += 1;
+            }
+            "level_change" | "best_bid_ask" | "bestbidask" => {
+                evidence.level_change_count += 1;
+            }
+            _ => {
+                if has_any_key(&event.payload, DEPLETION_EVIDENCE_KEYS) {
+                    evidence.level_change_count += 1;
+                }
+            }
         }
     }
 
@@ -2823,6 +3363,14 @@ impl ResearchReplayEngine {
         if token_id.is_empty() {
             return;
         }
+        let previous_bids = if self.request.fill_model == FillModel::QueueProxyBalanced {
+            self.books
+                .get(&token_id)
+                .map(|book| book.bids.clone())
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
         let book = self.books.entry(token_id.clone()).or_default();
         book.apply(payload, recorded_ts);
         if let Some((market_id, _)) = self.token_to_market.get(&token_id).cloned() {
@@ -2834,7 +3382,193 @@ impl ResearchReplayEngine {
                     .or_insert(1);
             }
         }
+        if is_queue_proxy_shadow_model(self.request.fill_model) {
+            self.record_queue_book_evidence(&token_id, payload);
+            if self.request.fill_model == FillModel::QueueProxyBalanced {
+                self.apply_queue_level_decreases(&token_id, &previous_bids);
+            }
+            return;
+        }
         self.fill_open_orders(&token_id, recorded_ts);
+    }
+
+    fn record_queue_book_evidence(&mut self, token_id: &str, payload: &Value) {
+        let Some((market_id, _)) = self.token_to_market.get(token_id).cloned() else {
+            return;
+        };
+        let evidence = self.queue_market_evidence.entry(market_id).or_default();
+        evidence.book_snapshot_count += 1;
+        if has_any_key(payload, DEPLETION_EVIDENCE_KEYS) {
+            evidence.depletion_event_count += 1;
+        }
+    }
+
+    fn initialize_queue_proxy_order(&mut self, order: &mut ReplayOrder) {
+        let evidence = self
+            .queue_market_evidence
+            .entry(order.market_id.clone())
+            .or_default();
+        evidence.order_lifecycle_count += 1;
+        if order.side != "buy" {
+            evidence
+                .ineligible_reasons
+                .insert("only_buy_maker_orders_supported".to_owned());
+            return;
+        }
+        let Some(book) = self.books.get(&order.token_id) else {
+            evidence
+                .ineligible_reasons
+                .insert("missing_book_snapshot_at_order_live_ts".to_owned());
+            return;
+        };
+        let Some(size_ahead) = book.bid_size_at(order.price) else {
+            evidence
+                .ineligible_reasons
+                .insert("missing_visible_bid_size_at_quote_price".to_owned());
+            return;
+        };
+        order.queue_initial_size_ahead = Some(size_ahead);
+        order.queue_size_ahead = Some(size_ahead);
+        evidence.size_ahead_samples.push(size_ahead);
+    }
+
+    fn apply_queue_level_decreases(
+        &mut self,
+        token_id: &str,
+        previous_bids: &BTreeMap<Decimal, Decimal>,
+    ) {
+        let open = self.open_orders.iter().copied().collect::<Vec<_>>();
+        for index in open {
+            if self.orders[index].token_id != token_id || self.orders[index].cancel_ts.is_some() {
+                continue;
+            }
+            let Some(size_ahead) = self.orders[index].queue_size_ahead else {
+                continue;
+            };
+            let price = self.orders[index].price;
+            let previous = previous_bids.get(&price).copied().unwrap_or(Decimal::ZERO);
+            let current = self
+                .books
+                .get(token_id)
+                .and_then(|book| book.bid_size_at(price))
+                .unwrap_or(Decimal::ZERO);
+            if previous > current {
+                let reduction = (previous - current).min(size_ahead);
+                self.orders[index].queue_size_ahead = Some(size_ahead - reduction);
+                if let Some((market_id, _)) = self.token_to_market.get(token_id).cloned() {
+                    self.queue_market_evidence
+                        .entry(market_id)
+                        .or_default()
+                        .depletion_event_count += 1;
+                }
+            }
+        }
+    }
+
+    fn handle_queue_trade(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
+        if !is_queue_proxy_shadow_model(self.request.fill_model) {
+            return;
+        }
+        let mut token_id = text(payload, "token_id");
+        if token_id.is_empty() {
+            token_id = text(payload, "asset_id");
+        }
+        if token_id.is_empty() {
+            token_id = text(payload, "token");
+        }
+        if token_id.is_empty() {
+            return;
+        }
+        let Some(trade_price) = decimal(payload.get("price"))
+            .or_else(|| decimal(payload.get("trade_price")))
+            .or_else(|| decimal(payload.get("last_trade_price")))
+        else {
+            return;
+        };
+        let Some(mut trade_size) = decimal(payload.get("size"))
+            .or_else(|| decimal(payload.get("trade_size")))
+            .or_else(|| decimal(payload.get("last_trade_size")))
+            .or_else(|| decimal(payload.get("filled_size")))
+        else {
+            return;
+        };
+        if trade_size <= Decimal::ZERO {
+            return;
+        }
+        if let Some((market_id, _)) = self.token_to_market.get(&token_id).cloned() {
+            let evidence = self.queue_market_evidence.entry(market_id).or_default();
+            evidence.trade_event_count += 1;
+            evidence.trade_size_count += 1;
+        }
+        let open = self.open_orders.iter().copied().collect::<Vec<_>>();
+        for index in open {
+            if trade_size <= Decimal::ZERO {
+                break;
+            }
+            if self.orders[index].token_id != token_id || self.orders[index].cancel_ts.is_some() {
+                continue;
+            }
+            if self.orders[index].side != "buy" || trade_price > self.orders[index].price {
+                continue;
+            }
+            if !self.queue_market_has_level_evidence(&self.orders[index].market_id) {
+                self.queue_market_evidence
+                    .entry(self.orders[index].market_id.clone())
+                    .or_default()
+                    .ineligible_reasons
+                    .insert("missing_price_change_or_level_update".to_owned());
+                continue;
+            }
+            if !self.order_can_fill(index, recorded_ts) {
+                continue;
+            }
+            let Some(size_ahead) = self.orders[index].queue_size_ahead else {
+                self.queue_market_evidence
+                    .entry(self.orders[index].market_id.clone())
+                    .or_default()
+                    .ineligible_reasons
+                    .insert("missing_size_ahead_for_order".to_owned());
+                continue;
+            };
+            if size_ahead > Decimal::ZERO {
+                let consumed = trade_size.min(size_ahead);
+                self.orders[index].queue_size_ahead = Some(size_ahead - consumed);
+                trade_size -= consumed;
+                if trade_size <= Decimal::ZERO {
+                    continue;
+                }
+            }
+            let remaining_order = self.orders[index].size - self.orders[index].filled_size;
+            if remaining_order <= Decimal::ZERO {
+                self.open_orders.remove(&index);
+                continue;
+            }
+            let fill_size = remaining_order.min(trade_size);
+            if fill_size > Decimal::ZERO {
+                if fill_size < remaining_order {
+                    self.queue_partial_fills += 1;
+                }
+                self.fill_order_size(
+                    index,
+                    self.orders[index].price,
+                    fill_size,
+                    recorded_ts,
+                    true,
+                );
+                if self.orders[index].filled_size >= self.orders[index].size {
+                    self.open_orders.remove(&index);
+                }
+                trade_size -= fill_size;
+            }
+        }
+    }
+
+    fn queue_market_has_level_evidence(&self, market_id: &str) -> bool {
+        self.queue_market_evidence
+            .get(market_id)
+            .is_some_and(|evidence| {
+                evidence.price_change_count > 0 || evidence.level_change_count > 0
+            })
     }
 
     fn handle_fair_value(&mut self, payload: &Value) {
@@ -2889,6 +3623,9 @@ impl ResearchReplayEngine {
             if candidate.quote_style == QuoteStyle::FairMinusMarginOnly {
                 order.price = (order.price - order.tick_size).max(order.tick_size);
             }
+        }
+        if is_queue_proxy_shadow_model(self.request.fill_model) {
+            self.initialize_queue_proxy_order(&mut order);
         }
         self.orders.push(order);
         let index = self.orders.len() - 1;
@@ -2960,6 +3697,8 @@ impl ResearchReplayEngine {
                 .map(|reference| reference.price),
             adverse_checked: false,
             cancel_ts: None,
+            queue_initial_size_ahead: None,
+            queue_size_ahead: None,
         })
     }
 
@@ -3287,28 +4026,55 @@ impl ResearchReplayEngine {
             return false;
         }
         match self.request.fill_model {
-            FillModel::NoMakerFills | FillModel::QueueProxy => false,
+            FillModel::NoMakerFills
+            | FillModel::QueueProxy
+            | FillModel::QueueProxyConservative
+            | FillModel::QueueProxyBalanced => false,
             FillModel::TradeThrough => best_ask <= order.price - order.tick_size,
             _ => best_ask <= order.price,
         }
     }
 
     fn fill_order(&mut self, index: usize, price: Decimal, fill_ts: DateTime<Utc>, maker: bool) {
-        if self.orders[index].is_filled() {
+        self.fill_order_size(index, price, self.orders[index].size, fill_ts, maker);
+    }
+
+    fn fill_order_size(
+        &mut self,
+        index: usize,
+        price: Decimal,
+        fill_size: Decimal,
+        fill_ts: DateTime<Utc>,
+        maker: bool,
+    ) {
+        if fill_size <= Decimal::ZERO {
             return;
         }
+        let remaining = self.orders[index].size - self.orders[index].filled_size;
+        if remaining <= Decimal::ZERO {
+            return;
+        }
+        let applied_fill_size = fill_size.min(remaining);
         let fill_ref_price = self
             .latest_reference_at(fill_ts)
             .map(|reference| reference.price);
         let order = &mut self.orders[index];
-        order.filled_size = order.size;
-        order.avg_price = Some(price);
-        order.fill_ts = Some(fill_ts);
-        order.fill_ref_price = fill_ref_price;
+        let previous_filled = order.filled_size;
+        let new_filled = previous_filled + applied_fill_size;
+        order.avg_price = Some(match order.avg_price {
+            Some(previous_price) if previous_filled > Decimal::ZERO => {
+                ((previous_price * previous_filled) + (price * applied_fill_size)) / new_filled
+            }
+            _ => price,
+        });
+        order.filled_size = new_filled.min(order.size);
+        order.fill_ts = order.fill_ts.or(Some(fill_ts));
+        order.fill_ref_price = order.fill_ref_price.or(fill_ref_price);
         if maker {
             self.maker_fills += 1;
         } else {
-            order.fee = crypto_taker_fee_per_share(price).unwrap_or(Decimal::ZERO) * order.size;
+            order.fee +=
+                crypto_taker_fee_per_share(price).unwrap_or(Decimal::ZERO) * applied_fill_size;
             self.taker_fills += 1;
         }
         self.fills += 1;
@@ -3447,18 +4213,24 @@ impl ResearchReplayEngine {
         let net = gross - fees - adverse_penalties;
         let stats = market_level_statistics_json(&market_results);
         let drawdown = max_drawdown(&market_results);
-        let queue_proxy = queue_proxy_report(
-            self.request.fill_model,
-            self.queue_evidence_events,
-            self.trade_evidence_events,
-            self.depletion_evidence_events,
-        );
-        if self.request.fill_model == FillModel::QueueProxy {
+        let queue_proxy = queue_proxy_report(QueueProxyReportInput {
+            fill_model: self.request.fill_model,
+            queue_events: self.queue_evidence_events,
+            trade_events: self.trade_evidence_events,
+            depletion_events: self.depletion_evidence_events,
+            queue_fills: self.maker_fills,
+            queue_partial_fills: self.queue_partial_fills,
+            evidence_by_market: &self.queue_market_evidence,
+            markets: &self.markets,
+        });
+        if is_queue_proxy_family(self.request.fill_model) {
             if queue_proxy["evidence_complete"].as_bool() == Some(true) {
-                self.warnings.insert(
-                    "queue_proxy evidence is present, but maker fills remain disabled until the depletion semantics are validated"
-                        .to_owned(),
-                );
+                if self.request.fill_model == FillModel::QueueProxy {
+                    self.warnings.insert(
+                        "queue_proxy evidence is present, but legacy queue_proxy remains disabled; use queue_proxy_conservative or queue_proxy_balanced for research-only shadow simulation"
+                            .to_owned(),
+                    );
+                }
             } else {
                 self.warnings.insert(
                     "queue_proxy skipped maker fills because queue depletion/trade evidence is incomplete"
@@ -3475,6 +4247,17 @@ impl ResearchReplayEngine {
             "name": self.request.name,
             "profile": self.request.mode.as_str(),
             "fill_model": self.request.fill_model.as_str(),
+            "queue_proxy_enabled": queue_proxy["queue_proxy_enabled"].clone(),
+            "queue_proxy_mode": queue_proxy["queue_proxy_mode"].clone(),
+            "queue_proxy_eligible_markets": queue_proxy["queue_proxy_eligible_markets"].clone(),
+            "queue_proxy_ineligible_markets": queue_proxy["queue_proxy_ineligible_markets"].clone(),
+            "queue_proxy_eligibility_rate": queue_proxy["queue_proxy_eligibility_rate"].clone(),
+            "queue_proxy_fills": queue_proxy["queue_proxy_fills"].clone(),
+            "queue_proxy_partial_fills": queue_proxy["queue_proxy_partial_fills"].clone(),
+            "queue_proxy_fill_rate": queue_proxy["queue_proxy_fill_rate"].clone(),
+            "avg_size_ahead": queue_proxy["avg_size_ahead"].clone(),
+            "p50_size_ahead": queue_proxy["p50_size_ahead"].clone(),
+            "p95_size_ahead": queue_proxy["p95_size_ahead"].clone(),
             "events": self.event_count,
             "markets_seen": self.markets.len(),
             "markets_settled": self.markets.values().filter(|market| market.complete_for_simulation()).count(),
@@ -4181,27 +4964,113 @@ fn market_level_statistics_json(market_results: &[Value]) -> Value {
     sample_size_stats(&pnls)
 }
 
-fn queue_proxy_report(
+struct QueueProxyReportInput<'a> {
     fill_model: FillModel,
     queue_events: usize,
     trade_events: usize,
     depletion_events: usize,
-) -> Value {
-    let evidence_complete = queue_events > 0 && trade_events > 0 && depletion_events > 0;
-    let status = if fill_model != FillModel::QueueProxy {
+    queue_fills: usize,
+    queue_partial_fills: usize,
+    evidence_by_market: &'a BTreeMap<String, QueueMarketEvidence>,
+    markets: &'a BTreeMap<String, MarketTruth>,
+}
+
+fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
+    let QueueProxyReportInput {
+        fill_model,
+        queue_events,
+        trade_events,
+        depletion_events,
+        queue_fills,
+        queue_partial_fills,
+        evidence_by_market,
+        markets,
+    } = input;
+    let queue_mode = match fill_model {
+        FillModel::QueueProxy => "legacy_skip",
+        FillModel::QueueProxyConservative => "conservative",
+        FillModel::QueueProxyBalanced => "balanced",
+        _ => "not_requested",
+    };
+    let mut eligible_markets = 0usize;
+    let mut ineligible_markets = 0usize;
+    let mut ineligible_reasons = BTreeMap::<String, usize>::new();
+    let mut size_ahead_samples = Vec::new();
+    for (market_id, evidence) in evidence_by_market {
+        size_ahead_samples.extend(evidence.size_ahead_samples.iter().copied());
+        let complete = markets
+            .get(market_id)
+            .is_some_and(MarketTruth::complete_for_simulation);
+        let mut reasons = evidence.ineligible_reasons.clone();
+        if !complete {
+            reasons.insert("missing_start_or_final_truth".to_owned());
+        }
+        if evidence.book_snapshot_count == 0 {
+            reasons.insert("missing_book_snapshots".to_owned());
+        }
+        if evidence.price_change_count == 0 && evidence.level_change_count == 0 {
+            reasons.insert("missing_price_change_or_level_update".to_owned());
+        }
+        if evidence.trade_event_count == 0 || evidence.trade_size_count == 0 {
+            reasons.insert("missing_last_trade_price_or_trade_size".to_owned());
+        }
+        if evidence.order_lifecycle_count == 0 {
+            reasons.insert("missing_simulated_order_lifecycle".to_owned());
+        }
+        if evidence.size_ahead_samples.is_empty() {
+            reasons.insert("missing_size_ahead_samples".to_owned());
+        }
+        if reasons.is_empty() {
+            eligible_markets += 1;
+        } else {
+            ineligible_markets += 1;
+            for reason in reasons {
+                *ineligible_reasons.entry(reason).or_insert(0) += 1;
+            }
+        }
+    }
+    let total_markets = eligible_markets + ineligible_markets;
+    let evidence_complete = eligible_markets > 0;
+    let enabled =
+        is_queue_proxy_shadow_model(fill_model) && eligible_markets > 0 && evidence_complete;
+    let status = if !is_queue_proxy_family(fill_model) {
         "not_requested"
+    } else if fill_model == FillModel::QueueProxy {
+        if evidence_complete {
+            "legacy_queue_proxy_skipped_use_shadow_mode"
+        } else {
+            "skipped_missing_queue_depletion_trade_evidence"
+        }
+    } else if enabled {
+        "enabled_shadow_research_only"
     } else if evidence_complete {
-        "evidence_present_fill_simulation_disabled_until_validated"
+        "skipped_no_eligible_markets"
     } else {
         "skipped_missing_queue_depletion_trade_evidence"
     };
     json!({
         "status": status,
-        "skipped": fill_model == FillModel::QueueProxy,
+        "skipped": is_queue_proxy_family(fill_model) && !enabled,
+        "queue_proxy_enabled": enabled,
+        "queue_proxy_mode": queue_mode,
         "evidence_complete": evidence_complete,
+        "total_markets_with_queue_state": total_markets,
+        "queue_proxy_eligible_markets": eligible_markets,
+        "queue_proxy_ineligible_markets": ineligible_markets,
+        "queue_proxy_eligibility_rate": ratio_usize(eligible_markets, total_markets),
+        "queue_proxy_fills": if is_queue_proxy_shadow_model(fill_model) { queue_fills } else { 0 },
+        "queue_proxy_partial_fills": if is_queue_proxy_shadow_model(fill_model) { queue_partial_fills } else { 0 },
+        "queue_proxy_fill_rate": if is_queue_proxy_shadow_model(fill_model) { ratio_usize(queue_fills, evidence_by_market.values().map(|evidence| evidence.order_lifecycle_count).sum::<usize>()) } else { Value::Null },
+        "avg_size_ahead": decimal_average_json(&size_ahead_samples),
+        "p50_size_ahead": decimal_percentile_json(size_ahead_samples.clone(), 0.50),
+        "p95_size_ahead": decimal_percentile_json(size_ahead_samples, 0.95),
         "queue_evidence_events": queue_events,
         "trade_evidence_events": trade_events,
         "depletion_evidence_events": depletion_events,
+        "ineligible_reasons": ineligible_reasons,
+        "queue_vs_touch_fill_delta": Value::Null,
+        "queue_vs_trade_through_fill_delta": Value::Null,
+        "queue_proxy_net_pnl": Value::Null,
         "required_before_enabling": [
             "resting queue position or size-ahead estimate",
             "trade prints or equivalent executed volume by token/price/time",
@@ -4226,6 +5095,24 @@ fn max_drawdown(market_results: &[Value]) -> Decimal {
         max_drawdown = max_drawdown.max(peak - cumulative);
     }
     max_drawdown
+}
+
+fn decimal_average_json(values: &[Decimal]) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let sum = values.iter().copied().sum::<Decimal>();
+    json!((sum / Decimal::from(values.len())).to_string())
+}
+
+fn decimal_percentile_json(mut values: Vec<Decimal>, percentile: f64) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    values.sort();
+    let bounded = percentile.clamp(0.0, 1.0);
+    let index = ((values.len() - 1) as f64 * bounded).round() as usize;
+    json!(values[index].to_string())
 }
 
 fn q_bucket(q: Decimal) -> String {
@@ -4488,6 +5375,21 @@ fn markets_markdown(report: &Value) -> String {
         summary["missing_final_price"],
         summary["total_decisions"],
         summary["total_fills"]
+    )
+}
+
+fn queue_audit_markdown(report: &Value) -> String {
+    let result = &report["result"];
+    format!(
+        "# QueueProxy Evidence Audit\n\n- Total markets: {}\n- QueueProxy eligible markets: {}\n- QueueProxy ineligible markets: {}\n- Eligibility rate: {}\n- Book snapshots: {}\n- Price changes: {}\n- Last trades: {}\n- Order lifecycle events: {}\n\nQueueProxy remains research-only/paper-only. Ineligible markets are skipped with explicit reasons.\n",
+        result["total_markets"],
+        result["queue_proxy_eligible_markets"],
+        result["queue_proxy_ineligible_markets"],
+        result["eligibility_rate"],
+        result["book_snapshot_count"],
+        result["price_change_count"],
+        result["last_trade_price_count"],
+        result["markets_with_usable_order_lifecycle"]
     )
 }
 

@@ -1,10 +1,11 @@
 use polyedge_reporting::research::{
     load_default_exclusions, load_frozen_candidate_registry, run_audit, run_backfill, run_baseline,
-    run_build_markets, run_calibration, run_final_report, run_normalize, run_regimes, run_replay,
-    run_sample_size, run_sweep, run_validate_prospective, AuditOptions, BackfillOptions,
-    BaselineOptions, BuildMarketsOptions, CalibrationOptions, ExcludedTimeWindow, FillModel,
-    FinalReportOptions, NormalizeOptions, ProspectiveValidationOptions, RegimesOptions,
-    ReplayOptions, SampleSizeOptions, SweepOptions,
+    run_build_markets, run_calibration, run_chart_backfill, run_final_report, run_normalize,
+    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
+    AuditOptions, BackfillOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions,
+    ChartBackfillOptions, ExcludedTimeWindow, FillModel, FinalReportOptions, NormalizeOptions,
+    ProspectiveValidationOptions, QueueAuditOptions, RegimesOptions, ReplayOptions,
+    SampleSizeOptions, SweepOptions,
 };
 use serde_json::Value;
 use std::fs;
@@ -62,34 +63,7 @@ windows:
 fn frozen_candidates_must_stay_disabled_and_research_only() {
     let dir = test_dir("frozen_candidates");
     let candidates = dir.join("frozen_candidates.yaml");
-    fs::write(
-        &candidates,
-        r#"version: 1
-updated_at: "2026-06-14T00:00:00Z"
-research_only: true
-paper_only: true
-enabled_by_default: false
-selection_rule: "Frozen candidates only."
-candidates:
-  - name: "static_baseline"
-    profile: "static"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "dynamic_quote_style"
-    profile: "dynamic_quote_style"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "full_deterministic_profile"
-    profile: "full_deterministic_profile"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "dynamic_safety_only"
-    profile: "dynamic_safety_only"
-    enabled_by_default: false
-    deployment_allowed: false
-"#,
-    )
-    .unwrap();
+    fs::write(&candidates, frozen_candidates_yaml()).unwrap();
 
     let registry = load_frozen_candidate_registry(&candidates).unwrap();
 
@@ -98,40 +72,19 @@ candidates:
         .candidates
         .iter()
         .all(|candidate| { !candidate.enabled_by_default && !candidate.deployment_allowed }));
+    assert!(registry
+        .candidates
+        .iter()
+        .all(|candidate| !candidate.candidate_version.is_empty()
+            && !candidate.config_hash.is_empty()
+            && !candidate.reason.is_empty()));
 }
 
 #[test]
 fn prospective_and_backfill_reports_keep_research_safety_flags() {
     let dir = test_dir("prospective_backfill");
     let candidates = dir.join("frozen_candidates.yaml");
-    fs::write(
-        &candidates,
-        r#"version: 1
-updated_at: "2026-06-14T00:00:00Z"
-research_only: true
-paper_only: true
-enabled_by_default: false
-selection_rule: "Frozen candidates only."
-candidates:
-  - name: "static_baseline"
-    profile: "static"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "dynamic_quote_style"
-    profile: "dynamic_quote_style"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "full_deterministic_profile"
-    profile: "full_deterministic_profile"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "dynamic_safety_only"
-    profile: "dynamic_safety_only"
-    enabled_by_default: false
-    deployment_allowed: false
-"#,
-    )
-    .unwrap();
+    fs::write(&candidates, frozen_candidates_yaml()).unwrap();
 
     let prospective = run_validate_prospective(ProspectiveValidationOptions {
         since: chrono::DateTime::parse_from_rfc3339("2026-06-14T00:00:00Z")
@@ -147,6 +100,19 @@ candidates:
     assert_eq!(prospective["result"]["research_only"], true);
     assert_eq!(prospective["result"]["live_deployment_allowed"], false);
     assert_eq!(prospective["result"]["status"], "collecting");
+    assert_eq!(
+        prospective["result"]["frozen_candidates"]["candidates"][0]["candidate_version"],
+        "static_baseline@2026-06-14"
+    );
+    assert_eq!(
+        prospective["result"]["paired_improvement"]["dynamic_quote_style"]["sample_size"],
+        0
+    );
+    assert_eq!(
+        prospective["result"]["paired_improvement"]["dynamic_quote_style"]
+            ["live_deployment_allowed"],
+        false
+    );
 
     let backfill = run_backfill(BackfillOptions {
         start: "2026-06-14".to_owned(),
@@ -239,6 +205,107 @@ fn normalize_and_build_markets_preserve_incomplete_markets() {
         .unwrap()
         .iter()
         .any(|value| value == "missing_final_price"));
+}
+
+#[test]
+fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
+    let dir = test_dir("queue_audit");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            raw_price_change_line("up", "0.50", "5", "2026-06-01T00:00:45+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+
+    let manifest = run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+
+    assert!(normalized.join("book_snapshots.jsonl").is_file());
+    assert!(normalized.join("price_changes.jsonl").is_file());
+    assert!(normalized.join("last_trades.jsonl").is_file());
+    assert_eq!(manifest["result"]["files"]["book_snapshot"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["price_change"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["last_trade"]["rows"], 1);
+
+    let markets_path = dir.join("markets.json");
+    run_build_markets(BuildMarketsOptions {
+        input: normalized.clone(),
+        out: markets_path.clone(),
+        markdown: dir.join("markets.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let audit = run_queue_audit(QueueAuditOptions {
+        input: normalized,
+        markets: markets_path,
+        out: dir.join("queue_audit.json"),
+        markdown: dir.join("queue_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    assert_eq!(audit["result"]["queue_proxy_eligible_markets"], 1);
+    assert_eq!(audit["result"]["queue_proxy_ineligible_markets"], 0);
+    assert_eq!(audit["result"]["events_by_market"]["m1"]["eligible"], true);
+    assert_eq!(audit["result"]["live_trading_enabled"], false);
+}
+
+#[test]
+fn chart_backfill_writes_read_only_chart_artifact() {
+    let dir = test_dir("chart_backfill");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            fair_value_line("m1", "0.60", "2026-06-01T00:00:30+00:00"),
+            book_line("up", "0.50", "2026-06-01T00:00:45+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            execution_report_line("m1", "up", "paper_filled", "2026-06-01T00:01:03+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+    })
+    .unwrap();
+
+    let report = run_chart_backfill(ChartBackfillOptions {
+        input: normalized,
+        out: dir.join("chart-backfill.json"),
+        markdown: dir.join("chart-backfill.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    assert_eq!(report["result"]["status"], "completed");
+    assert_eq!(report["result"]["job_id"], "chart-backfill");
+    assert_eq!(report["result"]["raw_data_mutated"], false);
+    assert_eq!(report["result"]["live_trading_enabled"], false);
+    assert_eq!(report["result"]["chart_store"]["market_count"], 1);
+    assert_eq!(report["result"]["chart_store"]["decision_marker_count"], 1);
+    assert_eq!(report["result"]["chart_store"]["fill_marker_count"], 1);
+    assert!(report["result"]["markets"][0]["points"]
+        .as_array()
+        .is_some_and(|points| points.len() >= 2));
+    assert!(dir.join("chart-backfill.md").is_file());
 }
 
 #[test]
@@ -563,34 +630,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     )
     .unwrap();
     let candidates = dir.join("frozen_candidates.yaml");
-    fs::write(
-        &candidates,
-        r#"version: 1
-updated_at: "2026-06-14T00:00:00Z"
-research_only: true
-paper_only: true
-enabled_by_default: false
-selection_rule: "Frozen candidates only."
-candidates:
-  - name: "static_baseline"
-    profile: "static"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "dynamic_quote_style"
-    profile: "dynamic_quote_style"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "full_deterministic_profile"
-    profile: "full_deterministic_profile"
-    enabled_by_default: false
-    deployment_allowed: false
-  - name: "dynamic_safety_only"
-    profile: "dynamic_safety_only"
-    enabled_by_default: false
-    deployment_allowed: false
-"#,
-    )
-    .unwrap();
+    fs::write(&candidates, frozen_candidates_yaml()).unwrap();
     let prospective = run_validate_prospective(ProspectiveValidationOptions {
         since: chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
             .unwrap()
@@ -606,6 +646,18 @@ candidates:
     assert_eq!(
         prospective["result"]["rows"][0]["ci_95_low"],
         sample["result"]["statistics"]["ci_low"]
+    );
+    assert!(prospective["result"]["rows"][0]
+        .as_object()
+        .unwrap()
+        .contains_key("dynamic_quote_style_paired_delta"));
+    assert!(prospective["result"]["rows"][0]
+        .as_object()
+        .unwrap()
+        .contains_key("dynamic_quote_style_decision_gate"));
+    assert_eq!(
+        prospective["result"]["paired_improvement"]["dynamic_quote_style"]["research_only"],
+        true
     );
     assert!(!serde_json::to_string(&final_report)
         .unwrap()
@@ -649,11 +701,143 @@ fn queue_proxy_remains_skipped_without_validated_depletion_semantics() {
     assert_eq!(present["result"]["fills"], 0);
     assert_eq!(
         present["result"]["replay_metrics"]["queue_proxy"]["status"],
-        "evidence_present_fill_simulation_disabled_until_validated"
+        "skipped_missing_queue_depletion_trade_evidence"
     );
     assert_eq!(
         present["result"]["replay_metrics"]["queue_proxy"]["evidence_complete"],
-        true
+        false
+    );
+}
+
+#[test]
+fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
+    let dir = test_dir("queue_proxy_conservative");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 1);
+    assert_eq!(report["result"]["maker_fills"], 1);
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["queue_proxy_mode"], "conservative");
+    assert_eq!(report["result"]["avg_size_ahead"], "5");
+}
+
+#[test]
+fn queue_proxy_refuses_market_without_level_evidence() {
+    let dir = test_dir("queue_proxy_missing_level");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_no_level_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 0);
+    assert_eq!(report["result"]["queue_proxy_enabled"], false);
+    assert_eq!(
+        report["result"]["replay_metrics"]["queue_proxy"]["ineligible_reasons"]
+            ["missing_price_change_or_level_update"],
+        1
+    );
+}
+
+#[test]
+fn queue_proxy_allows_multiple_trade_prints_to_complete_partial_fill() {
+    let dir = test_dir("queue_proxy_multi_print");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "7", "2026-06-01T00:01:03+00:00"),
+            trade_line("up", "0.50", "3", "2026-06-01T00:01:04+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 2);
+    assert_eq!(report["result"]["maker_fills"], 2);
+    assert_eq!(report["result"]["queue_proxy_partial_fills"], 1);
+    assert_eq!(report["result"]["market_results"][0]["filled_orders"], 1);
+}
+
+#[test]
+fn queue_proxy_balanced_allows_level_decrease_to_reduce_size_ahead_but_not_fill() {
+    let dir = test_dir("queue_proxy_balanced");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            bid_book_line("up", "0.50", "1", "2026-06-01T00:01:02+00:00"),
+            trade_line("up", "0.50", "5", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let conservative = replay(&dir, &events, FillModel::QueueProxyConservative);
+    let balanced = replay(&dir, &events, FillModel::QueueProxyBalanced);
+
+    assert_eq!(conservative["result"]["fills"], 0);
+    assert_eq!(balanced["result"]["fills"], 1);
+    assert_eq!(balanced["result"]["queue_proxy_mode"], "balanced");
+    assert_eq!(balanced["result"]["queue_proxy_partial_fills"], 1);
+}
+
+#[test]
+fn queue_proxy_refuses_market_without_size_ahead_book() {
+    let dir = test_dir("queue_proxy_ineligible");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 0);
+    assert_eq!(
+        report["result"]["queue_proxy_ineligible_markets"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        report["result"]["replay_metrics"]["queue_proxy"]["ineligible_reasons"]
+            ["missing_book_snapshot_at_order_live_ts"],
+        serde_json::json!(1)
     );
 }
 
@@ -810,10 +994,87 @@ fn book_line(token: &str, ask: &str, ts: &str) -> String {
     )
 }
 
+fn bid_book_line(token: &str, bid: &str, size: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"book","payload":{{"token_id":"{token}","bids":[{{"price":"{bid}","size":"{size}"}}],"asks":[{{"price":"0.60","size":"10"}}],"previous_size":"10","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn bid_book_no_level_line(token: &str, bid: &str, size: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"book","payload":{{"token_id":"{token}","bids":[{{"price":"{bid}","size":"{size}"}}],"asks":[{{"price":"0.60","size":"10"}}],"local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn trade_line(token: &str, price: &str, size: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"buy","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn execution_report_line(market_id: &str, token: &str, status: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"execution_report","payload":{{"market_id":"{market_id}","token_id":"{token}","status":"{status}","avg_price":"0.50","filled_size":"5","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn raw_price_change_line(token: &str, bid: &str, size: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"raw_market_event","payload":{{"event_type":"price_change","token_id":"{token}","best_bid":"{bid}","size":"{size}","local_ts":"{ts}","raw_payload":{{"event_type":"price_change","asset_id":"{token}","best_bid":"{bid}","size":"{size}"}}}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
 fn queue_evidence_book_line(token: &str, ask: &str, ts: &str) -> String {
     format!(
         r#"{{"event_type":"book","payload":{{"token_id":"{token}","bids":[{{"price":"0.49","size":"10"}}],"asks":[{{"price":"{ask}","size":"10"}}],"queue_depth":"3","trade_size":"2","previous_size":"12","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
     )
+}
+
+fn frozen_candidates_yaml() -> &'static str {
+    r#"version: 1
+updated_at: "2026-06-14T00:00:00Z"
+research_only: true
+paper_only: true
+enabled_by_default: false
+selection_rule: "Frozen candidates only."
+candidates:
+  - name: "static_baseline"
+    profile: "static"
+    candidate_version: "static_baseline@2026-06-14"
+    config_hash: "sha256:static-baseline-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Control profile for paired validation."
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_quote_style"
+    profile: "dynamic_quote_style"
+    candidate_version: "dynamic_quote_style@2026-06-14"
+    config_hash: "sha256:dynamic-quote-style-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Frozen quote-style candidate."
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "full_deterministic_profile"
+    profile: "full_deterministic_profile"
+    candidate_version: "full_deterministic_profile@2026-06-14"
+    config_hash: "sha256:full-deterministic-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Frozen full deterministic candidate."
+    enabled_by_default: false
+    deployment_allowed: false
+  - name: "dynamic_safety_only"
+    profile: "dynamic_safety_only"
+    candidate_version: "dynamic_safety_only@2026-06-14"
+    config_hash: "sha256:dynamic-safety-only-profile-v1"
+    created_at: "2026-06-14T00:00:00Z"
+    frozen_since: "2026-06-14T00:00:00Z"
+    reason: "Frozen safety-only candidate."
+    enabled_by_default: false
+    deployment_allowed: false
+"#
 }
 
 fn reference_line(price: &str, ts: &str) -> String {
