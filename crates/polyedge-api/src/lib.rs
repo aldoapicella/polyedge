@@ -364,14 +364,23 @@ async fn latest_report(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 async fn daily_report(Path(date): Path<String>) -> impl IntoResponse {
-    let _ = date;
-    match build_pnl_report(&fixture_path()) {
-        Ok(report) => (StatusCode::OK, Json(json!({ "report": report }))),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "detail": error.to_string() })),
-        ),
+    if !valid_daily_report_date(&date) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "detail": "date must be YYYY-MM-DD" })),
+        );
     }
+    (StatusCode::OK, Json(labs::daily_report_payload(&date)))
+}
+
+fn valid_daily_report_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, c)| matches!(index, 4 | 7) || c.is_ascii_digit())
 }
 
 async fn report_job(Path(job_id): Path<String>) -> impl IntoResponse {

@@ -8,7 +8,7 @@ test("anonymous dashboard and backend proxy requests are blocked", async ({ page
   expect(response.status()).toBe(401);
 });
 
-test("owner login unlocks dashboard and q lines draw before midpoint", async ({ page }) => {
+test("owner login unlocks dashboard and q/reference lines draw inside chart", async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -23,19 +23,38 @@ test("owner login unlocks dashboard and q lines draw before midpoint", async ({ 
   await expect(page.getByText("q 4", { exact: true })).toBeVisible();
   await expect(page.getByText("missing UP/DOWN book")).toBeVisible();
 
-  await page.locator('path.recharts-line-curve[name="q Up"]').first().waitFor({ state: "attached" });
-  const qPathStartsBeforeMidpoint = await page.evaluate(() => {
-    return Array.from(document.querySelectorAll('path.recharts-line-curve[name="q Up"]')).some((qPath) => {
-      const chart = qPath.closest(".recharts-wrapper");
-      if (!chart || !qPath.getAttribute("d")?.startsWith("M")) {
-        return false;
-      }
-      const chartWidth = chart.getBoundingClientRect().width;
-      const qPathRect = qPath.getBoundingClientRect();
-      return qPathRect.width > 0 && qPathRect.left - chart.getBoundingClientRect().left < chartWidth / 2;
-    });
+  const mainChart = page.getByText("Market Probability & Price", { exact: true }).locator("xpath=ancestor::section[1]");
+  await mainChart.locator('path.recharts-line-curve[name="q Up"]').waitFor({ state: "attached" });
+  await mainChart.locator('path.recharts-line-curve[name="reference price"]').waitFor({ state: "attached" });
+  await expect(page.getByText("51.0%", { exact: true })).toBeVisible();
+  const linesDrawInsidePlot = await page.evaluate(() => {
+    const mainChart = Array.from(document.querySelectorAll("section")).find((section) =>
+      section.textContent?.includes("Market Probability & Price")
+    );
+    if (!mainChart) {
+      return false;
+    }
+    const visibleLine = (name: string) => {
+      return Array.from(mainChart.querySelectorAll(`path.recharts-line-curve[name="${name}"]`)).some((path) => {
+        const chart = path.closest(".recharts-wrapper");
+        if (!chart || !path.getAttribute("d")?.startsWith("M")) {
+          return false;
+        }
+        const chartRect = chart.getBoundingClientRect();
+        const pathRect = path.getBoundingClientRect();
+        return (
+          pathRect.width > 0 &&
+          pathRect.left - chartRect.left < chartRect.width / 2 &&
+          pathRect.top >= chartRect.top &&
+          pathRect.bottom <= chartRect.bottom
+        );
+      });
+    };
+    return Array.from(mainChart.querySelectorAll('path.recharts-line-curve[name="q Up"]')).some((qPath) => {
+      return qPath.getAttribute("d")?.startsWith("M");
+    }) && visibleLine("q Up") && visibleLine("reference price");
   });
-  expect(qPathStartsBeforeMidpoint).toBe(true);
+  expect(linesDrawInsidePlot).toBe(true);
   expect(consoleErrors).toEqual([]);
 });
 
@@ -348,8 +367,8 @@ function market() {
     is_tradeable: true,
     fair_value: {
       market_id: "market-1",
-      q_up: "0.51",
-      q_down: "0.49",
+      q_up: "51",
+      q_down: "49",
       sigma: 0.2,
       drift_mu: 0,
       model_error: "0.01",
@@ -365,10 +384,10 @@ function chartPayload() {
     range: "full",
     domain: [start, start + 15 * 60 * 1000],
     points: [
-      { bucket: start, time: "2026-06-15T21:00:00Z", qUp: 0.5, qDown: 0.5, distanceBps: 0 },
-      { bucket: start + 60_000, time: "2026-06-15T21:01:00Z", qUp: 0.55, qDown: 0.45, distanceBps: 1 },
-      { bucket: start + 120_000, time: "2026-06-15T21:02:00Z", qUp: 0.52, qDown: 0.48, distanceBps: -1 },
-      { bucket: start + 180_000, time: "2026-06-15T21:03:00Z", qUp: 0.51, qDown: 0.49, distanceBps: 0.5 }
+      { bucket: start, time: "2026-06-15T21:00:00Z", qUp: 50, qDown: 50, upBid: 49, upAsk: 51, referencePrice: 66488.67, distanceBps: 0 },
+      { bucket: start + 60_000, time: "2026-06-15T21:01:00Z", qUp: 55, qDown: 45, upBid: 53, upAsk: 57, referencePrice: 66490.12, distanceBps: 1 },
+      { bucket: start + 120_000, time: "2026-06-15T21:02:00Z", qUp: 52, qDown: 48, upBid: 50, upAsk: 54, referencePrice: 66485.55, distanceBps: -1 },
+      { bucket: start + 180_000, time: "2026-06-15T21:03:00Z", qUp: 51, qDown: 49, upBid: 49, upAsk: 53, referencePrice: 66489, distanceBps: 0.5 }
     ],
     summary: {
       sample_count: 4,

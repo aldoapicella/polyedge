@@ -643,6 +643,21 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     .unwrap();
     assert_eq!(prospective["result"]["status"], "tracking");
     assert_eq!(prospective["result"]["rows"][0]["settled_markets"], 1);
+    let expected_static = baseline["result"]["fill_models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["fill_model"].as_str() == Some("touch_after_250ms"))
+        .unwrap()["net_pnl"]
+        .clone();
+    assert_eq!(
+        prospective["result"]["rows"][0]["static_net_pnl"],
+        expected_static
+    );
+    assert_ne!(
+        prospective["result"]["rows"][0]["static_net_pnl"],
+        Value::String("0".to_owned())
+    );
     assert_eq!(
         prospective["result"]["rows"][0]["ci_95_low"],
         sample["result"]["statistics"]["ci_low"]

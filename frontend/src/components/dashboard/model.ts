@@ -1,4 +1,4 @@
-import { compact, dateTime, numberText, pctText } from "@/lib/format";
+import { compact, dateTime, numberText, pctText, shareValue } from "@/lib/format";
 import type { ExecutionReport, MarketSummary, RuntimeEvent, Snapshot, TradeDecision } from "@/lib/types";
 import type { CollapsedDecision, EventTab, ExecutionFilter, RecorderHealth, TimelineRow, Tone } from "./types";
 
@@ -151,11 +151,8 @@ export function moneyText(value: unknown) {
 }
 
 export function sharePriceText(value: unknown) {
-  if (value === null || value === undefined || value === "") {
-    return "n/a";
-  }
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) {
+  const numeric = shareValue(value);
+  if (numeric === undefined) {
     return "n/a";
   }
   return numeric.toFixed(2);
@@ -371,7 +368,7 @@ function bookPrice(value: unknown) {
   if (!value || typeof value !== "object") {
     return undefined;
   }
-  return finiteNumber((value as Record<string, unknown>).price);
+  return shareValue((value as Record<string, unknown>).price);
 }
 
 function spreadText(bid?: number, ask?: number) {

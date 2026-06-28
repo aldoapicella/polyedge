@@ -45,9 +45,20 @@ export function numberText(value: unknown, digits = 2) {
   });
 }
 
-export function pctText(value: unknown) {
+export function shareValue(value: unknown) {
+  if (value === null || value === undefined || value === "") {
+    return undefined;
+  }
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
+    return undefined;
+  }
+  return Math.abs(numeric) > 1 && Math.abs(numeric) <= 100 ? numeric / 100 : numeric;
+}
+
+export function pctText(value: unknown) {
+  const numeric = shareValue(value);
+  if (numeric === undefined) {
     return "n/a";
   }
   return `${(numeric * 100).toFixed(1)}%`;

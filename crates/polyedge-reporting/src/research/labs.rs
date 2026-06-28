@@ -801,11 +801,16 @@ fn daily_prospective_row_from_reports(
     sample_size: Option<Value>,
     audit: Option<Value>,
 ) -> Result<Value, ResearchError> {
-    let source =
-        merge_optional_reports([final_report.as_ref(), regimes.as_ref(), baseline.as_ref()]);
-    let fill_model = text_at(&source, &["/result/fill_model"]).unwrap_or("touch_after_250ms");
-    let sample = sample_size.as_ref().unwrap_or(&source);
-    json_row(date, fill_model, &source, sample, audit.as_ref())
+    json_row(
+        date,
+        DailyReportSources {
+            final_report: final_report.as_ref(),
+            regimes: regimes.as_ref(),
+            baseline: baseline.as_ref(),
+        },
+        sample_size.as_ref(),
+        audit.as_ref(),
+    )
 }
 
 fn research_blob_client() -> Option<AzureBlobClient> {
@@ -869,19 +874,33 @@ fn merge_optional_reports(values: [Option<&Value>; 3]) -> Value {
     Value::Object(merged)
 }
 
+struct DailyReportSources<'a> {
+    final_report: Option<&'a Value>,
+    regimes: Option<&'a Value>,
+    baseline: Option<&'a Value>,
+}
+
 fn json_row(
     date: &str,
-    fill_model: &str,
-    source: &Value,
-    sample: &Value,
+    reports: DailyReportSources<'_>,
+    sample: Option<&Value>,
     audit: Option<&Value>,
 ) -> Result<Value, ResearchError> {
-    let static_net = find_profile_net(source, "static")
-        .or_else(|| find_profile_net(source, "static_baseline"))
-        .or_else(|| find_fill_model_net(source, fill_model));
-    let dynamic_net = find_profile_net(source, "dynamic_quote_style");
-    let full_net = find_profile_net(source, "full_deterministic_profile");
-    let safety_net = find_profile_net(source, "dynamic_safety_only");
+    let source = merge_optional_reports([reports.final_report, reports.regimes, reports.baseline]);
+    let sample = sample.unwrap_or(&source);
+    let fill_model = text_at(&source, &["/result/fill_model"]).unwrap_or("touch_after_250ms");
+    let static_net = select_regime_profile_net(reports.regimes, "static")
+        .or_else(|| select_regime_profile_net(reports.regimes, "static_baseline"))
+        .or_else(|| select_regime_profile_net(reports.final_report, "static"))
+        .or_else(|| select_regime_profile_net(reports.final_report, "static_baseline"))
+        .or_else(|| select_fill_model_net(reports.baseline, fill_model))
+        .or_else(|| select_fill_model_net(reports.final_report, fill_model));
+    let dynamic_net = select_regime_profile_net(reports.regimes, "dynamic_quote_style")
+        .or_else(|| select_regime_profile_net(reports.final_report, "dynamic_quote_style"));
+    let full_net = select_regime_profile_net(reports.regimes, "full_deterministic_profile")
+        .or_else(|| select_regime_profile_net(reports.final_report, "full_deterministic_profile"));
+    let safety_net = select_regime_profile_net(reports.regimes, "dynamic_safety_only")
+        .or_else(|| select_regime_profile_net(reports.final_report, "dynamic_safety_only"));
     let dynamic_delta = paired_delta(dynamic_net.as_deref(), static_net.as_deref());
     let full_delta = paired_delta(full_net.as_deref(), static_net.as_deref());
     let safety_delta = paired_delta(safety_net.as_deref(), static_net.as_deref());
@@ -895,7 +914,7 @@ fn json_row(
         &["/result/statistics/ci_high", "/statistics/ci_high"],
     );
     let settled_markets = number_at(
-        source,
+        &source,
         &[
             "/result.market_truth_table/result/summary/complete_for_simulation",
             "/result.summary/complete_for_simulation",
@@ -924,8 +943,8 @@ fn json_row(
         "full_deterministic_profile_paired_delta": full_delta.map(|value| value.to_string()),
         "dynamic_safety_only_paired_delta": safety_delta.map(|value| value.to_string()),
         "best_candidate_paired_delta": best_delta.map(|value| value.to_string()),
-        "max_drawdown": find_any_text(source, "max_drawdown"),
-        "cancel_per_fill": find_any_text(source, "cancel_fill_ratio"),
+        "max_drawdown": find_any_text(&source, "max_drawdown"),
+        "cancel_per_fill": find_any_text(&source, "cancel_fill_ratio"),
         "ci_95_low": ci_low,
         "ci_95_high": ci_high,
         "data_quality_status": quality,
@@ -1153,39 +1172,49 @@ fn number_at(value: &Value, pointers: &[&str]) -> Option<Value> {
     })
 }
 
-fn find_profile_net(value: &Value, profile: &str) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            if map.get("profile").and_then(Value::as_str) == Some(profile) {
-                return map
-                    .get("net_pnl")
-                    .and_then(value_to_string)
-                    .or_else(|| map.get("delta_vs_static").and_then(value_to_string));
-            }
-            map.values()
-                .find_map(|child| find_profile_net(child, profile))
-        }
-        Value::Array(values) => values
-            .iter()
-            .find_map(|child| find_profile_net(child, profile)),
-        _ => None,
-    }
+fn select_regime_profile_net(report: Option<&Value>, profile: &str) -> Option<String> {
+    let report = report?;
+    [
+        "/result/comparisons",
+        "/result/profiles",
+        "/result/regime_conditioned_profiles/result/comparisons",
+        "/result/regime_conditioned_profiles/result/profiles",
+    ]
+    .into_iter()
+    .find_map(|pointer| profile_net_in_rows(report.pointer(pointer), profile))
 }
 
-fn find_fill_model_net(value: &Value, fill_model: &str) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            if map.get("fill_model").and_then(Value::as_str) == Some(fill_model) {
-                return map.get("net_pnl").and_then(value_to_string);
-            }
-            map.values()
-                .find_map(|child| find_fill_model_net(child, fill_model))
+fn profile_net_in_rows(rows: Option<&Value>, profile: &str) -> Option<String> {
+    rows?.as_array()?.iter().find_map(|row| {
+        let map = row.as_object()?;
+        if map.get("profile").and_then(Value::as_str) != Some(profile) {
+            return None;
         }
-        Value::Array(values) => values
-            .iter()
-            .find_map(|child| find_fill_model_net(child, fill_model)),
-        _ => None,
-    }
+        map.get("net_pnl")
+            .and_then(value_to_string)
+            .or_else(|| map.get("delta_vs_static").and_then(value_to_string))
+    })
+}
+
+fn select_fill_model_net(report: Option<&Value>, fill_model: &str) -> Option<String> {
+    let report = report?;
+    [
+        "/result/fill_models",
+        "/result/fill_model_sensitivity",
+        "/result/baseline_static_strategy/result/fill_models",
+    ]
+    .into_iter()
+    .find_map(|pointer| fill_model_net_in_rows(report.pointer(pointer), fill_model))
+}
+
+fn fill_model_net_in_rows(rows: Option<&Value>, fill_model: &str) -> Option<String> {
+    rows?.as_array()?.iter().find_map(|row| {
+        let map = row.as_object()?;
+        if map.get("fill_model").and_then(Value::as_str) != Some(fill_model) {
+            return None;
+        }
+        map.get("net_pnl").and_then(value_to_string)
+    })
 }
 
 fn find_any_text(value: &Value, key: &str) -> Option<String> {

@@ -28,6 +28,7 @@ import type {
   Snapshot
 } from "@/lib/types";
 import { thinChartPoints, type ChartPoint, type ChartRange, type ChartSummary, type MarketSeries } from "@/lib/charting";
+import { shareValue } from "@/lib/format";
 
 type FetchOptions = {
   method?: "GET" | "POST";
@@ -409,18 +410,25 @@ function chartPoint(value: unknown): ChartPoint | null {
     bucket,
     time: text(record.time) ?? text(record.ts) ?? text(record.local_ts) ?? new Date(bucket).toISOString()
   };
-  assignNumber(point, "qUp", record.qUp, record.q_up);
-  assignNumber(point, "qDown", record.qDown, record.q_down);
-  assignNumber(point, "upBid", record.upBid, record.up_bid);
-  assignNumber(point, "upAsk", record.upAsk, record.up_ask);
-  assignNumber(point, "downBid", record.downBid, record.down_bid);
-  assignNumber(point, "downAsk", record.downAsk, record.down_ask);
+  assignShareNumber(point, "qUp", record.qUp, record.q_up);
+  assignShareNumber(point, "qDown", record.qDown, record.q_down);
+  assignShareNumber(point, "upBid", record.upBid, record.up_bid);
+  assignShareNumber(point, "upAsk", record.upAsk, record.up_ask);
+  assignShareNumber(point, "downBid", record.downBid, record.down_bid);
+  assignShareNumber(point, "downAsk", record.downAsk, record.down_ask);
   assignNumber(point, "distanceBps", record.distanceBps, record.distance_bps);
   assignNumber(point, "referencePrice", record.referencePrice, record.reference_price);
-  assignNumber(point, "fillPrice", record.fillPrice, record.fill_price);
+  assignShareNumber(point, "fillPrice", record.fillPrice, record.fill_price);
   assignNumber(point, "fillSize", record.fillSize, record.fill_size);
   point.fillOutcome = text(record.fillOutcome) ?? text(record.fill_outcome);
   return point;
+}
+
+function assignShareNumber(point: ChartPoint, key: keyof ChartPoint, ...values: unknown[]) {
+  const value = values.map(shareValue).find((candidate) => candidate !== undefined);
+  if (value !== undefined) {
+    (point as Record<keyof ChartPoint, unknown>)[key] = value;
+  }
 }
 
 function assignNumber(point: ChartPoint, key: keyof ChartPoint, ...values: unknown[]) {

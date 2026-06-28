@@ -1,4 +1,5 @@
 import type { JsonRecord, MarketSummary, RuntimeEvent } from "@/lib/types";
+import { shareValue } from "@/lib/format";
 
 export const MARKET_EVENT_BUFFER_LIMIT = 5000;
 export const MAX_VISIBLE_CHART_POINTS = 900;
@@ -188,8 +189,8 @@ function chartPointFromRuntimeEvent(event: RuntimeEvent, marketId: string): Char
       : {
           bucket,
           time: new Date(bucket).toISOString(),
-          qUp: numeric(event.data.q_up),
-          qDown: numeric(event.data.q_down)
+          qUp: shareValue(event.data.q_up),
+          qDown: shareValue(event.data.q_down)
         };
   }
   if (event.type === "book_update_summary") {
@@ -214,7 +215,7 @@ function chartPointFromRuntimeEvent(event: RuntimeEvent, marketId: string): Char
   if (event.type === "paper_fill" || event.type === "execution_report") {
     const bucket = eventBucket(event.data, event.ts, "local_ts");
     const filledSize = numeric(event.data.filled_size);
-    const fillPrice = numeric(event.data.avg_price);
+    const fillPrice = shareValue(event.data.avg_price);
     if (bucket === undefined || fillPrice === undefined || (filledSize ?? 0) <= 0) {
       return null;
     }
@@ -291,11 +292,11 @@ function hasFill(point: ChartPoint) {
 }
 
 function priceValue(value: unknown) {
-  const direct = numeric(value);
+  const direct = shareValue(value);
   if (direct !== undefined) {
     return direct;
   }
-  return numeric(record(value)?.price);
+  return shareValue(record(value)?.price);
 }
 
 function parseTs(value: string | undefined | null) {

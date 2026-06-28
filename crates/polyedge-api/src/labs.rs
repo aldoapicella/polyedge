@@ -206,18 +206,7 @@ async fn reports_daily(Path(date): Path<String>) -> impl IntoResponse {
         )
             .into_response();
     }
-    let dir = PathBuf::from(REPORT_ROOT).join("daily").join(&date);
-    Json(json!({
-        "date": date,
-        "report": read_json_or_null(dir.join("final_report.json")),
-        "audit": read_json_or_null(dir.join("data_audit.json")),
-        "baseline": read_json_or_null(dir.join("baseline.json")),
-        "regimes": read_json_or_null(dir.join("regimes.json")),
-        "calibration": read_json_or_null(dir.join("calibration.json")),
-        "sample_size": read_json_or_null(dir.join("sample_size.json")),
-        "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
-    }))
-    .into_response()
+    Json(daily_report_payload(&date)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -709,17 +698,7 @@ async fn start_research_job_by_id(
 
 fn read_latest_report_payload() -> Value {
     if let Some(date) = latest_daily_date() {
-        let dir = PathBuf::from(REPORT_ROOT).join("daily").join(&date);
-        return json!({
-            "date": date,
-            "report": read_json_or_null(dir.join("final_report.json")),
-            "audit": read_json_or_null(dir.join("data_audit.json")),
-            "baseline": read_json_or_null(dir.join("baseline.json")),
-            "regimes": read_json_or_null(dir.join("regimes.json")),
-            "calibration": read_json_or_null(dir.join("calibration.json")),
-            "sample_size": read_json_or_null(dir.join("sample_size.json")),
-            "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
-        });
+        return daily_report_payload(&date);
     }
     let root = PathBuf::from(REPORT_ROOT);
     let root_report = json!({
@@ -752,6 +731,20 @@ fn read_latest_report_payload() -> Value {
         "report": Value::Null,
         "detail": "No research daily report exists yet.",
         "artifacts": artifacts_for_prefix("")
+    })
+}
+
+pub(crate) fn daily_report_payload(date: &str) -> Value {
+    let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
+    json!({
+        "date": date,
+        "report": read_json_or_null(dir.join("final_report.json")),
+        "audit": read_json_or_null(dir.join("data_audit.json")),
+        "baseline": read_json_or_null(dir.join("baseline.json")),
+        "regimes": read_json_or_null(dir.join("regimes.json")),
+        "calibration": read_json_or_null(dir.join("calibration.json")),
+        "sample_size": read_json_or_null(dir.join("sample_size.json")),
+        "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
     })
 }
 
@@ -1671,6 +1664,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn daily_report_payload_reads_reports_research_daily_contract() {
+        let date = "2099-12-31";
+        let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
+        let _guard = CleanupPath(dir.clone());
+        fs::create_dir_all(&dir).expect("daily report dir");
+        fs::write(
+            dir.join("sample_size.json"),
+            r#"{"result":{"statistics":{"n":67}}}"#,
+        )
+        .expect("sample size");
+        fs::write(
+            dir.join("final_report.json"),
+            r#"{"result":{"executive_summary":{"recommendation":"collect"}}}"#,
+        )
+        .expect("final report");
+
+        let payload = daily_report_payload(date);
+
+        assert_eq!(payload["date"], date);
+        assert_eq!(payload["sample_size"]["result"]["statistics"]["n"], 67);
+        assert_eq!(
+            payload["report"]["result"]["executive_summary"]["recommendation"],
+            "collect"
+        );
+    }
+
+    #[test]
     fn log_analytics_rows_redact_secret_like_content() {
         let payload = json!({
             "tables": [{
@@ -1709,5 +1729,13 @@ mod tests {
         assert!(job["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("not configured") || detail.contains("hidden")));
+    }
+
+    struct CleanupPath(PathBuf);
+
+    impl Drop for CleanupPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }

@@ -21,7 +21,7 @@ import { EmptyState, Panel, PanelHeader, Pill } from "@/components/ui";
 import { toneDot } from "./model";
 import type { Tone } from "./types";
 
-type ChartToggle = "probability" | "books" | "fills" | "decisions" | "distance" | "markers";
+type ChartToggle = "probability" | "books" | "fills" | "decisions" | "marketPrice" | "distance" | "markers";
 
 export function MarketMainChart({
   points,
@@ -43,11 +43,13 @@ export function MarketMainChart({
     books: true,
     fills: true,
     decisions: true,
+    marketPrice: true,
     distance: false,
     markers: true
   });
   const markers = useMemo(() => eventMarkers(events, active, domain, toggles), [active, domain, events, toggles]);
   const fillPoints = points.filter((point) => point.fillPrice !== undefined);
+  const hasReferencePrice = points.some((point) => point.referencePrice !== undefined);
   return (
     <Panel className="min-w-0 xl:col-span-8">
       <PanelHeader
@@ -71,6 +73,16 @@ export function MarketMainChart({
                 tickFormatter={formatChartTime}
               />
               <YAxis yAxisId="probability" domain={[0, 1]} tick={{ fontSize: 11 }} width={36} />
+              {toggles.marketPrice && hasReferencePrice ? (
+                <YAxis
+                  yAxisId="marketPrice"
+                  orientation="right"
+                  domain={["auto", "auto"]}
+                  tick={{ fontSize: 11 }}
+                  width={72}
+                  tickFormatter={(value) => `$${numberText(value, 0)}`}
+                />
+              ) : null}
               {toggles.distance ? <YAxis yAxisId="distance" orientation="right" tick={{ fontSize: 11 }} width={44} /> : null}
               <Tooltip formatter={(value) => numberText(value, 3)} />
               <Legend />
@@ -87,20 +99,26 @@ export function MarketMainChart({
                   label={{ value: marker.label, fontSize: 10 }}
                 />
               ))}
-              {toggles.probability ? (
-                <>
-                  <Line yAxisId="probability" type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} />
-                  <Line yAxisId="probability" type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} />
-                </>
+              {toggles.marketPrice && hasReferencePrice ? (
+                <Line
+                  yAxisId="marketPrice"
+                  type="monotone"
+                  dataKey="referencePrice"
+                  name="reference price"
+                  stroke="#4b5563"
+                  strokeOpacity={0.65}
+                  dot={false}
+                  strokeWidth={1.6}
+                  connectNulls
+                  isAnimationActive={false}
+                />
               ) : null}
-              {toggles.books ? (
-                <>
-                  <Line yAxisId="probability" type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.5} connectNulls isAnimationActive={false} />
-                  <Line yAxisId="probability" type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
-                  <Line yAxisId="probability" type="monotone" dataKey="downBid" name="DOWN bid" stroke="#a45d13" dot={false} strokeWidth={1.5} connectNulls isAnimationActive={false} />
-                  <Line yAxisId="probability" type="monotone" dataKey="downAsk" name="DOWN ask" stroke="#d49a4e" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls isAnimationActive={false} />
-                </>
-              ) : null}
+              {toggles.probability ? <Line yAxisId="probability" type="monotone" dataKey="qUp" name="q Up" stroke="#18705b" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} /> : null}
+              {toggles.probability ? <Line yAxisId="probability" type="monotone" dataKey="qDown" name="q Down" stroke="#b3363a" dot={false} strokeWidth={2.4} connectNulls isAnimationActive={false} /> : null}
+              {toggles.books ? <Line yAxisId="probability" type="monotone" dataKey="upBid" name="UP bid" stroke="#2f7fcb" dot={false} strokeWidth={1.5} connectNulls isAnimationActive={false} /> : null}
+              {toggles.books ? <Line yAxisId="probability" type="monotone" dataKey="upAsk" name="UP ask" stroke="#74a8dd" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls isAnimationActive={false} /> : null}
+              {toggles.books ? <Line yAxisId="probability" type="monotone" dataKey="downBid" name="DOWN bid" stroke="#a45d13" dot={false} strokeWidth={1.5} connectNulls isAnimationActive={false} /> : null}
+              {toggles.books ? <Line yAxisId="probability" type="monotone" dataKey="downAsk" name="DOWN ask" stroke="#d49a4e" dot={false} strokeWidth={1.5} strokeDasharray="4 4" connectNulls isAnimationActive={false} /> : null}
               {toggles.distance ? (
                 <Line yAxisId="distance" type="monotone" dataKey="distanceBps" name="reference bps" stroke="#17201b" dot={false} strokeWidth={1.8} connectNulls isAnimationActive={false} />
               ) : null}
@@ -128,6 +146,7 @@ function ChartToggleBar({
     { key: "books", label: "bid/ask" },
     { key: "fills", label: "fills" },
     { key: "decisions", label: "decisions" },
+    { key: "marketPrice", label: "market $" },
     { key: "distance", label: "distance" },
     { key: "markers", label: "markers" }
   ];
