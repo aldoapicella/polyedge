@@ -26,6 +26,7 @@ test("owner login unlocks dashboard and q/reference lines draw inside chart", as
   const mainChart = page.getByText("Market Probability & Price", { exact: true }).locator("xpath=ancestor::section[1]");
   await mainChart.locator('path.recharts-line-curve[name="q Up"]').waitFor({ state: "attached" });
   await mainChart.locator('path.recharts-line-curve[name="reference price"]').waitFor({ state: "attached" });
+  await mainChart.locator(".recharts-scatter-symbol").first().waitFor({ state: "attached" });
   await expect(page.getByText("51.0%", { exact: true })).toBeVisible();
   const linesDrawInsidePlot = await page.evaluate(() => {
     const mainChart = Array.from(document.querySelectorAll("section")).find((section) =>
@@ -55,6 +56,19 @@ test("owner login unlocks dashboard and q/reference lines draw inside chart", as
     }) && visibleLine("q Up") && visibleLine("reference price");
   });
   expect(linesDrawInsidePlot).toBe(true);
+  const decisionsAreNotLabeledReferenceLines = await page.evaluate(() => {
+    const mainChart = Array.from(document.querySelectorAll("section")).find((section) =>
+      section.textContent?.includes("Market Probability & Price")
+    );
+    if (!mainChart) {
+      return false;
+    }
+    const referenceLabels = Array.from(mainChart.querySelectorAll(".recharts-reference-line text")).map((node) =>
+      node.textContent?.trim().toLowerCase()
+    );
+    return !referenceLabels.some((label) => label === "quote" || label === "cancel" || label === "decision");
+  });
+  expect(decisionsAreNotLabeledReferenceLines).toBe(true);
   expect(consoleErrors).toEqual([]);
 });
 
@@ -106,7 +120,7 @@ async function installApiMocks(page: Page) {
     await route.fulfill({ json: snapshotPayload() });
   });
   await page.route("**/api/backend/events/recent**", async (route) => {
-    await route.fulfill({ json: { events: [] } });
+    await route.fulfill({ json: { events: decisionEvents() } });
   });
   await page.route("**/api/backend/markets/**/chart?range=full", async (route) => {
     await route.fulfill({ json: chartPayload() });
@@ -399,4 +413,20 @@ function chartPayload() {
       warnings: ["no_book_quote_samples"]
     }
   };
+}
+
+function decisionEvents() {
+  const start = Date.parse("2026-06-15T21:00:00Z");
+  return Array.from({ length: 30 }, (_, index) => {
+    const action = index % 3 === 0 ? "place" : index % 3 === 1 ? "cancel_all" : "hold";
+    return {
+      type: "decision",
+      ts: new Date(start + 3 * 60_000 + index * 500).toISOString(),
+      data: {
+        action,
+        market_id: "market-1",
+        reason: "clustered test decision"
+      }
+    };
+  });
 }

@@ -48,6 +48,7 @@ export function MarketMainChart({
     markers: true
   });
   const markers = useMemo(() => eventMarkers(events, active, domain, toggles), [active, domain, events, toggles]);
+  const decisionPoints = useMemo(() => decisionMarkers(events, domain, toggles), [domain, events, toggles]);
   const fillPoints = points.filter((point) => point.fillPrice !== undefined);
   const hasReferencePrice = points.some((point) => point.referencePrice !== undefined);
   return (
@@ -122,6 +123,9 @@ export function MarketMainChart({
               {toggles.distance ? (
                 <Line yAxisId="distance" type="monotone" dataKey="distanceBps" name="reference bps" stroke="#17201b" dot={false} strokeWidth={1.8} connectNulls isAnimationActive={false} />
               ) : null}
+              <Scatter yAxisId="probability" data={decisionPoints.quote} dataKey="markerY" name="quote decisions" fill="#18705b" isAnimationActive={false} />
+              <Scatter yAxisId="probability" data={decisionPoints.cancel} dataKey="markerY" name="cancel decisions" fill="#b3363a" isAnimationActive={false} />
+              <Scatter yAxisId="probability" data={decisionPoints.other} dataKey="markerY" name="hold decisions" fill="#17201b" isAnimationActive={false} />
               {toggles.fills ? <Scatter yAxisId="probability" data={fillPoints} dataKey="fillPrice" name="paper fills" fill="#a45d13" isAnimationActive={false} /> : null}
             </ComposedChart>
           </ResponsiveContainer>
@@ -195,19 +199,67 @@ function eventMarkers(
   return [...output.values()].sort((left, right) => left.bucket - right.bucket);
 }
 
+function decisionMarkers(events: RuntimeEvent[], domain: [number, number], toggles: Record<ChartToggle, boolean>) {
+  const output = {
+    quote: new Map<number, { bucket: number; markerY: number; count: number }>(),
+    cancel: new Map<number, { bucket: number; markerY: number; count: number }>(),
+    other: new Map<number, { bucket: number; markerY: number; count: number }>()
+  };
+  if (!toggles.markers || !toggles.decisions) {
+    return groupedDecisionMarkers(output);
+  }
+  for (const event of events) {
+    if (event.type !== "decision") {
+      continue;
+    }
+    const bucket = new Date(event.ts).getTime();
+    if (!Number.isFinite(bucket) || bucket < domain[0] || bucket > domain[1]) {
+      continue;
+    }
+    const kind = decisionKind(event);
+    const coalescedBucket = Math.floor(bucket / 10_000) * 10_000;
+    const prior = output[kind].get(coalescedBucket);
+    output[kind].set(coalescedBucket, {
+      bucket,
+      markerY: kind === "quote" ? 0.96 : kind === "cancel" ? 0.04 : 0.1,
+      count: (prior?.count ?? 0) + 1
+    });
+    if (output.quote.size + output.cancel.size + output.other.size >= 80) {
+      break;
+    }
+  }
+  return groupedDecisionMarkers(output);
+}
+
+function groupedDecisionMarkers(output: {
+  quote: Map<number, { bucket: number; markerY: number; count: number }>;
+  cancel: Map<number, { bucket: number; markerY: number; count: number }>;
+  other: Map<number, { bucket: number; markerY: number; count: number }>;
+}) {
+  return {
+    quote: [...output.quote.values()].sort((left, right) => left.bucket - right.bucket),
+    cancel: [...output.cancel.values()].sort((left, right) => left.bucket - right.bucket),
+    other: [...output.other.values()].sort((left, right) => left.bucket - right.bucket)
+  };
+}
+
+function decisionKind(event: RuntimeEvent): "quote" | "cancel" | "other" {
+  const action = String(event.data.action ?? "").toLowerCase();
+  if (action.includes("cancel")) {
+    return "cancel";
+  }
+  if (action.includes("place")) {
+    return "quote";
+  }
+  return "other";
+}
+
 function markerForEvent(event: RuntimeEvent, active: MarketSummary | null | undefined, toggles: Record<ChartToggle, boolean>) {
   if ((event.type === "paper_fill" || event.type === "execution_report") && toggles.fills) {
     return { label: "fill", stroke: "#a45d13" };
   }
-  if (event.type === "decision" && toggles.decisions) {
-    const action = String(event.data.action ?? "decision").toLowerCase();
-    if (action.includes("cancel")) {
-      return { label: "cancel", stroke: "#b3363a", dash: "3 3" };
-    }
-    if (action.includes("place")) {
-      return { label: "quote", stroke: "#18705b", dash: "3 3" };
-    }
-    return { label: "decision", stroke: "#17201b", dash: "2 4" };
+  if (event.type === "decision") {
+    return null;
   }
   if (event.type.includes("regime")) {
     return { label: "regime", stroke: "#2f7fcb", dash: "4 4" };
