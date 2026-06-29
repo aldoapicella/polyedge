@@ -288,31 +288,51 @@ fn managed_identity_token(
     client_id: Option<&str>,
     resource: &str,
 ) -> Result<String, String> {
-    let mut url = format!(
-        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={}",
-        query_component(resource)
-    );
-    if let Some(client_id) = client_id {
-        url.push_str("&client_id=");
-        url.push_str(&query_component(client_id));
-    }
-    let response = agent
+    let identity_endpoint = env::var("IDENTITY_ENDPOINT").ok();
+    let identity_header = env::var("IDENTITY_HEADER").ok();
+    let url = managed_identity_token_url(identity_endpoint.as_deref(), client_id, resource);
+    let mut request = agent
         .get(&url)
         .set("Metadata", "true")
-        .set("Accept", "application/json")
-        .call()
-        .map_err(|error| {
-            format!(
-                "managed identity token unavailable: {}",
-                sanitized_error(error)
-            )
-        })?;
+        .set("Accept", "application/json");
+    if let (Some(_), Some(header)) = (identity_endpoint.as_deref(), identity_header.as_deref()) {
+        request = request.set("X-IDENTITY-HEADER", header);
+    }
+    let response = request.call().map_err(|error| {
+        format!(
+            "managed identity token unavailable: {}",
+            sanitized_error(error)
+        )
+    })?;
     let payload = response_json(response, "managed identity token")?;
     payload["access_token"]
         .as_str()
         .map(str::to_owned)
         .filter(|token| !token.is_empty())
         .ok_or_else(|| "managed identity token response was missing access_token".to_owned())
+}
+
+fn managed_identity_token_url(
+    identity_endpoint: Option<&str>,
+    client_id: Option<&str>,
+    resource: &str,
+) -> String {
+    let mut url = match identity_endpoint {
+        Some(endpoint) if !endpoint.trim().is_empty() => format!(
+            "{}?api-version=2019-08-01&resource={}",
+            endpoint,
+            query_component(resource)
+        ),
+        _ => format!(
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={}",
+            query_component(resource)
+        ),
+    };
+    if let Some(client_id) = client_id {
+        url.push_str("&client_id=");
+        url.push_str(&query_component(client_id));
+    }
+    url
 }
 
 fn container_app_job_log_query(job_name: &str, execution_id: &str) -> String {
@@ -421,5 +441,18 @@ mod tests {
         let query = container_app_job_log_query("polyedge-job", "exec'bad\nvalue");
         assert!(query.contains("let targetExecution = 'exec''bad value';"));
         assert!(!query.contains("exec'bad\nvalue"));
+    }
+
+    #[test]
+    fn managed_identity_token_url_uses_container_apps_endpoint() {
+        let url = managed_identity_token_url(
+            Some("http://127.0.0.1:42356/msi/token"),
+            Some("client/id"),
+            "https://management.azure.com/",
+        );
+        assert_eq!(
+            url,
+            "http://127.0.0.1:42356/msi/token?api-version=2019-08-01&resource=https%3A%2F%2Fmanagement.azure.com%2F&client_id=client%2Fid"
+        );
     }
 }
