@@ -501,6 +501,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: resourceGroup().name
             }
             {
+              name: 'AZURE_LOG_ANALYTICS_WORKSPACE_ID'
+              value: logAnalyticsWorkspace.properties.customerId
+            }
+            {
               name: 'TARGET_ASSET'
               value: 'BTC'
             }
