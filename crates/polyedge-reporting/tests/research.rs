@@ -774,6 +774,29 @@ fn queue_proxy_uses_raw_price_change_size_for_size_ahead() {
 }
 
 #[test]
+fn queue_proxy_counts_better_bid_depth_as_size_ahead() {
+    let dir = test_dir("queue_proxy_better_bid_depth");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.55", "7", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "12", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["avg_size_ahead"], "7");
+    assert_eq!(report["result"]["fills"], 1);
+}
+
+#[test]
 fn queue_proxy_refuses_market_without_level_evidence() {
     let dir = test_dir("queue_proxy_missing_level");
     let events = dir.join("events.jsonl");

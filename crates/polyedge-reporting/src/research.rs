@@ -2982,8 +2982,13 @@ impl OrderBookState {
         self.asks.iter().next().map(|(price, size)| (*price, *size))
     }
 
-    fn bid_size_at(&self, price: Decimal) -> Option<Decimal> {
-        self.bids.get(&price).copied()
+    fn bid_size_at_or_above(&self, price: Decimal) -> Option<Decimal> {
+        let size = self
+            .bids
+            .range(price..)
+            .map(|(_, size)| *size)
+            .sum::<Decimal>();
+        (size > Decimal::ZERO).then_some(size)
     }
 
     fn spread_ticks(&self, tick_size: Decimal) -> Option<f64> {
@@ -3475,7 +3480,7 @@ impl ResearchReplayEngine {
                 .insert("missing_book_snapshot_at_order_live_ts".to_owned());
             return;
         };
-        let Some(size_ahead) = book.bid_size_at(order.price) else {
+        let Some(size_ahead) = book.bid_size_at_or_above(order.price) else {
             evidence
                 .ineligible_reasons
                 .insert("missing_visible_bid_size_at_quote_price".to_owned());
@@ -3500,11 +3505,14 @@ impl ResearchReplayEngine {
                 continue;
             };
             let price = self.orders[index].price;
-            let previous = previous_bids.get(&price).copied().unwrap_or(Decimal::ZERO);
+            let previous = previous_bids
+                .range(price..)
+                .map(|(_, size)| *size)
+                .sum::<Decimal>();
             let current = self
                 .books
                 .get(token_id)
-                .and_then(|book| book.bid_size_at(price))
+                .and_then(|book| book.bid_size_at_or_above(price))
                 .unwrap_or(Decimal::ZERO);
             if previous > current {
                 let reduction = (previous - current).min(size_ahead);
