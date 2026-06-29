@@ -381,11 +381,7 @@ impl ReportBackedQueryBackend {
             "decision_features" => Ok(Vec::new()),
             "fill_candidates" => Ok(Vec::new()),
             "queue_evidence" => Ok(Vec::new()),
-            "queue_proxy_results" => Ok(report_rows(&[
-                "baseline.json",
-                "baseline_static_all_fill_models.json",
-                "regime_profiles.json",
-            ])),
+            "queue_proxy_results" => Ok(queue_proxy_report_rows()),
             "prospective_daily" => Ok(report_rows(&["prospective_validation.json"])),
             "candidate_market_pnl" => Ok(report_rows(&[
                 "prospective_validation.json",
@@ -604,6 +600,71 @@ fn report_rows(file_names: &[&str]) -> Vec<Value> {
     rows
 }
 
+fn queue_proxy_report_rows() -> Vec<Value> {
+    let file_names = ["baseline.json", "baseline_static_all_fill_models.json"];
+    if let Some(rows) = blob_queue_proxy_report_rows(&file_names) {
+        return rows;
+    }
+    let mut rows = Vec::new();
+    collect_queue_proxy_report_rows(Path::new(REPORT_ROOT), &file_names, &mut rows, MAX_LIMIT);
+    rows
+}
+
+fn queue_proxy_rows_from_payload(payload: &Value) -> Vec<Value> {
+    payload
+        .pointer("/result/fill_models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|row| {
+            row["fill_model"]
+                .as_str()
+                .is_some_and(|fill_model| fill_model.contains("queue_proxy"))
+        })
+        .cloned()
+        .collect()
+}
+
+fn blob_queue_proxy_report_rows(file_names: &[&str]) -> Option<Vec<Value>> {
+    let mut client = artifact_blob_client()?;
+    let blobs = client
+        .list_blobs_by_suffixes(
+            &format!("{REPORT_ROOT}/"),
+            file_names,
+            Some(MAX_LIMIT),
+            Some(64 * 1024 * 1024),
+        )
+        .ok()?;
+    let mut rows = Vec::new();
+    for blob in blobs {
+        if rows.len() >= MAX_LIMIT {
+            break;
+        }
+        let Ok(bytes) = client.download_blob_bytes(&blob.name) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let file_name = Path::new(&blob.name)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("report.json");
+        let relative = blob
+            .name
+            .strip_prefix(&format!("{REPORT_ROOT}/"))
+            .unwrap_or(&blob.name)
+            .to_owned();
+        for row in queue_proxy_rows_from_payload(&payload) {
+            rows.push(with_dataset_fields(file_name, &relative, row));
+            if rows.len() >= MAX_LIMIT {
+                return Some(rows);
+            }
+        }
+    }
+    Some(rows)
+}
+
 fn blob_report_rows(file_names: &[&str]) -> Option<Vec<Value>> {
     let mut client = artifact_blob_client()?;
     let blobs = client
@@ -649,6 +710,47 @@ fn blob_report_rows(file_names: &[&str]) -> Option<Vec<Value>> {
         }
     }
     Some(rows)
+}
+
+fn collect_queue_proxy_report_rows(
+    root: &Path,
+    file_names: &[&str],
+    rows: &mut Vec<Value>,
+    limit: usize,
+) {
+    if rows.len() >= limit || !root.exists() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if rows.len() >= limit {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_queue_proxy_report_rows(&path, file_names, rows, limit);
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_names.contains(&file_name) {
+            continue;
+        }
+        let payload = read_json_or_null(&path);
+        if payload.is_null() {
+            continue;
+        }
+        let relative = relative_report_path(&path);
+        for row in queue_proxy_rows_from_payload(&payload) {
+            rows.push(with_dataset_fields(file_name, &relative, row));
+            if rows.len() >= limit {
+                return;
+            }
+        }
+    }
 }
 
 fn collect_report_rows(root: &Path, file_names: &[&str], rows: &mut Vec<Value>, limit: usize) {
@@ -1665,6 +1767,41 @@ mod tests {
         ] {
             assert!(canonical_dataset(dataset).is_ok(), "{dataset}");
         }
+    }
+
+    #[test]
+    fn queue_proxy_rows_are_selected_without_recursive_report_truncation() {
+        let mut fill_models = (0..150)
+            .map(|index| json!({ "fill_model": "touch", "market_id": index, "net_pnl": "0" }))
+            .collect::<Vec<_>>();
+        fill_models.extend([
+            json!({
+                "fill_model": "queue_proxy",
+                "queue_proxy_mode": "legacy_skip",
+                "queue_proxy_enabled": false,
+                "queue_proxy_eligible_markets": 0
+            }),
+            json!({
+                "fill_model": "queue_proxy_conservative",
+                "queue_proxy_mode": "conservative",
+                "queue_proxy_enabled": false,
+                "queue_proxy_eligible_markets": 0
+            }),
+            json!({
+                "fill_model": "queue_proxy_balanced",
+                "queue_proxy_mode": "balanced",
+                "queue_proxy_enabled": false,
+                "queue_proxy_eligible_markets": 0
+            }),
+        ]);
+        let payload = json!({ "result": { "fill_models": fill_models } });
+
+        let rows = queue_proxy_rows_from_payload(&payload);
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["fill_model"], "queue_proxy");
+        assert_eq!(rows[1]["fill_model"], "queue_proxy_conservative");
+        assert_eq!(rows[2]["fill_model"], "queue_proxy_balanced");
     }
 
     #[test]
