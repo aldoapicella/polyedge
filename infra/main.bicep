@@ -738,6 +738,16 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+resource logAnalyticsReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(logAnalyticsWorkspace.id, containerAppIdentity.id, 'log-analytics-reader')
+  scope: logAnalyticsWorkspace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '73c42c96-874c-492b-b04d-ab87d138a893')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource researchJobOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (job, index) in researchJobDefinitions: {
   name: guid(researchJobs[index].id, containerAppIdentity.id, 'research-job-operator')
   scope: researchJobs[index]
