@@ -750,6 +750,30 @@ fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
 }
 
 #[test]
+fn queue_proxy_uses_raw_price_change_size_for_size_ahead() {
+    let dir = test_dir("queue_proxy_price_change_size");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_no_level_line("up", "0.49", "10", "2026-06-01T00:00:30+00:00"),
+            raw_price_change_line("up", "0.50", "5", "2026-06-01T00:00:45+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 1);
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["avg_size_ahead"], "5");
+}
+
+#[test]
 fn queue_proxy_refuses_market_without_level_evidence() {
     let dir = test_dir("queue_proxy_missing_level");
     let events = dir.join("events.jsonl");
@@ -1035,7 +1059,7 @@ fn execution_report_line(market_id: &str, token: &str, status: &str, ts: &str) -
 
 fn raw_price_change_line(token: &str, bid: &str, size: &str, ts: &str) -> String {
     format!(
-        r#"{{"event_type":"raw_market_event","payload":{{"event_type":"price_change","token_id":"{token}","best_bid":"{bid}","size":"{size}","local_ts":"{ts}","raw_payload":{{"event_type":"price_change","asset_id":"{token}","best_bid":"{bid}","size":"{size}"}}}},"recorded_ts":"{ts}"}}"#
+        r#"{{"event_type":"raw_market_event","payload":{{"event_type":"price_change","token_id":"{token}","best_bid":"{bid}","price":"{bid}","size":"{size}","side":"BUY","local_ts":"{ts}","raw_payload":{{"event_type":"price_change","asset_id":"{token}","best_bid":"{bid}","price":"{bid}","size":"{size}","side":"BUY"}}}},"recorded_ts":"{ts}"}}"#
     )
 }
 

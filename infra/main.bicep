@@ -189,10 +189,10 @@ var researchJobDefinitions = [
     name: 'polyedge-daily-research-job'
     triggerType: 'Schedule'
     cron: '30 0 * * *'
-    replicaTimeout: 10800
-    cpu: '2'
-    memory: '4Gi'
-    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; MARKETS="reports/research/daily/$DATE/markets_summary.json"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/baseline.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"'
+    replicaTimeout: 21600
+    cpu: '4'
+    memory: '8Gi'
+    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; MARKETS="reports/research/daily/$DATE/markets_summary.json"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/baseline.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"'
   }
   {
     id: 'prospective-validation'
@@ -208,11 +208,11 @@ var researchJobDefinitions = [
     id: 'compact-replay-index'
     name: 'polyedge-replay-index-job'
     triggerType: 'Schedule'
-    cron: '0 2 * * *'
-    replicaTimeout: 7200
-    cpu: '2'
-    memory: '4Gi'
-    command: 'DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/replay-index/$DATE/normalized"; mkdir -p "data/research/replay-index/$DATE"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-replay-index --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
+    cron: '0 3 * * *'
+    replicaTimeout: 21600
+    cpu: '4'
+    memory: '8Gi'
+    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/replay-index/$DATE/normalized"; mkdir -p "data/research/replay-index/$DATE"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-replay-index --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
   }
   {
     id: 'chart-backfill'
@@ -296,7 +296,7 @@ var logAlerts = [
     name: 'job-failed'
     displayName: 'PolyEdge job failed'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job" | where Log_s has "error" or Log_s has "failed" or Log_s has "panicked"'
+    query: 'union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL | where (ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job") or (JobName_s has "polyedge-" and JobName_s has "-job") | where Reason_s in ("Error", "BackoffLimitExceeded", "DeadlineExceeded", "Failed", "FailedMount", "ErrImagePull", "ImagePullBackOff", "ContainerCrashing") or Log_s has_any ("panicked", "exited with status Failed", "exit code: 1", "exit code 1", "has failed", "failed to", "runtime recorder flush failed")'
   }
   {
     name: 'job-duration-too-long'

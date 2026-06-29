@@ -2744,6 +2744,13 @@ fn is_queue_trade_event(event: &EventLine) -> bool {
     )
 }
 
+fn is_queue_level_event(event: &EventLine) -> bool {
+    matches!(
+        queue_audit_event_type(event).as_str(),
+        "price_change" | "pricechange" | "level_change" | "best_bid_ask" | "bestbidask"
+    )
+}
+
 fn event_text(event: &EventLine, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         event
@@ -3018,11 +3025,15 @@ fn apply_levels(book: &mut BTreeMap<Decimal, Decimal>, levels: Option<&Value>) {
             continue;
         };
         let size = decimal(level.get("size")).unwrap_or(Decimal::ZERO);
-        if size <= Decimal::ZERO {
-            book.remove(&price);
-        } else {
-            book.insert(price, size);
-        }
+        apply_single_level(book, price, size);
+    }
+}
+
+fn apply_single_level(book: &mut BTreeMap<Decimal, Decimal>, price: Decimal, size: Decimal) {
+    if size <= Decimal::ZERO {
+        book.remove(&price);
+    } else {
+        book.insert(price, size);
     }
 }
 
@@ -3230,8 +3241,14 @@ impl ResearchReplayEngine {
             "market_start_price" => self.handle_market_start(&event.payload),
             "reference" => self.handle_reference(&event.payload, event.recorded_ts),
             "book" => self.handle_book(&event.payload, event.recorded_ts),
+            "raw_market_event" if is_queue_level_event(event) => {
+                self.handle_queue_level_event(&event.payload, event.recorded_ts)
+            }
             "raw_market_event" if is_queue_trade_event(event) => {
                 self.handle_queue_trade(&event.payload, event.recorded_ts)
+            }
+            "price_change" | "pricechange" | "level_change" | "best_bid_ask" | "bestbidask" => {
+                self.handle_queue_level_event(&event.payload, event.recorded_ts)
             }
             "last_trade_price" | "last_trade" | "trade" => {
                 self.handle_queue_trade(&event.payload, event.recorded_ts)
@@ -3390,6 +3407,43 @@ impl ResearchReplayEngine {
             return;
         }
         self.fill_open_orders(&token_id, recorded_ts);
+    }
+
+    fn handle_queue_level_event(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
+        if !is_queue_proxy_shadow_model(self.request.fill_model) {
+            return;
+        }
+        let token_id = optional_text(payload, "token_id")
+            .or_else(|| optional_text(payload, "asset_id"))
+            .unwrap_or_default();
+        if token_id.is_empty() {
+            return;
+        }
+        let previous_bids = if self.request.fill_model == FillModel::QueueProxyBalanced {
+            self.books
+                .get(&token_id)
+                .map(|book| book.bids.clone())
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        let book = self.books.entry(token_id.clone()).or_default();
+        if let (Some(price), Some(size)) =
+            (decimal(payload.get("price")), decimal(payload.get("size")))
+        {
+            match text(payload, "side").to_ascii_lowercase().as_str() {
+                "buy" | "bid" => apply_single_level(&mut book.bids, price, size),
+                "sell" | "ask" => apply_single_level(&mut book.asks, price, size),
+                _ => {}
+            }
+        }
+        book.local_ts = parse_datetime(payload.get("local_ts"))
+            .or_else(|| parse_datetime(payload.get("source_ts")))
+            .or(Some(recorded_ts));
+        book.updates += 1;
+        if self.request.fill_model == FillModel::QueueProxyBalanced {
+            self.apply_queue_level_decreases(&token_id, &previous_bids);
+        }
     }
 
     fn record_queue_book_evidence(&mut self, token_id: &str, payload: &Value) {
