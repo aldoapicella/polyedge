@@ -199,7 +199,7 @@ impl AzureLogAnalyticsClient {
         managed_identity_token(
             &self.agent,
             self.client_id.as_deref(),
-            "https://api.loganalytics.azure.com",
+            "https://api.loganalytics.io",
         )
     }
 }
