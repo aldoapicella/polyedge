@@ -343,20 +343,20 @@ fn container_app_job_log_query(job_name: &str, execution_id: &str) -> String {
 let targetExecution = '{execution_id}';
 union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL
 | where TimeGenerated > ago(7d)
-| where tostring(JobName_s) == targetJob
-    or tostring(ContainerAppName_s) == targetJob
-    or tostring(ResourceName) == targetJob
-    or tostring(_ResourceId) has strcat('/jobs/', targetJob)
+| where tostring(column_ifexists('JobName_s', '')) == targetJob
+    or tostring(column_ifexists('ContainerAppName_s', '')) == targetJob
+    or tostring(column_ifexists('ResourceName', '')) == targetJob
+    or tostring(column_ifexists('_ResourceId', '')) has strcat('/jobs/', targetJob)
 | where isempty(targetExecution)
-    or tostring(ExecutionName_s) == targetExecution
-    or tostring(ReplicaName_s) has targetExecution
-    or tostring(ContainerName_s) has targetExecution
-    or tostring(Log_s) has targetExecution
+    or tostring(column_ifexists('ExecutionName_s', '')) == targetExecution
+    or tostring(column_ifexists('ReplicaName_s', '')) has targetExecution
+    or tostring(column_ifexists('ContainerName_s', '')) has targetExecution
+    or tostring(column_ifexists('Log_s', '')) has targetExecution
 | project TimeGenerated,
-          Level = coalesce(tostring(Level_s), tostring(LogLevel_s), ''),
-          Message = coalesce(tostring(Log_s), tostring(Message), tostring(Reason_s), tostring(Type_s), ''),
-          Replica = tostring(ReplicaName_s),
-          Container = tostring(ContainerName_s)
+          Level = coalesce(tostring(column_ifexists('Level_s', '')), tostring(column_ifexists('LogLevel_s', '')), ''),
+          Message = coalesce(tostring(column_ifexists('Log_s', '')), tostring(column_ifexists('Message', '')), tostring(column_ifexists('Reason_s', '')), tostring(column_ifexists('Type_s', '')), ''),
+          Replica = tostring(column_ifexists('ReplicaName_s', '')),
+          Container = tostring(column_ifexists('ContainerName_s', ''))
 | order by TimeGenerated desc
 | take 200"#
     )
@@ -440,6 +440,7 @@ mod tests {
     fn log_query_escapes_execution_id() {
         let query = container_app_job_log_query("polyedge-job", "exec'bad\nvalue");
         assert!(query.contains("let targetExecution = 'exec''bad value';"));
+        assert!(query.contains("column_ifexists('ResourceName', '')"));
         assert!(!query.contains("exec'bad\nvalue"));
     }
 
