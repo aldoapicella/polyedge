@@ -1167,6 +1167,7 @@ fn data_quality_status(audit: Option<&Value>) -> &'static str {
 
 fn is_informational_audit_message(message: &str) -> bool {
     message.ends_with("out-of-order timestamps")
+        || message.starts_with("out-of-order timestamp in ")
         || message.starts_with("azure input listed ")
         || (message.starts_with("0 events skipped by ")
             && message.ends_with("excluded event-time window(s)"))
@@ -1475,11 +1476,17 @@ mod data_quality_tests {
                 "missing_market_ids": 0,
                 "start_price_capture_rate": "0.99",
                 "settlement_rate": "0.99",
-                "warnings": ["8 out-of-order timestamps"],
+                "warnings": [
+                    "azure input listed 1440 blobs / 1 bytes from azure://example",
+                    "0 events skipped by 1 excluded event-time window(s)",
+                    "out-of-order timestamp in events/2026/06/15/04/02.jsonl",
+                    "8 out-of-order timestamps"
+                ],
                 "notices": ["azure blob inventory loaded"]
             }
         });
         assert_eq!(data_quality_status(Some(&audit)), "healthy");
+        assert!(data_quality_reasons(Some(&audit)).is_empty());
     }
 
     #[test]
@@ -1499,5 +1506,12 @@ mod data_quality_tests {
             }
         });
         assert_eq!(data_quality_status(Some(&audit)), "warning");
+        assert_eq!(
+            data_quality_reasons(Some(&audit)),
+            vec![
+                json!("settlement_coverage_below_95pct"),
+                json!("start_price_capture_below_95pct")
+            ]
+        );
     }
 }
