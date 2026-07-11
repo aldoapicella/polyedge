@@ -742,7 +742,16 @@ fn daily_prospective_row(date: &str, dir: &Path) -> Result<Value, ResearchError>
     )?);
     let sample_size = read_optional_json(&dir.join("sample_size.json"))?;
     let audit = read_optional_json(&dir.join("data_audit.json"))?;
-    daily_prospective_row_from_reports(date, final_report, regimes, baseline, sample_size, audit)
+    let execution_quality = read_optional_json(&dir.join("execution_quality.json"))?;
+    daily_prospective_row_from_reports(
+        date,
+        final_report,
+        regimes,
+        baseline,
+        sample_size,
+        audit,
+        execution_quality,
+    )
 }
 
 fn load_azure_daily_prospective_rows(
@@ -788,6 +797,10 @@ fn load_azure_daily_prospective_rows(
             ),
             read_blob_json(&mut client, &format!("{daily_prefix}sample_size.json"))?,
             read_blob_json(&mut client, &format!("{daily_prefix}data_audit.json"))?,
+            read_blob_json(
+                &mut client,
+                &format!("{daily_prefix}execution_quality.json"),
+            )?,
         )?);
     }
     Ok(rows)
@@ -800,6 +813,7 @@ fn daily_prospective_row_from_reports(
     baseline: Option<Value>,
     sample_size: Option<Value>,
     audit: Option<Value>,
+    execution_quality: Option<Value>,
 ) -> Result<Value, ResearchError> {
     json_row(
         date,
@@ -810,6 +824,7 @@ fn daily_prospective_row_from_reports(
         },
         sample_size.as_ref(),
         audit.as_ref(),
+        execution_quality.as_ref(),
     )
 }
 
@@ -885,6 +900,7 @@ fn json_row(
     reports: DailyReportSources<'_>,
     sample: Option<&Value>,
     audit: Option<&Value>,
+    execution_quality: Option<&Value>,
 ) -> Result<Value, ResearchError> {
     let source = merge_optional_reports([reports.final_report, reports.regimes, reports.baseline]);
     let sample = sample.unwrap_or(&source);
@@ -925,6 +941,11 @@ fn json_row(
     )
     .or_else(|| number_at(sample, &["/result/statistics/n", "/statistics/n"]));
     let quality = data_quality_status(audit);
+    let quality_reasons = data_quality_reasons(audit);
+    let execution_quality_gate = execution_quality
+        .and_then(|report| report.pointer("/result/evidence_gate"))
+        .cloned()
+        .unwrap_or_else(|| json!("NOT_AVAILABLE"));
     let recommendation = prospective_recommendation(ci_low, ci_high, dynamic_net.as_deref());
     let dynamic_gate =
         prospective_decision_gate(quality, dynamic_net.as_deref(), dynamic_delta, ci_low);
@@ -948,6 +969,12 @@ fn json_row(
         "ci_95_low": ci_low,
         "ci_95_high": ci_high,
         "data_quality_status": quality,
+        "data_quality_reasons": quality_reasons,
+        "execution_quality_gate": execution_quality_gate,
+        "queue_snapshot_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_coverage")).cloned(),
+        "markout_1s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/1/completion_rate")).cloned(),
+        "markout_5s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/5/completion_rate")).cloned(),
+        "markout_30s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/30/completion_rate")).cloned(),
         "recommendation": recommendation,
         "decision_gate": dynamic_gate,
         "dynamic_quote_style_decision_gate": dynamic_gate,
@@ -1123,7 +1150,7 @@ fn data_quality_status(audit: Option<&Value>) -> &'static str {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|warning| !warning.ends_with("out-of-order timestamps"));
+        .any(|warning| !is_informational_audit_message(warning));
     if duplicate > Decimal::ZERO
         || out_of_order_rate > Decimal::new(1, 5)
         || stale_reference_rate > Decimal::new(1, 3)
@@ -1136,6 +1163,53 @@ fn data_quality_status(audit: Option<&Value>) -> &'static str {
     } else {
         "healthy"
     }
+}
+
+fn is_informational_audit_message(message: &str) -> bool {
+    message.ends_with("out-of-order timestamps")
+        || message.starts_with("azure input listed ")
+        || (message.starts_with("0 events skipped by ")
+            && message.ends_with("excluded event-time window(s)"))
+}
+
+fn data_quality_reasons(audit: Option<&Value>) -> Vec<Value> {
+    let Some(result) = audit.map(|audit| &audit["result"]) else {
+        return vec![json!("audit_not_available")];
+    };
+    let mut reasons = Vec::new();
+    if result["fatal_data_quality_issues"]
+        .as_array()
+        .is_some_and(|issues| !issues.is_empty())
+    {
+        reasons.push(json!("fatal_data_quality_issue"));
+    }
+    if decimal_from_value(&result["malformed_lines"]).unwrap_or(Decimal::ZERO) > Decimal::ZERO {
+        reasons.push(json!("malformed_lines"));
+    }
+    if decimal_from_value(&result["duplicate_estimate"]).unwrap_or(Decimal::ZERO) > Decimal::ZERO {
+        reasons.push(json!("duplicate_events"));
+    }
+    if decimal_from_value(&result["start_price_capture_rate"])
+        .is_some_and(|rate| rate < Decimal::new(95, 2))
+    {
+        reasons.push(json!("start_price_capture_below_95pct"));
+    }
+    if decimal_from_value(&result["settlement_rate"]).is_some_and(|rate| rate < Decimal::new(95, 2))
+    {
+        reasons.push(json!("settlement_coverage_below_95pct"));
+    }
+    for warning in result["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|warning| !is_informational_audit_message(warning))
+    {
+        reasons.push(json!(warning));
+    }
+    reasons.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    reasons.dedup();
+    reasons
 }
 
 fn prospective_recommendation(

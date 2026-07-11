@@ -41,6 +41,7 @@ const MAX_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 1_048_576;
 const NORMALIZE_PROGRESS_INTERVAL_EVENTS: usize = 100_000;
 const ADAPTIVE_LOG_LIMIT: usize = 100;
 const REFERENCE_HISTORY_SECONDS: i64 = 130;
+const MARKOUT_HORIZONS_SECONDS: [i64; 3] = [1, 5, 30];
 const QUEUE_EVIDENCE_KEYS: &[&str] = &[
     "queue_position",
     "queue_ahead",
@@ -235,6 +236,14 @@ pub struct AuditOptions {
 }
 
 #[derive(Clone, Debug)]
+pub struct ExecutionQualityOptions {
+    pub input: PathBuf,
+    pub out: PathBuf,
+    pub markdown: PathBuf,
+    pub exclude_windows: Vec<ExcludedTimeWindow>,
+}
+
+#[derive(Clone, Debug)]
 pub struct NormalizeOptions {
     pub input: PathBuf,
     pub out: PathBuf,
@@ -394,6 +403,44 @@ pub fn run_audit(options: AuditOptions) -> Result<Value, ResearchError> {
         &options.markdown,
         &report,
         &audit_markdown(&report),
+    )?;
+    Ok(report)
+}
+
+pub fn run_execution_quality(options: ExecutionQualityOptions) -> Result<Value, ResearchError> {
+    let start = Instant::now();
+    let mut quality = ExecutionQualityAccumulator::default();
+    let stream = stream_events(
+        &options.input,
+        EventPathMode::ExecutionQuality,
+        &options.exclude_windows,
+        |event| quality.observe(event),
+    )?;
+    let mut result = quality.finish();
+    if let Some(object) = result.as_object_mut() {
+        object.insert("events_scanned".to_owned(), json!(stream.events));
+        object.insert("malformed_lines".to_owned(), json!(stream.malformed_lines));
+        object.insert(
+            "stream_notices".to_owned(),
+            Value::Array(stream.notices.iter().cloned().map(Value::String).collect()),
+        );
+        insert_exclusion_metadata(object, &stream, &options.exclude_windows);
+    }
+    let warnings = result["warnings"].as_array().cloned().unwrap_or_default();
+    let report = envelope(
+        "polyedge-rs research execution-quality",
+        &options.input,
+        "public_l2_shadow",
+        "execution_quality",
+        start.elapsed(),
+        warnings,
+        result,
+    );
+    write_json_and_markdown(
+        &options.out,
+        &options.markdown,
+        &report,
+        &execution_quality_markdown(&report),
     )?;
     Ok(report)
 }
@@ -967,6 +1014,7 @@ enum EventPathMode {
     QueueAudit,
     ChartBackfill,
     Calibration,
+    ExecutionQuality,
 }
 
 #[derive(Clone, Debug)]
@@ -1697,6 +1745,7 @@ fn filtered_normalized_event_paths(paths: &[PathBuf], mode: EventPathMode) -> Ve
             "fair_values.jsonl",
             "other.jsonl",
         ][..],
+        EventPathMode::ExecutionQuality => &["other.jsonl"][..],
     };
     paths
         .iter()
@@ -2039,6 +2088,255 @@ impl AuditAccumulator {
             "fatal_data_quality_issues": if self.total_events == 0 { vec!["no events found"] } else { Vec::<&str>::new() }
         })
     }
+}
+
+#[derive(Default)]
+struct ExecutionQualityAccumulator {
+    registrations: BTreeSet<String>,
+    snapshots: BTreeSet<String>,
+    size_ahead: Vec<Decimal>,
+    queue_fill_events: usize,
+    queue_fill_orders: BTreeSet<String>,
+    partial_fill_events: usize,
+    completed_fill_events: usize,
+    trade_through_events: usize,
+    cancel_latency_ms: Vec<Decimal>,
+    markouts: BTreeMap<i64, Vec<Decimal>>,
+    executable_markouts: BTreeMap<i64, Vec<Decimal>>,
+    markout_pnl: BTreeMap<i64, Decimal>,
+    executable_markout_pnl: BTreeMap<i64, Decimal>,
+    observation_delay_ms: BTreeMap<i64, Vec<Decimal>>,
+    markout_observed: BTreeMap<i64, usize>,
+    markout_missing: BTreeMap<i64, usize>,
+    fill_ids: BTreeSet<String>,
+    probe_events_excluded: usize,
+}
+
+impl ExecutionQualityAccumulator {
+    fn observe(&mut self, event: &EventLine) {
+        if event.payload["probe"].as_bool().unwrap_or(false)
+            || event.event_type.starts_with("execution_quality_probe")
+        {
+            self.probe_events_excluded += 1;
+            return;
+        }
+        let order_id = || optional_text(&event.payload, "order_id");
+        match event.event_type.as_str() {
+            "paper_order_queue_registration" => {
+                if let Some(order_id) = order_id() {
+                    self.registrations.insert(order_id);
+                }
+            }
+            "paper_order_queue_snapshot" => {
+                if let Some(order_id) = order_id() {
+                    self.snapshots.insert(order_id);
+                }
+                if let Some(value) = decimal(event.payload.get("visible_size_ahead_estimate")) {
+                    self.size_ahead.push(value);
+                }
+            }
+            "paper_queue_shadow_fill" => {
+                self.queue_fill_events += 1;
+                if let Some(order_id) = order_id() {
+                    self.queue_fill_orders.insert(order_id);
+                }
+                if event.payload["partial_fill"].as_bool().unwrap_or(false) {
+                    self.partial_fill_events += 1;
+                }
+                if decimal(event.payload.get("shadow_remaining_after"))
+                    .is_some_and(|value| value <= Decimal::ZERO)
+                {
+                    self.completed_fill_events += 1;
+                }
+                if event.payload["strict_trade_through"]
+                    .as_bool()
+                    .unwrap_or(false)
+                {
+                    self.trade_through_events += 1;
+                }
+            }
+            "paper_cancel_latency" => {
+                if let Some(value) = decimal(event.payload.get("cancel_latency_ms")) {
+                    self.cancel_latency_ms.push(value);
+                }
+            }
+            "paper_fill_markout" => self.observe_markout(&event.payload, false),
+            "paper_fill_markout_missing" => self.observe_markout(&event.payload, true),
+            _ => {}
+        }
+    }
+
+    fn observe_markout(&mut self, payload: &Value, missing: bool) {
+        let Some(horizon) = payload.get("horizon_seconds").and_then(Value::as_i64) else {
+            return;
+        };
+        if let Some(fill_id) = optional_text(payload, "fill_id") {
+            self.fill_ids.insert(fill_id);
+        }
+        if missing {
+            *self.markout_missing.entry(horizon).or_insert(0) += 1;
+            return;
+        }
+        *self.markout_observed.entry(horizon).or_insert(0) += 1;
+        if let Some(value) = decimal(payload.get("markout_per_share")) {
+            self.markouts.entry(horizon).or_default().push(value);
+        }
+        if let Some(value) = decimal(payload.get("executable_markout_per_share")) {
+            self.executable_markouts
+                .entry(horizon)
+                .or_default()
+                .push(value);
+        }
+        if let Some(value) = decimal(payload.get("markout_pnl")) {
+            *self.markout_pnl.entry(horizon).or_insert(Decimal::ZERO) += value;
+        }
+        if let Some(value) = decimal(payload.get("executable_markout_pnl")) {
+            *self
+                .executable_markout_pnl
+                .entry(horizon)
+                .or_insert(Decimal::ZERO) += value;
+        }
+        if let Some(value) = decimal(payload.get("observation_delay_ms")) {
+            self.observation_delay_ms
+                .entry(horizon)
+                .or_default()
+                .push(value);
+        }
+    }
+
+    fn finish(self) -> Value {
+        let snapshot_coverage = ratio_f64(self.snapshots.len(), self.registrations.len());
+        let mut warnings = Vec::new();
+        let mut notices = Vec::new();
+        if self.registrations.is_empty() {
+            notices.push(json!("no real paper order queue registrations observed"));
+        } else if snapshot_coverage.is_some_and(|value| value < 0.95) {
+            warnings.push(json!(format!(
+                "queue snapshot coverage below 95%: {}/{}",
+                self.snapshots.len(),
+                self.registrations.len()
+            )));
+        }
+        let horizons = MARKOUT_HORIZONS_SECONDS
+            .into_iter()
+            .map(|horizon| {
+                let observed = self.markout_observed.get(&horizon).copied().unwrap_or(0);
+                let missing = self.markout_missing.get(&horizon).copied().unwrap_or(0);
+                let expected = observed + missing;
+                let completion = ratio_f64(observed, expected);
+                if expected > 0 && completion.is_some_and(|value| value < 0.95) {
+                    warnings.push(json!(format!(
+                        "{horizon}s markout completion below 95%: {observed}/{expected}"
+                    )));
+                }
+                let midpoint = self.markouts.get(&horizon).cloned().unwrap_or_default();
+                let executable = self
+                    .executable_markouts
+                    .get(&horizon)
+                    .cloned()
+                    .unwrap_or_default();
+                let delays = self
+                    .observation_delay_ms
+                    .get(&horizon)
+                    .cloned()
+                    .unwrap_or_default();
+                (
+                    horizon.to_string(),
+                    json!({
+                        "horizon_seconds": horizon,
+                        "expected": expected,
+                        "observed": observed,
+                        "missing": missing,
+                        "completion_rate": completion,
+                        "midpoint": distribution_summary(&midpoint),
+                        "executable": distribution_summary(&executable),
+                        "markout_pnl": self.markout_pnl.get(&horizon).copied().unwrap_or(Decimal::ZERO).to_string(),
+                        "executable_markout_pnl": self.executable_markout_pnl.get(&horizon).copied().unwrap_or(Decimal::ZERO).to_string(),
+                        "observation_delay_ms": distribution_summary(&delays)
+                    }),
+                )
+            })
+            .collect::<Map<String, Value>>();
+        let has_markouts = horizons
+            .values()
+            .any(|row| row["expected"].as_u64().unwrap_or(0) > 0);
+        if !has_markouts {
+            notices.push(json!("no real paper fill markouts observed"));
+        }
+        if self.probe_events_excluded > 0 {
+            notices.push(json!(format!(
+                "{} deterministic probe events excluded from real evidence metrics",
+                self.probe_events_excluded
+            )));
+        }
+        let gate = if self.registrations.is_empty() && !has_markouts {
+            "COLLECTING"
+        } else if warnings.is_empty() {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        json!({
+            "status": gate.to_ascii_lowercase(),
+            "evidence_gate": gate,
+            "queue_position_source": "public_l2_shadow",
+            "registrations": self.registrations.len(),
+            "queue_snapshots": self.snapshots.len(),
+            "queue_snapshot_coverage": snapshot_coverage,
+            "visible_size_ahead": distribution_summary(&self.size_ahead),
+            "queue_shadow_fill_events": self.queue_fill_events,
+            "queue_shadow_filled_orders": self.queue_fill_orders.len(),
+            "partial_fill_events": self.partial_fill_events,
+            "completed_fill_events": self.completed_fill_events,
+            "strict_trade_through_events": self.trade_through_events,
+            "cancel_latency_ms": distribution_summary(&self.cancel_latency_ms),
+            "fill_lifecycles": self.fill_ids.len(),
+            "markouts": Value::Object(horizons),
+            "probe_events_excluded": self.probe_events_excluded,
+            "minimum_queue_snapshot_coverage": 0.95,
+            "minimum_markout_completion": 0.95,
+            "warnings": warnings,
+            "notices": notices,
+            "research_only": true,
+            "live_deployment_allowed": false
+        })
+    }
+}
+
+fn ratio_f64(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator > 0).then_some(numerator as f64 / denominator as f64)
+}
+
+fn distribution_summary(values: &[Decimal]) -> Value {
+    json!({
+        "count": values.len(),
+        "mean": decimal_average_json(values),
+        "p10": decimal_percentile_json(values.to_vec(), 0.10),
+        "p50": decimal_percentile_json(values.to_vec(), 0.50),
+        "p90": decimal_percentile_json(values.to_vec(), 0.90),
+        "p95": decimal_percentile_json(values.to_vec(), 0.95),
+        "positive_rate": ratio_f64(values.iter().filter(|value| **value > Decimal::ZERO).count(), values.len())
+    })
+}
+
+fn execution_quality_markdown(report: &Value) -> String {
+    let result = &report["result"];
+    let markouts = &result["markouts"];
+    format!(
+        "# Execution Quality Report\n\n- Evidence gate: **{}**\n- Queue registrations / snapshots: **{} / {}**\n- Queue snapshot coverage: **{}**\n- Partial / completed shadow fills: **{} / {}**\n- Strict trade-through events: **{}**\n- Cancel latency p50 / p95 ms: **{} / {}**\n- 1s markout completion: **{}**\n- 5s markout completion: **{}**\n- 30s markout completion: **{}**\n\nProbe events are excluded. Metrics are research-only public-L2 shadow evidence and do not establish true venue FIFO rank.\n",
+        result["evidence_gate"].as_str().unwrap_or("COLLECTING"),
+        result["registrations"],
+        result["queue_snapshots"],
+        result["queue_snapshot_coverage"],
+        result["partial_fill_events"],
+        result["completed_fill_events"],
+        result["strict_trade_through_events"],
+        result["cancel_latency_ms"]["p50"],
+        result["cancel_latency_ms"]["p95"],
+        markouts["1"]["completion_rate"],
+        markouts["5"]["completion_rate"],
+        markouts["30"]["completion_rate"]
+    )
 }
 
 struct NormalizedWriters {
@@ -3005,6 +3303,12 @@ struct OrderBookState {
 
 impl OrderBookState {
     fn apply(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
+        // Runtime `book` events are complete snapshots, including the compact
+        // top-of-book snapshots persisted by the active recorder. Treating
+        // them as deltas retains prices that disappeared from the venue and
+        // can eventually manufacture a crossed book and false paper fills.
+        self.bids.clear();
+        self.asks.clear();
         apply_levels(&mut self.bids, payload.get("bids"));
         apply_levels(&mut self.asks, payload.get("asks"));
         self.local_ts = parse_datetime(payload.get("local_ts")).or(Some(recorded_ts));
@@ -3034,10 +3338,16 @@ impl OrderBookState {
     fn spread_ticks(&self, tick_size: Decimal) -> Option<f64> {
         let (bid, _) = self.best_bid()?;
         let (ask, _) = self.best_ask()?;
-        if tick_size <= Decimal::ZERO {
+        if tick_size <= Decimal::ZERO || bid >= ask {
             return None;
         }
         ((ask - bid) / tick_size).to_f64()
+    }
+
+    fn has_valid_top(&self) -> bool {
+        self.best_bid()
+            .zip(self.best_ask())
+            .is_some_and(|((bid, _), (ask, _))| bid < ask)
     }
 
     fn top_size(&self) -> Option<f64> {
@@ -3454,6 +3764,16 @@ impl ResearchReplayEngine {
             if self.request.fill_model == FillModel::QueueProxyBalanced {
                 self.apply_queue_level_decreases(&token_id, &previous_bids);
             }
+            return;
+        }
+        if self
+            .books
+            .get(&token_id)
+            .is_some_and(|book| !book.has_valid_top())
+        {
+            self.warnings.insert(
+                "crossed or incomplete book snapshot skipped before fill evaluation".to_owned(),
+            );
             return;
         }
         self.fill_open_orders(&token_id, recorded_ts);
@@ -4018,10 +4338,8 @@ impl ResearchReplayEngine {
                     .is_some_and(|(start, end)| start <= now && now < end)
             }),
             has_start_price: start_price.is_some(),
-            has_books: up_book.and_then(OrderBookState::best_bid).is_some()
-                && up_book.and_then(OrderBookState::best_ask).is_some()
-                && down_book.and_then(OrderBookState::best_bid).is_some()
-                && down_book.and_then(OrderBookState::best_ask).is_some(),
+            has_books: up_book.is_some_and(OrderBookState::has_valid_top)
+                && down_book.is_some_and(OrderBookState::has_valid_top),
             reference_stale: reference.is_none_or(|reference| reference.stale)
                 || reference.is_some_and(|reference| {
                     now.signed_duration_since(reference.ts).num_milliseconds()
@@ -5889,6 +6207,107 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_book_snapshots_replace_obsolete_levels() {
+        let now = Utc::now();
+        let mut book = OrderBookState::default();
+        book.apply(
+            &json!({
+                "bids": [{"price": "0.60", "size": "5"}],
+                "asks": [{"price": "0.61", "size": "5"}]
+            }),
+            now,
+        );
+        book.apply(
+            &json!({
+                "bids": [{"price": "0.40", "size": "7"}],
+                "asks": [{"price": "0.41", "size": "7"}]
+            }),
+            now + Duration::seconds(1),
+        );
+
+        assert_eq!(book.best_bid().map(|(price, _)| price), Some(d("0.40")));
+        assert_eq!(book.best_ask().map(|(price, _)| price), Some(d("0.41")));
+        assert!(book.has_valid_top());
+        assert!(!book.bids.contains_key(&d("0.60")));
+        assert!(!book.asks.contains_key(&d("0.61")));
+    }
+
+    #[test]
+    fn crossed_books_are_invalid_for_regime_features_and_fills() {
+        let mut book = OrderBookState::default();
+        book.apply(
+            &json!({
+                "bids": [{"price": "0.55", "size": "5"}],
+                "asks": [{"price": "0.54", "size": "5"}]
+            }),
+            Utc::now(),
+        );
+
+        assert!(!book.has_valid_top());
+        assert_eq!(book.spread_ticks(d("0.01")), None);
+    }
+
+    #[test]
+    fn execution_quality_report_tracks_coverage_and_excludes_probes() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        for (event_type, payload) in [
+            (
+                "paper_order_queue_registration",
+                json!({"order_id": "order-1"}),
+            ),
+            (
+                "paper_order_queue_snapshot",
+                json!({"order_id": "order-1", "visible_size_ahead_estimate": "12"}),
+            ),
+            (
+                "paper_queue_shadow_fill",
+                json!({
+                    "order_id": "order-1",
+                    "partial_fill": true,
+                    "strict_trade_through": true,
+                    "shadow_remaining_after": "2"
+                }),
+            ),
+            (
+                "paper_cancel_latency",
+                json!({"order_id": "order-1", "cancel_latency_ms": "7.5"}),
+            ),
+            (
+                "paper_fill_markout",
+                json!({
+                    "fill_id": "fill-1",
+                    "horizon_seconds": 1,
+                    "markout_per_share": "0.01",
+                    "executable_markout_per_share": "0.005",
+                    "markout_pnl": "0.05",
+                    "executable_markout_pnl": "0.025",
+                    "observation_delay_ms": 3
+                }),
+            ),
+            (
+                "paper_order_queue_registration",
+                json!({"order_id": "probe", "probe": true}),
+            ),
+        ] {
+            quality.observe(&EventLine {
+                event_type: event_type.to_owned(),
+                recorded_ts: now,
+                payload,
+                raw: Value::Null,
+            });
+        }
+        let result = quality.finish();
+        assert_eq!(result["registrations"], 1);
+        assert_eq!(result["queue_snapshot_coverage"], 1.0);
+        assert_eq!(result["partial_fill_events"], 1);
+        assert_eq!(result["strict_trade_through_events"], 1);
+        assert_eq!(result["markouts"]["1"]["completion_rate"], 1.0);
+        assert_eq!(result["probe_events_excluded"], 1);
+        assert_eq!(result["evidence_gate"], "PASS");
+    }
 
     #[test]
     fn parses_azure_input_without_credentials_in_uri() {

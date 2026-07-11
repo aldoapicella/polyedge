@@ -54,6 +54,17 @@ crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend:<git-sha>
 
 Do not deploy by local `az acr build` or `az containerapp update`; use the workflow so validation and deployment evidence stay attached to the commit.
 
+After deployment the workflow logs into the dashboard without exposing the
+password, verifies authenticated health/status/snapshot/market/order/fill/
+decision/report routes, asserts paper-only recorder health, runs the
+deterministic execution-quality probe, and rejects any fresh replica restart.
+
+Azure Monitor alerts cover storage ingress, job failures, recorder failures or
+drops, recorder queue depth above 1,000 events, runtime restart/backoff, and a
+Container Apps working set above 750 MiB. The backend emits a compact
+`runtime_health` record every minute so the recorder alerts test numeric values
+instead of matching harmless fields whose value is zero.
+
 ## Frontend Wiring
 
 The frontend container proxies backend traffic to the Rust sidecar:

@@ -44,6 +44,13 @@ Post-only maker decisions:
 
 The replay enforces quote-live delay, TTL, market active window, final no-trade window, stale-book guard, and cancellation state.
 
+Recorded `book` events are complete snapshots, not deltas. Replay replaces the
+prior reconstructed book on every snapshot; retaining absent historical levels
+can manufacture crossed books and false fills. A crossed or incomplete top of
+book now fails closed before fill evaluation and is emitted as a report warning.
+Daily PnL produced before this invariant was enforced must be regenerated before
+it is used for strategy conclusions.
+
 ## Runtime Paper vs Replay
 
 Reports separate two ledgers:
@@ -60,6 +67,19 @@ Queue position, partial-fill, cancellation-latency, trade-through, and markout
 measurement boundaries are defined in
 [`execution-quality-limitations.md`](execution-quality-limitations.md). Public
 level-2 data provides a visible-size-ahead estimate, not a true FIFO rank.
+
+Generate the daily execution-quality evidence report with:
+
+```bash
+polyedge-rs research execution-quality \
+  --input data/research/normalized \
+  --out reports/research/execution_quality.json \
+  --markdown reports/research/execution_quality.md
+```
+
+The evidence gate requires at least 95% queue-snapshot coverage and 95%
+completion for each observed 1/5/30-second markout horizon. A lack of paper
+orders is `COLLECTING`, not a false data-quality failure.
 
 ## Settlement Model
 

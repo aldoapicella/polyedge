@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use polyedge_domain::{
-    BookState, DecisionAction, ExecutionReport, MarketId, OrderId, Side, TokenId, TradeDecision,
+    BookLevel, BookState, DecisionAction, ExecutionReport, MarketId, OrderId, OrderKind, Side,
+    TokenId, TradeDecision,
 };
 use polyedge_feeds::MarketChannelEvent;
 use rust_decimal::Decimal;
@@ -640,6 +641,273 @@ fn decimal_value(value: Option<&Value>) -> Option<Decimal> {
     }
 }
 
+pub(super) fn deterministic_probe(at: DateTime<Utc>) -> Vec<QualityEvent> {
+    let run_id = format!("paper-eq-probe-{}", at.timestamp_micros());
+    let market_id = MarketId::new(format!("{run_id}-market"));
+    let token_id = TokenId::new(format!("{run_id}-token"));
+    let mut tracker = ExecutionQualityTracker::default();
+    let mut events = Vec::new();
+
+    let fill_decision = probe_decision(&market_id, &token_id, "0.50", "5");
+    let fill_report = probe_report(
+        &market_id,
+        &token_id,
+        &format!("{run_id}-fill-order"),
+        "paper_resting",
+        at,
+    );
+    let initial = probe_book(&token_id, at, "0.50", "10", "0.52", "4", true);
+    if let Some(payload) = tracker.register_order(&fill_decision, &fill_report, Some(&initial), 250)
+    {
+        events.push(QualityEvent {
+            event_type: "paper_order_queue_registration",
+            payload,
+        });
+    }
+    events.extend(tracker.observe_book(&probe_book(
+        &token_id,
+        at + Duration::seconds(1),
+        "0.50",
+        "10",
+        "0.52",
+        "4",
+        true,
+    )));
+    events.extend(tracker.observe_market_event(&probe_trade(
+        &market_id,
+        &token_id,
+        at + Duration::seconds(2),
+        "0.49",
+        "16",
+    )));
+    events.extend(tracker.observe_book(&probe_book(
+        &token_id,
+        at + Duration::seconds(3),
+        "0.51",
+        "5",
+        "0.53",
+        "5",
+        false,
+    )));
+    events.extend(tracker.observe_market_event(&probe_trade(
+        &market_id,
+        &token_id,
+        at + Duration::seconds(4),
+        "0.49",
+        "3",
+    )));
+    for seconds in [7, 9, 32, 34] {
+        events.extend(tracker.observe_book(&probe_book(
+            &token_id,
+            at + Duration::seconds(seconds),
+            "0.52",
+            "5",
+            "0.54",
+            "5",
+            false,
+        )));
+    }
+
+    let cancel_decision = probe_decision(&market_id, &token_id, "0.48", "2");
+    let cancel_order_id = format!("{run_id}-cancel-order");
+    let cancel_resting = probe_report(
+        &market_id,
+        &token_id,
+        &cancel_order_id,
+        "paper_resting",
+        at + Duration::seconds(10),
+    );
+    if let Some(payload) =
+        tracker.register_order(&cancel_decision, &cancel_resting, Some(&initial), 250)
+    {
+        events.push(QualityEvent {
+            event_type: "paper_order_queue_registration",
+            payload,
+        });
+    }
+    events.extend(tracker.observe_book(&probe_book(
+        &token_id,
+        at + Duration::seconds(11),
+        "0.48",
+        "8",
+        "0.52",
+        "4",
+        true,
+    )));
+    let mut cancelled = probe_report(
+        &market_id,
+        &token_id,
+        &cancel_order_id,
+        "paper_cancelled",
+        at + Duration::seconds(12),
+    );
+    cancelled.raw.insert(
+        "cancel_requested_ts".to_owned(),
+        json!((at + Duration::milliseconds(11_500)).to_rfc3339()),
+    );
+    events.extend(tracker.observe_execution_report(&cancelled));
+
+    for event in &mut events {
+        if let Value::Object(payload) = &mut event.payload {
+            payload.insert("probe".to_owned(), json!(true));
+            payload.insert("probe_run_id".to_owned(), json!(run_id));
+            payload.insert("changes_live_execution".to_owned(), json!(false));
+        }
+    }
+    let count = |kind: &str| {
+        events
+            .iter()
+            .filter(|event| event.event_type == kind)
+            .count()
+    };
+    let partial_fills = events
+        .iter()
+        .filter(|event| {
+            event.event_type == "paper_queue_shadow_fill"
+                && event.payload["partial_fill"].as_bool() == Some(true)
+        })
+        .count();
+    let completed = count("paper_order_queue_registration") == 2
+        && count("paper_order_queue_snapshot") == 2
+        && count("paper_queue_shadow_fill") == 2
+        && partial_fills == 1
+        && count("paper_cancel_latency") == 1
+        && count("paper_fill_markout") == 6;
+    events.push(QualityEvent {
+        event_type: "execution_quality_probe_completed",
+        payload: json!({
+            "probe": true,
+            "probe_run_id": run_id,
+            "status": if completed { "pass" } else { "fail" },
+            "queue_registrations": count("paper_order_queue_registration"),
+            "queue_snapshots": count("paper_order_queue_snapshot"),
+            "queue_shadow_fills": count("paper_queue_shadow_fill"),
+            "partial_fills": partial_fills,
+            "strict_trade_through_events": events.iter().filter(|event| event.payload["strict_trade_through"].as_bool() == Some(true)).count(),
+            "cancel_latency_events": count("paper_cancel_latency"),
+            "markout_1s": events.iter().filter(|event| event.payload["horizon_seconds"] == 1).count(),
+            "markout_5s": events.iter().filter(|event| event.payload["horizon_seconds"] == 5).count(),
+            "markout_30s": events.iter().filter(|event| event.payload["horizon_seconds"] == 30).count(),
+            "venue_contacted": false,
+            "live_order_placed": false,
+            "changes_live_execution": false,
+            "research_only": true
+        }),
+    });
+    events
+}
+
+fn probe_decision(
+    market_id: &MarketId,
+    token_id: &TokenId,
+    price: &str,
+    size: &str,
+) -> TradeDecision {
+    TradeDecision {
+        action: DecisionAction::Place,
+        market_id: market_id.clone(),
+        condition_id: None,
+        token_id: Some(token_id.clone()),
+        outcome: None,
+        side: Some(Side::Buy),
+        price: decimal_text(Some(price)),
+        size: decimal_text(Some(size)),
+        quote_amount: None,
+        order_kind: Some(OrderKind::PostOnlyGtc),
+        reason: "deterministic paper execution quality probe".to_owned(),
+        ttl_ms: Some(60_000),
+        expected_edge: None,
+        post_only: true,
+        tick_size: Some(Decimal::new(1, 2)),
+        neg_risk: false,
+    }
+}
+
+fn probe_report(
+    market_id: &MarketId,
+    token_id: &TokenId,
+    order_id: &str,
+    status: &str,
+    local_ts: DateTime<Utc>,
+) -> ExecutionReport {
+    ExecutionReport {
+        order_id: Some(OrderId::new(order_id)),
+        market_id: market_id.clone(),
+        token_id: Some(token_id.clone()),
+        status: status.to_owned(),
+        filled_size: Decimal::ZERO,
+        avg_price: None,
+        fee: Decimal::ZERO,
+        local_ts,
+        raw: BTreeMap::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_book(
+    token_id: &TokenId,
+    local_ts: DateTime<Utc>,
+    bid_price: &str,
+    bid_size: &str,
+    ask_price: &str,
+    ask_size: &str,
+    add_better_bid: bool,
+) -> BookState {
+    let mut bids = vec![BookLevel {
+        price: decimal_text(Some(bid_price)).unwrap_or(Decimal::ZERO),
+        size: decimal_text(Some(bid_size)).unwrap_or(Decimal::ZERO),
+    }];
+    if add_better_bid {
+        bids.push(BookLevel {
+            price: Decimal::new(51, 2),
+            size: Decimal::from(4),
+        });
+    }
+    BookState {
+        token_id: token_id.clone(),
+        bids,
+        asks: vec![BookLevel {
+            price: decimal_text(Some(ask_price)).unwrap_or(Decimal::ZERO),
+            size: decimal_text(Some(ask_size)).unwrap_or(Decimal::ZERO),
+        }],
+        last_trade_price: None,
+        exchange_ts: Some(local_ts),
+        local_ts,
+        book_hash: Some("deterministic-probe".to_owned()),
+    }
+}
+
+fn probe_trade(
+    market_id: &MarketId,
+    token_id: &TokenId,
+    recorded_ts: DateTime<Utc>,
+    price: &str,
+    size: &str,
+) -> MarketChannelEvent {
+    MarketChannelEvent {
+        event_type: "trade".to_owned(),
+        recorded_ts,
+        source_ts: Some(recorded_ts),
+        market_id: Some(market_id.to_string()),
+        condition_id: None,
+        token_id: Some(token_id.to_string()),
+        asset_id: Some(token_id.to_string()),
+        side: Some("sell".to_owned()),
+        price: Some(price.to_owned()),
+        size: Some(size.to_owned()),
+        best_bid: None,
+        best_ask: None,
+        book_hash: None,
+        raw_payload: json!({
+            "event_type": "trade",
+            "asset_id": token_id,
+            "side": "sell",
+            "price": price,
+            "size": size
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +981,26 @@ mod tests {
             event.event_type == "paper_fill_markout_missing"
                 && event.payload["reason"] == "market_settled_before_observation"
         }));
+    }
+
+    #[test]
+    fn deterministic_probe_exercises_complete_lifecycle_without_venue_contact() {
+        let events = deterministic_probe(ts(0));
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "execution_quality_probe_completed")
+            .unwrap();
+        assert_eq!(completed.payload["status"], "pass");
+        assert_eq!(completed.payload["queue_registrations"], 2);
+        assert_eq!(completed.payload["queue_snapshots"], 2);
+        assert_eq!(completed.payload["queue_shadow_fills"], 2);
+        assert_eq!(completed.payload["partial_fills"], 1);
+        assert_eq!(completed.payload["cancel_latency_events"], 1);
+        assert_eq!(completed.payload["markout_1s"], 2);
+        assert_eq!(completed.payload["markout_5s"], 2);
+        assert_eq!(completed.payload["markout_30s"], 2);
+        assert_eq!(completed.payload["venue_contacted"], false);
+        assert!(events.iter().all(|event| event.payload["probe"] == true));
     }
 
     fn decision() -> TradeDecision {

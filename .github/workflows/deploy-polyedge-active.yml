@@ -158,6 +158,40 @@ jobs:
           test "$backend_base" = "http://127.0.0.1:8081/api/v1"
           test "$dashboard_secret" = "dashboard-session-secret"
 
+      - name: Authenticated post-deploy smoke and paper probe
+        env:
+          DASHBOARD_AUTH_PASSWORD: ${{ secrets.DASHBOARD_AUTH_PASSWORD }}
+        run: |
+          set -euo pipefail
+          app="${{ steps.deploy_outputs.outputs.container_app_name }}"
+          fqdn="${{ steps.deploy_outputs.outputs.container_app_fqdn }}"
+          login_body=$(jq -nc --arg password "$DASHBOARD_AUTH_PASSWORD" '{password:$password}')
+          ready=false
+          for attempt in $(seq 1 30); do
+            code=$(curl -sS -o login.json -c cookies.txt -w '%{http_code}' \
+              -H 'content-type: application/json' --data "$login_body" \
+              "https://$fqdn/api/auth/login" || true)
+            if [ "$code" = 200 ]; then
+              ready=true
+              break
+            fi
+            sleep 10
+          done
+          unset login_body
+          test "$ready" = true
+          for path in health status snapshot markets/current orders fills decisions reports/latest; do
+            curl --fail --silent --show-error -b cookies.txt \
+              "https://$fqdn/api/backend/$path" -o "smoke-${path//\//-}.json"
+          done
+          jq -e '.ok == true and .backend_impl == "rust" and .execution_mode == "paper"' smoke-health.json
+          jq -e '.execution_mode == "paper" and .task_health.runtime_loop == "running" and .recorder_metrics.failed_total == 0 and .recorder_metrics.queued == 0 and .recorder_status.dropped_count == 0 and .recorder_status.error_count == 0' smoke-status.json
+          curl --fail --silent --show-error -b cookies.txt -X POST \
+            "https://$fqdn/api/backend/execution-quality/probe" -o probe.json
+          jq -e '.status == "pass" and .venue_contacted == false and .live_order_placed == false and .markout_1s == 2 and .markout_5s == 2 and .markout_30s == 2' probe.json
+          revision=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --query properties.latestReadyRevisionName -o tsv)
+          az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --revision "$revision" -o json > replicas.json
+          jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' replicas.json
+
       - name: Print endpoint
         run: |
           echo "https://${{ steps.deploy_outputs.outputs.container_app_fqdn }}"

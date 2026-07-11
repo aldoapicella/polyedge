@@ -8,7 +8,7 @@ mod view;
 use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
-use execution_quality::ExecutionQualityTracker;
+use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
     BookState, DecisionAction, ExecutionReport, MarketId, MarketSpec, ReferencePrice, RuntimeEvent,
@@ -175,6 +175,28 @@ impl RuntimeController {
         }
     }
 
+    pub async fn run_execution_quality_probe(&self) -> Value {
+        let events = deterministic_probe(Utc::now());
+        let summary = events
+            .iter()
+            .find(|event| event.event_type == "execution_quality_probe_completed")
+            .map(|event| event.payload.clone())
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "fail",
+                    "detail": "deterministic probe did not produce a completion event",
+                    "venue_contacted": false,
+                    "live_order_placed": false,
+                    "research_only": true
+                })
+            });
+        for event in events {
+            self.record_event(event.event_type, event.payload, None, None)
+                .await;
+        }
+        summary
+    }
+
     pub fn start_if_configured(&self) {
         if !self.inner.settings.deploy.run_bot_on_startup {
             return;
@@ -186,6 +208,7 @@ impl RuntimeController {
         self.spawn_feed_event_loop(receiver);
         self.spawn_discovery_loop();
         self.spawn_strategy_loop();
+        self.spawn_runtime_telemetry_loop();
         self.spawn_market_feed_loop(sender.clone());
         self.spawn_rtds_loop(sender.clone());
         self.spawn_chainlink_http_loop(sender.clone());
@@ -312,6 +335,34 @@ impl RuntimeController {
             loop {
                 runtime.evaluate_once().await;
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    }
+
+    fn spawn_runtime_telemetry_loop(&self) -> JoinHandle<()> {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let status = runtime.status().await;
+                info!(
+                    "{}",
+                    json!({
+                        "event": "runtime_health",
+                        "execution_mode": status["execution_mode"],
+                        "uptime_seconds": status["uptime"],
+                        "markets": status["markets"],
+                        "books": status["books"],
+                        "recorder_queued": status["recorder_metrics"]["queued"],
+                        "recorder_failed_total": status["recorder_metrics"]["failed_total"],
+                        "recorder_dropped_count": status["recorder_status"]["dropped_count"],
+                        "recorder_error_count": status["recorder_status"]["error_count"],
+                        "runtime_loop": status["task_health"]["runtime_loop"],
+                        "feeds": status["task_health"]["feeds"]
+                    })
+                );
             }
         })
     }

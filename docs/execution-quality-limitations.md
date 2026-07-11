@@ -56,6 +56,25 @@ They include public same-price and better-price depth, visible size ahead,
 trade price/size/aggressor side, strict trade-through, shadow partial size,
 remaining size, and midpoint plus executable 1/5/30-second markouts.
 
+An authenticated operator can run `POST /api/v1/execution-quality/probe`. The
+probe uses an isolated in-memory tracker with synthetic books, trades, fills,
+and cancellation timestamps. It contacts no venue, places no order, records
+`probe=true`, and exercises registration, queue snapshot, partial/full shadow
+fills, strict trade-through, local cancel latency, and all three markout
+horizons. Daily evidence reports exclude probe events so a passing probe cannot
+be mistaken for real coverage.
+
+The daily `execution_quality.json` artifact reports queue-snapshot coverage,
+size-ahead distributions, partial/full shadow fills, trade-through counts,
+cancel-latency percentiles, markout completion and observation delay, and both
+midpoint and executable markout distributions. Its gate is:
+
+```text
+COLLECTING  no real paper lifecycles yet
+PASS        queue snapshots and every observed markout horizon are >= 95%
+FAIL        an observed coverage requirement is below 95%
+```
+
 ## How to Obtain Venue-Real Measurements
 
 Authenticated order lifecycle data can solve order identity, actual partial

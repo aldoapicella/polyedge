@@ -708,6 +708,7 @@ fn read_latest_report_payload() -> Value {
         "regimes": read_json_or_null(root.join("regimes.json")),
         "calibration": read_json_or_null(root.join("calibration.json")),
         "sample_size": read_json_or_null(root.join("sample_size.json")),
+        "execution_quality": read_json_or_null(root.join("execution_quality.json")),
         "artifacts": artifacts_for_prefix("")
     });
     if root_report["report"].is_object()
@@ -744,6 +745,7 @@ pub(crate) fn daily_report_payload(date: &str) -> Value {
         "regimes": read_json_or_null(dir.join("regimes.json")),
         "calibration": read_json_or_null(dir.join("calibration.json")),
         "sample_size": read_json_or_null(dir.join("sample_size.json")),
+        "execution_quality": read_json_or_null(dir.join("execution_quality.json")),
         "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
     })
 }

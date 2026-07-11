@@ -75,6 +75,10 @@ pub fn app(settings: RuntimeSettings) -> Router {
         .route("/api/v1/pnl", get(pnl))
         .route("/api/v1/reports/build", post(build_report))
         .route("/api/v1/reports/latest", get(latest_report))
+        .route(
+            "/api/v1/execution-quality/probe",
+            post(run_execution_quality_probe),
+        )
         .route("/api/v1/reports/daily/:date", get(daily_report))
         .route("/api/v1/reports/:job_id", get(report_job))
         .nest("/api/v1/labs", labs::router())
@@ -361,6 +365,10 @@ async fn latest_report(State(state): State<ApiState>) -> impl IntoResponse {
             })),
         ),
     }
+}
+
+async fn run_execution_quality_probe(State(state): State<ApiState>) -> Json<Value> {
+    Json(state.runtime.run_execution_quality_probe().await)
 }
 
 async fn daily_report(Path(date): Path<String>) -> impl IntoResponse {

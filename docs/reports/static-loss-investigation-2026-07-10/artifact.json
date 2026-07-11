@@ -1,0 +1,198 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Why the Static Replay Reported a $182.63 Loss",
+    "description": "Technical investigation of the 2026-07-09 PolyEdge prospective static result.",
+    "generatedAt": "2026-07-11T05:07:13Z",
+    "cards": [
+      {
+        "id": "reported_loss",
+        "description": "Static touch-after-250ms replay PnL across 73 simulation-complete BTC 15-minute markets.",
+        "dataset": "summary",
+        "sourceId": "regimes_report",
+        "metrics": [
+          { "label": "Reported static PnL", "field": "static_pnl", "format": "currency" },
+          { "label": "Replay fill rate", "field": "replay_fill_rate", "format": "percent" }
+        ]
+      },
+      {
+        "id": "actual_fills",
+        "description": "Runtime paper fills visible through the authenticated production API during the investigation.",
+        "dataset": "summary",
+        "sourceId": "runtime_api",
+        "metrics": [
+          { "label": "Actual runtime fills", "field": "actual_runtime_fills", "format": "number" }
+        ]
+      },
+      {
+        "id": "raw_book_check",
+        "description": "Complete top-of-book observations sampled from four minutes of the worst market.",
+        "dataset": "summary",
+        "sourceId": "raw_event_sample",
+        "metrics": [
+          { "label": "Complete raw books checked", "field": "raw_books_checked", "format": "number" },
+          { "label": "Crossed raw books", "field": "crossed_raw_books", "format": "number" }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "expiry_bucket_pnl",
+        "title": "Static replay PnL by time-to-expiry bucket",
+        "subtitle": "BTC 15-minute markets on 9 July 2026; simulated dollars under touch-after-250ms fills.",
+        "type": "bar",
+        "dataset": "expiry_buckets",
+        "sourceId": "regimes_report",
+        "encodings": {
+          "x": { "field": "bucket", "type": "ordinal", "label": "Time to expiry" },
+          "y": { "field": "pnl", "type": "quantitative", "label": "Simulated PnL", "format": "currency" }
+        },
+        "yAxisTitle": "Simulated PnL (USD)",
+        "valueFormat": "currency",
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "worst_markets",
+        "title": "Largest static replay losses",
+        "subtitle": "Five markets accounted for $125.70 of the displayed loss.",
+        "dataset": "worst_markets",
+        "sourceId": "regimes_report",
+        "defaultSort": { "field": "net_pnl", "direction": "asc" },
+        "density": "compact",
+        "layout": "full",
+        "columns": [
+          { "field": "market_id", "label": "Market", "type": "text" },
+          { "field": "filled_orders", "label": "Simulated fills", "format": "number" },
+          { "field": "net_pnl", "label": "Net PnL", "format": "currency", "movement": true }
+        ]
+      },
+      {
+        "id": "robustness_checks",
+        "title": "Validation and sensitivity checks",
+        "subtitle": "What each independent check establishes and what remains unresolved.",
+        "dataset": "checks",
+        "sourceId": "investigation_notes",
+        "defaultSort": { "field": "order", "direction": "asc" },
+        "density": "compact",
+        "layout": "full",
+        "columns": [
+          { "field": "order", "label": "Step", "format": "number" },
+          { "field": "check", "label": "Check", "type": "text" },
+          { "field": "result", "label": "Result", "type": "text" }
+        ]
+      }
+    ],
+    "sources": [
+      { "id": "regimes_report", "label": "9 July regimes report", "path": "reports/research/daily/2026-07-09/regimes.json", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT -182.625 AS static_pnl, 0.9436936937 AS replay_fill_rate, 73 AS settled_markets, 41 AS losing_markets, 31 AS profitable_markets", "description": "Materialize the reviewed static-profile headline values selected from the regimes artifact.", "tables_used": ["reports/research/daily/2026-07-09/regimes.json"], "executed_at": "2026-07-11T05:07:13Z" } },
+      { "id": "audit_report", "label": "9 July data audit", "path": "reports/research/daily/2026-07-09/data_audit.json", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT 48736190 AS total_events, 99 AS markets_seen, 79 AS markets_settled, 0 AS malformed_lines", "description": "Materialize the reviewed audit coverage and integrity values.", "tables_used": ["reports/research/daily/2026-07-09/data_audit.json"], "executed_at": "2026-07-11T05:07:13Z" } },
+      { "id": "runtime_api", "label": "Authenticated PolyEdge runtime API", "path": "api/v1/fills", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT 0 AS actual_runtime_fills", "description": "Materialize the reviewed authenticated runtime fill count.", "tables_used": ["api/v1/fills"], "executed_at": "2026-07-11T05:07:13Z" } },
+      { "id": "raw_event_sample", "label": "Worst-market raw event sample", "path": "events/2026/07/09/15/{00,05,10,14}.jsonl", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT 65395 AS complete_raw_books, 0 AS crossed_raw_books", "description": "Materialize the reviewed raw-book validation counts for market 2846068.", "tables_used": ["events/2026/07/09/15/{00,05,10,14}.jsonl"], "executed_at": "2026-07-11T05:07:13Z" } },
+      { "id": "investigation_notes", "label": "Investigation reconciliation", "path": "docs/reports/static-loss-investigation-2026-07-10/artifact.json", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT -182.625 AS reported_static_pnl, 0 AS actual_runtime_fills, 65395 AS complete_raw_books, 0 AS crossed_raw_books", "description": "Materialize the reviewed cross-source reconciliation.", "tables_used": ["reports/research/daily/2026-07-09/regimes.json", "api/v1/fills", "events/2026/07/09/15/{00,05,10,14}.jsonl"], "executed_at": "2026-07-11T05:07:13Z" } }
+    ],
+    "blocks": [
+      { "id": "title", "type": "markdown", "body": "# Why the Static Replay Reported a $182.63 Loss" },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "body": "## The loss was a corrupted replay estimate, not an account loss\n\nThe displayed **-$182.625** was produced by the offline `touch_after_250ms` simulation over 73 simulation-complete BTC 15-minute markets. The authenticated runtime API showed **zero actual paper fills**, so no account or runtime paper ledger lost $182.63.\n\nThe primary defect was snapshot semantics: complete `book` snapshots were merged as if they were deltas. Prices that had disappeared remained in replay state, eventually creating impossible negative spreads and permitting false touches. The raw source check found 65,395 complete top-of-book observations and zero crossed books in the sampled worst market, isolating the contradiction to reconstruction rather than the venue feed. Historical PnL must be regenerated with snapshot replacement before it is trusted.",
+        "sourceId": "investigation_notes"
+      },
+      { "id": "headline_metrics", "type": "metric-strip", "cardIds": ["reported_loss", "actual_fills", "raw_book_check"] },
+      {
+        "id": "loss_shape",
+        "type": "markdown",
+        "body": "## The simulated loss was broad but concentrated early in each market\n\nThe replay labeled 41 settled markets as losing and 31 as profitable. The five largest losses summed to **-$125.70**, about 69% of the daily result. Time-to-expiry decomposition placed **-$80.05** in the first three minutes after market open and another **-$56.95** between six and nine minutes to expiry. This pattern is consistent with an over-permissive touch model operating on stale reconstructed levels; it is not proof that the underlying strategy loses at those horizons.",
+        "sourceId": "regimes_report"
+      },
+      { "id": "expiry_chart", "type": "chart", "chartId": "expiry_bucket_pnl" },
+      {
+        "id": "worst_market_summary",
+        "type": "markdown",
+        "body": "**Largest displayed market losses:** 2846068 (-$27.95), 2846619 (-$27.45), 2845706 (-$24.45), 2845944 (-$23.70), and 2839982 (-$21.15)."
+      },
+      {
+        "id": "definitions",
+        "type": "markdown",
+        "body": "## Scope and metric definitions\n\n**Population.** Events recorded on 9 July 2026 UTC for 99 discovered BTC 15-minute markets; 73 had both start and final truth and entered PnL statistics.\n\n**Static PnL.** Settlement value minus simulated maker-fill notional and modeled fees under the `touch_after_250ms` fill rule. It is an offline estimate, not runtime or venue-real PnL.\n\n**Actual runtime fills.** Positive-fill execution reports returned by the authenticated live paper runtime. The count was zero during this investigation.\n\n**Raw book check.** Complete bid and ask top levels extracted for the worst market from minutes 00, 05, 10, and 14 of its 15-minute window."
+      },
+      {
+        "id": "method",
+        "type": "markdown",
+        "body": "## The reconciliation separated metric movement from measurement failure\n\nThe investigation first reproduced the dashboard row from the Azure prospective artifact, then decomposed PnL by market, model, quote probability, and time-to-expiry. It compared the report with the independent runtime fills endpoint and sampled raw `book` events for the worst market. Finally, it traced replay reconstruction and found that `OrderBookState::apply` inserted snapshot levels without clearing prior state.\n\nThe repair replaces every complete book snapshot atomically, rejects crossed or incomplete top-of-book state before fill evaluation, emits a warning when that guard fires, and adds regression tests proving obsolete levels cannot survive a later snapshot."
+      },
+      {
+        "id": "robustness_summary",
+        "type": "markdown",
+        "body": "## Independent checks agree on measurement failure\n\nThe stored report reproduces -$182.625; the authenticated runtime ledger contains zero actual fills; 65,395 sampled raw books were complete and none were crossed; the code trace found stale levels surviving snapshots; and the post-fix snapshot-replacement and crossed-book regression tests pass. The remaining unresolved step is a full-day corrected rerun."
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## Corrected replay still will not equal venue-real execution\n\nThe repair removes a known reconstruction bias, but public level-2 data still cannot reveal true FIFO rank, hidden liquidity, venue acknowledgements, or authenticated partial fills. The new queue and markout instrumentation remains a public-L2 shadow estimate. The 9 July corrected PnL is unresolved until the daily job is rerun with the repaired image; no strategy conclusion should use the old number."
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## Regenerate evidence before changing the strategy\n\n1. Deploy the snapshot replacement and fail-closed guard in paper mode.\n2. Rerun the 9 July daily research job and prospective validation.\n3. Confirm no negative spread enters replay and compare corrected touch, trade-through, and queue-shadow fill rates.\n4. Require at least 95% queue-snapshot and 1/5/30-second markout completion in the daily execution-quality report.\n5. Accumulate clean post-fix days before fitting ML or allocating capital."
+      },
+      {
+        "id": "questions",
+        "type": "markdown",
+        "body": "## Further questions\n\n- How much of prior prospective history changes after clean regeneration?\n- Does the candidate advantage persist under trade-through and queue-shadow evidence?\n- Are executable 5-second and 30-second markouts positive after realistic fill calibration?\n- Do start-price and settlement coverage reach 95% on post-fix primary days?"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-11T05:07:13Z",
+    "status": "ready",
+    "datasets": {
+      "summary": [
+        {
+          "static_pnl": -182.625,
+          "replay_fill_rate": 0.9436936937,
+          "actual_runtime_fills": 0,
+          "raw_books_checked": 65395,
+          "crossed_raw_books": 0,
+          "settled_markets": 73,
+          "losing_markets": 41,
+          "profitable_markets": 31
+        }
+      ],
+      "expiry_buckets": [
+        { "bucket": "15-12m", "pnl": -80.05, "sequence": 1, "market_window": "first 3 minutes", "fill_model": "touch_after_250ms" },
+        { "bucket": "12-9m", "pnl": -26.45, "sequence": 2, "market_window": "minutes 3-6", "fill_model": "touch_after_250ms" },
+        { "bucket": "9-6m", "pnl": -56.95, "sequence": 3, "market_window": "minutes 6-9", "fill_model": "touch_after_250ms" },
+        { "bucket": "6-3m", "pnl": -19.075, "sequence": 4, "market_window": "minutes 9-12", "fill_model": "touch_after_250ms" },
+        { "bucket": "3-1m", "pnl": -3.95, "sequence": 5, "market_window": "minutes 12-14", "fill_model": "touch_after_250ms" },
+        { "bucket": "final 60s", "pnl": 3.85, "sequence": 6, "market_window": "last minute", "fill_model": "touch_after_250ms" }
+      ],
+      "worst_markets": [
+        { "start_utc": "15:00", "market_id": "2846068", "winner": "Up", "filled_orders": 9, "notional_cost": 27.95, "net_pnl": -27.95 },
+        { "start_utc": "16:00", "market_id": "2846619", "winner": "Down", "filled_orders": 8, "notional_cost": 27.45, "net_pnl": -27.45 },
+        { "start_utc": "13:30", "market_id": "2845706", "winner": "Up", "filled_orders": 9, "notional_cost": 29.45, "net_pnl": -24.45 },
+        { "start_utc": "14:30", "market_id": "2845944", "winner": "Up", "filled_orders": 7, "notional_cost": 23.70, "net_pnl": -23.70 },
+        { "start_utc": "01:15", "market_id": "2839982", "winner": "Down", "filled_orders": 9, "notional_cost": 26.15, "net_pnl": -21.15 }
+      ],
+      "checks": [
+        { "order": 1, "check": "Prospective row reproduction", "result": "-$182.625 on 73 settled markets", "interpretation": "The dashboard value matches the stored daily report." },
+        { "order": 2, "check": "Independent runtime ledger", "result": "0 actual fills", "interpretation": "The displayed loss was not realized runtime PnL." },
+        { "order": 3, "check": "Raw top-of-book sample", "result": "65,395 complete; 0 crossed", "interpretation": "The venue-feed sample did not contain the replay's impossible spreads." },
+        { "order": 4, "check": "Code-path trace", "result": "Snapshots merged without clearing", "interpretation": "Obsolete levels caused replay-only crossed state and false touches." },
+        { "order": 5, "check": "Fill-model sensitivity", "result": "Touch -$180.13; trade-through -$177.98", "interpretation": "All book-touch variants inherited the corrupted reconstructed state." },
+        { "order": 6, "check": "Post-fix regression", "result": "Snapshot replacement and crossed-book tests pass", "interpretation": "The known reconstruction failure is now guarded, pending full-day rerun." }
+      ]
+    }
+  },
+  "sources": [
+    { "id": "regimes_report", "label": "9 July regimes report", "path": "reports/research/daily/2026-07-09/regimes.json", "description": "Azure daily profile and market-level PnL artifact generated 10 July 2026.", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT -182.625 AS static_pnl, 0.9436936937 AS replay_fill_rate, 73 AS settled_markets, 41 AS losing_markets, 31 AS profitable_markets", "description": "Materialize the reviewed static-profile headline values selected from the regimes artifact.", "tables_used": ["reports/research/daily/2026-07-09/regimes.json"], "executed_at": "2026-07-11T05:07:13Z" } },
+    { "id": "audit_report", "label": "9 July data audit", "path": "reports/research/daily/2026-07-09/data_audit.json", "description": "Azure event coverage and integrity audit for 9 July 2026 UTC.", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT 48736190 AS total_events, 99 AS markets_seen, 79 AS markets_settled, 0 AS malformed_lines", "description": "Materialize the reviewed audit coverage and integrity values.", "tables_used": ["reports/research/daily/2026-07-09/data_audit.json"], "executed_at": "2026-07-11T05:07:13Z" } },
+    { "id": "runtime_api", "label": "Authenticated PolyEdge runtime API", "path": "api/v1/fills", "description": "Live paper runtime fill ledger queried during the investigation.", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT 0 AS actual_runtime_fills", "description": "Materialize the reviewed authenticated runtime fill count.", "tables_used": ["api/v1/fills"], "executed_at": "2026-07-11T05:07:13Z" } },
+    { "id": "raw_event_sample", "label": "Worst-market raw event sample", "path": "events/2026/07/09/15/{00,05,10,14}.jsonl", "description": "Four sampled minute blobs for market 2846068.", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT 65395 AS complete_raw_books, 0 AS crossed_raw_books", "description": "Materialize the reviewed raw-book validation counts for market 2846068.", "tables_used": ["events/2026/07/09/15/{00,05,10,14}.jsonl"], "executed_at": "2026-07-11T05:07:13Z" } },
+    { "id": "investigation_notes", "label": "Investigation reconciliation", "path": "docs/reports/static-loss-investigation-2026-07-10/artifact.json", "description": "Reviewed reconciliation of report, runtime, raw-event, and code evidence.", "query": { "engine": "sqlite", "language": "sql", "sql": "SELECT -182.625 AS reported_static_pnl, 0 AS actual_runtime_fills, 65395 AS complete_raw_books, 0 AS crossed_raw_books", "description": "Materialize the reviewed cross-source reconciliation.", "tables_used": ["reports/research/daily/2026-07-09/regimes.json", "api/v1/fills", "events/2026/07/09/15/{00,05,10,14}.jsonl"], "executed_at": "2026-07-11T05:07:13Z" } }
+  ]
+}

@@ -192,7 +192,7 @@ var researchJobDefinitions = [
     replicaTimeout: 43200
     cpu: '2'
     memory: '4Gi'
-    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; MARKETS="reports/research/daily/$DATE/markets_summary.json"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/baseline.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"'
+    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; MARKETS="reports/research/daily/$DATE/markets_summary.json"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/execution_quality.json" --markdown "reports/research/daily/$DATE/execution_quality.md"; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/baseline.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"'
   }
   {
     id: 'prospective-validation'
@@ -261,6 +261,15 @@ var storageMetricAlerts = [
     operator: 'LessThanOrEqual'
   }
 ]
+var runtimeMetricAlerts = [
+  {
+    name: 'working-set-over-750mb'
+    displayName: 'PolyEdge container working set over 750 MiB'
+    metricName: 'WorkingSetBytes'
+    threshold: 786432000
+    operator: 'GreaterThan'
+  }
+]
 var logAlerts = [
   {
     name: 'no-new-blob-for-3-minutes'
@@ -284,13 +293,25 @@ var logAlerts = [
     name: 'recorder-failed-total-gt-0'
     displayName: 'PolyEdge recorder failed total > 0'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Log_s has "failed_total" or Log_s has "worker_alive=false"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_failed_total":([0-9]+)\', 1, Log_s)) | where value > 0 or Log_s has "worker_alive=false"'
   }
   {
     name: 'recorder-dropped-count-gt-0'
     displayName: 'PolyEdge recorder dropped count > 0'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Log_s has "dropped_count"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
+  }
+  {
+    name: 'recorder-queue-over-1000'
+    displayName: 'PolyEdge recorder queue over 1000 events'
+    severity: 1
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
+  }
+  {
+    name: 'runtime-container-restarted'
+    displayName: 'PolyEdge runtime container restarted or backed off'
+    severity: 0
+    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
   }
   {
     name: 'job-failed'
@@ -820,6 +841,49 @@ resource storageMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = 
           storage_account: storage.name
           container: storageContainerName
           recommended_action: 'Check PolyEdge data freshness and recorder status.'
+        }
+      }
+    ]
+  }
+}]
+
+resource runtimeMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = [for alert in runtimeMetricAlerts: {
+  name: '${containerAppName}-${alert.name}'
+  location: 'global'
+  tags: tags
+  properties: {
+    description: alert.displayName
+    severity: 1
+    enabled: true
+    scopes: [
+      containerApp.id
+    ]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    autoMitigate: true
+    targetResourceType: 'Microsoft.App/containerApps'
+    targetResourceRegion: location
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: alert.metricName
+          metricName: alert.metricName
+          metricNamespace: 'Microsoft.App/containerApps'
+          operator: alert.operator
+          threshold: alert.threshold
+          timeAggregation: 'Maximum'
+          criterionType: 'StaticThresholdCriterion'
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: actionGroup.id
+        webHookProperties: {
+          environment: environmentName
+          container_app: containerApp.name
+          recommended_action: 'Inspect replica memory, recorder queue, and recent book event volume.'
         }
       }
     ]

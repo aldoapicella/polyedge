@@ -51,6 +51,12 @@ async fn api_contract_routes_remain_reachable() {
         (Method::GET, "/api/v1/pnl", None, StatusCode::OK),
         (
             Method::POST,
+            "/api/v1/execution-quality/probe",
+            None,
+            StatusCode::OK,
+        ),
+        (
+            Method::POST,
             "/api/v1/reports/build",
             Some(json!({})),
             StatusCode::OK,
@@ -145,6 +151,28 @@ async fn api_contract_routes_remain_reachable() {
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), expected_status, "{path}");
     }
+}
+
+#[tokio::test]
+async fn execution_quality_probe_is_deterministic_and_paper_only() {
+    let app = app(RuntimeSettings::default());
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/execution-quality/probe",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["status"], "pass");
+    assert_eq!(payload["venue_contacted"], false);
+    assert_eq!(payload["live_order_placed"], false);
+    assert_eq!(payload["markout_1s"], 2);
+    assert_eq!(payload["markout_5s"], 2);
+    assert_eq!(payload["markout_30s"], 2);
 }
 
 #[tokio::test]
