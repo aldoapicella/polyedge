@@ -611,9 +611,10 @@ impl RuntimeController {
                 .cloned()
         };
         let publish_payload = book_summary(&book, market.as_ref());
+        let recorded_book = compact_recorded_book(&book);
         self.record_event(
             "book",
-            &book,
+            recorded_book,
             Some("book_update_summary"),
             Some(publish_payload),
         )
@@ -1269,6 +1270,18 @@ fn book_summary(book: &BookState, market: Option<&MarketSpec>) -> Value {
     value
 }
 
+fn compact_recorded_book(book: &BookState) -> BookState {
+    BookState {
+        token_id: book.token_id.clone(),
+        bids: book.best_bid().cloned().into_iter().collect(),
+        asks: book.best_ask().cloned().into_iter().collect(),
+        last_trade_price: book.last_trade_price,
+        exchange_ts: book.exchange_ts,
+        local_ts: book.local_ts,
+        book_hash: book.book_hash.clone(),
+    }
+}
+
 fn feed_summary(data: &RuntimeData) -> &'static str {
     if data.feed_status.values().any(|status| {
         status
@@ -1309,10 +1322,48 @@ fn truncate<T>(values: &mut VecDeque<T>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polyedge_domain::BookLevel;
     use serde_json::json;
     use std::fs;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn compact_recorded_book_keeps_replay_top_of_book_without_full_depth() {
+        let book = BookState {
+            token_id: TokenId::new("token"),
+            bids: vec![
+                BookLevel {
+                    price: Decimal::new(50, 2),
+                    size: Decimal::from(5),
+                },
+                BookLevel {
+                    price: Decimal::new(49, 2),
+                    size: Decimal::from(10),
+                },
+            ],
+            asks: vec![
+                BookLevel {
+                    price: Decimal::new(51, 2),
+                    size: Decimal::from(7),
+                },
+                BookLevel {
+                    price: Decimal::new(52, 2),
+                    size: Decimal::from(12),
+                },
+            ],
+            last_trade_price: Some(Decimal::new(50, 2)),
+            exchange_ts: None,
+            local_ts: Utc::now(),
+            book_hash: Some("hash".to_owned()),
+        };
+
+        let compact = compact_recorded_book(&book);
+        assert_eq!(compact.bids.len(), 1);
+        assert_eq!(compact.asks.len(), 1);
+        assert_eq!(compact.bids[0].price, Decimal::new(50, 2));
+        assert_eq!(compact.asks[0].price, Decimal::new(51, 2));
+    }
 
     #[test]
     fn recorder_worker_serializes_burst_without_try_lock_drops() {

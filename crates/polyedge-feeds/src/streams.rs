@@ -364,7 +364,7 @@ fn apply_price_change(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -
         Some(Value::Object(change)) => vec![Value::Object(change.clone())],
         _ => vec![event.clone()],
     };
-    let mut updated = Vec::new();
+    let mut updated_tokens = std::collections::BTreeSet::new();
     for change in changes {
         let token_id = TokenId::new(value_text(
             change
@@ -375,10 +375,9 @@ fn apply_price_change(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -
         if token_id.as_ref().is_empty() {
             continue;
         }
-        let mut book = books
-            .get(&token_id)
-            .cloned()
-            .unwrap_or_else(|| empty_book(token_id.clone()));
+        let book = books
+            .entry(token_id.clone())
+            .or_insert_with(|| empty_book(token_id.clone()));
         if let (Some(side), Some(price), Some(size)) = (
             change.get("side").and_then(Value::as_str),
             decimal(change.get("price")),
@@ -404,12 +403,14 @@ fn apply_price_change(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -
         book.exchange_ts =
             parse_event_ts(change.get("timestamp").or_else(|| event.get("timestamp")));
         book.local_ts = Utc::now();
-        book.book_hash =
-            value_opt_text(event.get("hash").or_else(|| change.get("hash"))).or(book.book_hash);
-        books.insert(token_id, book.clone());
-        updated.push(book);
+        book.book_hash = value_opt_text(event.get("hash").or_else(|| change.get("hash")))
+            .or_else(|| book.book_hash.clone());
+        updated_tokens.insert(token_id);
     }
-    updated
+    updated_tokens
+        .into_iter()
+        .filter_map(|token_id| books.get(&token_id).cloned())
+        .collect()
 }
 
 fn apply_last_trade(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -> Vec<BookState> {
@@ -509,6 +510,13 @@ mod tests {
                 .filter(|event| matches!(event, FeedEvent::RawMarketEvent(_)))
                 .count(),
             2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FeedEvent::Book(_)))
+                .count(),
+            1
         );
         let book = books.get(&TokenId::new("token")).unwrap();
         assert_eq!(book.bids.len(), 3);
