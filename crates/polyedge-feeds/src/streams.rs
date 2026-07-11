@@ -259,10 +259,10 @@ fn handle_market_event(event: &Value, books: &mut BTreeMap<TokenId, BookState>) 
         .map(value_text)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let mut events = vec![FeedEvent::RawMarketEvent(market_channel_event(
-        event,
-        &event_type,
-    ))];
+    let mut events = market_channel_events(event, &event_type)
+        .into_iter()
+        .map(FeedEvent::RawMarketEvent)
+        .collect::<Vec<_>>();
     let books = match event_type.as_str() {
         "book" | "orderbook" | "snapshot" => {
             let book = book_from_snapshot(event);
@@ -277,13 +277,24 @@ fn handle_market_event(event: &Value, books: &mut BTreeMap<TokenId, BookState>) 
     events
 }
 
-fn market_channel_event(event: &Value, event_type: &str) -> MarketChannelEvent {
-    let first_change = event
-        .get("price_changes")
-        .or_else(|| event.get("changes"))
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .unwrap_or(event);
+fn market_channel_events(event: &Value, event_type: &str) -> Vec<MarketChannelEvent> {
+    if matches!(event_type, "price_change" | "pricechange") {
+        if let Some(changes) = event
+            .get("price_changes")
+            .or_else(|| event.get("changes"))
+            .and_then(Value::as_array)
+        {
+            return changes
+                .iter()
+                .map(|change| market_channel_event(event, event_type, change))
+                .collect();
+        }
+    }
+    vec![market_channel_event(event, event_type, event)]
+}
+
+fn market_channel_event(event: &Value, event_type: &str, focus: &Value) -> MarketChannelEvent {
+    let change = focus;
     MarketChannelEvent {
         event_type: if event_type.is_empty() {
             "unknown".to_owned()
@@ -292,58 +303,40 @@ fn market_channel_event(event: &Value, event_type: &str) -> MarketChannelEvent {
         },
         recorded_ts: Utc::now(),
         source_ts: parse_event_ts(
-            event
+            change
                 .get("timestamp")
-                .or_else(|| event.get("ts"))
-                .or_else(|| first_change.get("timestamp"))
-                .or_else(|| first_change.get("ts")),
+                .or_else(|| change.get("ts"))
+                .or_else(|| event.get("timestamp"))
+                .or_else(|| event.get("ts")),
         ),
-        market_id: value_opt_text(
-            event
-                .get("market_id")
-                .or_else(|| first_change.get("market_id")),
-        ),
+        market_id: value_opt_text(change.get("market_id").or_else(|| event.get("market_id"))),
         condition_id: value_opt_text(
-            event
+            change
                 .get("condition_id")
-                .or_else(|| first_change.get("condition_id")),
+                .or_else(|| event.get("condition_id")),
         ),
-        token_id: value_opt_text(
-            event
-                .get("token_id")
-                .or_else(|| first_change.get("token_id")),
-        ),
-        asset_id: value_opt_text(
-            event
-                .get("asset_id")
-                .or_else(|| first_change.get("asset_id")),
-        ),
-        side: value_opt_text(event.get("side").or_else(|| first_change.get("side"))),
-        price: decimal(event.get("price").or_else(|| event.get("last_trade_price")))
-            .or_else(|| decimal(first_change.get("price")))
+        token_id: value_opt_text(change.get("token_id").or_else(|| event.get("token_id"))),
+        asset_id: value_opt_text(change.get("asset_id").or_else(|| event.get("asset_id"))),
+        side: value_opt_text(change.get("side").or_else(|| event.get("side"))),
+        price: decimal(change.get("price"))
+            .or_else(|| decimal(event.get("price").or_else(|| event.get("last_trade_price"))))
             .map(|value| value.to_string()),
-        size: decimal(
-            event
-                .get("size")
-                .or_else(|| event.get("trade_size"))
-                .or_else(|| event.get("last_trade_size")),
-        )
-        .or_else(|| decimal(first_change.get("size")))
-        .map(|value| value.to_string()),
-        best_bid: decimal(
-            event
-                .get("best_bid")
-                .or_else(|| first_change.get("best_bid")),
-        )
-        .map(|value| value.to_string()),
-        best_ask: decimal(
-            event
-                .get("best_ask")
-                .or_else(|| first_change.get("best_ask")),
-        )
-        .map(|value| value.to_string()),
-        book_hash: value_opt_text(event.get("hash").or_else(|| first_change.get("hash"))),
-        raw_payload: event.clone(),
+        size: decimal(change.get("size"))
+            .or_else(|| {
+                decimal(
+                    event
+                        .get("size")
+                        .or_else(|| event.get("trade_size"))
+                        .or_else(|| event.get("last_trade_size")),
+                )
+            })
+            .map(|value| value.to_string()),
+        best_bid: decimal(change.get("best_bid").or_else(|| event.get("best_bid")))
+            .map(|value| value.to_string()),
+        best_ask: decimal(change.get("best_ask").or_else(|| event.get("best_ask")))
+            .map(|value| value.to_string()),
+        book_hash: value_opt_text(change.get("hash").or_else(|| event.get("hash"))),
+        raw_payload: focus.clone(),
     }
 }
 
@@ -368,8 +361,8 @@ fn book_from_snapshot(event: &Value) -> BookState {
 fn apply_price_change(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -> Vec<BookState> {
     let changes = match event.get("price_changes").or_else(|| event.get("changes")) {
         Some(Value::Array(items)) => items.clone(),
-        Some(Value::Object(_)) => vec![event.clone()],
-        _ => Vec::new(),
+        Some(Value::Object(change)) => vec![Value::Object(change.clone())],
+        _ => vec![event.clone()],
     };
     let mut updated = Vec::new();
     for change in changes {
@@ -386,21 +379,33 @@ fn apply_price_change(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -
             .get(&token_id)
             .cloned()
             .unwrap_or_else(|| empty_book(token_id.clone()));
-        if let Some(best_bid) = decimal(change.get("best_bid")) {
-            book.bids = vec![BookLevel {
-                price: best_bid,
-                size: Decimal::ZERO,
-            }];
-        }
-        if let Some(best_ask) = decimal(change.get("best_ask")) {
-            book.asks = vec![BookLevel {
-                price: best_ask,
-                size: Decimal::ZERO,
-            }];
+        if let (Some(side), Some(price), Some(size)) = (
+            change.get("side").and_then(Value::as_str),
+            decimal(change.get("price")),
+            decimal(change.get("size")),
+        ) {
+            let levels = if side.eq_ignore_ascii_case("buy") {
+                &mut book.bids
+            } else if side.eq_ignore_ascii_case("sell") {
+                &mut book.asks
+            } else {
+                continue;
+            };
+            levels.retain(|level| level.price != price);
+            if size > Decimal::ZERO {
+                levels.push(BookLevel { price, size });
+            }
+            if side.eq_ignore_ascii_case("buy") {
+                levels.sort_by(|left, right| right.price.cmp(&left.price));
+            } else {
+                levels.sort_by(|left, right| left.price.cmp(&right.price));
+            }
         }
         book.exchange_ts =
             parse_event_ts(change.get("timestamp").or_else(|| event.get("timestamp")));
         book.local_ts = Utc::now();
+        book.book_hash =
+            value_opt_text(event.get("hash").or_else(|| change.get("hash"))).or(book.book_hash);
         books.insert(token_id, book.clone());
         updated.push(book);
     }
@@ -469,4 +474,121 @@ fn extract_timestamp(payload: &Value) -> Option<chrono::DateTime<Utc>> {
     candidates
         .into_iter()
         .find_map(|candidate| parse_ms_timestamp(candidate).or_else(|| parse_datetime(candidate)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn price_change_preserves_depth_and_emits_each_child_as_raw_evidence() {
+        let mut books = BTreeMap::new();
+        let snapshot = json!({
+            "event_type": "book",
+            "asset_id": "token",
+            "bids": [
+                {"price": "0.49", "size": "10"},
+                {"price": "0.48", "size": "8"}
+            ],
+            "asks": [{"price": "0.51", "size": "7"}]
+        });
+        handle_market_event(&snapshot, &mut books);
+
+        let change = json!({
+            "event_type": "price_change",
+            "timestamp": "2026-07-10T00:00:00Z",
+            "price_changes": [
+                {"asset_id": "token", "side": "BUY", "price": "0.49", "size": "6"},
+                {"asset_id": "token", "side": "BUY", "price": "0.50", "size": "4"}
+            ]
+        });
+        let events = handle_market_event(&change, &mut books);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, FeedEvent::RawMarketEvent(_)))
+                .count(),
+            2
+        );
+        let book = books.get(&TokenId::new("token")).unwrap();
+        assert_eq!(book.bids.len(), 3);
+        assert_eq!(book.bids[0].price, Decimal::new(50, 2));
+        assert_eq!(book.bids[0].size, Decimal::from(4));
+        assert_eq!(book.bids[1].price, Decimal::new(49, 2));
+        assert_eq!(book.bids[1].size, Decimal::from(6));
+        assert_eq!(book.bids[2].price, Decimal::new(48, 2));
+    }
+
+    #[test]
+    fn zero_size_price_change_removes_only_the_target_level() {
+        let token = TokenId::new("token");
+        let mut books = BTreeMap::from([(
+            token.clone(),
+            BookState {
+                token_id: token.clone(),
+                bids: vec![
+                    BookLevel {
+                        price: Decimal::new(50, 2),
+                        size: Decimal::from(4),
+                    },
+                    BookLevel {
+                        price: Decimal::new(49, 2),
+                        size: Decimal::from(6),
+                    },
+                ],
+                asks: Vec::new(),
+                last_trade_price: None,
+                exchange_ts: None,
+                local_ts: Utc::now(),
+                book_hash: None,
+            },
+        )]);
+        apply_price_change(
+            &json!({
+                "price_changes": [
+                    {"asset_id": "token", "side": "BUY", "price": "0.50", "size": "0"}
+                ]
+            }),
+            &mut books,
+        );
+        let book = books.get(&token).unwrap();
+        assert_eq!(book.bids.len(), 1);
+        assert_eq!(book.bids[0].price, Decimal::new(49, 2));
+    }
+
+    #[test]
+    fn direct_price_change_is_applied_and_child_fields_take_priority() {
+        let mut books = BTreeMap::new();
+        let direct = json!({
+            "event_type": "price_change",
+            "asset_id": "token",
+            "side": "BUY",
+            "price": "0.50",
+            "size": "3"
+        });
+        handle_market_event(&direct, &mut books);
+        assert_eq!(books[&TokenId::new("token")].bids[0].size, Decimal::from(3));
+
+        let nested = json!({
+            "event_type": "price_change",
+            "asset_id": "wrong-parent-token",
+            "price": "0.10",
+            "size": "99",
+            "price_changes": [
+                {"asset_id": "token", "side": "BUY", "price": "0.50", "size": "2"}
+            ]
+        });
+        let events = handle_market_event(&nested, &mut books);
+        let raw = events
+            .iter()
+            .find_map(|event| match event {
+                FeedEvent::RawMarketEvent(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(raw.asset_id.as_deref(), Some("token"));
+        assert_eq!(raw.price.as_deref(), Some("0.50"));
+        assert_eq!(raw.size.as_deref(), Some("2"));
+        assert_eq!(books[&TokenId::new("token")].bids[0].size, Decimal::from(2));
+    }
 }

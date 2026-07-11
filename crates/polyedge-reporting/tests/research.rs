@@ -1070,7 +1070,7 @@ fn bid_book_no_level_line(token: &str, bid: &str, size: &str, ts: &str) -> Strin
 
 fn trade_line(token: &str, price: &str, size: &str, ts: &str) -> String {
     format!(
-        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"buy","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"sell","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
     )
 }
 

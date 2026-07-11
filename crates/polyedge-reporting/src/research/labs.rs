@@ -1096,14 +1096,45 @@ fn data_quality_status(audit: Option<&Value>) -> &'static str {
     let Some(audit) = audit else {
         return "unknown";
     };
-    if audit
-        .pointer("/result/warnings")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
+    let result = &audit["result"];
+    let fatal = result["fatal_data_quality_issues"]
+        .as_array()
+        .is_some_and(|issues| !issues.is_empty());
+    let total_events = decimal_from_value(&result["total_events"]).unwrap_or(Decimal::ZERO);
+    let malformed = decimal_from_value(&result["malformed_lines"]).unwrap_or(Decimal::ZERO);
+    if fatal || total_events <= Decimal::ZERO || malformed > Decimal::ZERO {
+        return "critical";
+    }
+    let duplicate = decimal_from_value(&result["duplicate_estimate"]).unwrap_or(Decimal::ZERO);
+    let out_of_order =
+        decimal_from_value(&result["out_of_order_timestamps"]).unwrap_or(Decimal::ZERO);
+    let stale_references =
+        decimal_from_value(&result["stale_reference_count"]).unwrap_or(Decimal::ZERO);
+    let missing_market_ids =
+        decimal_from_value(&result["missing_market_ids"]).unwrap_or(Decimal::ZERO);
+    let start_capture =
+        decimal_from_value(&result["start_price_capture_rate"]).unwrap_or(Decimal::ZERO);
+    let settlement = decimal_from_value(&result["settlement_rate"]).unwrap_or(Decimal::ZERO);
+    let out_of_order_rate = out_of_order / total_events;
+    let stale_reference_rate = stale_references / total_events;
+    let missing_market_rate = missing_market_ids / total_events;
+    let unexpected_warning = result["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|warning| !warning.ends_with("out-of-order timestamps"));
+    if duplicate > Decimal::ZERO
+        || out_of_order_rate > Decimal::new(1, 5)
+        || stale_reference_rate > Decimal::new(1, 3)
+        || missing_market_rate > Decimal::new(1, 3)
+        || start_capture < Decimal::new(95, 2)
+        || settlement < Decimal::new(95, 2)
+        || unexpected_warning
     {
-        "healthy"
-    } else {
         "warning"
+    } else {
+        "healthy"
     }
 }
 
@@ -1351,4 +1382,48 @@ fn chart_backfill_markdown(report: &Value) -> String {
             .as_str()
             .unwrap_or("unknown")
     )
+}
+
+#[cfg(test)]
+mod data_quality_tests {
+    use super::*;
+
+    #[test]
+    fn informational_inventory_and_negligible_timestamp_disorder_are_healthy() {
+        let audit = json!({
+            "result": {
+                "fatal_data_quality_issues": [],
+                "total_events": 100_000_000,
+                "malformed_lines": 0,
+                "duplicate_estimate": 0,
+                "out_of_order_timestamps": 8,
+                "stale_reference_count": 0,
+                "missing_market_ids": 0,
+                "start_price_capture_rate": "0.99",
+                "settlement_rate": "0.99",
+                "warnings": ["8 out-of-order timestamps"],
+                "notices": ["azure blob inventory loaded"]
+            }
+        });
+        assert_eq!(data_quality_status(Some(&audit)), "healthy");
+    }
+
+    #[test]
+    fn material_capture_gaps_remain_warnings() {
+        let audit = json!({
+            "result": {
+                "fatal_data_quality_issues": [],
+                "total_events": 100_000,
+                "malformed_lines": 0,
+                "duplicate_estimate": 0,
+                "out_of_order_timestamps": 0,
+                "stale_reference_count": 0,
+                "missing_market_ids": 0,
+                "start_price_capture_rate": "0.82",
+                "settlement_rate": "0.91",
+                "warnings": []
+            }
+        });
+        assert_eq!(data_quality_status(Some(&audit)), "warning");
+    }
 }

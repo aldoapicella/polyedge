@@ -56,6 +56,11 @@ runtime_vs_replay comparison of fills and PnL between both ledgers
 
 The default runtime paper maker-fill policy is `touch_after_quote_was_live`.
 
+Queue position, partial-fill, cancellation-latency, trade-through, and markout
+measurement boundaries are defined in
+[`execution-quality-limitations.md`](execution-quality-limitations.md). Public
+level-2 data provides a visible-size-ahead estimate, not a true FIFO rank.
+
 ## Settlement Model
 
 For each market:

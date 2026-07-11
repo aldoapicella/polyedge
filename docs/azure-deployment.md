@@ -31,6 +31,11 @@ ALLOW_EMERGENCY_ACCOUNT_CANCEL=false
 ENABLE_LIVE_HEARTBEAT=true
 ```
 
+The deployed paper runtime's execution-quality metrics remain research-only.
+See [`execution-quality-limitations.md`](execution-quality-limitations.md) for
+the public-data boundary and the separately gated authenticated venue-probe
+path needed for real order acknowledgements, fills, and cancellation timing.
+
 ## Deployment Pipeline
 
 Deployments are driven by GitHub Actions. The active workflow is `.github/workflows/deploy-polyedge-active.yml`. It runs Rust checks, frontend typecheck/build, builds `Dockerfile.rust` and `Dockerfile.frontend`, pushes images to ACR, and deploys both images with `infra/main.bicep`.

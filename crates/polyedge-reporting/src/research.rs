@@ -34,7 +34,6 @@ pub use labs::{
 
 const SETTLEMENT_WINDOW_SECONDS: i64 = 15;
 const MAX_DUPLICATE_HASHES: usize = 100_000;
-const MAX_STREAM_WARNINGS: usize = 1_000;
 const DEFAULT_AZURE_PREFETCH_BLOBS: usize = 4;
 const MAX_AZURE_PREFETCH_BLOBS: usize = 32;
 const DEFAULT_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 8_192;
@@ -357,11 +356,28 @@ pub fn run_audit(options: AuditOptions) -> Result<Value, ResearchError> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    warnings.extend(stream_warnings.clone());
+    for warning in &stream_warnings {
+        if !warnings.contains(warning) {
+            warnings.push(warning.clone());
+        }
+    }
     warnings.extend(exclusion_warnings(&stream, &options.exclude_windows));
     if let Some(object) = result.as_object_mut() {
         object.insert("warnings".to_owned(), Value::Array(warnings.clone()));
         object.insert("stream_warnings".to_owned(), Value::Array(stream_warnings));
+        object.insert(
+            "stream_notices".to_owned(),
+            Value::Array(stream.notices.iter().cloned().map(Value::String).collect()),
+        );
+        object.insert(
+            "stream_ordering".to_owned(),
+            json!({
+                "out_of_order_timestamps": stream.out_of_order_timestamps,
+                "affected_sources": stream.out_of_order_sources,
+                "max_backward_ms": stream.max_backward_ms,
+                "rate": ratio_usize(stream.out_of_order_timestamps, stream.events)
+            }),
+        );
         insert_exclusion_metadata(object, &stream, &options.exclude_windows);
     }
     let report = envelope(
@@ -968,6 +984,10 @@ struct StreamStats {
     malformed_lines: usize,
     duplicate_estimate: usize,
     warnings: Vec<String>,
+    notices: Vec<String>,
+    out_of_order_timestamps: usize,
+    out_of_order_sources: BTreeSet<String>,
+    max_backward_ms: i64,
 }
 
 fn stream_events<F>(
@@ -993,6 +1013,7 @@ where
             &mut seen_hashes,
             &mut visitor,
         )?;
+        finalize_stream_stats(&mut stats);
         return Ok(stats);
     }
     for path in path_set.paths {
@@ -1011,6 +1032,7 @@ where
             );
         }
     }
+    finalize_stream_stats(&mut stats);
     Ok(stats)
 }
 
@@ -1098,8 +1120,14 @@ where
             .pop_first()
             .expect("reader selected with a pending event");
         let source = readers[reader_index].source.as_str();
-        if previous_ts.is_some_and(|prior| line.event.recorded_ts < prior) {
-            push_stream_warning(stats, format!("out-of-order timestamp in {source}"));
+        if let Some(prior) = previous_ts.filter(|prior| line.event.recorded_ts < *prior) {
+            stats.out_of_order_timestamps += 1;
+            stats.out_of_order_sources.insert(source.to_owned());
+            stats.max_backward_ms = stats.max_backward_ms.max(
+                prior
+                    .signed_duration_since(line.event.recorded_ts)
+                    .num_milliseconds(),
+            );
         }
         previous_ts = Some(line.event.recorded_ts);
         stats.events += 1;
@@ -1270,8 +1298,12 @@ fn process_event_line<F>(
         stats.excluded_events += 1;
         return;
     }
-    if previous_ts.is_some_and(|prior| recorded_ts < prior) {
-        push_stream_warning(stats, format!("out-of-order timestamp in {source}"));
+    if let Some(prior) = previous_ts.filter(|prior| recorded_ts < *prior) {
+        stats.out_of_order_timestamps += 1;
+        stats.out_of_order_sources.insert(source.to_owned());
+        stats.max_backward_ms = stats
+            .max_backward_ms
+            .max(prior.signed_duration_since(recorded_ts).num_milliseconds());
     }
     *previous_ts = Some(recorded_ts);
     let payload = raw
@@ -1288,13 +1320,12 @@ fn process_event_line<F>(
     });
 }
 
-fn push_stream_warning(stats: &mut StreamStats, warning: String) {
-    match stats.warnings.len().cmp(&MAX_STREAM_WARNINGS) {
-        std::cmp::Ordering::Less => stats.warnings.push(warning),
-        std::cmp::Ordering::Equal => stats.warnings.push(format!(
-            "additional stream warnings suppressed after {MAX_STREAM_WARNINGS} warnings"
-        )),
-        std::cmp::Ordering::Greater => {}
+fn finalize_stream_stats(stats: &mut StreamStats) {
+    if stats.out_of_order_timestamps > 0 {
+        stats.warnings.push(format!(
+            "{} out-of-order timestamps",
+            stats.out_of_order_timestamps
+        ));
     }
 }
 
@@ -1322,7 +1353,7 @@ fn insert_exclusion_metadata(
 }
 
 fn exclusion_warnings(stream: &StreamStats, windows: &[ExcludedTimeWindow]) -> Vec<Value> {
-    if windows.is_empty() {
+    if windows.is_empty() || stream.excluded_events == 0 {
         return Vec::new();
     }
     vec![json!(format!(
@@ -1353,7 +1384,7 @@ where
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
     let listed_bytes = blobs.iter().map(|blob| blob.content_length).sum::<u64>();
     let mut stats = StreamStats::default();
-    stats.warnings.push(format!(
+    stats.notices.push(format!(
         "azure input listed {} blobs / {} bytes from azure://{}/{}/{} with prefetch_blobs={}",
         blobs.len(),
         listed_bytes,
@@ -1381,6 +1412,7 @@ where
         }
         Ok(())
     })?;
+    finalize_stream_stats(&mut stats);
     Ok(stats)
 }
 
@@ -1960,7 +1992,15 @@ impl AuditAccumulator {
                 "no settled markets found; profitability simulation will be incomplete"
             ));
         }
+        let status = if self.total_events == 0 {
+            "critical"
+        } else if warnings.is_empty() {
+            "healthy"
+        } else {
+            "warning"
+        };
         json!({
+            "status": status,
             "total_events": self.total_events,
             "event_count_by_type": self.event_count_by_type,
             "event_count_by_day": self.event_count_by_day,
@@ -3385,6 +3425,11 @@ impl ResearchReplayEngine {
         if token_id.is_empty() {
             return;
         }
+        if is_queue_proxy_shadow_model(self.request.fill_model) {
+            // The first event after the paper order becomes live must snapshot the
+            // last book known at that instant, before applying the new event.
+            self.initialize_live_queue_orders(&token_id, recorded_ts);
+        }
         let previous_bids = if self.request.fill_model == FillModel::QueueProxyBalanced {
             self.books
                 .get(&token_id)
@@ -3424,6 +3469,9 @@ impl ResearchReplayEngine {
         if token_id.is_empty() {
             return;
         }
+        // Preserve the pre-event queue snapshot. Applying this level first would
+        // let a later depletion rewrite the order's starting size ahead.
+        self.initialize_live_queue_orders(&token_id, recorded_ts);
         let previous_bids = if self.request.fill_model == FillModel::QueueProxyBalanced {
             self.books
                 .get(&token_id)
@@ -3462,33 +3510,49 @@ impl ResearchReplayEngine {
         }
     }
 
-    fn initialize_queue_proxy_order(&mut self, order: &mut ReplayOrder) {
-        let evidence = self
-            .queue_market_evidence
-            .entry(order.market_id.clone())
-            .or_default();
-        evidence.order_lifecycle_count += 1;
-        if order.side != "buy" {
-            evidence
-                .ineligible_reasons
-                .insert("only_buy_maker_orders_supported".to_owned());
-            return;
+    fn initialize_live_queue_orders(&mut self, token_id: &str, recorded_ts: DateTime<Utc>) {
+        let open = self.open_orders.iter().copied().collect::<Vec<_>>();
+        for index in open {
+            let order = &self.orders[index];
+            if order.token_id != token_id
+                || order.cancel_ts.is_some()
+                || order.queue_size_ahead.is_some()
+                || recorded_ts
+                    < order.decision_ts
+                        + Duration::milliseconds(self.request.fill_model.live_after_ms())
+            {
+                continue;
+            }
+            let market_id = order.market_id.clone();
+            let side = order.side.clone();
+            let price = order.price;
+            let evidence = self
+                .queue_market_evidence
+                .entry(market_id.clone())
+                .or_default();
+            evidence.order_lifecycle_count += 1;
+            if side != "buy" {
+                evidence
+                    .ineligible_reasons
+                    .insert("only_buy_maker_orders_supported".to_owned());
+                continue;
+            }
+            let Some(book) = self.books.get(token_id) else {
+                evidence
+                    .ineligible_reasons
+                    .insert("missing_book_snapshot_at_order_live_ts".to_owned());
+                continue;
+            };
+            let Some(size_ahead) = book.bid_size_at_or_above(price) else {
+                evidence
+                    .ineligible_reasons
+                    .insert("missing_visible_bid_size_at_order_live_ts".to_owned());
+                continue;
+            };
+            self.orders[index].queue_initial_size_ahead = Some(size_ahead);
+            self.orders[index].queue_size_ahead = Some(size_ahead);
+            evidence.size_ahead_samples.push(size_ahead);
         }
-        let Some(book) = self.books.get(&order.token_id) else {
-            evidence
-                .ineligible_reasons
-                .insert("missing_book_snapshot_at_order_live_ts".to_owned());
-            return;
-        };
-        let Some(size_ahead) = book.bid_size_at_or_above(order.price) else {
-            evidence
-                .ineligible_reasons
-                .insert("missing_visible_bid_size_at_quote_price".to_owned());
-            return;
-        };
-        order.queue_initial_size_ahead = Some(size_ahead);
-        order.queue_size_ahead = Some(size_ahead);
-        evidence.size_ahead_samples.push(size_ahead);
     }
 
     fn apply_queue_level_decreases(
@@ -3541,6 +3605,7 @@ impl ResearchReplayEngine {
         if token_id.is_empty() {
             return;
         }
+        self.initialize_live_queue_orders(&token_id, recorded_ts);
         let Some(trade_price) = decimal(payload.get("price"))
             .or_else(|| decimal(payload.get("trade_price")))
             .or_else(|| decimal(payload.get("last_trade_price")))
@@ -3555,6 +3620,21 @@ impl ResearchReplayEngine {
             return;
         };
         if trade_size <= Decimal::ZERO {
+            return;
+        }
+        let trade_side = text(payload, "side").to_ascii_lowercase();
+        if trade_side != "sell" {
+            if let Some((market_id, _)) = self.token_to_market.get(&token_id).cloned() {
+                self.queue_market_evidence
+                    .entry(market_id)
+                    .or_default()
+                    .ineligible_reasons
+                    .insert(if trade_side.is_empty() {
+                        "trade_print_missing_aggressor_side".to_owned()
+                    } else {
+                        "trade_print_side_not_sell_for_maker_buy".to_owned()
+                    });
+            }
             return;
         }
         if let Some((market_id, _)) = self.token_to_market.get(&token_id).cloned() {
@@ -3685,9 +3765,6 @@ impl ResearchReplayEngine {
             if candidate.quote_style == QuoteStyle::FairMinusMarginOnly {
                 order.price = (order.price - order.tick_size).max(order.tick_size);
             }
-        }
-        if is_queue_proxy_shadow_model(self.request.fill_model) {
-            self.initialize_queue_proxy_order(&mut order);
         }
         self.orders.push(order);
         let index = self.orders.len() - 1;
@@ -5092,9 +5169,10 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         }
     }
     let total_markets = eligible_markets + ineligible_markets;
-    let evidence_complete = eligible_markets > 0;
-    let enabled =
-        is_queue_proxy_shadow_model(fill_model) && eligible_markets > 0 && evidence_complete;
+    let evidence_complete = eligible_markets > 0
+        && total_markets > 0
+        && eligible_markets.saturating_mul(100) >= total_markets.saturating_mul(80);
+    let enabled = is_queue_proxy_shadow_model(fill_model) && evidence_complete;
     let status = if !is_queue_proxy_family(fill_model) {
         "not_requested"
     } else if fill_model == FillModel::QueueProxy {
@@ -5105,8 +5183,8 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         }
     } else if enabled {
         "enabled_shadow_research_only"
-    } else if evidence_complete {
-        "skipped_no_eligible_markets"
+    } else if eligible_markets > 0 {
+        "collecting_insufficient_market_coverage"
     } else {
         "skipped_missing_queue_depletion_trade_evidence"
     };
@@ -5120,6 +5198,7 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         "queue_proxy_eligible_markets": eligible_markets,
         "queue_proxy_ineligible_markets": ineligible_markets,
         "queue_proxy_eligibility_rate": ratio_usize(eligible_markets, total_markets),
+        "minimum_required_eligibility_rate": "0.80",
         "queue_proxy_fills": if is_queue_proxy_shadow_model(fill_model) { queue_fills } else { 0 },
         "queue_proxy_partial_fills": if is_queue_proxy_shadow_model(fill_model) { queue_partial_fills } else { 0 },
         "queue_proxy_fill_rate": if is_queue_proxy_shadow_model(fill_model) { ratio_usize(queue_fills, evidence_by_market.values().map(|evidence| evidence.order_lifecycle_count).sum::<usize>()) } else { Value::Null },
@@ -5888,16 +5967,17 @@ mod tests {
     }
 
     #[test]
-    fn stream_warning_storage_is_bounded() {
-        let mut stats = StreamStats::default();
-        for index in 0..(MAX_STREAM_WARNINGS + 10) {
-            push_stream_warning(&mut stats, format!("warning {index}"));
-        }
+    fn stream_ordering_warning_is_aggregated() {
+        let mut stats = StreamStats {
+            out_of_order_timestamps: 42,
+            max_backward_ms: 7,
+            ..StreamStats::default()
+        };
+        stats
+            .out_of_order_sources
+            .insert("events/00.jsonl".to_owned());
+        finalize_stream_stats(&mut stats);
 
-        assert_eq!(stats.warnings.len(), MAX_STREAM_WARNINGS + 1);
-        assert!(stats
-            .warnings
-            .last()
-            .is_some_and(|warning| warning.contains("additional stream warnings suppressed")));
+        assert_eq!(stats.warnings, vec!["42 out-of-order timestamps"]);
     }
 }

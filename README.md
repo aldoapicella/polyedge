@@ -105,5 +105,6 @@ docs/azure-deployment.md
 docs/api-access.md
 docs/backtesting.md
 docs/chainlink-source.md
+docs/execution-quality-limitations.md
 docs/rust-migration-status.md
 ```

@@ -1,5 +1,6 @@
 mod chart;
 mod chart_history;
+mod execution_quality;
 mod recorder;
 mod reference;
 mod view;
@@ -7,6 +8,7 @@ mod view;
 use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
+use execution_quality::ExecutionQualityTracker;
 use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
     BookState, DecisionAction, ExecutionReport, MarketId, MarketSpec, ReferencePrice, RuntimeEvent,
@@ -37,6 +39,8 @@ const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
 const RECORDER_BATCH_LIMIT: usize = 500;
 const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
+const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
 
 #[derive(Clone)]
 pub struct RuntimeController {
@@ -87,6 +91,7 @@ struct RuntimeData {
     markets: BTreeMap<MarketId, MarketSpec>,
     books: BTreeMap<TokenId, BookState>,
     reference: Option<ReferencePrice>,
+    exact_references: VecDeque<ReferencePrice>,
     fair_values: BTreeMap<MarketId, Value>,
     chart_samples: BTreeMap<MarketId, VecDeque<Value>>,
     chart_last_persisted_ms: BTreeMap<MarketId, i64>,
@@ -107,6 +112,7 @@ struct RuntimeEngine {
     order_manager: OrderManager,
     execution: PaperExecutionClient,
     paper_fill_engine: PaperFillEngine,
+    execution_quality: ExecutionQualityTracker,
     reference_aggregator: ReferenceAggregator,
     last_volatility_update_key: Option<(String, DateTime<Utc>, Decimal)>,
 }
@@ -123,6 +129,7 @@ impl RuntimeController {
             markets: BTreeMap::new(),
             books: BTreeMap::new(),
             reference: None,
+            exact_references: VecDeque::new(),
             fair_values: BTreeMap::new(),
             chart_samples: BTreeMap::new(),
             chart_last_persisted_ms: BTreeMap::new(),
@@ -142,6 +149,7 @@ impl RuntimeController {
             order_manager: OrderManager::new(),
             execution: PaperExecutionClient::new(),
             paper_fill_engine: PaperFillEngine::new(settings.clone()),
+            execution_quality: ExecutionQualityTracker::default(),
             reference_aggregator: ReferenceAggregator::default(),
             last_volatility_update_key: None,
         };
@@ -323,22 +331,50 @@ impl RuntimeController {
                 runtime
                     .set_feed_status("polymarket_clob_market", "connecting", None)
                     .await;
-                match polyedge_feeds::run_market_feed(
+                let subscribed_tokens = token_ids.clone();
+                let mut feed = tokio::spawn(polyedge_feeds::run_market_feed(
                     runtime.inner.settings.clone(),
                     token_ids,
                     sender.clone(),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        runtime
-                            .set_feed_status("polymarket_clob_market", "disconnected", None)
-                            .await;
-                    }
-                    Err(error) => {
-                        runtime
-                            .feed_error(FeedName::PolymarketClobMarket, error.to_string())
-                            .await;
+                ));
+                let mut refresh = tokio::time::interval(Duration::from_secs(2));
+                loop {
+                    tokio::select! {
+                        result = &mut feed => {
+                            match result {
+                                Ok(Ok(())) => {
+                                    runtime
+                                        .set_feed_status("polymarket_clob_market", "disconnected", None)
+                                        .await;
+                                }
+                                Ok(Err(error)) => {
+                                    runtime
+                                        .feed_error(FeedName::PolymarketClobMarket, error.to_string())
+                                        .await;
+                                }
+                                Err(error) if !error.is_cancelled() => {
+                                    runtime
+                                        .feed_error(FeedName::PolymarketClobMarket, error.to_string())
+                                        .await;
+                                }
+                                Err(_) => {}
+                            }
+                            break;
+                        }
+                        _ = refresh.tick() => {
+                            if runtime.market_token_ids().await != subscribed_tokens {
+                                feed.abort();
+                                let _ = feed.await;
+                                runtime
+                                    .set_feed_status(
+                                        "polymarket_clob_market",
+                                        "resubscribing_token_set_changed",
+                                        None,
+                                    )
+                                    .await;
+                                break;
+                            }
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -465,8 +501,20 @@ impl RuntimeController {
     async fn replace_markets(&self, markets: Vec<MarketSpec>) {
         let mut data = self.inner.data.write().await;
         let existing = data.markets.clone();
-        data.markets.clear();
+        let now = Utc::now();
+        let settled = data.settled_markets.clone();
+        data.markets = existing
+            .values()
+            .filter(|market| {
+                !settled.contains(&market.market_id)
+                    && now.signed_duration_since(market.end_ts).num_seconds()
+                        <= PENDING_SETTLEMENT_RETENTION_SECONDS
+            })
+            .cloned()
+            .map(|market| (market.market_id.clone(), market))
+            .collect();
         for mut market in markets {
+            let mut recovered_start = None;
             if market.start_price.is_none() {
                 if let Some(prior) = existing.get(&market.market_id) {
                     if let Some(start_price) = prior.start_price {
@@ -474,11 +522,42 @@ impl RuntimeController {
                     }
                 }
             }
+            if market.start_price.is_none() {
+                let grace_millis = (self.inner.settings.target.start_price_capture_grace_seconds
+                    * 1_000.0)
+                    .round() as i64;
+                if let Some(reference) = data
+                    .exact_references
+                    .iter()
+                    .filter(|reference| {
+                        reference.source_ts >= market.start_ts
+                            && reference.source_ts
+                                <= market.start_ts
+                                    + chrono::Duration::milliseconds(grace_millis.max(0))
+                    })
+                    .min_by_key(|reference| reference.source_ts)
+                    .cloned()
+                {
+                    market = market.with_start_price(reference.price);
+                    recovered_start = Some(json!({
+                        "market_id": market.market_id,
+                        "market_slug": market.market_slug,
+                        "start_price": reference.price.to_string(),
+                        "reference_source": reference.source,
+                        "reference_source_ts": reference.source_ts,
+                        "capture_method": "exact_reference_history_after_discovery"
+                    }));
+                }
+            }
             let payload = serde_json::to_value(&market).unwrap_or(Value::Null);
             data.markets.insert(market.market_id.clone(), market);
             drop(data);
             self.record_event("market", payload, Some("market_discovered"), None)
                 .await;
+            if let Some(recovered_start) = recovered_start {
+                self.record_event("market_start_price", recovered_start, None, None)
+                    .await;
+            }
             data = self.inner.data.write().await;
         }
     }
@@ -505,6 +584,17 @@ impl RuntimeController {
         {
             let mut data = self.inner.data.write().await;
             data.reference = Some(composite.clone());
+            if composite.exact_resolution_source && !composite.stale {
+                let duplicate = data.exact_references.back().is_some_and(|reference| {
+                    reference.source == composite.source
+                        && reference.source_ts == composite.source_ts
+                        && reference.price == composite.price
+                });
+                if !duplicate {
+                    data.exact_references.push_back(composite.clone());
+                    truncate(&mut data.exact_references, EXACT_REFERENCE_HISTORY_LIMIT);
+                }
+            }
         }
         self.capture_market_start_prices(&composite).await;
         self.settle_finished_markets(&composite).await;
@@ -531,10 +621,22 @@ impl RuntimeController {
         if let Some(market) = market {
             self.push_market_chart_sample(&market.market_id).await;
         }
+        let quality_events = {
+            let mut engine = self.inner.engine.lock().await;
+            engine.execution_quality.observe_book(&book)
+        };
+        for event in quality_events {
+            self.record_event(event.event_type, event.payload, None, None)
+                .await;
+        }
         self.handle_paper_fills(&book).await;
     }
 
     async fn handle_raw_market_event(&self, event: polyedge_feeds::MarketChannelEvent) {
+        let quality_events = {
+            let mut engine = self.inner.engine.lock().await;
+            engine.execution_quality.observe_market_event(&event)
+        };
         let mut payload = serde_json::to_value(&event).unwrap_or(Value::Null);
         let token_id = event.token_id.as_deref().or(event.asset_id.as_deref());
         if let Some(token_id) = token_id {
@@ -559,6 +661,10 @@ impl RuntimeController {
         }
         self.record_event("raw_market_event", payload, None, None)
             .await;
+        for quality_event in quality_events {
+            self.record_event(quality_event.event_type, quality_event.payload, None, None)
+                .await;
+        }
     }
 
     async fn handle_paper_fills(&self, book: &BookState) {
@@ -609,6 +715,57 @@ impl RuntimeController {
         for report in reports {
             self.record_execution_report(report, true).await;
         }
+    }
+
+    async fn execute_paper_decision(
+        &self,
+        decision: &TradeDecision,
+        books: &BTreeMap<TokenId, BookState>,
+    ) -> Vec<ExecutionReport> {
+        let cancel_requested_ts = Utc::now();
+        let mut engine = self.inner.engine.lock().await;
+        let result = if decision.action == DecisionAction::CancelAll {
+            engine.execution.cancel_all(Some(&decision.market_id)).await
+        } else {
+            engine
+                .execution
+                .submit(decision)
+                .await
+                .map(|report| vec![report])
+        };
+        let mut reports = match result {
+            Ok(reports) => reports,
+            Err(error) => {
+                error!("paper execution failed: {error}");
+                return Vec::new();
+            }
+        };
+        for report in &mut reports {
+            if decision.action == DecisionAction::CancelAll {
+                report.raw.insert(
+                    "cancel_requested_ts".to_owned(),
+                    json!(cancel_requested_ts.to_rfc3339()),
+                );
+            }
+            if report.status == "paper_resting" {
+                let book = decision
+                    .token_id
+                    .as_ref()
+                    .and_then(|token_id| books.get(token_id));
+                if let Some(snapshot) = engine.execution_quality.register_order(
+                    decision,
+                    report,
+                    book,
+                    self.inner.settings.paper.order_live_after_ms,
+                ) {
+                    report.raw.insert("execution_quality".to_owned(), snapshot);
+                }
+            }
+            engine.order_manager.on_execution_report(decision, report);
+            engine.risk.on_execution_report(report);
+        }
+        engine.risk.open_order_count = engine.order_manager.open_order_count();
+        reports
     }
 
     async fn evaluate_once(&self) {
@@ -675,23 +832,8 @@ impl RuntimeController {
                     decision.action,
                     DecisionAction::Place | DecisionAction::CancelAll
                 ) {
-                    let report = {
-                        let mut engine = self.inner.engine.lock().await;
-                        match engine.execution.submit(&decision).await {
-                            Ok(report) => {
-                                engine.order_manager.on_execution_report(&decision, &report);
-                                engine.risk.open_order_count =
-                                    engine.order_manager.open_order_count();
-                                engine.risk.on_execution_report(&report);
-                                Some(report)
-                            }
-                            Err(error) => {
-                                error!("paper execution failed: {error}");
-                                None
-                            }
-                        }
-                    };
-                    if let Some(report) = report {
+                    let reports = self.execute_paper_decision(&decision, &books).await;
+                    for report in reports {
                         self.record_execution_report(report, false).await;
                     }
                 }
@@ -709,6 +851,10 @@ impl RuntimeController {
     }
 
     async fn record_execution_report(&self, report: ExecutionReport, publish_fill: bool) {
+        let quality_events = {
+            let mut engine = self.inner.engine.lock().await;
+            engine.execution_quality.observe_execution_report(&report)
+        };
         {
             let mut data = self.inner.data.write().await;
             data.execution_reports.push_back(report.clone());
@@ -716,6 +862,14 @@ impl RuntimeController {
         }
         self.record_event("execution_report", &report, None, None)
             .await;
+        if let Some(snapshot) = report.raw.get("execution_quality") {
+            self.record_event("paper_order_queue_registration", snapshot, None, None)
+                .await;
+        }
+        for event in quality_events {
+            self.record_event(event.event_type, event.payload, None, None)
+                .await;
+        }
         self.push_market_chart_sample(&report.market_id).await;
         if publish_fill && report.status == "paper_filled_maker" {
             self.publish_only("paper_fill", &report).await;
@@ -814,12 +968,20 @@ impl RuntimeController {
             } else {
                 "down"
             };
-            let cleared_position = {
+            let (cleared_position, missing_markouts) = {
                 let mut engine = self.inner.engine.lock().await;
                 engine.order_manager.clear_market(&market.market_id);
                 engine.execution.clear_market(&market.market_id);
-                engine.risk.clear_market(&market.market_id)
+                let missing_markouts = engine.execution_quality.clear_market(&market.market_id);
+                (
+                    engine.risk.clear_market(&market.market_id),
+                    missing_markouts,
+                )
             };
+            for event in missing_markouts {
+                self.record_event(event.event_type, event.payload, None, None)
+                    .await;
+            }
             {
                 let mut data = self.inner.data.write().await;
                 data.settled_markets.push(market.market_id.clone());
@@ -873,20 +1035,11 @@ impl RuntimeController {
                 neg_risk: false,
             };
             self.push_decision(decision.clone()).await;
-            let report = {
-                let mut engine = self.inner.engine.lock().await;
-                match engine.execution.submit(&decision).await {
-                    Ok(report) => {
-                        engine.order_manager.on_execution_report(&decision, &report);
-                        Some(report)
-                    }
-                    Err(error) => {
-                        warn!("cancel during pause failed: {error}");
-                        None
-                    }
-                }
+            let books = {
+                let data = self.inner.data.read().await;
+                data.books.clone()
             };
-            if let Some(report) = report {
+            for report in self.execute_paper_decision(&decision, &books).await {
                 self.record_execution_report(report, false).await;
             }
         }
