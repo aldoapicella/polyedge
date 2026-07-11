@@ -396,9 +396,9 @@ fn apply_price_change(event: &Value, books: &mut BTreeMap<TokenId, BookState>) -
                 levels.push(BookLevel { price, size });
             }
             if side.eq_ignore_ascii_case("buy") {
-                levels.sort_by(|left, right| right.price.cmp(&left.price));
+                levels.sort_by_key(|level| std::cmp::Reverse(level.price));
             } else {
-                levels.sort_by(|left, right| left.price.cmp(&right.price));
+                levels.sort_by_key(|level| level.price);
             }
         }
         book.exchange_ts =
