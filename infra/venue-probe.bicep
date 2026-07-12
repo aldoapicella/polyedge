@@ -10,10 +10,14 @@ param storageContainerName string = 'bot-events'
 param keyVaultName string = 'kvpolyedge6urdjr5nmwx7w'
 param logAnalyticsWorkspaceName string = 'log-polyedge-dev-6urdjr5nmwx7w'
 param funderAddress string = '0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8'
+param relayerApiKeyAddress string = '0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921'
+@description('Set true only after polymarket-relayer-api-key exists in Key Vault.')
+param relayerApiKeySecretConfigured bool = false
 
 var environmentName = 'polyedge-venue-neu-env'
 var identityName = 'polyedge-venue-neu-id'
 var jobName = 'polyedge-venue-probe-neu-job'
+var redemptionJobName = 'polyedge-redeem-neu-job'
 var vnetName = 'vnet-polyedge-venue-neu'
 var natName = 'nat-polyedge-venue-neu'
 var publicIpName = 'pip-polyedge-venue-neu-egress'
@@ -269,7 +273,110 @@ resource venueProbeJob 'Microsoft.App/jobs@2024-03-01' = {
   }
 }
 
+resource venueRedemptionJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: redemptionJobName
+  location: location
+  tags: union(tags, {
+    trigger: 'manual-only'
+    operation: 'resolved-position-redemption'
+    takerOrders: 'disabled'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaRetryLimit: 0
+      replicaTimeout: 600
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: registry.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: concat([
+        {
+          name: 'polymarket-private-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-private-key'
+          identity: identity.id
+        }
+        {
+          name: 'polymarket-api-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-key'
+          identity: identity.id
+        }
+        {
+          name: 'polymarket-api-secret'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret'
+          identity: identity.id
+        }
+        {
+          name: 'polymarket-api-passphrase'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase'
+          identity: identity.id
+        }
+      ], relayerApiKeySecretConfigured ? [
+        {
+          name: 'polymarket-relayer-api-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-relayer-api-key'
+          identity: identity.id
+        }
+      ] : [])
+    }
+    template: {
+      containers: [
+        {
+          name: 'venue-redemption'
+          image: venueProbeImage
+          command: [
+            'node'
+            'src/redeem.mjs'
+          ]
+          env: concat([
+            { name: 'EXECUTION_MODE', value: 'venue_redemption' }
+            { name: 'ALLOW_LIVE', value: 'false' }
+            { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
+            { name: 'VENUE_REDEMPTION_ENABLED', value: 'false' }
+            { name: 'VENUE_REDEMPTION_DRY_RUN', value: 'true' }
+            { name: 'VENUE_REDEMPTION_MAX_PAYOUT', value: '25' }
+            { name: 'VENUE_REDEMPTION_MAX_CONDITIONS', value: '5' }
+            { name: 'VENUE_PROBE_STARTING_CAPITAL', value: '9.23' }
+            { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: 'IE' }
+            { name: 'VENUE_PROBE_EXPECTED_EGRESS_IP', value: publicIp.properties.ipAddress }
+            { name: 'POLYMARKET_FUNDER_ADDRESS', value: funderAddress }
+            { name: 'POLYMARKET_SIGNATURE_TYPE', value: '3' }
+            { name: 'POLYMARKET_RELAYER_API_KEY_ADDRESS', value: relayerApiKeyAddress }
+            { name: 'POLYMARKET_PRIVATE_KEY', secretRef: 'polymarket-private-key' }
+            { name: 'POLYMARKET_API_KEY', secretRef: 'polymarket-api-key' }
+            { name: 'POLYMARKET_API_SECRET', secretRef: 'polymarket-api-secret' }
+            { name: 'POLYMARKET_API_PASSPHRASE', secretRef: 'polymarket-api-passphrase' }
+            { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
+            { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storage.name }
+            { name: 'AZURE_STORAGE_CONTAINER_NAME', value: storageContainerName }
+          ], relayerApiKeySecretConfigured ? [
+            { name: 'POLYMARKET_RELAYER_API_KEY', secretRef: 'polymarket-relayer-api-key' }
+          ] : [])
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+
 output venueProbeJobName string = venueProbeJob.name
+output venueRedemptionJobName string = venueRedemptionJob.name
 output managedEnvironmentName string = managedEnvironment.name
 output managedIdentityName string = identity.name
 output staticEgressIp string = publicIp.properties.ipAddress

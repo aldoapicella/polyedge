@@ -252,6 +252,46 @@ export type VenueExecutionEvidence = {
   remaining_limitation: string;
   research_only: boolean;
   strategy_promotion_allowed: boolean;
+  redemption?: {
+    run_id?: string;
+    status?: string;
+    finished_ts?: string;
+    dry_run?: boolean;
+    redemption_enabled?: boolean;
+    redemption_submitted?: boolean;
+    wallet_type?: string;
+    derived_wallet_match?: boolean;
+    liquid_collateral_before?: number;
+    liquid_collateral_after?: number;
+    realized_payout?: number;
+    transaction_hash?: string | null;
+    zero_open_orders_confirmed?: boolean;
+    portfolio?: VenuePortfolioSnapshot | null;
+    recent_redemptions?: Array<{
+      transaction_hash?: string | null;
+      condition_id?: string | null;
+      title?: string | null;
+      gross_payout?: number;
+      redeemed_ts?: string | null;
+      attribution?: "azure_redemption_worker" | "external_or_manual" | string;
+    }>;
+    selection?: {
+      selected_gross_payout?: number;
+      available_winner_conditions?: number;
+      skipped_winner_conditions?: number;
+      selected?: Array<{
+        condition_id?: string;
+        gross_payout?: number;
+        negative_risk?: boolean;
+        titles?: string[];
+      }>;
+    };
+    planned_calls?: Array<{
+      purpose?: string;
+      target?: string;
+      condition_id?: string | null;
+    }>;
+  } | null;
   latest?: {
     evidence_protocol_version?: number;
     run_id?: string;

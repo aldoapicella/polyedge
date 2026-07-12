@@ -18,7 +18,7 @@ import {
   getLabVenueExecution
 } from "@/lib/api";
 import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow, VenueExecutionEvidence } from "@/lib/types";
-import { compact, numberText } from "@/lib/format";
+import { compact, dateTime, numberText } from "@/lib/format";
 import {
   CALIBRATION_COLUMNS,
   FILL_MODEL_COLUMNS,
@@ -133,7 +133,9 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
   const order = latest?.order;
   const model = evidence.model;
   const latestAttempt = evidence.latest_attempt;
-  const portfolio = evidence.preflight?.portfolio ?? latestAttempt?.portfolio ?? latest?.portfolio;
+  const portfolio = evidence.redemption?.portfolio ?? evidence.preflight?.portfolio ?? latestAttempt?.portfolio ?? latest?.portfolio;
+  const redemption = evidence.redemption;
+  const mostRecentRedemption = redemption?.recent_redemptions?.[0];
   const globalUnresolvedRisk = evidence.preflight?.risk_at_end?.global_unresolved_risk_reservations ??
     latestAttempt?.risk_at_end?.global_unresolved_risk_reservations ??
     latest?.risk_at_end?.global_unresolved_risk_reservations ??
@@ -190,10 +192,24 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
               <Metric label="Starting Capital" value={usd(portfolio.starting_capital)} />
               <Metric label="True Net Account PnL" value={signedUsd(portfolio.account_net_pnl)} />
               <Metric label="Redeemable Winners" value={portfolio.redeemable_winner_count ?? 0} />
+              <Metric label="Redemption Worker" value={redemption?.status ?? "not run"} />
+              <Metric label="Selected Payout" value={usd(redemption?.selection?.selected_gross_payout)} />
+              <Metric label="Realized Payout" value={usd(redemption?.realized_payout)} />
+              <Metric label="Gasless Submission" value={redemption?.redemption_submitted ? "confirmed" : redemption?.dry_run ? "dry-run only" : "not submitted"} />
+              <Metric label="Most Recent Redemption" value={usd(mostRecentRedemption?.gross_payout)} />
+              <Metric label="Redemption Attribution" value={mostRecentRedemption?.attribution === "azure_redemption_worker" ? "Azure worker" : mostRecentRedemption ? "external / manual" : "none observed"} />
+              <Metric label="Redeemed At" value={dateTime(mostRecentRedemption?.redeemed_ts)} />
+              <Metric label="Redemption Open Orders" value={redemption?.zero_open_orders_confirmed ? "zero confirmed" : "not confirmed"} />
             </div>
             <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
               Gross payout is not profit. True account PnL equals liquid collateral plus current position value minus starting capital; losing resolved positions remain included in the calculation.
             </div>
+            {redemption ? (
+              <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+                Azure redemption: {redemption.status ?? "unknown"}. Wallet derivation {redemption.derived_wallet_match ? "verified" : "not verified"}; {redemption.planned_calls?.length ?? 0} bounded call(s) planned. Redemption only converts resolved outcome tokens into liquid collateral and does not reset the UTC trading-risk budget.
+                {mostRecentRedemption ? ` Most recent observed payout: ${usd(mostRecentRedemption.gross_payout)} via ${mostRecentRedemption.attribution === "azure_redemption_worker" ? "the Azure worker" : "an external/manual relayer transaction"}.` : ""}
+              </div>
+            ) : null}
           </>
         ) : <EmptyState label="No current Azure portfolio snapshot is available." />}
       </Panel>

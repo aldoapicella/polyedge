@@ -8,6 +8,7 @@
     "diagnose-balance": "node src/diagnose-balance.mjs",
     "diagnose-auth": "node src/diagnose-auth.mjs",
     "probe": "node src/probe.mjs",
+    "redeem": "node src/redeem.mjs",
     "train": "node src/train.mjs",
     "test": "node --test test/*.test.mjs"
   },

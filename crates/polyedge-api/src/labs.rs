@@ -70,6 +70,7 @@ async fn venue_execution() -> impl IntoResponse {
         "latest": read_json_or_null("reports/research/venue-probe/latest.json"),
         "latest_attempt": read_json_or_null("reports/research/venue-probe/latest_attempt.json"),
         "preflight": read_json_or_null("reports/research/venue-probe/latest_authenticated_dry_run.json"),
+        "redemption": read_json_or_null("reports/research/venue-probe/latest_redemption.json"),
         "model": read_json_or_null("reports/research/venue-probe/effective_queue_model.json"),
         "queue_position_source": "authenticated_lifecycle_plus_public_l2",
         "queue_position_metric": "inferred_size_ahead",

@@ -285,3 +285,48 @@ reconciles zero open orders and reports `campaign_stopped_safely` with
 `no_safe_order_after_prewarm` rather than misclassifying that transition as a
 failed execution. Completed probes and their conservative risk remain preserved
 in the immutable run summary.
+
+## Gasless resolved-position redemption
+
+`infra/venue-probe.bicep` also provisions
+`polyedge-redeem-neu-job` in the same isolated North Europe
+environment. Its persistent state is manual, `VENUE_REDEMPTION_ENABLED=false`,
+and `VENUE_REDEMPTION_DRY_RUN=true`. It shares the funded-wallet Blob lease with
+the probe, so redemption and order evidence collection cannot overlap.
+
+First create a Relayer API key in Polymarket **Settings > API Keys**. Store only
+its key value in Key Vault; the associated public owner address is a Bicep
+parameter:
+
+```bash
+az keyvault secret set \
+  --vault-name kvpolyedge6urdjr5nmwx7w \
+  --name polymarket-relayer-api-key \
+  --value '<relayer-api-key>' \
+  --output none
+
+az deployment group create \
+  --resource-group rg-polyedge-dev \
+  --template-file infra/venue-probe.bicep \
+  --parameters venueProbeImage="$VENUE_PROBE_IMAGE" \
+               relayerApiKeySecretConfigured=true \
+               relayerApiKeyAddress='<address shown for that key>'
+```
+
+Do not reuse the CLOB API key. The live launcher refuses to run until the Key
+Vault secret and job secret reference both exist:
+
+```bash
+./scripts/start-venue-redemption.sh
+```
+
+The launcher passes the enable and dry-run overrides only to one execution and
+verifies that the persisted job stays disabled/dry-run before and after start.
+It then validates the execution snapshot. A successful redemption does not
+start a probe; the $5 UTC trading-risk cap remains independent.
+
+Every dry-run and live artifact also reads the venue's recent public redemption
+activity. A transaction is attributed to `azure_redemption_worker` only when
+its hash matches the durable worker control record; otherwise the dashboard
+labels it `external_or_manual`. This prevents a wallet/UI redemption from being
+misreported as an Azure worker submission.

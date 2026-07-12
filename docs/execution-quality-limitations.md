@@ -222,10 +222,31 @@ against the configured starting capital. A resolved winner's redeemable value
 is a gross payout, not profit. `true_net_account_pnl` is calculated as liquid
 collateral plus current position value minus starting capital, so resolved
 losers are not omitted. Redemption converts a resolved winning conditional
-token into collateral; it does not create additional PnL. Automatic gasless
-redemption additionally requires a dedicated Polymarket relayer API key kept
-server-side in Key Vault. Until that credential and transaction path are
-configured, redemption remains an explicit operator action in Polymarket.
+token into collateral; it does not create additional PnL.
+
+Automatic gasless redemption uses a separate manual Azure North Europe job. It
+derives and verifies the configured UUPS deposit wallet, confirms zero open
+orders, selects only resolved positive-payout conditions within a $25 and
+five-condition ceiling, and submits one atomic deposit-wallet batch. The batch
+temporarily approves only Polymarket's official current CTF collateral adapter,
+redeems via that adapter, and restores the prior ERC-1155 approval state. It
+then requires a successful Polygon receipt, zero remaining condition-token
+balances, restored adapter approval, increased on-chain pUSD, matching CLOB
+collateral, no open orders, and no remaining redeemable winner before reporting
+success.
+
+The job is persisted disabled and dry-run. Submission additionally requires a
+dedicated Relayer API key from Polymarket Settings > API Keys, stored only as
+`polymarket-relayer-api-key` in Key Vault. CLOB credentials are not relayer
+credentials. The worker verifies the key/address pair against the venue's key
+inventory before signing, persists intent and the relayer transaction ID, and
+will not blindly retry an ambiguous submission. Redemption converts existing
+value to liquid collateral; it neither creates profit nor resets the UTC probe
+risk budget.
+
+Recent public redemption activity is shown separately and is attributed to the
+Azure worker only when its transaction hash matches that durable submission
+record. Manual or venue-UI redemptions remain explicitly `external_or_manual`.
 
 The existing East US execution job is retired because Polymarket correctly
 reports that origin as US/VA and blocks it. The authenticated worker is deployed
