@@ -181,3 +181,107 @@ Validated public paths:
 /api/backend/decisions   200
 /dashboard               200
 ```
+
+## North Europe authenticated evidence worker
+
+The paper strategy runtime and research control plane remain in East US. The
+manual authenticated evidence worker is a separate Azure Container Apps Job in
+North Europe because the East US origin is geoblocked by the venue.
+
+Provision or update it with the exact probe image:
+
+```bash
+az deployment group create \
+  --resource-group rg-polyedge-dev \
+  --template-file infra/venue-probe.bicep \
+  --parameters venueProbeImage="$VENUE_PROBE_IMAGE"
+```
+
+`infra/venue-probe.bicep` creates a dedicated North Europe managed environment,
+VNet, delegated infrastructure subnet, NAT Gateway, zone-redundant static public
+IP, and user-assigned managed identity. The job has no inbound endpoint. It
+reads credential references from the existing Key Vault and writes redacted,
+per-run evidence to the existing `bot-events` container. Redaction covers the
+signing key, API key identifier, API secret, passphrase, authorization fields,
+and authenticated lifecycle `owner`/`order_owner` fields. Blob WORM/versioning
+is not enabled, so evidence is append-only by application convention rather
+than storage-enforced immutability.
+
+The declarative state is manual and dry-run. Before any order-enabled override,
+verify the dry-run artifact proves all of the following:
+
+```text
+blocked: false
+country: IE
+observed egress IP: configured NAT public IP
+open orders before run: 0
+clock drift: <= 5000 ms
+authenticated user channel: ready
+public market channel: ready
+```
+
+The worker independently repeats the origin and clock checks immediately before
+every submission. Live evidence collection remains maker-only, one open order
+at a time, at most $1.25 per order for the current limited-funding campaign
+(`$2` remains the hard code ceiling), and at most $5 of conservative filled
+notional per UTC day. The East US probe job must remain deleted; deploying `main.bicep`
+does not recreate it.
+
+Dry-run preflight remains available after the daily risk budget is exhausted so
+operators can still verify origin, authentication, WebSocket readiness, clock
+drift, and zero open orders. This does not relax submission safety: the risk
+gate reports `submission_allowed: false`, and no order is signed or sent while
+`VENUE_PROBE_DRY_RUN=true`.
+
+For an authorized campaign, use the checked launcher from Azure Cloud Shell or
+the deployment runner:
+
+```bash
+./scripts/start-venue-probe-campaign.sh
+```
+
+The launcher refuses concurrent executions, requires the persisted manual job
+to begin in dry-run, temporarily arms it, starts exactly one execution, and
+restores dry-run under a shell trap. It then proves that the execution snapshot
+is `false` while the persisted job is back to `true`. This update/start/restore
+sequence is necessary because the installed Azure CLI accepted
+`job start --env-vars VENUE_PROBE_DRY_RUN=false` but silently retained the
+stored `true` value in the execution template. Never infer live authorization
+from the command exit code; inspect both templates.
+Restoration is retried five times with bounded backoff and read-back after every
+attempt. The EXIT trap is not removed until persisted `true` is observed; a
+failed restoration is a critical launcher failure, never a suppressed warning.
+
+The worker itself also holds a renewable Blob lease for the funded account, so
+overlapping executions fail closed even if they bypass the launcher. Evidence
+protocol v3 writes a durable full-notional reservation before every send and
+persists the venue order ID immediately after acknowledgement. A reservation
+is reduced to matched notional only after terminal REST/user-channel agreement
+and strict zero-open-order confirmation. An ambiguous or interrupted probe
+therefore consumes its full reservation and blocks later live runs until it is
+explicitly reconciled. Live orders are short-lived GTD orders; process signals
+trigger cancel-all recovery, while venue expiry remains the crash backstop.
+Lease calls are bounded to ten seconds and lease freshness is independently
+checked at 45 seconds on a monotonic clock, including immediately after the
+pre-send reservation. Live startup scans unresolved reservations across every
+UTC date, not only the current daily-risk partition.
+
+Post-cancel accounting is not finalized on the first empty REST response. The
+worker observes REST order/trade state, authenticated user events, and all open
+orders for at least ten seconds and requires five seconds of unchanged terminal
+state. Missing probe evidence is reconstructed as an ineligible audit row from
+its durable reservation, preventing a crashed execution from disappearing from
+the quality gate.
+
+Protocol v3 deliberately resets the promotion cohort. Older protocol-v2
+observations remain available in Azure and the dashboard as legacy history,
+but they do not count toward the 100-probe, 10-fill, 10-non-fill gate. Every
+distinct authenticated trade ID now requires an independent timely 1/5/30
+markout triplet, and REST/user-channel quantities and trade-ID sets must agree.
+
+A refreshed book that no longer supports a non-marketable order above the
+configured evidence floor is a normal market transition. The worker now
+reconciles zero open orders and reports `campaign_stopped_safely` with
+`no_safe_order_after_prewarm` rather than misclassifying that transition as a
+failed execution. Completed probes and their conservative risk remain preserved
+in the immutable run summary.

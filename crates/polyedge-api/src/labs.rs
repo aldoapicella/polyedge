@@ -61,6 +61,24 @@ pub fn router() -> Router<ApiState> {
         .route("/calibration/latest", get(calibration_latest))
         .route("/sample-size/latest", get(sample_size_latest))
         .route("/fill-models/latest", get(fill_models_latest))
+        .route("/venue-execution", get(venue_execution))
+}
+
+async fn venue_execution() -> impl IntoResponse {
+    Json(json!({
+        "generated_ts": now_ts(),
+        "latest": read_json_or_null("reports/research/venue-probe/latest.json"),
+        "latest_attempt": read_json_or_null("reports/research/venue-probe/latest_attempt.json"),
+        "preflight": read_json_or_null("reports/research/venue-probe/latest_authenticated_dry_run.json"),
+        "model": read_json_or_null("reports/research/venue-probe/effective_queue_model.json"),
+        "queue_position_source": "authenticated_lifecycle_plus_public_l2",
+        "queue_position_metric": "inferred_size_ahead",
+        "literal_fifo_rank_available": false,
+        "practical_target": "probability_of_fill_within_1_5_30_60_seconds",
+        "remaining_limitation": "Polymarket does not expose exact matching rank, per-order public priority, hidden liquidity, or venue-internal priority changes.",
+        "research_only": true,
+        "strategy_promotion_allowed": false
+    }))
 }
 
 async fn data_quality_latest(State(state): State<ApiState>) -> impl IntoResponse {

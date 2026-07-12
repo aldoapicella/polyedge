@@ -225,6 +225,167 @@ export type LabSummary = {
   live_deployment_allowed?: boolean;
 };
 
+export type VenuePortfolioSnapshot = {
+  status?: string;
+  stage?: string;
+  captured_ts?: string;
+  liquid_collateral?: number;
+  current_position_value?: number;
+  account_equity?: number;
+  starting_capital?: number | null;
+  account_net_pnl?: number | null;
+  gross_redeemable_value?: number;
+  resolved_position_cost?: number;
+  resolved_position_net_pnl?: number;
+  resolved_losing_cost?: number;
+  redeemable_position_count?: number;
+  redeemable_winner_count?: number;
+  gross_payout_is_profit?: false;
+};
+
+export type VenueExecutionEvidence = {
+  generated_ts: string;
+  queue_position_source: "authenticated_lifecycle_plus_public_l2" | string;
+  queue_position_metric: "inferred_size_ahead" | string;
+  literal_fifo_rank_available: false;
+  practical_target: string;
+  remaining_limitation: string;
+  research_only: boolean;
+  strategy_promotion_allowed: boolean;
+  latest?: {
+    evidence_protocol_version?: number;
+    run_id?: string;
+    status?: string;
+    started_ts?: string;
+    finished_ts?: string;
+    order_submitted?: boolean;
+    execution_origin?: string;
+    execution_country?: string | null;
+    static_egress_verified?: boolean;
+    campaign_enabled?: boolean;
+    submitted_order_count?: number;
+    completed_probe_count?: number;
+    stop_reason?: string;
+    risk_at_end?: {
+      conservative_loss_budget_consumed?: number;
+      submitted_orders?: number;
+      filled_orders?: number;
+      unresolved_risk_reservations?: number;
+      global_unresolved_risk_reservations?: number;
+    };
+    order?: {
+      price?: number;
+      size?: number;
+      notional?: number;
+      inferredSizeAhead?: number;
+      samePricePublicSize?: number;
+      betterPricePublicSize?: number;
+      spread?: number | null;
+    } | null;
+    lifecycle?: {
+      order_id?: string;
+      client_to_http_ack_ms?: number | null;
+      client_cancel_round_trip_ms?: number | null;
+      client_to_user_cancel_ack_ms?: number | null;
+      actual_matched_size?: number;
+      partial_fill?: boolean;
+      fully_filled?: boolean;
+      fill_raced_cancellation?: boolean;
+      public_touch_trade_count?: number;
+      public_strict_trade_through_count?: number;
+      public_trade_through_without_fill_count?: number;
+      venue_status?: string;
+      planned_rest_seconds?: number;
+      reconciliation_complete?: boolean;
+      zero_open_orders_confirmed?: boolean;
+      data_gap_detected?: boolean;
+      cancellation_failure?: boolean;
+      markout_capture_complete?: boolean;
+      matched_size_source_agreement?: boolean;
+      trade_id_source_agreement?: boolean;
+      related_trade_ids?: string[];
+      live_user_trade_ids?: string[];
+      authenticated_user_channel_reconnects?: number;
+      public_market_channel_reconnects?: number;
+    } | null;
+    markouts?: Array<{
+      fill_id?: string;
+      fill_size?: number;
+      horizon_seconds?: number;
+      midpoint_markout_per_share?: number | null;
+      executable_markout_per_share?: number | null;
+      observation_delay_ms?: number;
+    }>;
+    portfolio?: VenuePortfolioSnapshot | null;
+    remaining_literal_fifo_limitations?: string[];
+  } | null;
+  latest_attempt?: {
+    run_id?: string;
+    status?: string;
+    finished_ts?: string;
+    error?: string;
+    order_submitted?: boolean;
+    portfolio?: VenuePortfolioSnapshot | null;
+    risk_at_end?: {
+      unresolved_risk_reservations?: number;
+      global_unresolved_risk_reservations?: number;
+    };
+  } | null;
+  preflight?: {
+    run_id?: string;
+    status?: string;
+    finished_ts?: string;
+    order_submitted?: boolean;
+    portfolio?: VenuePortfolioSnapshot | null;
+    risk_at_end?: {
+      unresolved_risk_reservations?: number;
+      global_unresolved_risk_reservations?: number;
+    };
+  } | null;
+  model?: {
+    evidence_protocol_version?: number;
+    generated_at?: string;
+    status?: string;
+    sample_size?: number;
+    label_sample_size?: number;
+    positive_fills?: number;
+    minimum_samples?: number;
+    train_size?: number;
+    test_size?: number;
+    train_label_size?: number;
+    test_label_size?: number;
+    out_of_sample_brier_score?: number;
+    temporal_split?: string;
+    reason?: string;
+    promotion_allowed?: boolean;
+    promotion_ready?: boolean;
+    promotion_block_reason?: string;
+    negative_non_fills?: number;
+    excluded_observations?: number;
+    legacy_protocol_observations?: number;
+    net_markout_30s_sample_size?: number;
+    mean_net_executable_markout_30s_per_share?: number;
+    quality_gates?: {
+      passed?: boolean;
+      eligible_observations?: number;
+      excluded_observations?: number;
+      data_gap_observations?: number;
+      eligible_data_gap_observations?: number;
+      excluded_data_gap_observations?: number;
+      cancellation_failure_observations?: number;
+      filled_observations?: number;
+      complete_markout_observations?: number;
+      early_markout_observations?: number;
+      legacy_protocol_observations?: number;
+    };
+    horizon_metrics?: Record<string, {
+      sample_size?: number;
+      positive_fills?: number;
+      brier_score?: number;
+    }>;
+  } | null;
+};
+
 export type LabCandidateEvidence = {
   candidate: string;
   profile?: string | null;

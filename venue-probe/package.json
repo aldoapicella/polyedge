@@ -1,0 +1,21 @@
+{
+  "name": "polyedge-venue-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bootstrap-credentials": "node src/bootstrap-credentials.mjs",
+    "diagnose-balance": "node src/diagnose-balance.mjs",
+    "diagnose-auth": "node src/diagnose-auth.mjs",
+    "probe": "node src/probe.mjs",
+    "train": "node src/train.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@azure/identity": "^4.11.1",
+    "@azure/storage-blob": "^12.28.0",
+    "@polymarket/clob-client-v2": "1.0.8",
+    "viem": "^2.33.3",
+    "ws": "^8.18.3"
+  }
+}

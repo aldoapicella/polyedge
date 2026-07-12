@@ -81,11 +81,13 @@ Authenticated order lifecycle data can solve order identity, actual partial
 fills, and venue acknowledgement timing. It does not automatically solve true
 FIFO rank unless the venue explicitly exposes rank or size ahead.
 
-Implement a separate, disabled-by-default `venue_probe` execution mode:
+The complete venue-real design consists of:
 
 1. Use server-side Polymarket L1/L2 authentication. Never expose the signing
-   key, API secret, or passphrase to the frontend or event payloads.
-2. Submit post-only GTC/GTD maker orders and record a monotonic client-send
+   key, API key identifier, API secret, or passphrase to the frontend or event
+   payloads. Authenticated lifecycle fields named `owner` and `order_owner`
+   contain the API key identifier on Polymarket and must also be redacted.
+2. Submit post-only short-lived GTD maker orders and record a monotonic client-send
    timestamp before the request.
 3. Record the returned `orderID`, status, making/taking amounts, and client
    receive timestamp. A `live` response establishes order identity and the
@@ -98,12 +100,145 @@ Implement a separate, disabled-by-default `venue_probe` execution mode:
    and user-channel acknowledgement latency.
 6. Use authenticated `size_matched` and trade IDs for actual partial fills.
    Compute 1/5/30-second markouts from the first market snapshot at or after
-   each horizon, while retaining observation delay and executable bid/ask.
+   each horizon for every distinct authenticated trade ID, while retaining
+   observation delay and executable bid/ask.
 7. Snapshot the public book immediately before send and immediately after the
    venue acknowledges the order. Continue to call any derived queue value
    `inferred_size_ahead` unless the venue supplies explicit priority/rank.
 8. Add sequence/gap detection, reconnect reconciliation, synchronized clocks,
    immutable raw capture, and duplicate trade/order-event protection.
+
+The implemented probe is deliberately isolated from the paper runtime and has
+hard gates for one open order at a time, post-only maker execution, no takers,
+a maximum $1.25 order notional, and a conservative $5 daily loss budget. A canary
+may submit one order; an explicitly enabled evidence campaign submits 25–50
+orders sequentially with a deterministic randomized mix of 1/5/30/60-second
+resting periods. It persists an immutable event ledger,
+the venue-confirmed lifecycle, public depth before send and after
+acknowledgement, fill/cancellation races, and real 1/5/30-second markouts when a
+real fill occurs. Credentials are referenced from Azure Key Vault; they are not
+placed in the frontend, image, or evidence payload.
+
+Socket close/error events are persisted. Both authenticated and market channels
+reconnect and resubscribe with bounded retries, exact duplicate messages are
+suppressed, and each final order is reconciled through authenticated REST after
+cancellation. Any reconnect marks the affected observation as having an
+unprovable stream gap and therefore ineligible for model training. The
+documented Polymarket channels do not expose a universal sequence number, so a
+reconnect cannot prove that every intermediate event was received. Every order
+and every campaign also confirms zero open orders, with a fail-closed account
+cancel recovery if the isolated probe order remains open.
+The public book is refreshed after WebSocket prewarm and immediately before
+submission. A market that no longer supports a safe post-only price is stopped
+before submission. Once a durable pre-send reservation exists, any ambiguous
+HTTP submission failure stops the campaign, confirms zero open orders, and
+leaves the full reserved notional unresolved; it is never silently released or
+retried. If a later probe fails, already completed
+probes are retained in the failed-run summary so their fills, markouts, and
+conservative daily-risk consumption cannot disappear from training or limits.
+
+Evidence protocol v3 adds a 60-second renewable Azure Blob lease so only one
+campaign can own the funded account. Before each send it writes a durable
+probe risk reservation, and immediately after acknowledgement it durably adds
+the venue order ID. Until terminal REST reconciliation and zero open orders are
+both confirmed, the full reserved notional consumes the daily cap. An
+unresolved reservation blocks every subsequent live run across UTC-day
+boundaries and requires explicit order/trade reconciliation; dry-run
+diagnostics remain available. Every live
+order uses GTD expiry as a venue-side backstop, and SIGTERM/SIGINT initiates
+cancel-all plus strict zero-open verification.
+
+Lease acquisition, renewal, and release have ten-second request deadlines. The
+worker tracks the last confirmed renewal with a monotonic clock and refuses to
+send once lease freshness exceeds 45 seconds, even if an SDK renewal call hangs
+without returning an error. Lease health and termination state are rechecked
+after the durable reservation and immediately before the non-awaiting send
+critical section.
+
+The reservation includes principal plus a conservative fee upper bound derived
+from the venue-reported base fee in basis points. Order selection is capped
+against both remaining daily risk and liquid collateral after applying that
+bound; finalized filled risk retains the same fee bound. Therefore the $5 cap
+cannot be exceeded merely because execution fees were omitted from principal.
+
+For filled probes, protocol v3 requires REST order quantity, REST trade
+quantity, authenticated user-channel order quantity, and user-channel trade
+quantity to agree within a small numeric tolerance. REST and user-channel trade
+ID sets must also agree. Each distinct trade ID must have its own timely
+1/5/30-second midpoint and executable markout triplet, with no null values and
+no observation more than two seconds late. A single triplet cannot stand in for
+multiple partial fills. Any disagreement, gap, missing trade, late markout, or
+null price makes the entire submitted probe ineligible and fails the global
+quality gate.
+
+After cancellation or terminal fill, the probe polls REST order state, REST
+trades, authenticated user events, and the complete account open-order list for
+at least ten seconds. It requires an unchanged terminal snapshot for at least
+five seconds before reducing the full reservation to matched risk. A delayed
+cancel-race fill changes the snapshot and restarts the quiescence timer. If
+stable finality is not established within thirty seconds, the full reservation
+remains unresolved and later live runs are blocked. Reservation manifests that
+lack a complete probe observation are synthesized as submitted, ineligible
+audit rows, so a crash cannot disappear from the model quality gate.
+
+The worker checks CLOB server time at startup and immediately before every
+submission. It also checks `https://polymarket.com/api/geoblock` at startup and
+immediately before every submission. Live submission requires `blocked=false`,
+country `IE`, and an exact match to the worker's configured static Azure NAT
+Gateway egress IP. A changed IP, country, blocked response, active kill switch,
+clock drift, existing open order, insufficient balance, or exhausted daily
+risk budget prevents the order from being signed and submitted.
+
+The funded canary account is an email-login deposit wallet. Authenticated
+diagnostics reconcile its 9.23 pUSD on-chain balance only with `POLY_1271`
+signature type `3`; legacy proxy/safe types `1` and `2` correctly report zero
+for this signer/funder pair. The probe uses the reconciled type `3` mapping and
+fails closed if the CLOB balance is below the capped maker order.
+
+The practical queue limitation is addressed by training:
+
+```text
+P(fill within 1/5/30/60 seconds |
+  inferred size ahead, order age, trade flow, depth changes,
+  spread, volatility, price, size, time to expiry)
+```
+
+Training requires at least 100 distinct protocol-v3 eligible order probes with at least 10
+distinct filled probes and 10 distinct non-filled probes. The four horizon
+labels from one order never count as four independent probes. The first 80% of
+whole probes are used for fitting and the last 20% as a temporal holdout, so no
+order can appear on both sides of the split. Incomplete probes remain reported
+but are excluded from fitting and make the quality gate fail. Protocol-v2 and
+older observations remain visible as legacy evidence but do not count toward
+the v3 threshold or promotion. The model reports out-of-sample Brier score plus
+calibration bins and remains research-only; it cannot promote a strategy.
+
+The live dashboard exposes the authenticated lifecycle and model under **Labs
+> Venue Execution**. It always labels the value as `inferred_size_ahead` and
+shows that literal FIFO rank is unavailable.
+
+The same panel reconciles liquid collateral with all current position values
+against the configured starting capital. A resolved winner's redeemable value
+is a gross payout, not profit. `true_net_account_pnl` is calculated as liquid
+collateral plus current position value minus starting capital, so resolved
+losers are not omitted. Redemption converts a resolved winning conditional
+token into collateral; it does not create additional PnL. Automatic gasless
+redemption additionally requires a dedicated Polymarket relayer API key kept
+server-side in Key Vault. Until that credential and transaction path are
+configured, redemption remains an explicit operator action in Polymarket.
+
+The existing East US execution job is retired because Polymarket correctly
+reports that origin as US/VA and blocks it. The authenticated worker is deployed
+in an isolated Azure Container Apps environment in North Europe (Ireland), with
+a dedicated VNet, NAT Gateway, and static egress IP. It has no inbound endpoint,
+uses managed identity for ACR, Blob Storage, and Key Vault, and remains manual
+and dry-run by default. The East US environment remains the data, dashboard,
+research, and model control plane and cannot submit venue orders.
+
+This cloud-region design is a technical execution origin, not a determination
+of the account holder's legal eligibility. It must continue to obey the live
+Polymarket response and applicable account/venue terms. If Polymarket changes
+Ireland's status, the worker fails closed automatically.
 
 Relevant venue interfaces:
 
@@ -150,4 +285,8 @@ decision -> send -> venue orderID/live ack -> user-channel updates
          -> 1/5/30-second midpoint and executable markouts
 ```
 
-Until then, queue and cancellation metrics remain explicitly research-only.
+Literal FIFO rank can only be closed if Polymarket supplies explicit
+`queue_rank`/`size_ahead`, per-order priority events, or an institutional
+matching-priority feed. Until then, queue metrics remain explicitly inferred
+and research-only even when order identity, fills, cancellation latency, and
+markouts are venue-real.

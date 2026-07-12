@@ -25,7 +25,8 @@ import type {
   RuntimeEvent,
   RuntimeConfig,
   RuntimeConfigPatch,
-  Snapshot
+  Snapshot,
+  VenueExecutionEvidence
 } from "@/lib/types";
 import { thinChartPoints, type ChartPoint, type ChartRange, type ChartSummary, type MarketSeries } from "@/lib/charting";
 import { shareValue } from "@/lib/format";
@@ -162,6 +163,10 @@ export function getLabSampleSizeLatest() {
 
 export function getLabFillModelsLatest() {
   return backendFetch<{ date?: string; report?: JsonRecord | null }>("labs/fill-models/latest");
+}
+
+export function getLabVenueExecution() {
+  return backendFetch<VenueExecutionEvidence>("labs/venue-execution");
 }
 
 export function getLabJobs() {

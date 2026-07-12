@@ -12,6 +12,9 @@ param image string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:lates
 @description('Frontend container image. Leave empty for backend-only bootstrap deployments.')
 param frontendImage string = ''
 
+@description('Authenticated venue probe image. Leave empty to omit the isolated manual probe and model jobs.')
+param venueProbeImage string = ''
+
 @description('Bearer token required to access the public API.')
 @secure()
 param apiBearerToken string
@@ -71,6 +74,7 @@ var suffix = uniqueString(subscription().id, resourceGroup().id, appName)
 var safeAppName = toLower(replace(appName, '-', ''))
 var storageName = take('st${safeAppName}${suffix}', 24)
 var acrName = take('cr${safeAppName}${suffix}', 50)
+var keyVaultName = take('kv${safeAppName}${suffix}', 24)
 var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix}', 63)
 var managedEnvironmentName = '${appName}-${environmentName}-env'
 var containerAppName = '${appName}-${environmentName}'
@@ -88,6 +92,7 @@ var labTableNames = [
 ]
 var frontendEnabled = !empty(frontendImage)
 var containerAppIdentityName = '${containerAppName}-id'
+var venueProbeEnabled = !empty(venueProbeImage)
 var tags = {
   app: appName
   environment: environmentName
@@ -398,6 +403,26 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   }
   properties: {
     adminUserEnabled: false
+  }
+}
+
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: keyVaultName
+  location: location
+  tags: union(tags, {
+    purpose: 'venue-probe-credentials'
+  })
+  properties: {
+    tenantId: tenant().tenantId
+    enableRbacAuthorization: true
+    enablePurgeProtection: true
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 90
+    publicNetworkAccess: 'Enabled'
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
   }
 }
 
@@ -729,6 +754,71 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
   }
 }]
 
+resource venueModelJob 'Microsoft.App/jobs@2024-03-01' = if (venueProbeEnabled) {
+  name: 'polyedge-venue-model-job'
+  location: location
+  tags: union(tags, {
+    researchJob: 'venue-fill-model'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${containerAppIdentity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaRetryLimit: 1
+      replicaTimeout: 300
+      scheduleTriggerConfig: {
+        cronExpression: '45 1 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: containerAppIdentity.id
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'venue-model'
+          image: venueProbeImage
+          command: [
+            'node'
+          ]
+          args: [
+            'src/train.mjs'
+          ]
+          env: [
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: containerAppIdentity.properties.clientId
+            }
+            {
+              name: 'AZURE_STORAGE_ACCOUNT_NAME'
+              value: storage.name
+            }
+            {
+              name: 'AZURE_STORAGE_CONTAINER_NAME'
+              value: storageContainerName
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+
 resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, containerAppIdentity.id, 'blob-data-contributor')
   scope: storage
@@ -754,6 +844,16 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: acr
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource keyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, containerAppIdentity.id, 'key-vault-secrets-user')
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
     principalId: containerAppIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
@@ -940,6 +1040,7 @@ resource logAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = [fo
 
 output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
+output keyVaultName string = keyVault.name
 output containerAppName string = containerApp.name
 output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
 output containerAppIdentityName string = containerAppIdentity.name
@@ -951,3 +1052,4 @@ output chartTableName string = chartTableName
 output marketTableName string = marketTableName
 output labTableNames array = labTableNames
 output researchJobNames array = [for job in researchJobDefinitions: job.name]
+output venueModelJobName string = venueProbeEnabled ? venueModelJob.name : ''

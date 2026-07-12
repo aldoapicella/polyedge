@@ -122,12 +122,16 @@ jobs:
           az acr login --name "${{ steps.deploy_outputs.outputs.acr_name }}"
           backend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-rust-backend:${{ github.sha }}"
           frontend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-frontend:${{ github.sha }}"
+          venue_probe_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-venue-probe:${{ github.sha }}"
           docker build -f Dockerfile.rust -t "$backend_image" .
           docker build -f Dockerfile.frontend -t "$frontend_image" .
+          docker build -f Dockerfile.venue-probe -t "$venue_probe_image" .
           docker push "$backend_image"
           docker push "$frontend_image"
+          docker push "$venue_probe_image"
           echo "BACKEND_IMAGE=$backend_image" >> "$GITHUB_ENV"
           echo "FRONTEND_IMAGE=$frontend_image" >> "$GITHUB_ENV"
+          echo "VENUE_PROBE_IMAGE=$venue_probe_image" >> "$GITHUB_ENV"
 
       - name: Deploy active images
         env:
@@ -140,7 +144,15 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/main.bicep \
             --parameters infra/parameters/polyedge-active.bicepparam \
-            --parameters image="$BACKEND_IMAGE" frontendImage="$FRONTEND_IMAGE" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}" dashboardAuthPassword="${{ secrets.DASHBOARD_AUTH_PASSWORD }}" dashboardSessionSecret="${{ secrets.DASHBOARD_SESSION_SECRET }}"
+            --parameters image="$BACKEND_IMAGE" frontendImage="$FRONTEND_IMAGE" venueProbeImage="$VENUE_PROBE_IMAGE" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}" dashboardAuthPassword="${{ secrets.DASHBOARD_AUTH_PASSWORD }}" dashboardSessionSecret="${{ secrets.DASHBOARD_SESSION_SECRET }}"
+
+      - name: Deploy North Europe evidence worker
+        run: |
+          az deployment group create \
+            --name "$APP_NAME-venue-probe-neu" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/venue-probe.bicep \
+            --parameters venueProbeImage="$VENUE_PROBE_IMAGE"
 
       - name: Verify active writer configuration
         run: |
@@ -157,6 +169,12 @@ jobs:
           test -n "$azure_client_id"
           test "$backend_base" = "http://127.0.0.1:8081/api/v1"
           test "$dashboard_secret" = "dashboard-session-secret"
+          probe_dry_run=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='VENUE_PROBE_DRY_RUN'].value | [0]" -o tsv)
+          probe_country=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='VENUE_PROBE_EXPECTED_COUNTRY'].value | [0]" -o tsv)
+          probe_location=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query location -o tsv)
+          test "$probe_dry_run" = "true"
+          test "$probe_country" = "IE"
+          test "$probe_location" = "North Europe"
 
       - name: Authenticated post-deploy smoke and paper probe
         env:

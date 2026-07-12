@@ -533,6 +533,7 @@ pub fn smoke_paths() -> Vec<&'static str> {
         "/api/v1/labs/reports/latest",
         "/api/v1/labs/jobs",
         "/api/v1/labs/prospective",
+        "/api/v1/labs/venue-execution",
         "/api/v1/data-quality/timeline",
         "/api/v1/jobs",
         "/api/v1/config/current",

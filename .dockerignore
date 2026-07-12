@@ -12,6 +12,7 @@ src/*.egg-info
 frontend/.next
 frontend/node_modules
 frontend/tsconfig.tsbuildinfo
+venue-probe/node_modules
 docs/reports
 target
 .playwright-cli

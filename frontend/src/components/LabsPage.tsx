@@ -14,9 +14,10 @@ import {
   getLabProspective,
   getLabRegimesLatest,
   getLabSampleSizeLatest,
-  getLabSummary
+  getLabSummary,
+  getLabVenueExecution
 } from "@/lib/api";
-import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow } from "@/lib/types";
+import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow, VenueExecutionEvidence } from "@/lib/types";
 import { compact, numberText } from "@/lib/format";
 import {
   CALIBRATION_COLUMNS,
@@ -31,7 +32,7 @@ import {
 } from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
 
-const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "QueueProxy / Fill Realism", "Sample Size", "Artifacts"] as const;
+const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "QueueProxy / Fill Realism", "Venue Execution", "Sample Size", "Artifacts"] as const;
 
 export function LabsPage() {
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
@@ -42,6 +43,7 @@ export function LabsPage() {
   const calibration = useQuery({ queryKey: ["labs", "calibration"], queryFn: getLabCalibrationLatest, retry: false });
   const fillModels = useQuery({ queryKey: ["labs", "fill-models"], queryFn: getLabFillModelsLatest, retry: false });
   const sampleSize = useQuery({ queryKey: ["labs", "sample-size"], queryFn: getLabSampleSizeLatest, retry: false });
+  const venueExecution = useQuery({ queryKey: ["labs", "venue-execution"], queryFn: getLabVenueExecution, retry: false });
   const artifacts = useQuery({ queryKey: ["labs", "artifacts", "labs"], queryFn: () => getLabArtifacts(""), retry: false });
 
   const rows = prospective.data?.result?.rows ?? [];
@@ -53,7 +55,7 @@ export function LabsPage() {
         <div>
           <h1 className="text-xl font-semibold text-ink">Labs</h1>
         </div>
-        <IconButton label="Refresh labs" onClick={() => void Promise.all([labSummary.refetch(), candidateEvidence.refetch(), prospective.refetch(), regimes.refetch(), calibration.refetch(), fillModels.refetch(), sampleSize.refetch(), artifacts.refetch()])}>
+        <IconButton label="Refresh labs" onClick={() => void Promise.all([labSummary.refetch(), candidateEvidence.refetch(), prospective.refetch(), regimes.refetch(), calibration.refetch(), fillModels.refetch(), venueExecution.refetch(), sampleSize.refetch(), artifacts.refetch()])}>
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
@@ -115,10 +117,181 @@ export function LabsPage() {
           emptyLabel="No QueueProxy fill-realism rows found. Run queue-audit or a fill-model report with queue_proxy_conservative/balanced evidence."
         />
       ) : null}
+      {tab === "Venue Execution" ? <VenueExecutionPanel evidence={venueExecution.data} loading={venueExecution.isLoading} error={venueExecution.error} /> : null}
       {tab === "Sample Size" ? <SampleSizePanel report={sampleSize.data?.report} /> : null}
       {tab === "Artifacts" ? <ArtifactsPanel artifacts={artifacts.data?.artifacts ?? []} loading={artifacts.isLoading} /> : null}
     </div>
   );
+}
+
+function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExecutionEvidence; loading: boolean; error: Error | null }) {
+  if (!evidence) {
+    return <Panel><EmptyState label={loading ? "Loading authenticated venue evidence" : error?.message ?? "No authenticated venue evidence yet"} /></Panel>;
+  }
+  const latest = evidence.latest;
+  const lifecycle = latest?.lifecycle;
+  const order = latest?.order;
+  const model = evidence.model;
+  const latestAttempt = evidence.latest_attempt;
+  const portfolio = evidence.preflight?.portfolio ?? latestAttempt?.portfolio ?? latest?.portfolio;
+  const globalUnresolvedRisk = evidence.preflight?.risk_at_end?.global_unresolved_risk_reservations ??
+    latestAttempt?.risk_at_end?.global_unresolved_risk_reservations ??
+    latest?.risk_at_end?.global_unresolved_risk_reservations ??
+    latest?.risk_at_end?.unresolved_risk_reservations ?? 0;
+  const markouts = latest?.markouts ?? [];
+  return (
+    <div className="space-y-5">
+      <Panel>
+        <PanelHeader title="Authenticated Venue Evidence" meta={latest?.finished_ts ?? evidence.generated_ts} />
+        <div className="grid gap-3 p-4 md:grid-cols-4">
+          <Metric label="Probe Status" value={latest?.status ?? "not run"} />
+          <Metric label="Evidence Protocol" value={latest?.evidence_protocol_version ? `v${latest.evidence_protocol_version}` : "legacy"} />
+          <Metric label="Execution Origin" value={latest?.execution_country ? `${latest.execution_country} / Azure North Europe` : latest?.execution_origin ?? "not verified"} />
+          <Metric label="Static Egress Verified" value={latest?.static_egress_verified ? "yes" : "no"} />
+          <Metric label="Campaign Progress" value={`${latest?.completed_probe_count ?? 0} / ${latest?.submitted_order_count ?? 0} reconciled`} />
+          <Metric label="Order Submitted" value={latest?.order_submitted ? "yes" : "no"} />
+          <Metric label="Venue Ack" value={milliseconds(lifecycle?.client_to_http_ack_ms)} />
+          <Metric label="Cancel Round Trip" value={milliseconds(lifecycle?.client_cancel_round_trip_ms)} />
+          <Metric label="User Cancel Ack" value={milliseconds(lifecycle?.client_to_user_cancel_ack_ms)} />
+          <Metric label="Matched Size" value={lifecycle?.actual_matched_size ?? 0} />
+          <Metric label="Partial Fill" value={lifecycle?.partial_fill ? "yes" : "no"} />
+          <Metric label="Cancel Race Fill" value={lifecycle?.fill_raced_cancellation ? "yes" : "no"} />
+          <Metric label="Strict Trade-throughs" value={lifecycle?.public_strict_trade_through_count ?? 0} />
+          <Metric label="Trade-throughs Without Fill" value={lifecycle?.public_trade_through_without_fill_count ?? 0} />
+          <Metric label="Planned Rest" value={lifecycle?.planned_rest_seconds === undefined ? "not observed" : `${lifecycle.planned_rest_seconds}s`} />
+          <Metric label="Zero Open Orders" value={lifecycle?.zero_open_orders_confirmed ? "confirmed" : "not confirmed"} />
+          <Metric label="Data Gap" value={lifecycle?.data_gap_detected ? "ineligible" : "none detected"} />
+          <Metric label="Markouts Complete" value={lifecycle?.markout_capture_complete ? "yes" : "not applicable / incomplete"} />
+          <Metric label="Matched-size Agreement" value={lifecycle?.matched_size_source_agreement ? "REST = user channel" : "not confirmed"} />
+          <Metric label="Trade-ID Agreement" value={lifecycle?.trade_id_source_agreement ? "REST = user channel" : "not confirmed"} />
+          <Metric label="WS Reconnects" value={(lifecycle?.authenticated_user_channel_reconnects ?? 0) + (lifecycle?.public_market_channel_reconnects ?? 0)} />
+          <Metric label="Risk Budget Used" value={latest?.risk_at_end?.conservative_loss_budget_consumed ?? 0} />
+          <Metric label="Global Unresolved Risk Reservations" value={globalUnresolvedRisk} />
+        </div>
+        {latest?.stop_reason ? <div className="border-t border-line px-4 py-3 text-sm text-ink/70">Campaign stop reason: {latest.stop_reason}.</div> : null}
+        {latestAttempt?.run_id && latestAttempt.run_id !== latest?.run_id ? (
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            Latest attempt: {latestAttempt.status ?? "unknown"} at {latestAttempt.finished_ts ?? "unknown time"}. {latestAttempt.error ?? "No additional error reported."}
+          </div>
+        ) : null}
+      </Panel>
+
+      <Panel>
+        <PanelHeader title="Portfolio Settlement" meta={portfolio?.captured_ts ?? "awaiting Azure portfolio snapshot"} />
+        {portfolio?.status === "available" ? (
+          <>
+            <div className="grid gap-3 p-4 md:grid-cols-4">
+              <Metric label="Liquid Collateral" value={usd(portfolio.liquid_collateral)} />
+              <Metric label="Gross Redeemable Payout" value={usd(portfolio.gross_redeemable_value)} />
+              <Metric label="Resolved Position Cost" value={usd(portfolio.resolved_position_cost)} />
+              <Metric label="Resolved Losing Cost" value={usd(portfolio.resolved_losing_cost)} />
+              <Metric label="Current Position Value" value={usd(portfolio.current_position_value)} />
+              <Metric label="Account Equity" value={usd(portfolio.account_equity)} />
+              <Metric label="Starting Capital" value={usd(portfolio.starting_capital)} />
+              <Metric label="True Net Account PnL" value={signedUsd(portfolio.account_net_pnl)} />
+              <Metric label="Redeemable Winners" value={portfolio.redeemable_winner_count ?? 0} />
+            </div>
+            <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+              Gross payout is not profit. True account PnL equals liquid collateral plus current position value minus starting capital; losing resolved positions remain included in the calculation.
+            </div>
+          </>
+        ) : <EmptyState label="No current Azure portfolio snapshot is available." />}
+      </Panel>
+
+      <div className="grid gap-5 xl:grid-cols-2">
+        <Panel>
+          <PanelHeader title="Effective Queue Evidence" meta={evidence.queue_position_source} />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Queue Metric" value={evidence.queue_position_metric} />
+            <Metric label="Inferred Size Ahead" value={order?.inferredSizeAhead ?? "not observed"} />
+            <Metric label="Same-price Public Size" value={order?.samePricePublicSize ?? "not observed"} />
+            <Metric label="Better-price Public Size" value={order?.betterPricePublicSize ?? "not observed"} />
+            <Metric label="Probe Notional" value={order?.notional ?? "not submitted"} />
+            <Metric label="Literal FIFO Rank" value="unavailable from venue feeds" />
+          </div>
+          <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+            This is not exact FIFO queue position. It combines your authenticated order/fill lifecycle with public aggregated L2 depth. {evidence.remaining_limitation}
+          </div>
+        </Panel>
+
+        <Panel>
+          <PanelHeader title="Empirical Fill Model" meta={model?.status ?? "not trained"} />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Target" value="P(fill within 1/5/30/60s)" />
+            <Metric label="Eligible Order Probes" value={model?.sample_size ?? 0} />
+            <Metric label="Eligible Horizon Labels" value={model?.label_sample_size ?? 0} />
+            <Metric label="Filled Probes" value={model?.positive_fills ?? 0} />
+            <Metric label="Non-filled Probes" value={model?.negative_non_fills ?? 0} />
+            <Metric label="Excluded Probes" value={model?.excluded_observations ?? 0} />
+            <Metric label="Legacy Protocol Probes" value={model?.legacy_protocol_observations ?? 0} />
+            <Metric label="Minimum Eligible Probes" value={model?.minimum_samples ?? 100} />
+            <Metric label="Temporal Holdout" value={model?.temporal_split ?? "required before training"} />
+            <Metric label="OOS Brier Score" value={model?.out_of_sample_brier_score ?? "pending"} />
+            <Metric label="Quality Gates" value={model?.quality_gates?.passed ? "passed" : "collecting / failed"} />
+            <Metric label="Excluded Data-gap Probes" value={model?.quality_gates?.excluded_data_gap_observations ?? 0} />
+            <Metric label="Early Markout Exclusions" value={model?.quality_gates?.early_markout_observations ?? 0} />
+            <Metric label="Net 30s Markout" value={model?.net_markout_30s_sample_size ? numberText(model.mean_net_executable_markout_30s_per_share) : "pending"} />
+            <Metric label="Promotion Ready" value={model?.promotion_ready ? "yes — human approval required" : "no"} />
+          </div>
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            {model?.reason ?? model?.promotion_block_reason ?? "The model stays research-only and cannot be promoted until temporal out-of-sample validation is available."}
+          </div>
+          {(model?.legacy_protocol_observations ?? 0) > 0 ? (
+            <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+              Legacy protocol observations remain visible but do not qualify for promotion. Protocol v3 requires durable pre-send risk accounting, single-campaign leasing, REST/user-channel agreement, and one timely 1/5/30-second markout triplet per authenticated fill.
+            </div>
+          ) : null}
+        </Panel>
+      </div>
+
+      <Panel>
+        <PanelHeader title="Post-fill Markouts" meta="1 / 5 / 30 seconds" />
+        {markouts.length ? (
+          <div className="overflow-auto">
+            <table className="w-full min-w-[680px] text-left text-sm">
+              <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
+                <tr>{["Fill ID", "Fill Size", "Horizon", "Midpoint Markout / Share", "Executable Markout / Share", "Observation Delay"].map((header) => <th key={header} className="px-3 py-2">{header}</th>)}</tr>
+              </thead>
+              <tbody>{markouts.map((markout) => {
+                const delay = Number(markout.observation_delay_ms);
+                const invalid = markout.observation_delay_ms === null || markout.observation_delay_ms === undefined ||
+                  !Number.isFinite(delay) || delay < 0 || delay > 2000 ||
+                  markout.midpoint_markout_per_share === null || markout.midpoint_markout_per_share === undefined ||
+                  markout.executable_markout_per_share === null || markout.executable_markout_per_share === undefined;
+                return (
+                <tr key={`${markout.fill_id ?? "legacy"}-${markout.horizon_seconds}`} className={`border-b border-line last:border-b-0 ${invalid ? "bg-amber-50" : ""}`}>
+                  <td className="px-3 py-2 font-mono text-xs">{markout.fill_id ? `${markout.fill_id.slice(0, 10)}…` : "legacy"}</td>
+                  <td className="px-3 py-2">{numberText(markout.fill_size)}</td>
+                  <td className="px-3 py-2">{markout.horizon_seconds}s</td>
+                  <td className="px-3 py-2">{numberText(markout.midpoint_markout_per_share)}</td>
+                  <td className="px-3 py-2">{numberText(markout.executable_markout_per_share)}</td>
+                  <td className="px-3 py-2">{milliseconds(markout.observation_delay_ms)}{invalid ? " — excluded from v3 model" : ""}</td>
+                </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        ) : <EmptyState label="No real fill occurred, so no markout can honestly be reported yet." />}
+      </Panel>
+    </div>
+  );
+}
+
+function milliseconds(value: number | null | undefined) {
+  return value === null || value === undefined ? "not observed" : `${numberText(value)} ms`;
+}
+
+function usd(value: number | null | undefined) {
+  return value === null || value === undefined ? "n/a" : `$${numberText(value, 6)}`;
+}
+
+function signedUsd(value: number | null | undefined) {
+  if (value === null || value === undefined) return "n/a";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "n/a";
+  if (numeric > 0) return `+$${numberText(numeric, 6)}`;
+  if (numeric < 0) return `-$${numberText(Math.abs(numeric), 6)}`;
+  return "$0";
 }
 
 function Overview({
