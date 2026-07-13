@@ -32,6 +32,8 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-features
           cargo build --release -p polyedge-cli
+          grep -Fq -- '--expected-runtime-role profitability_shadow' research/run_shadow_daily.sh
+          grep -Fq -- '--expected-runtime-role primary' infra/main.bicep
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -132,7 +134,7 @@ jobs:
           backend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-rust-backend:${{ github.sha }}"
           frontend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-frontend:${{ github.sha }}"
           venue_probe_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-venue-probe:${{ github.sha }}"
-          docker build -f Dockerfile.rust -t "$backend_image" .
+          docker build --build-arg GIT_SHA="${{ github.sha }}" -f Dockerfile.rust -t "$backend_image" .
           docker build -f Dockerfile.frontend -t "$frontend_image" .
           docker build -f Dockerfile.venue-probe -t "$venue_probe_image" .
           docker push "$backend_image"
@@ -258,6 +260,7 @@ jobs:
           research_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_RESEARCH_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
           funded_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_FUNDED_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
           model_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
+          event_index_types=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value' containerapp.json)
           test "$run_on_startup" = "true"
           test -n "$azure_client_id"
           test "$backend_base" = "http://127.0.0.1:8081/api/v1"
@@ -265,6 +268,7 @@ jobs:
           test "$research_container" = "polyedge-research"
           test "$funded_container" = "polyedge-funded-evidence"
           test "$model_container" = "polyedge-models"
+          test "$(echo "$event_index_types" | grep -c 'runtime_provenance')" = "1"
           test "$(jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length' containerapp.json)" = "0"
           test "$(jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length' containerapp.json)" = "0"
           for research_job_name in polyedge-data-freshness-job polyedge-hourly-quality-job polyedge-daily-research-job polyedge-prospective-job polyedge-replay-index-job polyedge-chart-backfill-job polyedge-adx-ingestion-job polyedge-backfill-job; do
@@ -362,6 +366,7 @@ jobs:
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-models"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION") | .value')" = "conservative-execution-prior-v1"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_EXECUTION_MODEL_SHA256") | .value')" = "sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value | contains("runtime_provenance")')" = "true"
           test "$(echo "$shadow_json" | jq -r '[.properties.template.containers[0].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length')" = "0"
           test "$(echo "$shadow_json" | jq -r '(.properties.configuration.secrets // []) | length')" = "0"
           shadow_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-daily-neu-job -o json)
@@ -578,6 +583,7 @@ jobs:
           curl --fail --silent --show-error -b cookies.txt -X POST \
             "https://$fqdn/api/backend/execution-quality/probe" -o probe.json
           jq -e '.status == "pass" and .venue_contacted == false and .live_order_placed == false and .markout_1s == 2 and .markout_5s == 2 and .markout_30s == 2' probe.json
+          jq -e --arg expected_sha "${{ github.sha }}" '.git_sha == $expected_sha' smoke-status.json
           revision=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --query properties.latestReadyRevisionName -o tsv)
           az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --revision "$revision" -o json > replicas.json
           jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' replicas.json

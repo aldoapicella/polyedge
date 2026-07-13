@@ -54,6 +54,23 @@ The frozen candidate is `dynamic_quote_style@2026-06-14`. The first shadow decis
 - zero fatal, blocking, or unclassified data warnings;
 - a positive 30-second executable markout lower bound after costs.
 
+A clean day must cover the complete UTC window: the first event must arrive
+within five minutes of `00:00`, the last event within five minutes of `24:00`,
+all 24 UTC hour buckets must contain events, and no observed event-time gap may
+exceed five minutes. A bootstrap day, restart gap, or partial rerun is still
+published for auditability but receives a known blocking warning and cannot
+increase the clean-day streak. Every report embeds the exact 40-character Git
+revision, and each runtime writes a `runtime_provenance` event binding that
+revision, full runtime-configuration hash, role, safety settings, frozen
+candidate hash, execution-model binding, and storage destination. Provenance is
+durably flushed before feeds start and repeated every minute. A clean day also
+requires provenance within both five-minute UTC boundaries, no provenance gap
+over five minutes, one unchanged identity for the whole day, and an exact Git
+SHA match between the runtime and the reporter. Missing, unknown, mismatched,
+or mid-day-changing provenance is blocking. The publisher requires an explicit
+expected runtime role and stores it in the immutable manifest; the shadow job
+passes `profitability_shadow`, while the primary paper job passes `primary`.
+
 An inconclusive result may extend once to 60 calendar days or 2,000 markets. If every promotion gate has not passed when either limit is reached, the immutable manifest enters terminal `stopped_no_go`; the candidate is not tuned inside its holdout.
 
 ## Execution Model

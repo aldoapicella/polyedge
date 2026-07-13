@@ -33,6 +33,61 @@ fn audit_counts_fixture_and_malformed_lines() {
 }
 
 #[test]
+fn normalized_audit_preserves_and_summarizes_runtime_provenance() {
+    let dir = test_dir("runtime_provenance_audit");
+    let events = dir.join("events.jsonl");
+    let identity = valid_runtime_provenance_identity();
+    let lines = [
+        "2026-07-14T00:00:01Z",
+        "2026-07-14T00:01:01Z",
+        "2026-07-14T00:02:01Z",
+    ]
+    .into_iter()
+    .map(|recorded_ts| {
+        serde_json::json!({
+            "event_type": "runtime_provenance",
+            "recorded_ts": recorded_ts,
+            "payload": identity
+        })
+        .to_string()
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    write_events(&events, &format!("{lines}\n"));
+
+    let normalized = dir.join("normalized");
+    let normalize = run_normalize(NormalizeOptions {
+        input: events,
+        out: normalized.clone(),
+        format: "jsonl-indexed-gzip-sharded".to_owned(),
+        overwrite: true,
+    })
+    .unwrap();
+    assert_eq!(
+        normalize["result"]["files"]["runtime_provenance"]["rows"],
+        3
+    );
+
+    let audit = run_audit(AuditOptions {
+        input: normalized,
+        out: dir.join("data_audit.json"),
+        markdown: dir.join("data_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(audit["result"]["runtime_provenance"]["observations"], 3);
+    assert_eq!(
+        audit["result"]["runtime_provenance"]["valid_observations"],
+        3
+    );
+    assert_eq!(
+        audit["result"]["runtime_provenance"]["distinct_identity_count"],
+        1
+    );
+    assert_eq!(audit["result"]["runtime_provenance"]["max_gap_ms"], 60_000);
+}
+
+#[test]
 fn exclusion_registry_loads_put_bug_window_by_default() {
     let dir = test_dir("exclusion_registry");
     let registry = dir.join("exclusion_windows.yaml");
@@ -1139,6 +1194,40 @@ candidates:
     enabled_by_default: false
     deployment_allowed: false
 "#
+}
+
+fn valid_runtime_provenance_identity() -> Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "backend_impl": "rust",
+        "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+        "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+        "app_name": "polyedge-shadow-neu",
+        "runtime_role": "profitability_shadow",
+        "shadow_only": true,
+        "execution_mode": "paper",
+        "allow_live": false,
+        "enable_taker_orders": false,
+        "allow_emergency_account_cancel": false,
+        "paper_maker_fill_policy": "none",
+        "adaptive_regime_enabled": true,
+        "adaptive_regime_mode": "dynamic_quote_style",
+        "candidate": {
+            "name": "dynamic_quote_style",
+            "version": "dynamic_quote_style@2026-06-14",
+            "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+        },
+        "storage_account": "stpolyedgedev",
+        "storage_container": "polyedge-shadow-events",
+        "event_blob_prefix": "shadow-events/campaign-2026-07-12",
+        "publish_strategy_canary_intents": true,
+        "execution_model": {
+            "version": "conservative-execution-prior-v1",
+            "blob_uri": "azure://stpolyedgedev/polyedge-models/conservative-execution-prior-v1.json",
+            "sha256": format!("sha256:{}", "b".repeat(64))
+        },
+        "research_only": true
+    })
 }
 
 fn reference_line(price: &str, ts: &str) -> String {

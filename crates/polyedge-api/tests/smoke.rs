@@ -23,6 +23,9 @@ async fn shadow_role_is_reported_explicitly() {
     let mut settings = RuntimeSettings::default();
     settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
     settings.paper.maker_fill_policy = "none".to_owned();
+    settings.strategy.adaptive_regime_enabled = true;
+    settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+    settings.azure.publish_strategy_canary_intents = true;
     settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
     settings.azure.event_blob_prefix = "shadow-events/test-campaign".to_owned();
     let app = app(settings);

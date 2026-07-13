@@ -932,12 +932,32 @@ fn load_daily_prospective_rows(
     reports_dir: &Path,
     since: DateTime<Utc>,
 ) -> Result<Vec<Value>, ResearchError> {
-    let mut rows = load_local_daily_prospective_rows(reports_dir, since)?;
-    if rows.is_empty() {
-        rows = load_azure_daily_prospective_rows(reports_dir, since)?;
+    let local = load_local_daily_prospective_rows(reports_dir, since)?;
+    let azure = load_azure_daily_prospective_rows(reports_dir, since)?;
+    merge_daily_prospective_rows(local, azure)
+}
+
+fn merge_daily_prospective_rows(
+    local: Vec<Value>,
+    azure: Vec<Value>,
+) -> Result<Vec<Value>, ResearchError> {
+    let mut by_date = BTreeMap::new();
+    for (source, rows) in [("azure", azure), ("local", local)] {
+        for row in rows {
+            let date = row
+                .get("date")
+                .and_then(Value::as_str)
+                .filter(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
+                .ok_or_else(|| {
+                    ResearchError::InvalidInput(format!(
+                        "{source} prospective row has no valid UTC date"
+                    ))
+                })?
+                .to_owned();
+            by_date.insert(date, row);
+        }
     }
-    rows.sort_by(|left, right| left["date"].as_str().cmp(&right["date"].as_str()));
-    Ok(rows)
+    Ok(by_date.into_values().collect())
 }
 
 fn load_local_daily_prospective_rows(
@@ -964,9 +984,17 @@ fn load_local_daily_prospective_rows(
         let date_dir = entry.path();
         let atomic_marker_present =
             date_dir.join("latest.json").is_file() || date_dir.join("runs").is_dir();
-        let source_dir = if atomic_marker_present {
+        let (source_dir, manifest_quality, runtime_role) = if atomic_marker_present {
             match inspect_daily_dependency(reports_dir, report_date)? {
-                DailyDependency::Ready { bundle_dir, .. } => bundle_dir,
+                DailyDependency::Ready {
+                    bundle_dir,
+                    manifest,
+                    ..
+                } => (
+                    bundle_dir,
+                    Some(manifest.data_quality.clone()),
+                    manifest.runtime_role.clone(),
+                ),
                 DailyDependency::WaitingForDependency { reason, .. } => {
                     return Err(ResearchError::InvalidInput(format!(
                         "atomic daily bundle {date} is not verified: {reason}"
@@ -974,18 +1002,28 @@ fn load_local_daily_prospective_rows(
                 }
             }
         } else if legacy_daily_fallback_allowed(report_date, false) {
-            date_dir
+            (date_dir, None, None)
         } else {
             return Err(ResearchError::InvalidInput(format!(
                 "atomic daily bundle is required on or after {ATOMIC_DAILY_PROTOCOL_CUTOFF}: {date}"
             )));
         };
-        rows.push(daily_prospective_row(&date, &source_dir)?);
+        rows.push(daily_prospective_row(
+            &date,
+            &source_dir,
+            manifest_quality,
+            runtime_role,
+        )?);
     }
     Ok(rows)
 }
 
-fn daily_prospective_row(date: &str, dir: &Path) -> Result<Value, ResearchError> {
+fn daily_prospective_row(
+    date: &str,
+    dir: &Path,
+    manifest_quality: Option<DataQualitySummary>,
+    runtime_role: Option<polyedge_config::RuntimeRole>,
+) -> Result<Value, ResearchError> {
     let final_report = read_optional_json(&dir.join("final_report.json"))?;
     let regimes = read_optional_json(&dir.join("regimes.json"))?
         .or(read_optional_json(&dir.join("regime_profiles.json"))?);
@@ -1006,6 +1044,8 @@ fn daily_prospective_row(date: &str, dir: &Path) -> Result<Value, ResearchError>
             audit,
             execution_quality,
             cumulative_wallet,
+            manifest_quality,
+            runtime_role,
         },
     )
 }
@@ -1048,53 +1088,59 @@ fn load_azure_daily_prospective_rows(
             AzureDailyBundleState::Ready {
                 run_prefix,
                 manifest,
-            } => rows.push(daily_prospective_row_from_reports(
-                &date,
-                DailyReportDocuments {
-                    final_report: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["final_report.json", "final_strategy_research_report.json"],
-                    )?,
-                    regimes: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["regimes.json", "regime_profiles.json"],
-                    )?,
-                    baseline: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["baseline.json", "baseline_static_all_fill_models.json"],
-                    )?,
-                    sample_size: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["sample_size.json"],
-                    )?,
-                    audit: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["data_audit.json"],
-                    )?,
-                    execution_quality: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["execution_quality.json"],
-                    )?,
-                    cumulative_wallet: read_manifest_artifact(
-                        &mut client,
-                        &run_prefix,
-                        &manifest,
-                        &["cumulative_wallet.json"],
-                    )?,
-                },
-            )?),
+            } => {
+                let manifest_quality = Some(manifest.data_quality.clone());
+                let runtime_role = manifest.runtime_role.clone();
+                rows.push(daily_prospective_row_from_reports(
+                    &date,
+                    DailyReportDocuments {
+                        final_report: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["final_report.json", "final_strategy_research_report.json"],
+                        )?,
+                        regimes: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["regimes.json", "regime_profiles.json"],
+                        )?,
+                        baseline: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["baseline.json", "baseline_static_all_fill_models.json"],
+                        )?,
+                        sample_size: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["sample_size.json"],
+                        )?,
+                        audit: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["data_audit.json"],
+                        )?,
+                        execution_quality: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["execution_quality.json"],
+                        )?,
+                        cumulative_wallet: read_manifest_artifact(
+                            &mut client,
+                            &run_prefix,
+                            &manifest,
+                            &["cumulative_wallet.json"],
+                        )?,
+                        manifest_quality,
+                        runtime_role,
+                    },
+                )?)
+            }
             AzureDailyBundleState::Invalid { reason } => {
                 return Err(ResearchError::InvalidInput(format!(
                     "Azure atomic daily bundle {date} is not verified: {reason}"
@@ -1147,6 +1193,8 @@ fn load_azure_daily_prospective_rows(
                             &mut client,
                             &format!("{daily_prefix}cumulative_wallet.json"),
                         )?,
+                        manifest_quality: None,
+                        runtime_role: None,
                     },
                 )?);
             }
@@ -1265,6 +1313,26 @@ fn load_azure_complete_bundle(
             reason: "manifest_incomplete_or_identity_mismatch".to_owned(),
         });
     }
+    if super::daily_provenance_required(pointer.date) && manifest.schema_version != 2 {
+        return Ok(AzureDailyBundleState::Invalid {
+            reason: "manifest_schema_downgrade".to_owned(),
+        });
+    }
+    if manifest.schema_version == 2
+        && !manifest
+            .git_sha
+            .as_deref()
+            .is_some_and(polyedge_config::is_full_git_sha)
+    {
+        return Ok(AzureDailyBundleState::Invalid {
+            reason: "manifest_git_sha_invalid".to_owned(),
+        });
+    }
+    if manifest.schema_version == 2 && manifest.runtime_role.is_none() {
+        return Ok(AzureDailyBundleState::Invalid {
+            reason: "manifest_runtime_role_missing".to_owned(),
+        });
+    }
     let run_prefix = manifest_blob
         .strip_suffix("run_manifest.json")
         .unwrap_or(&manifest_blob)
@@ -1339,6 +1407,8 @@ struct DailyReportDocuments {
     audit: Option<Value>,
     execution_quality: Option<Value>,
     cumulative_wallet: Option<Value>,
+    manifest_quality: Option<DataQualitySummary>,
+    runtime_role: Option<polyedge_config::RuntimeRole>,
 }
 
 fn daily_prospective_row_from_reports(
@@ -1352,10 +1422,14 @@ fn daily_prospective_row_from_reports(
             regimes: documents.regimes.as_ref(),
             baseline: documents.baseline.as_ref(),
         },
-        documents.sample_size.as_ref(),
-        documents.audit.as_ref(),
-        documents.execution_quality.as_ref(),
-        documents.cumulative_wallet.as_ref(),
+        DailyRowEvidence {
+            sample: documents.sample_size.as_ref(),
+            audit: documents.audit.as_ref(),
+            execution_quality: documents.execution_quality.as_ref(),
+            cumulative_wallet: documents.cumulative_wallet.as_ref(),
+            manifest_quality: documents.manifest_quality.as_ref(),
+            runtime_role: documents.runtime_role.as_ref(),
+        },
     )
 }
 
@@ -1426,14 +1500,28 @@ struct DailyReportSources<'a> {
     baseline: Option<&'a Value>,
 }
 
+struct DailyRowEvidence<'a> {
+    sample: Option<&'a Value>,
+    audit: Option<&'a Value>,
+    execution_quality: Option<&'a Value>,
+    cumulative_wallet: Option<&'a Value>,
+    manifest_quality: Option<&'a DataQualitySummary>,
+    runtime_role: Option<&'a polyedge_config::RuntimeRole>,
+}
+
 fn json_row(
     date: &str,
     reports: DailyReportSources<'_>,
-    sample: Option<&Value>,
-    audit: Option<&Value>,
-    execution_quality: Option<&Value>,
-    cumulative_wallet: Option<&Value>,
+    evidence: DailyRowEvidence<'_>,
 ) -> Result<Value, ResearchError> {
+    let DailyRowEvidence {
+        sample,
+        audit,
+        execution_quality,
+        cumulative_wallet,
+        manifest_quality,
+        runtime_role,
+    } = evidence;
     let source = merge_optional_reports([reports.final_report, reports.regimes, reports.baseline]);
     let sample = sample.unwrap_or(&source);
     let fill_model = text_at(&source, &["/result/fill_model"]).unwrap_or("touch_after_250ms");
@@ -1479,9 +1567,17 @@ fn json_row(
         ],
     )
     .or_else(|| number_at(sample, &["/result/statistics/n", "/statistics/n"]));
-    let quality = data_quality_status(audit);
-    let quality_reasons = data_quality_reasons(audit);
-    let quality_summary = audit.map(quality_from_audit);
+    let quality_summary = manifest_quality
+        .cloned()
+        .or_else(|| audit.map(quality_from_audit));
+    let quality = quality_summary
+        .as_ref()
+        .map(manifest_quality_status)
+        .unwrap_or_else(|| data_quality_status(audit));
+    let quality_reasons = quality_summary
+        .as_ref()
+        .map(manifest_quality_reasons)
+        .unwrap_or_else(|| data_quality_reasons(audit));
     let execution_quality_gate = execution_quality
         .and_then(|report| report.pointer("/result/evidence_gate"))
         .cloned()
@@ -1521,6 +1617,7 @@ fn json_row(
         "data_quality_status": quality,
         "data_quality_reasons": quality_reasons,
         "data_quality": quality_summary,
+        "runtime_role": runtime_role.map(polyedge_config::RuntimeRole::as_str),
         "wallet_constrained": dynamic_wallet_constrained,
         "decision_parity_rate": number_at(&source, &["/result/decision_parity_rate", "/decision_parity_rate"]),
         "markout_30s_ci_low": execution_quality.and_then(|report| {
@@ -1963,7 +2060,8 @@ fn consecutive_clean_day_streak(rows: &[Value]) -> u32 {
             .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
         let clean = serde_json::from_value::<DataQualitySummary>(row["data_quality"].clone())
             .ok()
-            .is_some_and(|quality| quality.promotion_allowed());
+            .is_some_and(|quality| quality.promotion_allowed())
+            && row["runtime_role"].as_str() == Some("profitability_shadow");
         if !clean || date.is_none() || previous.is_some_and(|value| date != value.succ_opt()) {
             streak = 0;
         }
@@ -2175,6 +2273,40 @@ fn data_quality_status(audit: Option<&Value>) -> &'static str {
     }
 }
 
+fn manifest_quality_status(quality: &DataQualitySummary) -> &'static str {
+    if quality.total_events == 0 || !quality.fatal_issues.is_empty() {
+        "critical"
+    } else if quality.promotion_allowed() {
+        "healthy"
+    } else {
+        "warning"
+    }
+}
+
+fn manifest_quality_reasons(quality: &DataQualitySummary) -> Vec<Value> {
+    let mut reasons = quality
+        .fatal_issues
+        .iter()
+        .map(|reason| json!(format!("fatal:{reason}")))
+        .chain(
+            quality
+                .warnings
+                .iter()
+                .filter(|warning| warning.severity == super::run_bundle::WarningSeverity::Blocking)
+                .map(|warning| json!(warning.rule_id)),
+        )
+        .collect::<Vec<_>>();
+    if quality.decision_grade_coverage < Decimal::new(95, 2) {
+        reasons.push(json!("decision_grade_coverage_below_95pct"));
+    }
+    if !quality.event_time_ordering_restored {
+        reasons.push(json!("event_time_ordering_not_restored"));
+    }
+    reasons.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    reasons.dedup();
+    reasons
+}
+
 fn is_informational_audit_message(message: &str) -> bool {
     message.ends_with("out-of-order timestamps")
         || message.starts_with("out-of-order timestamp in ")
@@ -2374,6 +2506,7 @@ fn value_to_string(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod wallet_metric_tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn daily_row_and_profitability_evaluator_use_dynamic_wallet_metrics() {
@@ -2401,6 +2534,8 @@ mod wallet_metric_tests {
             "wallet_constrained_max_drawdown": "0",
             "wallet_constrained_unresolved_orders": 0
         });
+        let quality = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
+        let runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
         let row = json_row(
             "2026-07-12",
             DailyReportSources {
@@ -2408,10 +2543,14 @@ mod wallet_metric_tests {
                 regimes: Some(&regimes),
                 baseline: None,
             },
-            None,
-            None,
-            None,
-            Some(&cumulative_wallet),
+            DailyRowEvidence {
+                sample: None,
+                audit: None,
+                execution_quality: None,
+                cumulative_wallet: Some(&cumulative_wallet),
+                manifest_quality: Some(&quality),
+                runtime_role: Some(&runtime_role),
+            },
         )
         .unwrap();
 
@@ -2525,7 +2664,13 @@ mod wallet_metric_tests {
         let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
         let dirty =
             DataQualitySummary::new(100, Decimal::new(90, 2), Vec::new(), Vec::<String>::new());
-        let row = |date: &str, quality: &DataQualitySummary| json!({"date": date, "data_quality": quality});
+        let row = |date: &str, quality: &DataQualitySummary| {
+            json!({
+                "date": date,
+                "data_quality": quality,
+                "runtime_role": "profitability_shadow"
+            })
+        };
         assert_eq!(
             consecutive_clean_day_streak(&[row("2026-07-12", &clean), row("2026-07-13", &clean)]),
             2
@@ -2545,6 +2690,100 @@ mod wallet_metric_tests {
     }
 
     #[test]
+    fn published_blocking_manifest_cannot_increment_clean_days() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-manifest-quality-consumer-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        for name in [
+            "baseline.json",
+            "regimes.json",
+            "final_report.json",
+            "execution_quality.json",
+        ] {
+            std::fs::write(source.join(name), "{}").unwrap();
+        }
+        let observed_hours = (0..24)
+            .map(|hour| (format!("2026-07-14T{hour:02}"), 100_u64))
+            .collect::<BTreeMap<_, _>>();
+        let audit = json!({
+            "result": {
+                "total_events": 2400,
+                "decision_grade_coverage": 1.0,
+                "fatal_data_quality_issues": [],
+                "warnings": [],
+                "event_time_ordering_restored": true,
+                "out_of_order_timestamps": 0,
+                "first_event_timestamp": "2026-07-14T00:00:01Z",
+                "last_event_timestamp": "2026-07-14T23:59:59Z",
+                "event_count_by_hour": observed_hours,
+                "largest_time_gaps": [{"gap_ms": 60000}]
+            }
+        });
+        assert!(quality_from_audit(&audit).promotion_allowed());
+        let audit_path = source.join("data_audit.json");
+        std::fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+        let daily_root = root.join("daily");
+        let published = super::super::run_bundle::publish_daily_directory(
+            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            "shadow-blocked-20260714",
+            "4".repeat(64),
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+            &source,
+            &daily_root,
+            &audit_path,
+        )
+        .unwrap();
+        assert!(!published.manifest.data_quality.promotion_allowed());
+
+        let rows = load_local_daily_prospective_rows(
+            &daily_root,
+            Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["runtime_role"], "profitability_shadow");
+        let row_quality: DataQualitySummary =
+            serde_json::from_value(rows[0]["data_quality"].clone()).unwrap();
+        assert_eq!(row_quality, published.manifest.data_quality);
+        assert_eq!(consecutive_clean_day_streak(&rows), 0);
+    }
+
+    #[test]
+    fn fresh_local_day_merges_with_prior_azure_history() {
+        let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
+        let dirty = DataQualitySummary::new(
+            100,
+            Decimal::ONE,
+            vec!["duplicate stale current-day row".to_owned()],
+            Vec::<String>::new(),
+        );
+        let row = |date: &str, quality: &DataQualitySummary, source: &str| {
+            json!({
+                "date": date,
+                "data_quality": quality,
+                "runtime_role": "profitability_shadow",
+                "source": source
+            })
+        };
+        let azure = vec![
+            row("2026-07-12", &clean, "azure"),
+            row("2026-07-13", &clean, "azure"),
+            row("2026-07-14", &dirty, "azure-stale"),
+        ];
+        let local = vec![row("2026-07-14", &clean, "local")];
+        let merged = merge_daily_prospective_rows(local, azure).unwrap();
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[2]["date"], "2026-07-14");
+        assert_eq!(merged[2]["source"], "local");
+        assert_eq!(consecutive_clean_day_streak(&merged), 3);
+    }
+
+    #[test]
     fn clean_day_streak_resets_on_gap_or_dirty_day() {
         fn row(date: &str, clean: bool) -> Value {
             let quality = if clean {
@@ -2557,7 +2796,11 @@ mod wallet_metric_tests {
                     Vec::<String>::new(),
                 )
             };
-            json!({"date": date, "data_quality": quality})
+            json!({
+                "date": date,
+                "data_quality": quality,
+                "runtime_role": "profitability_shadow"
+            })
         }
 
         assert_eq!(

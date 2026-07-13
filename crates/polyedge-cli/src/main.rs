@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use polyedge_api::{app, benchmark_snapshot};
-use polyedge_config::RuntimeSettings;
+use polyedge_config::{embedded_git_sha, RuntimeRole, RuntimeSettings};
 use polyedge_reporting::research::{
     advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
     initialize_funded_manifest_after_canary, load_default_exclusions, publish_daily_directory,
@@ -326,6 +326,9 @@ enum ResearchCommand {
         run_id: String,
         #[arg(long)]
         input_sha256: String,
+        /// Runtime role whose continuous provenance must own the complete day.
+        #[arg(long, default_value = "primary")]
+        expected_runtime_role: String,
         #[arg(long)]
         source_dir: PathBuf,
         #[arg(long, default_value = "reports/research/daily")]
@@ -755,6 +758,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             date,
             run_id,
             input_sha256,
+            expected_runtime_role,
             source_dir,
             output_root,
             data_audit,
@@ -762,6 +766,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             parse_date_arg(&date)?,
             run_id,
             input_sha256,
+            parse_runtime_role_arg(&expected_runtime_role)?,
             &source_dir,
             &output_root,
             &data_audit,
@@ -956,6 +961,16 @@ fn parse_date_arg(value: &str) -> Result<NaiveDate> {
         .with_context(|| format!("invalid UTC date (expected YYYY-MM-DD): {value}"))
 }
 
+fn parse_runtime_role_arg(value: &str) -> Result<RuntimeRole> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "primary" => Ok(RuntimeRole::Primary),
+        "profitability_shadow" => Ok(RuntimeRole::ProfitabilityShadow),
+        _ => {
+            bail!("invalid expected runtime role {value}; expected primary or profitability_shadow")
+        }
+    }
+}
+
 fn confirm_source(settings: &RuntimeSettings) -> Result<serde_json::Value> {
     let markets = polyedge_feeds::discover_markets(settings).context("discovering markets")?;
     let symbol = settings.target.chainlink_symbol.to_ascii_lowercase();
@@ -1017,6 +1032,7 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
             "backend_impl": "rust",
             "runtime_role": settings.deploy.runtime_role.as_str(),
             "shadow_only": settings.deploy.runtime_role.is_shadow(),
+            "git_sha": embedded_git_sha().unwrap_or("unknown"),
             "execution_mode": "paper",
             "bind": bind
         })
@@ -1274,4 +1290,43 @@ fn rss_mb() -> Option<f64> {
 fn print_json(value: serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, ResearchCommand};
+    use clap::Parser;
+
+    #[test]
+    fn publish_daily_bundle_cli_binds_explicit_shadow_runtime_role() {
+        let cli = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "publish-daily-bundle",
+            "--date",
+            "2026-07-14",
+            "--run-id",
+            "shadow-2026-07-14",
+            "--input-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-runtime-role",
+            "profitability_shadow",
+            "--source-dir",
+            "staging",
+            "--data-audit",
+            "staging/data_audit.json",
+        ])
+        .expect("parse shadow daily command");
+        let Command::Research {
+            command:
+                ResearchCommand::PublishDailyBundle {
+                    expected_runtime_role,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(expected_runtime_role, "profitability_shadow");
+    }
 }

@@ -1,5 +1,7 @@
 use super::ResearchError;
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
+use polyedge_config::RuntimeRole;
+use polyedge_engine::FrozenStrategyMode;
 use polyedge_storage::AzureBlobClient;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -12,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v1";
 pub const DEFAULT_PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
+const DAILY_PROVENANCE_CUTOFF: &str = "2026-07-12";
 const MANIFEST_FILE: &str = "run_manifest.json";
 const LATEST_FILE: &str = "latest.json";
 
@@ -58,6 +61,60 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
         (
             "exclusion_window_noop",
             WarningSeverity::Informational,
+            true,
+        )
+    } else if message.starts_with("daily capture window incomplete for ") {
+        (
+            "daily_capture_window_incomplete",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily capture gap exceeds 300000ms for ") {
+        (
+            "daily_capture_gap_exceeds_5m",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily capture gap evidence missing for ") {
+        (
+            "daily_capture_gap_evidence_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily runtime provenance missing for ") {
+        (
+            "daily_runtime_provenance_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily runtime provenance invalid for ") {
+        (
+            "daily_runtime_provenance_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily runtime provenance window incomplete for ") {
+        (
+            "daily_runtime_provenance_window_incomplete",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily runtime provenance gap exceeds 300000ms for ") {
+        (
+            "daily_runtime_provenance_gap_exceeds_5m",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily runtime provenance identity changed for ") {
+        (
+            "daily_runtime_provenance_identity_changed",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("daily runtime provenance reporter mismatch for ") {
+        (
+            "daily_runtime_provenance_reporter_mismatch",
+            WarningSeverity::Blocking,
             true,
         )
     } else {
@@ -136,6 +193,10 @@ pub struct RunArtifact {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DailyRunManifest {
     pub schema_version: u32,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default)]
+    pub runtime_role: Option<RuntimeRole>,
     pub date: NaiveDate,
     pub run_id: String,
     pub created_at: DateTime<Utc>,
@@ -174,10 +235,33 @@ impl AtomicDailyRun {
         input_sha256: impl Into<String>,
         data_quality: DataQualitySummary,
     ) -> Result<Self, ResearchError> {
+        Self::begin_with_runtime_role(
+            root,
+            date,
+            run_id,
+            input_sha256,
+            data_quality,
+            RuntimeRole::Primary,
+        )
+    }
+
+    pub fn begin_with_runtime_role(
+        root: impl Into<PathBuf>,
+        date: NaiveDate,
+        run_id: impl Into<String>,
+        input_sha256: impl Into<String>,
+        data_quality: DataQualitySummary,
+        runtime_role: RuntimeRole,
+    ) -> Result<Self, ResearchError> {
         let root = root.into();
         let run_id = validate_component("run_id", run_id.into())?;
         let input_sha256 = input_sha256.into();
         validate_sha256("input_sha256", &input_sha256)?;
+        let git_sha = super::git_sha().ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "daily run requires an exact 40-character Git SHA".to_owned(),
+            )
+        })?;
         let run_dir = root
             .join(date.format("%Y-%m-%d").to_string())
             .join("runs")
@@ -193,7 +277,9 @@ impl AtomicDailyRun {
             }
         })?;
         let manifest = DailyRunManifest {
-            schema_version: 1,
+            schema_version: 2,
+            git_sha: Some(git_sha),
+            runtime_role: Some(runtime_role),
             date,
             run_id,
             created_at: Utc::now(),
@@ -313,6 +399,7 @@ pub fn publish_daily_directory(
     date: NaiveDate,
     run_id: impl Into<String>,
     input_sha256: impl Into<String>,
+    expected_runtime_role: RuntimeRole,
     source_dir: &Path,
     output_root: &Path,
     data_audit_path: &Path,
@@ -350,8 +437,15 @@ pub fn publish_daily_directory(
     ));
     artifacts.sort_by(|left, right| left.0.cmp(&right.0));
     let audit_value: serde_json::Value = read_json(data_audit_path)?;
-    let quality = quality_from_audit(&audit_value);
-    let mut run = AtomicDailyRun::begin(output_root, date, run_id, input_sha256, quality)?;
+    let quality = quality_from_audit_for_date(&audit_value, date, &expected_runtime_role);
+    let mut run = AtomicDailyRun::begin_with_runtime_role(
+        output_root,
+        date,
+        run_id,
+        input_sha256,
+        quality,
+        expected_runtime_role,
+    )?;
     for (relative, source) in artifacts {
         let bytes = fs::read(&source)?;
         let name = path_string(&relative)
@@ -418,6 +512,20 @@ pub fn inspect_daily_dependency(
         return Ok(waiting(expected_date, "manifest_hash_mismatch"));
     }
     let manifest: DailyRunManifest = serde_json::from_slice(&manifest_bytes)?;
+    if daily_provenance_required(expected_date) && manifest.schema_version != 2 {
+        return Ok(waiting(expected_date, "manifest_schema_downgrade"));
+    }
+    if manifest.schema_version == 2 && manifest.runtime_role.is_none() {
+        return Ok(waiting(expected_date, "manifest_runtime_role_missing"));
+    }
+    if manifest.schema_version == 2
+        && !manifest
+            .git_sha
+            .as_deref()
+            .is_some_and(polyedge_config::is_full_git_sha)
+    {
+        return Ok(waiting(expected_date, "manifest_git_sha_invalid"));
+    }
     if manifest.status != RunStatus::Complete {
         return Ok(waiting(expected_date, "manifest_incomplete"));
     }
@@ -506,6 +614,440 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(quality.out_of_order_events == 0);
     quality
+}
+
+fn quality_from_audit_for_date(
+    audit: &serde_json::Value,
+    date: NaiveDate,
+    expected_runtime_role: &RuntimeRole,
+) -> DataQualitySummary {
+    let mut quality = quality_from_audit(audit);
+    let result = audit.get("result").unwrap_or(audit);
+    let day_start = DateTime::<Utc>::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0).expect("midnight is valid"),
+        Utc,
+    );
+    let day_end = day_start + Duration::days(1);
+    let first = result
+        .get("first_event_timestamp")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_utc_timestamp);
+    let last = result
+        .get("last_event_timestamp")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_utc_timestamp);
+    let observed_hours = result
+        .get("event_count_by_hour")
+        .and_then(serde_json::Value::as_object)
+        .map(|hours| {
+            (0..24)
+                .filter(|hour| {
+                    hours
+                        .get(&format!("{}T{hour:02}", date.format("%Y-%m-%d")))
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|count| count > 0)
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let boundary_tolerance = Duration::minutes(5);
+    let full_window = first
+        .is_some_and(|value| value >= day_start && value <= day_start + boundary_tolerance)
+        && last.is_some_and(|value| value >= day_end - boundary_tolerance && value < day_end)
+        && observed_hours == 24;
+    if !full_window {
+        quality.warnings.push(classify_warning(format!(
+            "daily capture window incomplete for {date}: first={} last={} observed_hours={observed_hours}/24",
+            first
+                .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "missing".to_owned()),
+            last.map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "missing".to_owned())
+        )));
+    }
+    let gap_evidence = result
+        .get("largest_time_gaps")
+        .and_then(serde_json::Value::as_array)
+        .map(|gaps| {
+            gaps.iter()
+                .filter_map(|gap| gap.get("gap_ms").and_then(serde_json::Value::as_u64))
+                .collect::<Vec<_>>()
+        })
+        .filter(|gaps| !gaps.is_empty());
+    if let Some(gaps) = gap_evidence {
+        let max_gap_ms = gaps.into_iter().max().unwrap_or_default();
+        if max_gap_ms > 300_000 {
+            quality.warnings.push(classify_warning(format!(
+                "daily capture gap exceeds 300000ms for {date}: max_gap_ms={max_gap_ms}"
+            )));
+        }
+    } else {
+        quality.warnings.push(classify_warning(format!(
+            "daily capture gap evidence missing for {date}"
+        )));
+    }
+    validate_daily_runtime_provenance(result, date, expected_runtime_role, &mut quality);
+    quality
+}
+
+fn validate_daily_runtime_provenance(
+    result: &serde_json::Value,
+    date: NaiveDate,
+    expected_runtime_role: &RuntimeRole,
+    quality: &mut DataQualitySummary,
+) {
+    let Some(provenance) = result
+        .get("runtime_provenance")
+        .and_then(serde_json::Value::as_object)
+    else {
+        quality.warnings.push(classify_warning(format!(
+            "daily runtime provenance missing for {date}"
+        )));
+        return;
+    };
+    let observations = provenance
+        .get("observations")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let valid_observations = provenance
+        .get("valid_observations")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let invalid_observations = provenance
+        .get("invalid_observations")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let identities = provenance
+        .get("identities")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let invalid_reasons = provenance
+        .get("invalid_reasons")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    let identity_errors = identities
+        .iter()
+        .flat_map(|identity| match expected_runtime_role {
+            RuntimeRole::Primary => primary_runtime_provenance_errors(identity),
+            RuntimeRole::ProfitabilityShadow => shadow_runtime_provenance_errors(identity),
+        })
+        .collect::<Vec<_>>();
+    if observations == 0
+        || valid_observations == 0
+        || invalid_observations > 0
+        || !invalid_reasons.is_empty()
+        || !identity_errors.is_empty()
+    {
+        quality.warnings.push(classify_warning(format!(
+            "daily runtime provenance invalid for {date}: observations={observations} valid={valid_observations} invalid={invalid_observations} reasons={} identity_errors={}",
+            invalid_reasons.join("|"),
+            identity_errors.join("|")
+        )));
+    }
+    if identities.len() != 1 {
+        quality.warnings.push(classify_warning(format!(
+            "daily runtime provenance identity changed for {date}: distinct_identities={}",
+            identities.len()
+        )));
+    }
+
+    let day_start = DateTime::<Utc>::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0).expect("midnight is valid"),
+        Utc,
+    );
+    let day_end = day_start + Duration::days(1);
+    let first = provenance
+        .get("first_timestamp")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_utc_timestamp);
+    let last = provenance
+        .get("last_timestamp")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_utc_timestamp);
+    let boundary_tolerance = Duration::minutes(5);
+    let full_window = first
+        .is_some_and(|value| value >= day_start && value <= day_start + boundary_tolerance)
+        && last.is_some_and(|value| value >= day_end - boundary_tolerance && value < day_end);
+    if !full_window {
+        quality.warnings.push(classify_warning(format!(
+            "daily runtime provenance window incomplete for {date}: first={} last={}",
+            first
+                .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "missing".to_owned()),
+            last.map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "missing".to_owned())
+        )));
+    }
+    let max_gap_ms = provenance
+        .get("max_gap_ms")
+        .and_then(serde_json::Value::as_u64);
+    if max_gap_ms.is_none_or(|value| value > 300_000) {
+        quality.warnings.push(classify_warning(format!(
+            "daily runtime provenance gap exceeds 300000ms for {date}: max_gap_ms={}",
+            max_gap_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "missing".to_owned())
+        )));
+    }
+    if let (Some(reporter_git_sha), Some(identity)) = (super::git_sha(), identities.first()) {
+        if identity.get("git_sha").and_then(serde_json::Value::as_str)
+            != Some(reporter_git_sha.as_str())
+        {
+            quality.warnings.push(classify_warning(format!(
+                "daily runtime provenance reporter mismatch for {date}: runtime={} reporter={reporter_git_sha}",
+                identity
+                    .get("git_sha")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing")
+            )));
+        }
+    } else {
+        quality.warnings.push(classify_warning(format!(
+            "daily runtime provenance reporter mismatch for {date}: runtime_or_reporter_git_sha_missing"
+        )));
+    }
+}
+
+pub(super) fn runtime_provenance_common_errors(payload: &serde_json::Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    if payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        errors.push("/schema_version must equal 1".to_owned());
+    }
+    require_provenance_text(payload, "/backend_impl", "rust", &mut errors);
+    for pointer in [
+        "/app_name",
+        "/runtime_role",
+        "/execution_mode",
+        "/paper_maker_fill_policy",
+        "/storage_container",
+        "/event_blob_prefix",
+    ] {
+        if payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{pointer} must be non-empty"));
+        }
+    }
+    for pointer in [
+        "/shadow_only",
+        "/allow_live",
+        "/enable_taker_orders",
+        "/allow_emergency_account_cancel",
+        "/adaptive_regime_enabled",
+        "/publish_strategy_canary_intents",
+        "/research_only",
+    ] {
+        if payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        {
+            errors.push(format!("{pointer} must be boolean"));
+        }
+    }
+    if payload
+        .get("storage_account")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        errors.push("/storage_account must be non-empty".to_owned());
+    }
+    if payload
+        .get("git_sha")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| !polyedge_config::is_full_git_sha(value))
+    {
+        errors.push("/git_sha must be a canonical full commit ID".to_owned());
+    }
+    if payload
+        .pointer("/runtime_config_hash")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| !is_prefixed_sha256(value))
+    {
+        errors.push("/runtime_config_hash must be a canonical sha256 digest".to_owned());
+    }
+    errors
+}
+
+pub(super) fn shadow_runtime_provenance_errors(payload: &serde_json::Value) -> Vec<String> {
+    let expected_candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+    let mut errors = runtime_provenance_common_errors(payload);
+    require_provenance_text(payload, "/app_name", "polyedge-shadow-neu", &mut errors);
+    require_provenance_text(
+        payload,
+        "/runtime_role",
+        "profitability_shadow",
+        &mut errors,
+    );
+    require_provenance_bool(payload, "/shadow_only", true, &mut errors);
+    require_provenance_text(payload, "/execution_mode", "paper", &mut errors);
+    require_provenance_bool(payload, "/allow_live", false, &mut errors);
+    require_provenance_bool(payload, "/enable_taker_orders", false, &mut errors);
+    require_provenance_bool(
+        payload,
+        "/allow_emergency_account_cancel",
+        false,
+        &mut errors,
+    );
+    require_provenance_text(payload, "/paper_maker_fill_policy", "none", &mut errors);
+    require_provenance_bool(payload, "/adaptive_regime_enabled", true, &mut errors);
+    require_provenance_text(
+        payload,
+        "/adaptive_regime_mode",
+        "dynamic_quote_style",
+        &mut errors,
+    );
+    require_provenance_bool(
+        payload,
+        "/publish_strategy_canary_intents",
+        true,
+        &mut errors,
+    );
+    require_provenance_bool(payload, "/research_only", true, &mut errors);
+    require_provenance_text(
+        payload,
+        "/candidate/name",
+        &expected_candidate.name,
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/candidate/version",
+        &expected_candidate.version,
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/candidate/config_hash",
+        &expected_candidate.config_hash,
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/storage_container",
+        "polyedge-shadow-events",
+        &mut errors,
+    );
+    if payload
+        .get("event_blob_prefix")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| !value.starts_with("shadow-events/"))
+    {
+        errors.push("/event_blob_prefix must start with shadow-events/".to_owned());
+    }
+    if payload
+        .pointer("/execution_model/sha256")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| !is_prefixed_sha256(value))
+    {
+        errors.push("/execution_model/sha256 must be a canonical sha256 digest".to_owned());
+    }
+    for pointer in ["/execution_model/version", "/execution_model/blob_uri"] {
+        if payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{pointer} must be non-empty"));
+        }
+    }
+    errors
+}
+
+fn primary_runtime_provenance_errors(payload: &serde_json::Value) -> Vec<String> {
+    let mut errors = runtime_provenance_common_errors(payload);
+    require_provenance_text(payload, "/app_name", "polyedge", &mut errors);
+    require_provenance_text(payload, "/runtime_role", "primary", &mut errors);
+    require_provenance_bool(payload, "/shadow_only", false, &mut errors);
+    require_provenance_text(payload, "/execution_mode", "paper", &mut errors);
+    require_provenance_bool(payload, "/allow_live", false, &mut errors);
+    require_provenance_bool(payload, "/enable_taker_orders", false, &mut errors);
+    require_provenance_bool(
+        payload,
+        "/allow_emergency_account_cancel",
+        false,
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/paper_maker_fill_policy",
+        "touch_after_quote_was_live",
+        &mut errors,
+    );
+    require_provenance_bool(payload, "/adaptive_regime_enabled", false, &mut errors);
+    require_provenance_text(payload, "/adaptive_regime_mode", "paper_only", &mut errors);
+    require_provenance_bool(
+        payload,
+        "/publish_strategy_canary_intents",
+        false,
+        &mut errors,
+    );
+    require_provenance_bool(payload, "/research_only", true, &mut errors);
+    require_provenance_text(payload, "/storage_container", "bot-events", &mut errors);
+    require_provenance_text(payload, "/event_blob_prefix", "events", &mut errors);
+    if !payload
+        .get("candidate")
+        .is_some_and(serde_json::Value::is_null)
+    {
+        errors.push("/candidate must be null for the primary paper profile".to_owned());
+    }
+    errors
+}
+
+fn require_provenance_text(
+    payload: &serde_json::Value,
+    pointer: &str,
+    expected: &str,
+    errors: &mut Vec<String>,
+) {
+    if payload.pointer(pointer).and_then(serde_json::Value::as_str) != Some(expected) {
+        errors.push(format!("{pointer} must equal {expected}"));
+    }
+}
+
+fn require_provenance_bool(
+    payload: &serde_json::Value,
+    pointer: &str,
+    expected: bool,
+    errors: &mut Vec<String>,
+) {
+    if payload
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_bool)
+        != Some(expected)
+    {
+        errors.push(format!("{pointer} must equal {expected}"));
+    }
+}
+
+fn is_prefixed_sha256(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn daily_provenance_required(date: NaiveDate) -> bool {
+    let cutoff = NaiveDate::parse_from_str(DAILY_PROVENANCE_CUTOFF, "%Y-%m-%d")
+        .expect("daily provenance cutoff is valid");
+    date >= cutoff
+}
+
+fn parse_utc_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn collect_publishable_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, ResearchError> {

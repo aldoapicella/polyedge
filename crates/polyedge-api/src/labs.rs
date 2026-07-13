@@ -5,8 +5,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use polyedge_reporting::research::{
-    load_exclusion_registry, load_frozen_candidate_registry, DailyRunManifest, LatestRunPointer,
-    RunStatus, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
+    daily_provenance_required, load_exclusion_registry, load_frozen_candidate_registry,
+    DailyRunManifest, LatestRunPointer, RunStatus, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
 };
 use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use serde::Deserialize;
@@ -922,6 +923,20 @@ fn validate_manifest(
         .map_err(|error| format!("Atomic run manifest is invalid JSON: {error}"))?;
     if manifest.status != RunStatus::Complete {
         return Err("Atomic run manifest is not COMPLETE".to_owned());
+    }
+    if daily_provenance_required(pointer.date) && manifest.schema_version != 2 {
+        return Err("Atomic run manifest uses a downgraded schema".to_owned());
+    }
+    if manifest.schema_version == 2
+        && !manifest
+            .git_sha
+            .as_deref()
+            .is_some_and(polyedge_config::is_full_git_sha)
+    {
+        return Err("Atomic run manifest has invalid Git provenance".to_owned());
+    }
+    if manifest.schema_version == 2 && manifest.runtime_role.is_none() {
+        return Err("Atomic run manifest has no runtime role provenance".to_owned());
     }
     if manifest.date != pointer.date || manifest.run_id != pointer.run_id {
         return Err("Atomic run manifest identity does not match latest.json".to_owned());
@@ -2151,7 +2166,9 @@ mod tests {
         }
         let now = Utc::now();
         let manifest = DailyRunManifest {
-            schema_version: 1,
+            schema_version: 2,
+            git_sha: Some("a".repeat(40)),
+            runtime_role: Some(polyedge_config::RuntimeRole::Primary),
             date,
             run_id: run_id.to_owned(),
             created_at: now,

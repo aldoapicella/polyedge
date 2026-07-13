@@ -596,7 +596,7 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION', value: conservativePriorVersion }
             { name: 'STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI', value: conservativePriorBlobUri }
             { name: 'STRATEGY_CANARY_EXECUTION_MODEL_SHA256', value: conservativePriorSha256 }
-            { name: 'AZURE_EVENT_INDEX_TYPES', value: 'market,market_start_price,paper_settlement,fair_value,decision,execution_report,feed_error,reference' }
+            { name: 'AZURE_EVENT_INDEX_TYPES', value: 'runtime_provenance,market,market_start_price,paper_settlement,fair_value,decision,execution_report,feed_error,reference' }
           ]
           resources: {
             cpu: json('0.5')

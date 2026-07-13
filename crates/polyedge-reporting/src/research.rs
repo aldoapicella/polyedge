@@ -2,7 +2,7 @@ use chrono::{DateTime, Datelike, Duration, SecondsFormat, Timelike, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use polyedge_config::RuntimeSettings;
+use polyedge_config::{embedded_git_sha, is_full_git_sha, RuntimeSettings};
 use polyedge_domain::{
     ConditionId, DecisionAction, MarketId, OrderKind, Outcome, Side, TokenId, TradeDecision,
 };
@@ -45,9 +45,9 @@ pub use labs::{
     WALLET_CAMPAIGN_START,
 };
 pub use run_bundle::{
-    advance_funded_ladder, advance_funded_manifest, classify_warning, expire_funded_manifest,
-    initialize_funded_manifest_after_canary, inspect_daily_dependency, parse_azure_artifact_uri,
-    publish_daily_directory, stop_funded_manifest_from_stage_block,
+    advance_funded_ladder, advance_funded_manifest, classify_warning, daily_provenance_required,
+    expire_funded_manifest, initialize_funded_manifest_after_canary, inspect_daily_dependency,
+    parse_azure_artifact_uri, publish_daily_directory, stop_funded_manifest_from_stage_block,
     validate_protocol_v3_order_evidence, write_funded_ladder_state, write_promotion_manifest,
     AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AtomicDailyRun, CandidateIdentity,
     DailyDependency, DailyRunManifest, DataQualitySummary, ExecutionModelBinding,
@@ -1862,6 +1862,7 @@ struct AuditAccumulator {
     duplicate_estimate: usize,
     previous_ts: Option<DateTime<Utc>>,
     largest_gaps: Vec<(i64, DateTime<Utc>, DateTime<Utc>)>,
+    runtime_provenance: Vec<(DateTime<Utc>, Value)>,
 }
 
 impl AuditAccumulator {
@@ -1904,6 +1905,9 @@ impl AuditAccumulator {
             self.missing_payloads += 1;
         }
         match event.event_type.as_str() {
+            "runtime_provenance" => self
+                .runtime_provenance
+                .push((event.recorded_ts, event.payload.clone())),
             "market" => self.observe_market(&event.payload),
             "market_start_price" => self.observe_market_start(&event.payload),
             "reference" => self.observe_reference(&event.payload),
@@ -2045,6 +2049,7 @@ impl AuditAccumulator {
     }
 
     fn finish(mut self) -> Value {
+        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance);
         let markets_with_start = self
             .markets
             .values()
@@ -2125,10 +2130,50 @@ impl AuditAccumulator {
                 "from": ts(*from),
                 "to": ts(*to)
             })).collect::<Vec<_>>(),
+            "runtime_provenance": runtime_provenance,
             "warnings": warnings,
             "fatal_data_quality_issues": if self.total_events == 0 { vec!["no events found"] } else { Vec::<&str>::new() }
         })
     }
+}
+
+fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Value {
+    let mut valid_timestamps = Vec::new();
+    let mut identities = BTreeMap::<String, Value>::new();
+    let mut invalid_reasons = BTreeSet::new();
+    let mut invalid_observations = 0_u64;
+    for (timestamp, payload) in observations {
+        let errors = run_bundle::runtime_provenance_common_errors(payload);
+        if errors.is_empty() {
+            valid_timestamps.push(*timestamp);
+            let key = serde_json::to_string(payload).unwrap_or_else(|_| "invalid-json".to_owned());
+            identities.entry(key).or_insert_with(|| payload.clone());
+        } else {
+            invalid_observations += 1;
+            invalid_reasons.extend(errors);
+        }
+    }
+    valid_timestamps.sort();
+    let max_gap_ms = valid_timestamps
+        .windows(2)
+        .map(|window| {
+            window[1]
+                .signed_duration_since(window[0])
+                .num_milliseconds()
+        })
+        .max();
+    json!({
+        "schema_version": 1,
+        "observations": observations.len(),
+        "valid_observations": valid_timestamps.len(),
+        "invalid_observations": invalid_observations,
+        "first_timestamp": valid_timestamps.first().copied().map(ts),
+        "last_timestamp": valid_timestamps.last().copied().map(ts),
+        "max_gap_ms": max_gap_ms,
+        "distinct_identity_count": identities.len(),
+        "identities": identities.into_values().collect::<Vec<_>>(),
+        "invalid_reasons": invalid_reasons.into_iter().collect::<Vec<_>>()
+    })
 }
 
 #[derive(Default)]
@@ -2420,6 +2465,7 @@ impl NormalizedWriters {
             writer.write_row(&row)?;
         }
         let target = match event.event_type.as_str() {
+            "runtime_provenance" => "runtime_provenance",
             "market" => "market",
             "reference" => "reference",
             "book" => "book",
@@ -2572,6 +2618,10 @@ impl JsonlLineWriter {
 
 fn normalized_files(format: NormalizedFileFormat) -> Vec<(&'static str, String)> {
     vec![
+        (
+            "runtime_provenance",
+            format.file_name("runtime_provenance.jsonl"),
+        ),
         ("market", format.file_name("markets.jsonl")),
         ("reference", format.file_name("references.jsonl")),
         ("book", format.file_name("books.jsonl")),
@@ -5940,6 +5990,15 @@ fn data_window(result: &Value) -> Value {
 }
 
 fn git_sha() -> Option<String> {
+    if let Some(value) = embedded_git_sha() {
+        return Some(value.to_owned());
+    }
+    if let Ok(value) = std::env::var("GIT_SHA") {
+        let value = value.trim().to_ascii_lowercase();
+        if is_full_git_sha(&value) {
+            return Some(value);
+        }
+    }
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -5949,8 +6008,8 @@ fn git_sha() -> Option<String> {
     }
     String::from_utf8(output.stdout)
         .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| is_full_git_sha(value))
 }
 
 fn write_json_and_markdown(

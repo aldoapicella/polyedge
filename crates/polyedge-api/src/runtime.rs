@@ -13,7 +13,7 @@ use execution_intent::{
     build_execution_intent_with_model, resolve_execution_model, IntentPublisherConfig,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
-use polyedge_config::{ExecutionMode, RuntimeSettings};
+use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
     BookState, DecisionAction, ExecutionReport, FairValue, MarketId, MarketSpec, ReferencePrice,
     RuntimeEvent, TokenId, TradeDecision,
@@ -31,6 +31,7 @@ use reference::ReferenceAggregator;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -45,6 +46,7 @@ const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
 const RECORDER_BATCH_LIMIT: usize = 500;
 const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
 
@@ -214,11 +216,19 @@ impl RuntimeController {
         if self.inner.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        let provenance = runtime_provenance(&self.inner.settings).unwrap_or_else(|error| {
+            panic!("refusing runtime startup without exact provenance: {error}")
+        });
+        self.persist_startup_provenance(provenance)
+            .unwrap_or_else(|error| {
+                panic!("refusing runtime startup because provenance was not persisted: {error}")
+            });
         let (sender, receiver) = mpsc::channel(10_000);
         self.spawn_feed_event_loop(receiver);
         self.spawn_discovery_loop();
         self.spawn_strategy_loop();
         self.spawn_runtime_telemetry_loop();
+        self.spawn_runtime_provenance_loop();
         self.spawn_market_feed_loop(sender.clone());
         self.spawn_rtds_loop(sender.clone());
         self.spawn_chainlink_http_loop(sender.clone());
@@ -228,6 +238,57 @@ impl RuntimeController {
             info!("Direct Binance bookTicker feed disabled by configuration");
         }
         info!("Rust PolyEdge runtime started in paper mode");
+    }
+
+    fn persist_startup_provenance(&self, payload: Value) -> Result<(), String> {
+        let event = RuntimeEvent {
+            event_type: "runtime_provenance".to_owned(),
+            ts: Utc::now(),
+            data: payload,
+        };
+        self.inner
+            .recorder_metrics
+            .enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .recorder_metrics
+            .batches_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .recorder_metrics
+            .last_batch_size
+            .store(1, Ordering::Relaxed);
+        let result = self
+            .inner
+            .recorder
+            .lock()
+            .map_err(|error| format!("runtime recorder lock poisoned: {error}"))
+            .and_then(|mut recorder| {
+                recorder.record_batch(std::slice::from_ref(&event))?;
+                recorder.flush()
+            });
+        match result {
+            Ok(()) => {
+                self.inner
+                    .recorder_metrics
+                    .persisted_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Ok(mut state) = self.inner.data.try_write() {
+                    state.runtime_events += 1;
+                    state.recent_events.push_back(event.clone());
+                    truncate(&mut state.recent_events, RECENT_LIMIT);
+                }
+                let _ = self.inner.broadcaster.send(event);
+                Ok(())
+            }
+            Err(error) => {
+                self.inner
+                    .recorder_metrics
+                    .failed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(error)
+            }
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
@@ -373,6 +434,22 @@ impl RuntimeController {
                         "feeds": status["task_health"]["feeds"]
                     })
                 );
+            }
+        })
+    }
+
+    fn spawn_runtime_provenance_loop(&self) -> JoinHandle<()> {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RUNTIME_PROVENANCE_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let provenance = runtime_provenance(&runtime.inner.settings)
+                    .expect("startup already validated exact runtime provenance");
+                runtime
+                    .record_event("runtime_provenance", provenance, None, None)
+                    .await;
             }
         })
     }
@@ -1719,6 +1796,66 @@ fn report_status(shadow_only: bool) -> Value {
     })
 }
 
+pub(super) fn runtime_git_sha() -> &'static str {
+    embedded_git_sha().unwrap_or("unknown")
+}
+
+fn runtime_provenance(settings: &RuntimeSettings) -> Result<Value, String> {
+    let git_sha = embedded_git_sha()
+        .ok_or_else(|| "binary does not contain a canonical 40-character Git SHA".to_owned())?;
+    runtime_provenance_with_git_sha(settings, git_sha)
+}
+
+fn runtime_provenance_with_git_sha(
+    settings: &RuntimeSettings,
+    git_sha: &str,
+) -> Result<Value, String> {
+    if !polyedge_config::is_full_git_sha(git_sha) {
+        return Err("Git SHA is not a canonical 40-character lowercase commit ID".to_owned());
+    }
+    let candidate = if settings.strategy.adaptive_regime_enabled
+        && settings.strategy.adaptive_regime_mode == "dynamic_quote_style"
+    {
+        let candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+        json!({
+            "name": candidate.name,
+            "version": candidate.version,
+            "config_hash": candidate.config_hash
+        })
+    } else {
+        Value::Null
+    };
+    let settings_bytes = serde_json::to_vec(settings)
+        .map_err(|error| format!("failed to serialize runtime settings: {error}"))?;
+    Ok(json!({
+        "schema_version": 1,
+        "backend_impl": "rust",
+        "git_sha": git_sha,
+        "runtime_config_hash": format!("sha256:{:x}", Sha256::digest(settings_bytes)),
+        "app_name": settings.deploy.app_name,
+        "runtime_role": settings.deploy.runtime_role.as_str(),
+        "shadow_only": settings.deploy.runtime_role.is_shadow(),
+        "execution_mode": execution_mode(settings),
+        "allow_live": settings.live.allow_live,
+        "enable_taker_orders": settings.strategy.enable_taker_orders,
+        "allow_emergency_account_cancel": settings.live.allow_emergency_account_cancel,
+        "paper_maker_fill_policy": settings.paper.maker_fill_policy,
+        "adaptive_regime_enabled": settings.strategy.adaptive_regime_enabled,
+        "adaptive_regime_mode": settings.strategy.adaptive_regime_mode,
+        "candidate": candidate,
+        "storage_account": settings.azure.storage_account_name,
+        "storage_container": settings.azure.storage_container_name,
+        "event_blob_prefix": settings.azure.event_blob_prefix,
+        "publish_strategy_canary_intents": settings.azure.publish_strategy_canary_intents,
+        "execution_model": {
+            "version": settings.azure.strategy_canary_fill_model_version,
+            "blob_uri": settings.azure.strategy_canary_execution_model_blob_uri,
+            "sha256": settings.azure.strategy_canary_execution_model_sha256
+        },
+        "research_only": !settings.live_requested()
+    }))
+}
+
 fn execution_mode(settings: &RuntimeSettings) -> &'static str {
     match settings.live.execution_mode {
         ExecutionMode::Paper => "paper",
@@ -1740,6 +1877,37 @@ mod tests {
     use std::fs;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn runtime_provenance_binds_shadow_safety_candidate_and_code() {
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+        settings.paper.maker_fill_policy = "none".to_owned();
+        settings.strategy.adaptive_regime_enabled = true;
+        settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
+        settings.azure.event_blob_prefix = "shadow-events/test".to_owned();
+
+        let payload =
+            runtime_provenance_with_git_sha(&settings, "c40d9093783808b010eabd9c43697e9dcceb667b")
+                .expect("valid provenance");
+        assert_eq!(payload["runtime_role"], "profitability_shadow");
+        assert_eq!(payload["shadow_only"], true);
+        assert_eq!(payload["allow_live"], false);
+        assert_eq!(payload["paper_maker_fill_policy"], "none");
+        assert_eq!(payload["candidate"]["name"], "dynamic_quote_style");
+        assert!(payload["candidate"]["config_hash"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:")));
+        assert_eq!(
+            payload["git_sha"],
+            "c40d9093783808b010eabd9c43697e9dcceb667b"
+        );
+        assert!(payload["runtime_config_hash"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71));
+    }
 
     #[test]
     fn compact_recorded_book_keeps_replay_top_of_book_without_full_depth() {

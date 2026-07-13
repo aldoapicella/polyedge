@@ -213,7 +213,14 @@ primary East US recorder. `RUNTIME_ROLE=profitability_shadow` makes that role
 observable as `runtime_role: profitability_shadow` and `shadow_only: true`.
 The process refuses to start if this role is combined with live execution,
 live authorization, a signing key, taker orders, emergency cancellation,
-simulated maker fills, or non-shadow storage.
+simulated maker fills, a different adaptive candidate, disabled intent
+publication, or non-shadow storage. The backend image embeds and labels the
+exact deployment Git SHA. Runtime status, research artifacts, and the startup
+`runtime_provenance` event expose that immutable revision so evidence cannot be
+silently attributed to `unknown` code. Startup flushes that event to every
+configured recorder before any feed loop begins; failure aborts startup. The
+runtime then emits the same hash-bound identity every minute so the daily
+evaluator can prove continuous ownership of the evidence window.
 
 The declarative state is manual and dry-run. Before any order-enabled override,
 verify the dry-run artifact proves all of the following:

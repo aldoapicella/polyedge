@@ -46,6 +46,17 @@ impl RuntimeRole {
     }
 }
 
+pub fn embedded_git_sha() -> Option<&'static str> {
+    option_env!("GIT_SHA").filter(|value| is_full_git_sha(value))
+}
+
+pub fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployConfig {
     pub app_name: String,
@@ -560,6 +571,15 @@ impl RuntimeSettings {
         if self.paper.maker_fill_policy != "none" {
             reasons.push("PAPER_MAKER_FILL_POLICY must be none");
         }
+        if !self.strategy.adaptive_regime_enabled {
+            reasons.push("ADAPTIVE_REGIME_ENABLED must be true");
+        }
+        if self.strategy.adaptive_regime_mode != "dynamic_quote_style" {
+            reasons.push("ADAPTIVE_REGIME_MODE must be dynamic_quote_style");
+        }
+        if !self.azure.publish_strategy_canary_intents {
+            reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
+        }
         if self.azure.storage_container_name != "polyedge-shadow-events" {
             reasons.push("AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events");
         }
@@ -755,12 +775,15 @@ fn env_decimal(name: &str, default: Decimal) -> Result<Decimal, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings};
+    use super::{is_full_git_sha, ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings};
 
     fn safe_shadow_settings() -> RuntimeSettings {
         let mut settings = RuntimeSettings::default();
         settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
         settings.paper.maker_fill_policy = "none".to_owned();
+        settings.strategy.adaptive_regime_enabled = true;
+        settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+        settings.azure.publish_strategy_canary_intents = true;
         settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
         settings.azure.event_blob_prefix = "shadow-events/test-campaign".to_owned();
         settings
@@ -786,6 +809,9 @@ mod tests {
         settings.strategy.enable_taker_orders = true;
         settings.live.allow_emergency_account_cancel = true;
         settings.paper.maker_fill_policy = "touch_after_quote_was_live".to_owned();
+        settings.strategy.adaptive_regime_enabled = false;
+        settings.strategy.adaptive_regime_mode = "paper_only".to_owned();
+        settings.azure.publish_strategy_canary_intents = false;
         settings.azure.storage_container_name = "bot-events".to_owned();
         settings.azure.event_blob_prefix = "events".to_owned();
 
@@ -800,10 +826,21 @@ mod tests {
             "ENABLE_TAKER_ORDERS must be false",
             "ALLOW_EMERGENCY_ACCOUNT_CANCEL must be false",
             "PAPER_MAKER_FILL_POLICY must be none",
+            "ADAPTIVE_REGIME_ENABLED must be true",
+            "ADAPTIVE_REGIME_MODE must be dynamic_quote_style",
+            "PUBLISH_STRATEGY_CANARY_INTENTS must be true",
             "AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events",
             "AZURE_EVENT_BLOB_PREFIX must start with shadow-events/",
         ] {
             assert!(message.contains(expected), "missing {expected}: {message}");
         }
+    }
+
+    #[test]
+    fn full_git_sha_accepts_only_canonical_lowercase_commit_ids() {
+        assert!(is_full_git_sha("c40d9093783808b010eabd9c43697e9dcceb667b"));
+        assert!(!is_full_git_sha("unknown"));
+        assert!(!is_full_git_sha("C40D9093783808B010EABD9C43697E9DCCEB667B"));
+        assert!(!is_full_git_sha("c40d909"));
     }
 }

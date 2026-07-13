@@ -1,6 +1,6 @@
 use super::{
-    active_markets, execution_mode, feed_summary, report_status, RuntimeController, RuntimeData,
-    RuntimeRecorder,
+    active_markets, execution_mode, feed_summary, report_status, runtime_git_sha,
+    RuntimeController, RuntimeData, RuntimeRecorder,
 };
 use chrono::{SecondsFormat, Utc};
 use polyedge_domain::{ExecutionReport, MarketId, MarketSpec, RuntimeEvent, TradeDecision};
@@ -36,7 +36,7 @@ impl RuntimeController {
             "backend_impl": "rust",
             "runtime_role": self.inner.settings.deploy.runtime_role.as_str(),
             "shadow_only": shadow_only,
-            "git_sha": option_env!("GIT_SHA").unwrap_or("unknown"),
+            "git_sha": runtime_git_sha(),
             "version": env!("CARGO_PKG_VERSION"),
             "execution_mode": execution_mode(&self.inner.settings),
             "started_at": data.started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
