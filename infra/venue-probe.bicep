@@ -558,6 +558,7 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
           image: backendImage
           env: [
             { name: 'APP_NAME', value: 'polyedge-shadow-neu' }
+            { name: 'RUNTIME_ROLE', value: 'profitability_shadow' }
             { name: 'EXECUTION_MODE', value: 'paper' }
             { name: 'ALLOW_LIVE', value: 'false' }
             { name: 'RUN_BOT_ON_STARTUP', value: 'true' }

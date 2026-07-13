@@ -39,6 +39,9 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(settings: RuntimeSettings) -> Self {
+        settings.validate_runtime_role().unwrap_or_else(|error| {
+            panic!("refusing API startup with unsafe runtime role: {error}")
+        });
         let runtime = RuntimeController::new(settings.clone());
         runtime.start_if_configured();
         Self {

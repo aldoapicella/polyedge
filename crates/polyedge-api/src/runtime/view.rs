@@ -12,14 +12,16 @@ use std::sync::atomic::Ordering;
 impl RuntimeController {
     pub async fn health(&self) -> Value {
         let data = self.inner.data.read().await;
+        let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
         json!({
             "ok": true,
             "backend_impl": "rust",
-            "shadow_only": false,
+            "runtime_role": self.inner.settings.deploy.runtime_role.as_str(),
+            "shadow_only": shadow_only,
             "runtime_active": self.inner.started.load(Ordering::SeqCst),
             "execution_mode": execution_mode(&self.inner.settings),
             "kill_switch": data.kill_switch,
-            "reports": report_status(false)
+            "reports": report_status(shadow_only)
         })
     }
 
@@ -28,10 +30,12 @@ impl RuntimeController {
         let engine = self.inner.engine.lock().await;
         let now = Utc::now();
         let recorder_status = self.recorder_status();
+        let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
         json!({
             "app": self.inner.settings.deploy.app_name,
             "backend_impl": "rust",
-            "shadow_only": false,
+            "runtime_role": self.inner.settings.deploy.runtime_role.as_str(),
+            "shadow_only": shadow_only,
             "git_sha": option_env!("GIT_SHA").unwrap_or("unknown"),
             "version": env!("CARGO_PKG_VERSION"),
             "execution_mode": execution_mode(&self.inner.settings),
@@ -77,7 +81,7 @@ impl RuntimeController {
             "live_heartbeat": Value::Null,
             "recorder": recorder_status,
             "reference": data.reference,
-            "reports": report_status(false),
+            "reports": report_status(shadow_only),
             "latest_decisions": latest_chronological(&data.decisions, 20),
             "latest_execution_reports": latest_chronological(&data.execution_reports, 20)
         })

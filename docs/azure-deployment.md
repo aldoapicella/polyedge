@@ -209,7 +209,11 @@ than storage-enforced immutability. The same deployment creates the
 credential-free `polyedge-shadow-neu` app. It has no public ingress, contains
 no Polymarket wallet/API secrets, runs only `EXECUTION_MODE=paper` with
 `ALLOW_LIVE=false`, and records to `shadow-events/` so it cannot duplicate the
-primary East US recorder.
+primary East US recorder. `RUNTIME_ROLE=profitability_shadow` makes that role
+observable as `runtime_role: profitability_shadow` and `shadow_only: true`.
+The process refuses to start if this role is combined with live execution,
+live authorization, a signing key, taker orders, emergency cancellation,
+simulated maker fills, or non-shadow storage.
 
 The declarative state is manual and dry-run. Before any order-enabled override,
 verify the dry-run artifact proves all of the following:

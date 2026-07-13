@@ -518,7 +518,8 @@ async fn main() -> Result<()> {
                 "count": markets.len(),
                 "markets": markets,
                 "backend_impl": "rust",
-                "shadow_only": false
+                "runtime_role": settings.deploy.runtime_role.as_str(),
+                "shadow_only": settings.deploy.runtime_role.is_shadow()
             }))
         }
         Command::ConfirmSource => print_json(confirm_source(&settings)?),
@@ -993,7 +994,8 @@ fn confirm_source(settings: &RuntimeSettings) -> Result<serde_json::Value> {
     Ok(json!({
         "ok": ok,
         "backend_impl": "rust",
-        "shadow_only": false,
+        "runtime_role": settings.deploy.runtime_role.as_str(),
+        "shadow_only": settings.deploy.runtime_role.is_shadow(),
         "target_asset": settings.target.asset,
         "target_horizon": settings.target.horizon,
         "configured_rtds_url": settings.target.polymarket_rtds_url,
@@ -1013,7 +1015,8 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
         "{}",
         json!({
             "backend_impl": "rust",
-            "shadow_only": false,
+            "runtime_role": settings.deploy.runtime_role.as_str(),
+            "shadow_only": settings.deploy.runtime_role.is_shadow(),
             "execution_mode": "paper",
             "bind": bind
         })

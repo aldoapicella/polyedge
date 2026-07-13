@@ -346,6 +346,7 @@ jobs:
           test "$(echo "$redemption_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
           shadow_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-neu -o json)
           test "$(echo "$shadow_json" | jq -r '.properties.configuration.ingress.external // false')" = "false"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "RUNTIME_ROLE") | .value')" = "profitability_shadow"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "EXECUTION_MODE") | .value')" = "paper"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_LIVE") | .value')" = "false"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "PAPER_MAKER_FILL_POLICY") | .value')" = "none"

@@ -13,6 +13,8 @@ pub enum ConfigError {
     InvalidDecimal { name: String, value: String },
     #[error("invalid adaptive strategy configuration: {0}")]
     InvalidAdaptiveStrategy(String),
+    #[error("invalid runtime role configuration: {0}")]
+    InvalidRuntimeRole(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -23,9 +25,31 @@ pub enum ExecutionMode {
     Live,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRole {
+    #[default]
+    Primary,
+    ProfitabilityShadow,
+}
+
+impl RuntimeRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::ProfitabilityShadow => "profitability_shadow",
+        }
+    }
+
+    pub fn is_shadow(&self) -> bool {
+        matches!(self, Self::ProfitabilityShadow)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployConfig {
     pub app_name: String,
+    pub runtime_role: RuntimeRole,
     pub run_bot_on_startup: bool,
     pub require_api_auth: bool,
     pub rust_proxy_runtime_api: bool,
@@ -39,6 +63,7 @@ impl Default for DeployConfig {
     fn default() -> Self {
         Self {
             app_name: "polyedge".to_owned(),
+            runtime_role: RuntimeRole::Primary,
             run_bot_on_startup: false,
             require_api_auth: false,
             rust_proxy_runtime_api: false,
@@ -281,6 +306,17 @@ impl RuntimeSettings {
         if let Ok(app_name) = env::var("APP_NAME") {
             settings.deploy.app_name = app_name;
         }
+        if let Ok(role) = env::var("RUNTIME_ROLE") {
+            settings.deploy.runtime_role = match role.trim().to_ascii_lowercase().as_str() {
+                "primary" => RuntimeRole::Primary,
+                "profitability_shadow" => RuntimeRole::ProfitabilityShadow,
+                value => {
+                    return Err(ConfigError::InvalidRuntimeRole(format!(
+                        "unsupported RUNTIME_ROLE {value}"
+                    )))
+                }
+            };
+        }
         settings.deploy.run_bot_on_startup =
             env_bool("RUN_BOT_ON_STARTUP", settings.deploy.run_bot_on_startup);
         if let Ok(mode) = env::var("EXECUTION_MODE") {
@@ -468,6 +504,7 @@ impl RuntimeSettings {
             settings.paper.order_live_after_ms,
         );
         settings.validate_adaptive_strategy()?;
+        settings.validate_runtime_role()?;
         Ok(settings)
     }
 
@@ -498,6 +535,42 @@ impl RuntimeSettings {
             )));
         }
         Ok(())
+    }
+
+    pub fn validate_runtime_role(&self) -> Result<(), ConfigError> {
+        if !self.deploy.runtime_role.is_shadow() {
+            return Ok(());
+        }
+        let mut reasons = Vec::new();
+        if self.live_requested() {
+            reasons.push("EXECUTION_MODE must be paper");
+        }
+        if self.live.allow_live {
+            reasons.push("ALLOW_LIVE must be false");
+        }
+        if self.live.polymarket_private_key.is_some() {
+            reasons.push("POLYMARKET_PRIVATE_KEY must not be configured");
+        }
+        if self.strategy.enable_taker_orders {
+            reasons.push("ENABLE_TAKER_ORDERS must be false");
+        }
+        if self.live.allow_emergency_account_cancel {
+            reasons.push("ALLOW_EMERGENCY_ACCOUNT_CANCEL must be false");
+        }
+        if self.paper.maker_fill_policy != "none" {
+            reasons.push("PAPER_MAKER_FILL_POLICY must be none");
+        }
+        if self.azure.storage_container_name != "polyedge-shadow-events" {
+            reasons.push("AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events");
+        }
+        if !self.azure.event_blob_prefix.starts_with("shadow-events/") {
+            reasons.push("AZURE_EVENT_BLOB_PREFIX must start with shadow-events/");
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidRuntimeRole(reasons.join("; ")))
+        }
     }
 
     pub fn validate_live_gates(&self, exact_resolution_source: bool) -> Result<(), ConfigError> {
@@ -552,6 +625,9 @@ impl RuntimeSettings {
                 "paper_order_live_after_ms": self.paper.order_live_after_ms
             },
             "read_only": {
+                "app_name": self.deploy.app_name,
+                "runtime_role": self.deploy.runtime_role.as_str(),
+                "shadow_only": self.deploy.runtime_role.is_shadow(),
                 "execution_mode": match self.live.execution_mode {
                     ExecutionMode::Paper => "paper",
                     ExecutionMode::Live => "live"
@@ -674,5 +750,60 @@ fn env_decimal(name: &str, default: Decimal) -> Result<Decimal, ConfigError> {
             value,
         }),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings};
+
+    fn safe_shadow_settings() -> RuntimeSettings {
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
+        settings.paper.maker_fill_policy = "none".to_owned();
+        settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
+        settings.azure.event_blob_prefix = "shadow-events/test-campaign".to_owned();
+        settings
+    }
+
+    #[test]
+    fn profitability_shadow_accepts_fail_closed_configuration() {
+        let settings = safe_shadow_settings();
+        assert!(settings.validate_runtime_role().is_ok());
+        assert!(settings.deploy.runtime_role.is_shadow());
+        assert_eq!(
+            settings.deploy.runtime_role.as_str(),
+            "profitability_shadow"
+        );
+    }
+
+    #[test]
+    fn profitability_shadow_rejects_live_or_non_shadow_configuration() {
+        let mut settings = safe_shadow_settings();
+        settings.live.execution_mode = ExecutionMode::Live;
+        settings.live.allow_live = true;
+        settings.live.polymarket_private_key = Some("redacted-test-key".to_owned());
+        settings.strategy.enable_taker_orders = true;
+        settings.live.allow_emergency_account_cancel = true;
+        settings.paper.maker_fill_policy = "touch_after_quote_was_live".to_owned();
+        settings.azure.storage_container_name = "bot-events".to_owned();
+        settings.azure.event_blob_prefix = "events".to_owned();
+
+        let error = settings.validate_runtime_role().unwrap_err();
+        let ConfigError::InvalidRuntimeRole(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        for expected in [
+            "EXECUTION_MODE must be paper",
+            "ALLOW_LIVE must be false",
+            "POLYMARKET_PRIVATE_KEY must not be configured",
+            "ENABLE_TAKER_ORDERS must be false",
+            "ALLOW_EMERGENCY_ACCOUNT_CANCEL must be false",
+            "PAPER_MAKER_FILL_POLICY must be none",
+            "AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events",
+            "AZURE_EVENT_BLOB_PREFIX must start with shadow-events/",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
     }
 }
