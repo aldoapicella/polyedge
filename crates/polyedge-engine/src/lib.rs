@@ -12,8 +12,12 @@ use thiserror::Error;
 
 pub mod regime;
 pub use regime::{
-    AdaptiveStrategyResult, ProfiledStrategyConfig, QuoteStyle, RegimeClassifier, RegimeFeatures,
-    RegimeLabel, RegimePolicy, RegimeProfile,
+    evaluate_frozen_strategy, AdaptiveStrategyResult, FrozenCandidateIdentity,
+    FrozenStrategyEvaluation, FrozenStrategyMode, ProfiledStrategyConfig, QuoteStyle,
+    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
+    RegimeFeatures, RegimeLabel, RegimePolicy, RegimeProfile, RegimeReferencePoint,
+    StrategyDataQuality, StrategyDecisionEnvelope, StrategyDecisionMetadata,
+    DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON, DYNAMIC_QUOTE_STYLE_POLICY_SHA256,
 };
 
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 60.0 * 60.0;

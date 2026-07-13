@@ -18,7 +18,7 @@ candidates:
   - name: "dynamic_quote_style"
     profile: "dynamic_quote_style"
     candidate_version: "dynamic_quote_style@2026-06-14"
-    config_hash: "sha256:dynamic-quote-style-profile-v1"
+    config_hash: "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
     created_at: "2026-06-14T00:00:00Z"
     frozen_since: "2026-06-14T00:00:00Z"
     reason: "Promising research candidate frozen for out-of-sample tracking."

@@ -1,5 +1,6 @@
 mod chart;
 mod chart_history;
+mod execution_intent;
 mod execution_quality;
 mod recorder;
 mod reference;
@@ -8,15 +9,20 @@ mod view;
 use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
+use execution_intent::{
+    build_execution_intent_with_model, resolve_execution_model, IntentPublisherConfig,
+};
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
-    BookState, DecisionAction, ExecutionReport, MarketId, MarketSpec, ReferencePrice, RuntimeEvent,
-    TokenId, TradeDecision,
+    BookState, DecisionAction, ExecutionReport, FairValue, MarketId, MarketSpec, ReferencePrice,
+    RuntimeEvent, TokenId, TradeDecision,
 };
 use polyedge_engine::{
-    LogReturnFairValueModel, MakerFirstStrategy, OrderManager, PaperFillEngine, RestingMakerOrder,
-    RiskManager,
+    evaluate_frozen_strategy, FrozenStrategyMode, LogReturnFairValueModel, MakerFirstStrategy,
+    OrderManager, PaperFillEngine, QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier,
+    RegimeFeatureInput, RegimePolicy, RegimeReferencePoint, RestingMakerOrder, RiskManager,
+    StrategyDecisionEnvelope, StrategyDecisionMetadata,
 };
 use polyedge_execution::{ExecutionClient, PaperExecutionClient};
 use polyedge_feeds::{self, FeedEvent, FeedName};
@@ -115,6 +121,8 @@ struct RuntimeEngine {
     execution_quality: ExecutionQualityTracker,
     reference_aggregator: ReferenceAggregator,
     last_volatility_update_key: Option<(String, DateTime<Utc>, Decimal)>,
+    regime_classifiers: BTreeMap<MarketId, RegimeClassifier>,
+    regime_policy: RegimePolicy,
 }
 
 impl RuntimeController {
@@ -152,6 +160,8 @@ impl RuntimeController {
             execution_quality: ExecutionQualityTracker::default(),
             reference_aggregator: ReferenceAggregator::default(),
             last_volatility_update_key: None,
+            regime_classifiers: BTreeMap::new(),
+            regime_policy: RegimePolicy::new(settings.strategy.clone()),
         };
         let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new(&settings)));
         let recorder_metrics = Arc::new(RecorderMetrics::default());
@@ -821,10 +831,11 @@ impl RuntimeController {
     }
 
     async fn evaluate_once(&self) {
-        let (reference, markets, books, paused, kill_switch) = {
+        let (reference, references, markets, books, paused, kill_switch) = {
             let data = self.inner.data.read().await;
             (
                 data.reference.clone(),
+                data.exact_references.clone(),
                 active_markets(&data)
                     .into_iter()
                     .cloned()
@@ -841,7 +852,7 @@ impl RuntimeController {
             return;
         }
         for market in markets {
-            let decisions = {
+            let (decisions, strategy_metadata, fair_value, decision_ts) = {
                 let mut engine = self.inner.engine.lock().await;
                 engine.risk.open_order_count = engine.order_manager.open_order_count();
                 let now = Utc::now();
@@ -862,6 +873,58 @@ impl RuntimeController {
                 self.record_event("fair_value", &fair_value, Some("fair_value_update"), None)
                     .await;
                 let raw_decisions = engine.strategy.evaluate(&market, &fair_value, &books);
+                let mut strategy_metadata = Vec::new();
+                let strategy_decisions = if self.inner.settings.strategy.adaptive_regime_enabled {
+                    let mode = FrozenStrategyMode::from_runtime_mode(
+                        &self.inner.settings.strategy.adaptive_regime_mode,
+                    )
+                    .unwrap_or(FrozenStrategyMode::DynamicQuoteStyle);
+                    let features = runtime_regime_features(
+                        &market,
+                        &fair_value,
+                        &reference,
+                        &references,
+                        &books,
+                        now,
+                        engine.order_manager.open_order_count(),
+                        &self.inner.settings,
+                    );
+                    let policy = engine.regime_policy.clone();
+                    let classifier = engine
+                        .regime_classifiers
+                        .entry(market.market_id.clone())
+                        .or_default();
+                    raw_decisions
+                        .iter()
+                        .filter_map(|decision| {
+                            let q = match decision.outcome.as_ref() {
+                                Some(polyedge_domain::Outcome::Up) => Some(fair_value.q_up),
+                                Some(polyedge_domain::Outcome::Down) => Some(fair_value.q_down),
+                                None => None,
+                            };
+                            let best_bid = decision
+                                .token_id
+                                .as_ref()
+                                .and_then(|token| books.get(token))
+                                .and_then(BookState::best_bid)
+                                .map(|level| level.price);
+                            let evaluated = evaluate_frozen_strategy(
+                                mode,
+                                classifier,
+                                &policy,
+                                &features,
+                                now,
+                                decision,
+                                &QuoteTransformContext { best_bid, q },
+                            );
+                            strategy_metadata
+                                .push((decision.token_id.clone(), evaluated.metadata.clone()));
+                            evaluated.decision
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    raw_decisions
+                };
                 let assessment =
                     engine
                         .risk
@@ -869,17 +932,34 @@ impl RuntimeController {
                 let risk_decisions =
                     engine
                         .risk
-                        .filter_decisions(&raw_decisions, &market, &assessment);
-                engine.order_manager.reconcile(
+                        .filter_decisions(&strategy_decisions, &market, &assessment);
+                let decisions = engine.order_manager.reconcile(
                     &market.market_id,
                     &risk_decisions,
                     Some(market.condition_id.clone()),
                     now,
-                )
+                );
+                (decisions, strategy_metadata, fair_value, now)
             };
 
             for decision in decisions {
-                self.push_decision(decision.clone()).await;
+                let metadata = strategy_metadata
+                    .iter()
+                    .find(|(token, _)| token == &decision.token_id)
+                    .or_else(|| strategy_metadata.first())
+                    .map(|(_, metadata)| metadata.clone());
+                self.push_decision_with_metadata(decision.clone(), metadata.clone())
+                    .await;
+                self.maybe_publish_execution_intent(
+                    &market,
+                    &fair_value,
+                    &reference,
+                    &books,
+                    &decision,
+                    metadata.as_ref(),
+                    decision_ts,
+                )
+                .await;
                 if matches!(
                     decision.action,
                     DecisionAction::Place | DecisionAction::CancelAll
@@ -894,12 +974,233 @@ impl RuntimeController {
     }
 
     async fn push_decision(&self, decision: TradeDecision) {
+        self.push_decision_with_metadata(decision, None).await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn maybe_publish_execution_intent(
+        &self,
+        market: &MarketSpec,
+        fair_value: &FairValue,
+        reference: &ReferencePrice,
+        books: &BTreeMap<TokenId, BookState>,
+        decision: &TradeDecision,
+        metadata: Option<&StrategyDecisionMetadata>,
+        decision_ts: DateTime<Utc>,
+    ) {
+        if !self.inner.settings.azure.publish_strategy_canary_intents {
+            return;
+        }
+        let Some(metadata) = metadata else {
+            self.record_event(
+                "execution_intent_not_published",
+                json!({
+                    "market_id": market.market_id,
+                    "reason": "shared frozen strategy metadata is missing",
+                    "fail_closed": true
+                }),
+                None,
+                None,
+            )
+            .await;
+            return;
+        };
+        let Some(token_id) = decision.token_id.as_ref() else {
+            self.record_event(
+                "execution_intent_not_published",
+                json!({
+                    "market_id": market.market_id,
+                    "candidate_version": metadata.candidate.version,
+                    "reason": "decision token_id is missing",
+                    "fail_closed": true
+                }),
+                None,
+                None,
+            )
+            .await;
+            return;
+        };
+        let Some(book) = books.get(token_id) else {
+            self.record_event(
+                "execution_intent_not_published",
+                json!({
+                    "market_id": market.market_id,
+                    "token_id": token_id,
+                    "candidate_version": metadata.candidate.version,
+                    "reason": "captured token book is missing",
+                    "fail_closed": true
+                }),
+                None,
+                None,
+            )
+            .await;
+            return;
+        };
+        // Azure's credential and blob clients are synchronous. Keep canonical
+        // model control reads off the runtime/feed task so a transient storage
+        // delay cannot stall recording or market-data processing.
+        let model_settings = self.inner.settings.clone();
+        let execution_model = match tokio::task::spawn_blocking(move || {
+            resolve_execution_model(&model_settings, decision_ts)
+        })
+        .await
+        .map_err(|error| format!("execution-model control task failed: {error}"))
+        .and_then(|result| result)
+        {
+            Ok(model) => model,
+            Err(reason) => {
+                self.record_event(
+                    "execution_intent_not_published",
+                    json!({
+                        "market_id": market.market_id,
+                        "condition_id": market.condition_id,
+                        "token_id": token_id,
+                        "candidate_version": metadata.candidate.version,
+                        "reason": reason,
+                        "fail_closed": true
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let intent = match build_execution_intent_with_model(
+            &self.inner.settings,
+            market,
+            fair_value,
+            reference,
+            book,
+            decision,
+            metadata,
+            decision_ts,
+            &execution_model,
+        ) {
+            Ok(intent) => intent,
+            Err(reason) => {
+                self.record_event(
+                    "execution_intent_not_published",
+                    json!({
+                        "market_id": market.market_id,
+                        "condition_id": market.condition_id,
+                        "token_id": token_id,
+                        "candidate_version": metadata.candidate.version,
+                        "reason": reason,
+                        "fail_closed": true
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let publisher = match IntentPublisherConfig::from_settings(&self.inner.settings) {
+            Ok(publisher) => publisher,
+            Err(reason) => {
+                self.record_event(
+                    "execution_intent_not_published",
+                    json!({
+                        "decision_id": intent.decision_id,
+                        "market_id": intent.market_id,
+                        "reason": reason,
+                        "fail_closed": true
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let publish_intent = intent.clone();
+            let result =
+                tokio::task::spawn_blocking(move || publisher.publish(&publish_intent)).await;
+            match result {
+                Ok(Ok(published)) => {
+                    runtime
+                        .record_event(
+                            "execution_intent_published",
+                            json!({
+                                "decision_id": intent.decision_id,
+                                "market_id": intent.market_id,
+                                "condition_id": intent.condition_id,
+                                "token_id": intent.token_id,
+                                "candidate_version": intent.candidate_version,
+                                "blob_name": published.blob_name,
+                                "artifact_sha256": published.artifact_sha256,
+                                "valid_until": intent.valid_until,
+                                "order_submission_attempted": false,
+                                "credential_free": true
+                            }),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Ok(Err(reason)) => {
+                    runtime
+                        .record_event(
+                            "execution_intent_not_published",
+                            json!({
+                                "decision_id": intent.decision_id,
+                                "market_id": intent.market_id,
+                                "reason": reason,
+                                "fail_closed": true,
+                                "order_submission_attempted": false
+                            }),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    runtime
+                        .record_event(
+                            "execution_intent_not_published",
+                            json!({
+                                "decision_id": intent.decision_id,
+                                "market_id": intent.market_id,
+                                "reason": format!("publisher task failed: {error}"),
+                                "fail_closed": true,
+                                "order_submission_attempted": false
+                            }),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+            }
+        });
+    }
+
+    async fn push_decision_with_metadata(
+        &self,
+        decision: TradeDecision,
+        metadata: Option<StrategyDecisionMetadata>,
+    ) {
         {
             let mut data = self.inner.data.write().await;
             data.decisions.push_back(decision.clone());
             truncate(&mut data.decisions, HISTORY_LIMIT);
         }
-        self.record_event("decision", &decision, None, None).await;
+        if let Some(strategy_metadata) = metadata {
+            self.record_event(
+                "decision",
+                StrategyDecisionEnvelope {
+                    decision,
+                    strategy_metadata,
+                },
+                None,
+                None,
+            )
+            .await;
+        } else {
+            self.record_event("decision", &decision, None, None).await;
+        }
     }
 
     async fn record_execution_report(&self, report: ExecutionReport, publish_fill: bool) {
@@ -1298,6 +1599,67 @@ fn markets_by_token_from_data(data: &RuntimeData) -> BTreeMap<TokenId, MarketSpe
         markets_by_token.insert(market.down_token_id.clone(), market.clone());
     }
     markets_by_token
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_regime_features(
+    market: &MarketSpec,
+    fair_value: &FairValue,
+    reference: &ReferencePrice,
+    references: &VecDeque<ReferencePrice>,
+    books: &BTreeMap<TokenId, BookState>,
+    now: DateTime<Utc>,
+    open_orders: usize,
+    settings: &RuntimeSettings,
+) -> polyedge_engine::RegimeFeatures {
+    RegimeFeatureInput {
+        now,
+        market_start_ts: Some(market.start_ts),
+        market_end_ts: Some(market.end_ts),
+        start_price: market.start_price,
+        tick_size: market.tick_size,
+        reference: Some(RegimeReferencePoint {
+            ts: reference.local_ts,
+            price: reference.price,
+            stale: reference.stale,
+        }),
+        reference_history: references
+            .iter()
+            .map(|point| RegimeReferencePoint {
+                ts: point.local_ts,
+                price: point.price,
+                stale: point.stale,
+            })
+            .collect(),
+        q_up: Some(fair_value.q_up),
+        q_down: Some(fair_value.q_down),
+        sigma: Some(fair_value.sigma),
+        up_book: books.get(&market.up_token_id).map(runtime_book_snapshot),
+        down_book: books.get(&market.down_token_id).map(runtime_book_snapshot),
+        book_update_rate_10s: None,
+        feed_divergence_bps: None,
+        recent_feed_errors: 0,
+        open_positions: None,
+        open_orders,
+        recent_fill_count: 0,
+        recent_cancel_count: 0,
+        adverse_move_after_fill_bps: None,
+        max_reference_age_ms: settings.risk.max_reference_age_ms,
+        max_book_age_ms: settings.risk.max_book_age_ms,
+        final_no_trade_seconds: settings.strategy.final_no_trade_seconds,
+        quality_flags: reference.quality_flags.clone(),
+    }
+    .build()
+}
+
+fn runtime_book_snapshot(book: &BookState) -> RegimeBookSnapshot {
+    RegimeBookSnapshot {
+        bid: book.best_bid().map(|level| level.price),
+        ask: book.best_ask().map(|level| level.price),
+        bid_size: book.best_bid().map(|level| level.size),
+        ask_size: book.best_ask().map(|level| level.size),
+        local_ts: Some(book.local_ts),
+    }
 }
 
 fn book_summary(book: &BookState, market: Option<&MarketSpec>) -> Value {

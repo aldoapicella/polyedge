@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   assertEligibleOrigin,
+  buildQueueCalibrationArtifact,
   campaignRestSchedule,
+  evaluateCampaignRiskGate,
   evaluateDailyRiskGate,
   fitEffectiveQueueModel,
   isTransientUnsafeMarket,
@@ -10,9 +12,12 @@ import {
   loadProbeConfig,
   modelObservations,
   normalizeStoredObservation,
+  publishTerminalRiskPortfolioEvidence,
+  queueModelArtifactUri,
   reservationAuditObservation,
   sanitize,
   selectMakerOrder,
+  summarizeCampaignRisk,
   summarizeDailyRiskRecords,
   validateFillMarkouts,
   summarizePortfolio
@@ -26,7 +31,7 @@ const safeEnv = {
   MAX_OPEN_ORDERS: "1",
   VENUE_PROBE_CAMPAIGN_ENABLED: "true",
   VENUE_PROBE_MAXIMUM_ORDERS: "25",
-  VENUE_PROBE_MAX_ORDER_NOTIONAL: "2",
+  VENUE_PROBE_MAX_ORDER_NOTIONAL: "1",
   MAX_DAILY_LOSS: "5",
   POLYMARKET_PRIVATE_KEY: "key",
   POLYMARKET_API_KEY: "api",
@@ -41,7 +46,96 @@ test("safe venue probe gates load", () => {
   assert.equal(config.allowLive, false);
   assert.equal(config.maxOpenOrders, 1);
   assert.equal(config.maximumOrders, 25);
-  assert.equal(config.maxOrderNotional, 2);
+  assert.equal(config.maxOrderNotional, 1);
+  assert.equal(config.campaignBaselineEquity, 5.030521);
+  assert.equal(config.campaignEquityFloor, 4.03);
+  assert.equal(config.maxCampaignDrawdown, 1);
+});
+
+test("funded campaign risk does not reset at UTC midnight or process restart", () => {
+  const input = {
+    control: {
+      campaign_id: "funded-campaign-2026-07-12",
+      baseline_equity: 5.030521,
+      equity_floor: 4.03,
+      max_campaign_drawdown: 1,
+      max_order_notional: 1,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0
+    },
+    liquidCollateral: 4.02,
+    summedPositionValue: 0,
+    reportedPositionValue: 0
+  };
+  const beforeMidnight = summarizeCampaignRisk(input);
+  const afterMidnightAndRestart = summarizeCampaignRisk(input);
+  assert.deepEqual(afterMidnightAndRestart, beforeMidnight);
+  assert.equal(beforeMidnight.passed, false);
+  assert.match(beforeMidnight.blockers.join(","), /equity_floor_breached|campaign_drawdown_exhausted/);
+  assert.throws(() => evaluateCampaignRiskGate(beforeMidnight, false), /funded campaign risk gate blocked/);
+  assert.equal(evaluateCampaignRiskGate(beforeMidnight, true).diagnostics_only, true);
+});
+
+test("campaign risk is cash-flow aware and blocks discrepancies above one cent", () => {
+  const risk = summarizeCampaignRisk({
+    control: {
+      campaign_id: "funded-campaign-2026-07-12",
+      baseline_equity: 5.030521,
+      equity_floor: 4.03,
+      max_campaign_drawdown: 1,
+      max_order_notional: 1,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 2
+    },
+    liquidCollateral: 7.030521,
+    summedPositionValue: 0.02,
+    reportedPositionValue: 0,
+    proposedNotional: 1,
+    orderNotional: 1
+  });
+  assert.equal(risk.cash_flow_adjusted_baseline, 7.030521);
+  assert.equal(risk.equity_floor, 6.03);
+  assert.equal(risk.account_reconciliation_discrepancy, 0.02);
+  assert.equal(risk.passed, false);
+  assert.ok(risk.blockers.includes("account_reconciliation_discrepancy"));
+});
+
+test("one unresolved position is tolerated for reconciliation but blocks another submission", () => {
+  const control = {
+    campaign_id: "funded-campaign-2026-07-12",
+    baseline_equity: 5.030521,
+    equity_floor: 4.03,
+    max_campaign_drawdown: 1,
+    max_order_notional: 1,
+    max_reconciliation_discrepancy: 0.01,
+    net_external_cash_flow: 0
+  };
+  const reconcile = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 4.5,
+    summedPositionValue: 0.530521,
+    reportedPositionValue: 0.530521,
+    unresolvedPositionCount: 1
+  });
+  assert.equal(reconcile.passed, true);
+  const nextOrder = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 4.5,
+    summedPositionValue: 0.530521,
+    reportedPositionValue: 0.530521,
+    unresolvedPositionCount: 1,
+    proposedNotional: 0.5,
+    orderNotional: 0.5
+  });
+  assert.ok(nextOrder.blockers.includes("existing_unresolved_position_blocks_submission"));
+  const twoPositions = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 4.5,
+    summedPositionValue: 0.530521,
+    reportedPositionValue: 0.530521,
+    unresolvedPositionCount: 2
+  });
+  assert.ok(twoPositions.blockers.includes("unresolved_position_limit_exceeded"));
 });
 
 test("exhausted daily risk blocks submissions but still permits no-order diagnostics", () => {
@@ -95,6 +189,25 @@ test("venue probe rejects live or taker configuration", () => {
   assert.throws(() => loadProbeConfig({ ...safeEnv, ALLOW_LIVE: "true" }), /ALLOW_LIVE/);
   assert.throws(() => loadProbeConfig({ ...safeEnv, ENABLE_TAKER_ORDERS: "true" }), /ENABLE_TAKER_ORDERS/);
   assert.throws(() => loadProbeConfig({ ...safeEnv, MAX_OPEN_ORDERS: "2" }), /MAX_OPEN_ORDERS/);
+  assert.throws(() => loadProbeConfig({ ...safeEnv, VENUE_PROBE_MAX_ORDER_NOTIONAL: "2" }), /MAX_ORDER_NOTIONAL/);
+  assert.throws(() => loadProbeConfig({ ...safeEnv, VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR: "4.5", VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN: "1" }), /drawdown limit/);
+  assert.throws(() => loadProbeConfig({ ...safeEnv, VENUE_PROBE_CAMPAIGN_CASH_FLOWS: "not-json" }), /must be valid JSON/);
+});
+
+test("campaign cash flows require immutable transaction identities", () => {
+  const hash = `0x${"a".repeat(64)}`;
+  const config = loadProbeConfig({
+    ...safeEnv,
+    VENUE_PROBE_CAMPAIGN_CASH_FLOWS: JSON.stringify([{ id: "deposit-1", amount: 2, transaction_hash: hash }])
+  });
+  assert.deepEqual(config.campaignCashFlows, [{ id: "deposit-1", amount: 2, transaction_hash: hash }]);
+  assert.throws(() => loadProbeConfig({
+    ...safeEnv,
+    VENUE_PROBE_CAMPAIGN_CASH_FLOWS: JSON.stringify([
+      { id: "same", amount: 1, transaction_hash: hash },
+      { id: "same", amount: -1, transaction_hash: hash }
+    ])
+  }), /unique safe identifiers/);
 });
 
 test("maker order is postable below the notional cap and reports inferred size ahead", () => {
@@ -130,7 +243,7 @@ test("maker order enforces the venue one-dollar minimum without crossing the ask
   assert.throws(() => selectMakerOrder({ tick_size: "0.01", min_order_size: "5", bids: [], asks: [{ price: "0.01", size: "10" }] }, 2, 1, 0.05), /non-marketable/);
 });
 
-test("maker order moves below best bid to preserve the strict two-dollar cap", () => {
+test("maker order moves below best bid to preserve the strict one-dollar cap", () => {
   const order = selectMakerOrder(
     {
       tick_size: "0.01",
@@ -272,6 +385,72 @@ test("effective queue model trains with a temporal holdout", () => {
   assert.equal(model.test_label_size, 84);
   assert.equal(model.net_markout_30s_sample_size, 34);
   assert.ok(Number.isFinite(model.out_of_sample_brier_score));
+  assert.ok(Number.isFinite(model.naive_horizon_base_rate_brier_score));
+  assert.ok(Number.isFinite(model.brier_improvement_fraction));
+  assert.ok(Number.isFinite(model.expected_calibration_error));
+  assert.ok(Array.isArray(model.validation_folds));
+  assert.ok(model.validation_folds.length >= 2);
+  assert.equal(model.validation_method, "grouped_expanding_window_temporal");
+  assert.ok(Number.isFinite(model.net_executable_markout_30s_lower_confidence_bound_95));
+  assert.equal(model.promotion_allowed, false);
+  if (model.promotion_ready) {
+    assert.ok(model.brier_improvement_fraction >= 0.05);
+    assert.ok(model.expected_calibration_error <= 0.10);
+    assert.ok(model.net_executable_markout_30s_lower_confidence_bound_95 > 0);
+  }
+});
+
+test("checkpoint-100 model is immutable, content-addressed, and binds every exact training order", () => {
+  const observations = Array.from({ length: 100 }, (_, probe) =>
+    [1, 5, 30, 60].map((horizon) => ({
+      probe_id: `probe-${String(probe).padStart(3, "0")}`,
+      run_id: `run-${String(probe).padStart(3, "0")}`,
+      order_id: `order-${String(probe).padStart(3, "0")}`,
+      recorded_ts: new Date(1_700_000_000_000 + probe * 1000).toISOString(),
+      source_summary_blob_name: `runs/run-${probe}/summary.json`,
+      source_summary_sha256: `sha256:${String(probe % 10).repeat(64)}`,
+      eligible: true,
+      quality_eligible: true,
+      protocol_eligible: true,
+      order_submitted: true,
+      label_observed: true,
+      filled: probe % 3 === 0,
+      horizon_seconds: horizon,
+      inferred_size_ahead: probe % 20,
+      spread: 0.02,
+      order_price: 0.48,
+      order_size: 5,
+      time_to_expiry_seconds: 600,
+      pre_send_trade_size: 1,
+      pre_send_depth_changes: 1,
+      pre_send_volatility: 0.01,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true,
+      data_gap_detected: false,
+      cancellation_failure: false,
+      markout_complete: true,
+      markout_timing_valid: true,
+      executable_markout_30s_per_share: 0.01
+    }))
+  ).flat();
+  const model = fitEffectiveQueueModel(observations, 100);
+  const artifact = buildQueueCalibrationArtifact(model, observations, {
+    generatedAt: new Date("2026-07-13T12:00:00Z"),
+    checkpoint: { blob_name: "checkpoints/100.json", sha256: `sha256:${"a".repeat(64)}` },
+    candidate: { name: "dynamic_quote_style", candidate_version: "v1", config_hash: `sha256:${"b".repeat(64)}` }
+  });
+  assert.match(artifact.blobName, new RegExp(`${artifact.hash.slice(7)}\\.json$`));
+  assert.equal(
+    queueModelArtifactUri({ storageAccount: "stpolyedge", storageContainer: "polyedge-models" }, artifact),
+    `azure://stpolyedge/polyedge-models/${artifact.blobName}`
+  );
+  assert.equal(artifact.value.training_dataset.exact_order_count, 100);
+  assert.match(artifact.value.training_dataset.sha256, /^sha256:[0-9a-f]{64}$/);
+  assert.deepEqual(artifact.value.training_dataset.orders[0], {
+    run_id: "run-000", probe_id: "probe-000", order_id: "order-000",
+    observed_at: new Date(1_700_000_000_000).toISOString(),
+    summary_blob_name: "runs/run-0/summary.json", summary_sha256: `sha256:${"0".repeat(64)}`
+  });
 });
 
 test("any submitted incomplete probe fails the quality gate", () => {
@@ -356,10 +535,10 @@ test("unresolved durable reservations consume their full notional and are not do
   }], [summary]);
   assert.deepEqual(risk, {
     date: "2026-07-12",
-    conservative_loss_budget_consumed: 4.25,
+    conservative_loss_budget_consumed: 5,
     submitted_orders: 3,
     filled_orders: 2,
-    unresolved_risk_reservations: 1
+    unresolved_risk_reservations: 2
   });
 });
 
@@ -394,8 +573,124 @@ test("a confirmed no-order reservation release does not create a model audit row
 });
 
 test("risk reservations resolve only with explicit reconciliation and zero-open proof", () => {
-  assert.equal(isRiskReservationResolved({ state: "finalized", reconciliation_complete: true, zero_open_orders_confirmed: true }), true);
+  assert.equal(isRiskReservationResolved({ state: "finalized", matched_notional: 0, reconciliation_complete: true, zero_open_orders_confirmed: true }), true);
+  assert.equal(isRiskReservationResolved({ state: "finalized", matched_notional: 1, reconciliation_complete: true, zero_open_orders_confirmed: true }), false);
+  assert.equal(isRiskReservationResolved({ state: "position_unresolved", matched_notional: 1, reconciliation_complete: true, zero_open_orders_confirmed: true }), false);
+  assert.equal(isRiskReservationResolved({ state: "position_settled", matched_notional: 1, settlement_verified: true, settlement_evidence_source: "verified_onchain_redemption", settlement_transaction_hash: "0xabc" }), true);
+  assert.equal(isRiskReservationResolved({ state: "position_settled", matched_notional: 1, settlement_verified: true, settlement_evidence_source: "polymarket_data_api_redeemable" }), true);
+  assert.equal(isRiskReservationResolved({ state: "position_settled", matched_notional: 1, settlement_verified: false, settlement_evidence_source: "verified_onchain_redemption", settlement_transaction_hash: "0xabc" }), false);
   assert.equal(isRiskReservationResolved({ state: "finalized", reconciliation_complete: false, zero_open_orders_confirmed: true }), false);
   assert.equal(isRiskReservationResolved({ state: "submitted_pending_reconciliation", reconciliation_complete: true, zero_open_orders_confirmed: true }), false);
   assert.equal(isRiskReservationResolved({ state: "released_no_order", order_submitted: false, reconciliation_complete: true, zero_open_orders_confirmed: true }), true);
+});
+
+function recordingContainer() {
+  const uploads = [];
+  return {
+    uploads,
+    getBlockBlobClient(name) {
+      return {
+        async uploadData(bytes, options) {
+          uploads.push({ name, bytes: Buffer.from(bytes), options });
+        }
+      };
+    }
+  };
+}
+
+const terminalCampaign = {
+  baseline_equity: 5.030521,
+  net_external_cash_flow: 0,
+  cash_flow_ids: []
+};
+
+test("terminal producer publishes immutable no-fill evidence with an exact SHA", async () => {
+  const container = recordingContainer();
+  const result = await publishTerminalRiskPortfolioEvidence(container, {
+    reservation: {
+      run_id: "run-1",
+      probe_id: "probe-1",
+      order_id: "order-1",
+      condition_id: "condition-1",
+      state: "finalized_no_fill",
+      matched_notional: 0
+    },
+    settlement: {
+      settlement_verified: true,
+      zero_open_orders_confirmed: true,
+      evidence_source: "authenticated_no_fill",
+      settled_ts: "2026-07-13T12:00:00Z",
+      terminal_portfolio: {
+        liquid_collateral: 5.030521,
+        current_position_value: 0,
+        account_equity: 5.030521
+      }
+    },
+    campaign: terminalCampaign
+  });
+  assert.equal(result.blob_name, "reports/research/venue-probe/terminal-risk-portfolio/2026-07-13/probe-1.json");
+  assert.match(result.sha256, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(container.uploads.length, 1);
+  assert.deepEqual(container.uploads[0].options.conditions, { ifNoneMatch: "*" });
+  assert.equal(JSON.parse(container.uploads[0].bytes).source, "authenticated_no_fill");
+});
+
+test("terminal producer accepts an already-settled fill only with on-chain proof", async () => {
+  const container = recordingContainer();
+  const input = {
+    reservation: {
+      run_id: "run-2",
+      probe_id: "probe-2",
+      order_id: "order-2",
+      condition_id: "condition-2",
+      state: "position_settled",
+      matched_notional: 0.5
+    },
+    settlement: {
+      settlement_verified: true,
+      zero_open_orders_confirmed: true,
+      evidence_source: "polymarket_data_api_plus_onchain_redemption",
+      transaction_hash: "0xabc",
+      settled_ts: "2026-07-13T12:01:00Z",
+      terminal_portfolio: {
+        liquid_collateral: 5.13,
+        current_position_value: 0,
+        account_equity: 5.13
+      }
+    },
+    campaign: terminalCampaign
+  };
+  const result = await publishTerminalRiskPortfolioEvidence(container, input);
+  assert.equal(result.evidence.reservation_state, "position_settled");
+  assert.equal(result.evidence.settlement_transaction_hash, "0xabc");
+  await assert.rejects(
+    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+      ...input,
+      settlement: { ...input.settlement, transaction_hash: null }
+    }),
+    /fills also require a transaction hash/
+  );
+});
+
+test("terminal producer rejects portfolio discrepancies above one cent", async () => {
+  await assert.rejects(
+    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+      reservation: {
+        run_id: "run-3", probe_id: "probe-3", order_id: "order-3",
+        state: "finalized_no_fill", matched_notional: 0
+      },
+      settlement: {
+        settlement_verified: true,
+        zero_open_orders_confirmed: true,
+        evidence_source: "authenticated_no_fill",
+        terminal_portfolio: {
+          liquid_collateral: 5,
+          current_position_value: 0,
+          account_equity: 5.02
+        }
+      },
+      campaign: terminalCampaign
+    }),
+    /discrepancy exceeds \$0\.01/
+  );
 });

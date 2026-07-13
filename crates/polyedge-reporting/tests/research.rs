@@ -94,6 +94,7 @@ fn prospective_and_backfill_reports_keep_research_safety_flags() {
         candidates,
         out: dir.join("prospective.json"),
         markdown: dir.join("prospective.md"),
+        expected_daily_date: None,
     })
     .unwrap();
 
@@ -639,6 +640,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
         candidates,
         out: reports.join("prospective_validation.json"),
         markdown: reports.join("prospective_validation.md"),
+        expected_daily_date: None,
     })
     .unwrap();
     assert_eq!(prospective["result"]["status"], "tracking");
@@ -1112,7 +1114,7 @@ candidates:
   - name: "dynamic_quote_style"
     profile: "dynamic_quote_style"
     candidate_version: "dynamic_quote_style@2026-06-14"
-    config_hash: "sha256:dynamic-quote-style-profile-v1"
+    config_hash: "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
     created_at: "2026-06-14T00:00:00Z"
     frozen_since: "2026-06-14T00:00:00Z"
     reason: "Frozen quote-style candidate."

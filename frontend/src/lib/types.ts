@@ -243,6 +243,49 @@ export type VenuePortfolioSnapshot = {
   gross_payout_is_profit?: false;
 };
 
+export type VenueCampaignRisk = {
+  campaign_id?: string;
+  baseline_equity?: number;
+  cash_flow_adjusted_baseline?: number;
+  equity_floor?: number;
+  max_campaign_drawdown?: number;
+  account_equity?: number;
+  campaign_drawdown?: number;
+  projected_equity?: number;
+  projected_campaign_drawdown?: number;
+  proposed_notional?: number;
+  account_reconciliation_discrepancy?: number;
+  maximum_reconciliation_discrepancy?: number;
+  open_order_count?: number;
+  unresolved_position_count?: number;
+  unresolved_risk_reservation_count?: number;
+  blockers?: string[];
+  passed?: boolean;
+};
+
+export type VenueRiskSnapshot = {
+  campaign?: VenueCampaignRisk | null;
+  campaign_gate?: {
+    campaign_risk_ok?: boolean;
+    diagnostics_only?: boolean;
+    submission_allowed?: boolean;
+    blockers?: string[];
+  };
+  daily_turnover?: {
+    conservative_loss_budget_consumed?: number;
+    submitted_orders?: number;
+    filled_orders?: number;
+    unresolved_risk_reservations?: number;
+    global_unresolved_risk_reservations?: number;
+  };
+  primary_risk_source?: string;
+  conservative_loss_budget_consumed?: number;
+  submitted_orders?: number;
+  filled_orders?: number;
+  unresolved_risk_reservations?: number;
+  global_unresolved_risk_reservations?: number;
+};
+
 export type VenueExecutionEvidence = {
   generated_ts: string;
   queue_position_source: "authenticated_lifecycle_plus_public_l2" | string;
@@ -252,6 +295,159 @@ export type VenueExecutionEvidence = {
   remaining_limitation: string;
   research_only: boolean;
   strategy_promotion_allowed: boolean;
+  profitability?: {
+    generated_at?: string;
+    created_at?: string;
+    expires_at?: string;
+    phase?: "frozen" | "risk_repair" | "shadow_collecting" | "shadow_passed" | "evidence_collecting" | "canary_ready" | "limited_live" | "profitable_go" | "stopped_no_go" | string;
+    status?: string;
+    candidate?: {
+      name?: string;
+      version?: string;
+      candidate_version?: string;
+      config_hash?: string;
+    };
+    execution_model?: {
+      blob_uri?: string;
+      sha256?: string;
+      model_version?: string;
+    };
+    funded_ladder?: {
+      schema_version?: string;
+      campaign_id?: string;
+      phase?: "evidence_collecting" | "limited_live" | "profitable_go" | "stopped_no_go" | string;
+      active_stage_index?: number;
+      active_target_orders?: number;
+      completed_checkpoints?: number[];
+      human_grant_required?: boolean;
+      stage_authorized?: boolean;
+      terminal?: boolean;
+      promotion_allowed?: false;
+      maximum_calendar_days?: number;
+      maximum_funded_orders?: number;
+      metrics?: {
+        observed_calendar_days?: number;
+        cumulative_eligible_orders?: number;
+        cumulative_funded_orders?: number;
+        cumulative_net_pnl?: number;
+        cumulative_max_drawdown?: number;
+        mean_net_markout_30s?: number;
+        net_markout_30s_lower_95?: number;
+        markout_sample_size?: number;
+        data_quality_passed?: boolean;
+        unresolved_exposure?: number;
+      };
+      queue_model_transition?: {
+        schema_version?: string;
+        binding?: {
+          blob_uri?: string;
+          sha256?: string;
+          model_version?: string;
+        };
+        generated_at?: string;
+        training_cutoff?: string;
+        training_dataset_sha256?: string;
+        training_checkpoint_sha256?: string;
+        model_quality_passed?: boolean;
+      };
+      holdout_evaluation?: {
+        schema_version?: string;
+        exact_order_count?: number;
+        label_sample_size?: number;
+        filled_order_count?: number;
+        non_filled_order_count?: number;
+        brier_improvement_fraction?: number;
+        expected_calibration_error?: number;
+        markout_sample_size?: number;
+        mean_net_markout_30s?: number;
+        net_markout_30s_lower_95?: number;
+        holdout_net_pnl?: number;
+        holdout_max_drawdown?: number;
+        mean_holdout_net_pnl_per_order?: number;
+        holdout_net_pnl_per_order_lower_95?: number;
+        passed?: boolean;
+      };
+    };
+    blocking_reason?: string | null;
+    capital?: {
+      original_starting_capital?: number;
+      campaign_starting_equity?: number;
+      current_equity?: number;
+      campaign_net_pnl?: number;
+      lifetime_net_pnl?: number;
+      equity_floor?: number;
+      max_campaign_drawdown?: number;
+      current_drawdown?: number;
+      locked_principal?: number;
+      unresolved_exposure?: number;
+      external_deposits?: number;
+      withdrawals?: number;
+    };
+    shadow?: {
+      clean_days?: number;
+      required_clean_days?: number;
+      settled_markets?: number;
+      required_settled_markets?: number;
+      queue_conservative_net_pnl?: number;
+      pnl_ci_lower_95?: number;
+      positive_weekly_blocks?: number;
+      required_positive_weekly_blocks?: number;
+      max_drawdown?: number;
+      decision_parity_rate?: number;
+    };
+    data_quality?: {
+      status?: string;
+      decision_grade_coverage?: number;
+      minimum_coverage?: number;
+      fatal_warnings?: number;
+      blocking_warnings?: number;
+      unclassified_warnings?: number;
+    };
+    gates?: Record<string, {
+      passed?: boolean;
+      status?: string;
+      actual?: string | number | boolean | null;
+      required?: string | number | boolean | null;
+      reason?: string;
+    }>;
+    gate_metrics?: {
+      promotion_allowed?: boolean;
+      gates?: Array<{
+        gate?: string;
+        status?: string;
+        actual?: string;
+        required?: string;
+      }>;
+      metrics?: {
+        observed_calendar_days?: number;
+        clean_days?: number;
+        settled_markets?: number;
+        wallet_constrained_net_pnl?: string | number;
+        queue_conservative_net_pnl?: string | number;
+        pnl_ci_95_low?: string | number;
+        consecutive_positive_weekly_blocks?: number;
+        max_drawdown?: string | number;
+        markout_30s_ci_low?: string | number;
+        replay_runtime_parity?: boolean;
+        decision_parity_rate?: string | number;
+        missing_metrics?: string[];
+        data_quality?: {
+          registry_version?: string;
+          total_events?: number;
+          decision_grade_coverage?: string | number;
+          fatal_issues?: string[];
+          warnings?: Array<{
+            message?: string;
+            rule_id?: string;
+            severity?: "informational" | "blocking" | string;
+            known?: boolean;
+          }>;
+        };
+      };
+    };
+    promotion_allowed?: false;
+    human_authorization_required?: true;
+  } | null;
   redemption?: {
     run_id?: string;
     status?: string;
@@ -306,13 +502,7 @@ export type VenueExecutionEvidence = {
     submitted_order_count?: number;
     completed_probe_count?: number;
     stop_reason?: string;
-    risk_at_end?: {
-      conservative_loss_budget_consumed?: number;
-      submitted_orders?: number;
-      filled_orders?: number;
-      unresolved_risk_reservations?: number;
-      global_unresolved_risk_reservations?: number;
-    };
+    risk_at_end?: VenueRiskSnapshot;
     order?: {
       price?: number;
       size?: number;
@@ -366,10 +556,7 @@ export type VenueExecutionEvidence = {
     error?: string;
     order_submitted?: boolean;
     portfolio?: VenuePortfolioSnapshot | null;
-    risk_at_end?: {
-      unresolved_risk_reservations?: number;
-      global_unresolved_risk_reservations?: number;
-    };
+    risk_at_end?: VenueRiskSnapshot;
   } | null;
   preflight?: {
     run_id?: string;
@@ -377,12 +564,10 @@ export type VenueExecutionEvidence = {
     finished_ts?: string;
     order_submitted?: boolean;
     portfolio?: VenuePortfolioSnapshot | null;
-    risk_at_end?: {
-      unresolved_risk_reservations?: number;
-      global_unresolved_risk_reservations?: number;
-    };
+    risk_at_end?: VenueRiskSnapshot;
   } | null;
   model?: {
+    model_version?: string;
     evidence_protocol_version?: number;
     generated_at?: string;
     status?: string;
@@ -395,6 +580,11 @@ export type VenueExecutionEvidence = {
     train_label_size?: number;
     test_label_size?: number;
     out_of_sample_brier_score?: number;
+    naive_horizon_base_rate_brier_score?: number;
+    brier_improvement_fraction?: number;
+    brier_improvement_percent?: number;
+    expected_calibration_error?: number;
+    maximum_expected_calibration_error?: number;
     temporal_split?: string;
     reason?: string;
     promotion_allowed?: boolean;
@@ -405,6 +595,8 @@ export type VenueExecutionEvidence = {
     legacy_protocol_observations?: number;
     net_markout_30s_sample_size?: number;
     mean_net_executable_markout_30s_per_share?: number;
+    net_executable_markout_30s_lower_confidence_bound_95?: number | null;
+    markout_confidence_method?: string;
     quality_gates?: {
       passed?: boolean;
       eligible_observations?: number;

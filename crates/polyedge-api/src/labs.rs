@@ -5,12 +5,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use polyedge_reporting::research::{
-    load_exclusion_registry, load_frozen_candidate_registry, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
+    load_exclusion_registry, load_frozen_candidate_registry, DailyRunManifest, LatestRunPointer,
+    RunStatus, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
 };
 use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
@@ -65,13 +67,77 @@ pub fn router() -> Router<ApiState> {
 }
 
 async fn venue_execution() -> impl IntoResponse {
+    // The funded controller publishes the canonical, human-authorized ladder
+    // state in bot-events. Before that transition exists, the credential-free
+    // research identity publishes the shadow-only manifest in the isolated
+    // research container. Prefer the funded copy but never blend documents.
+    let profitability_path = FsPath::new("reports/research/profitability/latest.json");
+    let funded_profitability =
+        read_json_from_container_or_null(profitability_path, "AZURE_FUNDED_STORAGE_CONTAINER_NAME");
+    let profitability = if funded_profitability.is_null() {
+        read_json_from_container_or_null(
+            profitability_path,
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+        )
+    } else {
+        funded_profitability
+    };
+    let profitability = if profitability.is_null() {
+        json!({
+            "phase": "risk_repair",
+            "status": "funded_execution_frozen",
+            "candidate": {
+                "name": "dynamic_quote_style",
+                "version": "dynamic_quote_style@2026-06-14",
+                "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+            },
+            "blocking_reason": "Shadow profitability and execution-model gates have not passed.",
+            "capital": {
+                "original_starting_capital": 9.23,
+                "campaign_starting_equity": 5.030521,
+                "equity_floor": 4.03,
+                "max_campaign_drawdown": 1.0
+            },
+            "shadow": {
+                "clean_days": 0,
+                "required_clean_days": 30,
+                "settled_markets": 0,
+                "required_settled_markets": 1000,
+                "required_positive_weekly_blocks": 4
+            },
+            "data_quality": {
+                "status": "collecting",
+                "minimum_coverage": 0.95,
+                "fatal_warnings": 0,
+                "blocking_warnings": 0,
+                "unclassified_warnings": 0
+            },
+            "promotion_allowed": false,
+            "human_authorization_required": true
+        })
+    } else {
+        profitability
+    };
+    let trained_model = read_json_from_container_or_null(
+        FsPath::new("reports/research/venue-probe/effective_queue_model.json"),
+        "AZURE_MODEL_STORAGE_CONTAINER_NAME",
+    );
+    let execution_model = if trained_model.is_null() {
+        read_json_from_container_or_null(
+            FsPath::new("reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json"),
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+        )
+    } else {
+        trained_model
+    };
     Json(json!({
         "generated_ts": now_ts(),
-        "latest": read_json_or_null("reports/research/venue-probe/latest.json"),
-        "latest_attempt": read_json_or_null("reports/research/venue-probe/latest_attempt.json"),
-        "preflight": read_json_or_null("reports/research/venue-probe/latest_authenticated_dry_run.json"),
-        "redemption": read_json_or_null("reports/research/venue-probe/latest_redemption.json"),
-        "model": read_json_or_null("reports/research/venue-probe/effective_queue_model.json"),
+        "latest": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+        "latest_attempt": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest_attempt.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+        "preflight": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest_authenticated_dry_run.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+        "redemption": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest_redemption.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+        "model": execution_model,
+        "profitability": profitability,
         "queue_position_source": "authenticated_lifecycle_plus_public_l2",
         "queue_position_metric": "inferred_size_ahead",
         "literal_fifo_rank_available": false,
@@ -715,104 +781,283 @@ async fn start_research_job_by_id(
     }
 }
 
-fn read_latest_report_payload() -> Value {
-    if let Some(date) = latest_daily_date() {
-        return daily_report_payload(&date);
+struct VerifiedDailyBundle {
+    date: String,
+    source: String,
+    manifest: DailyRunManifest,
+    artifact_bytes: BTreeMap<String, Vec<u8>>,
+}
+
+fn resolve_verified_daily_bundle(
+    requested_date: Option<&str>,
+) -> Result<Option<VerifiedDailyBundle>, String> {
+    if let Some(mut client) = artifact_blob_client("AZURE_RESEARCH_STORAGE_CONTAINER_NAME") {
+        if let Some(bundle) = resolve_azure_verified_daily_bundle(&mut client, requested_date)? {
+            return Ok(Some(bundle));
+        }
     }
-    let root = PathBuf::from(REPORT_ROOT);
-    let root_report = json!({
-        "report": read_json_or_null(root.join("final_report.json")),
-        "audit": read_json_or_null(root.join("data_audit.json")),
-        "baseline": read_json_or_null(root.join("baseline.json")),
-        "regimes": read_json_or_null(root.join("regimes.json")),
-        "calibration": read_json_or_null(root.join("calibration.json")),
-        "sample_size": read_json_or_null(root.join("sample_size.json")),
-        "execution_quality": read_json_or_null(root.join("execution_quality.json")),
-        "artifacts": artifacts_for_prefix("")
-    });
-    if root_report["report"].is_object()
-        || root_report["audit"].is_object()
-        || root_report["baseline"].is_object()
-        || root_report["regimes"].is_object()
-        || root_report["calibration"].is_object()
-        || root_report["sample_size"].is_object()
+    resolve_local_verified_daily_bundle(requested_date)
+}
+
+fn resolve_azure_verified_daily_bundle(
+    client: &mut AzureBlobClient,
+    requested_date: Option<&str>,
+) -> Result<Option<VerifiedDailyBundle>, String> {
+    let daily_root = format!("{REPORT_ROOT}/daily");
+    let pointer_base = requested_date
+        .map(|date| format!("{daily_root}/{date}"))
+        .unwrap_or_else(|| daily_root.clone());
+    let pointer_name = format!("{pointer_base}/latest.json");
+    let pointer_bytes = match client.download_blob_bytes(&pointer_name) {
+        Ok(bytes) => bytes,
+        Err(AzureBlobError::HttpStatus(404)) => return Ok(None),
+        Err(error) => return Err(format!("Unable to read atomic latest pointer: {error}")),
+    };
+    let pointer: LatestRunPointer = serde_json::from_slice(&pointer_bytes)
+        .map_err(|error| format!("Atomic latest pointer is invalid JSON: {error}"))?;
+    validate_pointer(&pointer, requested_date)?;
+    let manifest_name = format!("{pointer_base}/{}", pointer.manifest_path);
+    let manifest_bytes = client
+        .download_blob_bytes(&manifest_name)
+        .map_err(|error| format!("Atomic run manifest is unavailable: {error}"))?;
+    let manifest = validate_manifest(&pointer, &manifest_bytes, requested_date)?;
+    let run_prefix = manifest_name
+        .strip_suffix("run_manifest.json")
+        .ok_or_else(|| "Atomic manifest path must end in run_manifest.json".to_owned())?;
+    let mut artifact_bytes = BTreeMap::new();
+    for artifact in manifest.artifacts.values() {
+        validate_relative_artifact_path(&artifact.relative_path)?;
+        let blob_name = format!("{run_prefix}{}", artifact.relative_path);
+        let bytes = client.download_blob_bytes(&blob_name).map_err(|error| {
+            format!(
+                "Atomic artifact {} is unavailable: {error}",
+                artifact.relative_path
+            )
+        })?;
+        verify_artifact(artifact, &bytes)?;
+        artifact_bytes.insert(artifact.relative_path.clone(), bytes);
+    }
+    Ok(Some(VerifiedDailyBundle {
+        date: pointer.date.to_string(),
+        source: format!("azure://{run_prefix}"),
+        manifest,
+        artifact_bytes,
+    }))
+}
+
+fn resolve_local_verified_daily_bundle(
+    requested_date: Option<&str>,
+) -> Result<Option<VerifiedDailyBundle>, String> {
+    let daily_root = PathBuf::from(REPORT_ROOT).join("daily");
+    let pointer_base = requested_date
+        .map(|date| daily_root.join(date))
+        .unwrap_or_else(|| daily_root.clone());
+    let pointer_path = pointer_base.join("latest.json");
+    let pointer_bytes = match fs::read(&pointer_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Unable to read atomic latest pointer: {error}")),
+    };
+    let pointer: LatestRunPointer = serde_json::from_slice(&pointer_bytes)
+        .map_err(|error| format!("Atomic latest pointer is invalid JSON: {error}"))?;
+    validate_pointer(&pointer, requested_date)?;
+    let manifest_path = pointer_base.join(&pointer.manifest_path);
+    let manifest_bytes = fs::read(&manifest_path)
+        .map_err(|error| format!("Atomic run manifest is unavailable: {error}"))?;
+    let manifest = validate_manifest(&pointer, &manifest_bytes, requested_date)?;
+    let run_dir = manifest_path
+        .parent()
+        .ok_or_else(|| "Atomic run manifest has no parent directory".to_owned())?;
+    let mut artifact_bytes = BTreeMap::new();
+    for artifact in manifest.artifacts.values() {
+        validate_relative_artifact_path(&artifact.relative_path)?;
+        let bytes = fs::read(run_dir.join(&artifact.relative_path)).map_err(|error| {
+            format!(
+                "Atomic artifact {} is unavailable: {error}",
+                artifact.relative_path
+            )
+        })?;
+        verify_artifact(artifact, &bytes)?;
+        artifact_bytes.insert(artifact.relative_path.clone(), bytes);
+    }
+    Ok(Some(VerifiedDailyBundle {
+        date: pointer.date.to_string(),
+        source: run_dir.to_string_lossy().replace('\\', "/"),
+        manifest,
+        artifact_bytes,
+    }))
+}
+
+fn validate_pointer(
+    pointer: &LatestRunPointer,
+    requested_date: Option<&str>,
+) -> Result<(), String> {
+    validate_relative_artifact_path(&pointer.manifest_path)?;
+    if !pointer.manifest_path.ends_with("run_manifest.json") {
+        return Err("Atomic latest pointer does not reference run_manifest.json".to_owned());
+    }
+    if requested_date.is_some_and(|date| pointer.date.to_string() != date) {
+        return Err("Atomic latest pointer date does not match the requested date".to_owned());
+    }
+    let expected_manifest_path = if requested_date.is_some() {
+        format!("runs/{}/run_manifest.json", pointer.run_id)
+    } else {
+        format!("{}/runs/{}/run_manifest.json", pointer.date, pointer.run_id)
+    };
+    if pointer.manifest_path != expected_manifest_path {
+        return Err("Atomic latest pointer does not use the canonical run path".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_manifest(
+    pointer: &LatestRunPointer,
+    bytes: &[u8],
+    requested_date: Option<&str>,
+) -> Result<DailyRunManifest, String> {
+    if sha256_hex(bytes) != pointer.manifest_sha256 {
+        return Err("Atomic run manifest hash does not match latest.json".to_owned());
+    }
+    let manifest: DailyRunManifest = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Atomic run manifest is invalid JSON: {error}"))?;
+    if manifest.status != RunStatus::Complete {
+        return Err("Atomic run manifest is not COMPLETE".to_owned());
+    }
+    if manifest.date != pointer.date || manifest.run_id != pointer.run_id {
+        return Err("Atomic run manifest identity does not match latest.json".to_owned());
+    }
+    if requested_date.is_some_and(|date| manifest.date.to_string() != date) {
+        return Err("Atomic run manifest date does not match the requested date".to_owned());
+    }
+    if manifest.artifacts.is_empty() {
+        return Err("Atomic run manifest contains no artifacts".to_owned());
+    }
+    Ok(manifest)
+}
+
+fn validate_relative_artifact_path(path: &str) -> Result<(), String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.split(['/', '\\']).any(|part| part == "..")
     {
-        return root_report;
+        return Err("Atomic bundle contains an unsafe relative path".to_owned());
     }
-    let latest = read_json_or_null(PathBuf::from(REPORT_ROOT).join("latest_daily_report.json"));
-    if !latest.is_null() {
-        return json!({
-            "report": latest,
-            "latest": true,
-            "artifacts": artifacts_for_prefix("")
-        });
+    Ok(())
+}
+
+fn verify_artifact(
+    artifact: &polyedge_reporting::research::RunArtifact,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if artifact.bytes != bytes.len() as u64 || artifact.sha256 != sha256_hex(bytes) {
+        return Err(format!(
+            "Atomic artifact hash or size mismatch: {}",
+            artifact.relative_path
+        ));
     }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn bundle_json(bundle: &VerifiedDailyBundle, candidates: &[&str]) -> Value {
+    candidates
+        .iter()
+        .find_map(|candidate| bundle.artifact_bytes.get(*candidate))
+        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn daily_payload_from_bundle(bundle: &VerifiedDailyBundle) -> Value {
+    let artifacts = bundle
+        .manifest
+        .artifacts
+        .values()
+        .map(|artifact| {
+            json!({
+                "artifact_id": format!("daily~{}~runs~{}~{}", bundle.date, bundle.manifest.run_id, artifact.relative_path.replace('/', "~")),
+                "path": artifact.relative_path,
+                "kind": FsPath::new(&artifact.relative_path).extension().and_then(|value| value.to_str()),
+                "size_bytes": artifact.bytes,
+                "sha256": artifact.sha256
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
-        "report": Value::Null,
-        "detail": "No research daily report exists yet.",
-        "artifacts": artifacts_for_prefix("")
+        "date": bundle.date,
+        "run_id": bundle.manifest.run_id,
+        "status": "complete",
+        "source": bundle.source,
+        "report": bundle_json(bundle, &["final_report.json", "final_strategy_research_report.json"]),
+        "audit": bundle_json(bundle, &["data_audit.json"]),
+        "baseline": bundle_json(bundle, &["baseline.json", "baseline_static_all_fill_models.json"]),
+        "regimes": bundle_json(bundle, &["regimes.json", "regime_profiles.json"]),
+        "calibration": bundle_json(bundle, &["calibration.json"]),
+        "sample_size": bundle_json(bundle, &["sample_size.json"]),
+        "execution_quality": bundle_json(bundle, &["execution_quality.json"]),
+        "artifacts": artifacts
     })
+}
+
+fn read_latest_report_payload() -> Value {
+    match resolve_verified_daily_bundle(None) {
+        Ok(Some(bundle)) => daily_payload_from_bundle(&bundle),
+        Ok(None) => json!({
+            "report": Value::Null,
+            "detail": "No verified atomic daily report exists yet.",
+            "artifacts": []
+        }),
+        Err(detail) => json!({
+            "report": Value::Null,
+            "detail": detail,
+            "status": "atomic_bundle_invalid",
+            "artifacts": []
+        }),
+    }
 }
 
 pub(crate) fn daily_report_payload(date: &str) -> Value {
-    let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
-    json!({
-        "date": date,
-        "report": read_json_or_null(dir.join("final_report.json")),
-        "audit": read_json_or_null(dir.join("data_audit.json")),
-        "baseline": read_json_or_null(dir.join("baseline.json")),
-        "regimes": read_json_or_null(dir.join("regimes.json")),
-        "calibration": read_json_or_null(dir.join("calibration.json")),
-        "sample_size": read_json_or_null(dir.join("sample_size.json")),
-        "execution_quality": read_json_or_null(dir.join("execution_quality.json")),
-        "artifacts": artifacts_for_prefix(&format!("daily/{date}"))
-    })
+    match resolve_verified_daily_bundle(Some(date)) {
+        Ok(Some(bundle)) => daily_payload_from_bundle(&bundle),
+        Ok(None) => json!({
+            "date": date,
+            "report": Value::Null,
+            "detail": "No verified atomic daily report exists for this date.",
+            "artifacts": []
+        }),
+        Err(detail) => json!({
+            "date": date,
+            "report": Value::Null,
+            "detail": detail,
+            "status": "atomic_bundle_invalid",
+            "artifacts": []
+        }),
+    }
 }
 
 fn latest_named_report(primary: &str, fallback: &str) -> Value {
-    let Some(date) = latest_daily_date() else {
-        let root = PathBuf::from(REPORT_ROOT);
-        let report = read_json_or_null(root.join(primary));
-        let report = if report.is_null() {
-            read_json_or_null(root.join(fallback))
-        } else {
-            report
-        };
-        return if report.is_null() {
-            json!({ "report": Value::Null, "detail": "No daily report exists yet." })
-        } else {
-            json!({
-                "report": report,
-                "source": format!("{REPORT_ROOT}/{primary}")
-            })
-        };
-    };
-    let dir = PathBuf::from(REPORT_ROOT).join("daily").join(&date);
-    let report = read_json_or_null(dir.join(primary));
-    let report = if report.is_null() {
-        read_json_or_null(dir.join(fallback))
-    } else {
-        report
-    };
-    json!({ "date": date, "report": report })
-}
-
-fn latest_daily_date() -> Option<String> {
-    if let Some(date) = latest_blob_daily_date() {
-        return Some(date);
+    match resolve_verified_daily_bundle(None) {
+        Ok(Some(bundle)) => json!({
+            "date": bundle.date,
+            "run_id": bundle.manifest.run_id,
+            "report": bundle_json(&bundle, &[primary, fallback]),
+            "source": bundle.source
+        }),
+        Ok(None) => json!({
+            "report": Value::Null,
+            "detail": "No verified atomic daily report exists yet."
+        }),
+        Err(detail) => json!({
+            "report": Value::Null,
+            "detail": detail,
+            "status": "atomic_bundle_invalid"
+        }),
     }
-    let root = PathBuf::from(REPORT_ROOT).join("daily");
-    let mut dates = fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .filter(|entry| entry.file_type().ok().is_some_and(|kind| kind.is_dir()))
-        .filter_map(|entry| {
-            let value = entry.file_name().to_string_lossy().into_owned();
-            valid_date(&value).then_some(value)
-        })
-        .collect::<Vec<_>>();
-    dates.sort();
-    dates.pop()
 }
 
 fn exclusion_payload() -> Value {
@@ -1190,14 +1435,18 @@ fn read_json_or_null(path: impl AsRef<FsPath>) -> Value {
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-fn artifact_blob_client() -> Option<AzureBlobClient> {
+fn artifact_blob_client(container_env: &str) -> Option<AzureBlobClient> {
     let account = env::var("AZURE_STORAGE_ACCOUNT_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())?;
-    let container = env::var("AZURE_STORAGE_CONTAINER_NAME")
+    let container = match env::var(container_env)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "bot-events".to_owned());
+    {
+        Some(value) => value,
+        None if container_env == "AZURE_STORAGE_CONTAINER_NAME" => "bot-events".to_owned(),
+        None => return None,
+    };
     let client_id = env::var("AZURE_CLIENT_ID")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -1206,26 +1455,83 @@ fn artifact_blob_client() -> Option<AzureBlobClient> {
     ))
 }
 
+fn artifact_container_env(blob_name: &str) -> &'static str {
+    if blob_name == "reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json"
+    {
+        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
+    } else if blob_name == "reports/research/venue-probe/effective_queue_model.json"
+        || blob_name.starts_with("reports/research/venue-probe/models/")
+    {
+        "AZURE_MODEL_STORAGE_CONTAINER_NAME"
+    } else if blob_name.starts_with("reports/research/venue-probe/") {
+        "AZURE_FUNDED_STORAGE_CONTAINER_NAME"
+    } else if blob_name.starts_with("reports/research/shadow/")
+        || blob_name.starts_with("reports/research/profitability/")
+    {
+        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
+    } else {
+        "AZURE_STORAGE_CONTAINER_NAME"
+    }
+}
+
+fn read_json_from_container_or_null(path: &FsPath, container_env: &str) -> Value {
+    let Some(blob_name) = blob_name_for_path(path) else {
+        return Value::Null;
+    };
+    let Some(mut client) = artifact_blob_client(container_env) else {
+        return Value::Null;
+    };
+    match client.download_blob_bytes(&blob_name) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        Err(AzureBlobError::HttpStatus(404)) => Value::Null,
+        Err(_) => Value::Null,
+    }
+}
+
 fn read_blob_bytes_for_path(path: &FsPath) -> Option<Vec<u8>> {
     let blob_name = blob_name_for_path(path)?;
     read_blob_bytes(&blob_name)
 }
 
 fn read_blob_bytes(blob_name: &str) -> Option<Vec<u8>> {
-    let mut client = artifact_blob_client()?;
-    match client.download_blob_bytes(blob_name) {
-        Ok(bytes) => Some(bytes),
-        Err(AzureBlobError::HttpStatus(404)) => None,
-        Err(_) => None,
+    let container_envs: &[&str] = if blob_name == "reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json"
+    {
+        &["AZURE_RESEARCH_STORAGE_CONTAINER_NAME"]
+    } else if blob_name.starts_with("reports/research/profitability/") {
+        &[
+            "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+        ]
+    } else if blob_name == "reports/research/venue-probe/effective_queue_model.json"
+        || blob_name.starts_with("reports/research/venue-probe/models/")
+    {
+        &[
+            "AZURE_MODEL_STORAGE_CONTAINER_NAME",
+            "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+        ]
+    } else {
+        &[artifact_container_env(blob_name)]
+    };
+    for container_env in container_envs {
+        let Some(mut client) = artifact_blob_client(container_env) else {
+            continue;
+        };
+        match client.download_blob_bytes(blob_name) {
+            Ok(bytes) => return Some(bytes),
+            Err(AzureBlobError::HttpStatus(404)) => continue,
+            Err(_) => return None,
+        }
     }
+    None
 }
 
 fn list_blob_json_files(root: &FsPath, file_name: &str, limit: usize) -> Option<Vec<Value>> {
-    let mut client = artifact_blob_client()?;
     let mut prefix = blob_name_for_path(root)?;
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
+    let mut client = artifact_blob_client(artifact_container_env(&prefix))?;
     let blobs = client
         .list_blobs_by_suffixes(&prefix, &[file_name], Some(limit), Some(32 * 1024 * 1024))
         .ok()?;
@@ -1241,7 +1547,6 @@ fn list_blob_json_files(root: &FsPath, file_name: &str, limit: usize) -> Option<
 }
 
 fn blob_artifacts_for_prefix(prefix: &str) -> Option<Vec<Value>> {
-    let mut client = artifact_blob_client()?;
     let mut blob_prefix = REPORT_ROOT.to_owned();
     let clean_prefix = prefix.trim().trim_start_matches('/').trim_end_matches('/');
     if !clean_prefix.is_empty() {
@@ -1251,49 +1556,62 @@ fn blob_artifacts_for_prefix(prefix: &str) -> Option<Vec<Value>> {
     if !blob_prefix.ends_with('/') {
         blob_prefix.push('/');
     }
-    let blobs = client
-        .list_blobs_by_suffixes(&blob_prefix, &[".json", ".md"], Some(1000), None)
-        .ok()?;
-    let mut artifacts = blobs
-        .into_iter()
-        .filter_map(|blob| {
-            let relative = blob.name.strip_prefix(&format!("{REPORT_ROOT}/"))?.to_owned();
-            let extension = FsPath::new(&relative)
+    let container_envs: &[&str] = if clean_prefix.is_empty() {
+        &[
+            "AZURE_STORAGE_CONTAINER_NAME",
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+            "AZURE_MODEL_STORAGE_CONTAINER_NAME",
+            "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+        ]
+    } else if clean_prefix == "profitability" || clean_prefix.starts_with("profitability/") {
+        &[
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+            "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+        ]
+    } else if clean_prefix == "venue-probe/models"
+        || clean_prefix.starts_with("venue-probe/models/")
+    {
+        &[
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+            "AZURE_MODEL_STORAGE_CONTAINER_NAME",
+        ]
+    } else {
+        &[artifact_container_env(&blob_prefix)]
+    };
+    let mut artifacts = BTreeMap::<String, Value>::new();
+    let mut any_client = false;
+    for container_env in container_envs {
+        let Some(mut client) = artifact_blob_client(container_env) else {
+            continue;
+        };
+        any_client = true;
+        let blobs = client
+            .list_blobs_by_suffixes(&blob_prefix, &[".json", ".md"], Some(1000), None)
+            .ok()?;
+        for blob in blobs {
+            let Some(relative) = blob.name.strip_prefix(&format!("{REPORT_ROOT}/")) else {
+                continue;
+            };
+            let Some(extension) = FsPath::new(relative)
                 .extension()
-                .and_then(|value| value.to_str())?;
-            Some(json!({
-                "artifact_id": relative.replace('/', "~"),
-                "path": relative,
-                "kind": extension,
-                "size_bytes": blob.content_length,
-                "modified_ts": blob.last_modified.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
-            }))
-        })
-        .collect::<Vec<_>>();
-    artifacts.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-    Some(artifacts)
-}
-
-fn latest_blob_daily_date() -> Option<String> {
-    let mut client = artifact_blob_client()?;
-    let blobs = client
-        .list_blobs_by_suffixes(
-            "reports/research/daily/",
-            &["final_report.json"],
-            Some(1000),
-            None,
-        )
-        .ok()?;
-    let mut dates = blobs
-        .into_iter()
-        .filter_map(|blob| {
-            let relative = blob.name.strip_prefix("reports/research/daily/")?;
-            let date = relative.split('/').next()?.to_owned();
-            valid_date(&date).then_some(date)
-        })
-        .collect::<Vec<_>>();
-    dates.sort();
-    dates.pop()
+                .and_then(|value| value.to_str())
+            else {
+                continue;
+            };
+            artifacts.insert(
+                relative.to_owned(),
+                json!({
+                    "artifact_id": relative.replace('/', "~"),
+                    "path": relative,
+                    "kind": extension,
+                    "size_bytes": blob.content_length,
+                    "modified_ts": blob.last_modified.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                    "storage_role": container_env
+                }),
+            );
+        }
+    }
+    any_client.then(|| artifacts.into_values().collect())
 }
 
 fn blob_name_for_path(path: &FsPath) -> Option<String> {
@@ -1685,30 +2003,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn daily_report_payload_reads_reports_research_daily_contract() {
+    fn profitability_and_shadow_artifacts_route_to_isolated_research_container() {
+        assert_eq!(
+            artifact_container_env("reports/research/profitability/latest.json"),
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
+        );
+        assert_eq!(
+            artifact_container_env("reports/research/shadow/daily/2026-07-12/latest.json"),
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
+        );
+        assert_eq!(
+            artifact_container_env("reports/research/venue-probe/latest.json"),
+            "AZURE_FUNDED_STORAGE_CONTAINER_NAME"
+        );
+        assert_eq!(
+            artifact_container_env("reports/research/venue-probe/effective_queue_model.json"),
+            "AZURE_MODEL_STORAGE_CONTAINER_NAME"
+        );
+        assert_eq!(
+            artifact_container_env("reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json"),
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
+        );
+    }
+
+    #[test]
+    fn daily_report_payload_reads_only_verified_atomic_contract() {
         let date = "2099-12-31";
         let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
         let _guard = CleanupPath(dir.clone());
-        fs::create_dir_all(&dir).expect("daily report dir");
-        fs::write(
-            dir.join("sample_size.json"),
-            r#"{"result":{"statistics":{"n":67}}}"#,
-        )
-        .expect("sample size");
-        fs::write(
-            dir.join("final_report.json"),
-            r#"{"result":{"executive_summary":{"recommendation":"collect"}}}"#,
-        )
-        .expect("final report");
+        build_atomic_test_bundle(date, "api-run-001");
 
         let payload = daily_report_payload(date);
 
         assert_eq!(payload["date"], date);
+        assert_eq!(payload["status"], "complete");
+        assert_eq!(payload["run_id"], "api-run-001");
         assert_eq!(payload["sample_size"]["result"]["statistics"]["n"], 67);
         assert_eq!(
             payload["report"]["result"]["executive_summary"]["recommendation"],
             "collect"
         );
+    }
+
+    #[test]
+    fn daily_report_payload_rejects_tampered_atomic_artifact_without_flat_fallback() {
+        let date = "2099-12-30";
+        let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
+        let _guard = CleanupPath(dir.clone());
+        build_atomic_test_bundle(date, "api-run-002");
+        fs::write(
+            dir.join("runs/api-run-002/final_report.json"),
+            r#"{"tampered":true}"#,
+        )
+        .expect("tamper test artifact");
+        fs::write(
+            dir.join("final_report.json"),
+            r#"{"obsolete_flat_path":true}"#,
+        )
+        .expect("obsolete flat artifact");
+
+        let payload = daily_report_payload(date);
+
+        assert_eq!(payload["status"], "atomic_bundle_invalid");
+        assert!(payload["report"].is_null());
+        assert!(payload["artifacts"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]
@@ -1750,6 +2108,74 @@ mod tests {
         assert!(job["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("not configured") || detail.contains("hidden")));
+    }
+
+    fn build_atomic_test_bundle(date: &str, run_id: &str) {
+        use chrono::NaiveDate;
+        use polyedge_reporting::research::{
+            DailyRunManifest, DataQualitySummary, LatestRunPointer, RunArtifact, RunStatus,
+        };
+        use rust_decimal::Decimal;
+
+        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        let quality = DataQualitySummary::new(2, Decimal::ONE, Vec::new(), Vec::new());
+        let date_dir = PathBuf::from(REPORT_ROOT)
+            .join("daily")
+            .join(date.to_string());
+        let run_dir = date_dir.join("runs").join(run_id);
+        fs::create_dir_all(&run_dir).expect("atomic test run directory");
+        let test_artifacts = [
+            (
+                "sample_size",
+                "sample_size.json",
+                br#"{"result":{"statistics":{"n":67}}}"#.as_slice(),
+            ),
+            (
+                "final_report",
+                "final_report.json",
+                br#"{"result":{"executive_summary":{"recommendation":"collect"}}}"#.as_slice(),
+            ),
+        ];
+        let mut artifacts = BTreeMap::new();
+        for (name, relative_path, bytes) in test_artifacts {
+            fs::write(run_dir.join(relative_path), bytes).expect("atomic test artifact");
+            artifacts.insert(
+                name.to_owned(),
+                RunArtifact {
+                    name: name.to_owned(),
+                    relative_path: relative_path.to_owned(),
+                    sha256: sha256_hex(bytes),
+                    bytes: bytes.len() as u64,
+                },
+            );
+        }
+        let now = Utc::now();
+        let manifest = DailyRunManifest {
+            schema_version: 1,
+            date,
+            run_id: run_id.to_owned(),
+            created_at: now,
+            completed_at: Some(now),
+            input_sha256: "a".repeat(64),
+            status: RunStatus::Complete,
+            artifacts,
+            data_quality: quality,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        fs::write(run_dir.join("run_manifest.json"), &manifest_bytes).unwrap();
+        let pointer = LatestRunPointer {
+            schema_version: 1,
+            date,
+            run_id: run_id.to_owned(),
+            manifest_path: format!("runs/{run_id}/run_manifest.json"),
+            manifest_sha256: sha256_hex(&manifest_bytes),
+            promoted_at: now,
+        };
+        fs::write(
+            date_dir.join("latest.json"),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .unwrap();
     }
 
     struct CleanupPath(PathBuf);

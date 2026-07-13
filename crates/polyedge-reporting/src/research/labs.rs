@@ -1,5 +1,7 @@
+use super::run_bundle::quality_from_audit;
 use super::*;
 use chrono::NaiveDate;
+use sha2::{Digest, Sha256};
 
 mod config;
 pub use config::{
@@ -8,6 +10,20 @@ pub use config::{
     DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
     FROZEN_CANDIDATE_NAMES,
 };
+
+/// First UTC research day for which the immutable run-manifest protocol is
+/// mandatory. Flat daily artifacts are read only for genuinely historical
+/// dates before this cutoff and only when no atomic marker exists.
+pub const ATOMIC_DAILY_PROTOCOL_CUTOFF: &str = "2026-07-12";
+pub const WALLET_CAMPAIGN_START: &str = "2026-07-12";
+pub const CUMULATIVE_WALLET_SCOPE: &str = "cumulative_since_2026-07-12";
+
+pub fn legacy_daily_fallback_allowed(report_date: NaiveDate, atomic_marker_present: bool) -> bool {
+    !atomic_marker_present
+        && report_date
+            < NaiveDate::parse_from_str(ATOMIC_DAILY_PROTOCOL_CUTOFF, "%Y-%m-%d")
+                .expect("atomic daily protocol cutoff is a valid date")
+}
 
 #[derive(Clone, Debug)]
 pub struct AzureFreshnessOptions {
@@ -27,6 +43,95 @@ pub struct ProspectiveValidationOptions {
     pub candidates: PathBuf,
     pub out: PathBuf,
     pub markdown: PathBuf,
+    /// When set, validation is dependency-aware and leaves the prior output
+    /// untouched until this UTC day's atomic bundle is COMPLETE and verified.
+    pub expected_daily_date: Option<NaiveDate>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfitabilityEvaluationOptions {
+    pub daily_root: PathBuf,
+    pub prospective: PathBuf,
+    pub gate_config: PathBuf,
+    pub execution_model: PathBuf,
+    pub out: PathBuf,
+    pub generated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CumulativeWalletSnapshotOptions {
+    pub regimes: PathBuf,
+    pub normalized_manifest: PathBuf,
+    pub snapshot_date: NaiveDate,
+    pub out: PathBuf,
+}
+
+/// Binds the wallet ledger produced by the cumulative replay to the exact
+/// normalized input manifest. The resulting file is included in the day's
+/// immutable bundle; profitability refuses daily reset wallet metrics.
+pub fn run_build_cumulative_wallet_snapshot(
+    options: CumulativeWalletSnapshotOptions,
+) -> Result<Value, ResearchError> {
+    let regimes_bytes = fs::read(&options.regimes)?;
+    let regimes: Value = serde_json::from_slice(&regimes_bytes)?;
+    let normalized_bytes = fs::read(&options.normalized_manifest)?;
+    let normalized: Value = serde_json::from_slice(&normalized_bytes)?;
+    let normalized_events = normalized["events"].as_u64().ok_or_else(|| {
+        ResearchError::InvalidInput("normalized cumulative manifest is missing events".to_owned())
+    })?;
+    let profile = find_regime_profile(&regimes, "dynamic_quote_style").ok_or_else(|| {
+        ResearchError::InvalidInput(
+            "cumulative replay is missing dynamic_quote_style profile".to_owned(),
+        )
+    })?;
+    if profile["wallet_constrained"].as_bool() != Some(true) {
+        return Err(ResearchError::InvalidInput(
+            "cumulative replay is not wallet constrained".to_owned(),
+        ));
+    }
+    let cumulative_events = profile["events"].as_u64().ok_or_else(|| {
+        ResearchError::InvalidInput("cumulative replay profile is missing events".to_owned())
+    })?;
+    if cumulative_events == 0 || cumulative_events > normalized_events {
+        return Err(ResearchError::InvalidInput(
+            "cumulative replay event count is outside its normalized input".to_owned(),
+        ));
+    }
+    for field in [
+        "wallet_constrained_net_pnl",
+        "wallet_constrained_ending_equity",
+        "wallet_constrained_max_drawdown",
+        "wallet_constrained_unresolved_orders",
+    ] {
+        if (field == "wallet_constrained_unresolved_orders" && profile[field].as_u64().is_none())
+            || (field != "wallet_constrained_unresolved_orders"
+                && decimal_from_value(&profile[field]).is_none())
+        {
+            return Err(ResearchError::InvalidInput(format!(
+                "cumulative replay is missing valid {field}"
+            )));
+        }
+    }
+    let snapshot = json!({
+        "schema_version": 1,
+        "wallet_scope": CUMULATIVE_WALLET_SCOPE,
+        "campaign_start": WALLET_CAMPAIGN_START,
+        "snapshot_date": options.snapshot_date.format("%Y-%m-%d").to_string(),
+        "cumulative_input_sha256": format!("sha256:{}", sha256_hex(&normalized_bytes)),
+        "cumulative_state_sha256": format!("sha256:{}", sha256_hex(&regimes_bytes)),
+        "cumulative_events": cumulative_events,
+        "candidate": "dynamic_quote_style",
+        "fill_model": regimes.pointer("/result/fill_model").cloned().unwrap_or(Value::Null),
+        "wallet_constrained": true,
+        "wallet_constrained_net_pnl": profile["wallet_constrained_net_pnl"].clone(),
+        "wallet_constrained_ending_equity": profile["wallet_constrained_ending_equity"].clone(),
+        "wallet_constrained_max_drawdown": profile["wallet_constrained_max_drawdown"].clone(),
+        "wallet_constrained_unresolved_orders": profile["wallet_constrained_unresolved_orders"].clone(),
+        "research_only": true,
+        "funded_execution_allowed": false
+    });
+    write_json_file(&options.out, &snapshot)?;
+    Ok(snapshot)
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +293,39 @@ pub fn run_validate_prospective(
 ) -> Result<Value, ResearchError> {
     let start = Instant::now();
     let candidates = load_frozen_candidate_registry(&options.candidates)?;
+    if let Some(expected_date) = options.expected_daily_date {
+        let local_dependency = inspect_daily_dependency(&options.reports_dir, expected_date)?;
+        let dependency = if matches!(
+            local_dependency,
+            DailyDependency::WaitingForDependency { .. }
+        ) {
+            inspect_azure_daily_dependency(&options.reports_dir, expected_date)?
+                .unwrap_or(local_dependency)
+        } else {
+            local_dependency
+        };
+        if let DailyDependency::WaitingForDependency { reason, .. } = &dependency {
+            return Ok(envelope(
+                "polyedge-rs research validate-prospective",
+                &options.reports_dir,
+                "queue_proxy_conservative",
+                "frozen_candidates",
+                start.elapsed(),
+                vec![json!(format!("waiting for daily dependency: {reason}"))],
+                json!({
+                    "status": "waiting_for_dependency",
+                    "expected_daily_date": expected_date,
+                    "dependency": dependency,
+                    "previous_latest_preserved": true,
+                    "output_written": false,
+                    "frozen_candidates": candidates.as_json(),
+                    "research_only": true,
+                    "paper_only": true,
+                    "live_deployment_allowed": false
+                }),
+            ));
+        }
+    }
     let rows = load_daily_prospective_rows(&options.reports_dir, options.since)?;
     let paired_improvement = paired_improvement_summary(&rows);
     let status = if rows.is_empty() {
@@ -232,6 +370,101 @@ pub fn run_validate_prospective(
         &prospective_markdown(&report),
     )?;
     Ok(report)
+}
+
+pub fn run_evaluate_profitability(
+    options: ProfitabilityEvaluationOptions,
+) -> Result<PromotionManifestV1, ResearchError> {
+    // `stopped_no_go` is an absorbing terminal state. Once the canonical
+    // manifest reaches it, later data or model recomputation cannot silently
+    // resurrect the candidate. A new candidate/version must use a new state.
+    let existing_manifest = read_local_or_azure_json(&options.out)?
+        .map(serde_json::from_value::<PromotionManifestV1>)
+        .transpose()?;
+    if let Some(existing) = &existing_manifest {
+        if existing.phase == PromotionPhase::StoppedNoGo {
+            return Ok(existing.clone());
+        }
+        if existing
+            .funded_ladder
+            .as_ref()
+            .is_some_and(|ladder| ladder.terminal)
+        {
+            return Ok(existing.clone());
+        }
+    }
+    let config = load_profitability_gate(&options.gate_config)?;
+    let prospective = read_local_or_azure_json(&options.prospective)?.unwrap_or(Value::Null);
+    let rows = load_daily_prospective_rows(
+        &options.daily_root,
+        DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is valid"),
+    )?;
+    let (execution_model, execution_model_binding) =
+        load_exact_execution_model(&options.execution_model)?;
+    let expected_prior_sha = if config.shadow_prior_sha256.starts_with("sha256:") {
+        config.shadow_prior_sha256.to_ascii_lowercase()
+    } else {
+        format!("sha256:{}", config.shadow_prior_sha256.to_ascii_lowercase())
+    };
+    if execution_model_binding.model_version != config.shadow_prior_model_version
+        || execution_model_binding.sha256 != expected_prior_sha
+        || execution_model["status"].as_str() != Some("frozen_conservative_prior")
+        || execution_model["prediction_policy"].as_str()
+            != Some("zero_fill_probability_until_authenticated_calibration")
+        || execution_model["sample_size"].as_u64() != Some(0)
+        || execution_model["promotion_ready"].as_bool() != Some(false)
+        || execution_model["promotion_allowed"].as_bool() != Some(false)
+        || execution_model["funded_execution_allowed"].as_bool() != Some(false)
+    {
+        return Err(ResearchError::InvalidInput(
+            "shadow profitability requires the exact pinned non-executable conservative execution prior"
+                .to_owned(),
+        ));
+    }
+    let metrics =
+        aggregate_profitability_metrics(&rows, &prospective, &execution_model, &config.thresholds);
+    let evaluation =
+        PromotionEvaluation::evaluate_shadow_with_thresholds(metrics, &config.thresholds);
+    let generated_at = options.generated_at.unwrap_or_else(Utc::now);
+    let mut manifest = PromotionManifestV1::new(
+        config.candidate,
+        evaluation,
+        BTreeMap::from([
+            (
+                "shadow_daily_root".to_owned(),
+                options.daily_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "prospective_result".to_owned(),
+                options.prospective.to_string_lossy().into_owned(),
+            ),
+            (
+                "profitability_gate".to_owned(),
+                options.gate_config.to_string_lossy().into_owned(),
+            ),
+            (
+                "effective_queue_model".to_owned(),
+                execution_model_binding.blob_uri.clone(),
+            ),
+        ]),
+        execution_model_binding,
+        generated_at,
+        generated_at + Duration::hours(24),
+    )?;
+    if let Some(existing) = existing_manifest {
+        if existing.candidate == manifest.candidate && existing.funded_ladder.is_some() {
+            manifest.funded_ladder = existing.funded_ladder;
+            manifest.phase = manifest
+                .funded_ladder
+                .as_ref()
+                .expect("preserved funded ladder exists")
+                .phase;
+        }
+    }
+    // PromotionManifestV1 is intentionally fail-closed. This research command
+    // can report passing gates, but it can never arm funded execution.
+    write_promotion_manifest(&options.out, &manifest)?;
+    Ok(manifest)
 }
 
 pub fn run_build_replay_index(options: ReplayIndexOptions) -> Result<Value, ResearchError> {
@@ -728,7 +961,26 @@ fn load_local_daily_prospective_rows(
         if report_date < since_date {
             continue;
         }
-        rows.push(daily_prospective_row(&date, &entry.path())?);
+        let date_dir = entry.path();
+        let atomic_marker_present =
+            date_dir.join("latest.json").is_file() || date_dir.join("runs").is_dir();
+        let source_dir = if atomic_marker_present {
+            match inspect_daily_dependency(reports_dir, report_date)? {
+                DailyDependency::Ready { bundle_dir, .. } => bundle_dir,
+                DailyDependency::WaitingForDependency { reason, .. } => {
+                    return Err(ResearchError::InvalidInput(format!(
+                        "atomic daily bundle {date} is not verified: {reason}"
+                    )))
+                }
+            }
+        } else if legacy_daily_fallback_allowed(report_date, false) {
+            date_dir
+        } else {
+            return Err(ResearchError::InvalidInput(format!(
+                "atomic daily bundle is required on or after {ATOMIC_DAILY_PROTOCOL_CUTOFF}: {date}"
+            )));
+        };
+        rows.push(daily_prospective_row(&date, &source_dir)?);
     }
     Ok(rows)
 }
@@ -743,14 +995,18 @@ fn daily_prospective_row(date: &str, dir: &Path) -> Result<Value, ResearchError>
     let sample_size = read_optional_json(&dir.join("sample_size.json"))?;
     let audit = read_optional_json(&dir.join("data_audit.json"))?;
     let execution_quality = read_optional_json(&dir.join("execution_quality.json"))?;
+    let cumulative_wallet = read_optional_json(&dir.join("cumulative_wallet.json"))?;
     daily_prospective_row_from_reports(
         date,
-        final_report,
-        regimes,
-        baseline,
-        sample_size,
-        audit,
-        execution_quality,
+        DailyReportDocuments {
+            final_report,
+            regimes,
+            baseline,
+            sample_size,
+            audit,
+            execution_quality,
+            cumulative_wallet,
+        },
     )
 }
 
@@ -763,7 +1019,12 @@ fn load_azure_daily_prospective_rows(
     };
     let prefix = report_blob_prefix(reports_dir);
     let blobs = client
-        .list_blobs_by_suffixes(&prefix, &["final_report.json"], Some(1000), None)
+        .list_blobs_by_suffixes(
+            &prefix,
+            &["latest.json", "run_manifest.json", "final_report.json"],
+            Some(3000),
+            None,
+        )
         .map_err(|error| {
             ResearchError::Azure(format!("listing prospective daily reports: {error}"))
         })?;
@@ -783,48 +1044,318 @@ fn load_azure_daily_prospective_rows(
     let mut rows = Vec::new();
     for date in dates {
         let daily_prefix = format!("{prefix}{date}/");
-        rows.push(daily_prospective_row_from_reports(
-            &date,
-            read_blob_json(&mut client, &format!("{daily_prefix}final_report.json"))?,
-            read_blob_json(&mut client, &format!("{daily_prefix}regimes.json"))?.or(
-                read_blob_json(&mut client, &format!("{daily_prefix}regime_profiles.json"))?,
-            ),
-            read_blob_json(&mut client, &format!("{daily_prefix}baseline.json"))?.or(
-                read_blob_json(
-                    &mut client,
-                    &format!("{daily_prefix}baseline_static_all_fill_models.json"),
-                )?,
-            ),
-            read_blob_json(&mut client, &format!("{daily_prefix}sample_size.json"))?,
-            read_blob_json(&mut client, &format!("{daily_prefix}data_audit.json"))?,
-            read_blob_json(
-                &mut client,
-                &format!("{daily_prefix}execution_quality.json"),
-            )?,
-        )?);
+        match load_azure_complete_bundle(&mut client, &prefix, &date)? {
+            AzureDailyBundleState::Ready {
+                run_prefix,
+                manifest,
+            } => rows.push(daily_prospective_row_from_reports(
+                &date,
+                DailyReportDocuments {
+                    final_report: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["final_report.json", "final_strategy_research_report.json"],
+                    )?,
+                    regimes: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["regimes.json", "regime_profiles.json"],
+                    )?,
+                    baseline: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["baseline.json", "baseline_static_all_fill_models.json"],
+                    )?,
+                    sample_size: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["sample_size.json"],
+                    )?,
+                    audit: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["data_audit.json"],
+                    )?,
+                    execution_quality: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["execution_quality.json"],
+                    )?,
+                    cumulative_wallet: read_manifest_artifact(
+                        &mut client,
+                        &run_prefix,
+                        &manifest,
+                        &["cumulative_wallet.json"],
+                    )?,
+                },
+            )?),
+            AzureDailyBundleState::Invalid { reason } => {
+                return Err(ResearchError::InvalidInput(format!(
+                    "Azure atomic daily bundle {date} is not verified: {reason}"
+                )))
+            }
+            AzureDailyBundleState::Absent => {
+                let report_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    .expect("date was validated while discovering daily blobs");
+                if !legacy_daily_fallback_allowed(report_date, false) {
+                    return Err(ResearchError::InvalidInput(format!(
+                        "Azure atomic daily bundle is required on or after {ATOMIC_DAILY_PROTOCOL_CUTOFF}: {date}"
+                    )));
+                }
+                rows.push(daily_prospective_row_from_reports(
+                    &date,
+                    DailyReportDocuments {
+                        final_report: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}final_report.json"),
+                        )?,
+                        regimes: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}regimes.json"),
+                        )?
+                        .or(read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}regime_profiles.json"),
+                        )?),
+                        baseline: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}baseline.json"),
+                        )?
+                        .or(read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}baseline_static_all_fill_models.json"),
+                        )?),
+                        sample_size: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}sample_size.json"),
+                        )?,
+                        audit: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}data_audit.json"),
+                        )?,
+                        execution_quality: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}execution_quality.json"),
+                        )?,
+                        cumulative_wallet: read_blob_json(
+                            &mut client,
+                            &format!("{daily_prefix}cumulative_wallet.json"),
+                        )?,
+                    },
+                )?);
+            }
+        }
     }
     Ok(rows)
 }
 
-fn daily_prospective_row_from_reports(
+fn inspect_azure_daily_dependency(
+    reports_dir: &Path,
+    expected_date: NaiveDate,
+) -> Result<Option<DailyDependency>, ResearchError> {
+    let Some(mut client) = research_blob_client() else {
+        return Ok(None);
+    };
+    let prefix = report_blob_prefix(reports_dir);
+    let date = expected_date.format("%Y-%m-%d").to_string();
+    Ok(Some(
+        match load_azure_complete_bundle(&mut client, &prefix, &date)? {
+            AzureDailyBundleState::Ready {
+                run_prefix,
+                manifest,
+            } => DailyDependency::Ready {
+                date: expected_date,
+                run_id: manifest.run_id.clone(),
+                bundle_dir: PathBuf::from(format!("azure://{run_prefix}")),
+                manifest,
+            },
+            AzureDailyBundleState::Absent => DailyDependency::WaitingForDependency {
+                date: expected_date,
+                reason: "azure_latest_pointer_absent".to_owned(),
+            },
+            AzureDailyBundleState::Invalid { reason } => DailyDependency::WaitingForDependency {
+                date: expected_date,
+                reason: format!("azure_atomic_bundle_invalid:{reason}"),
+            },
+        },
+    ))
+}
+
+enum AzureDailyBundleState {
+    Absent,
+    Ready {
+        run_prefix: String,
+        manifest: Box<DailyRunManifest>,
+    },
+    Invalid {
+        reason: String,
+    },
+}
+
+fn load_azure_complete_bundle(
+    client: &mut AzureBlobClient,
+    prefix: &str,
     date: &str,
+) -> Result<AzureDailyBundleState, ResearchError> {
+    let pointer_blob = format!("{prefix}{date}/latest.json");
+    let pointer_bytes = match client.download_blob_bytes(&pointer_blob) {
+        Ok(bytes) => bytes,
+        Err(AzureBlobError::HttpStatus(404)) => {
+            let run_prefix = format!("{prefix}{date}/runs/");
+            let manifests = client
+                .list_blobs_by_suffixes(&run_prefix, &["run_manifest.json"], Some(1), None)
+                .map_err(|error| {
+                    ResearchError::Azure(format!(
+                        "checking atomic manifests without a latest pointer under {run_prefix}: {error}"
+                    ))
+                })?;
+            return Ok(if manifests.is_empty() {
+                AzureDailyBundleState::Absent
+            } else {
+                AzureDailyBundleState::Invalid {
+                    reason: "manifest_present_without_latest_pointer".to_owned(),
+                }
+            });
+        }
+        Err(error) => {
+            return Err(ResearchError::Azure(format!(
+                "reading daily latest pointer {pointer_blob}: {error}"
+            )))
+        }
+    };
+    let pointer: LatestRunPointer = serde_json::from_slice(&pointer_bytes)?;
+    if pointer.date.format("%Y-%m-%d").to_string() != date
+        || !safe_blob_relative_path(&pointer.manifest_path)
+    {
+        return Ok(AzureDailyBundleState::Invalid {
+            reason: "latest_pointer_identity_or_path_invalid".to_owned(),
+        });
+    }
+    let manifest_blob = format!("{prefix}{date}/{}", pointer.manifest_path);
+    let manifest_bytes = match client.download_blob_bytes(&manifest_blob) {
+        Ok(bytes) => bytes,
+        Err(AzureBlobError::HttpStatus(404)) => {
+            return Ok(AzureDailyBundleState::Invalid {
+                reason: "manifest_absent".to_owned(),
+            })
+        }
+        Err(error) => {
+            return Err(ResearchError::Azure(format!(
+                "reading daily manifest {manifest_blob}: {error}"
+            )))
+        }
+    };
+    if sha256_hex(&manifest_bytes) != pointer.manifest_sha256 {
+        return Ok(AzureDailyBundleState::Invalid {
+            reason: "manifest_hash_mismatch".to_owned(),
+        });
+    }
+    let manifest: DailyRunManifest = serde_json::from_slice(&manifest_bytes)?;
+    if manifest.status != RunStatus::Complete
+        || manifest.run_id != pointer.run_id
+        || manifest.date != pointer.date
+    {
+        return Ok(AzureDailyBundleState::Invalid {
+            reason: "manifest_incomplete_or_identity_mismatch".to_owned(),
+        });
+    }
+    let run_prefix = manifest_blob
+        .strip_suffix("run_manifest.json")
+        .unwrap_or(&manifest_blob)
+        .to_owned();
+    for artifact in manifest.artifacts.values() {
+        if !safe_blob_relative_path(&artifact.relative_path) {
+            return Ok(AzureDailyBundleState::Invalid {
+                reason: "artifact_path_invalid".to_owned(),
+            });
+        }
+        let blob_name = format!("{run_prefix}{}", artifact.relative_path);
+        let bytes = match client.download_blob_bytes(&blob_name) {
+            Ok(bytes) => bytes,
+            Err(AzureBlobError::HttpStatus(404)) => {
+                return Ok(AzureDailyBundleState::Invalid {
+                    reason: format!("artifact_absent:{}", artifact.relative_path),
+                })
+            }
+            Err(error) => {
+                return Err(ResearchError::Azure(format!(
+                    "verifying daily artifact {blob_name}: {error}"
+                )))
+            }
+        };
+        if bytes.len() as u64 != artifact.bytes || sha256_hex(&bytes) != artifact.sha256 {
+            return Ok(AzureDailyBundleState::Invalid {
+                reason: format!("artifact_hash_or_size_mismatch:{}", artifact.relative_path),
+            });
+        }
+    }
+    Ok(AzureDailyBundleState::Ready {
+        run_prefix,
+        manifest: Box::new(manifest),
+    })
+}
+
+fn read_manifest_artifact(
+    client: &mut AzureBlobClient,
+    run_prefix: &str,
+    manifest: &DailyRunManifest,
+    candidates: &[&str],
+) -> Result<Option<Value>, ResearchError> {
+    let Some(artifact) = candidates.iter().find_map(|candidate| {
+        manifest
+            .artifacts
+            .values()
+            .find(|artifact| artifact.relative_path == *candidate)
+    }) else {
+        return Ok(None);
+    };
+    read_blob_json(client, &format!("{run_prefix}{}", artifact.relative_path))
+}
+
+fn safe_blob_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.starts_with('\\')
+        && !value.split(['/', '\\']).any(|part| part == "..")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+struct DailyReportDocuments {
     final_report: Option<Value>,
     regimes: Option<Value>,
     baseline: Option<Value>,
     sample_size: Option<Value>,
     audit: Option<Value>,
     execution_quality: Option<Value>,
+    cumulative_wallet: Option<Value>,
+}
+
+fn daily_prospective_row_from_reports(
+    date: &str,
+    documents: DailyReportDocuments,
 ) -> Result<Value, ResearchError> {
     json_row(
         date,
         DailyReportSources {
-            final_report: final_report.as_ref(),
-            regimes: regimes.as_ref(),
-            baseline: baseline.as_ref(),
+            final_report: documents.final_report.as_ref(),
+            regimes: documents.regimes.as_ref(),
+            baseline: documents.baseline.as_ref(),
         },
-        sample_size.as_ref(),
-        audit.as_ref(),
-        execution_quality.as_ref(),
+        documents.sample_size.as_ref(),
+        documents.audit.as_ref(),
+        documents.execution_quality.as_ref(),
+        documents.cumulative_wallet.as_ref(),
     )
 }
 
@@ -901,6 +1432,7 @@ fn json_row(
     sample: Option<&Value>,
     audit: Option<&Value>,
     execution_quality: Option<&Value>,
+    cumulative_wallet: Option<&Value>,
 ) -> Result<Value, ResearchError> {
     let source = merge_optional_reports([reports.final_report, reports.regimes, reports.baseline]);
     let sample = sample.unwrap_or(&source);
@@ -913,6 +1445,13 @@ fn json_row(
         .or_else(|| select_fill_model_net(reports.final_report, fill_model));
     let dynamic_net = select_regime_profile_net(reports.regimes, "dynamic_quote_style")
         .or_else(|| select_regime_profile_net(reports.final_report, "dynamic_quote_style"));
+    // Wallet fields are accepted only from the separately generated
+    // cumulative campaign replay. Per-day regime reports reset capital and
+    // therefore cannot support a promotion decision.
+    let dynamic_wallet_net =
+        cumulative_wallet.and_then(|wallet| value_to_string(&wallet["wallet_constrained_net_pnl"]));
+    let dynamic_wallet_constrained =
+        cumulative_wallet.and_then(|wallet| wallet["wallet_constrained"].as_bool());
     let full_net = select_regime_profile_net(reports.regimes, "full_deterministic_profile")
         .or_else(|| select_regime_profile_net(reports.final_report, "full_deterministic_profile"));
     let safety_net = select_regime_profile_net(reports.regimes, "dynamic_safety_only")
@@ -942,6 +1481,7 @@ fn json_row(
     .or_else(|| number_at(sample, &["/result/statistics/n", "/statistics/n"]));
     let quality = data_quality_status(audit);
     let quality_reasons = data_quality_reasons(audit);
+    let quality_summary = audit.map(quality_from_audit);
     let execution_quality_gate = execution_quality
         .and_then(|report| report.pointer("/result/evidence_gate"))
         .cloned()
@@ -958,6 +1498,16 @@ fn json_row(
         "fill_model": fill_model,
         "static_net_pnl": static_net,
         "dynamic_quote_style_net_pnl": dynamic_net,
+        "wallet_constrained_net_pnl": dynamic_wallet_net,
+        "wallet_constrained_ending_equity": cumulative_wallet.and_then(|wallet| value_to_string(&wallet["wallet_constrained_ending_equity"])),
+        "wallet_constrained_max_drawdown": cumulative_wallet.and_then(|wallet| value_to_string(&wallet["wallet_constrained_max_drawdown"])),
+        "wallet_constrained_unresolved_orders": cumulative_wallet.and_then(|wallet| wallet["wallet_constrained_unresolved_orders"].as_u64()),
+        "wallet_scope": cumulative_wallet.and_then(|wallet| wallet["wallet_scope"].as_str()),
+        "wallet_campaign_start": cumulative_wallet.and_then(|wallet| wallet["campaign_start"].as_str()),
+        "wallet_snapshot_date": cumulative_wallet.and_then(|wallet| wallet["snapshot_date"].as_str()),
+        "cumulative_input_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_input_sha256"].as_str()),
+        "cumulative_state_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_state_sha256"].as_str()),
+        "cumulative_events": cumulative_wallet.and_then(|wallet| wallet["cumulative_events"].as_u64()),
         "full_deterministic_profile_net_pnl": full_net,
         "dynamic_safety_only_net_pnl": safety_net,
         "dynamic_quote_style_paired_delta": dynamic_delta.map(|value| value.to_string()),
@@ -970,6 +1520,13 @@ fn json_row(
         "ci_95_high": ci_high,
         "data_quality_status": quality,
         "data_quality_reasons": quality_reasons,
+        "data_quality": quality_summary,
+        "wallet_constrained": dynamic_wallet_constrained,
+        "decision_parity_rate": number_at(&source, &["/result/decision_parity_rate", "/decision_parity_rate"]),
+        "markout_30s_ci_low": execution_quality.and_then(|report| {
+            report.pointer("/result/markouts/30/executable/ci_95_low")
+                .or_else(|| report.pointer("/result/markouts/30/executable_markout_ci_95_low"))
+        }).cloned(),
         "execution_quality_gate": execution_quality_gate,
         "queue_snapshot_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_coverage")).cloned(),
         "markout_1s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/1/completion_rate")).cloned(),
@@ -983,6 +1540,459 @@ fn json_row(
         "research_only": true,
         "live_deployment_allowed": false
     }))
+}
+
+struct LoadedProfitabilityGate {
+    candidate: CandidateIdentity,
+    thresholds: PromotionThresholds,
+    shadow_prior_model_version: String,
+    shadow_prior_sha256: String,
+}
+
+fn load_profitability_gate(path: &Path) -> Result<LoadedProfitabilityGate, ResearchError> {
+    let text = fs::read_to_string(path)?;
+    let values = flatten_simple_yaml(&text);
+    let required = |key: &str| {
+        values.get(key).cloned().ok_or_else(|| {
+            ResearchError::InvalidInput(format!("profitability gate is missing {key}"))
+        })
+    };
+    let parse_u32 = |key: &str| -> Result<u32, ResearchError> {
+        required(key)?.parse().map_err(|_| {
+            ResearchError::InvalidInput(format!("profitability gate has invalid {key}"))
+        })
+    };
+    let parse_u64 = |key: &str| -> Result<u64, ResearchError> {
+        required(key)?.parse().map_err(|_| {
+            ResearchError::InvalidInput(format!("profitability gate has invalid {key}"))
+        })
+    };
+    let parse_decimal = |key: &str| -> Result<Decimal, ResearchError> {
+        required(key)?.parse().map_err(|_| {
+            ResearchError::InvalidInput(format!("profitability gate has invalid {key}"))
+        })
+    };
+    Ok(LoadedProfitabilityGate {
+        candidate: CandidateIdentity {
+            name: required("candidate.name")?,
+            candidate_version: required("candidate.version")?,
+            config_hash: required("candidate.config_hash")?,
+        },
+        thresholds: PromotionThresholds {
+            required_clean_days: parse_u32("shadow.required_clean_days")?,
+            maximum_extension_days: parse_u32("shadow.maximum_extension_days")?,
+            required_settled_markets: parse_u64("shadow.required_settled_markets")?,
+            maximum_extension_markets: parse_u64("shadow.maximum_extension_markets")?,
+            required_positive_weekly_blocks: parse_u32("shadow.required_positive_weekly_blocks")?,
+            minimum_decision_parity_rate: parse_decimal("shadow.minimum_decision_parity_rate")?,
+            minimum_decision_grade_coverage: parse_decimal(
+                "shadow.minimum_decision_grade_coverage",
+            )?,
+            maximum_modeled_drawdown: parse_decimal("shadow.maximum_modeled_drawdown")?,
+            maximum_out_of_order_event_rate: parse_decimal(
+                "shadow.maximum_out_of_order_event_rate",
+            )?,
+            execution_model_protocol_version: parse_u32(
+                "execution_model.evidence_protocol_version",
+            )?,
+            minimum_execution_model_eligible_orders: parse_u64(
+                "execution_model.minimum_eligible_orders",
+            )?,
+            minimum_execution_model_filled_orders: parse_u64(
+                "execution_model.minimum_filled_orders",
+            )?,
+            minimum_execution_model_non_filled_orders: parse_u64(
+                "execution_model.minimum_non_filled_orders",
+            )?,
+            minimum_brier_improvement_over_base_rate: parse_decimal(
+                "execution_model.minimum_brier_improvement_over_base_rate",
+            )?,
+            maximum_expected_calibration_error: parse_decimal(
+                "execution_model.maximum_expected_calibration_error",
+            )?,
+        },
+        shadow_prior_model_version: required("execution_model.shadow_prior_model_version")?,
+        shadow_prior_sha256: required("execution_model.shadow_prior_sha256")?,
+    })
+}
+
+fn flatten_simple_yaml(text: &str) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    let mut parents: Vec<(usize, String)> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or_default();
+        if line.trim().is_empty() || line.trim_start().starts_with('-') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let Some((key, raw_value)) = line.trim().split_once(':') else {
+            continue;
+        };
+        while parents.last().is_some_and(|(level, _)| *level >= indent) {
+            parents.pop();
+        }
+        let raw_value = raw_value.trim();
+        if raw_value.is_empty() {
+            parents.push((indent, key.trim().to_owned()));
+            continue;
+        }
+        let full_key = parents
+            .iter()
+            .map(|(_, parent)| parent.as_str())
+            .chain(std::iter::once(key.trim()))
+            .collect::<Vec<_>>()
+            .join(".");
+        values.insert(full_key, raw_value.trim_matches(['\"', '\'']).to_owned());
+    }
+    values
+}
+
+fn read_local_or_azure_json(path: &Path) -> Result<Option<Value>, ResearchError> {
+    if let Some(value) = read_optional_json(path)? {
+        return Ok(Some(value));
+    }
+    let Some(mut client) = research_blob_client() else {
+        return Ok(None);
+    };
+    read_blob_json(&mut client, report_blob_prefix(path).trim_end_matches('/'))
+}
+
+fn load_exact_execution_model(
+    path: &Path,
+) -> Result<(Value, ExecutionModelBinding), ResearchError> {
+    let (bytes, blob_uri) = if path.is_file() {
+        let absolute = fs::canonicalize(path)?;
+        (
+            fs::read(&absolute)?,
+            format!("file://{}", absolute.display()),
+        )
+    } else {
+        let account = std::env::var("AZURE_STORAGE_ACCOUNT_NAME").map_err(|_| {
+            ResearchError::InvalidInput(
+                "effective queue model is missing locally and Azure storage is not configured"
+                    .to_owned(),
+            )
+        })?;
+        let container = std::env::var("AZURE_STORAGE_CONTAINER_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "bot-events".to_owned());
+        let blob_name = path.to_string_lossy().replace('\\', "/");
+        let mut client = research_blob_client().ok_or_else(|| {
+            ResearchError::InvalidInput("Azure storage is not configured".to_owned())
+        })?;
+        let bytes = client.download_blob_bytes(&blob_name).map_err(|error| {
+            ResearchError::Azure(format!(
+                "reading exact execution model {blob_name}: {error}"
+            ))
+        })?;
+        (bytes, format!("azure://{account}/{container}/{blob_name}"))
+    };
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let model_version = value
+        .get("model_version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ResearchError::InvalidInput("effective queue model is missing model_version".to_owned())
+        })?
+        .to_owned();
+    Ok((
+        value,
+        ExecutionModelBinding {
+            blob_uri,
+            sha256: format!("sha256:{}", sha256_hex(&bytes)),
+            model_version,
+        },
+    ))
+}
+
+fn aggregate_profitability_metrics(
+    rows: &[Value],
+    prospective: &Value,
+    execution_model: &Value,
+    thresholds: &PromotionThresholds,
+) -> ProfitabilityMetrics {
+    let mut missing = Vec::new();
+    if rows.is_empty() {
+        missing.push("complete_daily_rows".to_owned());
+    }
+    let qualities = rows
+        .iter()
+        .filter_map(|row| {
+            serde_json::from_value::<DataQualitySummary>(row["data_quality"].clone()).ok()
+        })
+        .collect::<Vec<_>>();
+    if qualities.len() != rows.len() || qualities.is_empty() {
+        missing.push("daily_data_quality".to_owned());
+    }
+    let total_events = qualities.iter().map(|quality| quality.total_events).sum();
+    let coverage = qualities
+        .iter()
+        .map(|quality| quality.decision_grade_coverage)
+        .min()
+        .unwrap_or(Decimal::ZERO);
+    let fatal_issues = qualities
+        .iter()
+        .flat_map(|quality| quality.fatal_issues.clone())
+        .collect();
+    let warnings = qualities
+        .iter()
+        .flat_map(|quality| quality.warnings.clone())
+        .collect();
+    let quality = DataQualitySummary {
+        registry_version: WARNING_REGISTRY_VERSION.to_owned(),
+        total_events,
+        decision_grade_coverage: coverage,
+        fatal_issues,
+        warnings,
+        out_of_order_events: qualities
+            .iter()
+            .map(|quality| quality.out_of_order_events)
+            .sum(),
+        event_time_ordering_restored: qualities
+            .iter()
+            .all(|quality| quality.event_time_ordering_restored),
+    };
+    let clean_days = consecutive_clean_day_streak(rows);
+
+    let settled = rows
+        .iter()
+        .map(|row| row["settled_markets"].as_u64())
+        .collect::<Option<Vec<_>>>();
+    if settled.is_none() {
+        missing.push("settled_markets".to_owned());
+    }
+    let settled_markets = settled.unwrap_or_default().into_iter().sum();
+
+    let daily_pnl = rows
+        .iter()
+        .map(|row| decimal_from_value(&row["dynamic_quote_style_net_pnl"]))
+        .collect::<Option<Vec<_>>>();
+    if daily_pnl.is_none() {
+        missing.push("queue_conservative_net_pnl".to_owned());
+    }
+    let pnl_values = daily_pnl.unwrap_or_default();
+    let queue_conservative = !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| row["fill_model"] == "queue_proxy_conservative");
+    let queue_pnl: Decimal = pnl_values.iter().copied().sum();
+    let cumulative_wallet = validated_cumulative_wallet_snapshots(rows);
+    if cumulative_wallet.is_none() {
+        missing.push("valid_cumulative_wallet_ledger".to_owned());
+    }
+    let wallet_snapshots = cumulative_wallet.unwrap_or_default();
+    let latest_wallet = wallet_snapshots.last();
+    let wallet_constrained = latest_wallet.is_some_and(|snapshot| snapshot.unresolved_orders == 0);
+    if latest_wallet.is_some_and(|snapshot| snapshot.unresolved_orders > 0) {
+        missing.push("cumulative_wallet_positions_resolved".to_owned());
+    }
+    let wallet_pnl = latest_wallet
+        .map(|snapshot| snapshot.net_pnl)
+        .unwrap_or_default();
+    let wallet_ending_equity = latest_wallet
+        .map(|snapshot| snapshot.ending_equity)
+        .unwrap_or_default();
+    let wallet_max_drawdown = latest_wallet
+        .map(|snapshot| snapshot.max_drawdown)
+        .unwrap_or_default();
+
+    let pnl_ci = decimal_at(
+        prospective,
+        &[
+            "/result/paired_improvement/dynamic_quote_style/ci_95_low",
+            "/result/pnl_ci_95_low",
+        ],
+    );
+    if pnl_ci.is_none() {
+        missing.push("pnl_ci_95_low".to_owned());
+    }
+    let markout_ci = decimal_at(prospective, &["/result/markout_30s_ci_low"]).or_else(|| {
+        rows.iter()
+            .filter_map(|row| decimal_from_value(&row["markout_30s_ci_low"]))
+            .min()
+    });
+    if markout_ci.is_none() {
+        missing.push("markout_30s_ci_low".to_owned());
+    }
+    let parity_rate = decimal_at(prospective, &["/result/decision_parity_rate"]).or_else(|| {
+        rows.iter()
+            .filter_map(|row| decimal_from_value(&row["decision_parity_rate"]))
+            .min()
+    });
+    if parity_rate.is_none() {
+        missing.push("decision_parity_rate".to_owned());
+    }
+    let parity_rate = parity_rate.unwrap_or(Decimal::ZERO);
+
+    let execution_model_protocol_version = execution_model["evidence_protocol_version"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok());
+    let execution_model_eligible_orders = execution_model["sample_size"].as_u64();
+    let execution_model_filled_orders = execution_model["positive_fills"].as_u64();
+    let execution_model_non_filled_orders = execution_model["negative_non_fills"].as_u64();
+    let execution_model_brier_improvement =
+        decimal_from_value(&execution_model["brier_improvement_fraction"]);
+    let execution_model_expected_calibration_error =
+        decimal_from_value(&execution_model["expected_calibration_error"]);
+    let execution_model_promotion_ready = execution_model["promotion_ready"].as_bool();
+    let execution_model_markout_30s_lower_95 = decimal_from_value(
+        &execution_model["net_executable_markout_30s_lower_confidence_bound_95"],
+    );
+    let mut weekly = BTreeMap::<(i32, u32), Decimal>::new();
+    let mut previous_cumulative_pnl = Decimal::ZERO;
+    for snapshot in &wallet_snapshots {
+        let week = snapshot.date.iso_week();
+        let delta = snapshot.net_pnl - previous_cumulative_pnl;
+        *weekly.entry((week.year(), week.week())).or_default() += delta;
+        previous_cumulative_pnl = snapshot.net_pnl;
+    }
+    let mut consecutive = 0_u32;
+    let mut best_consecutive = 0_u32;
+    for pnl in weekly.values() {
+        if *pnl > Decimal::ZERO {
+            consecutive += 1;
+            best_consecutive = best_consecutive.max(consecutive);
+        } else {
+            consecutive = 0;
+        }
+    }
+    if weekly.is_empty() {
+        missing.push("weekly_blocks".to_owned());
+    }
+    missing.sort();
+    missing.dedup();
+    ProfitabilityMetrics {
+        observed_calendar_days: observed_campaign_days(rows),
+        clean_days,
+        settled_markets,
+        wallet_constrained,
+        queue_conservative,
+        wallet_constrained_net_pnl: wallet_pnl,
+        wallet_constrained_ending_equity: wallet_ending_equity,
+        queue_conservative_net_pnl: queue_pnl,
+        pnl_ci_95_low: pnl_ci.unwrap_or(Decimal::ZERO),
+        consecutive_positive_weekly_blocks: best_consecutive,
+        max_drawdown: wallet_max_drawdown,
+        drawdown_limit: thresholds.maximum_modeled_drawdown,
+        markout_30s_ci_low: markout_ci.unwrap_or(Decimal::ZERO),
+        replay_runtime_parity: parity_rate >= thresholds.minimum_decision_parity_rate,
+        decision_parity_rate: parity_rate,
+        execution_model_protocol_version: execution_model_protocol_version.unwrap_or_default(),
+        execution_model_eligible_orders: execution_model_eligible_orders.unwrap_or_default(),
+        execution_model_filled_orders: execution_model_filled_orders.unwrap_or_default(),
+        execution_model_non_filled_orders: execution_model_non_filled_orders.unwrap_or_default(),
+        execution_model_brier_improvement: execution_model_brier_improvement.unwrap_or_default(),
+        execution_model_expected_calibration_error: execution_model_expected_calibration_error
+            .unwrap_or(Decimal::ONE),
+        execution_model_promotion_ready: execution_model_promotion_ready.unwrap_or(false),
+        execution_model_markout_30s_lower_95: execution_model_markout_30s_lower_95
+            .unwrap_or_default(),
+        data_quality: quality,
+        missing_metrics: missing,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CumulativeWalletSnapshot {
+    date: NaiveDate,
+    events: u64,
+    net_pnl: Decimal,
+    ending_equity: Decimal,
+    max_drawdown: Decimal,
+    unresolved_orders: u64,
+}
+
+fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<CumulativeWalletSnapshot>> {
+    if rows.is_empty() {
+        return None;
+    }
+    let campaign_start = NaiveDate::parse_from_str(WALLET_CAMPAIGN_START, "%Y-%m-%d").ok()?;
+    let mut snapshots: Vec<CumulativeWalletSnapshot> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let date_text = row["date"].as_str()?;
+        let date = NaiveDate::parse_from_str(date_text, "%Y-%m-%d").ok()?;
+        let input_hash = row["cumulative_input_sha256"].as_str()?;
+        let state_hash = row["cumulative_state_sha256"].as_str()?;
+        let snapshot = CumulativeWalletSnapshot {
+            date,
+            events: row["cumulative_events"].as_u64()?,
+            net_pnl: decimal_from_value(&row["wallet_constrained_net_pnl"])?,
+            ending_equity: decimal_from_value(&row["wallet_constrained_ending_equity"])?,
+            max_drawdown: decimal_from_value(&row["wallet_constrained_max_drawdown"])?,
+            unresolved_orders: row["wallet_constrained_unresolved_orders"].as_u64()?,
+        };
+        if row["wallet_scope"].as_str() != Some(CUMULATIVE_WALLET_SCOPE)
+            || row["wallet_campaign_start"].as_str() != Some(WALLET_CAMPAIGN_START)
+            || row["wallet_snapshot_date"].as_str() != Some(date_text)
+            || row["wallet_constrained"].as_bool() != Some(true)
+            || date < campaign_start
+            || !valid_sha256(input_hash)
+            || !valid_sha256(state_hash)
+            || snapshot.events == 0
+            || snapshot.ending_equity != WALLET_CAMPAIGN_BASELINE + snapshot.net_pnl
+            || snapshot.max_drawdown < Decimal::ZERO
+        {
+            return None;
+        }
+        if let Some(previous) = snapshots.last() {
+            if snapshot.date <= previous.date
+                || snapshot.events < previous.events
+                || snapshot.max_drawdown < previous.max_drawdown
+            {
+                return None;
+            }
+        }
+        snapshots.push(snapshot);
+    }
+    Some(snapshots)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    let hex = value.strip_prefix("sha256:").unwrap_or(value);
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn consecutive_clean_day_streak(rows: &[Value]) -> u32 {
+    let mut streak = 0_u32;
+    let mut previous: Option<NaiveDate> = None;
+    for row in rows {
+        let date = row["date"]
+            .as_str()
+            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok());
+        let clean = serde_json::from_value::<DataQualitySummary>(row["data_quality"].clone())
+            .ok()
+            .is_some_and(|quality| quality.promotion_allowed());
+        if !clean || date.is_none() || previous.is_some_and(|value| date != value.succ_opt()) {
+            streak = 0;
+        }
+        if clean && date.is_some() {
+            streak += 1;
+        }
+        previous = date;
+    }
+    streak
+}
+
+fn observed_campaign_days(rows: &[Value]) -> u32 {
+    let Some(latest) = rows
+        .iter()
+        .filter_map(|row| row["date"].as_str())
+        .filter_map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .max()
+    else {
+        return 0;
+    };
+    let start = NaiveDate::parse_from_str(WALLET_CAMPAIGN_START, "%Y-%m-%d")
+        .expect("wallet campaign start is valid");
+    u32::try_from((latest - start).num_days().max(0) + 1).unwrap_or(u32::MAX)
+}
+
+fn decimal_at(value: &Value, pointers: &[&str]) -> Option<Decimal> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(decimal_from_value))
 }
 
 fn paired_delta(candidate_net: Option<&str>, static_net: Option<&str>) -> Option<Decimal> {
@@ -1290,6 +2300,23 @@ fn select_regime_profile_net(report: Option<&Value>, profile: &str) -> Option<St
     .find_map(|pointer| profile_net_in_rows(report.pointer(pointer), profile))
 }
 
+fn find_regime_profile<'a>(report: &'a Value, profile: &str) -> Option<&'a Value> {
+    [
+        "/result/comparisons",
+        "/result/profiles",
+        "/result/regime_conditioned_profiles/result/comparisons",
+        "/result/regime_conditioned_profiles/result/profiles",
+    ]
+    .into_iter()
+    .find_map(|pointer| {
+        report
+            .pointer(pointer)?
+            .as_array()?
+            .iter()
+            .find(|row| row.get("profile").and_then(Value::as_str) == Some(profile))
+    })
+}
+
 fn profile_net_in_rows(rows: Option<&Value>, profile: &str) -> Option<String> {
     rows?.as_array()?.iter().find_map(|row| {
         let map = row.as_object()?;
@@ -1341,6 +2368,215 @@ fn value_to_string(value: &Value) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod wallet_metric_tests {
+    use super::*;
+
+    #[test]
+    fn daily_row_and_profitability_evaluator_use_dynamic_wallet_metrics() {
+        let regimes = json!({
+            "result": {
+                "fill_model": "queue_proxy_conservative",
+                "comparisons": [{
+                    "profile": "dynamic_quote_style",
+                    "net_pnl": "100",
+                    "wallet_constrained": true,
+                    "wallet_constrained_net_pnl": "0.25"
+                }]
+            }
+        });
+        let cumulative_wallet = json!({
+            "wallet_scope": CUMULATIVE_WALLET_SCOPE,
+            "campaign_start": WALLET_CAMPAIGN_START,
+            "snapshot_date": "2026-07-12",
+            "cumulative_input_sha256": format!("sha256:{}", "a".repeat(64)),
+            "cumulative_state_sha256": format!("sha256:{}", "c".repeat(64)),
+            "cumulative_events": 10,
+            "wallet_constrained": true,
+            "wallet_constrained_net_pnl": "0.25",
+            "wallet_constrained_ending_equity": "5.280521",
+            "wallet_constrained_max_drawdown": "0",
+            "wallet_constrained_unresolved_orders": 0
+        });
+        let row = json_row(
+            "2026-07-12",
+            DailyReportSources {
+                final_report: None,
+                regimes: Some(&regimes),
+                baseline: None,
+            },
+            None,
+            None,
+            None,
+            Some(&cumulative_wallet),
+        )
+        .unwrap();
+
+        assert_eq!(row["dynamic_quote_style_net_pnl"], "100");
+        assert_eq!(row["wallet_constrained"], true);
+        assert_eq!(row["wallet_constrained_net_pnl"], "0.25");
+
+        let metrics = aggregate_profitability_metrics(
+            &[row],
+            &json!({
+                "result": {
+                    "pnl_ci_95_low": "0.01",
+                    "markout_30s_ci_low": "0.01",
+                    "decision_parity_rate": "1"
+                }
+            }),
+            &json!({
+                "evidence_protocol_version": 3,
+                "sample_size": 100,
+                "positive_fills": 10,
+                "negative_non_fills": 90,
+                "brier_improvement_fraction": "0.05",
+                "expected_calibration_error": "0.10",
+                "promotion_ready": true,
+                "net_executable_markout_30s_lower_confidence_bound_95": "0.01"
+            }),
+            &PromotionThresholds::default(),
+        );
+        assert_eq!(metrics.queue_conservative_net_pnl, d("100"));
+        assert_eq!(metrics.wallet_constrained_net_pnl, d("0.25"));
+        assert_eq!(metrics.wallet_constrained_ending_equity, d("5.280521"));
+    }
+
+    #[test]
+    fn cumulative_wallet_never_sums_reset_daily_profit_and_blocks_capital_lock() {
+        fn row(
+            date: &str,
+            pnl: &str,
+            equity: &str,
+            drawdown: &str,
+            events: u64,
+            unresolved: u64,
+        ) -> Value {
+            json!({
+                "date": date,
+                "settled_markets": 10,
+                "fill_model": "queue_proxy_conservative",
+                // A reset-per-day implementation would incorrectly sum these to +2.
+                "dynamic_quote_style_net_pnl": "1",
+                "wallet_scope": CUMULATIVE_WALLET_SCOPE,
+                "wallet_campaign_start": WALLET_CAMPAIGN_START,
+                "wallet_snapshot_date": date,
+                "cumulative_input_sha256": format!("sha256:{}", if date.ends_with("12") { "a".repeat(64) } else { "b".repeat(64) }),
+                "cumulative_state_sha256": format!("sha256:{}", if date.ends_with("12") { "c".repeat(64) } else { "d".repeat(64) }),
+                "cumulative_events": events,
+                "wallet_constrained": true,
+                "wallet_constrained_net_pnl": pnl,
+                "wallet_constrained_ending_equity": equity,
+                "wallet_constrained_max_drawdown": drawdown,
+                "wallet_constrained_unresolved_orders": unresolved,
+                "data_quality": DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new())
+            })
+        }
+        let rows = vec![
+            row("2026-07-12", "1", "6.030521", "0", 100, 0),
+            row("2026-07-13", "-0.5", "4.530521", "1.5", 200, 1),
+        ];
+        let metrics = aggregate_profitability_metrics(
+            &rows,
+            &json!({"result":{"pnl_ci_95_low":"0.01","markout_30s_ci_low":"0.01","decision_parity_rate":"1"}}),
+            &json!({
+                "evidence_protocol_version": 3,
+                "sample_size": 100,
+                "positive_fills": 10,
+                "negative_non_fills": 90,
+                "brier_improvement_fraction": "0.05",
+                "expected_calibration_error": "0.10",
+                "promotion_ready": true,
+                "net_executable_markout_30s_lower_confidence_bound_95": "0.01"
+            }),
+            &PromotionThresholds::default(),
+        );
+        assert_eq!(metrics.queue_conservative_net_pnl, d("2"));
+        assert_eq!(metrics.wallet_constrained_net_pnl, d("-0.5"));
+        assert_eq!(metrics.wallet_constrained_ending_equity, d("4.530521"));
+        assert_eq!(metrics.max_drawdown, d("1.5"));
+        assert!(!metrics.wallet_constrained);
+        assert!(metrics
+            .missing_metrics
+            .contains(&"cumulative_wallet_positions_resolved".to_owned()));
+
+        let mut missing_state = rows;
+        missing_state[1]
+            .as_object_mut()
+            .unwrap()
+            .remove("cumulative_state_sha256");
+        let invalid = aggregate_profitability_metrics(
+            &missing_state,
+            &json!({}),
+            &json!({}),
+            &PromotionThresholds::default(),
+        );
+        assert!(!invalid.wallet_constrained);
+        assert!(invalid
+            .missing_metrics
+            .contains(&"valid_cumulative_wallet_ledger".to_owned()));
+    }
+
+    #[test]
+    fn clean_day_streak_resets_on_date_gap_and_dirty_day() {
+        let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
+        let dirty =
+            DataQualitySummary::new(100, Decimal::new(90, 2), Vec::new(), Vec::<String>::new());
+        let row = |date: &str, quality: &DataQualitySummary| json!({"date": date, "data_quality": quality});
+        assert_eq!(
+            consecutive_clean_day_streak(&[row("2026-07-12", &clean), row("2026-07-13", &clean)]),
+            2
+        );
+        assert_eq!(
+            consecutive_clean_day_streak(&[row("2026-07-12", &clean), row("2026-07-14", &clean)]),
+            1
+        );
+        assert_eq!(
+            consecutive_clean_day_streak(&[
+                row("2026-07-12", &clean),
+                row("2026-07-13", &dirty),
+                row("2026-07-14", &clean)
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn clean_day_streak_resets_on_gap_or_dirty_day() {
+        fn row(date: &str, clean: bool) -> Value {
+            let quality = if clean {
+                DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new())
+            } else {
+                DataQualitySummary::new(
+                    100,
+                    Decimal::ONE,
+                    vec!["fatal_test_gap".to_owned()],
+                    Vec::<String>::new(),
+                )
+            };
+            json!({"date": date, "data_quality": quality})
+        }
+
+        assert_eq!(
+            consecutive_clean_day_streak(&[
+                row("2026-07-12", true),
+                row("2026-07-13", true),
+                row("2026-07-15", true),
+            ]),
+            1
+        );
+        assert_eq!(
+            consecutive_clean_day_streak(&[
+                row("2026-07-12", true),
+                row("2026-07-13", false),
+                row("2026-07-14", true),
+                row("2026-07-15", true),
+            ]),
+            2
+        );
     }
 }
 

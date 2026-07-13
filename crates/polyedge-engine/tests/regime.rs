@@ -1,6 +1,41 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use polyedge_config::{ExecutionMode, RuntimeSettings};
-use polyedge_engine::{RegimeClassifier, RegimeFeatures, RegimeLabel, RegimePolicy};
+use polyedge_domain::{DecisionAction, MarketId, OrderKind, Outcome, Side, TokenId, TradeDecision};
+use polyedge_engine::{
+    evaluate_frozen_strategy, FrozenStrategyMode, QuoteTransformContext, RegimeBookSnapshot,
+    RegimeClassifier, RegimeFeatureInput, RegimeFeatures, RegimeLabel, RegimePolicy,
+    RegimeReferencePoint, StrategyDecisionEnvelope, DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON,
+    DYNAMIC_QUOTE_STYLE_POLICY_SHA256,
+};
+use rust_decimal::Decimal;
+use sha2::{Digest, Sha256};
+
+#[test]
+fn frozen_dynamic_quote_policy_hash_matches_explicit_canonical_policy() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../research/configs/frozen_dynamic_quote_style_policy_v1.json");
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&bytes).unwrap().trim_end(),
+        DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        serde_json::to_string(&parsed).unwrap(),
+        DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON
+    );
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON)
+    );
+    assert_eq!(digest, DYNAMIC_QUOTE_STYLE_POLICY_SHA256);
+    assert_eq!(
+        FrozenStrategyMode::DynamicQuoteStyle
+            .candidate()
+            .config_hash,
+        digest
+    );
+}
 
 #[test]
 fn regime_priority_prefers_feed_risk_over_other_safety_states() {
@@ -87,4 +122,148 @@ fn live_mode_rejects_adaptive_regime_profiles() {
 
     let error = settings.validate_live_gates(true).unwrap_err().to_string();
     assert!(error.contains("adaptive regime profiles are not allowed in live mode"));
+    assert!(settings.validate_adaptive_strategy().is_err());
+}
+
+#[test]
+fn frozen_runtime_mode_rejects_unknown_candidate_and_accepts_dynamic_quote_style() {
+    let mut settings = RuntimeSettings::default();
+    settings.strategy.adaptive_regime_enabled = true;
+    settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+    settings.validate_adaptive_strategy().unwrap();
+
+    settings.strategy.adaptive_regime_mode = "typo_candidate".to_owned();
+    assert!(settings.validate_adaptive_strategy().is_err());
+}
+
+#[test]
+fn runtime_and_replay_inputs_produce_the_same_frozen_decision() {
+    let now = DateTime::parse_from_rfc3339("2026-07-12T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let features = golden_feature_input(now).build();
+    let decision = golden_decision();
+    let context = QuoteTransformContext {
+        best_bid: Some(Decimal::new(44, 2)),
+        q: Some(Decimal::new(50, 2)),
+    };
+    let policy = RegimePolicy::new(RuntimeSettings::default().strategy);
+    let runtime = evaluate_frozen_strategy(
+        FrozenStrategyMode::DynamicQuoteStyle,
+        &mut RegimeClassifier::default(),
+        &policy,
+        &features,
+        now,
+        &decision,
+        &context,
+    );
+    let replay = evaluate_frozen_strategy(
+        FrozenStrategyMode::DynamicQuoteStyle,
+        &mut RegimeClassifier::default(),
+        &policy,
+        &golden_feature_input(now).build(),
+        now,
+        &decision,
+        &context,
+    );
+
+    assert_eq!(runtime, replay);
+    let envelope = StrategyDecisionEnvelope {
+        decision: runtime.decision.unwrap(),
+        strategy_metadata: runtime.metadata,
+    };
+    let golden = serde_json::to_value(envelope).unwrap();
+    assert_eq!(golden["price"], "0.44");
+    assert_eq!(golden["expected_edge"], "0.06");
+    assert_eq!(
+        golden["strategy_metadata"]["candidate"]["version"],
+        "dynamic_quote_style@2026-06-14"
+    );
+    assert_eq!(
+        golden["strategy_metadata"]["candidate"]["config_hash"],
+        "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+    );
+    assert_eq!(golden["strategy_metadata"]["regime"], "volatility_shock");
+    assert_eq!(golden["strategy_metadata"]["q"], "0.50");
+    assert_eq!(
+        golden["strategy_metadata"]["data_quality"]["decision_grade"],
+        true
+    );
+}
+
+fn golden_feature_input(now: DateTime<Utc>) -> RegimeFeatureInput {
+    let book = RegimeBookSnapshot {
+        bid: Some(Decimal::new(44, 2)),
+        ask: Some(Decimal::new(46, 2)),
+        bid_size: Some(Decimal::from(20)),
+        ask_size: Some(Decimal::from(20)),
+        local_ts: Some(now - Duration::milliseconds(50)),
+    };
+    RegimeFeatureInput {
+        now,
+        market_start_ts: Some(now - Duration::minutes(5)),
+        market_end_ts: Some(now + Duration::minutes(10)),
+        start_price: Some(Decimal::from(100_000)),
+        tick_size: Decimal::new(1, 2),
+        reference: Some(RegimeReferencePoint {
+            ts: now - Duration::milliseconds(20),
+            price: Decimal::from(100_100),
+            stale: false,
+        }),
+        reference_history: vec![
+            RegimeReferencePoint {
+                ts: now - Duration::seconds(120),
+                price: Decimal::from(99_900),
+                stale: false,
+            },
+            RegimeReferencePoint {
+                ts: now - Duration::seconds(10),
+                price: Decimal::from(100_000),
+                stale: false,
+            },
+            RegimeReferencePoint {
+                ts: now,
+                price: Decimal::from(100_100),
+                stale: false,
+            },
+        ],
+        q_up: Some(Decimal::new(50, 2)),
+        q_down: Some(Decimal::new(50, 2)),
+        sigma: Some(0.5),
+        up_book: Some(book.clone()),
+        down_book: Some(book),
+        book_update_rate_10s: None,
+        feed_divergence_bps: None,
+        recent_feed_errors: 0,
+        open_positions: None,
+        open_orders: 0,
+        recent_fill_count: 0,
+        recent_cancel_count: 0,
+        adverse_move_after_fill_bps: None,
+        max_reference_age_ms: 1_500,
+        max_book_age_ms: 1_500,
+        final_no_trade_seconds: 30,
+        quality_flags: Vec::new(),
+    }
+}
+
+fn golden_decision() -> TradeDecision {
+    TradeDecision {
+        action: DecisionAction::Place,
+        market_id: MarketId::new("market-1"),
+        condition_id: None,
+        token_id: Some(TokenId::new("token-1")),
+        outcome: Some(Outcome::Up),
+        side: Some(Side::Buy),
+        price: Some(Decimal::new(45, 2)),
+        size: Some(Decimal::ONE),
+        quote_amount: None,
+        order_kind: Some(OrderKind::PostOnlyGtc),
+        reason: "golden maker decision".to_owned(),
+        ttl_ms: Some(10_000),
+        expected_edge: Some(Decimal::new(5, 2)),
+        post_only: true,
+        tick_size: Some(Decimal::new(1, 2)),
+        neg_risk: false,
+    }
 }

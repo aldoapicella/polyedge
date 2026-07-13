@@ -135,14 +135,99 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
   const latestAttempt = evidence.latest_attempt;
   const portfolio = evidence.redemption?.portfolio ?? evidence.preflight?.portfolio ?? latestAttempt?.portfolio ?? latest?.portfolio;
   const redemption = evidence.redemption;
+  const profitability = evidence.profitability;
+  const promotionMetrics = profitability?.gate_metrics?.metrics;
+  const fundedLadder = profitability?.funded_ladder;
+  const fundedHoldout = fundedLadder?.holdout_evaluation;
+  const queueTransition = fundedLadder?.queue_model_transition;
+  const promotionQuality = promotionMetrics?.data_quality;
+  const blockingWarnings = promotionQuality?.warnings?.filter((warning) => warning.severity === "blocking").length;
+  const unclassifiedWarnings = promotionQuality?.warnings?.filter((warning) => warning.known === false).length;
+  const durableRisk = evidence.preflight?.risk_at_end ?? latestAttempt?.risk_at_end ?? latest?.risk_at_end;
+  const campaignRisk = durableRisk?.campaign;
+  const dailyTurnover = durableRisk?.daily_turnover ?? durableRisk;
   const mostRecentRedemption = redemption?.recent_redemptions?.[0];
-  const globalUnresolvedRisk = evidence.preflight?.risk_at_end?.global_unresolved_risk_reservations ??
-    latestAttempt?.risk_at_end?.global_unresolved_risk_reservations ??
-    latest?.risk_at_end?.global_unresolved_risk_reservations ??
-    latest?.risk_at_end?.unresolved_risk_reservations ?? 0;
+  const globalUnresolvedRisk = dailyTurnover?.global_unresolved_risk_reservations ??
+    dailyTurnover?.unresolved_risk_reservations ?? campaignRisk?.unresolved_risk_reservation_count ?? 0;
   const markouts = latest?.markouts ?? [];
   return (
     <div className="space-y-5">
+      <Panel>
+        <PanelHeader title="Profitability Path" meta={profitability?.generated_at ?? profitability?.created_at ?? "awaiting Azure promotion manifest"} />
+        <div className="grid gap-3 p-4 md:grid-cols-4">
+          <Metric label="Phase" value={profitability?.phase ?? "risk repair / funded freeze"} />
+          <Metric label="Candidate" value={profitability?.candidate?.name ?? "dynamic_quote_style (frozen)"} />
+          <Metric label="Candidate Version" value={profitability?.candidate?.version ?? profitability?.candidate?.candidate_version ?? "2026-06-14"} />
+          <Metric label="Promotion" value={fundedLadder?.phase === "profitable_go" ? "terminal validated GO — execution still unarmed" : fundedLadder?.phase === "stopped_no_go" || profitability?.phase === "stopped_no_go" ? "terminal NO-GO" : fundedLadder?.human_grant_required ? "awaiting exact human stage grant" : fundedLadder?.stage_authorized ? "stage authorized — collecting evidence" : profitability?.phase === "shadow_collecting" ? "shadow evidence collecting" : profitability?.promotion_allowed ? "armed" : "blocked — human authorization required"} />
+          <Metric label="Funded Ladder" value={fundedLadder ? `${fundedLadder.phase ?? "evidence_collecting"} — ${fundedLadder.metrics?.cumulative_funded_orders ?? 0} / ${fundedLadder.active_target_orders ?? 1}` : "not started"} />
+          <Metric label="Next Stage Grant" value={fundedLadder?.phase === "profitable_go" ? "validated GO — still not automatically armed" : fundedLadder?.phase === "stopped_no_go" ? "terminal NO-GO — immutable stop" : fundedLadder?.human_grant_required ? "exact one-shot human grant required" : fundedLadder?.terminal ? "terminal" : "stage grant consumed"} />
+          <Metric label="Eligible Evidence" value={`${fundedLadder?.metrics?.cumulative_eligible_orders ?? 0} eligible orders`} />
+          <Metric label="Filled Markout Samples" value={`${fundedLadder?.metrics?.markout_sample_size ?? 0} (non-fills remain fill labels)`} />
+          <Metric label="Funded Markout L95" value={signedUsd(fundedLadder?.metrics?.net_markout_30s_lower_95)} />
+          <Metric label="Intent Model" value={queueTransition?.model_quality_passed ? `${queueTransition.binding?.model_version ?? "queue model"} — checkpoint 100 bound` : profitability?.execution_model?.model_version ?? "frozen conservative prior"} />
+          <Metric label="Campaign Expiry" value={dateTime(profitability?.expires_at)} />
+          <Metric label="Campaign Equity" value={usd(profitability?.capital?.current_equity ?? campaignRisk?.account_equity ?? portfolio?.account_equity)} />
+          <Metric label="Campaign PnL" value={signedUsd(profitability?.capital?.campaign_net_pnl)} />
+          <Metric label="Lifetime Account PnL" value={signedUsd(profitability?.capital?.lifetime_net_pnl ?? portfolio?.account_net_pnl)} />
+          <Metric label="Equity Floor" value={usd(profitability?.capital?.equity_floor ?? campaignRisk?.equity_floor)} />
+          <Metric label="Current Drawdown" value={usd(profitability?.capital?.current_drawdown ?? campaignRisk?.campaign_drawdown)} />
+          <Metric label="Locked Principal" value={usd(profitability?.capital?.locked_principal)} />
+          <Metric label="Unresolved Exposure" value={usd(profitability?.capital?.unresolved_exposure)} />
+          <Metric label="Blocking Reason" value={profitability?.blocking_reason ?? campaignRisk?.blockers?.join(", ") ?? "funded execution remains disabled"} />
+        </div>
+        <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+          Historical simulation, execution-probe cost, shadow PnL, and live-strategy PnL are separate ledgers. A profitable post-reset campaign does not erase the lifetime account loss, and no phase automatically arms a real order.
+        </div>
+      </Panel>
+
+      {queueTransition || fundedHoldout ? (
+        <Panel>
+          <PanelHeader title="Orders 101–200 Holdout" meta={fundedHoldout?.passed ? "terminal holdout passed" : queueTransition?.model_quality_passed ? "frozen model active — collecting later orders" : "awaiting checkpoint 100"} />
+          <div className="grid gap-3 p-4 md:grid-cols-4">
+            <Metric label="Frozen Model" value={queueTransition?.binding?.model_version ?? "pending"} />
+            <Metric label="Training Cutoff" value={dateTime(queueTransition?.training_cutoff)} />
+            <Metric label="Exact Holdout Orders" value={`${fundedHoldout?.exact_order_count ?? 0} / 100`} />
+            <Metric label="Fill / Non-fill Labels" value={`${fundedHoldout?.filled_order_count ?? 0} / ${fundedHoldout?.non_filled_order_count ?? 0}`} />
+            <Metric label="Holdout Net PnL" value={signedUsd(fundedHoldout?.holdout_net_pnl)} />
+            <Metric label="PnL / Order L95" value={signedUsd(fundedHoldout?.holdout_net_pnl_per_order_lower_95)} />
+            <Metric label="Holdout Max Drawdown" value={usd(fundedHoldout?.holdout_max_drawdown)} />
+            <Metric label="Holdout Markout L95" value={signedUsd(fundedHoldout?.net_markout_30s_lower_95)} />
+            <Metric label="Brier Improvement" value={fundedHoldout?.brier_improvement_fraction === undefined ? "pending" : percentage(fundedHoldout.brier_improvement_fraction)} />
+            <Metric label="Calibration Error" value={fundedHoldout?.expected_calibration_error ?? "pending"} />
+            <Metric label="Decision" value={fundedHoldout?.passed ? "passed" : "not yet passed"} />
+          </div>
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            GO requires the later 101–200 orders themselves to be profitable with a positive per-order 95% lower bound; gains from orders 1–100 cannot mask a losing holdout.
+          </div>
+        </Panel>
+      ) : null}
+
+      <div className="grid gap-5 xl:grid-cols-2">
+        <Panel>
+          <PanelHeader title="Shadow Profitability Gate" meta="30 clean days and 1,000 settled markets" />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Clean Days" value={`${profitability?.shadow?.clean_days ?? promotionMetrics?.clean_days ?? 0} / ${profitability?.shadow?.required_clean_days ?? 30}`} />
+            <Metric label="Campaign Window" value={`${promotionMetrics?.observed_calendar_days ?? 0} / 60 calendar days`} />
+            <Metric label="Settled Markets" value={`${profitability?.shadow?.settled_markets ?? promotionMetrics?.settled_markets ?? 0} / ${profitability?.shadow?.required_settled_markets ?? 1000}`} />
+            <Metric label="Queue-conservative PnL" value={signedUsd(profitability?.shadow?.queue_conservative_net_pnl ?? promotionMetrics?.queue_conservative_net_pnl)} />
+            <Metric label="95% PnL Lower Bound" value={signedUsd(profitability?.shadow?.pnl_ci_lower_95 ?? promotionMetrics?.pnl_ci_95_low)} />
+            <Metric label="Positive Weekly Blocks" value={`${profitability?.shadow?.positive_weekly_blocks ?? promotionMetrics?.consecutive_positive_weekly_blocks ?? 0} / ${profitability?.shadow?.required_positive_weekly_blocks ?? 4}`} />
+            <Metric label="Decision Parity" value={percentage(profitability?.shadow?.decision_parity_rate ?? promotionMetrics?.decision_parity_rate)} />
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHeader title="Promotion Data Quality" meta={profitability?.data_quality?.status ?? promotionQuality?.registry_version ?? "collecting"} />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Decision-grade Coverage" value={percentage(profitability?.data_quality?.decision_grade_coverage ?? promotionQuality?.decision_grade_coverage)} />
+            <Metric label="Minimum Coverage" value={percentage(profitability?.data_quality?.minimum_coverage ?? 0.95)} />
+            <Metric label="Fatal Warnings" value={profitability?.data_quality?.fatal_warnings ?? promotionQuality?.fatal_issues?.length ?? 0} />
+            <Metric label="Blocking Warnings" value={profitability?.data_quality?.blocking_warnings ?? blockingWarnings ?? 0} />
+            <Metric label="Unclassified Warnings" value={profitability?.data_quality?.unclassified_warnings ?? unclassifiedWarnings ?? 0} />
+            <Metric label="Unknown Warnings" value={(profitability?.data_quality?.unclassified_warnings ?? unclassifiedWarnings ?? 0) > 0 ? "promotion blocked" : "none"} />
+          </div>
+        </Panel>
+      </div>
+
       <Panel>
         <PanelHeader title="Authenticated Venue Evidence" meta={latest?.finished_ts ?? evidence.generated_ts} />
         <div className="grid gap-3 p-4 md:grid-cols-4">
@@ -167,7 +252,9 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
           <Metric label="Matched-size Agreement" value={lifecycle?.matched_size_source_agreement ? "REST = user channel" : "not confirmed"} />
           <Metric label="Trade-ID Agreement" value={lifecycle?.trade_id_source_agreement ? "REST = user channel" : "not confirmed"} />
           <Metric label="WS Reconnects" value={(lifecycle?.authenticated_user_channel_reconnects ?? 0) + (lifecycle?.public_market_channel_reconnects ?? 0)} />
-          <Metric label="Risk Budget Used" value={latest?.risk_at_end?.conservative_loss_budget_consumed ?? 0} />
+          <Metric label="Campaign Risk" value={campaignRisk?.passed ? "passed" : campaignRisk?.blockers?.join(", ") ?? "legacy evidence"} />
+          <Metric label="Campaign Drawdown" value={usd(campaignRisk?.campaign_drawdown)} />
+          <Metric label="Legacy Daily Turnover" value={dailyTurnover?.conservative_loss_budget_consumed ?? 0} />
           <Metric label="Global Unresolved Risk Reservations" value={globalUnresolvedRisk} />
         </div>
         {latest?.stop_reason ? <div className="border-t border-line px-4 py-3 text-sm text-ink/70">Campaign stop reason: {latest.stop_reason}.</div> : null}
@@ -234,6 +321,8 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
           <PanelHeader title="Empirical Fill Model" meta={model?.status ?? "not trained"} />
           <div className="grid gap-3 p-4 md:grid-cols-2">
             <Metric label="Target" value="P(fill within 1/5/30/60s)" />
+            <Metric label="Model Version" value={model?.model_version ?? evidence.profitability?.execution_model?.model_version ?? "pending"} />
+            <Metric label="Promotion-bound Model SHA-256" value={evidence.profitability?.execution_model?.sha256 ?? "not bound"} />
             <Metric label="Eligible Order Probes" value={model?.sample_size ?? 0} />
             <Metric label="Eligible Horizon Labels" value={model?.label_sample_size ?? 0} />
             <Metric label="Filled Probes" value={model?.positive_fills ?? 0} />
@@ -243,10 +332,14 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Minimum Eligible Probes" value={model?.minimum_samples ?? 100} />
             <Metric label="Temporal Holdout" value={model?.temporal_split ?? "required before training"} />
             <Metric label="OOS Brier Score" value={model?.out_of_sample_brier_score ?? "pending"} />
+            <Metric label="Naive Brier Score" value={model?.naive_horizon_base_rate_brier_score ?? "pending"} />
+            <Metric label="Brier Improvement" value={model?.brier_improvement_fraction === undefined ? "pending" : percentage(model.brier_improvement_fraction)} />
+            <Metric label="Expected Calibration Error" value={model?.expected_calibration_error ?? "pending"} />
             <Metric label="Quality Gates" value={model?.quality_gates?.passed ? "passed" : "collecting / failed"} />
             <Metric label="Excluded Data-gap Probes" value={model?.quality_gates?.excluded_data_gap_observations ?? 0} />
             <Metric label="Early Markout Exclusions" value={model?.quality_gates?.early_markout_observations ?? 0} />
             <Metric label="Net 30s Markout" value={model?.net_markout_30s_sample_size ? numberText(model.mean_net_executable_markout_30s_per_share) : "pending"} />
+            <Metric label="Net 30s Markout 95% Lower" value={model?.net_executable_markout_30s_lower_confidence_bound_95 ?? "pending"} />
             <Metric label="Promotion Ready" value={model?.promotion_ready ? "yes — human approval required" : "no"} />
           </div>
           <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
@@ -301,13 +394,18 @@ function usd(value: number | null | undefined) {
   return value === null || value === undefined ? "n/a" : `$${numberText(value, 6)}`;
 }
 
-function signedUsd(value: number | null | undefined) {
+function signedUsd(value: string | number | null | undefined) {
   if (value === null || value === undefined) return "n/a";
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "n/a";
   if (numeric > 0) return `+$${numberText(numeric, 6)}`;
   if (numeric < 0) return `-$${numberText(Math.abs(numeric), 6)}`;
   return "$0";
+}
+
+function percentage(value: string | number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "pending";
+  return `${numberText(Number(value) * 100, 2)}%`;
 }
 
 function Overview({

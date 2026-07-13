@@ -11,6 +11,8 @@ pub enum ConfigError {
     LiveBlocked(String),
     #[error("invalid decimal for {name}: {value}")]
     InvalidDecimal { name: String, value: String },
+    #[error("invalid adaptive strategy configuration: {0}")]
+    InvalidAdaptiveStrategy(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -235,6 +237,12 @@ pub struct AzureConfig {
     pub storage_table_name: String,
     pub chart_table_name: String,
     pub market_table_name: String,
+    pub event_blob_prefix: String,
+    pub publish_strategy_canary_intents: bool,
+    pub strategy_canary_intent_prefix: String,
+    pub strategy_canary_fill_model_version: String,
+    pub strategy_canary_execution_model_blob_uri: String,
+    pub strategy_canary_execution_model_sha256: String,
 }
 
 impl Default for AzureConfig {
@@ -245,6 +253,13 @@ impl Default for AzureConfig {
             storage_table_name: "BotEventIndex".to_owned(),
             chart_table_name: "BotChartSeries".to_owned(),
             market_table_name: "BotMarketCatalog".to_owned(),
+            event_blob_prefix: "events".to_owned(),
+            publish_strategy_canary_intents: false,
+            strategy_canary_intent_prefix:
+                "reports/research/venue-probe/control/strategy-canary/intents".to_owned(),
+            strategy_canary_fill_model_version: "conservative-execution-prior-v1".to_owned(),
+            strategy_canary_execution_model_blob_uri: String::new(),
+            strategy_canary_execution_model_sha256: String::new(),
         }
     }
 }
@@ -375,6 +390,28 @@ impl RuntimeSettings {
             env_string("AZURE_CHART_TABLE_NAME", settings.azure.chart_table_name);
         settings.azure.market_table_name =
             env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
+        settings.azure.event_blob_prefix =
+            env_string("AZURE_EVENT_BLOB_PREFIX", settings.azure.event_blob_prefix);
+        settings.azure.publish_strategy_canary_intents = env_bool(
+            "PUBLISH_STRATEGY_CANARY_INTENTS",
+            settings.azure.publish_strategy_canary_intents,
+        );
+        settings.azure.strategy_canary_intent_prefix = env_string(
+            "STRATEGY_CANARY_INTENT_PREFIX",
+            settings.azure.strategy_canary_intent_prefix,
+        );
+        settings.azure.strategy_canary_fill_model_version = env_string(
+            "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION",
+            settings.azure.strategy_canary_fill_model_version,
+        );
+        settings.azure.strategy_canary_execution_model_blob_uri = env_string(
+            "STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI",
+            settings.azure.strategy_canary_execution_model_blob_uri,
+        );
+        settings.azure.strategy_canary_execution_model_sha256 = env_string(
+            "STRATEGY_CANARY_EXECUTION_MODEL_SHA256",
+            settings.azure.strategy_canary_execution_model_sha256,
+        );
         settings.strategy.taker_min_edge =
             env_decimal("TAKER_MIN_EDGE", settings.strategy.taker_min_edge)?;
         settings.strategy.enable_taker_orders =
@@ -430,11 +467,37 @@ impl RuntimeSettings {
             "PAPER_ORDER_LIVE_AFTER_MS",
             settings.paper.order_live_after_ms,
         );
+        settings.validate_adaptive_strategy()?;
         Ok(settings)
     }
 
     pub fn live_requested(&self) -> bool {
         self.live.execution_mode == ExecutionMode::Live
+    }
+
+    pub fn validate_adaptive_strategy(&self) -> Result<(), ConfigError> {
+        if !self.strategy.adaptive_regime_enabled {
+            return Ok(());
+        }
+        if self.live_requested() {
+            return Err(ConfigError::InvalidAdaptiveStrategy(
+                "frozen adaptive candidates are paper-only".to_owned(),
+            ));
+        }
+        if !matches!(
+            self.strategy.adaptive_regime_mode.as_str(),
+            "paper_only"
+                | "dynamic_quote_style"
+                | "dynamic_safety_only"
+                | "full_deterministic_profile"
+                | "full_deterministic"
+        ) {
+            return Err(ConfigError::InvalidAdaptiveStrategy(format!(
+                "unsupported ADAPTIVE_REGIME_MODE {}",
+                self.strategy.adaptive_regime_mode
+            )));
+        }
+        Ok(())
     }
 
     pub fn validate_live_gates(&self, exact_resolution_source: bool) -> Result<(), ConfigError> {
@@ -508,6 +571,14 @@ impl RuntimeSettings {
                 "api_bearer_token_configured": self.deploy.api_bearer_token.is_some(),
                 "polymarket_private_key_configured": self.live.polymarket_private_key.is_some(),
                 "azure_storage_configured": self.azure.storage_account_name.is_some()
+            },
+            "azure": {
+                "event_blob_prefix": self.azure.event_blob_prefix,
+                "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
+                "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
+                "strategy_canary_fill_model_version": self.azure.strategy_canary_fill_model_version
+                ,"strategy_canary_execution_model_blob_uri_configured": !self.azure.strategy_canary_execution_model_blob_uri.is_empty()
+                ,"strategy_canary_execution_model_sha256_configured": !self.azure.strategy_canary_execution_model_sha256.is_empty()
             }
         })
     }

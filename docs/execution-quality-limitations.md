@@ -110,10 +110,10 @@ The complete venue-real design consists of:
 
 The implemented probe is deliberately isolated from the paper runtime and has
 hard gates for one open order at a time, post-only maker execution, no takers,
-a maximum $1.25 order notional, and a conservative $5 daily loss budget. A canary
-may submit one order; an explicitly enabled evidence campaign submits 25–50
-orders sequentially with a deterministic randomized mix of 1/5/30/60-second
-resting periods. It persists an immutable event ledger,
+a maximum $1.00 order notional, a $1.00 cross-day campaign drawdown, and a
+$4.03 equity floor. A canary may submit one order. Any continuation uses a
+human-authorized 1/5/25/100/200 ladder, with at most one order per controller
+invocation and a fresh exact-state grant before each stage. It persists an immutable event ledger,
 the venue-confirmed lifecycle, public depth before send and after
 acknowledgement, fill/cancellation races, and real 1/5/30-second markouts when a
 real fill occurs. Credentials are referenced from Azure Key Vault; they are not
@@ -135,7 +135,7 @@ HTTP submission failure stops the campaign, confirms zero open orders, and
 leaves the full reserved notional unresolved; it is never silently released or
 retried. If a later probe fails, already completed
 probes are retained in the failed-run summary so their fills, markouts, and
-conservative daily-risk consumption cannot disappear from training or limits.
+conservative campaign-risk consumption cannot disappear from training or limits.
 
 Evidence protocol v3 adds a 60-second renewable Azure Blob lease so only one
 campaign can own the funded account. Before each send it writes a durable
@@ -157,9 +157,10 @@ critical section.
 
 The reservation includes principal plus a conservative fee upper bound derived
 from the venue-reported base fee in basis points. Order selection is capped
-against both remaining daily risk and liquid collateral after applying that
-bound; finalized filled risk retains the same fee bound. Therefore the $5 cap
-cannot be exceeded merely because execution fees were omitted from principal.
+against remaining cross-day campaign risk, the equity floor, and liquid
+collateral after applying that bound; finalized filled risk retains the same
+fee bound. Therefore the campaign cap cannot be bypassed merely because fees
+were omitted from principal or because the UTC date changed.
 
 For filled probes, protocol v3 requires REST order quantity, REST trade
 quantity, authenticated user-channel order quantity, and user-channel trade
@@ -294,6 +295,18 @@ book continuity is uncertain, reconciliation disagrees, or cancellation cannot
 be confirmed. Production strategy promotion remains a separate decision after
 enough representative probe observations show stable fill calibration and
 post-cost markouts.
+
+Filled risk is intentionally more conservative than the eventually consistent
+positions API. Reconciliation closes the order lifecycle but does not release
+capital: the durable reservation becomes `position_unresolved` and blocks the
+next submission until either the Data API positively marks the condition
+redeemable or the redemption worker verifies the on-chain transaction. A mere
+temporary absence from the positions API never releases the reservation.
+
+HTTP acknowledgement time is recorded immediately using a monotonic elapsed
+clock. Authenticated partial fills start independent concurrent deadlines for
+their own 1/5/30-second markouts; a late REST-only fill is retained as evidence
+but fails the timing-quality gate instead of being treated as timely.
 
 ## Acceptance Criteria
 

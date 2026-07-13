@@ -116,6 +116,7 @@ impl EventRecorder for AzureBlobRecorder {
 pub struct AzureAppendBlobRecorder {
     account: String,
     container: String,
+    event_blob_prefix: String,
     agent: ureq::Agent,
     token: ManagedIdentityToken,
     known_append_blobs: BTreeSet<String>,
@@ -128,9 +129,19 @@ impl AzureAppendBlobRecorder {
         container: impl Into<String>,
         client_id: Option<String>,
     ) -> Self {
+        Self::new_with_prefix(account, container, client_id, "events")
+    }
+
+    pub fn new_with_prefix(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+        event_blob_prefix: impl Into<String>,
+    ) -> Self {
         Self {
             account: account.into(),
             container: container.into(),
+            event_blob_prefix: normalize_blob_prefix(event_blob_prefix.into()),
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
                 .timeout_read(Duration::from_secs(30))
@@ -254,7 +265,7 @@ impl EventRecorder for AzureAppendBlobRecorder {
         for event in events {
             ready_blocks.extend(
                 self.pending_append_blocks
-                    .push_line(&event_blob_name(event), jsonl_event_line(event)?),
+                    .push_line(&self.event_blob_name(event), jsonl_event_line(event)?),
             );
         }
         self.append_ready_blocks(ready_blocks)?;
@@ -265,6 +276,12 @@ impl EventRecorder for AzureAppendBlobRecorder {
         let blocks = self.pending_append_blocks.drain();
         self.append_ready_blocks(blocks)?;
         Ok(())
+    }
+}
+
+impl AzureAppendBlobRecorder {
+    fn event_blob_name(&self, event: &RuntimeEvent) -> String {
+        event_blob_name(&self.event_blob_prefix, event)
     }
 }
 
@@ -350,8 +367,17 @@ impl BufferedAppendBlocks {
     }
 }
 
-fn event_blob_name(event: &RuntimeEvent) -> String {
-    format!("events/{}.jsonl", event.ts.format("%Y/%m/%d/%H/%M"))
+fn normalize_blob_prefix(prefix: String) -> String {
+    let prefix = prefix.trim().trim_matches('/');
+    if prefix.is_empty() {
+        "events".to_owned()
+    } else {
+        prefix.to_owned()
+    }
+}
+
+fn event_blob_name(prefix: &str, event: &RuntimeEvent) -> String {
+    format!("{prefix}/{}.jsonl", event.ts.format("%Y/%m/%d/%H/%M"))
 }
 
 fn jsonl_event_line(event: &RuntimeEvent) -> Result<Vec<u8>, StorageError> {
@@ -381,6 +407,18 @@ pub enum AzureBlobError {
     Xml(#[from] quick_xml::Error),
     #[error("failed to parse Azure blob list XML: {0}")]
     XmlMessage(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImmutableBlobWrite {
+    Created,
+    AlreadyExists,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedBlobBytes {
+    pub bytes: Vec<u8>,
+    pub etag: String,
 }
 
 impl AzureBlobError {
@@ -646,6 +684,31 @@ impl AzureBlobClient {
         self.get_bytes_with_retry(&url)
     }
 
+    /// Reads the exact blob bytes together with the Azure ETag needed for a
+    /// subsequent compare-and-swap update.
+    pub fn download_blob_bytes_with_etag(
+        &mut self,
+        name: &str,
+    ) -> Result<VersionedBlobBytes, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        let response = self.get_response(&url)?;
+        let etag = response
+            .header("etag")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AzureBlobError::Transport("Azure Blob response omitted ETag".to_owned())
+            })?
+            .to_owned();
+        let mut bytes = Vec::new();
+        response.into_reader().read_to_end(&mut bytes)?;
+        Ok(VersionedBlobBytes { bytes, etag })
+    }
+
     pub fn upload_block_blob_bytes(
         &mut self,
         name: &str,
@@ -659,6 +722,60 @@ impl AzureBlobClient {
             encode_blob_path(name)
         );
         self.put_block_blob_with_retry(&url, bytes, content_type)
+    }
+
+    /// Creates a block blob exactly once. An existing name is reported without
+    /// replacing its bytes, which makes the caller's artifact path immutable.
+    pub fn upload_block_blob_bytes_if_absent(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<ImmutableBlobWrite, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        self.put_block_blob_if_absent(&url, bytes, content_type)
+    }
+
+    /// Replaces a block blob only while it still has `expected_etag`.
+    /// Returns `false` for an Azure 409/412 precondition conflict; callers can
+    /// then re-read the pointer and fail closed or recognize an idempotent win.
+    pub fn upload_block_blob_bytes_if_match(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        content_type: &str,
+        expected_etag: &str,
+    ) -> Result<bool, AzureBlobError> {
+        if expected_etag.trim().is_empty()
+            || expected_etag
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(AzureBlobError::Transport(
+                "conditional Azure Blob upload requires a valid ETag".to_owned(),
+            ));
+        }
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self.put_block_blob_if_match(&url, bytes, content_type, expected_etag) {
+                Ok(updated) => return Ok(updated),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob conditional upload retry loop always returns");
     }
 
     fn get_text(&mut self, url: &str) -> Result<String, AzureBlobError> {
@@ -776,6 +893,83 @@ impl AzureBlobClient {
         };
         match response {
             Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn put_block_blob_if_absent(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<ImmutableBlobWrite, AzureBlobError> {
+        let date = rfc1123_now();
+        let response = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self
+                .agent
+                .put(&append_sas(url, sas))
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .set("x-ms-date", &date)
+                .set("x-ms-blob-type", "BlockBlob")
+                .set("content-type", content_type)
+                .set("if-none-match", "*")
+                .send_bytes(bytes),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("x-ms-date", &date)
+                    .set("x-ms-blob-type", "BlockBlob")
+                    .set("content-type", content_type)
+                    .set("if-none-match", "*")
+                    .send_bytes(bytes)
+            }
+        };
+        match response {
+            Ok(_) => Ok(ImmutableBlobWrite::Created),
+            Err(ureq::Error::Status(409 | 412, _)) => Ok(ImmutableBlobWrite::AlreadyExists),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn put_block_blob_if_match(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+        expected_etag: &str,
+    ) -> Result<bool, AzureBlobError> {
+        let date = rfc1123_now();
+        let response = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self
+                .agent
+                .put(&append_sas(url, sas))
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .set("x-ms-date", &date)
+                .set("x-ms-blob-type", "BlockBlob")
+                .set("content-type", content_type)
+                .set("if-match", expected_etag)
+                .send_bytes(bytes),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("x-ms-date", &date)
+                    .set("x-ms-blob-type", "BlockBlob")
+                    .set("content-type", content_type)
+                    .set("if-match", expected_etag)
+                    .send_bytes(bytes)
+            }
+        };
+        match response {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(409 | 412, _)) => Ok(false),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
@@ -1232,6 +1426,30 @@ mod tests {
     use super::*;
     use polyedge_domain::RuntimeEvent;
     use serde_json::json;
+
+    #[test]
+    fn event_blob_prefix_is_configurable_and_defaults_to_events() {
+        let event = RuntimeEvent {
+            event_type: "decision".to_owned(),
+            ts: DateTime::parse_from_rfc3339("2026-07-12T12:34:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            data: Value::Null,
+        };
+        assert_eq!(
+            event_blob_name("events", &event),
+            "events/2026/07/12/12/34.jsonl"
+        );
+        assert_eq!(
+            event_blob_name("shadow-events", &event),
+            "shadow-events/2026/07/12/12/34.jsonl"
+        );
+        assert_eq!(
+            normalize_blob_prefix(" /shadow-events/ ".to_owned()),
+            "shadow-events"
+        );
+        assert_eq!(normalize_blob_prefix("///".to_owned()), "events");
+    }
 
     #[test]
     fn buffered_append_blocks_preserves_lines_and_caps_chunks() {

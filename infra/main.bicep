@@ -79,6 +79,9 @@ var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix
 var managedEnvironmentName = '${appName}-${environmentName}-env'
 var containerAppName = '${appName}-${environmentName}'
 var storageContainerName = 'bot-events'
+var researchStorageContainerName = 'polyedge-research'
+var fundedEvidenceContainerName = 'polyedge-funded-evidence'
+var modelStorageContainerName = 'polyedge-models'
 var storageTableName = 'BotEventIndex'
 var chartTableName = 'BotChartSeries'
 var marketTableName = 'BotMarketCatalog'
@@ -92,6 +95,8 @@ var labTableNames = [
 ]
 var frontendEnabled = !empty(frontendImage)
 var containerAppIdentityName = '${containerAppName}-id'
+var venueModelIdentityName = '${containerAppName}-venue-model-id'
+var githubDeployIdentityName = 'id-github-polyedge-dev'
 var venueProbeEnabled = !empty(venueProbeImage)
 var tags = {
   app: appName
@@ -148,10 +153,6 @@ var jobCommonEnv = [
     value: storageTableName
   }
   {
-    name: 'AZURE_STORAGE_ACCOUNT_KEY'
-    secretRef: 'storage-account-key'
-  }
-  {
     name: 'AZURE_CHART_TABLE_NAME'
     value: chartTableName
   }
@@ -194,16 +195,16 @@ var researchJobDefinitions = [
     name: 'polyedge-daily-research-job'
     triggerType: 'Schedule'
     cron: '30 0 * * *'
-    replicaTimeout: 43200
+    replicaTimeout: 46800
     cpu: '2'
     memory: '4Gi'
-    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; MARKETS="reports/research/daily/$DATE/markets_summary.json"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/execution_quality.json" --markdown "reports/research/daily/$DATE/execution_quality.md"; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/baseline.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"'
+    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); RUN_ID="daily-$DATE-$(date -u +%Y%m%dT%H%M%SZ)"; INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; STAGING="reports/research/staging/$RUN_ID"; MARKETS="$STAGING/markets_summary.json"; mkdir -p "$STAGING" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/raw_data_audit.json" --markdown "$STAGING/raw_data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research audit --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/data_audit.json" --markdown "$STAGING/data_audit.md"; polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/execution_quality.json" --markdown "$STAGING/execution_quality.md"; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "$STAGING/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/baseline.json" --markdown "$STAGING/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --fill-model queue_proxy_conservative --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/regimes.json" --markdown "$STAGING/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/calibration.json" --markdown "$STAGING/calibration.md"; polyedge-rs research sample-size --results "$STAGING/baseline.json" --out "$STAGING/sample_size.json" --markdown "$STAGING/sample_size.md"; polyedge-rs research report --reports-dir "$STAGING" --out "$STAGING/final_report.json" --markdown "$STAGING/final_report.md"; INPUT_SHA="sha256:$(sha256sum "$NORMALIZED/events_manifest.json" | cut -d" " -f1)"; polyedge-rs research publish-daily-bundle --date "$DATE" --run-id "$RUN_ID" --input-sha256 "$INPUT_SHA" --source-dir "$STAGING" --output-root "reports/research/daily" --data-audit "$STAGING/data_audit.json"; polyedge-rs research report --reports-dir "$STAGING" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"; polyedge-rs research validate-prospective --since "2026-06-14T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --expected-daily-date "$DATE" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
   }
   {
     id: 'prospective-validation'
     name: 'polyedge-prospective-job'
-    triggerType: 'Schedule'
-    cron: '15 1 * * *'
+    triggerType: 'Manual'
+    cron: ''
     replicaTimeout: 1800
     cpu: cpu
     memory: memory
@@ -349,7 +350,7 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   properties: {
     accessTier: 'Hot'
     allowBlobPublicAccess: false
-    allowSharedKeyAccess: true
+    allowSharedKeyAccess: false
     defaultToOAuthAuthentication: true
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
@@ -366,6 +367,58 @@ resource eventContainer 'Microsoft.Storage/storageAccounts/blobServices/containe
   name: storageContainerName
   properties: {
     publicAccess: 'None'
+  }
+}
+
+resource researchContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: researchStorageContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource fundedEvidenceContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: fundedEvidenceContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource modelContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: modelStorageContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource githubDeployIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
+  name: githubDeployIdentityName
+}
+
+resource githubDeployEventReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(eventContainer.id, githubDeployIdentity.id, 'github-deploy-blob-reader')
+  scope: eventContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: githubDeployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource githubDeployResearchContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(researchContainer.id, githubDeployIdentity.id, 'github-deploy-blob-contributor')
+  scope: researchContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: githubDeployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource githubDeployFundedContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(fundedEvidenceContainer.id, githubDeployIdentity.id, 'github-deploy-blob-contributor')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: githubDeployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -459,6 +512,14 @@ resource containerAppIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@
   tags: tags
 }
 
+// Research-only identity for checkpoint-100 queue calibration. It is never
+// granted Key Vault access and therefore cannot obtain venue credentials.
+resource venueModelIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (venueProbeEnabled) {
+  name: venueModelIdentityName
+  location: location
+  tags: tags
+}
+
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: containerAppName
   location: location
@@ -491,10 +552,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'dashboard-session-secret'
           value: dashboardSessionSecret
-        }
-        {
-          name: 'storage-account-key'
-          value: storage.listKeys().keys[0].value
         }
       ]
       registries: [
@@ -587,12 +644,20 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: storageContainerName
             }
             {
-              name: 'AZURE_STORAGE_TABLE_NAME'
-              value: storageTableName
+              name: 'AZURE_RESEARCH_STORAGE_CONTAINER_NAME'
+              value: researchStorageContainerName
             }
             {
-              name: 'AZURE_STORAGE_ACCOUNT_KEY'
-              secretRef: 'storage-account-key'
+              name: 'AZURE_FUNDED_STORAGE_CONTAINER_NAME'
+              value: fundedEvidenceContainerName
+            }
+            {
+              name: 'AZURE_MODEL_STORAGE_CONTAINER_NAME'
+              value: modelStorageContainerName
+            }
+            {
+              name: 'AZURE_STORAGE_TABLE_NAME'
+              value: storageTableName
             }
             {
               name: 'AZURE_CHART_TABLE_NAME'
@@ -714,10 +779,6 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
           name: 'api-bearer-token'
           value: apiBearerToken
         }
-        {
-          name: 'storage-account-key'
-          value: storage.listKeys().keys[0].value
-        }
       ]
     }, job.triggerType == 'Schedule' ? {
       scheduleTriggerConfig: {
@@ -763,24 +824,23 @@ resource venueModelJob 'Microsoft.App/jobs@2024-03-01' = if (venueProbeEnabled) 
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
-      '${containerAppIdentity.id}': {}
+      '${venueModelIdentity!.id}': {}
     }
   }
   properties: {
     environmentId: managedEnvironment.id
     configuration: {
-      triggerType: 'Schedule'
-      replicaRetryLimit: 1
+      triggerType: 'Manual'
+      replicaRetryLimit: 0
       replicaTimeout: 300
-      scheduleTriggerConfig: {
-        cronExpression: '45 1 * * *'
+      manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1
       }
       registries: [
         {
           server: acr.properties.loginServer
-          identity: containerAppIdentity.id
+          identity: venueModelIdentity!.id
         }
       ]
     }
@@ -798,7 +858,7 @@ resource venueModelJob 'Microsoft.App/jobs@2024-03-01' = if (venueProbeEnabled) 
           env: [
             {
               name: 'AZURE_CLIENT_ID'
-              value: containerAppIdentity.properties.clientId
+              value: venueModelIdentity!.properties.clientId
             }
             {
               name: 'AZURE_STORAGE_ACCOUNT_NAME'
@@ -806,7 +866,35 @@ resource venueModelJob 'Microsoft.App/jobs@2024-03-01' = if (venueProbeEnabled) 
             }
             {
               name: 'AZURE_STORAGE_CONTAINER_NAME'
-              value: storageContainerName
+              value: fundedEvidenceContainerName
+            }
+            {
+              name: 'QUEUE_MODEL_SOURCE_CONTAINER_NAME'
+              value: fundedEvidenceContainerName
+            }
+            {
+              name: 'QUEUE_MODEL_OUTPUT_CONTAINER_NAME'
+              value: modelStorageContainerName
+            }
+            {
+              name: 'QUEUE_MODEL_TRAINING_ENABLED'
+              value: 'false'
+            }
+            {
+              name: 'QUEUE_MODEL_CHECKPOINT_BLOB_NAME'
+              value: ''
+            }
+            {
+              name: 'QUEUE_MODEL_CHECKPOINT_SHA256'
+              value: ''
+            }
+            {
+              name: 'ALLOW_LIVE'
+              value: 'false'
+            }
+            {
+              name: 'ENABLE_TAKER_ORDERS'
+              value: 'false'
             }
           ]
           resources: {
@@ -819,9 +907,39 @@ resource venueModelJob 'Microsoft.App/jobs@2024-03-01' = if (venueProbeEnabled) 
   }
 }
 
+resource venueModelFundedEvidenceReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (venueProbeEnabled) {
+  name: guid(fundedEvidenceContainer.id, venueModelIdentity!.id, 'venue-model-funded-reader')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: venueModelIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource venueModelOutputContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (venueProbeEnabled) {
+  name: guid(modelContainer.id, venueModelIdentity!.id, 'venue-model-output-contributor')
+  scope: modelContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: venueModelIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource venueModelAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (venueProbeEnabled) {
+  name: guid(acr.id, venueModelIdentity!.id, 'venue-model-acr-pull')
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+    principalId: venueModelIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, containerAppIdentity.id, 'blob-data-contributor')
-  scope: storage
+  name: guid(eventContainer.id, containerAppIdentity.id, 'blob-data-contributor')
+  scope: eventContainer
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: containerAppIdentity.properties.principalId
@@ -829,9 +947,39 @@ resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 }
 
-resource tableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, containerAppIdentity.id, 'table-data-contributor')
-  scope: storage
+resource appFundedEvidenceReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(fundedEvidenceContainer.id, containerAppIdentity.id, 'app-funded-evidence-reader')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource appModelReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(modelContainer.id, containerAppIdentity.id, 'app-model-reader')
+  scope: modelContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource appResearchReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(researchContainer.id, containerAppIdentity.id, 'app-research-reader')
+  scope: researchContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource eventIndexTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(eventIndexTable.id, containerAppIdentity.id, 'table-data-contributor')
+  scope: eventIndexTable
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
     principalId: containerAppIdentity.properties.principalId
@@ -839,21 +987,41 @@ resource tableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-0
   }
 }
 
-resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(acr.id, containerAppIdentity.id, 'acr-pull')
-  scope: acr
+resource chartSeriesTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(chartSeriesTable.id, containerAppIdentity.id, 'table-data-contributor')
+  scope: chartSeriesTable
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
     principalId: containerAppIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-resource keyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(keyVault.id, containerAppIdentity.id, 'key-vault-secrets-user')
-  scope: keyVault
+resource marketCatalogTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(marketCatalogTable.id, containerAppIdentity.id, 'table-data-contributor')
+  scope: marketCatalogTable
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource labTableContributors 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (tableName, index) in labTableNames: {
+  name: guid(labTables[index].id, containerAppIdentity.id, 'table-data-contributor')
+  scope: labTables[index]
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
+
+resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, containerAppIdentity.id, 'acr-pull')
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
     principalId: containerAppIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
@@ -1053,3 +1221,4 @@ output marketTableName string = marketTableName
 output labTableNames array = labTableNames
 output researchJobNames array = [for job in researchJobDefinitions: job.name]
 output venueModelJobName string = venueProbeEnabled ? venueModelJob.name : ''
+output venueModelIdentityName string = venueProbeEnabled ? venueModelIdentity!.name : ''

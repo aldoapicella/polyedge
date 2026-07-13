@@ -194,7 +194,7 @@ Provision or update it with the exact probe image:
 az deployment group create \
   --resource-group rg-polyedge-dev \
   --template-file infra/venue-probe.bicep \
-  --parameters venueProbeImage="$VENUE_PROBE_IMAGE"
+  --parameters venueProbeImage="$VENUE_PROBE_IMAGE" backendImage="$BACKEND_IMAGE"
 ```
 
 `infra/venue-probe.bicep` creates a dedicated North Europe managed environment,
@@ -205,7 +205,11 @@ per-run evidence to the existing `bot-events` container. Redaction covers the
 signing key, API key identifier, API secret, passphrase, authorization fields,
 and authenticated lifecycle `owner`/`order_owner` fields. Blob WORM/versioning
 is not enabled, so evidence is append-only by application convention rather
-than storage-enforced immutability.
+than storage-enforced immutability. The same deployment creates the
+credential-free `polyedge-shadow-neu` app. It has no public ingress, contains
+no Polymarket wallet/API secrets, runs only `EXECUTION_MODE=paper` with
+`ALLOW_LIVE=false`, and records to `shadow-events/` so it cannot duplicate the
+primary East US recorder.
 
 The declarative state is manual and dry-run. Before any order-enabled override,
 verify the dry-run artifact proves all of the following:
@@ -221,13 +225,13 @@ public market channel: ready
 ```
 
 The worker independently repeats the origin and clock checks immediately before
-every submission. Live evidence collection remains maker-only, one open order
-at a time, at most $1.25 per order for the current limited-funding campaign
-(`$2` remains the hard code ceiling), and at most $5 of conservative filled
-notional per UTC day. The East US probe job must remain deleted; deploying `main.bicep`
+every submission. Live evidence collection remains maker-only and one open
+order at a time. The repaired campaign permits at most `$1.00` order notional,
+`$1.00` cross-day campaign drawdown, and a `$4.03` equity floor. Risk does not
+reset at UTC midnight. The East US probe job must remain deleted; deploying `main.bicep`
 does not recreate it.
 
-Dry-run preflight remains available after the daily risk budget is exhausted so
+Dry-run preflight remains available after the campaign risk budget is exhausted so
 operators can still verify origin, authentication, WebSocket readiness, clock
 drift, and zero open orders. This does not relax submission safety: the risk
 gate reports `submission_allowed: false`, and no order is signed or sent while
@@ -308,7 +312,7 @@ az keyvault secret set \
 az deployment group create \
   --resource-group rg-polyedge-dev \
   --template-file infra/venue-probe.bicep \
-  --parameters venueProbeImage="$VENUE_PROBE_IMAGE" \
+  --parameters venueProbeImage="$VENUE_PROBE_IMAGE" backendImage="$BACKEND_IMAGE" \
                relayerApiKeySecretConfigured=true \
                relayerApiKeyAddress='<address shown for that key>'
 ```
@@ -323,7 +327,8 @@ Vault secret and job secret reference both exist:
 The launcher passes the enable and dry-run overrides only to one execution and
 verifies that the persisted job stays disabled/dry-run before and after start.
 It then validates the execution snapshot. A successful redemption does not
-start a probe; the $5 UTC trading-risk cap remains independent.
+start a probe; redemption does not change the cross-day campaign drawdown or
+equity-floor gates.
 
 Every dry-run and live artifact also reads the venue's recent public redemption
 activity. A transaction is attributed to `azure_redemption_worker` only when

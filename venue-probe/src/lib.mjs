@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { DefaultAzureCredential } from "@azure/identity";
 import {
   BlobServiceClient,
@@ -8,6 +9,10 @@ export const HORIZONS_SECONDS = [1, 5, 30, 60];
 export const MARKOUT_HORIZONS_SECONDS = [1, 5, 30];
 export const EVIDENCE_PROTOCOL_VERSION = 3;
 export const MAX_MARKOUT_OBSERVATION_DELAY_MS = 2000;
+export const DEFAULT_CAMPAIGN_BASELINE_EQUITY = 5.030521;
+export const DEFAULT_CAMPAIGN_EQUITY_FLOOR = 4.03;
+export const DEFAULT_MAX_CAMPAIGN_DRAWDOWN = 1;
+export const DEFAULT_MAX_RECONCILIATION_DISCREPANCY = 0.01;
 
 export function loadProbeConfig(env = process.env) {
   const value = {
@@ -20,10 +25,16 @@ export function loadProbeConfig(env = process.env) {
     killSwitch: parseBoolean(env.VENUE_PROBE_KILL_SWITCH),
     dryRun: env.VENUE_PROBE_DRY_RUN !== "false",
     maxOpenOrders: integer(env.MAX_OPEN_ORDERS, 1),
-    maxOrderNotional: number(env.VENUE_PROBE_MAX_ORDER_NOTIONAL, 2),
+    maxOrderNotional: number(env.VENUE_PROBE_MAX_ORDER_NOTIONAL, 1),
     minOrderNotional: number(env.VENUE_PROBE_MIN_ORDER_NOTIONAL, 1),
     minOrderPrice: number(env.VENUE_PROBE_MIN_ORDER_PRICE, 0.05),
     maxDailyLoss: number(env.MAX_DAILY_LOSS, 5),
+    campaignId: String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "funded-campaign-2026-07-12").trim(),
+    campaignBaselineEquity: number(env.VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY, DEFAULT_CAMPAIGN_BASELINE_EQUITY),
+    campaignEquityFloor: number(env.VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR, DEFAULT_CAMPAIGN_EQUITY_FLOOR),
+    maxCampaignDrawdown: number(env.VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN, DEFAULT_MAX_CAMPAIGN_DRAWDOWN),
+    maxReconciliationDiscrepancy: number(env.VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY, DEFAULT_MAX_RECONCILIATION_DISCREPANCY),
+    campaignCashFlows: parseCampaignCashFlows(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]"),
     maximumOrders: integer(env.VENUE_PROBE_MAXIMUM_ORDERS, 25),
     cancelAfterAckMs: integer(env.VENUE_PROBE_CANCEL_AFTER_ACK_MS, 0),
     restHorizonsSeconds: parseNumberList(env.VENUE_PROBE_REST_HORIZONS_SECONDS || "1,5,30,60"),
@@ -73,8 +84,8 @@ export function validateProbeConfig(config) {
   if (config.campaignEnabled && config.maximumOrders < 25) {
     errors.push("VENUE_PROBE_CAMPAIGN_ENABLED requires at least 25 orders");
   }
-  if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= 2)) {
-    errors.push("VENUE_PROBE_MAX_ORDER_NOTIONAL must be in (0, 2]");
+  if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= 1)) {
+    errors.push("VENUE_PROBE_MAX_ORDER_NOTIONAL must be in (0, 1]");
   }
   if (!(config.minOrderNotional >= 1 && config.minOrderNotional <= config.maxOrderNotional)) {
     errors.push("VENUE_PROBE_MIN_ORDER_NOTIONAL must be in [1, VENUE_PROBE_MAX_ORDER_NOTIONAL]");
@@ -84,6 +95,24 @@ export function validateProbeConfig(config) {
   }
   if (!(config.maxDailyLoss > 0 && config.maxDailyLoss <= 5)) {
     errors.push("MAX_DAILY_LOSS must be in (0, 5]");
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(config.campaignId)) {
+    errors.push("VENUE_PROBE_FUNDED_CAMPAIGN_ID must be a safe 1-80 character identifier");
+  }
+  if (!(config.campaignBaselineEquity > 0)) {
+    errors.push("VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY must be positive");
+  }
+  if (!(config.campaignEquityFloor >= 0 && config.campaignEquityFloor < config.campaignBaselineEquity)) {
+    errors.push("VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR must be non-negative and below the baseline equity");
+  }
+  if (!(config.maxCampaignDrawdown > 0 && config.maxCampaignDrawdown <= config.campaignBaselineEquity)) {
+    errors.push("VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN must be positive and no greater than baseline equity");
+  }
+  if (config.campaignBaselineEquity - config.maxCampaignDrawdown + 1e-9 < config.campaignEquityFloor) {
+    errors.push("campaign drawdown limit would breach VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR");
+  }
+  if (!(config.maxReconciliationDiscrepancy >= 0 && config.maxReconciliationDiscrepancy <= 0.01)) {
+    errors.push("VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY must be in [0, 0.01]");
   }
   if (config.startingCapital !== null && config.startingCapital <= 0) {
     errors.push("VENUE_PROBE_STARTING_CAPITAL must be positive when configured");
@@ -142,6 +171,88 @@ export function evaluateDailyRiskGate(consumed, limit, dryRun) {
     loss_limits_ok: lossLimitsOk,
     diagnostics_only: !lossLimitsOk && dryRun,
     submission_allowed: lossLimitsOk && !dryRun
+  };
+}
+
+export function summarizeCampaignRisk({
+  control,
+  liquidCollateral,
+  summedPositionValue,
+  reportedPositionValue,
+  openOrderCount = 0,
+  unresolvedPositionCount = 0,
+  unresolvedReservationCount = 0,
+  proposedNotional = 0,
+  orderNotional = proposedNotional
+}) {
+  const liquid = Math.max(0, number(liquidCollateral, 0));
+  const summed = Math.max(0, number(summedPositionValue, 0));
+  const reported = Math.max(0, number(reportedPositionValue, 0));
+  const discrepancy = Math.abs(summed - reported);
+  // Until the two independent position-value views agree, use the lower value.
+  const conservativePositionValue = Math.min(summed, reported);
+  const accountEquity = liquid + conservativePositionValue;
+  const adjustedBaseline = number(control?.baseline_equity, DEFAULT_CAMPAIGN_BASELINE_EQUITY) +
+    number(control?.net_external_cash_flow, 0);
+  const equityFloor = number(control?.equity_floor, DEFAULT_CAMPAIGN_EQUITY_FLOOR) +
+    number(control?.net_external_cash_flow, 0);
+  const maximumDrawdown = number(control?.max_campaign_drawdown, DEFAULT_MAX_CAMPAIGN_DRAWDOWN);
+  const reserved = Math.max(0, number(proposedNotional, 0));
+  const principal = Math.max(0, number(orderNotional, 0));
+  const campaignDrawdown = Math.max(0, adjustedBaseline - accountEquity);
+  const projectedEquity = accountEquity - reserved;
+  const projectedDrawdown = Math.max(0, adjustedBaseline - projectedEquity);
+  const blockers = [];
+  if (discrepancy > number(control?.max_reconciliation_discrepancy, DEFAULT_MAX_RECONCILIATION_DISCREPANCY) + 1e-9) {
+    blockers.push("account_reconciliation_discrepancy");
+  }
+  if (Number(openOrderCount) > 0) blockers.push("open_orders_present");
+  if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
+  if (Number(unresolvedPositionCount) > 1) blockers.push("unresolved_position_limit_exceeded");
+  if (reserved > 0 && Number(unresolvedPositionCount) > 0) blockers.push("existing_unresolved_position_blocks_submission");
+  if (accountEquity + 1e-9 < equityFloor) blockers.push("equity_floor_breached");
+  if (campaignDrawdown > maximumDrawdown + 1e-9) blockers.push("campaign_drawdown_exhausted");
+  if (principal > number(control?.max_order_notional, 1) + 1e-9) blockers.push("order_notional_limit_exceeded");
+  if (projectedEquity + 1e-9 < equityFloor) blockers.push("projected_equity_floor_breach");
+  if (projectedDrawdown > maximumDrawdown + 1e-9) blockers.push("projected_campaign_drawdown_breach");
+  return {
+    schema_version: 1,
+    campaign_id: control?.campaign_id || null,
+    baseline_equity: roundMoney(number(control?.baseline_equity, DEFAULT_CAMPAIGN_BASELINE_EQUITY)),
+    net_external_cash_flow: roundMoney(number(control?.net_external_cash_flow, 0)),
+    cash_flow_adjusted_baseline: roundMoney(adjustedBaseline),
+    equity_floor: roundMoney(equityFloor),
+    max_campaign_drawdown: roundMoney(maximumDrawdown),
+    liquid_collateral: roundMoney(liquid),
+    summed_position_value: roundMoney(summed),
+    reported_position_value: roundMoney(reported),
+    conservative_position_value: roundMoney(conservativePositionValue),
+    account_equity: roundMoney(accountEquity),
+    campaign_drawdown: roundMoney(campaignDrawdown),
+    proposed_notional: roundMoney(reserved),
+    order_notional: roundMoney(principal),
+    projected_equity: roundMoney(projectedEquity),
+    projected_campaign_drawdown: roundMoney(projectedDrawdown),
+    account_reconciliation_discrepancy: roundMoney(discrepancy),
+    maximum_reconciliation_discrepancy: roundMoney(number(control?.max_reconciliation_discrepancy, DEFAULT_MAX_RECONCILIATION_DISCREPANCY)),
+    open_order_count: Number(openOrderCount),
+    unresolved_position_count: Number(unresolvedPositionCount),
+    unresolved_risk_reservation_count: Number(unresolvedReservationCount),
+    blockers,
+    passed: blockers.length === 0
+  };
+}
+
+export function evaluateCampaignRiskGate(risk, dryRun) {
+  const passed = risk?.passed === true;
+  if (!passed && !dryRun) {
+    throw new Error(`fail closed: funded campaign risk gate blocked (${(risk?.blockers || ["unknown"]).join(", ")})`);
+  }
+  return {
+    campaign_risk_ok: passed,
+    diagnostics_only: !passed && dryRun,
+    submission_allowed: passed && !dryRun,
+    blockers: risk?.blockers || []
   };
 }
 
@@ -428,8 +539,11 @@ export function fitEffectiveQueueModel(observations, minimumSamples = 100) {
   const excluded = observations.filter((row) => !row.eligible);
   const positives = eligibleGroups.filter((group) => group.rows.some((row) => row.eligible && row.filled)).length;
   const negatives = eligibleGroups.length - positives;
+  const trainingDataEndTs = eligibleGroups.at(-1)?.recorded_ts || null;
   if (eligibleGroups.length < minimumSamples || positives < 10 || negatives < 10) {
     return {
+      model_version: "queue-calibration-v1",
+      training_data_end_ts: trainingDataEndTs,
       status: "collecting",
       evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
       queue_position_source: "authenticated_lifecycle_plus_public_l2",
@@ -469,33 +583,32 @@ export function fitEffectiveQueueModel(observations, minimumSamples = 100) {
     "pre_send_volatility",
     "horizon_seconds"
   ];
-  const normalization = featureNormalization(train);
-  const rows = train.map((row) => normalizedFeatures(row, normalization));
-  let weights = Array(featureNames.length).fill(0);
-  const rate = 0.08;
-  const regularization = 0.002;
-  for (let iteration = 0; iteration < 2500; iteration += 1) {
-    const gradient = Array(weights.length).fill(0);
-    for (let i = 0; i < rows.length; i += 1) {
-      const prediction = sigmoid(dot(weights, rows[i]));
-      const error = prediction - (train[i].filled ? 1 : 0);
-      for (let j = 0; j < weights.length; j += 1) gradient[j] += error * rows[i][j];
-    }
-    for (let j = 0; j < weights.length; j += 1) {
-      const penalty = j === 0 ? 0 : regularization * weights[j];
-      weights[j] -= rate * (gradient[j] / rows.length + penalty);
-    }
-  }
+  const { normalization, weights } = fitLogisticRows(train, featureNames.length, 2500);
   const predictions = test.map((row) => sigmoid(dot(weights, normalizedFeatures(row, normalization))));
-  const brier = average(predictions.map((prediction, index) => (prediction - (test[index].filled ? 1 : 0)) ** 2));
+  const rolling = groupedTemporalValidation(eligibleGroups, featureNames.length);
+  const validationRows = rolling.rows.length ? rolling.rows : test;
+  const validationPredictions = rolling.predictions.length ? rolling.predictions : predictions;
+  const naivePredictions = rolling.naive_predictions.length
+    ? rolling.naive_predictions
+    : naiveHorizonPredictions(train, test);
+  const brier = brierScore(validationPredictions, validationRows);
+  const naiveBrier = brierScore(naivePredictions, validationRows);
+  const brierImprovement = naiveBrier > 0 ? (naiveBrier - brier) / naiveBrier : 0;
+  const calibration = calibrationBins(validationPredictions, validationRows);
+  const ece = expectedCalibrationError(calibration, validationRows.length);
   const horizonMetrics = Object.fromEntries(HORIZONS_SECONDS.map((horizon) => {
-    const indexes = test.map((row, index) => ({ row, index })).filter(({ row }) => Number(row.horizon_seconds) === horizon);
-    const horizonPredictions = indexes.map(({ index }) => predictions[index]);
+    const indexes = validationRows.map((row, index) => ({ row, index })).filter(({ row }) => Number(row.horizon_seconds) === horizon);
+    const horizonPredictions = indexes.map(({ index }) => validationPredictions[index]);
+    const horizonNaivePredictions = indexes.map(({ index }) => naivePredictions[index]);
     const horizonRows = indexes.map(({ row }) => row);
+    const horizonBrier = brierScore(horizonPredictions, horizonRows);
+    const horizonNaiveBrier = brierScore(horizonNaivePredictions, horizonRows);
     return [String(horizon), {
       sample_size: horizonRows.length,
       positive_fills: horizonRows.filter((row) => row.filled).length,
-      brier_score: average(horizonPredictions.map((prediction, index) => (prediction - (horizonRows[index].filled ? 1 : 0)) ** 2)),
+      brier_score: horizonBrier,
+      naive_base_rate_brier_score: horizonNaiveBrier,
+      brier_improvement_fraction: horizonNaiveBrier > 0 ? (horizonNaiveBrier - horizonBrier) / horizonNaiveBrier : 0,
       calibration_bins: calibrationBins(horizonPredictions, horizonRows)
     }];
   }));
@@ -505,8 +618,14 @@ export function fitEffectiveQueueModel(observations, minimumSamples = 100) {
     return row ? [Number(row.executable_markout_30s_per_share) - number(row.estimated_round_trip_cost_per_share, 0)] : [];
   });
   const meanNetMarkout = average(netMarkouts);
-  const promotionReady = qualityGates.passed && netMarkouts.length >= 10 && meanNetMarkout > 0;
+  const markoutLower95 = lowerConfidenceBound95(netMarkouts);
+  const promotionReady = qualityGates.passed &&
+    eligibleGroups.length >= minimumSamples && positives >= 10 && negatives >= 10 &&
+    brierImprovement >= 0.05 && ece <= 0.10 &&
+    netMarkouts.length >= 10 && markoutLower95 > 0;
   return {
+    model_version: "queue-calibration-v1",
+    training_data_end_ts: trainingDataEndTs,
     status: "trained_research_only",
     evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
     queue_position_source: "authenticated_lifecycle_plus_public_l2",
@@ -525,20 +644,30 @@ export function fitEffectiveQueueModel(observations, minimumSamples = 100) {
     excluded_label_rows: excluded.length,
     legacy_protocol_observations: groups.filter((group) => group.rows.every((row) => row.protocol_eligible === false)).length,
     temporal_split: "first_80pct_train_last_20pct_test",
+    validation_method: "grouped_expanding_window_temporal",
+    validation_folds: rolling.folds,
+    validation_probe_count: rolling.probe_count,
     feature_names: featureNames,
     weights,
     normalization,
     out_of_sample_brier_score: brier,
-    calibration_bins: calibrationBins(predictions, test),
+    naive_horizon_base_rate_brier_score: naiveBrier,
+    brier_improvement_fraction: brierImprovement,
+    brier_improvement_percent: brierImprovement * 100,
+    expected_calibration_error: ece,
+    maximum_expected_calibration_error: 0.10,
+    calibration_bins: calibration,
     horizon_metrics: horizonMetrics,
     quality_gates: qualityGates,
     net_markout_30s_sample_size: netMarkouts.length,
     mean_net_executable_markout_30s_per_share: meanNetMarkout,
+    net_executable_markout_30s_lower_confidence_bound_95: Number.isFinite(markoutLower95) ? markoutLower95 : null,
+    markout_confidence_method: "normal_mean_lower_bound_1.96_se_grouped_by_probe",
     promotion_ready: promotionReady,
     promotion_allowed: false,
     promotion_block_reason: promotionReady
       ? "research gates passed; explicit human strategy approval is still required"
-      : "requires complete data quality and positive 30-second executable markouts after costs",
+      : "requires complete data quality, at least 5% Brier improvement over horizon base rates, ECE <= 0.10, and a positive 95% lower bound for net 30-second executable markout",
     research_only: true
   };
 }
@@ -652,6 +781,74 @@ export async function acquireCampaignLease(config, runId) {
   };
 }
 
+export async function loadCampaignRiskControl(config) {
+  const container = storageContainer(config);
+  if (!container) throw new Error("fail closed: durable storage is required for funded campaign risk control");
+  await container.createIfNotExists();
+  const prefix = `reports/research/venue-probe/control/campaign-risk/${config.campaignId}`;
+  const baselineBlob = container.getBlockBlobClient(`${prefix}/baseline.json`);
+  const expectedBaseline = {
+    schema_version: 1,
+    campaign_id: config.campaignId,
+    baseline_equity: roundMoney(config.campaignBaselineEquity),
+    equity_floor: roundMoney(config.campaignEquityFloor),
+    max_campaign_drawdown: roundMoney(config.maxCampaignDrawdown),
+    max_order_notional: roundMoney(config.maxOrderNotional),
+    max_open_orders: 1,
+    max_unresolved_positions: 1,
+    max_reconciliation_discrepancy: roundMoney(config.maxReconciliationDiscrepancy)
+  };
+  try {
+    await baselineBlob.uploadData(Buffer.from(JSON.stringify({ ...expectedBaseline, created_ts: new Date().toISOString() }, null, 2)), {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+  } catch (error) {
+    if (![409, 412].includes(Number(error.statusCode))) throw error;
+  }
+  const baseline = await downloadJson(baselineBlob);
+  for (const [field, expected] of Object.entries(expectedBaseline)) {
+    if (baseline?.[field] !== expected) {
+      throw new Error(`fail closed: immutable campaign baseline mismatch for ${field}`);
+    }
+  }
+
+  for (const flow of config.campaignCashFlows) {
+    const blob = container.getBlockBlobClient(`${prefix}/cash-flows/${flow.id}.json`);
+    const expected = {
+      schema_version: 1,
+      campaign_id: config.campaignId,
+      id: flow.id,
+      amount: roundMoney(flow.amount),
+      transaction_hash: flow.transaction_hash
+    };
+    try {
+      await blob.uploadData(Buffer.from(JSON.stringify({ ...expected, recorded_ts: new Date().toISOString() }, null, 2)), {
+        conditions: { ifNoneMatch: "*" },
+        blobHTTPHeaders: { blobContentType: "application/json" }
+      });
+    } catch (error) {
+      if (![409, 412].includes(Number(error.statusCode))) throw error;
+      const existing = await downloadJson(blob);
+      for (const [field, value] of Object.entries(expected)) {
+        if (existing?.[field] !== value) throw new Error(`fail closed: immutable campaign cash-flow mismatch for ${flow.id}`);
+      }
+    }
+  }
+
+  const cashFlows = [];
+  for await (const item of container.listBlobsFlat({ prefix: `${prefix}/cash-flows/` })) {
+    if (!item.name.endsWith(".json")) continue;
+    cashFlows.push(await downloadJson(container.getBlockBlobClient(item.name)));
+  }
+  return {
+    ...baseline,
+    net_external_cash_flow: roundMoney(cashFlows.reduce((sum, flow) => sum + number(flow?.amount, 0), 0)),
+    cash_flow_count: cashFlows.length,
+    cash_flow_ids: cashFlows.map((flow) => flow.id).sort()
+  };
+}
+
 export async function reserveProbeRisk(config, reservation) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable storage is required before order submission");
@@ -668,6 +865,9 @@ export async function reserveProbeRisk(config, reservation) {
     principal_notional: number(reservation.principal_notional, 0),
     fee_rate_bps: number(reservation.fee_rate_bps, 0),
     fee_risk_upper_bound: number(reservation.fee_risk_upper_bound, 0),
+    market_id: reservation.market_id || null,
+    condition_id: reservation.condition_id || null,
+    token_id: reservation.token_id || null,
     order_submission_intended: true,
     order_submitted: null,
     matched_notional: null,
@@ -703,21 +903,126 @@ export async function finalizeProbeRisk(config, reservation, result) {
   return payload;
 }
 
+export async function settleProbeRiskReservations(config, settlement) {
+  const conditionIds = new Set((settlement?.condition_ids || []).map((value) => String(value).toLowerCase()));
+  const redemptionVerified = settlement?.settlement_verified === true && Boolean(settlement?.transaction_hash);
+  const terminalVerified = settlement?.terminal_settlement_verified === true &&
+    settlement?.evidence_source === "polymarket_data_api_redeemable";
+  if (!conditionIds.size || (!redemptionVerified && !terminalVerified)) {
+    throw new Error("fail closed: verified settlement evidence is required to release filled risk reservations");
+  }
+  const container = storageContainer(config);
+  if (!container) throw new Error("fail closed: durable storage is required to settle order risk");
+  const campaign = settlement?.terminal_portfolio ? await loadCampaignRiskControl(config) : null;
+  let settled = 0;
+  for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
+    if (!item.name.endsWith(".json")) continue;
+    const blob = container.getBlockBlobClient(item.name);
+    const response = await blob.download();
+    const reservation = JSON.parse(await streamToString(response.readableStreamBody));
+    if (number(reservation?.matched_notional, 0) <= 0 || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
+    // A previous redemption pass may already have moved the reservation to
+    // position_settled before terminal portfolio evidence was available.  Do
+    // not skip that reservation: the trusted redemption path must still be
+    // able to publish its exact immutable terminal evidence artifact.
+    if (isRiskReservationResolved(reservation) && !settlement?.terminal_portfolio) continue;
+    const payload = {
+      ...reservation,
+      state: "position_settled",
+      settlement_verified: true,
+      settlement_evidence_source: redemptionVerified ? "verified_onchain_redemption" : settlement.evidence_source,
+      settlement_transaction_hash: settlement.transaction_hash ? String(settlement.transaction_hash) : null,
+      settlement_run_id: settlement.run_id || null,
+      settled_ts: settlement.settled_ts || new Date().toISOString(),
+      updated_ts: new Date().toISOString()
+    };
+    await blob.uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
+      conditions: response.etag ? { ifMatch: response.etag } : undefined,
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    if (settlement?.terminal_portfolio) {
+      await publishTerminalRiskPortfolioEvidence(container, {
+        reservation: payload,
+        settlement,
+        campaign
+      });
+    }
+    settled += 1;
+  }
+  return settled;
+}
+
+export async function publishTerminalRiskPortfolioEvidence(container, { reservation, settlement, campaign }) {
+  const portfolio = settlement?.terminal_portfolio;
+  const liquid = number(portfolio?.liquid_collateral, NaN);
+  const positions = number(portfolio?.current_position_value, NaN);
+  const accountEquity = number(portfolio?.account_equity, NaN);
+  const discrepancy = Math.abs(accountEquity - liquid - positions);
+  if (!reservation?.probe_id || !reservation?.run_id || !reservation?.order_id) {
+    throw new Error("fail closed: terminal evidence requires bound reservation run/probe/order identity");
+  }
+  if (![liquid, positions, accountEquity].every(Number.isFinite) || discrepancy > 0.01) {
+    throw new Error("fail closed: terminal portfolio reconciliation discrepancy exceeds $0.01");
+  }
+  const noFill = settlement?.evidence_source === "authenticated_no_fill" && number(reservation.matched_notional, 0) === 0;
+  if (settlement?.settlement_verified !== true || settlement?.zero_open_orders_confirmed !== true || (!noFill && !settlement?.transaction_hash)) {
+    throw new Error("fail closed: terminal evidence requires verified settlement and global zero-open confirmation; fills also require a transaction hash");
+  }
+  const baseline = number(campaign?.baseline_equity, NaN);
+  const cashFlows = number(campaign?.net_external_cash_flow, NaN);
+  if (![baseline, cashFlows].every(Number.isFinite)) throw new Error("fail closed: terminal evidence requires immutable campaign baseline and cash-flow ledger");
+  const adjustedStart = baseline + cashFlows;
+  const observedAt = settlement.settled_ts || new Date().toISOString();
+  const evidence = {
+    schema: "polyedge.canary_terminal_risk_portfolio.v1",
+    producer: "polyedge_node_authenticated_risk_terminal",
+    source: settlement.evidence_source || "polymarket_data_api_plus_onchain_redemption",
+    run_id: reservation.run_id,
+    probe_id: reservation.probe_id,
+    order_id: reservation.order_id,
+    condition_id: reservation.condition_id,
+    reservation_state: reservation.state,
+    settlement_verified: true,
+    settlement_transaction_hash: settlement.transaction_hash || null,
+    portfolio_reconciled: true,
+    reconciliation_discrepancy: roundMoney(discrepancy),
+    zero_open_orders_confirmed: true,
+    unresolved_exposure: 0,
+    campaign_starting_equity: baseline,
+    net_external_cash_flows: cashFlows,
+    liquid_collateral: liquid,
+    summed_position_value: positions,
+    cash_flow_adjusted_ending_equity: accountEquity,
+    minimum_observed_equity: accountEquity,
+    maximum_observed_equity: Math.max(adjustedStart, accountEquity),
+    campaign_cash_flow_ids: campaign.cash_flow_ids || [],
+    observed_at: observedAt
+  };
+  const date = String(observedAt).slice(0, 10);
+  const blobName = `reports/research/venue-probe/terminal-risk-portfolio/${date}/${reservation.probe_id}.json`;
+  const content = JSON.stringify(evidence, null, 2);
+  const sha256 = `sha256:${createHash("sha256").update(content).digest("hex")}`;
+  await uploadImmutable(container, blobName, content, "application/json");
+  return { blob_name: blobName, sha256, evidence };
+}
+
 export async function uploadEvidence(config, runId, summary, ledger) {
   const date = new Date().toISOString().slice(0, 10);
   const prefix = `reports/research/venue-probe/runs/${date}/${runId}`;
+  const safeSummary = sanitize(summary);
+  const safeEventsJsonl = ledger.jsonl();
   if (config.outputDir) {
     const { mkdir, writeFile } = await import("node:fs/promises");
     await mkdir(config.outputDir, { recursive: true, mode: 0o700 });
-    await writeFile(`${config.outputDir}/${runId}-summary.json`, JSON.stringify(summary, null, 2), { mode: 0o600 });
-    await writeFile(`${config.outputDir}/${runId}-events.jsonl`, ledger.jsonl(), { mode: 0o600 });
+    await writeFile(`${config.outputDir}/${runId}-summary.json`, JSON.stringify(safeSummary, null, 2), { mode: 0o600 });
+    await writeFile(`${config.outputDir}/${runId}-events.jsonl`, safeEventsJsonl, { mode: 0o600 });
   }
   const container = storageContainer(config);
   if (!container) return { uploaded: false, prefix: null };
   await container.createIfNotExists();
-  await uploadImmutable(container, `${prefix}/events.jsonl`, ledger.jsonl(), "application/x-ndjson");
-  await uploadImmutable(container, `${prefix}/summary.json`, JSON.stringify(summary, null, 2), "application/json");
-  const payload = Buffer.from(JSON.stringify(summary, null, 2));
+  await uploadImmutable(container, `${prefix}/events.jsonl`, safeEventsJsonl, "application/x-ndjson");
+  await uploadImmutable(container, `${prefix}/summary.json`, JSON.stringify(safeSummary, null, 2), "application/json");
+  const payload = Buffer.from(JSON.stringify(safeSummary, null, 2));
   await container
     .getBlockBlobClient("reports/research/venue-probe/latest_attempt.json")
     .uploadData(payload, { blobHTTPHeaders: { blobContentType: "application/json" } });
@@ -741,8 +1046,9 @@ export async function loadProbeObservations(config) {
   for await (const blob of container.listBlobsFlat({ prefix: "reports/research/venue-probe/runs/" })) {
     if (!blob.name.endsWith("/summary.json")) continue;
     const response = await container.getBlobClient(blob.name).download();
-    const text = await streamToString(response.readableStreamBody);
-    const summary = JSON.parse(text);
+    const bytes = await streamToBuffer(response.readableStreamBody);
+    const summaryHash = digest(bytes);
+    const summary = JSON.parse(bytes.toString("utf8"));
     const protocolEligible = Number(summary.evidence_protocol_version || 0) >= EVIDENCE_PROTOCOL_VERSION;
     const probes = Array.isArray(summary.probes) ? summary.probes : [summary];
     for (const probe of probes) {
@@ -759,6 +1065,9 @@ export async function loadProbeObservations(config) {
           recorded_ts: probe.finished_ts || summary.finished_ts,
           run_id: summary.run_id,
           probe_id: probe.probe_id || null,
+          order_id: probe.lifecycle?.order_id || null,
+          source_summary_blob_name: blob.name,
+          source_summary_sha256: summaryHash,
           estimated_round_trip_cost_per_share: summary.estimated_round_trip_cost_per_share || 0
         });
       }
@@ -773,6 +1082,64 @@ export async function loadProbeObservations(config) {
     if (auditObservation) observations.push(auditObservation);
   }
   return observations;
+}
+
+/**
+ * Loads the exact protocol-v3 order set bound by the checkpoint-100 artifact.
+ * The model job never scans a mutable prefix when producing the stage-200
+ * model: every source summary is named and SHA-bound by the checkpoint.
+ */
+export async function loadCheckpointProbeObservations(config, checkpointBlobName, checkpointSha256) {
+  const container = storageContainer(config);
+  if (!container) throw new Error("fail closed: durable Azure storage is required for queue-model training");
+  const checkpoint = await downloadExactJson(container, checkpointBlobName, checkpointSha256, "checkpoint-100");
+  const bindings = checkpoint.value?.protocol_v3_order_artifacts;
+  if (checkpoint.value?.schema_version !== "funded_checkpoint_evidence_v1" ||
+      Number(checkpoint.value?.evidence_protocol_version) !== EVIDENCE_PROTOCOL_VERSION ||
+      Number(checkpoint.value?.stage_target_orders) !== 100 ||
+      Number(checkpoint.value?.exact_funded_order_count) !== 100 ||
+      Number(checkpoint.value?.exact_eligible_order_count) !== 100 ||
+      !Array.isArray(bindings) || bindings.length !== 100) {
+    throw new Error("fail closed: queue-model training requires the exact canonical checkpoint-100 evidence set");
+  }
+  const observations = [];
+  const identities = new Set();
+  for (const binding of bindings) {
+    const summary = await downloadExactJson(container, binding?.blob_name, binding?.sha256, "protocol-v3 training summary");
+    const value = summary.value;
+    const probes = Array.isArray(value?.probes) ? value.probes : [];
+    const probe = probes[0];
+    const identity = `${value?.run_id || ""}\u0000${probe?.probe_id || ""}\u0000${probe?.lifecycle?.order_id || ""}`;
+    if (value?.schema_version !== 3 || Number(value?.evidence_protocol_version) !== EVIDENCE_PROTOCOL_VERSION ||
+        value?.order_submission_attempted !== true || Number(value?.submitted_order_count) !== 1 || probes.length !== 1 ||
+        !value?.run_id || !probe?.probe_id || !probe?.lifecycle?.order_id || identities.has(identity) ||
+        JSON.stringify(value?.candidate) !== JSON.stringify(checkpoint.value?.candidate)) {
+      throw new Error("fail closed: checkpoint-100 contains invalid, duplicated, or candidate-mismatched protocol-v3 evidence");
+    }
+    identities.add(identity);
+    for (const row of probe.model_observations || []) {
+      const normalized = normalizeStoredObservation(row, probe);
+      observations.push({
+        ...normalized,
+        eligible: normalized.eligible === true,
+        quality_eligible: normalized.quality_eligible === true,
+        protocol_eligible: true,
+        evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
+        recorded_ts: probe.finished_ts || value.finished_ts,
+        run_id: value.run_id,
+        probe_id: probe.probe_id,
+        order_id: probe.lifecycle.order_id,
+        source_summary_blob_name: summary.blobName,
+        source_summary_sha256: summary.hash,
+        estimated_round_trip_cost_per_share: value.estimated_round_trip_cost_per_share || 0
+      });
+    }
+  }
+  return {
+    checkpoint: { blob_name: checkpoint.blobName, sha256: checkpoint.hash },
+    candidate: checkpoint.value.candidate,
+    observations
+  };
 }
 
 export function reservationAuditObservation(reservation) {
@@ -847,7 +1214,7 @@ export function summarizeDailyRiskRecords(date, reservations, summaries) {
     const reserved = Math.max(0, number(reservation.reserved_notional, 0));
     consumed += finalized ? matched : reserved;
     if (reservation.order_submission_intended === true) submittedOrders += 1;
-    if (finalized && matched > 0) filledOrders += 1;
+    if (matched > 0) filledOrders += 1;
     if (!finalized) unresolvedReservations += 1;
   }
   for (const summary of summaries || []) {
@@ -871,25 +1238,144 @@ export function summarizeDailyRiskRecords(date, reservations, summaries) {
 }
 
 export function isRiskReservationResolved(reservation) {
-  const finalizedFill = String(reservation?.state) === "finalized" &&
+  const finalizedNoFill = ["finalized", "finalized_no_fill"].includes(String(reservation?.state)) &&
+    number(reservation?.matched_notional, 0) <= 0 &&
     reservation?.reconciliation_complete === true &&
     reservation?.zero_open_orders_confirmed === true;
+  const settledFill = String(reservation?.state) === "position_settled" &&
+    number(reservation?.matched_notional, 0) > 0 &&
+    reservation?.settlement_verified === true &&
+    ["verified_onchain_redemption", "polymarket_data_api_redeemable"].includes(reservation?.settlement_evidence_source);
   const releasedNoOrder = String(reservation?.state) === "released_no_order" &&
     reservation?.order_submitted === false &&
     reservation?.reconciliation_complete === true &&
     reservation?.zero_open_orders_confirmed === true;
-  return finalizedFill || releasedNoOrder;
+  return finalizedNoFill || settledFill || releasedNoOrder;
 }
 
-export async function uploadModel(config, model) {
+export function buildQueueCalibrationArtifact(model, observations, {
+  generatedAt = new Date(),
+  checkpoint,
+  candidate
+} = {}) {
+  if (model?.model_version !== "queue-calibration-v1" || model?.status !== "trained_research_only" || Number(model?.sample_size) !== 100) {
+    throw new Error("fail closed: checkpoint transition requires a trained queue-calibration-v1 model from exactly 100 orders");
+  }
+  if (!checkpoint?.blob_name || !validDigest(checkpoint?.sha256)) {
+    throw new Error("fail closed: exact checkpoint-100 artifact binding is required");
+  }
+  const orders = modelTrainingOrders(observations);
+  if (orders.length !== 100) throw new Error("fail closed: model training provenance must contain exactly 100 unique orders");
+  const datasetBytes = Buffer.from(JSON.stringify(orders));
+  const datasetHash = digest(datasetBytes);
+  const generated = generatedAt instanceof Date ? generatedAt : new Date(generatedAt);
+  if (!Number.isFinite(generated.getTime())) throw new Error("fail closed: model generated_at is invalid");
+  const payload = {
+    schema: "polyedge.execution_queue_model.v1",
+    generated_at: generated.toISOString(),
+    candidate,
+    training_checkpoint: checkpoint,
+    training_cutoff: orders.at(-1).observed_at,
+    training_dataset: {
+      schema: "polyedge.queue_calibration_training_dataset.v1",
+      exact_order_count: orders.length,
+      sha256: datasetHash,
+      orders
+    },
+    training_horizon_base_rates: Object.fromEntries(HORIZONS_SECONDS.map((horizon) => {
+      const rows = (observations || []).filter((row) => row.eligible === true && Number(row.horizon_seconds) === horizon);
+      return [String(horizon), rows.length ? average(rows.map((row) => row.filled ? 1 : 0)) : 0];
+    })),
+    ...model
+  };
+  const bytes = Buffer.from(JSON.stringify(payload, null, 2));
+  const hash = digest(bytes);
+  return {
+    value: payload,
+    bytes,
+    hash,
+    blobName: `reports/research/venue-probe/models/queue-calibration-v1/${hash.slice("sha256:".length)}.json`
+  };
+}
+
+export async function uploadModel(config, model, provenance) {
   const container = storageContainer(config);
   if (!container) return false;
-  const payload = JSON.stringify({ generated_at: new Date().toISOString(), ...model }, null, 2);
+  const artifact = buildQueueCalibrationArtifact(model, provenance?.observations, provenance);
+  await uploadImmutableExact(container, artifact.blobName, artifact.bytes, "application/json");
+  const pointer = {
+    schema: "polyedge.execution_queue_model_pointer.v1",
+    model_version: model.model_version,
+    blob_uri: queueModelArtifactUri(config, artifact),
+    sha256: artifact.hash,
+    generated_at: artifact.value.generated_at,
+    training_cutoff: artifact.value.training_cutoff,
+    training_dataset_sha256: artifact.value.training_dataset.sha256,
+    training_checkpoint: artifact.value.training_checkpoint,
+    promotion_allowed: false
+  };
   await container
     .getBlockBlobClient("reports/research/venue-probe/effective_queue_model.json")
-    .uploadData(Buffer.from(payload), { blobHTTPHeaders: { blobContentType: "application/json" } });
-  return true;
+    .uploadData(Buffer.from(JSON.stringify(pointer, null, 2)), { blobHTTPHeaders: { blobContentType: "application/json" } });
+  return { blobName: artifact.blobName, hash: artifact.hash, pointer };
 }
+
+export function queueModelArtifactUri(config, artifact) {
+  if (!config?.storageAccount || !config?.storageContainer || !artifact?.blobName) {
+    throw new Error("fail closed: model Azure URI requires account, output container, and immutable blob");
+  }
+  return `azure://${config.storageAccount}/${config.storageContainer}/${artifact.blobName}`;
+}
+
+function modelTrainingOrders(observations) {
+  const orders = new Map();
+  for (const row of observations || []) {
+    if (row.eligible !== true) continue;
+    const record = {
+      run_id: String(row.run_id || ""),
+      probe_id: String(row.probe_id || ""),
+      order_id: String(row.order_id || ""),
+      observed_at: String(row.recorded_ts || ""),
+      summary_blob_name: String(row.source_summary_blob_name || ""),
+      summary_sha256: normalizeDigest(row.source_summary_sha256)
+    };
+    if (!record.run_id || !record.probe_id || !record.order_id || !record.observed_at || !record.summary_blob_name || !record.summary_sha256) {
+      throw new Error("fail closed: model observation lacks exact order/source provenance");
+    }
+    const key = `${record.run_id}\u0000${record.probe_id}\u0000${record.order_id}`;
+    const prior = orders.get(key);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(record)) throw new Error("fail closed: model order provenance is inconsistent across horizon rows");
+    orders.set(key, record);
+  }
+  return [...orders.values()].sort((left, right) => left.observed_at.localeCompare(right.observed_at) || left.run_id.localeCompare(right.run_id) || left.probe_id.localeCompare(right.probe_id));
+}
+
+async function downloadExactJson(container, blobName, expectedSha256, label) {
+  if (!blobName || !validDigest(expectedSha256)) throw new Error(`fail closed: exact ${label} binding is required`);
+  const response = await container.getBlobClient(blobName).download();
+  const bytes = await streamToBuffer(response.readableStreamBody);
+  const actual = digest(bytes);
+  if (actual !== normalizeDigest(expectedSha256)) throw new Error(`fail closed: ${label} SHA-256 mismatch`);
+  return { value: JSON.parse(bytes.toString("utf8")), blobName, hash: actual };
+}
+
+async function uploadImmutableExact(container, name, bytes, contentType) {
+  try {
+    await container.getBlockBlobClient(name).uploadData(bytes, {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: contentType }
+    });
+  } catch (error) {
+    if (![409, 412].includes(Number(error.statusCode))) throw error;
+    const existing = await container.getBlobClient(name).download();
+    const existingBytes = await streamToBuffer(existing.readableStreamBody);
+    if (!existingBytes.equals(bytes)) throw new Error("fail closed: immutable queue-model content-address collision");
+  }
+}
+
+function digest(bytes) { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
+function normalizeDigest(value) { const text = String(value || "").trim().toLowerCase(); const prefixed = text.startsWith("sha256:") ? text : `sha256:${text}`; return /^sha256:[0-9a-f]{64}$/.test(prefixed) ? prefixed : ""; }
+function validDigest(value) { return Boolean(normalizeDigest(value)); }
 
 async function uploadImmutable(container, name, content, contentType) {
   await container.getBlockBlobClient(name).uploadData(Buffer.from(content), {
@@ -898,10 +1384,101 @@ async function uploadImmutable(container, name, content, contentType) {
   });
 }
 
+async function downloadJson(blob) {
+  const response = await blob.download();
+  return JSON.parse(await streamToString(response.readableStreamBody));
+}
+
 async function streamToString(stream) {
   const chunks = [];
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks).toString("utf8");
+}
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function fitLogisticRows(train, featureCount, iterations = 1000) {
+  const normalization = featureNormalization(train);
+  const rows = train.map((row) => normalizedFeatures(row, normalization));
+  let weights = Array(featureCount).fill(0);
+  const rate = 0.08;
+  const regularization = 0.002;
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const gradient = Array(weights.length).fill(0);
+    for (let i = 0; i < rows.length; i += 1) {
+      const prediction = sigmoid(dot(weights, rows[i]));
+      const error = prediction - (train[i].filled ? 1 : 0);
+      for (let j = 0; j < weights.length; j += 1) gradient[j] += error * rows[i][j];
+    }
+    for (let j = 0; j < weights.length; j += 1) {
+      const penalty = j === 0 ? 0 : regularization * weights[j];
+      weights[j] -= rate * (gradient[j] / rows.length + penalty);
+    }
+  }
+  return { normalization, weights };
+}
+
+function groupedTemporalValidation(groups, featureCount) {
+  const firstTest = Math.min(groups.length - 1, Math.max(20, Math.floor(groups.length * 0.6)));
+  const foldSize = Math.max(1, Math.floor(groups.length * 0.1));
+  const rows = [];
+  const predictions = [];
+  const naivePredictions = [];
+  const folds = [];
+  const testedProbeIds = new Set();
+  for (let start = firstTest; start < groups.length; start += foldSize) {
+    const trainGroups = groups.slice(0, start);
+    const testGroups = groups.slice(start, Math.min(groups.length, start + foldSize));
+    const train = trainGroups.flatMap((group) => group.rows.filter((row) => row.eligible));
+    const test = testGroups.flatMap((group) => group.rows.filter((row) => row.eligible));
+    if (!train.length || !test.length) continue;
+    const fitted = fitLogisticRows(train, featureCount, 1000);
+    predictions.push(...test.map((row) => sigmoid(dot(fitted.weights, normalizedFeatures(row, fitted.normalization)))));
+    naivePredictions.push(...naiveHorizonPredictions(train, test));
+    rows.push(...test);
+    testGroups.forEach((group) => testedProbeIds.add(group.key));
+    folds.push({
+      train_probe_count: trainGroups.length,
+      test_probe_count: testGroups.length,
+      train_label_count: train.length,
+      test_label_count: test.length,
+      train_through_ts: trainGroups.at(-1)?.recorded_ts || null,
+      test_from_ts: testGroups[0]?.recorded_ts || null,
+      test_through_ts: testGroups.at(-1)?.recorded_ts || null
+    });
+  }
+  return { rows, predictions, naive_predictions: naivePredictions, folds, probe_count: testedProbeIds.size };
+}
+
+function naiveHorizonPredictions(train, test) {
+  const overall = average(train.map((row) => row.filled ? 1 : 0));
+  const rates = new Map(HORIZONS_SECONDS.map((horizon) => {
+    const rows = train.filter((row) => Number(row.horizon_seconds) === horizon);
+    return [horizon, rows.length ? average(rows.map((row) => row.filled ? 1 : 0)) : overall];
+  }));
+  return test.map((row) => rates.get(Number(row.horizon_seconds)) ?? overall);
+}
+
+function brierScore(predictions, rows) {
+  return average(predictions.map((prediction, index) => (prediction - (rows[index].filled ? 1 : 0)) ** 2));
+}
+
+function expectedCalibrationError(bins, sampleSize) {
+  if (!sampleSize) return 1;
+  return bins.reduce((total, bin) => total +
+    (Number(bin.count) / sampleSize) * Math.abs(Number(bin.mean_prediction) - Number(bin.observed_fill_rate)), 0);
+}
+
+function lowerConfidenceBound95(values) {
+  if (!values.length) return Number.NEGATIVE_INFINITY;
+  const mean = average(values);
+  if (values.length < 2) return Number.NEGATIVE_INFINITY;
+  const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (values.length - 1);
+  return mean - 1.96 * Math.sqrt(variance / values.length);
 }
 
 function featureNormalization(rows) {
@@ -981,6 +1558,33 @@ function parseBoolean(value) {
 
 function parseNumberList(value) {
   return [...new Set(String(value).split(",").map((item) => Number.parseInt(item.trim(), 10)).filter(Number.isFinite))];
+}
+
+function parseCampaignCashFlows(value) {
+  let rows;
+  try {
+    rows = JSON.parse(String(value));
+  } catch {
+    throw new Error("venue_probe blocked: VENUE_PROBE_CAMPAIGN_CASH_FLOWS must be valid JSON");
+  }
+  if (!Array.isArray(rows)) throw new Error("venue_probe blocked: VENUE_PROBE_CAMPAIGN_CASH_FLOWS must be a JSON array");
+  const ids = new Set();
+  return rows.map((row) => {
+    const id = String(row?.id || "").trim();
+    const amount = Number(row?.amount);
+    const transactionHash = String(row?.transaction_hash || "").trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(id) || ids.has(id)) {
+      throw new Error("venue_probe blocked: campaign cash-flow ids must be unique safe identifiers");
+    }
+    if (!Number.isFinite(amount) || amount === 0) {
+      throw new Error(`venue_probe blocked: campaign cash-flow ${id} must have a non-zero finite amount`);
+    }
+    if (!/^0x[a-fA-F0-9]{64}$/.test(transactionHash)) {
+      throw new Error(`venue_probe blocked: campaign cash-flow ${id} requires a transaction_hash`);
+    }
+    ids.add(id);
+    return { id, amount: roundMoney(amount), transaction_hash: transactionHash };
+  });
 }
 
 function integer(value, fallback) {

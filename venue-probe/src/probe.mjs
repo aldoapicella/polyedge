@@ -16,9 +16,11 @@ import {
   acquireCampaignLease,
   assertEligibleOrigin,
   campaignRestSchedule,
+  evaluateCampaignRiskGate,
   evaluateDailyRiskGate,
   finalizeProbeRisk,
   isTransientUnsafeMarket,
+  loadCampaignRiskControl,
   loadDailyCampaignRisk,
   loadUnresolvedRiskReservations,
   loadProbeConfig,
@@ -27,6 +29,7 @@ import {
   reserveProbeRisk,
   sanitize,
   selectMakerOrder,
+  summarizeCampaignRisk,
   summarizePortfolio,
   uploadEvidence,
   validateFillMarkouts
@@ -41,6 +44,7 @@ let startupGeoblock = null;
 let startingRisk = null;
 let portfolioSnapshot = null;
 let campaignLease = null;
+let campaignRiskControl = null;
 let activeClient = null;
 let terminationRequested = false;
 let shutdownStarted = false;
@@ -56,10 +60,16 @@ try {
   const latest = completedProbes.at(-1) || null;
   let durableRisk = null;
   try {
-    durableRisk = await loadDailyCampaignRisk(config);
-    durableRisk.global_unresolved_risk_reservations = (await loadUnresolvedRiskReservations(config)).length;
+    const dailyTurnover = await loadDailyCampaignRisk(config);
+    durableRisk = activeClient && campaignRiskControl
+      ? {
+          campaign: (await captureCampaignRiskSnapshot(activeClient, "failure_reconciliation")).risk,
+          daily_turnover: dailyTurnover,
+          primary_risk_source: "cash_flow_adjusted_campaign_equity"
+        }
+      : { campaign: null, daily_turnover: dailyTurnover };
   } catch (riskError) {
-    ledger.record("venue_daily_risk_reload_failed", { message: riskError.message });
+    ledger.record("venue_campaign_risk_reload_failed", { message: riskError.message });
   }
   summary = {
     schema_version: 3,
@@ -129,6 +139,10 @@ async function runProbe() {
     maximum_open_orders: config.maxOpenOrders,
     maximum_order_notional: config.maxOrderNotional,
     maximum_daily_loss: config.maxDailyLoss,
+    funded_campaign_id: config.campaignId,
+    campaign_baseline_equity: config.campaignBaselineEquity,
+    campaign_equity_floor: config.campaignEquityFloor,
+    maximum_campaign_drawdown: config.maxCampaignDrawdown,
     taker_orders_enabled: config.enableTakerOrders,
     campaign_enabled: config.campaignEnabled,
     rest_horizons_seconds: config.restHorizonsSeconds,
@@ -174,25 +188,26 @@ async function runProbe() {
     collateral_allowance_count: Object.keys(balance.allowances || {}).length
   });
   if (openOrders.length !== 0) throw new Error(`fail closed: account has ${openOrders.length} open orders`);
-  await capturePortfolioSnapshot(Number(balance.balance) / 1_000_000, "startup");
-  const riskAtStart = await loadDailyCampaignRisk(config);
-  startingRisk = riskAtStart;
-  ledger.record("venue_daily_risk_loaded", riskAtStart);
-  const globallyUnresolvedReservations = await loadUnresolvedRiskReservations(config);
-  riskAtStart.global_unresolved_risk_reservations = globallyUnresolvedReservations.length;
-  ledger.record("venue_global_unresolved_risk_loaded", {
-    count: globallyUnresolvedReservations.length,
-    probe_ids: globallyUnresolvedReservations.map((reservation) => reservation.probe_id).filter(Boolean)
-  });
-  if (!config.dryRun && globallyUnresolvedReservations.length > 0) {
-    throw new Error(`fail closed: ${globallyUnresolvedReservations.length} unresolved durable risk reservation(s) across all UTC dates require reconciliation`);
-  }
-  const riskGate = evaluateDailyRiskGate(
-    riskAtStart.conservative_loss_budget_consumed,
+  campaignRiskControl = await loadCampaignRiskControl(config);
+  ledger.record("venue_campaign_risk_control_loaded", campaignRiskControl);
+  const campaignAtStart = await captureCampaignRiskSnapshot(client, "startup");
+  const dailyAtStart = await loadDailyCampaignRisk(config);
+  const dailyRiskGate = evaluateDailyRiskGate(
+    dailyAtStart.conservative_loss_budget_consumed,
     config.maxDailyLoss,
-    config.dryRun
+    true
   );
-  ledger.record("venue_daily_risk_gate", riskGate);
+  // The UTC ledger remains visible as turnover diagnostics only. It never grants
+  // fresh funded risk at midnight.
+  const riskAtStart = {
+    campaign: campaignAtStart.risk,
+    campaign_gate: campaignAtStart.gate,
+    daily_turnover: dailyAtStart,
+    daily_turnover_gate: dailyRiskGate,
+    primary_risk_source: "cash_flow_adjusted_campaign_equity"
+  };
+  startingRisk = riskAtStart;
+  ledger.record("venue_campaign_risk_loaded", riskAtStart);
   if (config.dryRun) {
     const selection = await discoverMarket(client, config, config.maxOrderNotional);
     ledger.record("venue_market_selected", selection.market);
@@ -219,14 +234,13 @@ async function runProbe() {
       }],
       riskAtStart,
       riskAtEnd: riskAtStart,
-      stopReason: riskGate.diagnostics_only ? "dry_run_loss_budget_exhausted" : "dry_run",
+      stopReason: campaignAtStart.gate.diagnostics_only ? "dry_run_campaign_risk_blocked" : "dry_run",
       orderSubmitted: false
     });
   }
 
   const schedule = campaignRestSchedule(config.maximumOrders, config.restHorizonsSeconds, runId);
   const probes = [];
-  let consumed = riskAtStart.conservative_loss_budget_consumed;
   let stopReason = "maximum_orders_reached";
   let index = 0;
   let attempts = 0;
@@ -237,9 +251,17 @@ async function runProbe() {
     }
     campaignLease.assertHealthy();
     attempts += 1;
-    const remainingRisk = config.maxDailyLoss - consumed;
+    const currentCampaign = await captureCampaignRiskSnapshot(client, `before_probe_${index + 1}`);
+    if (currentCampaign.risk.unresolved_position_count > 0) {
+      stopReason = "existing_unresolved_position_blocks_submission";
+      break;
+    }
+    const remainingRisk = Math.min(
+      currentCampaign.risk.max_campaign_drawdown - currentCampaign.risk.campaign_drawdown,
+      currentCampaign.risk.account_equity - currentCampaign.risk.equity_floor
+    );
     if (remainingRisk <= 1e-9) {
-      stopReason = "daily_loss_budget_exhausted";
+      stopReason = "campaign_drawdown_or_equity_floor_exhausted";
       break;
     }
     const latestBalance = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType });
@@ -288,7 +310,6 @@ async function runProbe() {
     }
     probes.push(probe);
     completedProbes.push(probe);
-    consumed += Number(probe.lifecycle?.conservative_matched_risk_notional || 0);
     index += 1;
     if (probe.lifecycle?.reconciliation_complete !== true) {
       stopReason = "unresolved_probe_reconciliation";
@@ -302,10 +323,13 @@ async function runProbe() {
     ledger.record("venue_batch_zero_open_orders_failed", { open_order_count: finalOpenOrders.length });
     await ensureNoOpenOrders(client, "campaign_end_recovery");
   }
-  const riskAtEnd = await loadDailyCampaignRisk(config);
-  riskAtEnd.global_unresolved_risk_reservations = (await loadUnresolvedRiskReservations(config)).length;
-  const finalBalance = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType });
-  await capturePortfolioSnapshot(Number(finalBalance.balance) / 1_000_000, "campaign_end");
+  const campaignAtEnd = await captureCampaignRiskSnapshot(client, "campaign_end");
+  const riskAtEnd = {
+    campaign: campaignAtEnd.risk,
+    campaign_gate: campaignAtEnd.gate,
+    daily_turnover: await loadDailyCampaignRisk(config),
+    primary_risk_source: "cash_flow_adjusted_campaign_equity"
+  };
   ledger.record("venue_batch_zero_open_orders_confirmed", { probe_count: probes.length, risk_at_end: riskAtEnd });
   return baseSummary({
     status: probes.length === config.maximumOrders ? "campaign_completed" : "campaign_stopped_safely",
@@ -374,6 +398,7 @@ async function executeSingleProbe({ client, index, restSeconds, market, book, or
     if (availableCollateral + 1e-9 < reservedNotional) {
       throw new Error(`insufficient collateral for principal plus fee-risk bound: need ${reservedNotional}`);
     }
+    await captureCampaignRiskSnapshot(client, `pre_reservation_${probeId}`, reservedNotional, order.notional);
     riskReservation = await reserveProbeRisk(config, {
       date: new Date().toISOString().slice(0, 10),
       run_id: runId,
@@ -384,6 +409,7 @@ async function executeSingleProbe({ client, index, restSeconds, market, book, or
       fee_risk_upper_bound: feeRiskUpperBound
     });
     ledger.record("venue_probe_risk_reserved", { probe_id: probeId, reserved_notional: reservedNotional, principal_notional: order.notional, fee_risk_upper_bound: feeRiskUpperBound });
+    await captureCampaignRiskSnapshot(client, `pre_send_${probeId}`, reservedNotional, order.notional, probeId);
     campaignLease.assertHealthy();
     if (terminationRequested) throw new Error("fail closed: termination requested after risk reservation and before order submission");
     const sendWallMs = Date.now();
@@ -539,6 +565,7 @@ async function executeSingleProbe({ client, index, restSeconds, market, book, or
       zero_open_orders_confirmed: zeroOpenOrders
     });
     ledger.record("venue_probe_risk_finalized", { probe_id: probeId, matched_notional: matchedSize * order.price * feeRiskMultiplier, fee_rate_bps: feeRateBps, reconciliation_complete: reconciliationComplete });
+    await captureCampaignRiskSnapshot(client, `post_reconciliation_${probeId}`);
     const observations = modelObservations({ order, market, lifecycle, context, markouts });
     const result = {
       schema_version: 3,
@@ -591,6 +618,10 @@ function baseSummary({ status, geoblock, probes, riskAtStart, riskAtEnd, stopRea
     maximum_open_orders: 1,
     maximum_order_notional: config.maxOrderNotional,
     maximum_daily_loss: config.maxDailyLoss,
+    funded_campaign_id: config.campaignId,
+    campaign_baseline_equity: config.campaignBaselineEquity,
+    campaign_equity_floor: config.campaignEquityFloor,
+    maximum_campaign_drawdown: config.maxCampaignDrawdown,
     rest_horizons_seconds: config.restHorizonsSeconds,
     order_submitted: orderSubmitted,
     submitted_order_count: probes.filter((probe) => probe.order_submitted).length,
@@ -627,22 +658,51 @@ function baseSummary({ status, geoblock, probes, riskAtStart, riskAtEnd, stopRea
   };
 }
 
-async function capturePortfolioSnapshot(liquidCollateral, stage) {
-  try {
-    const url = new URL("https://data-api.polymarket.com/positions");
-    url.searchParams.set("user", config.funderAddress);
-    url.searchParams.set("sizeThreshold", "0");
-    url.searchParams.set("limit", "500");
-    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!response.ok) throw new Error(`Data API returned HTTP ${response.status}`);
-    portfolioSnapshot = summarizePortfolio(await response.json(), liquidCollateral, config.startingCapital);
-    portfolioSnapshot.stage = stage;
-    portfolioSnapshot.captured_ts = new Date().toISOString();
-    ledger.record("venue_portfolio_snapshot", portfolioSnapshot);
-  } catch (error) {
-    ledger.record("venue_portfolio_snapshot_failed", { stage, message: error.message });
-    if (!portfolioSnapshot) portfolioSnapshot = { status: "unavailable", stage, captured_ts: new Date().toISOString() };
+async function captureCampaignRiskSnapshot(client, stage, proposedNotional = 0, orderNotional = proposedNotional, ignoredReservationId = null) {
+  if (!campaignRiskControl) throw new Error("fail closed: immutable funded campaign control is unavailable");
+  const positionsUrl = new URL("https://data-api.polymarket.com/positions");
+  positionsUrl.searchParams.set("user", config.funderAddress);
+  positionsUrl.searchParams.set("sizeThreshold", "0");
+  positionsUrl.searchParams.set("limit", "500");
+  const valueUrl = new URL("https://data-api.polymarket.com/value");
+  valueUrl.searchParams.set("user", config.funderAddress);
+  const [balance, positionsResponse, valueResponse, openOrders, reservations] = await Promise.all([
+    client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
+    fetch(positionsUrl, { signal: AbortSignal.timeout(10_000) }),
+    fetch(valueUrl, { signal: AbortSignal.timeout(10_000) }),
+    getOpenOrdersStrict(client, `campaign_risk_${stage}`),
+    loadUnresolvedRiskReservations(config)
+  ]);
+  if (!positionsResponse.ok) throw new Error(`fail closed: positions reconciliation returned HTTP ${positionsResponse.status}`);
+  if (!valueResponse.ok) throw new Error(`fail closed: position-value reconciliation returned HTTP ${valueResponse.status}`);
+  const positions = await positionsResponse.json();
+  const reportedRows = await valueResponse.json();
+  if (!Array.isArray(positions) || !Array.isArray(reportedRows)) {
+    throw new Error("fail closed: account reconciliation returned an invalid payload");
   }
+  const liquidCollateral = Number(balance.balance) / 1_000_000;
+  const summedPositionValue = positions.reduce((sum, row) => sum + Math.max(0, Number(row.currentValue) || 0), 0);
+  const reportedPositionValue = reportedRows.reduce((sum, row) => sum + Math.max(0, Number(row.value) || 0), 0);
+  const unresolvedPositions = positions.filter((row) => Number(row.size) > 1e-9 && row.redeemable !== true);
+  const relevantReservations = reservations.filter((reservation) => String(reservation.probe_id) !== String(ignoredReservationId || ""));
+  portfolioSnapshot = summarizePortfolio(positions, liquidCollateral, config.startingCapital);
+  portfolioSnapshot.stage = stage;
+  portfolioSnapshot.captured_ts = new Date().toISOString();
+  const risk = summarizeCampaignRisk({
+    control: campaignRiskControl,
+    liquidCollateral,
+    summedPositionValue,
+    reportedPositionValue,
+    openOrderCount: openOrders.length,
+    unresolvedPositionCount: unresolvedPositions.length,
+    unresolvedReservationCount: relevantReservations.length,
+    proposedNotional,
+    orderNotional
+  });
+  const gate = evaluateCampaignRiskGate(risk, config.dryRun);
+  ledger.record("venue_portfolio_snapshot", portfolioSnapshot);
+  ledger.record("venue_campaign_risk_snapshot", { stage, risk, gate, ignored_reservation_id: ignoredReservationId });
+  return { risk, gate };
 }
 
 async function discoverMarket(client, config, maxNotional) {

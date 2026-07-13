@@ -1,27 +1,37 @@
 import {
   fitEffectiveQueueModel,
-  loadProbeConfig,
-  loadProbeObservations,
+  loadCheckpointProbeObservations,
   sanitize,
   uploadModel
 } from "./lib.mjs";
 
-const config = loadProbeConfig({
-  ...process.env,
-  EXECUTION_MODE: process.env.EXECUTION_MODE || "venue_probe",
-  ALLOW_LIVE: "false",
-  ALLOW_VENUE_PROBE: "true",
-  ENABLE_TAKER_ORDERS: "false",
-  MAX_OPEN_ORDERS: "1",
-  VENUE_PROBE_MAXIMUM_ORDERS: "1",
-  POLYMARKET_PRIVATE_KEY: process.env.POLYMARKET_PRIVATE_KEY || "unused-for-training",
-  POLYMARKET_API_KEY: process.env.POLYMARKET_API_KEY || "unused-for-training",
-  POLYMARKET_API_SECRET: process.env.POLYMARKET_API_SECRET || "unused-for-training",
-  POLYMARKET_API_PASSPHRASE: process.env.POLYMARKET_API_PASSPHRASE || "unused-for-training",
-  POLYMARKET_FUNDER_ADDRESS: process.env.POLYMARKET_FUNDER_ADDRESS || "unused-for-training"
-});
+if (process.env.QUEUE_MODEL_TRAINING_ENABLED !== "true") {
+  throw new Error("fail closed: QUEUE_MODEL_TRAINING_ENABLED must be true");
+}
+if (process.env.ALLOW_LIVE !== "false" || process.env.ENABLE_TAKER_ORDERS !== "false") {
+  throw new Error("fail closed: training job must remain non-executable");
+}
+const config = {
+  storageAccount: process.env.AZURE_STORAGE_ACCOUNT_NAME,
+  storageContainer: process.env.QUEUE_MODEL_OUTPUT_CONTAINER_NAME || "polyedge-models",
+  storageAccountKey: process.env.AZURE_STORAGE_ACCOUNT_KEY,
+  azureClientId: process.env.AZURE_CLIENT_ID
+};
+if (!config.storageAccount) throw new Error("fail closed: Azure storage account is required");
+const sourceConfig = {
+  ...config,
+  storageContainer: process.env.QUEUE_MODEL_SOURCE_CONTAINER_NAME || "polyedge-funded-evidence"
+};
 
-const observations = await loadProbeObservations(config);
-const model = fitEffectiveQueueModel(observations);
-await uploadModel(config, model);
-console.log(JSON.stringify(sanitize(model)));
+const evidence = await loadCheckpointProbeObservations(
+  sourceConfig,
+  process.env.QUEUE_MODEL_CHECKPOINT_BLOB_NAME,
+  process.env.QUEUE_MODEL_CHECKPOINT_SHA256
+);
+const model = fitEffectiveQueueModel(evidence.observations, 100);
+const uploaded = await uploadModel(config, model, {
+  observations: evidence.observations,
+  checkpoint: evidence.checkpoint,
+  candidate: evidence.candidate
+});
+console.log(JSON.stringify(sanitize({ model, immutable_model: uploaded })));

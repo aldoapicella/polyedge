@@ -1,18 +1,24 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use polyedge_api::{app, benchmark_snapshot};
 use polyedge_config::RuntimeSettings;
 use polyedge_reporting::research::{
-    load_default_exclusions, run_audit, run_azure_freshness, run_backfill, run_baseline,
-    run_build_markets, run_build_replay_index, run_calibration, run_chart_backfill,
-    run_execution_quality, run_final_report, run_ml_calibrate, run_normalize, run_queue_audit,
-    run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective, AuditOptions,
-    AzureFreshnessOptions, BackfillOptions, BaselineOptions, BuildMarketsOptions,
-    CalibrationOptions, ChartBackfillOptions, ExcludedTimeWindow, ExecutionQualityOptions,
-    FillModel, FinalReportOptions, MlCalibrateOptions, NormalizeOptions,
-    ProspectiveValidationOptions, QueueAuditOptions, RegimesOptions, ReplayIndexOptions,
-    ReplayOptions, SampleSizeOptions, SweepOptions, DEFAULT_EXCLUSION_FILE,
+    advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
+    initialize_funded_manifest_after_canary, load_default_exclusions, publish_daily_directory,
+    run_audit, run_azure_freshness, run_backfill, run_baseline,
+    run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
+    run_calibration, run_chart_backfill, run_evaluate_profitability, run_execution_quality,
+    run_final_report, run_ml_calibrate, run_normalize, run_queue_audit, run_regimes, run_replay,
+    run_sample_size, run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
+    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
+    BackfillOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions,
+    ChartBackfillOptions, CumulativeWalletSnapshotOptions, ExcludedTimeWindow,
+    ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel, FinalReportOptions,
+    InitializeFundedManifestOptions, MlCalibrateOptions, NormalizeOptions,
+    ProfitabilityEvaluationOptions, ProspectiveValidationOptions, QueueAuditOptions,
+    RegimesOptions, ReplayIndexOptions, ReplayOptions, SampleSizeOptions,
+    StopFundedManifestFromStageBlockOptions, SweepOptions, DEFAULT_EXCLUSION_FILE,
     DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
@@ -307,6 +313,147 @@ enum ResearchCommand {
             default_value = "reports/research/prospective/prospective_validation.md"
         )]
         markdown: PathBuf,
+        /// Require a verified COMPLETE atomic daily bundle for this UTC date.
+        /// If absent/incomplete, report waiting and preserve the prior output.
+        #[arg(long)]
+        expected_daily_date: Option<String>,
+    },
+    /// Atomically package and publish a generated UTC daily research directory.
+    PublishDailyBundle {
+        #[arg(long)]
+        date: String,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        input_sha256: String,
+        #[arg(long)]
+        source_dir: PathBuf,
+        #[arg(long, default_value = "reports/research/daily")]
+        output_root: PathBuf,
+        #[arg(long)]
+        data_audit: PathBuf,
+    },
+    /// Bind the cumulative campaign wallet replay to its normalized input and
+    /// emit an artifact for inclusion in the immutable daily bundle.
+    BuildCumulativeWallet {
+        #[arg(long)]
+        regimes: PathBuf,
+        #[arg(long)]
+        normalized_manifest: PathBuf,
+        #[arg(long)]
+        snapshot_date: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Advance the durable funded ladder from exact hash-bound prior state,
+    /// observation and optional one-shot human stage grant.
+    AdvanceFundedLadder {
+        #[arg(long)]
+        prior_state: PathBuf,
+        #[arg(long)]
+        prior_state_sha256: String,
+        #[arg(long)]
+        observation: PathBuf,
+        #[arg(long)]
+        observation_sha256: String,
+        #[arg(long, requires = "grant_sha256")]
+        grant: Option<PathBuf>,
+        #[arg(long, requires = "grant")]
+        grant_sha256: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Initialize checkpoint 1 from exact hash-bound, reconciled protocol-v3
+    /// canary evidence and its already-consumed one-shot human grant.
+    InitializeFundedManifest {
+        #[arg(long)]
+        shadow_manifest: PathBuf,
+        #[arg(long)]
+        shadow_manifest_sha256: String,
+        #[arg(long)]
+        canary_evidence: PathBuf,
+        #[arg(long)]
+        canary_evidence_blob_name: String,
+        #[arg(long)]
+        canary_evidence_sha256: String,
+        #[arg(long)]
+        human_grant_consumption: PathBuf,
+        #[arg(long)]
+        human_grant_consumption_sha256: String,
+        #[arg(long)]
+        terminal_evidence: PathBuf,
+        #[arg(long)]
+        terminal_evidence_blob_name: String,
+        #[arg(long)]
+        terminal_evidence_sha256: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Advance targets 5/25/100/200 in the canonical API-visible manifest.
+    AdvanceFundedManifest {
+        #[arg(long)]
+        prior_manifest: PathBuf,
+        #[arg(long)]
+        prior_manifest_sha256: String,
+        #[arg(long)]
+        observation: PathBuf,
+        #[arg(long)]
+        observation_sha256: String,
+        #[arg(long, requires = "grant_sha256")]
+        grant: Option<PathBuf>,
+        #[arg(long, requires = "grant")]
+        grant_sha256: Option<String>,
+        #[arg(long, requires_all = ["next_execution_model_blob_uri", "next_execution_model_sha256"])]
+        next_execution_model: Option<PathBuf>,
+        #[arg(long, requires_all = ["next_execution_model", "next_execution_model_sha256"])]
+        next_execution_model_blob_uri: Option<String>,
+        #[arg(long, requires_all = ["next_execution_model", "next_execution_model_blob_uri"])]
+        next_execution_model_sha256: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Consume an immutable funded stage block and move the exact canonical
+    /// campaign into absorbing stopped_no_go. This command never authorizes an order.
+    StopFundedManifestFromStageBlock {
+        #[arg(long)]
+        prior_manifest: PathBuf,
+        #[arg(long)]
+        prior_manifest_sha256: String,
+        #[arg(long)]
+        stage_block: PathBuf,
+        #[arg(long)]
+        stage_block_sha256: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Move an exact expired active funded campaign into absorbing stopped_no_go.
+    ExpireFundedManifest {
+        #[arg(long)]
+        prior_manifest: PathBuf,
+        #[arg(long)]
+        prior_manifest_sha256: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Evaluate shadow profitability and publish a fail-closed research
+    /// manifest. This command never authorizes or arms funded execution.
+    EvaluateProfitability {
+        #[arg(long, default_value = "reports/research/shadow/daily")]
+        daily_root: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/prospective/prospective_validation.json"
+        )]
+        prospective: PathBuf,
+        #[arg(long, default_value = "research/configs/profitability_gate.yaml")]
+        gate_config: PathBuf,
+        #[arg(
+            long,
+            default_value = "reports/research/venue-probe/effective_queue_model.json"
+        )]
+        execution_model: PathBuf,
+        #[arg(long, default_value = "reports/research/profitability/latest.json")]
+        out: PathBuf,
     },
     BuildReplayIndex {
         #[arg(long, default_value = "data/research/normalized")]
@@ -591,13 +738,156 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             reports_dir,
             out,
             markdown,
+            expected_daily_date,
         } => run_validate_prospective(ProspectiveValidationOptions {
             since: parse_datetime_arg(&since)?,
             reports_dir,
             candidates,
             out,
             markdown,
+            expected_daily_date: expected_daily_date
+                .as_deref()
+                .map(parse_date_arg)
+                .transpose()?,
         })?,
+        ResearchCommand::PublishDailyBundle {
+            date,
+            run_id,
+            input_sha256,
+            source_dir,
+            output_root,
+            data_audit,
+        } => serde_json::to_value(publish_daily_directory(
+            parse_date_arg(&date)?,
+            run_id,
+            input_sha256,
+            &source_dir,
+            &output_root,
+            &data_audit,
+        )?)?,
+        ResearchCommand::BuildCumulativeWallet {
+            regimes,
+            normalized_manifest,
+            snapshot_date,
+            out,
+        } => run_build_cumulative_wallet_snapshot(CumulativeWalletSnapshotOptions {
+            regimes,
+            normalized_manifest,
+            snapshot_date: parse_date_arg(&snapshot_date)?,
+            out,
+        })?,
+        ResearchCommand::AdvanceFundedLadder {
+            prior_state,
+            prior_state_sha256,
+            observation,
+            observation_sha256,
+            grant,
+            grant_sha256,
+            out,
+        } => serde_json::to_value(advance_funded_ladder(AdvanceFundedLadderOptions {
+            prior_state,
+            prior_state_sha256,
+            observation,
+            observation_sha256,
+            grant,
+            grant_sha256,
+            out,
+            now: Utc::now(),
+        })?)?,
+        ResearchCommand::InitializeFundedManifest {
+            shadow_manifest,
+            shadow_manifest_sha256,
+            canary_evidence,
+            canary_evidence_blob_name,
+            canary_evidence_sha256,
+            human_grant_consumption,
+            human_grant_consumption_sha256,
+            terminal_evidence,
+            terminal_evidence_blob_name,
+            terminal_evidence_sha256,
+            out,
+        } => serde_json::to_value(initialize_funded_manifest_after_canary(
+            InitializeFundedManifestOptions {
+                shadow_manifest,
+                shadow_manifest_sha256,
+                canary_evidence,
+                canary_evidence_blob_name,
+                canary_evidence_sha256,
+                human_grant_consumption,
+                human_grant_consumption_sha256,
+                terminal_evidence,
+                terminal_evidence_blob_name,
+                terminal_evidence_sha256,
+                out,
+                now: Utc::now(),
+            },
+        )?)?,
+        ResearchCommand::AdvanceFundedManifest {
+            prior_manifest,
+            prior_manifest_sha256,
+            observation,
+            observation_sha256,
+            grant,
+            grant_sha256,
+            next_execution_model,
+            next_execution_model_blob_uri,
+            next_execution_model_sha256,
+            out,
+        } => serde_json::to_value(advance_funded_manifest(AdvanceFundedManifestOptions {
+            prior_manifest,
+            prior_manifest_sha256,
+            observation,
+            observation_sha256,
+            grant,
+            grant_sha256,
+            next_execution_model,
+            next_execution_model_blob_uri,
+            next_execution_model_sha256,
+            out,
+            now: Utc::now(),
+        })?)?,
+        ResearchCommand::StopFundedManifestFromStageBlock {
+            prior_manifest,
+            prior_manifest_sha256,
+            stage_block,
+            stage_block_sha256,
+            out,
+        } => serde_json::to_value(stop_funded_manifest_from_stage_block(
+            StopFundedManifestFromStageBlockOptions {
+                prior_manifest,
+                prior_manifest_sha256,
+                stage_block,
+                stage_block_sha256,
+                out,
+                now: Utc::now(),
+            },
+        )?)?,
+        ResearchCommand::ExpireFundedManifest {
+            prior_manifest,
+            prior_manifest_sha256,
+            out,
+        } => serde_json::to_value(expire_funded_manifest(ExpireFundedManifestOptions {
+            prior_manifest,
+            prior_manifest_sha256,
+            out,
+            now: Utc::now(),
+        })?)?,
+        ResearchCommand::EvaluateProfitability {
+            daily_root,
+            prospective,
+            gate_config,
+            execution_model,
+            out,
+        } => serde_json::to_value(run_evaluate_profitability(
+            ProfitabilityEvaluationOptions {
+                daily_root,
+                prospective,
+                gate_config,
+                execution_model,
+                out,
+                generated_at: None,
+            },
+        )?)?,
         ResearchCommand::BuildReplayIndex {
             input,
             out,
@@ -658,6 +948,11 @@ fn parse_datetime_arg(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .with_context(|| format!("invalid RFC3339 timestamp: {value}"))?
         .with_timezone(&Utc))
+}
+
+fn parse_date_arg(value: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .with_context(|| format!("invalid UTC date (expected YYYY-MM-DD): {value}"))
 }
 
 fn confirm_source(settings: &RuntimeSettings) -> Result<serde_json::Value> {

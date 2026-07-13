@@ -16,6 +16,7 @@ import {
   acquireCampaignLease,
   assertEligibleOrigin,
   sanitize,
+  settleProbeRiskReservations,
   storageContainer,
   summarizePortfolio
 } from "./lib.mjs";
@@ -249,6 +250,16 @@ async function run() {
     control.realized_payout = verified.realized_payout;
     control.updated_ts = new Date().toISOString();
     await writeRedemptionControl(control);
+    await settleProbeRiskReservations(config, {
+      condition_ids: selection.selected.map((row) => row.condition_id),
+      settlement_verified: true,
+      transaction_hash: transaction.transactionHash,
+      run_id: runId,
+      settled_ts: control.updated_ts,
+      terminal_portfolio: verified.portfolio,
+      zero_open_orders_confirmed: verified.zero_open_orders_confirmed,
+      evidence_source: "polymarket_data_api_plus_onchain_redemption"
+    });
     ledger.record("venue_redemption_verified", verified);
     return {
       ...baseSummary("redeemed_and_verified", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, verified.portfolio),

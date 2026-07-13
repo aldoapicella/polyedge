@@ -3,14 +3,22 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use polyedge_config::RuntimeSettings;
-use polyedge_engine::{
-    crypto_taker_fee_per_share, QuoteStyle, RegimeClassifier, RegimeFeatures, RegimePolicy,
+use polyedge_domain::{
+    ConditionId, DecisionAction, MarketId, OrderKind, Outcome, Side, TokenId, TradeDecision,
 };
-use polyedge_storage::{AzureBlobClient, AzureBlobError, AzureBlobItem};
+use polyedge_engine::{
+    crypto_taker_fee_per_share, evaluate_frozen_strategy, FrozenStrategyMode, QuoteStyle,
+    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
+    RegimeFeatures, RegimePolicy, RegimeReferencePoint,
+};
+use polyedge_storage::{
+    AzureBlobClient, AzureBlobError, AzureBlobItem, ImmutableBlobWrite, VersionedBlobBytes,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -23,13 +31,35 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod labs;
+mod run_bundle;
 pub use labs::{
-    load_default_exclusions, load_exclusion_registry, load_frozen_candidate_registry,
-    run_azure_freshness, run_backfill, run_build_replay_index, run_chart_backfill,
-    run_validate_prospective, AzureFreshnessOptions, BackfillOptions, ChartBackfillOptions,
-    ExclusionRegistry, ExclusionWindowRecord, FrozenCandidateRecord, FrozenCandidateRegistry,
-    ProspectiveValidationOptions, ReplayIndexOptions, DEFAULT_EXCLUSION_FILE,
+    legacy_daily_fallback_allowed, load_default_exclusions, load_exclusion_registry,
+    load_frozen_candidate_registry, run_azure_freshness, run_backfill,
+    run_build_cumulative_wallet_snapshot, run_build_replay_index, run_chart_backfill,
+    run_evaluate_profitability, run_validate_prospective, AzureFreshnessOptions, BackfillOptions,
+    ChartBackfillOptions, CumulativeWalletSnapshotOptions, ExclusionRegistry,
+    ExclusionWindowRecord, FrozenCandidateRecord, FrozenCandidateRegistry,
+    ProfitabilityEvaluationOptions, ProspectiveValidationOptions, ReplayIndexOptions,
+    ATOMIC_DAILY_PROTOCOL_CUTOFF, CUMULATIVE_WALLET_SCOPE, DEFAULT_EXCLUSION_FILE,
     DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES,
+    WALLET_CAMPAIGN_START,
+};
+pub use run_bundle::{
+    advance_funded_ladder, advance_funded_manifest, classify_warning, expire_funded_manifest,
+    initialize_funded_manifest_after_canary, inspect_daily_dependency, parse_azure_artifact_uri,
+    publish_daily_directory, stop_funded_manifest_from_stage_block,
+    validate_protocol_v3_order_evidence, write_funded_ladder_state, write_promotion_manifest,
+    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AtomicDailyRun, CandidateIdentity,
+    DailyDependency, DailyRunManifest, DataQualitySummary, ExecutionModelBinding,
+    ExpireFundedManifestOptions, FundedCheckpointEvidenceV1, FundedExpirationTransitionResult,
+    FundedHoldoutEvaluationV1, FundedLadderMetrics, FundedLadderStateV1,
+    FundedLadderTransitionResult, FundedManifestTransitionResult, FundedStageBlockTransitionResult,
+    FundedStageBlockV1, FundedStageGrantV1, GateOutcome, GateStatus, ImmutableArtifactBindingV1,
+    InitializeFundedManifestOptions, LatestRunPointer, ProfitabilityMetrics, PromotionEvaluation,
+    PromotionManifestV1, PromotionPhase, PromotionThresholds, PublishedDailyBundle,
+    QueueModelTransitionV1, RunArtifact, RunStatus, StopFundedManifestFromStageBlockOptions,
+    ValidatedProtocolV3OrderEvidence, WarningClassification, WarningSeverity,
+    DEFAULT_PROFITABILITY_LATEST, FUNDED_LADDER_TARGETS, WARNING_REGISTRY_VERSION,
 };
 
 const SETTLEMENT_WINDOW_SECONDS: i64 = 15;
@@ -41,6 +71,10 @@ const MAX_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 1_048_576;
 const NORMALIZE_PROGRESS_INTERVAL_EVENTS: usize = 100_000;
 const ADAPTIVE_LOG_LIMIT: usize = 100;
 const REFERENCE_HISTORY_SECONDS: i64 = 130;
+const WALLET_CAMPAIGN_BASELINE: Decimal = Decimal::from_parts(5_030_521, 0, 0, false, 6);
+const WALLET_EQUITY_FLOOR: Decimal = Decimal::from_parts(403, 0, 0, false, 2);
+const WALLET_MAX_DRAWDOWN: Decimal = Decimal::ONE;
+const WALLET_MAX_ORDER_NOTIONAL: Decimal = Decimal::ONE;
 const MARKOUT_HORIZONS_SECONDS: [i64; 3] = [1, 5, 30];
 const QUEUE_EVIDENCE_KEYS: &[&str] = &[
     "queue_position",
@@ -740,6 +774,13 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
             json!({
                 "profile": row["profile"],
                 "net_pnl": net.to_string(),
+                "wallet_constrained": row["wallet_constrained"],
+                "wallet_constrained_net_pnl": row["wallet_constrained_net_pnl"],
+                "wallet_constrained_ending_equity": row["wallet_constrained_ending_equity"],
+                "wallet_constrained_max_drawdown": row["wallet_constrained_max_drawdown"],
+                "wallet_constrained_accepted_orders": row["wallet_constrained_accepted_orders"],
+                "wallet_constrained_skipped_orders": row["wallet_constrained_skipped_orders"],
+                "wallet_constrained_equity_curve": row["wallet_constrained_equity_curve"],
                 "delta_vs_static": (net - static_net).to_string(),
                 "regime_frequency": row["regime_frequency"],
                 "regime_time_share": row["regime_time_share"],
@@ -3275,6 +3316,15 @@ impl StrategyProfileMode {
             Self::StaticSweep(_) => "static_sweep",
         }
     }
+
+    fn frozen_mode(&self) -> Option<FrozenStrategyMode> {
+        match self {
+            Self::DynamicSafetyOnly => Some(FrozenStrategyMode::DynamicSafetyOnly),
+            Self::DynamicQuoteStyle => Some(FrozenStrategyMode::DynamicQuoteStyle),
+            Self::FullDeterministic => Some(FrozenStrategyMode::FullDeterministicProfile),
+            Self::Static | Self::StaticSweep(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3335,6 +3385,7 @@ impl OrderBookState {
         (size > Decimal::ZERO).then_some(size)
     }
 
+    #[cfg(test)]
     fn spread_ticks(&self, tick_size: Decimal) -> Option<f64> {
         let (bid, _) = self.best_bid()?;
         let (ask, _) = self.best_ask()?;
@@ -3348,26 +3399,6 @@ impl OrderBookState {
         self.best_bid()
             .zip(self.best_ask())
             .is_some_and(|((bid, _), (ask, _))| bid < ask)
-    }
-
-    fn top_size(&self) -> Option<f64> {
-        let bid = self
-            .best_bid()
-            .map(|(_, size)| size)
-            .unwrap_or(Decimal::ZERO);
-        let ask = self
-            .best_ask()
-            .map(|(_, size)| size)
-            .unwrap_or(Decimal::ZERO);
-        bid.min(ask).to_f64()
-    }
-
-    fn age_ms(&self, now: DateTime<Utc>) -> Option<f64> {
-        self.local_ts.map(|local_ts| {
-            now.signed_duration_since(local_ts)
-                .num_microseconds()
-                .map_or(0.0, |micros| (micros.max(0) as f64) / 1000.0)
-        })
     }
 }
 
@@ -3417,6 +3448,63 @@ struct ReplayOrder {
     queue_size_ahead: Option<Decimal>,
 }
 
+fn replay_trade_decision(order: &ReplayOrder, payload: &Value) -> TradeDecision {
+    TradeDecision {
+        action: DecisionAction::Place,
+        market_id: MarketId::new(order.market_id.clone()),
+        condition_id: payload
+            .get("condition_id")
+            .and_then(Value::as_str)
+            .map(|value| ConditionId::new(value.to_owned())),
+        token_id: Some(TokenId::new(order.token_id.clone())),
+        outcome: match order.outcome.as_str() {
+            "up" => Some(Outcome::Up),
+            "down" => Some(Outcome::Down),
+            _ => None,
+        },
+        side: match order.side.as_str() {
+            "sell" => Some(Side::Sell),
+            _ => Some(Side::Buy),
+        },
+        price: Some(order.price),
+        size: Some(order.size),
+        quote_amount: None,
+        order_kind: match order.order_kind.as_str() {
+            "post_only_gtd" => Some(OrderKind::PostOnlyGtd),
+            "fak" => Some(OrderKind::Fak),
+            "fok" => Some(OrderKind::Fok),
+            _ => Some(OrderKind::PostOnlyGtc),
+        },
+        reason: text(payload, "reason"),
+        ttl_ms: order.ttl_ms,
+        expected_edge: decimal(payload.get("expected_edge")),
+        post_only: order.order_kind.starts_with("post_only"),
+        tick_size: Some(order.tick_size),
+        neg_risk: payload
+            .get("neg_risk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn replay_book_snapshot(book: &OrderBookState) -> RegimeBookSnapshot {
+    let (bid, bid_size) = book
+        .best_bid()
+        .map(|(price, size)| (Some(price), Some(size)))
+        .unwrap_or((None, None));
+    let (ask, ask_size) = book
+        .best_ask()
+        .map(|(price, size)| (Some(price), Some(size)))
+        .unwrap_or((None, None));
+    RegimeBookSnapshot {
+        bid,
+        ask,
+        bid_size,
+        ask_size,
+        local_ts: book.local_ts,
+    }
+}
+
 impl ReplayOrder {
     fn is_filled(&self) -> bool {
         self.filled_size > Decimal::ZERO
@@ -3425,6 +3513,263 @@ impl ReplayOrder {
     fn is_maker(&self) -> bool {
         self.order_kind.starts_with("post_only")
     }
+}
+
+#[derive(Clone, Debug)]
+struct WalletPendingOrder {
+    market_id: String,
+    settle_ts: Option<DateTime<Utc>>,
+    outcome: String,
+    filled_size: Decimal,
+    avg_price: Decimal,
+    fee_per_share: Decimal,
+    adverse_penalty_per_share: Decimal,
+    release_ts: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug)]
+struct WalletConstrainedResult {
+    net_pnl: Decimal,
+    ending_equity: Decimal,
+    max_drawdown: Decimal,
+    accepted_orders: usize,
+    skipped_orders: usize,
+    accepted_filled_orders: usize,
+    unresolved_orders: usize,
+    skip_reasons: BTreeMap<String, usize>,
+    equity_curve: Vec<Value>,
+}
+
+impl WalletConstrainedResult {
+    fn as_json(&self) -> Value {
+        json!({
+            "wallet_constrained": true,
+            "wallet_constrained_net_pnl": self.net_pnl.to_string(),
+            "wallet_constrained_ending_equity": self.ending_equity.to_string(),
+            "wallet_constrained_max_drawdown": self.max_drawdown.to_string(),
+            "wallet_constrained_accepted_orders": self.accepted_orders,
+            "wallet_constrained_skipped_orders": self.skipped_orders,
+            "wallet_constrained_accepted_filled_orders": self.accepted_filled_orders,
+            "wallet_constrained_unresolved_orders": self.unresolved_orders,
+            "wallet_constrained_skip_reasons": self.skip_reasons,
+            "wallet_constrained_equity_curve": self.equity_curve,
+            "wallet_constraints": {
+                "campaign_baseline": WALLET_CAMPAIGN_BASELINE.to_string(),
+                "equity_floor": WALLET_EQUITY_FLOOR.to_string(),
+                "maximum_drawdown": WALLET_MAX_DRAWDOWN.to_string(),
+                "maximum_order_notional": WALLET_MAX_ORDER_NOTIONAL.to_string(),
+                "maximum_unresolved_orders_or_positions": 1,
+                "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
+            }
+        })
+    }
+}
+
+fn wallet_constrained_replay(
+    orders: &[ReplayOrder],
+    markets: &BTreeMap<String, MarketTruth>,
+    fill_model: FillModel,
+) -> WalletConstrainedResult {
+    let mut ordered = orders.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_by(|(left_index, left), (right_index, right)| {
+        left.decision_ts
+            .cmp(&right.decision_ts)
+            .then(left_index.cmp(right_index))
+    });
+
+    let mut equity = WALLET_CAMPAIGN_BASELINE;
+    let mut peak_equity = equity;
+    let mut max_drawdown = Decimal::ZERO;
+    let mut accepted_orders = 0_usize;
+    let mut accepted_filled_orders = 0_usize;
+    let mut skipped_orders = 0_usize;
+    let mut skip_reasons = BTreeMap::<String, usize>::new();
+    let mut pending: Option<WalletPendingOrder> = None;
+    let mut equity_curve = vec![json!({
+        "ts": ordered.first().map(|(_, order)| ts(order.decision_ts)),
+        "event": "campaign_start",
+        "market_id": Value::Null,
+        "equity": equity.to_string(),
+        "net_pnl": "0",
+        "drawdown": "0"
+    })];
+
+    for (_, order) in ordered {
+        settle_wallet_pending(
+            &mut pending,
+            order.decision_ts,
+            markets,
+            &mut equity,
+            &mut peak_equity,
+            &mut max_drawdown,
+            &mut equity_curve,
+        );
+        if pending.is_some() {
+            increment_count(
+                &mut skip_reasons,
+                "overlapping_unresolved_order_or_position",
+            );
+            skipped_orders += 1;
+            continue;
+        }
+        if order.side != "buy" || order.price <= Decimal::ZERO || order.size <= Decimal::ZERO {
+            increment_count(&mut skip_reasons, "invalid_or_unsupported_order");
+            skipped_orders += 1;
+            continue;
+        }
+
+        // Size from facts available at decision time only. In particular, neither
+        // the eventual fill quantity nor the winning outcome may affect admission.
+        let fee_bound_per_share = if order.is_maker() {
+            Decimal::ZERO
+        } else {
+            crypto_taker_fee_per_share(order.price).unwrap_or(Decimal::ZERO)
+        };
+        let penalty_bound_per_share = if fill_model == FillModel::AdverseSelectionPenalized {
+            Decimal::new(5, 3)
+        } else {
+            Decimal::ZERO
+        };
+        let worst_loss_per_share = order.price + fee_bound_per_share + penalty_bound_per_share;
+        let drawdown_floor = (peak_equity - WALLET_MAX_DRAWDOWN).max(WALLET_EQUITY_FLOOR);
+        let loss_budget = equity - drawdown_floor;
+        if loss_budget <= Decimal::ZERO || worst_loss_per_share <= Decimal::ZERO {
+            increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
+            skipped_orders += 1;
+            continue;
+        }
+        let accepted_size = order
+            .size
+            .min(WALLET_MAX_ORDER_NOTIONAL / order.price)
+            .min(equity / order.price)
+            .min(loss_budget / worst_loss_per_share);
+        if accepted_size <= Decimal::ZERO {
+            increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
+            skipped_orders += 1;
+            continue;
+        }
+
+        accepted_orders += 1;
+        let constrained_fill = order.filled_size.min(accepted_size);
+        if constrained_fill > Decimal::ZERO {
+            accepted_filled_orders += 1;
+        }
+        let fee_per_share = if order.filled_size > Decimal::ZERO {
+            order.fee / order.filled_size
+        } else {
+            Decimal::ZERO
+        };
+        let adverse_penalty_per_share = if order.filled_size > Decimal::ZERO {
+            order.adverse_penalty / order.filled_size
+        } else {
+            Decimal::ZERO
+        };
+        let market_end = markets
+            .get(&order.market_id)
+            .and_then(|market| market.end_ts);
+        let release_ts = if constrained_fill > Decimal::ZERO {
+            market_end
+        } else {
+            [
+                order.cancel_ts,
+                order
+                    .ttl_ms
+                    .map(|ttl| order.decision_ts + Duration::milliseconds(ttl)),
+                market_end,
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        };
+        pending = Some(WalletPendingOrder {
+            market_id: order.market_id.clone(),
+            settle_ts: market_end,
+            outcome: order.outcome.clone(),
+            filled_size: constrained_fill,
+            avg_price: order.avg_price.unwrap_or(order.price),
+            fee_per_share,
+            adverse_penalty_per_share,
+            release_ts,
+        });
+    }
+
+    if let Some(release_ts) = pending.as_ref().and_then(|order| order.release_ts) {
+        settle_wallet_pending(
+            &mut pending,
+            release_ts,
+            markets,
+            &mut equity,
+            &mut peak_equity,
+            &mut max_drawdown,
+            &mut equity_curve,
+        );
+    }
+
+    WalletConstrainedResult {
+        net_pnl: equity - WALLET_CAMPAIGN_BASELINE,
+        ending_equity: equity,
+        max_drawdown,
+        accepted_orders,
+        skipped_orders,
+        accepted_filled_orders,
+        unresolved_orders: usize::from(pending.is_some()),
+        skip_reasons,
+        equity_curve,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_wallet_pending(
+    pending: &mut Option<WalletPendingOrder>,
+    now: DateTime<Utc>,
+    markets: &BTreeMap<String, MarketTruth>,
+    equity: &mut Decimal,
+    peak_equity: &mut Decimal,
+    max_drawdown: &mut Decimal,
+    equity_curve: &mut Vec<Value>,
+) {
+    let Some(order) = pending.as_ref() else {
+        return;
+    };
+    let Some(release_ts) = order.release_ts else {
+        return;
+    };
+    if release_ts > now {
+        return;
+    }
+    let order = pending.take().expect("pending order checked above");
+    let pnl = if order.filled_size > Decimal::ZERO && order.settle_ts.is_some() {
+        let winning_outcome = markets
+            .get(&order.market_id)
+            .and_then(|market| market.winning_outcome.as_deref());
+        let payout = if winning_outcome == Some(order.outcome.as_str()) {
+            order.filled_size
+        } else {
+            Decimal::ZERO
+        };
+        payout
+            - order.avg_price * order.filled_size
+            - order.fee_per_share * order.filled_size
+            - order.adverse_penalty_per_share * order.filled_size
+    } else {
+        Decimal::ZERO
+    };
+    *equity += pnl;
+    *peak_equity = (*peak_equity).max(*equity);
+    let drawdown = *peak_equity - *equity;
+    *max_drawdown = (*max_drawdown).max(drawdown);
+    equity_curve.push(json!({
+        "ts": ts(release_ts),
+        "event": if order.filled_size > Decimal::ZERO { "market_settlement" } else { "unfilled_order_release" },
+        "market_id": order.market_id,
+        "equity": equity.to_string(),
+        "net_pnl": (*equity - WALLET_CAMPAIGN_BASELINE).to_string(),
+        "drawdown": drawdown.to_string()
+    }));
+}
+
+fn increment_count(counts: &mut BTreeMap<String, usize>, key: &str) {
+    *counts.entry(key.to_owned()).or_insert(0) += 1;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4174,152 +4519,92 @@ impl ResearchReplayEngine {
             return true;
         }
         let features = self.features_for_order(order, recorded_ts);
+        let Some(mode) = self.request.mode.frozen_mode() else {
+            return true;
+        };
+        let decision = replay_trade_decision(order, payload);
+        let context = QuoteTransformContext {
+            best_bid: self
+                .books
+                .get(&order.token_id)
+                .and_then(OrderBookState::best_bid)
+                .map(|(price, _)| price),
+            q: order.q_at_decision,
+        };
         let classifier = self.classifiers.entry(order.market_id.clone()).or_default();
-        let regime = classifier.classify(&features, recorded_ts);
+        let evaluated = evaluate_frozen_strategy(
+            mode,
+            classifier,
+            &self.policy,
+            &features,
+            recorded_ts,
+            &decision,
+            &context,
+        );
+        let regime = evaluated.metadata.regime;
         *self
             .regime_frequency
             .entry(regime.as_str().to_owned())
             .or_insert(0) += 1;
-        let adaptive = self.policy.apply(regime, &features);
         if self.adaptive_logs.len() < ADAPTIVE_LOG_LIMIT {
             self.adaptive_logs.push(json!({
                 "recorded_ts": ts(recorded_ts),
                 "market_id": order.market_id,
                 "regime": regime.as_str(),
-                "profile": adaptive.profile.name,
-                "features_summary": adaptive.features_summary,
-                "original_params": adaptive.original_params,
-                "effective_params": adaptive.effective_params,
-                "reason": adaptive.reason
+                "profile": evaluated.adaptive.profile.name,
+                "strategy_metadata": evaluated.metadata,
+                "features_summary": evaluated.adaptive.features_summary,
+                "original_params": evaluated.adaptive.original_params,
+                "effective_params": evaluated.adaptive.effective_params,
+                "reason": evaluated.adaptive.reason
             }));
         }
-        if adaptive.effective_params.cancel_existing {
+        if evaluated.cancel_existing {
             self.cancel_market(&order.market_id, recorded_ts);
         }
-        if adaptive.effective_params.no_trade {
+        let Some(transformed) = evaluated.decision else {
             return false;
-        }
-        match self.request.mode {
-            StrategyProfileMode::DynamicSafetyOnly => true,
-            StrategyProfileMode::DynamicQuoteStyle => {
-                self.apply_quote_style(order, adaptive.effective_params.quote_style);
-                true
-            }
-            StrategyProfileMode::FullDeterministic => {
-                self.apply_quote_style(order, adaptive.effective_params.quote_style);
-                order.size *= adaptive.effective_params.size_multiplier;
-                if order.size <= Decimal::ZERO {
-                    return false;
-                }
-                order.ttl_ms = Some(
-                    order
-                        .ttl_ms
-                        .unwrap_or(adaptive.effective_params.order_ttl_seconds * 1000)
-                        .min(adaptive.effective_params.order_ttl_seconds * 1000),
-                );
-                let original_edge = decimal(payload.get("expected_edge")).unwrap_or(Decimal::ZERO);
-                original_edge >= adaptive.effective_params.maker_min_edge
-            }
-            _ => true,
-        }
-    }
-
-    fn apply_quote_style(&self, order: &mut ReplayOrder, style: QuoteStyle) {
-        match style {
-            QuoteStyle::ImproveOneTick => {}
-            QuoteStyle::JoinBestBid => {
-                if let Some((best_bid, _)) = self
-                    .books
-                    .get(&order.token_id)
-                    .and_then(OrderBookState::best_bid)
-                {
-                    order.price = order.price.min(best_bid);
-                }
-            }
-            QuoteStyle::FairMinusMarginOnly => {
-                order.price = (order.price - order.tick_size).max(order.tick_size);
-            }
-            QuoteStyle::NoQuote => {
-                order.size = Decimal::ZERO;
-            }
-        }
+        };
+        order.price = transformed.price.unwrap_or(order.price);
+        order.size = transformed.size.unwrap_or(order.size);
+        order.ttl_ms = transformed.ttl_ms;
+        true
     }
 
     fn features_for_order(&self, order: &ReplayOrder, now: DateTime<Utc>) -> RegimeFeatures {
         let market = self.market(&order.market_id);
         let up_book = market.and_then(|market| self.books.get(&market.up_token_id));
         let down_book = market.and_then(|market| self.books.get(&market.down_token_id));
-        let tick_size = Decimal::new(1, 2);
-        let start_price = market.and_then(|market| market.start_price);
         let reference = self.latest_reference_at(now);
-        let distance_bps = match (reference, start_price) {
-            (Some(reference), Some(start)) if start > Decimal::ZERO => {
-                ((reference.price - start) / start * Decimal::from(10_000)).to_f64()
-            }
-            _ => None,
-        };
-        let seconds_to_expiry = market
-            .and_then(|market| market.end_ts)
-            .map(|end| end.signed_duration_since(now).num_milliseconds() as f64 / 1000.0);
-        let seconds_since_start = market
-            .and_then(|market| market.start_ts)
-            .map(|start| now.signed_duration_since(start).num_milliseconds() as f64 / 1000.0);
-        let max_book_age_ms = self.request.settings.risk.max_book_age_ms as f64;
-        let up_age = up_book.and_then(|book| book.age_ms(now));
-        let down_age = down_book.and_then(|book| book.age_ms(now));
-        let book_age_ms = [up_age, down_age]
-            .into_iter()
-            .flatten()
-            .max_by(f64::total_cmp);
-        RegimeFeatures {
-            seconds_since_start,
-            seconds_to_expiry,
-            distance_bps,
-            chainlink_return_5s_bps: self.reference_return_bps(now, 5),
-            chainlink_return_10s_bps: self.reference_return_bps(now, 10),
-            chainlink_return_30s_bps: self.reference_return_bps(now, 30),
-            chainlink_return_120s_bps: self.reference_return_bps(now, 120),
-            realized_vol_30s_bps: self.realized_vol_bps(now, 30),
-            realized_vol_120s_bps: self.realized_vol_bps(now, 120),
-            shock_z: self.shock_z(now),
-            q_up: self
-                .fair_values
-                .get(&order.market_id)
-                .and_then(|fair| decimal(fair.get("q_up")))
-                .and_then(|value| value.to_f64()),
-            q_down: self
-                .fair_values
-                .get(&order.market_id)
-                .and_then(|fair| decimal(fair.get("q_down")))
-                .and_then(|value| value.to_f64()),
-            sigma: self
-                .fair_values
-                .get(&order.market_id)
+        let fair = self.fair_values.get(&order.market_id);
+        RegimeFeatureInput {
+            now,
+            market_start_ts: market.and_then(|market| market.start_ts),
+            market_end_ts: market.and_then(|market| market.end_ts),
+            start_price: market.and_then(|market| market.start_price),
+            tick_size: order.tick_size,
+            reference: reference.map(|point| RegimeReferencePoint {
+                ts: point.ts,
+                price: point.price,
+                stale: point.stale,
+            }),
+            reference_history: self
+                .reference_history
+                .iter()
+                .map(|point| RegimeReferencePoint {
+                    ts: point.ts,
+                    price: point.price,
+                    stale: point.stale,
+                })
+                .collect(),
+            q_up: fair.and_then(|fair| decimal(fair.get("q_up"))),
+            q_down: fair.and_then(|fair| decimal(fair.get("q_down"))),
+            sigma: fair
                 .and_then(|fair| fair.get("sigma"))
                 .and_then(Value::as_f64),
-            up_bid: up_book
-                .and_then(OrderBookState::best_bid)
-                .and_then(|(price, _)| price.to_f64()),
-            up_ask: up_book
-                .and_then(OrderBookState::best_ask)
-                .and_then(|(price, _)| price.to_f64()),
-            up_spread_ticks: up_book.and_then(|book| book.spread_ticks(tick_size)),
-            up_top_size: up_book.and_then(OrderBookState::top_size),
-            down_bid: down_book
-                .and_then(OrderBookState::best_bid)
-                .and_then(|(price, _)| price.to_f64()),
-            down_ask: down_book
-                .and_then(OrderBookState::best_ask)
-                .and_then(|(price, _)| price.to_f64()),
-            down_spread_ticks: down_book.and_then(|book| book.spread_ticks(tick_size)),
-            down_top_size: down_book.and_then(OrderBookState::top_size),
+            up_book: up_book.map(replay_book_snapshot),
+            down_book: down_book.map(replay_book_snapshot),
             book_update_rate_10s: None,
-            reference_age_ms: reference.map(|reference| {
-                now.signed_duration_since(reference.ts)
-                    .num_microseconds()
-                    .map_or(0.0, |micros| (micros.max(0) as f64) / 1000.0)
-            }),
-            book_age_ms,
             feed_divergence_bps: None,
             recent_feed_errors: self
                 .feed_error_times
@@ -4331,79 +4616,12 @@ impl ResearchReplayEngine {
             recent_fill_count: 0,
             recent_cancel_count: self.cancels as u32,
             adverse_move_after_fill_bps: None,
-            market_active: market.is_some_and(|market| {
-                market
-                    .start_ts
-                    .zip(market.end_ts)
-                    .is_some_and(|(start, end)| start <= now && now < end)
-            }),
-            has_start_price: start_price.is_some(),
-            has_books: up_book.is_some_and(OrderBookState::has_valid_top)
-                && down_book.is_some_and(OrderBookState::has_valid_top),
-            reference_stale: reference.is_none_or(|reference| reference.stale)
-                || reference.is_some_and(|reference| {
-                    now.signed_duration_since(reference.ts).num_milliseconds()
-                        > self.request.settings.risk.max_reference_age_ms
-                }),
-            book_stale: book_age_ms.is_none_or(|age| age > max_book_age_ms),
+            max_reference_age_ms: self.request.settings.risk.max_reference_age_ms,
+            max_book_age_ms: self.request.settings.risk.max_book_age_ms,
             final_no_trade_seconds: self.request.settings.strategy.final_no_trade_seconds,
             quality_flags: Vec::new(),
         }
-    }
-
-    fn reference_return_bps(&self, now: DateTime<Utc>, seconds: i64) -> Option<f64> {
-        let current = self.latest_reference_at(now)?;
-        let target = now - Duration::seconds(seconds);
-        let prior = self
-            .reference_history
-            .iter()
-            .rev()
-            .find(|point| point.ts <= target)?;
-        if prior.price <= Decimal::ZERO {
-            return None;
-        }
-        ((current.price - prior.price) / prior.price * Decimal::from(10_000)).to_f64()
-    }
-
-    fn realized_vol_bps(&self, now: DateTime<Utc>, seconds: i64) -> Option<f64> {
-        let lower = now - Duration::seconds(seconds);
-        let points = self
-            .reference_history
-            .iter()
-            .filter(|point| point.ts >= lower && point.ts <= now && point.price > Decimal::ZERO)
-            .collect::<Vec<_>>();
-        if points.len() < 3 {
-            return None;
-        }
-        let mut returns = Vec::new();
-        for pair in points.windows(2) {
-            let Some(prev) = pair.first() else {
-                continue;
-            };
-            let Some(next) = pair.get(1) else {
-                continue;
-            };
-            let Some(prev_price) = prev.price.to_f64() else {
-                continue;
-            };
-            let Some(next_price) = next.price.to_f64() else {
-                continue;
-            };
-            if prev_price > 0.0 {
-                returns.push((next_price / prev_price).ln() * 10_000.0);
-            }
-        }
-        sample_std_f64(&returns)
-    }
-
-    fn shock_z(&self, now: DateTime<Utc>) -> Option<f64> {
-        let ret = self.reference_return_bps(now, 10)?;
-        let vol = self.realized_vol_bps(now, 120)?;
-        if vol <= 0.0 {
-            None
-        } else {
-            Some(ret / vol)
-        }
+        .build()
     }
 
     fn fill_open_orders(&mut self, token_id: &str, recorded_ts: DateTime<Utc>) {
@@ -4605,6 +4823,9 @@ impl ResearchReplayEngine {
         for market in self.markets.values_mut() {
             market.finalize_flags();
         }
+        let wallet =
+            wallet_constrained_replay(&self.orders, &self.markets, self.request.fill_model);
+        let wallet_json = wallet.as_json();
         let mut market_results = Vec::new();
         let mut gross = Decimal::ZERO;
         let mut fees = Decimal::ZERO;
@@ -4731,6 +4952,17 @@ impl ResearchReplayEngine {
             "fees": fees.to_string(),
             "adverse_penalty": adverse_penalties.to_string(),
             "net_pnl": net.to_string(),
+            "wallet_constrained": wallet_json["wallet_constrained"].clone(),
+            "wallet_constrained_net_pnl": wallet_json["wallet_constrained_net_pnl"].clone(),
+            "wallet_constrained_ending_equity": wallet_json["wallet_constrained_ending_equity"].clone(),
+            "wallet_constrained_max_drawdown": wallet_json["wallet_constrained_max_drawdown"].clone(),
+            "wallet_constrained_accepted_orders": wallet_json["wallet_constrained_accepted_orders"].clone(),
+            "wallet_constrained_skipped_orders": wallet_json["wallet_constrained_skipped_orders"].clone(),
+            "wallet_constrained_accepted_filled_orders": wallet_json["wallet_constrained_accepted_filled_orders"].clone(),
+            "wallet_constrained_unresolved_orders": wallet_json["wallet_constrained_unresolved_orders"].clone(),
+            "wallet_constrained_skip_reasons": wallet_json["wallet_constrained_skip_reasons"].clone(),
+            "wallet_constrained_equity_curve": wallet_json["wallet_constrained_equity_curve"].clone(),
+            "wallet_constraints": wallet_json["wallet_constraints"].clone(),
             "notional_cost": notional_cost.to_string(),
             "roi": decimal_ratio(net, notional_cost),
             "market_level_statistics": stats,
@@ -4813,6 +5045,31 @@ fn empty_replay_result() -> Value {
         "orders": 0,
         "fills": 0,
         "net_pnl": "0",
+        "wallet_constrained": true,
+        "wallet_constrained_net_pnl": "0",
+        "wallet_constrained_ending_equity": WALLET_CAMPAIGN_BASELINE.to_string(),
+        "wallet_constrained_max_drawdown": "0",
+        "wallet_constrained_accepted_orders": 0,
+        "wallet_constrained_skipped_orders": 0,
+        "wallet_constrained_accepted_filled_orders": 0,
+        "wallet_constrained_unresolved_orders": 0,
+        "wallet_constrained_skip_reasons": {},
+        "wallet_constrained_equity_curve": [{
+            "ts": Value::Null,
+            "event": "campaign_start",
+            "market_id": Value::Null,
+            "equity": WALLET_CAMPAIGN_BASELINE.to_string(),
+            "net_pnl": "0",
+            "drawdown": "0"
+        }],
+        "wallet_constraints": {
+            "campaign_baseline": WALLET_CAMPAIGN_BASELINE.to_string(),
+            "equity_floor": WALLET_EQUITY_FLOOR.to_string(),
+            "maximum_drawdown": WALLET_MAX_DRAWDOWN.to_string(),
+            "maximum_order_notional": WALLET_MAX_ORDER_NOTIONAL.to_string(),
+            "maximum_unresolved_orders_or_positions": 1,
+            "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
+        },
         "warnings": ["no replay result produced"],
         "market_results": []
     })
@@ -5750,6 +6007,13 @@ fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
         .filter(|value| !value.trim().is_empty());
     let bytes = fs::read(path)?;
     let mut client = AzureBlobClient::with_managed_identity(account, container, client_id);
+    if blob_name == DEFAULT_PROFITABILITY_LATEST
+        && std::env::var("PROMOTION_TRANSITION_EXPECTED_CANONICAL_SHA256")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return publish_promotion_transition_compare_and_swap(&mut client, &blob_name, &bytes);
+    }
     client
         .upload_block_blob_bytes(&blob_name, &bytes, artifact_content_type(path))
         .map_err(|error| {
@@ -5758,9 +6022,190 @@ fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
     Ok(())
 }
 
+fn publish_promotion_transition_compare_and_swap(
+    client: &mut AzureBlobClient,
+    latest_blob_name: &str,
+    resulting_bytes: &[u8],
+) -> Result<(), ResearchError> {
+    let expected_prior = normalize_required_sha256(
+        &std::env::var("PROMOTION_TRANSITION_EXPECTED_CANONICAL_SHA256").unwrap_or_default(),
+        "PROMOTION_TRANSITION_EXPECTED_CANONICAL_SHA256",
+    )?;
+    let allow_initialize_if_absent = std::env::var("PROMOTION_TRANSITION_INITIALIZE_IF_ABSENT")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    publish_promotion_transition_compare_and_swap_store(
+        client,
+        latest_blob_name,
+        resulting_bytes,
+        &expected_prior,
+        allow_initialize_if_absent,
+    )
+}
+
+trait PromotionTransitionStore {
+    fn read_versioned(&mut self, name: &str) -> Result<Option<VersionedBlobBytes>, ResearchError>;
+    fn read(&mut self, name: &str) -> Result<Vec<u8>, ResearchError>;
+    fn put_immutable(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<ImmutableBlobWrite, ResearchError>;
+    fn compare_and_swap(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        expected_etag: &str,
+    ) -> Result<bool, ResearchError>;
+}
+
+impl PromotionTransitionStore for AzureBlobClient {
+    fn read_versioned(&mut self, name: &str) -> Result<Option<VersionedBlobBytes>, ResearchError> {
+        match self.download_blob_bytes_with_etag(name) {
+            Ok(blob) => Ok(Some(blob)),
+            Err(AzureBlobError::HttpStatus(404)) => Ok(None),
+            Err(error) => Err(ResearchError::Azure(format!(
+                "reading versioned promotion blob {name}: {error}"
+            ))),
+        }
+    }
+
+    fn read(&mut self, name: &str) -> Result<Vec<u8>, ResearchError> {
+        self.download_blob_bytes(name).map_err(|error| {
+            ResearchError::Azure(format!("reading promotion blob {name}: {error}"))
+        })
+    }
+
+    fn put_immutable(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<ImmutableBlobWrite, ResearchError> {
+        self.upload_block_blob_bytes_if_absent(name, bytes, "application/json")
+            .map_err(|error| {
+                ResearchError::Azure(format!(
+                    "publishing immutable promotion transition {name}: {error}"
+                ))
+            })
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        expected_etag: &str,
+    ) -> Result<bool, ResearchError> {
+        self.upload_block_blob_bytes_if_match(name, bytes, "application/json", expected_etag)
+            .map_err(|error| {
+                ResearchError::Azure(format!(
+                    "compare-and-swap of canonical promotion pointer failed: {error}"
+                ))
+            })
+    }
+}
+
+fn publish_promotion_transition_compare_and_swap_store<S: PromotionTransitionStore>(
+    store: &mut S,
+    latest_blob_name: &str,
+    resulting_bytes: &[u8],
+    expected_prior: &str,
+    allow_initialize_if_absent: bool,
+) -> Result<(), ResearchError> {
+    let current = store.read_versioned(latest_blob_name)?;
+    if let Some(current) = &current {
+        let current_hash = sha256_prefixed(&current.bytes);
+        if current_hash != expected_prior {
+            return Err(ResearchError::InvalidInput(format!(
+                "stale promotion transition: canonical latest is {current_hash}, expected {expected_prior}"
+            )));
+        }
+    } else if !allow_initialize_if_absent {
+        return Err(ResearchError::InvalidInput(
+            "canonical promotion state is absent; only exact passed-shadow initialization may create it"
+                .to_owned(),
+        ));
+    }
+
+    let resulting_hash = sha256_prefixed(resulting_bytes);
+    let immutable_blob_name = promotion_transition_blob_name(&resulting_hash);
+    match store.put_immutable(&immutable_blob_name, resulting_bytes)? {
+        ImmutableBlobWrite::Created => {}
+        ImmutableBlobWrite::AlreadyExists => {
+            let existing = store.read(&immutable_blob_name)?;
+            if existing != resulting_bytes {
+                return Err(ResearchError::InvalidInput(
+                    "content-addressed promotion transition has conflicting bytes".to_owned(),
+                ));
+            }
+        }
+    }
+
+    if current.is_none() {
+        return match store.put_immutable(latest_blob_name, resulting_bytes)? {
+            ImmutableBlobWrite::Created => Ok(()),
+            ImmutableBlobWrite::AlreadyExists => {
+                let winner = store.read(latest_blob_name)?;
+                if sha256_prefixed(&winner) == resulting_hash {
+                    Ok(())
+                } else {
+                    Err(ResearchError::InvalidInput(
+                        "promotion initialization lost an If-None-Match race; canonical latest was not overwritten"
+                            .to_owned(),
+                    ))
+                }
+            }
+        };
+    }
+
+    let updated = store.compare_and_swap(
+        latest_blob_name,
+        resulting_bytes,
+        &current.expect("present checked above").etag,
+    )?;
+    if updated {
+        return Ok(());
+    }
+    let winner = store.read(latest_blob_name)?;
+    if sha256_prefixed(&winner) == resulting_hash {
+        Ok(())
+    } else {
+        Err(ResearchError::InvalidInput(
+            "promotion transition lost a compare-and-swap race; canonical latest was not overwritten"
+                .to_owned(),
+        ))
+    }
+}
+
+fn normalize_required_sha256(value: &str, label: &str) -> Result<String, ResearchError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let normalized = normalized.strip_prefix("sha256:").unwrap_or(&normalized);
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ResearchError::InvalidInput(format!(
+            "{label} must be an exact SHA-256"
+        )));
+    }
+    Ok(format!("sha256:{normalized}"))
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn promotion_transition_blob_name(resulting_hash: &str) -> String {
+    format!(
+        "reports/research/profitability/transitions/{}.json",
+        resulting_hash.trim_start_matches("sha256:")
+    )
+}
+
 fn research_artifact_blob_name(path: &Path) -> Option<String> {
     let normalized = path.to_string_lossy().replace('\\', "/");
-    let relative = normalized.trim_start_matches("./");
+    let relative = normalized
+        .find("reports/research/")
+        .or_else(|| normalized.find("data_quality/freshness/"))
+        .or_else(|| normalized.find("data/research/replay-index/"))
+        .map(|offset| &normalized[offset..])
+        .unwrap_or_else(|| normalized.trim_start_matches("./"));
     if relative.starts_with("reports/research/") || relative.starts_with("data_quality/freshness/")
     {
         return Some(relative.to_owned());
@@ -5855,13 +6300,18 @@ fn queue_audit_markdown(report: &Value) -> String {
 fn replay_markdown(report: &Value) -> String {
     let result = &report["result"];
     format!(
-        "# Replay\n\n- Fill model: {}\n- Profile: {}\n- Markets settled: {}\n- Orders: {}\n- Fills: {}\n- Net PnL: {}\n- Max drawdown: {}\n- Cancel/fill ratio: {}\n- Warnings: {}\n",
+        "# Replay\n\n- Fill model: {}\n- Profile: {}\n- Markets settled: {}\n- Orders: {}\n- Fills: {}\n- Net PnL: {}\n- Wallet-constrained net PnL: {}\n- Wallet ending equity: {}\n- Wallet max drawdown: {}\n- Wallet accepted/skipped orders: {}/{}\n- Max drawdown: {}\n- Cancel/fill ratio: {}\n- Warnings: {}\n",
         result["fill_model"],
         result["profile"],
         result["markets_settled"],
         result["orders"],
         result["fills"],
         result["net_pnl"],
+        result["wallet_constrained_net_pnl"],
+        result["wallet_constrained_ending_equity"],
+        result["wallet_constrained_max_drawdown"],
+        result["wallet_constrained_accepted_orders"],
+        result["wallet_constrained_skipped_orders"],
         result["max_drawdown"],
         result["cancel_fill_ratio"],
         markdown_list(&result["warnings"])
@@ -5873,9 +6323,10 @@ fn baseline_markdown(report: &Value) -> String {
     if let Some(models) = report["result"]["fill_models"].as_array() {
         for model in models {
             text.push_str(&format!(
-                "- `{}`: net PnL {}, fills {}, markets {}, CI [{}, {}]\n",
+                "- `{}`: net PnL {}, wallet-constrained net PnL {}, fills {}, markets {}, CI [{}, {}]\n",
                 model["fill_model"].as_str().unwrap_or("unknown"),
                 model["net_pnl"].as_str().unwrap_or("0"),
+                model["wallet_constrained_net_pnl"].as_str().unwrap_or("0"),
                 model["fills"],
                 model["markets_settled"],
                 model["market_level_statistics"]["ci_low"]
@@ -5895,9 +6346,10 @@ fn regimes_markdown(report: &Value) -> String {
     if let Some(comparisons) = report["result"]["comparisons"].as_array() {
         for row in comparisons {
             text.push_str(&format!(
-                "- `{}`: net PnL {}, delta vs static {}\n",
+                "- `{}`: net PnL {}, wallet-constrained net PnL {}, delta vs static {}\n",
                 row["profile"].as_str().unwrap_or("unknown"),
                 row["net_pnl"].as_str().unwrap_or("0"),
+                row["wallet_constrained_net_pnl"].as_str().unwrap_or("0"),
                 row["delta_vs_static"].as_str().unwrap_or("0")
             ));
         }
@@ -6179,22 +6631,6 @@ fn std_decimal(values: &[Decimal], mean: Option<Decimal>) -> Option<Decimal> {
     Decimal::from_f64_retain(variance.to_f64()?.sqrt())
 }
 
-fn sample_std_f64(values: &[f64]) -> Option<f64> {
-    if values.len() < 2 {
-        return None;
-    }
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let variance = values
-        .iter()
-        .map(|value| {
-            let diff = *value - mean;
-            diff * diff
-        })
-        .sum::<f64>()
-        / (values.len() - 1) as f64;
-    Some(variance.sqrt())
-}
-
 fn stable_hash(bytes: &[u8]) -> u64 {
     let mut hash = 14_695_981_039_346_656_037_u64;
     for byte in bytes {
@@ -6207,6 +6643,185 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wallet_ts(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn wallet_market(id: &str, end: &str, winner: &str) -> MarketTruth {
+        MarketTruth {
+            market_id: id.to_owned(),
+            end_ts: Some(wallet_ts(end)),
+            winning_outcome: Some(winner.to_owned()),
+            ..MarketTruth::default()
+        }
+    }
+
+    fn wallet_order(id: &str, decision: &str, filled_size: &str) -> ReplayOrder {
+        ReplayOrder {
+            market_id: id.to_owned(),
+            token_id: format!("{id}-up"),
+            outcome: "up".to_owned(),
+            side: "buy".to_owned(),
+            price: d("0.50"),
+            size: d("5"),
+            order_kind: "post_only_gtc".to_owned(),
+            decision_ts: wallet_ts(decision),
+            ttl_ms: None,
+            tick_size: d("0.01"),
+            q_at_decision: None,
+            filled_size: d(filled_size),
+            avg_price: Some(d("0.50")),
+            fee: Decimal::ZERO,
+            adverse_penalty: Decimal::ZERO,
+            fill_ts: Some(wallet_ts(decision) + Duration::seconds(1)),
+            fill_ref_price: None,
+            adverse_checked: true,
+            cancel_ts: None,
+            queue_initial_size_ahead: None,
+            queue_size_ahead: None,
+        }
+    }
+
+    #[test]
+    fn wallet_replay_skips_overlapping_markets_until_settlement() {
+        let markets = BTreeMap::from([
+            (
+                "m1".to_owned(),
+                wallet_market("m1", "2026-06-01T00:15:00Z", "up"),
+            ),
+            (
+                "m2".to_owned(),
+                wallet_market("m2", "2026-06-01T00:16:00Z", "up"),
+            ),
+            (
+                "m3".to_owned(),
+                wallet_market("m3", "2026-06-01T00:31:00Z", "up"),
+            ),
+        ]);
+        let orders = vec![
+            wallet_order("m1", "2026-06-01T00:01:00Z", "5"),
+            wallet_order("m2", "2026-06-01T00:02:00Z", "5"),
+            wallet_order("m3", "2026-06-01T00:16:01Z", "5"),
+        ];
+
+        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+
+        assert_eq!(result.accepted_orders, 2);
+        assert_eq!(result.skipped_orders, 1);
+        assert_eq!(
+            result.skip_reasons["overlapping_unresolved_order_or_position"],
+            1
+        );
+    }
+
+    #[test]
+    fn wallet_replay_stops_at_campaign_drawdown_floor() {
+        let markets = BTreeMap::from([
+            (
+                "m1".to_owned(),
+                wallet_market("m1", "2026-06-01T00:15:00Z", "down"),
+            ),
+            (
+                "m2".to_owned(),
+                wallet_market("m2", "2026-06-01T00:31:00Z", "down"),
+            ),
+        ]);
+        let orders = vec![
+            wallet_order("m1", "2026-06-01T00:01:00Z", "5"),
+            wallet_order("m2", "2026-06-01T00:16:00Z", "5"),
+        ];
+
+        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+
+        assert_eq!(result.net_pnl, -Decimal::ONE);
+        assert_eq!(result.ending_equity, d("4.030521"));
+        assert_eq!(result.max_drawdown, Decimal::ONE);
+        assert_eq!(result.accepted_orders, 1);
+        assert_eq!(
+            result.skip_reasons["insufficient_equity_or_drawdown_budget"],
+            1
+        );
+    }
+
+    #[test]
+    fn wallet_replay_recycles_winner_capital_after_settlement() {
+        let markets = BTreeMap::from([
+            (
+                "m1".to_owned(),
+                wallet_market("m1", "2026-06-01T00:15:00Z", "up"),
+            ),
+            (
+                "m2".to_owned(),
+                wallet_market("m2", "2026-06-01T00:31:00Z", "up"),
+            ),
+        ]);
+        let orders = vec![
+            wallet_order("m1", "2026-06-01T00:01:00Z", "5"),
+            wallet_order("m2", "2026-06-01T00:16:00Z", "5"),
+        ];
+
+        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+
+        assert_eq!(result.accepted_orders, 2);
+        assert_eq!(result.net_pnl, d("2"));
+        assert_eq!(result.ending_equity, d("7.030521"));
+        assert_eq!(result.equity_curve.len(), 3);
+    }
+
+    #[test]
+    fn wallet_admission_does_not_use_future_winner() {
+        let orders = vec![
+            wallet_order("m1", "2026-06-01T00:01:00Z", "5"),
+            wallet_order("m2", "2026-06-01T00:02:00Z", "5"),
+        ];
+        let markets_for_winner = BTreeMap::from([
+            (
+                "m1".to_owned(),
+                wallet_market("m1", "2026-06-01T00:15:00Z", "up"),
+            ),
+            (
+                "m2".to_owned(),
+                wallet_market("m2", "2026-06-01T00:16:00Z", "up"),
+            ),
+        ]);
+        let markets_for_loser = BTreeMap::from([
+            (
+                "m1".to_owned(),
+                wallet_market("m1", "2026-06-01T00:15:00Z", "down"),
+            ),
+            (
+                "m2".to_owned(),
+                wallet_market("m2", "2026-06-01T00:16:00Z", "up"),
+            ),
+        ]);
+
+        let winner = wallet_constrained_replay(&orders, &markets_for_winner, FillModel::Touch);
+        let loser = wallet_constrained_replay(&orders, &markets_for_loser, FillModel::Touch);
+
+        assert_eq!(winner.accepted_orders, loser.accepted_orders);
+        assert_eq!(winner.skipped_orders, loser.skipped_orders);
+        assert_ne!(winner.net_pnl, loser.net_pnl);
+    }
+
+    #[test]
+    fn wallet_replay_preserves_partial_fill_fees_and_adverse_penalty() {
+        let markets = BTreeMap::from([(
+            "m1".to_owned(),
+            wallet_market("m1", "2026-06-01T00:15:00Z", "down"),
+        )]);
+        let mut order = wallet_order("m1", "2026-06-01T00:01:00Z", "1");
+        order.fee = d("0.01");
+        order.adverse_penalty = d("0.005");
+
+        let result =
+            wallet_constrained_replay(&[order], &markets, FillModel::AdverseSelectionPenalized);
+
+        assert_eq!(result.net_pnl, d("-0.515"));
+        assert_eq!(result.accepted_filled_orders, 1);
+    }
 
     #[test]
     fn complete_book_snapshots_replace_obsolete_levels() {
@@ -6398,5 +7013,201 @@ mod tests {
         finalize_stream_stats(&mut stats);
 
         assert_eq!(stats.warnings, vec!["42 out-of-order timestamps"]);
+    }
+
+    #[test]
+    fn promotion_transition_hash_and_content_address_are_exact() {
+        let hash = sha256_prefixed(b"canonical transition");
+        assert_eq!(hash.len(), 71);
+        assert_eq!(normalize_required_sha256(&hash, "test").unwrap(), hash);
+        assert_eq!(
+            promotion_transition_blob_name(&hash),
+            format!(
+                "reports/research/profitability/transitions/{}.json",
+                hash.trim_start_matches("sha256:")
+            )
+        );
+        assert_ne!(
+            promotion_transition_blob_name(&hash),
+            promotion_transition_blob_name(&sha256_prefixed(b"other transition"))
+        );
+    }
+
+    #[test]
+    fn promotion_transition_expected_hash_rejects_ambiguous_input() {
+        assert!(normalize_required_sha256("abc", "test").is_err());
+        assert!(normalize_required_sha256(&format!("{}z", "0".repeat(63)), "test").is_err());
+    }
+
+    #[derive(Default)]
+    struct FakePromotionState {
+        latest: Vec<u8>,
+        latest_exists: bool,
+        version: u64,
+        immutable: BTreeMap<String, Vec<u8>>,
+    }
+
+    #[derive(Clone)]
+    struct FakePromotionStore {
+        state: Arc<Mutex<FakePromotionState>>,
+        first_read_barrier: Arc<std::sync::Barrier>,
+        wait_on_first_read: bool,
+    }
+
+    impl PromotionTransitionStore for FakePromotionStore {
+        fn read_versioned(
+            &mut self,
+            _name: &str,
+        ) -> Result<Option<VersionedBlobBytes>, ResearchError> {
+            let result = {
+                let state = self.state.lock().unwrap();
+                state.latest_exists.then(|| VersionedBlobBytes {
+                    bytes: state.latest.clone(),
+                    etag: format!("etag-{}", state.version),
+                })
+            };
+            if self.wait_on_first_read {
+                self.wait_on_first_read = false;
+                self.first_read_barrier.wait();
+            }
+            Ok(result)
+        }
+
+        fn read(&mut self, name: &str) -> Result<Vec<u8>, ResearchError> {
+            let state = self.state.lock().unwrap();
+            if name == DEFAULT_PROFITABILITY_LATEST {
+                if state.latest_exists {
+                    Ok(state.latest.clone())
+                } else {
+                    Err(ResearchError::InvalidInput(
+                        "missing fake canonical latest".to_owned(),
+                    ))
+                }
+            } else {
+                state.immutable.get(name).cloned().ok_or_else(|| {
+                    ResearchError::InvalidInput(format!("missing fake immutable blob {name}"))
+                })
+            }
+        }
+
+        fn put_immutable(
+            &mut self,
+            name: &str,
+            bytes: &[u8],
+        ) -> Result<ImmutableBlobWrite, ResearchError> {
+            let mut state = self.state.lock().unwrap();
+            if name == DEFAULT_PROFITABILITY_LATEST {
+                if state.latest_exists {
+                    return Ok(ImmutableBlobWrite::AlreadyExists);
+                }
+                state.latest = bytes.to_vec();
+                state.latest_exists = true;
+                state.version += 1;
+                return Ok(ImmutableBlobWrite::Created);
+            }
+            if state.immutable.contains_key(name) {
+                Ok(ImmutableBlobWrite::AlreadyExists)
+            } else {
+                state.immutable.insert(name.to_owned(), bytes.to_vec());
+                Ok(ImmutableBlobWrite::Created)
+            }
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            _name: &str,
+            bytes: &[u8],
+            expected_etag: &str,
+        ) -> Result<bool, ResearchError> {
+            let mut state = self.state.lock().unwrap();
+            if !state.latest_exists || expected_etag != format!("etag-{}", state.version) {
+                return Ok(false);
+            }
+            state.latest = bytes.to_vec();
+            state.version += 1;
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn concurrent_promotion_transitions_cannot_both_replace_latest() {
+        let prior = b"prior canonical state".to_vec();
+        let state = Arc::new(Mutex::new(FakePromotionState {
+            latest: prior.clone(),
+            latest_exists: true,
+            ..FakePromotionState::default()
+        }));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let expected = sha256_prefixed(&prior);
+        let workers = [b"transition-a".to_vec(), b"transition-b".to_vec()]
+            .into_iter()
+            .map(|resulting| {
+                let mut store = FakePromotionStore {
+                    state: Arc::clone(&state),
+                    first_read_barrier: Arc::clone(&barrier),
+                    wait_on_first_read: true,
+                };
+                let expected = expected.clone();
+                std::thread::spawn(move || {
+                    let result = publish_promotion_transition_compare_and_swap_store(
+                        &mut store,
+                        DEFAULT_PROFITABILITY_LATEST,
+                        &resulting,
+                        &expected,
+                        false,
+                    );
+                    (resulting, result)
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, result)| result.is_err())
+                .count(),
+            1
+        );
+        let state = state.lock().unwrap();
+        let winner = outcomes
+            .iter()
+            .find(|(_, result)| result.is_ok())
+            .map(|(bytes, _)| bytes)
+            .unwrap();
+        assert_eq!(&state.latest, winner);
+        assert_eq!(state.immutable.len(), 2);
+        assert_eq!(state.version, 1);
+    }
+
+    #[test]
+    fn promotion_initialization_creates_absent_funded_latest_once() {
+        let state = Arc::new(Mutex::new(FakePromotionState::default()));
+        let mut store = FakePromotionStore {
+            state: Arc::clone(&state),
+            first_read_barrier: Arc::new(std::sync::Barrier::new(1)),
+            wait_on_first_read: false,
+        };
+        let result = b"initialized-funded-state";
+        publish_promotion_transition_compare_and_swap_store(
+            &mut store,
+            DEFAULT_PROFITABILITY_LATEST,
+            result,
+            &sha256_prefixed(b"exact-shadow-source"),
+            true,
+        )
+        .unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.latest_exists);
+        assert_eq!(state.latest, result);
+        assert_eq!(state.version, 1);
+        assert_eq!(state.immutable.len(), 1);
     }
 }
