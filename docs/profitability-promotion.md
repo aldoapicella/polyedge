@@ -75,13 +75,23 @@ An inconclusive result may extend once to 60 calendar days or 2,000 markets. If 
 
 ### Projected-day cumulative replay
 
-The daily job never rebuilds the cumulative wallet by downloading the entire
-raw campaign again. It normalizes exactly one sealed UTC day, publishes its
-decision-grade gzip shards under a content-addressed immutable path, writes the
-day manifest last, and then updates that day's `latest.json` with compare-and-
-swap. Campaign replay resolves an exact contiguous range of sealed days,
-verifies every manifest and shard hash, materializes it atomically, and streams
-one day's bounded shard set at a time. The Rust library rejects the current or
+The daily job normally normalizes exactly one sealed UTC day. During a
+historical correction or schema migration it automatically walks the affected
+range in chronological order. Every normalization records the exhaustive,
+ordered Azure raw-source inventory: account, container, exact day prefix, blob
+name, ETag, length, last-modified time, blob type, seal state, optional Azure
+version/MD5 metadata, and a SHA-256 computed from the bytes actually read. Each
+download is conditional on the listed ETag and the complete listing is repeated
+after the read; a changed, added, removed, duplicated, truncated, wrong-prefix,
+or unexpected non-JSONL source fails before publication.
+
+The job publishes decision-grade gzip shards under a content-addressed
+immutable path, writes the day manifest last, and updates that day's
+`latest.json` with compare-and-swap against the exact prior pointer. Campaign
+replay first snapshots every daily pointer in the requested contiguous range,
+verifies all manifests, raw inventories, and shard hashes, then revalidates the
+pointer snapshots immediately before atomic materialization. It streams one
+day's bounded shard set at a time. The Rust library rejects the current or
 future UTC day even when the CLI is called directly; the shell check is not the
 only protection against look-ahead.
 
@@ -92,21 +102,37 @@ date, modified local shard, schema downgrade, bad parent, or correction that
 breaks the existing sequence invalidates the entire wallet ledger and blocks
 promotion.
 
-Two provenance limitations remain:
+All scheduled and manual shadow writers run under one renewable Azure Blob
+lease. The child process is killed if renewal or ownership is lost, and the
+daily script refuses direct execution without the lease context. A durable,
+content-addressed correction journal is marked `in_progress` before the first
+day and `complete` only after the entire chronological range, terminal
+prospective validation, and profitability evaluation succeed. Labs and every
+promotion-facing view fail closed while a correction is active or invalid.
+Per-date pointers may advance during recovery, but the root daily pointer is
+monotonic and cannot regress to an older corrected date.
 
-1. The projected cache binds the exact normalized output bytes used by replay,
-   but its canonical manifest does not yet enumerate every original Azure raw
-   source blob name, ETag, byte count, and content hash. The recorder uses
-   append-only dated paths and the raw audit remains available, so this is not
-   a blocker for the credential-free shadow campaign. Before any funded
-   decision relies on this evidence, normalization should first seal and bind a
-   deterministic raw-source inventory.
-2. Replacing an earlier day's `latest.json` with a corrected canonical day
-   changes every later campaign-chain hash. Existing later wallet snapshots
-   then fail parent validation, as intended. Recovery requires rerunning the
-   corrected day and every subsequent snapshot in chronological order; a
-   future correction orchestrator should compute and execute that cascade
-   automatically.
+One historical provenance limitation remains: schema-v2 proves the exact Azure
+bytes observed during the corrected rerun, not what an unversioned append blob
+contained before that first inventory was captured. ETag plus computed SHA-256
+detects every later difference, but cannot reconstruct an earlier state that
+Azure never retained. Azure Blob/container soft delete is retained for 14 days
+and Change Feed for 30 days as extra deletion and mutation evidence. Blob
+versioning is deliberately not enabled solely for this stream because Azure
+does not create versions for `AppendBlock` operations. These protections cannot
+retroactively prove pre-schema-v2 bytes.
+
+Future physical sealing requires a writer-owned day-close barrier first. The
+recorder must prove its queue and Azure buffers drained, publish an immutable
+closed-day watermark, and reject or quarantine every later event for that day.
+Only then can a dedicated least-privilege sealer job seal each AppendBlob and
+make `sealed=true` mandatory in projected-day admission. Sealing without that
+barrier is unsafe: a delayed prior-day append would return `BlobIsSealed` and
+could obstruct later recorder flushes. Until that closure is deployed, reports
+must describe a day as a *sealed UTC date boundary*, not claim that every raw
+Azure AppendBlob is physically sealed. This limitation blocks any claim that a
+rerun is the original historical capture, but it does not permit mixed or
+silently mutated evidence into the shadow gate.
 
 ## Execution Model
 

@@ -214,6 +214,47 @@ fn latest_pointer_is_created_only_after_complete_verified_manifest() {
 }
 
 #[test]
+fn historical_correction_never_regresses_global_latest_pointer() {
+    let root = test_dir("atomic_global_latest_monotonic");
+    let newer_date = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+    let older_date = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+
+    let mut newer = AtomicDailyRun::begin(
+        &root,
+        newer_date,
+        "run-newer",
+        format!("sha256:{}", "a".repeat(64)),
+        clean_quality(),
+    )
+    .unwrap();
+    newer
+        .write_artifact("baseline", "baseline.json", br#"{"day":13}"#)
+        .unwrap();
+    newer.complete().unwrap();
+
+    let mut older = AtomicDailyRun::begin(
+        &root,
+        older_date,
+        "run-corrected-older",
+        format!("sha256:{}", "b".repeat(64)),
+        clean_quality(),
+    )
+    .unwrap();
+    older
+        .write_artifact("baseline", "baseline.json", br#"{"day":12}"#)
+        .unwrap();
+    older.complete().unwrap();
+
+    let global: LatestRunPointer =
+        serde_json::from_slice(&fs::read(root.join("latest.json")).unwrap()).unwrap();
+    assert_eq!(global.date, newer_date);
+    assert_eq!(global.run_id, "run-newer");
+    let corrected: LatestRunPointer =
+        serde_json::from_slice(&fs::read(root.join("2026-07-12/latest.json")).unwrap()).unwrap();
+    assert_eq!(corrected.run_id, "run-corrected-older");
+}
+
+#[test]
 fn post_cutoff_manifest_schema_downgrade_is_rejected() {
     let root = test_dir("manifest_schema_downgrade");
     let date = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();

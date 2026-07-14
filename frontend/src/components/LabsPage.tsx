@@ -31,6 +31,7 @@ import {
   selectRegimeProfileRows
 } from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
+import { CorrectionGateNotice } from "@/components/CorrectionGateNotice";
 
 const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "QueueProxy / Fill Realism", "Venue Execution", "Sample Size", "Artifacts"] as const;
 
@@ -48,6 +49,7 @@ export function LabsPage() {
 
   const rows = prospective.data?.result?.rows ?? [];
   const frozenCandidates = candidateRows(prospective.data?.result?.frozen_candidates);
+  const correction = venueExecution.data?.correction ?? prospective.data?.correction;
 
   return (
     <div className="space-y-5">
@@ -59,6 +61,8 @@ export function LabsPage() {
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
+
+      <CorrectionGateNotice correction={correction} />
 
       <div className="flex flex-wrap gap-1 border border-line bg-white p-1 shadow-hairline">
         {tabs.map((item) => (
@@ -129,6 +133,8 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
     return <Panel><EmptyState label={loading ? "Loading authenticated venue evidence" : error?.message ?? "No authenticated venue evidence yet"} /></Panel>;
   }
   const latest = evidence.latest;
+  const correction = evidence.correction;
+  const correctionBlocked = correction?.blocks_promotion === true;
   const lifecycle = latest?.lifecycle;
   const order = latest?.order;
   const model = evidence.model;
@@ -162,16 +168,16 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
       <Panel>
         <PanelHeader title="Profitability Path" meta={profitability?.generated_at ?? profitability?.created_at ?? "awaiting Azure promotion manifest"} />
         <div className="grid gap-3 p-4 md:grid-cols-4">
-          <Metric label="Phase" value={profitability?.phase ?? "risk repair / funded freeze"} />
+          <Metric label="Phase" value={correctionBlocked ? "risk_repair — correction NO-GO" : profitability?.phase ?? "risk repair / funded freeze"} />
           <Metric label="Selected Source" value={profitabilityProvenance?.selected_source ?? "API fallback"} />
           <Metric label="Selection Reason" value={profitabilityProvenance?.selection_reason ?? "no valid artifact"} />
           <Metric label="Artifact Freshness" value={selectedProfitability?.freshness ?? (selectedProfitability?.fresh ? "fresh" : "unknown")} />
           <Metric label="Artifact Time" value={dateTime(selectedProfitability?.authoritative_ts)} />
           <Metric label="Candidate" value={profitability?.candidate?.name ?? "dynamic_quote_style (frozen)"} />
           <Metric label="Candidate Version" value={profitability?.candidate?.version ?? profitability?.candidate?.candidate_version ?? "2026-06-14"} />
-          <Metric label="Promotion" value={fundedLadder?.phase === "profitable_go" ? "terminal validated GO — execution still unarmed" : fundedLadder?.phase === "stopped_no_go" || profitability?.phase === "stopped_no_go" ? "terminal NO-GO" : fundedLadder?.human_grant_required ? "awaiting exact human stage grant" : fundedLadder?.stage_authorized ? "stage authorized — collecting evidence" : profitability?.phase === "shadow_collecting" ? "shadow evidence collecting" : profitability?.promotion_allowed ? "armed" : "blocked — human authorization required"} />
+          <Metric label="Promotion" value={correctionBlocked ? "NO-GO — shadow correction blocks promotion" : fundedLadder?.phase === "profitable_go" ? "terminal validated GO — execution still unarmed" : fundedLadder?.phase === "stopped_no_go" || profitability?.phase === "stopped_no_go" ? "terminal NO-GO" : fundedLadder?.human_grant_required ? "awaiting exact human stage grant" : fundedLadder?.stage_authorized ? "stage authorized — collecting evidence" : profitability?.phase === "shadow_collecting" ? "shadow evidence collecting" : profitability?.promotion_allowed ? "armed" : "blocked — human authorization required"} />
           <Metric label="Funded Ladder" value={fundedLadder ? `${fundedLadder.phase ?? "evidence_collecting"} — ${fundedLadder.metrics?.cumulative_funded_orders ?? 0} / ${fundedLadder.active_target_orders ?? 1}` : "not started"} />
-          <Metric label="Next Stage Grant" value={fundedLadder?.phase === "profitable_go" ? "validated GO — still not automatically armed" : fundedLadder?.phase === "stopped_no_go" ? "terminal NO-GO — immutable stop" : fundedLadder?.human_grant_required ? "exact one-shot human grant required" : fundedLadder?.terminal ? "terminal" : "stage grant consumed"} />
+          <Metric label="Next Stage Grant" value={correctionBlocked ? "disabled — correction must complete" : fundedLadder?.phase === "profitable_go" ? "validated GO — still not automatically armed" : fundedLadder?.phase === "stopped_no_go" ? "terminal NO-GO — immutable stop" : fundedLadder?.human_grant_required ? "exact one-shot human grant required" : fundedLadder?.terminal ? "terminal" : "stage grant consumed"} />
           <Metric label="Eligible Evidence" value={`${fundedLadder?.metrics?.cumulative_eligible_orders ?? 0} eligible orders`} />
           <Metric label="Filled Markout Samples" value={`${fundedLadder?.metrics?.markout_sample_size ?? 0} (non-fills remain fill labels)`} />
           <Metric label="Funded Markout L95" value={signedUsd(fundedLadder?.metrics?.net_markout_30s_lower_95)} />
@@ -184,7 +190,7 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
           <Metric label="Current Drawdown" value={usd(profitability?.capital?.current_drawdown ?? campaignRisk?.campaign_drawdown)} />
           <Metric label="Locked Principal" value={usd(profitability?.capital?.locked_principal)} />
           <Metric label="Unresolved Exposure" value={usd(profitability?.capital?.unresolved_exposure)} />
-          <Metric label="Blocking Reason" value={profitability?.blocking_reason ?? campaignRisk?.blockers?.join(", ") ?? "funded execution remains disabled"} />
+          <Metric label="Blocking Reason" value={correction?.blocker ?? profitability?.blocking_reason ?? campaignRisk?.blockers?.join(", ") ?? "funded execution remains disabled"} />
         </div>
         <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
           Historical simulation, execution-probe cost, shadow PnL, and live-strategy PnL are separate ledgers. A profitable post-reset campaign does not erase the lifetime account loss, and no phase automatically arms a real order.

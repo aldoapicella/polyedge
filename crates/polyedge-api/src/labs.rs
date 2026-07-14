@@ -6,8 +6,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, Utc};
 use polyedge_reporting::research::{
     daily_provenance_required, load_exclusion_registry, load_frozen_candidate_registry,
-    DailyRunManifest, LatestRunPointer, PromotionManifestV1, PromotionPhase, RunStatus,
-    DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
+    read_shadow_correction_state, DailyRunManifest, LatestRunPointer, PromotionManifestV1,
+    PromotionPhase, RunStatus, ShadowCorrectionState, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
 };
 use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use serde::Deserialize;
@@ -73,8 +74,9 @@ pub fn router() -> Router<ApiState> {
 
 async fn venue_execution() -> impl IntoResponse {
     let now = Utc::now();
+    let correction = load_shadow_correction_gate();
     let profitability_path = FsPath::new(PROFITABILITY_LATEST);
-    let profitability_selection = select_profitability_artifact(
+    let mut profitability_selection = select_profitability_artifact(
         ProfitabilityArtifact::new(
             read_json_from_container_or_null(
                 profitability_path,
@@ -93,6 +95,7 @@ async fn venue_execution() -> impl IntoResponse {
         ),
         now,
     );
+    apply_shadow_correction_to_profitability(&mut profitability_selection.value, &correction);
     let latest_path = FsPath::new("reports/research/venue-probe/latest.json");
     let latest = normalize_venue_execution_summary(read_json_from_container_or_null(
         latest_path,
@@ -175,6 +178,9 @@ async fn venue_execution() -> impl IntoResponse {
         "redemption": redemption,
         "model": execution_model,
         "profitability": profitability_selection.value,
+        "correction": correction.as_json(),
+        "promotion_decision": correction.decision(),
+        "promotion_blocker": correction.blocker,
         "artifact_provenance": artifact_provenance,
         "queue_position_source": "authenticated_lifecycle_plus_public_l2",
         "queue_position_metric": "inferred_size_ahead",
@@ -184,6 +190,145 @@ async fn venue_execution() -> impl IntoResponse {
         "research_only": true,
         "strategy_promotion_allowed": false
     }))
+}
+
+#[derive(Clone, Debug)]
+struct ShadowCorrectionGate {
+    state: Option<ShadowCorrectionState>,
+    status: String,
+    blocks_promotion: bool,
+    blocker: Option<String>,
+    validation_error: bool,
+}
+
+impl ShadowCorrectionGate {
+    fn decision(&self) -> &'static str {
+        if self.blocks_promotion {
+            "NO-GO"
+        } else {
+            "ELIGIBILITY_UNCHANGED"
+        }
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "journal_path": "reports/research/shadow/corrections/active.json",
+            "available": self.state.is_some(),
+            "status": self.status,
+            "blocks_promotion": self.blocks_promotion,
+            "decision": self.decision(),
+            "blocker": self.blocker,
+            "validation_error": self.validation_error,
+            "state": self.state
+        })
+    }
+}
+
+fn load_shadow_correction_gate() -> ShadowCorrectionGate {
+    correction_gate_from_result(read_shadow_correction_state().map_err(|error| error.to_string()))
+}
+
+fn correction_gate_from_result(
+    result: Result<Option<ShadowCorrectionState>, String>,
+) -> ShadowCorrectionGate {
+    match result {
+        Ok(Some(state)) if matches!(state.status.as_str(), "in_progress" | "failed") => {
+            let blocker = format!(
+                "Shadow correction {} is {} for {} through {}. Profitability and promotion are NO-GO until corrected artifacts are atomically republished and the correction journal is complete.",
+                state.correction_id, state.status, state.from, state.through
+            );
+            ShadowCorrectionGate {
+                status: state.status.clone(),
+                state: Some(state),
+                blocks_promotion: true,
+                blocker: Some(blocker),
+                validation_error: false,
+            }
+        }
+        Ok(Some(state)) if state.status == "complete" => ShadowCorrectionGate {
+            status: state.status.clone(),
+            state: Some(state),
+            blocks_promotion: false,
+            blocker: None,
+            validation_error: false,
+        },
+        Ok(Some(state)) => ShadowCorrectionGate {
+            status: "invalid".to_owned(),
+            state: Some(state),
+            blocks_promotion: true,
+            blocker: Some(
+                "Shadow correction journal has an unsupported status. Profitability and promotion are NO-GO until the journal is repaired and verified."
+                    .to_owned(),
+            ),
+            validation_error: true,
+        },
+        Ok(None) => ShadowCorrectionGate {
+            state: None,
+            status: "none".to_owned(),
+            blocks_promotion: false,
+            blocker: None,
+            validation_error: false,
+        },
+        Err(_) => ShadowCorrectionGate {
+            state: None,
+            status: "unavailable".to_owned(),
+            blocks_promotion: true,
+            blocker: Some(
+                "Shadow correction journal could not be verified. Profitability and promotion are NO-GO until correction state is readable and valid."
+                    .to_owned(),
+            ),
+            validation_error: true,
+        },
+    }
+}
+
+fn apply_shadow_correction_to_profitability(
+    profitability: &mut Value,
+    correction: &ShadowCorrectionGate,
+) {
+    if !correction.blocks_promotion {
+        return;
+    }
+    if !profitability.is_object() {
+        *profitability = default_profitability_manifest();
+    }
+    let Some(object) = profitability.as_object_mut() else {
+        return;
+    };
+    if let Some(phase) = object.get("phase").cloned() {
+        object.insert("pre_correction_phase".to_owned(), phase);
+    }
+    if let Some(status) = object.get("status").cloned() {
+        object.insert("pre_correction_status".to_owned(), status);
+    }
+    object.insert("phase".to_owned(), json!("risk_repair"));
+    object.insert("status".to_owned(), json!("correction_blocked_no_go"));
+    object.insert("effective_decision".to_owned(), json!("NO-GO"));
+    object.insert("promotion_allowed".to_owned(), json!(false));
+    object.insert("human_authorization_required".to_owned(), json!(true));
+    object.insert(
+        "blocking_reason".to_owned(),
+        json!(correction
+            .blocker
+            .as_deref()
+            .unwrap_or("Shadow correction state blocks profitability promotion.")),
+    );
+    if let Some(gate_metrics) = object
+        .get_mut("gate_metrics")
+        .and_then(Value::as_object_mut)
+    {
+        gate_metrics.insert("promotion_allowed".to_owned(), json!(false));
+        gate_metrics.insert("effective_decision".to_owned(), json!("NO-GO"));
+    }
+    if let Some(funded_ladder) = object
+        .get_mut("funded_ladder")
+        .and_then(Value::as_object_mut)
+    {
+        funded_ladder.insert("promotion_allowed".to_owned(), json!(false));
+        funded_ladder.insert("stage_authorized".to_owned(), json!(false));
+        funded_ladder.insert("human_grant_required".to_owned(), json!(true));
+        funded_ladder.insert("effective_decision".to_owned(), json!("NO-GO"));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1190,7 +1335,8 @@ fn prospective_payload() -> Value {
             .join("prospective")
             .join("prospective_validation.json"),
     );
-    select_prospective_payload(shadow, primary)
+    let correction = load_shadow_correction_gate();
+    apply_shadow_correction_to_prospective(select_prospective_payload(shadow, primary), &correction)
 }
 
 fn select_prospective_payload(shadow: Value, primary: Value) -> Value {
@@ -1210,6 +1356,78 @@ fn select_prospective_payload(shadow: Value, primary: Value) -> Value {
             "live_deployment_allowed": false
         }
     })
+}
+
+fn apply_shadow_correction_to_prospective(
+    mut payload: Value,
+    correction: &ShadowCorrectionGate,
+) -> Value {
+    if !payload.is_object() {
+        payload = json!({
+            "generated_ts": now_ts(),
+            "result": {
+                "status": "collecting",
+                "rows": [],
+                "frozen_candidates": frozen_candidates_payload(),
+                "research_only": true,
+                "live_deployment_allowed": false
+            }
+        });
+    }
+    let correction_json = correction.as_json();
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    object.insert("correction".to_owned(), correction_json);
+    object.insert(
+        "promotion_decision".to_owned(),
+        json!(correction.decision()),
+    );
+    object.insert(
+        "promotion_blocker".to_owned(),
+        correction
+            .blocker
+            .clone()
+            .map_or(Value::Null, Value::String),
+    );
+    if !correction.blocks_promotion {
+        return payload;
+    }
+    object.insert("promotion_allowed".to_owned(), json!(false));
+    let result = object
+        .entry("result".to_owned())
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    let Some(result) = result else {
+        object.insert(
+            "result".to_owned(),
+            json!({
+                "status": "correction_blocked_no_go",
+                "decision": "NO-GO",
+                "promotion_allowed": false,
+                "live_deployment_allowed": false,
+                "research_only": true,
+                "blocker": correction.blocker
+            }),
+        );
+        return payload;
+    };
+    if let Some(status) = result.get("status").cloned() {
+        result.insert("pre_correction_status".to_owned(), status);
+    }
+    result.insert("status".to_owned(), json!("correction_blocked_no_go"));
+    result.insert("decision".to_owned(), json!("NO-GO"));
+    result.insert("promotion_allowed".to_owned(), json!(false));
+    result.insert("live_deployment_allowed".to_owned(), json!(false));
+    result.insert("research_only".to_owned(), json!(true));
+    result.insert(
+        "blocker".to_owned(),
+        correction
+            .blocker
+            .clone()
+            .map_or(Value::Null, Value::String),
+    );
+    payload
 }
 
 async fn regimes_latest() -> impl IntoResponse {
@@ -2607,6 +2825,93 @@ mod tests {
                 .is_some_and(Vec::is_empty)
         );
     }
+
+    #[test]
+    fn in_progress_correction_forces_prospective_no_go_without_hiding_rows() {
+        let correction =
+            correction_gate_from_result(Ok(Some(test_correction_state("in_progress"))));
+        let payload = apply_shadow_correction_to_prospective(
+            json!({
+                "result": {
+                    "status": "passed",
+                    "promotion_allowed": true,
+                    "live_deployment_allowed": true,
+                    "rows": [{"date": "2026-07-13", "decision_gate": "GO"}]
+                }
+            }),
+            &correction,
+        );
+
+        assert_eq!(payload["correction"]["status"], "in_progress");
+        assert_eq!(payload["correction"]["blocks_promotion"], true);
+        assert_eq!(payload["promotion_decision"], "NO-GO");
+        assert_eq!(payload["promotion_allowed"], false);
+        assert_eq!(payload["result"]["status"], "correction_blocked_no_go");
+        assert_eq!(payload["result"]["pre_correction_status"], "passed");
+        assert_eq!(payload["result"]["promotion_allowed"], false);
+        assert_eq!(payload["result"]["live_deployment_allowed"], false);
+        assert_eq!(payload["result"]["rows"][0]["decision_gate"], "GO");
+        assert!(payload["result"]["blocker"]
+            .as_str()
+            .is_some_and(|blocker| blocker.contains("corr-2026-07-13")));
+    }
+
+    #[test]
+    fn failed_correction_overrides_stale_profitability_and_nested_promotion_flags() {
+        let correction = correction_gate_from_result(Ok(Some(test_correction_state("failed"))));
+        let mut profitability = json!({
+            "phase": "profitable_go",
+            "status": "passed",
+            "promotion_allowed": true,
+            "human_authorization_required": false,
+            "gate_metrics": {"promotion_allowed": true},
+            "funded_ladder": {
+                "phase": "profitable_go",
+                "promotion_allowed": true,
+                "stage_authorized": true,
+                "human_grant_required": false
+            }
+        });
+
+        apply_shadow_correction_to_profitability(&mut profitability, &correction);
+
+        assert_eq!(profitability["phase"], "risk_repair");
+        assert_eq!(profitability["pre_correction_phase"], "profitable_go");
+        assert_eq!(profitability["status"], "correction_blocked_no_go");
+        assert_eq!(profitability["effective_decision"], "NO-GO");
+        assert_eq!(profitability["promotion_allowed"], false);
+        assert_eq!(profitability["human_authorization_required"], true);
+        assert_eq!(profitability["gate_metrics"]["promotion_allowed"], false);
+        assert_eq!(profitability["funded_ladder"]["promotion_allowed"], false);
+        assert_eq!(profitability["funded_ladder"]["stage_authorized"], false);
+        assert_eq!(profitability["funded_ladder"]["human_grant_required"], true);
+        assert!(profitability["blocking_reason"]
+            .as_str()
+            .is_some_and(|blocker| blocker.contains("failed")));
+    }
+
+    #[test]
+    fn complete_correction_preserves_current_eligibility_and_read_failure_blocks() {
+        let complete = correction_gate_from_result(Ok(Some(test_correction_state("complete"))));
+        let mut profitability = json!({
+            "phase": "shadow_collecting",
+            "promotion_allowed": false
+        });
+        apply_shadow_correction_to_profitability(&mut profitability, &complete);
+        assert_eq!(complete.decision(), "ELIGIBILITY_UNCHANGED");
+        assert_eq!(profitability["phase"], "shadow_collecting");
+        assert!(profitability.get("pre_correction_phase").is_none());
+
+        let unavailable = correction_gate_from_result(Err("unreadable".to_owned()));
+        let payload = apply_shadow_correction_to_prospective(
+            json!({"result": {"status": "passed", "rows": []}}),
+            &unavailable,
+        );
+        assert_eq!(payload["correction"]["status"], "unavailable");
+        assert_eq!(payload["correction"]["validation_error"], true);
+        assert_eq!(payload["result"]["decision"], "NO-GO");
+    }
+
     #[test]
     fn profitability_selection_prefers_newer_shadow_before_a_funded_ladder_exists() {
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
@@ -2967,6 +3272,21 @@ mod tests {
             created_at + Duration::hours(24),
         )
         .expect("valid test promotion manifest")
+    }
+
+    fn test_correction_state(status: &str) -> ShadowCorrectionState {
+        ShadowCorrectionState {
+            schema_version: 1,
+            campaign_id: "shadow-profitability-2026-07-12".to_owned(),
+            correction_id: "corr-2026-07-13".to_owned(),
+            from: chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+            through: chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+            reason: "repair projected cache lineage".to_owned(),
+            status: status.to_owned(),
+            builder_git_sha: Some("a".repeat(40)),
+            started_at: "2026-07-14T00:00:00Z".to_owned(),
+            completed_at: (status == "complete").then(|| "2026-07-14T01:00:00Z".to_owned()),
+        }
     }
 
     fn build_atomic_test_bundle(date: &str, run_id: &str) {

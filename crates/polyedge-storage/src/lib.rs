@@ -18,6 +18,9 @@ use tracing::warn;
 
 const AZURE_BLOB_API_VERSION: &str = "2023-11-03";
 const AZURE_BLOB_MAX_ATTEMPTS: usize = 5;
+const AZURE_LEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const AZURE_LEASE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const AZURE_LEASE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_APPEND_BLOCK_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const AZURE_TABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
@@ -416,9 +419,19 @@ pub enum ImmutableBlobWrite {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobLeaseAcquireResult {
+    Acquired(String),
+    AlreadyLeased,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionedBlobBytes {
     pub bytes: Vec<u8>,
     pub etag: String,
+    pub version_id: Option<String>,
+    pub content_md5: Option<String>,
+    pub blob_type: Option<String>,
+    pub sealed: Option<bool>,
 }
 
 impl AzureBlobError {
@@ -543,9 +556,18 @@ fn rfc1123_now() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AzureBlobItem {
     pub name: String,
+    /// Strong validator returned by Azure for the exact listed blob version.
+    /// This is kept together with size and modification time so callers can
+    /// fail closed if a sealed source blob changes while it is being read.
+    pub etag: String,
+    pub version_id: Option<String>,
+    pub is_current_version: Option<bool>,
+    pub content_md5: Option<String>,
+    pub blob_type: Option<String>,
+    pub sealed: Option<bool>,
     pub content_length: u64,
     pub last_modified: Option<DateTime<Utc>>,
 }
@@ -595,6 +617,26 @@ impl AzureBlobClient {
                 .timeout_connect(Duration::from_secs(10))
                 .timeout_read(Duration::from_secs(120))
                 .timeout_write(Duration::from_secs(30))
+                .build(),
+        }
+    }
+
+    /// Build a client whose individual network operations are short enough for
+    /// a finite Azure lease watchdog. Lease renewal is additionally single-shot
+    /// so a transient outage cannot keep a protected child alive past expiry.
+    pub fn with_managed_identity_for_lease(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            container: container.into(),
+            auth: AzureBlobAuth::ManagedIdentity(ManagedIdentityToken::new(client_id)),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(AZURE_LEASE_CONNECT_TIMEOUT)
+                .timeout_read(AZURE_LEASE_READ_TIMEOUT)
+                .timeout_write(AZURE_LEASE_WRITE_TIMEOUT)
                 .build(),
         }
     }
@@ -697,16 +739,34 @@ impl AzureBlobClient {
             encode_blob_path(name)
         );
         let response = self.get_response(&url)?;
-        let etag = response
-            .header("etag")
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                AzureBlobError::Transport("Azure Blob response omitted ETag".to_owned())
-            })?
-            .to_owned();
-        let mut bytes = Vec::new();
-        response.into_reader().read_to_end(&mut bytes)?;
-        Ok(VersionedBlobBytes { bytes, etag })
+        read_versioned_blob_response(response)
+    }
+
+    /// Reads a blob only if it is still the exact ETag returned by the prior
+    /// exhaustive listing. A 412 response proves the source changed before it
+    /// could be admitted into a sealed-day inventory.
+    pub fn download_blob_bytes_if_match(
+        &mut self,
+        name: &str,
+        expected_etag: &str,
+    ) -> Result<VersionedBlobBytes, AzureBlobError> {
+        if expected_etag.trim().is_empty()
+            || expected_etag
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(AzureBlobError::Transport(
+                "conditional Azure Blob read requires a valid ETag".to_owned(),
+            ));
+        }
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        let response = self.get_response_if_match(&url, expected_etag)?;
+        read_versioned_blob_response(response)
     }
 
     pub fn upload_block_blob_bytes(
@@ -778,8 +838,151 @@ impl AzureBlobClient {
         unreachable!("Azure Blob conditional upload retry loop always returns");
     }
 
+    /// Acquires a finite Azure lease on a dedicated block blob. The lock blob
+    /// is created once if it does not yet exist. Finite leases expire after a
+    /// crashed worker stops renewing, preventing a permanent campaign lock.
+    pub fn acquire_blob_lease(
+        &mut self,
+        name: &str,
+        duration_seconds: u32,
+    ) -> Result<BlobLeaseAcquireResult, AzureBlobError> {
+        if !(15..=60).contains(&duration_seconds) {
+            return Err(AzureBlobError::Transport(
+                "Azure finite lease duration must be between 15 and 60 seconds".to_owned(),
+            ));
+        }
+        let _ = self.upload_block_blob_bytes_if_absent(
+            name,
+            b"polyedge campaign lease\n",
+            "text/plain",
+        )?;
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}?comp=lease",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        match self.lease_request(&url, "acquire", None, Some(duration_seconds)) {
+            Ok(response) => response
+                .header("x-ms-lease-id")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| BlobLeaseAcquireResult::Acquired(value.to_owned()))
+                .ok_or_else(|| {
+                    AzureBlobError::Transport(
+                        "Azure lease acquire response omitted x-ms-lease-id".to_owned(),
+                    )
+                }),
+            Err(AzureBlobError::HttpStatus(409 | 412)) => Ok(BlobLeaseAcquireResult::AlreadyLeased),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn renew_blob_lease(&mut self, name: &str, lease_id: &str) -> Result<bool, AzureBlobError> {
+        validate_lease_id(lease_id)?;
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}?comp=lease",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        match self.lease_request_once(&url, "renew", Some(lease_id), None) {
+            Ok(_) => Ok(true),
+            Err(AzureBlobError::HttpStatus(409 | 412)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn release_blob_lease(
+        &mut self,
+        name: &str,
+        lease_id: &str,
+    ) -> Result<bool, AzureBlobError> {
+        validate_lease_id(lease_id)?;
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}?comp=lease",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        match self.lease_request(&url, "release", Some(lease_id), None) {
+            Ok(_) => Ok(true),
+            Err(AzureBlobError::HttpStatus(409 | 412)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn get_text(&mut self, url: &str) -> Result<String, AzureBlobError> {
         Ok(String::from_utf8(self.get_bytes_with_retry(url)?)?)
+    }
+
+    fn lease_request(
+        &mut self,
+        url: &str,
+        action: &str,
+        lease_id: Option<&str>,
+        duration_seconds: Option<u32>,
+    ) -> Result<ureq::Response, AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self.lease_request_once(url, action, lease_id, duration_seconds) {
+                Ok(response) => return Ok(response),
+                Err(AzureBlobError::HttpStatus(status)) => {
+                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(AzureBlobError::Transport(message)) => {
+                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::Transport(message));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure lease retry loop always returns");
+    }
+
+    fn lease_request_once(
+        &mut self,
+        url: &str,
+        action: &str,
+        lease_id: Option<&str>,
+        duration_seconds: Option<u32>,
+    ) -> Result<ureq::Response, AzureBlobError> {
+        let date = rfc1123_now();
+        let send = |request: ureq::Request| {
+            let mut request = request
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .set("x-ms-date", &date)
+                .set("x-ms-lease-action", action)
+                .set("content-length", "0");
+            if let Some(lease_id) = lease_id {
+                request = request.set("x-ms-lease-id", lease_id);
+            }
+            if let Some(duration) = duration_seconds {
+                request = request.set("x-ms-lease-duration", &duration.to_string());
+            }
+            request.call()
+        };
+        let response = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => send(self.agent.put(&append_sas(url, sas))),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                send(
+                    self.agent
+                        .put(url)
+                        .set("authorization", &format!("Bearer {access_token}")),
+                )
+            }
+        };
+        match response {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
     }
 
     fn get_bytes_with_retry(&mut self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
@@ -842,6 +1045,53 @@ impl AzureBlobClient {
             }
         }
         unreachable!("Azure Blob retry loop always returns");
+    }
+
+    fn get_response_if_match(
+        &mut self,
+        url: &str,
+        expected_etag: &str,
+    ) -> Result<ureq::Response, AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let date = rfc1123_now();
+            let response = match &mut self.auth {
+                AzureBlobAuth::Sas(sas) => self
+                    .agent
+                    .get(&append_sas(url, sas))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("if-match", expected_etag)
+                    .call(),
+                AzureBlobAuth::ManagedIdentity(token) => {
+                    let access_token = token.access_token(&self.agent)?;
+                    self.agent
+                        .get(url)
+                        .set("authorization", &format!("Bearer {access_token}"))
+                        .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                        .set("x-ms-date", &date)
+                        .set("if-match", expected_etag)
+                        .call()
+                }
+            };
+            match response {
+                Ok(response) => return Ok(response),
+                Err(ureq::Error::Status(status, _)) => {
+                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(ureq::Error::Transport(error)) => {
+                    let message = error.to_string();
+                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::Transport(message));
+                }
+            }
+        }
+        unreachable!("Azure Blob conditional read retry loop always returns");
     }
 
     fn put_block_blob_with_retry(
@@ -1274,6 +1524,53 @@ fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(250 * 2_u64.pow(attempt.min(4) as u32))
 }
 
+fn validate_lease_id(lease_id: &str) -> Result<(), AzureBlobError> {
+    if lease_id.trim().is_empty()
+        || lease_id.len() > 128
+        || lease_id.chars().any(|character| character.is_control())
+    {
+        return Err(AzureBlobError::Transport(
+            "Azure lease ID is empty or invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_versioned_blob_response(
+    response: ureq::Response,
+) -> Result<VersionedBlobBytes, AzureBlobError> {
+    let etag = response
+        .header("etag")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AzureBlobError::Transport("Azure Blob response omitted ETag".to_owned()))?
+        .to_owned();
+    let version_id = response
+        .header("x-ms-version-id")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let content_md5 = response
+        .header("content-md5")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let blob_type = response
+        .header("x-ms-blob-type")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let sealed = response
+        .header("x-ms-blob-sealed")
+        .and_then(|value| value.parse::<bool>().ok());
+    let mut bytes = Vec::new();
+    response.into_reader().read_to_end(&mut bytes)?;
+    Ok(VersionedBlobBytes {
+        bytes,
+        etag,
+        version_id,
+        content_md5,
+        blob_type,
+        sealed,
+    })
+}
+
 #[derive(Default)]
 struct BlobListPage {
     blobs: Vec<AzureBlobItem>,
@@ -1288,6 +1585,12 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
     let mut current_tag = String::new();
     let mut in_blob = false;
     let mut name = String::new();
+    let mut etag = String::new();
+    let mut version_id = None;
+    let mut is_current_version = None;
+    let mut content_md5 = None;
+    let mut blob_type = None;
+    let mut sealed = None;
     let mut content_length = 0_u64;
     let mut last_modified = None;
     loop {
@@ -1297,6 +1600,12 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                 if current_tag == "Blob" {
                     in_blob = true;
                     name.clear();
+                    etag.clear();
+                    version_id = None;
+                    is_current_version = None;
+                    content_md5 = None;
+                    blob_type = None;
+                    sealed = None;
                     content_length = 0;
                     last_modified = None;
                 }
@@ -1304,8 +1613,19 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
             Event::End(event) => {
                 let tag = String::from_utf8_lossy(event.name().as_ref()).into_owned();
                 if tag == "Blob" && in_blob {
+                    if name.is_empty() || etag.trim().is_empty() {
+                        return Err(AzureBlobError::XmlMessage(
+                            "Azure blob listing omitted Name or ETag".to_owned(),
+                        ));
+                    }
                     page.blobs.push(AzureBlobItem {
                         name: name.clone(),
+                        etag: etag.clone(),
+                        version_id: version_id.clone(),
+                        is_current_version,
+                        content_md5: content_md5.clone(),
+                        blob_type: blob_type.clone(),
+                        sealed,
                         content_length,
                         last_modified,
                     });
@@ -1320,6 +1640,18 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                     .into_owned();
                 if in_blob && current_tag == "Name" {
                     name = text;
+                } else if in_blob && current_tag == "Etag" {
+                    etag = text;
+                } else if in_blob && current_tag == "VersionId" {
+                    version_id = (!text.is_empty()).then_some(text);
+                } else if in_blob && current_tag == "IsCurrentVersion" {
+                    is_current_version = text.parse::<bool>().ok();
+                } else if in_blob && current_tag == "Content-MD5" {
+                    content_md5 = (!text.is_empty()).then_some(text);
+                } else if in_blob && current_tag == "BlobType" {
+                    blob_type = (!text.is_empty()).then_some(text);
+                } else if in_blob && current_tag == "Sealed" {
+                    sealed = text.parse::<bool>().ok();
                 } else if in_blob && current_tag == "Content-Length" {
                     content_length = text.parse().unwrap_or(0);
                 } else if in_blob && current_tag == "Last-Modified" {
@@ -1516,5 +1848,47 @@ mod tests {
         let chunks = buffer.drain();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, b"failed\npending\n");
+    }
+
+    #[test]
+    fn blob_listing_requires_and_preserves_strong_identity_metadata() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults>
+  <Blobs>
+    <Blob>
+      <Name>shadow-events/campaign-2026-07-12/2026/07/13/00/00.jsonl</Name>
+      <Properties>
+        <Last-Modified>Mon, 13 Jul 2026 00:01:00 GMT</Last-Modified>
+        <Etag>&quot;0x8DB123&quot;</Etag>
+        <Content-MD5>YWJjZA==</Content-MD5>
+        <Content-Length>123</Content-Length>
+        <BlobType>AppendBlob</BlobType>
+        <Sealed>true</Sealed>
+      </Properties>
+      <VersionId>2026-07-13T00:01:00.0000000Z</VersionId>
+      <IsCurrentVersion>true</IsCurrentVersion>
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+        let page = parse_blob_list(xml).unwrap();
+        assert_eq!(page.blobs.len(), 1);
+        assert_eq!(page.blobs[0].etag, "\"0x8DB123\"");
+        assert_eq!(page.blobs[0].content_length, 123);
+        assert_eq!(page.blobs[0].content_md5.as_deref(), Some("YWJjZA=="));
+        assert_eq!(page.blobs[0].blob_type.as_deref(), Some("AppendBlob"));
+        assert_eq!(page.blobs[0].sealed, Some(true));
+        assert_eq!(
+            page.blobs[0].version_id.as_deref(),
+            Some("2026-07-13T00:01:00.0000000Z")
+        );
+        assert_eq!(page.blobs[0].is_current_version, Some(true));
+        assert_eq!(
+            page.blobs[0].name,
+            "shadow-events/campaign-2026-07-12/2026/07/13/00/00.jsonl"
+        );
+
+        let missing_etag = xml.replace("<Etag>&quot;0x8DB123&quot;</Etag>", "<Etag></Etag>");
+        assert!(parse_blob_list(&missing_etag).is_err());
     }
 }

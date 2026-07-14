@@ -31,6 +31,7 @@ hmac = "0.12"
 # idna_adapter releases require Edition 2024 support.
 idna_adapter = "=1.2.0"
 libm = "0.2"
+libc = "0.2"
 polyedge-api = { path = "crates/polyedge-api" }
 polyedge-config = { path = "crates/polyedge-config" }
 polyedge-domain = { path = "crates/polyedge-domain" }

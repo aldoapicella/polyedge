@@ -1,11 +1,15 @@
 use super::*;
 use chrono::NaiveDate;
-const PROJECTED_DAY_SCHEMA_VERSION: u32 = 1;
-const PROJECTED_CAMPAIGN_SCHEMA_VERSION: u32 = 1;
-const PROJECTED_CACHE_DOMAIN: &str = "polyedge.projected-day-cache.v1";
-const PROJECTED_CAMPAIGN_DOMAIN: &str = "polyedge.projected-campaign-chain.v1";
+const PROJECTED_DAY_SCHEMA_VERSION: u32 = 2;
+const PROJECTED_CAMPAIGN_SCHEMA_VERSION: u32 = 2;
+const PROJECTED_CACHE_DOMAIN: &str = "polyedge.projected-day-cache.v2";
+const PROJECTED_CAMPAIGN_DOMAIN: &str = "polyedge.projected-campaign-chain.v2";
 pub const PROJECTED_CAMPAIGN_INDEX_FILE: &str = "campaign_index.json";
 const PROJECTED_DAY_MANIFEST_FILE: &str = "projected_day_manifest.json";
+const SHADOW_CORRECTION_SCHEMA_VERSION: u32 = 1;
+const SHADOW_CORRECTION_ROOT: &str = "reports/research/shadow/corrections";
+const SHADOW_CORRECTION_ACTIVE: &str = "active.json";
+const SHADOW_CORRECTION_RUNS: &str = "runs";
 
 #[derive(Clone, Debug)]
 pub struct PublishProjectedDayOptions {
@@ -14,6 +18,8 @@ pub struct PublishProjectedDayOptions {
     pub campaign_id: String,
     pub cache_root: String,
     pub out: PathBuf,
+    pub require_azure_source: bool,
+    pub expected_source_container: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -24,6 +30,48 @@ pub struct MaterializeProjectedCampaignOptions {
     pub cache_root: String,
     pub out: PathBuf,
     pub manifest: PathBuf,
+    pub require_azure_source: bool,
+    pub expected_source_container: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BeginShadowCorrectionOptions {
+    pub campaign_id: String,
+    pub correction_id: String,
+    pub from: NaiveDate,
+    pub through: NaiveDate,
+    pub reason: String,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompleteShadowCorrectionOptions {
+    pub campaign_id: String,
+    pub from: NaiveDate,
+    pub through: NaiveDate,
+    pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShadowCorrectionState {
+    pub schema_version: u32,
+    pub campaign_id: String,
+    pub correction_id: String,
+    pub from: NaiveDate,
+    pub through: NaiveDate,
+    pub reason: String,
+    pub status: String,
+    pub builder_git_sha: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ShadowCorrectionPointer {
+    schema_version: u32,
+    state_sha256: String,
+    state_path: String,
+    state: ShadowCorrectionState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -49,6 +97,7 @@ pub struct ProjectedDayCanonical {
     pub events: u64,
     pub input_events: u64,
     pub malformed_lines: u64,
+    pub raw_source_inventory: RawSourceInventory,
     pub first_recorded_ts: String,
     pub last_recorded_ts: String,
     pub event_counts: BTreeMap<String, u64>,
@@ -69,6 +118,16 @@ struct ProjectedDayPointer {
     canonical_sha256: String,
     manifest_path: String,
     manifest_sha256: String,
+    #[serde(default)]
+    supersedes_pointer_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedDayPointerSnapshot {
+    date: NaiveDate,
+    path: String,
+    bytes: Vec<u8>,
+    pointer: ProjectedDayPointer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +136,8 @@ pub struct ProjectedCampaignSegment {
     pub relative_path: String,
     pub day_canonical_sha256: String,
     pub day_manifest_sha256: String,
+    pub raw_source_inventory_sha256: String,
+    pub raw_source_kind: String,
     pub parent_chain_sha256: Option<String>,
     pub chain_sha256: String,
     pub events: u64,
@@ -91,6 +152,8 @@ pub struct ProjectedCampaignIndex {
     pub since: NaiveDate,
     pub through: NaiveDate,
     pub cutoff_exclusive: String,
+    pub source_policy: String,
+    pub source_container: Option<String>,
     pub canonical_sha256: String,
     pub total_events: u64,
     pub segments: Vec<ProjectedCampaignSegment>,
@@ -109,6 +172,12 @@ pub fn run_publish_projected_day(
         options.date,
         &options.campaign_id,
         &normalize_manifest,
+    )?;
+    validate_projected_day_source(
+        &canonical,
+        options.date,
+        options.require_azure_source,
+        options.expected_source_container.as_deref(),
     )?;
     let canonical_sha256 = sha256_prefixed(&canonical_bytes(&canonical)?);
     let manifest = ProjectedDayManifest {
@@ -135,16 +204,32 @@ pub fn run_publish_projected_day(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let manifest_bytes = with_trailing_newline(manifest_bytes);
     store.put_immutable_verified(&manifest_path, &manifest_bytes)?;
+    let pointer_path = format!("days/{}/latest.json", options.date.format("%Y-%m-%d"));
+    let prior_pointer_bytes = store.read_optional(&pointer_path)?;
+    let prior_pointer_sha256 = prior_pointer_bytes.as_deref().map(sha256_prefixed);
+    if let Some(prior_bytes) = &prior_pointer_bytes {
+        let prior: ProjectedDayPointer = serde_json::from_slice(prior_bytes)?;
+        if prior.date == options.date
+            && prior.canonical_sha256 == canonical_sha256
+            && prior.manifest_path == manifest_path
+            && prior.manifest_sha256 == sha256_prefixed(&manifest_bytes)
+        {
+            write_pretty_json(&options.out, &manifest)?;
+            return serde_json::to_value(&manifest).map_err(ResearchError::Json);
+        }
+    }
     let pointer = ProjectedDayPointer {
         schema_version: PROJECTED_DAY_SCHEMA_VERSION,
         date: options.date,
         canonical_sha256,
         manifest_path,
         manifest_sha256: sha256_prefixed(&manifest_bytes),
+        supersedes_pointer_sha256: prior_pointer_sha256.clone(),
     };
     store.put_pointer_cas(
-        &format!("days/{}/latest.json", options.date.format("%Y-%m-%d")),
+        &pointer_path,
         &with_trailing_newline(serde_json::to_vec_pretty(&pointer)?),
+        prior_pointer_sha256.as_deref(),
     )?;
     write_pretty_json(&options.out, &manifest)?;
     serde_json::to_value(&manifest).map_err(ResearchError::Json)
@@ -161,6 +246,7 @@ pub fn run_materialize_projected_campaign(
         ));
     }
     let mut store = ProjectedCacheStore::open(&options.cache_root)?;
+    let pointer_snapshots = read_pointer_snapshots(&mut store, options.since, options.through)?;
     let staging = sibling_staging_path(&options.out);
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
@@ -169,22 +255,11 @@ pub fn run_materialize_projected_campaign(
 
     let materialized = (|| {
         let mut segments = Vec::new();
-        let mut date = options.since;
         let mut parent_chain_sha256 = None::<String>;
         let mut total_events = 0_u64;
-        loop {
-            let pointer_path = format!("days/{}/latest.json", date.format("%Y-%m-%d"));
-            let pointer_bytes = store.read(&pointer_path).map_err(|error| {
-                ResearchError::InvalidInput(format!(
-                    "projected cache is missing a complete day for {date}: {error}"
-                ))
-            })?;
-            let pointer: ProjectedDayPointer = serde_json::from_slice(&pointer_bytes)?;
-            if pointer.date != date || pointer.schema_version != PROJECTED_DAY_SCHEMA_VERSION {
-                return Err(ResearchError::InvalidInput(format!(
-                    "projected cache pointer identity mismatch for {date}"
-                )));
-            }
+        for snapshot in &pointer_snapshots {
+            let date = snapshot.date;
+            let pointer = &snapshot.pointer;
             let manifest_bytes = store.read(&pointer.manifest_path)?;
             if sha256_prefixed(&manifest_bytes) != pointer.manifest_sha256 {
                 return Err(ResearchError::InvalidInput(format!(
@@ -193,6 +268,12 @@ pub fn run_materialize_projected_campaign(
             }
             let manifest: ProjectedDayManifest = serde_json::from_slice(&manifest_bytes)?;
             validate_day_manifest(&manifest, date, &options.campaign_id)?;
+            validate_projected_day_source(
+                &manifest.canonical,
+                date,
+                options.require_azure_source,
+                options.expected_source_container.as_deref(),
+            )?;
             if manifest.canonical_sha256 != pointer.canonical_sha256 {
                 return Err(ResearchError::InvalidInput(format!(
                     "projected cache canonical pointer mismatch for {date}"
@@ -231,6 +312,7 @@ pub fn run_materialize_projected_campaign(
                     "format": manifest.canonical.format,
                     "decision_grade_projection": manifest.canonical.decision_grade_projection,
                     "events": manifest.canonical.events,
+                    "raw_source_inventory_sha256": manifest.canonical.raw_source_inventory.canonical_sha256,
                     "first_recorded_ts": manifest.canonical.first_recorded_ts,
                     "last_recorded_ts": manifest.canonical.last_recorded_ts
                 }),
@@ -250,7 +332,16 @@ pub fn run_materialize_projected_campaign(
                 date,
                 relative_path: segment_relative,
                 day_canonical_sha256: manifest.canonical_sha256,
-                day_manifest_sha256: pointer.manifest_sha256,
+                day_manifest_sha256: pointer.manifest_sha256.clone(),
+                raw_source_inventory_sha256: manifest
+                    .canonical
+                    .raw_source_inventory
+                    .canonical_sha256,
+                raw_source_kind: manifest
+                    .canonical
+                    .raw_source_inventory
+                    .canonical
+                    .source_kind,
                 parent_chain_sha256: parent_chain_sha256.clone(),
                 chain_sha256: chain_sha256.clone(),
                 events: manifest.canonical.events,
@@ -258,12 +349,6 @@ pub fn run_materialize_projected_campaign(
                 last_recorded_ts: manifest.canonical.last_recorded_ts,
             });
             parent_chain_sha256 = Some(chain_sha256);
-            if date == options.through {
-                break;
-            }
-            date = date.succ_opt().ok_or_else(|| {
-                ResearchError::InvalidInput("projected campaign date overflow".to_owned())
-            })?;
         }
 
         let index = ProjectedCampaignIndex {
@@ -272,6 +357,12 @@ pub fn run_materialize_projected_campaign(
             since: options.since,
             through: options.through,
             cutoff_exclusive: day_end(options.through),
+            source_policy: if options.require_azure_source {
+                "exact_azure_blob_inventory_v1".to_owned()
+            } else {
+                "local_test_inventory_v1".to_owned()
+            },
+            source_container: options.expected_source_container.clone(),
             canonical_sha256: parent_chain_sha256.ok_or_else(|| {
                 ResearchError::InvalidInput("projected campaign contains no segments".to_owned())
             })?,
@@ -279,6 +370,7 @@ pub fn run_materialize_projected_campaign(
             segments,
         };
         validate_campaign_index(&index, Some(&staging))?;
+        verify_pointer_snapshots_current(&mut store, &pointer_snapshots)?;
         write_pretty_json(&staging.join(PROJECTED_CAMPAIGN_INDEX_FILE), &index)?;
         Ok::<ProjectedCampaignIndex, ResearchError>(index)
     })();
@@ -296,6 +388,284 @@ pub fn run_materialize_projected_campaign(
     fs::rename(&staging, &options.out)?;
     write_pretty_json(&options.manifest, &index)?;
     serde_json::to_value(&index).map_err(ResearchError::Json)
+}
+
+pub fn run_begin_shadow_correction(
+    options: BeginShadowCorrectionOptions,
+) -> Result<Value, ResearchError> {
+    let mut store = shadow_correction_store()?;
+    begin_shadow_correction_with_store(options, &mut store)
+}
+
+fn begin_shadow_correction_with_store(
+    options: BeginShadowCorrectionOptions,
+    store: &mut ProjectedCacheStore,
+) -> Result<Value, ResearchError> {
+    validate_campaign_id(&options.campaign_id)?;
+    validate_campaign_id(&options.correction_id)?;
+    ensure_sealed_utc_day(options.through, "shadow correction through date")?;
+    if options.from > options.through
+        || options.reason.trim().is_empty()
+        || options.reason.len() > 256
+    {
+        return Err(ResearchError::InvalidInput(
+            "shadow correction range or reason is invalid".to_owned(),
+        ));
+    }
+    let prior_bytes = store.read_optional(SHADOW_CORRECTION_ACTIVE)?;
+    let prior_sha256 = prior_bytes.as_deref().map(sha256_prefixed);
+    if let Some(prior_bytes) = &prior_bytes {
+        let prior: ShadowCorrectionPointer = serde_json::from_slice(prior_bytes)?;
+        validate_shadow_correction_pointer(&prior)?;
+        if matches!(prior.state.status.as_str(), "in_progress" | "failed") {
+            if prior.state.campaign_id == options.campaign_id
+                && prior.state.from == options.from
+                && prior.state.through == options.through
+            {
+                write_pretty_json(&options.out, &prior)?;
+                return serde_json::to_value(prior).map_err(ResearchError::Json);
+            }
+            return Err(ResearchError::InvalidInput(format!(
+                "shadow correction {} is still {}; resume or resolve it before starting another range",
+                prior.state.correction_id, prior.state.status
+            )));
+        }
+    }
+    let state = ShadowCorrectionState {
+        schema_version: SHADOW_CORRECTION_SCHEMA_VERSION,
+        campaign_id: options.campaign_id,
+        correction_id: options.correction_id,
+        from: options.from,
+        through: options.through,
+        reason: options.reason,
+        status: "in_progress".to_owned(),
+        builder_git_sha: git_sha(),
+        started_at: now_ts(),
+        completed_at: None,
+    };
+    let pointer = correction_pointer(state)?;
+    let state_bytes = with_trailing_newline(serde_json::to_vec_pretty(&pointer.state)?);
+    store.put_immutable_verified(&pointer.state_path, &state_bytes)?;
+    let pointer_bytes = with_trailing_newline(serde_json::to_vec_pretty(&pointer)?);
+    store.put_pointer_cas(
+        SHADOW_CORRECTION_ACTIVE,
+        &pointer_bytes,
+        prior_sha256.as_deref(),
+    )?;
+    write_pretty_json(&options.out, &pointer)?;
+    serde_json::to_value(pointer).map_err(ResearchError::Json)
+}
+
+pub fn run_complete_shadow_correction(
+    options: CompleteShadowCorrectionOptions,
+) -> Result<Value, ResearchError> {
+    let mut store = shadow_correction_store()?;
+    complete_shadow_correction_with_store(options, &mut store)
+}
+
+fn complete_shadow_correction_with_store(
+    options: CompleteShadowCorrectionOptions,
+    store: &mut ProjectedCacheStore,
+) -> Result<Value, ResearchError> {
+    validate_campaign_id(&options.campaign_id)?;
+    ensure_sealed_utc_day(options.through, "shadow correction through date")?;
+    let prior_bytes = store
+        .read_optional(SHADOW_CORRECTION_ACTIVE)?
+        .ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "shadow correction cannot complete without an active state".to_owned(),
+            )
+        })?;
+    let prior_sha256 = sha256_prefixed(&prior_bytes);
+    let prior: ShadowCorrectionPointer = serde_json::from_slice(&prior_bytes)?;
+    validate_shadow_correction_pointer(&prior)?;
+    if prior.state.campaign_id != options.campaign_id
+        || prior.state.from != options.from
+        || prior.state.through != options.through
+        || prior.state.status != "in_progress"
+    {
+        return Err(ResearchError::InvalidInput(
+            "shadow correction completion does not match the active in-progress range".to_owned(),
+        ));
+    }
+    let mut state = prior.state;
+    state.status = "complete".to_owned();
+    state.completed_at = Some(now_ts());
+    let pointer = correction_pointer(state)?;
+    let state_bytes = with_trailing_newline(serde_json::to_vec_pretty(&pointer.state)?);
+    store.put_immutable_verified(&pointer.state_path, &state_bytes)?;
+    let pointer_bytes = with_trailing_newline(serde_json::to_vec_pretty(&pointer)?);
+    store.put_pointer_cas(
+        SHADOW_CORRECTION_ACTIVE,
+        &pointer_bytes,
+        Some(&prior_sha256),
+    )?;
+    write_pretty_json(&options.out, &pointer)?;
+    serde_json::to_value(pointer).map_err(ResearchError::Json)
+}
+
+pub fn read_shadow_correction_state() -> Result<Option<ShadowCorrectionState>, ResearchError> {
+    let mut store = shadow_correction_store()?;
+    read_shadow_correction_state_from_store(&mut store)
+}
+
+fn read_shadow_correction_state_from_store(
+    store: &mut ProjectedCacheStore,
+) -> Result<Option<ShadowCorrectionState>, ResearchError> {
+    let Some(bytes) = store.read_optional(SHADOW_CORRECTION_ACTIVE)? else {
+        return Ok(None);
+    };
+    let pointer: ShadowCorrectionPointer = serde_json::from_slice(&bytes)?;
+    validate_shadow_correction_pointer(&pointer)?;
+    let state_bytes = store.read(&pointer.state_path)?;
+    if sha256_prefixed(&canonical_bytes(&pointer.state)?) != pointer.state_sha256
+        || serde_json::from_slice::<ShadowCorrectionState>(&state_bytes)? != pointer.state
+    {
+        return Err(ResearchError::InvalidInput(
+            "shadow correction immutable state does not match its active pointer".to_owned(),
+        ));
+    }
+    Ok(Some(pointer.state))
+}
+
+fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
+    let root = match std::env::var("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(account) => {
+            let container = std::env::var("AZURE_RESEARCH_STORAGE_CONTAINER_NAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("AZURE_STORAGE_CONTAINER_NAME")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .ok_or_else(|| {
+                    ResearchError::InvalidInput(
+                        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME or AZURE_STORAGE_CONTAINER_NAME is required for the shadow correction journal".to_owned(),
+                    )
+                })?;
+            format!("azure://{account}/{container}/{SHADOW_CORRECTION_ROOT}")
+        }
+        None => SHADOW_CORRECTION_ROOT.to_owned(),
+    };
+    ProjectedCacheStore::open(&root)
+}
+
+fn correction_pointer(
+    state: ShadowCorrectionState,
+) -> Result<ShadowCorrectionPointer, ResearchError> {
+    let state_bytes = canonical_bytes(&state)?;
+    let state_sha256 = sha256_prefixed(&state_bytes);
+    let pointer = ShadowCorrectionPointer {
+        schema_version: SHADOW_CORRECTION_SCHEMA_VERSION,
+        state_path: format!(
+            "{SHADOW_CORRECTION_RUNS}/{}.json",
+            state_sha256.trim_start_matches("sha256:")
+        ),
+        state_sha256,
+        state,
+    };
+    validate_shadow_correction_pointer(&pointer)?;
+    Ok(pointer)
+}
+
+fn validate_shadow_correction_pointer(
+    pointer: &ShadowCorrectionPointer,
+) -> Result<(), ResearchError> {
+    if pointer.schema_version != SHADOW_CORRECTION_SCHEMA_VERSION
+        || pointer.state.schema_version != SHADOW_CORRECTION_SCHEMA_VERSION
+        || !matches!(
+            pointer.state.status.as_str(),
+            "in_progress" | "failed" | "complete"
+        )
+        || pointer.state.from > pointer.state.through
+        || pointer.state.reason.trim().is_empty()
+        || !valid_sha256(&pointer.state_sha256)
+    {
+        return Err(ResearchError::InvalidInput(
+            "shadow correction pointer is invalid".to_owned(),
+        ));
+    }
+    validate_campaign_id(&pointer.state.campaign_id)?;
+    validate_campaign_id(&pointer.state.correction_id)?;
+    validate_relative_cache_path(&pointer.state_path)?;
+    let expected = sha256_prefixed(&canonical_bytes(&pointer.state)?);
+    if pointer.state_sha256 != expected
+        || pointer.state_path
+            != format!(
+                "{SHADOW_CORRECTION_RUNS}/{}.json",
+                expected.trim_start_matches("sha256:")
+            )
+    {
+        return Err(ResearchError::InvalidInput(
+            "shadow correction state hash or path mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_pointer_snapshots(
+    store: &mut ProjectedCacheStore,
+    since: NaiveDate,
+    through: NaiveDate,
+) -> Result<Vec<ProjectedDayPointerSnapshot>, ResearchError> {
+    let mut snapshots = Vec::new();
+    let mut date = since;
+    loop {
+        let path = format!("days/{}/latest.json", date.format("%Y-%m-%d"));
+        let bytes = store.read(&path).map_err(|error| {
+            ResearchError::InvalidInput(format!(
+                "projected cache is missing a complete day for {date}: {error}"
+            ))
+        })?;
+        let pointer: ProjectedDayPointer = serde_json::from_slice(&bytes)?;
+        if pointer.date != date || pointer.schema_version != PROJECTED_DAY_SCHEMA_VERSION {
+            return Err(ResearchError::InvalidInput(format!(
+                "projected cache pointer identity mismatch for {date}"
+            )));
+        }
+        if pointer
+            .supersedes_pointer_sha256
+            .as_deref()
+            .is_some_and(|value| !valid_sha256(value))
+        {
+            return Err(ResearchError::InvalidInput(format!(
+                "projected cache correction lineage is invalid for {date}"
+            )));
+        }
+        snapshots.push(ProjectedDayPointerSnapshot {
+            date,
+            path,
+            bytes,
+            pointer,
+        });
+        if date == through {
+            break;
+        }
+        date = date.succ_opt().ok_or_else(|| {
+            ResearchError::InvalidInput("projected campaign date overflow".to_owned())
+        })?;
+    }
+    Ok(snapshots)
+}
+
+fn verify_pointer_snapshots_current(
+    store: &mut ProjectedCacheStore,
+    snapshots: &[ProjectedDayPointerSnapshot],
+) -> Result<(), ResearchError> {
+    for snapshot in snapshots {
+        let current = store.read(&snapshot.path)?;
+        if current != snapshot.bytes {
+            return Err(ResearchError::InvalidInput(format!(
+                "projected cache changed during campaign materialization at {}; retry under a stable campaign lease",
+                snapshot.date
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load_campaign_index(
@@ -360,6 +730,16 @@ fn build_day_canonical(
         events,
         input_events: required_u64(manifest, "input_events")?,
         malformed_lines: manifest["malformed_lines"].as_u64().unwrap_or(0),
+        raw_source_inventory: serde_json::from_value(
+            manifest
+                .get("raw_source_inventory")
+                .cloned()
+                .ok_or_else(|| {
+                    ResearchError::InvalidInput(
+                        "normalized manifest is missing raw_source_inventory".to_owned(),
+                    )
+                })?,
+        )?,
         first_recorded_ts,
         last_recorded_ts,
         event_counts,
@@ -438,6 +818,7 @@ fn validate_day_manifest(
         &manifest.canonical.first_recorded_ts,
         &manifest.canonical.last_recorded_ts,
     )?;
+    validate_raw_source_inventory(&manifest.canonical.raw_source_inventory)?;
     let expected = sha256_prefixed(&canonical_bytes(&manifest.canonical)?);
     if expected != manifest.canonical_sha256 {
         return Err(ResearchError::InvalidInput(format!(
@@ -456,6 +837,62 @@ fn validate_day_manifest(
     Ok(())
 }
 
+fn validate_projected_day_source(
+    canonical: &ProjectedDayCanonical,
+    expected_date: NaiveDate,
+    require_azure_source: bool,
+    expected_source_container: Option<&str>,
+) -> Result<(), ResearchError> {
+    if !require_azure_source {
+        return Ok(());
+    }
+    let inventory = &canonical.raw_source_inventory.canonical;
+    let expected_suffix = format!("{}/", expected_date.format("%Y/%m/%d"));
+    let expected_campaign_component = format!("/{}/", canonical.campaign_id);
+    let expected_source_container = expected_source_container
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "exact Azure projected source policy requires expected_source_container".to_owned(),
+            )
+        })?;
+    if inventory.source_kind != "azure_blob"
+        || inventory.account.as_deref().is_none_or(str::is_empty)
+        || inventory.container.as_deref().is_none_or(str::is_empty)
+        || inventory.container.as_deref() != Some(expected_source_container)
+        || !inventory.exhaustive_listing
+        || inventory.max_blobs.is_some()
+        || inventory.max_bytes.is_some()
+        || !inventory.prefix.ends_with(&expected_suffix)
+        || !format!("/{}", inventory.prefix).contains(&expected_campaign_component)
+    {
+        return Err(ResearchError::InvalidInput(format!(
+            "projected day {expected_date} requires an exhaustive Azure raw-source inventory bound to its exact UTC prefix"
+        )));
+    }
+    if inventory.canonical_blob_names_invalid_for_prefix() {
+        return Err(ResearchError::InvalidInput(format!(
+            "projected day {expected_date} contains a raw blob outside its exact Azure day prefix"
+        )));
+    }
+    Ok(())
+}
+
+impl RawSourceInventoryCanonical {
+    fn canonical_blob_names_invalid_for_prefix(&self) -> bool {
+        self.blobs.iter().any(|blob| {
+            !blob.name.starts_with(&self.prefix)
+                || !blob.name.ends_with(".jsonl")
+                || blob.blob_type.as_deref() != Some("AppendBlob")
+                || blob.sealed.is_none()
+                || blob
+                    .last_modified
+                    .as_deref()
+                    .is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_err())
+        })
+    }
+}
+
 fn validate_campaign_index(
     index: &ProjectedCampaignIndex,
     materialized_root: Option<&Path>,
@@ -466,6 +903,13 @@ fn validate_campaign_index(
         || index.since > index.through
         || index.cutoff_exclusive != day_end(index.through)
         || index.segments.is_empty()
+        || !matches!(
+            index.source_policy.as_str(),
+            "exact_azure_blob_inventory_v1" | "local_test_inventory_v1"
+        )
+        || (index.source_policy == "exact_azure_blob_inventory_v1"
+            && index.source_container.as_deref().is_none_or(str::is_empty))
+        || (index.source_policy == "local_test_inventory_v1" && index.source_container.is_some())
     {
         return Err(ResearchError::InvalidInput(
             "projected campaign index schema, range, or cutoff is invalid".to_owned(),
@@ -505,6 +949,11 @@ fn validate_campaign_index(
         );
         if segment.chain_sha256 != expected_chain
             || !valid_sha256(&segment.day_manifest_sha256)
+            || !valid_sha256(&segment.raw_source_inventory_sha256)
+            || (index.source_policy == "exact_azure_blob_inventory_v1"
+                && segment.raw_source_kind != "azure_blob")
+            || (index.source_policy == "local_test_inventory_v1"
+                && segment.raw_source_kind != "local_files")
             || segment.events == 0
         {
             return Err(ResearchError::InvalidInput(format!(
@@ -530,8 +979,22 @@ fn validate_campaign_index(
             }
             let day_manifest: ProjectedDayManifest = serde_json::from_slice(&day_manifest_bytes)?;
             validate_day_manifest(&day_manifest, segment.date, &index.campaign_id)?;
+            validate_projected_day_source(
+                &day_manifest.canonical,
+                segment.date,
+                index.source_policy == "exact_azure_blob_inventory_v1",
+                index.source_container.as_deref(),
+            )?;
             if day_manifest.canonical_sha256 != segment.day_canonical_sha256
                 || day_manifest.canonical.events != segment.events
+                || day_manifest.canonical.raw_source_inventory.canonical_sha256
+                    != segment.raw_source_inventory_sha256
+                || day_manifest
+                    .canonical
+                    .raw_source_inventory
+                    .canonical
+                    .source_kind
+                    != segment.raw_source_kind
                 || day_manifest.canonical.first_recorded_ts != segment.first_recorded_ts
                 || day_manifest.canonical.last_recorded_ts != segment.last_recorded_ts
             {
@@ -771,6 +1234,24 @@ impl ProjectedCacheStore {
         }
     }
 
+    fn read_optional(&mut self, relative: &str) -> Result<Option<Vec<u8>>, ResearchError> {
+        validate_relative_cache_path(relative)?;
+        match self {
+            Self::Local { root } => match fs::read(root.join(relative)) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(ResearchError::Io(error)),
+            },
+            Self::Azure { client, prefix } => {
+                match client.download_blob_bytes(&format!("{prefix}/{relative}")) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(AzureBlobError::HttpStatus(404)) => Ok(None),
+                    Err(error) => Err(ResearchError::Azure(error.to_string())),
+                }
+            }
+        }
+    }
+
     fn put_immutable_verified(
         &mut self,
         relative: &str,
@@ -823,7 +1304,12 @@ impl ProjectedCacheStore {
         }
     }
 
-    fn put_pointer_cas(&mut self, relative: &str, bytes: &[u8]) -> Result<(), ResearchError> {
+    fn put_pointer_cas(
+        &mut self,
+        relative: &str,
+        bytes: &[u8],
+        expected_prior_sha256: Option<&str>,
+    ) -> Result<(), ResearchError> {
         validate_relative_cache_path(relative)?;
         match self {
             Self::Local { root } => {
@@ -846,7 +1332,17 @@ impl ProjectedCacheStore {
                         }
                     })?;
                 let result = (|| {
-                    if path.is_file() && fs::read(&path)? == bytes {
+                    let current = if path.is_file() {
+                        Some(fs::read(&path)?)
+                    } else {
+                        None
+                    };
+                    if current.as_deref().map(sha256_prefixed).as_deref() != expected_prior_sha256 {
+                        return Err(ResearchError::InvalidInput(format!(
+                            "projected cache pointer expected-prior mismatch at {relative}"
+                        )));
+                    }
+                    if current.as_deref() == Some(bytes) {
                         return Ok(());
                     }
                     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -865,6 +1361,16 @@ impl ProjectedCacheStore {
                     Err(AzureBlobError::HttpStatus(404)) => None,
                     Err(error) => return Err(ResearchError::Azure(error.to_string())),
                 };
+                if prior
+                    .as_ref()
+                    .map(|prior| sha256_prefixed(&prior.bytes))
+                    .as_deref()
+                    != expected_prior_sha256
+                {
+                    return Err(ResearchError::InvalidInput(format!(
+                        "projected cache pointer expected-prior mismatch at {relative}"
+                    )));
+                }
                 if prior.as_ref().is_some_and(|prior| prior.bytes == bytes) {
                     return Ok(());
                 }
@@ -918,6 +1424,65 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn temporary_test_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("polyedge-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn shadow_correction_journal_blocks_overlap_and_is_resumable() {
+        let root = temporary_test_root("shadow-correction");
+        let output = root.join("active-output.json");
+        let mut store = ProjectedCacheStore::open(root.to_str().unwrap()).unwrap();
+        let begin = BeginShadowCorrectionOptions {
+            campaign_id: "campaign-2026-07-12".to_owned(),
+            correction_id: "correction-july-13".to_owned(),
+            from: NaiveDate::from_ymd_opt(2026, 7, 12).unwrap(),
+            through: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+            reason: "schema migration".to_owned(),
+            out: output.clone(),
+        };
+        begin_shadow_correction_with_store(begin.clone(), &mut store).unwrap();
+        let active = read_shadow_correction_state_from_store(&mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, "in_progress");
+        assert_eq!(active.correction_id, "correction-july-13");
+
+        let resumed = begin_shadow_correction_with_store(begin, &mut store).unwrap();
+        assert_eq!(resumed["state"]["correction_id"], "correction-july-13");
+
+        let conflicting = BeginShadowCorrectionOptions {
+            campaign_id: "campaign-2026-07-12".to_owned(),
+            correction_id: "correction-july-11".to_owned(),
+            from: NaiveDate::from_ymd_opt(2026, 7, 11).unwrap(),
+            through: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+            reason: "overlap".to_owned(),
+            out: output.clone(),
+        };
+        assert!(begin_shadow_correction_with_store(conflicting, &mut store).is_err());
+
+        complete_shadow_correction_with_store(
+            CompleteShadowCorrectionOptions {
+                campaign_id: "campaign-2026-07-12".to_owned(),
+                from: NaiveDate::from_ymd_opt(2026, 7, 12).unwrap(),
+                through: NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+                out: output,
+            },
+            &mut store,
+        )
+        .unwrap();
+        let complete = read_shadow_correction_state_from_store(&mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.status, "complete");
+        assert!(complete.completed_at.is_some());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn campaign_index_rejects_gap_and_bad_parent() {
         let first = ProjectedCampaignSegment {
@@ -925,6 +1490,8 @@ mod tests {
             relative_path: "segments/2026-07-10".to_owned(),
             day_canonical_sha256: format!("sha256:{}", "a".repeat(64)),
             day_manifest_sha256: format!("sha256:{}", "b".repeat(64)),
+            raw_source_inventory_sha256: format!("sha256:{}", "c".repeat(64)),
+            raw_source_kind: "local_files".to_owned(),
             parent_chain_sha256: None,
             chain_sha256: String::new(),
             events: 1,
@@ -945,11 +1512,13 @@ mod tests {
             &second.day_canonical_sha256,
         );
         let index = ProjectedCampaignIndex {
-            schema_version: 1,
+            schema_version: PROJECTED_CAMPAIGN_SCHEMA_VERSION,
             campaign_id: "campaign-2026-07-12".to_owned(),
             since: first.date,
             through: second.date,
             cutoff_exclusive: "2026-07-13T00:00:00Z".to_owned(),
+            source_policy: "local_test_inventory_v1".to_owned(),
+            source_container: None,
             canonical_sha256: second.chain_sha256.clone(),
             total_events: 2,
             segments: vec![first, second],
@@ -974,6 +1543,8 @@ mod tests {
             campaign_id: "campaign-open-day-rejection".to_owned(),
             cache_root: missing.to_string_lossy().into_owned(),
             out: missing.join("publish.json"),
+            require_azure_source: false,
+            expected_source_container: None,
         })
         .unwrap_err();
         assert!(publish.to_string().contains("must be a sealed UTC day"));
@@ -985,6 +1556,8 @@ mod tests {
             cache_root: missing.to_string_lossy().into_owned(),
             out: missing.join("campaign"),
             manifest: missing.join("campaign.json"),
+            require_azure_source: false,
+            expected_source_container: None,
         })
         .unwrap_err();
         assert!(materialize.to_string().contains("must be a sealed UTC day"));
@@ -1005,9 +1578,170 @@ mod tests {
         .unwrap();
         let mut store = ProjectedCacheStore::open(&root.to_string_lossy()).unwrap();
         let error = store
-            .put_pointer_cas("days/2026-07-12/latest.json", b"{}\n")
+            .put_pointer_cas("days/2026-07-12/latest.json", b"{}\n", None)
             .unwrap_err();
         assert!(error.to_string().contains("already in progress"));
         assert!(!root.join("days/2026-07-12/latest.json").exists());
+    }
+
+    #[test]
+    fn local_pointer_compare_and_swap_rejects_wrong_expected_prior() {
+        let root = temporary_test_root("pointer-expected-prior");
+        let relative = "days/2026-07-10/latest.json";
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"prior\n").unwrap();
+        let mut store = ProjectedCacheStore::open(root.to_str().unwrap()).unwrap();
+
+        let wrong_prior = format!("sha256:{}", "0".repeat(64));
+        let error = store
+            .put_pointer_cas(relative, b"next\n", Some(&wrong_prior))
+            .unwrap_err();
+        assert!(error.to_string().contains("expected-prior mismatch"));
+        assert_eq!(fs::read(&path).unwrap(), b"prior\n");
+        assert!(!path.with_extension("cas-lock").exists());
+
+        let exact_prior = sha256_prefixed(b"prior\n");
+        store
+            .put_pointer_cas(relative, b"next\n", Some(&exact_prior))
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"next\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mixed_pointer_and_legacy_campaign_schemas_are_rejected() {
+        let root = temporary_test_root("mixed-pointer-schema");
+        let first_date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let second_date = NaiveDate::from_ymd_opt(2026, 7, 11).unwrap();
+        for (date, schema_version) in [
+            (first_date, PROJECTED_DAY_SCHEMA_VERSION),
+            (second_date, PROJECTED_DAY_SCHEMA_VERSION - 1),
+        ] {
+            let relative = format!("days/{date}/latest.json");
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let pointer = ProjectedDayPointer {
+                schema_version,
+                date,
+                canonical_sha256: format!("sha256:{}", "a".repeat(64)),
+                manifest_path: format!("days/{date}/runs/test/manifest.json"),
+                manifest_sha256: format!("sha256:{}", "b".repeat(64)),
+                supersedes_pointer_sha256: None,
+            };
+            fs::write(
+                path,
+                with_trailing_newline(serde_json::to_vec(&pointer).unwrap()),
+            )
+            .unwrap();
+        }
+        let mut store = ProjectedCacheStore::open(root.to_str().unwrap()).unwrap();
+        let error = read_pointer_snapshots(&mut store, first_date, second_date).unwrap_err();
+        assert!(error.to_string().contains("pointer identity mismatch"));
+
+        let segment = ProjectedCampaignSegment {
+            date: first_date,
+            relative_path: "segments/2026-07-10".to_owned(),
+            day_canonical_sha256: format!("sha256:{}", "a".repeat(64)),
+            day_manifest_sha256: format!("sha256:{}", "b".repeat(64)),
+            raw_source_inventory_sha256: format!("sha256:{}", "c".repeat(64)),
+            raw_source_kind: "local_files".to_owned(),
+            parent_chain_sha256: None,
+            chain_sha256: campaign_chain_hash(
+                None,
+                first_date,
+                &format!("sha256:{}", "a".repeat(64)),
+            ),
+            events: 1,
+            first_recorded_ts: "2026-07-10T00:00:00Z".to_owned(),
+            last_recorded_ts: "2026-07-10T23:59:59Z".to_owned(),
+        };
+        let legacy_index = ProjectedCampaignIndex {
+            schema_version: PROJECTED_CAMPAIGN_SCHEMA_VERSION - 1,
+            campaign_id: "campaign-2026-07-12".to_owned(),
+            since: first_date,
+            through: first_date,
+            cutoff_exclusive: "2026-07-11T00:00:00Z".to_owned(),
+            source_policy: "local_test_inventory_v1".to_owned(),
+            source_container: None,
+            canonical_sha256: segment.chain_sha256.clone(),
+            total_events: 1,
+            segments: vec![segment],
+        };
+        assert!(validate_campaign_index(&legacy_index, None).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn raw_inventory_field_mutation_changes_identity_and_requires_rehash() {
+        let binding = RawSourceBlobBinding {
+            ordinal: 0,
+            name: "shadow-events/campaign-2026-07-12/2026/07/10/00/00.jsonl".to_owned(),
+            etag: Some("source-etag-a".to_owned()),
+            version_id: None,
+            content_md5: None,
+            blob_type: Some("AppendBlob".to_owned()),
+            sealed: Some(true),
+            content_length: 4,
+            last_modified: Some("2026-07-10T00:00:00Z".to_owned()),
+            sha256: sha256_prefixed(b"data"),
+        };
+        let inventory = super::super::build_raw_source_inventory(
+            "azure_blob",
+            Some("stpolyedge".to_owned()),
+            Some("polyedge-shadow-events".to_owned()),
+            "shadow-events/campaign-2026-07-12/2026/07/10/".to_owned(),
+            None,
+            None,
+            vec![binding],
+        )
+        .unwrap();
+        let original_identity = inventory.canonical_sha256.clone();
+        let mut mutated = inventory;
+        mutated.canonical.blobs[0].etag = Some("source-etag-b".to_owned());
+
+        let stale_hash_error = validate_raw_source_inventory(&mutated).unwrap_err();
+        assert!(stale_hash_error
+            .to_string()
+            .contains("canonical SHA-256 mismatch"));
+        mutated.canonical_sha256 = sha256_prefixed(&canonical_bytes(&mutated.canonical).unwrap());
+        assert_ne!(mutated.canonical_sha256, original_identity);
+        validate_raw_source_inventory(&mutated).unwrap();
+    }
+
+    #[test]
+    fn pointer_snapshot_mutation_is_detected_before_campaign_publication() {
+        let root = temporary_test_root("pointer-snapshot-mutation");
+        let date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let relative = format!("days/{date}/latest.json");
+        let path = root.join(&relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut pointer = ProjectedDayPointer {
+            schema_version: PROJECTED_DAY_SCHEMA_VERSION,
+            date,
+            canonical_sha256: format!("sha256:{}", "a".repeat(64)),
+            manifest_path: format!("days/{date}/runs/a/manifest.json"),
+            manifest_sha256: format!("sha256:{}", "b".repeat(64)),
+            supersedes_pointer_sha256: None,
+        };
+        fs::write(
+            &path,
+            with_trailing_newline(serde_json::to_vec_pretty(&pointer).unwrap()),
+        )
+        .unwrap();
+        let mut store = ProjectedCacheStore::open(root.to_str().unwrap()).unwrap();
+        let snapshots = read_pointer_snapshots(&mut store, date, date).unwrap();
+
+        pointer.canonical_sha256 = format!("sha256:{}", "c".repeat(64));
+        fs::write(
+            &path,
+            with_trailing_newline(serde_json::to_vec_pretty(&pointer).unwrap()),
+        )
+        .unwrap();
+        let error = verify_pointer_snapshots_current(&mut store, &snapshots).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed during campaign materialization"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -31,6 +31,7 @@ var promotionTransitionJobName = 'polyedge-promotion-neu-job'
 var redemptionJobName = 'polyedge-redeem-neu-job'
 var shadowAppName = 'polyedge-shadow-neu'
 var shadowDailyJobName = 'polyedge-shadow-daily-neu-job'
+var shadowCampaignLeaseBlobName = 'data/research/shadow/campaign-2026-07-12/control/replay.lock'
 var vnetName = 'vnet-polyedge-venue-neu'
 var natName = 'nat-polyedge-venue-neu'
 var publicIpName = 'pip-polyedge-venue-neu-egress'
@@ -654,10 +655,21 @@ resource shadowDailyJob 'Microsoft.App/jobs@2024-03-01' = {
           name: 'shadow-daily'
           image: backendImage
           command: [
+            'polyedge-rs'
+          ]
+          args: [
+            'research'
+            'with-azure-lease'
+            '--account'
+            storage.name
+            '--container'
+            researchContainer.name
+            '--blob'
+            shadowCampaignLeaseBlobName
+            '--'
             '/bin/sh'
             '/app/research/run_shadow_daily.sh'
           ]
-          args: []
           env: [
             { name: 'APP_NAME', value: 'polyedge-shadow-neu' }
             { name: 'EXECUTION_MODE', value: 'paper' }

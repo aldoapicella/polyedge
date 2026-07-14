@@ -57,6 +57,15 @@ fn projected_days_equal_full_cross_midnight_replay_and_bound_readers() {
     .unwrap();
     let full = normalize(&combined, &dir.join("normalized-full"));
 
+    // Exercise the projection's pending-state flush at the UTC boundary. The
+    // final `down` book on day one is not followed by another day-one event,
+    // so per-day `finish()` and the full replay's next-day flush must retain
+    // exactly the same sampled book inventory.
+    let day_one_normalize_manifest = read_json(&normalized_one.join("events_manifest.json"));
+    let full_normalize_manifest = read_json(&full.join("events_manifest.json"));
+    assert_eq!(day_one_normalize_manifest["event_counts"]["book"], 2);
+    assert_eq!(full_normalize_manifest["event_counts"]["book"], 2);
+
     let campaign_markets_path = dir.join("campaign-markets.json");
     let full_markets_path = dir.join("full-markets.json");
     let campaign_markets = build_markets(&campaign, &campaign_markets_path);
@@ -162,6 +171,43 @@ fn projected_day_rerun_is_canonical_and_materialization_rejects_gap_or_corruptio
         first_manifest["canonical_sha256"],
         second_manifest["canonical_sha256"]
     );
+    assert_eq!(
+        first_manifest["canonical"]["raw_source_inventory"]["canonical_sha256"],
+        second_manifest["canonical"]["raw_source_inventory"]["canonical_sha256"]
+    );
+
+    // The semantic event is unchanged, but changing the exact raw file bytes
+    // must create a corrected day identity and therefore a new campaign head.
+    fs::write(&raw, format!("  {}\n", simple_day())).unwrap();
+    let corrected = normalize(&raw, &dir.join("corrected"));
+    let corrected_manifest = publish_day(
+        &corrected,
+        date(2026, 7, 12),
+        &cache,
+        &dir.join("corrected-manifest.json"),
+    );
+    assert_ne!(
+        first_manifest["canonical"]["raw_source_inventory"]["canonical_sha256"],
+        corrected_manifest["canonical"]["raw_source_inventory"]["canonical_sha256"]
+    );
+    assert_ne!(
+        first_manifest["canonical_sha256"],
+        corrected_manifest["canonical_sha256"]
+    );
+
+    let strict_source_error = run_publish_projected_day(PublishProjectedDayOptions {
+        normalized: corrected,
+        date: date(2026, 7, 12),
+        campaign_id: CAMPAIGN.to_owned(),
+        cache_root: cache.to_string_lossy().into_owned(),
+        out: dir.join("strict-source-manifest.json"),
+        require_azure_source: true,
+        expected_source_container: Some("polyedge-shadow-events".to_owned()),
+    })
+    .unwrap_err();
+    assert!(strict_source_error
+        .to_string()
+        .contains("requires an exhaustive Azure raw-source inventory"));
 
     let gap = materialize(
         &cache,
@@ -193,7 +239,7 @@ fn projected_day_rerun_is_canonical_and_materialization_rejects_gap_or_corruptio
     .unwrap_err();
     assert!(replay_error.to_string().contains("failed size or SHA-256"));
 
-    let gzip = find_first_gzip(&cache);
+    let gzip = current_pointer_gzip(&cache, date(2026, 7, 12));
     fs::write(&gzip, b"corrupt").unwrap();
     let corrupt = materialize(
         &cache,
@@ -226,6 +272,8 @@ fn publish_day(normalized: &Path, day: NaiveDate, cache: &Path, out: &Path) -> V
         campaign_id: CAMPAIGN.to_owned(),
         cache_root: cache.to_string_lossy().into_owned(),
         out: out.to_path_buf(),
+        require_azure_source: false,
+        expected_source_container: None,
     })
     .unwrap()
 }
@@ -244,6 +292,8 @@ fn materialize(
         cache_root: cache.to_string_lossy().into_owned(),
         out: out.to_path_buf(),
         manifest: manifest.to_path_buf(),
+        require_azure_source: false,
+        expected_source_container: None,
     })
 }
 
@@ -319,6 +369,24 @@ fn find_first_gzip(root: &Path) -> PathBuf {
         }
     }
     panic!("projected cache did not contain a gzip shard")
+}
+
+fn current_pointer_gzip(cache: &Path, date: NaiveDate) -> PathBuf {
+    let pointer = read_json(&cache.join(format!("days/{date}/latest.json")));
+    let manifest_path = pointer["manifest_path"].as_str().unwrap();
+    let manifest = read_json(&cache.join(manifest_path));
+    let file = manifest["canonical"]["files"]
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()["relative_path"]
+        .as_str()
+        .unwrap();
+    cache.join(manifest_path).parent().unwrap().join(file)
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {

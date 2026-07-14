@@ -360,6 +360,20 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
+  properties: {
+    changeFeed: {
+      enabled: true
+      retentionInDays: 30
+    }
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
+    containerDeleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
+  }
 }
 
 resource eventContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {

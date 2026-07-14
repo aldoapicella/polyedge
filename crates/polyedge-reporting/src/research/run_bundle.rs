@@ -2,7 +2,7 @@ use super::ResearchError;
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
 use polyedge_config::RuntimeRole;
 use polyedge_engine::FrozenStrategyMode;
-use polyedge_storage::AzureBlobClient;
+use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -374,7 +374,14 @@ impl AtomicDailyRun {
             ),
             ..pointer.clone()
         };
-        replace_json(&self.root.join(LATEST_FILE), &global_pointer)?;
+        let global_path = self.root.join(LATEST_FILE);
+        let promote_global = match read_existing_research_json::<LatestRunPointer>(&global_path)? {
+            Some(existing) => existing.date <= global_pointer.date,
+            None => true,
+        };
+        if promote_global {
+            replace_json(&global_path, &global_pointer)?;
+        }
         self.finalized = true;
         Ok(pointer)
     }
@@ -5549,6 +5556,40 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ResearchErr
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn read_existing_research_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<Option<T>, ResearchError> {
+    if path.is_file() {
+        return read_json(path).map(Some);
+    }
+    let Some(blob_name) = super::research_artifact_blob_name(path) else {
+        return Ok(None);
+    };
+    let Some(account) = std::env::var("AZURE_STORAGE_ACCOUNT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let container = std::env::var("AZURE_STORAGE_CONTAINER_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "bot-events".to_owned());
+    let client_id = std::env::var("AZURE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut client = AzureBlobClient::with_managed_identity(account, container, client_id);
+    match client.download_blob_bytes(&blob_name) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(ResearchError::Json),
+        Err(AzureBlobError::HttpStatus(404)) => Ok(None),
+        Err(error) => Err(ResearchError::Azure(format!(
+            "reading existing research pointer {blob_name}: {error}"
+        ))),
+    }
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

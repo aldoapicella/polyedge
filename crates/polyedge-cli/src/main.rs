@@ -6,33 +6,36 @@ use polyedge_config::{embedded_git_sha, RuntimeRole, RuntimeSettings};
 use polyedge_reporting::research::{
     advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
     initialize_funded_manifest_after_canary, load_default_exclusions, publish_daily_directory,
-    run_audit, run_azure_freshness, run_backfill, run_baseline,
+    run_audit, run_azure_freshness, run_backfill, run_baseline, run_begin_shadow_correction,
     run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
-    run_calibration, run_chart_backfill, run_evaluate_profitability, run_execution_quality,
-    run_final_report, run_materialize_projected_campaign, run_ml_calibrate, run_normalize,
-    run_publish_projected_day, run_queue_audit, run_regimes, run_replay, run_sample_size,
-    run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
-    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
-    BackfillOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions,
-    ChartBackfillOptions, CumulativeWalletSnapshotOptions, ExcludedTimeWindow,
-    ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel, FinalReportOptions,
-    InitializeFundedManifestOptions, MaterializeProjectedCampaignOptions, MlCalibrateOptions,
-    NormalizeOptions, ProfitabilityEvaluationOptions, ProspectiveValidationOptions,
-    PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions, ReplayIndexOptions,
-    ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions, SweepOptions,
-    DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
+    run_calibration, run_chart_backfill, run_complete_shadow_correction,
+    run_evaluate_profitability, run_execution_quality, run_final_report,
+    run_materialize_projected_campaign, run_ml_calibrate, run_normalize, run_publish_projected_day,
+    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
+    stop_funded_manifest_from_stage_block, AdvanceFundedLadderOptions,
+    AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions, BackfillOptions,
+    BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions, CalibrationOptions,
+    ChartBackfillOptions, CompleteShadowCorrectionOptions, CumulativeWalletSnapshotOptions,
+    ExcludedTimeWindow, ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel,
+    FinalReportOptions, InitializeFundedManifestOptions, MaterializeProjectedCampaignOptions,
+    MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
+    ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
+    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions,
+    SweepOptions, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
 };
-use polyedge_storage::{AzureBlobClient, AzureBlobItem};
+use polyedge_storage::{AzureBlobClient, AzureBlobItem, BlobLeaseAcquireResult};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
+use std::process::{Child, Command as ProcessCommand};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
@@ -98,6 +101,54 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ResearchCommand {
+    /// Serialize an entire research writer process with a finite Azure Blob
+    /// lease. The child is killed if lease renewal is ever lost.
+    WithAzureLease {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        container: String,
+        #[arg(long)]
+        blob: String,
+        #[arg(long, default_value_t = 60)]
+        lease_seconds: u32,
+        #[arg(long, default_value_t = 20)]
+        renew_seconds: u64,
+        #[arg(long, default_value_t = 600)]
+        wait_seconds: u64,
+        #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    BeginShadowCorrection {
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        correction_id: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        through: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(
+            long,
+            default_value = "reports/research/shadow/corrections/active.json"
+        )]
+        out: PathBuf,
+    },
+    CompleteShadowCorrection {
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        through: String,
+        #[arg(
+            long,
+            default_value = "reports/research/shadow/corrections/active.json"
+        )]
+        out: PathBuf,
+    },
     Audit {
         #[arg(long, default_value = "data/events.jsonl")]
         input: PathBuf,
@@ -148,6 +199,10 @@ enum ResearchCommand {
         cache_root: String,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        require_azure_source: bool,
+        #[arg(long)]
+        expected_source_container: Option<String>,
     },
     /// Verify and materialize sealed projected-day bundles through an explicit
     /// UTC cutoff. Open/current-day data is never included.
@@ -164,6 +219,10 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        require_azure_source: bool,
+        #[arg(long)]
+        expected_source_container: Option<String>,
     },
     QueueAudit {
         #[arg(long, default_value = "data/research/normalized")]
@@ -588,6 +647,49 @@ async fn main() -> Result<()> {
 
 fn run_research_command(command: ResearchCommand) -> Result<()> {
     let value = match command {
+        ResearchCommand::WithAzureLease {
+            account,
+            container,
+            blob,
+            lease_seconds,
+            renew_seconds,
+            wait_seconds,
+            command,
+        } => run_with_azure_lease(
+            account,
+            container,
+            blob,
+            lease_seconds,
+            renew_seconds,
+            wait_seconds,
+            command,
+        )?,
+        ResearchCommand::BeginShadowCorrection {
+            campaign_id,
+            correction_id,
+            from,
+            through,
+            reason,
+            out,
+        } => run_begin_shadow_correction(BeginShadowCorrectionOptions {
+            campaign_id,
+            correction_id,
+            from: parse_date_arg(&from)?,
+            through: parse_date_arg(&through)?,
+            reason,
+            out,
+        })?,
+        ResearchCommand::CompleteShadowCorrection {
+            campaign_id,
+            from,
+            through,
+            out,
+        } => run_complete_shadow_correction(CompleteShadowCorrectionOptions {
+            campaign_id,
+            from: parse_date_arg(&from)?,
+            through: parse_date_arg(&through)?,
+            out,
+        })?,
         ResearchCommand::Audit {
             input,
             out,
@@ -631,12 +733,16 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             campaign_id,
             cache_root,
             out,
+            require_azure_source,
+            expected_source_container,
         } => run_publish_projected_day(PublishProjectedDayOptions {
             normalized,
             date: parse_date_arg(&date)?,
             campaign_id,
             cache_root,
             out,
+            require_azure_source,
+            expected_source_container,
         })?,
         ResearchCommand::MaterializeProjectedCampaign {
             since,
@@ -645,6 +751,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             cache_root,
             out,
             manifest,
+            require_azure_source,
+            expected_source_container,
         } => run_materialize_projected_campaign(MaterializeProjectedCampaignOptions {
             since: parse_date_arg(&since)?,
             through: parse_date_arg(&through)?,
@@ -652,6 +760,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             cache_root,
             out,
             manifest,
+            require_azure_source,
+            expected_source_container,
         })?,
         ResearchCommand::QueueAudit {
             input,
@@ -998,6 +1108,178 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         })?,
     };
     print_json(value)
+}
+
+fn run_with_azure_lease(
+    account: String,
+    container: String,
+    blob: String,
+    lease_seconds: u32,
+    renew_seconds: u64,
+    wait_seconds: u64,
+    command: Vec<String>,
+) -> Result<serde_json::Value> {
+    if account.trim().is_empty() || container.trim().is_empty() || blob.trim().is_empty() {
+        bail!("Azure lease account, container, and blob are required");
+    }
+    if !(15..=60).contains(&lease_seconds) {
+        bail!("lease-seconds must be between 15 and 60");
+    }
+    if renew_seconds == 0 || renew_seconds >= u64::from(lease_seconds) {
+        bail!("renew-seconds must be positive and shorter than lease-seconds");
+    }
+    let executable = command
+        .first()
+        .filter(|value| !value.trim().is_empty())
+        .context("with-azure-lease requires a child command after --")?;
+    let client_id = std::env::var("AZURE_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut client = AzureBlobClient::with_managed_identity_for_lease(
+        account.clone(),
+        container.clone(),
+        client_id,
+    );
+    let acquire_started = Instant::now();
+    let lease_id = loop {
+        match client
+            .acquire_blob_lease(&blob, lease_seconds)
+            .context("acquiring Azure campaign lease")?
+        {
+            BlobLeaseAcquireResult::Acquired(lease_id) => break lease_id,
+            BlobLeaseAcquireResult::AlreadyLeased
+                if acquire_started.elapsed() < StdDuration::from_secs(wait_seconds) =>
+            {
+                thread::sleep(StdDuration::from_secs(5));
+            }
+            BlobLeaseAcquireResult::AlreadyLeased => {
+                bail!(
+                    "Azure campaign lease remained held for {wait_seconds}s; refusing overlapping research writer"
+                );
+            }
+        }
+    };
+
+    let mut child_command = ProcessCommand::new(executable);
+    child_command
+        .args(command.iter().skip(1))
+        .env("POLYEDGE_CAMPAIGN_LEASE_ACTIVE", "true")
+        .env("POLYEDGE_CAMPAIGN_LEASE_ID", &lease_id)
+        .env("POLYEDGE_CAMPAIGN_LEASE_ACCOUNT", &account)
+        .env("POLYEDGE_CAMPAIGN_LEASE_CONTAINER", &container)
+        .env("POLYEDGE_CAMPAIGN_LEASE_BLOB", &blob);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child_command.process_group(0);
+    }
+    let mut child = match child_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = client.release_blob_lease(&blob, &lease_id);
+            return Err(error).context("starting Azure-lease child command");
+        }
+    };
+
+    let renew_interval = StdDuration::from_secs(renew_seconds);
+    let mut last_renewed = Instant::now();
+    let child_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate_lease_child_tree(&mut child);
+                let _ = client.release_blob_lease(&blob, &lease_id);
+                return Err(error).context(
+                    "checking Azure-lease child; child was killed and lease release attempted",
+                );
+            }
+        }
+        if last_renewed.elapsed() >= renew_interval {
+            let (renew_tx, renew_rx) = mpsc::sync_channel(1);
+            let mut renew_client = client.clone();
+            let renew_blob = blob.clone();
+            let renew_lease_id = lease_id.clone();
+            thread::spawn(move || {
+                let _ = renew_tx.send(renew_client.renew_blob_lease(&renew_blob, &renew_lease_id));
+            });
+            let renewal_deadline = StdDuration::from_secs(
+                u64::from(lease_seconds)
+                    .saturating_sub(renew_seconds)
+                    .min(10),
+            );
+            let renewal = renew_rx.recv_timeout(renewal_deadline);
+            match renewal {
+                Ok(Ok(true)) => last_renewed = Instant::now(),
+                Ok(Ok(false)) => {
+                    terminate_lease_child_tree(&mut child);
+                    let _ = client.release_blob_lease(&blob, &lease_id);
+                    bail!("Azure campaign lease was lost; child was killed before publication");
+                }
+                Ok(Err(error)) => {
+                    terminate_lease_child_tree(&mut child);
+                    let _ = client.release_blob_lease(&blob, &lease_id);
+                    return Err(error).context(
+                        "renewing Azure campaign lease; child was killed before publication",
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    terminate_lease_child_tree(&mut child);
+                    let _ = client.release_blob_lease(&blob, &lease_id);
+                    bail!(
+                        "Azure campaign lease renewal exceeded its safety deadline; child was killed before lease expiry"
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    terminate_lease_child_tree(&mut child);
+                    let _ = client.release_blob_lease(&blob, &lease_id);
+                    bail!(
+                        "Azure campaign lease renewal worker exited; child was killed before lease expiry"
+                    );
+                }
+            }
+        }
+        thread::sleep(StdDuration::from_secs(1));
+    };
+    let released = client
+        .release_blob_lease(&blob, &lease_id)
+        .context("releasing Azure campaign lease")?;
+    if !released {
+        bail!("Azure campaign lease was no longer owned at child completion");
+    }
+    if !child_status.success() {
+        bail!(
+            "Azure-lease child command failed with status {}",
+            child_status
+        );
+    }
+    Ok(json!({
+        "status": "completed",
+        "lease": "released",
+        "account": account,
+        "container": container,
+        "blob": blob,
+        "child_status": child_status.code()
+    }))
+}
+
+fn terminate_lease_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(process_group) = i32::try_from(child.id()) {
+            // SAFETY: the child was spawned into a process group whose PGID is
+            // its PID. A negative PID targets only that group, never this
+            // lease-wrapper process. ESRCH is harmless if it already exited.
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 fn load_exclusions(path: PathBuf, values: Vec<String>) -> Result<Vec<ExcludedTimeWindow>> {
@@ -1358,7 +1640,7 @@ fn print_json(value: serde_json::Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ResearchCommand};
+    use super::{terminate_lease_child_tree, Cli, Command, ResearchCommand};
     use clap::Parser;
 
     #[test]
@@ -1392,5 +1674,74 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(expected_runtime_role, "profitability_shadow");
+    }
+
+    #[test]
+    fn azure_lease_cli_preserves_the_exact_child_command() {
+        let cli = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "with-azure-lease",
+            "--account",
+            "storage",
+            "--container",
+            "research",
+            "--blob",
+            "campaign/control/replay.lock",
+            "--",
+            "/bin/sh",
+            "/app/research/run_shadow_daily.sh",
+            "--test-child-argument",
+        ])
+        .expect("parse Azure lease wrapper");
+        let Command::Research {
+            command:
+                ResearchCommand::WithAzureLease {
+                    lease_seconds,
+                    renew_seconds,
+                    command,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(lease_seconds, 60);
+        assert_eq!(renew_seconds, 20);
+        assert_eq!(
+            command,
+            [
+                "/bin/sh",
+                "/app/research/run_shadow_daily.sh",
+                "--test-child-argument"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_tree_termination_kills_the_entire_process_group() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 300 & wait"]).process_group(0);
+        let mut child = command.spawn().expect("spawn lease child process group");
+        let process_group = i32::try_from(child.id()).expect("child PID fits i32");
+        thread::sleep(Duration::from_millis(50));
+        terminate_lease_child_tree(&mut child);
+
+        for _ in 0..50 {
+            // SAFETY: signal 0 only checks whether the dedicated child process
+            // group still exists; it sends no signal.
+            let result = unsafe { libc::kill(-process_group, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("lease child process group survived watchdog termination");
     }
 }

@@ -46,9 +46,12 @@ pub use labs::{
     WALLET_CAMPAIGN_START,
 };
 pub use projected_cache::{
-    read_verified_campaign_index, run_materialize_projected_campaign, run_publish_projected_day,
+    read_shadow_correction_state, read_verified_campaign_index, run_begin_shadow_correction,
+    run_complete_shadow_correction, run_materialize_projected_campaign, run_publish_projected_day,
+    BeginShadowCorrectionOptions, CompleteShadowCorrectionOptions,
     MaterializeProjectedCampaignOptions, ProjectedCampaignIndex, ProjectedCampaignSegment,
-    ProjectedDayManifest, PublishProjectedDayOptions, PROJECTED_CAMPAIGN_INDEX_FILE,
+    ProjectedDayManifest, PublishProjectedDayOptions, ShadowCorrectionState,
+    PROJECTED_CAMPAIGN_INDEX_FILE,
 };
 pub use run_bundle::{
     advance_funded_ladder, advance_funded_manifest, classify_warning, daily_provenance_required,
@@ -75,6 +78,8 @@ const MAX_AZURE_PREFETCH_BLOBS: usize = 32;
 const DEFAULT_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 8_192;
 const MAX_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 1_048_576;
 const NORMALIZE_PROGRESS_INTERVAL_EVENTS: usize = 100_000;
+const RAW_SOURCE_INVENTORY_SCHEMA_VERSION: u32 = 1;
+const RAW_SOURCE_INVENTORY_DOMAIN: &str = "polyedge.raw-source-inventory.v1";
 const ADAPTIVE_LOG_LIMIT: usize = 100;
 const REFERENCE_HISTORY_SECONDS: i64 = 130;
 const WALLET_CAMPAIGN_BASELINE: Decimal = Decimal::from_parts(5_030_521, 0, 0, false, 6);
@@ -428,6 +433,12 @@ pub fn run_audit(options: AuditOptions) -> Result<Value, ResearchError> {
                 "rate": ratio_usize(stream.out_of_order_timestamps, stream.events)
             }),
         );
+        if let Some(inventory) = &stream.source_inventory {
+            object.insert(
+                "raw_source_inventory".to_owned(),
+                serde_json::to_value(inventory)?,
+            );
+        }
         insert_exclusion_metadata(object, &stream, &options.exclude_windows);
     }
     let report = envelope(
@@ -574,6 +585,11 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
             last_ts,
         ),
     )?;
+    let source_inventory = match stream.source_inventory.clone() {
+        Some(inventory) => inventory,
+        None => build_local_source_inventory(&options.input, EventPathMode::AllJsonl)?,
+    };
+    validate_raw_source_inventory(&source_inventory)?;
     let manifest = json!({
         "format": file_format.as_str(),
         "compression": file_format.compression(),
@@ -590,6 +606,7 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
         "input_event_counts": input_counts,
         "first_recorded_ts": first_ts.map(ts),
         "last_recorded_ts": last_ts.map(ts),
+        "raw_source_inventory": source_inventory,
         "warnings": stream.warnings
     });
     write_json_file(&options.out.join("events_manifest.json"), &manifest)?;
@@ -1122,6 +1139,45 @@ struct StreamStats {
     out_of_order_timestamps: usize,
     out_of_order_sources: BTreeSet<String>,
     max_backward_ms: i64,
+    source_inventory: Option<RawSourceInventory>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RawSourceBlobBinding {
+    pub ordinal: u64,
+    pub name: String,
+    pub etag: Option<String>,
+    pub version_id: Option<String>,
+    pub content_md5: Option<String>,
+    pub blob_type: Option<String>,
+    pub sealed: Option<bool>,
+    pub content_length: u64,
+    pub last_modified: Option<String>,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RawSourceInventoryCanonical {
+    pub domain: String,
+    pub schema_version: u32,
+    pub source_kind: String,
+    pub account: Option<String>,
+    pub container: Option<String>,
+    pub prefix: String,
+    pub max_blobs: Option<usize>,
+    pub max_bytes: Option<u64>,
+    pub ordering: String,
+    pub exhaustive_listing: bool,
+    pub blob_count: u64,
+    pub total_bytes: u64,
+    pub blobs: Vec<RawSourceBlobBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RawSourceInventory {
+    pub schema_version: u32,
+    pub canonical_sha256: String,
+    pub canonical: RawSourceInventoryCanonical,
 }
 
 fn stream_events<F>(
@@ -1569,9 +1625,21 @@ where
             std::env::var("AZURE_CLIENT_ID").ok(),
         ),
     };
-    let blobs = client
-        .list_blobs(&source.prefix, source.max_blobs, source.max_bytes)
+    let mut blobs = client
+        .list_blobs_unfiltered(&source.prefix, source.max_blobs, source.max_bytes)
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
+    blobs.sort_by(|left, right| left.name.cmp(&right.name));
+    if let Some(unexpected) = blobs.iter().find(|blob| !blob.name.ends_with(".jsonl")) {
+        return Err(ResearchError::InvalidInput(format!(
+            "Azure raw-source day prefix contains unexpected non-JSONL blob {}",
+            unexpected.name
+        )));
+    }
+    if blobs.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(ResearchError::InvalidInput(
+            "Azure raw-source listing contains duplicate blob names".to_owned(),
+        ));
+    }
     let listed_bytes = blobs.iter().map(|blob| blob.content_length).sum::<u64>();
     let mut stats = StreamStats::default();
     stats.notices.push(format!(
@@ -1584,7 +1652,21 @@ where
         source.worker_count(blobs.len())
     ));
     let mut seen_hashes = BTreeSet::new();
-    stream_ordered_azure_blobs(client, blobs, source.prefetch_blobs, |prefetched| {
+    let initial_blobs = blobs.clone();
+    let mut source_bindings = Vec::with_capacity(blobs.len());
+    stream_ordered_azure_blobs(client.clone(), blobs, source.prefetch_blobs, |prefetched| {
+        source_bindings.push(RawSourceBlobBinding {
+            ordinal: prefetched.index as u64,
+            name: prefetched.blob.name.clone(),
+            etag: Some(prefetched.response_etag.clone()),
+            version_id: prefetched.version_id.clone(),
+            content_md5: prefetched.content_md5.clone(),
+            blob_type: prefetched.blob_type.clone(),
+            sealed: prefetched.sealed,
+            content_length: prefetched.bytes.len() as u64,
+            last_modified: prefetched.blob.last_modified.map(ts),
+            sha256: sha256_prefixed(&prefetched.bytes),
+        });
         let reader =
             BufReader::with_capacity(super::REPLAY_BUFFER_BYTES, prefetched.bytes.as_slice());
         let mut previous_ts = None;
@@ -1602,6 +1684,25 @@ where
         }
         Ok(())
     })?;
+    let mut final_blobs = client
+        .list_blobs_unfiltered(&source.prefix, source.max_blobs, source.max_bytes)
+        .map_err(|error| ResearchError::Azure(error.to_string()))?;
+    final_blobs.sort_by(|left, right| left.name.cmp(&right.name));
+    if final_blobs != initial_blobs {
+        return Err(ResearchError::InvalidInput(
+            "Azure raw-source inventory changed while normalization was reading it; retry the sealed day"
+                .to_owned(),
+        ));
+    }
+    stats.source_inventory = Some(build_raw_source_inventory(
+        "azure_blob",
+        Some(source.account.clone()),
+        Some(source.container.clone()),
+        source.prefix.clone(),
+        source.max_blobs,
+        source.max_bytes,
+        source_bindings,
+    )?);
     finalize_stream_stats(&mut stats);
     Ok(stats)
 }
@@ -1609,6 +1710,11 @@ where
 struct PrefetchedAzureBlob {
     index: usize,
     blob: AzureBlobItem,
+    response_etag: String,
+    version_id: Option<String>,
+    content_md5: Option<String>,
+    blob_type: Option<String>,
+    sealed: Option<bool>,
     bytes: Vec<u8>,
 }
 
@@ -1641,10 +1747,42 @@ where
                 .map_err(|_| ())
                 .and_then(|receiver| receiver.recv().map_err(|_| ()))
             {
-                let result = worker_client
-                    .download_blob_bytes(&blob.name)
-                    .map(|bytes| PrefetchedAzureBlob { index, blob, bytes })
-                    .map_err(|error| ResearchError::Azure(error.to_string()));
+                let result =
+                    worker_client
+                        .download_blob_bytes_if_match(&blob.name, &blob.etag)
+                        .map_err(|error| ResearchError::Azure(error.to_string()))
+                        .and_then(|versioned| {
+                            if versioned.etag != blob.etag
+                                || versioned.bytes.len() as u64 != blob.content_length
+                                || blob.version_id.as_ref().is_some_and(|listed| {
+                                    versioned.version_id.as_ref() != Some(listed)
+                                })
+                                || blob.content_md5.as_ref().is_some_and(|listed| {
+                                    versioned.content_md5.as_ref() != Some(listed)
+                                })
+                                || blob.blob_type.as_ref().is_some_and(|listed| {
+                                    versioned.blob_type.as_ref() != Some(listed)
+                                })
+                                || blob
+                                    .sealed
+                                    .is_some_and(|listed| versioned.sealed != Some(listed))
+                            {
+                                return Err(ResearchError::InvalidInput(format!(
+                                    "Azure raw blob {} changed between listing and download",
+                                    blob.name
+                                )));
+                            }
+                            Ok(PrefetchedAzureBlob {
+                                index,
+                                blob,
+                                response_etag: versioned.etag,
+                                version_id: versioned.version_id,
+                                content_md5: versioned.content_md5,
+                                blob_type: versioned.blob_type,
+                                sealed: versioned.sealed,
+                                bytes: versioned.bytes,
+                            })
+                        });
                 if worker_result_tx.send(result).is_err() {
                     break;
                 }
@@ -1806,6 +1944,167 @@ impl AzureEventSource {
     fn worker_count(&self, blob_count: usize) -> usize {
         self.prefetch_blobs.max(1).min(blob_count.max(1))
     }
+}
+
+fn build_local_source_inventory(
+    input: &Path,
+    mode: EventPathMode,
+) -> Result<RawSourceInventory, ResearchError> {
+    let mut paths = collect_jsonl_path_set(input, mode)?.paths;
+    paths.sort();
+    let mut bindings = Vec::with_capacity(paths.len());
+    for (ordinal, path) in paths.into_iter().enumerate() {
+        let bytes = fs::read(&path)?;
+        let metadata = fs::metadata(&path)?;
+        let last_modified = metadata.modified().ok().map(DateTime::<Utc>::from).map(ts);
+        bindings.push(RawSourceBlobBinding {
+            ordinal: ordinal as u64,
+            name: path.to_string_lossy().replace('\\', "/"),
+            etag: None,
+            version_id: None,
+            content_md5: None,
+            blob_type: Some("LocalFile".to_owned()),
+            sealed: Some(true),
+            content_length: bytes.len() as u64,
+            last_modified,
+            sha256: sha256_prefixed(&bytes),
+        });
+    }
+    build_raw_source_inventory(
+        "local_files",
+        None,
+        None,
+        input.to_string_lossy().replace('\\', "/"),
+        None,
+        None,
+        bindings,
+    )
+}
+
+fn build_raw_source_inventory(
+    source_kind: &str,
+    account: Option<String>,
+    container: Option<String>,
+    prefix: String,
+    max_blobs: Option<usize>,
+    max_bytes: Option<u64>,
+    blobs: Vec<RawSourceBlobBinding>,
+) -> Result<RawSourceInventory, ResearchError> {
+    let total_bytes = blobs.iter().try_fold(0_u64, |total, blob| {
+        total.checked_add(blob.content_length).ok_or_else(|| {
+            ResearchError::InvalidInput("raw-source inventory byte total overflow".to_owned())
+        })
+    })?;
+    let canonical = RawSourceInventoryCanonical {
+        domain: RAW_SOURCE_INVENTORY_DOMAIN.to_owned(),
+        schema_version: RAW_SOURCE_INVENTORY_SCHEMA_VERSION,
+        source_kind: source_kind.to_owned(),
+        account,
+        container,
+        prefix,
+        max_blobs,
+        max_bytes,
+        ordering: "blob_name_ascii_ascending".to_owned(),
+        exhaustive_listing: max_blobs.is_none() && max_bytes.is_none(),
+        blob_count: blobs.len() as u64,
+        total_bytes,
+        blobs,
+    };
+    let inventory = RawSourceInventory {
+        schema_version: RAW_SOURCE_INVENTORY_SCHEMA_VERSION,
+        canonical_sha256: sha256_prefixed(&serde_json::to_vec(&canonical)?),
+        canonical,
+    };
+    validate_raw_source_inventory(&inventory)?;
+    Ok(inventory)
+}
+
+pub(crate) fn validate_raw_source_inventory(
+    inventory: &RawSourceInventory,
+) -> Result<(), ResearchError> {
+    if inventory.schema_version != RAW_SOURCE_INVENTORY_SCHEMA_VERSION
+        || inventory.canonical.schema_version != RAW_SOURCE_INVENTORY_SCHEMA_VERSION
+        || inventory.canonical.domain != RAW_SOURCE_INVENTORY_DOMAIN
+        || inventory.canonical.prefix.trim().is_empty()
+        || inventory.canonical.blobs.is_empty()
+        || inventory.canonical.ordering != "blob_name_ascii_ascending"
+        || inventory.canonical.blob_count != inventory.canonical.blobs.len() as u64
+    {
+        return Err(ResearchError::InvalidInput(
+            "raw-source inventory identity, schema, or contents are invalid".to_owned(),
+        ));
+    }
+    match inventory.canonical.source_kind.as_str() {
+        "azure_blob" => {
+            if inventory
+                .canonical
+                .account
+                .as_deref()
+                .is_none_or(str::is_empty)
+                || inventory
+                    .canonical
+                    .container
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+            {
+                return Err(ResearchError::InvalidInput(
+                    "Azure raw-source inventory is missing account or container".to_owned(),
+                ));
+            }
+        }
+        "local_files" => {
+            if inventory.canonical.account.is_some() || inventory.canonical.container.is_some() {
+                return Err(ResearchError::InvalidInput(
+                    "local raw-source inventory must not claim an Azure identity".to_owned(),
+                ));
+            }
+        }
+        _ => {
+            return Err(ResearchError::InvalidInput(
+                "raw-source inventory has an unsupported source kind".to_owned(),
+            ));
+        }
+    }
+    let mut names = BTreeSet::new();
+    let mut total_bytes = 0_u64;
+    for (ordinal, blob) in inventory.canonical.blobs.iter().enumerate() {
+        if blob.ordinal != ordinal as u64
+            || blob.name.trim().is_empty()
+            || !names.insert(blob.name.as_str())
+            || !valid_prefixed_sha256(&blob.sha256)
+            || (inventory.canonical.source_kind == "azure_blob"
+                && blob.etag.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(ResearchError::InvalidInput(format!(
+                "raw-source inventory blob binding is invalid at ordinal {ordinal}"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(blob.content_length)
+            .ok_or_else(|| {
+                ResearchError::InvalidInput("raw-source inventory byte total overflow".to_owned())
+            })?;
+    }
+    if total_bytes != inventory.canonical.total_bytes {
+        return Err(ResearchError::InvalidInput(
+            "raw-source inventory byte total does not match its blob bindings".to_owned(),
+        ));
+    }
+    let expected = sha256_prefixed(&serde_json::to_vec(&inventory.canonical)?);
+    if inventory.canonical_sha256 != expected {
+        return Err(ResearchError::InvalidInput(
+            "raw-source inventory canonical SHA-256 mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_prefixed_sha256(value: &str) -> bool {
+    let digest = value.strip_prefix("sha256:").unwrap_or(value);
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn collect_jsonl_path_set(
@@ -7318,6 +7617,10 @@ mod tests {
                 state.latest_exists.then(|| VersionedBlobBytes {
                     bytes: state.latest.clone(),
                     etag: format!("etag-{}", state.version),
+                    version_id: None,
+                    content_md5: None,
+                    blob_type: None,
+                    sealed: None,
                 })
             };
             if self.wait_on_first_read {

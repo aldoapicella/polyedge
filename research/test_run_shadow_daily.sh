@@ -43,7 +43,11 @@ chmod +x "$TMP/bin/polyedge-rs"
   cd "$TMP/work"
   PATH="$TMP/bin:$PATH" \
   POLYEDGE_TEST_ARGS="$TMP/args" \
+  POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
+  POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
   SHADOW_REPORT_DATE=2026-07-13 \
+  SHADOW_CASCADE_THROUGH=2026-07-13 \
   SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
@@ -52,12 +56,16 @@ chmod +x "$TMP/bin/polyedge-rs"
 )
 
 test "$(grep -c '^research normalize ' "$TMP/args")" -eq 1
+test "$(grep -c '^research begin-shadow-correction ' "$TMP/args")" -eq 1
+test "$(grep -c '^research complete-shadow-correction ' "$TMP/args")" -eq 1
+grep -F 'research begin-shadow-correction --campaign-id campaign-2026-07-12 --correction-id shadow-2026-07-13-through-2026-07-13 --from 2026-07-13 --through 2026-07-13 ' "$TMP/args" >/dev/null
 grep -F 'research normalize --input azure://stpolyedge/polyedge-shadow-events/shadow-events/campaign-2026-07-12/2026/07/13/' "$TMP/args" >/dev/null
 if grep -E 'research normalize --input .*campaign-2026-07-12/\?prefetch' "$TMP/args" >/dev/null; then
   echo "campaign-wide raw normalization was invoked" >&2
   exit 1
 fi
 grep -F 'research publish-projected-day ' "$TMP/args" >/dev/null
+grep -F -- '--require-azure-source true --expected-source-container polyedge-shadow-events' "$TMP/args" >/dev/null
 grep -F 'research materialize-projected-campaign --since 2026-07-13 --through 2026-07-13 ' "$TMP/args" >/dev/null
 grep -F 'research build-cumulative-wallet ' "$TMP/args" | grep -F -- '--campaign-manifest ' >/dev/null
 grep -F 'stage=normalize-day date=2026-07-13 status=starting' "$TMP/stdout" >/dev/null
@@ -69,7 +77,50 @@ fi
 if (
   cd "$TMP/work"
   PATH="$TMP/bin:$PATH" \
+  POLYEDGE_TEST_ARGS="$TMP/args-no-lease" \
+  SHADOW_REPORT_DATE=2026-07-13 \
+  SHADOW_CASCADE_THROUGH=2026-07-13 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
+  AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
+); then
+  echo "shadow daily accepted a direct writer without the Azure campaign lease" >&2
+  exit 1
+fi
+
+(
+  cd "$TMP/work"
+  PATH="$TMP/bin:$PATH" \
+  POLYEDGE_TEST_ARGS="$TMP/args-cascade" \
+  POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
+  POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
+  SHADOW_REPORT_DATE=2026-07-12 \
+  SHADOW_CASCADE_THROUGH=2026-07-13 \
+  SHADOW_PROJECTED_DATA_START=2026-07-12 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
+  AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  sh "$REPO/research/run_shadow_daily.sh" >"$TMP/stdout-cascade"
+)
+test "$(grep -c '^research normalize ' "$TMP/args-cascade")" -eq 2
+test "$(grep -c '^research begin-shadow-correction ' "$TMP/args-cascade")" -eq 1
+test "$(grep -c '^research complete-shadow-correction ' "$TMP/args-cascade")" -eq 1
+test "$(grep -c '^research validate-prospective ' "$TMP/args-cascade")" -eq 1
+test "$(grep -c '^research evaluate-profitability ' "$TMP/args-cascade")" -eq 1
+grep -F 'cascade date=2026-07-12 through=2026-07-13 status=starting' "$TMP/stdout-cascade" >/dev/null
+grep -F 'cascade date=2026-07-13 through=2026-07-13 status=completed' "$TMP/stdout-cascade" >/dev/null
+
+if (
+  cd "$TMP/work"
+  PATH="$TMP/bin:$PATH" \
   POLYEDGE_TEST_ARGS="$TMP/args-current" \
+  POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
+  POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
   SHADOW_REPORT_DATE="$(date -u +%Y-%m-%d)" \
   SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \

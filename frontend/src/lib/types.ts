@@ -329,6 +329,30 @@ export type VenueEvidenceEligibility = {
   reasons?: string[];
 };
 
+export type ShadowCorrectionState = {
+  schema_version: 1 | number;
+  campaign_id: string;
+  correction_id: string;
+  from: string;
+  through: string;
+  reason: string;
+  status: "in_progress" | "failed" | "complete" | string;
+  builder_git_sha?: string | null;
+  started_at: string;
+  completed_at?: string | null;
+};
+
+export type ShadowCorrectionVisibility = {
+  journal_path: "reports/research/shadow/corrections/active.json" | string;
+  available: boolean;
+  status: "none" | "in_progress" | "failed" | "complete" | "invalid" | "unavailable" | string;
+  blocks_promotion: boolean;
+  decision: "NO-GO" | "ELIGIBILITY_UNCHANGED" | string;
+  blocker?: string | null;
+  validation_error: boolean;
+  state?: ShadowCorrectionState | null;
+};
+
 export type VenueExecutionEvidence = {
   generated_ts: string;
   queue_position_source: "authenticated_lifecycle_plus_public_l2" | string;
@@ -338,6 +362,9 @@ export type VenueExecutionEvidence = {
   remaining_limitation: string;
   research_only: boolean;
   strategy_promotion_allowed: boolean;
+  correction?: ShadowCorrectionVisibility;
+  promotion_decision?: "NO-GO" | "ELIGIBILITY_UNCHANGED" | string;
+  promotion_blocker?: string | null;
   artifact_provenance?: {
     profitability?: ProfitabilityArtifactProvenance;
     latest?: LabArtifactProvenance;
@@ -351,7 +378,10 @@ export type VenueExecutionEvidence = {
     created_at?: string;
     expires_at?: string;
     phase?: "frozen" | "risk_repair" | "shadow_collecting" | "shadow_passed" | "evidence_collecting" | "canary_ready" | "limited_live" | "profitable_go" | "stopped_no_go" | string;
+    pre_correction_phase?: string;
     status?: string;
+    pre_correction_status?: string;
+    effective_decision?: "NO-GO" | string;
     candidate?: {
       name?: string;
       version?: string;
@@ -793,8 +823,17 @@ export type ProspectiveValidationRow = {
 
 export type ProspectiveValidation = {
   generated_at?: string;
+  generated_ts?: string;
+  correction?: ShadowCorrectionVisibility;
+  promotion_decision?: "NO-GO" | "ELIGIBILITY_UNCHANGED" | string;
+  promotion_blocker?: string | null;
+  promotion_allowed?: boolean;
   result?: {
     status?: string;
+    pre_correction_status?: string;
+    decision?: "NO-GO" | string;
+    blocker?: string | null;
+    promotion_allowed?: boolean;
     since?: string;
     rows?: ProspectiveValidationRow[];
     frozen_candidates?: JsonRecord;
