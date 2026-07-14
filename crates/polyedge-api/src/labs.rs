@@ -1181,13 +1181,24 @@ async fn prospective() -> impl IntoResponse {
 }
 
 fn prospective_payload() -> Value {
-    let payload = read_json_or_null(
+    let shadow = read_json_from_container_or_null(
+        FsPath::new("reports/research/shadow/prospective/prospective_validation.json"),
+        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+    );
+    let primary = read_json_or_null(
         PathBuf::from(REPORT_ROOT)
             .join("prospective")
             .join("prospective_validation.json"),
     );
-    if !payload.is_null() {
-        return payload;
+    select_prospective_payload(shadow, primary)
+}
+
+fn select_prospective_payload(shadow: Value, primary: Value) -> Value {
+    if !shadow.is_null() {
+        return shadow;
+    }
+    if !primary.is_null() {
+        return primary;
     }
     json!({
         "generated_ts": now_ts(),
@@ -2570,6 +2581,32 @@ mod tests {
     };
     use rust_decimal::Decimal;
 
+    #[test]
+    fn shadow_campaign_prospective_precedes_stale_primary_history() {
+        let shadow = json!({
+            "result": {
+                "status": "tracking",
+                "rows": [{"date": "2026-07-13", "wallet_schema_version": 2}]
+            }
+        });
+        let primary = json!({
+            "result": {
+                "status": "tracking",
+                "rows": [{"date": "2026-07-11"}]
+            }
+        });
+        let selected = select_prospective_payload(shadow.clone(), primary.clone());
+        assert_eq!(selected, shadow);
+        assert_eq!(
+            select_prospective_payload(Value::Null, primary.clone()),
+            primary
+        );
+        assert!(
+            select_prospective_payload(Value::Null, Value::Null)["result"]["rows"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+    }
     #[test]
     fn profitability_selection_prefers_newer_shadow_before_a_funded_ladder_exists() {
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
