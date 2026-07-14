@@ -1747,42 +1747,51 @@ where
                 .map_err(|_| ())
                 .and_then(|receiver| receiver.recv().map_err(|_| ()))
             {
-                let result =
-                    worker_client
-                        .download_blob_bytes_if_match(&blob.name, &blob.etag)
-                        .map_err(|error| ResearchError::Azure(error.to_string()))
-                        .and_then(|versioned| {
-                            if versioned.etag != blob.etag
-                                || versioned.bytes.len() as u64 != blob.content_length
-                                || blob.version_id.as_ref().is_some_and(|listed| {
-                                    versioned.version_id.as_ref() != Some(listed)
-                                })
-                                || blob.content_md5.as_ref().is_some_and(|listed| {
-                                    versioned.content_md5.as_ref() != Some(listed)
-                                })
-                                || blob.blob_type.as_ref().is_some_and(|listed| {
-                                    versioned.blob_type.as_ref() != Some(listed)
-                                })
-                                || blob
-                                    .sealed
-                                    .is_some_and(|listed| versioned.sealed != Some(listed))
-                            {
-                                return Err(ResearchError::InvalidInput(format!(
-                                    "Azure raw blob {} changed between listing and download",
-                                    blob.name
-                                )));
-                            }
-                            Ok(PrefetchedAzureBlob {
-                                index,
-                                blob,
-                                response_etag: versioned.etag,
-                                version_id: versioned.version_id,
-                                content_md5: versioned.content_md5,
-                                blob_type: versioned.blob_type,
-                                sealed: versioned.sealed,
-                                bytes: versioned.bytes,
-                            })
-                        });
+                let result = worker_client
+                    .download_blob_bytes_if_match(&blob.name, &blob.etag)
+                    .map_err(|error| ResearchError::Azure(error.to_string()))
+                    .and_then(|versioned| {
+                        // Azure's List Blobs response includes metadata that
+                        // Get Blob is allowed to omit. A successful If-Match
+                        // plus the exact response ETag/length is authoritative;
+                        // compare optional metadata only when both responses
+                        // actually supplied it. The exhaustive post-read
+                        // re-list below still rejects any later mutation.
+                        if versioned.etag != blob.etag
+                            || versioned.bytes.len() as u64 != blob.content_length
+                            || optional_metadata_differs(
+                                blob.version_id.as_ref(),
+                                versioned.version_id.as_ref(),
+                            )
+                            || optional_metadata_differs(
+                                blob.content_md5.as_ref(),
+                                versioned.content_md5.as_ref(),
+                            )
+                            || optional_metadata_differs(
+                                blob.blob_type.as_ref(),
+                                versioned.blob_type.as_ref(),
+                            )
+                            || matches!(
+                                (blob.sealed, versioned.sealed),
+                                (Some(listed), Some(downloaded)) if listed != downloaded
+                            )
+                        {
+                            return Err(ResearchError::InvalidInput(format!(
+                                "Azure raw blob {} changed between listing and download",
+                                blob.name
+                            )));
+                        }
+                        Ok(PrefetchedAzureBlob {
+                            index,
+                            blob,
+                            response_etag: versioned.etag,
+                            version_id: versioned.version_id,
+                            content_md5: versioned.content_md5,
+                            blob_type: versioned.blob_type,
+                            sealed: versioned.sealed,
+                            bytes: versioned.bytes,
+                        })
+                    });
                 if worker_result_tx.send(result).is_err() {
                     break;
                 }
@@ -1850,6 +1859,10 @@ where
         ));
     }
     Ok(())
+}
+
+fn optional_metadata_differs<T: PartialEq>(listed: Option<&T>, downloaded: Option<&T>) -> bool {
+    matches!((listed, downloaded), (Some(listed), Some(downloaded)) if listed != downloaded)
 }
 
 fn join_azure_workers(handles: Vec<thread::JoinHandle<()>>) {
@@ -7194,6 +7207,17 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_blob_read_accepts_omitted_optional_response_metadata() {
+        let listed = "AppendBlob".to_owned();
+        assert!(!optional_metadata_differs(Some(&listed), None));
+        assert!(!optional_metadata_differs(Some(&listed), Some(&listed)));
+        assert!(optional_metadata_differs(
+            Some(&listed),
+            Some(&"BlockBlob".to_owned())
+        ));
+    }
 
     fn wallet_ts(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
