@@ -61,6 +61,7 @@ export function loadRedemptionConfig(env = process.env) {
     executionMode: env.EXECUTION_MODE,
     enabled: env.VENUE_REDEMPTION_ENABLED === "true",
     dryRun: env.VENUE_REDEMPTION_DRY_RUN !== "false",
+    trustBoundaryReady: env.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY === "true",
     allowLive: env.ALLOW_LIVE === "true",
     enableTakerOrders: env.ENABLE_TAKER_ORDERS === "true",
     expectedCountry: String(env.VENUE_PROBE_EXPECTED_COUNTRY || "").trim().toUpperCase(),
@@ -122,6 +123,7 @@ export function validateRedemptionConfig(config) {
     if (value !== expected) errors.push(`${name} must equal ${expected}`);
   }
   if (!config.dryRun) {
+    if (!config.trustBoundaryReady) errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control/attestor isolation");
     if (!config.enabled) errors.push("VENUE_REDEMPTION_ENABLED must be true for submission");
     if (!config.expectedCountry) errors.push("VENUE_PROBE_EXPECTED_COUNTRY is required for submission");
     if (!config.expectedEgressIp) errors.push("VENUE_PROBE_EXPECTED_EGRESS_IP is required for submission");

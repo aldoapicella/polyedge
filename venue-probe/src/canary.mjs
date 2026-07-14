@@ -2,10 +2,10 @@ import { AssetType, Chain, ClobClient, OrderType, Side } from "@polymarket/clob-
 import { createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
-import WebSocket from "ws";
 import {
   EVIDENCE_PROTOCOL_VERSION,
   EventLedger,
+  HORIZONS_SECONDS,
   acquireCampaignLease,
   assertEligibleOrigin,
   finalizeProbeRisk,
@@ -19,7 +19,8 @@ import {
   sanitize,
   storageContainer,
   summarizeCampaignRisk,
-  uploadEvidence
+  uploadEvidence,
+  validateFillMarkouts
 } from "./lib.mjs";
 import {
   consumeOneShotAuthorization,
@@ -28,8 +29,27 @@ import {
   executeStrategyCanary,
   loadCanaryConfig,
   loadHashedJson,
+  polymarketV2FeePerShare,
   validateCanaryPreflight
 } from "./canary-lib.mjs";
+import {
+  cancelOrderWithMetrics,
+  cancellationEventReceivedAt,
+  connectLifecycleChannel,
+  firstFillTimestamp,
+  hasExactEligibleHorizons,
+  marketMessagesThrough,
+  maximumMatchedSize,
+  mergeTradeFills,
+  nearlyEqualSize,
+  postCancelFillStats,
+  publicTradeThroughStats,
+  sameStringSet,
+  sum,
+  tradeFillsFromRest,
+  tradeFillsFromUserEvents,
+  waitForStablePostCancelReconciliation
+} from "./canary-lifecycle-lib.mjs";
 
 const config = loadCanaryConfig();
 const runId = process.env.STRATEGY_CANARY_RUN_ID || `strategy-canary-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
@@ -125,6 +145,7 @@ async function main() {
       },
       settlement: {
         settlement_verified: true,
+        trust_boundary_ready: config.trustBoundaryReady,
         zero_open_orders_confirmed: terminalRuntime.openOrderCount === 0,
         evidence_source: "authenticated_no_fill",
         settled_ts: new Date().toISOString(),
@@ -175,6 +196,7 @@ async function main() {
       funded_stage_consumption_sha256: documents.authorization.funded_stage_consumption_sha256 || null,
       funded_stage_source_state_sha256: documents.authorization.funded_stage_source_state_sha256 || null,
       funded_stage_target_orders: documents.authorization.funded_stage_target_orders || null,
+      authorization_blob_name: config.authorizationBlobName,
       authorization_sha256: documents.authorizationHash,
       authorization_container_name: config.storageContainer,
       intent_container_name: config.intentContainerName,
@@ -191,6 +213,7 @@ async function main() {
     },
     execution_origin: "azure_north_europe_static_egress",
     execution_country: runtime.geoblock.country,
+    funder_address: config.funderAddress,
     static_egress_verified: runtime.geoblock.ip === config.expectedEgressIp,
     probes: [evidenceProbe],
     market: evidenceProbe.market,
@@ -224,11 +247,16 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
   const requestFinished = Date.now();
   const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
   const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
-  const clockDriftMs = Math.abs((requestStarted + requestFinished) / 2 - serverMs);
+  const clockRoundTripMs = requestFinished - requestStarted;
+  const localMidpointMs = (requestStarted + requestFinished) / 2;
+  const clockServerMinusLocalMs = serverMs - localMidpointMs;
+  const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
+  const clockUncertaintyMs = clockRoundTripMs / 2 + serverClockQuantizationMs;
+  const clockDriftMs = Math.abs(clockServerMinusLocalMs);
   const market = await loadExactMarket(intent);
-  const [book, feeRateBps, openOrders, riskControl, balance, positionsResponse, valueResponse] = await Promise.all([
+  const [book, clobMarketInfo, openOrders, riskControl, balance, positionsResponse, valueResponse] = await Promise.all([
     client.getOrderBook(String(intent.token_id)),
-    client.getFeeRateBps(String(intent.token_id)).then(Number),
+    client.getClobMarketInfo(String(intent.condition_id)),
     getOpenOrdersStrict(client),
     loadCampaignRiskControl(config),
     client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
@@ -236,7 +264,16 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
     fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) })
   ]);
   if (!Number.isFinite(clockDriftMs)) throw new Error("fail closed: venue clock is invalid");
-  if (!Number.isFinite(feeRateBps) || feeRateBps < 0 || feeRateBps > 10_000) throw new Error("fail closed: venue fee rate is invalid");
+  const feeRate = Number(clobMarketInfo?.fd?.r ?? 0);
+  const feeExponent = Number(clobMarketInfo?.fd?.e ?? 0);
+  const feeTakerOnly = clobMarketInfo?.fd?.to === true || feeRate === 0;
+  const feeRateBps = feeRate * 10_000;
+  if (!Number.isFinite(feeRate) || feeRate < 0 || feeRate > 1 ||
+      !Number.isFinite(feeExponent) || feeExponent < 0 || feeExponent > 10 ||
+      !Number.isFinite(feeRateBps) || feeRateBps < 0 || feeRateBps > 10_000 ||
+      (feeRate > 0 && !feeTakerOnly)) {
+    throw new Error("fail closed: Polymarket V2 market fee rate/exponent/taker-only parameters are invalid");
+  }
   if (!positionsResponse.ok || !valueResponse.ok) throw new Error("fail closed: account reconciliation endpoint failed");
   const positions = await positionsResponse.json();
   const reportedValues = await valueResponse.json();
@@ -254,7 +291,7 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
   }
   const reservations = await loadUnresolvedRiskReservations(config);
   const principal = Number(intent.notional);
-  const feeRisk = principal * feeRateBps / 10_000;
+  const feeRisk = Number(intent.shares) * polymarketV2FeePerShare(intent.price, feeRate, feeExponent);
   const risk = summarizeCampaignRisk({
     control: riskControl,
     liquidCollateral: Number(balance.balance) / 1_000_000,
@@ -269,9 +306,16 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
   return {
     geoblock,
     clockDriftMs,
+    clockServerMinusLocalMs,
+    clockRoundTripMs,
+    clockUncertaintyMs,
     market,
     book,
+    feeModel: "polymarket_clob_v2_curve",
+    feeRate,
     feeRateBps,
+    feeExponent,
+    feeTakerOnly,
     risk,
     openOrderCount: openOrders.length,
     fillModelVersion: config.requiredFillModelVersion,
@@ -282,25 +326,65 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
 }
 
 async function executeLifecycle(client, { intent, documents, runtime, reservation }) {
-  lease.assertHealthy();
-  // Both channels are opened before signing so partial fills, cancellation races,
-  // public trade-through, and markout evidence have no intentional blind window.
-  userChannel = await openChannel(config.userWsUrl, {
-    auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
-    markets: [intent.condition_id],
-    type: "user"
-  });
-  marketChannel = await openChannel(config.marketWsUrl, {
-    assets_ids: [intent.token_id],
-    type: "market",
-    custom_feature_enabled: true
-  });
-  const refreshed = await capturePreflight(client, intent, reservation.probe_id);
-  // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
-  // authorization contract immediately before the only signing call.
-  validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
-  lease.assertHealthy();
+  let refreshed;
+  let preSendCapturedWallMs;
+  let preSendContext;
+  try {
+    lease.assertHealthy();
+    // Both channels are opened before signing so partial fills, cancellation races,
+    // public trade-through, and markout evidence have no intentional blind window.
+    userChannel = await connectLifecycleChannel({
+      url: config.userWsUrl,
+      subscription: {
+        auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
+        markets: [intent.condition_id],
+        type: "user"
+      },
+      ledger,
+      eventType: "venue_user_channel"
+    });
+    marketChannel = await connectLifecycleChannel({
+      url: config.marketWsUrl,
+      subscription: {
+        assets_ids: [intent.token_id],
+        type: "market",
+        custom_feature_enabled: true
+      },
+      ledger,
+      eventType: "venue_market_channel"
+    });
+    refreshed = await capturePreflight(client, intent, reservation.probe_id);
+    // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
+    // authorization contract immediately before the only signing call.
+    validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
+    lease.assertHealthy();
+    await Promise.all([userChannel.ensureOpen(), marketChannel.ensureOpen()]);
+    if (userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
+        userChannel.unparsedCount() > 0 || marketChannel.unparsedCount() > 0) {
+      throw new Error("fail closed: authenticated/public websocket completeness was lost before submission");
+    }
+    preSendCapturedWallMs = Date.now();
+    preSendContext = {
+      ...marketContext(marketMessagesThrough(marketChannel.messages, preSendCapturedWallMs)),
+      source: "public_market_channel_before_submission",
+      captured_wall_ms: preSendCapturedWallMs
+    };
+  } catch (error) {
+    try {
+      await finalizeProbeRisk(config, reservation, {
+        state: "released_no_order",
+        order_submitted: false,
+        matched_notional: 0,
+        reconciliation_complete: true,
+        zero_open_orders_confirmed: true
+      });
+    } catch (releaseError) {
+      throw new Error(`fail closed: pre-submit lifecycle failed and no-order risk release also failed (${error.message}; ${releaseError.message})`);
+    }
+    throw error;
+  }
   const expiration = Math.floor(Date.parse(intent.gtd_expiry_ts) / 1000);
+  while (Date.now() <= preSendCapturedWallMs) await sleep(1);
   const sentAt = new Date();
   const sentMonotonicMs = performance.now();
   let response;
@@ -314,7 +398,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     });
     response = await client.createAndPostOrder(
       { tokenID: intent.token_id, price: Number(intent.price), size: Number(intent.shares), side: Side.BUY, expiration },
-      { tickSize: String(runtime.book.tick_size ?? runtime.book.tickSize), negRisk: runtime.book.neg_risk === true || runtime.book.negRisk === true },
+      { tickSize: String(refreshed.book.tick_size ?? refreshed.book.tickSize), negRisk: refreshed.book.neg_risk === true || refreshed.book.negRisk === true },
       OrderType.GTD,
       true
     );
@@ -329,9 +413,25 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
   const acknowledgedAt = new Date();
   const acknowledgementLatencyMs = Math.max(0, performance.now() - sentMonotonicMs);
   const orderId = String(response.orderID);
-  ledger.record("venue_order_http_ack", { probe_id: reservation.probe_id, order_id: orderId, response, acknowledgement_latency_ms: acknowledgementLatencyMs });
+  ledger.record("venue_order_http_ack", { probe_id: reservation.probe_id, order_id: orderId, response, client_to_http_ack_ms: acknowledgementLatencyMs });
   let markoutCapture;
   try {
+    markoutCapture = beginFillMarkoutCapture(
+      client,
+      intent.token_id,
+      () => normalizeFillClock(
+        tradeFillsFromUserEvents(userChannel.messages, orderId),
+        refreshed.clockServerMinusLocalMs
+      ),
+      {
+        feeParameters: {
+          rate: refreshed.feeRate,
+          rateBps: refreshed.feeRateBps,
+          exponent: refreshed.feeExponent,
+          takerOnly: refreshed.feeTakerOnly
+        }
+      }
+    );
     await finalizeProbeRisk(config, reservation, {
       state: "submitted_pending_reconciliation",
       order_submitted: true,
@@ -340,32 +440,59 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       reconciliation_complete: false,
       zero_open_orders_confirmed: false
     });
-    markoutCapture = beginFillMarkoutCapture(
-      client,
-      intent.token_id,
-      () => fillsFromUserChannel(userChannel.messages, orderId)
+    const plannedRestMs = Math.min(
+      config.restSeconds * 1_000,
+      Math.max(0, Date.parse(intent.valid_until) - Date.now())
     );
-    await sleep(Math.min(config.restSeconds * 1000, Math.max(0, Date.parse(intent.valid_until) - Date.now() - 1000)));
+    await sleep(plannedRestMs);
     const openBeforeCancel = (await getOpenOrdersStrict(client)).some((row) => String(row.id) === orderId);
-    const cancelRequestedAt = openBeforeCancel ? new Date() : null;
-    if (openBeforeCancel) await cancelWithRetries(client, orderId);
-    const cancelAcknowledgedAt = openBeforeCancel ? new Date() : null;
-    const reconciliation = await reconcile(client, intent.condition_id, orderId);
-    const orderTerminalAt = new Date();
-    const userFills = fillsFromUserChannel(userChannel.messages, orderId);
-    const restFills = fillsFromTrades(reconciliation.trades, orderId);
-    const fills = mergeFills(userFills, restFills);
-    const markouts = await markoutCapture.finish(fills);
-    const matchedShares = Math.max(
-      Number(reconciliation.order?.size_matched || 0),
-      userFills.reduce((sum, fill) => sum + fill.size, 0),
-      restFills.reduce((sum, fill) => sum + fill.size, 0)
+    const cancellation = openBeforeCancel
+      ? await cancelOrderWithMetrics(client, orderId, ledger)
+      : {
+          cancelSendWallMs: null,
+          cancelResponseWallMs: Date.now(),
+          cancelRoundTripMs: null,
+          cancelResponse: { already_terminal: true },
+          failedAttempts: 0
+        };
+    ledger.record("venue_cancel_http_response", {
+      probe_id: reservation.probe_id,
+      order_id: orderId,
+      response: cancellation.cancelResponse,
+      client_cancel_round_trip_ms: cancellation.cancelRoundTripMs
+    });
+    const reconciliation = await waitForStablePostCancelReconciliation({
+      client,
+      conditionId: intent.condition_id,
+      orderId,
+      userChannel,
+      ledger,
+      assertHealthy: () => lease.assertHealthy()
+    });
+    await Promise.all([userChannel.ensureOpen(), marketChannel.ensureOpen()]);
+    const userFills = normalizeFillClock(
+      tradeFillsFromUserEvents(reconciliation.userEvents, orderId),
+      refreshed.clockServerMinusLocalMs
     );
-    const restIds = new Set(restFills.map((fill) => fill.id));
-    const userIds = new Set(userFills.map((fill) => fill.id));
-    const tradeIdsAgree = restIds.size === userIds.size && [...restIds].every((id) => userIds.has(id));
-    const reconciliationComplete = reconciliation.zeroOpenOrders && reconciliation.terminal && tradeIdsAgree;
-    const matchedRisk = matchedShares * Number(intent.price) * (1 + Number(runtime.feeRateBps || 0) / 10_000);
+    const restFills = normalizeFillClock(
+      tradeFillsFromRest(reconciliation.relatedTrades, orderId),
+      refreshed.clockServerMinusLocalMs
+    );
+    const fills = mergeTradeFills(userFills, restFills);
+    const markouts = await markoutCapture.finish(fills);
+    const restOrderMatched = Number(reconciliation.finalOrder?.size_matched || 0);
+    const userOrderMatched = maximumMatchedSize(reconciliation.userEvents);
+    const restTradesMatched = sum(restFills.map((fill) => fill.size));
+    const userTradesMatched = sum(userFills.map((fill) => fill.size));
+    const matchedShares = Math.max(restOrderMatched, userOrderMatched, restTradesMatched, userTradesMatched);
+    const matchedSizeSourceAgreement = [restOrderMatched, userOrderMatched, restTradesMatched, userTradesMatched]
+      .every((value) => nearlyEqualSize(value, matchedShares));
+    const tradeIdSourceAgreement = sameStringSet(restFills.map((fill) => fill.id), userFills.map((fill) => fill.id));
+    const restOrderReturned = Boolean(reconciliation.finalOrder);
+    const reconciliationComplete = reconciliation.zeroOpenOrders && reconciliation.stableFinality &&
+      reconciliation.terminalConfirmed && restOrderReturned && matchedSizeSourceAgreement && tradeIdSourceAgreement;
+    const matchedRisk = matchedShares * (Number(intent.price) +
+      polymarketV2FeePerShare(intent.price, refreshed.feeRate, refreshed.feeExponent));
     await finalizeProbeRisk(config, reservation, {
       state: reconciliationComplete
         ? (matchedShares > 0 ? "position_unresolved" : "finalized_no_fill")
@@ -379,52 +506,120 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     if (!reconciliationComplete) throw new Error("canary lifecycle did not reconcile across REST and authenticated user channel");
 
     const terminalAt = new Date();
-    const firstFillWallMs = fills.length ? Math.min(...fills.map((fill) => fill.timestampMs)) : null;
-    const context = marketContext(marketChannel.messages);
-    const order = evidenceOrder(intent, runtime.book);
+    const firstFillWallMs = firstFillTimestamp(fills);
+    const cancellationReceivedWallMs = cancellationEventReceivedAt(reconciliation.userEvents);
+    const order = evidenceOrder(intent, refreshed.book);
+    const tradeThrough = publicTradeThroughStats(
+      marketChannel.messages,
+      order,
+      acknowledgedAt.getTime(),
+      cancellationReceivedWallMs ?? cancellation.cancelResponseWallMs ?? terminalAt.getTime(),
+      fills
+    );
+    const cancelRace = postCancelFillStats(fills, cancellation.cancelSendWallMs);
+    const fullContext = marketContext(marketChannel.messages);
+    const dataGapDetected = !reconciliation.stableFinality ||
+      userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
+      userChannel.unparsedCount() > 0 || marketChannel.unparsedCount() > 0 ||
+      (cancellation.cancelSendWallMs !== null && cancellationReceivedWallMs === null) ||
+      (cancellation.cancelSendWallMs === null && matchedShares < Number(intent.shares)) ||
+      (matchedShares > 0 && (!tradeIdSourceAgreement || !matchedSizeSourceAgreement));
+    const terminalWallMs = cancellationReceivedWallMs ?? cancellation.cancelResponseWallMs ?? firstFillWallMs ?? terminalAt.getTime();
+    const markoutCoverage = validateFillMarkouts(markouts, restFills.map((fill) => fill.id), matchedShares);
+    const markoutCaptureComplete = markoutCoverage.complete && markoutCoverage.timing_valid;
     const lifecycle = {
       order_id: orderId,
       send_wall_ms: sentAt.getTime(),
       ack_wall_ms: acknowledgedAt.getTime(),
       submitted_ts: sentAt.toISOString(),
       acknowledged_ts: acknowledgedAt.toISOString(),
+      client_to_http_ack_ms: acknowledgementLatencyMs,
       acknowledgement_latency_ms: acknowledgementLatencyMs,
       acknowledgement_latency_clock: "monotonic_performance_now",
-      cancel_requested_ts: cancelRequestedAt?.toISOString() || null,
-      cancel_acknowledged_ts: cancelAcknowledgedAt?.toISOString() || null,
-      live_duration_ms: orderTerminalAt.getTime() - acknowledgedAt.getTime(),
+      clock_server_minus_local_ms: refreshed.clockServerMinusLocalMs,
+      clock_round_trip_ms: refreshed.clockRoundTripMs,
+      clock_uncertainty_ms: refreshed.clockUncertaintyMs,
+      fill_timestamp_clock: "venue_timestamp_normalized_to_local_wall_clock",
+      cancel_send_wall_ms: cancellation.cancelSendWallMs,
+      cancel_http_response_wall_ms: cancellation.cancelResponseWallMs,
+      client_cancel_round_trip_ms: cancellation.cancelRoundTripMs,
+      user_channel_cancel_received_wall_ms: cancellationReceivedWallMs,
+      client_to_user_cancel_ack_ms: cancellation.cancelSendWallMs === null || cancellationReceivedWallMs === null
+        ? null
+        : cancellationReceivedWallMs - cancellation.cancelSendWallMs,
+      cancel_requested_ts: cancellation.cancelSendWallMs === null ? null : new Date(cancellation.cancelSendWallMs).toISOString(),
+      cancel_acknowledged_ts: cancellation.cancelSendWallMs === null
+        ? null
+        : new Date(cancellation.cancelResponseWallMs).toISOString(),
+      cancel_failed_attempts: cancellation.failedAttempts,
+      planned_rest_seconds: plannedRestMs / 1_000,
+      planned_rest_until_ts: intent.valid_until,
+      live_duration_ms: Math.max(0, terminalWallMs - acknowledgedAt.getTime()),
       first_fill_after_ack_ms: firstFillWallMs === null ? null : Math.max(0, firstFillWallMs - acknowledgedAt.getTime()),
       actual_matched_size: matchedShares,
       partial_fill: matchedShares > 0 && matchedShares < Number(intent.shares),
       fully_filled: matchedShares >= Number(intent.shares),
-      venue_fee_rate_bps: Number(runtime.feeRateBps || 0),
-      related_trade_ids: fills.map((fill) => fill.id),
-      rest_user_trade_ids_agree: tradeIdsAgree,
-      zero_open_orders_confirmed: true,
-      reconciliation_complete: true,
-      data_gap_detected: false,
-      cancellation_failure: false,
+      post_cancel_fill_count: cancelRace.postCancelFillCount,
+      first_fill_after_cancel_ms: cancelRace.firstFillAfterCancelMs,
+      fill_raced_cancellation: cancelRace.postCancelFillCount > 0,
+      public_touch_trade_count: tradeThrough.touch_count,
+      public_strict_trade_through_count: tradeThrough.strict_trade_through_count,
+      public_trade_through_without_fill_count: tradeThrough.trade_through_without_fill_count,
+      venue_status: reconciliation.finalOrder?.status || "terminal_not_returned",
+      venue_fee_model: refreshed.feeModel,
+      venue_fee_rate: refreshed.feeRate,
+      venue_fee_rate_bps: Number(refreshed.feeRateBps || 0),
+      venue_fee_exponent: refreshed.feeExponent,
+      venue_fee_taker_only: refreshed.feeTakerOnly,
+      related_trade_ids: restFills.map((fill) => fill.id),
+      live_user_trade_ids: userFills.map((fill) => fill.id),
+      rest_order_matched_size: restOrderMatched,
+      user_order_matched_size: userOrderMatched,
+      rest_trade_matched_size: restTradesMatched,
+      user_trade_matched_size: userTradesMatched,
+      matched_size_source_agreement: matchedSizeSourceAgreement,
+      trade_id_source_agreement: tradeIdSourceAgreement,
+      rest_user_trade_ids_agree: tradeIdSourceAgreement,
+      rest_order_returned: restOrderReturned,
+      post_cancel_finality_stable: reconciliation.stableFinality,
+      post_cancel_observation_ms: reconciliation.observationMs,
+      authenticated_user_channel_reconnects: userChannel.reconnectCount(),
+      public_market_channel_reconnects: marketChannel.reconnectCount(),
+      authenticated_user_channel_duplicates: userChannel.duplicateCount(),
+      public_market_channel_duplicates: marketChannel.duplicateCount(),
+      authenticated_user_channel_unparsed: userChannel.unparsedCount(),
+      public_market_channel_unparsed: marketChannel.unparsedCount(),
+      reconciliation_complete: reconciliationComplete,
+      zero_open_orders_confirmed: reconciliation.zeroOpenOrders,
+      data_gap_detected: dataGapDetected,
+      cancellation_failure: cancellation.failedAttempts > 0 && !reconciliation.zeroOpenOrders,
+      markout_capture_complete: markoutCaptureComplete,
       public_trade_messages: marketChannel.messages.filter((row) => String(row.event_type || row.type).toLowerCase().includes("trade")).length
     };
     const market = {
-      id: String(runtime.market.marketId),
-      conditionId: String(runtime.market.conditionId),
-      tokenId: String(runtime.market.tokenId),
-      endTs: runtime.market.endTs || null
+      id: String(refreshed.market.marketId),
+      conditionId: String(refreshed.market.conditionId),
+      tokenId: String(refreshed.market.tokenId),
+      endTs: refreshed.market.endTs || null
     };
-    const observations = modelObservations({ order, market, lifecycle, context, markouts });
+    const observations = modelObservations({ order, market, lifecycle, context: preSendContext, markouts });
+    lifecycle.estimated_round_trip_cost_per_share = observations[0]?.estimated_round_trip_cost_per_share ?? null;
+    const exactEligibleHorizons = hasExactEligibleHorizons(observations, HORIZONS_SECONDS);
+    const evidenceStatus = !dataGapDetected && markoutCaptureComplete && exactEligibleHorizons
+      ? "completed"
+      : "completed_ineligible";
     const evidenceProbe = {
       schema_version: 3,
       evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
       probe_id: reservation.probe_id,
-      status: "completed",
+      status: evidenceStatus,
       started_ts: sentAt.toISOString(),
       finished_ts: terminalAt.toISOString(),
       order_submitted: true,
       market,
       order,
-      context,
-      pre_send_context: context,
+      context: fullContext,
+      pre_send_context: preSendContext,
       lifecycle,
       markouts,
       model_observations: observations
@@ -437,7 +632,8 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
   } catch (error) {
     if (markoutCapture) await markoutCapture.abort().catch(() => null);
     const emergency = await emergencyReconcileAfterAck(client, intent.condition_id, orderId);
-    const matchedRisk = emergency.matchedShares * Number(intent.price) * (1 + Number(runtime.feeRateBps || 0) / 10_000);
+    const matchedRisk = emergency.matchedShares * (Number(intent.price) +
+      polymarketV2FeePerShare(intent.price, refreshed.feeRate, refreshed.feeExponent));
     let reservationPersistenceError = null;
     try {
       await finalizeProbeRisk(config, reservation, {
@@ -460,12 +656,13 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     });
     await uploadFailedPostAckEvidence({
       intent,
-      runtime,
+      runtime: refreshed,
       reservation,
       orderId,
       acknowledgedAt,
       sentAt,
       acknowledgementLatencyMs,
+      preSendContext,
       emergency,
       originalError: error
     }).catch((uploadError) => {
@@ -481,7 +678,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
   }
 }
 
-async function uploadFailedPostAckEvidence({ intent, runtime, reservation, orderId, acknowledgedAt, sentAt, acknowledgementLatencyMs, emergency, originalError }) {
+async function uploadFailedPostAckEvidence({ intent, runtime, reservation, orderId, acknowledgedAt, sentAt, acknowledgementLatencyMs, preSendContext, emergency, originalError }) {
   const finishedAt = new Date();
   const context = marketChannel ? marketContext(marketChannel.messages) : {
     observed_trade_count: 0,
@@ -496,12 +693,17 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     ack_wall_ms: acknowledgedAt.getTime(),
     submitted_ts: sentAt.toISOString(),
     acknowledged_ts: acknowledgedAt.toISOString(),
+    client_to_http_ack_ms: acknowledgementLatencyMs,
     acknowledgement_latency_ms: acknowledgementLatencyMs,
     live_duration_ms: Math.max(0, finishedAt.getTime() - acknowledgedAt.getTime()),
     first_fill_after_ack_ms: null,
     actual_matched_size: emergency.matchedShares,
     related_trade_ids: [],
+    venue_fee_model: runtime.feeModel,
+    venue_fee_rate: runtime.feeRate,
     venue_fee_rate_bps: Number(runtime.feeRateBps || 0),
+    venue_fee_exponent: runtime.feeExponent,
+    venue_fee_taker_only: runtime.feeTakerOnly,
     reconciliation_complete: false,
     zero_open_orders_confirmed: emergency.zeroOpenOrders,
     data_gap_detected: true,
@@ -513,7 +715,8 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     tokenId: String(runtime.market.tokenId),
     endTs: runtime.market.endTs || null
   };
-  const observations = modelObservations({ order, market, lifecycle, context, markouts: [] });
+  const observations = modelObservations({ order, market, lifecycle, context: preSendContext, markouts: [] });
+  lifecycle.estimated_round_trip_cost_per_share = observations[0]?.estimated_round_trip_cost_per_share ?? null;
   const probe = {
     schema_version: 3,
     evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
@@ -525,7 +728,7 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     market,
     order,
     context,
-    pre_send_context: context,
+    pre_send_context: preSendContext,
     lifecycle,
     markouts: [],
     model_observations: observations,
@@ -545,7 +748,7 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     probes: [probe],
     market,
     order,
-    pre_send_context: context,
+    pre_send_context: preSendContext,
     lifecycle,
     markouts: [],
     model_observations: observations,
@@ -583,12 +786,18 @@ function evidenceOrder(intent, book) {
 async function emergencyReconcileAfterAck(client, conditionId, orderId) {
   await client.cancelOrder({ orderID: orderId }).catch(() => null);
   await client.cancelAll().catch(() => null);
-  const reconciliation = await reconcile(client, conditionId, orderId).catch(() => null);
+  const reconciliation = await waitForStablePostCancelReconciliation({
+    client,
+    conditionId,
+    orderId,
+    userChannel: userChannel || { messages: [], ensureOpen: async () => true },
+    ledger
+  }).catch(() => null);
   const openOrders = await getOpenOrdersStrict(client).catch(() => null);
   const zeroOpenOrders = Array.isArray(openOrders) && openOrders.length === 0;
-  const restFills = reconciliation ? fillsFromTrades(reconciliation.trades, orderId) : [];
+  const restFills = reconciliation ? tradeFillsFromRest(reconciliation.relatedTrades, orderId) : [];
   const matchedShares = Math.max(
-    Number(reconciliation?.order?.size_matched || 0),
+    Number(reconciliation?.finalOrder?.size_matched || 0),
     restFills.reduce((sum, fill) => sum + fill.size, 0)
   );
   return { zeroOpenOrders, matchedShares };
@@ -610,74 +819,9 @@ async function loadExactMarket(intent) {
   };
 }
 
-async function openChannel(url, subscription) {
-  const ws = new WebSocket(url);
-  const messages = [];
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("fail closed: websocket open timeout")), 8000);
-    ws.once("open", () => { clearTimeout(timer); resolve(); });
-    ws.once("error", reject);
-  });
-  ws.on("message", (data) => {
-    const text = data.toString();
-    if (text === "PONG") return;
-    try { const value = JSON.parse(text); messages.push(...(Array.isArray(value) ? value : [value]).map((row) => ({ ...row, _received_wall_ms: Date.now() }))); }
-    catch { /* Unparseable messages are excluded and reconciliation fails closed. */ }
-  });
-  ws.send(JSON.stringify(subscription));
-  await sleep(250);
-  return { messages, close: () => ws.close() };
-}
-
-async function cancelWithRetries(client, orderId) {
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try { return await client.cancelOrder({ orderID: orderId }); }
-    catch (error) { lastError = error; await sleep(200 * attempt); }
-  }
-  await client.cancelAll();
-  if ((await getOpenOrdersStrict(client)).length) throw new Error(`fail closed: canary cancellation failed (${lastError?.message || "unknown"})`);
-}
-
 async function cancelAllAndConfirm(client) {
   await client.cancelAll().catch(() => null);
   if ((await getOpenOrdersStrict(client)).length) throw new Error("fail closed: emergency cancellation did not produce zero open orders");
-}
-
-async function reconcile(client, conditionId, orderId) {
-  let last;
-  for (let attempt = 0; attempt < 15; attempt += 1) {
-    const [openOrders, order, trades] = await Promise.all([
-      getOpenOrdersStrict(client),
-      client.getOrder(orderId).catch(() => null),
-      client.getTrades({ market: conditionId }).catch(() => [])
-    ]);
-    const status = String(order?.status || "").toUpperCase();
-    last = { order, trades: Array.isArray(trades) ? trades : [], zeroOpenOrders: !openOrders.some((row) => String(row.id) === orderId), terminal: ["CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXPIRED"].some((value) => status.includes(value)) };
-    if (last.zeroOpenOrders && last.terminal) return last;
-    await sleep(400);
-  }
-  return last || { order: null, trades: [], zeroOpenOrders: false, terminal: false };
-}
-
-function fillsFromUserChannel(messages, orderId) {
-  return messages.flatMap((row) => {
-    const type = String(row.event_type || row.type || "").toLowerCase();
-    if (!type.includes("trade") || ![row.maker_order_id, row.taker_order_id, row.order_id].map(String).includes(String(orderId))) return [];
-    return [{ id: String(row.id || row.trade_id || row.transaction_hash || ""), size: Number(row.size || row.matched_amount || 0), price: Number(row.price || 0), timestampMs: epochMs(row.timestamp || row.match_time || row.created_at) }];
-  }).filter(validFill);
-}
-
-function fillsFromTrades(trades, orderId) {
-  return (trades || []).flatMap((row) => {
-    const ids = [row.maker_order_id, row.taker_order_id, row.order_id, ...(row.maker_orders || []).map((item) => item.order_id)].map(String);
-    if (!ids.includes(String(orderId))) return [];
-    return [{ id: String(row.id || row.trade_id || row.transaction_hash || ""), size: Number(row.size || row.amount || 0), price: Number(row.price || 0), timestampMs: epochMs(row.match_time || row.timestamp || row.created_at) }];
-  }).filter(validFill);
-}
-
-function mergeFills(left, right) {
-  return [...new Map([...left, ...right].map((row) => [row.id, row])).values()];
 }
 
 async function getOpenOrdersStrict(client) {
@@ -686,8 +830,23 @@ async function getOpenOrdersStrict(client) {
   return value;
 }
 
-function validFill(row) { return row.id && row.size > 0 && row.price > 0 && Number.isFinite(row.timestampMs); }
-function epochMs(value) { const number = Number(value); if (Number.isFinite(number)) return number < 1e12 ? number * 1000 : number; return Date.parse(value); }
+function normalizeFillClock(fills, serverMinusLocalMs) {
+  if (!Number.isFinite(Number(serverMinusLocalMs))) {
+    throw new Error("fail closed: signed venue clock offset is unavailable for authenticated fills");
+  }
+  return (fills || []).map((fill) => {
+    const venueTimestampMs = Number(fill.timestampMs);
+    if (!Number.isFinite(venueTimestampMs)) {
+      throw new Error("fail closed: authenticated fill timestamp is invalid");
+    }
+    return {
+      ...fill,
+      venueTimestampMs,
+      timestampMs: venueTimestampMs - Number(serverMinusLocalMs)
+    };
+  });
+}
+
 function normalizePrivateKey(value) { const clean = String(value || "").trim(); return clean.startsWith("0x") ? clean : `0x${clean}`; }
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }

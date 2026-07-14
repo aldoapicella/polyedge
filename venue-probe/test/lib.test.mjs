@@ -7,8 +7,9 @@ import {
   evaluateCampaignRiskGate,
   evaluateDailyRiskGate,
   fitEffectiveQueueModel,
-  isTransientUnsafeMarket,
+  isEvidenceProtocolVersionEligible,
   isRiskReservationResolved,
+  isTransientUnsafeMarket,
   loadProbeConfig,
   modelObservations,
   normalizeStoredObservation,
@@ -170,6 +171,7 @@ test("live cloud probe requires and verifies fixed country and egress IP", () =>
   const config = loadProbeConfig({
     ...safeEnv,
     VENUE_PROBE_DRY_RUN: "false",
+    FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
     VENUE_PROBE_EXPECTED_COUNTRY: "IE",
     VENUE_PROBE_EXPECTED_EGRESS_IP: "203.0.113.8"
   });
@@ -330,6 +332,77 @@ test("pre-horizon markouts are retained as evidence but excluded from model elig
   });
   assert.equal(observations.every((row) => row.markout_timing_valid === false), true);
   assert.equal(observations.every((row) => row.markout_complete === false), true);
+  assert.equal(observations.every((row) => row.eligible === false), true);
+});
+
+test("stable terminal no-fill finality observes every later horizon", () => {
+  const observations = modelObservations({
+    order: { size: 5, inferredSizeAhead: 10, spread: 0.02, price: 0.4 },
+    market: { endTs: null },
+    lifecycle: {
+      actual_matched_size: 0,
+      related_trade_ids: [],
+      live_duration_ms: 1_000,
+      first_fill_after_ack_ms: null,
+      ack_wall_ms: Date.now(),
+      cancel_send_wall_ms: Date.now(),
+      client_cancel_round_trip_ms: 25,
+      client_to_user_cancel_ack_ms: 50,
+      fully_filled: false,
+      rest_order_returned: true,
+      post_cancel_finality_stable: true,
+      post_cancel_observation_ms: 10_000,
+      matched_size_source_agreement: true,
+      trade_id_source_agreement: true,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true,
+      data_gap_detected: false,
+      cancellation_failure: false,
+      markout_capture_complete: true
+    },
+    context: { observed_trade_size: 1, observed_depth_changes: 1, price_volatility: 0.01 },
+    markouts: []
+  });
+
+  assert.deepEqual(observations.map((row) => row.horizon_seconds), [1, 5, 30, 60]);
+  assert.equal(observations.every((row) => row.label_observed === true), true);
+  assert.equal(observations.every((row) => row.filled === false), true);
+  assert.equal(observations.every((row) => row.quality_eligible === true), true);
+  assert.equal(observations.every((row) => row.eligible === true), true);
+});
+
+test("terminal-looking no-fill evidence remains ineligible before ten stable seconds", () => {
+  const observations = modelObservations({
+    order: { size: 5, inferredSizeAhead: 10, spread: 0.02, price: 0.4 },
+    market: { endTs: null },
+    lifecycle: {
+      actual_matched_size: 0,
+      related_trade_ids: [],
+      live_duration_ms: 1_000,
+      first_fill_after_ack_ms: null,
+      ack_wall_ms: Date.now(),
+      cancel_send_wall_ms: Date.now(),
+      client_cancel_round_trip_ms: 25,
+      client_to_user_cancel_ack_ms: 50,
+      fully_filled: false,
+      rest_order_returned: true,
+      post_cancel_finality_stable: true,
+      post_cancel_observation_ms: 9_999,
+      matched_size_source_agreement: true,
+      trade_id_source_agreement: true,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true,
+      data_gap_detected: false,
+      cancellation_failure: false,
+      markout_capture_complete: true
+    },
+    context: { observed_trade_size: 1, observed_depth_changes: 1, price_volatility: 0.01 },
+    markouts: []
+  });
+
+  assert.equal(observations[0].label_observed, true, "the quote was live through one second");
+  assert.equal(observations.slice(1).every((row) => row.label_observed === false), true);
+  assert.equal(observations.every((row) => row.quality_eligible === false), true);
   assert.equal(observations.every((row) => row.eligible === false), true);
 });
 
@@ -564,6 +637,24 @@ test("a v3 order reservation without probe observations is an ineligible submitt
   assert.equal(model.quality_gates.passed, false);
 });
 
+test("only the exact frozen evidence protocol is eligible", () => {
+  assert.equal(isEvidenceProtocolVersionEligible(3), true);
+  assert.equal(isEvidenceProtocolVersionEligible("3"), true);
+  assert.equal(isEvidenceProtocolVersionEligible(2), false);
+  assert.equal(isEvidenceProtocolVersionEligible(4), false);
+
+  const future = reservationAuditObservation({
+    evidence_protocol_version: 4,
+    state: "submitted_pending_reconciliation",
+    run_id: "run-future",
+    probe_id: "probe-future",
+    order_submission_intended: true,
+    order_submitted: true
+  });
+  assert.equal(future.protocol_eligible, false);
+  assert.equal(future.eligible, false);
+});
+
 test("a confirmed no-order reservation release does not create a model audit row", () => {
   assert.equal(reservationAuditObservation({
     probe_id: "probe-rejected",
@@ -584,17 +675,35 @@ test("risk reservations resolve only with explicit reconciliation and zero-open 
   assert.equal(isRiskReservationResolved({ state: "released_no_order", order_submitted: false, reconciliation_complete: true, zero_open_orders_confirmed: true }), true);
 });
 
-function recordingContainer() {
+function recordingContainer(reservations = []) {
   const uploads = [];
-  return {
-    uploads,
-    getBlockBlobClient(name) {
+  const reservationBlobs = new Map(reservations.map((reservation, index) => [
+    `reports/research/venue-probe/risk-reservations/2026-07-13/reservation-${index}.json`,
+    reservation
+  ]));
+  const blobClient = (name) => ({
+    async uploadData(bytes, options) {
+      uploads.push({ name, bytes: Buffer.from(bytes), options });
+    },
+    async download() {
+      const value = reservationBlobs.get(name);
+      if (value === undefined) throw new Error(`missing test blob ${name}`);
       return {
-        async uploadData(bytes, options) {
-          uploads.push({ name, bytes: Buffer.from(bytes), options });
-        }
+        readableStreamBody: (async function* stream() {
+          yield Buffer.from(JSON.stringify(value));
+        }())
       };
     }
+  });
+  return {
+    uploads,
+    async *listBlobsFlat({ prefix }) {
+      for (const name of reservationBlobs.keys()) {
+        if (name.startsWith(prefix)) yield { name };
+      }
+    },
+    getBlobClient: blobClient,
+    getBlockBlobClient: blobClient
   };
 }
 
@@ -617,6 +726,7 @@ test("terminal producer publishes immutable no-fill evidence with an exact SHA",
     },
     settlement: {
       settlement_verified: true,
+      trust_boundary_ready: true,
       zero_open_orders_confirmed: true,
       evidence_source: "authenticated_no_fill",
       settled_ts: "2026-07-13T12:00:00Z",
@@ -632,7 +742,42 @@ test("terminal producer publishes immutable no-fill evidence with an exact SHA",
   assert.match(result.sha256, /^sha256:[0-9a-f]{64}$/);
   assert.equal(container.uploads.length, 1);
   assert.deepEqual(container.uploads[0].options.conditions, { ifNoneMatch: "*" });
-  assert.equal(JSON.parse(container.uploads[0].bytes).source, "authenticated_no_fill");
+  const stored = JSON.parse(container.uploads[0].bytes);
+  assert.equal(stored.source, "authenticated_no_fill");
+  assert.equal(stored.unresolved_risk_reservations, 0);
+});
+
+test("terminal producer derives durable zero-unresolved proof and fails closed otherwise", async () => {
+  await assert.rejects(
+    publishTerminalRiskPortfolioEvidence(recordingContainer([{
+      state: "submitted_pending_reconciliation",
+      matched_notional: 0,
+      reserved_notional: 1
+    }]), {
+      reservation: {
+        run_id: "run-blocked",
+        probe_id: "probe-blocked",
+        order_id: "order-blocked",
+        condition_id: "condition-blocked",
+        state: "finalized_no_fill",
+        matched_notional: 0
+      },
+      settlement: {
+        settlement_verified: true,
+        trust_boundary_ready: true,
+        zero_open_orders_confirmed: true,
+        evidence_source: "authenticated_no_fill",
+        settled_ts: "2026-07-13T12:00:00Z",
+        terminal_portfolio: {
+          liquid_collateral: 5.030521,
+          current_position_value: 0,
+          account_equity: 5.030521
+        }
+      },
+      campaign: terminalCampaign
+    }),
+    /zero durable unresolved risk reservations/
+  );
 });
 
 test("terminal producer accepts an already-settled fill only with on-chain proof", async () => {
@@ -648,9 +793,17 @@ test("terminal producer accepts an already-settled fill only with on-chain proof
     },
     settlement: {
       settlement_verified: true,
+      trust_boundary_ready: true,
       zero_open_orders_confirmed: true,
       evidence_source: "polymarket_data_api_plus_onchain_redemption",
-      transaction_hash: "0xabc",
+      transaction_hash: `0x${"a".repeat(64)}`,
+      polygon_chain_id: 137,
+      transaction_receipt_status: "success",
+      transaction_block_number: "12345678",
+      transaction_receipt_confirmations: 2,
+      settlement_wallet: `0x${"b".repeat(40)}`,
+      settlement_signer: `0x${"c".repeat(40)}`,
+      condition_ids: ["condition-2"],
       settled_ts: "2026-07-13T12:01:00Z",
       terminal_portfolio: {
         liquid_collateral: 5.13,
@@ -662,13 +815,29 @@ test("terminal producer accepts an already-settled fill only with on-chain proof
   };
   const result = await publishTerminalRiskPortfolioEvidence(container, input);
   assert.equal(result.evidence.reservation_state, "position_settled");
-  assert.equal(result.evidence.settlement_transaction_hash, "0xabc");
+  assert.equal(result.evidence.settlement_transaction_hash, `0x${"a".repeat(64)}`);
+  assert.equal(result.evidence.transaction_receipt_status, "success");
+  assert.equal(result.evidence.transaction_block_number, "12345678");
   await assert.rejects(
     publishTerminalRiskPortfolioEvidence(recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, transaction_hash: null }
     }),
     /fills also require a transaction hash/
+  );
+  await assert.rejects(
+    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+      ...input,
+      settlement: { ...input.settlement, transaction_receipt_confirmations: undefined }
+    }),
+    /confirmed Polygon receipt/
+  );
+  await assert.rejects(
+    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+      ...input,
+      settlement: { ...input.settlement, condition_ids: ["condition-other"] }
+    }),
+    /condition binding/
   );
 });
 

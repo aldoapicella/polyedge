@@ -274,6 +274,8 @@ pub struct AzureConfig {
     pub chart_table_name: String,
     pub market_table_name: String,
     pub event_blob_prefix: String,
+    pub compact_shadow_recording: bool,
+    pub shadow_book_sample_ms: usize,
     pub publish_strategy_canary_intents: bool,
     pub strategy_canary_intent_prefix: String,
     pub strategy_canary_fill_model_version: String,
@@ -290,6 +292,8 @@ impl Default for AzureConfig {
             chart_table_name: "BotChartSeries".to_owned(),
             market_table_name: "BotMarketCatalog".to_owned(),
             event_blob_prefix: "events".to_owned(),
+            compact_shadow_recording: false,
+            shadow_book_sample_ms: 1_000,
             publish_strategy_canary_intents: false,
             strategy_canary_intent_prefix:
                 "reports/research/venue-probe/control/strategy-canary/intents".to_owned(),
@@ -439,6 +443,15 @@ impl RuntimeSettings {
             env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
         settings.azure.event_blob_prefix =
             env_string("AZURE_EVENT_BLOB_PREFIX", settings.azure.event_blob_prefix);
+        settings.azure.compact_shadow_recording = env_bool(
+            "COMPACT_SHADOW_RECORDING",
+            settings.azure.compact_shadow_recording,
+        );
+        settings.azure.shadow_book_sample_ms = env_usize(
+            "SHADOW_BOOK_SAMPLE_MS",
+            settings.azure.shadow_book_sample_ms,
+        )
+        .max(1);
         settings.azure.publish_strategy_canary_intents = env_bool(
             "PUBLISH_STRATEGY_CANARY_INTENTS",
             settings.azure.publish_strategy_canary_intents,
@@ -670,6 +683,8 @@ impl RuntimeSettings {
             },
             "azure": {
                 "event_blob_prefix": self.azure.event_blob_prefix,
+                "compact_shadow_recording": self.azure.compact_shadow_recording,
+                "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
                 "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
                 "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
                 "strategy_canary_fill_model_version": self.azure.strategy_canary_fill_model_version

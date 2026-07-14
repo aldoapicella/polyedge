@@ -155,6 +155,13 @@ without returning an error. Lease health and termination state are rechecked
 after the durable reservation and immediately before the non-awaiting send
 critical section.
 
+The protocol version is an exact frozen contract: only
+`evidence_protocol_version = 3` is eligible. A later, unknown version is not
+silently treated as compatible. Existing funded orders from older protocols
+remain in the lifetime account PnL and audit history, but cannot be relabeled as
+v3 evidence because the missing lifecycle guarantees cannot be reconstructed
+after the fact.
+
 The reservation includes principal plus a conservative fee upper bound derived
 from the venue-reported base fee in basis points. Order selection is capped
 against remaining cross-day campaign risk, the equity floor, and liquid
@@ -181,6 +188,103 @@ stable finality is not established within thirty seconds, the full reservation
 remains unresolved and later live runs are blocked. Reservation manifests that
 lack a complete probe observation are synthesized as submitted, ineligible
 audit rows, so a crash cannot disappear from the model quality gate.
+
+The order is never kept live merely to manufacture a 60-second label. Its rest
+time is bounded by both the deployed 30-second ceiling and the immutable intent
+validity window. Once cancellation or terminal reconciliation has observed at
+least ten seconds of stable finality, including at least five unchanged
+seconds, zero open orders proves that the order cannot fill later. That proof
+creates valid negative 1/5/30/60-second fill labels for horizons after terminal
+finality. Filled orders still require their real per-trade 1/5/30-second
+markouts; stable cancellation cannot manufacture a filled markout.
+
+Admission does not trust producer booleans alone. The independent JavaScript
+controller and Rust reporting validator recompute acknowledgement and
+cancellation chronology, per-fill timing, cancellation races, markout timing,
+source agreement, and exact horizon labels from the raw lifecycle rows. They
+also bind every model feature back to the observed order, market, and pre-send
+book context. Any mismatch makes the submitted order ineligible.
+
+Protocol v3 also binds the child summary to the exact parent run ID, intent,
+authorization, human-grant consumption, and canonical promotion manifest by
+both blob name and SHA-256. Pending terminal work persists that complete
+binding and rechecks it against the objects reloaded from Azure before it can
+advance a funded checkpoint. A summary produced for a different controller
+invocation cannot be substituted merely because its candidate or decision ID
+looks similar.
+
+The authenticated and public WebSocket clients send recurring heartbeats at
+least every ten seconds and require a fresh PONG for each heartbeat. A stale
+PONG, disconnect, reconnect, or unparsed message fails the observation closed.
+Venue clock offset is measured with the HTTP round trip and carried with an
+explicit uncertainty bound; protocol-v3 evidence rejects uncertainty above
+750 ms and rejects fill/cancel or horizon labels whose ordering is ambiguous
+inside that bound. Venue timestamps are normalized with the signed offset, not
+mixed directly with the local wall clock.
+
+Each markout records request start, response completion, response duration,
+the venue book timestamp when supplied, and a canonical book hash. Observation
+delay begins when the book response finishes, so HTTP time cannot be hidden as
+a zero-delay observation. The validators independently recompute BUY midpoint
+and executable markouts from authenticated fill price and observed book price.
+They also recompute the round-trip fee cost from fill price, 30-second
+executable price, and the venue-reported fee rate; a producer cannot make a
+losing fill appear profitable by claiming a zero or smaller cost.
+
+Terminal filled evidence is eligible only after a successful Polygon receipt
+on chain 137, a positive block number, at least two confirmations, the exact
+funded wallet, exact condition ID, zero open orders, zero unresolved durable
+risk reservations, and portfolio arithmetic within one cent. No-fill terminal
+evidence uses the independently reconciled authenticated no-fill path and may
+not contain a settlement transaction claim.
+
+## Remaining Funded-Evidence Trust Boundary
+
+There is one important implementation limitation beyond Polymarket's missing
+FIFO feed. The currently deployed canary and funded-ladder image can both write
+funded control/evidence and access the venue signing credentials through the
+same managed identity and process boundary. The protocol validators make
+accidental or forged-file admission substantially harder, but that topology is
+not independent attestation: a compromised credentialed process could attempt
+to manufacture both an action and its control record.
+
+For that reason every deployed funded, canary, probe, and redemption job has:
+
+```text
+FUNDED_EVIDENCE_TRUST_BOUNDARY_READY=false
+```
+
+Any non-dry-run canary, probe, or ladder execution fails closed while this
+value is false, and terminal evidence is ineligible unless it records
+`trust_boundary_ready=true`. This is a deliberate funded-activation blocker,
+not a data-collection blocker; the credential-free paper and shadow recorders
+continue unchanged.
+
+Closing this boundary requires the following Azure split before the flag may
+be changed:
+
+1. Run the canonical controller under an identity with no Key Vault access. It
+   may read shadow/research inputs, consume grants, write canonical control,
+   and start one exact signer job.
+2. Run the signer under a different identity that can read immutable control
+   inputs and the four narrow venue secrets but cannot write canonical control
+   or promotion state.
+3. Store signer lifecycle output in a separate append-only evidence container;
+   store grant consumption, authorizations, progress, and canonical state in a
+   controller-only control container.
+4. Run terminal portfolio/receipt reconciliation under a third no-signing
+   identity, or an equivalently isolated attestor, which reads raw evidence and
+   on-chain state and writes only immutable terminal attestations.
+5. Give the controller permission to start only the fixed signer job, bind the
+   exact job execution ID and input hashes into its authorization, and admit
+   only evidence carrying that execution binding.
+6. Prove with Azure RBAC inspection and negative integration tests that the
+   signer cannot update control, the controller cannot read secrets or sign,
+   and neither producer can overwrite the other's immutable artifacts.
+
+Only after those checks pass may deployment set the trust flag to true for a
+separately human-authorized, capped stage. Until then, collecting shadow data
+and validating dry runs is safe, but no new funded evidence may count.
 
 The worker checks CLOB server time at startup and immediately before every
 submission. It also checks `https://polymarket.com/api/geoblock` at startup and
@@ -216,7 +320,12 @@ calibration bins and remains research-only; it cannot promote a strategy.
 
 The live dashboard exposes the authenticated lifecycle and model under **Labs
 > Venue Execution**. It always labels the value as `inferred_size_ahead` and
-shows that literal FIFO rank is unavailable.
+shows that literal FIFO rank is unavailable. It also exposes each selected
+artifact's source, authoritative timestamp, freshness, schema validity, and
+selection reason. Labs is a display surface only: it never independently makes
+a protocol-admission or promotion claim. A valid canonical funded ladder is
+authoritative once it exists; before then, a newer valid shadow manifest cannot
+be hidden by a stale funded placeholder.
 
 The same panel reconciles liquid collateral with all current position values
 against the configured starting capital. A resolved winner's redeemable value

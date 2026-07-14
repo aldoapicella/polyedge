@@ -8,7 +8,9 @@ import {
   buildFundedCheckpointEvidence,
   buildStageBlock,
   buildStageConsumption,
+  cumulativeProgressHash,
   loadFundedLadderConfig,
+  progressPayloadHash,
   putImmutableJson,
   validateBeforeEveryOrder,
   validateProtocolV3ChildEvidence,
@@ -73,7 +75,7 @@ export async function runFundedLadderController({ env = process.env, invokeChild
     throw new Error("fail closed: orphan funded authorization durably blocked the stage");
   }
   if (inventory.pending.length) {
-    const result = await settlePendingTerminal(clients.control, config, consumptionDocument.value, inventory.pending[0], inventory.completed, clock());
+    const result = await settlePendingTerminal(clients.control, config, consumptionDocument, inventory.pending[0], inventory.completed, clock());
     if (result.status === "funded_stage_order_completed" && result.remaining === 0) {
       result.checkpoint = await publishStageCheckpoint(clients.control, config, manifestDocument.value);
     }
@@ -122,20 +124,32 @@ export async function runFundedLadderController({ env = process.env, invokeChild
   }
   try {
     const summary = await locateChildSummary(clients.control, childRunId);
-    const summaryEvidence = validateProtocolV3ChildSummary({ summary: summary.value, consumption: consumptionDocument.value, decisionId: intent.value.decision_id });
+    const expectedBinding = exactChildControlBinding({ manifestDocument, consumptionDocument, authorization, intent, childRunId });
+    const summaryEvidence = validateProtocolV3ChildSummary({
+      summary: summary.value,
+      consumption: consumptionDocument.value,
+      decisionId: intent.value.decision_id,
+      expectedBinding
+    });
     const boundTerminalName = summary.value?.provenance?.terminal_evidence_blob_name;
     const boundTerminalHash = summary.value?.provenance?.terminal_evidence_sha256;
     if (!boundTerminalName || !boundTerminalHash) {
       if (!summaryEvidence.filled) throw new Error("no-fill child lacks its immediate exact terminal evidence binding");
       const pending = await putImmutableJson(clients.control, {
         blobName: `${campaignControlPrefix(config, consumptionDocument.value)}/pending-terminal/${consumptionDocument.value.grant_id}/${intent.value.decision_id}.json`,
-        value: pendingProgress(consumptionDocument.value, intent, authorization, childRunId, summary, summaryEvidence, clock())
+        value: pendingProgress(consumptionDocument.value, intent, authorization, childRunId, summary, summaryEvidence, expectedBinding, clock())
       });
       return { status: "funded_stage_pending_terminal", attempted: attempted.length + 1, submitted: inventory.completed.length + 1, eligible: inventory.completed.length, remaining: quota.remaining - 1, pending_sha256: pending.hash, funded_execution_armed: false };
     }
     const terminal = await loadHashedJson(clients.control, boundTerminalName, boundTerminalHash);
-    validateProtocolV3ChildEvidence({ summary: summary.value, terminal: terminal.value, consumption: consumptionDocument.value, decisionId: intent.value.decision_id });
-    const completion = await recordCompletion(clients.control, config, consumptionDocument.value, intent, authorization, childRunId, summary, terminal, inventory.completed, clock());
+    validateProtocolV3ChildEvidence({
+      summary: summary.value,
+      terminal: terminal.value,
+      consumption: consumptionDocument.value,
+      decisionId: intent.value.decision_id,
+      expectedBinding
+    });
+    const completion = await recordCompletion(clients.control, config, consumptionDocument.value, intent, authorization, childRunId, summary, terminal, inventory.completed, expectedBinding, clock());
     const result = { status: "funded_stage_order_completed", attempted: attempted.length + 1, submitted: inventory.completed.length + 1, eligible: inventory.completed.length + 1, remaining: quota.remaining - 1, progress_sha256: completion.hash, funded_execution_armed: false };
     if (result.remaining === 0) result.checkpoint = await publishStageCheckpoint(clients.control, config, manifestDocument.value);
     return result;
@@ -337,7 +351,26 @@ async function locateChildSummary(container, childRunId) {
   return loadJsonUntrustedHash(container, matches[0]);
 }
 
-function pendingProgress(consumption, intent, authorization, childRunId, summary, evidence, now) {
+function exactChildControlBinding({ manifestDocument, consumptionDocument, authorization, intent, childRunId }) {
+  return {
+    child_run_id: childRunId,
+    consumption_blob_name: consumptionDocument.blobName,
+    consumption_sha256: consumptionDocument.hash,
+    authorization_blob_name: authorization.blobName,
+    authorization_sha256: authorization.hash,
+    intent_blob_name: intent.blobName,
+    intent_sha256: intent.hash,
+    manifest_blob_name: manifestDocument.blobName,
+    manifest_sha256: manifestDocument.hash,
+    prediction_model: {
+      blob_uri: consumptionDocument.value.execution_model.blob_uri,
+      sha256: consumptionDocument.value.execution_model.sha256,
+      model_version: consumptionDocument.value.execution_model.model_version
+    }
+  };
+}
+
+function pendingProgress(consumption, intent, authorization, childRunId, summary, evidence, expectedBinding, now) {
   return {
     schema: "polyedge.funded_stage_pending_terminal.v1", grant_id: consumption.grant_id,
     campaign_id: consumption.campaign_id, campaign_control_id: consumption.campaign_control_id,
@@ -348,21 +381,32 @@ function pendingProgress(consumption, intent, authorization, childRunId, summary
     authorization_blob_name: authorization.blobName, authorization_sha256: authorization.hash,
     child_run_id: childRunId, run_id: evidence.runId, probe_id: evidence.probeId, order_id: evidence.orderId,
     protocol_v3_summary_blob_name: summary.blobName, protocol_v3_summary_sha256: summary.hash,
+    expected_control_binding: expectedBinding,
     attempted_order_count: 1, submitted_order_count: 1, eligible_order_count: 0,
     status: "pending_terminal", created_at: now.toISOString()
   };
 }
 
-async function settlePendingTerminal(container, config, consumption, pendingDocument, completed, now) {
+async function settlePendingTerminal(container, config, consumptionDocument, pendingDocument, completed, now) {
+  const consumption = consumptionDocument.value;
   const pending = pendingDocument.value;
+  if (normalizeHash(pending.expected_control_binding?.consumption_sha256) !== consumptionDocument.hash) {
+    throw new Error("fail closed: pending terminal does not bind the exact loaded stage consumption");
+  }
   const terminal = await discoverTerminal(container, pending);
   if (!terminal) return { status: "funded_stage_pending_terminal", remaining: Number(consumption.quota_orders) - completed.length - 1 };
   const summary = await loadHashedJson(container, pending.protocol_v3_summary_blob_name, pending.protocol_v3_summary_sha256);
-  validateProtocolV3ChildEvidence({ summary: summary.value, terminal: terminal.value, consumption, decisionId: pending.decision_id });
+  validateProtocolV3ChildEvidence({
+    summary: summary.value,
+    terminal: terminal.value,
+    consumption,
+    decisionId: pending.decision_id,
+    expectedBinding: pending.expected_control_binding
+  });
   const completion = await recordCompletion(container, config, consumption,
     { value: { decision_id: pending.decision_id }, blobName: pending.intent_blob_name, hash: pending.intent_sha256, sourceBlobName: pending.source_intent_blob_name, sourceHash: pending.source_intent_sha256 },
     { blobName: pending.authorization_blob_name, hash: pending.authorization_sha256 }, pending.child_run_id,
-    summary, terminal, completed, now);
+    summary, terminal, completed, pending.expected_control_binding, now);
   return { status: "funded_stage_order_completed", remaining: Number(consumption.quota_orders) - completed.length - 1, progress_sha256: completion.hash };
 }
 
@@ -377,10 +421,19 @@ async function discoverTerminal(container, pending) {
   return matches[0] || null;
 }
 
-async function recordCompletion(container, config, consumption, intent, authorization, childRunId, summary, terminal, completed, now) {
-  const priorDigest = completed.at(-1)?.value?.cumulative_evidence_sha256 || consumption.source_state_sha256;
-  const cumulativeDigest = sha256(Buffer.from(JSON.stringify({ prior: priorDigest, summary: summary.hash, terminal: terminal.hash })));
+async function recordCompletion(container, config, consumption, intent, authorization, childRunId, summary, terminal, completed, expectedControlBinding, now) {
   const sequence = Number(consumption.starting_funded_orders) + completed.length + 1;
+  const summaryBinding = { blob_name: summary.blobName, sha256: summary.hash };
+  const terminalBinding = { blob_name: terminal.blobName, sha256: terminal.hash };
+  const progressPayloadSha256 = progressPayloadHash({
+    sequence,
+    decisionId: intent.value.decision_id,
+    expectedControlBinding,
+    summaryBinding,
+    terminalBinding
+  });
+  const priorDigest = await priorCumulativeProgressHash(container, config, consumption, completed, sequence);
+  const cumulativeDigest = cumulativeProgressHash(priorDigest, progressPayloadSha256);
   const value = {
     schema: "polyedge.funded_stage_order_progress.v1", grant_id: consumption.grant_id,
     campaign_id: consumption.campaign_id, campaign_control_id: consumption.campaign_control_id,
@@ -391,6 +444,8 @@ async function recordCompletion(container, config, consumption, intent, authoriz
     authorization_blob_name: authorization.blobName, authorization_sha256: authorization.hash, child_run_id: childRunId,
     protocol_v3_summary_blob_name: summary.blobName, protocol_v3_summary_sha256: summary.hash,
     terminal_evidence_blob_name: terminal.blobName, terminal_evidence_sha256: terminal.hash,
+    expected_control_binding: expectedControlBinding,
+    progress_payload_sha256: progressPayloadSha256,
     prior_cumulative_evidence_sha256: priorDigest, cumulative_evidence_sha256: cumulativeDigest,
     attempted_order_count: 1, submitted_order_count: 1, eligible_order_count: 1,
     completed_at: now.toISOString()
@@ -407,6 +462,42 @@ async function recordCompletion(container, config, consumption, intent, authoriz
     }
   });
   return progress;
+}
+
+async function priorCumulativeProgressHash(container, config, consumption, completed, nextSequence) {
+  const all = await listJson(container, `${campaignControlPrefix(config, consumption)}/progress/`);
+  const prior = all
+    .filter((document) => Number(document.value?.sequence) < nextSequence)
+    .sort((left, right) => Number(left.value.sequence) - Number(right.value.sequence));
+  if (prior.length !== nextSequence - 2 || completed.length > prior.length) {
+    throw new Error("fail closed: cumulative funded progress is missing or duplicated before the next order");
+  }
+  let cumulative = normalizeHash(consumption.checkpoint_1_chain_root_sha256);
+  if (!cumulative) throw new Error("fail closed: checkpoint-1 progress-chain root is missing");
+  for (const [index, document] of prior.entries()) {
+    const value = document.value;
+    const sequence = index + 2;
+    if (value.schema !== "polyedge.funded_stage_order_progress.v1" ||
+        Number(value.sequence) !== sequence || value.campaign_id !== consumption.campaign_id ||
+        JSON.stringify(value.candidate) !== JSON.stringify(consumption.candidate)) {
+      throw new Error("fail closed: cumulative funded progress sequence/control identity is invalid");
+    }
+    const payload = progressPayloadHash({
+      sequence,
+      decisionId: value.decision_id,
+      expectedControlBinding: value.expected_control_binding,
+      summaryBinding: { blob_name: value.protocol_v3_summary_blob_name, sha256: value.protocol_v3_summary_sha256 },
+      terminalBinding: { blob_name: value.terminal_evidence_blob_name, sha256: value.terminal_evidence_sha256 }
+    });
+    const expectedCumulative = cumulativeProgressHash(cumulative, payload);
+    if (normalizeHash(value.progress_payload_sha256) !== payload ||
+        normalizeHash(value.prior_cumulative_evidence_sha256) !== cumulative ||
+        normalizeHash(value.cumulative_evidence_sha256) !== expectedCumulative) {
+      throw new Error("fail closed: cumulative funded progress hash chain is invalid");
+    }
+    cumulative = expectedCumulative;
+  }
+  return cumulative;
 }
 
 async function writeStageBlock(container, config, consumption, decisionId, childRunId, reason, now) {
@@ -428,8 +519,11 @@ async function publishStageCheckpoint(container, config, manifest) {
     summaryBinding: initialSummary,
     terminalBinding: initialTerminal,
     summary: (await loadHashedJson(container, initialSummary.blob_name, initialSummary.sha256)).value,
-    terminal: (await loadHashedJson(container, initialTerminal.blob_name, initialTerminal.sha256)).value
+    terminal: (await loadHashedJson(container, initialTerminal.blob_name, initialTerminal.sha256)).value,
+    progress: null,
+    progressBinding: null
   }];
+  entries[0].expectedControlBinding = controlBindingFromSummary(entries[0].summary);
   const base = `${config.controlPrefix}/campaigns/${sha256(Buffer.from(state.campaign_id)).slice("sha256:".length)}`;
   const progress = await listJson(container, `${base}/progress/`);
   for (const document of progress) {
@@ -444,6 +538,9 @@ async function publishStageCheckpoint(container, config, manifest) {
       sequence: Number(value.sequence),
       summaryBinding: { blob_name: summary.blobName, sha256: summary.hash },
       terminalBinding: { blob_name: terminal.blobName, sha256: terminal.hash },
+      progressBinding: { blob_name: document.blobName, sha256: document.hash },
+      progress: value,
+      expectedControlBinding: value.expected_control_binding,
       summary: summary.value,
       terminal: terminal.value
     });
@@ -454,6 +551,27 @@ async function publishStageCheckpoint(container, config, manifest) {
   const blobName = `${base}/checkpoints/${target}/${hash.slice("sha256:".length)}.json`;
   const document = await putImmutableOrVerify(container, { blobName, value });
   return { blob_name: document.blobName, sha256: document.hash, stage_target_orders: target };
+}
+
+function controlBindingFromSummary(summary) {
+  const provenance = summary?.provenance || {};
+  const model = summary?.prediction_model || {};
+  return {
+    child_run_id: summary?.run_id,
+    consumption_blob_name: provenance.funded_stage_consumption_blob_name,
+    consumption_sha256: provenance.funded_stage_consumption_sha256,
+    authorization_blob_name: provenance.authorization_blob_name,
+    authorization_sha256: provenance.authorization_sha256,
+    intent_blob_name: provenance.intent_blob_name,
+    intent_sha256: provenance.intent_sha256,
+    manifest_blob_name: provenance.promotion_manifest_blob_name,
+    manifest_sha256: provenance.promotion_manifest_sha256,
+    prediction_model: {
+      blob_uri: model.blob_uri,
+      sha256: model.sha256,
+      model_version: model.model_version
+    }
+  };
 }
 
 function campaignControlPrefix(config, consumption) {

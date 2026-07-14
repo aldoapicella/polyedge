@@ -22,7 +22,7 @@ CUMULATIVE_EXCLUSION="${TODAY}T00:00:00Z..2100-01-01T00:00:00Z"
 mkdir -p "$STAGING" "$NORMALIZED" "$CUMULATIVE_NORMALIZED"
 
 polyedge-rs research audit --input "$INPUT" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/raw_data_audit.json" --markdown "$STAGING/raw_data_audit.md"
-polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true
+polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true --decision-grade-projection true
 polyedge-rs research audit --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/data_audit.json" --markdown "$STAGING/data_audit.md"
 polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/execution_quality.json" --markdown "$STAGING/execution_quality.md"
 polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$MARKETS" --markdown "$STAGING/markets_summary.md"
@@ -34,7 +34,7 @@ polyedge-rs research report --reports-dir "$STAGING" --out "$STAGING/final_repor
 # Rebuild the campaign wallet from the fixed shadow stream every day. Current-
 # day events are normalized for deterministic inventory but excluded from both
 # truth construction and replay, preventing look-ahead beyond the snapshot.
-polyedge-rs research normalize --input "$CUMULATIVE_INPUT" --out "$CUMULATIVE_NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true
+polyedge-rs research normalize --input "$CUMULATIVE_INPUT" --out "$CUMULATIVE_NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true --decision-grade-projection true
 polyedge-rs research build-markets --input "$CUMULATIVE_NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --exclude-window "$CUMULATIVE_EXCLUSION" --out "$CUMULATIVE_MARKETS" --markdown "$STAGING/cumulative_markets_summary.md"
 polyedge-rs research regimes --input "$CUMULATIVE_NORMALIZED" --markets "$CUMULATIVE_MARKETS" --fill-model queue_proxy_conservative --profile-config research/configs/frozen_candidates.yaml --exclude-file data_quality/exclusion_windows.yaml --exclude-window "$CUMULATIVE_EXCLUSION" --out "$CUMULATIVE_REGIMES" --markdown "$STAGING/cumulative_regimes.md"
 polyedge-rs research build-cumulative-wallet --regimes "$CUMULATIVE_REGIMES" --normalized-manifest "$CUMULATIVE_NORMALIZED/events_manifest.json" --snapshot-date "$DATE" --out "$STAGING/cumulative_wallet.json"

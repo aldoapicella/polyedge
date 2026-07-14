@@ -286,6 +286,49 @@ export type VenueRiskSnapshot = {
   global_unresolved_risk_reservations?: number;
 };
 
+export type LabArtifactProvenance = {
+  path?: string;
+  source?: "funded_evidence" | "profitability_shadow" | "trained_model_storage" | "research_conservative_prior" | "api_fallback" | string;
+  trust_scope?: "funded_control" | "shadow_research" | "none" | string;
+  available?: boolean;
+  schema_version?: string | number | null;
+  valid_current_schema?: boolean;
+  authoritative_ts?: string | null;
+  authoritative_ts_field?: string | null;
+  age_seconds?: number | null;
+  freshness_window_seconds?: number;
+  freshness?: "fresh" | "stale" | "unknown" | "unavailable" | string;
+  fresh?: boolean;
+  control_valid?: boolean;
+  expires_at?: string | null;
+  expired?: boolean;
+  canonical_funded_state?: boolean;
+  promotion_ready?: false;
+  legacy_eligibility?: "current_schema" | "current_protocol" | "requires_full_validator" | "display_only_legacy" | "display_only_fallback" | "unknown_display_only" | "conservative_prior_only" | "not_applicable" | "unavailable" | string;
+  validation_error?: string | null;
+};
+
+export type ProfitabilityArtifactProvenance = {
+  selected_source?: "funded_evidence" | "profitability_shadow" | "api_fallback" | string;
+  selection_reason?: "canonical_funded_state" | "newest_fresh_valid_manifest" | "newest_valid_manifest" | "legacy_display_only" | string;
+  canonical_funded_state?: boolean;
+  promotion_ready?: false;
+  selected?: LabArtifactProvenance;
+  candidates?: LabArtifactProvenance[];
+};
+
+export type VenueEvidenceEligibility = {
+  required_protocol_version?: number;
+  observed_protocol_version?: number | null;
+  exact_protocol_version?: boolean;
+  legacy?: boolean;
+  legacy_eligibility?: "requires_full_validator" | "display_only_legacy" | string;
+  counts_toward_protocol_evidence?: false;
+  aggregate_promotion_ready?: false;
+  validation_status?: "terminal_binding_and_full_protocol_v3_validation_required" | "ineligible_protocol_version" | string;
+  reasons?: string[];
+};
+
 export type VenueExecutionEvidence = {
   generated_ts: string;
   queue_position_source: "authenticated_lifecycle_plus_public_l2" | string;
@@ -295,6 +338,14 @@ export type VenueExecutionEvidence = {
   remaining_limitation: string;
   research_only: boolean;
   strategy_promotion_allowed: boolean;
+  artifact_provenance?: {
+    profitability?: ProfitabilityArtifactProvenance;
+    latest?: LabArtifactProvenance;
+    latest_attempt?: LabArtifactProvenance;
+    preflight?: LabArtifactProvenance;
+    redemption?: LabArtifactProvenance;
+    model?: LabArtifactProvenance;
+  };
   profitability?: {
     generated_at?: string;
     created_at?: string;
@@ -494,6 +545,7 @@ export type VenueExecutionEvidence = {
     status?: string;
     started_ts?: string;
     finished_ts?: string;
+    order_submission_attempted?: boolean;
     order_submitted?: boolean;
     execution_origin?: string;
     execution_country?: string | null;
@@ -548,6 +600,7 @@ export type VenueExecutionEvidence = {
     }>;
     portfolio?: VenuePortfolioSnapshot | null;
     remaining_literal_fifo_limitations?: string[];
+    evidence_eligibility?: VenueEvidenceEligibility;
   } | null;
   latest_attempt?: {
     run_id?: string;

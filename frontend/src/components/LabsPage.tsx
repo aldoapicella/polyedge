@@ -132,6 +132,10 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
   const lifecycle = latest?.lifecycle;
   const order = latest?.order;
   const model = evidence.model;
+  const profitabilityProvenance = evidence.artifact_provenance?.profitability;
+  const selectedProfitability = profitabilityProvenance?.selected;
+  const latestProvenance = evidence.artifact_provenance?.latest;
+  const evidenceEligibility = latest?.evidence_eligibility;
   const latestAttempt = evidence.latest_attempt;
   const portfolio = evidence.redemption?.portfolio ?? evidence.preflight?.portfolio ?? latestAttempt?.portfolio ?? latest?.portfolio;
   const redemption = evidence.redemption;
@@ -150,12 +154,19 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
   const globalUnresolvedRisk = dailyTurnover?.global_unresolved_risk_reservations ??
     dailyTurnover?.unresolved_risk_reservations ?? campaignRisk?.unresolved_risk_reservation_count ?? 0;
   const markouts = latest?.markouts ?? [];
+  const latestLegacyProtocolOrders = latest?.order_submitted && latest?.evidence_protocol_version !== 3
+    ? latest.submitted_order_count ?? 1
+    : 0;
   return (
     <div className="space-y-5">
       <Panel>
         <PanelHeader title="Profitability Path" meta={profitability?.generated_at ?? profitability?.created_at ?? "awaiting Azure promotion manifest"} />
         <div className="grid gap-3 p-4 md:grid-cols-4">
           <Metric label="Phase" value={profitability?.phase ?? "risk repair / funded freeze"} />
+          <Metric label="Selected Source" value={profitabilityProvenance?.selected_source ?? "API fallback"} />
+          <Metric label="Selection Reason" value={profitabilityProvenance?.selection_reason ?? "no valid artifact"} />
+          <Metric label="Artifact Freshness" value={selectedProfitability?.freshness ?? (selectedProfitability?.fresh ? "fresh" : "unknown")} />
+          <Metric label="Artifact Time" value={dateTime(selectedProfitability?.authoritative_ts)} />
           <Metric label="Candidate" value={profitability?.candidate?.name ?? "dynamic_quote_style (frozen)"} />
           <Metric label="Candidate Version" value={profitability?.candidate?.version ?? profitability?.candidate?.candidate_version ?? "2026-06-14"} />
           <Metric label="Promotion" value={fundedLadder?.phase === "profitable_go" ? "terminal validated GO — execution still unarmed" : fundedLadder?.phase === "stopped_no_go" || profitability?.phase === "stopped_no_go" ? "terminal NO-GO" : fundedLadder?.human_grant_required ? "awaiting exact human stage grant" : fundedLadder?.stage_authorized ? "stage authorized — collecting evidence" : profitability?.phase === "shadow_collecting" ? "shadow evidence collecting" : profitability?.promotion_allowed ? "armed" : "blocked — human authorization required"} />
@@ -233,6 +244,9 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
         <div className="grid gap-3 p-4 md:grid-cols-4">
           <Metric label="Probe Status" value={latest?.status ?? "not run"} />
           <Metric label="Evidence Protocol" value={latest?.evidence_protocol_version ? `v${latest.evidence_protocol_version}` : "legacy"} />
+          <Metric label="Protocol Admission" value={evidenceEligibility?.counts_toward_protocol_evidence ? "eligible" : "display-only — terminal validator required"} />
+          <Metric label="Evidence Freshness" value={latestProvenance?.freshness ?? (latestProvenance?.fresh ? "fresh" : "unknown")} />
+          <Metric label="Evidence Time" value={dateTime(latestProvenance?.authoritative_ts)} />
           <Metric label="Execution Origin" value={latest?.execution_country ? `${latest.execution_country} / Azure North Europe` : latest?.execution_origin ?? "not verified"} />
           <Metric label="Static Egress Verified" value={latest?.static_egress_verified ? "yes" : "no"} />
           <Metric label="Campaign Progress" value={`${latest?.completed_probe_count ?? 0} / ${latest?.submitted_order_count ?? 0} reconciled`} />
@@ -258,6 +272,16 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
           <Metric label="Global Unresolved Risk Reservations" value={globalUnresolvedRisk} />
         </div>
         {latest?.stop_reason ? <div className="border-t border-line px-4 py-3 text-sm text-ink/70">Campaign stop reason: {latest.stop_reason}.</div> : null}
+        {latest?.order_submitted && !evidenceEligibility?.counts_toward_protocol_evidence ? (
+          <div className="border-t border-line bg-sky-50 px-4 py-3 text-sm leading-relaxed text-sky-950">
+            Labs is showing this artifact for audit only. Protocol admission is decided by the terminal identity-bound controller and reporting validators, not by this dashboard response.
+          </div>
+        ) : null}
+        {latestLegacyProtocolOrders > 0 ? (
+          <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+            These {latestLegacyProtocolOrders} real funded order{latestLegacyProtocolOrders === 1 ? "" : "s"} remain included in lifetime account PnL, but cannot count toward protocol-v3 promotion evidence. Their artifacts predate the immutable v3 lifecycle contract, and missing guarantees cannot be asserted retroactively. No spend or PnL is erased or reclassified.
+          </div>
+        ) : null}
         {latestAttempt?.run_id && latestAttempt.run_id !== latest?.run_id ? (
           <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
             Latest attempt: {latestAttempt.status ?? "unknown"} at {latestAttempt.finished_ts ?? "unknown time"}. {latestAttempt.error ?? "No additional error reported."}
@@ -328,7 +352,7 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Filled Probes" value={model?.positive_fills ?? 0} />
             <Metric label="Non-filled Probes" value={model?.negative_non_fills ?? 0} />
             <Metric label="Excluded Probes" value={model?.excluded_observations ?? 0} />
-            <Metric label="Legacy Protocol Probes" value={model?.legacy_protocol_observations ?? 0} />
+            <Metric label="Legacy Protocol Probes" value={model?.legacy_protocol_observations ?? latestLegacyProtocolOrders} />
             <Metric label="Minimum Eligible Probes" value={model?.minimum_samples ?? 100} />
             <Metric label="Temporal Holdout" value={model?.temporal_split ?? "required before training"} />
             <Metric label="OOS Brier Score" value={model?.out_of_sample_brier_score ?? "pending"} />

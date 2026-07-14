@@ -62,6 +62,7 @@ struct RuntimeInner {
     recorder: Arc<StdMutex<RuntimeRecorder>>,
     recorder_tx: std_mpsc::Sender<RuntimeEvent>,
     recorder_metrics: Arc<RecorderMetrics>,
+    persistence_filter: StdMutex<PersistenceFilter>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
 }
@@ -71,6 +72,7 @@ struct RecorderMetrics {
     queued: AtomicUsize,
     enqueued_total: AtomicU64,
     persisted_total: AtomicU64,
+    filtered_total: AtomicU64,
     failed_total: AtomicU64,
     batches_total: AtomicU64,
     last_batch_size: AtomicUsize,
@@ -82,10 +84,81 @@ impl RecorderMetrics {
             "queued": self.queued.load(Ordering::Relaxed),
             "enqueued_total": self.enqueued_total.load(Ordering::Relaxed),
             "persisted_total": self.persisted_total.load(Ordering::Relaxed),
+            "filtered_total": self.filtered_total.load(Ordering::Relaxed),
             "failed_total": self.failed_total.load(Ordering::Relaxed),
             "batches_total": self.batches_total.load(Ordering::Relaxed),
             "last_batch_size": self.last_batch_size.load(Ordering::Relaxed)
         })
+    }
+}
+
+#[derive(Debug, Default)]
+struct PersistenceFilter {
+    last_bucket_by_stream_and_token: BTreeMap<String, i64>,
+}
+
+impl PersistenceFilter {
+    fn should_persist(
+        &mut self,
+        settings: &RuntimeSettings,
+        event_type: &str,
+        data: &Value,
+        timestamp: DateTime<Utc>,
+        force: bool,
+    ) -> bool {
+        if force
+            || !settings.deploy.runtime_role.is_shadow()
+            || !settings.azure.compact_shadow_recording
+        {
+            return true;
+        }
+        if event_type == "raw_market_event" {
+            let kind = data
+                .get("event_type")
+                .or_else(|| data.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(kind.as_str(), "last_trade_price" | "last_trade" | "trade") {
+                return true;
+            }
+            if matches!(
+                kind.as_str(),
+                "price_change" | "pricechange" | "level_change" | "best_bid_ask" | "bestbidask"
+            ) {
+                return self.should_sample(settings, "level", data, timestamp);
+            }
+            return false;
+        }
+        if event_type != "book" {
+            return true;
+        }
+        self.should_sample(settings, "book", data, timestamp)
+    }
+
+    fn should_sample(
+        &mut self,
+        settings: &RuntimeSettings,
+        family: &str,
+        data: &Value,
+        timestamp: DateTime<Utc>,
+    ) -> bool {
+        let token = data
+            .get("token_id")
+            .or_else(|| data.get("asset_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let key = format!("{family}:{token}");
+        let interval = i64::try_from(settings.azure.shadow_book_sample_ms).unwrap_or(i64::MAX);
+        let bucket = timestamp.timestamp_millis().div_euclid(interval.max(1));
+        match self.last_bucket_by_stream_and_token.get(&key) {
+            Some(previous) if *previous >= bucket => false,
+            _ => {
+                self.last_bucket_by_stream_and_token.insert(key, bucket);
+                true
+            }
+        }
     }
 }
 
@@ -181,6 +254,7 @@ impl RuntimeController {
                 recorder,
                 recorder_tx,
                 recorder_metrics,
+                persistence_filter: StdMutex::new(PersistenceFilter::default()),
                 broadcaster,
                 started: AtomicBool::new(false),
             }),
@@ -764,6 +838,9 @@ impl RuntimeController {
             let mut engine = self.inner.engine.lock().await;
             engine.execution_quality.observe_book(&book)
         };
+        if !quality_events.is_empty() {
+            self.force_record_book(&book).await;
+        }
         for event in quality_events {
             self.record_event(event.event_type, event.payload, None, None)
                 .await;
@@ -851,6 +928,9 @@ impl RuntimeController {
             }
             filled
         };
+        if !reports.is_empty() {
+            self.force_record_book(book).await;
+        }
         for report in reports {
             self.record_execution_report(report, true).await;
         }
@@ -1264,6 +1344,7 @@ impl RuntimeController {
             data.decisions.push_back(decision.clone());
             truncate(&mut data.decisions, HISTORY_LIMIT);
         }
+        self.record_pre_decision_book(&decision).await;
         if let Some(strategy_metadata) = metadata {
             self.record_event(
                 "decision",
@@ -1484,21 +1565,55 @@ impl RuntimeController {
     ) where
         P: Serialize,
     {
+        self.record_event_inner(event_type, payload, publish_type, publish_payload, false)
+            .await;
+    }
+
+    async fn record_event_inner<P>(
+        &self,
+        event_type: &str,
+        payload: P,
+        publish_type: Option<&str>,
+        publish_payload: Option<Value>,
+        force_persistence: bool,
+    ) where
+        P: Serialize,
+    {
         let data = serde_json::to_value(payload).unwrap_or(Value::Null);
         let event = RuntimeEvent {
             event_type: event_type.to_owned(),
             ts: Utc::now(),
             data: data.clone(),
         };
-        self.inner
-            .recorder_metrics
-            .queued
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .recorder_metrics
-            .enqueued_total
-            .fetch_add(1, Ordering::Relaxed);
-        let recorder_queue_failed = self.inner.recorder_tx.send(event.clone()).is_err();
+        let persist = self
+            .inner
+            .persistence_filter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .should_persist(
+                &self.inner.settings,
+                event_type,
+                &data,
+                event.ts,
+                force_persistence,
+            );
+        let recorder_queue_failed = if persist {
+            self.inner
+                .recorder_metrics
+                .queued
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .recorder_metrics
+                .enqueued_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner.recorder_tx.send(event.clone()).is_err()
+        } else {
+            self.inner
+                .recorder_metrics
+                .filtered_total
+                .fetch_add(1, Ordering::Relaxed);
+            false
+        };
         if recorder_queue_failed {
             saturating_sub_atomic(&self.inner.recorder_metrics.queued, 1);
             self.inner
@@ -1526,6 +1641,33 @@ impl RuntimeController {
         };
         if let Err(error) = self.inner.broadcaster.send(publish_event) {
             debug!("runtime event had no subscribers: {error}");
+        }
+    }
+
+    async fn record_pre_decision_book(&self, decision: &TradeDecision) {
+        if !self.inner.settings.deploy.runtime_role.is_shadow()
+            || !self.inner.settings.azure.compact_shadow_recording
+        {
+            return;
+        }
+        let Some(token_id) = decision.token_id.as_ref() else {
+            return;
+        };
+        let book = {
+            let data = self.inner.data.read().await;
+            data.books.get(token_id).map(compact_recorded_book)
+        };
+        if let Some(book) = book {
+            self.force_record_book(&book).await;
+        }
+    }
+
+    async fn force_record_book(&self, book: &BookState) {
+        if self.inner.settings.deploy.runtime_role.is_shadow()
+            && self.inner.settings.azure.compact_shadow_recording
+        {
+            self.record_event_inner("book", compact_recorded_book(book), None, None, true)
+                .await;
         }
     }
 
@@ -1846,6 +1988,8 @@ fn runtime_provenance_with_git_sha(
         "storage_account": settings.azure.storage_account_name,
         "storage_container": settings.azure.storage_container_name,
         "event_blob_prefix": settings.azure.event_blob_prefix,
+        "compact_shadow_recording": settings.azure.compact_shadow_recording,
+        "shadow_book_sample_ms": settings.azure.shadow_book_sample_ms,
         "publish_strategy_canary_intents": settings.azure.publish_strategy_canary_intents,
         "execution_model": {
             "version": settings.azure.strategy_canary_fill_model_version,
@@ -1888,6 +2032,8 @@ mod tests {
         settings.azure.publish_strategy_canary_intents = true;
         settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
         settings.azure.event_blob_prefix = "shadow-events/test".to_owned();
+        settings.azure.compact_shadow_recording = true;
+        settings.azure.shadow_book_sample_ms = 1_000;
 
         let payload =
             runtime_provenance_with_git_sha(&settings, "c40d9093783808b010eabd9c43697e9dcceb667b")
@@ -1897,6 +2043,8 @@ mod tests {
         assert_eq!(payload["allow_live"], false);
         assert_eq!(payload["paper_maker_fill_policy"], "none");
         assert_eq!(payload["candidate"]["name"], "dynamic_quote_style");
+        assert_eq!(payload["compact_shadow_recording"], true);
+        assert_eq!(payload["shadow_book_sample_ms"], 1_000);
         assert!(payload["candidate"]["config_hash"]
             .as_str()
             .is_some_and(|value| value.starts_with("sha256:")));
@@ -1944,6 +2092,62 @@ mod tests {
         assert_eq!(compact.asks.len(), 1);
         assert_eq!(compact.bids[0].price, Decimal::new(50, 2));
         assert_eq!(compact.asks[0].price, Decimal::new(51, 2));
+    }
+
+    #[test]
+    fn shadow_persistence_filter_keeps_trades_and_bounded_books() {
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+        settings.azure.compact_shadow_recording = true;
+        settings.azure.shadow_book_sample_ms = 1_000;
+        let start = DateTime::parse_from_rfc3339("2026-07-14T00:00:00.100Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut filter = PersistenceFilter::default();
+
+        assert!(filter.should_persist(
+            &settings,
+            "raw_market_event",
+            &json!({"event_type": "price_change", "token_id": "up"}),
+            start,
+            false,
+        ));
+        assert!(!filter.should_persist(
+            &settings,
+            "raw_market_event",
+            &json!({"event_type": "price_change", "token_id": "up"}),
+            start + chrono::Duration::milliseconds(500),
+            false,
+        ));
+        assert!(filter.should_persist(
+            &settings,
+            "raw_market_event",
+            &json!({"event_type": "last_trade_price", "token_id": "up"}),
+            start,
+            false,
+        ));
+        assert!(filter.should_persist(&settings, "book", &json!({"token_id": "up"}), start, false,));
+        assert!(!filter.should_persist(
+            &settings,
+            "book",
+            &json!({"token_id": "up"}),
+            start + chrono::Duration::milliseconds(500),
+            false,
+        ));
+        assert!(filter.should_persist(
+            &settings,
+            "book",
+            &json!({"token_id": "up"}),
+            start + chrono::Duration::milliseconds(1_000),
+            false,
+        ));
+        assert!(filter.should_persist(
+            &settings,
+            "book",
+            &json!({"token_id": "up"}),
+            start + chrono::Duration::milliseconds(500),
+            true,
+        ));
     }
 
     #[test]

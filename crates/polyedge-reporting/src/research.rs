@@ -283,6 +283,7 @@ pub struct NormalizeOptions {
     pub out: PathBuf,
     pub format: String,
     pub overwrite: bool,
+    pub decision_grade_projection: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -493,31 +494,47 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
     }
     fs::create_dir_all(&options.out)?;
     let mut writers = NormalizedWriters::new(&options.out, file_format)?;
-    let mut counts = BTreeMap::<String, usize>::new();
+    let mut input_counts = BTreeMap::<String, usize>::new();
+    let mut projected_counts = BTreeMap::<String, usize>::new();
     let mut first_ts = None;
     let mut last_ts = None;
-    let mut processed_events = 0_usize;
+    let mut input_events = 0_usize;
+    let mut projected_events = 0_usize;
     let mut write_error = None::<String>;
+    let mut projection = DecisionGradeProjection::default();
     let stream = stream_events(&options.input, EventPathMode::AllJsonl, &[], |event| {
         first_ts = min_ts(first_ts, Some(event.recorded_ts));
         last_ts = max_ts(last_ts, Some(event.recorded_ts));
-        processed_events += 1;
-        *counts.entry(event.event_type.clone()).or_insert(0) += 1;
+        input_events += 1;
+        *input_counts.entry(event.event_type.clone()).or_insert(0) += 1;
+
         if write_error.is_none() {
-            if let Err(error) = writers.write(event) {
+            let mut emit = |event: &EventLine| {
+                projected_events += 1;
+                *projected_counts
+                    .entry(event.event_type.clone())
+                    .or_insert(0) += 1;
+                writers.write(event)
+            };
+            let result = if options.decision_grade_projection {
+                projection.observe(event, &mut emit)
+            } else {
+                emit(event)
+            };
+            if let Err(error) = result {
                 write_error = Some(error.to_string());
             }
         }
-        if write_error.is_none()
-            && is_multiple_of(processed_events, NORMALIZE_PROGRESS_INTERVAL_EVENTS)
+        if write_error.is_none() && is_multiple_of(input_events, NORMALIZE_PROGRESS_INTERVAL_EVENTS)
         {
             if let Err(error) = write_json_file(
                 &options.out.join("normalize_progress.json"),
                 &normalize_progress(
                     "running",
                     file_format,
-                    processed_events,
-                    &counts,
+                    input_events,
+                    projected_events,
+                    &projected_counts,
                     first_ts,
                     last_ts,
                 ),
@@ -529,14 +546,24 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
     if let Some(error) = write_error {
         return Err(ResearchError::InvalidInput(error));
     }
+    if options.decision_grade_projection {
+        for event in projection.finish() {
+            projected_events += 1;
+            *projected_counts
+                .entry(event.event_type.clone())
+                .or_insert(0) += 1;
+            writers.write(&event)?;
+        }
+    }
     writers.flush()?;
     write_json_file(
         &options.out.join("normalize_progress.json"),
         &normalize_progress(
             "completed",
             file_format,
-            stream.events,
-            &counts,
+            input_events,
+            projected_events,
+            &projected_counts,
             first_ts,
             last_ts,
         ),
@@ -546,12 +573,15 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
         "compression": file_format.compression(),
         "event_log_written": file_format.writes_event_log(),
         "input": options.input.to_string_lossy(),
+        "decision_grade_projection": options.decision_grade_projection,
         "generated_at": now_ts(),
         "backend": "rust",
         "files": writers.manifest(),
-        "events": stream.events,
+        "events": projected_events,
+        "input_events": input_events,
         "malformed_lines": stream.malformed_lines,
-        "event_counts": counts,
+        "event_counts": projected_counts,
+        "input_event_counts": input_counts,
         "first_recorded_ts": first_ts.map(ts),
         "last_recorded_ts": last_ts.map(ts),
         "warnings": stream.warnings
@@ -1765,6 +1795,7 @@ fn filtered_normalized_event_paths(paths: &[PathBuf], mode: EventPathMode) -> Ve
             "other.jsonl",
         ][..],
         EventPathMode::QueueAudit => &[
+            "books.jsonl",
             "raw_market_events.jsonl",
             "price_changes.jsonl",
             "last_trades.jsonl",
@@ -2425,6 +2456,89 @@ fn execution_quality_markdown(report: &Value) -> String {
     )
 }
 
+#[derive(Default)]
+struct DecisionGradeProjection {
+    pending_state: BTreeMap<String, (i64, EventLine)>,
+}
+
+impl DecisionGradeProjection {
+    fn observe<F>(&mut self, event: &EventLine, emit: &mut F) -> Result<(), ResearchError>
+    where
+        F: FnMut(&EventLine) -> Result<(), ResearchError>,
+    {
+        let sampled_state = event.event_type == "book"
+            || (event.event_type == "raw_market_event" && is_queue_level_event(event));
+        if sampled_state {
+            let key = projection_state_key(event);
+            let bucket = event.recorded_ts.timestamp_millis().div_euclid(1_000);
+            for pending in self.take_before(bucket) {
+                emit(&pending)?;
+            }
+            if let Some((pending_bucket, pending)) = self.pending_state.remove(&key) {
+                if bucket == pending_bucket && event.recorded_ts >= pending.recorded_ts {
+                    self.pending_state.insert(key, (bucket, event.clone()));
+                } else {
+                    self.pending_state.insert(key, (pending_bucket, pending));
+                }
+            } else {
+                self.pending_state.insert(key, (bucket, event.clone()));
+            }
+            return Ok(());
+        }
+
+        if event.event_type == "raw_market_event" && !is_queue_trade_event(event) {
+            return Ok(());
+        }
+
+        for pending in self.take_pending() {
+            emit(&pending)?;
+        }
+        emit(event)
+    }
+
+    fn finish(&mut self) -> Vec<EventLine> {
+        self.take_pending()
+    }
+
+    fn take_before(&mut self, bucket: i64) -> Vec<EventLine> {
+        let keys = self
+            .pending_state
+            .iter()
+            .filter_map(|(key, (pending_bucket, _))| {
+                (*pending_bucket < bucket).then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut events = keys
+            .into_iter()
+            .filter_map(|key| self.pending_state.remove(&key))
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.recorded_ts);
+        events
+    }
+
+    fn take_pending(&mut self) -> Vec<EventLine> {
+        let mut events = std::mem::take(&mut self.pending_state)
+            .into_values()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.recorded_ts);
+        events
+    }
+}
+
+fn projection_state_key(event: &EventLine) -> String {
+    let family = if event.event_type == "book" {
+        "book"
+    } else {
+        "level"
+    };
+    let subject = event_text(event, &["token_id", "asset_id", "token"])
+        .or_else(|| event_text(event, &["market_id"]))
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("{family}:{subject}")
+}
+
 struct NormalizedWriters {
     root: PathBuf,
     format: NormalizedFileFormat,
@@ -2474,17 +2588,16 @@ impl NormalizedWriters {
             "execution_report" => "execution_report",
             "paper_settlement" => "paper_settlement",
             "feed_error" => "feed_error",
+            "raw_market_event" => "raw_market_event",
+            "price_change" | "pricechange" => "price_change",
+            "last_trade_price" | "last_trade" | "trade" => "last_trade",
+            "book_snapshot" | "orderbook" | "snapshot" => "book_snapshot",
+            "level_change" | "best_bid_ask" | "bestbidask" => "level_change",
             _ => "other",
         };
         if let Some(writer) = self.by_type.get_mut(target) {
             writer.write_row(&row)?;
             *self.counts.entry(target.to_owned()).or_insert(0) += 1;
-        }
-        for (queue_target, queue_row) in queue_evidence_rows(event, self.sequence - 1) {
-            if let Some(writer) = self.by_type.get_mut(queue_target) {
-                writer.write_row(&queue_row)?;
-                *self.counts.entry(queue_target.to_owned()).or_insert(0) += 1;
-            }
         }
         Ok(())
     }
@@ -2651,7 +2764,8 @@ fn normalized_files(format: NormalizedFileFormat) -> Vec<(&'static str, String)>
 fn normalize_progress(
     status: &str,
     format: NormalizedFileFormat,
-    events: usize,
+    input_events: usize,
+    projected_events: usize,
     counts: &BTreeMap<String, usize>,
     first_ts: Option<DateTime<Utc>>,
     last_ts: Option<DateTime<Utc>>,
@@ -2661,7 +2775,8 @@ fn normalize_progress(
         "format": format.as_str(),
         "compression": format.compression(),
         "event_log_written": format.writes_event_log(),
-        "events": events,
+        "events": projected_events,
+        "input_events": input_events,
         "event_counts": counts,
         "first_recorded_ts": first_ts.map(ts),
         "last_recorded_ts": last_ts.map(ts),
@@ -2688,109 +2803,8 @@ fn normalized_row(event: &EventLine, sequence: u64) -> Value {
             .or_else(|| decimal(payload.get("start_price")).map(|value| value.to_string())),
         "size": decimal(payload.get("size")).map(|value| value.to_string())
             .or_else(|| decimal(payload.get("filled_size")).map(|value| value.to_string())),
-        "raw_payload": redact_json(payload),
-        "raw_event": redact_json(&event.raw)
+        "raw_payload": redact_json(payload)
     })
-}
-
-fn queue_evidence_rows(event: &EventLine, sequence: u64) -> Vec<(&'static str, Value)> {
-    let payload = &event.payload;
-    let raw_kind = payload
-        .get("event_type")
-        .or_else(|| payload.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or(event.event_type.as_str())
-        .to_ascii_lowercase();
-    let mut rows = Vec::new();
-    if event.event_type == "raw_market_event" {
-        let row = queue_evidence_row(event, sequence, &raw_kind, payload);
-        rows.push(("raw_market_event", row.clone()));
-        match raw_kind.as_str() {
-            "price_change" | "pricechange" => {
-                rows.push(("price_change", row.clone()));
-                rows.push(("level_change", row));
-            }
-            "last_trade_price" | "last_trade" | "trade" => rows.push(("last_trade", row)),
-            "book" | "orderbook" | "snapshot" => rows.push(("book_snapshot", row)),
-            "best_bid_ask" | "bestbidask" => rows.push(("level_change", row)),
-            _ => {}
-        }
-    } else {
-        match raw_kind.as_str() {
-            "price_change" | "pricechange" => {
-                let row = queue_evidence_row(event, sequence, &raw_kind, payload);
-                rows.push(("price_change", row.clone()));
-                rows.push(("level_change", row));
-            }
-            "last_trade_price" | "last_trade" | "trade" => {
-                rows.push((
-                    "last_trade",
-                    queue_evidence_row(event, sequence, &raw_kind, payload),
-                ));
-            }
-            "book" | "orderbook" | "snapshot" => {
-                rows.push((
-                    "book_snapshot",
-                    queue_evidence_row(event, sequence, "book", payload),
-                ));
-            }
-            _ => {}
-        }
-    }
-    rows
-}
-
-fn queue_evidence_row(
-    event: &EventLine,
-    sequence: u64,
-    event_type: &str,
-    payload: &Value,
-) -> Value {
-    let raw_payload = payload.get("raw_payload").unwrap_or(payload);
-    json!({
-        "sequence": sequence,
-        "event_type": event_type,
-        "recorded_ts": ts(event.recorded_ts),
-        "source_ts": queue_ts(payload).map(ts),
-        "market_id": text(payload, "market_id"),
-        "condition_id": text(payload, "condition_id"),
-        "token_id": optional_text(payload, "token_id")
-            .or_else(|| optional_text(payload, "asset_id"))
-            .unwrap_or_default(),
-        "asset_id": text(payload, "asset_id"),
-        "side": text(payload, "side"),
-        "price": decimal(payload.get("price")
-            .or_else(|| payload.get("last_trade_price"))
-            .or_else(|| raw_payload.get("price"))
-            .or_else(|| raw_payload.get("last_trade_price")))
-            .map(|value| value.to_string()),
-        "size": decimal(payload.get("size")
-            .or_else(|| payload.get("trade_size"))
-            .or_else(|| payload.get("last_trade_size"))
-            .or_else(|| raw_payload.get("size"))
-            .or_else(|| raw_payload.get("trade_size"))
-            .or_else(|| raw_payload.get("last_trade_size")))
-            .map(|value| value.to_string()),
-        "best_bid": decimal(payload.get("best_bid").or_else(|| raw_payload.get("best_bid")))
-            .or_else(|| best_level_price(payload.get("bids"), true))
-            .or_else(|| best_level_price(raw_payload.get("bids"), true))
-            .map(|value| value.to_string()),
-        "best_ask": decimal(payload.get("best_ask").or_else(|| raw_payload.get("best_ask")))
-            .or_else(|| best_level_price(payload.get("asks"), false))
-            .or_else(|| best_level_price(raw_payload.get("asks"), false))
-            .map(|value| value.to_string()),
-        "book_hash": optional_text(payload, "book_hash")
-            .or_else(|| optional_text(payload, "hash"))
-            .or_else(|| optional_text(raw_payload, "hash")),
-        "raw_payload": redact_json(raw_payload)
-    })
-}
-
-fn queue_ts(payload: &Value) -> Option<DateTime<Utc>> {
-    parse_datetime(payload.get("source_ts"))
-        .or_else(|| parse_datetime(payload.get("exchange_ts")))
-        .or_else(|| parse_datetime(payload.get("timestamp")))
-        .or_else(|| parse_datetime(payload.get("local_ts")))
 }
 
 fn best_level_price(levels: Option<&Value>, bid: bool) -> Option<Decimal> {
@@ -3475,6 +3489,8 @@ fn apply_single_level(book: &mut BTreeMap<Decimal, Decimal>, price: Decimal, siz
 
 #[derive(Clone, Debug)]
 struct ReplayOrder {
+    order_id: Option<String>,
+    queue_snapshot_bound: bool,
     market_id: String,
     token_id: String,
     outcome: String,
@@ -4006,6 +4022,10 @@ impl ResearchReplayEngine {
             "fair_value" => self.handle_fair_value(&event.payload),
             "decision" => self.handle_decision(&event.payload, event.recorded_ts),
             "execution_report" => self.handle_execution_report(&event.payload, event.recorded_ts),
+            "paper_order_queue_registration" => {
+                self.handle_queue_registration(&event.payload, event.recorded_ts)
+            }
+            "paper_order_queue_snapshot" => self.handle_queue_snapshot(&event.payload),
             "feed_error" => self.feed_error_times.push_back(event.recorded_ts),
             _ => {}
         }
@@ -4232,6 +4252,7 @@ impl ResearchReplayEngine {
             if order.token_id != token_id
                 || order.cancel_ts.is_some()
                 || order.queue_size_ahead.is_some()
+                || (order.order_id.is_some() && !order.queue_snapshot_bound)
                 || recorded_ts
                     < order.decision_ts
                         + Duration::milliseconds(self.request.fill_model.live_after_ms())
@@ -4278,6 +4299,9 @@ impl ResearchReplayEngine {
         let open = self.open_orders.iter().copied().collect::<Vec<_>>();
         for index in open {
             if self.orders[index].token_id != token_id || self.orders[index].cancel_ts.is_some() {
+                continue;
+            }
+            if self.orders[index].order_id.is_some() && !self.orders[index].queue_snapshot_bound {
                 continue;
             }
             let Some(size_ahead) = self.orders[index].queue_size_ahead else {
@@ -4366,6 +4390,9 @@ impl ResearchReplayEngine {
                 continue;
             }
             if self.orders[index].side != "buy" || trade_price > self.orders[index].price {
+                continue;
+            }
+            if self.orders[index].order_id.is_some() && !self.orders[index].queue_snapshot_bound {
                 continue;
             }
             if !self.queue_market_has_level_evidence(&self.orders[index].market_id) {
@@ -4505,6 +4532,99 @@ impl ResearchReplayEngine {
         }
     }
 
+    fn handle_queue_registration(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
+        let order_id = text(payload, "order_id");
+        let market_id = text(payload, "market_id");
+        let token_id = text(payload, "token_id");
+        let side = text(payload, "side");
+        let Some(quote_price) = decimal(payload.get("quote_price")) else {
+            return;
+        };
+        let Some(order_size) = decimal(payload.get("order_size")) else {
+            return;
+        };
+        if order_id.is_empty() || market_id.is_empty() || token_id.is_empty() || side.is_empty() {
+            return;
+        }
+        let candidate = self
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, order)| {
+                order.order_id.is_none()
+                    && order.market_id == market_id
+                    && order.token_id == token_id
+                    && order.side == side
+                    && order.price == quote_price
+                    && order.size == order_size
+                    && order.decision_ts <= recorded_ts
+            })
+            .max_by_key(|(_, order)| order.decision_ts)
+            .map(|(index, _)| index);
+        if let Some(index) = candidate {
+            let previous = self.orders[index].queue_initial_size_ahead.take();
+            self.orders[index].queue_size_ahead = None;
+            self.orders[index].order_id = Some(order_id);
+            let evidence = self.queue_market_evidence.entry(market_id).or_default();
+            if let Some(previous) = previous {
+                if let Some(position) = evidence
+                    .size_ahead_samples
+                    .iter()
+                    .position(|sample| *sample == previous)
+                {
+                    evidence.size_ahead_samples.remove(position);
+                }
+            }
+            evidence.order_lifecycle_count += 1;
+        }
+    }
+
+    fn handle_queue_snapshot(&mut self, payload: &Value) {
+        let order_id = text(payload, "order_id");
+        let Some(size_ahead) = decimal(payload.get("visible_size_ahead_estimate")) else {
+            return;
+        };
+        if order_id.is_empty() || size_ahead < Decimal::ZERO {
+            return;
+        }
+        let Some(index) = self
+            .orders
+            .iter()
+            .position(|order| order.order_id.as_deref() == Some(order_id.as_str()))
+        else {
+            return;
+        };
+        let market_id = self.orders[index].market_id.clone();
+        let binding_matches = text(payload, "market_id") == market_id
+            && text(payload, "token_id") == self.orders[index].token_id
+            && text(payload, "side") == self.orders[index].side
+            && decimal(payload.get("quote_price")) == Some(self.orders[index].price)
+            && decimal(payload.get("order_size")) == Some(self.orders[index].size);
+        if !binding_matches {
+            self.queue_market_evidence
+                .entry(market_id)
+                .or_default()
+                .ineligible_reasons
+                .insert("invalid_runtime_queue_snapshot_binding".to_owned());
+            return;
+        }
+        let previous = self.orders[index].queue_initial_size_ahead;
+        self.orders[index].queue_initial_size_ahead = Some(size_ahead);
+        self.orders[index].queue_size_ahead = Some(size_ahead);
+        self.orders[index].queue_snapshot_bound = true;
+        let evidence = self.queue_market_evidence.entry(market_id).or_default();
+        if let Some(previous) = previous {
+            if let Some(position) = evidence
+                .size_ahead_samples
+                .iter()
+                .position(|sample| *sample == previous)
+            {
+                evidence.size_ahead_samples.remove(position);
+            }
+        }
+        evidence.size_ahead_samples.push(size_ahead);
+    }
+
     fn order_from_decision(
         &self,
         payload: &Value,
@@ -4530,6 +4650,8 @@ impl ResearchReplayEngine {
             }
         });
         Some(ReplayOrder {
+            order_id: None,
+            queue_snapshot_bound: false,
             market_id,
             token_id,
             outcome: text(payload, "outcome"),
@@ -6720,6 +6842,8 @@ mod tests {
 
     fn wallet_order(id: &str, decision: &str, filled_size: &str) -> ReplayOrder {
         ReplayOrder {
+            order_id: None,
+            queue_snapshot_bound: false,
             market_id: id.to_owned(),
             token_id: format!("{id}-up"),
             outcome: "up".to_owned(),

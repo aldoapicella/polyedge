@@ -3,11 +3,11 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use polyedge_reporting::research::{
     daily_provenance_required, load_exclusion_registry, load_frozen_candidate_registry,
-    DailyRunManifest, LatestRunPointer, RunStatus, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
+    DailyRunManifest, LatestRunPointer, PromotionManifestV1, PromotionPhase, RunStatus,
+    DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
 };
 use polyedge_storage::{AzureBlobClient, AzureBlobError};
 use serde::Deserialize;
@@ -26,6 +26,10 @@ use crate::ApiState;
 
 const REPORT_ROOT: &str = "reports/research";
 const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
+const PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
+const PROMOTION_MANIFEST_SCHEMA: &str = "promotion_manifest_v1";
+const EVIDENCE_PROTOCOL_VERSION: u64 = 3;
+const ARTIFACT_FRESHNESS_SECONDS: i64 = 24 * 60 * 60;
 
 pub fn router() -> Router<ApiState> {
     Router::new()
@@ -68,77 +72,110 @@ pub fn router() -> Router<ApiState> {
 }
 
 async fn venue_execution() -> impl IntoResponse {
-    // The funded controller publishes the canonical, human-authorized ladder
-    // state in bot-events. Before that transition exists, the credential-free
-    // research identity publishes the shadow-only manifest in the isolated
-    // research container. Prefer the funded copy but never blend documents.
-    let profitability_path = FsPath::new("reports/research/profitability/latest.json");
-    let funded_profitability =
-        read_json_from_container_or_null(profitability_path, "AZURE_FUNDED_STORAGE_CONTAINER_NAME");
-    let profitability = if funded_profitability.is_null() {
-        read_json_from_container_or_null(
-            profitability_path,
-            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
-        )
-    } else {
-        funded_profitability
-    };
-    let profitability = if profitability.is_null() {
-        json!({
-            "phase": "risk_repair",
-            "status": "funded_execution_frozen",
-            "candidate": {
-                "name": "dynamic_quote_style",
-                "version": "dynamic_quote_style@2026-06-14",
-                "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
-            },
-            "blocking_reason": "Shadow profitability and execution-model gates have not passed.",
-            "capital": {
-                "original_starting_capital": 9.23,
-                "campaign_starting_equity": 5.030521,
-                "equity_floor": 4.03,
-                "max_campaign_drawdown": 1.0
-            },
-            "shadow": {
-                "clean_days": 0,
-                "required_clean_days": 30,
-                "settled_markets": 0,
-                "required_settled_markets": 1000,
-                "required_positive_weekly_blocks": 4
-            },
-            "data_quality": {
-                "status": "collecting",
-                "minimum_coverage": 0.95,
-                "fatal_warnings": 0,
-                "blocking_warnings": 0,
-                "unclassified_warnings": 0
-            },
-            "promotion_allowed": false,
-            "human_authorization_required": true
-        })
-    } else {
-        profitability
-    };
-    let trained_model = read_json_from_container_or_null(
-        FsPath::new("reports/research/venue-probe/effective_queue_model.json"),
-        "AZURE_MODEL_STORAGE_CONTAINER_NAME",
+    let now = Utc::now();
+    let profitability_path = FsPath::new(PROFITABILITY_LATEST);
+    let profitability_selection = select_profitability_artifact(
+        ProfitabilityArtifact::new(
+            read_json_from_container_or_null(
+                profitability_path,
+                "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+            ),
+            ProfitabilitySource::Funded,
+            now,
+        ),
+        ProfitabilityArtifact::new(
+            read_json_from_container_or_null(
+                profitability_path,
+                "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+            ),
+            ProfitabilitySource::Shadow,
+            now,
+        ),
+        now,
     );
-    let execution_model = if trained_model.is_null() {
-        read_json_from_container_or_null(
-            FsPath::new("reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json"),
-            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+    let latest_path = FsPath::new("reports/research/venue-probe/latest.json");
+    let latest = normalize_venue_execution_summary(read_json_from_container_or_null(
+        latest_path,
+        "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+    ));
+    let latest_attempt_path = FsPath::new("reports/research/venue-probe/latest_attempt.json");
+    let latest_attempt = read_json_from_container_or_null(
+        latest_attempt_path,
+        "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
+    );
+    let preflight_path =
+        FsPath::new("reports/research/venue-probe/latest_authenticated_dry_run.json");
+    let preflight =
+        read_json_from_container_or_null(preflight_path, "AZURE_FUNDED_STORAGE_CONTAINER_NAME");
+    let redemption_path = FsPath::new("reports/research/venue-probe/latest_redemption.json");
+    let redemption =
+        read_json_from_container_or_null(redemption_path, "AZURE_FUNDED_STORAGE_CONTAINER_NAME");
+    let trained_model_path = FsPath::new("reports/research/venue-probe/effective_queue_model.json");
+    let trained_model =
+        read_json_from_container_or_null(trained_model_path, "AZURE_MODEL_STORAGE_CONTAINER_NAME");
+    let prior_model_path = FsPath::new(
+        "reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    );
+    let (execution_model, execution_model_source, execution_model_path) = if trained_model.is_null()
+    {
+        (
+            read_json_from_container_or_null(
+                prior_model_path,
+                "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+            ),
+            "research_conservative_prior",
+            prior_model_path,
         )
     } else {
-        trained_model
+        (trained_model, "trained_model_storage", trained_model_path)
     };
+    let artifact_provenance = json!({
+        "profitability": profitability_selection.provenance,
+        "latest": artifact_provenance(
+            &latest,
+            latest_path,
+            "funded_execution_evidence",
+            now,
+            Some(venue_legacy_eligibility(&latest)),
+        ),
+        "latest_attempt": artifact_provenance(
+            &latest_attempt,
+            latest_attempt_path,
+            "funded_execution_evidence",
+            now,
+            Some(venue_legacy_eligibility(&latest_attempt)),
+        ),
+        "preflight": artifact_provenance(
+            &preflight,
+            preflight_path,
+            "funded_execution_evidence",
+            now,
+            Some("not_applicable"),
+        ),
+        "redemption": artifact_provenance(
+            &redemption,
+            redemption_path,
+            "funded_execution_evidence",
+            now,
+            Some("not_applicable"),
+        ),
+        "model": artifact_provenance(
+            &execution_model,
+            execution_model_path,
+            execution_model_source,
+            now,
+            Some(model_legacy_eligibility(&execution_model)),
+        )
+    });
     Json(json!({
-        "generated_ts": now_ts(),
-        "latest": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
-        "latest_attempt": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest_attempt.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
-        "preflight": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest_authenticated_dry_run.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
-        "redemption": read_json_from_container_or_null(FsPath::new("reports/research/venue-probe/latest_redemption.json"), "AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+        "generated_ts": now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "latest": latest,
+        "latest_attempt": latest_attempt,
+        "preflight": preflight,
+        "redemption": redemption,
         "model": execution_model,
-        "profitability": profitability,
+        "profitability": profitability_selection.value,
+        "artifact_provenance": artifact_provenance,
         "queue_position_source": "authenticated_lifecycle_plus_public_l2",
         "queue_position_metric": "inferred_size_ahead",
         "literal_fifo_rank_available": false,
@@ -147,6 +184,516 @@ async fn venue_execution() -> impl IntoResponse {
         "research_only": true,
         "strategy_promotion_allowed": false
     }))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfitabilitySource {
+    Funded,
+    Shadow,
+}
+
+impl ProfitabilitySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Funded => "funded_evidence",
+            Self::Shadow => "profitability_shadow",
+        }
+    }
+
+    fn trust_scope(self) -> &'static str {
+        match self {
+            Self::Funded => "funded_control",
+            Self::Shadow => "shadow_research",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProfitabilityArtifact {
+    value: Value,
+    source: ProfitabilitySource,
+    manifest: Option<PromotionManifestV1>,
+    validation_error: Option<String>,
+    authoritative_ts: Option<DateTime<Utc>>,
+    authoritative_ts_field: Option<&'static str>,
+    control_valid: bool,
+    fresh: bool,
+    canonical_funded_state: bool,
+}
+
+impl ProfitabilityArtifact {
+    fn new(value: Value, source: ProfitabilitySource, now: DateTime<Utc>) -> Self {
+        let (manifest, validation_error) = match validate_profitability_manifest(&value, source) {
+            Ok(manifest) => (Some(manifest), None),
+            Err(error) => (None, Some(error)),
+        };
+        let canonical_funded_state = source == ProfitabilitySource::Funded
+            && manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.funded_ladder.is_some());
+        let (authoritative_ts, authoritative_ts_field) = manifest
+            .as_ref()
+            .map(|manifest| {
+                if canonical_funded_state {
+                    (
+                        manifest
+                            .funded_ladder
+                            .as_ref()
+                            .map(|ladder| ladder.updated_at),
+                        Some("funded_ladder.updated_at"),
+                    )
+                } else {
+                    (Some(manifest.created_at), Some("created_at"))
+                }
+            })
+            .unwrap_or_else(|| artifact_timestamp(&value));
+        let control_valid = manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.expires_at > now && manifest.created_at <= now);
+        let fresh = control_valid
+            && authoritative_ts.is_some_and(|timestamp| {
+                timestamp <= now
+                    && now.signed_duration_since(timestamp).num_seconds()
+                        <= ARTIFACT_FRESHNESS_SECONDS
+            });
+        Self {
+            value,
+            source,
+            manifest,
+            validation_error,
+            authoritative_ts,
+            authoritative_ts_field,
+            control_valid,
+            fresh,
+            canonical_funded_state,
+        }
+    }
+
+    fn available(&self) -> bool {
+        self.value.is_object()
+    }
+
+    fn valid_current_schema(&self) -> bool {
+        self.manifest.is_some()
+    }
+
+    fn metadata(&self, now: DateTime<Utc>) -> Value {
+        let expires_at = self.manifest.as_ref().map(|manifest| {
+            manifest
+                .expires_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        });
+        let age_seconds = self
+            .authoritative_ts
+            .map(|timestamp| now.signed_duration_since(timestamp).num_seconds().max(0));
+        let legacy_eligibility = if self.valid_current_schema() {
+            "current_schema"
+        } else if self.available() {
+            "display_only_legacy"
+        } else {
+            "unavailable"
+        };
+        json!({
+            "path": PROFITABILITY_LATEST,
+            "source": self.source.as_str(),
+            "trust_scope": self.source.trust_scope(),
+            "available": self.available(),
+            "schema_version": self.value.get("schema_version").cloned().unwrap_or(Value::Null),
+            "valid_current_schema": self.valid_current_schema(),
+            "legacy_eligibility": legacy_eligibility,
+            "authoritative_ts": self.authoritative_ts.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            "authoritative_ts_field": self.authoritative_ts_field,
+            "age_seconds": age_seconds,
+            "freshness_window_seconds": ARTIFACT_FRESHNESS_SECONDS,
+            "freshness": if !self.available() { "unavailable" } else if self.authoritative_ts.is_none() { "unknown" } else if self.fresh { "fresh" } else { "stale" },
+            "control_valid": self.control_valid,
+            "expires_at": expires_at,
+            "fresh": self.fresh,
+            "expired": self.manifest.as_ref().is_some_and(|manifest| manifest.expires_at <= now),
+            "canonical_funded_state": self.canonical_funded_state,
+            "promotion_ready": false,
+            "validation_error": self.validation_error
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProfitabilitySelection {
+    value: Value,
+    provenance: Value,
+}
+
+fn select_profitability_artifact(
+    funded: ProfitabilityArtifact,
+    shadow: ProfitabilityArtifact,
+    now: DateTime<Utc>,
+) -> ProfitabilitySelection {
+    let candidates = vec![funded, shadow];
+    let (selected_index, selection_reason) = if candidates[0].canonical_funded_state {
+        (Some(0), "canonical_funded_state")
+    } else {
+        let mut valid = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, artifact)| artifact.valid_current_schema())
+            .collect::<Vec<_>>();
+        valid.sort_by_key(|(_, artifact)| {
+            (
+                artifact.fresh,
+                artifact
+                    .authoritative_ts
+                    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+            )
+        });
+        valid.last().map_or_else(
+            || {
+                let mut legacy = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, artifact)| artifact.available())
+                    .collect::<Vec<_>>();
+                legacy.sort_by_key(|(_, artifact)| {
+                    artifact
+                        .authoritative_ts
+                        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+                });
+                (
+                    legacy.last().map(|(index, _)| *index),
+                    "legacy_display_only",
+                )
+            },
+            |(index, artifact)| {
+                (
+                    Some(*index),
+                    if artifact.fresh {
+                        "newest_fresh_valid_manifest"
+                    } else {
+                        "newest_valid_manifest"
+                    },
+                )
+            },
+        )
+    };
+    let candidate_metadata = candidates
+        .iter()
+        .map(|candidate| candidate.metadata(now))
+        .collect::<Vec<_>>();
+    let (value, selected_source, canonical_funded_state) = selected_index.map_or_else(
+        || (default_profitability_manifest(), "api_fallback", false),
+        |index| {
+            let selected = &candidates[index];
+            (
+                fail_closed_profitability_value(
+                    selected.value.clone(),
+                    selected.canonical_funded_state,
+                    selected.valid_current_schema(),
+                ),
+                selected.source.as_str(),
+                selected.canonical_funded_state,
+            )
+        },
+    );
+    let selected_metadata = selected_index
+        .map(|index| candidates[index].metadata(now))
+        .unwrap_or_else(|| {
+            json!({
+                "path": PROFITABILITY_LATEST,
+                "source": "api_fallback",
+                "trust_scope": "none",
+                "available": false,
+                "valid_current_schema": false,
+                "legacy_eligibility": "display_only_fallback",
+                "fresh": false,
+                "freshness": "unavailable",
+                "control_valid": false,
+                "canonical_funded_state": false,
+                "promotion_ready": false
+            })
+        });
+    ProfitabilitySelection {
+        value,
+        provenance: json!({
+            "selected_source": selected_source,
+            "selection_reason": selection_reason,
+            "canonical_funded_state": canonical_funded_state,
+            "promotion_ready": false,
+            "selected": selected_metadata,
+            "candidates": candidate_metadata
+        }),
+    }
+}
+
+fn validate_profitability_manifest(
+    value: &Value,
+    source: ProfitabilitySource,
+) -> Result<PromotionManifestV1, String> {
+    if !value.is_object() {
+        return Err("artifact is unavailable or is not a JSON object".to_owned());
+    }
+    let manifest: PromotionManifestV1 = serde_json::from_value(value.clone())
+        .map_err(|error| format!("artifact does not match {PROMOTION_MANIFEST_SCHEMA}: {error}"))?;
+    if manifest.schema_version != PROMOTION_MANIFEST_SCHEMA {
+        return Err("unsupported promotion manifest schema".to_owned());
+    }
+    if manifest.expires_at <= manifest.created_at {
+        return Err("promotion manifest validity window is invalid".to_owned());
+    }
+    if !manifest.human_authorization_required || manifest.promotion_allowed {
+        return Err("profitability artifacts must remain non-executable".to_owned());
+    }
+    if manifest.candidate.name.trim().is_empty()
+        || manifest.candidate.candidate_version.trim().is_empty()
+        || !valid_prefixed_sha256(&manifest.candidate.config_hash)
+    {
+        return Err("candidate identity is incomplete or invalid".to_owned());
+    }
+    if let Some(ladder) = &manifest.funded_ladder {
+        if source != ProfitabilitySource::Funded {
+            return Err("shadow storage cannot publish canonical funded ladder state".to_owned());
+        }
+        ladder
+            .validate()
+            .map_err(|error| format!("funded ladder is invalid: {error}"))?;
+        if ladder.candidate != manifest.candidate
+            || ladder.phase != manifest.phase
+            || manifest.gate_metrics.phase != PromotionPhase::ShadowPassed
+            || !manifest.gate_metrics.promotion_allowed
+        {
+            return Err("funded ladder identity or phase is inconsistent".to_owned());
+        }
+    } else if manifest.phase != manifest.gate_metrics.phase
+        || !matches!(
+            manifest.phase,
+            PromotionPhase::Frozen
+                | PromotionPhase::RiskRepair
+                | PromotionPhase::ShadowCollecting
+                | PromotionPhase::ShadowPassed
+        )
+    {
+        return Err("pre-funded artifact claims a funded-only phase".to_owned());
+    }
+    Ok(manifest)
+}
+
+fn fail_closed_profitability_value(
+    mut value: Value,
+    canonical_funded_state: bool,
+    valid_current_schema: bool,
+) -> Value {
+    let Some(object) = value.as_object_mut() else {
+        return default_profitability_manifest();
+    };
+    object.insert("promotion_allowed".to_owned(), json!(false));
+    object.insert("human_authorization_required".to_owned(), json!(true));
+    if !canonical_funded_state {
+        object.remove("funded_ladder");
+    }
+    if !valid_current_schema {
+        object.insert("phase".to_owned(), json!("risk_repair"));
+        object.insert("status".to_owned(), json!("legacy_evidence_display_only"));
+        object.insert(
+            "blocking_reason".to_owned(),
+            json!("Legacy or invalid profitability evidence is display-only and cannot authorize promotion."),
+        );
+    }
+    value
+}
+
+fn default_profitability_manifest() -> Value {
+    json!({
+        "phase": "risk_repair",
+        "status": "funded_execution_frozen",
+        "candidate": {
+            "name": "dynamic_quote_style",
+            "version": "dynamic_quote_style@2026-06-14",
+            "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+        },
+        "blocking_reason": "Shadow profitability and execution-model gates have not passed.",
+        "capital": {
+            "original_starting_capital": 9.23,
+            "campaign_starting_equity": 5.030521,
+            "equity_floor": 4.03,
+            "max_campaign_drawdown": 1.0
+        },
+        "shadow": {
+            "clean_days": 0,
+            "required_clean_days": 30,
+            "settled_markets": 0,
+            "required_settled_markets": 1000,
+            "required_positive_weekly_blocks": 4
+        },
+        "data_quality": {
+            "status": "collecting",
+            "minimum_coverage": 0.95,
+            "fatal_warnings": 0,
+            "blocking_warnings": 0,
+            "unclassified_warnings": 0
+        },
+        "promotion_allowed": false,
+        "human_authorization_required": true
+    })
+}
+
+fn normalize_venue_execution_summary(mut value: Value) -> Value {
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let nested_probe = object
+        .get("probes")
+        .and_then(Value::as_array)
+        .and_then(|probes| probes.last())
+        .and_then(Value::as_object)
+        .cloned();
+    if let Some(probe) = nested_probe {
+        for key in [
+            "evidence_protocol_version",
+            "started_ts",
+            "finished_ts",
+            "status",
+            "order_submitted",
+            "order",
+            "lifecycle",
+            "markouts",
+            "portfolio",
+        ] {
+            if !object.contains_key(key) {
+                if let Some(field) = probe.get(key) {
+                    object.insert(key.to_owned(), field.clone());
+                }
+            }
+        }
+    }
+    let order_submitted = object
+        .get("order_submitted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    object
+        .entry("order_submission_attempted".to_owned())
+        .or_insert_with(|| json!(order_submitted));
+    object
+        .entry("submitted_order_count".to_owned())
+        .or_insert_with(|| json!(u8::from(order_submitted)));
+    let completed = object
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "completed" | "campaign_completed"));
+    object
+        .entry("completed_probe_count".to_owned())
+        .or_insert_with(|| json!(u8::from(completed && order_submitted)));
+    let eligibility = venue_evidence_eligibility(&value);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("evidence_eligibility".to_owned(), eligibility);
+    }
+    value
+}
+
+fn venue_evidence_eligibility(value: &Value) -> Value {
+    if !value.is_object() {
+        return Value::Null;
+    }
+    let protocol_version = value.get("evidence_protocol_version").and_then(json_u64);
+    let exact_protocol = protocol_version == Some(EVIDENCE_PROTOCOL_VERSION);
+    json!({
+        "required_protocol_version": EVIDENCE_PROTOCOL_VERSION,
+        "observed_protocol_version": protocol_version,
+        "exact_protocol_version": exact_protocol,
+        "legacy": !exact_protocol,
+        "legacy_eligibility": if exact_protocol { "requires_full_validator" } else { "display_only_legacy" },
+        "counts_toward_protocol_evidence": false,
+        "aggregate_promotion_ready": false,
+        "validation_status": if exact_protocol { "terminal_binding_and_full_protocol_v3_validation_required" } else { "ineligible_protocol_version" },
+        "reasons": if exact_protocol {
+            vec!["labs_api_does_not_assert_protocol_eligibility_without_terminal_binding"]
+        } else {
+            vec!["evidence_protocol_version_must_equal_3"]
+        }
+    })
+}
+
+fn artifact_provenance(
+    value: &Value,
+    path: &FsPath,
+    source: &str,
+    now: DateTime<Utc>,
+    legacy_eligibility: Option<&str>,
+) -> Value {
+    let (timestamp, timestamp_field) = artifact_timestamp(value);
+    let age_seconds =
+        timestamp.map(|timestamp| now.signed_duration_since(timestamp).num_seconds().max(0));
+    let fresh = age_seconds.is_some_and(|age| age <= ARTIFACT_FRESHNESS_SECONDS)
+        && timestamp.is_some_and(|timestamp| timestamp <= now);
+    json!({
+        "path": path.to_string_lossy(),
+        "source": source,
+        "available": value.is_object(),
+        "schema_version": value.get("schema_version").cloned().unwrap_or(Value::Null),
+        "authoritative_ts": timestamp.map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        "authoritative_ts_field": timestamp_field,
+        "age_seconds": age_seconds,
+        "freshness_window_seconds": ARTIFACT_FRESHNESS_SECONDS,
+        "fresh": fresh,
+        "freshness": if !value.is_object() { "unavailable" } else if timestamp.is_none() { "unknown" } else if fresh { "fresh" } else { "stale" },
+        "legacy_eligibility": legacy_eligibility.unwrap_or("not_applicable")
+    })
+}
+
+fn artifact_timestamp(value: &Value) -> (Option<DateTime<Utc>>, Option<&'static str>) {
+    for (pointer, field) in [
+        ("/funded_ladder/updated_at", "funded_ladder.updated_at"),
+        ("/updated_at", "updated_at"),
+        ("/finished_ts", "finished_ts"),
+        ("/generated_at", "generated_at"),
+        ("/generated_ts", "generated_ts"),
+        ("/created_at", "created_at"),
+        ("/captured_ts", "captured_ts"),
+    ] {
+        if let Some(timestamp) = value
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(parse_utc_timestamp)
+        {
+            return (Some(timestamp), Some(field));
+        }
+    }
+    (None, None)
+}
+
+fn venue_legacy_eligibility(value: &Value) -> &'static str {
+    match value.get("evidence_protocol_version").and_then(json_u64) {
+        Some(EVIDENCE_PROTOCOL_VERSION) => "current_protocol",
+        Some(_) => "display_only_legacy",
+        None if value.is_object() => "unknown_display_only",
+        None => "unavailable",
+    }
+}
+
+fn model_legacy_eligibility(value: &Value) -> &'static str {
+    match value.get("evidence_protocol_version").and_then(json_u64) {
+        Some(EVIDENCE_PROTOCOL_VERSION) => "current_protocol",
+        Some(_) => "display_only_legacy",
+        None if value.is_object() => "conservative_prior_only",
+        None => "unavailable",
+    }
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+}
+
+fn parse_utc_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn valid_prefixed_sha256(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn data_quality_latest(State(state): State<ApiState>) -> impl IntoResponse {
@@ -2016,6 +2563,207 @@ fn now_ts() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, TimeZone};
+    use polyedge_reporting::research::{
+        CandidateIdentity, DataQualitySummary, ExecutionModelBinding, FundedLadderStateV1,
+        ProfitabilityMetrics, PromotionEvaluation,
+    };
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn profitability_selection_prefers_newer_shadow_before_a_funded_ladder_exists() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
+        let funded =
+            test_promotion_manifest(now - Duration::hours(3), PromotionPhase::RiskRepair, false);
+        let shadow = test_promotion_manifest(
+            now - Duration::hours(1),
+            PromotionPhase::ShadowCollecting,
+            false,
+        );
+
+        let selected = select_profitability_artifact(
+            ProfitabilityArtifact::new(
+                serde_json::to_value(funded).unwrap(),
+                ProfitabilitySource::Funded,
+                now,
+            ),
+            ProfitabilityArtifact::new(
+                serde_json::to_value(shadow).unwrap(),
+                ProfitabilitySource::Shadow,
+                now,
+            ),
+            now,
+        );
+
+        assert_eq!(selected.value["phase"], "shadow_collecting");
+        assert_eq!(
+            selected.provenance["selected_source"],
+            "profitability_shadow"
+        );
+        assert_eq!(
+            selected.provenance["selection_reason"],
+            "newest_fresh_valid_manifest"
+        );
+        assert_eq!(selected.provenance["canonical_funded_state"], false);
+        assert_eq!(selected.value["promotion_allowed"], false);
+        assert!(selected.value.get("funded_ladder").is_none());
+    }
+
+    #[test]
+    fn profitability_selection_keeps_canonical_funded_state_over_newer_shadow() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
+        let mut funded =
+            test_promotion_manifest(now - Duration::hours(4), PromotionPhase::ShadowPassed, true);
+        let ladder = FundedLadderStateV1::new(funded.candidate.clone(), now - Duration::hours(3))
+            .expect("valid funded ladder");
+        funded.phase = ladder.phase;
+        funded.funded_ladder = Some(ladder);
+        let shadow = test_promotion_manifest(
+            now - Duration::minutes(5),
+            PromotionPhase::ShadowCollecting,
+            false,
+        );
+
+        let selected = select_profitability_artifact(
+            ProfitabilityArtifact::new(
+                serde_json::to_value(funded).unwrap(),
+                ProfitabilitySource::Funded,
+                now,
+            ),
+            ProfitabilityArtifact::new(
+                serde_json::to_value(shadow).unwrap(),
+                ProfitabilitySource::Shadow,
+                now,
+            ),
+            now,
+        );
+
+        assert_eq!(selected.value["phase"], "evidence_collecting");
+        assert_eq!(selected.provenance["selected_source"], "funded_evidence");
+        assert_eq!(
+            selected.provenance["selection_reason"],
+            "canonical_funded_state"
+        );
+        assert_eq!(selected.provenance["canonical_funded_state"], true);
+        assert!(selected.value["funded_ladder"].is_object());
+        assert_eq!(selected.value["promotion_allowed"], false);
+    }
+
+    #[test]
+    fn shadow_storage_cannot_masquerade_as_canonical_funded_state() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
+        let mut rogue_shadow = test_promotion_manifest(
+            now - Duration::minutes(5),
+            PromotionPhase::ShadowPassed,
+            true,
+        );
+        let ladder = FundedLadderStateV1::new(rogue_shadow.candidate.clone(), now)
+            .expect("valid ladder shape");
+        rogue_shadow.phase = ladder.phase;
+        rogue_shadow.funded_ladder = Some(ladder);
+
+        let selected = select_profitability_artifact(
+            ProfitabilityArtifact::new(Value::Null, ProfitabilitySource::Funded, now),
+            ProfitabilityArtifact::new(
+                serde_json::to_value(rogue_shadow).unwrap(),
+                ProfitabilitySource::Shadow,
+                now,
+            ),
+            now,
+        );
+
+        assert_eq!(selected.value["phase"], "risk_repair");
+        assert_eq!(selected.value["status"], "legacy_evidence_display_only");
+        assert_eq!(selected.value["promotion_allowed"], false);
+        assert!(selected.value.get("funded_ladder").is_none());
+        assert_eq!(selected.provenance["canonical_funded_state"], false);
+        assert_eq!(
+            selected.provenance["selected"]["valid_current_schema"],
+            false
+        );
+    }
+
+    #[test]
+    fn venue_summary_uses_latest_probe_and_preserves_standard_lifecycle_schema() {
+        let summary = json!({
+            "schema_version": 3,
+            "probes": [
+                {
+                    "evidence_protocol_version": 2,
+                    "status": "completed",
+                    "finished_ts": "2026-07-13T10:00:00Z",
+                    "order_submitted": true,
+                    "lifecycle": { "client_to_http_ack_ms": 9999 }
+                },
+                {
+                    "evidence_protocol_version": 3,
+                    "status": "completed",
+                    "started_ts": "2026-07-13T11:00:00Z",
+                    "finished_ts": "2026-07-13T11:01:00Z",
+                    "order_submitted": true,
+                    "order": { "size": 5, "inferredSizeAhead": 12 },
+                    "lifecycle": {
+                        "order_id": "order-new",
+                        "client_to_http_ack_ms": 41,
+                        "client_cancel_round_trip_ms": 52,
+                        "client_to_user_cancel_ack_ms": 63,
+                        "actual_matched_size": 2,
+                        "partial_fill": true,
+                        "fully_filled": false,
+                        "fill_raced_cancellation": true,
+                        "public_touch_trade_count": 4,
+                        "public_strict_trade_through_count": 3,
+                        "public_trade_through_without_fill_count": 1,
+                        "reconciliation_complete": true,
+                        "zero_open_orders_confirmed": true,
+                        "data_gap_detected": false,
+                        "cancellation_failure": false,
+                        "markout_capture_complete": true,
+                        "matched_size_source_agreement": true,
+                        "trade_id_source_agreement": true,
+                        "authenticated_user_channel_reconnects": 0,
+                        "public_market_channel_reconnects": 1
+                    },
+                    "markouts": [{ "fill_id": "trade-1", "horizon_seconds": 1 }]
+                }
+            ]
+        });
+
+        let normalized = normalize_venue_execution_summary(summary);
+
+        assert_eq!(normalized["evidence_protocol_version"], 3);
+        assert_eq!(normalized["finished_ts"], "2026-07-13T11:01:00Z");
+        assert_eq!(normalized["lifecycle"]["order_id"], "order-new");
+        assert_eq!(normalized["lifecycle"]["client_to_http_ack_ms"], 41);
+        assert_eq!(normalized["lifecycle"]["client_cancel_round_trip_ms"], 52);
+        assert_eq!(normalized["lifecycle"]["client_to_user_cancel_ack_ms"], 63);
+        assert_eq!(normalized["lifecycle"]["fill_raced_cancellation"], true);
+        assert_eq!(
+            normalized["lifecycle"]["public_strict_trade_through_count"],
+            3
+        );
+        assert_eq!(
+            normalized["lifecycle"]["matched_size_source_agreement"],
+            true
+        );
+        assert_eq!(
+            normalized["lifecycle"]["authenticated_user_channel_reconnects"],
+            0
+        );
+        assert_eq!(normalized["markouts"][0]["fill_id"], "trade-1");
+        assert_eq!(
+            normalized["evidence_eligibility"]["exact_protocol_version"],
+            true
+        );
+        assert_eq!(
+            normalized["evidence_eligibility"]["counts_toward_protocol_evidence"],
+            false
+        );
+        assert_eq!(
+            normalized["evidence_eligibility"]["validation_status"],
+            "terminal_binding_and_full_protocol_v3_validation_required"
+        );
+    }
 
     #[test]
     fn profitability_and_shadow_artifacts_route_to_isolated_research_container() {
@@ -2123,6 +2871,65 @@ mod tests {
         assert!(job["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("not configured") || detail.contains("hidden")));
+    }
+
+    fn test_promotion_manifest(
+        created_at: DateTime<Utc>,
+        phase: PromotionPhase,
+        shadow_gates_passed: bool,
+    ) -> PromotionManifestV1 {
+        let quality = DataQualitySummary::new(2, Decimal::ONE, Vec::new(), Vec::new());
+        let metrics = ProfitabilityMetrics {
+            observed_calendar_days: 0,
+            clean_days: 0,
+            settled_markets: 0,
+            wallet_constrained: true,
+            queue_conservative: true,
+            wallet_constrained_net_pnl: Decimal::ZERO,
+            wallet_constrained_ending_equity: Decimal::ZERO,
+            queue_conservative_net_pnl: Decimal::ZERO,
+            pnl_ci_95_low: Decimal::ZERO,
+            consecutive_positive_weekly_blocks: 0,
+            max_drawdown: Decimal::ZERO,
+            drawdown_limit: Decimal::ONE,
+            markout_30s_ci_low: Decimal::ZERO,
+            replay_runtime_parity: true,
+            decision_parity_rate: Decimal::ONE,
+            execution_model_protocol_version: 3,
+            execution_model_eligible_orders: 0,
+            execution_model_filled_orders: 0,
+            execution_model_non_filled_orders: 0,
+            execution_model_brier_improvement: Decimal::ZERO,
+            execution_model_expected_calibration_error: Decimal::ONE,
+            execution_model_promotion_ready: false,
+            execution_model_markout_30s_lower_95: Decimal::ZERO,
+            data_quality: quality,
+            missing_metrics: Vec::new(),
+        };
+        let candidate = CandidateIdentity {
+            name: "dynamic_quote_style".to_owned(),
+            candidate_version: "dynamic_quote_style@2026-06-14".to_owned(),
+            config_hash: format!("sha256:{}", "a".repeat(64)),
+        };
+        PromotionManifestV1::new(
+            candidate,
+            PromotionEvaluation {
+                schema_version: 1,
+                phase,
+                promotion_allowed: shadow_gates_passed,
+                gates: Vec::new(),
+                metrics,
+            },
+            BTreeMap::new(),
+            ExecutionModelBinding {
+                blob_uri: "azure://account/container/model.json".to_owned(),
+                sha256: format!("sha256:{}", "b".repeat(64)),
+                model_version: "conservative-execution-prior-v1".to_owned(),
+            },
+            created_at,
+            created_at + Duration::hours(24),
+        )
+        .expect("valid test promotion manifest")
     }
 
     fn build_atomic_test_bundle(date: &str, run_id: &str) {

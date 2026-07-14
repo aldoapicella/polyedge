@@ -130,6 +130,9 @@ enum ResearchCommand {
         format: String,
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         overwrite: bool,
+        /// Preserve decision-grade state and trades while sampling high-rate books.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        decision_grade_projection: bool,
     },
     QueueAudit {
         #[arg(long, default_value = "data/research/normalized")]
@@ -583,11 +586,13 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             out,
             format,
             overwrite,
+            decision_grade_projection,
         } => run_normalize(NormalizeOptions {
             input,
             out,
             format,
             overwrite,
+            decision_grade_projection,
         })?,
         ResearchCommand::QueueAudit {
             input,

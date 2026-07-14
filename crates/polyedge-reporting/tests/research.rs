@@ -61,6 +61,7 @@ fn normalized_audit_preserves_and_summarizes_runtime_provenance() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip-sharded".to_owned(),
         overwrite: true,
+        decision_grade_projection: false,
     })
     .unwrap();
     assert_eq!(
@@ -244,6 +245,7 @@ fn normalize_and_build_markets_preserve_incomplete_markets() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
     let report = run_build_markets(BuildMarketsOptions {
@@ -286,14 +288,16 @@ fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
-    assert!(normalized.join("book_snapshots.jsonl").is_file());
-    assert!(normalized.join("price_changes.jsonl").is_file());
+    assert!(normalized.join("books.jsonl").is_file());
+    assert!(normalized.join("raw_market_events.jsonl").is_file());
     assert!(normalized.join("last_trades.jsonl").is_file());
-    assert_eq!(manifest["result"]["files"]["book_snapshot"]["rows"], 1);
-    assert_eq!(manifest["result"]["files"]["price_change"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["book"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["raw_market_event"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["price_change"]["rows"], 0);
     assert_eq!(manifest["result"]["files"]["last_trade"]["rows"], 1);
 
     let markets_path = dir.join("markets.json");
@@ -320,6 +324,100 @@ fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
 }
 
 #[test]
+fn decision_grade_projection_bounds_books_and_preserves_pre_decision_state_and_trades() {
+    let dir = test_dir("decision_grade_projection");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.48", "5", "2026-06-01T00:00:30.100+00:00"),
+            bid_book_line("up", "0.49", "5", "2026-06-01T00:00:30.500+00:00"),
+            raw_price_change_line("up", "0.49", "5", "2026-06-01T00:00:30.600+00:00"),
+            trade_line("up", "0.49", "2", "2026-06-01T00:00:30.700+00:00"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:31.100+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:00:31.200+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+
+    let manifest = run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+        decision_grade_projection: true,
+    })
+    .unwrap();
+
+    assert_eq!(manifest["result"]["input_events"], 8);
+    assert_eq!(manifest["result"]["events"], 7);
+    assert_eq!(manifest["result"]["files"]["book"]["rows"], 2);
+    assert_eq!(manifest["result"]["files"]["raw_market_event"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["last_trade"]["rows"], 1);
+    let books = fs::read_to_string(normalized.join("books.jsonl")).unwrap();
+    assert!(!books.contains("\"0.48\""));
+    assert!(books.contains("\"0.49\""));
+    assert!(books.contains("\"0.50\""));
+
+    let markets = dir.join("markets.json");
+    run_build_markets(BuildMarketsOptions {
+        input: normalized.clone(),
+        out: markets.clone(),
+        markdown: dir.join("markets.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let queue_audit = run_queue_audit(QueueAuditOptions {
+        input: normalized,
+        markets,
+        out: dir.join("queue_audit.json"),
+        markdown: dir.join("queue_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(queue_audit["result"]["queue_proxy_eligible_markets"], 1);
+}
+
+#[test]
+fn decision_grade_projection_flushes_sparse_tokens_in_global_time_order() {
+    let dir = test_dir("decision_grade_projection_ordering");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.48", "5", "2026-06-01T00:00:30.100+00:00"),
+            bid_book_line("down", "0.51", "5", "2026-06-01T00:00:30.200+00:00"),
+            bid_book_line("up", "0.49", "5", "2026-06-01T00:00:31.100+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:00:31.200+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+        decision_grade_projection: true,
+    })
+    .unwrap();
+
+    let audit = run_audit(AuditOptions {
+        input: normalized,
+        out: dir.join("audit.json"),
+        markdown: dir.join("audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(audit["result"]["out_of_order_timestamps"], 0);
+}
+
+#[test]
 fn chart_backfill_writes_read_only_chart_artifact() {
     let dir = test_dir("chart_backfill");
     let raw = dir.join("raw.jsonl");
@@ -340,6 +438,7 @@ fn chart_backfill_writes_read_only_chart_artifact() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -376,6 +475,7 @@ fn gzip_normalized_outputs_feed_build_markets_and_replay() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -418,6 +518,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip-sharded".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -477,6 +578,7 @@ fn sharded_gzip_reader_reorders_local_shard_timestamp_inversions() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip-sharded".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -505,6 +607,7 @@ fn normalize_rejects_unknown_format_without_removing_output() {
         out: normalized.clone(),
         format: "parquet-ish".to_owned(),
         overwrite: true,
+        decision_grade_projection: false,
     })
     .unwrap_err()
     .to_string();
@@ -807,6 +910,33 @@ fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
 }
 
 #[test]
+fn queue_proxy_uses_runtime_full_depth_snapshot_instead_of_compact_top_only_book() {
+    let dir = test_dir("queue_proxy_runtime_size_ahead");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_no_level_line("up", "0.50", "2", "2026-06-01T00:00:30+00:00"),
+            raw_price_change_line("up", "0.50", "2", "2026-06-01T00:00:45+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            r#"{"event_type":"paper_order_queue_registration","payload":{"order_id":"order-1","market_id":"m1","token_id":"up","side":"buy","quote_price":"0.50","order_size":"5"},"recorded_ts":"2026-06-01T00:01:00.010+00:00"}"#,
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:00.300+00:00"),
+            bid_book_no_level_line("up", "0.50", "2", "2026-06-01T00:01:00.400+00:00"),
+            r#"{"event_type":"paper_order_queue_snapshot","payload":{"order_id":"order-1","market_id":"m1","token_id":"up","side":"buy","quote_price":"0.50","order_size":"5","visible_size_ahead_estimate":"12"},"recorded_ts":"2026-06-01T00:01:00.401+00:00"}"#,
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["avg_size_ahead"], "12");
+    assert_eq!(report["result"]["fills"], 0);
+}
+
+#[test]
 fn queue_proxy_uses_raw_price_change_size_for_size_ahead() {
     let dir = test_dir("queue_proxy_price_change_size");
     let events = dir.join("events.jsonl");
@@ -1016,6 +1146,7 @@ fn normalize_redacts_secret_fields_without_redacting_public_token_ids() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
     let normalized_events = fs::read_to_string(normalized.join("events.jsonl")).unwrap();

@@ -2,15 +2,25 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { fundedChildEnvironment, runFundedLadderController } from "../src/funded-ladder-controller.mjs";
-import { canonicalBookHash, sha256, validateCanaryPreflight } from "../src/canary-lib.mjs";
+import { modelObservations } from "../src/lib.mjs";
+import {
+  canonicalBookHash,
+  canonicalMarkoutBookHash,
+  canonicalMarkoutBookSnapshot,
+  sha256,
+  validateCanaryPreflight
+} from "../src/canary-lib.mjs";
 import {
   buildFundedIntentAuthorization,
   buildFundedCheckpointEvidence,
   buildStageBlock,
   buildStageConsumption,
   canonicalStateHash,
+  checkpointOneChainRoot,
+  cumulativeProgressHash,
   loadFundedLadderConfig,
   putImmutableJson,
+  progressPayloadHash,
   validateBeforeEveryOrder,
   validateProtocolV3ChildEvidence,
   validateProtocolV3ChildSummary,
@@ -20,6 +30,7 @@ import {
 const h = (char) => `sha256:${char.repeat(64)}`;
 const now = new Date("2026-07-13T12:00:00Z");
 const candidate = { name: "dynamic_quote_style", candidate_version: "dynamic_quote_style@test", config_hash: h("a") };
+const settlementWallet = "0x1111111111111111111111111111111111111111";
 
 function state() {
   const value = {
@@ -31,6 +42,8 @@ function state() {
     stage_authorized: false, consumed_grant_ids: ["canary"], terminal: false,
     promotion_allowed: false, created_at: now.toISOString(), updated_at: now.toISOString()
   };
+  value.checkpoint_1_protocol_v3_artifact = { blob_name: "runs/run-1/summary.json", sha256: h("1") };
+  value.checkpoint_1_terminal_artifact = { blob_name: "terminal/probe-1.json", sha256: h("5") };
   return value;
 }
 
@@ -130,6 +143,7 @@ function stageInitializationFixture({ afterPersist } = {}) {
     FUNDED_LADDER_CONTROLLER_ENABLED: "true",
     ALLOW_FUNDED_LADDER: "true",
     FUNDED_LADDER_DRY_RUN: "false",
+    FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
     FUNDED_LADDER_MANIFEST_BLOB_NAME: "profitability/latest.json",
     FUNDED_LADDER_MANIFEST_SHA256: sha256(manifestBytes),
     FUNDED_LADDER_GRANT_BLOB_NAME: "grants/stage-5.json",
@@ -142,58 +156,269 @@ function stageInitializationFixture({ afterPersist } = {}) {
 }
 
 function protocolV3CheckpointEntries(count = 5) {
-  return Array.from({ length: count }, (_, index) => {
+  const entries = Array.from({ length: count }, (_, index) => {
     const sequence = index + 1;
     const run = `run-${sequence}`;
     const probe = `probe-${sequence}`;
     const order = `order-${sequence}`;
     const started = new Date(Date.UTC(2026, 6, 13 + index, 12)).toISOString();
     const observed = new Date(Date.UTC(2026, 6, 13 + index, 13)).toISOString();
-    return {
+    const expectedControlBinding = {
+      child_run_id: run,
+      consumption_blob_name: `control/consumption-${sequence}.json`,
+      consumption_sha256: h("b"),
+      authorization_blob_name: `control/authorization-${sequence}.json`,
+      authorization_sha256: h("c"),
+      intent_blob_name: `control/intent-${sequence}.json`,
+      intent_sha256: h("d"),
+      manifest_blob_name: "profitability/latest.json",
+      manifest_sha256: h("e"),
+      prediction_model: { blob_uri: "azure://st/models/model.json", sha256: h("b"), model_version: "queue-v1" }
+    };
+    const entry = {
       sequence,
       summaryBinding: { blob_name: `runs/${run}/summary.json`, sha256: h(String(sequence)) },
       terminalBinding: { blob_name: `terminal/${probe}.json`, sha256: h(String(sequence + 4)) },
+      progressBinding: sequence === 1 ? null : { blob_name: `progress/${sequence}.json`, sha256: h("f") },
+      progress: null,
+      expectedControlBinding,
       summary: {
         schema_version: 3,
         evidence_protocol_version: 3,
         status: "completed",
         run_id: run,
         started_ts: started,
+        finished_ts: new Date(Date.parse(started) + 31_000).toISOString(),
+        funder_address: settlementWallet,
         order_submission_attempted: true,
         order_submitted: true,
         submitted_order_count: 1,
         completed_probe_count: 1,
         candidate,
-        probes: [{
-          probe_id: probe,
-          lifecycle: { order_id: order, actual_matched_size: 1 },
-          markouts: [1, 5, 30].map((horizon) => ({ horizon_seconds: horizon, fill_size: 1, executable_markout_per_share: 0.02 })),
-          model_observations: [{
-            eligible: true,
-            quality_eligible: true,
-            reconciliation_complete: true,
-            zero_open_orders_confirmed: true,
-            data_gap_detected: false,
-            cancellation_failure: false
-          }]
-        }]
+        prediction_model: {
+          ...expectedControlBinding.prediction_model,
+          generated_at: "2026-07-12T00:00:00Z",
+          training_data_end_ts: null
+        },
+        provenance: {
+          decision_id: `decision-${sequence}`,
+          funded_stage_consumption_blob_name: expectedControlBinding.consumption_blob_name,
+          funded_stage_consumption_sha256: expectedControlBinding.consumption_sha256,
+          authorization_blob_name: expectedControlBinding.authorization_blob_name,
+          authorization_sha256: expectedControlBinding.authorization_sha256,
+          intent_blob_name: expectedControlBinding.intent_blob_name,
+          intent_sha256: expectedControlBinding.intent_sha256,
+          promotion_manifest_blob_name: expectedControlBinding.manifest_blob_name,
+          promotion_manifest_sha256: expectedControlBinding.manifest_sha256
+        },
+        probes: [completeProtocolV3Probe({ probeId: probe, orderId: order, started })]
       },
       terminal: {
         schema: "polyedge.canary_terminal_risk_portfolio.v1",
+        producer: "polyedge_node_authenticated_risk_terminal",
+        source: "polymarket_data_api_plus_onchain_redemption",
         run_id: run,
         probe_id: probe,
         order_id: order,
+        condition_id: `condition-${sequence}`,
+        settlement_verified: true,
+        settlement_transaction_hash: `0x${String(sequence).padStart(64, "0")}`,
+        polygon_chain_id: 137,
+        transaction_receipt_status: "success",
+        transaction_block_number: sequence,
+        transaction_receipt_confirmations: 2,
+        redemption_condition_ids: [`condition-${sequence}`],
+        settlement_wallet: settlementWallet,
+        trust_boundary_ready: true,
         portfolio_reconciled: true,
         zero_open_orders_confirmed: true,
         unresolved_exposure: 0,
+        unresolved_risk_reservations: 0,
         reconciliation_discrepancy: 0,
         campaign_starting_equity: 5,
         net_external_cash_flows: 0,
+        liquid_collateral: 5 + sequence / 100,
+        summed_position_value: 0,
         cash_flow_adjusted_ending_equity: 5 + sequence / 100,
+        minimum_observed_equity: 5,
+        maximum_observed_equity: 5 + sequence / 100,
         observed_at: observed
       }
     };
+    return entry;
   });
+  let cumulative = checkpointOneChainRoot(state());
+  for (const entry of entries.slice(1)) {
+    const payload = progressPayloadHash({
+      sequence: entry.sequence,
+      decisionId: `decision-${entry.sequence}`,
+      expectedControlBinding: entry.expectedControlBinding,
+      summaryBinding: entry.summaryBinding,
+      terminalBinding: entry.terminalBinding
+    });
+    const next = cumulativeProgressHash(cumulative, payload);
+    entry.progress = {
+      schema: "polyedge.funded_stage_order_progress.v1",
+      campaign_id: "campaign",
+      candidate,
+      sequence: entry.sequence,
+      decision_id: `decision-${entry.sequence}`,
+      protocol_v3_summary_blob_name: entry.summaryBinding.blob_name,
+      protocol_v3_summary_sha256: entry.summaryBinding.sha256,
+      terminal_evidence_blob_name: entry.terminalBinding.blob_name,
+      terminal_evidence_sha256: entry.terminalBinding.sha256,
+      expected_control_binding: entry.expectedControlBinding,
+      progress_payload_sha256: payload,
+      prior_cumulative_evidence_sha256: cumulative,
+      cumulative_evidence_sha256: next
+    };
+    cumulative = next;
+  }
+  return entries;
+}
+
+function completeProtocolV3Probe({ probeId = "probe-1", orderId = "order-1", started = now.toISOString() } = {}) {
+  const sendWallMs = Date.parse(started);
+  const ackWallMs = sendWallMs + 100;
+  const fillWallMs = ackWallMs + 500;
+  const tradeId = `trade-${probeId}`;
+  const context = {
+    source: "public_market_channel_before_submission",
+    captured_wall_ms: sendWallMs - 50,
+    observed_trade_count: 2,
+    observed_trade_size: 3,
+    observed_depth_changes: 4,
+    price_volatility: 0.01
+  };
+  return {
+    schema_version: 3,
+    evidence_protocol_version: 3,
+    probe_id: probeId,
+    status: "completed",
+    order_submitted: true,
+    market: { conditionId: `condition-${probeId.replace("probe-", "") || "1"}`, tokenId: "token-1", endTs: null },
+    order: { side: "BUY", size: 1, price: 0.2, spread: 0.02, inferredSizeAhead: 4 },
+    pre_send_context: context,
+    lifecycle: {
+      order_id: orderId,
+      send_wall_ms: sendWallMs,
+      ack_wall_ms: ackWallMs,
+      client_to_http_ack_ms: 100,
+      clock_server_minus_local_ms: 0,
+      clock_round_trip_ms: 10,
+      clock_uncertainty_ms: 5,
+      cancel_send_wall_ms: null,
+      client_cancel_round_trip_ms: null,
+      client_to_user_cancel_ack_ms: null,
+      live_duration_ms: 1_000,
+      first_fill_after_ack_ms: 500,
+      actual_matched_size: 1,
+      venue_fee_model: "polymarket_clob_v2_curve",
+      venue_fee_rate: 0,
+      venue_fee_rate_bps: 0,
+      venue_fee_exponent: 0,
+      venue_fee_taker_only: true,
+      estimated_round_trip_cost_per_share: 0,
+      partial_fill: false,
+      fully_filled: true,
+      fill_raced_cancellation: false,
+      post_cancel_fill_count: 0,
+      first_fill_after_cancel_ms: null,
+      public_touch_trade_count: 1,
+      public_strict_trade_through_count: 1,
+      public_trade_through_without_fill_count: 0,
+      related_trade_ids: [tradeId],
+      live_user_trade_ids: [tradeId],
+      rest_order_matched_size: 1,
+      user_order_matched_size: 1,
+      rest_trade_matched_size: 1,
+      user_trade_matched_size: 1,
+      matched_size_source_agreement: true,
+      trade_id_source_agreement: true,
+      rest_order_returned: true,
+      authenticated_user_channel_reconnects: 0,
+      public_market_channel_reconnects: 0,
+      authenticated_user_channel_unparsed: 0,
+      public_market_channel_unparsed: 0,
+      authenticated_user_channel_duplicates: 0,
+      public_market_channel_duplicates: 0,
+      post_cancel_finality_stable: true,
+      post_cancel_observation_ms: 10_000,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true,
+      data_gap_detected: false,
+      cancellation_failure: false,
+      markout_capture_complete: true
+    },
+    markouts: [1, 5, 30].map((horizon) => {
+      const target = fillWallMs + horizon * 1_000;
+      const rawOrderbook = canonicalMarkoutBookSnapshot({
+        tick_size: "0.01", min_order_size: "1", hash: "1".repeat(40),
+        bids: [{ price: "0.22", size: "2" }], asks: [{ price: "0.24", size: "2" }]
+      }, "token-1");
+      return {
+        fill_id: tradeId,
+        horizon_seconds: horizon,
+        fill_timestamp: new Date(fillWallMs).toISOString(),
+        venue_fill_timestamp: new Date(fillWallMs).toISOString(),
+        target_observation_ts: new Date(target).toISOString(),
+        request_started_at: new Date(target).toISOString(),
+        response_completed_at: new Date(target + 100).toISOString(),
+        observed_at: new Date(target + 100).toISOString(),
+        response_duration_ms: 100,
+        observation_delay_ms: 100,
+        raw_orderbook: rawOrderbook,
+        book_hash: canonicalMarkoutBookHash(rawOrderbook),
+        venue_book_hash: "1".repeat(40),
+        venue_book_timestamp: new Date(target + 100).toISOString(),
+        fill_size: 1,
+        fill_price: 0.2,
+        trader_side: null,
+        authenticated_order_role: null,
+        authenticated_fee_rate_bps: null,
+        authenticated_fee_amount: null,
+        authenticated_fee_raw: null,
+        entry_fee_per_share: 0,
+        hypothetical_exit_fee_per_share: 0,
+        round_trip_fee_per_share: 0,
+        midpoint: 0.23,
+        executable_price: 0.22,
+        midpoint_markout_per_share: 0.03,
+        executable_markout_per_share: 0.02
+      };
+    }),
+    model_observations: [1, 5, 30, 60].map((horizon) => ({
+      horizon_seconds: horizon,
+      order_submitted: true,
+      eligible: true,
+      label_observed: true,
+      quality_eligible: true,
+      filled: true,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true,
+      data_gap_detected: false,
+      cancellation_failure: false,
+      markout_complete: true,
+      markout_timing_valid: true,
+      executable_markout_30s_per_share: 0.02,
+      venue_fee_model: "polymarket_clob_v2_curve",
+      venue_fee_rate: 0,
+      venue_fee_rate_bps: 0,
+      venue_fee_exponent: 0,
+      venue_fee_taker_only: true,
+      entry_fee_per_share: 0,
+      hypothetical_exit_fee_per_share: 0,
+      estimated_round_trip_cost_per_share: 0,
+      inferred_size_ahead: 4,
+      spread: 0.02,
+      order_price: 0.2,
+      order_size: 1,
+      time_to_expiry_seconds: null,
+      pre_send_trade_size: context.observed_trade_size,
+      pre_send_depth_changes: context.observed_depth_changes,
+      pre_send_volatility: context.price_volatility
+    }))
+  };
 }
 
 test("module is import-safe and deployed defaults remain disabled", () => {
@@ -403,6 +628,7 @@ test("concurrent stage grants CAS canonical latest so exactly one authorization 
     FUNDED_LADDER_CONTROLLER_ENABLED: "true",
     ALLOW_FUNDED_LADDER: "true",
     FUNDED_LADDER_DRY_RUN: "false",
+    FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
     FUNDED_LADDER_MANIFEST_BLOB_NAME: "profitability/latest.json",
     FUNDED_LADDER_MANIFEST_SHA256: sha256(manifestBytes),
     FUNDED_LADDER_GRANT_BLOB_NAME: `grants/${grants[index].grant_id}.json`,
@@ -620,6 +846,7 @@ test("checkpoint-100 target-200 queue-model authorization passes funded prefligh
     maxReferenceAgeMs: 2_000,
     maxBookAgeMs: 1_000,
     maxClockDriftMs: 5_000,
+    maxClockUncertaintyMs: 750,
     expectedCountry: "IE",
     expectedEgressIp: "203.0.113.8",
     intentBlobName: intentDocument.blobName,
@@ -638,10 +865,18 @@ test("checkpoint-100 target-200 queue-model authorization passes funded prefligh
   const runtime = {
     geoblock: { blocked: false, country: "IE", ip: canaryConfig.expectedEgressIp },
     clockDriftMs: 25,
+    clockServerMinusLocalMs: 25,
+    clockRoundTripMs: 100,
+    clockUncertaintyMs: 550,
     risk: { passed: true, blockers: [] },
     openOrderCount: 0,
     market: { marketId: intent.market_id, conditionId: intent.condition_id, tokenId: intent.token_id, acceptingOrders: true, closed: false },
     book,
+    feeModel: "polymarket_clob_v2_curve",
+    feeRate: 0,
+    feeRateBps: 0,
+    feeExponent: 0,
+    feeTakerOnly: true,
     fillModelVersion: "queue-calibration-v1",
     exactResolutionSource: true,
     resolutionSource: "chainlink_reference"
@@ -726,27 +961,333 @@ test("stage block is immutable-path and exact canonical manifest/state bound", (
 test("filled protocol-v3 evidence can pause pending terminal, but terminal admission is exact identity-bound", () => {
   const consumption = buildStageConsumption({ ...inputs(), runId: "run-1", now }).value;
   const decisionId = "f".repeat(64);
+  const expectedBinding = {
+    child_run_id: "funded-run",
+    consumption_blob_name: "control/stage-consumption.json",
+    consumption_sha256: h("e"),
+    authorization_blob_name: "control/authorization.json",
+    authorization_sha256: h("a"),
+    intent_blob_name: "control/intent.json",
+    intent_sha256: h("b"),
+    manifest_blob_name: "profitability/latest.json",
+    manifest_sha256: consumption.authorized_manifest_sha256,
+    prediction_model: {
+      blob_uri: consumption.execution_model.blob_uri,
+      sha256: consumption.execution_model.sha256,
+      model_version: consumption.execution_model.model_version
+    }
+  };
   const summary = {
-    schema_version: 3, evidence_protocol_version: 3, run_id: "funded-run", order_submission_attempted: true,
-    submitted_order_count: 1,
+    schema_version: 3, evidence_protocol_version: 3, run_id: "funded-run", status: "completed",
+    started_ts: now.toISOString(), finished_ts: new Date(now.getTime() + 31_000).toISOString(),
+    funder_address: settlementWallet, candidate,
+    prediction_model: {
+      blob_uri: consumption.execution_model.blob_uri, sha256: consumption.execution_model.sha256,
+      model_version: consumption.execution_model.model_version, generated_at: "2026-07-12T00:00:00Z",
+      training_data_end_ts: null
+    },
+    order_submission_attempted: true, order_submitted: true, submitted_order_count: 1, completed_probe_count: 1,
     provenance: {
       authorization_kind: "funded_stage", decision_id: decisionId,
       funded_stage_grant_id: consumption.grant_id, funded_stage_grant_sha256: consumption.grant_sha256,
-      funded_stage_consumption_sha256: h("e"), funded_stage_source_state_sha256: consumption.source_state_sha256,
-      funded_stage_target_orders: consumption.stage_target_orders
+      funded_stage_consumption_blob_name: expectedBinding.consumption_blob_name,
+      funded_stage_consumption_sha256: expectedBinding.consumption_sha256,
+      funded_stage_source_state_sha256: consumption.source_state_sha256,
+      funded_stage_target_orders: consumption.stage_target_orders,
+      authorization_blob_name: expectedBinding.authorization_blob_name,
+      authorization_sha256: expectedBinding.authorization_sha256,
+      intent_blob_name: expectedBinding.intent_blob_name,
+      intent_sha256: expectedBinding.intent_sha256,
+      promotion_manifest_blob_name: expectedBinding.manifest_blob_name,
+      promotion_manifest_sha256: expectedBinding.manifest_sha256
     },
-    probes: [{
-      probe_id: "probe-1", lifecycle: { order_id: "order-1", actual_matched_size: 1 },
-      model_observations: [{ eligible: true, quality_eligible: true, reconciliation_complete: true,
-        zero_open_orders_confirmed: true, data_gap_detected: false, cancellation_failure: false,
-        markout_complete: true, markout_timing_valid: true }]
-    }]
+    probes: [completeProtocolV3Probe()]
   };
-  const pending = validateProtocolV3ChildSummary({ summary, consumption, decisionId });
+  const validateSummary = (value) => validateProtocolV3ChildSummary({
+    summary: value, consumption, decisionId, expectedBinding
+  });
+  const validateEvidence = (value, terminalValue) => validateProtocolV3ChildEvidence({
+    summary: value, terminal: terminalValue, consumption, decisionId, expectedBinding
+  });
+  const pending = validateSummary(summary);
   assert.equal(pending.filled, true);
-  const terminal = { schema: "polyedge.canary_terminal_risk_portfolio.v1", run_id: "funded-run", probe_id: "probe-1", order_id: "order-1", portfolio_reconciled: true, zero_open_orders_confirmed: true, unresolved_exposure: 0 };
-  assert.equal(validateProtocolV3ChildEvidence({ summary, terminal, consumption, decisionId }).orderId, "order-1");
-  assert.throws(() => validateProtocolV3ChildEvidence({ summary, terminal: { ...terminal, order_id: "other" }, consumption, decisionId }), /identity-mismatched/);
+
+  // Exercise the real JS model-row producer through the independent funded
+  // admission validator. This prevents the producer and validator schemas from
+  // silently drifting while hand-built fixtures continue to pass.
+  const producerSummary = structuredClone(summary);
+  const producerProbe = producerSummary.probes[0];
+  producerProbe.model_observations = modelObservations({
+    order: producerProbe.order,
+    market: producerProbe.market,
+    lifecycle: producerProbe.lifecycle,
+    context: producerProbe.pre_send_context,
+    markouts: producerProbe.markouts
+  });
+  assert.equal(producerProbe.model_observations[0].venue_fee_rate_bps, 0);
+  assert.equal(producerProbe.model_observations[0].estimated_round_trip_cost_per_share, 0);
+  assert.equal(validateSummary(producerSummary).filled, true);
+
+  // V2 fees are a market curve and apply only to the taker. A post-only maker
+  // entry therefore has zero entry fee, while a conservative hypothetical exit
+  // pays the taker curve at the executable bid.
+  const feeBearingSummary = structuredClone(summary);
+  const feeProbe = feeBearingSummary.probes[0];
+  const feeRate = 0.07;
+  const feeRateBps = 700;
+  const feeExponent = 1;
+  const exitFee = feeRate * (0.22 * (1 - 0.22)) ** feeExponent;
+  Object.assign(feeProbe.lifecycle, {
+    venue_fee_rate: feeRate,
+    venue_fee_rate_bps: feeRateBps,
+    venue_fee_exponent: feeExponent,
+    venue_fee_taker_only: true,
+    estimated_round_trip_cost_per_share: exitFee
+  });
+  for (const row of feeProbe.markouts) Object.assign(row, {
+    trader_side: "MAKER",
+    authenticated_order_role: "MAKER",
+    authenticated_fee_rate_bps: 0,
+    authenticated_fee_amount: null,
+    authenticated_fee_raw: { fee_rate_bps: "0", fee: null, fee_usdc: null, builder_fee: null },
+    entry_fee_per_share: 0,
+    hypothetical_exit_fee_per_share: exitFee,
+    round_trip_fee_per_share: exitFee
+  });
+  feeProbe.model_observations = modelObservations({
+    order: feeProbe.order,
+    market: feeProbe.market,
+    lifecycle: feeProbe.lifecycle,
+    context: feeProbe.pre_send_context,
+    markouts: feeProbe.markouts
+  });
+  assert.equal(feeProbe.model_observations[0].venue_fee_rate_bps, feeRateBps);
+  assert.ok(Math.abs(feeProbe.model_observations[0].hypothetical_exit_fee_per_share - 0.012012) < 1e-12);
+  assert.equal(validateSummary(feeBearingSummary).filled, true);
+
+  // A genuine no-fill still has market fee parameters, but incurs no entry or
+  // exit fee and has no per-fill markouts. It remains eligible once stable
+  // authenticated terminal finality proves that no later fill can occur.
+  const feeBearingNoFill = structuredClone(feeBearingSummary);
+  const noFillProbe = feeBearingNoFill.probes[0];
+  const noFillLifecycle = noFillProbe.lifecycle;
+  Object.assign(noFillLifecycle, {
+    cancel_send_wall_ms: noFillLifecycle.ack_wall_ms + 200,
+    cancel_http_response_wall_ms: noFillLifecycle.ack_wall_ms + 250,
+    user_channel_cancel_received_wall_ms: noFillLifecycle.ack_wall_ms + 270,
+    client_cancel_round_trip_ms: 50,
+    client_to_user_cancel_ack_ms: 70,
+    first_fill_after_ack_ms: null,
+    actual_matched_size: 0,
+    partial_fill: false,
+    fully_filled: false,
+    fill_raced_cancellation: false,
+    post_cancel_fill_count: 0,
+    first_fill_after_cancel_ms: null,
+    related_trade_ids: [],
+    live_user_trade_ids: [],
+    rest_order_matched_size: 0,
+    user_order_matched_size: 0,
+    rest_trade_matched_size: 0,
+    user_trade_matched_size: 0,
+    estimated_round_trip_cost_per_share: 0
+  });
+  noFillProbe.markouts = [];
+  noFillProbe.model_observations = modelObservations({
+    order: noFillProbe.order,
+    market: noFillProbe.market,
+    lifecycle: noFillLifecycle,
+    context: noFillProbe.pre_send_context,
+    markouts: []
+  });
+  assert.ok(noFillProbe.model_observations.every((row) => row.eligible && row.estimated_round_trip_cost_per_share === 0));
+  assert.equal(validateSummary(feeBearingNoFill).filled, false);
+  const canceled = structuredClone(summary);
+  const canceledLifecycle = canceled.probes[0].lifecycle;
+  canceledLifecycle.cancel_send_wall_ms = canceledLifecycle.ack_wall_ms + 200;
+  canceledLifecycle.cancel_http_response_wall_ms = canceledLifecycle.cancel_send_wall_ms + 50;
+  canceledLifecycle.user_channel_cancel_received_wall_ms = canceledLifecycle.cancel_send_wall_ms + 70;
+  canceledLifecycle.client_cancel_round_trip_ms = 50;
+  canceledLifecycle.client_to_user_cancel_ack_ms = 70;
+  canceledLifecycle.fill_raced_cancellation = true;
+  canceledLifecycle.post_cancel_fill_count = 1;
+  canceledLifecycle.first_fill_after_cancel_ms = 300;
+  assert.equal(validateSummary(canceled).filled, true);
+  canceledLifecycle.client_to_user_cancel_ack_ms = 68;
+  assert.throws(() => validateSummary(canceled), /chronology/);
+  const terminal = {
+    schema: "polyedge.canary_terminal_risk_portfolio.v1",
+    producer: "polyedge_node_authenticated_risk_terminal",
+    source: "polymarket_data_api_plus_onchain_redemption",
+    settlement_verified: true,
+    settlement_transaction_hash: `0x${"a".repeat(64)}`,
+    condition_id: "condition-1",
+    polygon_chain_id: 137,
+    transaction_receipt_status: "success",
+    transaction_block_number: 1,
+    transaction_receipt_confirmations: 2,
+    redemption_condition_ids: ["condition-1"],
+    settlement_wallet: settlementWallet,
+    trust_boundary_ready: true,
+    run_id: "funded-run",
+    probe_id: "probe-1",
+    order_id: "order-1",
+    portfolio_reconciled: true,
+    zero_open_orders_confirmed: true,
+    unresolved_exposure: 0,
+    unresolved_risk_reservations: 0,
+    reconciliation_discrepancy: 0,
+    campaign_starting_equity: 5,
+    net_external_cash_flows: 0,
+    liquid_collateral: 5.1,
+    summed_position_value: 0,
+    cash_flow_adjusted_ending_equity: 5.1,
+    minimum_observed_equity: 5,
+    maximum_observed_equity: 5.1,
+    observed_at: new Date(now.getTime() + 32_000).toISOString()
+  };
+  assert.equal(validateEvidence(summary, terminal).orderId, "order-1");
+  assert.throws(() => validateEvidence(summary, { ...terminal, order_id: "other" }), /identity-mismatched/);
+
+  const forgedBoolean = structuredClone(summary);
+  forgedBoolean.probes[0].lifecycle.rest_trade_matched_size = 0;
+  assert.throws(() => validateSummary(forgedBoolean), /independently reconcile/);
+
+  const missingHorizon = structuredClone(summary);
+  missingHorizon.probes[0].model_observations.pop();
+  assert.throws(() => validateSummary(missingHorizon), /exactly 1\/5\/30\/60/);
+
+  const lateMarkout = structuredClone(summary);
+  lateMarkout.probes[0].markouts[0].observation_delay_ms = 2_001;
+  assert.throws(() => validateSummary(lateMarkout), /timing/);
+
+  const staleFinality = structuredClone(summary);
+  staleFinality.probes[0].lifecycle.post_cancel_observation_ms = 9_999;
+  assert.throws(() => validateSummary(staleFinality), /stable, zero-open/);
+
+  const hiddenGap = structuredClone(summary);
+  hiddenGap.probes[0].lifecycle.authenticated_user_channel_unparsed = 1;
+  assert.throws(() => validateSummary(hiddenGap), /unclosed data-gap/);
+
+  const producerOnlyEligibility = structuredClone(summary);
+  producerOnlyEligibility.probes[0].pre_send_context.captured_wall_ms = producerOnlyEligibility.probes[0].lifecycle.send_wall_ms + 1;
+  assert.throws(() => validateSummary(producerOnlyEligibility), /captured after/);
+
+  const forgedFirstFill = structuredClone(summary);
+  forgedFirstFill.probes[0].lifecycle.first_fill_after_ack_ms = 1;
+  assert.throws(() => validateSummary(forgedFirstFill), /first-fill timing/);
+
+  const forgedModelFeature = structuredClone(summary);
+  forgedModelFeature.probes[0].model_observations[0].inferred_size_ahead = 999;
+  assert.throws(() => validateSummary(forgedModelFeature), /raw order\/market features/);
+
+  const forgedPositiveMarkout = structuredClone(summary);
+  forgedPositiveMarkout.probes[0].markouts[2].executable_markout_per_share = 0.9;
+  assert.throws(() => validateSummary(forgedPositiveMarkout), /claimed BUY markout/);
+
+  const tamperedRawBook = structuredClone(summary);
+  tamperedRawBook.probes[0].markouts[2].raw_orderbook.bids[0].price = "0.23";
+  assert.throws(() => validateSummary(tamperedRawBook), /raw orderbook/);
+
+  const wrongVenueHash = structuredClone(summary);
+  wrongVenueHash.probes[0].markouts[2].venue_book_hash = "different-venue-hash";
+  assert.throws(() => validateSummary(wrongVenueHash), /venue hash/);
+
+  const missingVenueHash = structuredClone(summary);
+  missingVenueHash.probes[0].markouts[2].raw_orderbook.venue_hash = null;
+  missingVenueHash.probes[0].markouts[2].venue_book_hash = null;
+  missingVenueHash.probes[0].markouts[2].book_hash = canonicalMarkoutBookHash(
+    missingVenueHash.probes[0].markouts[2].raw_orderbook
+  );
+  assert.throws(() => validateSummary(missingVenueHash), /venue hash/);
+
+  const inconsistentFill = structuredClone(summary);
+  inconsistentFill.probes[0].markouts[1].fill_price = 0.19;
+  inconsistentFill.probes[0].markouts[1].midpoint_markout_per_share = 0.04;
+  inconsistentFill.probes[0].markouts[1].executable_markout_per_share = 0.03;
+  assert.throws(() => validateSummary(inconsistentFill), /inconsistent prices/);
+
+  const forgedRowMarkout = structuredClone(summary);
+  forgedRowMarkout.probes[0].model_observations[0].executable_markout_30s_per_share = 0.9;
+  assert.throws(() => validateSummary(forgedRowMarkout), /derived 30-second/);
+
+  const forgedFeeCost = structuredClone(summary);
+  forgedFeeCost.probes[0].lifecycle.venue_fee_rate = 0.01;
+  forgedFeeCost.probes[0].lifecycle.venue_fee_rate_bps = 100;
+  forgedFeeCost.probes[0].lifecycle.estimated_round_trip_cost_per_share = 0.001;
+  for (const row of forgedFeeCost.probes[0].model_observations) {
+    row.venue_fee_rate_bps = 100;
+    row.estimated_round_trip_cost_per_share = 0.001;
+  }
+  assert.throws(() => validateSummary(forgedFeeCost), /fee-bearing|venue fee|Polymarket V2/);
+
+  const missingFeeSide = structuredClone(feeBearingSummary);
+  for (const row of missingFeeSide.probes[0].markouts) row.trader_side = null;
+  assert.throws(() => validateSummary(missingFeeSide), /missing trader_side/);
+
+  const makerChargedFee = structuredClone(feeBearingSummary);
+  for (const row of makerChargedFee.probes[0].markouts) row.authenticated_fee_amount = 0.001;
+  assert.throws(() => validateSummary(makerChargedFee), /maker fill reports a nonzero/);
+
+  const forgedFeeExponent = structuredClone(feeBearingSummary);
+  forgedFeeExponent.probes[0].lifecycle.venue_fee_exponent = 2;
+  for (const row of forgedFeeExponent.probes[0].model_observations) row.venue_fee_exponent = 2;
+  assert.throws(() => validateSummary(forgedFeeExponent), /independently recomputed Polymarket V2|round-trip cost/);
+
+  const oversizedFill = structuredClone(summary);
+  oversizedFill.probes[0].lifecycle.actual_matched_size = 2;
+  for (const field of ["rest_order_matched_size", "user_order_matched_size", "rest_trade_matched_size", "user_trade_matched_size"]) {
+    oversizedFill.probes[0].lifecycle[field] = 2;
+  }
+  assert.throws(() => validateSummary(oversizedFill), /exceeds submitted order size/);
+
+  const preOrderFill = structuredClone(summary);
+  const forgedFillAt = preOrderFill.probes[0].lifecycle.send_wall_ms - 10;
+  for (const row of preOrderFill.probes[0].markouts) {
+    row.fill_timestamp = new Date(forgedFillAt).toISOString();
+    row.venue_fill_timestamp = row.fill_timestamp;
+    row.target_observation_ts = new Date(forgedFillAt + row.horizon_seconds * 1_000).toISOString();
+    row.request_started_at = row.target_observation_ts;
+    row.response_completed_at = new Date(Date.parse(row.target_observation_ts) + 100).toISOString();
+    row.observed_at = row.response_completed_at;
+    row.venue_book_timestamp = row.response_completed_at;
+  }
+  assert.throws(() => validateSummary(preOrderFill), /predates order submission/);
+
+  const forgedRequestChronology = structuredClone(summary);
+  forgedRequestChronology.probes[0].markouts[0].request_started_at = new Date(
+    Date.parse(forgedRequestChronology.probes[0].markouts[0].target_observation_ts) - 1
+  ).toISOString();
+  assert.throws(() => validateSummary(forgedRequestChronology), /raw timestamps/);
+
+  const wrongCandidate = structuredClone(summary);
+  wrongCandidate.candidate.config_hash = h("f");
+  assert.throws(() => validateSummary(wrongCandidate), /candidate/);
+
+  const wrongModel = structuredClone(summary);
+  wrongModel.prediction_model.sha256 = h("f");
+  assert.throws(() => validateSummary(wrongModel), /prediction model/);
+
+  const terminalBeforeSummary = { ...terminal, observed_at: new Date(now.getTime() + 30_000).toISOString() };
+  assert.throws(() => validateEvidence(summary, terminalBeforeSummary), /predates completion/);
+
+  assert.throws(() => validateEvidence(summary, {
+    ...terminal,
+    transaction_receipt_confirmations: 1
+  }), /settlement\/redemption proof/);
+  assert.throws(() => validateEvidence(summary, {
+    ...terminal,
+    redemption_condition_ids: ["condition-other"]
+  }), /settlement\/redemption proof/);
+  assert.throws(() => validateEvidence(summary, {
+    ...terminal,
+    redemption_condition_ids: ["condition-1", "CONDITION-1"]
+  }), /duplicate/);
+
+  assert.throws(() => validateProtocolV3ChildSummary({
+    summary, consumption, decisionId,
+    expectedBinding: { ...expectedBinding, child_run_id: "wrong-child" }
+  }), /exact loaded parent control artifacts/);
 });
 
 test("retry publishes the exact checkpoint when progress reached quota before checkpoint persistence", async () => {
@@ -765,6 +1306,27 @@ test("retry publishes the exact checkpoint when progress reached quota before ch
   source.manifest.funded_ladder.checkpoint_1_terminal_artifact = entries[0].terminalBinding;
   source.manifest.funded_ladder.last_verified_terminal_artifact = entries[0].terminalBinding;
   source.grant.source_state_sha256 = canonicalStateHash(source.manifest.funded_ladder);
+  let cumulative = checkpointOneChainRoot(source.manifest.funded_ladder);
+  for (const entry of entries.slice(1)) {
+    const payload = progressPayloadHash({
+      sequence: entry.sequence,
+      decisionId: `decision-${entry.sequence}`,
+      expectedControlBinding: entry.expectedControlBinding,
+      summaryBinding: entry.summaryBinding,
+      terminalBinding: entry.terminalBinding
+    });
+    const next = cumulativeProgressHash(cumulative, payload);
+    Object.assign(entry.progress, {
+      protocol_v3_summary_blob_name: entry.summaryBinding.blob_name,
+      protocol_v3_summary_sha256: entry.summaryBinding.sha256,
+      terminal_evidence_blob_name: entry.terminalBinding.blob_name,
+      terminal_evidence_sha256: entry.terminalBinding.sha256,
+      progress_payload_sha256: payload,
+      prior_cumulative_evidence_sha256: cumulative,
+      cumulative_evidence_sha256: next
+    });
+    cumulative = next;
+  }
   const consumption = buildStageConsumption({ ...source, now });
   const canonicalBytes = Buffer.from(JSON.stringify(consumption.authorizedManifest, null, 2));
   const consumptionBytes = Buffer.from(JSON.stringify(consumption.value, null, 2));
@@ -775,6 +1337,7 @@ test("retry publishes the exact checkpoint when progress reached quota before ch
   for (const entry of entries.slice(1)) {
     const probe = entry.summary.probes[0];
     const progress = {
+      ...entry.progress,
       schema: "polyedge.funded_stage_order_progress.v1",
       grant_id: consumption.value.grant_id,
       campaign_id: consumption.value.campaign_id,
@@ -783,10 +1346,6 @@ test("retry publishes the exact checkpoint when progress reached quota before ch
       stage_target_orders: 5,
       sequence: entry.sequence,
       decision_id: `decision-${entry.sequence}`,
-      protocol_v3_summary_blob_name: entry.summaryBinding.blob_name,
-      protocol_v3_summary_sha256: entry.summaryBinding.sha256,
-      terminal_evidence_blob_name: entry.terminalBinding.blob_name,
-      terminal_evidence_sha256: entry.terminalBinding.sha256,
       completed_at: entry.terminal.observed_at
     };
     documents.set(`${progressPrefix}/decision-${entry.sequence}.json`, Buffer.from(JSON.stringify(progress)));
@@ -803,6 +1362,7 @@ test("retry publishes the exact checkpoint when progress reached quota before ch
     FUNDED_LADDER_CONTROLLER_ENABLED: "true",
     ALLOW_FUNDED_LADDER: "true",
     FUNDED_LADDER_DRY_RUN: "false",
+    FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
     FUNDED_LADDER_MANIFEST_BLOB_NAME: source.config.manifestBlobName,
     FUNDED_LADDER_MANIFEST_SHA256: sha256(canonicalBytes),
     FUNDED_LADDER_CONSUMPTION_BLOB_NAME: consumption.blobName,
@@ -849,16 +1409,29 @@ test("target-5 checkpoint producer derives cumulative cross-grant evidence and r
   assert.ok(Math.abs(checkpoint.cumulative_net_pnl - 0.05) < 1e-9);
   assert.equal(checkpoint.markout_sample_size, 5);
   assert.equal(checkpoint.protocol_v3_order_artifacts[0].blob_name, "runs/run-1/summary.json");
+  assert.equal(checkpoint.checkpoint_1_chain_root_sha256, checkpointOneChainRoot(manifest.funded_ladder));
+  assert.equal(checkpoint.final_cumulative_evidence_sha256, entries.at(-1).progress.cumulative_evidence_sha256);
+  assert.deepEqual(checkpoint.progress_artifacts, entries.slice(1).map((entry) => entry.progressBinding));
+  assert.deepEqual(checkpoint.control_bindings, entries.map((entry) => entry.expectedControlBinding));
   assert.throws(() => buildFundedCheckpointEvidence({ manifest, entries: entries.slice(1) }), /exact cumulative sequence count/);
   const duplicateSequence = structuredClone(entries);
   duplicateSequence[4].sequence = 4;
   assert.throws(() => buildFundedCheckpointEvidence({ manifest, entries: duplicateSequence }), /missing, duplicated/);
   const duplicateIdentity = structuredClone(entries);
   duplicateIdentity[4].summary.run_id = duplicateIdentity[3].summary.run_id;
+  duplicateIdentity[4].expectedControlBinding.child_run_id = duplicateIdentity[3].summary.run_id;
   duplicateIdentity[4].summary.probes[0].probe_id = duplicateIdentity[3].summary.probes[0].probe_id;
   duplicateIdentity[4].summary.probes[0].lifecycle.order_id = duplicateIdentity[3].summary.probes[0].lifecycle.order_id;
   duplicateIdentity[4].terminal.run_id = duplicateIdentity[3].terminal.run_id;
   duplicateIdentity[4].terminal.probe_id = duplicateIdentity[3].terminal.probe_id;
   duplicateIdentity[4].terminal.order_id = duplicateIdentity[3].terminal.order_id;
   assert.throws(() => buildFundedCheckpointEvidence({ manifest, entries: duplicateIdentity }), /duplicated/);
+
+  const forgedParent = structuredClone(entries);
+  forgedParent[2].progress.expected_control_binding.intent_sha256 = h("9");
+  assert.throws(() => buildFundedCheckpointEvidence({ manifest, entries: forgedParent }), /parent control|order\/control evidence bindings/);
+
+  const brokenChain = structuredClone(entries);
+  brokenChain[3].progress.prior_cumulative_evidence_sha256 = h("9");
+  assert.throws(() => buildFundedCheckpointEvidence({ manifest, entries: brokenChain }), /cumulative progress hash chain/);
 });

@@ -79,6 +79,13 @@ Shadow promotion uses an immutable, zero-fill conservative prior. It deliberatel
 
 The first practical model remains regularized and low-capacity. It is trained exactly once from orders 1–100, only after checkpoint 100 contains at least 100 distinct protocol-v3 eligible orders, including 10 fills and 10 non-fills. The immutable model artifact binds the exact checkpoint, dataset hash, training cutoff, order identities, and generation time. Orders 101–200 then use that frozen model without refitting. The terminal evaluation recomputes Brier score, expected calibration error, markout performance, cash-flow-adjusted net PnL, maximum drawdown, and the per-order PnL lower 95% bound only on this genuinely later holdout.
 
+Protocol-v3 admission is exact and independently revalidated from raw evidence.
+The controller and reporter derive fill timing, cancellation races, source
+agreement, markout completeness, and 1/5/30/60-second labels instead of trusting
+summary flags. They bind the recorded model features to the actual order,
+market, and pre-send book context. Older funded orders remain visible in
+lifetime PnL, but are display-only evidence and never increase a v3 checkpoint.
+
 The trained model must improve Brier score over the horizon base-rate predictor by at least 5%, keep expected calibration error at or below 0.10, and retain a positive lower confidence bound for net executable markout. At checkpoints 25/100/200, the predeclared execution threshold is at least 10 filled orders with complete 30-second markouts and a positive lower 95% bound; it does not incorrectly require every funded order to fill. The orders 101–200 holdout must independently have positive net PnL, drawdown within `$1.00`, and a positive per-order PnL lower 95% bound. In-sample gains cannot mask a losing holdout or produce `profitable_go`.
 
 Exact FIFO position remains unavailable. The only honest label is:
@@ -101,11 +108,35 @@ The continuous shadow worker runs in North Europe without wallet credentials, pu
 
 The East US paper/API identity has no storage account key, no Key Vault secret-reader role, and no write access to funded evidence or trained models. Historical/research jobs publish immutable, hashed `COMPLETE` bundles before updating `latest`; dependent jobs wait instead of reading partial or stale results.
 
+The current North Europe funded topology still shares one managed identity and
+process boundary between the credentialed child and funded control writer. It
+therefore does **not** yet satisfy independent funded-evidence attestation.
+Deployment keeps `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY=false`, and every
+non-dry-run probe, canary, or ladder path fails closed while that remains false.
+Shadow collection and research publishing are unaffected.
+
+Before any funded stage can be authorized, Azure must split canonical control,
+the venue signer, and terminal attestation into distinct identities and
+containers: the controller has no secrets; the signer cannot write control or
+promotion state; the attestor cannot sign orders; and all communication is by
+immutable, hash-bound artifacts plus an exact Container Apps Job execution ID.
+RBAC-negative tests must prove each forbidden access before the trust flag may
+be enabled. The detailed closure plan is in
+[`execution-quality-limitations.md`](execution-quality-limitations.md#remaining-funded-evidence-trust-boundary).
+
 A passing shadow creates `shadow_passed`, not `canary_ready` and not a live order. Only the isolated controller can create the one-use `canary_ready` transition, and only after it atomically consumes a short-lived human grant bound to the exact candidate, promotion manifest, execution-model artifact, and first qualifying future intent. Dry-run controllers are read-only and cannot burn a grant, create an authorization, or invoke an order child.
 
 The funded ladder is sequential and re-evaluated after exactly 1, 5, 25, 100, and at most 200 eligible orders. Each later stage requires a new short-lived, exact-state human grant. A submitted but ineligible order, orphan authorization, unresolved fill, missing terminal artifact, crash after authorization, drawdown breach, or data-quality failure blocks replacement spending. Stages 1 and 5 require positive realized PnL and positive mean 30-second net markout; stages 25 and later require a positive 95% markout lower bound. Checkpoint 100 additionally requires the immutable trained-model transition. Checkpoint 200 additionally requires the frozen-model orders-101–200 holdout to pass. No deposit or automatic replenishment is permitted by the default configuration.
 
 Azure persists the canary, ladder, model-training, redemption, and promotion-transition jobs as manual, disabled, fail-closed jobs with empty exact artifact references. Deployment never starts them. A passing terminal `profitable_go` remains evidence, not automatic permission to trade; future capital deployment is a separate human decision.
+
+The Labs API reports source, freshness, schema validity, and selection reason
+for the shadow, funded, model, probe, and redemption artifacts. A real valid
+canonical funded ladder remains authoritative even if older than a shadow
+artifact. Before canonical funded state exists, selection prefers the newest
+fresh valid manifest so a stale funded placeholder cannot hide current shadow
+progress. These fields are observability metadata only and cannot authorize an
+order or satisfy the terminal evidence validator.
 
 Canonical promotion transitions are race-safe. Each result is first written to an immutable content-addressed transition blob, then `latest.json` is replaced with an Azure ETag compare-and-swap against `PROMOTION_TRANSITION_EXPECTED_CANONICAL_SHA256`. A stale or concurrent job fails closed and cannot regress the ladder. Stage authorization itself also moves canonical state with ETag compare-and-swap, so the exact authorized prior hash must equal the expected canonical hash before advancement. The first passed-shadow initialization may create funded `latest.json` only with `If-None-Match: *`.
 

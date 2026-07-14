@@ -43,6 +43,7 @@ test("execution model URI resolves its exact cross-container artifact", () => {
 function fixture(dryRun = true) {
   const config = {
     dryRun,
+    trustBoundaryReady: true,
     candidateName: "dynamic_quote_style",
     candidateVersion: "dynamic_quote_style@2026-06-14",
     candidateConfigHash: "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c",
@@ -151,11 +152,18 @@ function fixture(dryRun = true) {
   const runtime = {
     geoblock: { blocked: false, country: "IE", ip: config.expectedEgressIp },
     clockDriftMs: 25,
+    clockServerMinusLocalMs: 25,
+    clockRoundTripMs: 20,
+    clockUncertaintyMs: 11,
     risk: { passed: true, blockers: [] },
     openOrderCount: 0,
     market: { marketId: intent.market_id, conditionId: intent.condition_id, tokenId: intent.token_id, acceptingOrders: true, closed: false },
     book,
+    feeModel: "polymarket_clob_v2_curve",
+    feeRate: 0,
     feeRateBps: 0,
+    feeExponent: 0,
+    feeTakerOnly: true,
     fillModelVersion: config.requiredFillModelVersion,
     exactResolutionSource: true,
     resolutionSource: config.requiredResolutionSource
@@ -308,9 +316,12 @@ test("all per-fill markout deadlines are scheduled concurrently", async () => {
   const capture = beginFillMarkoutCapture({
     async getOrderBook(tokenId) {
       calls.push({ tokenId, at: Date.now() });
-      return { bids: [{ price: "0.45" }], asks: [{ price: "0.55" }] };
+      return { bids: [{ price: "0.45", size: "3" }], asks: [{ price: "0.55", size: "3" }], hash: "a".repeat(40) };
     }
-  }, "token-1", () => visible, { horizons: [10, 20, 30], horizonScaleMs: 1, pollMs: 1 });
+  }, "token-1", () => visible, {
+    horizons: [10, 20, 30], horizonScaleMs: 1, pollMs: 1,
+    feeParameters: { rate: 0, rateBps: 0, exponent: 0, takerOnly: true }
+  });
   await new Promise((resolve) => setTimeout(resolve, 2));
   visible = [];
   const rows = await capture.finish(fills);
@@ -320,5 +331,34 @@ test("all per-fill markout deadlines are scheduled concurrently", async () => {
   assert.equal(calls.length, 6);
   assert.ok(rows.every((row) => row.fill_size > 0));
   assert.ok(rows.every((row) => row.midpoint !== null && row.executable_price !== null));
+  assert.ok(rows.every((row) => row.request_started_at <= row.response_completed_at));
+  assert.ok(rows.every((row) => row.observed_at === row.response_completed_at));
+  assert.ok(rows.every((row) => row.response_duration_ms >= 0));
+  assert.ok(rows.every((row) => /^sha256:[0-9a-f]{64}$/.test(row.book_hash)));
   assert.ok(Date.now() - started < 100, "concurrent deadlines should complete near the longest horizon");
+});
+
+test("markout delay is measured after the order-book response completes", async () => {
+  const clock = [0, 1, 10_001];
+  const capture = beginFillMarkoutCapture({
+    async getOrderBook() {
+      return {
+        timestamp: 10_001,
+        hash: "b".repeat(40),
+        bids: [{ price: "0.45", size: "1" }],
+        asks: [{ price: "0.55", size: "1" }]
+      };
+    }
+  }, "token-1", () => [], {
+    horizons: [1],
+    horizonScaleMs: 1,
+    pollMs: 1,
+    nowMs: () => clock.shift() ?? 10_001
+    ,feeParameters: { rate: 0, rateBps: 0, exponent: 0, takerOnly: true }
+  });
+  const [row] = await capture.finish([{ id: "fill-slow", size: 1, price: 0.4, timestampMs: 0 }]);
+  assert.equal(row.request_started_at, "1970-01-01T00:00:00.001Z");
+  assert.equal(row.response_completed_at, "1970-01-01T00:00:10.001Z");
+  assert.equal(row.response_duration_ms, 10_000);
+  assert.equal(row.observation_delay_ms, 10_000);
 });

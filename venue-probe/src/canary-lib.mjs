@@ -14,6 +14,7 @@ export function loadCanaryConfig(env = process.env) {
     allowCanary: boolean(env.ALLOW_STRATEGY_CANARY),
     enableTakerOrders: boolean(env.ENABLE_TAKER_ORDERS),
     dryRun: env.STRATEGY_CANARY_DRY_RUN !== "false",
+    trustBoundaryReady: boolean(env.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY),
     intentBlobName: clean(env.STRATEGY_CANARY_INTENT_BLOB_NAME),
     intentBlobHash: normalizeHash(env.STRATEGY_CANARY_INTENT_SHA256),
     manifestBlobName: clean(env.STRATEGY_CANARY_PROMOTION_MANIFEST_BLOB_NAME),
@@ -34,6 +35,7 @@ export function loadCanaryConfig(env = process.env) {
     expectedCountry: clean(env.VENUE_PROBE_EXPECTED_COUNTRY).toUpperCase(),
     expectedEgressIp: clean(env.VENUE_PROBE_EXPECTED_EGRESS_IP),
     maxClockDriftMs: integer(env.VENUE_PROBE_MAX_CLOCK_DRIFT_MS, 5000),
+    maxClockUncertaintyMs: integer(env.VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS, 750),
     maxOrderNotional: number(env.STRATEGY_CANARY_MAX_ORDER_NOTIONAL, 1),
     maxReferenceAgeMs: integer(env.STRATEGY_CANARY_MAX_REFERENCE_AGE_MS, 2000),
     maxBookAgeMs: integer(env.STRATEGY_CANARY_MAX_BOOK_AGE_MS, 1000),
@@ -68,6 +70,7 @@ export function loadCanaryConfig(env = process.env) {
 export function validateCanaryConfig(config) {
   const errors = [];
   if (config.executionMode !== "strategy_canary") errors.push("EXECUTION_MODE must equal strategy_canary");
+  if (!config.dryRun && config.trustBoundaryReady !== true) errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control isolation");
   if (config.allowLive) errors.push("ALLOW_LIVE must remain false");
   if (!config.allowCanary) errors.push("ALLOW_STRATEGY_CANARY must be true");
   if (config.enableTakerOrders) errors.push("ENABLE_TAKER_ORDERS must remain false");
@@ -128,6 +131,44 @@ export function canonicalBookHash(book, tokenId) {
     bids: levels(book?.bids),
     asks: levels(book?.asks)
   })));
+}
+
+/**
+ * Immutable, lossless-enough order-book evidence used by protocol-v3 markouts.
+ * Numeric strings are normalized before hashing so the independent admission
+ * validator can recompute prices and the exact content digest without trusting
+ * producer-derived best-price fields.
+ */
+export function canonicalMarkoutBookSnapshot(book, tokenId) {
+  const levels = (values) => (values || [])
+    .map((row) => ({ price: decimal(row?.price), size: decimal(row?.size) }))
+    .filter((row) => row.price !== null && row.size !== null)
+    .sort((left, right) => Number(left.price) - Number(right.price) || Number(left.size) - Number(right.size));
+  return {
+    token_id: String(tokenId),
+    tick_size: decimal(book?.tick_size ?? book?.tickSize),
+    min_order_size: decimal(book?.min_order_size ?? book?.minOrderSize),
+    bids: levels(book?.bids),
+    asks: levels(book?.asks),
+    venue_hash: clean(book?.venue_hash ?? book?.hash) || null
+  };
+}
+
+export function canonicalMarkoutBookHash(rawBook) {
+  return sha256(Buffer.from(stableJson(rawBook)));
+}
+
+export function polymarketV2FeePerShare(price, feeRate, feeExponent) {
+  const p = Number(price);
+  const rate = Number(feeRate);
+  const exponent = Number(feeExponent);
+  if (!Number.isFinite(p) || p < 0 || p > 1 ||
+      !Number.isFinite(rate) || rate < 0 || rate > 1 ||
+      !Number.isFinite(exponent) || exponent < 0 || exponent > 10) {
+    throw new Error("fail closed: Polymarket V2 fee parameters are invalid");
+  }
+  if (rate === 0) return 0;
+  return rate * (p * (1 - p)) ** exponent;
 }
 
 export function validateCanaryPreflight({ config, intent, manifest, authorization, executionModel, executionModelHash, runtime, now = new Date() }) {
@@ -212,6 +253,11 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
 
   if (runtime.geoblock?.blocked !== false || String(runtime.geoblock?.country || "").toUpperCase() !== config.expectedCountry || runtime.geoblock?.ip !== config.expectedEgressIp) fail("geoblock country or static egress validation failed");
   if (!Number.isFinite(runtime.clockDriftMs) || runtime.clockDriftMs > config.maxClockDriftMs) fail("clock drift exceeds limit");
+  if (!Number.isFinite(runtime.clockServerMinusLocalMs) || !Number.isFinite(runtime.clockRoundTripMs)
+      || !Number.isFinite(runtime.clockUncertaintyMs) || runtime.clockRoundTripMs < 0
+      || runtime.clockUncertaintyMs < 0 || runtime.clockUncertaintyMs > config.maxClockUncertaintyMs) {
+    fail("clock uncertainty exceeds limit");
+  }
   if (runtime.risk?.passed !== true) fail(`campaign equity/risk gate failed (${(runtime.risk?.blockers || ["unknown"]).join(", ")})`);
   if (Number(runtime.openOrderCount) !== 0) fail("account has open orders");
   if (String(runtime.market?.marketId) !== String(intent.market_id) || String(runtime.market?.conditionId) !== String(intent.condition_id) || String(runtime.market?.tokenId) !== String(intent.token_id)) fail("market, condition, or token identity mismatch");
@@ -224,6 +270,16 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (!(tick > 0) || Math.abs(price / tick - Math.round(price / tick)) > 1e-7) fail("intent price does not agree with the current tick size");
   const minimumOrderSize = Number(runtime.book?.min_order_size ?? runtime.book?.minOrderSize);
   if (!(minimumOrderSize > 0) || Math.abs(minimumOrderSize - intentMinimumOrderSize) > 1e-9 || shares + 1e-9 < minimumOrderSize) fail("intent shares or bound minimum_order_size disagree with the venue");
+  const feeRate = Number(runtime.feeRate);
+  const feeRateBps = Number(runtime.feeRateBps);
+  const feeExponent = Number(runtime.feeExponent);
+  if (runtime.feeModel !== "polymarket_clob_v2_curve" ||
+      !Number.isFinite(feeRate) || feeRate < 0 || feeRate > 1 ||
+      !Number.isFinite(feeRateBps) || Math.abs(feeRate * 10_000 - feeRateBps) > 1e-6 ||
+      !Number.isFinite(feeExponent) || feeExponent < 0 || feeExponent > 10 ||
+      (feeRate > 0 && runtime.feeTakerOnly !== true)) {
+    fail("exact Polymarket V2 fee rate/exponent/taker-only parameters are required");
+  }
   return { price, shares, notional, validUntilMs, venueExpiryMs: expiryMs, actualBookHash };
 }
 
@@ -256,13 +312,21 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
   if (config.dryRun) {
     return { status: "strategy_intent_validated_no_order", order_submission_attempted: false, authorization_consumed: false, decision_id: documents.intent.decision_id };
   }
-  const feeRiskUpperBound = validated.notional * Number(runtime.feeRateBps || 0) / 10_000;
+  const feeRiskUpperBound = validated.shares * polymarketV2FeePerShare(
+    validated.price,
+    runtime.feeRate,
+    runtime.feeExponent
+  );
   const reservation = await reserveRisk({
     run_id: runId,
     probe_id: `strategy-canary-${documents.intent.decision_id}`,
     reserved_notional: validated.notional + feeRiskUpperBound,
     principal_notional: validated.notional,
+    fee_model: "polymarket_clob_v2_curve",
+    fee_rate: runtime.feeRate,
     fee_rate_bps: runtime.feeRateBps,
+    fee_exponent: runtime.feeExponent,
+    fee_taker_only: runtime.feeTakerOnly,
     fee_risk_upper_bound: feeRiskUpperBound,
     market_id: documents.intent.market_id,
     condition_id: documents.intent.condition_id,
@@ -290,6 +354,7 @@ export function beginFillMarkoutCapture(client, tokenId, currentFills, options =
   const horizonScaleMs = options.horizonScaleMs ?? 1000;
   const pollMs = options.pollMs ?? 50;
   const nowMs = options.nowMs || Date.now;
+  const feeParameters = normalizeV2FeeParameters(options.feeParameters);
   const scheduled = new Map();
   const abortController = new AbortController();
   let stopping = false;
@@ -298,22 +363,47 @@ export function beginFillMarkoutCapture(client, tokenId, currentFills, options =
     const capture = Promise.all(horizons.map(async (horizon) => {
       const deadlineMs = fill.timestampMs + horizon * horizonScaleMs;
       await sleepAbortable(Math.max(0, deadlineMs - nowMs()), abortController.signal);
-      const observedAt = nowMs();
+      const requestStartedAt = nowMs();
       const book = await client.getOrderBook(tokenId);
+      const responseCompletedAt = nowMs();
       const bids = (book.bids || []).map((row) => Number(row.price)).filter(Number.isFinite);
       const asks = (book.asks || []).map((row) => Number(row.price)).filter(Number.isFinite);
       const bestBid = bids.length ? Math.max(...bids) : null;
       const bestAsk = asks.length ? Math.min(...asks) : null;
       const midpoint = bestBid === null || bestAsk === null ? null : (bestBid + bestAsk) / 2;
+      const venueBookTimestampMs = finiteTimestampMs(book?.timestamp ?? book?.ts);
+      const rawOrderbook = canonicalMarkoutBookSnapshot(book, tokenId);
+      if (!/^[0-9a-f]{40}$/i.test(rawOrderbook.venue_hash || "")) {
+        throw new Error("fail closed: exact venue SHA-1 order-book hash is required for markout evidence");
+      }
+      const fees = fillFeeEvidence(fill, bestBid, feeParameters);
       return {
         fill_id: fill.id,
         horizon_seconds: horizon,
         fill_timestamp: new Date(fill.timestampMs).toISOString(),
+        venue_fill_timestamp: Number.isFinite(Number(fill.venueTimestampMs))
+          ? new Date(Number(fill.venueTimestampMs)).toISOString()
+          : null,
         target_observation_ts: new Date(deadlineMs).toISOString(),
-        observed_at: new Date(observedAt).toISOString(),
-        observation_delay_ms: observedAt - deadlineMs,
+        request_started_at: new Date(requestStartedAt).toISOString(),
+        response_completed_at: new Date(responseCompletedAt).toISOString(),
+        observed_at: new Date(responseCompletedAt).toISOString(),
+        response_duration_ms: responseCompletedAt - requestStartedAt,
+        observation_delay_ms: responseCompletedAt - deadlineMs,
+        venue_book_timestamp: venueBookTimestampMs === null ? null : new Date(venueBookTimestampMs).toISOString(),
+        venue_book_hash: book?.hash ? String(book.hash) : null,
+        raw_orderbook: rawOrderbook,
+        book_hash: canonicalMarkoutBookHash(rawOrderbook),
         fill_size: fill.size,
         fill_price: fill.price,
+        trader_side: fees.traderSide,
+        authenticated_order_role: fees.orderRole,
+        authenticated_fee_rate_bps: fees.authenticatedFeeRateBps,
+        authenticated_fee_amount: fees.authenticatedFeeAmount,
+        authenticated_fee_raw: fees.authenticatedFeeRaw,
+        entry_fee_per_share: fees.entryFeePerShare,
+        hypothetical_exit_fee_per_share: fees.hypotheticalExitFeePerShare,
+        round_trip_fee_per_share: fees.roundTripFeePerShare,
         midpoint,
         executable_price: bestBid,
         midpoint_markout_per_share: midpoint === null ? null : midpoint - fill.price,
@@ -345,6 +435,75 @@ export function beginFillMarkoutCapture(client, tokenId, currentFills, options =
       await Promise.allSettled([...scheduled.values()]);
     }
   };
+}
+
+function normalizeV2FeeParameters(value) {
+  const rate = Number(value?.rate);
+  const exponent = Number(value?.exponent);
+  const rateBps = Number(value?.rateBps);
+  const takerOnly = value?.takerOnly;
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1 ||
+      !Number.isFinite(exponent) || exponent < 0 || exponent > 10 ||
+      !Number.isFinite(rateBps) || rateBps < 0 || rateBps > 10_000 ||
+      Math.abs(rate * 10_000 - rateBps) > 1e-6 ||
+      (rate > 0 && takerOnly !== true)) {
+    throw new Error("fail closed: exact Polymarket V2 market fee parameters are required for markouts");
+  }
+  return { rate, exponent, rateBps, takerOnly: takerOnly === true };
+}
+
+function fillFeeEvidence(fill, executablePrice, feeParameters) {
+  const traderSide = clean(fill?.traderSide).toUpperCase() || null;
+  const orderRole = clean(fill?.orderRole).toUpperCase() || null;
+  const authenticatedFeeRateBps = optionalFiniteNumber(fill?.authenticatedFeeRateBps);
+  const authenticatedFeeAmount = optionalFiniteNumber(fill?.authenticatedFeeAmount);
+  if (traderSide !== "MAKER" && traderSide !== "TAKER" && feeParameters.rate > 0) {
+    throw new Error("fail closed: fee-bearing authenticated fill is missing trader_side");
+  }
+  if (feeParameters.rate > 0 &&
+      (authenticatedFeeRateBps === null || (traderSide === "TAKER"
+        ? Math.abs(authenticatedFeeRateBps - feeParameters.rateBps) > 1e-6
+        : authenticatedFeeRateBps > 1e-6 && Math.abs(authenticatedFeeRateBps - feeParameters.rateBps) > 1e-6))) {
+    throw new Error("fail closed: fee-bearing authenticated fill fee_rate_bps disagrees with market fee parameters");
+  }
+  if ((orderRole === "MAKER" || orderRole === "TAKER") && traderSide !== orderRole) {
+    throw new Error("fail closed: authenticated trader_side contradicts the order's matched role");
+  }
+  if (authenticatedFeeAmount !== null && authenticatedFeeAmount < 0) {
+    throw new Error("fail closed: authenticated fill fee amount is negative");
+  }
+  if (traderSide === "MAKER" && authenticatedFeeAmount !== null && authenticatedFeeAmount > 1e-12) {
+    throw new Error("fail closed: post-only maker fill reports a nonzero authenticated fee amount");
+  }
+  const curveEntry = traderSide === "TAKER"
+    ? polymarketV2FeePerShare(fill.price, feeParameters.rate, feeParameters.exponent)
+    : 0;
+  const reportedEntry = traderSide !== "TAKER" || authenticatedFeeAmount === null
+    ? 0
+    : authenticatedFeeAmount / Number(fill.size);
+  const entryFeePerShare = Math.max(curveEntry, reportedEntry);
+  const hypotheticalExitFeePerShare = executablePrice === null
+    ? null
+    : polymarketV2FeePerShare(executablePrice, feeParameters.rate, feeParameters.exponent);
+  return {
+    traderSide,
+    orderRole,
+    authenticatedFeeRateBps,
+    authenticatedFeeAmount,
+    authenticatedFeeRaw: fill?.authenticatedFeeRaw || null,
+    entryFeePerShare,
+    hypotheticalExitFeePerShare,
+    roundTripFeePerShare: hypotheticalExitFeePerShare === null
+      ? null
+      : entryFeePerShare + hypotheticalExitFeePerShare
+  };
+}
+
+function optionalFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error("fail closed: authenticated fill fee evidence is invalid");
+  return parsed;
 }
 
 export function sha256(value) {
@@ -380,6 +539,14 @@ function stableJson(value) {
 
 function validMarkoutFill(fill) {
   return Boolean(fill?.id) && Number(fill?.size) > 0 && Number(fill?.price) > 0 && Number.isFinite(Number(fill?.timestampMs));
+}
+
+function finiteTimestampMs(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }

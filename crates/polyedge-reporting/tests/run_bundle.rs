@@ -1,11 +1,14 @@
-use chrono::{Duration, NaiveDate, TimeZone, Utc};
+#![recursion_limit = "512"]
+
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use polyedge_reporting::research::{
     classify_warning, expire_funded_manifest, initialize_funded_manifest_after_canary,
     inspect_daily_dependency, legacy_daily_fallback_allowed, parse_azure_artifact_uri,
     publish_daily_directory, run_evaluate_profitability, run_validate_prospective,
-    stop_funded_manifest_from_stage_block, write_funded_ladder_state, write_promotion_manifest,
-    AtomicDailyRun, CandidateIdentity, DailyDependency, DataQualitySummary, ExecutionModelBinding,
-    ExpireFundedManifestOptions, FundedHoldoutEvaluationV1, FundedLadderMetrics,
+    stop_funded_manifest_from_stage_block, validate_protocol_v3_order_evidence,
+    write_funded_ladder_state, write_promotion_manifest, AtomicDailyRun, CandidateIdentity,
+    DailyDependency, DataQualitySummary, ExecutionModelBinding, ExpireFundedManifestOptions,
+    FundedCheckpointEvidenceV1, FundedHoldoutEvaluationV1, FundedLadderMetrics,
     FundedLadderStateV1, FundedStageBlockV1, FundedStageGrantV1, GateStatus,
     ImmutableArtifactBindingV1, InitializeFundedManifestOptions, LatestRunPointer,
     ProfitabilityEvaluationOptions, ProfitabilityMetrics, PromotionEvaluation, PromotionManifestV1,
@@ -18,6 +21,103 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+fn stable_json_for_test(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(stable_json_for_test)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap(),
+                        stable_json_for_test(&values[key])
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        _ => serde_json::to_string(value).unwrap(),
+    }
+}
+
+fn protocol_v3_raw_book(token_id: &str, best_bid: &str, best_ask: &str) -> serde_json::Value {
+    serde_json::json!({
+        "token_id": token_id,
+        "tick_size": "0.01",
+        "min_order_size": "1",
+        "bids": [{"price": best_bid, "size": "10"}],
+        "asks": [{"price": best_ask, "size": "10"}],
+        "venue_hash": "1111111111111111111111111111111111111111"
+    })
+}
+
+fn protocol_v3_book_hash(book: &serde_json::Value) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(stable_json_for_test(book).as_bytes())
+    )
+}
+
+fn protocol_v3_markout_rows(now: DateTime<Utc>) -> Vec<serde_json::Value> {
+    [
+        (1_i64, "0.24", "0.26"),
+        (5, "0.25", "0.27"),
+        (30, "0.26", "0.28"),
+    ]
+    .into_iter()
+    .map(|(horizon, best_bid, best_ask)| {
+        let book = protocol_v3_raw_book("token-1", best_bid, best_ask);
+        let midpoint = (best_bid.parse::<Decimal>().unwrap()
+            + best_ask.parse::<Decimal>().unwrap())
+            / Decimal::from(2_u32);
+        let executable = best_bid.parse::<Decimal>().unwrap();
+        let fill_price = Decimal::new(20, 2);
+        let target = now + Duration::milliseconds(600) + Duration::seconds(horizon);
+        let response = target + Duration::milliseconds(100);
+        serde_json::json!({
+            "fill_id": "trade-1",
+            "horizon_seconds": horizon,
+            "fill_timestamp": (now + Duration::milliseconds(600)).to_rfc3339(),
+            "venue_fill_timestamp": (now + Duration::milliseconds(600)).to_rfc3339(),
+            "target_observation_ts": target.to_rfc3339(),
+            "request_started_at": target.to_rfc3339(),
+            "response_completed_at": response.to_rfc3339(),
+            "observed_at": response.to_rfc3339(),
+            "response_duration_ms": 100,
+            "observation_delay_ms": 100,
+            "book_hash": protocol_v3_book_hash(&book),
+            "venue_book_hash": "1111111111111111111111111111111111111111",
+            "venue_book_timestamp": response.to_rfc3339(),
+            "raw_orderbook": book,
+            "fill_size": "5",
+            "fill_price": "0.20",
+            "midpoint": midpoint.to_string(),
+            "executable_price": best_bid,
+            "midpoint_markout_per_share": (midpoint - fill_price).to_string(),
+            "executable_markout_per_share": (executable - fill_price).to_string(),
+            "trader_side": "MAKER",
+            "authenticated_order_role": "MAKER",
+            "authenticated_fee_rate_bps": null,
+            "authenticated_fee_amount": null,
+            "authenticated_fee_raw": null,
+            "entry_fee_per_share": "0",
+            "hypothetical_exit_fee_per_share": "0",
+            "round_trip_fee_per_share": "0"
+        })
+    })
+    .collect()
+}
 
 #[test]
 fn warning_registry_is_versioned_and_unknown_warnings_block() {
@@ -1133,11 +1233,19 @@ fn canonical_manifest_initializes_only_from_hash_bound_protocol_v3_canary() {
         "condition_id": "condition-1",
         "reservation_state": "position_settled",
         "settlement_verified": true,
-        "settlement_transaction_hash": "0xabc",
+        "settlement_transaction_hash": format!("0x{}", "a".repeat(64)),
+        "polygon_chain_id": 137,
+        "transaction_receipt_status": "success",
+        "transaction_block_number": 1,
+        "transaction_receipt_confirmations": 2,
+        "settlement_wallet": "0x1111111111111111111111111111111111111111",
+        "redemption_condition_ids": ["condition-1"],
+        "trust_boundary_ready": true,
         "portfolio_reconciled": true,
         "reconciliation_discrepancy": "0",
         "zero_open_orders_confirmed": true,
         "unresolved_exposure": "0",
+        "unresolved_risk_reservations": 0,
         "campaign_starting_equity": "5.030521",
         "net_external_cash_flows": "0",
         "liquid_collateral": "5.13",
@@ -1146,7 +1254,7 @@ fn canonical_manifest_initializes_only_from_hash_bound_protocol_v3_canary() {
         "minimum_observed_equity": "5.13",
         "maximum_observed_equity": "5.13",
         "campaign_cash_flow_ids": [],
-        "observed_at": (now + Duration::seconds(30)).to_rfc3339()
+        "observed_at": (now + Duration::seconds(32)).to_rfc3339()
     });
     fs::write(
         &terminal_path,
@@ -1154,13 +1262,50 @@ fn canonical_manifest_initializes_only_from_hash_bound_protocol_v3_canary() {
     )
     .unwrap();
     let terminal_hash = hash_file(&terminal_path);
+    let model_observations = [1, 5, 30, 60]
+        .into_iter()
+        .map(|horizon| {
+            serde_json::json!({
+                "horizon_seconds": horizon,
+                "order_submitted": true,
+                "eligible": true,
+                "label_observed": true,
+                "filled": true,
+                "quality_eligible": true,
+                "reconciliation_complete": true,
+                "zero_open_orders_confirmed": true,
+                "data_gap_detected": false,
+                "cancellation_failure": false,
+                "markout_complete": true,
+                "markout_timing_valid": true,
+                "executable_markout_30s_per_share": "0.06",
+                "venue_fee_model": "polymarket_clob_v2_curve",
+                "venue_fee_rate": "0",
+                "venue_fee_rate_bps": "0",
+                "venue_fee_exponent": 1,
+                "venue_fee_taker_only": true,
+                "entry_fee_per_share": "0",
+                "hypothetical_exit_fee_per_share": "0",
+                "estimated_round_trip_cost_per_share": "0",
+                "inferred_size_ahead": "4",
+                "spread": "0.02",
+                "order_price": "0.2",
+                "order_size": "5",
+                "time_to_expiry_seconds": null,
+                "pre_send_trade_size": "3",
+                "pre_send_depth_changes": 4,
+                "pre_send_volatility": "0.01"
+            })
+        })
+        .collect::<Vec<_>>();
     let evidence = serde_json::json!({
         "schema_version": 3,
         "evidence_protocol_version": 3,
         "run_id": "canary-run-1",
         "status": "completed",
         "started_ts": now.to_rfc3339(),
-        "finished_ts": (now + Duration::seconds(2)).to_rfc3339(),
+        "finished_ts": (now + Duration::seconds(31)).to_rfc3339(),
+        "funder_address": "0x1111111111111111111111111111111111111111",
         "order_submission_attempted": true,
         "order_submitted": true,
         "submitted_order_count": 1,
@@ -1193,28 +1338,74 @@ fn canonical_manifest_initializes_only_from_hash_bound_protocol_v3_canary() {
         "cumulative_net_pnl": "999",
         "data_quality_passed": true,
         "probes": [{
+            "schema_version": 3,
+            "evidence_protocol_version": 3,
             "probe_id": "probe-1",
+            "status": "completed",
             "order_submitted": true,
+            "market": {"conditionId": "condition-1", "tokenId": "token-1", "endTs": null},
+            "order": {"side": "BUY", "size": "5", "price": "0.2", "spread": "0.02", "inferredSizeAhead": "4"},
+            "pre_send_context": {
+                "source": "public_market_channel_before_submission",
+                "captured_wall_ms": now.timestamp_millis() - 50,
+                "observed_trade_count": 2,
+                "observed_trade_size": "3",
+                "observed_depth_changes": 4,
+                "price_volatility": "0.01"
+            },
             "lifecycle": {
                 "order_id": "order-1",
+                "send_wall_ms": now.timestamp_millis(),
+                "ack_wall_ms": now.timestamp_millis() + 100,
+                "client_to_http_ack_ms": "100",
+                "clock_server_minus_local_ms": "0",
+                "clock_round_trip_ms": "10",
+                "clock_uncertainty_ms": "5",
+                "cancel_send_wall_ms": null,
+                "client_cancel_round_trip_ms": null,
+                "client_to_user_cancel_ack_ms": null,
+                "live_duration_ms": "1000",
+                "first_fill_after_ack_ms": "500",
                 "reconciliation_complete": true,
                 "zero_open_orders_confirmed": true,
                 "data_gap_detected": false,
                 "cancellation_failure": false,
                 "actual_matched_size": "5",
-                "related_trade_ids": ["trade-1"]
+                "venue_fee_model": "polymarket_clob_v2_curve",
+                "venue_fee_rate": "0",
+                "venue_fee_rate_bps": "0",
+                "venue_fee_exponent": 1,
+                "venue_fee_taker_only": true,
+                "estimated_round_trip_cost_per_share": "0",
+                "partial_fill": false,
+                "fully_filled": true,
+                "fill_raced_cancellation": false,
+                "post_cancel_fill_count": 0,
+                "first_fill_after_cancel_ms": null,
+                "public_touch_trade_count": 1,
+                "public_strict_trade_through_count": 1,
+                "public_trade_through_without_fill_count": 0,
+                "related_trade_ids": ["trade-1"],
+                "live_user_trade_ids": ["trade-1"],
+                "rest_order_matched_size": "5",
+                "user_order_matched_size": "5",
+                "rest_trade_matched_size": "5",
+                "user_trade_matched_size": "5",
+                "matched_size_source_agreement": true,
+                "trade_id_source_agreement": true,
+                "rest_order_returned": true,
+                "authenticated_user_channel_reconnects": 0,
+                "public_market_channel_reconnects": 0,
+                "authenticated_user_channel_unparsed": 0,
+                "public_market_channel_unparsed": 0,
+                "authenticated_user_channel_duplicates": 0,
+                "public_market_channel_duplicates": 0,
+                "post_cancel_finality_stable": true,
+                "post_cancel_observation_ms": 10000,
+                "markout_capture_complete": true
             },
-            "markouts": [
-                {"fill_id":"trade-1","horizon_seconds":1,"observation_delay_ms":100,"fill_size":"5","midpoint":"0.25","executable_price":"0.24","executable_markout_per_share":"0.04"},
-                {"fill_id":"trade-1","horizon_seconds":5,"observation_delay_ms":100,"fill_size":"5","midpoint":"0.26","executable_price":"0.25","executable_markout_per_share":"0.05"},
-                {"fill_id":"trade-1","horizon_seconds":30,"observation_delay_ms":100,"fill_size":"5","midpoint":"0.27","executable_price":"0.26","executable_markout_per_share":"0.06"}
-            ],
-            "model_observations": [{
-                "eligible": true,
-                "quality_eligible": true,
-                "reconciliation_complete": true,
-                "zero_open_orders_confirmed": true
-            }]
+            "markouts": protocol_v3_markout_rows(now),
+            "model_observations": model_observations
         }]
     });
     fs::write(
@@ -1267,6 +1458,390 @@ fn canonical_manifest_initializes_only_from_hash_bound_protocol_v3_canary() {
             .cumulative_net_pnl,
         Decimal::new(99479, 6)
     );
+
+    let terminal_binding = ImmutableArtifactBindingV1 {
+        blob_name: "reports/research/venue-probe/terminal-risk-portfolio/2026-07-13/probe-1.json"
+            .to_owned(),
+        sha256: hash_file(&terminal_path),
+    };
+    let assert_rejected = |candidate_evidence: serde_json::Value| {
+        assert!(validate_protocol_v3_order_evidence(
+            &manifest.candidate,
+            &candidate_evidence,
+            &terminal,
+            &terminal_binding,
+        )
+        .is_err());
+    };
+
+    let mut fee_bearing_no_fill = evidence.clone();
+    {
+        let provenance = &mut fee_bearing_no_fill["provenance"];
+        provenance["terminal_evidence_blob_name"] = serde_json::json!(terminal_binding.blob_name);
+        provenance["terminal_evidence_sha256"] = serde_json::json!(terminal_binding.sha256);
+        let lifecycle = &mut fee_bearing_no_fill["probes"][0]["lifecycle"];
+        lifecycle["actual_matched_size"] = serde_json::json!("0");
+        lifecycle["venue_fee_rate"] = serde_json::json!("0.07");
+        lifecycle["venue_fee_rate_bps"] = serde_json::json!("700");
+        lifecycle["venue_fee_exponent"] = serde_json::json!(1);
+        lifecycle["venue_fee_taker_only"] = serde_json::json!(true);
+        lifecycle["estimated_round_trip_cost_per_share"] = serde_json::json!("0");
+        lifecycle["partial_fill"] = serde_json::json!(false);
+        lifecycle["fully_filled"] = serde_json::json!(false);
+        lifecycle["first_fill_after_ack_ms"] = serde_json::Value::Null;
+        lifecycle["related_trade_ids"] = serde_json::json!([]);
+        lifecycle["live_user_trade_ids"] = serde_json::json!([]);
+        lifecycle["rest_order_matched_size"] = serde_json::json!("0");
+        lifecycle["user_order_matched_size"] = serde_json::json!("0");
+        lifecycle["rest_trade_matched_size"] = serde_json::json!("0");
+        lifecycle["user_trade_matched_size"] = serde_json::json!("0");
+        lifecycle["public_touch_trade_count"] = serde_json::json!(0);
+        lifecycle["public_strict_trade_through_count"] = serde_json::json!(0);
+        lifecycle["cancel_send_wall_ms"] = serde_json::json!(now.timestamp_millis() + 1_000);
+        lifecycle["cancel_http_response_wall_ms"] =
+            serde_json::json!(now.timestamp_millis() + 1_100);
+        lifecycle["user_channel_cancel_received_wall_ms"] =
+            serde_json::json!(now.timestamp_millis() + 1_100);
+        lifecycle["client_cancel_round_trip_ms"] = serde_json::json!(100);
+        lifecycle["client_to_user_cancel_ack_ms"] = serde_json::json!(100);
+    }
+    fee_bearing_no_fill["probes"][0]["markouts"] = serde_json::json!([]);
+    for row in fee_bearing_no_fill["probes"][0]["model_observations"]
+        .as_array_mut()
+        .unwrap()
+    {
+        row["filled"] = serde_json::json!(false);
+        row["executable_markout_30s_per_share"] = serde_json::Value::Null;
+        row["venue_fee_rate"] = serde_json::json!("0.07");
+        row["venue_fee_rate_bps"] = serde_json::json!("700");
+        row["venue_fee_exponent"] = serde_json::json!(1);
+        row["venue_fee_taker_only"] = serde_json::json!(true);
+        row["entry_fee_per_share"] = serde_json::json!("0");
+        row["hypothetical_exit_fee_per_share"] = serde_json::json!("0");
+        row["estimated_round_trip_cost_per_share"] = serde_json::json!("0");
+    }
+    let mut no_fill_terminal = terminal.clone();
+    no_fill_terminal["source"] = serde_json::json!("authenticated_no_fill");
+    no_fill_terminal["reservation_state"] = serde_json::json!("order_cancelled_no_fill");
+    no_fill_terminal["settlement_transaction_hash"] = serde_json::Value::Null;
+    no_fill_terminal["polygon_chain_id"] = serde_json::Value::Null;
+    no_fill_terminal["transaction_receipt_status"] = serde_json::Value::Null;
+    no_fill_terminal["transaction_block_number"] = serde_json::Value::Null;
+    no_fill_terminal["transaction_receipt_confirmations"] = serde_json::Value::Null;
+    no_fill_terminal["settlement_wallet"] = serde_json::Value::Null;
+    no_fill_terminal["redemption_condition_ids"] = serde_json::json!([]);
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &fee_bearing_no_fill,
+        &no_fill_terminal,
+        &terminal_binding,
+    )
+    .is_ok());
+
+    let mut canceled_fill = evidence.clone();
+    canceled_fill["probes"][0]["lifecycle"]["cancel_send_wall_ms"] =
+        serde_json::json!(now.timestamp_millis() + 400);
+    canceled_fill["probes"][0]["lifecycle"]["cancel_http_response_wall_ms"] =
+        serde_json::json!(now.timestamp_millis() + 450);
+    canceled_fill["probes"][0]["lifecycle"]["user_channel_cancel_received_wall_ms"] =
+        serde_json::json!(now.timestamp_millis() + 470);
+    canceled_fill["probes"][0]["lifecycle"]["client_cancel_round_trip_ms"] = serde_json::json!(50);
+    canceled_fill["probes"][0]["lifecycle"]["client_to_user_cancel_ack_ms"] = serde_json::json!(70);
+    canceled_fill["probes"][0]["lifecycle"]["post_cancel_fill_count"] = serde_json::json!(1);
+    canceled_fill["probes"][0]["lifecycle"]["first_fill_after_cancel_ms"] = serde_json::json!(200);
+    canceled_fill["probes"][0]["lifecycle"]["fill_raced_cancellation"] = serde_json::json!(true);
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &canceled_fill,
+        &terminal,
+        &terminal_binding,
+    )
+    .is_ok());
+
+    let mut forged_source_agreement = evidence.clone();
+    forged_source_agreement["probes"][0]["lifecycle"]["rest_trade_matched_size"] =
+        serde_json::json!(0);
+    assert_rejected(forged_source_agreement);
+
+    let mut missing_horizon = evidence.clone();
+    missing_horizon["probes"][0]["model_observations"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert_rejected(missing_horizon);
+
+    let mut producer_only_context = evidence.clone();
+    producer_only_context["probes"][0]["pre_send_context"]["captured_wall_ms"] =
+        serde_json::json!(now.timestamp_millis() + 1);
+    assert_rejected(producer_only_context);
+
+    let mut late_markout = evidence.clone();
+    late_markout["probes"][0]["markouts"][0]["observation_delay_ms"] = serde_json::json!(2_001);
+    assert_rejected(late_markout);
+
+    let mut unstable_finality = evidence.clone();
+    unstable_finality["probes"][0]["lifecycle"]["post_cancel_observation_ms"] =
+        serde_json::json!(9_999);
+    assert_rejected(unstable_finality);
+
+    let mut hidden_channel_gap = evidence.clone();
+    hidden_channel_gap["probes"][0]["lifecycle"]["authenticated_user_channel_unparsed"] =
+        serde_json::json!(1);
+    assert_rejected(hidden_channel_gap);
+
+    let mut missing_ack_latency = evidence.clone();
+    missing_ack_latency["probes"][0]["lifecycle"]["client_to_http_ack_ms"] =
+        serde_json::Value::Null;
+    assert_rejected(missing_ack_latency);
+
+    let mut missing_cancel_latency = evidence.clone();
+    missing_cancel_latency["probes"][0]["lifecycle"]["cancel_send_wall_ms"] =
+        serde_json::json!(now.timestamp_millis() + 500);
+    assert_rejected(missing_cancel_latency);
+
+    let mut forged_fill_race = evidence.clone();
+    forged_fill_race["probes"][0]["lifecycle"]["fill_raced_cancellation"] = serde_json::json!(true);
+    assert_rejected(forged_fill_race);
+
+    let mut forged_first_fill = evidence.clone();
+    forged_first_fill["probes"][0]["lifecycle"]["first_fill_after_ack_ms"] = serde_json::json!(1);
+    assert_rejected(forged_first_fill);
+
+    let mut forged_model_feature = evidence.clone();
+    forged_model_feature["probes"][0]["model_observations"][0]["inferred_size_ahead"] =
+        serde_json::json!(999);
+    assert_rejected(forged_model_feature);
+
+    let mut forged_positive_markout = evidence.clone();
+    forged_positive_markout["probes"][0]["markouts"][2]["executable_markout_per_share"] =
+        serde_json::json!("0.90");
+    assert_rejected(forged_positive_markout);
+
+    let mut inconsistent_fill = evidence.clone();
+    inconsistent_fill["probes"][0]["markouts"][1]["fill_price"] = serde_json::json!("0.19");
+    inconsistent_fill["probes"][0]["markouts"][1]["midpoint_markout_per_share"] =
+        serde_json::json!("0.07");
+    inconsistent_fill["probes"][0]["markouts"][1]["executable_markout_per_share"] =
+        serde_json::json!("0.06");
+    assert_rejected(inconsistent_fill);
+
+    let mut forged_model_markout = evidence.clone();
+    forged_model_markout["probes"][0]["model_observations"][0]
+        ["executable_markout_30s_per_share"] = serde_json::json!("0.90");
+    assert_rejected(forged_model_markout);
+
+    let mut forged_fee_cost = evidence.clone();
+    forged_fee_cost["probes"][0]["lifecycle"]["venue_fee_rate_bps"] = serde_json::json!("100");
+    forged_fee_cost["probes"][0]["lifecycle"]["estimated_round_trip_cost_per_share"] =
+        serde_json::json!("0.001");
+    for row in forged_fee_cost["probes"][0]["model_observations"]
+        .as_array_mut()
+        .unwrap()
+    {
+        row["venue_fee_rate_bps"] = serde_json::json!("100");
+        row["estimated_round_trip_cost_per_share"] = serde_json::json!("0.001");
+    }
+    assert_rejected(forged_fee_cost);
+
+    let mut v2_fee_curve = evidence.clone();
+    {
+        let lifecycle = &mut v2_fee_curve["probes"][0]["lifecycle"];
+        lifecycle["venue_fee_rate"] = serde_json::json!("0.07");
+        lifecycle["venue_fee_rate_bps"] = serde_json::json!("700");
+        lifecycle["venue_fee_exponent"] = serde_json::json!(1);
+        lifecycle["venue_fee_taker_only"] = serde_json::json!(true);
+        lifecycle["estimated_round_trip_cost_per_share"] = serde_json::json!("0.013468");
+    }
+    for markout in v2_fee_curve["probes"][0]["markouts"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let price = markout["executable_price"]
+            .as_str()
+            .unwrap()
+            .parse::<Decimal>()
+            .unwrap();
+        let fee = Decimal::new(7, 2) * price * (Decimal::ONE - price);
+        markout["authenticated_fee_rate_bps"] = serde_json::json!("700");
+        markout["entry_fee_per_share"] = serde_json::json!("0");
+        markout["hypothetical_exit_fee_per_share"] = serde_json::json!(fee.to_string());
+        markout["round_trip_fee_per_share"] = serde_json::json!(fee.to_string());
+    }
+    for row in v2_fee_curve["probes"][0]["model_observations"]
+        .as_array_mut()
+        .unwrap()
+    {
+        row["venue_fee_rate"] = serde_json::json!("0.07");
+        row["venue_fee_rate_bps"] = serde_json::json!("700");
+        row["venue_fee_exponent"] = serde_json::json!(1);
+        row["venue_fee_taker_only"] = serde_json::json!(true);
+        row["entry_fee_per_share"] = serde_json::json!("0");
+        row["hypothetical_exit_fee_per_share"] = serde_json::json!("0.013468");
+        row["estimated_round_trip_cost_per_share"] = serde_json::json!("0.013468");
+    }
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &v2_fee_curve,
+        &terminal,
+        &terminal_binding,
+    )
+    .is_ok());
+
+    let mut forged_maker_fee = v2_fee_curve.clone();
+    forged_maker_fee["probes"][0]["markouts"][2]["entry_fee_per_share"] = serde_json::json!("0.01");
+    forged_maker_fee["probes"][0]["markouts"][2]["round_trip_fee_per_share"] =
+        serde_json::json!("0.023468");
+    assert_rejected(forged_maker_fee);
+
+    let mut tiny_nonzero_maker_fee = v2_fee_curve.clone();
+    tiny_nonzero_maker_fee["probes"][0]["markouts"][2]["authenticated_fee_amount"] =
+        serde_json::json!("0.000000001");
+    assert_rejected(tiny_nonzero_maker_fee);
+
+    let mut missing_raw_fee_evidence = evidence.clone();
+    missing_raw_fee_evidence["probes"][0]["markouts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("authenticated_fee_raw");
+    assert_rejected(missing_raw_fee_evidence);
+
+    let mut inconsistent_raw_fee_evidence = evidence.clone();
+    inconsistent_raw_fee_evidence["probes"][0]["markouts"][1]["authenticated_fee_raw"] =
+        serde_json::json!({"fee_rate_bps":"0"});
+    assert_rejected(inconsistent_raw_fee_evidence);
+
+    let mut forged_raw_book = evidence.clone();
+    forged_raw_book["probes"][0]["markouts"][2]["raw_orderbook"]["bids"][0]["price"] =
+        serde_json::json!("0.99");
+    assert_rejected(forged_raw_book);
+
+    let mut self_hashed_false_book = evidence.clone();
+    self_hashed_false_book["probes"][0]["markouts"][2]["raw_orderbook"]["bids"][0]["price"] =
+        serde_json::json!("0.25");
+    let false_book = self_hashed_false_book["probes"][0]["markouts"][2]["raw_orderbook"].clone();
+    self_hashed_false_book["probes"][0]["markouts"][2]["book_hash"] =
+        serde_json::json!(protocol_v3_book_hash(&false_book));
+    assert_rejected(self_hashed_false_book);
+
+    let mut forged_venue_hash = evidence.clone();
+    forged_venue_hash["probes"][0]["markouts"][0]["venue_book_hash"] =
+        serde_json::json!("different-venue-hash");
+    assert_rejected(forged_venue_hash);
+
+    let mut missing_venue_hash = evidence.clone();
+    missing_venue_hash["probes"][0]["markouts"][0]["raw_orderbook"]
+        .as_object_mut()
+        .unwrap()
+        .remove("venue_hash");
+    missing_venue_hash["probes"][0]["markouts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("venue_book_hash");
+    assert_rejected(missing_venue_hash);
+
+    let mut null_venue_hash = evidence.clone();
+    null_venue_hash["probes"][0]["markouts"][0]["raw_orderbook"]["venue_hash"] =
+        serde_json::Value::Null;
+    null_venue_hash["probes"][0]["markouts"][0]["venue_book_hash"] = serde_json::Value::Null;
+    assert_rejected(null_venue_hash);
+
+    let mut malformed_venue_hash = evidence.clone();
+    malformed_venue_hash["probes"][0]["markouts"][0]["raw_orderbook"]["venue_hash"] =
+        serde_json::json!("not-a-40-hex-venue-hash");
+    malformed_venue_hash["probes"][0]["markouts"][0]["venue_book_hash"] =
+        serde_json::json!("not-a-40-hex-venue-hash");
+    let malformed_book = malformed_venue_hash["probes"][0]["markouts"][0]["raw_orderbook"].clone();
+    malformed_venue_hash["probes"][0]["markouts"][0]["book_hash"] =
+        serde_json::json!(protocol_v3_book_hash(&malformed_book));
+    assert_rejected(malformed_venue_hash);
+
+    let mut oversized_fill = evidence.clone();
+    oversized_fill["probes"][0]["lifecycle"]["actual_matched_size"] = serde_json::json!("6");
+    for field in [
+        "rest_order_matched_size",
+        "user_order_matched_size",
+        "rest_trade_matched_size",
+        "user_trade_matched_size",
+    ] {
+        oversized_fill["probes"][0]["lifecycle"][field] = serde_json::json!("6");
+    }
+    assert_rejected(oversized_fill);
+
+    let mut forged_request_chronology = evidence.clone();
+    forged_request_chronology["probes"][0]["markouts"][0]["request_started_at"] =
+        serde_json::json!((now + Duration::milliseconds(1599)).to_rfc3339());
+    assert_rejected(forged_request_chronology);
+
+    let mut pre_order_fill = evidence.clone();
+    let forged_fill_at = now - Duration::milliseconds(10);
+    for row in pre_order_fill["probes"][0]["markouts"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let horizon = row["horizon_seconds"].as_i64().unwrap();
+        let target = forged_fill_at + Duration::seconds(horizon);
+        let response = target + Duration::milliseconds(100);
+        row["fill_timestamp"] = serde_json::json!(forged_fill_at.to_rfc3339());
+        row["venue_fill_timestamp"] = serde_json::json!(forged_fill_at.to_rfc3339());
+        row["target_observation_ts"] = serde_json::json!(target.to_rfc3339());
+        row["request_started_at"] = serde_json::json!(target.to_rfc3339());
+        row["response_completed_at"] = serde_json::json!(response.to_rfc3339());
+        row["observed_at"] = serde_json::json!(response.to_rfc3339());
+        row["venue_book_timestamp"] = serde_json::json!(response.to_rfc3339());
+    }
+    assert_rejected(pre_order_fill);
+
+    let mut terminal_before_summary = terminal.clone();
+    terminal_before_summary["observed_at"] =
+        serde_json::json!((now + Duration::seconds(30)).to_rfc3339());
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &evidence,
+        &terminal_before_summary,
+        &terminal_binding,
+    )
+    .is_err());
+
+    let mut single_confirmation = terminal.clone();
+    single_confirmation["transaction_receipt_confirmations"] = serde_json::json!(1);
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &evidence,
+        &single_confirmation,
+        &terminal_binding,
+    )
+    .is_err());
+
+    let mut wrong_redeemed_condition = terminal.clone();
+    wrong_redeemed_condition["redemption_condition_ids"] = serde_json::json!(["condition-2"]);
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &evidence,
+        &wrong_redeemed_condition,
+        &terminal_binding,
+    )
+    .is_err());
+
+    let mut duplicate_redeemed_condition = terminal.clone();
+    duplicate_redeemed_condition["redemption_condition_ids"] =
+        serde_json::json!(["condition-1", "condition-1"]);
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &evidence,
+        &duplicate_redeemed_condition,
+        &terminal_binding,
+    )
+    .is_err());
+
+    let mut empty_redeemed_condition = terminal.clone();
+    empty_redeemed_condition["redemption_condition_ids"] = serde_json::json!(["condition-1", ""]);
+    assert!(validate_protocol_v3_order_evidence(
+        &manifest.candidate,
+        &evidence,
+        &empty_redeemed_condition,
+        &terminal_binding,
+    )
+    .is_err());
 
     let forged_manifest_path = root.join("forged-manifest.json");
     let forged_evidence_path = root.join("forged-canary.json");
@@ -1329,6 +1904,401 @@ fn canonical_manifest_initializes_only_from_hash_bound_protocol_v3_canary() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn funded_checkpoint_rejects_forged_parent_bindings_and_progress_chain() {
+    #[derive(serde::Serialize)]
+    struct ModelBinding<'a> {
+        blob_uri: &'a str,
+        sha256: &'a str,
+        model_version: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct ParentBinding<'a> {
+        child_run_id: &'a str,
+        consumption_blob_name: &'a str,
+        consumption_sha256: &'a str,
+        authorization_blob_name: &'a str,
+        authorization_sha256: &'a str,
+        intent_blob_name: &'a str,
+        intent_sha256: &'a str,
+        manifest_blob_name: &'a str,
+        manifest_sha256: &'a str,
+        prediction_model: ModelBinding<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct ChainRoot<'a> {
+        schema: &'static str,
+        campaign_id: &'a str,
+        candidate: &'a CandidateIdentity,
+        sequence: u32,
+        protocol_v3_summary: &'a ImmutableArtifactBindingV1,
+        terminal_risk_portfolio: &'a ImmutableArtifactBindingV1,
+    }
+    #[derive(serde::Serialize)]
+    struct ProgressPayload<'a> {
+        schema: &'static str,
+        sequence: u32,
+        decision_id: &'a str,
+        expected_control_binding: &'a ParentBinding<'a>,
+        protocol_v3_summary: &'a ImmutableArtifactBindingV1,
+        terminal_risk_portfolio: &'a ImmutableArtifactBindingV1,
+    }
+    #[derive(serde::Serialize)]
+    struct Cumulative<'a> {
+        prior: &'a str,
+        progress: &'a str,
+    }
+
+    let root = test_dir("funded_checkpoint_progress_chain");
+    let candidate = ladder_candidate();
+    let now = Utc.with_ymd_and_hms(2026, 7, 14, 12, 0, 0).unwrap();
+    let strict_hash = |value: char| format!("sha256:{}", value.to_string().repeat(64));
+    let hash_file = |path: &Path| format!("sha256:{:x}", Sha256::digest(fs::read(path).unwrap()));
+    let mut summaries = Vec::new();
+    let mut terminals = Vec::new();
+    let mut controls = Vec::new();
+    for sequence in 1_u32..=5 {
+        let run_id = format!("funded-run-{sequence}");
+        let probe_id = format!("probe-{sequence}");
+        let order_id = format!("order-{sequence}");
+        let decision_id = format!("decision-{sequence}");
+        let started = now + Duration::minutes(i64::from(sequence));
+        let finished = started + Duration::seconds(1);
+        let observed = started + Duration::seconds(2);
+        let terminal_path = root.join(format!("terminal-{sequence}.json"));
+        let ending = Decimal::from(100_u32) + Decimal::new(i64::from(sequence), 2);
+        let terminal = serde_json::json!({
+            "schema": "polyedge.canary_terminal_risk_portfolio.v1",
+            "producer": "polyedge_node_authenticated_risk_terminal",
+            "source": "authenticated_no_fill",
+            "run_id": run_id,
+            "probe_id": probe_id,
+            "order_id": order_id,
+            "condition_id": "condition-1",
+            "reservation_state": "finalized_no_fill",
+            "settlement_verified": true,
+            "trust_boundary_ready": true,
+            "settlement_transaction_hash": null,
+            "polygon_chain_id": null,
+            "transaction_receipt_status": null,
+            "transaction_block_number": null,
+            "transaction_receipt_confirmations": null,
+            "settlement_wallet": null,
+            "redemption_condition_ids": [],
+            "portfolio_reconciled": true,
+            "reconciliation_discrepancy": "0",
+            "zero_open_orders_confirmed": true,
+            "unresolved_exposure": "0",
+            "unresolved_risk_reservations": 0,
+            "campaign_starting_equity": "100",
+            "net_external_cash_flows": "0",
+            "liquid_collateral": ending.to_string(),
+            "summed_position_value": "0",
+            "cash_flow_adjusted_ending_equity": ending.to_string(),
+            "minimum_observed_equity": ending.to_string(),
+            "maximum_observed_equity": ending.to_string(),
+            "campaign_cash_flow_ids": [],
+            "observed_at": observed.to_rfc3339()
+        });
+        fs::write(
+            &terminal_path,
+            serde_json::to_vec_pretty(&terminal).unwrap(),
+        )
+        .unwrap();
+        let terminal_binding = ImmutableArtifactBindingV1 {
+            blob_name: terminal_path.to_string_lossy().to_string(),
+            sha256: hash_file(&terminal_path),
+        };
+        let control = serde_json::json!({
+            "child_run_id": run_id,
+            "consumption_blob_name": format!("control/consumption-{sequence}.json"),
+            "consumption_sha256": strict_hash('a'),
+            "authorization_blob_name": format!("control/authorization-{sequence}.json"),
+            "authorization_sha256": strict_hash('b'),
+            "intent_blob_name": format!("control/intent-{sequence}.json"),
+            "intent_sha256": strict_hash('c'),
+            "manifest_blob_name": format!("control/manifest-{sequence}.json"),
+            "manifest_sha256": strict_hash('d'),
+            "prediction_model": {
+                "blob_uri": "azure://account/container/prior.json",
+                "sha256": strict_hash('e'),
+                "model_version": "conservative-execution-prior-v1"
+            }
+        });
+        let observations = [1, 5, 30, 60]
+            .into_iter()
+            .map(|horizon| {
+                serde_json::json!({
+                    "horizon_seconds": horizon,
+                    "order_submitted": true,
+                    "eligible": true,
+                    "label_observed": true,
+                    "filled": false,
+                    "quality_eligible": true,
+                    "reconciliation_complete": true,
+                    "zero_open_orders_confirmed": true,
+                    "data_gap_detected": false,
+                    "cancellation_failure": false,
+                    "markout_complete": true,
+                    "markout_timing_valid": true,
+                    "executable_markout_30s_per_share": null,
+                    "venue_fee_model": "polymarket_clob_v2_curve",
+                    "venue_fee_rate": "0",
+                    "venue_fee_rate_bps": "0",
+                    "venue_fee_exponent": 1,
+                    "venue_fee_taker_only": true,
+                    "entry_fee_per_share": "0",
+                    "hypothetical_exit_fee_per_share": "0",
+                    "estimated_round_trip_cost_per_share": "0",
+                    "inferred_size_ahead": "4",
+                    "spread": "0.02",
+                    "order_price": "0.2",
+                    "order_size": "5",
+                    "time_to_expiry_seconds": null,
+                    "pre_send_trade_size": "0",
+                    "pre_send_depth_changes": 0,
+                    "pre_send_volatility": "0"
+                })
+            })
+            .collect::<Vec<_>>();
+        let summary_path = root.join(format!("summary-{sequence}.json"));
+        let summary = serde_json::json!({
+            "schema_version": 3,
+            "evidence_protocol_version": 3,
+            "run_id": run_id,
+            "status": "completed",
+            "started_ts": started.to_rfc3339(),
+            "finished_ts": finished.to_rfc3339(),
+            "funder_address": "0x1111111111111111111111111111111111111111",
+            "order_submission_attempted": true,
+            "order_submitted": true,
+            "submitted_order_count": 1,
+            "completed_probe_count": 1,
+            "candidate": candidate,
+            "prediction_model": {
+                "blob_uri": "azure://account/container/prior.json",
+                "container_name": "container",
+                "blob_name": "prior.json",
+                "sha256": strict_hash('e'),
+                "model_version": "conservative-execution-prior-v1",
+                "generated_at": "2026-07-12T00:00:00Z",
+                "training_data_end_ts": "2026-07-11T00:00:00Z"
+            },
+            "provenance": {
+                "funded_stage_consumption_blob_name": control["consumption_blob_name"],
+                "funded_stage_consumption_sha256": control["consumption_sha256"],
+                "authorization_blob_name": control["authorization_blob_name"],
+                "authorization_sha256": control["authorization_sha256"],
+                "intent_blob_name": control["intent_blob_name"],
+                "intent_sha256": control["intent_sha256"],
+                "promotion_manifest_blob_name": control["manifest_blob_name"],
+                "promotion_manifest_sha256": control["manifest_sha256"],
+                "terminal_evidence_blob_name": terminal_binding.blob_name,
+                "terminal_evidence_sha256": terminal_binding.sha256
+            },
+            "probes": [{
+                "schema_version": 3,
+                "evidence_protocol_version": 3,
+                "probe_id": probe_id,
+                "status": "completed",
+                "order_submitted": true,
+                "market": {"conditionId":"condition-1","tokenId":"token-1","endTs":null},
+                "order": {"side":"BUY","size":"5","price":"0.2","spread":"0.02","inferredSizeAhead":"4"},
+                "pre_send_context": {"source":"public_market_channel_before_submission","captured_wall_ms":started.timestamp_millis()-10,"observed_trade_count":0,"observed_trade_size":"0","observed_depth_changes":0,"price_volatility":"0"},
+                "lifecycle": {
+                    "order_id": order_id,
+                    "send_wall_ms": started.timestamp_millis(),
+                    "ack_wall_ms": started.timestamp_millis()+100,
+                    "client_to_http_ack_ms": "100",
+                    "clock_server_minus_local_ms":"0","clock_round_trip_ms":"10","clock_uncertainty_ms":"5",
+                    "cancel_send_wall_ms": started.timestamp_millis()+200,
+                    "cancel_http_response_wall_ms": started.timestamp_millis()+250,
+                    "user_channel_cancel_received_wall_ms": started.timestamp_millis()+270,
+                    "client_cancel_round_trip_ms":"50","client_to_user_cancel_ack_ms":"70",
+                    "live_duration_ms":"1000","first_fill_after_ack_ms":null,
+                    "actual_matched_size":"0","partial_fill":false,"fully_filled":false,
+                    "post_cancel_fill_count":0,"first_fill_after_cancel_ms":null,"fill_raced_cancellation":false,
+                    "public_touch_trade_count":0,"public_strict_trade_through_count":0,"public_trade_through_without_fill_count":0,
+                    "venue_fee_model":"polymarket_clob_v2_curve","venue_fee_rate":"0","venue_fee_rate_bps":"0","venue_fee_exponent":1,"venue_fee_taker_only":true,
+                    "estimated_round_trip_cost_per_share":"0",
+                    "related_trade_ids":[],"live_user_trade_ids":[],
+                    "rest_order_matched_size":"0","user_order_matched_size":"0","rest_trade_matched_size":"0","user_trade_matched_size":"0",
+                    "matched_size_source_agreement":true,"trade_id_source_agreement":true,"rest_order_returned":true,
+                    "authenticated_user_channel_reconnects":0,"public_market_channel_reconnects":0,
+                    "authenticated_user_channel_unparsed":0,"public_market_channel_unparsed":0,
+                    "authenticated_user_channel_duplicates":0,"public_market_channel_duplicates":0,
+                    "post_cancel_finality_stable":true,"post_cancel_observation_ms":10000,
+                    "reconciliation_complete":true,"zero_open_orders_confirmed":true,
+                    "data_gap_detected":false,"cancellation_failure":false,"markout_capture_complete":true
+                },
+                "markouts": [],
+                "model_observations": observations
+            }]
+        });
+        fs::write(&summary_path, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+        summaries.push(ImmutableArtifactBindingV1 {
+            blob_name: summary_path.to_string_lossy().to_string(),
+            sha256: hash_file(&summary_path),
+        });
+        terminals.push(terminal_binding);
+        controls.push(control);
+        let _ = decision_id;
+    }
+
+    let mut state = FundedLadderStateV1::new(candidate.clone(), now).unwrap();
+    state.phase = PromotionPhase::LimitedLive;
+    state.active_stage_index = 1;
+    state.active_target_orders = 5;
+    state.completed_checkpoints = vec![1];
+    state.human_grant_required = true;
+    state.stage_authorized = false;
+    state.checkpoint_1_protocol_v3_artifact = Some(summaries[0].clone());
+    state.checkpoint_1_terminal_artifact = Some(terminals[0].clone());
+    state.last_verified_terminal_artifact = Some(terminals[0].clone());
+
+    let chain_root = {
+        let value = ChainRoot {
+            schema: "polyedge.funded_checkpoint_1_chain_root.v1",
+            campaign_id: &state.campaign_id,
+            candidate: &state.candidate,
+            sequence: 1,
+            protocol_v3_summary: &summaries[0],
+            terminal_risk_portfolio: &terminals[0],
+        };
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&value).unwrap())
+        )
+    };
+    let mut cumulative = chain_root.clone();
+    let mut progress_artifacts = Vec::new();
+    for sequence in 2_u32..=5 {
+        let index = sequence as usize - 1;
+        let decision_id = format!("decision-{sequence}");
+        let parent_value = &controls[index];
+        let parent = ParentBinding {
+            child_run_id: parent_value["child_run_id"].as_str().unwrap(),
+            consumption_blob_name: parent_value["consumption_blob_name"].as_str().unwrap(),
+            consumption_sha256: parent_value["consumption_sha256"].as_str().unwrap(),
+            authorization_blob_name: parent_value["authorization_blob_name"].as_str().unwrap(),
+            authorization_sha256: parent_value["authorization_sha256"].as_str().unwrap(),
+            intent_blob_name: parent_value["intent_blob_name"].as_str().unwrap(),
+            intent_sha256: parent_value["intent_sha256"].as_str().unwrap(),
+            manifest_blob_name: parent_value["manifest_blob_name"].as_str().unwrap(),
+            manifest_sha256: parent_value["manifest_sha256"].as_str().unwrap(),
+            prediction_model: ModelBinding {
+                blob_uri: parent_value["prediction_model"]["blob_uri"]
+                    .as_str()
+                    .unwrap(),
+                sha256: parent_value["prediction_model"]["sha256"].as_str().unwrap(),
+                model_version: parent_value["prediction_model"]["model_version"]
+                    .as_str()
+                    .unwrap(),
+            },
+        };
+        let payload = ProgressPayload {
+            schema: "polyedge.funded_stage_progress_payload.v1",
+            sequence,
+            decision_id: &decision_id,
+            expected_control_binding: &parent,
+            protocol_v3_summary: &summaries[index],
+            terminal_risk_portfolio: &terminals[index],
+        };
+        let payload_hash = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&payload).unwrap())
+        );
+        let next_cumulative = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&Cumulative {
+                    prior: &cumulative,
+                    progress: &payload_hash,
+                })
+                .unwrap()
+            )
+        );
+        let progress_path = root.join(format!("progress-{sequence}.json"));
+        let progress = serde_json::json!({
+            "schema":"polyedge.funded_stage_order_progress.v1",
+            "grant_id":"grant-1",
+            "campaign_id":state.campaign_id,
+            "campaign_control_id":"campaign-control-1",
+            "candidate":candidate,
+            "stage_target_orders":5,
+            "sequence":sequence,
+            "decision_id":decision_id,
+            "intent_blob_name":controls[index]["intent_blob_name"],
+            "intent_sha256":controls[index]["intent_sha256"],
+            "authorization_blob_name":controls[index]["authorization_blob_name"],
+            "authorization_sha256":controls[index]["authorization_sha256"],
+            "child_run_id":controls[index]["child_run_id"],
+            "protocol_v3_summary_blob_name":summaries[index].blob_name,
+            "protocol_v3_summary_sha256":summaries[index].sha256,
+            "terminal_evidence_blob_name":terminals[index].blob_name,
+            "terminal_evidence_sha256":terminals[index].sha256,
+            "expected_control_binding":controls[index],
+            "progress_payload_sha256":payload_hash,
+            "prior_cumulative_evidence_sha256":cumulative,
+            "cumulative_evidence_sha256":next_cumulative,
+            "attempted_order_count":1,"submitted_order_count":1,"eligible_order_count":1,
+            "completed_at":(now+Duration::minutes(i64::from(sequence))+Duration::seconds(3)).to_rfc3339()
+        });
+        fs::write(
+            &progress_path,
+            serde_json::to_vec_pretty(&progress).unwrap(),
+        )
+        .unwrap();
+        progress_artifacts.push(ImmutableArtifactBindingV1 {
+            blob_name: progress_path.to_string_lossy().to_string(),
+            sha256: hash_file(&progress_path),
+        });
+        cumulative = next_cumulative;
+    }
+    let checkpoint_value = serde_json::json!({
+        "schema_version":"funded_checkpoint_evidence_v1",
+        "evidence_protocol_version":3,
+        "candidate":candidate,
+        "source_state_sha256":state.state_sha256().unwrap(),
+        "stage_target_orders":5,
+        "exact_eligible_order_count":5,
+        "exact_funded_order_count":5,
+        "observed_calendar_days":1,
+        "cumulative_net_pnl":"0.05",
+        "cumulative_max_drawdown":"0",
+        "mean_net_markout_30s":"0",
+        "net_markout_30s_lower_95":"0",
+        "markout_sample_size":0,
+        "data_quality_passed":true,
+        "unresolved_exposure":"0",
+        "lifecycle_reconciled":true,
+        "checkpoint_1_chain_root_sha256":chain_root,
+        "final_cumulative_evidence_sha256":cumulative,
+        "protocol_v3_order_artifacts":summaries,
+        "terminal_risk_portfolio_artifacts":terminals,
+        "progress_artifacts":progress_artifacts,
+        "control_bindings":controls
+    });
+    let checkpoint: FundedCheckpointEvidenceV1 = serde_json::from_value(checkpoint_value).unwrap();
+    assert!(checkpoint.validated_metrics(&state).is_ok());
+
+    let mut wrong_parent = checkpoint.clone();
+    wrong_parent.control_bindings[2].manifest_sha256 = strict_hash('f');
+    assert!(wrong_parent.validated_metrics(&state).is_err());
+
+    let mut wrong_model = checkpoint.clone();
+    wrong_model.control_bindings[3].prediction_model.sha256 = strict_hash('f');
+    assert!(wrong_model.validated_metrics(&state).is_err());
+
+    let mut wrong_chain = checkpoint.clone();
+    wrong_chain.final_cumulative_evidence_sha256 = strict_hash('f');
+    assert!(wrong_chain.validated_metrics(&state).is_err());
+
+    let mut reordered_progress = checkpoint.clone();
+    reordered_progress.progress_artifacts.swap(0, 1);
+    assert!(reordered_progress.validated_metrics(&state).is_err());
 }
 
 fn passing_metrics() -> ProfitabilityMetrics {

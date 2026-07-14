@@ -42,11 +42,21 @@ test("redemption defaults to disabled dry-run and requires separate relayer auth
   const config = loadRedemptionConfig(safeEnv);
   assert.equal(config.enabled, false);
   assert.equal(config.dryRun, true);
-  assert.throws(() => loadRedemptionConfig({ ...safeEnv, VENUE_REDEMPTION_DRY_RUN: "false" }), /ENABLED.*EXPECTED_COUNTRY.*EXPECTED_EGRESS_IP.*RELAYER_API_KEY/s);
+  assert.throws(() => loadRedemptionConfig({ ...safeEnv, VENUE_REDEMPTION_DRY_RUN: "false" }), /TRUST_BOUNDARY_READY.*ENABLED.*EXPECTED_COUNTRY.*EXPECTED_EGRESS_IP.*RELAYER_API_KEY/s);
+  assert.throws(() => loadRedemptionConfig({
+    ...safeEnv,
+    VENUE_REDEMPTION_ENABLED: "true",
+    VENUE_REDEMPTION_DRY_RUN: "false",
+    VENUE_PROBE_EXPECTED_COUNTRY: "IE",
+    VENUE_PROBE_EXPECTED_EGRESS_IP: "203.0.113.8",
+    POLYMARKET_RELAYER_API_KEY: "relayer-key",
+    POLYMARKET_RELAYER_API_KEY_ADDRESS: owner
+  }), /FUNDED_EVIDENCE_TRUST_BOUNDARY_READY/);
   const live = loadRedemptionConfig({
     ...safeEnv,
     VENUE_REDEMPTION_ENABLED: "true",
     VENUE_REDEMPTION_DRY_RUN: "false",
+    FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
     VENUE_PROBE_EXPECTED_COUNTRY: "IE",
     VENUE_PROBE_EXPECTED_EGRESS_IP: "203.0.113.8",
     POLYMARKET_RELAYER_API_KEY: "relayer-key",

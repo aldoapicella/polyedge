@@ -1184,6 +1184,27 @@ pub struct ImmutableArtifactBindingV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FundedPredictionModelBindingV1 {
+    pub blob_uri: String,
+    pub sha256: String,
+    pub model_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FundedParentControlBindingV1 {
+    pub child_run_id: String,
+    pub consumption_blob_name: String,
+    pub consumption_sha256: String,
+    pub authorization_blob_name: String,
+    pub authorization_sha256: String,
+    pub intent_blob_name: String,
+    pub intent_sha256: String,
+    pub manifest_blob_name: String,
+    pub manifest_sha256: String,
+    pub prediction_model: FundedPredictionModelBindingV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueModelTransitionV1 {
     pub schema_version: String,
     pub binding: ExecutionModelBinding,
@@ -1233,8 +1254,12 @@ pub struct FundedCheckpointEvidenceV1 {
     pub data_quality_passed: bool,
     pub unresolved_exposure: Decimal,
     pub lifecycle_reconciled: bool,
+    pub checkpoint_1_chain_root_sha256: String,
+    pub final_cumulative_evidence_sha256: String,
     pub protocol_v3_order_artifacts: Vec<ImmutableArtifactBindingV1>,
     pub terminal_risk_portfolio_artifacts: Vec<ImmutableArtifactBindingV1>,
+    pub progress_artifacts: Vec<ImmutableArtifactBindingV1>,
+    pub control_bindings: Vec<FundedParentControlBindingV1>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1252,8 +1277,568 @@ pub struct ValidatedProtocolV3OrderEvidence {
     pub net_markout_30s: Option<Decimal>,
 }
 
+#[derive(Serialize)]
+struct FundedCheckpointOneChainRoot<'a> {
+    schema: &'static str,
+    campaign_id: &'a str,
+    candidate: &'a CandidateIdentity,
+    sequence: u32,
+    protocol_v3_summary: &'a ImmutableArtifactBindingV1,
+    terminal_risk_portfolio: &'a ImmutableArtifactBindingV1,
+}
+
+#[derive(Serialize)]
+struct FundedProgressPayload<'a> {
+    schema: &'static str,
+    sequence: u32,
+    decision_id: &'a str,
+    expected_control_binding: &'a FundedParentControlBindingV1,
+    protocol_v3_summary: &'a ImmutableArtifactBindingV1,
+    terminal_risk_portfolio: &'a ImmutableArtifactBindingV1,
+}
+
+#[derive(Serialize)]
+struct FundedCumulativeProgress<'a> {
+    prior: &'a str,
+    progress: &'a str,
+}
+
+fn normalized_artifact_binding(
+    binding: &ImmutableArtifactBindingV1,
+    label: &str,
+) -> Result<ImmutableArtifactBindingV1, ResearchError> {
+    if binding.blob_name.trim().is_empty() {
+        return Err(ResearchError::InvalidInput(format!(
+            "{label} blob name is missing"
+        )));
+    }
+    Ok(ImmutableArtifactBindingV1 {
+        blob_name: binding.blob_name.clone(),
+        sha256: normalize_sha256(&binding.sha256)?,
+    })
+}
+
+fn normalized_parent_control_binding(
+    binding: &FundedParentControlBindingV1,
+) -> Result<FundedParentControlBindingV1, ResearchError> {
+    if [
+        binding.child_run_id.as_str(),
+        binding.consumption_blob_name.as_str(),
+        binding.authorization_blob_name.as_str(),
+        binding.intent_blob_name.as_str(),
+        binding.manifest_blob_name.as_str(),
+        binding.prediction_model.blob_uri.as_str(),
+        binding.prediction_model.model_version.as_str(),
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
+    {
+        return Err(ResearchError::InvalidInput(
+            "funded checkpoint exact parent control/model binding is incomplete".to_owned(),
+        ));
+    }
+    Ok(FundedParentControlBindingV1 {
+        child_run_id: binding.child_run_id.clone(),
+        consumption_blob_name: binding.consumption_blob_name.clone(),
+        consumption_sha256: normalize_sha256(&binding.consumption_sha256)?,
+        authorization_blob_name: binding.authorization_blob_name.clone(),
+        authorization_sha256: normalize_sha256(&binding.authorization_sha256)?,
+        intent_blob_name: binding.intent_blob_name.clone(),
+        intent_sha256: normalize_sha256(&binding.intent_sha256)?,
+        manifest_blob_name: binding.manifest_blob_name.clone(),
+        manifest_sha256: normalize_sha256(&binding.manifest_sha256)?,
+        prediction_model: FundedPredictionModelBindingV1 {
+            blob_uri: binding.prediction_model.blob_uri.clone(),
+            sha256: normalize_sha256(&binding.prediction_model.sha256)?,
+            model_version: binding.prediction_model.model_version.clone(),
+        },
+    })
+}
+
+fn checkpoint_one_chain_root(
+    state: &FundedLadderStateV1,
+    summary: &ImmutableArtifactBindingV1,
+    terminal: &ImmutableArtifactBindingV1,
+) -> Result<String, ResearchError> {
+    let summary = normalized_artifact_binding(summary, "checkpoint-1 summary")?;
+    let terminal = normalized_artifact_binding(terminal, "checkpoint-1 terminal")?;
+    let value = FundedCheckpointOneChainRoot {
+        schema: "polyedge.funded_checkpoint_1_chain_root.v1",
+        campaign_id: &state.campaign_id,
+        candidate: &state.candidate,
+        sequence: 1,
+        protocol_v3_summary: &summary,
+        terminal_risk_portfolio: &terminal,
+    };
+    Ok(format!(
+        "sha256:{}",
+        sha256_bytes(&serde_json::to_vec(&value)?)
+    ))
+}
+
+fn progress_payload_hash(
+    sequence: u32,
+    decision_id: &str,
+    parent: &FundedParentControlBindingV1,
+    summary: &ImmutableArtifactBindingV1,
+    terminal: &ImmutableArtifactBindingV1,
+) -> Result<String, ResearchError> {
+    if sequence < 2 || decision_id.trim().is_empty() {
+        return Err(ResearchError::InvalidInput(
+            "funded checkpoint progress sequence or decision is invalid".to_owned(),
+        ));
+    }
+    let parent = normalized_parent_control_binding(parent)?;
+    let summary = normalized_artifact_binding(summary, "progress summary")?;
+    let terminal = normalized_artifact_binding(terminal, "progress terminal")?;
+    let value = FundedProgressPayload {
+        schema: "polyedge.funded_stage_progress_payload.v1",
+        sequence,
+        decision_id,
+        expected_control_binding: &parent,
+        protocol_v3_summary: &summary,
+        terminal_risk_portfolio: &terminal,
+    };
+    Ok(format!(
+        "sha256:{}",
+        sha256_bytes(&serde_json::to_vec(&value)?)
+    ))
+}
+
+fn cumulative_progress_hash(prior: &str, progress: &str) -> Result<String, ResearchError> {
+    let prior = normalize_sha256(prior)?;
+    let progress = normalize_sha256(progress)?;
+    Ok(format!(
+        "sha256:{}",
+        sha256_bytes(&serde_json::to_vec(&FundedCumulativeProgress {
+            prior: &prior,
+            progress: &progress,
+        })?)
+    ))
+}
+
+fn validate_summary_parent_control_binding(
+    summary: &serde_json::Value,
+    binding: &FundedParentControlBindingV1,
+) -> Result<(), ResearchError> {
+    let binding = normalized_parent_control_binding(binding)?;
+    let provenance = &summary["provenance"];
+    let model = &summary["prediction_model"];
+    let summary_model_hash = normalize_sha256(model["sha256"].as_str().ok_or_else(|| {
+        ResearchError::InvalidInput("funded summary prediction-model hash is missing".to_owned())
+    })?)?;
+    if summary["run_id"].as_str() != Some(binding.child_run_id.as_str())
+        || provenance["funded_stage_consumption_blob_name"].as_str()
+            != Some(binding.consumption_blob_name.as_str())
+        || normalize_sha256(
+            provenance["funded_stage_consumption_sha256"]
+                .as_str()
+                .ok_or_else(|| {
+                    ResearchError::InvalidInput(
+                        "funded summary consumption hash is missing".to_owned(),
+                    )
+                })?,
+        )? != binding.consumption_sha256
+        || provenance["authorization_blob_name"].as_str()
+            != Some(binding.authorization_blob_name.as_str())
+        || normalize_sha256(provenance["authorization_sha256"].as_str().ok_or_else(|| {
+            ResearchError::InvalidInput("funded summary authorization hash is missing".to_owned())
+        })?)?
+            != binding.authorization_sha256
+        || provenance["intent_blob_name"].as_str() != Some(binding.intent_blob_name.as_str())
+        || normalize_sha256(provenance["intent_sha256"].as_str().ok_or_else(|| {
+            ResearchError::InvalidInput("funded summary intent hash is missing".to_owned())
+        })?)?
+            != binding.intent_sha256
+        || provenance["promotion_manifest_blob_name"].as_str()
+            != Some(binding.manifest_blob_name.as_str())
+        || normalize_sha256(
+            provenance["promotion_manifest_sha256"]
+                .as_str()
+                .ok_or_else(|| {
+                    ResearchError::InvalidInput(
+                        "funded summary promotion-manifest hash is missing".to_owned(),
+                    )
+                })?,
+        )? != binding.manifest_sha256
+        || model["blob_uri"].as_str() != Some(binding.prediction_model.blob_uri.as_str())
+        || summary_model_hash != binding.prediction_model.sha256
+        || model["model_version"].as_str() != Some(binding.prediction_model.model_version.as_str())
+    {
+        return Err(ResearchError::InvalidInput(
+            "funded checkpoint summary does not match its exact parent control/model binding"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProtocolV3FeeCurve {
+    rate: Decimal,
+    rate_bps: Decimal,
+    exponent: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ProtocolV3MarkoutEconomics {
+    fill_size: Decimal,
+    fill_price: Decimal,
+    executable_price: Decimal,
+    entry_fee_per_share: Decimal,
+    hypothetical_exit_fee_per_share: Decimal,
+    round_trip_fee_per_share: Decimal,
+    fee_evidence_fingerprint: String,
+}
+
+fn stable_json(value: &serde_json::Value) -> Result<String, ResearchError> {
+    match value {
+        serde_json::Value::Array(values) => Ok(format!(
+            "[{}]",
+            values
+                .iter()
+                .map(stable_json)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(",")
+        )),
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    Ok(format!(
+                        "{}:{}",
+                        serde_json::to_string(key)?,
+                        stable_json(&values[key])?
+                    ))
+                })
+                .collect::<Result<Vec<_>, ResearchError>>()?;
+            Ok(format!("{{{}}}", fields.join(",")))
+        }
+        _ => Ok(serde_json::to_string(value)?),
+    }
+}
+
+fn protocol_v3_fee_curve(
+    price: Decimal,
+    curve: ProtocolV3FeeCurve,
+) -> Result<Decimal, ResearchError> {
+    if !(Decimal::ZERO..=Decimal::ONE).contains(&price) || curve.exponent > 10 {
+        return Err(ResearchError::InvalidInput(
+            "protocol-v3 fee curve has an invalid price or exponent".to_owned(),
+        ));
+    }
+    let base = price * (Decimal::ONE - price);
+    let mut powered = Decimal::ONE;
+    for _ in 0..curve.exponent {
+        powered *= base;
+    }
+    Ok(curve.rate * powered)
+}
+
+fn protocol_v3_markout_economics(
+    row: &serde_json::Value,
+    expected_token_id: &str,
+    curve: ProtocolV3FeeCurve,
+) -> Result<ProtocolV3MarkoutEconomics, ResearchError> {
+    let fail = |message: &str| {
+        ResearchError::InvalidInput(format!("protocol-v3 order evidence rejected: {message}"))
+    };
+    let row_object = row
+        .as_object()
+        .ok_or_else(|| fail("markout row is not an object"))?;
+    for field in [
+        "trader_side",
+        "authenticated_order_role",
+        "authenticated_fee_rate_bps",
+        "authenticated_fee_amount",
+        "authenticated_fee_raw",
+        "entry_fee_per_share",
+        "hypothetical_exit_fee_per_share",
+        "round_trip_fee_per_share",
+    ] {
+        if !row_object.contains_key(field) {
+            return Err(fail("markout fee evidence schema is incomplete"));
+        }
+    }
+    if !row["authenticated_fee_raw"].is_null() && !row["authenticated_fee_raw"].is_object() {
+        return Err(fail("authenticated_fee_raw is neither an object nor null"));
+    }
+    let fill_size = protocol_positive(&row["fill_size"], "fill_size")?;
+    let fill_price = protocol_probability_price(&row["fill_price"], "fill_price", false)?;
+    let raw = row["raw_orderbook"]
+        .as_object()
+        .ok_or_else(|| fail("markout raw_orderbook is missing"))?;
+    let expected_keys = [
+        "asks",
+        "bids",
+        "min_order_size",
+        "tick_size",
+        "token_id",
+        "venue_hash",
+    ];
+    if raw.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !raw.contains_key(*key))
+        || raw["token_id"].as_str() != Some(expected_token_id)
+    {
+        return Err(fail(
+            "markout raw_orderbook is not the exact token-bound canonical schema",
+        ));
+    }
+    let canonical_decimal = |value: &serde_json::Value| -> Option<String> {
+        let parsed = value
+            .as_str()
+            .and_then(|text| text.parse::<f64>().ok())
+            .or_else(|| value.as_f64())?;
+        if !parsed.is_finite() {
+            return None;
+        }
+        let mut text = format!("{parsed:.12}");
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+        Some(text)
+    };
+    let canonical_levels = |side: &str| -> Result<Vec<serde_json::Value>, ResearchError> {
+        let mut levels = raw[side]
+            .as_array()
+            .ok_or_else(|| fail("markout raw_orderbook side is not an array"))?
+            .iter()
+            .map(|level| {
+                let price = canonical_decimal(&level["price"])
+                    .ok_or_else(|| fail("markout raw_orderbook price is invalid"))?;
+                let size = canonical_decimal(&level["size"])
+                    .ok_or_else(|| fail("markout raw_orderbook size is invalid"))?;
+                Ok((
+                    price
+                        .parse::<Decimal>()
+                        .map_err(|_| fail("markout raw_orderbook canonical price is invalid"))?,
+                    size.parse::<Decimal>()
+                        .map_err(|_| fail("markout raw_orderbook canonical size is invalid"))?,
+                    serde_json::json!({"price": price, "size": size}),
+                ))
+            })
+            .collect::<Result<Vec<_>, ResearchError>>()?;
+        levels.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        Ok(levels.into_iter().map(|(_, _, value)| value).collect())
+    };
+    let canonical_raw = serde_json::json!({
+        "token_id": expected_token_id,
+        "tick_size": canonical_decimal(&raw["tick_size"])
+            .ok_or_else(|| fail("markout raw_orderbook tick_size is invalid"))?,
+        "min_order_size": canonical_decimal(&raw["min_order_size"])
+            .ok_or_else(|| fail("markout raw_orderbook min_order_size is invalid"))?,
+        "bids": canonical_levels("bids")?,
+        "asks": canonical_levels("asks")?,
+        "venue_hash": raw["venue_hash"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    if canonical_raw != row["raw_orderbook"] {
+        return Err(fail("markout raw_orderbook is not canonically normalized"));
+    }
+    let _tick_size = protocol_positive(&raw["tick_size"], "raw_orderbook.tick_size")?;
+    let _minimum_order_size =
+        protocol_positive(&raw["min_order_size"], "raw_orderbook.min_order_size")?;
+    let parse_levels = |side: &str| -> Result<Vec<(Decimal, Decimal)>, ResearchError> {
+        let levels = raw[side]
+            .as_array()
+            .ok_or_else(|| fail("markout raw_orderbook side is not an array"))?;
+        let mut parsed = Vec::with_capacity(levels.len());
+        let mut prices = std::collections::BTreeSet::new();
+        for level in levels {
+            let object = level
+                .as_object()
+                .filter(|object| {
+                    object.len() == 2 && object.contains_key("price") && object.contains_key("size")
+                })
+                .ok_or_else(|| fail("markout raw_orderbook level schema is invalid"))?;
+            let price = protocol_probability_price(&object["price"], "raw_orderbook.price", false)?;
+            let size = protocol_positive(&object["size"], "raw_orderbook.size")?;
+            if !prices.insert(price) {
+                return Err(fail(
+                    "markout raw_orderbook contains a duplicate price level",
+                ));
+            }
+            parsed.push((price, size));
+        }
+        if parsed.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(fail(
+                "markout raw_orderbook levels are not canonically sorted",
+            ));
+        }
+        Ok(parsed)
+    };
+    let bids = parse_levels("bids")?;
+    let asks = parse_levels("asks")?;
+    let best_bid = bids
+        .iter()
+        .map(|(price, _)| *price)
+        .max()
+        .ok_or_else(|| fail("markout raw_orderbook has no executable BUY bid"))?;
+    let best_ask = asks
+        .iter()
+        .map(|(price, _)| *price)
+        .min()
+        .ok_or_else(|| fail("markout raw_orderbook has no ask for midpoint"))?;
+    if best_bid >= best_ask {
+        return Err(fail("markout raw_orderbook is crossed or locked"));
+    }
+    let midpoint = (best_bid + best_ask) / Decimal::from(2_u32);
+    let claimed_midpoint = protocol_probability_price(&row["midpoint"], "midpoint", false)?;
+    let executable_price =
+        protocol_probability_price(&row["executable_price"], "executable_price", false)?;
+    if (claimed_midpoint - midpoint).abs() > Decimal::new(1, 8)
+        || (executable_price - best_bid).abs() > Decimal::new(1, 8)
+    {
+        return Err(fail(
+            "markout midpoint or executable BUY price does not equal the raw book",
+        ));
+    }
+    let raw_value = &row["raw_orderbook"];
+    let calculated_hash = format!(
+        "sha256:{}",
+        sha256_bytes(stable_json(raw_value)?.as_bytes())
+    );
+    let raw_venue_hash = raw["venue_hash"].as_str().unwrap_or_default();
+    let claimed_venue_hash = row["venue_book_hash"].as_str().unwrap_or_default();
+    let venue_hash_matches = raw_venue_hash.len() == 40
+        && raw_venue_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && claimed_venue_hash == raw_venue_hash;
+    if normalize_sha256(
+        row["book_hash"]
+            .as_str()
+            .ok_or_else(|| fail("markout book_hash is missing"))?,
+    )? != calculated_hash
+        || !venue_hash_matches
+    {
+        return Err(fail(
+            "markout canonical book hash or venue hash binding is invalid",
+        ));
+    }
+    let claimed_midpoint_markout = json_decimal(&row["midpoint_markout_per_share"])?;
+    let claimed_executable_markout = json_decimal(&row["executable_markout_per_share"])?;
+    if (claimed_midpoint_markout - (midpoint - fill_price)).abs() > Decimal::new(1, 8)
+        || (claimed_executable_markout - (executable_price - fill_price)).abs() > Decimal::new(1, 8)
+    {
+        return Err(fail(
+            "claimed BUY markout does not equal raw-book price minus authenticated fill price",
+        ));
+    }
+
+    let trader_side = row["trader_side"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    if (curve.rate > Decimal::ZERO
+        && !trader_side.is_some_and(|side| matches!(side, "MAKER" | "TAKER")))
+        || trader_side.is_some_and(|side| !matches!(side, "MAKER" | "TAKER"))
+    {
+        return Err(fail("authenticated trader_side is invalid"));
+    }
+    let authenticated_order_role = row["authenticated_order_role"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    if authenticated_order_role.is_some_and(|role| !matches!(role, "MAKER" | "TAKER"))
+        || authenticated_order_role.is_some_and(|role| Some(role) != trader_side)
+    {
+        return Err(fail(
+            "authenticated trader_side contradicts the order's matched role",
+        ));
+    }
+    let authenticated_rate_bps = if row["authenticated_fee_rate_bps"].is_null() {
+        None
+    } else {
+        Some(protocol_nonnegative(
+            &row["authenticated_fee_rate_bps"],
+            "authenticated_fee_rate_bps",
+        )?)
+    };
+    if curve.rate > Decimal::ZERO {
+        let valid_rate = match trader_side {
+            Some("TAKER") => authenticated_rate_bps
+                .is_some_and(|rate| (rate - curve.rate_bps).abs() <= Decimal::new(1, 8)),
+            Some("MAKER") => authenticated_rate_bps.is_some_and(|rate| {
+                rate.abs() <= Decimal::new(1, 8)
+                    || (rate - curve.rate_bps).abs() <= Decimal::new(1, 8)
+            }),
+            _ => false,
+        };
+        if !valid_rate {
+            return Err(fail(
+                "fee-bearing fill does not bind the authenticated V2 fee rate",
+            ));
+        }
+    }
+    if curve.rate == Decimal::ZERO
+        && authenticated_rate_bps.is_some_and(|rate| rate != Decimal::ZERO)
+    {
+        return Err(fail("zero-fee market has a nonzero authenticated fee rate"));
+    }
+    let authenticated_fee_amount = if row["authenticated_fee_amount"].is_null() {
+        None
+    } else {
+        Some(protocol_nonnegative(
+            &row["authenticated_fee_amount"],
+            "authenticated_fee_amount",
+        )?)
+    };
+    let entry_curve = protocol_v3_fee_curve(fill_price, curve)?;
+    let entry_fee_per_share = if trader_side != Some("TAKER") {
+        Decimal::ZERO
+    } else {
+        entry_curve.max(
+            authenticated_fee_amount
+                .map(|amount| amount / fill_size)
+                .unwrap_or(Decimal::ZERO),
+        )
+    };
+    if trader_side == Some("MAKER")
+        && authenticated_fee_amount.is_some_and(|amount| amount > Decimal::new(1, 12))
+    {
+        return Err(fail(
+            "maker fill reports a nonzero authenticated platform fee",
+        ));
+    }
+    let hypothetical_exit_fee_per_share = protocol_v3_fee_curve(executable_price, curve)?;
+    let round_trip_fee_per_share = entry_fee_per_share + hypothetical_exit_fee_per_share;
+    for (field, expected) in [
+        ("entry_fee_per_share", entry_fee_per_share),
+        (
+            "hypothetical_exit_fee_per_share",
+            hypothetical_exit_fee_per_share,
+        ),
+        ("round_trip_fee_per_share", round_trip_fee_per_share),
+    ] {
+        if (protocol_nonnegative(&row[field], field)? - expected).abs() > Decimal::new(1, 8) {
+            return Err(fail(
+                "markout fee claims do not equal independently derived V2 economics",
+            ));
+        }
+    }
+    Ok(ProtocolV3MarkoutEconomics {
+        fill_size,
+        fill_price,
+        executable_price,
+        entry_fee_per_share,
+        hypothetical_exit_fee_per_share,
+        round_trip_fee_per_share,
+        fee_evidence_fingerprint: stable_json(&serde_json::json!({
+            "trader_side": row["trader_side"],
+            "authenticated_order_role": row["authenticated_order_role"],
+            "authenticated_fee_rate_bps": row["authenticated_fee_rate_bps"],
+            "authenticated_fee_amount": row["authenticated_fee_amount"],
+            "authenticated_fee_raw": row["authenticated_fee_raw"],
+        }))?,
+    })
+}
+
 impl FundedCheckpointEvidenceV1 {
-    fn validated_metrics(
+    pub fn validated_metrics(
         &self,
         state: &FundedLadderStateV1,
     ) -> Result<FundedLadderMetrics, ResearchError> {
@@ -1266,6 +1851,9 @@ impl FundedCheckpointEvidenceV1 {
             || self.exact_eligible_order_count != state.active_target_orders
             || self.protocol_v3_order_artifacts.len() != state.active_target_orders as usize
             || self.terminal_risk_portfolio_artifacts.len() != state.active_target_orders as usize
+            || self.control_bindings.len() != state.active_target_orders as usize
+            || self.progress_artifacts.len()
+                != state.active_target_orders.saturating_sub(1) as usize
             || !self.lifecycle_reconciled
         {
             return Err(ResearchError::InvalidInput(
@@ -1273,15 +1861,210 @@ impl FundedCheckpointEvidenceV1 {
                     .to_owned(),
             ));
         }
+        let checkpoint_one_summary = self.protocol_v3_order_artifacts.first().ok_or_else(|| {
+            ResearchError::InvalidInput("funded checkpoint has no checkpoint-1 summary".to_owned())
+        })?;
+        let checkpoint_one_terminal =
+            self.terminal_risk_portfolio_artifacts
+                .first()
+                .ok_or_else(|| {
+                    ResearchError::InvalidInput(
+                        "funded checkpoint has no checkpoint-1 terminal".to_owned(),
+                    )
+                })?;
+        let state_checkpoint_one_summary = state
+            .checkpoint_1_protocol_v3_artifact
+            .as_ref()
+            .ok_or_else(|| {
+                ResearchError::InvalidInput(
+                    "canonical funded state has no checkpoint-1 summary binding".to_owned(),
+                )
+            })?;
+        let state_checkpoint_one_terminal = state
+            .checkpoint_1_terminal_artifact
+            .as_ref()
+            .ok_or_else(|| {
+                ResearchError::InvalidInput(
+                    "canonical funded state has no checkpoint-1 terminal binding".to_owned(),
+                )
+            })?;
+        if normalized_artifact_binding(checkpoint_one_summary, "checkpoint-1 summary")?
+            != normalized_artifact_binding(
+                state_checkpoint_one_summary,
+                "state checkpoint-1 summary",
+            )?
+            || normalized_artifact_binding(checkpoint_one_terminal, "checkpoint-1 terminal")?
+                != normalized_artifact_binding(
+                    state_checkpoint_one_terminal,
+                    "state checkpoint-1 terminal",
+                )?
+        {
+            return Err(ResearchError::InvalidInput(
+                "funded checkpoint does not start from the canonical checkpoint-1 artifacts"
+                    .to_owned(),
+            ));
+        }
+        let checkpoint_one_root = checkpoint_one_chain_root(
+            state,
+            state_checkpoint_one_summary,
+            state_checkpoint_one_terminal,
+        )?;
+        if normalize_sha256(&self.checkpoint_1_chain_root_sha256)? != checkpoint_one_root {
+            return Err(ResearchError::InvalidInput(
+                "funded checkpoint-1 cumulative chain root is invalid".to_owned(),
+            ));
+        }
         let mut identities = std::collections::BTreeSet::new();
         let mut orders = Vec::new();
-        for (summary_binding, terminal_binding) in self
+        let mut cumulative = checkpoint_one_root;
+        for (index, (summary_binding, terminal_binding)) in self
             .protocol_v3_order_artifacts
             .iter()
             .zip(&self.terminal_risk_portfolio_artifacts)
+            .enumerate()
         {
+            let sequence = u32::try_from(index + 1).map_err(|_| {
+                ResearchError::InvalidInput("funded checkpoint sequence overflow".to_owned())
+            })?;
             let summary = load_bound_artifact(summary_binding)?;
             let terminal = load_bound_artifact(terminal_binding)?;
+            let parent = normalized_parent_control_binding(&self.control_bindings[index])?;
+            if parent != self.control_bindings[index] {
+                return Err(ResearchError::InvalidInput(
+                    "funded checkpoint parent control binding is not canonical".to_owned(),
+                ));
+            }
+            validate_summary_parent_control_binding(&summary, &parent)?;
+            if index > 0 {
+                let progress_binding = &self.progress_artifacts[index - 1];
+                let progress = load_bound_artifact(progress_binding)?;
+                let raw_progress_parent: FundedParentControlBindingV1 =
+                    serde_json::from_value(progress["expected_control_binding"].clone())?;
+                let progress_parent = normalized_parent_control_binding(&raw_progress_parent)?;
+                if progress_parent != raw_progress_parent {
+                    return Err(ResearchError::InvalidInput(
+                        "funded progress parent control binding is not canonical".to_owned(),
+                    ));
+                }
+                let decision_id = progress["decision_id"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        ResearchError::InvalidInput(
+                            "funded checkpoint progress decision_id is missing".to_owned(),
+                        )
+                    })?;
+                let summary_binding =
+                    normalized_artifact_binding(summary_binding, "checkpoint summary")?;
+                let terminal_binding =
+                    normalized_artifact_binding(terminal_binding, "checkpoint terminal")?;
+                let candidate: CandidateIdentity =
+                    serde_json::from_value(progress["candidate"].clone())?;
+                if progress["schema"].as_str() != Some("polyedge.funded_stage_order_progress.v1")
+                    || progress["campaign_id"].as_str() != Some(state.campaign_id.as_str())
+                    || candidate != state.candidate
+                    || progress["stage_target_orders"].as_u64()
+                        != Some(u64::from(state.active_target_orders))
+                    || progress["sequence"].as_u64() != Some(u64::from(sequence))
+                    || progress["child_run_id"].as_str() != Some(parent.child_run_id.as_str())
+                    || progress["intent_blob_name"].as_str()
+                        != Some(parent.intent_blob_name.as_str())
+                    || normalize_sha256(progress["intent_sha256"].as_str().ok_or_else(|| {
+                        ResearchError::InvalidInput(
+                            "funded progress intent SHA-256 is missing".to_owned(),
+                        )
+                    })?)?
+                        != parent.intent_sha256
+                    || progress["authorization_blob_name"].as_str()
+                        != Some(parent.authorization_blob_name.as_str())
+                    || normalize_sha256(progress["authorization_sha256"].as_str().ok_or_else(
+                        || {
+                            ResearchError::InvalidInput(
+                                "funded progress authorization SHA-256 is missing".to_owned(),
+                            )
+                        },
+                    )?)? != parent.authorization_sha256
+                    || progress["protocol_v3_summary_blob_name"].as_str()
+                        != Some(summary_binding.blob_name.as_str())
+                    || normalize_sha256(
+                        progress["protocol_v3_summary_sha256"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                ResearchError::InvalidInput(
+                                    "funded progress summary SHA-256 is missing".to_owned(),
+                                )
+                            })?,
+                    )? != summary_binding.sha256
+                    || progress["terminal_evidence_blob_name"].as_str()
+                        != Some(terminal_binding.blob_name.as_str())
+                    || normalize_sha256(progress["terminal_evidence_sha256"].as_str().ok_or_else(
+                        || {
+                            ResearchError::InvalidInput(
+                                "funded progress terminal SHA-256 is missing".to_owned(),
+                            )
+                        },
+                    )?)? != terminal_binding.sha256
+                    || progress_parent != parent
+                    || progress["attempted_order_count"].as_u64() != Some(1)
+                    || progress["submitted_order_count"].as_u64() != Some(1)
+                    || progress["eligible_order_count"].as_u64() != Some(1)
+                {
+                    return Err(ResearchError::InvalidInput(
+                        "funded checkpoint progress does not retain exact order/control bindings"
+                            .to_owned(),
+                    ));
+                }
+                let completed_at = protocol_timestamp(&progress["completed_at"], "completed_at")?;
+                let terminal_observed_at =
+                    protocol_timestamp(&terminal["observed_at"], "terminal.observed_at")?;
+                if completed_at < terminal_observed_at {
+                    return Err(ResearchError::InvalidInput(
+                        "funded progress completion predates terminal evidence".to_owned(),
+                    ));
+                }
+                let payload_hash = progress_payload_hash(
+                    sequence,
+                    decision_id,
+                    &parent,
+                    &summary_binding,
+                    &terminal_binding,
+                )?;
+                let stated_payload_hash =
+                    normalize_sha256(progress["progress_payload_sha256"].as_str().ok_or_else(
+                        || {
+                            ResearchError::InvalidInput(
+                                "funded progress payload SHA-256 is missing".to_owned(),
+                            )
+                        },
+                    )?)?;
+                let stated_prior = normalize_sha256(
+                    progress["prior_cumulative_evidence_sha256"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            ResearchError::InvalidInput(
+                                "funded progress prior cumulative SHA-256 is missing".to_owned(),
+                            )
+                        })?,
+                )?;
+                let expected_cumulative = cumulative_progress_hash(&cumulative, &payload_hash)?;
+                let stated_cumulative =
+                    normalize_sha256(progress["cumulative_evidence_sha256"].as_str().ok_or_else(
+                        || {
+                            ResearchError::InvalidInput(
+                                "funded progress cumulative SHA-256 is missing".to_owned(),
+                            )
+                        },
+                    )?)?;
+                if stated_payload_hash != payload_hash
+                    || stated_prior != cumulative
+                    || stated_cumulative != expected_cumulative
+                {
+                    return Err(ResearchError::InvalidInput(
+                        "funded checkpoint cumulative progress hash chain is invalid".to_owned(),
+                    ));
+                }
+                cumulative = expected_cumulative;
+            }
             let order = validate_protocol_v3_order_evidence(
                 &self.candidate,
                 &summary,
@@ -1298,6 +2081,11 @@ impl FundedCheckpointEvidenceV1 {
                 ));
             }
             orders.push(order);
+        }
+        if normalize_sha256(&self.final_cumulative_evidence_sha256)? != cumulative {
+            return Err(ResearchError::InvalidInput(
+                "funded checkpoint final cumulative evidence hash is invalid".to_owned(),
+            ));
         }
         orders.sort_by_key(|order| order.observed_at);
         let baseline = orders
@@ -1409,34 +2197,6 @@ pub fn validate_protocol_v3_order_evidence(
     {
         return Err(fail("candidate identity does not match"));
     }
-    let probes = summary["probes"]
-        .as_array()
-        .ok_or_else(|| fail("probes array is missing"))?;
-    if probes.len() != 1 || probes[0]["order_submitted"].as_bool() != Some(true) {
-        return Err(fail("exactly one submitted probe is required"));
-    }
-    let probe = &probes[0];
-    let lifecycle = &probe["lifecycle"];
-    if lifecycle["reconciliation_complete"].as_bool() != Some(true)
-        || lifecycle["zero_open_orders_confirmed"].as_bool() != Some(true)
-        || lifecycle["data_gap_detected"].as_bool() != Some(false)
-        || lifecycle["cancellation_failure"].as_bool() != Some(false)
-    {
-        return Err(fail(
-            "lifecycle is not reconciled, globally zero-open, and data-gap free",
-        ));
-    }
-    let observations = probe["model_observations"]
-        .as_array()
-        .ok_or_else(|| fail("model observations are missing"))?;
-    if !observations.iter().any(|row| {
-        row["eligible"].as_bool() == Some(true)
-            && row["quality_eligible"].as_bool() == Some(true)
-            && row["reconciliation_complete"].as_bool() == Some(true)
-            && row["zero_open_orders_confirmed"].as_bool() == Some(true)
-    }) {
-        return Err(fail("no eligible reconciled model observation exists"));
-    }
     let started_at = DateTime::parse_from_rfc3339(
         summary["started_ts"]
             .as_str()
@@ -1444,6 +2204,527 @@ pub fn validate_protocol_v3_order_evidence(
     )
     .map_err(|_| fail("summary started_ts is invalid"))?
     .with_timezone(&Utc);
+    let finished_at = DateTime::parse_from_rfc3339(
+        summary["finished_ts"]
+            .as_str()
+            .ok_or_else(|| fail("summary finished_ts is missing"))?,
+    )
+    .map_err(|_| fail("summary finished_ts is invalid"))?
+    .with_timezone(&Utc);
+    if finished_at < started_at {
+        return Err(fail("summary finished before it started"));
+    }
+    let probes = summary["probes"]
+        .as_array()
+        .ok_or_else(|| fail("probes array is missing"))?;
+    if probes.len() != 1 || probes[0]["order_submitted"].as_bool() != Some(true) {
+        return Err(fail("exactly one submitted probe is required"));
+    }
+    let probe = &probes[0];
+    if probe["schema_version"].as_u64() != Some(3)
+        || probe["evidence_protocol_version"].as_u64() != Some(3)
+        || probe["status"].as_str() != Some("completed")
+    {
+        return Err(fail(
+            "submitted probe is not exact completed protocol-v3 evidence",
+        ));
+    }
+    let lifecycle = &probe["lifecycle"];
+    if lifecycle["reconciliation_complete"].as_bool() != Some(true)
+        || lifecycle["zero_open_orders_confirmed"].as_bool() != Some(true)
+        || lifecycle["data_gap_detected"].as_bool() != Some(false)
+        || lifecycle["cancellation_failure"].as_bool() != Some(false)
+        || lifecycle["rest_order_returned"].as_bool() != Some(true)
+        || lifecycle["post_cancel_finality_stable"].as_bool() != Some(true)
+        || protocol_nonnegative(
+            &lifecycle["post_cancel_observation_ms"],
+            "post_cancel_observation_ms",
+        )? < Decimal::from(10_000_u64)
+    {
+        return Err(fail(
+            "lifecycle is not reconciled, stably globally zero-open, and data-gap free",
+        ));
+    }
+    let context = &probe["pre_send_context"];
+    if context["source"].as_str() != Some("public_market_channel_before_submission") {
+        return Err(fail(
+            "pre-send context source is not public-market provenance",
+        ));
+    }
+    let send_wall_ms = protocol_nonnegative(&lifecycle["send_wall_ms"], "send_wall_ms")?;
+    let ack_wall_ms = protocol_nonnegative(&lifecycle["ack_wall_ms"], "ack_wall_ms")?;
+    let ack_latency =
+        protocol_nonnegative(&lifecycle["client_to_http_ack_ms"], "client_to_http_ack_ms")?;
+    let clock_offset_ms = json_decimal(&lifecycle["clock_server_minus_local_ms"])
+        .map_err(|_| fail("clock_server_minus_local_ms is missing or invalid"))?;
+    let _clock_round_trip_ms =
+        protocol_nonnegative(&lifecycle["clock_round_trip_ms"], "clock_round_trip_ms")?;
+    let clock_uncertainty_ms =
+        protocol_nonnegative(&lifecycle["clock_uncertainty_ms"], "clock_uncertainty_ms")?;
+    if clock_uncertainty_ms > Decimal::from(750_u64) {
+        return Err(fail("clock uncertainty exceeds 750ms"));
+    }
+    let captured_wall_ms = protocol_nonnegative(
+        &context["captured_wall_ms"],
+        "pre_send_context.captured_wall_ms",
+    )?;
+    if ack_wall_ms < send_wall_ms
+        || (ack_wall_ms - send_wall_ms - ack_latency).abs() > Decimal::from(10_u64)
+        || captured_wall_ms > send_wall_ms
+    {
+        return Err(fail("pre-send/ack chronology is invalid"));
+    }
+    for field in [
+        "observed_trade_count",
+        "observed_trade_size",
+        "observed_depth_changes",
+        "price_volatility",
+    ] {
+        let _ = protocol_nonnegative(&context[field], field)?;
+    }
+
+    let matched = protocol_nonnegative(&lifecycle["actual_matched_size"], "actual_matched_size")?;
+    let order_size = protocol_positive(&probe["order"]["size"], "order.size")?;
+    if matched > order_size + Decimal::new(1, 8) {
+        return Err(fail("actual matched size exceeds submitted order size"));
+    }
+    if probe["order"]["side"].as_str() != Some("BUY") {
+        return Err(fail("funded protocol-v3 economics require a BUY order"));
+    }
+    let _order_limit_price =
+        protocol_probability_price(&probe["order"]["price"], "order.price", true)?;
+    if lifecycle["venue_fee_model"].as_str() != Some("polymarket_clob_v2_curve") {
+        return Err(fail(
+            "venue fee evidence is not the Polymarket CLOB V2 curve",
+        ));
+    }
+    let venue_fee_rate = protocol_nonnegative(&lifecycle["venue_fee_rate"], "venue_fee_rate")?;
+    if venue_fee_rate > Decimal::ONE {
+        return Err(fail("venue_fee_rate exceeds one"));
+    }
+    let venue_fee_rate_bps =
+        protocol_nonnegative(&lifecycle["venue_fee_rate_bps"], "venue_fee_rate_bps")?;
+    if venue_fee_rate_bps > Decimal::from(10_000_u64)
+        || (venue_fee_rate_bps - venue_fee_rate * Decimal::from(10_000_u64)).abs()
+            > Decimal::new(1, 8)
+    {
+        return Err(fail("venue_fee_rate_bps does not agree with V2 fd.r"));
+    }
+    let venue_fee_exponent_decimal =
+        protocol_nonnegative(&lifecycle["venue_fee_exponent"], "venue_fee_exponent")?;
+    let venue_fee_exponent = venue_fee_exponent_decimal
+        .to_u32()
+        .filter(|value| Decimal::from(*value) == venue_fee_exponent_decimal && *value <= 10)
+        .ok_or_else(|| fail("venue_fee_exponent is not a supported nonnegative integer"))?;
+    let venue_fee_taker_only = lifecycle["venue_fee_taker_only"]
+        .as_bool()
+        .ok_or_else(|| fail("venue_fee_taker_only is missing"))?;
+    if venue_fee_rate > Decimal::ZERO && !venue_fee_taker_only {
+        return Err(fail("fee-bearing V2 market is not taker-only"));
+    }
+    let fee_curve = ProtocolV3FeeCurve {
+        rate: venue_fee_rate,
+        rate_bps: venue_fee_rate_bps,
+        exponent: venue_fee_exponent,
+    };
+    let round_trip_cost_per_share = protocol_nonnegative(
+        &lifecycle["estimated_round_trip_cost_per_share"],
+        "estimated_round_trip_cost_per_share",
+    )?;
+    if venue_fee_rate_bps > Decimal::ZERO
+        && matched > Decimal::ZERO
+        && round_trip_cost_per_share <= Decimal::ZERO
+    {
+        return Err(fail(
+            "positive venue fees cannot default funded cost to zero",
+        ));
+    }
+    let partial_fill = matched > Decimal::ZERO && matched < order_size;
+    let fully_filled = matched >= order_size;
+    if lifecycle["partial_fill"].as_bool() != Some(partial_fill)
+        || lifecycle["fully_filled"].as_bool() != Some(fully_filled)
+    {
+        return Err(fail("partial/full-fill claims contradict raw sizes"));
+    }
+    for field in [
+        "rest_order_matched_size",
+        "user_order_matched_size",
+        "rest_trade_matched_size",
+        "user_trade_matched_size",
+    ] {
+        if (protocol_nonnegative(&lifecycle[field], field)? - matched).abs() > Decimal::new(1, 8) {
+            return Err(fail("REST/user matched-size sources do not reconcile"));
+        }
+    }
+    if lifecycle["matched_size_source_agreement"].as_bool() != Some(true) {
+        return Err(fail("matched-size source agreement is absent"));
+    }
+
+    let related_ids = protocol_ids(&lifecycle["related_trade_ids"], "related_trade_ids")?;
+    let live_user_ids = protocol_ids(&lifecycle["live_user_trade_ids"], "live_user_trade_ids")?;
+    if related_ids != live_user_ids
+        || lifecycle["trade_id_source_agreement"].as_bool() != Some(true)
+        || (matched > Decimal::ZERO) == related_ids.is_empty()
+    {
+        return Err(fail(
+            "REST/user trade IDs or matched-size state do not reconcile",
+        ));
+    }
+
+    let live_duration_ms =
+        protocol_nonnegative(&lifecycle["live_duration_ms"], "live_duration_ms")?;
+    let first_fill_after_ack_ms = if lifecycle["first_fill_after_ack_ms"].is_null() {
+        None
+    } else {
+        Some(
+            json_decimal(&lifecycle["first_fill_after_ack_ms"])
+                .map_err(|_| fail("first_fill_after_ack_ms is missing or invalid"))?,
+        )
+    };
+    if (matched > Decimal::ZERO) != first_fill_after_ack_ms.is_some() {
+        return Err(fail("matched size and first-fill timing disagree"));
+    }
+    let cancel_send_wall_ms = if lifecycle["cancel_send_wall_ms"].is_null() {
+        if !fully_filled
+            || !lifecycle["client_cancel_round_trip_ms"].is_null()
+            || !lifecycle["client_to_user_cancel_ack_ms"].is_null()
+        {
+            return Err(fail(
+                "cancel latency may be absent only for a terminal full fill",
+            ));
+        }
+        None
+    } else {
+        let cancel =
+            protocol_nonnegative(&lifecycle["cancel_send_wall_ms"], "cancel_send_wall_ms")?;
+        if cancel < send_wall_ms {
+            return Err(fail("cancel predates order submission"));
+        }
+        let cancel_response = protocol_nonnegative(
+            &lifecycle["cancel_http_response_wall_ms"],
+            "cancel_http_response_wall_ms",
+        )?;
+        let user_cancel_received = protocol_nonnegative(
+            &lifecycle["user_channel_cancel_received_wall_ms"],
+            "user_channel_cancel_received_wall_ms",
+        )?;
+        let cancel_round_trip = protocol_nonnegative(
+            &lifecycle["client_cancel_round_trip_ms"],
+            "client_cancel_round_trip_ms",
+        )?;
+        let user_cancel_latency = protocol_nonnegative(
+            &lifecycle["client_to_user_cancel_ack_ms"],
+            "client_to_user_cancel_ack_ms",
+        )?;
+        if cancel_response < cancel
+            || user_cancel_received < cancel
+            || (cancel_response - cancel - cancel_round_trip).abs() > Decimal::from(10_u64)
+            || (user_cancel_received - cancel - user_cancel_latency).abs() > Decimal::ONE
+        {
+            return Err(fail(
+                "cancel acknowledgement chronology contradicts raw timestamps",
+            ));
+        }
+        Some(cancel)
+    };
+    for field in [
+        "public_touch_trade_count",
+        "public_strict_trade_through_count",
+        "public_trade_through_without_fill_count",
+        "post_cancel_fill_count",
+        "authenticated_user_channel_reconnects",
+        "public_market_channel_reconnects",
+        "authenticated_user_channel_unparsed",
+        "public_market_channel_unparsed",
+        "authenticated_user_channel_duplicates",
+        "public_market_channel_duplicates",
+    ] {
+        if lifecycle[field].as_u64().is_none() {
+            return Err(fail(
+                "trade-through/reconnect/duplicate counters are missing",
+            ));
+        }
+    }
+    if lifecycle["public_trade_through_without_fill_count"]
+        .as_u64()
+        .unwrap_or(u64::MAX)
+        > lifecycle["public_strict_trade_through_count"]
+            .as_u64()
+            .unwrap_or_default()
+        || lifecycle["authenticated_user_channel_reconnects"].as_u64() != Some(0)
+        || lifecycle["public_market_channel_reconnects"].as_u64() != Some(0)
+        || lifecycle["authenticated_user_channel_unparsed"].as_u64() != Some(0)
+        || lifecycle["public_market_channel_unparsed"].as_u64() != Some(0)
+        || lifecycle["markout_capture_complete"].as_bool() != Some(true)
+    {
+        return Err(fail(
+            "trade-through or markout-capture evidence is inconsistent",
+        ));
+    }
+
+    let markouts = probe["markouts"]
+        .as_array()
+        .ok_or_else(|| fail("markouts are missing"))?;
+    let expected_token_id = probe["market"]["tokenId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| fail("markout market tokenId is missing"))?;
+    let mut preliminary_fills =
+        std::collections::BTreeMap::<String, (DateTime<Utc>, Decimal, Decimal, String)>::new();
+    let mut preliminary_thirty_weighted = Decimal::ZERO;
+    let mut preliminary_thirty_cost_weighted = Decimal::ZERO;
+    let mut preliminary_thirty_entry_cost_weighted = Decimal::ZERO;
+    let mut preliminary_thirty_exit_cost_weighted = Decimal::ZERO;
+    let mut preliminary_thirty_size = Decimal::ZERO;
+    for row in markouts {
+        let fill_id = row["fill_id"]
+            .as_str()
+            .filter(|fill_id| !fill_id.is_empty())
+            .ok_or_else(|| fail("markout fill ID is missing"))?;
+        let fill_timestamp = protocol_timestamp(&row["fill_timestamp"], "fill_timestamp")?;
+        let venue_fill_timestamp =
+            protocol_timestamp(&row["venue_fill_timestamp"], "venue_fill_timestamp")?;
+        let expected_local_fill_ms =
+            Decimal::from(venue_fill_timestamp.timestamp_millis()) - clock_offset_ms;
+        if (Decimal::from(fill_timestamp.timestamp_millis()) - expected_local_fill_ms).abs()
+            > Decimal::ONE
+        {
+            return Err(fail(
+                "normalized fill timestamp contradicts venue timestamp and measured clock offset",
+            ));
+        }
+        if Decimal::from(fill_timestamp.timestamp_millis()) < send_wall_ms - clock_uncertainty_ms {
+            return Err(fail(
+                "authenticated fill timestamp predates order submission beyond clock uncertainty",
+            ));
+        }
+        let economics = protocol_v3_markout_economics(row, expected_token_id, fee_curve)?;
+        let fill_size = economics.fill_size;
+        let fill_price = economics.fill_price;
+        if row["horizon_seconds"].as_u64() == Some(30) {
+            preliminary_thirty_weighted += (economics.executable_price - fill_price) * fill_size;
+            preliminary_thirty_entry_cost_weighted += economics.entry_fee_per_share * fill_size;
+            preliminary_thirty_exit_cost_weighted +=
+                economics.hypothetical_exit_fee_per_share * fill_size;
+            preliminary_thirty_cost_weighted += economics.round_trip_fee_per_share * fill_size;
+            preliminary_thirty_size += fill_size;
+        }
+        if let Some((existing_timestamp, existing_size, existing_price, existing_fee_evidence)) =
+            preliminary_fills.get(fill_id)
+        {
+            if *existing_timestamp != fill_timestamp {
+                return Err(fail(
+                    "a fill has inconsistent authenticated timestamps across markouts",
+                ));
+            }
+            if (*existing_size - fill_size).abs() > Decimal::new(1, 8) {
+                return Err(fail("a fill has inconsistent sizes across markouts"));
+            }
+            if (*existing_price - fill_price).abs() > Decimal::new(1, 8) {
+                return Err(fail("a fill has inconsistent prices across markouts"));
+            }
+            if existing_fee_evidence != &economics.fee_evidence_fingerprint {
+                return Err(fail(
+                    "a fill has inconsistent authenticated fee evidence across markouts",
+                ));
+            }
+        } else {
+            preliminary_fills.insert(
+                fill_id.to_owned(),
+                (
+                    fill_timestamp,
+                    fill_size,
+                    fill_price,
+                    economics.fee_evidence_fingerprint,
+                ),
+            );
+        }
+    }
+    let derived_first_fill_after_ack_ms = preliminary_fills
+        .values()
+        .map(|(timestamp, _, _, _)| Decimal::from(timestamp.timestamp_millis()) - ack_wall_ms)
+        .min();
+    let preliminary_markout_30 = if preliminary_thirty_size > Decimal::ZERO {
+        Some(preliminary_thirty_weighted / preliminary_thirty_size)
+    } else {
+        None
+    };
+    let independently_derived_round_trip_cost = if preliminary_thirty_size > Decimal::ZERO {
+        preliminary_thirty_cost_weighted / preliminary_thirty_size
+    } else {
+        Decimal::ZERO
+    };
+    let independently_derived_entry_fee = if preliminary_thirty_size > Decimal::ZERO {
+        preliminary_thirty_entry_cost_weighted / preliminary_thirty_size
+    } else {
+        Decimal::ZERO
+    };
+    let independently_derived_exit_fee = if preliminary_thirty_size > Decimal::ZERO {
+        preliminary_thirty_exit_cost_weighted / preliminary_thirty_size
+    } else {
+        Decimal::ZERO
+    };
+    if (round_trip_cost_per_share - independently_derived_round_trip_cost).abs()
+        > Decimal::new(1, 8)
+    {
+        return Err(fail(
+            "claimed round-trip cost does not equal independently derived venue fees",
+        ));
+    }
+    if match (derived_first_fill_after_ack_ms, first_fill_after_ack_ms) {
+        (None, None) => false,
+        (Some(derived), Some(claimed)) => (derived - claimed).abs() > Decimal::ONE,
+        _ => true,
+    } {
+        return Err(fail(
+            "first-fill timing contradicts authenticated per-fill timestamps",
+        ));
+    }
+
+    let observations = probe["model_observations"]
+        .as_array()
+        .ok_or_else(|| fail("model observations are missing"))?;
+    if observations.len() != 4 {
+        return Err(fail(
+            "model evidence must contain exactly 1/5/30/60-second labels",
+        ));
+    }
+    let inferred_size_ahead = protocol_nonnegative(
+        &probe["order"]["inferredSizeAhead"],
+        "order.inferredSizeAhead",
+    )?;
+    let order_spread = protocol_optional_decimal(&probe["order"]["spread"], "order.spread")?;
+    let order_price = protocol_probability_price(&probe["order"]["price"], "order.price", true)?;
+    let time_to_expiry = if probe["market"]["endTs"].is_null() {
+        None
+    } else {
+        let end = protocol_timestamp(&probe["market"]["endTs"], "market.endTs")?;
+        Some(
+            (Decimal::from(end.timestamp_millis()) - ack_wall_ms).max(Decimal::ZERO)
+                / Decimal::from(1_000_u64),
+        )
+    };
+    for horizon in [1_u64, 5, 30, 60] {
+        let rows = observations
+            .iter()
+            .filter(|row| row["horizon_seconds"].as_u64() == Some(horizon))
+            .collect::<Vec<_>>();
+        if rows.len() != 1 {
+            return Err(fail(
+                "each 1/5/30/60-second model horizon is required exactly once",
+            ));
+        }
+        let row = rows[0];
+        if derived_first_fill_after_ack_ms.is_some_and(|first_fill| {
+            (first_fill - Decimal::from(horizon * 1_000)).abs() <= clock_uncertainty_ms
+        }) {
+            return Err(fail(
+                "fill label is ambiguous at a horizon boundary within clock uncertainty",
+            ));
+        }
+        let derived_filled = derived_first_fill_after_ack_ms
+            .is_some_and(|first_fill| first_fill <= Decimal::from(horizon * 1_000));
+        let derived_observed = live_duration_ms >= Decimal::from(horizon * 1_000)
+            || derived_filled
+            || lifecycle["post_cancel_finality_stable"].as_bool() == Some(true);
+        if !derived_observed
+            || row["label_observed"].as_bool() != Some(true)
+            || row["filled"].as_bool() != Some(derived_filled)
+            || row["order_submitted"].as_bool() != Some(true)
+            || row["eligible"].as_bool() != Some(true)
+            || row["quality_eligible"].as_bool() != Some(true)
+            || row["reconciliation_complete"].as_bool() != Some(true)
+            || row["zero_open_orders_confirmed"].as_bool() != Some(true)
+            || row["data_gap_detected"].as_bool() != Some(false)
+            || row["cancellation_failure"].as_bool() != Some(false)
+            || row["markout_complete"].as_bool() != Some(true)
+            || row["markout_timing_valid"].as_bool() != Some(true)
+            || (protocol_nonnegative(&row["pre_send_trade_size"], "pre_send_trade_size")?
+                - protocol_nonnegative(&context["observed_trade_size"], "observed_trade_size")?)
+            .abs()
+                > Decimal::new(1, 8)
+            || (protocol_nonnegative(&row["pre_send_depth_changes"], "pre_send_depth_changes")?
+                - protocol_nonnegative(
+                    &context["observed_depth_changes"],
+                    "observed_depth_changes",
+                )?)
+            .abs()
+                > Decimal::new(1, 8)
+            || (protocol_nonnegative(&row["pre_send_volatility"], "pre_send_volatility")?
+                - protocol_nonnegative(&context["price_volatility"], "price_volatility")?)
+            .abs()
+                > Decimal::new(1, 8)
+        {
+            return Err(fail(
+                "a model horizon is incomplete or contradicts raw lifecycle/context evidence",
+            ));
+        }
+        if (protocol_nonnegative(&row["inferred_size_ahead"], "inferred_size_ahead")?
+            - inferred_size_ahead)
+            .abs()
+            > Decimal::new(1, 8)
+            || !protocol_optional_decimal_equal(&row["spread"], order_spread, "spread")?
+            || (protocol_positive(&row["order_price"], "order_price")? - order_price).abs()
+                > Decimal::new(1, 8)
+            || (protocol_positive(&row["order_size"], "order_size")? - order_size).abs()
+                > Decimal::new(1, 8)
+            || !protocol_optional_decimal_equal(
+                &row["time_to_expiry_seconds"],
+                time_to_expiry,
+                "time_to_expiry_seconds",
+            )?
+        {
+            return Err(fail(
+                "a model horizon does not preserve raw order/market features",
+            ));
+        }
+        let claimed_markout_30 = protocol_optional_signed_decimal(
+            &row["executable_markout_30s_per_share"],
+            "executable_markout_30s_per_share",
+        )?;
+        if match (claimed_markout_30, preliminary_markout_30) {
+            (None, None) => false,
+            (Some(claimed), Some(derived)) => (claimed - derived).abs() > Decimal::new(1, 8),
+            _ => true,
+        } {
+            return Err(fail(
+                "model horizon does not bind the derived 30-second executable markout",
+            ));
+        }
+        if row["venue_fee_model"].as_str() != Some("polymarket_clob_v2_curve")
+            || (protocol_nonnegative(&row["venue_fee_rate"], "model.venue_fee_rate")?
+                - venue_fee_rate)
+                .abs()
+                > Decimal::new(1, 8)
+            || (protocol_nonnegative(&row["venue_fee_rate_bps"], "model.venue_fee_rate_bps")?
+                - venue_fee_rate_bps)
+                .abs()
+                > Decimal::new(1, 8)
+            || protocol_nonnegative(&row["venue_fee_exponent"], "model.venue_fee_exponent")?
+                != Decimal::from(venue_fee_exponent)
+            || row["venue_fee_taker_only"].as_bool() != Some(venue_fee_taker_only)
+            || (protocol_nonnegative(&row["entry_fee_per_share"], "model.entry_fee_per_share")?
+                - independently_derived_entry_fee)
+                .abs()
+                > Decimal::new(1, 8)
+            || (protocol_nonnegative(
+                &row["hypothetical_exit_fee_per_share"],
+                "model.hypothetical_exit_fee_per_share",
+            )? - independently_derived_exit_fee)
+                .abs()
+                > Decimal::new(1, 8)
+            || (protocol_nonnegative(
+                &row["estimated_round_trip_cost_per_share"],
+                "model.estimated_round_trip_cost_per_share",
+            )? - independently_derived_round_trip_cost)
+                .abs()
+                > Decimal::new(1, 8)
+        {
+            return Err(fail(
+                "model horizon does not bind actual venue cost evidence",
+            ));
+        }
+    }
     let model = &summary["prediction_model"];
     normalize_sha256(
         model["sha256"]
@@ -1482,31 +2763,6 @@ pub fn validate_protocol_v3_order_evidence(
     let run_id = required_json_text(summary, "/run_id")?;
     let probe_id = required_json_text(probe, "/probe_id")?;
     let order_id = required_json_text(lifecycle, "/order_id")?;
-    let matched = json_decimal(&lifecycle["actual_matched_size"])?;
-    if matched < Decimal::ZERO {
-        return Err(fail("matched size is negative"));
-    }
-    let related_ids = lifecycle["related_trade_ids"]
-        .as_array()
-        .ok_or_else(|| fail("related trade IDs are missing"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| fail("related trade ID is empty"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let unique_related = related_ids
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    if unique_related.len() != related_ids.len() {
-        return Err(fail("related trade IDs are duplicated"));
-    }
-    let markouts = probe["markouts"]
-        .as_array()
-        .ok_or_else(|| fail("markouts are missing"))?;
     if matched == Decimal::ZERO && (!related_ids.is_empty() || !markouts.is_empty()) {
         return Err(fail("a no-fill order contains fill or markout claims"));
     }
@@ -1517,12 +2773,13 @@ pub fn validate_protocol_v3_order_evidence(
     }
     let mut weighted_markout = Decimal::ZERO;
     let mut weighted_size = Decimal::ZERO;
+    let mut fill_timestamps = std::collections::BTreeMap::<String, DateTime<Utc>>::new();
     for fill_id in &related_ids {
         for horizon in [1_u64, 5, 30] {
             let rows = markouts
                 .iter()
                 .filter(|row| {
-                    row["fill_id"].as_str() == Some(*fill_id)
+                    row["fill_id"].as_str() == Some(fill_id.as_str())
                         && row["horizon_seconds"].as_u64() == Some(horizon)
                 })
                 .collect::<Vec<_>>();
@@ -1535,18 +2792,119 @@ pub fn validate_protocol_v3_order_evidence(
             let delay = row["observation_delay_ms"]
                 .as_i64()
                 .ok_or_else(|| fail("markout delay is missing"))?;
-            let fill_size = json_decimal(&row["fill_size"])?;
-            let _ = json_decimal(&row["midpoint"])?;
-            let _ = json_decimal(&row["executable_price"])?;
+            let fill_size = protocol_positive(&row["fill_size"], "fill_size")?;
+            let fill_price = protocol_probability_price(&row["fill_price"], "fill_price", false)?;
+            let midpoint = protocol_probability_price(&row["midpoint"], "midpoint", false)?;
+            let executable_price =
+                protocol_probability_price(&row["executable_price"], "executable_price", false)?;
+            let midpoint_markout = json_decimal(&row["midpoint_markout_per_share"])?;
             let executable_markout = json_decimal(&row["executable_markout_per_share"])?;
-            if !(0..=2_000).contains(&delay) || fill_size <= Decimal::ZERO {
+            if (midpoint_markout - (midpoint - fill_price)).abs() > Decimal::new(1, 8)
+                || (executable_markout - (executable_price - fill_price)).abs() > Decimal::new(1, 8)
+            {
+                return Err(fail(
+                    "claimed BUY markout does not equal observed price minus authenticated fill price",
+                ));
+            }
+            let fill_timestamp = protocol_timestamp(&row["fill_timestamp"], "fill_timestamp")?;
+            if let Some(existing) = fill_timestamps.get(fill_id) {
+                if *existing != fill_timestamp {
+                    return Err(fail(
+                        "a fill has inconsistent authenticated timestamps across markouts",
+                    ));
+                }
+            } else {
+                fill_timestamps.insert(fill_id.clone(), fill_timestamp);
+            }
+            let target_timestamp =
+                protocol_timestamp(&row["target_observation_ts"], "target_observation_ts")?;
+            let request_started_at =
+                protocol_timestamp(&row["request_started_at"], "request_started_at")?;
+            let response_completed_at =
+                protocol_timestamp(&row["response_completed_at"], "response_completed_at")?;
+            let observed_timestamp = protocol_timestamp(&row["observed_at"], "observed_at")?;
+            let response_duration =
+                protocol_nonnegative(&row["response_duration_ms"], "response_duration_ms")?;
+            normalize_sha256(
+                row["book_hash"]
+                    .as_str()
+                    .ok_or_else(|| fail("markout book_hash is missing"))?,
+            )?;
+            if !row["venue_book_timestamp"].is_null() {
+                let venue_book_at =
+                    protocol_timestamp(&row["venue_book_timestamp"], "venue_book_timestamp")?;
+                let venue_book_local_ms =
+                    Decimal::from(venue_book_at.timestamp_millis()) - clock_offset_ms;
+                let response_ms = Decimal::from(response_completed_at.timestamp_millis());
+                if venue_book_local_ms > response_ms + clock_uncertainty_ms
+                    || response_ms - venue_book_local_ms
+                        > Decimal::from(2_000_u64) + clock_uncertainty_ms
+                {
+                    return Err(fail(
+                        "venue order book is stale or future-dated relative to the markout response",
+                    ));
+                }
+            }
+            let target_offset = (target_timestamp - fill_timestamp).num_milliseconds();
+            let response_delay = (response_completed_at - target_timestamp).num_milliseconds();
+            let measured_response_duration =
+                (response_completed_at - request_started_at).num_milliseconds();
+            if !(0..=2_000).contains(&delay)
+                || fill_size <= Decimal::ZERO
+                || (target_offset - i64::try_from(horizon * 1_000).unwrap_or(i64::MAX)).abs() > 1
+                || request_started_at < target_timestamp
+                || response_completed_at < request_started_at
+                || observed_timestamp != response_completed_at
+                || (Decimal::from(measured_response_duration) - response_duration).abs()
+                    > Decimal::ONE
+                || (response_delay - delay).abs() > 1
+                || observed_timestamp > finished_at
+            {
                 return Err(fail("markout values are incomplete or untimely"));
             }
             if horizon == 30 {
-                weighted_markout += executable_markout * fill_size;
+                weighted_markout += (executable_price - fill_price) * fill_size;
                 weighted_size += fill_size;
             }
         }
+    }
+    let post_cancel_delays = if let Some(cancel) = cancel_send_wall_ms {
+        let mut delays = Vec::new();
+        for timestamp in fill_timestamps.values() {
+            let delay = Decimal::from(timestamp.timestamp_millis()) - cancel;
+            if delay.abs() <= clock_uncertainty_ms {
+                return Err(fail(
+                    "fill/cancel ordering is ambiguous within clock uncertainty",
+                ));
+            }
+            if delay > Decimal::ZERO {
+                delays.push(delay);
+            }
+        }
+        delays
+    } else {
+        Vec::new()
+    };
+    let first_fill_after_cancel = post_cancel_delays.iter().copied().min();
+    let claimed_first_fill_after_cancel = if lifecycle["first_fill_after_cancel_ms"].is_null() {
+        None
+    } else {
+        Some(protocol_nonnegative(
+            &lifecycle["first_fill_after_cancel_ms"],
+            "first_fill_after_cancel_ms",
+        )?)
+    };
+    if lifecycle["post_cancel_fill_count"].as_u64() != u64::try_from(post_cancel_delays.len()).ok()
+        || lifecycle["fill_raced_cancellation"].as_bool() != Some(!post_cancel_delays.is_empty())
+        || match (first_fill_after_cancel, claimed_first_fill_after_cancel) {
+            (None, None) => false,
+            (Some(derived), Some(claimed)) => (derived - claimed).abs() > Decimal::ONE,
+            _ => true,
+        }
+    {
+        return Err(fail(
+            "fill/cancel race evidence contradicts per-fill authenticated timestamps",
+        ));
     }
     if matched > Decimal::ZERO && (weighted_size - matched).abs() > Decimal::new(1, 8) {
         return Err(fail(
@@ -1554,7 +2912,7 @@ pub fn validate_protocol_v3_order_evidence(
         ));
     }
     let net_markout_30s = if weighted_size > Decimal::ZERO {
-        Some(weighted_markout / weighted_size)
+        Some(weighted_markout / weighted_size - round_trip_cost_per_share)
     } else {
         None
     };
@@ -1567,8 +2925,17 @@ pub fn validate_protocol_v3_order_evidence(
         || terminal["settlement_verified"].as_bool() != Some(true)
         || terminal["portfolio_reconciled"].as_bool() != Some(true)
         || terminal["zero_open_orders_confirmed"].as_bool() != Some(true)
+        || terminal["trust_boundary_ready"].as_bool() != Some(true)
+        || terminal["unresolved_risk_reservations"].as_u64() != Some(0)
         || json_decimal(&terminal["unresolved_exposure"])? != Decimal::ZERO
-        || json_decimal(&terminal["reconciliation_discrepancy"])? > Decimal::new(1, 2)
+        || protocol_nonnegative(
+            &terminal["reconciliation_discrepancy"],
+            "reconciliation_discrepancy",
+        )? > Decimal::new(1, 2)
+        || terminal["condition_id"].as_str()
+            != probe["market"]["conditionId"]
+                .as_str()
+                .filter(|value| !value.is_empty())
     {
         return Err(fail(
             "terminal risk/portfolio evidence is invalid or mismatched",
@@ -1578,10 +2945,55 @@ pub fn validate_protocol_v3_order_evidence(
     let transaction_hash = terminal["settlement_transaction_hash"]
         .as_str()
         .unwrap_or_default();
+    let valid_transaction_hash = transaction_hash
+        .strip_prefix("0x")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let expected_wallet = summary["funder_address"].as_str().unwrap_or_default();
+    let settlement_wallet = terminal["settlement_wallet"].as_str().unwrap_or_default();
+    let valid_expected_wallet = expected_wallet
+        .strip_prefix("0x")
+        .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let expected_condition = probe["market"]["conditionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let redeemed_conditions = terminal["redemption_condition_ids"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let unique_redeemed_conditions = redeemed_conditions
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let redeemed_condition_membership_valid = !expected_condition.is_empty()
+        && redeemed_conditions.len() == unique_redeemed_conditions.len()
+        && redeemed_conditions.iter().all(|condition| {
+            !condition.is_empty()
+                && condition == condition.trim()
+                && condition == &condition.to_ascii_lowercase()
+        })
+        && unique_redeemed_conditions.contains(&expected_condition);
     if (matched == Decimal::ZERO && source != "authenticated_no_fill")
         || (matched > Decimal::ZERO
             && (source != "polymarket_data_api_plus_onchain_redemption"
-                || transaction_hash.is_empty()))
+                || !valid_transaction_hash
+                || terminal["polygon_chain_id"].as_u64() != Some(137)
+                || terminal["transaction_receipt_status"].as_str() != Some("success")
+                || terminal["transaction_block_number"]
+                    .as_u64()
+                    .is_none_or(|block| block == 0)
+                || terminal["transaction_receipt_confirmations"]
+                    .as_u64()
+                    .is_none_or(|confirmations| confirmations < 2)
+                || !redeemed_condition_membership_valid
+                || !valid_expected_wallet
+                || !settlement_wallet.eq_ignore_ascii_case(expected_wallet)))
     {
         return Err(fail("terminal evidence source does not match fill state"));
     }
@@ -1600,12 +3012,22 @@ pub fn validate_protocol_v3_order_evidence(
             ));
         }
     }
-    let baseline = json_decimal(&terminal["campaign_starting_equity"])?;
+    let baseline = protocol_nonnegative(
+        &terminal["campaign_starting_equity"],
+        "campaign_starting_equity",
+    )?;
     let cash_flows = json_decimal(&terminal["net_external_cash_flows"])?;
-    let liquid = json_decimal(&terminal["liquid_collateral"])?;
-    let positions = json_decimal(&terminal["summed_position_value"])?;
-    let ending = json_decimal(&terminal["cash_flow_adjusted_ending_equity"])?;
-    let stated_discrepancy = json_decimal(&terminal["reconciliation_discrepancy"])?;
+    let liquid = protocol_nonnegative(&terminal["liquid_collateral"], "liquid_collateral")?;
+    let positions =
+        protocol_nonnegative(&terminal["summed_position_value"], "summed_position_value")?;
+    let ending = protocol_nonnegative(
+        &terminal["cash_flow_adjusted_ending_equity"],
+        "cash_flow_adjusted_ending_equity",
+    )?;
+    let stated_discrepancy = protocol_nonnegative(
+        &terminal["reconciliation_discrepancy"],
+        "reconciliation_discrepancy",
+    )?;
     let calculated_discrepancy = (liquid + positions - ending).abs();
     if calculated_discrepancy > Decimal::new(1, 2)
         || (calculated_discrepancy - stated_discrepancy).abs() > Decimal::new(1, 2)
@@ -1614,8 +3036,14 @@ pub fn validate_protocol_v3_order_evidence(
             "terminal equity components do not reconcile within $0.01",
         ));
     }
-    let maximum = json_decimal(&terminal["maximum_observed_equity"])?;
-    let minimum = json_decimal(&terminal["minimum_observed_equity"])?;
+    let maximum = protocol_nonnegative(
+        &terminal["maximum_observed_equity"],
+        "maximum_observed_equity",
+    )?;
+    let minimum = protocol_nonnegative(
+        &terminal["minimum_observed_equity"],
+        "minimum_observed_equity",
+    )?;
     if maximum < minimum {
         return Err(fail("terminal equity extrema are invalid"));
     }
@@ -1626,8 +3054,10 @@ pub fn validate_protocol_v3_order_evidence(
     )
     .map_err(|_| fail("terminal observed_at is invalid"))?
     .with_timezone(&Utc);
-    if observed_at < started_at {
-        return Err(fail("terminal evidence predates the order"));
+    if observed_at < finished_at {
+        return Err(fail(
+            "terminal evidence predates completion of the order summary",
+        ));
     }
     Ok(ValidatedProtocolV3OrderEvidence {
         run_id,
@@ -2856,6 +4286,121 @@ fn json_decimal(value: &serde_json::Value) -> Result<Decimal, ResearchError> {
         })?;
     text.parse::<Decimal>()
         .map_err(|_| ResearchError::InvalidInput(format!("invalid decimal evidence value: {text}")))
+}
+
+fn protocol_nonnegative(value: &serde_json::Value, label: &str) -> Result<Decimal, ResearchError> {
+    let parsed = json_decimal(value).map_err(|_| {
+        ResearchError::InvalidInput(format!(
+            "protocol-v3 order evidence rejected: {label} is missing or invalid"
+        ))
+    })?;
+    if parsed < Decimal::ZERO {
+        return Err(ResearchError::InvalidInput(format!(
+            "protocol-v3 order evidence rejected: {label} is negative"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn protocol_positive(value: &serde_json::Value, label: &str) -> Result<Decimal, ResearchError> {
+    let parsed = protocol_nonnegative(value, label)?;
+    if parsed <= Decimal::ZERO {
+        return Err(ResearchError::InvalidInput(format!(
+            "protocol-v3 order evidence rejected: {label} must be positive"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn protocol_optional_decimal(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<Option<Decimal>, ResearchError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        protocol_nonnegative(value, label).map(Some)
+    }
+}
+
+fn protocol_optional_signed_decimal(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<Option<Decimal>, ResearchError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        json_decimal(value).map(Some).map_err(|_| {
+            ResearchError::InvalidInput(format!(
+                "protocol-v3 order evidence rejected: {label} is missing or invalid"
+            ))
+        })
+    }
+}
+
+fn protocol_probability_price(
+    value: &serde_json::Value,
+    label: &str,
+    strictly_positive: bool,
+) -> Result<Decimal, ResearchError> {
+    let parsed = protocol_nonnegative(value, label)?;
+    if parsed > Decimal::ONE || (strictly_positive && parsed <= Decimal::ZERO) {
+        return Err(ResearchError::InvalidInput(format!(
+            "protocol-v3 order evidence rejected: {label} is outside the allowed probability-price range"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn protocol_optional_decimal_equal(
+    value: &serde_json::Value,
+    expected: Option<Decimal>,
+    label: &str,
+) -> Result<bool, ResearchError> {
+    let actual = protocol_optional_decimal(value, label)?;
+    Ok(match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => (actual - expected).abs() <= Decimal::new(1, 8),
+        _ => false,
+    })
+}
+
+fn protocol_ids(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<std::collections::BTreeSet<String>, ResearchError> {
+    let values = value.as_array().ok_or_else(|| {
+        ResearchError::InvalidInput(format!(
+            "protocol-v3 order evidence rejected: {label} must be an array"
+        ))
+    })?;
+    let mut ids = std::collections::BTreeSet::new();
+    for value in values {
+        let id = value.as_str().filter(|id| !id.is_empty()).ok_or_else(|| {
+            ResearchError::InvalidInput(format!(
+                "protocol-v3 order evidence rejected: {label} contains an empty ID"
+            ))
+        })?;
+        if !ids.insert(id.to_owned()) {
+            return Err(ResearchError::InvalidInput(format!(
+                "protocol-v3 order evidence rejected: {label} contains duplicate IDs"
+            )));
+        }
+    }
+    Ok(ids)
+}
+
+fn protocol_timestamp(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<DateTime<Utc>, ResearchError> {
+    DateTime::parse_from_rfc3339(value.as_str().unwrap_or_default())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| {
+            ResearchError::InvalidInput(format!(
+                "protocol-v3 order evidence rejected: {label} is missing or invalid"
+            ))
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

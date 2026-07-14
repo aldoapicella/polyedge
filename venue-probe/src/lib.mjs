@@ -8,6 +8,11 @@ import {
 export const HORIZONS_SECONDS = [1, 5, 30, 60];
 export const MARKOUT_HORIZONS_SECONDS = [1, 5, 30];
 export const EVIDENCE_PROTOCOL_VERSION = 3;
+export const MIN_STABLE_FINALITY_OBSERVATION_MS = 10_000;
+
+export function isEvidenceProtocolVersionEligible(value) {
+  return Number(value || 0) === EVIDENCE_PROTOCOL_VERSION;
+}
 export const MAX_MARKOUT_OBSERVATION_DELAY_MS = 2000;
 export const DEFAULT_CAMPAIGN_BASELINE_EQUITY = 5.030521;
 export const DEFAULT_CAMPAIGN_EQUITY_FLOOR = 4.03;
@@ -24,6 +29,7 @@ export function loadProbeConfig(env = process.env) {
     campaignEnabled: parseBoolean(env.VENUE_PROBE_CAMPAIGN_ENABLED),
     killSwitch: parseBoolean(env.VENUE_PROBE_KILL_SWITCH),
     dryRun: env.VENUE_PROBE_DRY_RUN !== "false",
+    trustBoundaryReady: parseBoolean(env.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY),
     maxOpenOrders: integer(env.MAX_OPEN_ORDERS, 1),
     maxOrderNotional: number(env.VENUE_PROBE_MAX_ORDER_NOTIONAL, 1),
     minOrderNotional: number(env.VENUE_PROBE_MIN_ORDER_NOTIONAL, 1),
@@ -132,6 +138,9 @@ export function validateProbeConfig(config) {
   }
   if (!config.dryRun && !config.storageAccount) {
     errors.push("AZURE_STORAGE_ACCOUNT_NAME is required for durable live risk reservations");
+  }
+  if (!config.dryRun && !config.trustBoundaryReady) {
+    errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control identities and containers are isolated");
   }
   for (const [name, value] of [
     ["POLYMARKET_PRIVATE_KEY", config.privateKey],
@@ -425,15 +434,40 @@ export function modelObservations({ order, market, lifecycle, context, markouts 
   const markoutTimingValid = coverage.timing_valid;
   const markoutComplete = coverage.complete;
   const markout30 = weightedExecutableMarkout(markouts, 30);
+  const derivedEntryFee30 = weightedMarkoutMetric(markouts, 30, "entry_fee_per_share");
+  const derivedExitFee30 = weightedMarkoutMetric(markouts, 30, "hypothetical_exit_fee_per_share");
+  const derivedRoundTripCost30 = weightedMarkoutMetric(markouts, 30, "round_trip_fee_per_share");
+  const roundTripCost30 = Number(lifecycle.actual_matched_size) > 0 ? derivedRoundTripCost30 : 0;
+  const entryFee30 = Number(lifecycle.actual_matched_size) > 0 ? derivedEntryFee30 : 0;
+  const exitFee30 = Number(lifecycle.actual_matched_size) > 0 ? derivedExitFee30 : 0;
+  const stableTerminalFinality = lifecycle.post_cancel_finality_stable === true &&
+    Number(lifecycle.post_cancel_observation_ms) >= MIN_STABLE_FINALITY_OBSERVATION_MS;
+  const cancellationEvidenceComplete = lifecycle.cancel_send_wall_ms === null
+    ? lifecycle.fully_filled === true && lifecycle.client_cancel_round_trip_ms === null &&
+      lifecycle.client_to_user_cancel_ack_ms === null
+    : Number.isFinite(Number(lifecycle.cancel_send_wall_ms)) &&
+      Number.isFinite(Number(lifecycle.client_cancel_round_trip_ms)) && Number(lifecycle.client_cancel_round_trip_ms) >= 0 &&
+      Number.isFinite(Number(lifecycle.client_to_user_cancel_ack_ms)) && Number(lifecycle.client_to_user_cancel_ack_ms) >= 0;
   return HORIZONS_SECONDS.map((horizon) => {
     const liveSeconds = lifecycle.live_duration_ms / 1000;
     const filledAtMs = lifecycle.first_fill_after_ack_ms;
     const filled = filledAtMs !== null && filledAtMs <= horizon * 1000;
-    const labelObserved = liveSeconds >= horizon || filled;
+    // Once authenticated/REST reconciliation proves stable terminal finality
+    // with a globally empty account, this order cannot acquire a later fill.
+    // That makes all remaining horizon labels observable without pretending the
+    // quote itself stayed live through those horizons.
+    const labelObserved = liveSeconds >= horizon || filled || stableTerminalFinality;
     const qualityEligible = lifecycle.reconciliation_complete === true &&
       lifecycle.zero_open_orders_confirmed === true &&
       lifecycle.data_gap_detected !== true &&
       lifecycle.cancellation_failure !== true &&
+      lifecycle.rest_order_returned === true &&
+      lifecycle.matched_size_source_agreement === true &&
+      lifecycle.trade_id_source_agreement === true &&
+      lifecycle.markout_capture_complete === true &&
+      stableTerminalFinality &&
+      cancellationEvidenceComplete &&
+      markoutTimingValid &&
       (lifecycle.actual_matched_size <= 0 || markoutComplete);
     return {
       horizon_seconds: horizon,
@@ -459,7 +493,15 @@ export function modelObservations({ order, market, lifecycle, context, markouts 
       cancellation_failure: lifecycle.cancellation_failure === true,
       markout_complete: markoutComplete,
       markout_timing_valid: markoutTimingValid,
-      executable_markout_30s_per_share: markout30
+      executable_markout_30s_per_share: markout30,
+      venue_fee_model: lifecycle.venue_fee_model,
+      venue_fee_rate: lifecycle.venue_fee_rate,
+      venue_fee_rate_bps: lifecycle.venue_fee_rate_bps,
+      venue_fee_exponent: lifecycle.venue_fee_exponent,
+      venue_fee_taker_only: lifecycle.venue_fee_taker_only,
+      entry_fee_per_share: entryFee30,
+      hypothetical_exit_fee_per_share: exitFee30,
+      estimated_round_trip_cost_per_share: roundTripCost30
     };
   });
 }
@@ -467,16 +509,47 @@ export function modelObservations({ order, market, lifecycle, context, markouts 
 export function normalizeStoredObservation(row, probe) {
   const probeFilled = Number(probe?.lifecycle?.actual_matched_size || 0) > 0 ||
     (probe?.model_observations || []).some((candidate) => candidate.filled === true);
-  if (!probeFilled) return { ...row, markout_timing_valid: row.markout_timing_valid !== false };
+  if (!probeFilled) {
+    const outcomeBound = row.executable_markout_30s_per_share === null
+      && (row.estimated_round_trip_cost_per_share === null || Number(row.estimated_round_trip_cost_per_share) === 0);
+    return {
+      ...row,
+      eligible: row.eligible === true && outcomeBound,
+      quality_eligible: row.quality_eligible === true && outcomeBound,
+      markout_timing_valid: row.markout_timing_valid !== false,
+      executable_markout_30s_per_share: null,
+      entry_fee_per_share: 0,
+      hypothetical_exit_fee_per_share: 0,
+      estimated_round_trip_cost_per_share: 0
+    };
+  }
   const markouts = Array.isArray(probe?.markouts) ? probe.markouts : [];
   const coverage = validateFillMarkouts(markouts, probe?.lifecycle?.related_trade_ids || [], probe?.lifecycle?.actual_matched_size || 0);
   const timingValid = coverage.timing_valid;
+  const derivedMarkout = weightedExecutableMarkout(markouts, 30);
+  const derivedEntryFee = weightedMarkoutMetric(markouts, 30, "entry_fee_per_share");
+  const derivedExitFee = weightedMarkoutMetric(markouts, 30, "hypothetical_exit_fee_per_share");
+  const derivedCost = weightedMarkoutMetric(markouts, 30, "round_trip_fee_per_share");
+  const outcomeBound = finiteMetric(derivedMarkout) && finiteMetric(derivedCost)
+    && Math.abs(Number(row.executable_markout_30s_per_share) - derivedMarkout) <= 1e-8
+    && Math.abs(Number(row.entry_fee_per_share) - derivedEntryFee) <= 1e-8
+    && Math.abs(Number(row.hypothetical_exit_fee_per_share) - derivedExitFee) <= 1e-8
+    && Math.abs(Number(row.estimated_round_trip_cost_per_share) - derivedCost) <= 1e-8
+    && row.venue_fee_model === probe?.lifecycle?.venue_fee_model
+    && Math.abs(Number(row.venue_fee_rate) - Number(probe?.lifecycle?.venue_fee_rate)) <= 1e-8
+    && Math.abs(Number(row.venue_fee_rate_bps) - Number(probe?.lifecycle?.venue_fee_rate_bps)) <= 1e-8
+    && Math.abs(Number(row.venue_fee_exponent) - Number(probe?.lifecycle?.venue_fee_exponent)) <= 1e-8
+    && row.venue_fee_taker_only === probe?.lifecycle?.venue_fee_taker_only;
   return {
     ...row,
-    eligible: row.eligible === true && timingValid,
-    quality_eligible: row.quality_eligible === true && timingValid,
+    eligible: row.eligible === true && timingValid && outcomeBound,
+    quality_eligible: row.quality_eligible === true && timingValid && outcomeBound,
     markout_complete: row.markout_complete === true && coverage.complete,
-    markout_timing_valid: timingValid
+    markout_timing_valid: timingValid,
+    executable_markout_30s_per_share: derivedMarkout,
+    entry_fee_per_share: derivedEntryFee,
+    hypothetical_exit_fee_per_share: derivedExitFee,
+    estimated_round_trip_cost_per_share: derivedCost
   };
 }
 
@@ -525,6 +598,16 @@ function weightedExecutableMarkout(markouts, horizon) {
   const totalSize = rows.reduce((total, row) => total + Number(row.fill_size), 0);
   if (!(totalSize > 0)) return null;
   return rows.reduce((total, row) => total + Number(row.executable_markout_per_share) * Number(row.fill_size), 0) / totalSize;
+}
+
+function weightedMarkoutMetric(markouts, horizon, field) {
+  const rows = (markouts || []).filter((row) =>
+    Number(row.horizon_seconds) === horizon && finiteMetric(row.fill_size) && Number(row.fill_size) > 0
+      && finiteMetric(row[field])
+  );
+  const totalSize = rows.reduce((total, row) => total + Number(row.fill_size), 0);
+  if (!(totalSize > 0)) return null;
+  return rows.reduce((total, row) => total + Number(row[field]) * Number(row.fill_size), 0) / totalSize;
 }
 
 function finiteMetric(value) {
@@ -915,6 +998,7 @@ export async function settleProbeRiskReservations(config, settlement) {
   if (!container) throw new Error("fail closed: durable storage is required to settle order risk");
   const campaign = settlement?.terminal_portfolio ? await loadCampaignRiskControl(config) : null;
   let settled = 0;
+  const terminalReservations = [];
   for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
     if (!item.name.endsWith(".json")) continue;
     const blob = container.getBlockBlobClient(item.name);
@@ -940,14 +1024,19 @@ export async function settleProbeRiskReservations(config, settlement) {
       conditions: response.etag ? { ifMatch: response.etag } : undefined,
       blobHTTPHeaders: { blobContentType: "application/json" }
     });
-    if (settlement?.terminal_portfolio) {
-      await publishTerminalRiskPortfolioEvidence(container, {
-        reservation: payload,
-        settlement,
-        campaign
-      });
-    }
+    if (settlement?.terminal_portfolio) terminalReservations.push(payload);
     settled += 1;
+  }
+  // Publish terminal artifacts only after every reservation covered by this
+  // verified atomic settlement has been durably updated. Otherwise the first
+  // artifact in a multi-condition redemption would correctly observe the
+  // remaining members as unresolved and fail before they could be finalized.
+  for (const reservation of terminalReservations) {
+    await publishTerminalRiskPortfolioEvidence(container, {
+      reservation,
+      settlement,
+      campaign
+    });
   }
   return settled;
 }
@@ -968,11 +1057,32 @@ export async function publishTerminalRiskPortfolioEvidence(container, { reservat
   if (settlement?.settlement_verified !== true || settlement?.zero_open_orders_confirmed !== true || (!noFill && !settlement?.transaction_hash)) {
     throw new Error("fail closed: terminal evidence requires verified settlement and global zero-open confirmation; fills also require a transaction hash");
   }
+  if (!noFill) {
+    const transactionHash = String(settlement.transaction_hash || "");
+    const settlementWallet = String(settlement.settlement_wallet || "");
+    const conditions = new Set((settlement.condition_ids || []).map((value) => String(value).toLowerCase()));
+    const confirmations = Number(settlement.transaction_receipt_confirmations);
+    if (!/^0x[0-9a-fA-F]{64}$/.test(transactionHash)
+        || Number(settlement.polygon_chain_id) !== 137
+        || settlement.transaction_receipt_status !== "success"
+        || !/^\d+$/.test(String(settlement.transaction_block_number || ""))
+        || BigInt(settlement.transaction_block_number) <= 0n
+        || !Number.isInteger(confirmations)
+        || confirmations < 2
+        || !/^0x[0-9a-fA-F]{40}$/.test(settlementWallet)
+        || !conditions.has(String(reservation.condition_id || "").toLowerCase())) {
+      throw new Error("fail closed: filled terminal evidence lacks exact confirmed Polygon receipt, wallet, or condition binding");
+    }
+  }
   const baseline = number(campaign?.baseline_equity, NaN);
   const cashFlows = number(campaign?.net_external_cash_flow, NaN);
   if (![baseline, cashFlows].every(Number.isFinite)) throw new Error("fail closed: terminal evidence requires immutable campaign baseline and cash-flow ledger");
   const adjustedStart = baseline + cashFlows;
   const observedAt = settlement.settled_ts || new Date().toISOString();
+  const unresolvedRiskReservations = await countUnresolvedRiskReservations(container);
+  if (unresolvedRiskReservations !== 0) {
+    throw new Error(`fail closed: terminal evidence requires zero durable unresolved risk reservations (observed ${unresolvedRiskReservations})`);
+  }
   const evidence = {
     schema: "polyedge.canary_terminal_risk_portfolio.v1",
     producer: "polyedge_node_authenticated_risk_terminal",
@@ -983,11 +1093,20 @@ export async function publishTerminalRiskPortfolioEvidence(container, { reservat
     condition_id: reservation.condition_id,
     reservation_state: reservation.state,
     settlement_verified: true,
+    trust_boundary_ready: settlement.trust_boundary_ready === true,
     settlement_transaction_hash: settlement.transaction_hash || null,
+    polygon_chain_id: noFill ? null : 137,
+    transaction_receipt_status: noFill ? null : settlement.transaction_receipt_status,
+    transaction_block_number: noFill ? null : String(settlement.transaction_block_number),
+    transaction_receipt_confirmations: noFill ? null : Number(settlement.transaction_receipt_confirmations),
+    settlement_wallet: noFill ? null : String(settlement.settlement_wallet).toLowerCase(),
+    settlement_signer: noFill || !settlement.settlement_signer ? null : String(settlement.settlement_signer).toLowerCase(),
+    redemption_condition_ids: noFill ? [] : [...new Set(settlement.condition_ids.map((value) => String(value).toLowerCase()))].sort(),
     portfolio_reconciled: true,
     reconciliation_discrepancy: roundMoney(discrepancy),
     zero_open_orders_confirmed: true,
     unresolved_exposure: 0,
+    unresolved_risk_reservations: unresolvedRiskReservations,
     campaign_starting_equity: baseline,
     net_external_cash_flows: cashFlows,
     liquid_collateral: liquid,
@@ -1004,6 +1123,19 @@ export async function publishTerminalRiskPortfolioEvidence(container, { reservat
   const sha256 = `sha256:${createHash("sha256").update(content).digest("hex")}`;
   await uploadImmutable(container, blobName, content, "application/json");
   return { blob_name: blobName, sha256, evidence };
+}
+
+async function countUnresolvedRiskReservations(container) {
+  let count = 0;
+  for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
+    if (!item.name.endsWith(".json")) continue;
+    const blob = typeof container.getBlobClient === "function"
+      ? container.getBlobClient(item.name)
+      : container.getBlockBlobClient(item.name);
+    const reservation = await downloadJson(blob);
+    if (!isRiskReservationResolved(reservation)) count += 1;
+  }
+  return count;
 }
 
 export async function uploadEvidence(config, runId, summary, ledger) {
@@ -1049,7 +1181,7 @@ export async function loadProbeObservations(config) {
     const bytes = await streamToBuffer(response.readableStreamBody);
     const summaryHash = digest(bytes);
     const summary = JSON.parse(bytes.toString("utf8"));
-    const protocolEligible = Number(summary.evidence_protocol_version || 0) >= EVIDENCE_PROTOCOL_VERSION;
+    const protocolEligible = isEvidenceProtocolVersionEligible(summary.evidence_protocol_version);
     const probes = Array.isArray(summary.probes) ? summary.probes : [summary];
     for (const probe of probes) {
       const probeRows = probe.model_observations || [];
@@ -1067,8 +1199,7 @@ export async function loadProbeObservations(config) {
           probe_id: probe.probe_id || null,
           order_id: probe.lifecycle?.order_id || null,
           source_summary_blob_name: blob.name,
-          source_summary_sha256: summaryHash,
-          estimated_round_trip_cost_per_share: summary.estimated_round_trip_cost_per_share || 0
+          source_summary_sha256: summaryHash
         });
       }
     }
@@ -1130,8 +1261,7 @@ export async function loadCheckpointProbeObservations(config, checkpointBlobName
         probe_id: probe.probe_id,
         order_id: probe.lifecycle.order_id,
         source_summary_blob_name: summary.blobName,
-        source_summary_sha256: summary.hash,
-        estimated_round_trip_cost_per_share: value.estimated_round_trip_cost_per_share || 0
+        source_summary_sha256: summary.hash
       });
     }
   }
@@ -1145,7 +1275,7 @@ export async function loadCheckpointProbeObservations(config, checkpointBlobName
 export function reservationAuditObservation(reservation) {
   if (!reservation?.probe_id) return null;
   if (String(reservation.state) === "released_no_order" && reservation.order_submitted === false) return null;
-  const protocolEligible = Number(reservation.evidence_protocol_version || 0) >= EVIDENCE_PROTOCOL_VERSION;
+  const protocolEligible = isEvidenceProtocolVersionEligible(reservation.evidence_protocol_version);
   return {
     probe_id: String(reservation.probe_id),
     run_id: reservation.run_id || null,

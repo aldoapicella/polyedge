@@ -591,6 +591,8 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_FUNDED_STORAGE_CONTAINER_NAME', value: fundedEvidenceContainer.name }
             { name: 'AZURE_MODEL_STORAGE_CONTAINER_NAME', value: modelContainer.name }
             { name: 'AZURE_EVENT_BLOB_PREFIX', value: 'shadow-events/campaign-2026-07-12' }
+            { name: 'COMPACT_SHADOW_RECORDING', value: 'true' }
+            { name: 'SHADOW_BOOK_SAMPLE_MS', value: '1000' }
             { name: 'PUBLISH_STRATEGY_CANARY_INTENTS', value: 'true' }
             { name: 'STRATEGY_CANARY_INTENT_PREFIX', value: 'reports/research/venue-probe/control/strategy-canary/intents' }
             { name: 'STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION', value: conservativePriorVersion }
@@ -671,8 +673,8 @@ resource shadowDailyJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'SHADOW_EXECUTION_MODEL_SHA256', value: conservativePriorSha256 }
           ]
           resources: {
-            cpu: json('2')
-            memory: '4Gi'
+            cpu: json('4')
+            memory: '8Gi'
           }
         }
       ]
@@ -757,8 +759,10 @@ resource venueProbeJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'VENUE_PROBE_REST_HORIZONS_SECONDS', value: '1,5,30,60' }
             { name: 'VENUE_PROBE_INTER_ORDER_DELAY_MS', value: '1000' }
             { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
+            { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }
             { name: 'VENUE_PROBE_KILL_SWITCH', value: 'false' }
             { name: 'VENUE_PROBE_DRY_RUN', value: 'true' }
+            { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: 'IE' }
             { name: 'VENUE_PROBE_EXPECTED_EGRESS_IP', value: publicIp.properties.ipAddress }
             { name: 'POLYMARKET_FUNDER_ADDRESS', value: funderAddress }
@@ -851,6 +855,7 @@ resource strategyCanaryJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'STRATEGY_CANARY_CONTROLLER_ENABLED', value: 'false' }
             { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
             { name: 'STRATEGY_CANARY_DRY_RUN', value: 'true' }
+            { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'STRATEGY_CANARY_HUMAN_GRANT_BLOB_NAME', value: '' }
             { name: 'STRATEGY_CANARY_HUMAN_GRANT_SHA256', value: '' }
             { name: 'STRATEGY_CANARY_INTENT_PREFIX', value: 'reports/research/venue-probe/control/strategy-canary/intents' }
@@ -872,7 +877,9 @@ resource strategyCanaryJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: '1' }
             { name: 'STRATEGY_CANARY_MAX_REFERENCE_AGE_MS', value: '2000' }
             { name: 'STRATEGY_CANARY_MAX_BOOK_AGE_MS', value: '1000' }
-            { name: 'STRATEGY_CANARY_REST_SECONDS', value: '1' }
+            // The effective rest remains bounded by the exact strategy intent's
+            // valid_until safety boundary and frozen 30-second intent TTL.
+            { name: 'STRATEGY_CANARY_REST_SECONDS', value: '30' }
             { name: 'MAX_OPEN_ORDERS', value: '1' }
             { name: 'VENUE_PROBE_STARTING_CAPITAL', value: '9.23' }
             { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: 'funded-campaign-2026-07-12' }
@@ -881,6 +888,7 @@ resource strategyCanaryJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: '1' }
             { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
             { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
+            { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }
             { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: 'IE' }
             { name: 'VENUE_PROBE_EXPECTED_EGRESS_IP', value: publicIp.properties.ipAddress }
             { name: 'POLYMARKET_FUNDER_ADDRESS', value: funderAddress }
@@ -940,6 +948,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
+          { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
           { name: 'ALLOW_LIVE', value: 'false' }
           { name: 'ALLOW_STRATEGY_CANARY', value: 'false' }
           { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
@@ -963,6 +972,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: '1' }
           { name: 'STRATEGY_CANARY_MAX_REFERENCE_AGE_MS', value: '2000' }
           { name: 'STRATEGY_CANARY_MAX_BOOK_AGE_MS', value: '1000' }
+          { name: 'STRATEGY_CANARY_REST_SECONDS', value: '30' }
           { name: 'MAX_OPEN_ORDERS', value: '1' }
           { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: 'funded-campaign-2026-07-12' }
           { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: '5.030521' }
@@ -970,6 +980,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: '1' }
           { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
           { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
+          { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }
           { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: 'IE' }
           { name: 'VENUE_PROBE_EXPECTED_EGRESS_IP', value: publicIp.properties.ipAddress }
           { name: 'POLYMARKET_FUNDER_ADDRESS', value: funderAddress }
@@ -1142,6 +1153,7 @@ resource venueRedemptionJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
             { name: 'VENUE_REDEMPTION_ENABLED', value: 'false' }
             { name: 'VENUE_REDEMPTION_DRY_RUN', value: 'true' }
+            { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'VENUE_REDEMPTION_MAX_PAYOUT', value: '25' }
             { name: 'VENUE_REDEMPTION_MAX_CONDITIONS', value: '5' }
             { name: 'VENUE_PROBE_STARTING_CAPITAL', value: '9.23' }
