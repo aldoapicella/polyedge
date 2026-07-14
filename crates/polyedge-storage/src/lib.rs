@@ -953,32 +953,27 @@ impl AzureBlobClient {
         duration_seconds: Option<u32>,
     ) -> Result<ureq::Response, AzureBlobError> {
         let date = rfc1123_now();
-        let send = |request: ureq::Request| {
-            let mut request = request
-                .set("x-ms-version", AZURE_BLOB_API_VERSION)
-                .set("x-ms-date", &date)
-                .set("x-ms-lease-action", action)
-                .set("content-length", "0");
-            if let Some(lease_id) = lease_id {
-                request = request.set("x-ms-lease-id", lease_id);
-            }
-            if let Some(duration) = duration_seconds {
-                request = request.set("x-ms-lease-duration", &duration.to_string());
-            }
-            request.call()
-        };
-        let response = match &mut self.auth {
-            AzureBlobAuth::Sas(sas) => send(self.agent.put(&append_sas(url, sas))),
+        let mut request = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self.agent.put(&append_sas(url, sas)),
             AzureBlobAuth::ManagedIdentity(token) => {
                 let access_token = token.access_token(&self.agent)?;
-                send(
-                    self.agent
-                        .put(url)
-                        .set("authorization", &format!("Bearer {access_token}")),
-                )
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
             }
         };
-        match response {
+        request = request
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &date)
+            .set("x-ms-lease-action", action)
+            .set("content-length", "0");
+        if let Some(lease_id) = lease_id {
+            request = request.set("x-ms-lease-id", lease_id);
+        }
+        if let Some(duration) = duration_seconds {
+            request = request.set("x-ms-lease-duration", &duration.to_string());
+        }
+        match request.call() {
             Ok(response) => Ok(response),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
