@@ -17,6 +17,9 @@ pub use config::{
 pub const ATOMIC_DAILY_PROTOCOL_CUTOFF: &str = "2026-07-12";
 pub const WALLET_CAMPAIGN_START: &str = "2026-07-12";
 pub const CUMULATIVE_WALLET_SCOPE: &str = "cumulative_since_2026-07-12";
+/// First snapshot backed by the immutable projected-day campaign chain.
+/// Legacy schema-v1 wallets remain readable only before this date.
+const PROJECTED_WALLET_PROTOCOL_CUTOFF: &str = "2026-07-13";
 
 pub fn legacy_daily_fallback_allowed(report_date: NaiveDate, atomic_marker_present: bool) -> bool {
     !atomic_marker_present
@@ -61,7 +64,7 @@ pub struct ProfitabilityEvaluationOptions {
 #[derive(Clone, Debug)]
 pub struct CumulativeWalletSnapshotOptions {
     pub regimes: PathBuf,
-    pub normalized_manifest: PathBuf,
+    pub campaign_manifest: PathBuf,
     pub snapshot_date: NaiveDate,
     pub out: PathBuf,
 }
@@ -74,11 +77,25 @@ pub fn run_build_cumulative_wallet_snapshot(
 ) -> Result<Value, ResearchError> {
     let regimes_bytes = fs::read(&options.regimes)?;
     let regimes: Value = serde_json::from_slice(&regimes_bytes)?;
-    let normalized_bytes = fs::read(&options.normalized_manifest)?;
-    let normalized: Value = serde_json::from_slice(&normalized_bytes)?;
-    let normalized_events = normalized["events"].as_u64().ok_or_else(|| {
-        ResearchError::InvalidInput("normalized cumulative manifest is missing events".to_owned())
-    })?;
+    let campaign_manifest_bytes = fs::read(&options.campaign_manifest)?;
+    let campaign = read_verified_campaign_index(&options.campaign_manifest)?;
+    let campaign_manifest_sha256 = format!("sha256:{}", sha256_hex(&campaign_manifest_bytes));
+    if regimes
+        .pointer("/result/projected_campaign_manifest_sha256")
+        .and_then(Value::as_str)
+        != Some(campaign_manifest_sha256.as_str())
+    {
+        return Err(ResearchError::InvalidInput(
+            "cumulative regimes are not bound to the exact projected campaign manifest".to_owned(),
+        ));
+    }
+    if campaign.through != options.snapshot_date {
+        return Err(ResearchError::InvalidInput(format!(
+            "projected campaign cutoff {} does not match wallet snapshot {}",
+            campaign.through, options.snapshot_date
+        )));
+    }
+    let normalized_events = campaign.total_events;
     let profile = find_regime_profile(&regimes, "dynamic_quote_style").ok_or_else(|| {
         ResearchError::InvalidInput(
             "cumulative replay is missing dynamic_quote_style profile".to_owned(),
@@ -112,13 +129,42 @@ pub fn run_build_cumulative_wallet_snapshot(
             )));
         }
     }
-    let snapshot = json!({
-        "schema_version": 1,
+    let canonical_state = json!({
+        "schema_version": 2,
         "wallet_scope": CUMULATIVE_WALLET_SCOPE,
         "campaign_start": WALLET_CAMPAIGN_START,
         "snapshot_date": options.snapshot_date.format("%Y-%m-%d").to_string(),
-        "cumulative_input_sha256": format!("sha256:{}", sha256_hex(&normalized_bytes)),
-        "cumulative_state_sha256": format!("sha256:{}", sha256_hex(&regimes_bytes)),
+        "cumulative_input_sha256": campaign.canonical_sha256.clone(),
+        "candidate": "dynamic_quote_style",
+        "fill_model": regimes.pointer("/result/fill_model").cloned().unwrap_or(Value::Null),
+        "cumulative_events": cumulative_events,
+        "wallet_constrained": true,
+        "wallet_constrained_net_pnl": profile["wallet_constrained_net_pnl"].clone(),
+        "wallet_constrained_ending_equity": profile["wallet_constrained_ending_equity"].clone(),
+        "wallet_constrained_max_drawdown": profile["wallet_constrained_max_drawdown"].clone(),
+        "wallet_constrained_accepted_orders": profile["wallet_constrained_accepted_orders"].clone(),
+        "wallet_constrained_skipped_orders": profile["wallet_constrained_skipped_orders"].clone(),
+        "wallet_constrained_accepted_filled_orders": profile["wallet_constrained_accepted_filled_orders"].clone(),
+        "wallet_constrained_unresolved_orders": profile["wallet_constrained_unresolved_orders"].clone(),
+        "wallet_constrained_skip_reasons": profile["wallet_constrained_skip_reasons"].clone(),
+        "wallet_constrained_equity_curve": profile["wallet_constrained_equity_curve"].clone(),
+        "wallet_constraints": profile["wallet_constraints"].clone()
+    });
+    let canonical_state_bytes = serde_json::to_vec(&canonical_state)?;
+    let campaign_parent_input_sha256 = campaign
+        .segments
+        .last()
+        .and_then(|segment| segment.parent_chain_sha256.clone());
+    let snapshot = json!({
+        "schema_version": 2,
+        "wallet_scope": CUMULATIVE_WALLET_SCOPE,
+        "campaign_start": WALLET_CAMPAIGN_START,
+        "snapshot_date": options.snapshot_date.format("%Y-%m-%d").to_string(),
+        "cumulative_input_sha256": campaign.canonical_sha256.clone(),
+        "cumulative_parent_input_sha256": campaign_parent_input_sha256,
+        "cumulative_input_manifest_sha256": campaign_manifest_sha256,
+        "cumulative_state_sha256": format!("sha256:{}", sha256_hex(&canonical_state_bytes)),
+        "cumulative_regimes_artifact_sha256": format!("sha256:{}", sha256_hex(&regimes_bytes)),
         "cumulative_events": cumulative_events,
         "candidate": "dynamic_quote_style",
         "fill_model": regimes.pointer("/result/fill_model").cloned().unwrap_or(Value::Null),
@@ -1601,8 +1647,12 @@ fn json_row(
         "wallet_scope": cumulative_wallet.and_then(|wallet| wallet["wallet_scope"].as_str()),
         "wallet_campaign_start": cumulative_wallet.and_then(|wallet| wallet["campaign_start"].as_str()),
         "wallet_snapshot_date": cumulative_wallet.and_then(|wallet| wallet["snapshot_date"].as_str()),
+        "wallet_schema_version": cumulative_wallet.and_then(|wallet| wallet["schema_version"].as_u64()),
         "cumulative_input_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_input_sha256"].as_str()),
+        "cumulative_parent_input_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_parent_input_sha256"].as_str()),
+        "cumulative_input_manifest_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_input_manifest_sha256"].as_str()),
         "cumulative_state_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_state_sha256"].as_str()),
+        "cumulative_regimes_artifact_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_regimes_artifact_sha256"].as_str()),
         "cumulative_events": cumulative_wallet.and_then(|wallet| wallet["cumulative_events"].as_u64()),
         "full_deterministic_profile_net_pnl": full_net,
         "dynamic_safety_only_net_pnl": safety_net,
@@ -1994,6 +2044,9 @@ fn aggregate_profitability_metrics(
 #[derive(Clone, Debug)]
 struct CumulativeWalletSnapshot {
     date: NaiveDate,
+    schema_version: u64,
+    input_sha256: String,
+    parent_input_sha256: Option<String>,
     events: u64,
     net_pnl: Decimal,
     ending_equity: Decimal,
@@ -2006,14 +2059,23 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
         return None;
     }
     let campaign_start = NaiveDate::parse_from_str(WALLET_CAMPAIGN_START, "%Y-%m-%d").ok()?;
+    let projected_wallet_cutoff =
+        NaiveDate::parse_from_str(PROJECTED_WALLET_PROTOCOL_CUTOFF, "%Y-%m-%d").ok()?;
     let mut snapshots: Vec<CumulativeWalletSnapshot> = Vec::with_capacity(rows.len());
     for row in rows {
         let date_text = row["date"].as_str()?;
         let date = NaiveDate::parse_from_str(date_text, "%Y-%m-%d").ok()?;
         let input_hash = row["cumulative_input_sha256"].as_str()?;
         let state_hash = row["cumulative_state_sha256"].as_str()?;
+        let schema_version = row["wallet_schema_version"].as_u64().unwrap_or(1);
+        let parent_input_sha256 = row["cumulative_parent_input_sha256"]
+            .as_str()
+            .map(ToOwned::to_owned);
         let snapshot = CumulativeWalletSnapshot {
             date,
+            schema_version,
+            input_sha256: input_hash.to_owned(),
+            parent_input_sha256,
             events: row["cumulative_events"].as_u64()?,
             net_pnl: decimal_from_value(&row["wallet_constrained_net_pnl"])?,
             ending_equity: decimal_from_value(&row["wallet_constrained_ending_equity"])?,
@@ -2025,8 +2087,24 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
             || row["wallet_snapshot_date"].as_str() != Some(date_text)
             || row["wallet_constrained"].as_bool() != Some(true)
             || date < campaign_start
+            || schema_version == 0
+            || schema_version > 2
+            || (date >= projected_wallet_cutoff && schema_version != 2)
             || !valid_sha256(input_hash)
             || !valid_sha256(state_hash)
+            || (schema_version >= 2
+                && (!row["cumulative_input_manifest_sha256"]
+                    .as_str()
+                    .is_some_and(valid_sha256)
+                    || !row["cumulative_regimes_artifact_sha256"]
+                        .as_str()
+                        .is_some_and(valid_sha256)
+                    || snapshot
+                        .parent_input_sha256
+                        .as_deref()
+                        .is_some_and(|hash| !valid_sha256(hash))
+                    || (date == projected_wallet_cutoff && snapshot.parent_input_sha256.is_some())
+                    || (date > projected_wallet_cutoff && snapshot.parent_input_sha256.is_none())))
             || snapshot.events == 0
             || snapshot.ending_equity != WALLET_CAMPAIGN_BASELINE + snapshot.net_pnl
             || snapshot.max_drawdown < Decimal::ZERO
@@ -2037,6 +2115,10 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
             if snapshot.date <= previous.date
                 || snapshot.events < previous.events
                 || snapshot.max_drawdown < previous.max_drawdown
+                || (snapshot.schema_version == 2
+                    && previous.schema_version == 2
+                    && snapshot.parent_input_sha256.as_deref()
+                        != Some(previous.input_sha256.as_str()))
             {
                 return None;
             }
@@ -2434,10 +2516,10 @@ fn select_regime_profile_net(report: Option<&Value>, profile: &str) -> Option<St
 
 fn find_regime_profile<'a>(report: &'a Value, profile: &str) -> Option<&'a Value> {
     [
-        "/result/comparisons",
         "/result/profiles",
-        "/result/regime_conditioned_profiles/result/comparisons",
+        "/result/comparisons",
         "/result/regime_conditioned_profiles/result/profiles",
+        "/result/regime_conditioned_profiles/result/comparisons",
     ]
     .into_iter()
     .find_map(|pointer| {
@@ -2507,6 +2589,26 @@ fn value_to_string(value: &Value) -> Option<String> {
 mod wallet_metric_tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn cumulative_wallet_selects_full_profile_before_lossy_comparison() {
+        let report = json!({
+            "result": {
+                "comparisons": [{
+                    "profile": "dynamic_quote_style",
+                    "net_pnl": "1"
+                }],
+                "profiles": [{
+                    "profile": "dynamic_quote_style",
+                    "events": 42,
+                    "wallet_constrained": true
+                }]
+            }
+        });
+        let profile = find_regime_profile(&report, "dynamic_quote_style").unwrap();
+        assert_eq!(profile["events"], 42);
+        assert_eq!(profile["wallet_constrained"], true);
+    }
 
     #[test]
     fn daily_row_and_profitability_evaluator_use_dynamic_wallet_metrics() {
@@ -2594,6 +2696,7 @@ mod wallet_metric_tests {
             events: u64,
             unresolved: u64,
         ) -> Value {
+            let projected_wallet = date >= PROJECTED_WALLET_PROTOCOL_CUTOFF;
             json!({
                 "date": date,
                 "settled_markets": 10,
@@ -2603,8 +2706,12 @@ mod wallet_metric_tests {
                 "wallet_scope": CUMULATIVE_WALLET_SCOPE,
                 "wallet_campaign_start": WALLET_CAMPAIGN_START,
                 "wallet_snapshot_date": date,
+                "wallet_schema_version": if projected_wallet { 2 } else { 1 },
                 "cumulative_input_sha256": format!("sha256:{}", if date.ends_with("12") { "a".repeat(64) } else { "b".repeat(64) }),
+                "cumulative_parent_input_sha256": Value::Null,
+                "cumulative_input_manifest_sha256": if projected_wallet { json!(format!("sha256:{}", "e".repeat(64))) } else { Value::Null },
                 "cumulative_state_sha256": format!("sha256:{}", if date.ends_with("12") { "c".repeat(64) } else { "d".repeat(64) }),
+                "cumulative_regimes_artifact_sha256": if projected_wallet { json!(format!("sha256:{}", "f".repeat(64))) } else { Value::Null },
                 "cumulative_events": events,
                 "wallet_constrained": true,
                 "wallet_constrained_net_pnl": pnl,
@@ -2657,6 +2764,40 @@ mod wallet_metric_tests {
         assert!(invalid
             .missing_metrics
             .contains(&"valid_cumulative_wallet_ledger".to_owned()));
+    }
+
+    #[test]
+    fn cumulative_wallet_rejects_schema_downgrade_after_projected_chain_cutover() {
+        fn row(date: &str, input: char, parent: Option<char>, schema: u64) -> Value {
+            json!({
+                "date": date,
+                "wallet_scope": CUMULATIVE_WALLET_SCOPE,
+                "wallet_campaign_start": WALLET_CAMPAIGN_START,
+                "wallet_snapshot_date": date,
+                "wallet_schema_version": schema,
+                "cumulative_input_sha256": format!("sha256:{}", input.to_string().repeat(64)),
+                "cumulative_parent_input_sha256": parent.map(|value| format!("sha256:{}", value.to_string().repeat(64))),
+                "cumulative_input_manifest_sha256": format!("sha256:{}", "c".repeat(64)),
+                "cumulative_state_sha256": format!("sha256:{}", "d".repeat(64)),
+                "cumulative_regimes_artifact_sha256": format!("sha256:{}", "e".repeat(64)),
+                "cumulative_events": if date.ends_with("13") { 100 } else { 200 },
+                "wallet_constrained": true,
+                "wallet_constrained_net_pnl": "0",
+                "wallet_constrained_ending_equity": WALLET_CAMPAIGN_BASELINE.to_string(),
+                "wallet_constrained_max_drawdown": "0",
+                "wallet_constrained_unresolved_orders": 0
+            })
+        }
+
+        let valid = vec![
+            row("2026-07-13", 'a', None, 2),
+            row("2026-07-14", 'b', Some('a'), 2),
+        ];
+        assert!(validated_cumulative_wallet_snapshots(&valid).is_some());
+
+        let mut downgraded = valid;
+        downgraded[1]["wallet_schema_version"] = json!(1);
+        assert!(validated_cumulative_wallet_snapshots(&downgraded).is_none());
     }
 
     #[test]

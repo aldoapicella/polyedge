@@ -9,17 +9,18 @@ use polyedge_reporting::research::{
     run_audit, run_azure_freshness, run_backfill, run_baseline,
     run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
     run_calibration, run_chart_backfill, run_evaluate_profitability, run_execution_quality,
-    run_final_report, run_ml_calibrate, run_normalize, run_queue_audit, run_regimes, run_replay,
-    run_sample_size, run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
+    run_final_report, run_materialize_projected_campaign, run_ml_calibrate, run_normalize,
+    run_publish_projected_day, run_queue_audit, run_regimes, run_replay, run_sample_size,
+    run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
     AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
     BackfillOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions,
     ChartBackfillOptions, CumulativeWalletSnapshotOptions, ExcludedTimeWindow,
     ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel, FinalReportOptions,
-    InitializeFundedManifestOptions, MlCalibrateOptions, NormalizeOptions,
-    ProfitabilityEvaluationOptions, ProspectiveValidationOptions, QueueAuditOptions,
-    RegimesOptions, ReplayIndexOptions, ReplayOptions, SampleSizeOptions,
-    StopFundedManifestFromStageBlockOptions, SweepOptions, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
+    InitializeFundedManifestOptions, MaterializeProjectedCampaignOptions, MlCalibrateOptions,
+    NormalizeOptions, ProfitabilityEvaluationOptions, ProspectiveValidationOptions,
+    PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions, ReplayIndexOptions,
+    ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions, SweepOptions,
+    DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -133,6 +134,36 @@ enum ResearchCommand {
         /// Preserve decision-grade state and trades while sampling high-rate books.
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         decision_grade_projection: bool,
+    },
+    /// Publish an already-produced projected UTC day as an immutable,
+    /// content-addressed cache bundle. The manifest is written last.
+    PublishProjectedDay {
+        #[arg(long)]
+        normalized: PathBuf,
+        #[arg(long)]
+        date: String,
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        cache_root: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Verify and materialize sealed projected-day bundles through an explicit
+    /// UTC cutoff. Open/current-day data is never included.
+    MaterializeProjectedCampaign {
+        #[arg(long)]
+        since: String,
+        #[arg(long)]
+        through: String,
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        cache_root: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
     },
     QueueAudit {
         #[arg(long, default_value = "data/research/normalized")]
@@ -345,7 +376,7 @@ enum ResearchCommand {
         #[arg(long)]
         regimes: PathBuf,
         #[arg(long)]
-        normalized_manifest: PathBuf,
+        campaign_manifest: PathBuf,
         #[arg(long)]
         snapshot_date: String,
         #[arg(long)]
@@ -594,6 +625,34 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             overwrite,
             decision_grade_projection,
         })?,
+        ResearchCommand::PublishProjectedDay {
+            normalized,
+            date,
+            campaign_id,
+            cache_root,
+            out,
+        } => run_publish_projected_day(PublishProjectedDayOptions {
+            normalized,
+            date: parse_date_arg(&date)?,
+            campaign_id,
+            cache_root,
+            out,
+        })?,
+        ResearchCommand::MaterializeProjectedCampaign {
+            since,
+            through,
+            campaign_id,
+            cache_root,
+            out,
+            manifest,
+        } => run_materialize_projected_campaign(MaterializeProjectedCampaignOptions {
+            since: parse_date_arg(&since)?,
+            through: parse_date_arg(&through)?,
+            campaign_id,
+            cache_root,
+            out,
+            manifest,
+        })?,
         ResearchCommand::QueueAudit {
             input,
             markets,
@@ -778,12 +837,12 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         )?)?,
         ResearchCommand::BuildCumulativeWallet {
             regimes,
-            normalized_manifest,
+            campaign_manifest,
             snapshot_date,
             out,
         } => run_build_cumulative_wallet_snapshot(CumulativeWalletSnapshotOptions {
             regimes,
-            normalized_manifest,
+            campaign_manifest,
             snapshot_date: parse_date_arg(&snapshot_date)?,
             out,
         })?,

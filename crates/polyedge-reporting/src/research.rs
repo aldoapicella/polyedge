@@ -31,6 +31,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod labs;
+mod projected_cache;
 mod run_bundle;
 pub use labs::{
     legacy_daily_fallback_allowed, load_default_exclusions, load_exclusion_registry,
@@ -43,6 +44,11 @@ pub use labs::{
     ATOMIC_DAILY_PROTOCOL_CUTOFF, CUMULATIVE_WALLET_SCOPE, DEFAULT_EXCLUSION_FILE,
     DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES,
     WALLET_CAMPAIGN_START,
+};
+pub use projected_cache::{
+    read_verified_campaign_index, run_materialize_projected_campaign, run_publish_projected_day,
+    MaterializeProjectedCampaignOptions, ProjectedCampaignIndex, ProjectedCampaignSegment,
+    ProjectedDayManifest, PublishProjectedDayOptions, PROJECTED_CAMPAIGN_INDEX_FILE,
 };
 pub use run_bundle::{
     advance_funded_ladder, advance_funded_manifest, classify_warning, daily_provenance_required,
@@ -769,6 +775,14 @@ pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
 
 pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let projected_campaign_manifest_sha256 = {
+        let path = options.input.join(PROJECTED_CAMPAIGN_INDEX_FILE);
+        if path.is_file() {
+            Some(format!("sha256:{:x}", Sha256::digest(fs::read(path)?)))
+        } else {
+            None
+        }
+    };
     let markets = load_market_truth(options.markets.as_deref())?;
     let settings = RuntimeSettings::default();
     let modes = [
@@ -822,6 +836,7 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
         "fill_model": options.fill_model.as_str(),
         "profiles": results,
         "comparisons": comparisons,
+        "projected_campaign_manifest_sha256": projected_campaign_manifest_sha256,
         "profile_config": options.profile_config.map(|path| path.to_string_lossy().into_owned()),
         "research_only": true,
         "live_deployment_allowed": false
@@ -1118,22 +1133,79 @@ fn stream_events<F>(
 where
     F: FnMut(&EventLine),
 {
+    if let Some(index) = projected_cache::load_campaign_index(input)? {
+        return stream_projected_campaign_events(
+            input,
+            &index,
+            mode,
+            exclude_windows,
+            &mut visitor,
+        );
+    }
     if let Some(source) = AzureEventSource::parse(&input.to_string_lossy())? {
         return stream_azure_events(&source, exclude_windows, &mut visitor);
     }
     let path_set = collect_jsonl_path_set(input, mode)?;
     let mut stats = StreamStats::default();
     let mut seen_hashes = BTreeSet::new();
-    if path_set.merge_by_event_time {
-        stream_merged_event_paths(
-            path_set.paths,
+    stream_local_path_set(
+        path_set,
+        exclude_windows,
+        &mut stats,
+        &mut seen_hashes,
+        &mut visitor,
+    )?;
+    finalize_stream_stats(&mut stats);
+    Ok(stats)
+}
+
+fn stream_projected_campaign_events<F>(
+    root: &Path,
+    index: &ProjectedCampaignIndex,
+    mode: EventPathMode,
+    exclude_windows: &[ExcludedTimeWindow],
+    visitor: &mut F,
+) -> Result<StreamStats, ResearchError>
+where
+    F: FnMut(&EventLine),
+{
+    let mut stats = StreamStats::default();
+    let mut seen_hashes = BTreeSet::new();
+    let mut max_open_readers = 0_usize;
+    for segment in &index.segments {
+        let segment_root = root.join(&segment.relative_path);
+        let path_set = collect_jsonl_path_set(&segment_root, mode)?;
+        max_open_readers = max_open_readers.max(path_set.paths.len());
+        stream_local_path_set(
+            path_set,
             exclude_windows,
             &mut stats,
             &mut seen_hashes,
-            &mut visitor,
+            visitor,
         )?;
-        finalize_stream_stats(&mut stats);
-        return Ok(stats);
+    }
+    stats.notices.push(format!(
+        "projected campaign streamed {} sealed day segment(s) with at most {} open shard reader(s)",
+        index.segments.len(),
+        max_open_readers
+    ));
+    finalize_stream_stats(&mut stats);
+    Ok(stats)
+}
+
+fn stream_local_path_set<F>(
+    path_set: EventPathSet,
+    exclude_windows: &[ExcludedTimeWindow],
+    stats: &mut StreamStats,
+    seen_hashes: &mut BTreeSet<u64>,
+    visitor: &mut F,
+) -> Result<(), ResearchError>
+where
+    F: FnMut(&EventLine),
+{
+    if path_set.merge_by_event_time {
+        stream_merged_event_paths(path_set.paths, exclude_windows, stats, seen_hashes, visitor)?;
+        return Ok(());
     }
     for path in path_set.paths {
         let reader = open_event_reader(&path)?;
@@ -1145,14 +1217,13 @@ where
                 &path.display().to_string(),
                 &mut previous_ts,
                 exclude_windows,
-                &mut stats,
-                &mut seen_hashes,
-                &mut visitor,
+                stats,
+                seen_hashes,
+                visitor,
             );
         }
     }
-    finalize_stream_stats(&mut stats);
-    Ok(stats)
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

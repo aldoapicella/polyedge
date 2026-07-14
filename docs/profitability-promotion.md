@@ -73,6 +73,41 @@ passes `profitability_shadow`, while the primary paper job passes `primary`.
 
 An inconclusive result may extend once to 60 calendar days or 2,000 markets. If every promotion gate has not passed when either limit is reached, the immutable manifest enters terminal `stopped_no_go`; the candidate is not tuned inside its holdout.
 
+### Projected-day cumulative replay
+
+The daily job never rebuilds the cumulative wallet by downloading the entire
+raw campaign again. It normalizes exactly one sealed UTC day, publishes its
+decision-grade gzip shards under a content-addressed immutable path, writes the
+day manifest last, and then updates that day's `latest.json` with compare-and-
+swap. Campaign replay resolves an exact contiguous range of sealed days,
+verifies every manifest and shard hash, materializes it atomically, and streams
+one day's bounded shard set at a time. The Rust library rejects the current or
+future UTC day even when the CLI is called directly; the shell check is not the
+only protection against look-ahead.
+
+The cumulative wallet snapshot schema is version 2 from 2026-07-13 onward. It
+binds the campaign terminal hash, its parent hash, the exact campaign-index
+bytes, cumulative replay state, and cumulative regimes artifact. A missing
+date, modified local shard, schema downgrade, bad parent, or correction that
+breaks the existing sequence invalidates the entire wallet ledger and blocks
+promotion.
+
+Two provenance limitations remain:
+
+1. The projected cache binds the exact normalized output bytes used by replay,
+   but its canonical manifest does not yet enumerate every original Azure raw
+   source blob name, ETag, byte count, and content hash. The recorder uses
+   append-only dated paths and the raw audit remains available, so this is not
+   a blocker for the credential-free shadow campaign. Before any funded
+   decision relies on this evidence, normalization should first seal and bind a
+   deterministic raw-source inventory.
+2. Replacing an earlier day's `latest.json` with a corrected canonical day
+   changes every later campaign-chain hash. Existing later wallet snapshots
+   then fail parent validation, as intended. Recovery requires rerunning the
+   corrected day and every subsequent snapshot in chronological order; a
+   future correction orchestrator should compute and execute that cascade
+   automatically.
+
 ## Execution Model
 
 Shadow promotion uses an immutable, zero-fill conservative prior. It deliberately has zero authenticated samples and is not marked promotion-ready; requiring a trained model before the first authenticated order would create an impossible circular gate.
