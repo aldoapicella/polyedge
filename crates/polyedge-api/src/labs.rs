@@ -328,7 +328,7 @@ fn select_profitability_artifact(
     shadow: ProfitabilityArtifact,
     now: DateTime<Utc>,
 ) -> ProfitabilitySelection {
-    let candidates = vec![funded, shadow];
+    let candidates = [funded, shadow];
     let (selected_index, selection_reason) = if candidates[0].canonical_funded_state {
         (Some(0), "canonical_funded_state")
     } else {
