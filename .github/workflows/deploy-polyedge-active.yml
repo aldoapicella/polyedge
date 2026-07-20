@@ -35,6 +35,12 @@ jobs:
           sh research/test_run_shadow_daily.sh
           grep -Fq -- '--expected-runtime-role profitability_shadow' research/run_shadow_daily.sh
           grep -Fq -- '--expected-runtime-role primary' infra/main.bicep
+          grep -Fq -- 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)' infra/main.bicep
+          ! grep -Fq -- 'HOUR=$(date -u -d "10 minutes ago" +%H)' infra/main.bicep
+          test "$(grep -Fc -- 'validate-prospective --since "2026-07-13T00:00:00Z"' infra/main.bicep)" -eq 2
+          test "$(date -u -d '2026-07-20 19:10 UTC - 1 hour' +%Y/%m/%d/%H)" = "2026/07/20/18"
+          test "$(date -u -d '2026-07-21 00:10 UTC - 1 hour' +%Y/%m/%d/%H)" = "2026/07/20/23"
+          az bicep build --file infra/main.bicep --outfile /tmp/polyedge-main.json
 
       - name: Set up Node
         uses: actions/setup-node@v4

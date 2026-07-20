@@ -156,6 +156,12 @@ Azure Table: PolyEdgeDataFreshness
 
 **Schedule:** hourly, at minute 10.
 
+The audit targets the fully closed preceding UTC hour. The job derives both
+the date and hour from one `1 hour ago` timestamp, so the midnight rollover is
+correct. Auditing the current hour is unsafe because the recorder can still
+replace the active minute blob, which correctly makes the sealed inventory's
+conditional read fail with Azure HTTP 412.
+
 **Command:**
 
 ```bash
@@ -178,6 +184,11 @@ polyedge-rs research audit \
 - Recorder errors.
 - Time gaps.
 - Start/settlement capture if markets close in that hour.
+
+Primary prospective validation starts on 2026-07-13, the first complete
+protocol-v3 daily chain. Older reports remain retained for exploratory and
+historical analysis, but cannot enter promotion evidence unless they are
+backfilled into verified atomic daily bundles.
 
 **Outputs:**
 
