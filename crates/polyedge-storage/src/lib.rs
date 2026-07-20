@@ -1551,9 +1551,17 @@ fn read_versioned_blob_response(
         .header("x-ms-blob-type")
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned);
-    let sealed = response
+    let reported_sealed = response
         .header("x-ms-blob-sealed")
         .and_then(|value| value.parse::<bool>().ok());
+    // Azure omits x-ms-blob-sealed for an unsealed append blob. Normalize
+    // that documented wire representation so downstream evidence records the
+    // physical state explicitly instead of confusing false with unknown.
+    let sealed = if blob_type.as_deref() == Some("AppendBlob") {
+        Some(reported_sealed.unwrap_or(false))
+    } else {
+        reported_sealed
+    };
     let mut bytes = Vec::new();
     response.into_reader().read_to_end(&mut bytes)?;
     Ok(VersionedBlobBytes {
@@ -1613,6 +1621,14 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                             "Azure blob listing omitted Name or ETag".to_owned(),
                         ));
                     }
+                    // List Blobs returns Sealed only when an append blob is
+                    // sealed. Its absence on AppendBlob therefore means false,
+                    // not an unavailable physical-seal state.
+                    let normalized_sealed = if blob_type.as_deref() == Some("AppendBlob") {
+                        Some(sealed.unwrap_or(false))
+                    } else {
+                        sealed
+                    };
                     page.blobs.push(AzureBlobItem {
                         name: name.clone(),
                         etag: etag.clone(),
@@ -1620,7 +1636,7 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                         is_current_version,
                         content_md5: content_md5.clone(),
                         blob_type: blob_type.clone(),
-                        sealed,
+                        sealed: normalized_sealed,
                         content_length,
                         last_modified,
                     });
@@ -1885,5 +1901,14 @@ mod tests {
 
         let missing_etag = xml.replace("<Etag>&quot;0x8DB123&quot;</Etag>", "<Etag></Etag>");
         assert!(parse_blob_list(&missing_etag).is_err());
+
+        let unsealed = xml.replace("        <Sealed>true</Sealed>\n", "");
+        let unsealed_page = parse_blob_list(&unsealed).unwrap();
+        assert_eq!(
+            unsealed_page.blobs[0].blob_type.as_deref(),
+            Some("AppendBlob")
+        );
+        assert_eq!(unsealed_page.blobs[0].sealed, Some(false));
+        assert!(unsealed_page.blobs[0].last_modified.is_some());
     }
 }
