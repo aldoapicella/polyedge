@@ -654,13 +654,11 @@ fn empty_or_malformed_gap_evidence_is_blocking() {
 }
 
 #[test]
-fn runtime_provenance_missing_unknown_mismatched_or_changed_is_blocking() {
+fn runtime_provenance_missing_unknown_or_changed_is_blocking() {
     let root = test_dir("runtime_provenance_gate");
-    let reporter_sha = current_git_sha();
     for (run_id, expected_rule) in [
         ("missing", "daily_runtime_provenance_missing"),
         ("unknown", "daily_runtime_provenance_invalid"),
-        ("mismatched", "daily_runtime_provenance_reporter_mismatch"),
         (
             "mid-day-change",
             "daily_runtime_provenance_identity_changed",
@@ -689,10 +687,6 @@ fn runtime_provenance_missing_unknown_mismatched_or_changed_is_blocking() {
                 audit["result"]["runtime_provenance"]["identities"][0]["git_sha"] =
                     serde_json::json!("unknown");
             }
-            "mismatched" => {
-                audit["result"]["runtime_provenance"]["identities"][0]["git_sha"] =
-                    serde_json::json!("f".repeat(40));
-            }
             "mid-day-change" => {
                 let mut changed = audit["result"]["runtime_provenance"]["identities"][0].clone();
                 changed["runtime_config_hash"] =
@@ -705,10 +699,6 @@ fn runtime_provenance_missing_unknown_mismatched_or_changed_is_blocking() {
                     serde_json::json!(2);
             }
             _ => unreachable!(),
-        }
-        if run_id == "mismatched" && reporter_sha == "f".repeat(40) {
-            audit["result"]["runtime_provenance"]["identities"][0]["git_sha"] =
-                serde_json::json!("e".repeat(40));
         }
         let audit_path = source.join("data_audit.json");
         fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
@@ -730,6 +720,65 @@ fn runtime_provenance_missing_unknown_mismatched_or_changed_is_blocking() {
             .iter()
             .any(|warning| warning.rule_id == expected_rule));
     }
+}
+
+#[test]
+fn historical_reporter_sha_difference_is_informational_lineage() {
+    let root = test_dir("runtime_provenance_historical_reporter");
+    let source = root.join("mismatched");
+    fs::create_dir_all(&source).unwrap();
+    for name in [
+        "baseline.json",
+        "regimes.json",
+        "final_report.json",
+        "execution_quality.json",
+    ] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    let reporter_sha = current_git_sha();
+    let runtime_sha = if reporter_sha == "f".repeat(40) {
+        "e".repeat(40)
+    } else {
+        "f".repeat(40)
+    };
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-14", 1.0)).unwrap();
+    audit["result"]["runtime_provenance"]["identities"][0]["git_sha"] =
+        serde_json::json!(runtime_sha.clone());
+    let audit_path = source.join("data_audit.json");
+    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+
+    let published = publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+        "historical-reporter",
+        "2".repeat(64),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit_path,
+    )
+    .unwrap();
+
+    let mismatch = published
+        .manifest
+        .data_quality
+        .warnings
+        .iter()
+        .find(|warning| warning.rule_id == "daily_runtime_provenance_reporter_mismatch")
+        .expect("the distinct recorder and reporter SHAs remain visible");
+    assert_eq!(mismatch.severity, WarningSeverity::Informational);
+    assert_eq!(
+        published.manifest.git_sha.as_deref(),
+        Some(reporter_sha.as_str())
+    );
+    let published_audit: serde_json::Value =
+        serde_json::from_slice(&fs::read(published.bundle_dir.join("data_audit.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        published_audit["result"]["runtime_provenance"]["identities"][0]["git_sha"],
+        runtime_sha
+    );
+    assert!(published.manifest.data_quality.promotion_allowed());
 }
 
 #[test]
@@ -809,9 +858,11 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
     fs::write(
         source.join("cumulative_wallet.json"),
         format!(
-            r#"{{"schema_version":1,"wallet_scope":"cumulative_since_2026-07-12","campaign_start":"2026-07-12","snapshot_date":"2026-07-12","cumulative_input_sha256":"sha256:{}","cumulative_state_sha256":"sha256:{}","cumulative_events":1000,"wallet_constrained":true,"wallet_constrained_net_pnl":"1.25","wallet_constrained_ending_equity":"6.280521","wallet_constrained_max_drawdown":"0","wallet_constrained_unresolved_orders":0}}"#,
+            r#"{{"schema_version":2,"wallet_scope":"cumulative_since_2026-07-12","campaign_start":"2026-07-12","snapshot_date":"2026-07-13","cumulative_input_sha256":"sha256:{}","cumulative_parent_input_sha256":null,"cumulative_input_manifest_sha256":"sha256:{}","cumulative_state_sha256":"sha256:{}","cumulative_regimes_artifact_sha256":"sha256:{}","cumulative_events":1000,"wallet_constrained":true,"wallet_constrained_net_pnl":"1.25","wallet_constrained_ending_equity":"6.280521","wallet_constrained_max_drawdown":"0","wallet_constrained_unresolved_orders":0}}"#,
             "a".repeat(64),
-            "b".repeat(64)
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64)
         ),
     )
     .unwrap();
@@ -821,12 +872,35 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
     )
     .unwrap();
     let audit = source.join("data_audit.json");
-    fs::write(&audit, complete_daily_audit("2026-07-12", 1.0)).unwrap();
+    fs::write(&audit, complete_daily_audit("2026-07-13", 1.0)).unwrap();
     let daily_root = root.join("reports/research/shadow/daily");
     publish_daily_directory(
-        NaiveDate::from_ymd_opt(2026, 7, 12).unwrap(),
-        "shadow-20260712",
+        NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
+        "shadow-20260713",
         "e".repeat(64),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &daily_root,
+        &audit,
+    )
+    .unwrap();
+    fs::write(
+        source.join("cumulative_wallet.json"),
+        format!(
+            r#"{{"schema_version":2,"wallet_scope":"cumulative_since_2026-07-12","campaign_start":"2026-07-12","snapshot_date":"2026-07-14","cumulative_input_sha256":"sha256:{}","cumulative_parent_input_sha256":"sha256:{}","cumulative_input_manifest_sha256":"sha256:{}","cumulative_state_sha256":"sha256:{}","cumulative_regimes_artifact_sha256":"sha256:{}","cumulative_events":2000,"wallet_constrained":true,"wallet_constrained_net_pnl":"2.50","wallet_constrained_ending_equity":"7.530521","wallet_constrained_max_drawdown":"0","wallet_constrained_unresolved_orders":0}}"#,
+            "e".repeat(64),
+            "a".repeat(64),
+            "f".repeat(64),
+            "1".repeat(64),
+            "2".repeat(64)
+        ),
+    )
+    .unwrap();
+    fs::write(&audit, complete_daily_audit("2026-07-14", 1.0)).unwrap();
+    publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+        "shadow-20260714",
+        "f".repeat(64),
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &daily_root,
@@ -853,7 +927,7 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
   version: dynamic_quote_style@test
   config_hash: sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c
 shadow:
-  required_clean_days: 1
+  required_clean_days: 2
   maximum_extension_days: 60
   required_settled_markets: 1
   maximum_extension_markets: 2000
@@ -885,7 +959,12 @@ execution_model:
         generated_at: Some(Utc::now()),
     })
     .unwrap();
-    assert_eq!(manifest.phase, PromotionPhase::ShadowPassed);
+    assert_eq!(
+        manifest.phase,
+        PromotionPhase::ShadowPassed,
+        "{:#?}",
+        manifest.gate_metrics
+    );
     assert!(manifest.gate_metrics.promotion_allowed);
     assert!(manifest.gate_metrics.metrics.missing_metrics.is_empty());
     assert!(!manifest.promotion_allowed);

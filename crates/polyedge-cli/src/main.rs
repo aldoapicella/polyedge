@@ -21,7 +21,7 @@ use polyedge_reporting::research::{
     MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
     ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
     ReplayIndexOptions, ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions,
-    SweepOptions, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
     DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
@@ -1058,16 +1058,46 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             gate_config,
             execution_model,
             out,
-        } => serde_json::to_value(run_evaluate_profitability(
-            ProfitabilityEvaluationOptions {
+        } => {
+            let manifest = run_evaluate_profitability(ProfitabilityEvaluationOptions {
                 daily_root,
                 prospective,
                 gate_config,
                 execution_model,
                 out,
                 generated_at: None,
-            },
-        )?)?,
+            })?;
+            let metrics = &manifest.gate_metrics.metrics;
+            let blocking_warnings = metrics
+                .data_quality
+                .warnings
+                .iter()
+                .filter(|warning| warning.severity == WarningSeverity::Blocking)
+                .count();
+            let phase = serde_json::to_value(manifest.phase)?
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned();
+            let authorization_flags = profitability_authorization_flags(
+                manifest.gate_metrics.promotion_allowed,
+                manifest.promotion_allowed,
+            );
+            eprintln!(
+                "polyedge_profitability_summary phase={phase} clean_days={} settled_markets={} queue_conservative_net_pnl={} wallet_constrained_net_pnl={} pnl_ci_95_low={} positive_weekly_blocks={} decision_parity_rate={} markout_30s_ci_low={} decision_grade_coverage={} blocking_warnings={} missing_metrics={} {authorization_flags}",
+                metrics.clean_days,
+                metrics.settled_markets,
+                metrics.queue_conservative_net_pnl,
+                metrics.wallet_constrained_net_pnl,
+                metrics.pnl_ci_95_low,
+                metrics.consecutive_positive_weekly_blocks,
+                metrics.decision_parity_rate,
+                metrics.markout_30s_ci_low,
+                metrics.data_quality.decision_grade_coverage,
+                blocking_warnings,
+                metrics.missing_metrics.join(","),
+            );
+            serde_json::to_value(manifest)?
+        }
         ResearchCommand::BuildReplayIndex {
             input,
             out,
@@ -1638,9 +1668,21 @@ fn print_json(value: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn profitability_authorization_flags(
+    shadow_gate_passed: bool,
+    execution_promotion_allowed: bool,
+) -> String {
+    format!(
+        "shadow_gate_passed={shadow_gate_passed} execution_promotion_allowed={execution_promotion_allowed}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{terminate_lease_child_tree, Cli, Command, ResearchCommand};
+    use super::{
+        profitability_authorization_flags, terminate_lease_child_tree, Cli, Command,
+        ResearchCommand,
+    };
     use clap::Parser;
 
     #[test]
@@ -1674,6 +1716,14 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(expected_runtime_role, "profitability_shadow");
+    }
+
+    #[test]
+    fn profitability_log_distinguishes_shadow_evidence_from_execution_authorization() {
+        assert_eq!(
+            profitability_authorization_flags(true, false),
+            "shadow_gate_passed=true execution_promotion_allowed=false"
+        );
     }
 
     #[test]

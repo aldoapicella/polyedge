@@ -114,7 +114,13 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
     } else if message.starts_with("daily runtime provenance reporter mismatch for ") {
         (
             "daily_runtime_provenance_reporter_mismatch",
-            WarningSeverity::Blocking,
+            // The recorder runtime and the later report builder are two
+            // independently pinned pieces of lineage. A historical replay is
+            // expected to use a newer reporter SHA while preserving the exact
+            // runtime SHA embedded in the immutable source events. Both SHAs
+            // must still be present and valid; inequality alone is not a data
+            // defect.
+            WarningSeverity::Informational,
             true,
         )
     } else {

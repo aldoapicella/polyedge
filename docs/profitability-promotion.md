@@ -65,11 +65,23 @@ revision, full runtime-configuration hash, role, safety settings, frozen
 candidate hash, execution-model binding, and storage destination. Provenance is
 durably flushed before feeds start and repeated every minute. A clean day also
 requires provenance within both five-minute UTC boundaries, no provenance gap
-over five minutes, one unchanged identity for the whole day, and an exact Git
-SHA match between the runtime and the reporter. Missing, unknown, mismatched,
-or mid-day-changing provenance is blocking. The publisher requires an explicit
-expected runtime role and stores it in the immutable manifest; the shadow job
-passes `profitability_shadow`, while the primary paper job passes `primary`.
+over five minutes, and one unchanged valid identity for the whole day. The
+recorder SHA and report-builder SHA are stored independently: a historical
+rebuild is expected to use a newer reporter while preserving the exact runtime
+SHA from the source events. Their difference remains an informational lineage
+warning; a missing/unknown SHA, invalid identity, wrong runtime role, or
+mid-day-changing identity remains blocking. The publisher requires an explicit
+expected runtime role and stores it with the report-builder SHA in the
+immutable manifest; the shadow job passes `profitability_shadow`, while the
+primary paper job passes `primary`.
+
+Promotion statistics use only the current contiguous suffix of clean shadow
+days. Older bootstrap, restart, or gapped days remain immutable and visible in
+the prospective rows and cumulative wallet ledger, but their markets, model
+PnL, parity, markouts, and confidence bounds cannot help a candidate pass. The
+overall wallet-constrained equity and drawdown still include the full campaign,
+so excluding a dirty day from statistical evidence cannot hide a real capital
+loss.
 
 An inconclusive result may extend once to 60 calendar days or 2,000 markets. If every promotion gate has not passed when either limit is reached, the immutable manifest enters terminal `stopped_no_go`; the candidate is not tuned inside its holdout.
 
@@ -98,9 +110,12 @@ only protection against look-ahead.
 The cumulative wallet snapshot schema is version 2 from 2026-07-13 onward. It
 binds the campaign terminal hash, its parent hash, the exact campaign-index
 bytes, cumulative replay state, and cumulative regimes artifact. A missing
-date, modified local shard, schema downgrade, bad parent, or correction that
-breaks the existing sequence invalidates the entire wallet ledger and blocks
-promotion.
+date, late first snapshot, modified local shard, schema downgrade, bad parent,
+or correction that breaks the existing sequence invalidates the entire wallet
+ledger and blocks promotion. The validated sequence must start on the first
+recorded projected day, 2026-07-13, and advance by exactly one UTC day; the
+campaign identity remains anchored to 2026-07-12 without fabricating an empty
+wallet snapshot for that bootstrap date.
 
 All scheduled and manual shadow writers run under one renewable Azure Blob
 lease. The child process is killed if renewal or ownership is lost, and the
