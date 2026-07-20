@@ -765,8 +765,19 @@ impl AzureBlobClient {
             self.container,
             encode_blob_path(name)
         );
-        let response = self.get_response_if_match(&url, expected_etag)?;
-        read_versioned_blob_response(response)
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let result = self
+                .get_response_if_match(&url, expected_etag)
+                .and_then(read_versioned_blob_response);
+            match result {
+                Ok(versioned) => return Ok(versioned),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob conditional read retry loop always returns")
     }
 
     pub fn upload_block_blob_bytes(
