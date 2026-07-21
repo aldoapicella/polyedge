@@ -8,7 +8,15 @@ if [ "${POLYEDGE_CAMPAIGN_LEASE_ACTIVE:-false}" != "true" ] \
   exit 1
 fi
 
-TODAY="$(date -u +%Y-%m-%d)"
+if [ -n "${POLYEDGE_UTC_TODAY:-}" ] && [ -z "${POLYEDGE_TEST_ARGS:-}" ]; then
+  echo "POLYEDGE_UTC_TODAY is test-only" >&2
+  exit 1
+fi
+TODAY="${POLYEDGE_UTC_TODAY:-$(date -u +%Y-%m-%d)}"
+if [ "$(date -u -d "$TODAY" +%Y-%m-%d 2>/dev/null || true)" != "$TODAY" ]; then
+  echo "POLYEDGE_UTC_TODAY must be a valid YYYY-MM-DD UTC date" >&2
+  exit 1
+fi
 DATE="${SHADOW_REPORT_DATE:-$(date -u -d 'yesterday' +%Y-%m-%d)}"
 if [ "$(date -u -d "$DATE" +%Y-%m-%d 2>/dev/null || true)" != "$DATE" ]; then
   echo "SHADOW_REPORT_DATE must be a valid YYYY-MM-DD UTC date" >&2
@@ -25,21 +33,42 @@ if [ "$(date -u -d "$CASCADE_THROUGH" +%Y-%m-%d 2>/dev/null || true)" != "$CASCA
   echo "SHADOW_CASCADE_THROUGH must be a sealed UTC date on or after SHADOW_REPORT_DATE" >&2
   exit 1
 fi
-CAMPAIGN_ID="campaign-2026-07-12"
+CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:-campaign-2026-07-22}"
+CAMPAIGN_START="${SHADOW_CAMPAIGN_START:-2026-07-22}"
+CAMPAIGN_PREFIX="${SHADOW_CAMPAIGN_PREFIX:-shadow-events/$CAMPAIGN_ID}"
+CAMPAIGN_ROOT="${SHADOW_CAMPAIGN_REPORT_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID}"
+CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:-research/configs/profitability_gate_v3_2026-07-22.yaml}"
+CORRECTION_ROOT="${SHADOW_CORRECTION_ROOT:-$CAMPAIGN_ROOT/corrections}"
+DAILY_ROOT="$CAMPAIGN_ROOT/daily"
+PROSPECTIVE_ROOT="$CAMPAIGN_ROOT/prospective"
+PROFITABILITY_ROOT="$CAMPAIGN_ROOT/profitability"
+
+if [ "$(date -u -d "$CAMPAIGN_START" +%Y-%m-%d 2>/dev/null || true)" != "$CAMPAIGN_START" ]; then
+  echo "SHADOW_CAMPAIGN_START must be a valid YYYY-MM-DD UTC date" >&2
+  exit 1
+fi
+if [ "$(date -u -d "$CASCADE_THROUGH" +%s)" -lt "$(date -u -d "$CAMPAIGN_START" +%s)" ]; then
+  echo "polyedge_shadow_daily status=not_started first_eligible_date=$CAMPAIGN_START requested_through=$CASCADE_THROUGH"
+  exit 0
+fi
+if [ "$(date -u -d "$DATE" +%s)" -lt "$(date -u -d "$CAMPAIGN_START" +%s)" ]; then
+  echo "SHADOW_REPORT_DATE must be on or after campaign start $CAMPAIGN_START" >&2
+  exit 1
+fi
 
 # A historical correction always rebuilds every dependent wallet day in
 # chronological order under the same Azure lease. Normal scheduled runs have
 # DATE == CASCADE_THROUGH and therefore execute exactly once.
 if [ "${POLYEDGE_SHADOW_CASCADE_CHILD:-false}" != "true" ]; then
   CORRECTION_ID="${SHADOW_CORRECTION_ID:-shadow-$DATE-through-$CASCADE_THROUGH}"
-  CORRECTION_REASON="${SHADOW_CORRECTION_REASON:-chronological schema-v2 evidence rebuild}"
+  CORRECTION_REASON="${SHADOW_CORRECTION_REASON:-chronological protocol-v3 evidence build}"
   polyedge-rs research begin-shadow-correction \
     --campaign-id "$CAMPAIGN_ID" \
     --correction-id "$CORRECTION_ID" \
     --from "$DATE" \
     --through "$CASCADE_THROUGH" \
     --reason "$CORRECTION_REASON" \
-    --out reports/research/shadow/corrections/active.json >/dev/null
+    --out "$CORRECTION_ROOT/active.json" >/dev/null
   CURRENT="$DATE"
   while [ "$(date -u -d "$CURRENT" +%s)" -le "$(date -u -d "$CASCADE_THROUGH" +%s)" ]; do
     echo "polyedge_shadow_cascade date=$CURRENT through=$CASCADE_THROUGH status=starting"
@@ -54,7 +83,7 @@ if [ "${POLYEDGE_SHADOW_CASCADE_CHILD:-false}" != "true" ]; then
     --campaign-id "$CAMPAIGN_ID" \
     --from "$DATE" \
     --through "$CASCADE_THROUGH" \
-    --out reports/research/shadow/corrections/active.json >/dev/null
+    --out "$CORRECTION_ROOT/active.json" >/dev/null
   exit 0
 fi
 
@@ -64,19 +93,16 @@ SOURCE_CONTAINER="${SHADOW_SOURCE_CONTAINER_NAME:?SHADOW_SOURCE_CONTAINER_NAME i
 EXECUTION_MODEL_BLOB_NAME="${SHADOW_EXECUTION_MODEL_BLOB_NAME:?SHADOW_EXECUTION_MODEL_BLOB_NAME is required}"
 RESEARCH_CONTAINER="${AZURE_STORAGE_CONTAINER_NAME:?AZURE_STORAGE_CONTAINER_NAME is required}"
 ROOT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$SOURCE_CONTAINER"
-CAMPAIGN_PREFIX="shadow-events/campaign-2026-07-12"
-# The deployed shadow stream first contains events on 2026-07-13. Keep the
-# campaign/wallet identity at July 12, but never fabricate an empty cache day.
-PROJECTED_DATA_START="${SHADOW_PROJECTED_DATA_START:-2026-07-13}"
+PROJECTED_DATA_START="${SHADOW_PROJECTED_DATA_START:-$CAMPAIGN_START}"
 if [ "$(date -u -d "$PROJECTED_DATA_START" +%Y-%m-%d 2>/dev/null || true)" != "$PROJECTED_DATA_START" ] \
   || [ "$(date -u -d "$PROJECTED_DATA_START" +%s)" -gt "$(date -u -d "$DATE" +%s)" ]; then
   echo "SHADOW_PROJECTED_DATA_START must be a valid UTC date on or before SHADOW_REPORT_DATE" >&2
   exit 1
 fi
 INPUT="$ROOT/$CAMPAIGN_PREFIX/$DAY/?prefetch_blobs=16"
-NORMALIZED="data/research/shadow/$DATE/normalized"
-CUMULATIVE_NORMALIZED="data/research/shadow/cumulative/$DATE/normalized"
-STAGING="reports/research/shadow/staging/$RUN_ID"
+NORMALIZED="data/research/shadow/$CAMPAIGN_ID/$DATE/normalized"
+CUMULATIVE_NORMALIZED="data/research/shadow/$CAMPAIGN_ID/cumulative/$DATE/normalized"
+STAGING="$CAMPAIGN_ROOT/staging/$RUN_ID"
 CACHE_ROOT="${SHADOW_PROJECTED_CACHE_ROOT:-azure://$AZURE_STORAGE_ACCOUNT_NAME/$RESEARCH_CONTAINER/data/research/shadow/$CAMPAIGN_ID/projected-cache}"
 CACHE_DAY_MANIFEST="$STAGING/projected_day_manifest.json"
 CUMULATIVE_INPUT_MANIFEST="$STAGING/cumulative_input_manifest.json"
@@ -110,13 +136,13 @@ run_stage report-day polyedge-rs research report --reports-dir "$STAGING" --out 
 # shards through DATE. It never reads or normalizes the open current UTC day.
 run_stage build-markets-cumulative polyedge-rs research build-markets --input "$CUMULATIVE_NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$CUMULATIVE_MARKETS" --markdown "$STAGING/cumulative_markets_summary.md"
 run_stage regimes-cumulative polyedge-rs research regimes --input "$CUMULATIVE_NORMALIZED" --markets "$CUMULATIVE_MARKETS" --fill-model queue_proxy_conservative --profile-config research/configs/frozen_candidates.yaml --exclude-file data_quality/exclusion_windows.yaml --out "$CUMULATIVE_REGIMES" --markdown "$STAGING/cumulative_regimes.md"
-run_stage build-cumulative-wallet polyedge-rs research build-cumulative-wallet --regimes "$CUMULATIVE_REGIMES" --campaign-manifest "$CUMULATIVE_INPUT_MANIFEST" --snapshot-date "$DATE" --out "$STAGING/cumulative_wallet.json"
+run_stage build-cumulative-wallet polyedge-rs research build-cumulative-wallet --regimes "$CUMULATIVE_REGIMES" --campaign-manifest "$CUMULATIVE_INPUT_MANIFEST" --snapshot-date "$DATE" --campaign-contract "$CAMPAIGN_CONTRACT" --out "$STAGING/cumulative_wallet.json"
 
 INPUT_SHA="sha256:$(sha256sum "$NORMALIZED/events_manifest.json" | cut -d' ' -f1)"
-run_stage publish-daily-bundle polyedge-rs research publish-daily-bundle --date "$DATE" --run-id "$RUN_ID" --input-sha256 "$INPUT_SHA" --expected-runtime-role profitability_shadow --source-dir "$STAGING" --output-root reports/research/shadow/daily --data-audit "$STAGING/data_audit.json"
+run_stage publish-daily-bundle polyedge-rs research publish-daily-bundle --date "$DATE" --run-id "$RUN_ID" --input-sha256 "$INPUT_SHA" --expected-runtime-role profitability_shadow --source-dir "$STAGING" --output-root "$DAILY_ROOT" --data-audit "$STAGING/data_audit.json"
 if [ "$DATE" = "$CASCADE_THROUGH" ]; then
-  run_stage validate-prospective polyedge-rs research validate-prospective --since 2026-07-13T00:00:00Z --candidates research/configs/frozen_candidates.yaml --reports-dir reports/research/shadow/daily --expected-daily-date "$DATE" --out reports/research/shadow/prospective/prospective_validation.json --markdown reports/research/shadow/prospective/prospective_validation.md
-  run_stage evaluate-profitability polyedge-rs research evaluate-profitability --daily-root reports/research/shadow/daily --prospective reports/research/shadow/prospective/prospective_validation.json --gate-config research/configs/profitability_gate.yaml --execution-model "$EXECUTION_MODEL_BLOB_NAME" --out reports/research/profitability/latest.json
+  run_stage validate-prospective polyedge-rs research validate-prospective --since "${CAMPAIGN_START}T00:00:00Z" --candidates research/configs/frozen_candidates.yaml --reports-dir "$DAILY_ROOT" --expected-daily-date "$DATE" --out "$PROSPECTIVE_ROOT/prospective_validation.json" --markdown "$PROSPECTIVE_ROOT/prospective_validation.md"
+  run_stage evaluate-profitability polyedge-rs research evaluate-profitability --daily-root "$DAILY_ROOT" --prospective "$PROSPECTIVE_ROOT/prospective_validation.json" --gate-config "$CAMPAIGN_CONTRACT" --execution-model "$EXECUTION_MODEL_BLOB_NAME" --out "$PROFITABILITY_ROOT/latest.json"
 else
   echo "polyedge_shadow_daily stage=terminal-evidence date=$DATE status=deferred-through-$CASCADE_THROUGH"
 fi

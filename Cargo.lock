@@ -1196,6 +1196,7 @@ dependencies = [
 name = "polyedge-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "polyedge-domain",
  "rust_decimal",
  "serde",

@@ -31,7 +31,11 @@ var promotionTransitionJobName = 'polyedge-promotion-neu-job'
 var redemptionJobName = 'polyedge-redeem-neu-job'
 var shadowAppName = 'polyedge-shadow-neu'
 var shadowDailyJobName = 'polyedge-shadow-daily-neu-job'
-var shadowCampaignLeaseBlobName = 'data/research/shadow/campaign-2026-07-12/control/replay.lock'
+var shadowCampaignId = 'campaign-2026-07-22'
+var shadowCampaignStart = '2026-07-22'
+var shadowCampaignEventPrefix = 'shadow-events/${shadowCampaignId}'
+var shadowCampaignReportRoot = 'reports/research/shadow/campaigns/${shadowCampaignId}'
+var shadowCampaignLeaseBlobName = 'data/research/shadow/${shadowCampaignId}/control/replay.lock'
 var vnetName = 'vnet-polyedge-venue-neu'
 var natName = 'nat-polyedge-venue-neu'
 var publicIpName = 'pip-polyedge-venue-neu-egress'
@@ -592,6 +596,8 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_FUNDED_STORAGE_CONTAINER_NAME', value: fundedEvidenceContainer.name }
             { name: 'AZURE_MODEL_STORAGE_CONTAINER_NAME', value: modelContainer.name }
             { name: 'AZURE_EVENT_BLOB_PREFIX', value: 'shadow-events/campaign-2026-07-12' }
+            { name: 'AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER', value: shadowCampaignEventPrefix }
+            { name: 'AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC', value: '${shadowCampaignStart}T00:00:00Z' }
             { name: 'COMPACT_SHADOW_RECORDING', value: 'true' }
             { name: 'SHADOW_BOOK_SAMPLE_MS', value: '1000' }
             { name: 'PUBLISH_STRATEGY_CANARY_INTENTS', value: 'true' }
@@ -683,6 +689,13 @@ resource shadowDailyJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'SHADOW_EXECUTION_MODEL_BLOB_URI', value: conservativePriorBlobUri }
             { name: 'SHADOW_EXECUTION_MODEL_BLOB_NAME', value: conservativePriorBlobName }
             { name: 'SHADOW_EXECUTION_MODEL_SHA256', value: conservativePriorSha256 }
+            { name: 'SHADOW_CAMPAIGN_ID', value: shadowCampaignId }
+            { name: 'SHADOW_CAMPAIGN_START', value: shadowCampaignStart }
+            { name: 'SHADOW_CAMPAIGN_PREFIX', value: shadowCampaignEventPrefix }
+            { name: 'SHADOW_CAMPAIGN_REPORT_ROOT', value: shadowCampaignReportRoot }
+            { name: 'SHADOW_CAMPAIGN_CONTRACT', value: 'research/configs/profitability_gate_v3_2026-07-22.yaml' }
+            { name: 'SHADOW_PROJECTED_CACHE_ROOT', value: 'azure://${storage.name}/${researchContainer.name}/data/research/shadow/${shadowCampaignId}/projected-cache' }
+            { name: 'SHADOW_CORRECTION_ROOT', value: '${shadowCampaignReportRoot}/corrections' }
           ]
           resources: {
             cpu: json('4')

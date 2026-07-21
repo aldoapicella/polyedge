@@ -2810,6 +2810,14 @@ fn runtime_provenance_with_git_sha(
     settings: &RuntimeSettings,
     git_sha: &str,
 ) -> Result<Value, String> {
+    runtime_provenance_with_git_sha_at(settings, git_sha, Utc::now())
+}
+
+fn runtime_provenance_with_git_sha_at(
+    settings: &RuntimeSettings,
+    git_sha: &str,
+    event_ts: DateTime<Utc>,
+) -> Result<Value, String> {
     if !polyedge_config::is_full_git_sha(git_sha) {
         return Err("Git SHA is not a canonical 40-character lowercase commit ID".to_owned());
     }
@@ -2843,7 +2851,14 @@ fn runtime_provenance_with_git_sha(
         "candidate": candidate,
         "storage_account": settings.azure.storage_account_name,
         "storage_container": settings.azure.storage_container_name,
-        "event_blob_prefix": settings.azure.event_blob_prefix,
+        "event_blob_prefix": settings.azure.event_blob_prefix_at(event_ts),
+        "event_blob_prefix_routing": {
+            "before_cutover": settings.azure.event_blob_prefix,
+            "after_cutover": settings.azure.event_blob_prefix_after_cutover,
+            "cutover_utc": settings.azure.event_blob_prefix_cutover_utc,
+            "evaluated_event_ts": event_ts,
+            "effective_prefix": settings.azure.event_blob_prefix_at(event_ts)
+        },
         "compact_shadow_recording": settings.azure.compact_shadow_recording,
         "shadow_book_sample_ms": settings.azure.shadow_book_sample_ms,
         "publish_strategy_canary_intents": settings.azure.publish_strategy_canary_intents,
@@ -2898,6 +2913,11 @@ fn decision_config_projection(
             "confirm_non_restricted_location": settings.live.confirm_non_restricted_location,
             "require_exact_resolution_source_for_live": settings.live.require_exact_resolution_source_for_live,
             "allow_emergency_account_cancel": settings.live.allow_emergency_account_cancel
+        },
+        "event_blob_routing": {
+            "before_cutover": settings.azure.event_blob_prefix,
+            "after_cutover": settings.azure.event_blob_prefix_after_cutover,
+            "cutover_utc": settings.azure.event_blob_prefix_cutover_utc
         },
         "adaptive_mode": adaptive_mode,
         "candidate": adaptive_mode.map(FrozenStrategyMode::candidate)
@@ -3281,6 +3301,44 @@ mod tests {
         assert!(payload["runtime_config_hash"]
             .as_str()
             .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71));
+    }
+
+    #[test]
+    fn runtime_provenance_and_decision_hash_bind_event_time_prefix_cutover() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.event_blob_prefix = "shadow-events/old".to_owned();
+        settings.azure.event_blob_prefix_after_cutover = Some("shadow-events/new".to_owned());
+        let cutover = DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        settings.azure.event_blob_prefix_cutover_utc = Some(cutover);
+        let git_sha = "c40d9093783808b010eabd9c43697e9dcceb667b";
+
+        let before = runtime_provenance_with_git_sha_at(
+            &settings,
+            git_sha,
+            cutover - chrono::Duration::milliseconds(1),
+        )
+        .unwrap();
+        let after = runtime_provenance_with_git_sha_at(&settings, git_sha, cutover).unwrap();
+        assert_eq!(before["event_blob_prefix"], "shadow-events/old");
+        assert_eq!(after["event_blob_prefix"], "shadow-events/new");
+        assert_eq!(
+            after["event_blob_prefix_routing"]["before_cutover"],
+            "shadow-events/old"
+        );
+        assert_eq!(
+            after["event_blob_prefix_routing"]["after_cutover"],
+            "shadow-events/new"
+        );
+        assert_eq!(
+            after["event_blob_prefix_routing"]["cutover_utc"],
+            json!(cutover)
+        );
+
+        let bound_hash = decision_config_sha256(&settings, None);
+        settings.azure.event_blob_prefix_after_cutover = Some("shadow-events/different".to_owned());
+        assert_ne!(bound_hash, decision_config_sha256(&settings, None));
     }
 
     #[test]

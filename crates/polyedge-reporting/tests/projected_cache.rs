@@ -96,6 +96,7 @@ fn projected_days_equal_full_cross_midnight_replay_and_bound_readers() {
     let wallet = run_build_cumulative_wallet_snapshot(CumulativeWalletSnapshotOptions {
         regimes: dir.join("campaign-regimes.json"),
         campaign_manifest: dir.join("campaign-input.json"),
+        campaign_contract: None,
         snapshot_date: date(2026, 7, 13),
         out: dir.join("wallet.json"),
     })
@@ -121,6 +122,7 @@ fn projected_days_equal_full_cross_midnight_replay_and_bound_readers() {
     let mismatch = run_build_cumulative_wallet_snapshot(CumulativeWalletSnapshotOptions {
         regimes: mismatched_regimes_path,
         campaign_manifest: dir.join("campaign-input.json"),
+        campaign_contract: None,
         snapshot_date: date(2026, 7, 13),
         out: dir.join("mismatched-wallet.json"),
     })

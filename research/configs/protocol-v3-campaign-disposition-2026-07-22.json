@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-07-21T21:35:00Z",
+  "active_campaign": {
+    "campaign_id": "campaign-2026-07-22",
+    "contract": "research/configs/profitability_gate_v3_2026-07-22.yaml",
+    "start_date": "2026-07-22",
+    "first_eligible_date": "2026-07-22",
+    "first_possible_sealed_publication": "2026-07-23T02:15:00Z",
+    "terminal_date_inclusive": "2026-09-19",
+    "virtual_wallet_baseline": 5.030521,
+    "funded_execution_allowed": false
+  },
+  "historical_evidence": [
+    {
+      "campaign_id": "campaign-2026-07-12",
+      "date_from": "2026-07-13",
+      "date_through": "2026-07-20",
+      "disposition": "historical_ineligible",
+      "preserved": true,
+      "deleted": false,
+      "wallet_constrained_net_pnl": -0.9,
+      "observed_calendar_days": 9,
+      "minimum_component_coverage": 0.5416666666666666,
+      "blocking_warning_count": 17,
+      "reason": "The source days predate the complete protocol-v3 runtime evidence contract. A corrected rerun can verify recorded bytes but cannot reconstruct venue observations and pre-mutation decision state that were never captured."
+    },
+    {
+      "date_from": "2026-07-21",
+      "date_through": "2026-07-21",
+      "disposition": "cutover_partial_ineligible",
+      "preserved": true,
+      "deleted": false,
+      "reason": "The campaign cutover occurs at the next UTC boundary, so July 21 cannot be a complete single-identity protocol-v3 day."
+    }
+  ],
+  "accounting_boundary": "The new virtual shadow ledger does not reset, refund, or hide funded or lifetime account losses.",
+  "queue_position_metric": "inferred_size_ahead",
+  "literal_fifo_rank_available": false,
+  "research_only": true,
+  "promotion_allowed": false
+}

@@ -267,6 +267,8 @@ jobs:
           research_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_RESEARCH_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
           funded_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_FUNDED_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
           model_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
+          shadow_campaign_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' containerapp.json)
+          shadow_correction_root=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value' containerapp.json)
           event_index_types=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value' containerapp.json)
           test "$run_on_startup" = "true"
           test -n "$azure_client_id"
@@ -275,6 +277,8 @@ jobs:
           test "$research_container" = "polyedge-research"
           test "$funded_container" = "polyedge-funded-evidence"
           test "$model_container" = "polyedge-models"
+          test "$shadow_campaign_id" = "campaign-2026-07-22"
+          test "$shadow_correction_root" = "reports/research/shadow/campaigns/campaign-2026-07-22/corrections"
           test "$(echo "$event_index_types" | grep -c 'runtime_provenance')" = "1"
           test "$(jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length' containerapp.json)" = "0"
           test "$(jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length' containerapp.json)" = "0"
@@ -363,6 +367,8 @@ jobs:
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "PAPER_MAKER_FILL_POLICY") | .value')" = "none"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "ADAPTIVE_REGIME_MODE") | .value')" = "dynamic_quote_style"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX") | .value')" = "shadow-events/campaign-2026-07-12"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER") | .value')" = "shadow-events/campaign-2026-07-22"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC") | .value')" = "2026-07-22T00:00:00Z"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "PUBLISH_STRATEGY_CANARY_INTENTS") | .value')" = "true"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_PREFIX") | .value')" = "reports/research/venue-probe/control/strategy-canary/intents"
           test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-shadow-events"
@@ -379,10 +385,15 @@ jobs:
           shadow_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-daily-neu-job -o json)
           test "$(echo "$shadow_job" | jq -r '.properties.configuration.triggerType')" = "Schedule"
           test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "polyedge-rs"
-          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].args | join(" ")')" = "research with-azure-lease --account stpolyedge6urdjr5nmwx7w --container polyedge-research --blob data/research/shadow/campaign-2026-07-12/control/replay.lock -- /bin/sh /app/research/run_shadow_daily.sh"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].args | join(" ")')" = "research with-azure-lease --account stpolyedge6urdjr5nmwx7w --container polyedge-research --blob data/research/shadow/campaign-2026-07-22/control/replay.lock -- /bin/sh /app/research/run_shadow_daily.sh"
           test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_LIVE") | .value')" = "false"
           test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-research"
           test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_SOURCE_CONTAINER_NAME") | .value')" = "polyedge-shadow-events"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value')" = "campaign-2026-07-22"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_START") | .value')" = "2026-07-22"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_PREFIX") | .value')" = "shadow-events/campaign-2026-07-22"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_CONTRACT") | .value')" = "research/configs/profitability_gate_v3_2026-07-22.yaml"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value')" = "reports/research/shadow/campaigns/campaign-2026-07-22/corrections"
           test "$(echo "$shadow_job" | jq -r '[.properties.template.containers[0].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length')" = "0"
           test "$(echo "$shadow_job" | jq -r '(.properties.configuration.secrets // []) | length')" = "0"
 

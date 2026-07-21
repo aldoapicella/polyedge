@@ -20,6 +20,9 @@ pub const CUMULATIVE_WALLET_SCOPE: &str = "cumulative_since_2026-07-12";
 /// First snapshot backed by the immutable projected-day campaign chain.
 /// Legacy schema-v1 wallets remain readable only before this date.
 const PROJECTED_WALLET_PROTOCOL_CUTOFF: &str = "2026-07-13";
+const CAMPAIGN_BOUND_WALLET_SCHEMA_VERSION: u64 = 3;
+const SHADOW_CAMPAIGN_CONTRACT_SCHEMA_VERSION: u32 = 1;
+const SHADOW_EVIDENCE_PROTOCOL_VERSION: u32 = 3;
 
 pub fn legacy_daily_fallback_allowed(report_date: NaiveDate, atomic_marker_present: bool) -> bool {
     !atomic_marker_present
@@ -65,8 +68,77 @@ pub struct ProfitabilityEvaluationOptions {
 pub struct CumulativeWalletSnapshotOptions {
     pub regimes: PathBuf,
     pub campaign_manifest: PathBuf,
+    /// Optional immutable campaign contract. Historical callers may omit this
+    /// and retain the schema-v2 July-2026 wallet contract. New protocol-v3
+    /// campaigns must provide it and receive a schema-v3 snapshot.
+    pub campaign_contract: Option<PathBuf>,
     pub snapshot_date: NaiveDate,
     pub out: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShadowCampaignContract {
+    pub schema_version: u32,
+    pub evidence_protocol_version: u32,
+    pub campaign_id: String,
+    pub start_date: NaiveDate,
+    pub first_eligible_date: NaiveDate,
+    pub terminal_date: NaiveDate,
+    pub wallet_scope: String,
+    pub wallet_baseline: Decimal,
+    pub equity_floor: Decimal,
+    pub maximum_drawdown: Decimal,
+    pub event_blob_prefix: String,
+    pub projected_cache_root: String,
+    pub daily_root: String,
+    pub prospective_path: String,
+    pub correction_root: String,
+    pub profitability_path: String,
+    pub lease_blob: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShadowCampaignContractBinding {
+    pub contract: ShadowCampaignContract,
+    pub sha256: String,
+}
+
+impl ShadowCampaignContractBinding {
+    pub fn campaign_id(&self) -> &str {
+        &self.contract.campaign_id
+    }
+}
+
+fn bind_campaign_contract(
+    value: &mut Value,
+    binding: Option<&ShadowCampaignContractBinding>,
+) -> Result<(), ResearchError> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let object = value.as_object_mut().ok_or_else(|| {
+        ResearchError::InvalidInput("wallet campaign binding target must be an object".to_owned())
+    })?;
+    let contract = &binding.contract;
+    object.insert(
+        "evidence_protocol_version".to_owned(),
+        json!(contract.evidence_protocol_version),
+    );
+    object.insert("campaign_id".to_owned(), json!(contract.campaign_id));
+    object.insert("campaign_contract_sha256".to_owned(), json!(binding.sha256));
+    object.insert(
+        "campaign_first_eligible_date".to_owned(),
+        json!(contract.first_eligible_date),
+    );
+    object.insert(
+        "campaign_terminal_date".to_owned(),
+        json!(contract.terminal_date),
+    );
+    object.insert(
+        "campaign_baseline".to_owned(),
+        json!(contract.wallet_baseline),
+    );
+    Ok(())
 }
 
 /// Binds the wallet ledger produced by the cumulative replay to the exact
@@ -75,6 +147,11 @@ pub struct CumulativeWalletSnapshotOptions {
 pub fn run_build_cumulative_wallet_snapshot(
     options: CumulativeWalletSnapshotOptions,
 ) -> Result<Value, ResearchError> {
+    let campaign_contract = options
+        .campaign_contract
+        .as_deref()
+        .map(load_shadow_campaign_contract)
+        .transpose()?;
     let regimes_bytes = fs::read(&options.regimes)?;
     let regimes: Value = serde_json::from_slice(&regimes_bytes)?;
     let campaign_manifest_bytes = fs::read(&options.campaign_manifest)?;
@@ -95,6 +172,19 @@ pub fn run_build_cumulative_wallet_snapshot(
             campaign.through, options.snapshot_date
         )));
     }
+    if let Some(binding) = &campaign_contract {
+        let contract = &binding.contract;
+        if campaign.campaign_id != contract.campaign_id
+            || campaign.since != contract.first_eligible_date
+            || options.snapshot_date < contract.first_eligible_date
+            || options.snapshot_date > contract.terminal_date
+        {
+            return Err(ResearchError::InvalidInput(
+                "projected campaign identity or date range does not match the immutable shadow campaign contract"
+                    .to_owned(),
+            ));
+        }
+    }
     let normalized_events = campaign.total_events;
     let profile = find_regime_profile(&regimes, "dynamic_quote_style").ok_or_else(|| {
         ResearchError::InvalidInput(
@@ -105,6 +195,20 @@ pub fn run_build_cumulative_wallet_snapshot(
         return Err(ResearchError::InvalidInput(
             "cumulative replay is not wallet constrained".to_owned(),
         ));
+    }
+    if let Some(binding) = &campaign_contract {
+        let constraints = &profile["wallet_constraints"];
+        let contract = &binding.contract;
+        if decimal_from_value(&constraints["campaign_baseline"]) != Some(contract.wallet_baseline)
+            || decimal_from_value(&constraints["equity_floor"]) != Some(contract.equity_floor)
+            || decimal_from_value(&constraints["maximum_drawdown"])
+                != Some(contract.maximum_drawdown)
+        {
+            return Err(ResearchError::InvalidInput(
+                "cumulative replay wallet constraints do not match the immutable shadow campaign contract"
+                    .to_owned(),
+            ));
+        }
     }
     let cumulative_events = profile["events"].as_u64().ok_or_else(|| {
         ResearchError::InvalidInput("cumulative replay profile is missing events".to_owned())
@@ -129,10 +233,21 @@ pub fn run_build_cumulative_wallet_snapshot(
             )));
         }
     }
-    let canonical_state = json!({
-        "schema_version": 2,
-        "wallet_scope": CUMULATIVE_WALLET_SCOPE,
-        "campaign_start": WALLET_CAMPAIGN_START,
+    let schema_version = campaign_contract
+        .as_ref()
+        .map_or(2, |_| CAMPAIGN_BOUND_WALLET_SCHEMA_VERSION);
+    let wallet_scope = campaign_contract
+        .as_ref()
+        .map(|binding| binding.contract.wallet_scope.as_str())
+        .unwrap_or(CUMULATIVE_WALLET_SCOPE);
+    let campaign_start = campaign_contract
+        .as_ref()
+        .map(|binding| binding.contract.start_date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| WALLET_CAMPAIGN_START.to_owned());
+    let mut canonical_state = json!({
+        "schema_version": schema_version,
+        "wallet_scope": wallet_scope,
+        "campaign_start": campaign_start,
         "snapshot_date": options.snapshot_date.format("%Y-%m-%d").to_string(),
         "cumulative_input_sha256": campaign.canonical_sha256.clone(),
         "candidate": "dynamic_quote_style",
@@ -150,15 +265,16 @@ pub fn run_build_cumulative_wallet_snapshot(
         "wallet_constrained_equity_curve": profile["wallet_constrained_equity_curve"].clone(),
         "wallet_constraints": profile["wallet_constraints"].clone()
     });
+    bind_campaign_contract(&mut canonical_state, campaign_contract.as_ref())?;
     let canonical_state_bytes = serde_json::to_vec(&canonical_state)?;
     let campaign_parent_input_sha256 = campaign
         .segments
         .last()
         .and_then(|segment| segment.parent_chain_sha256.clone());
-    let snapshot = json!({
-        "schema_version": 2,
-        "wallet_scope": CUMULATIVE_WALLET_SCOPE,
-        "campaign_start": WALLET_CAMPAIGN_START,
+    let mut snapshot = json!({
+        "schema_version": schema_version,
+        "wallet_scope": wallet_scope,
+        "campaign_start": campaign_start,
         "snapshot_date": options.snapshot_date.format("%Y-%m-%d").to_string(),
         "cumulative_input_sha256": campaign.canonical_sha256.clone(),
         "cumulative_parent_input_sha256": campaign_parent_input_sha256,
@@ -176,6 +292,7 @@ pub fn run_build_cumulative_wallet_snapshot(
         "research_only": true,
         "funded_execution_allowed": false
     });
+    bind_campaign_contract(&mut snapshot, campaign_contract.as_ref())?;
     write_json_file(&options.out, &snapshot)?;
     Ok(snapshot)
 }
@@ -430,12 +547,29 @@ pub fn run_validate_prospective(
 pub fn run_evaluate_profitability(
     options: ProfitabilityEvaluationOptions,
 ) -> Result<PromotionManifestV1, ResearchError> {
+    let config = load_profitability_gate(&options.gate_config)?;
     // `stopped_no_go` is an absorbing terminal state. Once the canonical
     // manifest reaches it, later data or model recomputation cannot silently
     // resurrect the candidate. A new candidate/version must use a new state.
     let existing_manifest = read_local_or_azure_json(&options.out)?
         .map(serde_json::from_value::<PromotionManifestV1>)
         .transpose()?;
+    if let (Some(existing), Some(binding)) = (&existing_manifest, &config.campaign_contract) {
+        let artifacts = &existing.artifact_uris;
+        if artifacts.get("shadow_campaign_id") != Some(&binding.contract.campaign_id)
+            || artifacts.get("campaign_contract_sha256") != Some(&binding.sha256)
+            || artifacts.get("shadow_daily_root") != Some(&binding.contract.daily_root)
+            || artifacts.get("shadow_prospective_result")
+                != Some(&binding.contract.prospective_path)
+            || artifacts.get("shadow_profitability_result")
+                != Some(&binding.contract.profitability_path)
+        {
+            return Err(ResearchError::InvalidInput(
+                "existing profitability state does not match the immutable shadow campaign contract"
+                    .to_owned(),
+            ));
+        }
+    }
     if let Some(existing) = &existing_manifest {
         if existing.phase == PromotionPhase::StoppedNoGo {
             return Ok(existing.clone());
@@ -448,7 +582,19 @@ pub fn run_evaluate_profitability(
             return Ok(existing.clone());
         }
     }
-    let config = load_profitability_gate(&options.gate_config)?;
+    if let Some(binding) = &config.campaign_contract {
+        let contract = &binding.contract;
+        let normalized = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        if normalized(&options.daily_root) != contract.daily_root
+            || normalized(&options.prospective) != contract.prospective_path
+            || normalized(&options.out) != contract.profitability_path
+        {
+            return Err(ResearchError::InvalidInput(
+                "profitability inputs and output do not match the immutable shadow campaign roots"
+                    .to_owned(),
+            ));
+        }
+    }
     let prospective = read_local_or_azure_json(&options.prospective)?.unwrap_or(Value::Null);
     let rows = load_daily_prospective_rows(
         &options.daily_root,
@@ -476,8 +622,13 @@ pub fn run_evaluate_profitability(
                 .to_owned(),
         ));
     }
-    let metrics =
-        aggregate_profitability_metrics(&rows, &prospective, &execution_model, &config.thresholds);
+    let metrics = aggregate_profitability_metrics(
+        &rows,
+        &prospective,
+        &execution_model,
+        &config.thresholds,
+        config.campaign_contract.as_ref(),
+    );
     let evaluation =
         PromotionEvaluation::evaluate_shadow_with_thresholds(metrics, &config.thresholds);
     let generated_at = options.generated_at.unwrap_or_else(Utc::now);
@@ -506,6 +657,34 @@ pub fn run_evaluate_profitability(
         generated_at,
         generated_at + Duration::hours(24),
     )?;
+    if let Some(binding) = &config.campaign_contract {
+        manifest.artifact_uris.extend(BTreeMap::from([
+            (
+                "campaign_contract".to_owned(),
+                options.gate_config.to_string_lossy().into_owned(),
+            ),
+            (
+                "campaign_contract_sha256".to_owned(),
+                binding.sha256.clone(),
+            ),
+            (
+                "shadow_campaign_id".to_owned(),
+                binding.contract.campaign_id.clone(),
+            ),
+            (
+                "shadow_daily_root".to_owned(),
+                binding.contract.daily_root.clone(),
+            ),
+            (
+                "shadow_prospective_result".to_owned(),
+                binding.contract.prospective_path.clone(),
+            ),
+            (
+                "shadow_profitability_result".to_owned(),
+                binding.contract.profitability_path.clone(),
+            ),
+        ]));
+    }
     if let Some(existing) = existing_manifest {
         if existing.candidate == manifest.candidate && existing.funded_ladder.is_some() {
             manifest.funded_ladder = existing.funded_ladder;
@@ -1654,7 +1833,13 @@ fn json_row(
         "wallet_constrained_max_drawdown": cumulative_wallet.and_then(|wallet| value_to_string(&wallet["wallet_constrained_max_drawdown"])),
         "wallet_constrained_unresolved_orders": cumulative_wallet.and_then(|wallet| wallet["wallet_constrained_unresolved_orders"].as_u64()),
         "wallet_scope": cumulative_wallet.and_then(|wallet| wallet["wallet_scope"].as_str()),
+        "wallet_campaign_id": cumulative_wallet.and_then(|wallet| wallet["campaign_id"].as_str()),
+        "wallet_campaign_contract_sha256": cumulative_wallet.and_then(|wallet| wallet["campaign_contract_sha256"].as_str()),
         "wallet_campaign_start": cumulative_wallet.and_then(|wallet| wallet["campaign_start"].as_str()),
+        "wallet_campaign_first_eligible_date": cumulative_wallet.and_then(|wallet| wallet["campaign_first_eligible_date"].as_str()),
+        "wallet_campaign_terminal_date": cumulative_wallet.and_then(|wallet| wallet["campaign_terminal_date"].as_str()),
+        "wallet_campaign_baseline": cumulative_wallet.and_then(|wallet| value_to_string(&wallet["campaign_baseline"])),
+        "wallet_evidence_protocol_version": cumulative_wallet.and_then(|wallet| wallet["evidence_protocol_version"].as_u64()),
         "wallet_snapshot_date": cumulative_wallet.and_then(|wallet| wallet["snapshot_date"].as_str()),
         "wallet_schema_version": cumulative_wallet.and_then(|wallet| wallet["schema_version"].as_u64()),
         "cumulative_input_sha256": cumulative_wallet.and_then(|wallet| wallet["cumulative_input_sha256"].as_str()),
@@ -1715,6 +1900,114 @@ struct LoadedProfitabilityGate {
     thresholds: PromotionThresholds,
     shadow_prior_model_version: String,
     shadow_prior_sha256: String,
+    campaign_contract: Option<ShadowCampaignContractBinding>,
+}
+
+pub fn load_shadow_campaign_contract(
+    path: &Path,
+) -> Result<ShadowCampaignContractBinding, ResearchError> {
+    let text = fs::read_to_string(path)?;
+    let values = flatten_simple_yaml(&text);
+    parse_shadow_campaign_contract(&values)?.ok_or_else(|| {
+        ResearchError::InvalidInput(
+            "profitability gate has no immutable shadow campaign contract".to_owned(),
+        )
+    })
+}
+
+fn parse_shadow_campaign_contract(
+    values: &BTreeMap<String, String>,
+) -> Result<Option<ShadowCampaignContractBinding>, ResearchError> {
+    if !values.contains_key("campaign.id") {
+        return Ok(None);
+    }
+    let required = |key: &str| {
+        values.get(key).cloned().ok_or_else(|| {
+            ResearchError::InvalidInput(format!("shadow campaign contract is missing {key}"))
+        })
+    };
+    let parse_u32 = |key: &str| -> Result<u32, ResearchError> {
+        required(key)?.parse().map_err(|_| {
+            ResearchError::InvalidInput(format!("shadow campaign contract has invalid {key}"))
+        })
+    };
+    let parse_date = |key: &str| -> Result<NaiveDate, ResearchError> {
+        NaiveDate::parse_from_str(&required(key)?, "%Y-%m-%d").map_err(|_| {
+            ResearchError::InvalidInput(format!("shadow campaign contract has invalid {key}"))
+        })
+    };
+    let parse_decimal = |key: &str| -> Result<Decimal, ResearchError> {
+        required(key)?.parse().map_err(|_| {
+            ResearchError::InvalidInput(format!("shadow campaign contract has invalid {key}"))
+        })
+    };
+    let contract = ShadowCampaignContract {
+        schema_version: parse_u32("campaign.schema_version")?,
+        evidence_protocol_version: parse_u32("campaign.evidence_protocol_version")?,
+        campaign_id: required("campaign.id")?,
+        start_date: parse_date("campaign.start_date")?,
+        first_eligible_date: parse_date("campaign.first_eligible_date")?,
+        terminal_date: parse_date("campaign.terminal_date")?,
+        wallet_scope: required("campaign.wallet_scope")?,
+        wallet_baseline: parse_decimal("campaign.wallet_baseline")?,
+        equity_floor: parse_decimal("campaign.equity_floor")?,
+        maximum_drawdown: parse_decimal("campaign.maximum_drawdown")?,
+        event_blob_prefix: required("campaign.event_blob_prefix")?,
+        projected_cache_root: required("campaign.projected_cache_root")?,
+        daily_root: required("campaign.daily_root")?,
+        prospective_path: required("campaign.prospective_path")?,
+        correction_root: required("campaign.correction_root")?,
+        profitability_path: required("campaign.profitability_path")?,
+        lease_blob: required("campaign.lease_blob")?,
+    };
+    validate_shadow_campaign_contract(&contract)?;
+    let canonical = serde_json::to_vec(&contract)?;
+    Ok(Some(ShadowCampaignContractBinding {
+        contract,
+        sha256: format!("sha256:{}", sha256_hex(&canonical)),
+    }))
+}
+
+fn validate_shadow_campaign_contract(
+    contract: &ShadowCampaignContract,
+) -> Result<(), ResearchError> {
+    let valid_id = !contract.campaign_id.is_empty()
+        && contract
+            .campaign_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    let expected_days = (contract.terminal_date - contract.start_date).num_days() + 1;
+    let scoped_paths = [
+        &contract.event_blob_prefix,
+        &contract.projected_cache_root,
+        &contract.daily_root,
+        &contract.prospective_path,
+        &contract.correction_root,
+        &contract.profitability_path,
+        &contract.lease_blob,
+    ];
+    if contract.schema_version != SHADOW_CAMPAIGN_CONTRACT_SCHEMA_VERSION
+        || contract.evidence_protocol_version != SHADOW_EVIDENCE_PROTOCOL_VERSION
+        || !valid_id
+        || contract.start_date != contract.first_eligible_date
+        || expected_days != 60
+        || contract.wallet_scope != format!("cumulative_since_{}", contract.start_date)
+        || contract.wallet_baseline <= Decimal::ZERO
+        || contract.equity_floor < Decimal::ZERO
+        || contract.equity_floor >= contract.wallet_baseline
+        || contract.maximum_drawdown <= Decimal::ZERO
+        || scoped_paths.iter().any(|path| {
+            path.is_empty()
+                || path.starts_with('/')
+                || path.split(['/', '\\']).any(|component| component == "..")
+                || !path.contains(&contract.campaign_id)
+        })
+    {
+        return Err(ResearchError::InvalidInput(
+            "immutable shadow campaign contract is invalid or not fully campaign-scoped".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn load_profitability_gate(path: &Path) -> Result<LoadedProfitabilityGate, ResearchError> {
@@ -1740,47 +2033,54 @@ fn load_profitability_gate(path: &Path) -> Result<LoadedProfitabilityGate, Resea
             ResearchError::InvalidInput(format!("profitability gate has invalid {key}"))
         })
     };
+    let campaign_contract = parse_shadow_campaign_contract(&values)?;
+    let thresholds = PromotionThresholds {
+        required_clean_days: parse_u32("shadow.required_clean_days")?,
+        maximum_extension_days: parse_u32("shadow.maximum_extension_days")?,
+        required_settled_markets: parse_u64("shadow.required_settled_markets")?,
+        maximum_extension_markets: parse_u64("shadow.maximum_extension_markets")?,
+        required_positive_weekly_blocks: parse_u32("shadow.required_positive_weekly_blocks")?,
+        minimum_decision_parity_rate: parse_decimal("shadow.minimum_decision_parity_rate")?,
+        minimum_decision_grade_coverage: parse_decimal("shadow.minimum_decision_grade_coverage")?,
+        maximum_modeled_drawdown: parse_decimal("shadow.maximum_modeled_drawdown")?,
+        maximum_out_of_order_event_rate: parse_decimal("shadow.maximum_out_of_order_event_rate")?,
+        execution_model_protocol_version: parse_u32("execution_model.evidence_protocol_version")?,
+        minimum_execution_model_eligible_orders: parse_u64(
+            "execution_model.minimum_eligible_orders",
+        )?,
+        minimum_execution_model_filled_orders: parse_u64("execution_model.minimum_filled_orders")?,
+        minimum_execution_model_non_filled_orders: parse_u64(
+            "execution_model.minimum_non_filled_orders",
+        )?,
+        minimum_brier_improvement_over_base_rate: parse_decimal(
+            "execution_model.minimum_brier_improvement_over_base_rate",
+        )?,
+        maximum_expected_calibration_error: parse_decimal(
+            "execution_model.maximum_expected_calibration_error",
+        )?,
+    };
+    if let Some(binding) = &campaign_contract {
+        let contract_days =
+            (binding.contract.terminal_date - binding.contract.start_date).num_days() + 1;
+        if u32::try_from(contract_days).ok() != Some(thresholds.maximum_extension_days)
+            || binding.contract.maximum_drawdown != thresholds.maximum_modeled_drawdown
+        {
+            return Err(ResearchError::InvalidInput(
+                "shadow campaign contract deadline or drawdown does not match profitability thresholds"
+                    .to_owned(),
+            ));
+        }
+    }
     Ok(LoadedProfitabilityGate {
         candidate: CandidateIdentity {
             name: required("candidate.name")?,
             candidate_version: required("candidate.version")?,
             config_hash: required("candidate.config_hash")?,
         },
-        thresholds: PromotionThresholds {
-            required_clean_days: parse_u32("shadow.required_clean_days")?,
-            maximum_extension_days: parse_u32("shadow.maximum_extension_days")?,
-            required_settled_markets: parse_u64("shadow.required_settled_markets")?,
-            maximum_extension_markets: parse_u64("shadow.maximum_extension_markets")?,
-            required_positive_weekly_blocks: parse_u32("shadow.required_positive_weekly_blocks")?,
-            minimum_decision_parity_rate: parse_decimal("shadow.minimum_decision_parity_rate")?,
-            minimum_decision_grade_coverage: parse_decimal(
-                "shadow.minimum_decision_grade_coverage",
-            )?,
-            maximum_modeled_drawdown: parse_decimal("shadow.maximum_modeled_drawdown")?,
-            maximum_out_of_order_event_rate: parse_decimal(
-                "shadow.maximum_out_of_order_event_rate",
-            )?,
-            execution_model_protocol_version: parse_u32(
-                "execution_model.evidence_protocol_version",
-            )?,
-            minimum_execution_model_eligible_orders: parse_u64(
-                "execution_model.minimum_eligible_orders",
-            )?,
-            minimum_execution_model_filled_orders: parse_u64(
-                "execution_model.minimum_filled_orders",
-            )?,
-            minimum_execution_model_non_filled_orders: parse_u64(
-                "execution_model.minimum_non_filled_orders",
-            )?,
-            minimum_brier_improvement_over_base_rate: parse_decimal(
-                "execution_model.minimum_brier_improvement_over_base_rate",
-            )?,
-            maximum_expected_calibration_error: parse_decimal(
-                "execution_model.maximum_expected_calibration_error",
-            )?,
-        },
+        thresholds,
         shadow_prior_model_version: required("execution_model.shadow_prior_model_version")?,
         shadow_prior_sha256: required("execution_model.shadow_prior_sha256")?,
+        campaign_contract,
     })
 }
 
@@ -1880,6 +2180,7 @@ fn aggregate_profitability_metrics(
     _prospective: &Value,
     execution_model: &Value,
     thresholds: &PromotionThresholds,
+    campaign_contract: Option<&ShadowCampaignContractBinding>,
 ) -> ProfitabilityMetrics {
     let evidence_rows = current_clean_suffix(rows);
     let mut missing = Vec::new();
@@ -2000,7 +2301,7 @@ fn aggregate_profitability_metrics(
             .iter()
             .all(|row| row["fill_model"] == "queue_proxy_conservative");
     let queue_pnl: Decimal = pnl_values.iter().copied().sum();
-    let cumulative_wallet = validated_cumulative_wallet_snapshots(rows);
+    let cumulative_wallet = validated_cumulative_wallet_snapshots(rows, campaign_contract);
     if cumulative_wallet.is_none() {
         missing.push("valid_cumulative_wallet_ledger".to_owned());
     }
@@ -2079,7 +2380,7 @@ fn aggregate_profitability_metrics(
     missing.sort();
     missing.dedup();
     ProfitabilityMetrics {
-        observed_calendar_days: observed_campaign_days(rows),
+        observed_calendar_days: observed_campaign_days(&wallet_snapshots),
         clean_days,
         settled_markets,
         wallet_constrained,
@@ -2153,7 +2454,7 @@ fn clean_wallet_daily_increments(
         .iter()
         .map(|snapshot| (snapshot.date, snapshot))
         .collect::<BTreeMap<_, _>>();
-    let first = NaiveDate::parse_from_str(PROJECTED_WALLET_PROTOCOL_CUTOFF, "%Y-%m-%d").ok()?;
+    let first = snapshots.first()?.date;
     evidence_rows
         .iter()
         .map(|row| {
@@ -2218,6 +2519,8 @@ fn block_bootstrap_daily_markout_lower_95(rows: &[Value]) -> Option<Decimal> {
 struct CumulativeWalletSnapshot {
     date: NaiveDate,
     schema_version: u64,
+    campaign_start: NaiveDate,
+    campaign_baseline: Decimal,
     input_sha256: String,
     parent_input_sha256: Option<String>,
     events: u64,
@@ -2227,13 +2530,29 @@ struct CumulativeWalletSnapshot {
     unresolved_orders: u64,
 }
 
-fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<CumulativeWalletSnapshot>> {
+fn validated_cumulative_wallet_snapshots(
+    rows: &[Value],
+    expected_contract: Option<&ShadowCampaignContractBinding>,
+) -> Option<Vec<CumulativeWalletSnapshot>> {
     if rows.is_empty() {
         return None;
     }
-    let campaign_start = NaiveDate::parse_from_str(WALLET_CAMPAIGN_START, "%Y-%m-%d").ok()?;
-    let projected_wallet_cutoff =
+    let legacy_campaign_start =
+        NaiveDate::parse_from_str(WALLET_CAMPAIGN_START, "%Y-%m-%d").ok()?;
+    let legacy_first_snapshot =
         NaiveDate::parse_from_str(PROJECTED_WALLET_PROTOCOL_CUTOFF, "%Y-%m-%d").ok()?;
+    let expected_first_snapshot = expected_contract
+        .map(|binding| binding.contract.first_eligible_date)
+        .unwrap_or(legacy_first_snapshot);
+    let expected_campaign_start = expected_contract
+        .map(|binding| binding.contract.start_date)
+        .unwrap_or(legacy_campaign_start);
+    let expected_baseline = expected_contract
+        .map(|binding| binding.contract.wallet_baseline)
+        .unwrap_or(WALLET_CAMPAIGN_BASELINE);
+    let expected_schema = expected_contract
+        .map(|_| CAMPAIGN_BOUND_WALLET_SCHEMA_VERSION)
+        .unwrap_or(2);
     let mut snapshots: Vec<CumulativeWalletSnapshot> = Vec::with_capacity(rows.len());
     for row in rows {
         let date_text = row["date"].as_str()?;
@@ -2247,6 +2566,16 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
         let snapshot = CumulativeWalletSnapshot {
             date,
             schema_version,
+            campaign_start: NaiveDate::parse_from_str(
+                row["wallet_campaign_start"].as_str()?,
+                "%Y-%m-%d",
+            )
+            .ok()?,
+            campaign_baseline: if schema_version == CAMPAIGN_BOUND_WALLET_SCHEMA_VERSION {
+                decimal_from_value(&row["wallet_campaign_baseline"])?
+            } else {
+                WALLET_CAMPAIGN_BASELINE
+            },
             input_sha256: input_hash.to_owned(),
             parent_input_sha256,
             events: row["cumulative_events"].as_u64()?,
@@ -2255,15 +2584,46 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
             max_drawdown: decimal_from_value(&row["wallet_constrained_max_drawdown"])?,
             unresolved_orders: row["wallet_constrained_unresolved_orders"].as_u64()?,
         };
-        if (snapshots.is_empty() && date != projected_wallet_cutoff)
-            || row["wallet_scope"].as_str() != Some(CUMULATIVE_WALLET_SCOPE)
-            || row["wallet_campaign_start"].as_str() != Some(WALLET_CAMPAIGN_START)
+        let contract_valid = if let Some(binding) = expected_contract {
+            row["wallet_campaign_id"].as_str() == Some(binding.contract.campaign_id.as_str())
+                && row["wallet_campaign_contract_sha256"].as_str() == Some(binding.sha256.as_str())
+                && row["wallet_campaign_first_eligible_date"].as_str()
+                    == Some(
+                        binding
+                            .contract
+                            .first_eligible_date
+                            .format("%Y-%m-%d")
+                            .to_string()
+                            .as_str(),
+                    )
+                && row["wallet_campaign_terminal_date"].as_str()
+                    == Some(
+                        binding
+                            .contract
+                            .terminal_date
+                            .format("%Y-%m-%d")
+                            .to_string()
+                            .as_str(),
+                    )
+                && row["wallet_evidence_protocol_version"].as_u64()
+                    == Some(u64::from(binding.contract.evidence_protocol_version))
+        } else {
+            true
+        };
+        if (snapshots.is_empty() && date != expected_first_snapshot)
+            || row["wallet_scope"].as_str()
+                != Some(
+                    expected_contract
+                        .map(|binding| binding.contract.wallet_scope.as_str())
+                        .unwrap_or(CUMULATIVE_WALLET_SCOPE),
+                )
+            || snapshot.campaign_start != expected_campaign_start
             || row["wallet_snapshot_date"].as_str() != Some(date_text)
             || row["wallet_constrained"].as_bool() != Some(true)
-            || date < campaign_start
+            || date < expected_campaign_start
             || schema_version == 0
-            || schema_version > 2
-            || (date >= projected_wallet_cutoff && schema_version != 2)
+            || schema_version != expected_schema
+            || !contract_valid
             || !valid_sha256(input_hash)
             || !valid_sha256(state_hash)
             || (schema_version >= 2
@@ -2277,10 +2637,11 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
                         .parent_input_sha256
                         .as_deref()
                         .is_some_and(|hash| !valid_sha256(hash))
-                    || (date == projected_wallet_cutoff && snapshot.parent_input_sha256.is_some())
-                    || (date > projected_wallet_cutoff && snapshot.parent_input_sha256.is_none())))
+                    || (date == expected_first_snapshot && snapshot.parent_input_sha256.is_some())
+                    || (date > expected_first_snapshot && snapshot.parent_input_sha256.is_none())))
             || snapshot.events == 0
-            || snapshot.ending_equity != WALLET_CAMPAIGN_BASELINE + snapshot.net_pnl
+            || snapshot.campaign_baseline != expected_baseline
+            || snapshot.ending_equity != expected_baseline + snapshot.net_pnl
             || snapshot.max_drawdown < Decimal::ZERO
         {
             return None;
@@ -2289,8 +2650,8 @@ fn validated_cumulative_wallet_snapshots(rows: &[Value]) -> Option<Vec<Cumulativ
             if snapshot.date != previous.date.succ_opt()?
                 || snapshot.events < previous.events
                 || snapshot.max_drawdown < previous.max_drawdown
-                || (snapshot.schema_version == 2
-                    && previous.schema_version == 2
+                || (snapshot.schema_version >= 2
+                    && previous.schema_version == snapshot.schema_version
                     && snapshot.parent_input_sha256.as_deref()
                         != Some(previous.input_sha256.as_str()))
             {
@@ -2335,18 +2696,11 @@ fn current_clean_suffix(rows: &[Value]) -> &[Value] {
     &rows[start..]
 }
 
-fn observed_campaign_days(rows: &[Value]) -> u32 {
-    let Some(latest) = rows
-        .iter()
-        .filter_map(|row| row["date"].as_str())
-        .filter_map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
-        .max()
-    else {
+fn observed_campaign_days(snapshots: &[CumulativeWalletSnapshot]) -> u32 {
+    let Some(latest) = snapshots.last() else {
         return 0;
     };
-    let start = NaiveDate::parse_from_str(WALLET_CAMPAIGN_START, "%Y-%m-%d")
-        .expect("wallet campaign start is valid");
-    u32::try_from((latest - start).num_days().max(0) + 1).unwrap_or(u32::MAX)
+    u32::try_from((latest.date - latest.campaign_start).num_days().max(0) + 1).unwrap_or(u32::MAX)
 }
 
 fn paired_delta(candidate_net: Option<&str>, static_net: Option<&str>) -> Option<Decimal> {
@@ -2878,6 +3232,7 @@ mod wallet_metric_tests {
             &json!({}),
             &json!({}),
             &PromotionThresholds::default(),
+            None,
         );
         assert!(!same_metrics
             .missing_metrics
@@ -2889,6 +3244,7 @@ mod wallet_metric_tests {
             &json!({}),
             &json!({}),
             &PromotionThresholds::default(),
+            None,
         );
         assert!(changed_metrics
             .missing_metrics
@@ -2901,6 +3257,7 @@ mod wallet_metric_tests {
             &json!({}),
             &json!({}),
             &PromotionThresholds::default(),
+            None,
         );
         assert!(noncanonical_metrics
             .missing_metrics
@@ -2913,6 +3270,8 @@ mod wallet_metric_tests {
             |day: u32, equity: Decimal, stored_drawdown: Decimal| CumulativeWalletSnapshot {
                 date: NaiveDate::from_ymd_opt(2026, 7, day).unwrap(),
                 schema_version: 2,
+                campaign_start: NaiveDate::from_ymd_opt(2026, 7, 12).unwrap(),
+                campaign_baseline: WALLET_CAMPAIGN_BASELINE,
                 input_sha256: format!("sha256:{}", "a".repeat(64)),
                 parent_input_sha256: None,
                 events: u64::from(day),
@@ -3030,6 +3389,7 @@ mod wallet_metric_tests {
                 "net_executable_markout_30s_lower_confidence_bound_95": "0.01"
             }),
             &PromotionThresholds::default(),
+            None,
         );
         assert_eq!(metrics.queue_conservative_net_pnl, d("100"));
         assert_eq!(metrics.wallet_constrained_net_pnl, d("0.25"));
@@ -3090,6 +3450,7 @@ mod wallet_metric_tests {
                 "net_executable_markout_30s_lower_confidence_bound_95": "0.01"
             }),
             &PromotionThresholds::default(),
+            None,
         );
         assert_eq!(metrics.queue_conservative_net_pnl, d("2"));
         assert_eq!(metrics.wallet_constrained_net_pnl, d("-0.5"));
@@ -3110,6 +3471,7 @@ mod wallet_metric_tests {
             &json!({}),
             &json!({}),
             &PromotionThresholds::default(),
+            None,
         );
         assert!(!invalid.wallet_constrained);
         assert!(invalid
@@ -3144,20 +3506,20 @@ mod wallet_metric_tests {
             row("2026-07-13", 'a', None, 2),
             row("2026-07-14", 'b', Some('a'), 2),
         ];
-        assert!(validated_cumulative_wallet_snapshots(&valid).is_some());
+        assert!(validated_cumulative_wallet_snapshots(&valid, None).is_some());
 
         let mut downgraded = valid;
         downgraded[1]["wallet_schema_version"] = json!(1);
-        assert!(validated_cumulative_wallet_snapshots(&downgraded).is_none());
+        assert!(validated_cumulative_wallet_snapshots(&downgraded, None).is_none());
 
         let late_start = vec![row("2026-07-14", 'b', Some('a'), 2)];
-        assert!(validated_cumulative_wallet_snapshots(&late_start).is_none());
+        assert!(validated_cumulative_wallet_snapshots(&late_start, None).is_none());
 
         let gapped = vec![
             row("2026-07-13", 'a', None, 2),
             row("2026-07-15", 'b', Some('a'), 2),
         ];
-        assert!(validated_cumulative_wallet_snapshots(&gapped).is_none());
+        assert!(validated_cumulative_wallet_snapshots(&gapped, None).is_none());
     }
 
     #[test]
@@ -3311,6 +3673,7 @@ mod wallet_metric_tests {
                 "net_executable_markout_30s_lower_confidence_bound_95": "0.01"
             }),
             &PromotionThresholds::default(),
+            None,
         );
 
         assert_eq!(metrics.clean_days, 2);
@@ -3471,6 +3834,80 @@ mod wallet_metric_tests {
             ]),
             2
         );
+    }
+
+    #[test]
+    fn july_22_protocol_v3_campaign_contract_is_hash_bound_and_scoped() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../research/configs/profitability_gate_v3_2026-07-22.yaml");
+        let first = load_shadow_campaign_contract(&path).unwrap();
+        let second = load_shadow_campaign_contract(&path).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.contract.campaign_id, "campaign-2026-07-22");
+        assert_eq!(
+            first.contract.start_date,
+            NaiveDate::from_ymd_opt(2026, 7, 22).unwrap()
+        );
+        assert_eq!(
+            first.contract.terminal_date,
+            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()
+        );
+        assert_eq!(first.contract.wallet_baseline, d("5.030521"));
+        assert_eq!(first.contract.evidence_protocol_version, 3);
+        assert_eq!(
+            first.contract.daily_root,
+            "reports/research/shadow/campaigns/campaign-2026-07-22/daily"
+        );
+        assert!(valid_sha256(&first.sha256));
+    }
+
+    #[test]
+    fn schema_v3_wallet_chain_rejects_mixed_campaign_and_broken_parent() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../research/configs/profitability_gate_v3_2026-07-22.yaml");
+        let binding = load_shadow_campaign_contract(&path).unwrap();
+        let hash = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        let row = |day: u32, input: String, parent: Option<String>, pnl: &str| {
+            json!({
+                "date": format!("2026-07-{day:02}"),
+                "wallet_schema_version": 3,
+                "wallet_scope": binding.contract.wallet_scope,
+                "wallet_campaign_id": binding.contract.campaign_id,
+                "wallet_campaign_contract_sha256": binding.sha256,
+                "wallet_campaign_start": "2026-07-22",
+                "wallet_campaign_first_eligible_date": "2026-07-22",
+                "wallet_campaign_terminal_date": "2026-09-19",
+                "wallet_campaign_baseline": "5.030521",
+                "wallet_evidence_protocol_version": 3,
+                "wallet_snapshot_date": format!("2026-07-{day:02}"),
+                "wallet_constrained": true,
+                "cumulative_input_sha256": input,
+                "cumulative_parent_input_sha256": parent,
+                "cumulative_input_manifest_sha256": hash('c'),
+                "cumulative_state_sha256": hash('d'),
+                "cumulative_regimes_artifact_sha256": hash('e'),
+                "cumulative_events": u64::from(day - 21) * 100,
+                "wallet_constrained_net_pnl": pnl,
+                "wallet_constrained_ending_equity": (d("5.030521") + d(pnl)).to_string(),
+                "wallet_constrained_max_drawdown": "0",
+                "wallet_constrained_unresolved_orders": 0
+            })
+        };
+        let first_input = hash('a');
+        let valid = vec![
+            row(22, first_input.clone(), None, "0.1"),
+            row(23, hash('b'), Some(first_input), "0.2"),
+        ];
+        assert!(validated_cumulative_wallet_snapshots(&valid, Some(&binding)).is_some());
+
+        let mut mixed = valid.clone();
+        mixed[1]["wallet_campaign_id"] = json!("campaign-2026-07-12");
+        assert!(validated_cumulative_wallet_snapshots(&mixed, Some(&binding)).is_none());
+
+        let mut broken_parent = valid;
+        broken_parent[1]["cumulative_parent_input_sha256"] = json!(hash('f'));
+        assert!(validated_cumulative_wallet_snapshots(&broken_parent, Some(&binding)).is_none());
     }
 }
 

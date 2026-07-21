@@ -529,6 +529,19 @@ fn read_shadow_correction_state_from_store(
 }
 
 fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
+    let correction_root = std::env::var("SHADOW_CORRECTION_ROOT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| SHADOW_CORRECTION_ROOT.to_owned());
+    let correction_root = correction_root.trim_matches('/');
+    if correction_root.is_empty()
+        || correction_root.starts_with("azure://")
+        || correction_root.split('/').any(|segment| segment == "..")
+    {
+        return Err(ResearchError::InvalidInput(
+            "SHADOW_CORRECTION_ROOT must be a non-empty relative blob prefix".to_owned(),
+        ));
+    }
     let root = match std::env::var("AZURE_STORAGE_ACCOUNT_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -547,9 +560,9 @@ fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
                         "AZURE_RESEARCH_STORAGE_CONTAINER_NAME or AZURE_STORAGE_CONTAINER_NAME is required for the shadow correction journal".to_owned(),
                     )
                 })?;
-            format!("azure://{account}/{container}/{SHADOW_CORRECTION_ROOT}")
+            format!("azure://{account}/{container}/{correction_root}")
         }
-        None => SHADOW_CORRECTION_ROOT.to_owned(),
+        None => correction_root.to_owned(),
     };
     ProjectedCacheStore::open(&root)
 }

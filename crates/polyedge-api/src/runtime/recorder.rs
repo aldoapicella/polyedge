@@ -21,11 +21,13 @@ impl RuntimeRecorder {
         recorders.push(Box::new(JsonlRecorder::new(path)));
         if let Some(account) = settings.azure.storage_account_name.as_deref() {
             let client_id = env::var("AZURE_CLIENT_ID").ok();
-            recorders.push(Box::new(AzureAppendBlobRecorder::new_with_prefix(
+            recorders.push(Box::new(AzureAppendBlobRecorder::new_with_prefix_cutover(
                 account,
                 settings.azure.storage_container_name.clone(),
                 client_id,
                 settings.azure.event_blob_prefix.clone(),
+                settings.azure.event_blob_prefix_after_cutover.clone(),
+                settings.azure.event_blob_prefix_cutover_utc,
             )));
         }
         Self {

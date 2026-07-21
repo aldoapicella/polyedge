@@ -16,13 +16,40 @@ The dashboard and reports must never combine:
 3. wallet-constrained shadow PnL;
 4. funded strategy PnL.
 
-The original account baseline is `$9.23`. The repaired campaign baseline is `$5.030521`. Campaign PnL is:
+The original account baseline is `$9.23`. The protocol-v3 shadow holdout
+`campaign-2026-07-22` uses a virtual wallet baseline of `$5.030521`. Campaign
+PnL is:
 
 ```text
 current equity + campaign withdrawals - campaign deposits - 5.030521
 ```
 
-A profitable repaired campaign does not erase the existing lifetime account loss. Gross redemption payout is not profit.
+A profitable repaired campaign does not erase the existing lifetime account
+loss or the historical shadow loss. The July 13–20 predecessor campaign remains
+immutable and display-only with wallet-constrained PnL of `-$0.90`; it cannot
+help or hurt the new campaign's promotion statistics. Gross redemption payout
+is not profit.
+
+## Protocol-v3 Campaign Boundary
+
+The immutable holdout contract is
+`research/configs/profitability_gate_v3_2026-07-22.yaml`. It binds the campaign
+ID, candidate, capital limits, source/cache/report/correction/profitability
+roots, lease blob, first eligible date, terminal date, and a canonical SHA-256
+that is repeated in every schema-v3 wallet row and profitability manifest.
+
+- July 13–20 remains under `campaign-2026-07-12`, labeled
+  `historical_ineligible`; no data is deleted or relabeled.
+- July 21 is the cutover/bootstrap boundary and is ineligible.
+- July 22 is the first UTC day that can count. Its sealed report can first be
+  published by the July 23 scheduled run at approximately `02:15 UTC`.
+- September 19 is the inclusive 60-day terminal date. Failure to pass every
+  gate by then is `stopped_no_go`.
+
+The recorder does not restart at midnight. It routes each event by the event's
+own UTC timestamp: events before `2026-07-22T00:00:00Z` remain in the legacy
+prefix and events at or after the boundary go to the new campaign prefix. This
+prevents a cutover restart gap from dirtying the first day.
 
 ## Capital Boundary
 
@@ -253,15 +280,16 @@ day's bounded shard set at a time. The Rust library rejects the current or
 future UTC day even when the CLI is called directly; the shell check is not the
 only protection against look-ahead.
 
-The cumulative wallet snapshot schema is version 2 from 2026-07-13 onward. It
-binds the campaign terminal hash, its parent hash, the exact campaign-index
-bytes, cumulative replay state, and cumulative regimes artifact. A missing
-date, late first snapshot, modified local shard, schema downgrade, bad parent,
-or correction that breaks the existing sequence invalidates the entire wallet
-ledger and blocks promotion. The validated sequence must start on the first
-recorded projected day, 2026-07-13, and advance by exactly one UTC day; the
-campaign identity remains anchored to 2026-07-12 without fabricating an empty
-wallet snapshot for that bootstrap date.
+Historical cumulative wallet snapshots remain schema version 2 and verifiable
+under the July 12/13 legacy rules. `campaign-2026-07-22` uses schema version 3.
+In addition to the campaign terminal hash, parent hash, exact campaign-index
+bytes, cumulative replay state, and cumulative regimes artifact, schema v3
+binds the immutable campaign ID, contract SHA-256, start/first-eligible/terminal
+dates, wallet scope, and `$5.030521` baseline. A missing date, late first
+snapshot, modified local shard, mixed campaign, schema downgrade, baseline
+mismatch, bad parent, or correction that breaks the existing sequence
+invalidates the entire wallet ledger and blocks promotion. The new sequence
+must begin on July 22 and advance by exactly one UTC day.
 
 All scheduled and manual shadow writers run under one renewable Azure Blob
 lease. The child process is killed if renewal or ownership is lost, and the

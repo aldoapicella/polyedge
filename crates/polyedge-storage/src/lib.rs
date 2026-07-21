@@ -120,6 +120,8 @@ pub struct AzureAppendBlobRecorder {
     account: String,
     container: String,
     event_blob_prefix: String,
+    event_blob_prefix_after_cutover: Option<String>,
+    event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
     agent: ureq::Agent,
     token: ManagedIdentityToken,
     known_append_blobs: BTreeSet<String>,
@@ -141,10 +143,32 @@ impl AzureAppendBlobRecorder {
         client_id: Option<String>,
         event_blob_prefix: impl Into<String>,
     ) -> Self {
+        Self::new_with_prefix_cutover(
+            account,
+            container,
+            client_id,
+            event_blob_prefix,
+            None::<String>,
+            None,
+        )
+    }
+
+    pub fn new_with_prefix_cutover(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+        event_blob_prefix: impl Into<String>,
+        event_blob_prefix_after_cutover: Option<impl Into<String>>,
+        event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             account: account.into(),
             container: container.into(),
             event_blob_prefix: normalize_blob_prefix(event_blob_prefix.into()),
+            event_blob_prefix_after_cutover: event_blob_prefix_after_cutover
+                .map(Into::into)
+                .map(normalize_blob_prefix),
+            event_blob_prefix_cutover_utc,
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
                 .timeout_read(Duration::from_secs(30))
@@ -284,7 +308,14 @@ impl EventRecorder for AzureAppendBlobRecorder {
 
 impl AzureAppendBlobRecorder {
     fn event_blob_name(&self, event: &RuntimeEvent) -> String {
-        event_blob_name(&self.event_blob_prefix, event)
+        let prefix = match (
+            self.event_blob_prefix_after_cutover.as_deref(),
+            self.event_blob_prefix_cutover_utc,
+        ) {
+            (Some(prefix), Some(cutover)) if event.ts >= cutover => prefix,
+            _ => &self.event_blob_prefix,
+        };
+        event_blob_name(prefix, event)
     }
 }
 
@@ -1803,6 +1834,40 @@ mod tests {
             "shadow-events"
         );
         assert_eq!(normalize_blob_prefix("///".to_owned()), "events");
+    }
+
+    #[test]
+    fn append_blob_prefix_cutover_routes_by_event_timestamp() {
+        let cutover = DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recorder = AzureAppendBlobRecorder::new_with_prefix_cutover(
+            "account",
+            "container",
+            None,
+            "shadow-events/old",
+            Some("shadow-events/new"),
+            Some(cutover),
+        );
+        let event = |ts: &str| RuntimeEvent {
+            event_type: "decision".to_owned(),
+            ts: DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc),
+            data: Value::Null,
+        };
+        assert_eq!(
+            recorder.event_blob_name(&event("2026-07-21T23:59:59.999Z")),
+            "shadow-events/old/2026/07/21/23/59.jsonl"
+        );
+        assert_eq!(
+            recorder.event_blob_name(&event("2026-07-22T00:00:00Z")),
+            "shadow-events/new/2026/07/22/00/00.jsonl"
+        );
+        assert_eq!(
+            recorder.event_blob_name(&event("2026-07-22T00:00:00.001Z")),
+            "shadow-events/new/2026/07/22/00/00.jsonl"
+        );
     }
 
     #[test]

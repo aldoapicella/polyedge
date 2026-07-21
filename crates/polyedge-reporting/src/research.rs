@@ -37,15 +37,15 @@ mod projected_cache;
 mod run_bundle;
 pub use labs::{
     legacy_daily_fallback_allowed, load_default_exclusions, load_exclusion_registry,
-    load_frozen_candidate_registry, run_azure_freshness, run_backfill,
-    run_build_cumulative_wallet_snapshot, run_build_replay_index, run_chart_backfill,
+    load_frozen_candidate_registry, load_shadow_campaign_contract, run_azure_freshness,
+    run_backfill, run_build_cumulative_wallet_snapshot, run_build_replay_index, run_chart_backfill,
     run_evaluate_profitability, run_validate_prospective, AzureFreshnessOptions, BackfillOptions,
     ChartBackfillOptions, CumulativeWalletSnapshotOptions, ExclusionRegistry,
     ExclusionWindowRecord, FrozenCandidateRecord, FrozenCandidateRegistry,
     ProfitabilityEvaluationOptions, ProspectiveValidationOptions, ReplayIndexOptions,
-    ATOMIC_DAILY_PROTOCOL_CUTOFF, CUMULATIVE_WALLET_SCOPE, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES,
-    WALLET_CAMPAIGN_START,
+    ShadowCampaignContract, ShadowCampaignContractBinding, ATOMIC_DAILY_PROTOCOL_CUTOFF,
+    CUMULATIVE_WALLET_SCOPE, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES, WALLET_CAMPAIGN_START,
 };
 pub use projected_cache::{
     read_shadow_correction_state, read_verified_campaign_index, run_begin_shadow_correction,

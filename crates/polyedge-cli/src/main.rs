@@ -436,6 +436,10 @@ enum ResearchCommand {
         regimes: PathBuf,
         #[arg(long)]
         campaign_manifest: PathBuf,
+        /// Immutable protocol-v3 campaign contract. Omit only for historical
+        /// schema-v2 wallet reconstruction.
+        #[arg(long)]
+        campaign_contract: Option<PathBuf>,
         #[arg(long)]
         snapshot_date: String,
         #[arg(long)]
@@ -948,11 +952,13 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         ResearchCommand::BuildCumulativeWallet {
             regimes,
             campaign_manifest,
+            campaign_contract,
             snapshot_date,
             out,
         } => run_build_cumulative_wallet_snapshot(CumulativeWalletSnapshotOptions {
             regimes,
             campaign_manifest,
+            campaign_contract,
             snapshot_date: parse_date_arg(&snapshot_date)?,
             out,
         })?,

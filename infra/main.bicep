@@ -670,6 +670,22 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: modelStorageContainerName
             }
             {
+              name: 'SHADOW_CAMPAIGN_ID'
+              value: 'campaign-2026-07-22'
+            }
+            {
+              name: 'SHADOW_CAMPAIGN_START'
+              value: '2026-07-22'
+            }
+            {
+              name: 'SHADOW_CAMPAIGN_REPORT_ROOT'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-22'
+            }
+            {
+              name: 'SHADOW_CORRECTION_ROOT'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-22/corrections'
+            }
+            {
               name: 'AZURE_STORAGE_TABLE_NAME'
               value: storageTableName
             }

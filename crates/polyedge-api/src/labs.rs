@@ -3,11 +3,12 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use polyedge_reporting::research::{
     daily_provenance_required, load_exclusion_registry, load_frozen_candidate_registry,
-    read_shadow_correction_state, DailyRunManifest, LatestRunPointer, PromotionManifestV1,
-    PromotionPhase, RunStatus, ShadowCorrectionState, DEFAULT_EXCLUSION_FILE,
+    load_shadow_campaign_contract, read_shadow_correction_state, DailyRunManifest,
+    LatestRunPointer, PromotionManifestV1, PromotionPhase, RunStatus,
+    ShadowCampaignContractBinding, ShadowCorrectionState, DEFAULT_EXCLUSION_FILE,
     DEFAULT_FROZEN_CANDIDATES_FILE, FROZEN_CANDIDATE_NAMES,
 };
 use polyedge_storage::{AzureBlobClient, AzureBlobError};
@@ -26,8 +27,25 @@ use crate::azure_jobs::{
 use crate::ApiState;
 
 const REPORT_ROOT: &str = "reports/research";
+#[cfg(test)]
 const PRIMARY_DAILY_ROOT: &str = "reports/research/daily";
 const SHADOW_DAILY_ROOT: &str = "reports/research/shadow/daily";
+const ACTIVE_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-22";
+const LEGACY_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-12";
+const ACTIVE_SHADOW_CAMPAIGN_START: &str = "2026-07-22";
+const ACTIVE_SHADOW_CAMPAIGN_TERMINAL: &str = "2026-09-19";
+const LEGACY_SHADOW_FIRST_DATE: &str = "2026-07-13";
+const LEGACY_SHADOW_LAST_DATE: &str = "2026-07-20";
+const ACTIVE_SHADOW_DAILY_ROOT: &str =
+    "reports/research/shadow/campaigns/campaign-2026-07-22/daily";
+const ACTIVE_SHADOW_PROSPECTIVE_PATH: &str =
+    "reports/research/shadow/campaigns/campaign-2026-07-22/prospective/prospective_validation.json";
+const ACTIVE_SHADOW_PROFITABILITY_LATEST: &str =
+    "reports/research/shadow/campaigns/campaign-2026-07-22/profitability/latest.json";
+const ACTIVE_SHADOW_CORRECTION_PATH: &str =
+    "reports/research/shadow/campaigns/campaign-2026-07-22/corrections/active.json";
+const ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH: &str =
+    "research/configs/profitability_gate_v3_2026-07-22.yaml";
 const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
 const PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const PROMOTION_MANIFEST_SCHEMA: &str = "promotion_manifest_v1";
@@ -89,7 +107,7 @@ async fn venue_execution() -> impl IntoResponse {
         ),
         ProfitabilityArtifact::new(
             read_json_from_container_or_null(
-                profitability_path,
+                FsPath::new(ACTIVE_SHADOW_PROFITABILITY_LATEST),
                 "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
             ),
             ProfitabilitySource::Shadow,
@@ -214,7 +232,7 @@ impl ShadowCorrectionGate {
 
     fn as_json(&self) -> Value {
         json!({
-            "journal_path": "reports/research/shadow/corrections/active.json",
+            "journal_path": ACTIVE_SHADOW_CORRECTION_PATH,
             "available": self.state.is_some(),
             "status": self.status,
             "blocks_promotion": self.blocks_promotion,
@@ -227,7 +245,16 @@ impl ShadowCorrectionGate {
 }
 
 fn load_shadow_correction_gate() -> ShadowCorrectionGate {
-    correction_gate_from_result(read_shadow_correction_state().map_err(|error| error.to_string()))
+    let result = read_shadow_correction_state()
+        .map_err(|error| error.to_string())
+        .and_then(|state| match state {
+            Some(state) if state.campaign_id != ACTIVE_SHADOW_CAMPAIGN_ID => Err(format!(
+                "correction journal belongs to {}, not the active campaign",
+                state.campaign_id
+            )),
+            state => Ok(state),
+        });
+    correction_gate_from_result(result)
 }
 
 fn correction_gate_from_result(
@@ -366,6 +393,7 @@ struct ProfitabilityArtifact {
     control_valid: bool,
     fresh: bool,
     canonical_funded_state: bool,
+    path: &'static str,
 }
 
 impl ProfitabilityArtifact {
@@ -413,6 +441,10 @@ impl ProfitabilityArtifact {
             control_valid,
             fresh,
             canonical_funded_state,
+            path: match source {
+                ProfitabilitySource::Funded => PROFITABILITY_LATEST,
+                ProfitabilitySource::Shadow => ACTIVE_SHADOW_PROFITABILITY_LATEST,
+            },
         }
     }
 
@@ -441,7 +473,7 @@ impl ProfitabilityArtifact {
             "unavailable"
         };
         json!({
-            "path": PROFITABILITY_LATEST,
+            "path": self.path,
             "source": self.source.as_str(),
             "trust_scope": self.source.trust_scope(),
             "available": self.available(),
@@ -478,48 +510,10 @@ fn select_profitability_artifact(
     let candidates = [funded, shadow];
     let (selected_index, selection_reason) = if candidates[0].canonical_funded_state {
         (Some(0), "canonical_funded_state")
+    } else if candidates[1].available() {
+        (Some(1), "active_campaign_shadow")
     } else {
-        let mut valid = candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, artifact)| artifact.valid_current_schema())
-            .collect::<Vec<_>>();
-        valid.sort_by_key(|(_, artifact)| {
-            (
-                artifact.fresh,
-                artifact
-                    .authoritative_ts
-                    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
-            )
-        });
-        valid.last().map_or_else(
-            || {
-                let mut legacy = candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, artifact)| artifact.available())
-                    .collect::<Vec<_>>();
-                legacy.sort_by_key(|(_, artifact)| {
-                    artifact
-                        .authoritative_ts
-                        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-                });
-                (
-                    legacy.last().map(|(index, _)| *index),
-                    "legacy_display_only",
-                )
-            },
-            |(index, artifact)| {
-                (
-                    Some(*index),
-                    if artifact.fresh {
-                        "newest_fresh_valid_manifest"
-                    } else {
-                        "newest_valid_manifest"
-                    },
-                )
-            },
-        )
+        (None, "awaiting_active_campaign_profitability")
     };
     let candidate_metadata = candidates
         .iter()
@@ -544,7 +538,7 @@ fn select_profitability_artifact(
         .map(|index| candidates[index].metadata(now))
         .unwrap_or_else(|| {
             json!({
-                "path": PROFITABILITY_LATEST,
+                "path": ACTIVE_SHADOW_PROFITABILITY_LATEST,
                 "source": "api_fallback",
                 "trust_scope": "none",
                 "available": false,
@@ -581,6 +575,9 @@ fn validate_profitability_manifest(
         .map_err(|error| format!("artifact does not match {PROMOTION_MANIFEST_SCHEMA}: {error}"))?;
     if manifest.schema_version != PROMOTION_MANIFEST_SCHEMA {
         return Err("unsupported promotion manifest schema".to_owned());
+    }
+    if source == ProfitabilitySource::Shadow {
+        validate_active_shadow_profitability_binding(&manifest.artifact_uris)?;
     }
     if manifest.expires_at <= manifest.created_at {
         return Err("promotion manifest validity window is invalid".to_owned());
@@ -622,6 +619,63 @@ fn validate_profitability_manifest(
     Ok(manifest)
 }
 
+fn validate_active_shadow_profitability_binding(
+    artifact_uris: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let binding = active_shadow_campaign_contract()?;
+    let required = [
+        ("campaign_contract", ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH),
+        ("shadow_campaign_id", binding.contract.campaign_id.as_str()),
+        ("shadow_daily_root", binding.contract.daily_root.as_str()),
+        (
+            "shadow_prospective_result",
+            binding.contract.prospective_path.as_str(),
+        ),
+        (
+            "shadow_profitability_result",
+            binding.contract.profitability_path.as_str(),
+        ),
+    ];
+    for (key, expected) in required {
+        let value = artifact_uris
+            .get(key)
+            .ok_or_else(|| format!("active campaign binding is missing {key}"))?;
+        if value != expected && !value.ends_with(&format!("/{expected}")) {
+            return Err(format!("active campaign binding has wrong {key}"));
+        }
+    }
+    let contract_sha = artifact_uris
+        .get("campaign_contract_sha256")
+        .ok_or_else(|| "active campaign binding is missing campaign_contract_sha256".to_owned())?;
+    if contract_sha != &binding.sha256 {
+        return Err("active campaign binding has wrong campaign_contract_sha256".to_owned());
+    }
+    Ok(())
+}
+
+fn active_shadow_campaign_contract() -> Result<ShadowCampaignContractBinding, String> {
+    let relative = PathBuf::from(ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH);
+    let path = if relative.is_file() {
+        relative
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH)
+    };
+    let binding = load_shadow_campaign_contract(&path)
+        .map_err(|error| format!("active campaign contract is unavailable or invalid: {error}"))?;
+    if binding.contract.campaign_id != ACTIVE_SHADOW_CAMPAIGN_ID
+        || binding.contract.start_date.to_string() != ACTIVE_SHADOW_CAMPAIGN_START
+        || binding.contract.terminal_date.to_string() != ACTIVE_SHADOW_CAMPAIGN_TERMINAL
+        || binding.contract.daily_root != ACTIVE_SHADOW_DAILY_ROOT
+        || binding.contract.prospective_path != ACTIVE_SHADOW_PROSPECTIVE_PATH
+        || binding.contract.profitability_path != ACTIVE_SHADOW_PROFITABILITY_LATEST
+    {
+        return Err("active campaign contract does not match the Labs API campaign".to_owned());
+    }
+    Ok(binding)
+}
+
 fn fail_closed_profitability_value(
     mut value: Value,
     canonical_funded_state: bool,
@@ -648,14 +702,17 @@ fn fail_closed_profitability_value(
 
 fn default_profitability_manifest() -> Value {
     json!({
+        "campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+        "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
+        "campaign_terminal_date": ACTIVE_SHADOW_CAMPAIGN_TERMINAL,
         "phase": "risk_repair",
-        "status": "funded_execution_frozen",
+        "status": "awaiting_first_sealed_day",
         "candidate": {
             "name": "dynamic_quote_style",
             "version": "dynamic_quote_style@2026-06-14",
             "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
         },
-        "blocking_reason": "Shadow profitability and execution-model gates have not passed.",
+        "blocking_reason": "No campaign-bound sealed profitability evidence exists for the active campaign yet.",
         "capital": {
             "original_starting_capital": 9.23,
             "campaign_starting_equity": 5.030521,
@@ -1328,36 +1385,91 @@ async fn prospective() -> impl IntoResponse {
 }
 
 fn prospective_payload() -> Value {
-    let shadow = read_json_from_container_or_null(
-        FsPath::new("reports/research/shadow/prospective/prospective_validation.json"),
-        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
-    );
-    let primary = read_json_or_null(
-        PathBuf::from(REPORT_ROOT)
-            .join("prospective")
-            .join("prospective_validation.json"),
-    );
+    let active = read_json_or_null(FsPath::new(ACTIVE_SHADOW_PROSPECTIVE_PATH));
     let correction = load_shadow_correction_gate();
-    apply_shadow_correction_to_prospective(select_prospective_payload(shadow, primary), &correction)
+    apply_shadow_correction_to_prospective(active_campaign_prospective_payload(active), &correction)
 }
 
-fn select_prospective_payload(shadow: Value, primary: Value) -> Value {
-    if !shadow.is_null() {
-        return shadow;
-    }
-    if !primary.is_null() {
-        return primary;
-    }
+fn awaiting_active_campaign_prospective(status: &str, detail: &str) -> Value {
     json!({
         "generated_ts": now_ts(),
+        "campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+        "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
+        "campaign_terminal_date": ACTIVE_SHADOW_CAMPAIGN_TERMINAL,
+        "promotion_allowed": false,
         "result": {
-            "status": "collecting",
+            "status": status,
+            "detail": detail,
             "rows": [],
             "frozen_candidates": frozen_candidates_payload(),
             "research_only": true,
             "live_deployment_allowed": false
         }
     })
+}
+
+fn active_campaign_prospective_payload(mut payload: Value) -> Value {
+    let binding = match active_shadow_campaign_contract() {
+        Ok(binding) => binding,
+        Err(error) => {
+            return awaiting_active_campaign_prospective("active_campaign_binding_invalid", &error);
+        }
+    };
+    if payload.is_null() {
+        return awaiting_active_campaign_prospective(
+            "awaiting_first_sealed_day",
+            "No sealed prospective evidence exists for the active campaign yet.",
+        );
+    }
+    let Some(rows) = payload.pointer("/result/rows").and_then(Value::as_array) else {
+        return awaiting_active_campaign_prospective(
+            "active_campaign_binding_invalid",
+            "Active prospective evidence has no rows array.",
+        );
+    };
+    if rows.is_empty() {
+        return awaiting_active_campaign_prospective(
+            "awaiting_first_sealed_day",
+            "No sealed prospective evidence exists for the active campaign yet.",
+        );
+    }
+    let bound = rows.iter().all(|row| {
+        row["wallet_campaign_id"].as_str() == Some(ACTIVE_SHADOW_CAMPAIGN_ID)
+            && row["wallet_campaign_start"].as_str() == Some(ACTIVE_SHADOW_CAMPAIGN_START)
+            && row["wallet_campaign_first_eligible_date"].as_str()
+                == Some(ACTIVE_SHADOW_CAMPAIGN_START)
+            && row["wallet_campaign_terminal_date"].as_str()
+                == Some(ACTIVE_SHADOW_CAMPAIGN_TERMINAL)
+            && row["wallet_campaign_contract_sha256"]
+                .as_str()
+                .is_some_and(|sha256| sha256 == binding.sha256.as_str())
+            && row["date"]
+                .as_str()
+                .is_some_and(|date| date >= ACTIVE_SHADOW_CAMPAIGN_START)
+    });
+    if !bound {
+        return awaiting_active_campaign_prospective(
+            "active_campaign_binding_invalid",
+            "Prospective evidence is missing or has the wrong active campaign binding.",
+        );
+    }
+    let Some(object) = payload.as_object_mut() else {
+        return awaiting_active_campaign_prospective(
+            "active_campaign_binding_invalid",
+            "Active prospective evidence is not a JSON object.",
+        );
+    };
+    object.insert("campaign_id".to_owned(), json!(ACTIVE_SHADOW_CAMPAIGN_ID));
+    object.insert(
+        "campaign_start".to_owned(),
+        json!(ACTIVE_SHADOW_CAMPAIGN_START),
+    );
+    object.insert("promotion_allowed".to_owned(), json!(false));
+    if let Some(result) = object.get_mut("result").and_then(Value::as_object_mut) {
+        result.insert("research_only".to_owned(), json!(true));
+        result.insert("live_deployment_allowed".to_owned(), json!(false));
+    }
+    payload
 }
 
 fn apply_shadow_correction_to_prospective(
@@ -1571,41 +1683,29 @@ struct VerifiedDailyBundle {
 fn resolve_verified_daily_bundle(
     requested_date: Option<&str>,
 ) -> Result<Option<VerifiedDailyBundle>, String> {
-    for (daily_root, container_env, expected_runtime_role) in [
-        (
-            SHADOW_DAILY_ROOT,
-            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
-            polyedge_config::RuntimeRole::ProfitabilityShadow,
-        ),
-        (
-            PRIMARY_DAILY_ROOT,
-            "AZURE_STORAGE_CONTAINER_NAME",
-            polyedge_config::RuntimeRole::Primary,
-        ),
-    ] {
-        if let Some(mut client) = artifact_blob_client(container_env) {
-            if let Some(bundle) = resolve_azure_verified_daily_bundle(
-                &mut client,
-                daily_root,
-                &expected_runtime_role,
-                requested_date,
-            )? {
-                return Ok(Some(bundle));
-            }
+    let daily_root = match requested_date {
+        None => ACTIVE_SHADOW_DAILY_ROOT,
+        Some(date) if date >= ACTIVE_SHADOW_CAMPAIGN_START => ACTIVE_SHADOW_DAILY_ROOT,
+        Some(date) if (LEGACY_SHADOW_FIRST_DATE..=LEGACY_SHADOW_LAST_DATE).contains(&date) => {
+            SHADOW_DAILY_ROOT
         }
-    }
-    for (daily_root, expected_runtime_role) in [
-        (
-            SHADOW_DAILY_ROOT,
-            polyedge_config::RuntimeRole::ProfitabilityShadow,
-        ),
-        (PRIMARY_DAILY_ROOT, polyedge_config::RuntimeRole::Primary),
-    ] {
-        if let Some(bundle) =
-            resolve_local_verified_daily_bundle(daily_root, &expected_runtime_role, requested_date)?
-        {
+        Some(_) => return Ok(None),
+    };
+    let expected_runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+    if let Some(mut client) = artifact_blob_client("AZURE_RESEARCH_STORAGE_CONTAINER_NAME") {
+        if let Some(bundle) = resolve_azure_verified_daily_bundle(
+            &mut client,
+            daily_root,
+            &expected_runtime_role,
+            requested_date,
+        )? {
             return Ok(Some(bundle));
         }
+    }
+    if let Some(bundle) =
+        resolve_local_verified_daily_bundle(daily_root, &expected_runtime_role, requested_date)?
+    {
+        return Ok(Some(bundle));
     }
     Ok(None)
 }
@@ -1627,6 +1727,7 @@ fn resolve_azure_verified_daily_bundle(
     };
     let pointer: LatestRunPointer = serde_json::from_slice(&pointer_bytes)
         .map_err(|error| format!("Atomic latest pointer is invalid JSON: {error}"))?;
+    validate_daily_root_date(daily_root, pointer.date)?;
     validate_pointer(&pointer, requested_date)?;
     let manifest_name = format!("{pointer_base}/{}", pointer.manifest_path);
     let manifest_bytes = client
@@ -1680,6 +1781,7 @@ fn resolve_local_verified_daily_bundle(
     };
     let pointer: LatestRunPointer = serde_json::from_slice(&pointer_bytes)
         .map_err(|error| format!("Atomic latest pointer is invalid JSON: {error}"))?;
+    validate_daily_root_date(&daily_root.to_string_lossy(), pointer.date)?;
     validate_pointer(&pointer, requested_date)?;
     let manifest_path = pointer_base.join(&pointer.manifest_path);
     let manifest_bytes = fs::read(&manifest_path)
@@ -1712,6 +1814,19 @@ fn resolve_local_verified_daily_bundle(
         manifest,
         artifact_bytes,
     }))
+}
+
+fn validate_daily_root_date(daily_root: &str, date: NaiveDate) -> Result<(), String> {
+    let date = date.to_string();
+    if daily_root == ACTIVE_SHADOW_DAILY_ROOT && date.as_str() < ACTIVE_SHADOW_CAMPAIGN_START {
+        return Err("Active campaign daily root points before the campaign start".to_owned());
+    }
+    if daily_root == SHADOW_DAILY_ROOT
+        && !(LEGACY_SHADOW_FIRST_DATE..=LEGACY_SHADOW_LAST_DATE).contains(&date.as_str())
+    {
+        return Err("Legacy shadow daily root points outside the display-only window".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_pointer(
@@ -1843,10 +1958,16 @@ fn daily_payload_from_bundle(bundle: &VerifiedDailyBundle) -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let historical = bundle.daily_root == SHADOW_DAILY_ROOT;
     json!({
         "date": bundle.date,
+        "campaign_id": if historical { LEGACY_SHADOW_CAMPAIGN_ID } else { ACTIVE_SHADOW_CAMPAIGN_ID },
+        "active_campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+        "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
+        "evidence_eligibility": if historical { "historical_ineligible" } else { "active_campaign_eligible" },
         "run_id": bundle.manifest.run_id,
-        "status": "complete",
+        "status": if historical { "historical_ineligible" } else { "complete" },
+        "bundle_status": "complete",
         "source": bundle.source,
         "report": bundle_json(bundle, &["final_report.json", "final_strategy_research_report.json"]),
         "audit": bundle_json(bundle, &["data_audit.json"]),
@@ -1863,8 +1984,11 @@ fn read_latest_report_payload() -> Value {
     match resolve_verified_daily_bundle(None) {
         Ok(Some(bundle)) => daily_payload_from_bundle(&bundle),
         Ok(None) => json!({
+            "campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+            "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
             "report": Value::Null,
-            "detail": "No verified atomic daily report exists yet.",
+            "detail": "No sealed daily report exists for the active campaign yet.",
+            "status": "awaiting_first_sealed_day",
             "artifacts": []
         }),
         Err(detail) => json!({
@@ -1877,12 +2001,34 @@ fn read_latest_report_payload() -> Value {
 }
 
 pub(crate) fn daily_report_payload(date: &str) -> Value {
-    match resolve_verified_daily_bundle(Some(date)) {
-        Ok(Some(bundle)) => daily_payload_from_bundle(&bundle),
-        Ok(None) => json!({
+    if NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return json!({
             "date": date,
             "report": Value::Null,
-            "detail": "No verified atomic daily report exists for this date.",
+            "detail": "Date must be a real YYYY-MM-DD calendar date.",
+            "status": "invalid_date",
+            "artifacts": []
+        });
+    }
+    match resolve_verified_daily_bundle(Some(date)) {
+        Ok(Some(bundle)) => daily_payload_from_bundle(&bundle),
+        Ok(None) if date < ACTIVE_SHADOW_CAMPAIGN_START => json!({
+            "date": date,
+            "campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+            "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
+            "evidence_eligibility": "historical_ineligible",
+            "report": Value::Null,
+            "detail": if date == "2026-07-21" { "July 21 is the campaign reset boundary and is ineligible." } else { "No eligible legacy shadow report exists for this historical date." },
+            "status": "historical_ineligible",
+            "artifacts": []
+        }),
+        Ok(None) => json!({
+            "date": date,
+            "campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+            "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
+            "report": Value::Null,
+            "detail": "No sealed daily report exists for this active campaign date.",
+            "status": "awaiting_sealed_day",
             "artifacts": []
         }),
         Err(detail) => json!({
@@ -1904,8 +2050,11 @@ fn latest_named_report(primary: &str, fallback: &str) -> Value {
             "source": bundle.source
         }),
         Ok(None) => json!({
+            "campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+            "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
             "report": Value::Null,
-            "detail": "No verified atomic daily report exists yet."
+            "detail": "No sealed daily report exists for the active campaign yet.",
+            "status": "awaiting_first_sealed_day"
         }),
         Err(detail) => json!({
             "report": Value::Null,
@@ -2864,29 +3013,38 @@ mod tests {
     use rust_decimal::Decimal;
 
     #[test]
-    fn shadow_campaign_prospective_precedes_stale_primary_history() {
-        let shadow = json!({
+    fn prospective_accepts_only_active_campaign_bound_rows() {
+        let contract_sha256 = active_shadow_campaign_contract().unwrap().sha256;
+        let active = json!({
             "result": {
                 "status": "tracking",
-                "rows": [{"date": "2026-07-13", "wallet_schema_version": 2}]
+                "rows": [{
+                    "date": "2026-07-22",
+                    "wallet_schema_version": 3,
+                    "wallet_campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
+                    "wallet_campaign_contract_sha256": contract_sha256,
+                    "wallet_campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
+                    "wallet_campaign_first_eligible_date": ACTIVE_SHADOW_CAMPAIGN_START,
+                    "wallet_campaign_terminal_date": ACTIVE_SHADOW_CAMPAIGN_TERMINAL
+                }]
             }
         });
-        let primary = json!({
+        let stale = json!({
             "result": {
                 "status": "tracking",
-                "rows": [{"date": "2026-07-11"}]
+                "rows": [{"date": "2026-07-20"}]
             }
         });
-        let selected = select_prospective_payload(shadow.clone(), primary.clone());
-        assert_eq!(selected, shadow);
+        let selected = active_campaign_prospective_payload(active);
+        assert_eq!(selected["campaign_id"], ACTIVE_SHADOW_CAMPAIGN_ID);
+        assert_eq!(selected["result"]["live_deployment_allowed"], false);
         assert_eq!(
-            select_prospective_payload(Value::Null, primary.clone()),
-            primary
+            active_campaign_prospective_payload(stale)["result"]["status"],
+            "active_campaign_binding_invalid"
         );
-        assert!(
-            select_prospective_payload(Value::Null, Value::Null)["result"]["rows"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
+        assert_eq!(
+            active_campaign_prospective_payload(Value::Null)["result"]["status"],
+            "awaiting_first_sealed_day"
         );
     }
 
@@ -3008,11 +3166,42 @@ mod tests {
         );
         assert_eq!(
             selected.provenance["selection_reason"],
-            "newest_fresh_valid_manifest"
+            "active_campaign_shadow"
         );
         assert_eq!(selected.provenance["canonical_funded_state"], false);
         assert_eq!(selected.value["promotion_allowed"], false);
         assert!(selected.value.get("funded_ladder").is_none());
+    }
+
+    #[test]
+    fn shadow_profitability_fails_closed_without_active_campaign_binding() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap();
+        let mut shadow = test_promotion_manifest(
+            now - Duration::minutes(5),
+            PromotionPhase::ShadowCollecting,
+            false,
+        );
+        shadow.artifact_uris.remove("shadow_campaign_id");
+
+        let selected = select_profitability_artifact(
+            ProfitabilityArtifact::new(Value::Null, ProfitabilitySource::Funded, now),
+            ProfitabilityArtifact::new(
+                serde_json::to_value(shadow).unwrap(),
+                ProfitabilitySource::Shadow,
+                now,
+            ),
+            now,
+        );
+
+        assert_eq!(selected.value["promotion_allowed"], false);
+        assert_eq!(selected.value["status"], "legacy_evidence_display_only");
+        assert_eq!(
+            selected.provenance["selected"]["valid_current_schema"],
+            false
+        );
+        assert!(selected.provenance["selected"]["validation_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("shadow_campaign_id")));
     }
 
     #[test]
@@ -3198,7 +3387,7 @@ mod tests {
     #[test]
     fn daily_report_payload_reads_only_verified_atomic_contract() {
         let date = "2099-12-31";
-        let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
+        let dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);
         let _guard = CleanupPath(dir.clone());
         build_atomic_test_bundle(date, "api-run-001");
 
@@ -3217,7 +3406,7 @@ mod tests {
     #[test]
     fn daily_report_payload_rejects_tampered_atomic_artifact_without_flat_fallback() {
         let date = "2099-12-30";
-        let dir = PathBuf::from(REPORT_ROOT).join("daily").join(date);
+        let dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);
         let _guard = CleanupPath(dir.clone());
         build_atomic_test_bundle(date, "api-run-002");
         fs::write(
@@ -3242,7 +3431,7 @@ mod tests {
     fn daily_report_payload_prefers_verified_shadow_bundle() {
         let date = "2099-12-29";
         let primary_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(date);
-        let shadow_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let shadow_dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);
         let _primary_guard = CleanupPath(primary_dir);
         let _shadow_guard = CleanupPath(shadow_dir);
         build_atomic_test_bundle_at(
@@ -3252,7 +3441,7 @@ mod tests {
             polyedge_config::RuntimeRole::Primary,
         );
         build_atomic_test_bundle_at(
-            SHADOW_DAILY_ROOT,
+            ACTIVE_SHADOW_DAILY_ROOT,
             date,
             "api-shadow-001",
             polyedge_config::RuntimeRole::ProfitabilityShadow,
@@ -3264,7 +3453,7 @@ mod tests {
         assert_eq!(payload["run_id"], "api-shadow-001");
         assert!(payload["source"]
             .as_str()
-            .is_some_and(|source| source.contains("reports/research/shadow/daily")));
+            .is_some_and(|source| source.contains(ACTIVE_SHADOW_DAILY_ROOT)));
         let artifact_id = payload["artifacts"]
             .as_array()
             .and_then(|artifacts| {
@@ -3274,7 +3463,9 @@ mod tests {
             })
             .and_then(|artifact| artifact["artifact_id"].as_str())
             .expect("shadow artifact id");
-        assert!(artifact_id.starts_with("shadow~daily~2099-12-29~runs~api-shadow-001~"));
+        assert!(artifact_id.starts_with(
+            "shadow~campaigns~campaign-2026-07-22~daily~2099-12-29~runs~api-shadow-001~"
+        ));
         let artifact_path = PathBuf::from(REPORT_ROOT).join(artifact_id.replace('~', "/"));
         let artifact = artifact_payload(&artifact_path)
             .expect("read shadow artifact")
@@ -3289,7 +3480,7 @@ mod tests {
     fn invalid_shadow_bundle_does_not_fall_back_to_primary() {
         let date = "2099-12-28";
         let primary_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(date);
-        let shadow_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let shadow_dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);
         let _primary_guard = CleanupPath(primary_dir);
         let _shadow_guard = CleanupPath(shadow_dir.clone());
         build_atomic_test_bundle_at(
@@ -3299,7 +3490,7 @@ mod tests {
             polyedge_config::RuntimeRole::Primary,
         );
         build_atomic_test_bundle_at(
-            SHADOW_DAILY_ROOT,
+            ACTIVE_SHADOW_DAILY_ROOT,
             date,
             "api-shadow-002",
             polyedge_config::RuntimeRole::ProfitabilityShadow,
@@ -3320,10 +3511,10 @@ mod tests {
     #[test]
     fn daily_report_payload_rejects_runtime_role_root_mismatch() {
         let date = "2099-12-27";
-        let shadow_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let shadow_dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);
         let _shadow_guard = CleanupPath(shadow_dir);
         build_atomic_test_bundle_at(
-            SHADOW_DAILY_ROOT,
+            ACTIVE_SHADOW_DAILY_ROOT,
             date,
             "api-shadow-role-mismatch",
             polyedge_config::RuntimeRole::Primary,
@@ -3339,45 +3530,82 @@ mod tests {
     }
 
     #[test]
-    fn latest_report_uses_global_shadow_pointer_and_primary_fallback() {
+    fn legacy_shadow_is_display_only_and_reset_boundary_is_ineligible() {
+        let legacy_date = "2026-07-20";
+        let legacy_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(legacy_date);
+        let _legacy_guard = CleanupPath(legacy_dir);
+        build_atomic_test_bundle_at(
+            SHADOW_DAILY_ROOT,
+            legacy_date,
+            "api-legacy-display-only",
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        );
+
+        let legacy = daily_report_payload(legacy_date);
+        assert_eq!(legacy["status"], "historical_ineligible");
+        assert_eq!(legacy["campaign_id"], LEGACY_SHADOW_CAMPAIGN_ID);
+        assert_eq!(legacy["active_campaign_id"], ACTIVE_SHADOW_CAMPAIGN_ID);
+        assert_eq!(legacy["bundle_status"], "complete");
+        assert_eq!(legacy["evidence_eligibility"], "historical_ineligible");
+
+        let reset = daily_report_payload("2026-07-21");
+        assert_eq!(reset["status"], "historical_ineligible");
+        assert!(reset["report"].is_null());
+    }
+
+    #[test]
+    fn latest_report_awaits_then_uses_only_active_campaign_pointer() {
         let date = "2099-12-26";
-        let primary_date_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(date);
-        let shadow_date_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let legacy_date = "2026-07-20";
+        let primary_date_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(legacy_date);
+        let legacy_date_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(legacy_date);
+        let active_date_dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);
         let _primary_date_guard = CleanupPath(primary_date_dir);
-        let _shadow_date_guard = CleanupPath(shadow_date_dir.clone());
+        let _legacy_date_guard = CleanupPath(legacy_date_dir);
+        let _active_date_guard = CleanupPath(active_date_dir.clone());
         let _primary_pointer_guard =
             RestoreFile::new(PathBuf::from(PRIMARY_DAILY_ROOT).join("latest.json"));
-        let _shadow_pointer_guard =
+        let _legacy_pointer_guard =
             RestoreFile::new(PathBuf::from(SHADOW_DAILY_ROOT).join("latest.json"));
+        let active_pointer_path = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join("latest.json");
+        let _active_pointer_guard = RestoreFile::new(active_pointer_path.clone());
+        let _ = fs::remove_file(&active_pointer_path);
         build_atomic_test_bundle_at(
             PRIMARY_DAILY_ROOT,
-            date,
+            legacy_date,
             "api-primary-global",
             polyedge_config::RuntimeRole::Primary,
         );
-        write_global_pointer(PRIMARY_DAILY_ROOT, date);
-
-        let primary = read_latest_report_payload();
-        assert_eq!(primary["status"], "complete");
-        assert_eq!(primary["run_id"], "api-primary-global");
-
+        write_global_pointer(PRIMARY_DAILY_ROOT, legacy_date);
         build_atomic_test_bundle_at(
             SHADOW_DAILY_ROOT,
-            date,
-            "api-shadow-global",
+            legacy_date,
+            "api-legacy-global",
             polyedge_config::RuntimeRole::ProfitabilityShadow,
         );
-        write_global_pointer(SHADOW_DAILY_ROOT, date);
+        write_global_pointer(SHADOW_DAILY_ROOT, legacy_date);
 
-        let shadow = read_latest_report_payload();
-        assert_eq!(shadow["status"], "complete");
-        assert_eq!(shadow["run_id"], "api-shadow-global");
-        assert!(shadow["source"]
+        let awaiting = read_latest_report_payload();
+        assert_eq!(awaiting["status"], "awaiting_first_sealed_day");
+        assert!(awaiting["report"].is_null());
+
+        build_atomic_test_bundle_at(
+            ACTIVE_SHADOW_DAILY_ROOT,
+            date,
+            "api-active-global",
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        );
+        write_global_pointer(ACTIVE_SHADOW_DAILY_ROOT, date);
+
+        let active = read_latest_report_payload();
+        assert_eq!(active["status"], "complete");
+        assert_eq!(active["run_id"], "api-active-global");
+        assert!(active["source"]
             .as_str()
-            .is_some_and(|source| source.contains("reports/research/shadow/daily")));
+            .is_some_and(|source| source.contains(ACTIVE_SHADOW_DAILY_ROOT)));
 
         fs::write(
-            shadow_date_dir.join("runs/api-shadow-global/final_report.json"),
+            active_date_dir.join("runs/api-active-global/final_report.json"),
             r#"{"tampered":true}"#,
         )
         .expect("tamper global shadow artifact");
@@ -3465,6 +3693,33 @@ mod tests {
             candidate_version: "dynamic_quote_style@2026-06-14".to_owned(),
             config_hash: format!("sha256:{}", "a".repeat(64)),
         };
+        let mut artifact_uris = BTreeMap::new();
+        artifact_uris.insert(
+            "campaign_contract".to_owned(),
+            ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH.to_owned(),
+        );
+        artifact_uris.insert(
+            "shadow_campaign_id".to_owned(),
+            ACTIVE_SHADOW_CAMPAIGN_ID.to_owned(),
+        );
+        artifact_uris.insert(
+            "campaign_contract_sha256".to_owned(),
+            active_shadow_campaign_contract()
+                .expect("active test campaign contract")
+                .sha256,
+        );
+        artifact_uris.insert(
+            "shadow_daily_root".to_owned(),
+            ACTIVE_SHADOW_DAILY_ROOT.to_owned(),
+        );
+        artifact_uris.insert(
+            "shadow_prospective_result".to_owned(),
+            ACTIVE_SHADOW_PROSPECTIVE_PATH.to_owned(),
+        );
+        artifact_uris.insert(
+            "shadow_profitability_result".to_owned(),
+            ACTIVE_SHADOW_PROFITABILITY_LATEST.to_owned(),
+        );
         PromotionManifestV1::new(
             candidate,
             PromotionEvaluation {
@@ -3474,7 +3729,7 @@ mod tests {
                 gates: Vec::new(),
                 metrics,
             },
-            BTreeMap::new(),
+            artifact_uris,
             ExecutionModelBinding {
                 blob_uri: "azure://account/container/model.json".to_owned(),
                 sha256: format!("sha256:{}", "b".repeat(64)),
@@ -3503,10 +3758,10 @@ mod tests {
 
     fn build_atomic_test_bundle(date: &str, run_id: &str) {
         build_atomic_test_bundle_at(
-            PRIMARY_DAILY_ROOT,
+            ACTIVE_SHADOW_DAILY_ROOT,
             date,
             run_id,
-            polyedge_config::RuntimeRole::Primary,
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
         );
     }
 

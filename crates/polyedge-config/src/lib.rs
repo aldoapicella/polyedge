@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use polyedge_domain::decimal_string;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,8 @@ pub enum ConfigError {
     InvalidAdaptiveStrategy(String),
     #[error("invalid runtime role configuration: {0}")]
     InvalidRuntimeRole(String),
+    #[error("invalid event blob prefix cutover: {0}")]
+    InvalidEventBlobPrefixCutover(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -276,6 +279,8 @@ pub struct AzureConfig {
     pub chart_table_name: String,
     pub market_table_name: String,
     pub event_blob_prefix: String,
+    pub event_blob_prefix_after_cutover: Option<String>,
+    pub event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
     pub compact_shadow_recording: bool,
     pub shadow_book_sample_ms: usize,
     pub publish_strategy_canary_intents: bool,
@@ -294,6 +299,8 @@ impl Default for AzureConfig {
             chart_table_name: "BotChartSeries".to_owned(),
             market_table_name: "BotMarketCatalog".to_owned(),
             event_blob_prefix: "events".to_owned(),
+            event_blob_prefix_after_cutover: None,
+            event_blob_prefix_cutover_utc: None,
             compact_shadow_recording: false,
             shadow_book_sample_ms: 1_000,
             publish_strategy_canary_intents: false,
@@ -302,6 +309,18 @@ impl Default for AzureConfig {
             strategy_canary_fill_model_version: "conservative-execution-prior-v1".to_owned(),
             strategy_canary_execution_model_blob_uri: String::new(),
             strategy_canary_execution_model_sha256: String::new(),
+        }
+    }
+}
+
+impl AzureConfig {
+    pub fn event_blob_prefix_at(&self, event_ts: DateTime<Utc>) -> &str {
+        match (
+            self.event_blob_prefix_after_cutover.as_deref(),
+            self.event_blob_prefix_cutover_utc,
+        ) {
+            (Some(prefix), Some(cutover)) if event_ts >= cutover => prefix,
+            _ => &self.event_blob_prefix,
         }
     }
 }
@@ -449,6 +468,27 @@ impl RuntimeSettings {
             env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
         settings.azure.event_blob_prefix =
             env_string("AZURE_EVENT_BLOB_PREFIX", settings.azure.event_blob_prefix);
+        settings.azure.event_blob_prefix_after_cutover =
+            env_non_empty("AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER");
+        settings.azure.event_blob_prefix_cutover_utc =
+            match env_non_empty("AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC") {
+                Some(value) => Some(
+                    DateTime::parse_from_rfc3339(&value)
+                        .map_err(|error| {
+                            ConfigError::InvalidEventBlobPrefixCutover(error.to_string())
+                        })?
+                        .with_timezone(&Utc),
+                ),
+                None => None,
+            };
+        if settings.azure.event_blob_prefix_after_cutover.is_some()
+            != settings.azure.event_blob_prefix_cutover_utc.is_some()
+        {
+            return Err(ConfigError::InvalidEventBlobPrefixCutover(
+                "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER and AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC must be configured together"
+                    .to_owned(),
+            ));
+        }
         settings.azure.compact_shadow_recording = env_bool(
             "COMPACT_SHADOW_RECORDING",
             settings.azure.compact_shadow_recording,
@@ -605,6 +645,21 @@ impl RuntimeSettings {
         if !self.azure.event_blob_prefix.starts_with("shadow-events/") {
             reasons.push("AZURE_EVENT_BLOB_PREFIX must start with shadow-events/");
         }
+        if self.azure.event_blob_prefix_after_cutover.is_some()
+            != self.azure.event_blob_prefix_cutover_utc.is_some()
+        {
+            reasons.push(
+                "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER and AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC must be configured together",
+            );
+        }
+        if self
+            .azure
+            .event_blob_prefix_after_cutover
+            .as_deref()
+            .is_some_and(|prefix| !prefix.starts_with("shadow-events/"))
+        {
+            reasons.push("AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER must start with shadow-events/");
+        }
         if reasons.is_empty() {
             Ok(())
         } else {
@@ -689,6 +744,8 @@ impl RuntimeSettings {
             },
             "azure": {
                 "event_blob_prefix": self.azure.event_blob_prefix,
+                "event_blob_prefix_after_cutover": self.azure.event_blob_prefix_after_cutover,
+                "event_blob_prefix_cutover_utc": self.azure.event_blob_prefix_cutover_utc,
                 "compact_shadow_recording": self.azure.compact_shadow_recording,
                 "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
                 "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
@@ -797,6 +854,7 @@ fn env_decimal(name: &str, default: Decimal) -> Result<Decimal, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::{is_full_git_sha, ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings};
+    use chrono::{DateTime, Utc};
 
     fn safe_shadow_settings() -> RuntimeSettings {
         let mut settings = RuntimeSettings::default();
@@ -819,6 +877,39 @@ mod tests {
             settings.deploy.runtime_role.as_str(),
             "profitability_shadow"
         );
+    }
+
+    #[test]
+    fn event_blob_prefix_cutover_is_paired_and_uses_event_time_boundary() {
+        let mut settings = safe_shadow_settings();
+        settings.azure.event_blob_prefix = "shadow-events/old".to_owned();
+        settings.azure.event_blob_prefix_after_cutover = Some("shadow-events/new".to_owned());
+        settings.azure.event_blob_prefix_cutover_utc = Some(
+            DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert_eq!(
+            settings.azure.event_blob_prefix_at(
+                DateTime::parse_from_rfc3339("2026-07-21T23:59:59.999Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+            "shadow-events/old"
+        );
+        assert_eq!(
+            settings.azure.event_blob_prefix_at(
+                DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+            "shadow-events/new"
+        );
+        assert!(settings.validate_runtime_role().is_ok());
+
+        settings.azure.event_blob_prefix_cutover_utc = None;
+        let error = settings.validate_runtime_role().unwrap_err().to_string();
+        assert!(error.contains("must be configured together"));
     }
 
     #[test]
