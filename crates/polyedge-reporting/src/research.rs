@@ -86,6 +86,20 @@ const RAW_SOURCE_INVENTORY_SCHEMA_VERSION: u32 = 1;
 const RAW_SOURCE_INVENTORY_DOMAIN: &str = "polyedge.raw-source-inventory.v1";
 const ADAPTIVE_LOG_LIMIT: usize = 100;
 const REFERENCE_HISTORY_SECONDS: i64 = 130;
+const SWEEP_SELECTION_RULE: &str = "Rank candidates only by aggregate PnL across chronological validation days: maximize the worst fill-model validation PnL, then total validation PnL, then candidate name; final-day test results are opened only for the fixed winner.";
+const SWEEP_FOLD_SELECTION_RULE: &str = "Within this fold, rank candidates only on its single validation day: maximize the worst fill-model validation PnL, then total validation PnL, then candidate name.";
+const SWEEP_BLOCK_DAYS: usize = 7;
+const SWEEP_MIN_BLOCKS: usize = 4;
+const SWEEP_BOOTSTRAP_RESAMPLES: usize = 10_000;
+const SWEEP_MAX_SEARCH_COMBINATIONS: usize = 100_000;
+
+fn sweep_robust_candidate_rule() -> String {
+    format!(
+        "The fixed winner is robust only when validation net PnL and the deterministic {SWEEP_BLOCK_DAYS}-day circular block-bootstrap lower 95% bound ({SWEEP_BOOTSTRAP_RESAMPLES} resamples, at least {} daily clusters) are both above zero under touch_after_250ms and trade_through, and the sealed final-day test has at least one complete market and non-negative net PnL under both models.",
+        SWEEP_BLOCK_DAYS * SWEEP_MIN_BLOCKS
+    )
+}
+
 const WALLET_CAMPAIGN_BASELINE: Decimal = Decimal::from_parts(5_030_521, 0, 0, false, 6);
 const WALLET_EQUITY_FLOOR: Decimal = Decimal::from_parts(403, 0, 0, false, 2);
 const WALLET_MAX_DRAWDOWN: Decimal = Decimal::ONE;
@@ -877,10 +891,23 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
 
 pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    if !options.split.eq_ignore_ascii_case("walk_forward") {
+        return Err(ResearchError::InvalidInput(format!(
+            "sweep selection supports only chronological walk_forward, got {}",
+            options.split
+        )));
+    }
     let markets = load_market_truth(options.markets.as_deref())?;
     let settings = RuntimeSettings::default();
-    let candidates = sweep_candidates(options.max_experiments.max(1));
-    let requests = candidates
+    let build = sweep_candidates(options.max_experiments.max(1), options.search.as_deref())?;
+    if build.configured && build.candidates.len() == 1 {
+        return Err(ResearchError::InvalidInput(
+            "explicit sweep --search requires max_experiments >= 2 so at least one configured candidate is evaluated alongside the baseline"
+                .to_owned(),
+        ));
+    }
+    let requests = build
+        .candidates
         .iter()
         .flat_map(|candidate| {
             [
@@ -902,19 +929,41 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
     let results =
         run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
     let (plan, mut split_warnings) = split_plan(&results, &options.split);
-    let mut grouped = group_sweep_results(results);
-    add_split_metrics(&mut grouped, &plan);
+    let grouped = group_sweep_results(results);
+    let (candidates, fold_results, selection) =
+        build_sweep_evidence(&grouped, &build.candidates, &plan);
+    if build.truncated {
+        split_warnings.push(json!(format!(
+            "search space truncated: {} configured combinations plus baseline, {} candidates evaluated under max_experiments={}",
+            build.requested_combinations,
+            build.candidates.len(),
+            options.max_experiments.max(1)
+        )));
+    }
     split_warnings.push(json!(
         "coarse deterministic search over logged decisions; no live deployment"
     ));
     let result = json!({
+        "schema_version": 2,
         "split_method": options.split,
         "split_plan": plan,
-        "search": options.search.map(|path| path.to_string_lossy().into_owned()),
+        "fold_results": fold_results,
+        "search": options.search.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        "search_space": {
+            "schema_version": 1,
+            "configured": build.configured,
+            "supported_parameters": ["maker_min_edge", "ttl_seconds", "final_no_trade_seconds", "quote_style"],
+            "requested_combinations": build.requested_combinations,
+            "baseline_included": true,
+            "evaluated_candidates": build.candidates.len(),
+            "truncated": build.truncated
+        },
         "max_experiments": options.max_experiments,
-        "candidates": grouped,
-        "selection_rule": "Rank on validation only; test is reported, not optimized.",
-        "robust_candidate_rule": "Validation positive under touch_after_250ms and trade_through, test does not collapse, and CI lower bound remains above zero.",
+        "candidates": candidates,
+        "selection": selection,
+        "selection_rule": SWEEP_SELECTION_RULE,
+        "robust_candidate_rule": sweep_robust_candidate_rule(),
+        "test_sealing_rule": "For each non-final chronological fold, the fold validation winner's next-day test is opened as walk-forward diagnostic evidence. The final aggregate test remains sealed and is opened only for the winner fixed from all chronological validation days; if the final fold winner differs, that fold test remains sealed.",
         "warnings": split_warnings.clone()
     });
     let report = envelope(
@@ -6417,13 +6466,49 @@ impl StrategyProfileMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SweepCandidate {
     name: String,
     maker_min_edge: Decimal,
     ttl_seconds: i64,
     final_no_trade_seconds: i64,
     quote_style: QuoteStyle,
+}
+
+impl SweepCandidate {
+    fn parameters_json(&self) -> Value {
+        json!({
+            "maker_min_edge": self.maker_min_edge.to_string(),
+            "ttl_seconds": self.ttl_seconds,
+            "final_no_trade_seconds": self.final_no_trade_seconds,
+            "quote_style": sweep_quote_style_name(self.quote_style),
+        })
+    }
+}
+
+fn sweep_quote_style_name(style: QuoteStyle) -> &'static str {
+    match style {
+        QuoteStyle::ImproveOneTick => "improve_one_tick",
+        QuoteStyle::JoinBestBid => "join_best_bid",
+        QuoteStyle::FairMinusMarginOnly => "fair_minus_margin_only",
+        QuoteStyle::NoQuote => "no_quote",
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SweepSearchSpace {
+    maker_min_edges: Vec<Decimal>,
+    ttl_seconds: Vec<i64>,
+    final_no_trade_seconds: Vec<i64>,
+    quote_styles: Vec<QuoteStyle>,
+}
+
+#[derive(Clone, Debug)]
+struct SweepCandidateBuild {
+    candidates: Vec<SweepCandidate>,
+    requested_combinations: usize,
+    truncated: bool,
+    configured: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -7650,8 +7735,24 @@ impl ResearchReplayEngine {
                 self.skipped_by_profile += 1;
                 return;
             }
-            if candidate.quote_style == QuoteStyle::FairMinusMarginOnly {
-                order.price = (order.price - order.tick_size).max(order.tick_size);
+            match candidate.quote_style {
+                QuoteStyle::ImproveOneTick => {}
+                QuoteStyle::JoinBestBid => {
+                    if let Some((best_bid, _)) = self
+                        .books
+                        .get(&order.token_id)
+                        .and_then(OrderBookState::best_bid)
+                    {
+                        order.price = order.price.min(best_bid);
+                    }
+                }
+                QuoteStyle::FairMinusMarginOnly => {
+                    order.price = (order.price - order.tick_size).max(order.tick_size);
+                }
+                QuoteStyle::NoQuote => {
+                    self.skipped_by_profile += 1;
+                    return;
+                }
             }
         }
         order.applied_order_id = applied_order_id;
@@ -8671,7 +8772,7 @@ fn calibration_group_json(groups: &BTreeMap<String, BTreeMap<String, Calibration
     Value::Object(output)
 }
 
-fn group_sweep_results(results: Vec<Value>) -> Vec<Value> {
+fn group_sweep_results(results: Vec<Value>) -> BTreeMap<String, Vec<Value>> {
     let mut by_candidate = BTreeMap::<String, Vec<Value>>::new();
     for result in results {
         let name = result["name"].as_str().unwrap_or("unknown");
@@ -8683,20 +8784,6 @@ fn group_sweep_results(results: Vec<Value>) -> Vec<Value> {
         by_candidate.entry(candidate).or_default().push(result);
     }
     by_candidate
-        .into_iter()
-        .map(|(candidate, rows)| {
-            let robust = rows.iter().all(|row| {
-                row["net_pnl"]
-                    .as_str()
-                    .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
-            }) && rows.len() >= 2;
-            json!({
-                "candidate": candidate,
-                "robust_candidate": robust,
-                "fill_model_results": rows
-            })
-        })
-        .collect()
 }
 
 fn split_plan(results: &[Value], split_method: &str) -> (Value, Vec<Value>) {
@@ -8765,35 +8852,389 @@ fn split_plan(results: &[Value], split_method: &str) -> (Value, Vec<Value>) {
     )
 }
 
-fn add_split_metrics(candidates: &mut [Value], plan: &Value) {
+#[derive(Clone, Debug)]
+struct SweepCandidateEvidence {
+    candidate: SweepCandidate,
+    validation_models: Vec<Value>,
+    validation_folds: Vec<Value>,
+    minimum_validation_pnl: Decimal,
+    total_validation_pnl: Decimal,
+    validation_net_positive: bool,
+    validation_block_bound_positive: bool,
+}
+
+fn build_sweep_evidence(
+    grouped: &BTreeMap<String, Vec<Value>>,
+    candidates: &[SweepCandidate],
+    plan: &Value,
+) -> (Vec<Value>, Vec<Value>, Value) {
+    let folds = plan
+        .pointer("/walk_forward/folds")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let validation_days = folds
+        .iter()
+        .filter_map(|fold| fold["validation_day"].as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
     let latest = &plan["latest_walk_forward"];
-    let train_days = json_string_array(&latest["train_days"]);
-    let validation_days = latest["validation_day"]
+    let latest_train_days = json_string_array(&latest["train_days"]);
+    let latest_validation_days = latest["validation_day"]
         .as_str()
         .map(|day| vec![day.to_owned()])
         .unwrap_or_default();
-    let test_days = latest["test_day"]
+    let final_test_days = latest["test_day"]
         .as_str()
         .map(|day| vec![day.to_owned()])
         .unwrap_or_default();
-    for candidate in candidates {
-        let Some(rows) = candidate
-            .get_mut("fill_model_results")
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
+
+    let mut evidence = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let rows = grouped.get(&candidate.name)?;
+            let validation_models = rows
+                .iter()
+                .map(|row| validation_model_evidence(row, &validation_days))
+                .collect::<Vec<_>>();
+            let pnls = validation_models
+                .iter()
+                .filter_map(|row| row["net_pnl"].as_str().map(decimal_from_str))
+                .collect::<Vec<_>>();
+            let minimum_validation_pnl = pnls.iter().copied().min().unwrap_or_default();
+            let total_validation_pnl = pnls.iter().copied().sum();
+            let validation_net_positive = validation_models.len() == 2
+                && validation_models.iter().all(|row| {
+                    row["net_pnl"]
+                        .as_str()
+                        .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
+                });
+            let validation_block_bound_positive = validation_models.len() == 2
+                && validation_models.iter().all(|row| {
+                    row["block_confidence_lower_95"]
+                        .as_str()
+                        .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
+                });
+            let validation_folds = folds
+                .iter()
+                .enumerate()
+                .map(|(index, fold)| {
+                    let day = fold["validation_day"]
+                        .as_str()
+                        .map(|day| vec![day.to_owned()])
+                        .unwrap_or_default();
+                    let fill_model_results = rows
+                        .iter()
+                        .map(|row| {
+                            let mut stats = market_split_stats(row, &day);
+                            if let Some(object) = stats.as_object_mut() {
+                                object.insert("fill_model".to_owned(), row["fill_model"].clone());
+                            }
+                            stats
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "fold_index": index,
+                        "validation_day": fold["validation_day"],
+                        "fill_model_results": fill_model_results
+                    })
+                })
+                .collect();
+            Some(SweepCandidateEvidence {
+                candidate: candidate.clone(),
+                validation_models,
+                validation_folds,
+                minimum_validation_pnl,
+                total_validation_pnl,
+                validation_net_positive,
+                validation_block_bound_positive,
+            })
+        })
+        .collect::<Vec<_>>();
+    rank_sweep_candidates(&mut evidence);
+    let selected_name = (!validation_days.is_empty())
+        .then(|| evidence.first().map(|row| row.candidate.name.clone()))
+        .flatten();
+    let selected_test = selected_name
+        .as_ref()
+        .and_then(|name| grouped.get(name))
+        .map(|rows| sealed_test_evidence(rows, &final_test_days));
+    let test_non_collapsing = selected_test
+        .as_ref()
+        .is_some_and(sealed_test_non_collapsing);
+    let selected_robust = evidence.first().is_some_and(|row| {
+        row.validation_net_positive && row.validation_block_bound_positive && test_non_collapsing
+    });
+
+    let candidate_rows = evidence
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let selected = selected_name.as_deref() == Some(row.candidate.name.as_str());
+            let original = grouped
+                .get(&row.candidate.name)
+                .cloned()
+                .unwrap_or_default();
+            let compatible_models = original
+                .iter()
+                .zip(row.validation_models.iter())
+                .map(|(source, validation)| {
+                    let test = if selected {
+                        market_split_stats(source, &final_test_days)
+                    } else {
+                        json!({"status": "sealed_not_selected", "opened": false})
+                    };
+                    json!({
+                        "fill_model": source["fill_model"],
+                        "evidence_scope": "validation_only_except_fixed_winner_test",
+                        "markets": validation["markets"],
+                        "net_pnl": validation["net_pnl"],
+                        "profitable_markets": validation["profitable_markets"],
+                        "losing_markets": validation["losing_markets"],
+                        "validation": validation,
+                        "split_performance": {
+                            "train": market_split_stats(source, &latest_train_days),
+                            "validation": market_split_stats(source, &latest_validation_days),
+                            "test": test
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "candidate": row.candidate.name,
+                "parameters": row.candidate.parameters_json(),
+                "validation_rank": index + 1,
+                "selected": selected,
+                "robust_candidate": selected && selected_robust,
+                "validation_minimum_fill_model_net_pnl": row.minimum_validation_pnl.to_string(),
+                "validation_total_fill_model_net_pnl": row.total_validation_pnl.to_string(),
+                "validation_net_positive_under_both_models": row.validation_net_positive,
+                "validation_block_bound_positive_under_both_models": row.validation_block_bound_positive,
+                "validation_folds": row.validation_folds,
+                "fill_model_results": compatible_models,
+                "sealed_test": if selected { selected_test.clone().unwrap_or(Value::Null) } else { Value::Null }
+            })
+        })
+        .collect::<Vec<_>>();
+    let fold_results = build_fold_results(grouped, candidates, &folds, selected_name.as_deref());
+    let selection = selected_name.map_or_else(
+        || {
+            json!({
+                "status": "insufficient_chronological_folds",
+                "candidate": null,
+                "robust_candidate": false,
+                "sealed_test": null
+            })
+        },
+        |candidate| {
+            json!({
+                "status": "winner_fixed_before_test_open",
+                "candidate": candidate,
+                "selection_source": "chronological_validation_days_only",
+                "robust_candidate": selected_robust,
+                "sealed_test": selected_test,
+            })
+        },
+    );
+    (candidate_rows, fold_results, selection)
+}
+
+fn rank_sweep_candidates(rows: &mut [SweepCandidateEvidence]) {
+    rows.sort_by(|left, right| {
+        right
+            .minimum_validation_pnl
+            .cmp(&left.minimum_validation_pnl)
+            .then(right.total_validation_pnl.cmp(&left.total_validation_pnl))
+            .then(left.candidate.name.cmp(&right.candidate.name))
+    });
+}
+
+fn validation_model_evidence(result: &Value, days: &[String]) -> Value {
+    let stats = market_split_stats(result, days);
+    let daily = daily_market_pnl(result, days);
+    let values = daily
+        .iter()
+        .filter_map(|row| row["net_pnl"].as_str().map(decimal_from_str))
+        .collect::<Vec<_>>();
+    json!({
+        "fill_model": result["fill_model"],
+        "days": days,
+        "markets": stats["markets"],
+        "net_pnl": stats["net_pnl"],
+        "profitable_markets": stats["profitable_markets"],
+        "losing_markets": stats["losing_markets"],
+        "daily_pnl": daily,
+        "block_confidence_method": "seven_day_circular_block_bootstrap_10000_resamples_minimum_28_daily_clusters",
+        "block_confidence_lower_95": sweep_block_bootstrap_daily_lower_95(&values).map(|value| value.to_string())
+    })
+}
+
+fn daily_market_pnl(result: &Value, days: &[String]) -> Vec<Value> {
+    let mut totals = days
+        .iter()
+        .map(|day| (day.clone(), Decimal::ZERO))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(rows) = result.get("market_results").and_then(Value::as_array) {
         for row in rows {
-            let split = json!({
-                "train": market_split_stats(row, &train_days),
-                "validation": market_split_stats(row, &validation_days),
-                "test": market_split_stats(row, &test_days)
-            });
-            if let Some(object) = row.as_object_mut() {
-                object.insert("split_performance".to_owned(), split);
+            if row["complete_for_simulation"].as_bool() != Some(true) {
+                continue;
             }
+            let Some(day) = market_day(row) else {
+                continue;
+            };
+            let Some(total) = totals.get_mut(&day) else {
+                continue;
+            };
+            *total += row["net_pnl"]
+                .as_str()
+                .map(decimal_from_str)
+                .unwrap_or_default();
         }
     }
+    totals
+        .into_iter()
+        .map(|(date, pnl)| json!({"date": date, "net_pnl": pnl.to_string()}))
+        .collect()
+}
+
+fn sweep_block_bootstrap_daily_lower_95(values: &[Decimal]) -> Option<Decimal> {
+    if values.len() < SWEEP_BLOCK_DAYS * SWEEP_MIN_BLOCKS {
+        return None;
+    }
+    let encoded =
+        serde_json::to_vec(&values.iter().map(Decimal::to_string).collect::<Vec<_>>()).ok()?;
+    let digest = Sha256::digest(encoded);
+    let mut seed = u64::from_le_bytes(digest[..8].try_into().ok()?);
+    if seed == 0 {
+        seed = 0x9e37_79b9_7f4a_7c15;
+    }
+    let mut estimates = Vec::with_capacity(SWEEP_BOOTSTRAP_RESAMPLES);
+    for _ in 0..SWEEP_BOOTSTRAP_RESAMPLES {
+        let mut total = Decimal::ZERO;
+        let mut sampled = 0_usize;
+        while sampled < values.len() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let start = (seed as usize) % values.len();
+            for offset in 0..SWEEP_BLOCK_DAYS.min(values.len() - sampled) {
+                total += values[(start + offset) % values.len()];
+                sampled += 1;
+            }
+        }
+        estimates.push(total / Decimal::from(values.len() as u64));
+    }
+    estimates.sort_unstable();
+    estimates
+        .get((SWEEP_BOOTSTRAP_RESAMPLES * 25) / 1_000)
+        .copied()
+}
+
+fn sealed_test_evidence(rows: &[Value], test_days: &[String]) -> Value {
+    json!({
+        "status": "opened_after_winner_fixed",
+        "days": test_days,
+        "fill_model_results": rows.iter().map(|row| {
+            let mut stats = market_split_stats(row, test_days);
+            if let Some(object) = stats.as_object_mut() {
+                object.insert("fill_model".to_owned(), row["fill_model"].clone());
+            }
+            stats
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn sealed_test_non_collapsing(test: &Value) -> bool {
+    test["fill_model_results"].as_array().is_some_and(|rows| {
+        rows.len() == 2
+            && rows.iter().all(|row| {
+                row["markets"].as_u64().unwrap_or_default() > 0
+                    && row["net_pnl"]
+                        .as_str()
+                        .is_some_and(|value| decimal_from_str(value) >= Decimal::ZERO)
+            })
+    })
+}
+
+fn build_fold_results(
+    grouped: &BTreeMap<String, Vec<Value>>,
+    candidates: &[SweepCandidate],
+    folds: &[Value],
+    aggregate_winner: Option<&str>,
+) -> Vec<Value> {
+    folds
+        .iter()
+        .enumerate()
+        .filter_map(|(fold_index, fold)| {
+            let validation_days = fold["validation_day"]
+                .as_str()
+                .map(|day| vec![day.to_owned()])?;
+            let test_days = fold["test_day"]
+                .as_str()
+                .map(|day| vec![day.to_owned()])?;
+            let mut rankings = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    let rows = grouped.get(&candidate.name)?;
+                    let models = rows
+                        .iter()
+                        .map(|row| {
+                            let mut stats = market_split_stats(row, &validation_days);
+                            if let Some(object) = stats.as_object_mut() {
+                                object.insert("fill_model".to_owned(), row["fill_model"].clone());
+                            }
+                            stats
+                        })
+                        .collect::<Vec<_>>();
+                    let pnls = models
+                        .iter()
+                        .filter_map(|row| row["net_pnl"].as_str().map(decimal_from_str))
+                        .collect::<Vec<_>>();
+                    Some((
+                        candidate.name.clone(),
+                        pnls.iter().copied().min().unwrap_or_default(),
+                        pnls.iter().copied().sum::<Decimal>(),
+                        models,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            rankings.sort_by(|left, right| {
+                right
+                    .1
+                    .cmp(&left.1)
+                    .then(right.2.cmp(&left.2))
+                    .then(left.0.cmp(&right.0))
+            });
+            let winner = rankings.first()?.0.clone();
+            let is_final_fold = fold_index + 1 == folds.len();
+            let sealed_test = if !is_final_fold || aggregate_winner == Some(winner.as_str()) {
+                grouped
+                    .get(&winner)
+                    .map(|rows| sealed_test_evidence(rows, &test_days))
+            } else {
+                Some(json!({
+                    "status": "sealed_fold_winner_differs_from_fixed_aggregate_winner",
+                    "days": test_days,
+                    "fill_model_results": null
+                }))
+            };
+            Some(json!({
+                "fold_index": fold_index,
+                "train_days": fold["train_days"],
+                "validation_day": fold["validation_day"],
+                "test_day": fold["test_day"],
+                "selection_rule": SWEEP_FOLD_SELECTION_RULE,
+                "validation_rankings": rankings.into_iter().enumerate().map(|(index, (candidate, minimum, total, models))| json!({
+                    "rank": index + 1,
+                    "candidate": candidate,
+                    "minimum_fill_model_net_pnl": minimum.to_string(),
+                    "total_fill_model_net_pnl": total.to_string(),
+                    "fill_model_results": models
+                })).collect::<Vec<_>>(),
+                "selected_candidate": winner,
+                "sealed_test": sealed_test
+            }))
+        })
+        .collect()
 }
 
 fn sweep_market_days(results: &[Value]) -> Vec<String> {
@@ -8801,8 +9242,10 @@ fn sweep_market_days(results: &[Value]) -> Vec<String> {
     for result in results {
         if let Some(markets) = result.get("market_results").and_then(Value::as_array) {
             for market in markets {
-                if let Some(day) = market_day(market) {
-                    days.insert(day);
+                if market["complete_for_simulation"].as_bool() == Some(true) {
+                    if let Some(day) = market_day(market) {
+                        days.insert(day);
+                    }
                 }
             }
         }
@@ -8836,7 +9279,9 @@ fn market_split_stats(result: &Value, days: &[String]) -> Value {
     let mut losing = 0usize;
     if let Some(rows) = result.get("market_results").and_then(Value::as_array) {
         for row in rows {
-            if market_day(row).is_some_and(|day| days.contains(&day)) {
+            if row["complete_for_simulation"].as_bool() == Some(true)
+                && market_day(row).is_some_and(|day| days.contains(&day))
+            {
                 markets += 1;
                 let pnl = row
                     .get("net_pnl")
@@ -8869,15 +9314,343 @@ fn market_day(row: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn sweep_candidates(max: usize) -> Vec<SweepCandidate> {
-    let edges = [d("0.005"), d("0.010"), d("0.015"), d("0.020"), d("0.030")];
-    let ttls = [1, 2, 5, 10, 20, 30];
-    let final_windows = [30, 60, 90, 120, 180];
-    let styles = [
-        QuoteStyle::ImproveOneTick,
-        QuoteStyle::JoinBestBid,
-        QuoteStyle::FairMinusMarginOnly,
+fn load_sweep_search_space(path: Option<&Path>) -> Result<SweepSearchSpace, ResearchError> {
+    let Some(path) = path else {
+        return Ok(SweepSearchSpace {
+            maker_min_edges: vec![d("0.005"), d("0.010"), d("0.015"), d("0.020"), d("0.030")],
+            ttl_seconds: vec![1, 2, 5, 10, 20, 30],
+            final_no_trade_seconds: vec![30, 60, 90, 120, 180],
+            quote_styles: vec![
+                QuoteStyle::ImproveOneTick,
+                QuoteStyle::JoinBestBid,
+                QuoteStyle::FairMinusMarginOnly,
+            ],
+        });
+    };
+    let text = fs::read_to_string(path)?;
+    let values = if text.trim_start().starts_with('{') {
+        parse_sweep_search_json(&text)?
+    } else {
+        parse_sweep_search_yaml(&text)?
+    };
+    let versions = values
+        .get("version")
+        .ok_or_else(|| ResearchError::InvalidInput("sweep search version is missing".to_owned()))?;
+    if versions.len() != 1 {
+        return Err(ResearchError::InvalidInput(
+            "sweep search version must contain exactly one scalar".to_owned(),
+        ));
+    }
+    let version = &versions[0];
+    if version != "1" {
+        return Err(ResearchError::InvalidInput(format!(
+            "unsupported sweep search version {version}; expected 1"
+        )));
+    }
+    let supported = [
+        "version",
+        "maker_min_edge",
+        "ttl",
+        "ttl_seconds",
+        "final_no_trade",
+        "final_no_trade_seconds",
+        "quote_style",
     ];
+    if let Some(key) = values.keys().find(|key| !supported.contains(&key.as_str())) {
+        return Err(ResearchError::InvalidInput(format!(
+            "unsupported sweep search parameter {key}; supported parameters are maker_min_edge, ttl_seconds, final_no_trade_seconds, and quote_style"
+        )));
+    }
+    if values.contains_key("ttl") && values.contains_key("ttl_seconds") {
+        return Err(ResearchError::InvalidInput(
+            "sweep search cannot define both ttl and ttl_seconds".to_owned(),
+        ));
+    }
+    if values.contains_key("final_no_trade") && values.contains_key("final_no_trade_seconds") {
+        return Err(ResearchError::InvalidInput(
+            "sweep search cannot define both final_no_trade and final_no_trade_seconds".to_owned(),
+        ));
+    }
+    let maker_min_edges = parse_unique_search_decimals(
+        values.get("maker_min_edge"),
+        "maker_min_edge",
+        d("0.010"),
+        |value| value > Decimal::ZERO && value <= Decimal::ONE,
+    )?;
+    let ttl_seconds = parse_unique_search_integers(
+        values.get("ttl_seconds").or_else(|| values.get("ttl")),
+        "ttl_seconds",
+        10,
+        1..=3_600,
+    )?;
+    let final_no_trade_seconds = parse_unique_search_integers(
+        values
+            .get("final_no_trade_seconds")
+            .or_else(|| values.get("final_no_trade")),
+        "final_no_trade_seconds",
+        30,
+        0..=900,
+    )?;
+    let quote_styles = parse_unique_search_quote_styles(values.get("quote_style"))?;
+    Ok(SweepSearchSpace {
+        maker_min_edges,
+        ttl_seconds,
+        final_no_trade_seconds,
+        quote_styles,
+    })
+}
+
+struct UniqueSearchJsonObject(BTreeMap<String, Value>);
+
+impl<'de> Deserialize<'de> for UniqueSearchJsonObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueSearchJsonVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for UniqueSearchJsonVisitor {
+            type Value = UniqueSearchJsonObject;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a sweep search JSON object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if values.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate sweep search JSON parameter {key}"
+                        )));
+                    }
+                }
+                Ok(UniqueSearchJsonObject(values))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueSearchJsonVisitor)
+    }
+}
+
+fn parse_sweep_search_json(text: &str) -> Result<BTreeMap<String, Vec<String>>, ResearchError> {
+    let UniqueSearchJsonObject(object) = serde_json::from_str(text).map_err(|error| {
+        ResearchError::InvalidInput(format!("invalid sweep search JSON: {error}"))
+    })?;
+    object
+        .into_iter()
+        .map(|(key, value)| {
+            let rows = value.as_array().map_or_else(
+                || vec![search_scalar(&value)],
+                |values| values.iter().map(search_scalar).collect(),
+            );
+            if rows.iter().any(String::is_empty) {
+                return Err(ResearchError::InvalidInput(format!(
+                    "sweep search parameter {key} contains a non-scalar value"
+                )));
+            }
+            Ok((key, rows))
+        })
+        .collect()
+}
+
+fn search_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.as_number().map(ToString::to_string))
+        .unwrap_or_default()
+}
+
+fn parse_sweep_search_yaml(text: &str) -> Result<BTreeMap<String, Vec<String>>, ResearchError> {
+    let mut values = BTreeMap::<String, Vec<String>>::new();
+    let mut open_list = None::<String>;
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() || line == "---" {
+            continue;
+        }
+        if let Some(item) = line.strip_prefix('-') {
+            let key = open_list.as_ref().ok_or_else(|| {
+                ResearchError::InvalidInput(format!(
+                    "sweep search line {} has a list item without a parameter",
+                    index + 1
+                ))
+            })?;
+            values
+                .entry(key.clone())
+                .or_default()
+                .push(unquote_search_value(item.trim()));
+            continue;
+        }
+        let (key, raw_value) = line.split_once(':').ok_or_else(|| {
+            ResearchError::InvalidInput(format!(
+                "sweep search line {} must be KEY: VALUE",
+                index + 1
+            ))
+        })?;
+        let key = key.trim().to_owned();
+        if key.is_empty() || values.contains_key(&key) {
+            return Err(ResearchError::InvalidInput(format!(
+                "sweep search parameter {key} is empty or duplicated"
+            )));
+        }
+        let raw_value = raw_value.trim();
+        if raw_value.is_empty() {
+            values.insert(key.clone(), Vec::new());
+            open_list = Some(key);
+            continue;
+        }
+        open_list = None;
+        let raw_value = raw_value
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(raw_value);
+        let parsed = raw_value
+            .split(',')
+            .map(|value| unquote_search_value(value.trim()))
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        values.insert(key, parsed);
+    }
+    Ok(values)
+}
+
+fn unquote_search_value(value: &str) -> String {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+        .trim()
+        .to_owned()
+}
+
+fn parse_unique_search_decimals<F>(
+    values: Option<&Vec<String>>,
+    field: &str,
+    default: Decimal,
+    valid: F,
+) -> Result<Vec<Decimal>, ResearchError>
+where
+    F: Fn(Decimal) -> bool,
+{
+    let values = values.cloned().unwrap_or_else(|| vec![default.to_string()]);
+    if values.is_empty() {
+        return Err(ResearchError::InvalidInput(format!(
+            "sweep search parameter {field} cannot be empty"
+        )));
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    let mut unique = BTreeSet::new();
+    for value in values {
+        let number = Decimal::from_str(&value).map_err(|_| {
+            ResearchError::InvalidInput(format!(
+                "sweep search parameter {field} has invalid decimal {value}"
+            ))
+        })?;
+        if !valid(number) || !unique.insert(number) {
+            return Err(ResearchError::InvalidInput(format!(
+                "sweep search parameter {field} has out-of-range or duplicate value {value}"
+            )));
+        }
+        parsed.push(number);
+    }
+    Ok(parsed)
+}
+
+fn parse_unique_search_integers(
+    values: Option<&Vec<String>>,
+    field: &str,
+    default: i64,
+    range: std::ops::RangeInclusive<i64>,
+) -> Result<Vec<i64>, ResearchError> {
+    let values = values.cloned().unwrap_or_else(|| vec![default.to_string()]);
+    if values.is_empty() {
+        return Err(ResearchError::InvalidInput(format!(
+            "sweep search parameter {field} cannot be empty"
+        )));
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    let mut unique = BTreeSet::new();
+    for value in values {
+        let number = value.parse::<i64>().map_err(|_| {
+            ResearchError::InvalidInput(format!(
+                "sweep search parameter {field} has invalid integer {value}"
+            ))
+        })?;
+        if !range.contains(&number) || !unique.insert(number) {
+            return Err(ResearchError::InvalidInput(format!(
+                "sweep search parameter {field} has out-of-range or duplicate value {value}"
+            )));
+        }
+        parsed.push(number);
+    }
+    Ok(parsed)
+}
+
+fn parse_unique_search_quote_styles(
+    values: Option<&Vec<String>>,
+) -> Result<Vec<QuoteStyle>, ResearchError> {
+    let values = values
+        .cloned()
+        .unwrap_or_else(|| vec!["improve_one_tick".to_owned()]);
+    if values.is_empty() {
+        return Err(ResearchError::InvalidInput(
+            "sweep search parameter quote_style cannot be empty".to_owned(),
+        ));
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    let mut unique = BTreeSet::new();
+    for value in values {
+        let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
+        let style = match normalized.as_str() {
+            "improveonetick" => QuoteStyle::ImproveOneTick,
+            "joinbestbid" => QuoteStyle::JoinBestBid,
+            "fairminusmarginonly" => QuoteStyle::FairMinusMarginOnly,
+            _ => {
+                return Err(ResearchError::InvalidInput(format!(
+                    "sweep search parameter quote_style has unsupported value {value}"
+                )))
+            }
+        };
+        if !unique.insert(sweep_quote_style_name(style)) {
+            return Err(ResearchError::InvalidInput(format!(
+                "sweep search parameter quote_style has duplicate value {value}"
+            )));
+        }
+        parsed.push(style);
+    }
+    Ok(parsed)
+}
+
+fn sweep_candidates(
+    max: usize,
+    search_path: Option<&Path>,
+) -> Result<SweepCandidateBuild, ResearchError> {
+    let space = load_sweep_search_space(search_path)?;
+    let requested_combinations = [
+        space.maker_min_edges.len(),
+        space.ttl_seconds.len(),
+        space.final_no_trade_seconds.len(),
+        space.quote_styles.len(),
+    ]
+    .into_iter()
+    .try_fold(1_usize, |total, count| total.checked_mul(count))
+    .filter(|total| *total <= SWEEP_MAX_SEARCH_COMBINATIONS)
+    .ok_or_else(|| {
+        ResearchError::InvalidInput(format!(
+            "sweep search exceeds the {SWEEP_MAX_SEARCH_COMBINATIONS}-combination safety limit"
+        ))
+    })?;
+    let limit = max.max(1);
     let mut candidates = Vec::new();
     candidates.push(SweepCandidate {
         name: "baseline".to_owned(),
@@ -8886,29 +9659,38 @@ fn sweep_candidates(max: usize) -> Vec<SweepCandidate> {
         final_no_trade_seconds: 30,
         quote_style: QuoteStyle::ImproveOneTick,
     });
-    'outer: for edge in edges {
-        for ttl in ttls {
-            for final_window in final_windows {
-                for style in styles {
+    'outer: for edge in space.maker_min_edges {
+        for ttl in &space.ttl_seconds {
+            for final_window in &space.final_no_trade_seconds {
+                for style in &space.quote_styles {
+                    if candidates.len() >= limit {
+                        break 'outer;
+                    }
                     candidates.push(SweepCandidate {
                         name: format!(
-                            "edge_{}_ttl_{}_final_{}_style_{:?}",
-                            edge, ttl, final_window, style
+                            "edge_{}_ttl_{}_final_{}_style_{}",
+                            edge,
+                            ttl,
+                            final_window,
+                            sweep_quote_style_name(*style)
                         )
                         .to_ascii_lowercase(),
                         maker_min_edge: edge,
-                        ttl_seconds: ttl,
-                        final_no_trade_seconds: final_window,
-                        quote_style: style,
+                        ttl_seconds: *ttl,
+                        final_no_trade_seconds: *final_window,
+                        quote_style: *style,
                     });
-                    if candidates.len() >= max {
-                        break 'outer;
-                    }
                 }
             }
         }
     }
-    candidates
+    let truncated = candidates.len() < requested_combinations.saturating_add(1);
+    Ok(SweepCandidateBuild {
+        candidates,
+        requested_combinations,
+        truncated,
+        configured: search_path.is_some(),
+    })
 }
 
 fn sample_size_stats(values: &[Decimal]) -> Value {
@@ -9748,12 +10530,19 @@ fn sweep_markdown(report: &Value) -> String {
     let count = report["result"]["candidates"]
         .as_array()
         .map_or(0, Vec::len);
+    let selection = &report["result"]["selection"];
     format!(
-        "# Parameter Sweep\n\n- Candidates evaluated: {}\n- Split method: {}\n- Warning: {}\n",
+        "# Parameter Sweep\n\n- Candidates evaluated: {}\n- Split method: {}\n- Selected candidate: {}\n- Robust candidate: {}\n- Selection rule: {}\n- Robust-candidate rule: {}\n- Warning: {}\n",
         count,
         report["result"]["split_method"]
             .as_str()
             .unwrap_or("walk_forward"),
+        selection["candidate"].as_str().unwrap_or("none"),
+        selection["robust_candidate"].as_bool().unwrap_or(false),
+        SWEEP_SELECTION_RULE,
+        report["result"]["robust_candidate_rule"]
+            .as_str()
+            .unwrap_or("robust-candidate rule unavailable"),
         markdown_list(&report["warnings"])
     )
 }
@@ -10029,6 +10818,37 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_block_bound_is_fail_closed_deterministic_and_positive_only_with_enough_days() {
+        assert_eq!(
+            sweep_block_bootstrap_daily_lower_95(&[Decimal::ONE; 27]),
+            None
+        );
+        let values = [Decimal::ONE; 28];
+        let first = sweep_block_bootstrap_daily_lower_95(&values).unwrap();
+        let second = sweep_block_bootstrap_daily_lower_95(&values).unwrap();
+        assert_eq!(first, second);
+        assert!(first > Decimal::ZERO);
+        assert_eq!(
+            sweep_block_bootstrap_daily_lower_95(&[Decimal::ZERO; 28]),
+            Some(Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn sweep_sealed_test_accepts_zero_but_rejects_negative_pnl() {
+        let test = |second_pnl: &str| {
+            json!({
+                "fill_model_results": [
+                    {"markets": 1, "net_pnl": "0"},
+                    {"markets": 1, "net_pnl": second_pnl}
+                ]
+            })
+        };
+        assert!(sealed_test_non_collapsing(&test("0")));
+        assert!(!sealed_test_non_collapsing(&test("-0.01")));
+    }
 
     fn wallet_ts(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)

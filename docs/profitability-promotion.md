@@ -51,6 +51,18 @@ own UTC timestamp: events before `2026-07-22T00:00:00Z` remain in the legacy
 prefix and events at or after the boundary go to the new campaign prefix. This
 prevents a cutover restart gap from dirtying the first day.
 
+A pre-cutover freshness probe on July 21 found a deterministic recorder stall
+at the 15-minute market rollover. Telemetry acquired the runtime data read lock
+before the engine lock while settlement held the engine and awaited a durable
+event path that needed the data write lock. Commit `4b459dc` made the lock order
+consistent and releases the engine before durable settlement/application
+acknowledgements; revision `polyedge-shadow-neu--0000019` then crossed the
+`23:15 UTC` rollover and the former `23:18 UTC` failure point with zero recorder
+errors or restarts. Three post-rollover managed-identity freshness checks
+advanced through minute blobs `16`, `18`, and `21` with `0–1` second age and no
+warnings. This repairs the forward recorder; the stalled predecessor interval
+remains part of the ineligible July 21 boundary and is not backfilled.
+
 ## Capital Boundary
 
 Funded execution remains manual and disabled by default. Before any future order:

@@ -1241,6 +1241,258 @@ fn sweep_reports_walk_forward_and_leave_one_day_splits() {
             .unwrap()
             > 0
     );
+    assert_eq!(
+        report["result"]["selection"]["status"],
+        "winner_fixed_before_test_open"
+    );
+    assert_eq!(report["result"]["candidates"][0]["selected"], true);
+    assert!(report["result"]["fold_results"].as_array().unwrap().len() >= 3);
+}
+
+#[test]
+fn sweep_parses_and_applies_supported_search_space() {
+    let dir = test_dir("sweep_search_applied");
+    let events = dir.join("events.jsonl");
+    let search = dir.join("search_space.yaml");
+    write_events(&events, &filled_five_day_fixture("101"));
+    fs::write(
+        &search,
+        r#"version: 1
+maker_min_edge: [0.030]
+ttl_seconds: [2]
+final_no_trade_seconds: [90]
+quote_style: [fair_minus_margin_only]
+"#,
+    )
+    .unwrap();
+
+    let report = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: Some(search.clone()),
+        split: "walk_forward".to_owned(),
+        max_experiments: 2,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let candidates = report["result"]["candidates"].as_array().unwrap();
+    let configured = candidates
+        .iter()
+        .find(|row| row["candidate"] != "baseline")
+        .unwrap();
+    let baseline = candidates
+        .iter()
+        .find(|row| row["candidate"] == "baseline")
+        .unwrap();
+
+    assert_eq!(
+        report["result"]["search"],
+        search.to_string_lossy().as_ref()
+    );
+    assert_eq!(report["result"]["search_space"]["configured"], true);
+    assert_eq!(configured["parameters"]["maker_min_edge"], "0.030");
+    assert_eq!(configured["parameters"]["ttl_seconds"], 2);
+    assert_eq!(configured["parameters"]["final_no_trade_seconds"], 90);
+    assert_eq!(
+        configured["parameters"]["quote_style"],
+        "fair_minus_margin_only"
+    );
+    let touch_validation_pnl = |candidate: &Value| {
+        candidate["fill_model_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["fill_model"] == "touch_after_250ms")
+            .unwrap()["validation"]["net_pnl"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+    };
+    assert!(touch_validation_pnl(baseline) > 0.0);
+    assert_eq!(touch_validation_pnl(configured), 0.0);
+}
+
+#[test]
+fn sweep_rejects_search_parameters_that_are_not_applied() {
+    let dir = test_dir("sweep_search_rejects_unused");
+    let events = dir.join("events.jsonl");
+    let search = dir.join("search_space.yaml");
+    write_events(&events, &five_day_fixture());
+    fs::write(&search, "version: 1\nmaker_margin: [0.01, 0.02]\n").unwrap();
+
+    let error = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: Some(search),
+        split: "walk_forward".to_owned(),
+        max_experiments: 2,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("unsupported sweep search parameter maker_margin"));
+}
+
+#[test]
+fn sweep_search_rejects_zero_configured_runs_duplicate_json_and_multiple_versions() {
+    let dir = test_dir("sweep_search_fail_closed");
+    let events = dir.join("events.jsonl");
+    write_events(&events, &five_day_fixture());
+
+    for (name, text, max_experiments, expected) in [
+        (
+            "zero-configured.yaml",
+            "version: 1\nmaker_min_edge: [0.01]\n",
+            1,
+            "requires max_experiments >= 2",
+        ),
+        (
+            "duplicate.json",
+            r#"{"version":1,"maker_min_edge":[0.01],"maker_min_edge":[0.02]}"#,
+            2,
+            "duplicate sweep search JSON parameter maker_min_edge",
+        ),
+        (
+            "versions.yaml",
+            "version: [1, 2]\nmaker_min_edge: [0.01]\n",
+            2,
+            "version must contain exactly one scalar",
+        ),
+    ] {
+        let search = dir.join(name);
+        fs::write(&search, text).unwrap();
+        let error = run_sweep(SweepOptions {
+            input: events.clone(),
+            markets: None,
+            search: Some(search),
+            split: "walk_forward".to_owned(),
+            max_experiments,
+            out: dir.join(format!("{name}.out.json")),
+            markdown: dir.join(format!("{name}.out.md")),
+            exclude_windows: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn sweep_selection_is_invariant_to_the_sealed_final_test_day() {
+    let first = run_leakage_sweep("sweep_leakage_up", "101");
+    let second = run_leakage_sweep("sweep_leakage_down", "99");
+
+    assert_eq!(
+        first["result"]["selection"]["candidate"],
+        second["result"]["selection"]["candidate"]
+    );
+    assert_eq!(
+        first["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (
+                &row["candidate"],
+                &row["validation_rank"],
+                &row["validation_total_fill_model_net_pnl"]
+            ))
+            .collect::<Vec<_>>(),
+        second["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (
+                &row["candidate"],
+                &row["validation_rank"],
+                &row["validation_total_fill_model_net_pnl"]
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        first["result"]["selection"]["sealed_test"],
+        second["result"]["selection"]["sealed_test"]
+    );
+    assert!(first["result"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["selected"] == false)
+        .all(|row| row["sealed_test"].is_null()));
+    for report in [&first, &second] {
+        let aggregate_winner = &report["result"]["selection"]["candidate"];
+        let final_day = &report["result"]["split_plan"]["latest_walk_forward"]["test_day"];
+        let final_fold = report["result"]["fold_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fold| &fold["test_day"] == final_day)
+            .unwrap();
+        let fold_test_status = final_fold["sealed_test"]["status"].as_str().unwrap();
+        if fold_test_status == "opened_after_winner_fixed" {
+            assert_eq!(&final_fold["selected_candidate"], aggregate_winner);
+        } else {
+            assert_eq!(
+                fold_test_status,
+                "sealed_fold_winner_differs_from_fixed_aggregate_winner"
+            );
+            assert!(final_fold["sealed_test"]["fill_model_results"].is_null());
+        }
+    }
+}
+
+#[test]
+fn sweep_report_rule_text_matches_fail_closed_computation() {
+    let dir = test_dir("sweep_rule_contract");
+    let events = dir.join("events.jsonl");
+    let markdown = dir.join("sweep.md");
+    write_events(&events, &filled_five_day_fixture("101"));
+
+    let report = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: None,
+        split: "walk_forward".to_owned(),
+        max_experiments: 1,
+        out: dir.join("sweep.json"),
+        markdown: markdown.clone(),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let robust_rule = report["result"]["robust_candidate_rule"].as_str().unwrap();
+    let rendered = fs::read_to_string(markdown).unwrap();
+
+    assert!(robust_rule.contains("7-day circular block-bootstrap lower 95% bound"));
+    assert!(robust_rule.contains("10000 resamples, at least 28 daily clusters"));
+    assert!(robust_rule.contains("non-negative net PnL under both models"));
+    assert!(rendered.contains(robust_rule));
+    assert!(report["result"]["test_sealing_rule"]
+        .as_str()
+        .unwrap()
+        .contains("final aggregate test remains sealed"));
+    assert!(report["result"]["fold_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|fold| fold["selection_rule"]
+            .as_str()
+            .unwrap()
+            .contains("single validation day")));
+    assert_eq!(report["result"]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(report["result"]["selection"]["robust_candidate"], false);
+    assert!(report["result"]["candidates"][0]["fill_model_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| {
+            row["validation"]["block_confidence_lower_95"].is_null()
+                && row["net_pnl"] == row["validation"]["net_pnl"]
+        }));
 }
 
 fn replay(dir: &Path, events: &Path, fill_model: FillModel) -> Value {
@@ -1274,21 +1526,25 @@ fn market_line(market_id: &str, up: &str, down: &str) -> String {
 }
 
 fn market_start_line(market_id: &str) -> String {
+    market_start_line_at(market_id, "2026-06-01")
+}
+
+fn market_start_line_at(market_id: &str, date: &str) -> String {
     serde_json::json!({
         "event_type": "market_start_price",
         "payload": {
             "schema_version": 1,
             "schema": "polyedge.market_start_price.v1",
             "market_id": market_id,
-            "market_start_ts": "2026-06-01T00:00:00Z",
-            "market_end_ts": "2026-06-01T00:15:00Z",
+            "market_start_ts": format!("{date}T00:00:00Z"),
+            "market_end_ts": format!("{date}T00:15:00Z"),
             "start_price": "100",
             "reference_source": "polymarket_rtds_chainlink_btc_usd",
-            "reference_source_ts": "2026-06-01T00:00:01Z",
+            "reference_source_ts": format!("{date}T00:00:01Z"),
             "reference_exact_resolution_source": true,
             "reference_stale": false
         },
-        "recorded_ts": "2026-06-01T00:00:01+00:00"
+        "recorded_ts": format!("{date}T00:00:01+00:00")
     })
     .to_string()
 }
@@ -1452,6 +1708,46 @@ fn filled_touch_fixture(book_ts: &str) -> String {
     )
 }
 
+fn run_leakage_sweep(name: &str, final_day_price: &str) -> Value {
+    let dir = test_dir(name);
+    let events = dir.join("events.jsonl");
+    write_events(&events, &filled_five_day_fixture(final_day_price));
+    run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: None,
+        split: "walk_forward".to_owned(),
+        max_experiments: 4,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn filled_five_day_fixture(final_day_price: &str) -> String {
+    (1..=5)
+        .map(|day| {
+            let date = format!("2026-06-{day:02}");
+            let market = format!("filled-m{day}");
+            let up = format!("filled-up{day}");
+            let down = format!("filled-down{day}");
+            let final_price = if day == 5 { final_day_price } else { "101" };
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                market_line_at(&market, &up, &down, &date),
+                market_start_line_at(&market, &date),
+                fair_value_line(&market, "0.60", &format!("{date}T00:00:30+00:00")),
+                decision_line(&market, &up, "up", &format!("{date}T00:01:00+00:00")),
+                book_line(&up, "0.50", &format!("{date}T00:01:01+00:00")),
+                book_line(&down, "0.50", &format!("{date}T00:01:01+00:00")),
+                reference_line(final_price, &format!("{date}T00:15:01+00:00"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn five_day_fixture() -> String {
     (1..=5)
         .map(|day| {
@@ -1460,8 +1756,9 @@ fn five_day_fixture() -> String {
             let up = format!("up{day}");
             let down = format!("down{day}");
             format!(
-                "{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 market_line_at(&market, &up, &down, &date),
+                market_start_line_at(&market, &date),
                 fair_value_line(&market, "0.60", &format!("{date}T00:00:30+00:00")),
                 book_line(&up, "0.50", &format!("{date}T00:00:45+00:00")),
                 book_line(&down, "0.50", &format!("{date}T00:00:45+00:00")),
