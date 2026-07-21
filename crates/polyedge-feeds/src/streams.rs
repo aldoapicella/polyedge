@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -48,10 +49,23 @@ pub async fn run_rtds_feed(
     let mut ping = tokio::time::interval(Duration::from_secs_f64(
         settings.target.rtds_ping_interval_seconds.max(1.0),
     ));
+    let chainlink_timeout =
+        Duration::from_secs_f64(settings.target.rtds_chainlink_watchdog_seconds.max(5.0));
+    let mut chainlink_watchdog = tokio::time::interval(Duration::from_secs(1));
+    chainlink_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_chainlink = Instant::now();
     loop {
         tokio::select! {
             _ = ping.tick() => {
                 write.send(Message::Text("PING".to_owned())).await?;
+            }
+            _ = chainlink_watchdog.tick(), if settings.target.enable_polymarket_rtds_chainlink => {
+                if source_watchdog_expired(last_chainlink, chainlink_timeout) {
+                    return Err(FeedError::SourceStalled(format!(
+                        "polymarket RTDS Chainlink produced no matching update for {:.0}s while the socket remained connected",
+                        chainlink_timeout.as_secs_f64()
+                    )));
+                }
             }
             message = read.next() => {
                 let Some(message) = message else {
@@ -60,6 +74,7 @@ pub async fn run_rtds_feed(
                 let message = message?;
                 if let Some(reference) = parse_rtds_message(message, &settings) {
                     let source = if reference.exact_resolution_source {
+                        last_chainlink = Instant::now();
                         FeedName::PolymarketRtdsChainlink
                     } else {
                         FeedName::PolymarketRtdsBinance
@@ -70,6 +85,10 @@ pub async fn run_rtds_feed(
             }
         }
     }
+}
+
+fn source_watchdog_expired(last_observation: Instant, timeout: Duration) -> bool {
+    last_observation.elapsed() >= timeout
 }
 
 pub async fn run_market_feed(
@@ -599,4 +618,13 @@ mod tests {
         assert_eq!(raw.size.as_deref(), Some("2"));
         assert_eq!(books[&TokenId::new("token")].bids[0].size, Decimal::from(2));
     }
+}
+#[test]
+fn source_watchdog_is_independent_of_other_topic_activity() {
+    let timeout = Duration::from_secs(30);
+    assert!(!source_watchdog_expired(Instant::now(), timeout));
+    assert!(source_watchdog_expired(
+        Instant::now() - Duration::from_secs(31),
+        timeout
+    ));
 }

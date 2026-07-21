@@ -266,14 +266,54 @@ fn normalize_and_build_markets_preserve_incomplete_markets() {
 }
 
 #[test]
+fn explicit_build_markets_outputs_do_not_overwrite_each_other() {
+    let dir = test_dir("explicit_market_outputs");
+    let daily_input = dir.join("daily.jsonl");
+    let cumulative_input = dir.join("cumulative.jsonl");
+    write_events(
+        &daily_input,
+        &format!("{}\n", market_line("m1", "up-1", "down-1")),
+    );
+    write_events(
+        &cumulative_input,
+        &format!(
+            "{}\n{}\n",
+            market_line("m1", "up-1", "down-1"),
+            market_line("m2", "up-2", "down-2")
+        ),
+    );
+    let daily_out = dir.join("markets_summary.json");
+    let cumulative_out = dir.join("cumulative_markets_summary.json");
+
+    run_build_markets(BuildMarketsOptions {
+        input: daily_input,
+        out: daily_out.clone(),
+        markdown: dir.join("markets_summary.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    run_build_markets(BuildMarketsOptions {
+        input: cumulative_input,
+        out: cumulative_out,
+        markdown: dir.join("cumulative_markets_summary.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    let daily: Value = serde_json::from_slice(&fs::read(daily_out).unwrap()).unwrap();
+    assert_eq!(daily["result"]["summary"]["markets"], 1);
+}
+
+#[test]
 fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
     let dir = test_dir("queue_audit");
     let raw = dir.join("raw.jsonl");
     write_events(
         &raw,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
             raw_price_change_line("up", "0.50", "5", "2026-06-01T00:00:45+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
@@ -330,8 +370,9 @@ fn decision_grade_projection_bounds_books_and_preserves_pre_decision_state_and_t
     write_events(
         &raw,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.48", "5", "2026-06-01T00:00:30.100+00:00"),
             bid_book_line("up", "0.49", "5", "2026-06-01T00:00:30.500+00:00"),
             raw_price_change_line("up", "0.49", "5", "2026-06-01T00:00:30.600+00:00"),
@@ -352,8 +393,8 @@ fn decision_grade_projection_bounds_books_and_preserves_pre_decision_state_and_t
     })
     .unwrap();
 
-    assert_eq!(manifest["result"]["input_events"], 8);
-    assert_eq!(manifest["result"]["events"], 7);
+    assert_eq!(manifest["result"]["input_events"], 9);
+    assert_eq!(manifest["result"]["events"], 8);
     assert_eq!(manifest["result"]["files"]["book"]["rows"], 2);
     assert_eq!(manifest["result"]["files"]["raw_market_event"]["rows"], 1);
     assert_eq!(manifest["result"]["files"]["last_trade"]["rows"], 1);
@@ -532,7 +573,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
     )
     .unwrap();
     assert_eq!(progress["status"], "completed");
-    assert_eq!(progress["events"], 4);
+    assert_eq!(progress["events"], 5);
 
     let markets_path = dir.join("markets.json");
     let markets = run_build_markets(BuildMarketsOptions {
@@ -693,8 +734,9 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             fair_value_line("m1", "0.60", "2026-06-01T00:00:30+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             book_line("up", "0.50", "2026-06-01T00:01:01+00:00"),
@@ -863,8 +905,9 @@ fn queue_proxy_remains_skipped_without_validated_depletion_semantics() {
     write_events(
         &with_evidence,
         &format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             queue_evidence_book_line("up", "0.50", "2026-06-01T00:01:01+00:00"),
             book_line("up", "0.50", "2026-06-01T00:01:02+00:00"),
@@ -891,8 +934,9 @@ fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
@@ -916,8 +960,9 @@ fn queue_proxy_uses_runtime_full_depth_snapshot_instead_of_compact_top_only_book
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_no_level_line("up", "0.50", "2", "2026-06-01T00:00:30+00:00"),
             raw_price_change_line("up", "0.50", "2", "2026-06-01T00:00:45+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
@@ -943,8 +988,9 @@ fn queue_proxy_uses_raw_price_change_size_for_size_ahead() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_no_level_line("up", "0.49", "10", "2026-06-01T00:00:30+00:00"),
             raw_price_change_line("up", "0.50", "5", "2026-06-01T00:00:45+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
@@ -967,8 +1013,9 @@ fn queue_proxy_counts_better_bid_depth_as_size_ahead() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.55", "7", "2026-06-01T00:00:30+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             trade_line("up", "0.50", "12", "2026-06-01T00:01:03+00:00"),
@@ -1226,6 +1273,26 @@ fn market_line(market_id: &str, up: &str, down: &str) -> String {
     )
 }
 
+fn market_start_line(market_id: &str) -> String {
+    serde_json::json!({
+        "event_type": "market_start_price",
+        "payload": {
+            "schema_version": 1,
+            "schema": "polyedge.market_start_price.v1",
+            "market_id": market_id,
+            "market_start_ts": "2026-06-01T00:00:00Z",
+            "market_end_ts": "2026-06-01T00:15:00Z",
+            "start_price": "100",
+            "reference_source": "polymarket_rtds_chainlink_btc_usd",
+            "reference_source_ts": "2026-06-01T00:00:01Z",
+            "reference_exact_resolution_source": true,
+            "reference_stale": false
+        },
+        "recorded_ts": "2026-06-01T00:00:01+00:00"
+    })
+    .to_string()
+}
+
 fn decision_line(market_id: &str, token: &str, outcome: &str, ts: &str) -> String {
     format!(
         r#"{{"event_type":"decision","payload":{{"action":"place","market_id":"{market_id}","token_id":"{token}","outcome":"{outcome}","side":"buy","price":"0.50","size":"5","order_kind":"post_only_gtc","ttl_ms":10000,"expected_edge":"0.02","tick_size":"0.01"}},"recorded_ts":"{ts}"}}"#
@@ -1363,7 +1430,7 @@ fn valid_runtime_provenance_identity() -> Value {
 
 fn reference_line(price: &str, ts: &str) -> String {
     format!(
-        r#"{{"event_type":"reference","payload":{{"source":"polymarket_rtds_chainlink_btc_usd","price":"{price}","source_ts":"{ts}","stale":false}},"recorded_ts":"{ts}"}}"#
+        r#"{{"event_type":"reference","payload":{{"source":"polymarket_rtds_chainlink_btc_usd","price":"{price}","source_ts":"{ts}","stale":false,"exact_resolution_source":true}},"recorded_ts":"{ts}"}}"#
     )
 }
 
@@ -1376,8 +1443,9 @@ fn fair_value_line(market_id: &str, q_up: &str, ts: &str) -> String {
 
 fn filled_touch_fixture(book_ts: &str) -> String {
     format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         market_line("m1", "up", "down"),
+        market_start_line("m1"),
         decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
         book_line("up", "0.50", book_ts),
         reference_line("101", "2026-06-01T00:15:01+00:00")

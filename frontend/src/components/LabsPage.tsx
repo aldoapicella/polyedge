@@ -151,6 +151,7 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
   const fundedHoldout = fundedLadder?.holdout_evaluation;
   const queueTransition = fundedLadder?.queue_model_transition;
   const promotionQuality = promotionMetrics?.data_quality;
+  const coverageBreakdown = profitability?.data_quality?.coverage_breakdown ?? promotionQuality?.coverage_breakdown;
   const blockingWarnings = promotionQuality?.warnings?.filter((warning) => warning.severity === "blocking").length;
   const unclassifiedWarnings = promotionQuality?.warnings?.filter((warning) => warning.known === false).length;
   const durableRisk = evidence.preflight?.risk_at_end ?? latestAttempt?.risk_at_end ?? latest?.risk_at_end;
@@ -226,17 +227,28 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Clean Days" value={`${profitability?.shadow?.clean_days ?? promotionMetrics?.clean_days ?? 0} / ${profitability?.shadow?.required_clean_days ?? 30}`} />
             <Metric label="Campaign Window" value={`${promotionMetrics?.observed_calendar_days ?? 0} / 60 calendar days`} />
             <Metric label="Settled Markets" value={`${profitability?.shadow?.settled_markets ?? promotionMetrics?.settled_markets ?? 0} / ${profitability?.shadow?.required_settled_markets ?? 1000}`} />
-            <Metric label="Queue-conservative PnL" value={signedUsd(profitability?.shadow?.queue_conservative_net_pnl ?? promotionMetrics?.queue_conservative_net_pnl)} />
-            <Metric label="95% PnL Lower Bound" value={signedUsd(profitability?.shadow?.pnl_ci_lower_95 ?? promotionMetrics?.pnl_ci_95_low)} />
+            <Metric label="Wallet-constrained PnL" value={signedUsd(profitability?.shadow?.wallet_constrained_net_pnl ?? promotionMetrics?.wallet_constrained_net_pnl)} />
+            <Metric label="Queue-conservative PnL (all intents)" value={signedUsd(profitability?.shadow?.queue_conservative_net_pnl ?? promotionMetrics?.queue_conservative_net_pnl)} />
+            <Metric label="Daily Wallet PnL L95" value={signedUsd(profitability?.shadow?.pnl_ci_lower_95 ?? promotionMetrics?.pnl_ci_95_low)} />
             <Metric label="Positive Weekly Blocks" value={`${profitability?.shadow?.positive_weekly_blocks ?? promotionMetrics?.consecutive_positive_weekly_blocks ?? 0} / ${profitability?.shadow?.required_positive_weekly_blocks ?? 4}`} />
-            <Metric label="Decision Parity" value={percentage(profitability?.shadow?.decision_parity_rate ?? promotionMetrics?.decision_parity_rate)} />
+            <Metric label="Full Decision Replay Parity" value={percentage(profitability?.shadow?.decision_parity_rate ?? promotionMetrics?.decision_parity_rate)} />
           </div>
         </Panel>
         <Panel>
           <PanelHeader title="Promotion Data Quality" meta={profitability?.data_quality?.status ?? promotionQuality?.registry_version ?? "collecting"} />
-          <div className="grid gap-3 p-4 md:grid-cols-2">
-            <Metric label="Decision-grade Coverage" value={percentage(profitability?.data_quality?.decision_grade_coverage ?? promotionQuality?.decision_grade_coverage)} />
+          <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3">
+            <Metric label="Decision-grade Evaluations" value={percentage(profitability?.data_quality?.decision_grade_coverage ?? promotionQuality?.decision_grade_coverage)} />
             <Metric label="Minimum Coverage" value={percentage(profitability?.data_quality?.minimum_coverage ?? 0.95)} />
+            <Metric label="Start-price Coverage" value={percentage(coverageBreakdown?.start_price_capture_rate)} />
+            <Metric label="Settlement Coverage" value={percentage(coverageBreakdown?.settlement_rate)} />
+            <Metric label="Exact-source Hour Coverage" value={percentage(coverageBreakdown?.exact_reference_hour_coverage)} />
+            <Metric label="Decision Metadata" value={percentage(coverageBreakdown?.decision_metadata_coverage)} />
+            <Metric label="Execution Fields" value={percentage(coverageBreakdown?.execution_field_coverage)} />
+            <Metric label="Full Decision Replay" value={percentage(coverageBreakdown?.decision_parity_rate)} />
+            <Metric label="Queue Snapshots" value={percentage(coverageBreakdown?.queue_snapshot_coverage)} />
+            <Metric label="1s Markout Completion" value={percentage(coverageBreakdown?.markout_1s_completion)} />
+            <Metric label="5s Markout Completion" value={percentage(coverageBreakdown?.markout_5s_completion)} />
+            <Metric label="30s Markout Completion" value={percentage(coverageBreakdown?.markout_30s_completion)} />
             <Metric label="Fatal Warnings" value={profitability?.data_quality?.fatal_warnings ?? promotionQuality?.fatal_issues?.length ?? 0} />
             <Metric label="Blocking Warnings" value={profitability?.data_quality?.blocking_warnings ?? blockingWarnings ?? 0} />
             <Metric label="Unclassified Warnings" value={profitability?.data_quality?.unclassified_warnings ?? unclassifiedWarnings ?? 0} />
@@ -385,18 +397,25 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
 
       <Panel>
         <PanelHeader title="Post-fill Markouts" meta="1 / 5 / 30 seconds" />
+        <div className="border-b border-line px-4 py-2 text-xs leading-relaxed text-ink/60">
+          Shadow net executable markout subtracts the recorded entry fee only. It is an adverse-selection diagnostic, not round-trip liquidation PnL; a round-trip fee is shown only when explicitly recorded.
+        </div>
         {markouts.length ? (
           <div className="overflow-auto">
-            <table className="w-full min-w-[680px] text-left text-sm">
+            <table className="w-full min-w-[1050px] text-left text-sm">
               <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
-                <tr>{["Fill ID", "Fill Size", "Horizon", "Midpoint Markout / Share", "Executable Markout / Share", "Observation Delay"].map((header) => <th key={header} className="px-3 py-2">{header}</th>)}</tr>
+                <tr>{["Fill ID", "Fill Size", "Horizon", "Gross Midpoint / Share", "Gross Executable / Share", "Recorded / Entry Fee / Share", "Explicit Round-trip Fee / Share", "Recorded Net Executable / Share", "Observation Delay"].map((header) => <th key={header} className="px-3 py-2">{header}</th>)}</tr>
               </thead>
               <tbody>{markouts.map((markout) => {
-                const delay = Number(markout.observation_delay_ms);
+                const delay = optionalNumeric(markout.observation_delay_ms);
+                const recordedFee = optionalNumeric(markout.fee_per_share ?? markout.entry_fee_per_share);
+                const explicitRoundTripFee = optionalNumeric(markout.round_trip_fee_per_share);
+                const recordedNetExecutable = optionalNumeric(markout.net_executable_markout_per_share);
                 const invalid = markout.observation_delay_ms === null || markout.observation_delay_ms === undefined ||
                   !Number.isFinite(delay) || delay < 0 || delay > 2000 ||
                   markout.midpoint_markout_per_share === null || markout.midpoint_markout_per_share === undefined ||
-                  markout.executable_markout_per_share === null || markout.executable_markout_per_share === undefined;
+                  markout.executable_markout_per_share === null || markout.executable_markout_per_share === undefined ||
+                  !Number.isFinite(recordedFee) || !Number.isFinite(recordedNetExecutable);
                 return (
                 <tr key={`${markout.fill_id ?? "legacy"}-${markout.horizon_seconds}`} className={`border-b border-line last:border-b-0 ${invalid ? "bg-amber-50" : ""}`}>
                   <td className="px-3 py-2 font-mono text-xs">{markout.fill_id ? `${markout.fill_id.slice(0, 10)}…` : "legacy"}</td>
@@ -404,6 +423,9 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
                   <td className="px-3 py-2">{markout.horizon_seconds}s</td>
                   <td className="px-3 py-2">{numberText(markout.midpoint_markout_per_share)}</td>
                   <td className="px-3 py-2">{numberText(markout.executable_markout_per_share)}</td>
+                  <td className="px-3 py-2">{Number.isFinite(recordedFee) ? numberText(recordedFee) : "missing"}</td>
+                  <td className="px-3 py-2">{Number.isFinite(explicitRoundTripFee) ? numberText(explicitRoundTripFee) : "not recorded"}</td>
+                  <td className="px-3 py-2">{Number.isFinite(recordedNetExecutable) ? numberText(recordedNetExecutable) : "missing"}</td>
                   <td className="px-3 py-2">{milliseconds(markout.observation_delay_ms)}{invalid ? " — excluded from v3 model" : ""}</td>
                 </tr>
                 );
@@ -418,6 +440,12 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
 
 function milliseconds(value: number | null | undefined) {
   return value === null || value === undefined ? "not observed" : `${numberText(value)} ms`;
+}
+
+function optionalNumeric(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === "") return Number.NaN;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
 }
 
 function usd(value: number | null | undefined) {

@@ -7,9 +7,9 @@ use polyedge_reporting::research::{
     publish_daily_directory, run_evaluate_profitability, run_validate_prospective,
     stop_funded_manifest_from_stage_block, validate_protocol_v3_order_evidence,
     write_funded_ladder_state, write_promotion_manifest, AtomicDailyRun, CandidateIdentity,
-    DailyDependency, DataQualitySummary, ExecutionModelBinding, ExpireFundedManifestOptions,
-    FundedCheckpointEvidenceV1, FundedHoldoutEvaluationV1, FundedLadderMetrics,
-    FundedLadderStateV1, FundedStageBlockV1, FundedStageGrantV1, GateStatus,
+    DailyDependency, DataQualityCoverageBreakdown, DataQualitySummary, ExecutionModelBinding,
+    ExpireFundedManifestOptions, FundedCheckpointEvidenceV1, FundedHoldoutEvaluationV1,
+    FundedLadderMetrics, FundedLadderStateV1, FundedStageBlockV1, FundedStageGrantV1, GateStatus,
     ImmutableArtifactBindingV1, InitializeFundedManifestOptions, LatestRunPointer,
     ProfitabilityEvaluationOptions, ProfitabilityMetrics, PromotionEvaluation, PromotionManifestV1,
     PromotionPhase, ProspectiveValidationOptions, QueueModelTransitionV1,
@@ -137,6 +137,144 @@ fn warning_registry_is_versioned_and_unknown_warnings_block() {
     );
     assert_eq!(quality.registry_version, WARNING_REGISTRY_VERSION);
     assert!(!quality.promotion_allowed());
+
+    for (message, expected_code) in [
+        (
+            "runtime/replay full decision pipeline parity below 100%: 0/1 replayed",
+            "full_decision_pipeline_parity_below_100pct",
+        ),
+        (
+            "settlement journal conflicts: 1",
+            "settlement_journal_conflict",
+        ),
+        (
+            "incomplete or hash-invalid settlement journals: 1",
+            "settlement_journal_incomplete_or_hash_invalid",
+        ),
+        (
+            "v3 paper settlements missing durable journal binding: 1",
+            "settlement_journal_binding_missing",
+        ),
+        (
+            "invalid exact market start price evidence: 1",
+            "market_start_exact_evidence_invalid",
+        ),
+        (
+            "decision config is missing or changed within the eligible day: 2 distinct hashes",
+            "decision_config_missing_or_changed",
+        ),
+    ] {
+        let classified = classify_warning(message);
+        assert!(classified.known, "{message}");
+        assert_eq!(classified.severity, WarningSeverity::Blocking);
+        assert_eq!(classified.rule_id, expected_code);
+    }
+}
+
+#[test]
+fn execution_quality_join_warnings_are_known_and_remain_promotion_blocking() {
+    let cases = [
+        (
+            "place-output application binding below 100%: 1/2 applied, 1 unbound, 0 orphan applications, 0 identity mismatches, 0 invalid, 0 conflicts, 0 reused order IDs",
+            "decision_application_binding_below_100pct",
+        ),
+        (
+            "durable actionable decision application binding below 100%: 1/2 applied, 1 unbound, 0 orphan applications",
+            "decision_application_binding_below_100pct",
+        ),
+        (
+            "invalid paper decision application proof blocks v3 replay",
+            "decision_application_binding_invalid",
+        ),
+        (
+            "1 queue registrations could not be joined because order_id is missing",
+            "queue_registration_order_id_missing",
+        ),
+        (
+            "conflicting queue registrations reused 1 order IDs",
+            "queue_registration_order_id_conflict",
+        ),
+        (
+            "1 queue registration order IDs lack complete lifecycle identity fields",
+            "queue_registration_identity_invalid",
+        ),
+        (
+            "1 queue registrations do not join one-to-one to applied place outputs",
+            "queue_registration_application_join_invalid",
+        ),
+        (
+            "orphan queue snapshots cannot satisfy registered orders: 2 events across 1 order IDs",
+            "queue_snapshot_orphan",
+        ),
+        (
+            "duplicate queue snapshots are promotion-blocking: 1 excess events across 1 order IDs",
+            "queue_snapshot_duplicate",
+        ),
+        (
+            "1 queue snapshots lack numeric inferred_size_ahead",
+            "queue_snapshot_size_ahead_invalid",
+        ),
+        (
+            "queue snapshot coverage below 95%: 94/100",
+            "queue_snapshot_coverage_below_95pct",
+        ),
+        (
+            "1 eligible fill lifecycle events lack the fields required for markout joins",
+            "markout_fill_lifecycle_join_fields_missing",
+        ),
+        (
+            "1 fill lifecycle joins conflict with registered order identity",
+            "fill_lifecycle_registration_conflict",
+        ),
+        (
+            "1 markout rows lack a supported horizon or lifecycle join fields",
+            "markout_row_join_fields_invalid",
+        ),
+        (
+            "1 orphan markout rows do not join to an eligible fill lifecycle",
+            "markout_row_orphan",
+        ),
+        (
+            "1 excess markout fill IDs cannot be matched to actual fill lifecycles",
+            "markout_fill_id_excess",
+        ),
+        (
+            "duplicate markouts are promotion-blocking: 1 excess rows across 1 lifecycle/horizon slots",
+            "markout_row_duplicate",
+        ),
+        (
+            "1 markout rows are missing, null, gross-only, fee-inconsistent, non-executable, or more than 2000ms late",
+            "markout_row_invalid_or_untimely",
+        ),
+        (
+            "30s markout completion below 95%: 94/100",
+            "markout_completion_below_95pct",
+        ),
+        (
+            "settlement journal events with incomplete or invalid binding: 1",
+            "settlement_journal_event_binding_invalid",
+        ),
+    ];
+
+    for (message, rule_id) in cases {
+        let classified = classify_warning(message);
+        assert!(classified.known, "warning should be registered: {message}");
+        assert_eq!(classified.rule_id, rule_id, "wrong rule for {message}");
+        assert_eq!(classified.severity, WarningSeverity::Blocking);
+
+        let quality =
+            DataQualitySummary::new(100, Decimal::ONE, Vec::new(), vec![message.to_owned()]);
+        assert!(
+            !quality.promotion_allowed(),
+            "registered warning must continue to block promotion: {message}"
+        );
+    }
+
+    let unknown = classify_warning(
+        "a new execution-quality anomaly that has no reviewed warning-registry rule",
+    );
+    assert!(!unknown.known);
+    assert_eq!(unknown.severity, WarningSeverity::Blocking);
 }
 
 #[test]
@@ -508,6 +646,11 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
     ] {
         fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
     }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
     let audit = source.join("data_audit.json");
     fs::write(&audit, complete_daily_audit("2026-07-12", 0.97)).unwrap();
 
@@ -659,6 +802,8 @@ fn runtime_provenance_missing_unknown_or_changed_is_blocking() {
     for (run_id, expected_rule) in [
         ("missing", "daily_runtime_provenance_missing"),
         ("unknown", "daily_runtime_provenance_invalid"),
+        ("v2-contract", "daily_runtime_provenance_invalid"),
+        ("missing-config", "daily_runtime_provenance_invalid"),
         (
             "mid-day-change",
             "daily_runtime_provenance_identity_changed",
@@ -686,6 +831,17 @@ fn runtime_provenance_missing_unknown_or_changed_is_blocking() {
             "unknown" => {
                 audit["result"]["runtime_provenance"]["identities"][0]["git_sha"] =
                     serde_json::json!("unknown");
+            }
+            "v2-contract" => {
+                audit["result"]["runtime_provenance"]["identities"][0]
+                    ["decision_pipeline_schema"] =
+                    serde_json::json!("polyedge.strategy_decision_batch.v2");
+            }
+            "missing-config" => {
+                audit["result"]["runtime_provenance"]["identities"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("decision_config_sha256");
             }
             "mid-day-change" => {
                 let mut changed = audit["result"]["runtime_provenance"]["identities"][0].clone();
@@ -735,6 +891,11 @@ fn historical_reporter_sha_difference_is_informational_lineage() {
     ] {
         fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
     }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
     let reporter_sha = current_git_sha();
     let runtime_sha = if reporter_sha == "f".repeat(40) {
         "e".repeat(40)
@@ -794,6 +955,11 @@ fn primary_daily_role_uses_its_own_provenance_contract() {
     ] {
         fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
     }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
     let mut audit: serde_json::Value =
         serde_json::from_slice(&complete_daily_audit("2026-07-14", 1.0)).unwrap();
     audit["result"]["runtime_provenance"]["identities"][0] =
@@ -819,7 +985,7 @@ fn primary_daily_role_uses_its_own_provenance_contract() {
 
 #[test]
 fn out_of_order_events_require_a_low_measured_rate_and_restored_ordering() {
-    let mut high_rate = DataQualitySummary::new(
+    let mut high_rate = measured_quality(
         1_000,
         Decimal::ONE,
         Vec::new(),
@@ -828,7 +994,7 @@ fn out_of_order_events_require_a_low_measured_rate_and_restored_ordering() {
     high_rate.event_time_ordering_restored = true;
     assert!(!high_rate.promotion_allowed());
 
-    let mut low_rate = DataQualitySummary::new(
+    let mut low_rate = measured_quality(
         100_000,
         Decimal::ONE,
         Vec::new(),
@@ -837,6 +1003,16 @@ fn out_of_order_events_require_a_low_measured_rate_and_restored_ordering() {
     assert!(!low_rate.promotion_allowed());
     low_rate.event_time_ordering_restored = true;
     assert!(low_rate.promotion_allowed());
+}
+
+#[test]
+fn scalar_quality_without_measured_components_cannot_pass_open() {
+    let quality = DataQualitySummary::new(100_000, Decimal::ONE, Vec::new(), Vec::<String>::new());
+    assert_eq!(
+        quality.coverage_breakdown,
+        DataQualityCoverageBreakdown::default()
+    );
+    assert!(!quality.promotion_allowed());
 }
 
 #[test]
@@ -856,57 +1032,59 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
     .unwrap();
     fs::write(source.join("final_report.json"), r#"{"result":{}}"#).unwrap();
     fs::write(
-        source.join("cumulative_wallet.json"),
-        format!(
-            r#"{{"schema_version":2,"wallet_scope":"cumulative_since_2026-07-12","campaign_start":"2026-07-12","snapshot_date":"2026-07-13","cumulative_input_sha256":"sha256:{}","cumulative_parent_input_sha256":null,"cumulative_input_manifest_sha256":"sha256:{}","cumulative_state_sha256":"sha256:{}","cumulative_regimes_artifact_sha256":"sha256:{}","cumulative_events":1000,"wallet_constrained":true,"wallet_constrained_net_pnl":"1.25","wallet_constrained_ending_equity":"6.280521","wallet_constrained_max_drawdown":"0","wallet_constrained_unresolved_orders":0}}"#,
-            "a".repeat(64),
-            "b".repeat(64),
-            "c".repeat(64),
-            "d".repeat(64)
-        ),
-    )
-    .unwrap();
-    fs::write(
         source.join("execution_quality.json"),
-        r#"{"result":{"markouts":{"30":{"executable":{"ci_95_low":"0.02"}}}}}"#,
+        complete_execution_quality(),
     )
     .unwrap();
     let audit = source.join("data_audit.json");
-    fs::write(&audit, complete_daily_audit("2026-07-13", 1.0)).unwrap();
     let daily_root = root.join("reports/research/shadow/daily");
-    publish_daily_directory(
-        NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(),
-        "shadow-20260713",
-        "e".repeat(64),
-        polyedge_config::RuntimeRole::ProfitabilityShadow,
-        &source,
-        &daily_root,
-        &audit,
-    )
-    .unwrap();
-    fs::write(
-        source.join("cumulative_wallet.json"),
-        format!(
-            r#"{{"schema_version":2,"wallet_scope":"cumulative_since_2026-07-12","campaign_start":"2026-07-12","snapshot_date":"2026-07-14","cumulative_input_sha256":"sha256:{}","cumulative_parent_input_sha256":"sha256:{}","cumulative_input_manifest_sha256":"sha256:{}","cumulative_state_sha256":"sha256:{}","cumulative_regimes_artifact_sha256":"sha256:{}","cumulative_events":2000,"wallet_constrained":true,"wallet_constrained_net_pnl":"2.50","wallet_constrained_ending_equity":"7.530521","wallet_constrained_max_drawdown":"0","wallet_constrained_unresolved_orders":0}}"#,
-            "e".repeat(64),
-            "a".repeat(64),
-            "f".repeat(64),
-            "1".repeat(64),
-            "2".repeat(64)
-        ),
-    )
-    .unwrap();
-    fs::write(&audit, complete_daily_audit("2026-07-14", 1.0)).unwrap();
-    publish_daily_directory(
-        NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
-        "shadow-20260714",
-        "f".repeat(64),
-        polyedge_config::RuntimeRole::ProfitabilityShadow,
-        &source,
-        &daily_root,
-        &audit,
-    )
-    .unwrap();
+    let first_date = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+    let mut prior_input: Option<String> = None;
+    for index in 0..28_u32 {
+        let date = first_date + Duration::days(i64::from(index));
+        let input = format!("{:064x}", index + 1);
+        let cumulative_net = Decimal::new(125, 2) * Decimal::from(u64::from(index + 1));
+        let ending_equity = Decimal::new(5_030_521, 6) + cumulative_net;
+        let parent = prior_input
+            .as_ref()
+            .map(|value| serde_json::json!(format!("sha256:{value}")))
+            .unwrap_or(serde_json::Value::Null);
+        let wallet = serde_json::json!({
+            "schema_version": 2,
+            "wallet_scope": "cumulative_since_2026-07-12",
+            "campaign_start": "2026-07-12",
+            "snapshot_date": date.format("%Y-%m-%d").to_string(),
+            "cumulative_input_sha256": format!("sha256:{input}"),
+            "cumulative_parent_input_sha256": parent,
+            "cumulative_input_manifest_sha256": format!("sha256:{:064x}", 1_000 + index),
+            "cumulative_state_sha256": format!("sha256:{:064x}", 2_000 + index),
+            "cumulative_regimes_artifact_sha256": format!("sha256:{:064x}", 3_000 + index),
+            "cumulative_events": u64::from(index + 1) * 1_000,
+            "wallet_constrained": true,
+            "wallet_constrained_net_pnl": cumulative_net.to_string(),
+            "wallet_constrained_ending_equity": ending_equity.to_string(),
+            "wallet_constrained_max_drawdown": "0",
+            "wallet_constrained_unresolved_orders": 0
+        });
+        fs::write(
+            source.join("cumulative_wallet.json"),
+            serde_json::to_vec_pretty(&wallet).unwrap(),
+        )
+        .unwrap();
+        let date_text = date.format("%Y-%m-%d").to_string();
+        fs::write(&audit, complete_daily_audit(&date_text, 1.0)).unwrap();
+        publish_daily_directory(
+            date,
+            format!("shadow-{}", date.format("%Y%m%d")),
+            format!("{:064x}", 4_000 + index),
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+            &source,
+            &daily_root,
+            &audit,
+        )
+        .unwrap();
+        prior_input = Some(input);
+    }
     let prospective = root.join("reports/research/prospective/prospective_validation.json");
     fs::create_dir_all(prospective.parent().unwrap()).unwrap();
     fs::write(
@@ -973,7 +1151,30 @@ execution_model:
 }
 
 fn clean_quality() -> DataQualitySummary {
-    DataQualitySummary::new(10, Decimal::ONE, Vec::new(), Vec::<String>::new())
+    measured_quality(10, Decimal::ONE, Vec::new(), Vec::new())
+}
+
+fn measured_quality(
+    total_events: u64,
+    coverage: Decimal,
+    fatal_issues: Vec<String>,
+    warnings: Vec<String>,
+) -> DataQualitySummary {
+    let mut quality = DataQualitySummary::new(total_events, coverage, fatal_issues, warnings);
+    quality.coverage_breakdown = DataQualityCoverageBreakdown {
+        start_price_capture_rate: Some(coverage),
+        settlement_rate: Some(coverage),
+        exact_reference_hour_coverage: Some(coverage),
+        decision_metadata_coverage: Some(coverage),
+        decision_grade_coverage: Some(coverage),
+        execution_field_coverage: Some(coverage),
+        decision_parity_rate: Some(Decimal::ONE),
+        queue_snapshot_coverage: Some(coverage),
+        markout_1s_completion: Some(coverage),
+        markout_5s_completion: Some(coverage),
+        markout_30s_completion: Some(coverage),
+    };
+    quality
 }
 
 fn ladder_candidate() -> CandidateIdentity {
@@ -2479,7 +2680,14 @@ fn complete_daily_audit(date: &str, coverage: f64) -> Vec<u8> {
     serde_json::to_vec_pretty(&serde_json::json!({
         "result": {
             "total_events": 1000,
+            "start_price_capture_rate": coverage,
+            "settlement_rate": coverage,
+            "exact_resolution_reference_hour_coverage": coverage,
+            "decision_metadata_coverage": coverage,
             "decision_grade_coverage": coverage,
+            "execution_field_coverage": coverage,
+            "decision_parity_rate": 1.0,
+            "decision_config_sha256": format!("sha256:{}", "d".repeat(64)),
             "fatal_data_quality_issues": [],
             "warnings": [],
             "event_time_ordering_restored": true,
@@ -2510,6 +2718,10 @@ fn valid_runtime_provenance_identity(git_sha: &str) -> serde_json::Value {
         "paper_maker_fill_policy": "none",
         "adaptive_regime_enabled": true,
         "adaptive_regime_mode": "dynamic_quote_style",
+        "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+        "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
+        "decision_config_schema": "polyedge.decision_config.v1",
+        "decision_config_sha256": format!("sha256:{}", "d".repeat(64)),
         "candidate": {
             "name": "dynamic_quote_style",
             "version": "dynamic_quote_style@2026-06-14",
@@ -2526,6 +2738,29 @@ fn valid_runtime_provenance_identity(git_sha: &str) -> serde_json::Value {
         },
         "research_only": true
     })
+}
+
+fn complete_execution_quality() -> Vec<u8> {
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "result": {
+            "queue_snapshot_coverage": 1.0,
+            "markouts": {
+                "1": {"completion_rate": 1.0},
+                "5": {"completion_rate": 1.0},
+                "30": {
+                    "completion_rate": 1.0,
+                    "executable": {
+                        "count": 10,
+                        "mean": "0.02",
+                        "sample_std": "0.001",
+                        "ci_95_low": "0.019"
+                    }
+                }
+            },
+            "warnings": []
+        }
+    }))
+    .unwrap()
 }
 
 fn valid_primary_runtime_provenance_identity(git_sha: &str) -> serde_json::Value {

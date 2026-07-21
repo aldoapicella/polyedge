@@ -115,7 +115,7 @@ run_stage build-cumulative-wallet polyedge-rs research build-cumulative-wallet -
 INPUT_SHA="sha256:$(sha256sum "$NORMALIZED/events_manifest.json" | cut -d' ' -f1)"
 run_stage publish-daily-bundle polyedge-rs research publish-daily-bundle --date "$DATE" --run-id "$RUN_ID" --input-sha256 "$INPUT_SHA" --expected-runtime-role profitability_shadow --source-dir "$STAGING" --output-root reports/research/shadow/daily --data-audit "$STAGING/data_audit.json"
 if [ "$DATE" = "$CASCADE_THROUGH" ]; then
-  run_stage validate-prospective polyedge-rs research validate-prospective --since 2026-07-12T00:00:00Z --candidates research/configs/frozen_candidates.yaml --reports-dir reports/research/shadow/daily --expected-daily-date "$DATE" --out reports/research/shadow/prospective/prospective_validation.json --markdown reports/research/shadow/prospective/prospective_validation.md
+  run_stage validate-prospective polyedge-rs research validate-prospective --since 2026-07-13T00:00:00Z --candidates research/configs/frozen_candidates.yaml --reports-dir reports/research/shadow/daily --expected-daily-date "$DATE" --out reports/research/shadow/prospective/prospective_validation.json --markdown reports/research/shadow/prospective/prospective_validation.md
   run_stage evaluate-profitability polyedge-rs research evaluate-profitability --daily-root reports/research/shadow/daily --prospective reports/research/shadow/prospective/prospective_validation.json --gate-config research/configs/profitability_gate.yaml --execution-model "$EXECUTION_MODEL_BLOB_NAME" --out reports/research/profitability/latest.json
 else
   echo "polyedge_shadow_daily stage=terminal-evidence date=$DATE status=deferred-through-$CASCADE_THROUGH"

@@ -14,9 +14,9 @@ pub mod regime;
 pub use regime::{
     evaluate_frozen_strategy, AdaptiveStrategyResult, FrozenCandidateIdentity,
     FrozenStrategyEvaluation, FrozenStrategyMode, ProfiledStrategyConfig, QuoteStyle,
-    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
-    RegimeFeatures, RegimeLabel, RegimePolicy, RegimeProfile, RegimeReferencePoint,
-    StrategyDataQuality, StrategyDecisionEnvelope, StrategyDecisionMetadata,
+    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeClassifierSnapshot,
+    RegimeFeatureInput, RegimeFeatures, RegimeLabel, RegimePolicy, RegimeProfile,
+    RegimeReferencePoint, StrategyDataQuality, StrategyDecisionEnvelope, StrategyDecisionMetadata,
     DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON, DYNAMIC_QUOTE_STYLE_POLICY_SHA256,
 };
 
@@ -356,6 +356,14 @@ pub struct RiskManager {
     pub open_order_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RiskManagerSnapshot {
+    pub positions_by_market: BTreeMap<MarketId, Decimal>,
+    pub total_position: Decimal,
+    pub daily_pnl: Decimal,
+    pub open_order_count: usize,
+}
+
 impl RiskManager {
     pub fn new(settings: RuntimeSettings) -> Self {
         Self {
@@ -364,6 +372,25 @@ impl RiskManager {
             total_position: Decimal::ZERO,
             daily_pnl: Decimal::ZERO,
             open_order_count: 0,
+        }
+    }
+
+    pub fn snapshot(&self) -> RiskManagerSnapshot {
+        RiskManagerSnapshot {
+            positions_by_market: self.positions_by_market.clone(),
+            total_position: self.total_position,
+            daily_pnl: self.daily_pnl,
+            open_order_count: self.open_order_count,
+        }
+    }
+
+    pub fn from_snapshot(settings: RuntimeSettings, snapshot: RiskManagerSnapshot) -> Self {
+        Self {
+            settings,
+            positions_by_market: snapshot.positions_by_market,
+            total_position: snapshot.total_position,
+            daily_pnl: snapshot.daily_pnl,
+            open_order_count: snapshot.open_order_count,
         }
     }
 
@@ -556,9 +583,72 @@ pub struct OrderManager {
     quotes: HashMap<QuoteKey, ManagedQuote>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManagedQuoteSnapshot {
+    pub market_id: MarketId,
+    pub token_id: TokenId,
+    pub side: Side,
+    pub decision: TradeDecision,
+    pub placed_ts: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub order_id: Option<OrderId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrderManagerSnapshot {
+    pub quotes: Vec<ManagedQuoteSnapshot>,
+}
+
 impl OrderManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn snapshot(&self) -> OrderManagerSnapshot {
+        let mut quotes = self
+            .quotes
+            .values()
+            .map(|quote| ManagedQuoteSnapshot {
+                market_id: quote.key.market_id.clone(),
+                token_id: quote.key.token_id.clone(),
+                side: quote.key.side.clone(),
+                decision: quote.decision.clone(),
+                placed_ts: quote.placed_ts,
+                expires_at: quote.expires_at,
+                order_id: quote.order_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        quotes.sort_by(|left, right| {
+            left.market_id
+                .to_string()
+                .cmp(&right.market_id.to_string())
+                .then(left.token_id.to_string().cmp(&right.token_id.to_string()))
+                .then(format!("{:?}", left.side).cmp(&format!("{:?}", right.side)))
+        });
+        OrderManagerSnapshot { quotes }
+    }
+
+    pub fn from_snapshot(snapshot: OrderManagerSnapshot) -> Self {
+        let quotes = snapshot
+            .quotes
+            .into_iter()
+            .map(|quote| {
+                let key = QuoteKey {
+                    market_id: quote.market_id,
+                    token_id: quote.token_id,
+                    side: quote.side,
+                };
+                let managed = ManagedQuote {
+                    key: key.clone(),
+                    decision: quote.decision,
+                    placed_ts: quote.placed_ts,
+                    expires_at: quote.expires_at,
+                    order_id: quote.order_id,
+                };
+                (key, managed)
+            })
+            .collect();
+        Self { quotes }
     }
 
     pub fn open_order_count(&self) -> usize {
@@ -743,6 +833,151 @@ impl OrderManager {
             .filter(|quote| &quote.key.market_id == market_id)
             .cloned()
             .collect()
+    }
+}
+
+/// Complete, secret-free state required to independently recompute the
+/// strategy, risk, and reconciliation pipeline for one market evaluation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MarketStartEvidenceV1 {
+    pub schema_version: u32,
+    pub market_id: MarketId,
+    pub market_start_ts: DateTime<Utc>,
+    pub market_end_ts: DateTime<Utc>,
+    pub start_price: Decimal,
+    pub reference_source: String,
+    pub reference_source_ts: DateTime<Utc>,
+    pub reference_exact_resolution_source: bool,
+    pub reference_stale: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionPipelineInputV3 {
+    pub schema_version: u32,
+    pub settings: RuntimeSettings,
+    pub market: MarketSpec,
+    pub market_start_evidence: MarketStartEvidenceV1,
+    pub fair_value: FairValue,
+    pub reference: ReferencePrice,
+    pub books: BTreeMap<TokenId, BookState>,
+    pub decision_ts: DateTime<Utc>,
+    pub kill_switch_enabled: bool,
+    pub adaptive_mode: Option<FrozenStrategyMode>,
+    pub regime_feature_input: RegimeFeatureInput,
+    pub classifier_before: Option<RegimeClassifierSnapshot>,
+    pub risk_before: RiskManagerSnapshot,
+    pub order_manager_before: OrderManagerSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPipelineStrategyEvaluationV3 {
+    pub evaluation_index: usize,
+    pub quote_context: QuoteTransformContext,
+    pub classifier_before: RegimeClassifierSnapshot,
+    pub classifier_after: RegimeClassifierSnapshot,
+    pub evaluated_decision: Option<TradeDecision>,
+    pub cancel_existing: bool,
+    pub metadata: StrategyDecisionMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPipelineOutputV3 {
+    pub raw_decisions: Vec<TradeDecision>,
+    pub strategy_evaluations: Vec<DecisionPipelineStrategyEvaluationV3>,
+    pub strategy_decisions: Vec<TradeDecision>,
+    pub risk_assessment: RiskAssessment,
+    pub risk_decisions: Vec<TradeDecision>,
+    pub final_decisions: Vec<TradeDecision>,
+    pub classifier_after: Option<RegimeClassifierSnapshot>,
+}
+
+/// Shared pure evaluator used by both the runtime and the promotion reporter.
+/// It intentionally stops before execution or any state mutation.
+pub fn evaluate_decision_pipeline_v3(input: &DecisionPipelineInputV3) -> DecisionPipelineOutputV3 {
+    let regime_features = input.regime_feature_input.clone().build();
+    let raw_decisions = MakerFirstStrategy::new(input.settings.clone()).evaluate(
+        &input.market,
+        &input.fair_value,
+        &input.books,
+    );
+    let mut strategy_evaluations = Vec::new();
+    let (strategy_decisions, classifier_after) = match input.adaptive_mode {
+        Some(mode) => {
+            let mut classifier = RegimeClassifier::from_snapshot(
+                input
+                    .classifier_before
+                    .clone()
+                    .unwrap_or_else(|| RegimeClassifier::default().snapshot()),
+            );
+            let policy = RegimePolicy::new(input.settings.strategy.clone());
+            let decisions = raw_decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(evaluation_index, decision)| {
+                    let q = match decision.outcome.as_ref() {
+                        Some(Outcome::Up) => Some(input.fair_value.q_up),
+                        Some(Outcome::Down) => Some(input.fair_value.q_down),
+                        None => None,
+                    };
+                    let best_bid = decision
+                        .token_id
+                        .as_ref()
+                        .and_then(|token| input.books.get(token))
+                        .and_then(BookState::best_bid)
+                        .map(|level| level.price);
+                    let quote_context = QuoteTransformContext { best_bid, q };
+                    let classifier_before = classifier.snapshot();
+                    let evaluated = evaluate_frozen_strategy(
+                        mode,
+                        &mut classifier,
+                        &policy,
+                        &regime_features,
+                        input.decision_ts,
+                        decision,
+                        &quote_context,
+                    );
+                    let classifier_after = classifier.snapshot();
+                    strategy_evaluations.push(DecisionPipelineStrategyEvaluationV3 {
+                        evaluation_index,
+                        quote_context,
+                        classifier_before,
+                        classifier_after,
+                        evaluated_decision: evaluated.decision.clone(),
+                        cancel_existing: evaluated.cancel_existing,
+                        metadata: evaluated.metadata,
+                    });
+                    evaluated.decision
+                })
+                .collect::<Vec<_>>();
+            (decisions, Some(classifier.snapshot()))
+        }
+        None => (raw_decisions.clone(), None),
+    };
+    let risk = RiskManager::from_snapshot(input.settings.clone(), input.risk_before.clone());
+    let risk_assessment = risk.assess_market(
+        &input.market,
+        &input.reference,
+        &input.books,
+        input.decision_ts,
+        input.kill_switch_enabled,
+    );
+    let risk_decisions =
+        risk.filter_decisions(&strategy_decisions, &input.market, &risk_assessment);
+    let order_manager = OrderManager::from_snapshot(input.order_manager_before.clone());
+    let final_decisions = order_manager.reconcile(
+        &input.market.market_id,
+        &risk_decisions,
+        Some(input.market.condition_id.clone()),
+        input.decision_ts,
+    );
+    DecisionPipelineOutputV3 {
+        raw_decisions,
+        strategy_evaluations,
+        strategy_decisions,
+        risk_assessment,
+        risk_decisions,
+        final_decisions,
+        classifier_after,
     }
 }
 

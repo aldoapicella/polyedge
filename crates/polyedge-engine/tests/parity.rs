@@ -5,8 +5,10 @@ use polyedge_domain::{
     TradeDecision,
 };
 use polyedge_engine::{
-    LogReturnFairValueModel, MakerFirstStrategy, OrderManager, PaperFillEngine, RestingMakerOrder,
-    RiskManager,
+    evaluate_decision_pipeline_v3, DecisionPipelineInputV3, FrozenStrategyMode,
+    LogReturnFairValueModel, MakerFirstStrategy, MarketStartEvidenceV1, OrderManager,
+    PaperFillEngine, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
+    RegimeReferencePoint, RestingMakerOrder, RiskManager,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -84,6 +86,82 @@ fn order_manager_matches_fixture_golden_master() {
         );
         assert_eq!(serde_json::to_value(actual).unwrap(), case["expected"]);
     }
+}
+
+#[test]
+fn complete_decision_pipeline_snapshot_round_trips_and_replays_exactly() {
+    let cases = fixture();
+    let case = &cases["strategy_cases"][0];
+    let risk_case = &cases["risk_cases"][0];
+    let mut runtime_settings = settings(&case["settings"]);
+    runtime_settings.strategy.adaptive_regime_enabled = true;
+    runtime_settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+    let market: MarketSpec = serde_json::from_value(case["market"].clone()).unwrap();
+    let fair_value: FairValue = serde_json::from_value(case["fair_value"].clone()).unwrap();
+    let reference: ReferencePrice = serde_json::from_value(risk_case["reference"].clone()).unwrap();
+    let books = books(&case["books"]);
+    let decision_ts = parse_ts(case["fair_value"]["computed_ts"].as_str().unwrap());
+    let regime_feature_input = RegimeFeatureInput {
+        now: decision_ts,
+        market_start_ts: Some(market.start_ts),
+        market_end_ts: Some(market.end_ts),
+        start_price: market.start_price,
+        tick_size: market.tick_size,
+        reference: Some(RegimeReferencePoint {
+            ts: reference.local_ts,
+            price: reference.price,
+            stale: reference.stale,
+        }),
+        reference_history: Vec::new(),
+        q_up: Some(fair_value.q_up),
+        q_down: Some(fair_value.q_down),
+        sigma: Some(fair_value.sigma),
+        up_book: Some(RegimeBookSnapshot::default()),
+        down_book: Some(RegimeBookSnapshot::default()),
+        book_update_rate_10s: None,
+        feed_divergence_bps: None,
+        recent_feed_errors: 0,
+        open_positions: None,
+        open_orders: 0,
+        recent_fill_count: 0,
+        recent_cancel_count: 0,
+        adverse_move_after_fill_bps: None,
+        max_reference_age_ms: runtime_settings.risk.max_reference_age_ms,
+        max_book_age_ms: runtime_settings.risk.max_book_age_ms,
+        final_no_trade_seconds: 30,
+        quality_flags: Vec::new(),
+    };
+    let market_start_evidence = MarketStartEvidenceV1 {
+        schema_version: 1,
+        market_id: market.market_id.clone(),
+        market_start_ts: market.start_ts,
+        market_end_ts: market.end_ts,
+        start_price: market.start_price.unwrap(),
+        reference_source: reference.source.clone(),
+        reference_source_ts: market.start_ts,
+        reference_exact_resolution_source: true,
+        reference_stale: false,
+    };
+    let input = DecisionPipelineInputV3 {
+        schema_version: 3,
+        settings: runtime_settings.clone(),
+        market,
+        market_start_evidence,
+        fair_value,
+        reference,
+        books,
+        decision_ts,
+        kill_switch_enabled: false,
+        adaptive_mode: Some(FrozenStrategyMode::DynamicQuoteStyle),
+        regime_feature_input,
+        classifier_before: Some(RegimeClassifier::default().snapshot()),
+        risk_before: RiskManager::new(runtime_settings).snapshot(),
+        order_manager_before: OrderManager::new().snapshot(),
+    };
+    let expected = evaluate_decision_pipeline_v3(&input);
+    let serialized = serde_json::to_value(&input).unwrap();
+    let restored: DecisionPipelineInputV3 = serde_json::from_value(serialized).unwrap();
+    assert_eq!(evaluate_decision_pipeline_v3(&restored), expected);
 }
 
 #[test]

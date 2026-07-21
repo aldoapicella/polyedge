@@ -88,6 +88,40 @@ fn regime_hysteresis_requires_confirm_and_dwell_for_non_safety_switch() {
 }
 
 #[test]
+fn classifier_snapshot_round_trip_preserves_the_next_decision() {
+    let mut original = RegimeClassifier::new(3, 5);
+    let now = Utc::now();
+    let normal = RegimeFeatures {
+        market_active: true,
+        has_start_price: true,
+        has_books: true,
+        up_spread_ticks: Some(2.0),
+        down_spread_ticks: Some(2.0),
+        up_top_size: Some(20.0),
+        down_top_size: Some(20.0),
+        final_no_trade_seconds: 30,
+        seconds_to_expiry: Some(300.0),
+        ..RegimeFeatures::default()
+    };
+    let shock = RegimeFeatures {
+        chainlink_return_10s_bps: Some(8.0),
+        ..normal.clone()
+    };
+    original.classify(&normal, now);
+    original.classify(&shock, now + Duration::seconds(2));
+
+    let encoded = serde_json::to_value(original.snapshot()).unwrap();
+    let snapshot = serde_json::from_value(encoded).unwrap();
+    let mut restored = RegimeClassifier::from_snapshot(snapshot);
+
+    assert_eq!(
+        original.classify(&shock, now + Duration::seconds(6)),
+        restored.classify(&shock, now + Duration::seconds(6))
+    );
+    assert_eq!(original.snapshot(), restored.snapshot());
+}
+
+#[test]
 fn regime_profiles_are_bounded_and_never_increase_size() {
     let policy = RegimePolicy::new(RuntimeSettings::default().strategy);
     for label in [

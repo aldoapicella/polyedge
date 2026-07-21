@@ -88,6 +88,8 @@ pub enum FeedError {
     Json(#[from] serde_json::Error),
     #[error("WebSocket error: {0}")]
     WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>),
+    #[error("source stalled: {0}")]
+    SourceStalled(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for FeedError {

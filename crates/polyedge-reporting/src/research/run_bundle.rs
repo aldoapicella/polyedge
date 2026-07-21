@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v1";
+pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v3";
 pub const DEFAULT_PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const DAILY_PROVENANCE_CUTOFF: &str = "2026-07-12";
 const MANIFEST_FILE: &str = "run_manifest.json";
@@ -123,6 +123,254 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
             WarningSeverity::Informational,
             true,
         )
+    } else if message.starts_with("start price capture below 95%: ") {
+        (
+            "start_price_capture_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("settlement coverage below 95%: ") {
+        (
+            "settlement_coverage_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("exact-resolution reference hour coverage below 95%: ") {
+        (
+            "exact_resolution_reference_hours_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("decision metadata coverage below 95%: ") {
+        (
+            "decision_metadata_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("decision-grade evaluation coverage below 95%: ") {
+        (
+            "decision_grade_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("place-decision execution-field coverage below 95%: ") {
+        (
+            "execution_fields_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message == "decision parity evidence missing" {
+        (
+            "decision_parity_evidence_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("strategy transform parity below 100%: ") {
+        (
+            "strategy_transform_parity_below_100pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message == "runtime/replay decision batch evidence missing" {
+        (
+            "decision_batch_evidence_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("runtime/replay decision output parity below 100%: ") {
+        (
+            "decision_output_parity_below_100pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("runtime/replay full decision pipeline parity below 100%: ") {
+        (
+            "full_decision_pipeline_parity_below_100pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .starts_with("durable actionable decision application binding below 100%: ")
+        || message.starts_with("place-output application binding below 100%: ")
+    {
+        (
+            "decision_application_binding_below_100pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if matches!(
+        message.as_str(),
+        "invalid v3 actionable decision cannot be application-bound for replay"
+            | "conflicting v3 actionable decision output binding blocks replay"
+            | "invalid paper decision application proof blocks v3 replay"
+            | "conflicting paper decision application proofs block v3 replay"
+            | "paper decision application identity does not match durable output"
+    ) {
+        (
+            "decision_application_binding_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("invalid paper settlement timing: ") {
+        (
+            "invalid_paper_settlement_timing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("settlement journal conflicts: ") {
+        (
+            "settlement_journal_conflict",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("incomplete or hash-invalid settlement journals: ") {
+        (
+            "settlement_journal_incomplete_or_hash_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("v3 paper settlements missing durable journal binding: ") {
+        (
+            "settlement_journal_binding_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("settlement journal events with incomplete or invalid binding: ") {
+        (
+            "settlement_journal_event_binding_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("invalid exact market start price evidence: ") {
+        (
+            "market_start_exact_evidence_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("decision config is missing or changed within the eligible day: ")
+    {
+        (
+            "decision_config_missing_or_changed",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" queue registrations could not be joined because order_id is missing")
+    {
+        (
+            "queue_registration_order_id_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("conflicting queue registrations reused ")
+        && message.ends_with(" order IDs")
+    {
+        (
+            "queue_registration_order_id_conflict",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" queue registration order IDs lack complete lifecycle identity fields")
+    {
+        (
+            "queue_registration_identity_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" queue registrations do not join one-to-one to applied place outputs")
+    {
+        (
+            "queue_registration_application_join_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("orphan queue snapshots cannot satisfy registered orders: ") {
+        (
+            "queue_snapshot_orphan",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("duplicate queue snapshots are promotion-blocking: ") {
+        (
+            "queue_snapshot_duplicate",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.ends_with(" queue snapshots lack numeric inferred_size_ahead") {
+        (
+            "queue_snapshot_size_ahead_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("queue snapshot coverage below 95%: ") {
+        (
+            "queue_snapshot_coverage_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" eligible fill lifecycle events lack the fields required for markout joins")
+    {
+        (
+            "markout_fill_lifecycle_join_fields_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" fill lifecycle joins conflict with registered order identity")
+    {
+        (
+            "fill_lifecycle_registration_conflict",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" markout rows lack a supported horizon or lifecycle join fields")
+    {
+        (
+            "markout_row_join_fields_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" orphan markout rows do not join to an eligible fill lifecycle")
+    {
+        (
+            "markout_row_orphan",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        .ends_with(" excess markout fill IDs cannot be matched to actual fill lifecycles")
+    {
+        (
+            "markout_fill_id_excess",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("duplicate markouts are promotion-blocking: ") {
+        (
+            "markout_row_duplicate",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.contains(
+        " markout rows are missing, null, gross-only, fee-inconsistent, non-executable, or more than ",
+    ) && message.ends_with("ms late")
+    {
+        (
+            "markout_row_invalid_or_untimely",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.contains("s markout completion below 95%: ") {
+        (
+            "markout_completion_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
     } else {
         ("unknown_warning", WarningSeverity::Blocking, false)
     };
@@ -132,6 +380,32 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
         severity,
         known,
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DataQualityCoverageBreakdown {
+    #[serde(default)]
+    pub start_price_capture_rate: Option<Decimal>,
+    #[serde(default)]
+    pub settlement_rate: Option<Decimal>,
+    #[serde(default)]
+    pub exact_reference_hour_coverage: Option<Decimal>,
+    #[serde(default)]
+    pub decision_metadata_coverage: Option<Decimal>,
+    #[serde(default)]
+    pub decision_grade_coverage: Option<Decimal>,
+    #[serde(default)]
+    pub execution_field_coverage: Option<Decimal>,
+    #[serde(default)]
+    pub decision_parity_rate: Option<Decimal>,
+    #[serde(default)]
+    pub queue_snapshot_coverage: Option<Decimal>,
+    #[serde(default)]
+    pub markout_1s_completion: Option<Decimal>,
+    #[serde(default)]
+    pub markout_5s_completion: Option<Decimal>,
+    #[serde(default)]
+    pub markout_30s_completion: Option<Decimal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -145,6 +419,8 @@ pub struct DataQualitySummary {
     pub out_of_order_events: u64,
     #[serde(default)]
     pub event_time_ordering_restored: bool,
+    #[serde(default)]
+    pub coverage_breakdown: DataQualityCoverageBreakdown,
 }
 
 impl DataQualitySummary {
@@ -171,12 +447,32 @@ impl DataQualitySummary {
                 .collect(),
             out_of_order_events: measured_out_of_order,
             event_time_ordering_restored: measured_out_of_order == 0,
+            // The scalar is retained for backward-compatible display only. A
+            // caller that has not measured the production components must not
+            // manufacture start/settlement/execution/parity evidence from it.
+            // `quality_from_audit` and the daily publisher fill these fields
+            // from their authoritative artifacts.
+            coverage_breakdown: DataQualityCoverageBreakdown::default(),
         }
     }
 
     pub fn promotion_allowed(&self) -> bool {
+        let minimum = Decimal::new(95, 2);
+        let complete = |value: Option<Decimal>| value.is_some_and(|value| value >= minimum);
         self.total_events > 0
-            && self.decision_grade_coverage >= Decimal::new(95, 2)
+            && self.registry_version == WARNING_REGISTRY_VERSION
+            && self.decision_grade_coverage >= minimum
+            && complete(self.coverage_breakdown.start_price_capture_rate)
+            && complete(self.coverage_breakdown.settlement_rate)
+            && complete(self.coverage_breakdown.exact_reference_hour_coverage)
+            && complete(self.coverage_breakdown.decision_metadata_coverage)
+            && complete(self.coverage_breakdown.decision_grade_coverage)
+            && complete(self.coverage_breakdown.execution_field_coverage)
+            && self.coverage_breakdown.decision_parity_rate == Some(Decimal::ONE)
+            && complete(self.coverage_breakdown.queue_snapshot_coverage)
+            && complete(self.coverage_breakdown.markout_1s_completion)
+            && complete(self.coverage_breakdown.markout_5s_completion)
+            && complete(self.coverage_breakdown.markout_30s_completion)
             && self.fatal_issues.is_empty()
             && self.event_time_ordering_restored
             && Decimal::from(self.out_of_order_events) / Decimal::from(self.total_events)
@@ -450,7 +746,43 @@ pub fn publish_daily_directory(
     ));
     artifacts.sort_by(|left, right| left.0.cmp(&right.0));
     let audit_value: serde_json::Value = read_json(data_audit_path)?;
-    let quality = quality_from_audit_for_date(&audit_value, date, &expected_runtime_role);
+    let mut quality = quality_from_audit_for_date(&audit_value, date, &expected_runtime_role);
+    let execution_quality_path = source_dir.join("execution_quality.json");
+    if execution_quality_path.is_file() {
+        let execution_quality: serde_json::Value = read_json(&execution_quality_path)?;
+        let result = execution_quality
+            .get("result")
+            .unwrap_or(&execution_quality);
+        quality.coverage_breakdown.queue_snapshot_coverage = result
+            .get("queue_snapshot_coverage")
+            .and_then(decimal_from_json);
+        quality.coverage_breakdown.markout_1s_completion = result
+            .pointer("/markouts/1/completion_rate")
+            .and_then(decimal_from_json);
+        quality.coverage_breakdown.markout_5s_completion = result
+            .pointer("/markouts/5/completion_rate")
+            .and_then(decimal_from_json);
+        quality.coverage_breakdown.markout_30s_completion = result
+            .pointer("/markouts/30/completion_rate")
+            .and_then(decimal_from_json);
+        for warning in execution_quality
+            .pointer("/result/warnings")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(value_as_message)
+        {
+            quality.warnings.push(classify_warning(warning));
+        }
+        quality.warnings.sort_by(|left, right| {
+            left.rule_id
+                .cmp(&right.rule_id)
+                .then(left.message.cmp(&right.message))
+        });
+        quality
+            .warnings
+            .dedup_by(|left, right| left.rule_id == right.rule_id && left.message == right.message);
+    }
     let mut run = AtomicDailyRun::begin_with_runtime_role(
         output_root,
         date,
@@ -609,6 +941,24 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
     warnings.sort();
     warnings.dedup();
     let mut quality = DataQualitySummary::new(total_events, coverage, fatal_issues, warnings);
+    quality.coverage_breakdown = DataQualityCoverageBreakdown {
+        start_price_capture_rate: start_capture,
+        settlement_rate: settlement,
+        exact_reference_hour_coverage: result
+            .get("exact_resolution_reference_hour_coverage")
+            .and_then(decimal_from_json),
+        decision_metadata_coverage: result
+            .get("decision_metadata_coverage")
+            .and_then(decimal_from_json),
+        decision_grade_coverage: explicit_coverage,
+        execution_field_coverage: result
+            .get("execution_field_coverage")
+            .and_then(decimal_from_json),
+        decision_parity_rate: result
+            .get("decision_parity_rate")
+            .and_then(decimal_from_json),
+        ..DataQualityCoverageBreakdown::default()
+    };
     quality.out_of_order_events = result
         .pointer("/stream_ordering/out_of_order_timestamps")
         .and_then(serde_json::Value::as_u64)
@@ -920,6 +1270,32 @@ pub(super) fn shadow_runtime_provenance_errors(payload: &serde_json::Value) -> V
         "dynamic_quote_style",
         &mut errors,
     );
+    require_provenance_text(
+        payload,
+        "/decision_pipeline_schema",
+        "polyedge.strategy_decision_batch.v3",
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/decision_pipeline_parity_scope",
+        "full_decision_pipeline_recomputation",
+        &mut errors,
+    );
+    if payload
+        .get("decision_config_schema")
+        .and_then(serde_json::Value::as_str)
+        != Some("polyedge.decision_config.v1")
+    {
+        errors.push("/decision_config_schema must equal polyedge.decision_config.v1".to_owned());
+    }
+    if payload
+        .get("decision_config_sha256")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| !is_prefixed_sha256(value))
+    {
+        errors.push("/decision_config_sha256 must be a canonical sha256 digest".to_owned());
+    }
     require_provenance_bool(
         payload,
         "/publish_strategy_canary_intents",
@@ -1504,7 +1880,7 @@ struct ProtocolV3MarkoutEconomics {
     fee_evidence_fingerprint: String,
 }
 
-fn stable_json(value: &serde_json::Value) -> Result<String, ResearchError> {
+pub(super) fn stable_json(value: &serde_json::Value) -> Result<String, ResearchError> {
     match value {
         serde_json::Value::Array(values) => Ok(format!(
             "[{}]",
@@ -5325,19 +5701,12 @@ impl PromotionEvaluation {
             },
             required: "no missing metrics".to_owned(),
         });
-        let data_quality_passes = metrics.data_quality.total_events > 0
+        let data_quality_passes = metrics.data_quality.promotion_allowed()
             && metrics.data_quality.decision_grade_coverage
                 >= thresholds.minimum_decision_grade_coverage
-            && metrics.data_quality.fatal_issues.is_empty()
-            && metrics.data_quality.event_time_ordering_restored
             && Decimal::from(metrics.data_quality.out_of_order_events)
                 / Decimal::from(metrics.data_quality.total_events)
-                <= thresholds.maximum_out_of_order_event_rate
-            && metrics
-                .data_quality
-                .warnings
-                .iter()
-                .all(|warning| warning.severity == WarningSeverity::Informational);
+                <= thresholds.maximum_out_of_order_event_rate;
         gates.push(GateOutcome {
             gate: "data_quality".to_owned(),
             status: if data_quality_passes {

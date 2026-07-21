@@ -48,14 +48,14 @@ pub struct RegimeFeatures {
     pub quality_flags: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RegimeReferencePoint {
     pub ts: DateTime<Utc>,
     pub price: Decimal,
     pub stale: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct RegimeBookSnapshot {
     pub bid: Option<Decimal>,
     pub ask: Option<Decimal>,
@@ -64,7 +64,7 @@ pub struct RegimeBookSnapshot {
     pub local_ts: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RegimeFeatureInput {
     pub now: DateTime<Utc>,
     pub market_start_ts: Option<DateTime<Utc>>,
@@ -288,7 +288,7 @@ pub struct StrategyDecisionEnvelope {
     pub strategy_metadata: StrategyDecisionMetadata,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct QuoteTransformContext {
     pub best_bid: Option<Decimal>,
     pub q: Option<Decimal>,
@@ -628,6 +628,15 @@ impl RegimePolicy {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RegimeClassifierSnapshot {
+    pub switch_confirm_seconds: i64,
+    pub min_dwell_seconds: i64,
+    pub current: Option<RegimeLabel>,
+    pub candidate: Option<(RegimeLabel, DateTime<Utc>)>,
+    pub last_switch: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RegimeClassifier {
     switch_confirm: Duration,
@@ -651,6 +660,26 @@ impl RegimeClassifier {
             current: None,
             candidate: None,
             last_switch: None,
+        }
+    }
+
+    pub fn snapshot(&self) -> RegimeClassifierSnapshot {
+        RegimeClassifierSnapshot {
+            switch_confirm_seconds: self.switch_confirm.num_seconds(),
+            min_dwell_seconds: self.min_dwell.num_seconds(),
+            current: self.current,
+            candidate: self.candidate,
+            last_switch: self.last_switch,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: RegimeClassifierSnapshot) -> Self {
+        Self {
+            switch_confirm: Duration::seconds(snapshot.switch_confirm_seconds.max(0)),
+            min_dwell: Duration::seconds(snapshot.min_dwell_seconds.max(0)),
+            current: snapshot.current,
+            candidate: snapshot.candidate,
+            last_switch: snapshot.last_switch,
         }
     }
 

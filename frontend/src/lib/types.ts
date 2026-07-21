@@ -469,6 +469,7 @@ export type VenueExecutionEvidence = {
       required_clean_days?: number;
       settled_markets?: number;
       required_settled_markets?: number;
+      wallet_constrained_net_pnl?: number;
       queue_conservative_net_pnl?: number;
       pnl_ci_lower_95?: number;
       positive_weekly_blocks?: number;
@@ -483,6 +484,19 @@ export type VenueExecutionEvidence = {
       fatal_warnings?: number;
       blocking_warnings?: number;
       unclassified_warnings?: number;
+      coverage_breakdown?: {
+        start_price_capture_rate?: string | number | null;
+        settlement_rate?: string | number | null;
+        exact_reference_hour_coverage?: string | number | null;
+        decision_metadata_coverage?: string | number | null;
+        decision_grade_coverage?: string | number | null;
+        execution_field_coverage?: string | number | null;
+        decision_parity_rate?: string | number | null;
+        queue_snapshot_coverage?: string | number | null;
+        markout_1s_completion?: string | number | null;
+        markout_5s_completion?: string | number | null;
+        markout_30s_completion?: string | number | null;
+      };
     };
     gates?: Record<string, {
       passed?: boolean;
@@ -516,6 +530,19 @@ export type VenueExecutionEvidence = {
           registry_version?: string;
           total_events?: number;
           decision_grade_coverage?: string | number;
+          coverage_breakdown?: {
+            start_price_capture_rate?: string | number | null;
+            settlement_rate?: string | number | null;
+            exact_reference_hour_coverage?: string | number | null;
+            decision_metadata_coverage?: string | number | null;
+            decision_grade_coverage?: string | number | null;
+            execution_field_coverage?: string | number | null;
+            decision_parity_rate?: string | number | null;
+            queue_snapshot_coverage?: string | number | null;
+            markout_1s_completion?: string | number | null;
+            markout_5s_completion?: string | number | null;
+            markout_30s_completion?: string | number | null;
+          };
           fatal_issues?: string[];
           warnings?: Array<{
             message?: string;
@@ -626,6 +653,12 @@ export type VenueExecutionEvidence = {
       horizon_seconds?: number;
       midpoint_markout_per_share?: number | null;
       executable_markout_per_share?: number | null;
+      fee_per_share?: number | null;
+      entry_fee_per_share?: number | null;
+      hypothetical_exit_fee_per_share?: number | null;
+      round_trip_fee_per_share?: number | null;
+      net_midpoint_markout_per_share?: number | null;
+      net_executable_markout_per_share?: number | null;
       observation_delay_ms?: number;
     }>;
     portfolio?: VenuePortfolioSnapshot | null;

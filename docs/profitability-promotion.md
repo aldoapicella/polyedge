@@ -52,7 +52,9 @@ The frozen candidate is `dynamic_quote_style@2026-06-14`. The first shadow decis
 - 100% replay/runtime decision parity;
 - at least 95% decision-grade data coverage;
 - zero fatal, blocking, or unclassified data warnings;
-- a positive 30-second executable markout lower bound after costs.
+- a positive 30-second executable markout lower bound after the recorded entry
+  fee. This is an adverse-selection gate, not round-trip liquidation PnL;
+  hypothetical exit fees are not deducted from shadow markouts.
 
 A clean day must cover the complete UTC window: the first event must arrive
 within five minutes of `00:00`, the last event within five minutes of `24:00`,
@@ -82,6 +84,150 @@ PnL, parity, markouts, and confidence bounds cannot help a candidate pass. The
 overall wallet-constrained equity and drawdown still include the full campaign,
 so excluding a dirty day from statistical evidence cannot hide a real capital
 loss.
+
+### Decision-grade evidence version 3
+
+The promotion-facing scalar `decision_grade_coverage` is the fraction of all
+recorded strategy evaluations whose recorded inputs qualify as decision grade.
+This denominator includes suppressed and no-quote evaluations, so filtering a
+bad input before the final decision stream cannot improve the rate. It is not a
+proxy for start-price or settlement coverage. Every daily artifact also
+publishes the separate start-price, settlement, final-decision metadata,
+final-decision grade, execution-field, queue-snapshot, and 1/5/30-second
+markout completion rates. Any required component below 95% is a known blocking
+warning; the dashboard shows the components separately so one healthy measure
+cannot hide a different missing field.
+
+Queue coverage is an exact ID join: the numerator is the set of registered
+shadow order IDs having exactly one valid queue snapshot, and the denominator
+is the set of eligible registered order IDs. Missing/invalid size, duplicates,
+and orphan snapshots block promotion and can never push coverage above 100%.
+Markout denominators come from actual eligible fill lifecycles, not from the
+markout rows that happened to survive. Every fill requires exactly one timely,
+numeric 1/5/30-second observation using midpoint and executable returns net of
+the fee recorded on entry. The shadow metric does not assume an exit order and
+therefore does not subtract a hypothetical exit fee; it must not be labeled
+round-trip PnL. Missing, null, gross-only, entry-fee-inconsistent, late,
+duplicate, or orphan markouts are excluded from the numerator and create a
+blocking warning.
+
+Daily market denominators include only markets whose `start_ts` falls inside
+the UTC dates represented by the audited event stream. Discovery records for a
+future UTC day are retained in raw evidence and counted as excluded future
+stubs, but cannot lower or improve the current day's coverage. A market with no
+known `start_ts` is retained only when it has decision or execution activity,
+so orphan activity remains fail-closed.
+
+`paper_settlement` is authoritative runtime evidence for the recorded start
+and final price. Reference fallback accepts only exact, non-stale resolution
+ticks: the first tick from zero through five seconds after market start and the
+first tick from zero through 15 seconds after market end. A pre-end tick can
+never settle a market. Exact references observed before late market metadata
+are retained and joined after the full stream is read.
+
+The `start_price` repeated in a descriptive `market` discovery payload is not
+promotion truth. An eligible `market_start_price` must independently bind a
+non-empty exact-resolution source, `stale=false`, and a source timestamp from
+zero through five seconds after the market start. Every settlement must repeat
+the same exact start binding even when an earlier start event exists; a missing
+or conflicting binding is blocking.
+
+Frozen-strategy transform parity is independently recomputed from versioned
+`strategy_evaluation` events containing the raw decision, full strategy
+configuration, quote context, features, and classifier state before and after
+evaluation. Full decision replay is a separate version-3 contract. Before any
+decision can act, the runtime durably appends and flushes a canonical
+`strategy_decision_batch` containing the secret-free pre-mutation settings,
+market, fair value, exact reference, relevant two-token books, regime feature
+input, classifier state, risk state, order-manager state, kill-switch state, and
+the exact market-start source, timestamp, value, and immutable market
+boundaries. The start evidence is a separate versioned event that must receive
+a durable recorder acknowledgement before the market becomes decision-eligible;
+its canonical SHA-256 is also bound into the batch input and checked against the
+independent event by the reporter. Out-of-order start/market events are safe
+because the event carries its own boundaries and parity is finalized only after
+the full stream has been read.
+The runtime and reporter call the same pure evaluator to recompute MakerFirst,
+the frozen regime transform, risk assessment/filtering, and order
+reconciliation. The reporter requires exact input and output hashes plus a
+one-to-one match between each recomputed final output and its durable decision
+event by batch ID, output index, metadata lineage, and SHA-256. The declared
+scope is `full_decision_pipeline_recomputation`; v2 output-only batches are not
+eligible. A failed evidence append or flush suppresses the entire batch rather
+than creating an unaudited decision.
+
+The secret-free decision settings are also reduced to the canonical
+`polyedge.decision_config.v1` projection and SHA-256. That digest covers the
+full secret-free target/reference/population policy, compact-recording and book-
+sampling data policy, strategy, risk, paper-execution, adaptive-regime,
+candidate, and execution-safety settings that can change a decision or its
+eligible population. It is embedded in every v3 batch
+and repeated in runtime provenance. A missing digest, a batch/provenance
+mismatch, or more than one digest inside the eligible clean suffix blocks the
+campaign. This prevents a mutable deployment from continuing under an
+unchanged candidate label.
+
+The runtime uses one mutation gate plus generation-checked compare-and-apply for
+the book, exact-start state, pause, kill switch, and engine state. If a book,
+control, fill, risk, order, settlement, or another decision mutates after
+evaluation, the prepared batch is rejected and reevaluated instead of being
+applied to the newer state. Once both generations match, all relevant mutations
+remain serialized through the required durable evidence acknowledgement and
+atomic paper application. This can add paper-feed latency during storage
+degradation, but it prevents an unaudited or stale decision from executing.
+
+A transient recorder failure keeps the first exact start event frozen in memory
+and retries it even after the capture window closes. A process crash before any
+durable acknowledgement can still lose that pending in-memory event; the market
+then remains ineligible rather than reconstructing evidence. Eliminating that
+availability limitation requires a venue/source replay feed or a separate
+durable write-ahead sink. It cannot be solved by accepting descriptive market
+text as exact evidence.
+
+Stable batch, evaluation, output, and settlement-journal IDs make retry safe.
+Byte-identical retries are deduplicated before any denominator is computed;
+conflicting duplicates, missing outputs, or orphan outputs are blocking. Local
+JSONL and Azure Blob Storage still cannot form one distributed transaction, so
+a cross-sink partial failure may leave duplicate stable IDs. The consumer-side
+deduplication rule is therefore part of the evidence contract, not an optional
+cleanup. Historical days that predate v3 cannot fabricate the required state
+snapshot or full replay and remain ineligible for promotion. The first eligible
+v3 day is the first complete UTC day recorded after the repaired runtime is
+deployed.
+
+Every settlement-journal event carries its stable journal ID, zero-based event
+index, total event count, and a canonical SHA-256 over the complete ordered
+unbound journal. Consumers buffer the journal and admit it only when indices
+`0..count-1` are present exactly once and the recomputed hash matches. An
+identical retry is ignored; a conflicting duplicate, incomplete journal, or
+hash mismatch blocks settlement and markout evidence. A frozen pending journal
+is retried before current-reference timing checks, so a storage delay cannot
+make a valid settlement permanently disappear after its 15-second final-price
+window closes.
+
+The frozen candidate's observed runtime decision is replayed exactly once. A
+post-transform decision is never passed through `dynamic_quote_style` a second
+time. Historical static and alternative-profile counterfactuals that only see
+the candidate-filtered runtime stream are explicitly diagnostic-only; future
+raw evaluation events preserve the inputs needed for honest counterfactual
+research without changing the active frozen candidate.
+
+The 95% PnL lower bound is a deterministic circular seven-day block bootstrap
+of the current clean suffix's wallet-constrained daily PnL increments. It is
+reported in mean daily PnL units and is unavailable before 28 clean days. The
+four-block gate counts only the latest-aligned complete, non-overlapping
+seven-day blocks. These are trailing evidence blocks, not calendar weeks, and
+their membership is recomputed when a new day arrives; an earlier good block
+cannot hide a later losing block. Maximum
+drawdown is the conservative maximum of the recorded intraday value and a
+recomputed high-watermark drawdown across the complete validated wallet chain,
+including dirty-day losses. Queue-conservative PnL for all candidate intents
+remains a separate diagnostic; unfundable intents cannot manufacture a
+positive confidence bound or weekly block.
+
+Daily and cumulative market artifacts have distinct explicit output paths.
+Building a cumulative summary must never overwrite the day's
+`markets_summary.json` before atomic publication.
 
 An inconclusive result may extend once to 60 calendar days or 2,000 markets. If every promotion gate has not passed when either limit is reached, the immutable manifest enters terminal `stopped_no_go`; the candidate is not tuned inside its holdout.
 

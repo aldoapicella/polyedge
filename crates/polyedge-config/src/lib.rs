@@ -107,6 +107,7 @@ pub struct TargetConfig {
     pub enable_polymarket_rtds_binance: bool,
     pub enable_direct_binance_book_ticker: bool,
     pub rtds_ping_interval_seconds: f64,
+    pub rtds_chainlink_watchdog_seconds: f64,
     pub start_price_capture_grace_seconds: f64,
     #[serde(with = "decimal_string")]
     pub reference_divergence_pause_threshold: Decimal,
@@ -134,6 +135,7 @@ impl Default for TargetConfig {
             enable_polymarket_rtds_binance: true,
             enable_direct_binance_book_ticker: false,
             rtds_ping_interval_seconds: 5.0,
+            rtds_chainlink_watchdog_seconds: 30.0,
             start_price_capture_grace_seconds: 5.0,
             reference_divergence_pause_threshold: Decimal::new(15, 4),
         }
@@ -390,6 +392,10 @@ impl RuntimeSettings {
         settings.target.rtds_ping_interval_seconds = env_f64(
             "RTDS_PING_INTERVAL_SECONDS",
             settings.target.rtds_ping_interval_seconds,
+        );
+        settings.target.rtds_chainlink_watchdog_seconds = env_f64(
+            "RTDS_CHAINLINK_WATCHDOG_SECONDS",
+            settings.target.rtds_chainlink_watchdog_seconds,
         );
         settings.target.start_price_capture_grace_seconds = env_f64(
             "START_PRICE_CAPTURE_GRACE_SECONDS",

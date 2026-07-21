@@ -1678,11 +1678,23 @@ fn json_row(
         "data_quality": quality_summary,
         "runtime_role": runtime_role.map(polyedge_config::RuntimeRole::as_str),
         "wallet_constrained": dynamic_wallet_constrained,
-        "decision_parity_rate": number_at(&source, &["/result/decision_parity_rate", "/decision_parity_rate"]),
+        "decision_parity_rate": number_at(&source, &["/result/decision_parity_rate", "/decision_parity_rate"])
+            .or_else(|| audit.and_then(|report| number_at(report, &["/result/decision_parity_rate", "/decision_parity_rate"]))),
+        "decision_config_sha256": audit.and_then(|report| {
+            report.pointer("/result/decision_config_sha256")
+                .or_else(|| report.get("decision_config_sha256"))
+                .and_then(Value::as_str)
+        }),
+        "decision_metadata_coverage": audit.and_then(|report| number_at(report, &["/result/decision_metadata_coverage", "/decision_metadata_coverage"])),
+        "decision_grade_decision_coverage": audit.and_then(|report| number_at(report, &["/result/decision_grade_coverage", "/decision_grade_coverage"])),
+        "execution_field_coverage": audit.and_then(|report| number_at(report, &["/result/execution_field_coverage", "/execution_field_coverage"])),
         "markout_30s_ci_low": execution_quality.and_then(|report| {
             report.pointer("/result/markouts/30/executable/ci_95_low")
                 .or_else(|| report.pointer("/result/markouts/30/executable_markout_ci_95_low"))
         }).cloned(),
+        "markout_30s_mean": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/mean")).cloned(),
+        "markout_30s_sample_std": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/sample_std")).cloned(),
+        "markout_30s_sample_size": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/count")).cloned(),
         "execution_quality_gate": execution_quality_gate,
         "queue_snapshot_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_coverage")).cloned(),
         "markout_1s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/1/completion_rate")).cloned(),
@@ -1877,6 +1889,24 @@ fn aggregate_profitability_metrics(
     if evidence_rows.is_empty() {
         missing.push("eligible_clean_daily_rows".to_owned());
     }
+    let decision_configs = evidence_rows
+        .iter()
+        .map(|row| {
+            row["decision_config_sha256"].as_str().filter(|hash| {
+                hash.len() == 71
+                    && hash.starts_with("sha256:")
+                    && hash[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    if decision_configs
+        .as_ref()
+        .is_none_or(|hashes| hashes.is_empty() || hashes.iter().collect::<BTreeSet<_>>().len() != 1)
+    {
+        missing.push("frozen_decision_config_sha256".to_owned());
+    }
     // If the latest day is dirty, surface its exact blockers. Otherwise the
     // quality summary describes the same clean suffix used by the statistical
     // gates instead of making one old bootstrap day poison the campaign
@@ -1909,6 +1939,14 @@ fn aggregate_profitability_metrics(
         .iter()
         .flat_map(|quality| quality.warnings.clone())
         .collect();
+    let minimum_component = |selector: fn(&DataQualityCoverageBreakdown) -> Option<Decimal>| {
+        qualities
+            .iter()
+            .map(|quality| selector(&quality.coverage_breakdown))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    };
     let quality = DataQualitySummary {
         registry_version: WARNING_REGISTRY_VERSION.to_owned(),
         total_events,
@@ -1922,6 +1960,21 @@ fn aggregate_profitability_metrics(
         event_time_ordering_restored: qualities
             .iter()
             .all(|quality| quality.event_time_ordering_restored),
+        coverage_breakdown: DataQualityCoverageBreakdown {
+            start_price_capture_rate: minimum_component(|row| row.start_price_capture_rate),
+            settlement_rate: minimum_component(|row| row.settlement_rate),
+            exact_reference_hour_coverage: minimum_component(|row| {
+                row.exact_reference_hour_coverage
+            }),
+            decision_metadata_coverage: minimum_component(|row| row.decision_metadata_coverage),
+            decision_grade_coverage: minimum_component(|row| row.decision_grade_coverage),
+            execution_field_coverage: minimum_component(|row| row.execution_field_coverage),
+            decision_parity_rate: minimum_component(|row| row.decision_parity_rate),
+            queue_snapshot_coverage: minimum_component(|row| row.queue_snapshot_coverage),
+            markout_1s_completion: minimum_component(|row| row.markout_1s_completion),
+            markout_5s_completion: minimum_component(|row| row.markout_5s_completion),
+            markout_30s_completion: minimum_component(|row| row.markout_30s_completion),
+        },
     };
     let clean_days = consecutive_clean_day_streak(rows);
 
@@ -1963,33 +2016,29 @@ fn aggregate_profitability_metrics(
     let wallet_ending_equity = latest_wallet
         .map(|snapshot| snapshot.ending_equity)
         .unwrap_or_default();
-    let wallet_max_drawdown = latest_wallet
-        .map(|snapshot| snapshot.max_drawdown)
-        .unwrap_or_default();
+    // Reconcile the cumulative replay's intraday drawdown with a second,
+    // independent lower bound derived from trusted end-of-day equity. The
+    // full wallet chain is used here (including dirty days), so a loss on a
+    // day excluded from statistical evidence still counts against the risk
+    // gate. Taking the maximum preserves any larger intraday drawdown while
+    // preventing an understated stored metric from passing.
+    let wallet_max_drawdown = reconciled_wallet_max_drawdown(&wallet_snapshots);
+    let wallet_daily_pnl = clean_wallet_daily_increments(evidence_rows, &wallet_snapshots);
+    if wallet_daily_pnl.is_none() {
+        missing.push("clean_wallet_daily_pnl".to_owned());
+    }
 
-    // Recompute the confidence bound from the exact clean suffix instead of
-    // trusting a potentially stale prospective artifact. The separately
-    // published prospective report carries a hash of these same rows for
-    // auditability, but it is not an authorization input.
-    let paired_summary = complete_paired_candidate_summary(
-        evidence_rows,
-        "dynamic_quote_style",
-        "dynamic_quote_style_paired_delta",
-        "dynamic_quote_style_net_pnl",
-    );
-    let pnl_ci = paired_summary
-        .as_ref()
-        .and_then(|summary| decimal_from_value(&summary["ci_95_low"]));
+    // Recompute the predeclared seven-day block-bootstrap bound from the exact
+    // clean suffix. It is a bound on wallet-constrained queue-conservative
+    // daily PnL, not on improvement over static or on unconstrained replay PnL.
+    // A stale prospective artifact is never an authorization input.
+    let pnl_ci = wallet_daily_pnl
+        .as_deref()
+        .and_then(block_bootstrap_daily_pnl_lower_95);
     if pnl_ci.is_none() {
         missing.push("pnl_ci_95_low".to_owned());
     }
-    let markout_values = evidence_rows
-        .iter()
-        .map(|row| decimal_from_value(&row["markout_30s_ci_low"]))
-        .collect::<Option<Vec<_>>>();
-    let markout_ci = markout_values
-        .as_ref()
-        .and_then(|values| values.iter().copied().min());
+    let markout_ci = block_bootstrap_daily_markout_lower_95(evidence_rows);
     if markout_ci.is_none() {
         missing.push("markout_30s_ci_low".to_owned());
     }
@@ -2019,28 +2068,12 @@ fn aggregate_profitability_metrics(
     let execution_model_markout_30s_lower_95 = decimal_from_value(
         &execution_model["net_executable_markout_30s_lower_confidence_bound_95"],
     );
-    let mut weekly = BTreeMap::<(i32, u32), Decimal>::new();
-    for (row, pnl) in evidence_rows.iter().zip(pnl_values.iter()) {
-        let Some(date) = row["date"]
-            .as_str()
-            .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
-        else {
-            continue;
-        };
-        let week = date.iso_week();
-        *weekly.entry((week.year(), week.week())).or_default() += *pnl;
-    }
-    let mut consecutive = 0_u32;
-    let mut best_consecutive = 0_u32;
-    for pnl in weekly.values() {
-        if *pnl > Decimal::ZERO {
-            consecutive += 1;
-            best_consecutive = best_consecutive.max(consecutive);
-        } else {
-            consecutive = 0;
-        }
-    }
-    if weekly.is_empty() {
+    // Weekly profitability uses the same capital-realistic ledger increments
+    // as the confidence bound. Unfundable shadow intents cannot manufacture a
+    // positive week.
+    let (consecutive, complete_weekly_blocks) =
+        trailing_positive_complete_weekly_blocks(wallet_daily_pnl.as_deref().unwrap_or_default());
+    if complete_weekly_blocks == 0 {
         missing.push("weekly_blocks".to_owned());
     }
     missing.sort();
@@ -2055,7 +2088,9 @@ fn aggregate_profitability_metrics(
         wallet_constrained_ending_equity: wallet_ending_equity,
         queue_conservative_net_pnl: queue_pnl,
         pnl_ci_95_low: pnl_ci.unwrap_or(Decimal::ZERO),
-        consecutive_positive_weekly_blocks: best_consecutive,
+        // Promotion requires the current trailing run. An old winning streak
+        // cannot survive a subsequently losing complete block.
+        consecutive_positive_weekly_blocks: consecutive,
         max_drawdown: wallet_max_drawdown,
         drawdown_limit: thresholds.maximum_modeled_drawdown,
         markout_30s_ci_low: markout_ci.unwrap_or(Decimal::ZERO),
@@ -2074,6 +2109,109 @@ fn aggregate_profitability_metrics(
         data_quality: quality,
         missing_metrics: missing,
     }
+}
+
+fn block_bootstrap_daily_pnl_lower_95(values: &[Decimal]) -> Option<Decimal> {
+    const BLOCK_DAYS: usize = 7;
+    const MIN_BLOCKS: usize = 4;
+    const RESAMPLES: usize = 10_000;
+    if values.len() < BLOCK_DAYS * MIN_BLOCKS {
+        return None;
+    }
+    let encoded =
+        serde_json::to_vec(&values.iter().map(Decimal::to_string).collect::<Vec<_>>()).ok()?;
+    let digest = Sha256::digest(encoded);
+    let mut seed = u64::from_le_bytes(digest[..8].try_into().ok()?);
+    if seed == 0 {
+        seed = 0x9e37_79b9_7f4a_7c15;
+    }
+    let mut estimates = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut total = Decimal::ZERO;
+        let mut sampled = 0_usize;
+        while sampled < values.len() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let start = (seed as usize) % values.len();
+            for offset in 0..BLOCK_DAYS.min(values.len() - sampled) {
+                total += values[(start + offset) % values.len()];
+                sampled += 1;
+            }
+        }
+        estimates.push(total / Decimal::from(values.len() as u64));
+    }
+    estimates.sort_unstable();
+    estimates.get((RESAMPLES * 25) / 1_000).copied()
+}
+
+fn clean_wallet_daily_increments(
+    evidence_rows: &[Value],
+    snapshots: &[CumulativeWalletSnapshot],
+) -> Option<Vec<Decimal>> {
+    let by_date = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.date, snapshot))
+        .collect::<BTreeMap<_, _>>();
+    let first = NaiveDate::parse_from_str(PROJECTED_WALLET_PROTOCOL_CUTOFF, "%Y-%m-%d").ok()?;
+    evidence_rows
+        .iter()
+        .map(|row| {
+            let date = row["date"]
+                .as_str()
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())?;
+            let current = *by_date.get(&date)?;
+            if current.unresolved_orders > 0 {
+                return None;
+            }
+            let previous = if date == first {
+                Decimal::ZERO
+            } else {
+                by_date.get(&date.pred_opt()?)?.net_pnl
+            };
+            Some(current.net_pnl - previous)
+        })
+        .collect()
+}
+
+fn recomputed_wallet_equity_drawdown(snapshots: &[CumulativeWalletSnapshot]) -> Decimal {
+    let mut high_watermark = WALLET_CAMPAIGN_BASELINE;
+    let mut max_drawdown = Decimal::ZERO;
+    for snapshot in snapshots {
+        high_watermark = high_watermark.max(snapshot.ending_equity);
+        max_drawdown = max_drawdown.max(high_watermark - snapshot.ending_equity);
+    }
+    max_drawdown
+}
+
+fn reconciled_wallet_max_drawdown(snapshots: &[CumulativeWalletSnapshot]) -> Decimal {
+    snapshots
+        .last()
+        .map(|snapshot| snapshot.max_drawdown)
+        .unwrap_or_default()
+        .max(recomputed_wallet_equity_drawdown(snapshots))
+}
+
+fn trailing_positive_complete_weekly_blocks(daily_pnl: &[Decimal]) -> (u32, usize) {
+    let mut blocks = daily_pnl.rchunks_exact(7);
+    let complete_blocks = blocks.len();
+    let consecutive = blocks
+        .by_ref()
+        .take_while(|block| block.iter().copied().sum::<Decimal>() > Decimal::ZERO)
+        .count();
+    (
+        u32::try_from(consecutive).unwrap_or(u32::MAX),
+        complete_blocks,
+    )
+}
+
+fn block_bootstrap_daily_markout_lower_95(rows: &[Value]) -> Option<Decimal> {
+    let daily_means = rows
+        .iter()
+        .filter(|row| row["markout_30s_sample_size"].as_u64().unwrap_or_default() > 0)
+        .map(|row| decimal_from_value(&row["markout_30s_mean"]))
+        .collect::<Option<Vec<_>>>()?;
+    block_bootstrap_daily_pnl_lower_95(&daily_means)
 }
 
 #[derive(Clone, Debug)]
@@ -2310,6 +2448,7 @@ fn paired_candidate_summary(
     })
 }
 
+#[cfg(test)]
 fn complete_paired_candidate_summary(
     rows: &[Value],
     candidate: &str,
@@ -2639,6 +2778,164 @@ mod wallet_metric_tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn measured_quality(
+        total_events: u64,
+        coverage: Decimal,
+        fatal_issues: Vec<String>,
+        warnings: Vec<String>,
+    ) -> DataQualitySummary {
+        let mut quality = DataQualitySummary::new(total_events, coverage, fatal_issues, warnings);
+        quality.coverage_breakdown = DataQualityCoverageBreakdown {
+            start_price_capture_rate: Some(coverage),
+            settlement_rate: Some(coverage),
+            exact_reference_hour_coverage: Some(coverage),
+            decision_metadata_coverage: Some(coverage),
+            decision_grade_coverage: Some(coverage),
+            execution_field_coverage: Some(coverage),
+            decision_parity_rate: Some(Decimal::ONE),
+            queue_snapshot_coverage: Some(coverage),
+            markout_1s_completion: Some(coverage),
+            markout_5s_completion: Some(coverage),
+            markout_30s_completion: Some(coverage),
+        };
+        quality
+    }
+
+    #[test]
+    fn block_bootstrap_bound_is_deterministic_for_daily_wallet_pnl() {
+        let positive = vec![Decimal::ONE; 28];
+        assert_eq!(
+            block_bootstrap_daily_pnl_lower_95(&positive),
+            Some(Decimal::ONE)
+        );
+        let mut mixed = positive;
+        for value in mixed.iter_mut().take(14) {
+            *value = -Decimal::ONE;
+        }
+        let first = block_bootstrap_daily_pnl_lower_95(&mixed);
+        let second = block_bootstrap_daily_pnl_lower_95(&mixed);
+        assert_eq!(first, second);
+        assert!(first.is_some_and(|value| value < Decimal::ZERO));
+        assert!(block_bootstrap_daily_pnl_lower_95(&vec![Decimal::ONE; 27]).is_none());
+    }
+
+    #[test]
+    fn markout_bound_requires_four_daily_clusters_and_is_block_bootstrapped() {
+        let too_few = (0..27)
+            .map(|_| json!({"markout_30s_sample_size": 2, "markout_30s_mean": "0.02"}))
+            .collect::<Vec<_>>();
+        assert!(block_bootstrap_daily_markout_lower_95(&too_few).is_none());
+
+        let enough = (0..28)
+            .map(|_| json!({"markout_30s_sample_size": 2, "markout_30s_mean": "0.02"}))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            block_bootstrap_daily_markout_lower_95(&enough),
+            Some(Decimal::new(2, 2))
+        );
+    }
+
+    #[test]
+    fn weekly_gate_counts_only_the_trailing_positive_complete_blocks() {
+        let mut daily = vec![Decimal::ONE; 28];
+        assert_eq!(trailing_positive_complete_weekly_blocks(&daily), (4, 4));
+
+        // A later losing complete week resets the gate even though four
+        // positive historical weeks still exist.
+        daily.extend(vec![-Decimal::ONE; 7]);
+        assert_eq!(trailing_positive_complete_weekly_blocks(&daily), (0, 5));
+
+        // An incomplete in-progress week is not evidence for or against a
+        // complete weekly block.
+        daily.push(-Decimal::ONE);
+        assert_eq!(trailing_positive_complete_weekly_blocks(&daily), (0, 5));
+
+        // Oldest-aligned chunking would ignore this adverse one-day tail and
+        // incorrectly retain four winning blocks. Latest-aligned blocks must
+        // include it in the newest complete week.
+        let mut adverse_tail = vec![Decimal::ONE; 28];
+        adverse_tail.push(-Decimal::from(10));
+        assert_eq!(
+            trailing_positive_complete_weekly_blocks(&adverse_tail),
+            (0, 4)
+        );
+    }
+
+    #[test]
+    fn campaign_gate_requires_one_frozen_decision_config_across_clean_days() {
+        let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let row = |date: &str, digest: char| {
+            json!({
+                "date": date,
+                "runtime_role": "profitability_shadow",
+                "decision_config_sha256": format!("sha256:{}", digest.to_string().repeat(64)),
+                "data_quality": quality
+            })
+        };
+        let same = vec![row("2026-07-20", 'a'), row("2026-07-21", 'a')];
+        let same_metrics = aggregate_profitability_metrics(
+            &same,
+            &json!({}),
+            &json!({}),
+            &PromotionThresholds::default(),
+        );
+        assert!(!same_metrics
+            .missing_metrics
+            .contains(&"frozen_decision_config_sha256".to_owned()));
+
+        let changed = vec![row("2026-07-20", 'a'), row("2026-07-21", 'b')];
+        let changed_metrics = aggregate_profitability_metrics(
+            &changed,
+            &json!({}),
+            &json!({}),
+            &PromotionThresholds::default(),
+        );
+        assert!(changed_metrics
+            .missing_metrics
+            .contains(&"frozen_decision_config_sha256".to_owned()));
+
+        let mut noncanonical = same;
+        noncanonical[1]["decision_config_sha256"] = json!(format!("sha256:{}", "A".repeat(64)));
+        let noncanonical_metrics = aggregate_profitability_metrics(
+            &noncanonical,
+            &json!({}),
+            &json!({}),
+            &PromotionThresholds::default(),
+        );
+        assert!(noncanonical_metrics
+            .missing_metrics
+            .contains(&"frozen_decision_config_sha256".to_owned()));
+    }
+
+    #[test]
+    fn drawdown_reconciliation_catches_underreported_dirty_day_loss() {
+        let snapshot =
+            |day: u32, equity: Decimal, stored_drawdown: Decimal| CumulativeWalletSnapshot {
+                date: NaiveDate::from_ymd_opt(2026, 7, day).unwrap(),
+                schema_version: 2,
+                input_sha256: format!("sha256:{}", "a".repeat(64)),
+                parent_input_sha256: None,
+                events: u64::from(day),
+                net_pnl: equity - WALLET_CAMPAIGN_BASELINE,
+                ending_equity: equity,
+                max_drawdown: stored_drawdown,
+                unresolved_orders: 0,
+            };
+        let snapshots = vec![
+            snapshot(13, d("6"), Decimal::ZERO),
+            // This snapshot can correspond to a dirty day. It must remain in
+            // the cumulative risk ledger even when excluded from clean stats.
+            snapshot(14, d("4.8"), Decimal::ZERO),
+            snapshot(15, d("5.5"), Decimal::ZERO),
+        ];
+        assert_eq!(recomputed_wallet_equity_drawdown(&snapshots), d("1.2"));
+        assert_eq!(reconciled_wallet_max_drawdown(&snapshots), d("1.2"));
+
+        let mut larger_intraday = snapshots;
+        larger_intraday.last_mut().unwrap().max_drawdown = d("1.4");
+        assert_eq!(reconciled_wallet_max_drawdown(&larger_intraday), d("1.4"));
+    }
+
     #[test]
     fn cumulative_wallet_selects_full_profile_before_lossy_comparison() {
         let report = json!({
@@ -2689,7 +2986,7 @@ mod wallet_metric_tests {
             "wallet_constrained_max_drawdown": "0",
             "wallet_constrained_unresolved_orders": 0
         });
-        let quality = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
+        let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
         let runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
         let row = json_row(
             "2026-07-13",
@@ -2772,7 +3069,7 @@ mod wallet_metric_tests {
                 "wallet_constrained_ending_equity": equity,
                 "wallet_constrained_max_drawdown": drawdown,
                 "wallet_constrained_unresolved_orders": unresolved,
-                "data_quality": DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new())
+                "data_quality": measured_quality(100, Decimal::ONE, Vec::new(), Vec::new())
             })
         }
         let rows = vec![
@@ -2865,9 +3162,8 @@ mod wallet_metric_tests {
 
     #[test]
     fn clean_day_streak_resets_on_date_gap_and_dirty_day() {
-        let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
-        let dirty =
-            DataQualitySummary::new(100, Decimal::new(90, 2), Vec::new(), Vec::<String>::new());
+        let clean = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let dirty = measured_quality(100, Decimal::new(90, 2), Vec::new(), Vec::new());
         let row = |date: &str, quality: &DataQualitySummary| {
             json!({
                 "date": date,
@@ -2895,8 +3191,8 @@ mod wallet_metric_tests {
 
     #[test]
     fn statistical_evidence_uses_only_the_current_clean_suffix() {
-        let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
-        let dirty = DataQualitySummary::new(
+        let clean = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let dirty = measured_quality(
             100,
             Decimal::new(50, 2),
             Vec::new(),
@@ -2944,8 +3240,8 @@ mod wallet_metric_tests {
 
     #[test]
     fn dirty_profit_and_markets_cannot_help_gates_but_wallet_loss_remains() {
-        let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
-        let dirty = DataQualitySummary::new(
+        let clean = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let dirty = measured_quality(
             100,
             Decimal::new(50, 2),
             Vec::new(),
@@ -3059,7 +3355,13 @@ mod wallet_metric_tests {
         let audit = json!({
             "result": {
                 "total_events": 2400,
+                "start_price_capture_rate": 1.0,
+                "settlement_rate": 1.0,
+                "exact_resolution_reference_hour_coverage": 1.0,
+                "decision_metadata_coverage": 1.0,
                 "decision_grade_coverage": 1.0,
+                "execution_field_coverage": 1.0,
+                "decision_parity_rate": 1.0,
                 "fatal_data_quality_issues": [],
                 "warnings": [],
                 "event_time_ordering_restored": true,
@@ -3070,7 +3372,9 @@ mod wallet_metric_tests {
                 "largest_time_gaps": [{"gap_ms": 60000}]
             }
         });
-        assert!(quality_from_audit(&audit).promotion_allowed());
+        // Audit-only evidence is intentionally incomplete: queue and markout
+        // coverage are merged from execution_quality.json during publication.
+        assert!(!quality_from_audit(&audit).promotion_allowed());
         let audit_path = source.join("data_audit.json");
         std::fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
         let daily_root = root.join("daily");
@@ -3101,8 +3405,8 @@ mod wallet_metric_tests {
 
     #[test]
     fn fresh_local_day_merges_with_prior_azure_history() {
-        let clean = DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new());
-        let dirty = DataQualitySummary::new(
+        let clean = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let dirty = measured_quality(
             100,
             Decimal::ONE,
             vec!["duplicate stale current-day row".to_owned()],
@@ -3134,9 +3438,9 @@ mod wallet_metric_tests {
     fn clean_day_streak_resets_on_gap_or_dirty_day() {
         fn row(date: &str, clean: bool) -> Value {
             let quality = if clean {
-                DataQualitySummary::new(100, Decimal::ONE, Vec::new(), Vec::<String>::new())
+                measured_quality(100, Decimal::ONE, Vec::new(), Vec::new())
             } else {
-                DataQualitySummary::new(
+                measured_quality(
                     100,
                     Decimal::ONE,
                     vec!["fatal_test_gap".to_owned()],

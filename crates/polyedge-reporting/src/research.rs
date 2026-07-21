@@ -2,14 +2,16 @@ use chrono::{DateTime, Datelike, Duration, SecondsFormat, Timelike, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use polyedge_config::{embedded_git_sha, is_full_git_sha, RuntimeSettings};
+use polyedge_config::{embedded_git_sha, is_full_git_sha, RuntimeSettings, StrategyConfig};
 use polyedge_domain::{
     ConditionId, DecisionAction, MarketId, OrderKind, Outcome, Side, TokenId, TradeDecision,
 };
 use polyedge_engine::{
-    crypto_taker_fee_per_share, evaluate_frozen_strategy, FrozenStrategyMode, QuoteStyle,
-    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
-    RegimeFeatures, RegimePolicy, RegimeReferencePoint,
+    crypto_taker_fee_per_share, evaluate_decision_pipeline_v3, evaluate_frozen_strategy,
+    DecisionPipelineInputV3, DecisionPipelineOutputV3, FrozenStrategyMode, MarketStartEvidenceV1,
+    QuoteStyle, QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier,
+    RegimeClassifierSnapshot, RegimeFeatureInput, RegimeFeatures, RegimePolicy,
+    RegimeReferencePoint, StrategyDecisionMetadata,
 };
 use polyedge_storage::{
     AzureBlobClient, AzureBlobError, AzureBlobItem, ImmutableBlobWrite, VersionedBlobBytes,
@@ -59,19 +61,21 @@ pub use run_bundle::{
     parse_azure_artifact_uri, publish_daily_directory, stop_funded_manifest_from_stage_block,
     validate_protocol_v3_order_evidence, write_funded_ladder_state, write_promotion_manifest,
     AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AtomicDailyRun, CandidateIdentity,
-    DailyDependency, DailyRunManifest, DataQualitySummary, ExecutionModelBinding,
-    ExpireFundedManifestOptions, FundedCheckpointEvidenceV1, FundedExpirationTransitionResult,
-    FundedHoldoutEvaluationV1, FundedLadderMetrics, FundedLadderStateV1,
-    FundedLadderTransitionResult, FundedManifestTransitionResult, FundedStageBlockTransitionResult,
-    FundedStageBlockV1, FundedStageGrantV1, GateOutcome, GateStatus, ImmutableArtifactBindingV1,
-    InitializeFundedManifestOptions, LatestRunPointer, ProfitabilityMetrics, PromotionEvaluation,
-    PromotionManifestV1, PromotionPhase, PromotionThresholds, PublishedDailyBundle,
-    QueueModelTransitionV1, RunArtifact, RunStatus, StopFundedManifestFromStageBlockOptions,
-    ValidatedProtocolV3OrderEvidence, WarningClassification, WarningSeverity,
-    DEFAULT_PROFITABILITY_LATEST, FUNDED_LADDER_TARGETS, WARNING_REGISTRY_VERSION,
+    DailyDependency, DailyRunManifest, DataQualityCoverageBreakdown, DataQualitySummary,
+    ExecutionModelBinding, ExpireFundedManifestOptions, FundedCheckpointEvidenceV1,
+    FundedExpirationTransitionResult, FundedHoldoutEvaluationV1, FundedLadderMetrics,
+    FundedLadderStateV1, FundedLadderTransitionResult, FundedManifestTransitionResult,
+    FundedStageBlockTransitionResult, FundedStageBlockV1, FundedStageGrantV1, GateOutcome,
+    GateStatus, ImmutableArtifactBindingV1, InitializeFundedManifestOptions, LatestRunPointer,
+    ProfitabilityMetrics, PromotionEvaluation, PromotionManifestV1, PromotionPhase,
+    PromotionThresholds, PublishedDailyBundle, QueueModelTransitionV1, RunArtifact, RunStatus,
+    StopFundedManifestFromStageBlockOptions, ValidatedProtocolV3OrderEvidence,
+    WarningClassification, WarningSeverity, DEFAULT_PROFITABILITY_LATEST, FUNDED_LADDER_TARGETS,
+    WARNING_REGISTRY_VERSION,
 };
 
 const SETTLEMENT_WINDOW_SECONDS: i64 = 15;
+const START_PRICE_CAPTURE_WINDOW_SECONDS: i64 = 5;
 const MAX_DUPLICATE_HASHES: usize = 100_000;
 const DEFAULT_AZURE_PREFETCH_BLOBS: usize = 4;
 const MAX_AZURE_PREFETCH_BLOBS: usize = 32;
@@ -87,6 +91,7 @@ const WALLET_EQUITY_FLOOR: Decimal = Decimal::from_parts(403, 0, 0, false, 2);
 const WALLET_MAX_DRAWDOWN: Decimal = Decimal::ONE;
 const WALLET_MAX_ORDER_NOTIONAL: Decimal = Decimal::ONE;
 const MARKOUT_HORIZONS_SECONDS: [i64; 3] = [1, 5, 30];
+const MAX_MARKOUT_OBSERVATION_DELAY_MS: i64 = 2_000;
 const QUEUE_EVIDENCE_KEYS: &[&str] = &[
     "queue_position",
     "queue_ahead",
@@ -708,12 +713,6 @@ pub fn run_build_markets(options: BuildMarketsOptions) -> Result<Value, Research
         &report,
         &markets_markdown(&report),
     )?;
-    if let Some(parent) = options.markdown.parent() {
-        let summary_json = parent.join("markets_summary.json");
-        if summary_json != options.out {
-            write_json_file(&summary_json, &report)?;
-        }
-    }
     Ok(report)
 }
 
@@ -2143,6 +2142,7 @@ fn filtered_normalized_event_paths(paths: &[PathBuf], mode: EventPathMode) -> Ve
             "fair_values.jsonl",
             "decisions.jsonl",
             "execution_reports.jsonl",
+            "paper_settlements.jsonl",
             "feed_errors.jsonl",
             "other.jsonl",
         ][..],
@@ -2169,7 +2169,9 @@ fn filtered_normalized_event_paths(paths: &[PathBuf], mode: EventPathMode) -> Ve
             "fair_values.jsonl",
             "other.jsonl",
         ][..],
-        EventPathMode::ExecutionQuality => &["other.jsonl"][..],
+        EventPathMode::ExecutionQuality => {
+            &["decisions.jsonl", "execution_reports.jsonl", "other.jsonl"][..]
+        }
     };
     paths
         .iter()
@@ -2217,6 +2219,84 @@ fn is_gzip_jsonl_path(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".jsonl.gz"))
 }
 
+#[derive(Clone, Debug)]
+struct StrategyBatchOutputV3 {
+    decision_sha256: String,
+    decision: Value,
+}
+
+#[derive(Clone, Debug)]
+struct StrategyBatchAuditV3 {
+    event_sha256: String,
+    expected_outputs: Option<Vec<StrategyBatchOutputV3>>,
+    market_start_evidence: Option<MarketStartEvidenceV1>,
+    conflicted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ObservedStrategyOutputV3 {
+    event_sha256: String,
+    payload: Value,
+    conflicted: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DecisionOutputKeyV3 {
+    batch_id: String,
+    output_index: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaceOutputIdentityV3 {
+    market_id: String,
+    token_id: String,
+    side: String,
+    price: Decimal,
+    size: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableDecisionOutputV3 {
+    key: DecisionOutputKeyV3,
+    decision_sha256: String,
+    action: String,
+    place_identity: Option<PlaceOutputIdentityV3>,
+}
+
+#[derive(Clone, Debug)]
+struct AppliedDecisionOutputV1 {
+    key: DecisionOutputKeyV3,
+    decision_sha256: String,
+    action: String,
+    place_identity: Option<PlaceOutputIdentityV3>,
+    order_id: Option<String>,
+    event_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementJournalEventV1 {
+    event_type: String,
+    payload: Value,
+    event_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementJournalAuditV1 {
+    event_count: u64,
+    journal_sha256: String,
+    events: BTreeMap<u64, SettlementJournalEventV1>,
+    paper_settlement_events: usize,
+    conflicted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalObservation {
+    NotJournaled,
+    New,
+    Duplicate,
+    Conflict,
+}
+
 #[derive(Default)]
 struct AuditAccumulator {
     total_events: usize,
@@ -2228,6 +2308,39 @@ struct AuditAccumulator {
     markets: BTreeMap<String, MarketTruth>,
     token_to_market: BTreeMap<String, String>,
     decisions: usize,
+    decisions_with_strategy_metadata: usize,
+    decision_grade_decisions: usize,
+    decision_grade_evaluations: usize,
+    place_decisions: usize,
+    place_decisions_with_complete_execution_fields: usize,
+    strategy_evaluations: usize,
+    strategy_evaluation_matches: usize,
+    strategy_evaluation_invalid: usize,
+    strategy_evaluation_retry_duplicates: usize,
+    strategy_evaluation_conflicts: usize,
+    strategy_evaluation_observed: BTreeMap<(String, u64), ObservedStrategyOutputV3>,
+    strategy_batch_events: usize,
+    strategy_batches: usize,
+    strategy_batch_replayed: usize,
+    strategy_batch_matches: usize,
+    strategy_batch_invalid: usize,
+    strategy_batch_ineligible: usize,
+    strategy_batch_retry_duplicates: usize,
+    strategy_batch_conflicts: usize,
+    strategy_batch_expected_outputs: usize,
+    strategy_batch_bound_outputs: usize,
+    strategy_binding_retry_duplicates: usize,
+    strategy_binding_conflicts: usize,
+    strategy_binding_ineligible: usize,
+    unbound_strategy_decisions: usize,
+    strategy_batch_expected: BTreeMap<String, StrategyBatchAuditV3>,
+    strategy_batch_observed: BTreeMap<String, BTreeMap<u64, ObservedStrategyOutputV3>>,
+    actionable_decision_outputs: BTreeMap<DecisionOutputKeyV3, DurableDecisionOutputV3>,
+    decision_application_outputs: BTreeMap<DecisionOutputKeyV3, AppliedDecisionOutputV1>,
+    decision_application_invalid: usize,
+    decision_application_retry_duplicates: usize,
+    decision_application_conflicts: usize,
+    decision_config_sha256s: BTreeSet<String>,
     execution_reports: usize,
     paper_resting: usize,
     paper_cancelled: usize,
@@ -2235,9 +2348,19 @@ struct AuditAccumulator {
     paper_filled_maker: usize,
     cancel_decisions: usize,
     paper_settlements: usize,
+    invalid_paper_settlements: usize,
+    settlement_journal_retry_duplicates: usize,
+    settlement_journal_conflicts: usize,
+    settlement_journal_unbound_settlements: usize,
+    settlement_journal_invalid: usize,
+    settlement_journals: BTreeMap<String, SettlementJournalAuditV1>,
     feed_errors: usize,
     stale_reference_count: usize,
     stale_book_count: usize,
+    invalid_market_start_prices: usize,
+    market_start_evidence: BTreeMap<String, MarketStartEvidenceV1>,
+    market_start_evidence_conflicts: BTreeSet<String>,
+    market_stubs_excluded_outside_event_window: usize,
     malformed_lines: usize,
     missing_payloads: usize,
     missing_market_ids: usize,
@@ -2246,10 +2369,22 @@ struct AuditAccumulator {
     previous_ts: Option<DateTime<Utc>>,
     largest_gaps: Vec<(i64, DateTime<Utc>, DateTime<Utc>)>,
     runtime_provenance: Vec<(DateTime<Utc>, Value)>,
+    exact_reference_history: Vec<(DateTime<Utc>, Decimal)>,
+    exact_reference_hours: BTreeSet<String>,
 }
 
 impl AuditAccumulator {
     fn observe(&mut self, event: &EventLine) {
+        let journal = self.observe_settlement_journal_event(event);
+        if event.event_type == "paper_settlement" && journal == JournalObservation::NotJournaled {
+            self.settlement_journal_unbound_settlements += 1;
+        }
+        if matches!(
+            journal,
+            JournalObservation::Duplicate | JournalObservation::Conflict
+        ) {
+            return;
+        }
         self.total_events += 1;
         *self
             .event_count_by_type
@@ -2296,14 +2431,126 @@ impl AuditAccumulator {
             "reference" => self.observe_reference(&event.payload),
             "book" => self.observe_book(&event.payload),
             "decision" => self.observe_decision(&event.payload),
+            "strategy_evaluation" => self.observe_strategy_evaluation(&event.payload),
+            "strategy_decision_batch" => self.observe_strategy_batch(&event.payload),
+            "paper_decision_output_applied" => self.observe_decision_application(&event.payload),
             "execution_report" => self.observe_execution_report(&event.payload),
-            "paper_settlement" => self.paper_settlements += 1,
+            "paper_settlement" => self.observe_paper_settlement(&event.payload),
             "feed_error" => self.feed_errors += 1,
             "fair_value" => self.observe_market_count(&event.payload, |market| {
                 market.fair_value_count += 1;
             }),
             _ => {}
         }
+    }
+
+    fn observe_settlement_journal_event(&mut self, event: &EventLine) -> JournalObservation {
+        let payload = &event.payload;
+        let fields = [
+            "settlement_journal_schema",
+            "settlement_journal_id",
+            "settlement_journal_event_index",
+            "settlement_journal_event_count",
+            "settlement_journal_sha256",
+        ];
+        if fields.iter().all(|field| payload.get(*field).is_none()) {
+            return JournalObservation::NotJournaled;
+        }
+        let parsed = (|| {
+            if payload
+                .get("settlement_journal_schema")
+                .and_then(Value::as_str)
+                != Some("polyedge.paper_settlement_journal.v1")
+            {
+                return None;
+            }
+            let journal_id = payload.get("settlement_journal_id")?.as_str()?.to_owned();
+            if !valid_settlement_journal_id(&journal_id) {
+                return None;
+            }
+            let event_index = payload.get("settlement_journal_event_index")?.as_u64()?;
+            let event_count = payload.get("settlement_journal_event_count")?.as_u64()?;
+            let journal_sha256 = payload
+                .get("settlement_journal_sha256")?
+                .as_str()?
+                .to_owned();
+            if event_count == 0
+                || event_index >= event_count
+                || !valid_prefixed_sha256(&journal_sha256)
+            {
+                return None;
+            }
+            let mut frozen_payload = payload.clone();
+            let object = frozen_payload.as_object_mut()?;
+            for field in fields {
+                object.remove(field);
+            }
+            let event_sha256 = canonical_value_sha256(&json!({
+                "event_index": event_index,
+                "event_type": event.event_type,
+                "payload": frozen_payload
+            }))?;
+            Some((
+                journal_id,
+                event_index,
+                event_count,
+                journal_sha256,
+                frozen_payload,
+                event_sha256,
+            ))
+        })();
+        let Some((
+            journal_id,
+            event_index,
+            event_count,
+            journal_sha256,
+            frozen_payload,
+            event_sha256,
+        )) = parsed
+        else {
+            self.settlement_journal_conflicts += 1;
+            return JournalObservation::Conflict;
+        };
+        let journal = self
+            .settlement_journals
+            .entry(journal_id)
+            .or_insert_with(|| SettlementJournalAuditV1 {
+                event_count,
+                journal_sha256: journal_sha256.clone(),
+                events: BTreeMap::new(),
+                paper_settlement_events: 0,
+                conflicted: false,
+            });
+        if journal.event_count != event_count || journal.journal_sha256 != journal_sha256 {
+            if !journal.conflicted {
+                self.settlement_journal_conflicts += 1;
+            }
+            journal.conflicted = true;
+            return JournalObservation::Conflict;
+        }
+        if let Some(existing) = journal.events.get_mut(&event_index) {
+            if existing.event_sha256 == event_sha256 {
+                self.settlement_journal_retry_duplicates += 1;
+                return JournalObservation::Duplicate;
+            }
+            if !journal.conflicted {
+                self.settlement_journal_conflicts += 1;
+            }
+            journal.conflicted = true;
+            return JournalObservation::Conflict;
+        }
+        if event.event_type == "paper_settlement" {
+            journal.paper_settlement_events += 1;
+        }
+        journal.events.insert(
+            event_index,
+            SettlementJournalEventV1 {
+                event_type: event.event_type.clone(),
+                payload: frozen_payload,
+                event_sha256,
+            },
+        );
+        JournalObservation::New
     }
 
     fn observe_market(&mut self, payload: &Value) {
@@ -2320,13 +2567,103 @@ impl AuditAccumulator {
             self.token_to_market
                 .insert(market.down_token_id.clone(), market.market_id.clone());
         }
-        self.markets
-            .entry(market.market_id.clone())
-            .and_modify(|existing| existing.merge(market.clone()))
-            .or_insert(market);
+        if let Some(existing) = self.markets.get_mut(&market.market_id) {
+            let boundary_conflict = existing
+                .start_ts
+                .zip(market.start_ts)
+                .is_some_and(|(left, right)| left != right)
+                || existing
+                    .end_ts
+                    .zip(market.end_ts)
+                    .is_some_and(|(left, right)| left != right);
+            if boundary_conflict {
+                self.invalid_market_start_prices += 1;
+                self.market_start_evidence_conflicts
+                    .insert(market.market_id.clone());
+            }
+            existing.merge(market);
+        } else {
+            self.markets.insert(market.market_id.clone(), market);
+        }
     }
 
     fn observe_market_start(&mut self, payload: &Value) {
+        let market_id = text(payload, "market_id");
+        if market_id.is_empty() {
+            self.missing_market_ids += 1;
+            return;
+        }
+        if let Some(evidence) = market_start_evidence_from_event(payload) {
+            match self.market_start_evidence.get(&market_id) {
+                Some(existing) if existing != &evidence => {
+                    self.market_start_evidence_conflicts
+                        .insert(market_id.clone());
+                }
+                Some(_) => {}
+                None => {
+                    self.market_start_evidence
+                        .insert(market_id.clone(), evidence);
+                }
+            }
+        }
+        let market = self
+            .markets
+            .entry(market_id.clone())
+            .or_insert_with(|| MarketTruth {
+                market_id: market_id.clone(),
+                ..MarketTruth::default()
+            });
+        let event_start_ts = parse_datetime(payload.get("market_start_ts"));
+        let event_end_ts = parse_datetime(payload.get("market_end_ts"));
+        let boundary_conflict = market
+            .start_ts
+            .zip(event_start_ts)
+            .is_some_and(|(left, right)| left != right)
+            || market
+                .end_ts
+                .zip(event_end_ts)
+                .is_some_and(|(left, right)| left != right);
+        if boundary_conflict || event_start_ts.is_none() || event_end_ts.is_none() {
+            self.invalid_market_start_prices += 1;
+            self.market_start_evidence_conflicts.insert(market_id);
+            return;
+        }
+        market.start_ts = market.start_ts.or(event_start_ts);
+        market.end_ts = market.end_ts.or(event_end_ts);
+        if !apply_exact_market_start(market, payload) {
+            self.invalid_market_start_prices += 1;
+        }
+    }
+
+    fn observe_reference(&mut self, payload: &Value) {
+        let stale = bool_value(payload, "stale");
+        if stale {
+            self.stale_reference_count += 1;
+        }
+        let Some(price) = decimal(payload.get("price")) else {
+            return;
+        };
+        let Some(source_ts) = parse_datetime(payload.get("source_ts")) else {
+            return;
+        };
+        if stale
+            || payload
+                .get("exact_resolution_source")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return;
+        }
+        self.exact_reference_history.push((source_ts, price));
+        self.exact_reference_hours.insert(hour_key(source_ts));
+        for market in self.markets.values_mut() {
+            market.reference_tick_count += 1;
+            market.observe_settlement_reference(source_ts, price);
+        }
+    }
+
+    fn observe_paper_settlement(&mut self, payload: &Value) {
+        self.paper_settlements += 1;
         let market_id = text(payload, "market_id");
         if market_id.is_empty() {
             self.missing_market_ids += 1;
@@ -2336,26 +2673,83 @@ impl AuditAccumulator {
             .markets
             .entry(market_id.clone())
             .or_insert_with(|| MarketTruth {
-                market_id: market_id.clone(),
+                market_id,
                 ..MarketTruth::default()
             });
-        market.start_price = decimal(payload.get("start_price")).or(market.start_price);
-        market.start_source = Some("market_start_price".to_owned());
-    }
-
-    fn observe_reference(&mut self, payload: &Value) {
-        if bool_value(payload, "stale") {
-            self.stale_reference_count += 1;
+        market.start_ts = market
+            .start_ts
+            .or_else(|| parse_datetime(payload.get("start_ts")));
+        market.end_ts = market
+            .end_ts
+            .or_else(|| parse_datetime(payload.get("end_ts")));
+        let mut invalid = false;
+        let settlement_start_price = decimal(payload.get("start_price"));
+        let start_source = optional_text(payload, "start_reference_source");
+        let start_source_ts = parse_datetime(payload.get("start_reference_source_ts"));
+        let start_distance_ms =
+            market
+                .start_ts
+                .zip(start_source_ts)
+                .map(|(start_ts, source_ts)| {
+                    source_ts.signed_duration_since(start_ts).num_milliseconds()
+                });
+        let valid_start_binding = settlement_start_price.is_some()
+            && start_source.is_some_and(|source| !source.is_empty())
+            && payload
+                .get("start_reference_exact_resolution_source")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && payload
+                .get("start_reference_stale")
+                .and_then(Value::as_bool)
+                == Some(false)
+            && start_distance_ms.is_some_and(|distance_ms| {
+                (0..=START_PRICE_CAPTURE_WINDOW_SECONDS * 1_000).contains(&distance_ms)
+            })
+            && market
+                .start_price
+                .is_none_or(|existing| Some(existing) == settlement_start_price);
+        if valid_start_binding {
+            market.start_price = settlement_start_price;
+            market.start_source = Some("paper_settlement_exact_start_reference".to_owned());
+        } else {
+            invalid = true;
         }
-        let Some(price) = decimal(payload.get("price")) else {
-            return;
-        };
-        let Some(source_ts) = parse_datetime(payload.get("source_ts")) else {
-            return;
-        };
-        for market in self.markets.values_mut() {
-            market.reference_tick_count += 1;
-            market.observe_settlement_reference(source_ts, price);
+        if let Some(final_price) = decimal(payload.get("final_price")) {
+            let exact = payload
+                .get("final_reference_exact_resolution_source")
+                .and_then(Value::as_bool)
+                == Some(true);
+            let explicitly_nonstale = payload
+                .get("final_reference_stale")
+                .and_then(Value::as_bool)
+                == Some(false);
+            let source = optional_text(payload, "final_reference_source");
+            let source_ts = parse_datetime(payload.get("final_reference_source_ts"));
+            let valid_timing = market.end_ts.zip(source_ts);
+            match valid_timing {
+                Some((end_ts, reference_ts))
+                    if !invalid && exact && explicitly_nonstale && source.is_some() =>
+                {
+                    let distance_ms = reference_ts
+                        .signed_duration_since(end_ts)
+                        .num_milliseconds();
+                    if (0..=SETTLEMENT_WINDOW_SECONDS * 1_000).contains(&distance_ms) {
+                        market.final_price = Some(final_price);
+                        market.final_distance_ms = Some(distance_ms);
+                        market.final_source = Some("paper_settlement".to_owned());
+                    } else {
+                        invalid = true;
+                    }
+                }
+                _ => invalid = true,
+            }
+        }
+        if invalid {
+            self.invalid_paper_settlements += 1;
+        }
+        if market.final_price.is_some() {
+            market.winning_outcome = optional_text(payload, "winning_outcome");
         }
     }
 
@@ -2378,8 +2772,108 @@ impl AuditAccumulator {
     }
 
     fn observe_decision(&mut self, payload: &Value) {
-        self.decisions += 1;
         let action = text(payload, "action");
+        if matches!(action.as_str(), "place" | "cancel_all")
+            && payload
+                .get("decision_batch_schema_version")
+                .and_then(Value::as_u64)
+                == Some(3)
+        {
+            if let Some(output) = durable_decision_output_v3(payload) {
+                if let Some(existing) = self.actionable_decision_outputs.get(&output.key) {
+                    if existing != &output {
+                        self.decision_application_conflicts += 1;
+                    }
+                } else {
+                    self.actionable_decision_outputs
+                        .insert(output.key.clone(), output);
+                }
+            } else {
+                self.decision_application_invalid += 1;
+            }
+        }
+        if let Some(batch_id) = payload
+            .get("strategy_batch_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            if payload
+                .get("decision_batch_schema_version")
+                .and_then(Value::as_u64)
+                != Some(3)
+            {
+                self.strategy_binding_ineligible += 1;
+            } else if let (Some(output_index), Some(_declared_hash)) = (
+                payload
+                    .get("strategy_batch_output_index")
+                    .and_then(Value::as_u64),
+                payload
+                    .get("strategy_decision_sha256")
+                    .and_then(Value::as_str),
+            ) {
+                let event_sha256 = run_bundle::stable_json(payload)
+                    .ok()
+                    .map(|canonical| sha256_prefixed(canonical.as_bytes()));
+                if let Some(event_sha256) = event_sha256 {
+                    let observed = self
+                        .strategy_batch_observed
+                        .entry(batch_id.to_owned())
+                        .or_default();
+                    if let Some(existing) = observed.get_mut(&output_index) {
+                        if existing.event_sha256 == event_sha256 {
+                            self.strategy_binding_retry_duplicates += 1;
+                            return;
+                        } else {
+                            if !existing.conflicted {
+                                self.strategy_binding_conflicts += 1;
+                            }
+                            existing.conflicted = true;
+                            return;
+                        }
+                    } else {
+                        observed.insert(
+                            output_index,
+                            ObservedStrategyOutputV3 {
+                                event_sha256,
+                                payload: payload.clone(),
+                                conflicted: false,
+                            },
+                        );
+                    }
+                } else {
+                    self.strategy_binding_conflicts += 1;
+                }
+            } else {
+                self.strategy_binding_conflicts += 1;
+            }
+        } else {
+            self.unbound_strategy_decisions += 1;
+        }
+        self.decisions += 1;
+        if let Some(metadata) = payload.get("strategy_metadata") {
+            self.decisions_with_strategy_metadata += 1;
+            if metadata
+                .pointer("/data_quality/decision_grade")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                self.decision_grade_decisions += 1;
+            }
+        }
+        if action == "place" {
+            self.place_decisions += 1;
+            let complete = !text(payload, "market_id").is_empty()
+                && optional_text(payload, "token_id").is_some()
+                && optional_text(payload, "side").is_some()
+                && decimal(payload.get("price")).is_some()
+                && decimal(payload.get("size")).is_some_and(|value| value > Decimal::ZERO)
+                && optional_text(payload, "order_kind").is_some()
+                && decimal(payload.get("tick_size")).is_some_and(|value| value > Decimal::ZERO)
+                && payload.get("ttl_ms").and_then(Value::as_i64).is_some();
+            if complete {
+                self.place_decisions_with_complete_execution_fields += 1;
+            }
+        }
         if action == "cancel_all" {
             self.cancel_decisions += 1;
         }
@@ -2389,6 +2883,307 @@ impl AuditAccumulator {
                 market.cancels += 1;
             }
         });
+    }
+
+    fn observe_decision_application(&mut self, payload: &Value) {
+        let Some(application) = applied_decision_output_v1(payload) else {
+            self.decision_application_invalid += 1;
+            return;
+        };
+        if let Some(existing) = self.decision_application_outputs.get(&application.key) {
+            if existing.event_sha256 == application.event_sha256 {
+                self.decision_application_retry_duplicates += 1;
+            } else {
+                self.decision_application_conflicts += 1;
+            }
+            return;
+        }
+        self.decision_application_outputs
+            .insert(application.key.clone(), application);
+    }
+
+    fn observe_strategy_evaluation(&mut self, payload: &Value) {
+        if payload
+            .get("decision_batch_schema_version")
+            .and_then(Value::as_u64)
+            == Some(3)
+        {
+            let Some(key) = payload
+                .get("strategy_batch_id")
+                .and_then(Value::as_str)
+                .zip(payload.get("evaluation_index").and_then(Value::as_u64))
+                .map(|(batch_id, index)| (batch_id.to_owned(), index))
+            else {
+                self.strategy_evaluation_invalid += 1;
+                return;
+            };
+            let Some(event_sha256) = canonical_value_sha256(payload) else {
+                self.strategy_evaluation_invalid += 1;
+                return;
+            };
+            if let Some(existing) = self.strategy_evaluation_observed.get_mut(&key) {
+                if existing.event_sha256 == event_sha256 {
+                    self.strategy_evaluation_retry_duplicates += 1;
+                } else {
+                    if !existing.conflicted {
+                        self.strategy_evaluation_conflicts += 1;
+                        self.strategy_evaluation_invalid += 1;
+                    }
+                    existing.conflicted = true;
+                }
+                return;
+            }
+            self.strategy_evaluation_observed.insert(
+                key,
+                ObservedStrategyOutputV3 {
+                    event_sha256,
+                    payload: payload.clone(),
+                    conflicted: false,
+                },
+            );
+        }
+        self.strategy_evaluations += 1;
+        let parsed = (|| {
+            if payload.get("schema_version").and_then(Value::as_u64) != Some(1) {
+                return None;
+            }
+            let decision_ts = parse_datetime(payload.get("decision_ts"))?;
+            let mode =
+                serde_json::from_value::<FrozenStrategyMode>(payload.get("mode")?.clone()).ok()?;
+            let raw_decision =
+                serde_json::from_value::<TradeDecision>(payload.get("raw_decision")?.clone())
+                    .ok()?;
+            let context = serde_json::from_value::<QuoteTransformContext>(
+                payload.get("quote_context")?.clone(),
+            )
+            .ok()?;
+            let features =
+                serde_json::from_value::<RegimeFeatures>(payload.get("features")?.clone()).ok()?;
+            let before = serde_json::from_value::<RegimeClassifierSnapshot>(
+                payload.get("classifier_before")?.clone(),
+            )
+            .ok()?;
+            let expected_after = serde_json::from_value::<RegimeClassifierSnapshot>(
+                payload.get("classifier_after")?.clone(),
+            )
+            .ok()?;
+            let expected_decision = match payload.get("evaluated_decision")? {
+                Value::Null => None,
+                value => Some(serde_json::from_value::<TradeDecision>(value.clone()).ok()?),
+            };
+            let expected_metadata = serde_json::from_value::<StrategyDecisionMetadata>(
+                payload.get("strategy_metadata")?.clone(),
+            )
+            .ok()?;
+            let expected_cancel = payload.get("cancel_existing")?.as_bool()?;
+            let config =
+                serde_json::from_value::<StrategyConfig>(payload.get("strategy_config")?.clone())
+                    .ok()?;
+            Some((
+                decision_ts,
+                mode,
+                raw_decision,
+                context,
+                features,
+                before,
+                expected_after,
+                expected_decision,
+                expected_metadata,
+                expected_cancel,
+                config,
+            ))
+        })();
+        let Some((
+            decision_ts,
+            mode,
+            raw_decision,
+            context,
+            features,
+            before,
+            expected_after,
+            expected_decision,
+            expected_metadata,
+            expected_cancel,
+            config,
+        )) = parsed
+        else {
+            self.strategy_evaluation_invalid += 1;
+            return;
+        };
+        if expected_metadata.data_quality.decision_grade {
+            self.decision_grade_evaluations += 1;
+        }
+        let mut classifier = RegimeClassifier::from_snapshot(before);
+        let policy = RegimePolicy::new(config);
+        let replayed = evaluate_frozen_strategy(
+            mode,
+            &mut classifier,
+            &policy,
+            &features,
+            decision_ts,
+            &raw_decision,
+            &context,
+        );
+        if replayed.decision == expected_decision
+            && replayed.cancel_existing == expected_cancel
+            && replayed.metadata == expected_metadata
+            && classifier.snapshot() == expected_after
+        {
+            self.strategy_evaluation_matches += 1;
+        }
+    }
+
+    fn observe_strategy_batch(&mut self, payload: &Value) {
+        self.strategy_batch_events += 1;
+        if payload.get("schema_version").and_then(Value::as_u64) != Some(3)
+            || payload.get("schema").and_then(Value::as_str)
+                != Some("polyedge.strategy_decision_batch.v3")
+            || payload.get("parity_scope").and_then(Value::as_str)
+                != Some("full_decision_pipeline_recomputation")
+        {
+            self.strategy_batch_ineligible += 1;
+            return;
+        }
+        let Some(batch_id) = payload
+            .get("batch_id")
+            .and_then(Value::as_str)
+            .filter(|value| valid_strategy_batch_id(value))
+            .map(ToOwned::to_owned)
+        else {
+            self.strategy_batch_invalid += 1;
+            return;
+        };
+        let Some(event_sha256) = run_bundle::stable_json(payload)
+            .ok()
+            .map(|canonical| sha256_prefixed(canonical.as_bytes()))
+        else {
+            self.strategy_batch_invalid += 1;
+            return;
+        };
+        if let Some(existing) = self.strategy_batch_expected.get_mut(&batch_id) {
+            if existing.event_sha256 == event_sha256 {
+                self.strategy_batch_retry_duplicates += 1;
+            } else {
+                if !existing.conflicted {
+                    self.strategy_batch_conflicts += 1;
+                    self.strategy_batch_invalid += 1;
+                }
+                existing.conflicted = true;
+                existing.expected_outputs = None;
+            }
+            return;
+        }
+        self.strategy_batches += 1;
+        let validated = validate_strategy_batch_v3(payload);
+        if validated.is_none() {
+            self.strategy_batch_invalid += 1;
+        }
+        let (expected_outputs, decision_config_sha256, market_start_evidence) = validated
+            .map(|(outputs, hash, start)| (Some(outputs), Some(hash), Some(start)))
+            .unwrap_or((None, None, None));
+        if let Some(hash) = decision_config_sha256.as_ref() {
+            self.decision_config_sha256s.insert(hash.clone());
+        }
+        self.strategy_batch_expected.insert(
+            batch_id,
+            StrategyBatchAuditV3 {
+                event_sha256,
+                expected_outputs,
+                market_start_evidence,
+                conflicted: false,
+            },
+        );
+    }
+
+    fn finalize_strategy_batch_parity(&mut self) {
+        for (batch_id, batch) in &self.strategy_batch_expected {
+            let observed = self
+                .strategy_batch_observed
+                .remove(batch_id)
+                .unwrap_or_default();
+            let independent_start_matches =
+                batch
+                    .market_start_evidence
+                    .as_ref()
+                    .is_some_and(|expected| {
+                        let market_id = expected.market_id.to_string();
+                        !self.market_start_evidence_conflicts.contains(&market_id)
+                            && self.market_start_evidence.get(&market_id) == Some(expected)
+                    });
+            if batch.expected_outputs.is_some() && !independent_start_matches {
+                self.strategy_batch_invalid += 1;
+                self.strategy_binding_conflicts += observed.len();
+                continue;
+            }
+            let Some(expected) = batch
+                .expected_outputs
+                .as_ref()
+                .filter(|_| !batch.conflicted)
+            else {
+                self.strategy_binding_conflicts += observed.len();
+                continue;
+            };
+            self.strategy_batch_replayed += 1;
+            self.strategy_batch_expected_outputs += expected.len();
+            let mut batch_matches = observed.len() == expected.len();
+            let mut bound = 0_usize;
+            for (index, expected_entry) in expected.iter().enumerate() {
+                let Some(observed_entry) = observed.get(&(index as u64)) else {
+                    batch_matches = false;
+                    continue;
+                };
+                if observed_entry.conflicted {
+                    batch_matches = false;
+                    continue;
+                }
+                let observed_payload = &observed_entry.payload;
+                let mut unbound = observed_payload.clone();
+                if let Some(object) = unbound.as_object_mut() {
+                    object.remove("decision_batch_schema_version");
+                    object.remove("strategy_batch_id");
+                    object.remove("strategy_batch_output_index");
+                    object.remove("strategy_decision_sha256");
+                }
+                let actual_hash = run_bundle::stable_json(&unbound)
+                    .ok()
+                    .map(|canonical| sha256_prefixed(canonical.as_bytes()));
+                let binding_matches = observed_payload
+                    .get("decision_batch_schema_version")
+                    .and_then(Value::as_u64)
+                    == Some(3)
+                    && observed_payload
+                        .get("strategy_batch_id")
+                        .and_then(Value::as_str)
+                        == Some(batch_id.as_str())
+                    && observed_payload
+                        .get("strategy_batch_output_index")
+                        .and_then(Value::as_u64)
+                        == Some(index as u64);
+                if observed_payload
+                    .get("strategy_decision_sha256")
+                    .and_then(Value::as_str)
+                    == Some(expected_entry.decision_sha256.as_str())
+                    && actual_hash.as_deref() == Some(expected_entry.decision_sha256.as_str())
+                    && expected_entry.decision == unbound
+                    && binding_matches
+                {
+                    bound += 1;
+                } else {
+                    batch_matches = false;
+                }
+            }
+            self.strategy_batch_bound_outputs += bound;
+            if batch_matches && bound == expected.len() {
+                self.strategy_batch_matches += 1;
+            }
+        }
+        if !self.strategy_batch_observed.is_empty() {
+            self.strategy_binding_conflicts += self
+                .strategy_batch_observed
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>();
+        }
     }
 
     fn observe_execution_report(&mut self, payload: &Value) {
@@ -2432,20 +3227,116 @@ impl AuditAccumulator {
     }
 
     fn finish(mut self) -> Value {
+        let v3_provenance_day = self.runtime_provenance.iter().any(|(_, payload)| {
+            payload
+                .get("decision_pipeline_schema")
+                .and_then(Value::as_str)
+                == Some("polyedge.strategy_decision_batch.v3")
+                && payload
+                    .get("decision_pipeline_parity_scope")
+                    .and_then(Value::as_str)
+                    == Some("full_decision_pipeline_recomputation")
+        });
+        self.finalize_settlement_journals();
+        self.decision_config_sha256s
+            .extend(self.runtime_provenance.iter().filter_map(|(_, payload)| {
+                (payload
+                    .get("decision_pipeline_schema")
+                    .and_then(Value::as_str)
+                    == Some("polyedge.strategy_decision_batch.v3"))
+                .then(|| {
+                    payload
+                        .get("decision_config_sha256")
+                        .and_then(Value::as_str)
+                        .filter(|hash| valid_prefixed_sha256(hash))
+                        .map(ToOwned::to_owned)
+                })
+                .flatten()
+            }));
+        let decision_config_sha256 = (self.decision_config_sha256s.len() == 1)
+            .then(|| self.decision_config_sha256s.iter().next().cloned())
+            .flatten();
         let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance);
+        self.finalize_market_truth();
+        self.finalize_strategy_batch_parity();
         let markets_with_start = self
             .markets
             .values()
             .filter(|market| market.start_price.is_some())
             .count();
-        for market in self.markets.values_mut() {
-            market.finalize_flags();
-        }
         let markets_settled = self
             .markets
             .values()
             .filter(|market| market.final_price.is_some())
             .count();
+        let start_price_capture_rate = ratio_f64(markets_with_start, self.markets.len());
+        let settlement_rate = ratio_f64(markets_settled, self.markets.len());
+        let decision_metadata_coverage =
+            ratio_f64(self.decisions_with_strategy_metadata, self.decisions);
+        let final_decision_grade_coverage =
+            ratio_f64(self.decision_grade_decisions, self.decisions);
+        let decision_grade_coverage =
+            ratio_f64(self.decision_grade_evaluations, self.strategy_evaluations);
+        let execution_field_coverage = if self.place_decisions == 0 {
+            Some(1.0)
+        } else {
+            ratio_f64(
+                self.place_decisions_with_complete_execution_fields,
+                self.place_decisions,
+            )
+        };
+        let strategy_transform_parity_rate =
+            ratio_f64(self.strategy_evaluation_matches, self.strategy_evaluations);
+        let decision_pipeline_replay_rate =
+            ratio_f64(self.strategy_batch_replayed, self.strategy_batches);
+        let decision_parity_rate = if self.strategy_batches > 0
+            && (self.strategy_batch_invalid > 0
+                || self.strategy_batch_ineligible > 0
+                || self.strategy_batch_conflicts > 0
+                || self.strategy_binding_ineligible > 0
+                || self.strategy_binding_conflicts > 0
+                || self.unbound_strategy_decisions > 0)
+        {
+            Some(0.0)
+        } else {
+            ratio_f64(self.strategy_batch_matches, self.strategy_batches)
+        };
+        let decision_output_binding_rate = ratio_f64(
+            self.strategy_batch_bound_outputs,
+            self.strategy_batch_expected_outputs,
+        )
+        .or_else(|| {
+            (self.strategy_batches > 0
+                && self.strategy_batch_replayed == self.strategy_batches
+                && self.strategy_batch_matches == self.strategy_batches)
+                .then_some(1.0)
+        });
+        let actionable_decision_outputs = self.actionable_decision_outputs.len();
+        let applied_decision_outputs = self
+            .actionable_decision_outputs
+            .iter()
+            .filter(|(key, decision)| {
+                self.decision_application_outputs
+                    .get(*key)
+                    .is_some_and(|application| application_matches_decision(application, decision))
+            })
+            .count();
+        let unbound_actionable_decision_outputs =
+            actionable_decision_outputs.saturating_sub(applied_decision_outputs);
+        let orphan_decision_applications = self
+            .decision_application_outputs
+            .keys()
+            .filter(|key| !self.actionable_decision_outputs.contains_key(*key))
+            .count();
+        let decision_application_binding_rate =
+            ratio_f64(applied_decision_outputs, actionable_decision_outputs);
+        let exact_reference_hours = self
+            .exact_reference_hours
+            .iter()
+            .filter(|hour| self.event_count_by_hour.contains_key(*hour))
+            .count();
+        let exact_reference_hour_coverage =
+            ratio_f64(exact_reference_hours, self.event_count_by_hour.len());
         let mut warnings = Vec::new();
         if self.malformed_lines > 0 {
             warnings.push(json!(format!(
@@ -2463,6 +3354,131 @@ impl AuditAccumulator {
             warnings.push(json!(format!(
                 "{} out-of-order timestamps",
                 self.out_of_order_timestamps
+            )));
+        }
+        if start_price_capture_rate.is_some_and(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "start price capture below 95%: {markets_with_start}/{}",
+                self.markets.len()
+            )));
+        }
+        if self.invalid_market_start_prices > 0 {
+            warnings.push(json!(format!(
+                "invalid exact market start price evidence: {}",
+                self.invalid_market_start_prices
+            )));
+        }
+        if settlement_rate.is_some_and(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "settlement coverage below 95%: {markets_settled}/{}",
+                self.markets.len()
+            )));
+        }
+        if exact_reference_hour_coverage.is_some_and(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "exact-resolution reference hour coverage below 95%: {exact_reference_hours}/{}",
+                self.event_count_by_hour.len()
+            )));
+        }
+        if self.decisions > 0 && decision_metadata_coverage.is_none_or(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "decision metadata coverage below 95%: {}/{}",
+                self.decisions_with_strategy_metadata, self.decisions
+            )));
+        }
+        if self.strategy_evaluations > 0 && decision_grade_coverage.is_none_or(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "decision-grade evaluation coverage below 95%: {}/{}",
+                self.decision_grade_evaluations, self.strategy_evaluations
+            )));
+        }
+        if self.place_decisions > 0 && execution_field_coverage.is_none_or(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "place-decision execution-field coverage below 95%: {}/{}",
+                self.place_decisions_with_complete_execution_fields, self.place_decisions
+            )));
+        }
+        if self.decisions > 0 && self.strategy_evaluations == 0 {
+            warnings.push(json!("decision parity evidence missing"));
+        } else if self.strategy_evaluation_invalid > 0
+            || self.strategy_evaluation_matches != self.strategy_evaluations
+        {
+            warnings.push(json!(format!(
+                "strategy transform parity below 100%: {}/{} matched; {} invalid",
+                self.strategy_evaluation_matches,
+                self.strategy_evaluations,
+                self.strategy_evaluation_invalid
+            )));
+        }
+        if self.strategy_batches == 0 {
+            warnings.push(json!("runtime/replay decision batch evidence missing"));
+        }
+        if (self.strategy_batches > 0 || v3_provenance_day)
+            && (self.strategy_batch_invalid > 0
+                || self.strategy_batch_ineligible > 0
+                || self.strategy_batch_conflicts > 0
+                || self.strategy_binding_ineligible > 0
+                || self.strategy_binding_conflicts > 0
+                || self.strategy_batch_replayed != self.strategy_batches
+                || self.strategy_batch_matches != self.strategy_batches
+                || self.strategy_batch_bound_outputs != self.strategy_batch_expected_outputs
+                || self.unbound_strategy_decisions > 0)
+        {
+            warnings.push(json!(format!(
+                "runtime/replay full decision pipeline parity below 100%: {}/{} replayed, {}/{} fully bound batches, {}/{} outputs, {} invalid, {} ineligible batch events, {} batch conflicts, {} ineligible bindings, {} binding conflicts, {} unbound",
+                self.strategy_batch_replayed,
+                self.strategy_batches,
+                self.strategy_batch_matches,
+                self.strategy_batches,
+                self.strategy_batch_bound_outputs,
+                self.strategy_batch_expected_outputs,
+                self.strategy_batch_invalid,
+                self.strategy_batch_ineligible,
+                self.strategy_batch_conflicts,
+                self.strategy_binding_ineligible,
+                self.strategy_binding_conflicts,
+                self.unbound_strategy_decisions
+            )));
+        }
+        if self.strategy_batches > 0 && decision_config_sha256.is_none() {
+            warnings.push(json!(format!(
+                "decision config is missing or changed within the eligible day: {} distinct hashes",
+                self.decision_config_sha256s.len()
+            )));
+        }
+        if unbound_actionable_decision_outputs > 0
+            || orphan_decision_applications > 0
+            || self.decision_application_invalid > 0
+            || self.decision_application_conflicts > 0
+        {
+            warnings.push(json!(format!(
+                "durable actionable decision application binding below 100%: {applied_decision_outputs}/{actionable_decision_outputs} applied, {unbound_actionable_decision_outputs} unbound, {orphan_decision_applications} orphan applications, {} invalid, {} conflicts",
+                self.decision_application_invalid,
+                self.decision_application_conflicts
+            )));
+        }
+        if self.invalid_paper_settlements > 0 {
+            warnings.push(json!(format!(
+                "invalid paper settlement timing: {}",
+                self.invalid_paper_settlements
+            )));
+        }
+        if self.settlement_journal_conflicts > 0 {
+            warnings.push(json!(format!(
+                "settlement journal conflicts: {}",
+                self.settlement_journal_conflicts
+            )));
+        }
+        if self.settlement_journal_invalid > 0 {
+            warnings.push(json!(format!(
+                "incomplete or hash-invalid settlement journals: {}",
+                self.settlement_journal_invalid
+            )));
+        }
+        if v3_provenance_day && self.settlement_journal_unbound_settlements > 0 {
+            warnings.push(json!(format!(
+                "v3 paper settlements missing durable journal binding: {}",
+                self.settlement_journal_unbound_settlements
             )));
         }
         if markets_settled == 0 {
@@ -2488,11 +3504,56 @@ impl AuditAccumulator {
             "markets_seen": self.markets.len(),
             "markets_with_start_price": markets_with_start,
             "markets_settled": markets_settled,
-            "start_price_capture_rate": ratio_usize(markets_with_start, self.markets.len()),
-            "settlement_rate": ratio_usize(markets_settled, self.markets.len()),
+            "start_price_capture_rate": start_price_capture_rate,
+            "invalid_market_start_prices": self.invalid_market_start_prices,
+            "settlement_rate": settlement_rate,
+            "exact_resolution_reference_hours": exact_reference_hours,
+            "exact_resolution_reference_hour_coverage": exact_reference_hour_coverage,
             "missing_start_markets": self.markets.values().filter(|market| market.start_price.is_none()).map(|market| market.market_id.clone()).collect::<Vec<_>>(),
             "missing_final_markets": self.markets.values().filter(|market| market.final_price.is_none()).map(|market| market.market_id.clone()).collect::<Vec<_>>(),
             "decision_count": self.decisions,
+            "decisions_with_strategy_metadata": self.decisions_with_strategy_metadata,
+            "decision_metadata_coverage": decision_metadata_coverage,
+            "decision_grade_decisions": self.decision_grade_decisions,
+            "final_decision_grade_coverage": final_decision_grade_coverage,
+            "decision_grade_evaluations": self.decision_grade_evaluations,
+            "decision_grade_coverage": decision_grade_coverage,
+            "place_decisions": self.place_decisions,
+            "place_decisions_with_complete_execution_fields": self.place_decisions_with_complete_execution_fields,
+            "execution_field_coverage": execution_field_coverage,
+            "strategy_evaluations": self.strategy_evaluations,
+            "strategy_evaluation_matches": self.strategy_evaluation_matches,
+            "strategy_evaluation_invalid": self.strategy_evaluation_invalid,
+            "strategy_evaluation_retry_duplicates": self.strategy_evaluation_retry_duplicates,
+            "strategy_evaluation_conflicts": self.strategy_evaluation_conflicts,
+            "strategy_transform_parity_rate": strategy_transform_parity_rate,
+            "strategy_batch_events": self.strategy_batch_events,
+            "strategy_batches": self.strategy_batches,
+            "strategy_batch_replayed": self.strategy_batch_replayed,
+            "strategy_batch_matches": self.strategy_batch_matches,
+            "strategy_batch_invalid": self.strategy_batch_invalid,
+            "strategy_batch_ineligible": self.strategy_batch_ineligible,
+            "strategy_batch_retry_duplicates": self.strategy_batch_retry_duplicates,
+            "strategy_batch_conflicts": self.strategy_batch_conflicts,
+            "strategy_batch_expected_outputs": self.strategy_batch_expected_outputs,
+            "strategy_batch_bound_outputs": self.strategy_batch_bound_outputs,
+            "strategy_binding_retry_duplicates": self.strategy_binding_retry_duplicates,
+            "strategy_binding_conflicts": self.strategy_binding_conflicts,
+            "strategy_binding_ineligible": self.strategy_binding_ineligible,
+            "unbound_strategy_decisions": self.unbound_strategy_decisions,
+            "decision_pipeline_replay_rate": decision_pipeline_replay_rate,
+            "decision_output_binding_rate": decision_output_binding_rate,
+            "actionable_decision_outputs": actionable_decision_outputs,
+            "applied_decision_outputs": applied_decision_outputs,
+            "unbound_actionable_decision_outputs": unbound_actionable_decision_outputs,
+            "orphan_decision_applications": orphan_decision_applications,
+            "decision_application_binding_rate": decision_application_binding_rate,
+            "decision_application_invalid": self.decision_application_invalid,
+            "decision_application_retry_duplicates": self.decision_application_retry_duplicates,
+            "decision_application_conflicts": self.decision_application_conflicts,
+            "decision_parity_rate": decision_parity_rate,
+            "decision_config_sha256": decision_config_sha256,
+            "decision_config_distinct_hashes": self.decision_config_sha256s.len(),
             "execution_report_count": self.execution_reports,
             "paper_resting": self.paper_resting,
             "paper_cancelled": self.paper_cancelled,
@@ -2500,9 +3561,15 @@ impl AuditAccumulator {
             "paper_filled_maker": self.paper_filled_maker,
             "cancel_decisions": self.cancel_decisions,
             "paper_settlements": self.paper_settlements,
+            "invalid_paper_settlements": self.invalid_paper_settlements,
+            "settlement_journal_retry_duplicates": self.settlement_journal_retry_duplicates,
+            "settlement_journal_conflicts": self.settlement_journal_conflicts,
+            "settlement_journal_invalid": self.settlement_journal_invalid,
+            "settlement_journal_unbound_settlements": self.settlement_journal_unbound_settlements,
             "feed_errors": self.feed_errors,
             "stale_reference_count": self.stale_reference_count,
             "stale_book_count": self.stale_book_count,
+            "market_stubs_excluded_outside_event_window": self.market_stubs_excluded_outside_event_window,
             "malformed_lines": self.malformed_lines,
             "missing_payloads": self.missing_payloads,
             "missing_market_ids": self.missing_market_ids,
@@ -2518,6 +3585,576 @@ impl AuditAccumulator {
             "fatal_data_quality_issues": if self.total_events == 0 { vec!["no events found"] } else { Vec::<&str>::new() }
         })
     }
+
+    fn finalize_market_truth(&mut self) {
+        if let (Some(first), Some(last)) = (self.first_ts, self.last_ts) {
+            let window_start = first
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight is valid")
+                .and_utc();
+            let window_end = last
+                .date_naive()
+                .succ_opt()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .expect("observed event date has a successor")
+                .and_utc();
+            let before = self.markets.len();
+            self.markets.retain(|_, market| {
+                market.start_ts.map_or_else(
+                    || {
+                        market.decisions > 0
+                            || market.reports > 0
+                            || market.fills > 0
+                            || market.cancels > 0
+                    },
+                    |start_ts| start_ts >= window_start && start_ts < window_end,
+                )
+            });
+            self.market_stubs_excluded_outside_event_window =
+                before.saturating_sub(self.markets.len());
+        }
+        self.exact_reference_history
+            .sort_by_key(|(timestamp, _)| *timestamp);
+        for market in self.markets.values_mut() {
+            market.recover_from_exact_references(&self.exact_reference_history);
+            market.finalize_flags();
+        }
+    }
+
+    fn finalize_settlement_journals(&mut self) {
+        for (journal_id, journal) in &self.settlement_journals {
+            let complete_indices = journal.events.len() == journal.event_count as usize
+                && (0..journal.event_count).all(|index| journal.events.contains_key(&index));
+            let events = journal
+                .events
+                .iter()
+                .map(|(event_index, event)| {
+                    json!({
+                        "event_index": event_index,
+                        "event_type": event.event_type,
+                        "payload": event.payload
+                    })
+                })
+                .collect::<Vec<_>>();
+            let expected_hash = canonical_value_sha256(&json!({
+                "schema": "polyedge.paper_settlement_journal.v1",
+                "settlement_journal_id": journal_id,
+                "settlement_journal_event_count": journal.event_count,
+                "events": events
+            }));
+            if journal.conflicted
+                || !complete_indices
+                || journal.paper_settlement_events != 1
+                || expected_hash.as_deref() != Some(journal.journal_sha256.as_str())
+            {
+                self.settlement_journal_invalid += 1;
+            }
+        }
+    }
+}
+
+fn valid_strategy_batch_id(value: &str) -> bool {
+    value.strip_prefix("strategy-batch-").is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_settlement_journal_id(value: &str) -> bool {
+    value.strip_prefix("paper-settlement-").is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn market_start_evidence_from_event(payload: &Value) -> Option<MarketStartEvidenceV1> {
+    if payload.get("schema").and_then(Value::as_str) != Some("polyedge.market_start_price.v1") {
+        return None;
+    }
+    let evidence = MarketStartEvidenceV1 {
+        schema_version: payload.get("schema_version")?.as_u64()?.try_into().ok()?,
+        market_id: MarketId::new(payload.get("market_id")?.as_str()?.to_owned()),
+        market_start_ts: parse_datetime(payload.get("market_start_ts"))?,
+        market_end_ts: parse_datetime(payload.get("market_end_ts"))?,
+        start_price: decimal(payload.get("start_price"))?,
+        reference_source: payload.get("reference_source")?.as_str()?.to_owned(),
+        reference_source_ts: parse_datetime(payload.get("reference_source_ts"))?,
+        reference_exact_resolution_source: payload
+            .get("reference_exact_resolution_source")?
+            .as_bool()?,
+        reference_stale: payload.get("reference_stale")?.as_bool()?,
+    };
+    (evidence.schema_version == 1
+        && !evidence.market_id.to_string().is_empty()
+        && evidence.market_end_ts > evidence.market_start_ts
+        && !evidence.reference_source.is_empty()
+        && evidence.reference_exact_resolution_source
+        && !evidence.reference_stale)
+        .then_some(evidence)
+}
+
+fn validate_strategy_batch_v3(
+    payload: &Value,
+) -> Option<(Vec<StrategyBatchOutputV3>, String, MarketStartEvidenceV1)> {
+    let batch_id = payload.get("batch_id")?.as_str()?;
+    let input_value = payload.get("pipeline_input")?;
+    let output_value = payload.get("pipeline_output")?;
+    if contains_secret_key(input_value) {
+        return None;
+    }
+    let input = serde_json::from_value::<DecisionPipelineInputV3>(input_value.clone()).ok()?;
+    let recorded_output =
+        serde_json::from_value::<DecisionPipelineOutputV3>(output_value.clone()).ok()?;
+    let start = &input.market_start_evidence;
+    let start_deadline = input.market.start_ts
+        + Duration::milliseconds(
+            (input.settings.target.start_price_capture_grace_seconds * 1_000.0)
+                .round()
+                .max(0.0) as i64,
+        );
+    if input.schema_version != 3
+        || input.settings.deploy.runtime_role != polyedge_config::RuntimeRole::ProfitabilityShadow
+        || input.settings.live.execution_mode != polyedge_config::ExecutionMode::Paper
+        || input.settings.live.allow_live
+        || input.settings.live.polymarket_private_key.is_some()
+        || input.settings.strategy.enable_taker_orders
+        || input.settings.live.allow_emergency_account_cancel
+        || input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle)
+        || input.settings.validate_runtime_role().is_err()
+        || input.fair_value.market_id != input.market.market_id
+        || start.schema_version != 1
+        || start.market_id != input.market.market_id
+        || start.market_start_ts != input.market.start_ts
+        || start.market_end_ts != input.market.end_ts
+        || input.market.start_price != Some(start.start_price)
+        || start.reference_source.is_empty()
+        || !start.reference_exact_resolution_source
+        || start.reference_stale
+        || start.reference_source_ts < input.market.start_ts
+        || start.reference_source_ts > start_deadline
+        || input.risk_before.open_order_count != input.order_manager_before.quotes.len()
+        || !regime_feature_input_matches_pipeline_state(&input)
+        || serde_json::to_value(&input).ok()?.as_object() != input_value.as_object()
+        || serde_json::to_value(&recorded_output).ok()?.as_object() != output_value.as_object()
+        || payload.get("market_id") != Some(&json!(input.market.market_id))
+        || payload.get("decision_ts") != Some(&json!(input.decision_ts))
+    {
+        return None;
+    }
+
+    let input_sha256 = canonical_value_sha256(input_value)?;
+    let output_sha256 = canonical_value_sha256(output_value)?;
+    let start_sha256 = canonical_value_sha256(&serde_json::to_value(start).ok()?)?;
+    if payload.get("pipeline_input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str())
+        || payload
+            .get("pipeline_output_sha256")
+            .and_then(Value::as_str)
+            != Some(output_sha256.as_str())
+        || payload
+            .get("market_start_evidence_sha256")
+            .and_then(Value::as_str)
+            != Some(start_sha256.as_str())
+        || batch_id
+            != format!(
+                "strategy-batch-{}",
+                input_sha256.trim_start_matches("sha256:")
+            )
+    {
+        return None;
+    }
+    let expected_candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+    if payload.get("candidate") != Some(&serde_json::to_value(expected_candidate).ok()?) {
+        return None;
+    }
+    let decision_config_sha256 = decision_config_sha256(&input)?;
+    if payload
+        .get("decision_config_schema")
+        .and_then(Value::as_str)
+        != Some("polyedge.decision_config.v1")
+        || payload
+            .get("decision_config_sha256")
+            .and_then(Value::as_str)
+            != Some(decision_config_sha256.as_str())
+    {
+        return None;
+    }
+
+    let replayed_output = evaluate_decision_pipeline_v3(&input);
+    if replayed_output != recorded_output {
+        return None;
+    }
+    let expected_decisions = expected_v3_decision_payloads(&replayed_output)?;
+    let bound = payload.get("bound_final_decisions")?.as_array()?;
+    if bound.len() != expected_decisions.len() {
+        return None;
+    }
+    let mut outputs = Vec::with_capacity(bound.len());
+    for (index, (entry, decision)) in bound.iter().zip(expected_decisions).enumerate() {
+        let decision_sha256 = canonical_value_sha256(&decision)?;
+        if entry.get("output_index").and_then(Value::as_u64) != Some(index as u64)
+            || entry.get("decision_sha256").and_then(Value::as_str)
+                != Some(decision_sha256.as_str())
+            || entry.get("decision") != Some(&decision)
+        {
+            return None;
+        }
+        outputs.push(StrategyBatchOutputV3 {
+            decision_sha256,
+            decision,
+        });
+    }
+    Some((outputs, decision_config_sha256, input.market_start_evidence))
+}
+
+fn decision_config_sha256(input: &DecisionPipelineInputV3) -> Option<String> {
+    canonical_value_sha256(&json!({
+        "schema": "polyedge.decision_config.v1",
+        "target": input.settings.target,
+        "data_policy": {
+            "compact_shadow_recording": input.settings.azure.compact_shadow_recording,
+            "shadow_book_sample_ms": input.settings.azure.shadow_book_sample_ms
+        },
+        "strategy": input.settings.strategy,
+        "risk": input.settings.risk,
+        "paper_execution": input.settings.paper,
+        "execution_safety": {
+            "execution_mode": input.settings.live.execution_mode,
+            "allow_live": input.settings.live.allow_live,
+            "confirm_non_restricted_location": input.settings.live.confirm_non_restricted_location,
+            "require_exact_resolution_source_for_live": input.settings.live.require_exact_resolution_source_for_live,
+            "allow_emergency_account_cancel": input.settings.live.allow_emergency_account_cancel
+        },
+        "adaptive_mode": input.adaptive_mode,
+        "candidate": input.adaptive_mode.map(FrozenStrategyMode::candidate)
+    }))
+}
+
+fn canonical_value_sha256(value: &Value) -> Option<String> {
+    run_bundle::stable_json(value)
+        .ok()
+        .map(|canonical| sha256_prefixed(canonical.as_bytes()))
+}
+
+fn durable_decision_output_v3(payload: &Value) -> Option<DurableDecisionOutputV3> {
+    if payload
+        .get("decision_batch_schema_version")
+        .and_then(Value::as_u64)
+        != Some(3)
+    {
+        return None;
+    }
+    let key = DecisionOutputKeyV3 {
+        batch_id: optional_text(payload, "strategy_batch_id")?,
+        output_index: payload
+            .get("strategy_batch_output_index")
+            .and_then(Value::as_u64)?,
+    };
+    let decision_sha256 = optional_text(payload, "strategy_decision_sha256")?;
+    if !valid_prefixed_sha256(&decision_sha256) {
+        return None;
+    }
+    let mut unbound = payload.clone();
+    let object = unbound.as_object_mut()?;
+    object.remove("decision_batch_schema_version");
+    object.remove("strategy_batch_id");
+    object.remove("strategy_batch_output_index");
+    object.remove("strategy_decision_sha256");
+    if canonical_value_sha256(&unbound).as_deref() != Some(decision_sha256.as_str()) {
+        return None;
+    }
+    let action = text(payload, "action").to_ascii_lowercase();
+    let place_identity = (action == "place")
+        .then(|| place_output_identity(payload))
+        .flatten();
+    if action == "place" && place_identity.is_none() {
+        return None;
+    }
+    Some(DurableDecisionOutputV3 {
+        key,
+        decision_sha256,
+        action,
+        place_identity,
+    })
+}
+
+fn place_output_identity(payload: &Value) -> Option<PlaceOutputIdentityV3> {
+    let identity = PlaceOutputIdentityV3 {
+        market_id: optional_text(payload, "market_id")?,
+        token_id: optional_text(payload, "token_id")?,
+        side: optional_text(payload, "side")?.to_ascii_lowercase(),
+        price: decimal(payload.get("price"))?,
+        size: decimal(payload.get("size"))?,
+    };
+    (identity.size > Decimal::ZERO && identity.price > Decimal::ZERO).then_some(identity)
+}
+
+fn application_id_v1(key: &DecisionOutputKeyV3, decision_sha256: &str) -> Option<String> {
+    Some(format!(
+        "paper-application-{}",
+        canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_decision_output_application.v1",
+            "strategy_batch_id": key.batch_id,
+            "strategy_batch_output_index": key.output_index,
+            "strategy_decision_sha256": decision_sha256
+        }))?
+        .trim_start_matches("sha256:")
+    ))
+}
+
+fn applied_decision_output_v1(payload: &Value) -> Option<AppliedDecisionOutputV1> {
+    if payload.get("schema").and_then(Value::as_str)
+        != Some("polyedge.paper_decision_output_application.v1")
+        || payload.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || payload.get("applied").and_then(Value::as_bool) != Some(true)
+        || payload.get("paper_only").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let key = DecisionOutputKeyV3 {
+        batch_id: optional_text(payload, "strategy_batch_id")?,
+        output_index: payload
+            .get("strategy_batch_output_index")
+            .and_then(Value::as_u64)?,
+    };
+    let decision_sha256 = optional_text(payload, "strategy_decision_sha256")?;
+    if !valid_prefixed_sha256(&decision_sha256) {
+        return None;
+    }
+    let application_id = optional_text(payload, "application_id")?;
+    if application_id_v1(&key, &decision_sha256).as_deref() != Some(application_id.as_str()) {
+        return None;
+    }
+    let reports = payload.get("execution_reports")?.as_array()?;
+    if payload
+        .get("execution_report_count")
+        .and_then(Value::as_u64)
+        != Some(reports.len() as u64)
+        || canonical_value_sha256(&Value::Array(reports.clone())).as_deref()
+            != payload
+                .get("execution_reports_sha256")
+                .and_then(Value::as_str)
+    {
+        return None;
+    }
+    let action = text(payload, "action").to_ascii_lowercase();
+    let place_identity = (action == "place")
+        .then(|| place_output_identity(payload))
+        .flatten();
+    let order_id = optional_text(payload, "order_id");
+    if action == "place" {
+        let identity = place_identity.as_ref()?;
+        let order_id = order_id.as_ref()?;
+        if reports.len() != 1
+            || optional_text(&reports[0], "order_id").as_deref() != Some(order_id.as_str())
+            || optional_text(&reports[0], "market_id").as_deref()
+                != Some(identity.market_id.as_str())
+            || optional_text(&reports[0], "token_id").as_deref() != Some(identity.token_id.as_str())
+        {
+            return None;
+        }
+    } else if action != "cancel_all" {
+        return None;
+    }
+    for report in reports {
+        if !text(report, "status").starts_with("paper_")
+            || report
+                .pointer("/raw/decision_application/schema")
+                .and_then(Value::as_str)
+                != Some("polyedge.paper_decision_output_application.v1")
+            || report
+                .pointer("/raw/decision_application/application_id")
+                .and_then(Value::as_str)
+                != Some(application_id.as_str())
+            || report
+                .pointer("/raw/decision_application/strategy_batch_id")
+                .and_then(Value::as_str)
+                != Some(key.batch_id.as_str())
+            || report
+                .pointer("/raw/decision_application/strategy_batch_output_index")
+                .and_then(Value::as_u64)
+                != Some(key.output_index)
+            || report
+                .pointer("/raw/decision_application/strategy_decision_sha256")
+                .and_then(Value::as_str)
+                != Some(decision_sha256.as_str())
+        {
+            return None;
+        }
+    }
+    Some(AppliedDecisionOutputV1 {
+        key,
+        decision_sha256,
+        action,
+        place_identity,
+        order_id,
+        event_sha256: canonical_value_sha256(payload)?,
+    })
+}
+
+fn application_matches_decision(
+    application: &AppliedDecisionOutputV1,
+    decision: &DurableDecisionOutputV3,
+) -> bool {
+    application.key == decision.key
+        && application.decision_sha256 == decision.decision_sha256
+        && application.action == decision.action
+        && application.place_identity == decision.place_identity
+}
+
+fn regime_feature_input_matches_pipeline_state(input: &DecisionPipelineInputV3) -> bool {
+    let actual = &input.regime_feature_input;
+    let book_snapshot = |book: &polyedge_domain::BookState| RegimeBookSnapshot {
+        bid: book.best_bid().map(|level| level.price),
+        ask: book.best_ask().map(|level| level.price),
+        bid_size: book.best_bid().map(|level| level.size),
+        ask_size: book.best_ask().map(|level| level.size),
+        local_ts: Some(book.local_ts),
+    };
+    let expected = RegimeFeatureInput {
+        now: input.decision_ts,
+        market_start_ts: Some(input.market.start_ts),
+        market_end_ts: Some(input.market.end_ts),
+        start_price: input.market.start_price,
+        tick_size: input.market.tick_size,
+        reference: Some(RegimeReferencePoint {
+            ts: input.reference.local_ts,
+            price: input.reference.price,
+            stale: input.reference.stale,
+        }),
+        // Reference history is explicit replay state; unlike every other field
+        // here it has no second representation in DecisionPipelineInputV3.
+        // Preserve it while enforcing deterministic ordering and no future
+        // observations below.
+        reference_history: actual.reference_history.clone(),
+        q_up: Some(input.fair_value.q_up),
+        q_down: Some(input.fair_value.q_down),
+        sigma: Some(input.fair_value.sigma),
+        up_book: input
+            .books
+            .get(&input.market.up_token_id)
+            .map(book_snapshot),
+        down_book: input
+            .books
+            .get(&input.market.down_token_id)
+            .map(book_snapshot),
+        book_update_rate_10s: None,
+        feed_divergence_bps: None,
+        recent_feed_errors: 0,
+        open_positions: None,
+        open_orders: input.order_manager_before.quotes.len(),
+        recent_fill_count: 0,
+        recent_cancel_count: 0,
+        adverse_move_after_fill_bps: None,
+        max_reference_age_ms: input.settings.risk.max_reference_age_ms,
+        max_book_age_ms: input.settings.risk.max_book_age_ms,
+        final_no_trade_seconds: input.settings.strategy.final_no_trade_seconds,
+        quality_flags: input.reference.quality_flags.clone(),
+    };
+    let history_is_ordered = actual
+        .reference_history
+        .windows(2)
+        .all(|pair| pair[0].ts <= pair[1].ts)
+        && actual
+            .reference_history
+            .iter()
+            .all(|point| point.ts <= input.decision_ts);
+    history_is_ordered && *actual == expected
+}
+
+fn contains_secret_key(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| is_secret_key(key) || contains_secret_key(value)),
+        Value::Array(values) => values.iter().any(contains_secret_key),
+        _ => false,
+    }
+}
+
+fn expected_v3_decision_payloads(output: &DecisionPipelineOutputV3) -> Option<Vec<Value>> {
+    let lineage = output
+        .strategy_evaluations
+        .iter()
+        .filter_map(|evaluation| {
+            evaluation
+                .evaluated_decision
+                .as_ref()
+                .map(|decision| (evaluation.evaluation_index, decision, &evaluation.metadata))
+        })
+        .enumerate()
+        .map(
+            |(strategy_output_index, (evaluation_index, decision, metadata))| {
+                (evaluation_index, strategy_output_index, decision, metadata)
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut used = vec![false; lineage.len()];
+    output
+        .final_decisions
+        .iter()
+        .map(|decision| {
+            let exact = lineage
+                .iter()
+                .enumerate()
+                .find(|(index, (_, _, source, _))| !used[*index] && **source == *decision)
+                .map(|(index, _)| index);
+            let matched = exact.or_else(|| {
+                if decision.action != DecisionAction::Place {
+                    return None;
+                }
+                let candidates = lineage
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, (_, _, source, _))| {
+                        !used[*index] && same_place_decision_lineage(source, decision)
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                (candidates.len() == 1).then_some(candidates[0])
+            });
+            let mut payload = serde_json::to_value(decision).ok()?;
+            if let Some(index) = matched {
+                used[index] = true;
+                let (evaluation_index, strategy_output_index, _, metadata) = lineage[index];
+                let object = payload.as_object_mut()?;
+                object.insert(
+                    "strategy_metadata".to_owned(),
+                    serde_json::to_value(metadata).ok()?,
+                );
+                object.insert(
+                    "strategy_evaluation_index".to_owned(),
+                    json!(evaluation_index),
+                );
+                object.insert(
+                    "strategy_output_index".to_owned(),
+                    json!(strategy_output_index),
+                );
+            }
+            Some(payload)
+        })
+        .collect()
+}
+
+fn same_place_decision_lineage(source: &TradeDecision, final_decision: &TradeDecision) -> bool {
+    source.action == DecisionAction::Place
+        && final_decision.action == DecisionAction::Place
+        && source.market_id == final_decision.market_id
+        && source.condition_id == final_decision.condition_id
+        && source.token_id == final_decision.token_id
+        && source.outcome == final_decision.outcome
+        && source.side == final_decision.side
+        && source.price == final_decision.price
+        && source.order_kind == final_decision.order_kind
+        && source.ttl_ms == final_decision.ttl_ms
+        && source.expected_edge == final_decision.expected_edge
+        && source.post_only == final_decision.post_only
+        && source.tick_size == final_decision.tick_size
+        && source.neg_risk == final_decision.neg_risk
 }
 
 fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Value {
@@ -2559,25 +4196,181 @@ fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Valu
     })
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FillLifecycleJoinKey {
+    source: String,
+    order_id: String,
+    market_id: String,
+    token_id: String,
+    side: String,
+    fill_price: Decimal,
+    fill_ts: DateTime<Utc>,
+    fill_size: Decimal,
+    fee_per_share: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueueRegistrationIdentity {
+    market_id: String,
+    token_id: String,
+    side: String,
+    quote_price: Decimal,
+    order_size: Decimal,
+}
+
+impl QueueRegistrationIdentity {
+    fn from_payload(payload: &Value) -> Option<Self> {
+        let identity = Self {
+            market_id: optional_text(payload, "market_id")?,
+            token_id: optional_text(payload, "token_id")?,
+            side: optional_text(payload, "side")?.to_ascii_lowercase(),
+            quote_price: decimal(payload.get("quote_price"))?,
+            order_size: decimal(payload.get("order_size"))?,
+        };
+        (identity.quote_price > Decimal::ZERO
+            && identity.quote_price < Decimal::ONE
+            && identity.order_size > Decimal::ZERO)
+            .then_some(identity)
+    }
+
+    fn matches_lifecycle(&self, key: &FillLifecycleJoinKey) -> bool {
+        self.market_id == key.market_id
+            && self.token_id == key.token_id
+            && self.side == key.side
+            && self.quote_price == key.fill_price
+    }
+
+    fn matches_place_output(&self, identity: &PlaceOutputIdentityV3) -> bool {
+        self.market_id == identity.market_id
+            && self.token_id == identity.token_id
+            && self.side == identity.side
+            && self.quote_price == identity.price
+            && self.order_size == identity.size
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueueRegistrationRecord {
+    identity: Option<QueueRegistrationIdentity>,
+    event_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrderLifecycleIdentity {
+    market_id: String,
+    token_id: String,
+    side: String,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementJournalQualityEvent {
+    event_type: String,
+    recorded_ts: DateTime<Utc>,
+    payload: Value,
+    event_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementJournalQualityBuffer {
+    event_count: u64,
+    journal_sha256: String,
+    events: BTreeMap<u64, SettlementJournalQualityEvent>,
+    conflicted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MarkoutObservation {
+    key: FillLifecycleJoinKey,
+    fill_id: String,
+    horizon: i64,
+    missing: bool,
+    gross_markout_per_share: Option<Decimal>,
+    gross_executable_markout_per_share: Option<Decimal>,
+    fee_per_share: Option<Decimal>,
+    net_markout_per_share: Option<Decimal>,
+    net_executable_markout_per_share: Option<Decimal>,
+    net_markout_pnl: Option<Decimal>,
+    net_executable_markout_pnl: Option<Decimal>,
+    observation_delay_ms: Option<i64>,
+    observed_ts: Option<DateTime<Utc>>,
+}
+
+impl MarkoutObservation {
+    fn is_complete_and_timely(&self) -> bool {
+        let (Some(delay), Some(observed_ts)) = (self.observation_delay_ms, self.observed_ts) else {
+            return false;
+        };
+        let (
+            Some(gross),
+            Some(gross_executable),
+            Some(fee),
+            Some(net),
+            Some(net_executable),
+            Some(net_pnl),
+            Some(net_executable_pnl),
+        ) = (
+            self.gross_markout_per_share,
+            self.gross_executable_markout_per_share,
+            self.fee_per_share,
+            self.net_markout_per_share,
+            self.net_executable_markout_per_share,
+            self.net_markout_pnl,
+            self.net_executable_markout_pnl,
+        )
+        else {
+            return false;
+        };
+        let target_ts = self.key.fill_ts + Duration::seconds(self.horizon);
+        let measured_delay = observed_ts
+            .signed_duration_since(target_ts)
+            .num_milliseconds();
+        !self.missing
+            && fee >= Decimal::ZERO
+            && fee == self.key.fee_per_share
+            && net == gross - fee
+            && net_executable == gross_executable - fee
+            && net_pnl == net * self.key.fill_size
+            && net_executable_pnl == net_executable * self.key.fill_size
+            && (0..=MAX_MARKOUT_OBSERVATION_DELAY_MS).contains(&delay)
+            && (0..=MAX_MARKOUT_OBSERVATION_DELAY_MS).contains(&measured_delay)
+            && (measured_delay - delay).abs() <= 1
+    }
+}
+
 #[derive(Default)]
 struct ExecutionQualityAccumulator {
-    registrations: BTreeSet<String>,
-    snapshots: BTreeSet<String>,
-    size_ahead: Vec<Decimal>,
+    applicable_place_outputs: BTreeMap<DecisionOutputKeyV3, DurableDecisionOutputV3>,
+    applied_place_outputs: BTreeMap<DecisionOutputKeyV3, AppliedDecisionOutputV1>,
+    decision_application_invalid: usize,
+    decision_application_retry_duplicates: usize,
+    decision_application_conflicts: usize,
+    registrations: BTreeMap<String, QueueRegistrationRecord>,
+    registration_events: usize,
+    registration_events_without_order_id: usize,
+    registration_retry_duplicates: usize,
+    registration_conflicting_order_ids: BTreeSet<String>,
+    registration_invalid_order_ids: BTreeSet<String>,
+    snapshots: BTreeMap<String, Vec<Option<Decimal>>>,
+    snapshot_events: usize,
+    snapshot_events_without_order_id: usize,
     queue_fill_events: usize,
     queue_fill_orders: BTreeSet<String>,
     partial_fill_events: usize,
     completed_fill_events: usize,
     trade_through_events: usize,
     cancel_latency_ms: Vec<Decimal>,
-    markouts: BTreeMap<i64, Vec<Decimal>>,
-    executable_markouts: BTreeMap<i64, Vec<Decimal>>,
-    markout_pnl: BTreeMap<i64, Decimal>,
-    executable_markout_pnl: BTreeMap<i64, Decimal>,
-    observation_delay_ms: BTreeMap<i64, Vec<Decimal>>,
-    markout_observed: BTreeMap<i64, usize>,
-    markout_missing: BTreeMap<i64, usize>,
-    fill_ids: BTreeSet<String>,
+    expected_fill_lifecycles: BTreeMap<FillLifecycleJoinKey, usize>,
+    lifecycle_order_identities: BTreeMap<String, OrderLifecycleIdentity>,
+    lifecycle_conflicting_order_ids: BTreeSet<String>,
+    malformed_fill_lifecycle_events: usize,
+    markout_observations: Vec<MarkoutObservation>,
+    malformed_markout_rows: usize,
+    settlement_journals: BTreeMap<String, SettlementJournalQualityBuffer>,
+    settlement_journal_retry_duplicates: usize,
+    settlement_journal_conflicts: usize,
+    settlement_journal_incomplete: usize,
+    settlement_journal_invalid_events: usize,
+    settlement_journal_verified: usize,
     probe_events_excluded: usize,
 }
 
@@ -2589,19 +4382,94 @@ impl ExecutionQualityAccumulator {
             self.probe_events_excluded += 1;
             return;
         }
+        if Self::has_settlement_journal_fields(&event.payload) {
+            self.observe_settlement_journal_event(event);
+            return;
+        }
+        self.observe_unjournaled(event);
+    }
+
+    fn observe_unjournaled(&mut self, event: &EventLine) {
         let order_id = || optional_text(&event.payload, "order_id");
         match event.event_type.as_str() {
+            "decision"
+                if text(&event.payload, "action") == "place"
+                    && event
+                        .payload
+                        .get("decision_batch_schema_version")
+                        .and_then(Value::as_u64)
+                        == Some(3) =>
+            {
+                if let Some(output) = durable_decision_output_v3(&event.payload) {
+                    if let Some(existing) = self.applicable_place_outputs.get(&output.key) {
+                        if existing != &output {
+                            self.decision_application_conflicts += 1;
+                        }
+                    } else {
+                        self.applicable_place_outputs
+                            .insert(output.key.clone(), output);
+                    }
+                } else {
+                    self.decision_application_invalid += 1;
+                }
+            }
+            "paper_decision_output_applied" => {
+                let Some(output) = applied_decision_output_v1(&event.payload) else {
+                    self.decision_application_invalid += 1;
+                    return;
+                };
+                if output.action != "place" {
+                    return;
+                }
+                if let Some(existing) = self.applied_place_outputs.get(&output.key) {
+                    if existing.event_sha256 == output.event_sha256 {
+                        self.decision_application_retry_duplicates += 1;
+                    } else {
+                        self.decision_application_conflicts += 1;
+                    }
+                } else {
+                    self.applied_place_outputs
+                        .insert(output.key.clone(), output);
+                }
+            }
             "paper_order_queue_registration" => {
+                self.registration_events += 1;
                 if let Some(order_id) = order_id() {
-                    self.registrations.insert(order_id);
+                    let event_sha256 = canonical_value_sha256(&event.payload)
+                        .unwrap_or_else(|| "invalid-registration-payload".to_owned());
+                    let identity = QueueRegistrationIdentity::from_payload(&event.payload);
+                    if identity.is_none() {
+                        self.registration_invalid_order_ids.insert(order_id.clone());
+                    }
+                    if let Some(existing) = self.registrations.get(&order_id) {
+                        if existing.event_sha256 == event_sha256 {
+                            self.registration_retry_duplicates += 1;
+                        } else {
+                            self.registration_conflicting_order_ids
+                                .insert(order_id.clone());
+                        }
+                    } else {
+                        self.registrations.insert(
+                            order_id,
+                            QueueRegistrationRecord {
+                                identity,
+                                event_sha256,
+                            },
+                        );
+                    }
+                } else {
+                    self.registration_events_without_order_id += 1;
                 }
             }
             "paper_order_queue_snapshot" => {
+                self.snapshot_events += 1;
                 if let Some(order_id) = order_id() {
-                    self.snapshots.insert(order_id);
-                }
-                if let Some(value) = decimal(event.payload.get("visible_size_ahead_estimate")) {
-                    self.size_ahead.push(value);
+                    self.snapshots
+                        .entry(order_id)
+                        .or_default()
+                        .push(decimal(event.payload.get("visible_size_ahead_estimate")));
+                } else {
+                    self.snapshot_events_without_order_id += 1;
                 }
             }
             "paper_queue_shadow_fill" => {
@@ -2623,6 +4491,30 @@ impl ExecutionQualityAccumulator {
                 {
                     self.trade_through_events += 1;
                 }
+                if decimal(event.payload.get("shadow_fill_size"))
+                    .is_some_and(|value| value > Decimal::ZERO)
+                {
+                    self.observe_fill_lifecycle(
+                        "queue_shadow_fill",
+                        &event.payload,
+                        "trade_ts",
+                        "shadow_fill_size",
+                        None,
+                    );
+                }
+            }
+            "execution_report" => {
+                if decimal(event.payload.get("filled_size"))
+                    .is_some_and(|value| value > Decimal::ZERO)
+                {
+                    self.observe_fill_lifecycle(
+                        "touch_fill",
+                        &event.payload,
+                        "local_ts",
+                        "filled_size",
+                        Some("fee"),
+                    );
+                }
             }
             "paper_cancel_latency" => {
                 if let Some(value) = decimal(event.payload.get("cancel_latency_ms")) {
@@ -2635,77 +4527,748 @@ impl ExecutionQualityAccumulator {
         }
     }
 
-    fn observe_markout(&mut self, payload: &Value, missing: bool) {
-        let Some(horizon) = payload.get("horizon_seconds").and_then(Value::as_i64) else {
+    fn has_settlement_journal_fields(payload: &Value) -> bool {
+        [
+            "settlement_journal_schema",
+            "settlement_journal_id",
+            "settlement_journal_event_index",
+            "settlement_journal_event_count",
+            "settlement_journal_sha256",
+        ]
+        .iter()
+        .any(|key| payload.get(*key).is_some())
+    }
+
+    fn observe_settlement_journal_event(&mut self, event: &EventLine) {
+        let binding = event
+            .payload
+            .get("settlement_journal_schema")
+            .and_then(Value::as_str)
+            .filter(|schema| *schema == "polyedge.paper_settlement_journal.v1")
+            .zip(
+                event
+                    .payload
+                    .get("settlement_journal_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| valid_settlement_journal_id(id)),
+            )
+            .map(|(_, journal_id)| journal_id)
+            .zip(
+                event
+                    .payload
+                    .get("settlement_journal_event_index")
+                    .and_then(Value::as_u64),
+            )
+            .zip(
+                event
+                    .payload
+                    .get("settlement_journal_event_count")
+                    .and_then(Value::as_u64)
+                    .filter(|count| *count > 0),
+            )
+            .zip(
+                event
+                    .payload
+                    .get("settlement_journal_sha256")
+                    .and_then(Value::as_str)
+                    .filter(|sha256| valid_prefixed_sha256(sha256)),
+            )
+            .map(
+                |(((journal_id, event_index), event_count), journal_sha256)| {
+                    (
+                        journal_id.to_owned(),
+                        event_index,
+                        event_count,
+                        journal_sha256.to_owned(),
+                    )
+                },
+            );
+        let Some((journal_id, event_index, event_count, journal_sha256)) = binding else {
+            self.settlement_journal_invalid_events += 1;
             return;
         };
-        if let Some(fill_id) = optional_text(payload, "fill_id") {
-            self.fill_ids.insert(fill_id);
-        }
-        if missing {
-            *self.markout_missing.entry(horizon).or_insert(0) += 1;
+        if event_index >= event_count {
+            self.settlement_journal_invalid_events += 1;
             return;
         }
-        *self.markout_observed.entry(horizon).or_insert(0) += 1;
-        if let Some(value) = decimal(payload.get("markout_per_share")) {
-            self.markouts.entry(horizon).or_default().push(value);
+        let Some(event_sha256) = canonical_value_sha256(&json!({
+            "event_type": event.event_type,
+            "payload": event.payload
+        })) else {
+            self.settlement_journal_invalid_events += 1;
+            return;
+        };
+        let journal = self
+            .settlement_journals
+            .entry(journal_id)
+            .or_insert_with(|| SettlementJournalQualityBuffer {
+                event_count,
+                journal_sha256: journal_sha256.clone(),
+                events: BTreeMap::new(),
+                conflicted: false,
+            });
+        if journal.event_count != event_count || journal.journal_sha256 != journal_sha256 {
+            if !journal.conflicted {
+                self.settlement_journal_conflicts += 1;
+            }
+            journal.conflicted = true;
+            return;
         }
-        if let Some(value) = decimal(payload.get("executable_markout_per_share")) {
-            self.executable_markouts
-                .entry(horizon)
-                .or_default()
-                .push(value);
+        if let Some(existing) = journal.events.get(&event_index) {
+            if existing.event_sha256 == event_sha256 {
+                self.settlement_journal_retry_duplicates += 1;
+            } else {
+                if !journal.conflicted {
+                    self.settlement_journal_conflicts += 1;
+                }
+                journal.conflicted = true;
+            }
+            return;
         }
-        if let Some(value) = decimal(payload.get("markout_pnl")) {
-            *self.markout_pnl.entry(horizon).or_insert(Decimal::ZERO) += value;
-        }
-        if let Some(value) = decimal(payload.get("executable_markout_pnl")) {
-            *self
-                .executable_markout_pnl
-                .entry(horizon)
-                .or_insert(Decimal::ZERO) += value;
-        }
-        if let Some(value) = decimal(payload.get("observation_delay_ms")) {
-            self.observation_delay_ms
-                .entry(horizon)
-                .or_default()
-                .push(value);
+        journal.events.insert(
+            event_index,
+            SettlementJournalQualityEvent {
+                event_type: event.event_type.clone(),
+                recorded_ts: event.recorded_ts,
+                payload: event.payload.clone(),
+                event_sha256,
+            },
+        );
+    }
+
+    fn settlement_journal_sha256(
+        journal_id: &str,
+        journal: &SettlementJournalQualityBuffer,
+    ) -> Option<String> {
+        let events = journal
+            .events
+            .iter()
+            .map(|(event_index, event)| {
+                let mut payload = event.payload.clone();
+                let object = payload.as_object_mut()?;
+                for key in [
+                    "settlement_journal_schema",
+                    "settlement_journal_id",
+                    "settlement_journal_event_index",
+                    "settlement_journal_event_count",
+                    "settlement_journal_sha256",
+                ] {
+                    object.remove(key);
+                }
+                Some(json!({
+                    "event_index": event_index,
+                    "event_type": event.event_type,
+                    "payload": payload
+                }))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": journal.event_count,
+            "events": events
+        }))
+    }
+
+    fn apply_complete_settlement_journals(&mut self) {
+        let journals = std::mem::take(&mut self.settlement_journals);
+        for (journal_id, journal) in journals {
+            let complete = !journal.conflicted
+                && journal.events.len() == journal.event_count as usize
+                && (0..journal.event_count).all(|index| journal.events.contains_key(&index));
+            if !complete {
+                self.settlement_journal_incomplete += 1;
+                continue;
+            }
+            if Self::settlement_journal_sha256(&journal_id, &journal).as_deref()
+                != Some(journal.journal_sha256.as_str())
+            {
+                self.settlement_journal_conflicts += 1;
+                continue;
+            }
+            self.settlement_journal_verified += 1;
+            for event in journal.events.into_values() {
+                self.observe_unjournaled(&EventLine {
+                    event_type: event.event_type,
+                    recorded_ts: event.recorded_ts,
+                    payload: event.payload,
+                    raw: Value::Null,
+                });
+            }
         }
     }
 
-    fn finish(self) -> Value {
-        let snapshot_coverage = ratio_f64(self.snapshots.len(), self.registrations.len());
+    fn observe_fill_lifecycle(
+        &mut self,
+        source: &str,
+        payload: &Value,
+        timestamp_field: &str,
+        size_field: &str,
+        fee_field: Option<&str>,
+    ) {
+        let order_id = optional_text(payload, "order_id");
+        let side = optional_text(payload, "side")
+            .or_else(|| {
+                payload
+                    .pointer("/raw/decision/side")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                order_id.as_ref().and_then(|order_id| {
+                    self.registrations
+                        .get(order_id)
+                        .and_then(|record| record.identity.as_ref())
+                        .map(|identity| identity.side.clone())
+                })
+            })
+            .map(|value| value.to_ascii_lowercase());
+        let fill_price_field = if source == "queue_shadow_fill" {
+            "quote_price"
+        } else {
+            "avg_price"
+        };
+        let fields_present = fee_field.is_none()
+            || (optional_text(payload, "token_id").is_some()
+                && decimal(payload.get("avg_price")).is_some()
+                && fee_field
+                    .and_then(|field| decimal(payload.get(field)))
+                    .is_some());
+        let key = order_id
+            .zip(optional_text(payload, "market_id"))
+            .zip(optional_text(payload, "token_id"))
+            .zip(side)
+            .zip(decimal(payload.get(fill_price_field)))
+            .zip(parse_datetime(payload.get(timestamp_field)))
+            .zip(decimal(payload.get(size_field)))
+            .filter(|(_, size)| *size > Decimal::ZERO)
+            .filter(|_| fields_present)
+            .and_then(
+                |(
+                    (((((order_id, market_id), token_id), side), fill_price), fill_ts),
+                    fill_size,
+                )| {
+                    let fee_per_share = fee_field.map_or(Some(Decimal::ZERO), |field| {
+                        decimal(payload.get(field)).map(|fee| fee / fill_size)
+                    })?;
+                    (fee_per_share >= Decimal::ZERO).then_some(FillLifecycleJoinKey {
+                        source: source.to_owned(),
+                        order_id,
+                        market_id,
+                        token_id,
+                        side,
+                        fill_price,
+                        fill_ts,
+                        fill_size,
+                        fee_per_share,
+                    })
+                },
+            );
+        if let Some(key) = key {
+            let identity = OrderLifecycleIdentity {
+                market_id: key.market_id.clone(),
+                token_id: key.token_id.clone(),
+                side: key.side.clone(),
+            };
+            if let Some(existing) = self.lifecycle_order_identities.get(&key.order_id) {
+                if existing != &identity {
+                    self.lifecycle_conflicting_order_ids
+                        .insert(key.order_id.clone());
+                }
+            } else {
+                self.lifecycle_order_identities
+                    .insert(key.order_id.clone(), identity);
+            }
+            *self.expected_fill_lifecycles.entry(key).or_insert(0) += 1;
+        } else {
+            self.malformed_fill_lifecycle_events += 1;
+        }
+    }
+
+    fn observe_markout(&mut self, payload: &Value, missing: bool) {
+        let Some(horizon) = payload
+            .get("horizon_seconds")
+            .and_then(Value::as_i64)
+            .filter(|horizon| MARKOUT_HORIZONS_SECONDS.contains(horizon))
+        else {
+            self.malformed_markout_rows += 1;
+            return;
+        };
+        let key = optional_text(payload, "fill_source")
+            .zip(optional_text(payload, "order_id"))
+            .zip(optional_text(payload, "market_id"))
+            .zip(optional_text(payload, "token_id"))
+            .zip(optional_text(payload, "side").map(|side| side.to_ascii_lowercase()))
+            .zip(decimal(payload.get("fill_price")))
+            .zip(parse_datetime(payload.get("fill_ts")))
+            .zip(decimal(payload.get("fill_size")))
+            .zip(decimal(payload.get("fee_per_share")))
+            .filter(|((_, size), fee)| *size > Decimal::ZERO && *fee >= Decimal::ZERO)
+            .map(
+                |(
+                    (
+                        (
+                            (((((source, order_id), market_id), token_id), side), fill_price),
+                            fill_ts,
+                        ),
+                        fill_size,
+                    ),
+                    fee_per_share,
+                )| {
+                    FillLifecycleJoinKey {
+                        source,
+                        order_id,
+                        market_id,
+                        token_id,
+                        side,
+                        fill_price,
+                        fill_ts,
+                        fill_size,
+                        fee_per_share,
+                    }
+                },
+            );
+        let (Some(key), Some(fill_id)) = (key, optional_text(payload, "fill_id")) else {
+            self.malformed_markout_rows += 1;
+            return;
+        };
+        self.markout_observations.push(MarkoutObservation {
+            key,
+            fill_id,
+            horizon,
+            missing,
+            gross_markout_per_share: decimal(payload.get("markout_per_share")),
+            gross_executable_markout_per_share: decimal(
+                payload.get("executable_markout_per_share"),
+            ),
+            fee_per_share: decimal(payload.get("fee_per_share")),
+            net_markout_per_share: decimal(payload.get("net_markout_per_share")),
+            net_executable_markout_per_share: decimal(
+                payload.get("net_executable_markout_per_share"),
+            ),
+            net_markout_pnl: decimal(payload.get("net_markout_pnl")),
+            net_executable_markout_pnl: decimal(payload.get("net_executable_markout_pnl")),
+            observation_delay_ms: payload.get("observation_delay_ms").and_then(Value::as_i64),
+            observed_ts: parse_datetime(payload.get("observed_ts")),
+        });
+    }
+
+    fn finish(mut self) -> Value {
+        self.apply_complete_settlement_journals();
+        let strict_v3_place_denominator = !self.applicable_place_outputs.is_empty()
+            || !self.applied_place_outputs.is_empty()
+            || self.decision_application_invalid > 0
+            || self.decision_application_conflicts > 0;
+        let mut application_join_conflicts = 0_usize;
+        let mut application_order_ids = BTreeMap::<String, DecisionOutputKeyV3>::new();
+        let mut reused_application_order_ids = BTreeSet::new();
+        let mut valid_applied_places =
+            BTreeMap::<DecisionOutputKeyV3, (PlaceOutputIdentityV3, String)>::new();
+        for (key, decision) in &self.applicable_place_outputs {
+            let Some(application) = self.applied_place_outputs.get(key) else {
+                continue;
+            };
+            let Some(identity) = application.place_identity.clone() else {
+                application_join_conflicts += 1;
+                continue;
+            };
+            let Some(order_id) = application.order_id.clone() else {
+                application_join_conflicts += 1;
+                continue;
+            };
+            if !application_matches_decision(application, decision) {
+                application_join_conflicts += 1;
+                continue;
+            }
+            if let Some(existing) = application_order_ids.get(&order_id) {
+                if existing != key {
+                    reused_application_order_ids.insert(order_id.clone());
+                    continue;
+                }
+            } else {
+                application_order_ids.insert(order_id.clone(), key.clone());
+            }
+            valid_applied_places.insert(key.clone(), (identity, order_id));
+        }
+        if !reused_application_order_ids.is_empty() {
+            valid_applied_places
+                .retain(|_, (_, order_id)| !reused_application_order_ids.contains(order_id));
+        }
+        let eligible_applied_order_ids = valid_applied_places
+            .values()
+            .map(|(_, order_id)| order_id.clone())
+            .collect::<BTreeSet<_>>();
+        let applicable_place_outputs = self.applicable_place_outputs.len();
+        let applied_place_outputs = valid_applied_places.len();
+        let unbound_place_outputs = applicable_place_outputs.saturating_sub(applied_place_outputs);
+        let orphan_place_applications = self
+            .applied_place_outputs
+            .keys()
+            .filter(|key| !self.applicable_place_outputs.contains_key(*key))
+            .count();
+        let orphan_registration_order_ids = if strict_v3_place_denominator {
+            self.registrations
+                .keys()
+                .filter(|order_id| !eligible_applied_order_ids.contains(*order_id))
+                .count()
+        } else {
+            0
+        };
+        let orphan_snapshot_ids = self
+            .snapshots
+            .keys()
+            .filter(|order_id| {
+                if strict_v3_place_denominator {
+                    !eligible_applied_order_ids.contains(*order_id)
+                } else {
+                    !self.registrations.contains_key(*order_id)
+                }
+            })
+            .count();
+        let orphan_snapshot_events = self
+            .snapshots
+            .iter()
+            .filter(|(order_id, _)| {
+                if strict_v3_place_denominator {
+                    !eligible_applied_order_ids.contains(*order_id)
+                } else {
+                    !self.registrations.contains_key(*order_id)
+                }
+            })
+            .map(|(_, rows)| rows.len())
+            .sum::<usize>()
+            + self.snapshot_events_without_order_id;
+        let duplicate_snapshot_ids = self
+            .snapshots
+            .values()
+            .filter(|rows| rows.len() > 1)
+            .count();
+        let duplicate_snapshot_events = self
+            .snapshots
+            .values()
+            .map(|rows| rows.len().saturating_sub(1))
+            .sum::<usize>();
+        let invalid_snapshot_events = self
+            .snapshots
+            .values()
+            .flatten()
+            .filter(|value| value.is_none())
+            .count();
+        let expected_queue_orders = if strict_v3_place_denominator {
+            applicable_place_outputs
+        } else {
+            self.registrations.len()
+        };
+        let mut joined_snapshot_orders = 0_usize;
+        let mut size_ahead = Vec::new();
+        if strict_v3_place_denominator {
+            for (identity, order_id) in valid_applied_places.values() {
+                let registration_matches = self
+                    .registrations
+                    .get(order_id)
+                    .and_then(|record| record.identity.as_ref())
+                    .is_some_and(|registration| registration.matches_place_output(identity));
+                if registration_matches
+                    && !self.registration_conflicting_order_ids.contains(order_id)
+                    && !self.registration_invalid_order_ids.contains(order_id)
+                {
+                    if let Some(rows) = self.snapshots.get(order_id) {
+                        if rows.len() == 1 {
+                            if let Some(value) = rows[0] {
+                                joined_snapshot_orders += 1;
+                                size_ahead.push(value);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for order_id in self.registrations.keys() {
+                if self.registration_conflicting_order_ids.contains(order_id)
+                    || self.registration_invalid_order_ids.contains(order_id)
+                {
+                    continue;
+                }
+                if let Some(rows) = self.snapshots.get(order_id) {
+                    if rows.len() == 1 {
+                        if let Some(value) = rows[0] {
+                            joined_snapshot_orders += 1;
+                            size_ahead.push(value);
+                        }
+                    }
+                }
+            }
+        }
+        let missing_snapshot_orders = expected_queue_orders.saturating_sub(joined_snapshot_orders);
+        let snapshot_coverage = ratio_f64(joined_snapshot_orders, expected_queue_orders);
         let mut warnings = Vec::new();
         let mut notices = Vec::new();
-        if self.registrations.is_empty() {
+        if strict_v3_place_denominator
+            && (unbound_place_outputs > 0
+                || orphan_place_applications > 0
+                || application_join_conflicts > 0
+                || self.decision_application_invalid > 0
+                || self.decision_application_conflicts > 0
+                || !reused_application_order_ids.is_empty())
+        {
+            warnings.push(json!(format!(
+                "place-output application binding below 100%: {applied_place_outputs}/{applicable_place_outputs} applied, {unbound_place_outputs} unbound, {orphan_place_applications} orphan applications, {application_join_conflicts} identity mismatches, {} invalid, {} conflicts, {} reused order IDs",
+                self.decision_application_invalid,
+                self.decision_application_conflicts,
+                reused_application_order_ids.len()
+            )));
+        }
+        if orphan_registration_order_ids > 0 {
+            warnings.push(json!(format!(
+                "{orphan_registration_order_ids} queue registrations do not join one-to-one to applied place outputs"
+            )));
+        }
+        if self.registration_events_without_order_id > 0 {
+            warnings.push(json!(format!(
+                "{} queue registrations could not be joined because order_id is missing",
+                self.registration_events_without_order_id
+            )));
+        }
+        if !self.registration_conflicting_order_ids.is_empty() {
+            warnings.push(json!(format!(
+                "conflicting queue registrations reused {} order IDs",
+                self.registration_conflicting_order_ids.len()
+            )));
+        }
+        if !self.registration_invalid_order_ids.is_empty() {
+            warnings.push(json!(format!(
+                "{} queue registration order IDs lack complete lifecycle identity fields",
+                self.registration_invalid_order_ids.len()
+            )));
+        }
+        if self.registration_retry_duplicates > 0 {
+            notices.push(json!(format!(
+                "{} identical queue registration retries deduplicated",
+                self.registration_retry_duplicates
+            )));
+        }
+        if orphan_snapshot_events > 0 {
+            warnings.push(json!(format!(
+                "orphan queue snapshots cannot satisfy registered orders: {orphan_snapshot_events} events across {orphan_snapshot_ids} order IDs"
+            )));
+        }
+        if duplicate_snapshot_events > 0 {
+            warnings.push(json!(format!(
+                "duplicate queue snapshots are promotion-blocking: {duplicate_snapshot_events} excess events across {duplicate_snapshot_ids} order IDs"
+            )));
+        }
+        if invalid_snapshot_events > 0 {
+            warnings.push(json!(format!(
+                "{invalid_snapshot_events} queue snapshots lack numeric inferred_size_ahead"
+            )));
+        }
+        if expected_queue_orders == 0 {
             notices.push(json!("no real paper order queue registrations observed"));
         } else if snapshot_coverage.is_some_and(|value| value < 0.95) {
             warnings.push(json!(format!(
                 "queue snapshot coverage below 95%: {}/{}",
-                self.snapshots.len(),
-                self.registrations.len()
+                joined_snapshot_orders, expected_queue_orders
             )));
         }
+
+        if self.malformed_fill_lifecycle_events > 0 {
+            warnings.push(json!(format!(
+                "{} eligible fill lifecycle events lack the fields required for markout joins",
+                self.malformed_fill_lifecycle_events
+            )));
+        }
+        if self.malformed_markout_rows > 0 {
+            warnings.push(json!(format!(
+                "{} markout rows lack a supported horizon or lifecycle join fields",
+                self.malformed_markout_rows
+            )));
+        }
+        if self.settlement_journal_invalid_events > 0 {
+            warnings.push(json!(format!(
+                "settlement journal events with incomplete or invalid binding: {}",
+                self.settlement_journal_invalid_events
+            )));
+        }
+        if self.settlement_journal_conflicts > 0 {
+            warnings.push(json!(format!(
+                "settlement journal conflicts: {}",
+                self.settlement_journal_conflicts
+            )));
+        }
+        if self.settlement_journal_incomplete > 0 {
+            warnings.push(json!(format!(
+                "incomplete or hash-invalid settlement journals: {}",
+                self.settlement_journal_incomplete
+            )));
+        }
+        if self.settlement_journal_retry_duplicates > 0 {
+            notices.push(json!(format!(
+                "{} identical settlement journal retry events deduplicated",
+                self.settlement_journal_retry_duplicates
+            )));
+        }
+
+        let invalid_lifecycle_keys = self
+            .expected_fill_lifecycles
+            .keys()
+            .filter(|key| {
+                if strict_v3_place_denominator
+                    && !eligible_applied_order_ids.contains(&key.order_id)
+                {
+                    return true;
+                }
+                if self.lifecycle_conflicting_order_ids.contains(&key.order_id)
+                    || self
+                        .registration_conflicting_order_ids
+                        .contains(&key.order_id)
+                    || self.registration_invalid_order_ids.contains(&key.order_id)
+                {
+                    return true;
+                }
+                let registration = self.registrations.get(&key.order_id);
+                if key.source == "queue_shadow_fill" && registration.is_none() {
+                    return true;
+                }
+                registration
+                    .and_then(|record| record.identity.as_ref())
+                    .is_some_and(|identity| !identity.matches_lifecycle(key))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let invalid_lifecycle_events = invalid_lifecycle_keys
+            .iter()
+            .filter_map(|key| self.expected_fill_lifecycles.get(key))
+            .copied()
+            .sum::<usize>();
+        if invalid_lifecycle_events > 0 {
+            warnings.push(json!(format!(
+                "{invalid_lifecycle_events} fill lifecycle joins conflict with registered order identity"
+            )));
+        }
+
+        let mut rows_by_slot =
+            BTreeMap::<(FillLifecycleJoinKey, String, i64), Vec<&MarkoutObservation>>::new();
+        let mut orphan_markout_rows = 0_usize;
+        let mut distinct_fill_ids = BTreeSet::new();
+        for observation in &self.markout_observations {
+            distinct_fill_ids.insert(observation.fill_id.clone());
+            if !self.expected_fill_lifecycles.contains_key(&observation.key)
+                || invalid_lifecycle_keys.contains(&observation.key)
+            {
+                orphan_markout_rows += 1;
+                continue;
+            }
+            rows_by_slot
+                .entry((
+                    observation.key.clone(),
+                    observation.fill_id.clone(),
+                    observation.horizon,
+                ))
+                .or_default()
+                .push(observation);
+        }
+        let mut excess_lifecycle_fill_ids = 0_usize;
+        for (key, expected) in &self.expected_fill_lifecycles {
+            let observed_ids = rows_by_slot
+                .keys()
+                .filter(|(observed_key, _, _)| observed_key == key)
+                .map(|(_, fill_id, _)| fill_id)
+                .collect::<BTreeSet<_>>()
+                .len();
+            excess_lifecycle_fill_ids += observed_ids.saturating_sub(*expected);
+        }
+        let mut duplicate_markout_rows = 0_usize;
+        let mut duplicate_markout_slots = 0_usize;
+        let mut invalid_markout_rows = 0_usize;
+        let mut observed_by_horizon = BTreeMap::<i64, usize>::new();
+        let mut markouts = BTreeMap::<i64, Vec<Decimal>>::new();
+        let mut executable_markouts = BTreeMap::<i64, Vec<Decimal>>::new();
+        let mut markout_pnl = BTreeMap::<i64, Decimal>::new();
+        let mut executable_markout_pnl = BTreeMap::<i64, Decimal>::new();
+        let mut observation_delay_ms = BTreeMap::<i64, Vec<Decimal>>::new();
+        for ((_, _, horizon), rows) in &rows_by_slot {
+            if rows.len() != 1 {
+                duplicate_markout_slots += 1;
+                duplicate_markout_rows += rows.len().saturating_sub(1);
+                continue;
+            }
+            let row = rows[0];
+            if !row.is_complete_and_timely() {
+                invalid_markout_rows += 1;
+                continue;
+            }
+            *observed_by_horizon.entry(*horizon).or_insert(0) += 1;
+            markouts.entry(*horizon).or_default().push(
+                row.net_markout_per_share
+                    .expect("validated numeric net markout"),
+            );
+            executable_markouts.entry(*horizon).or_default().push(
+                row.net_executable_markout_per_share
+                    .expect("validated numeric net executable markout"),
+            );
+            *markout_pnl.entry(*horizon).or_insert(Decimal::ZERO) += row
+                .net_markout_pnl
+                .expect("validated numeric net markout PnL");
+            *executable_markout_pnl
+                .entry(*horizon)
+                .or_insert(Decimal::ZERO) += row
+                .net_executable_markout_pnl
+                .expect("validated numeric net executable markout PnL");
+            observation_delay_ms
+                .entry(*horizon)
+                .or_default()
+                .push(Decimal::from(
+                    row.observation_delay_ms.expect("validated markout delay"),
+                ));
+        }
+        if orphan_markout_rows > 0 {
+            warnings.push(json!(format!(
+                "{orphan_markout_rows} orphan markout rows do not join to an eligible fill lifecycle"
+            )));
+        }
+        if excess_lifecycle_fill_ids > 0 {
+            warnings.push(json!(format!(
+                "{excess_lifecycle_fill_ids} excess markout fill IDs cannot be matched to actual fill lifecycles"
+            )));
+        }
+        if duplicate_markout_rows > 0 {
+            warnings.push(json!(format!(
+                "duplicate markouts are promotion-blocking: {duplicate_markout_rows} excess rows across {duplicate_markout_slots} lifecycle/horizon slots"
+            )));
+        }
+        if invalid_markout_rows > 0 {
+            warnings.push(json!(format!(
+                "{invalid_markout_rows} markout rows are missing, null, gross-only, fee-inconsistent, non-executable, or more than {MAX_MARKOUT_OBSERVATION_DELAY_MS}ms late"
+            )));
+        }
+        let expected_fill_lifecycles = self
+            .expected_fill_lifecycles
+            .values()
+            .copied()
+            .sum::<usize>();
         let horizons = MARKOUT_HORIZONS_SECONDS
             .into_iter()
             .map(|horizon| {
-                let observed = self.markout_observed.get(&horizon).copied().unwrap_or(0);
-                let missing = self.markout_missing.get(&horizon).copied().unwrap_or(0);
-                let expected = observed + missing;
+                let expected = expected_fill_lifecycles;
+                let observed = observed_by_horizon
+                    .get(&horizon)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(expected);
+                let missing = expected.saturating_sub(observed);
                 let completion = ratio_f64(observed, expected);
                 if expected > 0 && completion.is_some_and(|value| value < 0.95) {
                     warnings.push(json!(format!(
                         "{horizon}s markout completion below 95%: {observed}/{expected}"
                     )));
                 }
-                let midpoint = self.markouts.get(&horizon).cloned().unwrap_or_default();
-                let executable = self
-                    .executable_markouts
+                let midpoint = markouts.get(&horizon).cloned().unwrap_or_default();
+                let executable = executable_markouts
                     .get(&horizon)
                     .cloned()
                     .unwrap_or_default();
-                let delays = self
-                    .observation_delay_ms
+                let delays = observation_delay_ms
                     .get(&horizon)
                     .cloned()
                     .unwrap_or_default();
@@ -2717,19 +5280,18 @@ impl ExecutionQualityAccumulator {
                         "observed": observed,
                         "missing": missing,
                         "completion_rate": completion,
+                        "return_basis": "net_after_fee_per_share",
                         "midpoint": distribution_summary(&midpoint),
                         "executable": distribution_summary(&executable),
-                        "markout_pnl": self.markout_pnl.get(&horizon).copied().unwrap_or(Decimal::ZERO).to_string(),
-                        "executable_markout_pnl": self.executable_markout_pnl.get(&horizon).copied().unwrap_or(Decimal::ZERO).to_string(),
+                        "markout_pnl": markout_pnl.get(&horizon).copied().unwrap_or(Decimal::ZERO).to_string(),
+                        "executable_markout_pnl": executable_markout_pnl.get(&horizon).copied().unwrap_or(Decimal::ZERO).to_string(),
                         "observation_delay_ms": distribution_summary(&delays)
                     }),
                 )
             })
             .collect::<Map<String, Value>>();
-        let has_markouts = horizons
-            .values()
-            .any(|row| row["expected"].as_u64().unwrap_or(0) > 0);
-        if !has_markouts {
+        let has_expected_markouts = expected_fill_lifecycles > 0;
+        if !has_expected_markouts {
             notices.push(json!("no real paper fill markouts observed"));
         }
         if self.probe_events_excluded > 0 {
@@ -2738,32 +5300,70 @@ impl ExecutionQualityAccumulator {
                 self.probe_events_excluded
             )));
         }
-        let gate = if self.registrations.is_empty() && !has_markouts {
-            "COLLECTING"
-        } else if warnings.is_empty() {
-            "PASS"
-        } else {
+        let gate = if !warnings.is_empty() {
             "FAIL"
+        } else if expected_queue_orders == 0 && !has_expected_markouts {
+            "COLLECTING"
+        } else {
+            "PASS"
         };
         json!({
             "status": gate.to_ascii_lowercase(),
             "evidence_gate": gate,
             "queue_position_source": "public_l2_shadow",
+            "queue_coverage_denominator": if strict_v3_place_denominator { "applicable_v3_place_outputs" } else { "legacy_queue_registrations" },
+            "applicable_place_outputs": applicable_place_outputs,
+            "applied_place_outputs": applied_place_outputs,
+            "unbound_place_outputs": unbound_place_outputs,
+            "orphan_place_applications": orphan_place_applications,
+            "decision_application_invalid": self.decision_application_invalid,
+            "decision_application_retry_duplicates": self.decision_application_retry_duplicates,
+            "decision_application_conflicts": self.decision_application_conflicts,
+            "decision_application_identity_mismatches": application_join_conflicts,
+            "decision_application_reused_order_ids": reused_application_order_ids.len(),
             "registrations": self.registrations.len(),
-            "queue_snapshots": self.snapshots.len(),
+            "registration_events": self.registration_events,
+            "registration_retry_duplicates": self.registration_retry_duplicates,
+            "registration_conflicting_order_ids": self.registration_conflicting_order_ids.len(),
+            "registration_invalid_order_ids": self.registration_invalid_order_ids.len(),
+            "queue_snapshots": self.snapshot_events,
+            "queue_snapshot_joined_orders": joined_snapshot_orders,
+            "queue_snapshot_missing_orders": missing_snapshot_orders,
+            "queue_registration_orphan_order_ids": orphan_registration_order_ids,
+            "queue_snapshot_orphan_events": orphan_snapshot_events,
+            "queue_snapshot_orphan_order_ids": orphan_snapshot_ids,
+            "queue_snapshot_duplicate_events": duplicate_snapshot_events,
+            "queue_snapshot_duplicate_order_ids": duplicate_snapshot_ids,
+            "queue_snapshot_invalid_size_events": invalid_snapshot_events,
             "queue_snapshot_coverage": snapshot_coverage,
-            "visible_size_ahead": distribution_summary(&self.size_ahead),
+            "visible_size_ahead": distribution_summary(&size_ahead),
             "queue_shadow_fill_events": self.queue_fill_events,
             "queue_shadow_filled_orders": self.queue_fill_orders.len(),
             "partial_fill_events": self.partial_fill_events,
             "completed_fill_events": self.completed_fill_events,
             "strict_trade_through_events": self.trade_through_events,
             "cancel_latency_ms": distribution_summary(&self.cancel_latency_ms),
-            "fill_lifecycles": self.fill_ids.len(),
+            "fill_lifecycles": expected_fill_lifecycles,
+            "invalid_lifecycle_join_events": invalid_lifecycle_events,
+            "lifecycle_conflicting_order_ids": self.lifecycle_conflicting_order_ids.len(),
+            "markout_fill_ids": distinct_fill_ids.len(),
+            "malformed_fill_lifecycle_events": self.malformed_fill_lifecycle_events,
+            "malformed_markout_rows": self.malformed_markout_rows,
+            "orphan_markout_rows": orphan_markout_rows,
+            "excess_markout_fill_ids": excess_lifecycle_fill_ids,
+            "duplicate_markout_rows": duplicate_markout_rows,
+            "duplicate_markout_slots": duplicate_markout_slots,
+            "invalid_markout_rows": invalid_markout_rows,
+            "settlement_journal_verified": self.settlement_journal_verified,
+            "settlement_journal_retry_duplicates": self.settlement_journal_retry_duplicates,
+            "settlement_journal_conflicts": self.settlement_journal_conflicts,
+            "settlement_journal_incomplete": self.settlement_journal_incomplete,
+            "settlement_journal_invalid_events": self.settlement_journal_invalid_events,
             "markouts": Value::Object(horizons),
             "probe_events_excluded": self.probe_events_excluded,
             "minimum_queue_snapshot_coverage": 0.95,
             "minimum_markout_completion": 0.95,
+            "maximum_markout_observation_delay_ms": MAX_MARKOUT_OBSERVATION_DELAY_MS,
             "warnings": warnings,
             "notices": notices,
             "research_only": true,
@@ -2777,9 +5377,30 @@ fn ratio_f64(numerator: usize, denominator: usize) -> Option<f64> {
 }
 
 fn distribution_summary(values: &[Decimal]) -> Value {
+    let (sample_std, ci_95_low, ci_95_high) = if values.len() >= 2 {
+        let mean = values.iter().filter_map(Decimal::to_f64).sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .filter_map(Decimal::to_f64)
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (values.len() - 1) as f64;
+        let std = variance.sqrt();
+        let margin = 1.96 * std / (values.len() as f64).sqrt();
+        (
+            Decimal::from_f64_retain(std),
+            Decimal::from_f64_retain(mean - margin),
+            Decimal::from_f64_retain(mean + margin),
+        )
+    } else {
+        (None, None, None)
+    };
     json!({
         "count": values.len(),
         "mean": decimal_average_json(values),
+        "sample_std": sample_std.map(|value| value.to_string()),
+        "ci_95_low": ci_95_low.map(|value| value.to_string()),
+        "ci_95_high": ci_95_high.map(|value| value.to_string()),
         "p10": decimal_percentile_json(values.to_vec(), 0.10),
         "p50": decimal_percentile_json(values.to_vec(), 0.50),
         "p90": decimal_percentile_json(values.to_vec(), 0.90),
@@ -2792,10 +5413,12 @@ fn execution_quality_markdown(report: &Value) -> String {
     let result = &report["result"];
     let markouts = &result["markouts"];
     format!(
-        "# Execution Quality Report\n\n- Evidence gate: **{}**\n- Queue registrations / snapshots: **{} / {}**\n- Queue snapshot coverage: **{}**\n- Partial / completed shadow fills: **{} / {}**\n- Strict trade-through events: **{}**\n- Cancel latency p50 / p95 ms: **{} / {}**\n- 1s markout completion: **{}**\n- 5s markout completion: **{}**\n- 30s markout completion: **{}**\n\nProbe events are excluded. Metrics are research-only public-L2 shadow evidence and do not establish true venue FIFO rank.\n",
+        "# Execution Quality Report\n\n- Evidence gate: **{}**\n- Applicable / applied place outputs: **{} / {}**\n- Queue registrations / joined snapshots: **{} / {}**\n- Queue snapshot coverage: **{}**\n- Partial / completed shadow fills: **{} / {}**\n- Strict trade-through events: **{}**\n- Cancel latency p50 / p95 ms: **{} / {}**\n- 1s markout completion: **{}**\n- 5s markout completion: **{}**\n- 30s markout completion: **{}**\n\nProbe events are excluded. Metrics are research-only public-L2 shadow evidence and do not establish true venue FIFO rank.\n",
         result["evidence_gate"].as_str().unwrap_or("COLLECTING"),
+        result["applicable_place_outputs"],
+        result["applied_place_outputs"],
         result["registrations"],
-        result["queue_snapshots"],
+        result["queue_snapshot_joined_orders"],
         result["queue_snapshot_coverage"],
         result["partial_fill_events"],
         result["completed_fill_events"],
@@ -3185,6 +5808,7 @@ struct MarketTruth {
     down_token_id: String,
     start_ts: Option<DateTime<Utc>>,
     end_ts: Option<DateTime<Utc>>,
+    descriptive_start_price: Option<Decimal>,
     start_price: Option<Decimal>,
     final_price: Option<Decimal>,
     final_distance_ms: Option<i64>,
@@ -3202,6 +5826,34 @@ struct MarketTruth {
     flags: Vec<String>,
 }
 
+fn apply_exact_market_start(market: &mut MarketTruth, payload: &Value) -> bool {
+    let start_price = decimal(payload.get("start_price"));
+    let source = optional_text(payload, "reference_source");
+    let source_ts = parse_datetime(payload.get("reference_source_ts"));
+    let distance_ms = market
+        .start_ts
+        .zip(source_ts)
+        .map(|(start_ts, source_ts)| source_ts.signed_duration_since(start_ts).num_milliseconds());
+    let valid = start_price.is_some()
+        && source.is_some_and(|source| !source.is_empty())
+        && payload
+            .get("reference_exact_resolution_source")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && payload.get("reference_stale").and_then(Value::as_bool) == Some(false)
+        && distance_ms.is_some_and(|distance_ms| {
+            (0..=START_PRICE_CAPTURE_WINDOW_SECONDS * 1_000).contains(&distance_ms)
+        })
+        && market
+            .start_price
+            .is_none_or(|existing| Some(existing) == start_price);
+    if valid {
+        market.start_price = start_price;
+        market.start_source = Some("market_start_price_exact_reference".to_owned());
+    }
+    valid
+}
+
 impl MarketTruth {
     fn merge(&mut self, other: Self) {
         self.condition_id = self.condition_id.clone().or(other.condition_id);
@@ -3217,19 +5869,17 @@ impl MarketTruth {
         }
         self.start_ts = self.start_ts.or(other.start_ts);
         self.end_ts = self.end_ts.or(other.end_ts);
-        self.start_price = self.start_price.or(other.start_price);
-        self.start_source = self.start_source.clone().or(other.start_source);
+        self.descriptive_start_price = self
+            .descriptive_start_price
+            .or(other.descriptive_start_price);
     }
 
     fn observe_settlement_reference(&mut self, source_ts: DateTime<Utc>, price: Decimal) {
         let Some(end_ts) = self.end_ts else {
             return;
         };
-        let distance_ms = source_ts
-            .signed_duration_since(end_ts)
-            .num_milliseconds()
-            .abs();
-        if distance_ms > SETTLEMENT_WINDOW_SECONDS * 1000 {
+        let distance_ms = source_ts.signed_duration_since(end_ts).num_milliseconds();
+        if !(0..=SETTLEMENT_WINDOW_SECONDS * 1000).contains(&distance_ms) {
             return;
         }
         if self
@@ -3239,6 +5889,34 @@ impl MarketTruth {
             self.final_distance_ms = Some(distance_ms);
             self.final_price = Some(price);
             self.final_source = Some("chainlink_reference_settlement_window".to_owned());
+        }
+    }
+
+    fn recover_from_exact_references(&mut self, references: &[(DateTime<Utc>, Decimal)]) {
+        if self.start_price.is_none() {
+            if let Some(start_ts) = self.start_ts {
+                if let Some((_, price)) = references.iter().find(|(timestamp, _)| {
+                    *timestamp >= start_ts
+                        && *timestamp
+                            <= start_ts + Duration::seconds(START_PRICE_CAPTURE_WINDOW_SECONDS)
+                }) {
+                    self.start_price = Some(*price);
+                    self.start_source = Some("exact_reference_history".to_owned());
+                }
+            }
+        }
+        if self.final_price.is_none() {
+            if let Some(end_ts) = self.end_ts {
+                if let Some((timestamp, price)) = references.iter().find(|(timestamp, _)| {
+                    *timestamp >= end_ts
+                        && *timestamp <= end_ts + Duration::seconds(SETTLEMENT_WINDOW_SECONDS)
+                }) {
+                    self.final_price = Some(*price);
+                    self.final_distance_ms =
+                        Some(timestamp.signed_duration_since(end_ts).num_milliseconds());
+                    self.final_source = Some("exact_reference_history".to_owned());
+                }
+            }
         }
     }
 
@@ -3582,10 +6260,8 @@ fn build_market_rows(
         },
     )?;
     audit.malformed_lines = stream.malformed_lines;
+    audit.finalize_market_truth();
     let mut rows = audit.markets.into_values().collect::<Vec<_>>();
-    for row in &mut rows {
-        row.finalize_flags();
-    }
     rows.sort_by(|left, right| {
         left.start_ts
             .cmp(&right.start_ts)
@@ -3628,15 +6304,12 @@ fn market_from_payload(payload: &Value) -> MarketTruth {
         down_token_id: text(payload, "down_token_id"),
         start_ts: parse_datetime(payload.get("start_ts")),
         end_ts: parse_datetime(payload.get("end_ts")),
-        start_price: decimal(payload.get("start_price")),
+        descriptive_start_price: decimal(payload.get("start_price")),
+        start_price: None,
         final_price: None,
         final_distance_ms: None,
         winning_outcome: None,
-        start_source: if payload.get("start_price").is_some() {
-            Some("market_payload".to_owned())
-        } else {
-            None
-        },
+        start_source: None,
         final_source: None,
         reference_tick_count: 0,
         book_update_counts: BTreeMap::new(),
@@ -3676,6 +6349,7 @@ fn market_from_json(value: &Value) -> MarketTruth {
         down_token_id: text(value, "down_token_id"),
         start_ts: parse_datetime(value.get("start_ts")),
         end_ts: parse_datetime(value.get("end_ts")),
+        descriptive_start_price: None,
         start_price: decimal(value.get("start_price")),
         final_price: decimal(value.get("final_price")),
         final_distance_ms: None,
@@ -3842,6 +6516,7 @@ fn apply_single_level(book: &mut BTreeMap<Decimal, Decimal>, price: Decimal, siz
 #[derive(Clone, Debug)]
 struct ReplayOrder {
     order_id: Option<String>,
+    applied_order_id: Option<String>,
     queue_snapshot_bound: bool,
     market_id: String,
     token_id: String,
@@ -3864,6 +6539,18 @@ struct ReplayOrder {
     cancel_ts: Option<DateTime<Utc>>,
     queue_initial_size_ahead: Option<Decimal>,
     queue_size_ahead: Option<Decimal>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingReplayDecisionV3 {
+    output: DurableDecisionOutputV3,
+    payload: Value,
+}
+
+#[derive(Clone, Debug)]
+struct PendingReplayApplicationV1 {
+    output: AppliedDecisionOutputV1,
+    recorded_ts: DateTime<Utc>,
 }
 
 fn replay_trade_decision(order: &ReplayOrder, payload: &Value) -> TradeDecision {
@@ -4214,6 +6901,9 @@ struct ResearchReplayEngine {
     feed_error_times: VecDeque<DateTime<Utc>>,
     orders: Vec<ReplayOrder>,
     open_orders: BTreeSet<usize>,
+    pending_actionable_decisions: BTreeMap<DecisionOutputKeyV3, PendingReplayDecisionV3>,
+    pending_decision_applications: BTreeMap<DecisionOutputKeyV3, PendingReplayApplicationV1>,
+    applied_actionable_decisions: BTreeSet<DecisionOutputKeyV3>,
     classifiers: BTreeMap<String, RegimeClassifier>,
     policy: RegimePolicy,
     event_count: usize,
@@ -4280,6 +6970,9 @@ impl ResearchReplayEngine {
                 feed_error_times: VecDeque::new(),
                 orders: Vec::new(),
                 open_orders: BTreeSet::new(),
+                pending_actionable_decisions: BTreeMap::new(),
+                pending_decision_applications: BTreeMap::new(),
+                applied_actionable_decisions: BTreeSet::new(),
                 classifiers: BTreeMap::new(),
                 event_count: 0,
                 decisions_seen: 0,
@@ -4319,6 +7012,9 @@ impl ResearchReplayEngine {
                 feed_error_times: VecDeque::new(),
                 orders: Vec::new(),
                 open_orders: BTreeSet::new(),
+                pending_actionable_decisions: BTreeMap::new(),
+                pending_decision_applications: BTreeMap::new(),
+                applied_actionable_decisions: BTreeSet::new(),
                 classifiers: BTreeMap::new(),
                 event_count: 0,
                 decisions_seen: 0,
@@ -4372,7 +7068,10 @@ impl ResearchReplayEngine {
                 self.handle_queue_trade(&event.payload, event.recorded_ts)
             }
             "fair_value" => self.handle_fair_value(&event.payload),
-            "decision" => self.handle_decision(&event.payload, event.recorded_ts),
+            "decision" => self.observe_replay_decision(&event.payload, event.recorded_ts),
+            "paper_decision_output_applied" => {
+                self.observe_replay_application(&event.payload, event.recorded_ts)
+            }
             "execution_report" => self.handle_execution_report(&event.payload, event.recorded_ts),
             "paper_order_queue_registration" => {
                 self.handle_queue_registration(&event.payload, event.recorded_ts)
@@ -4456,8 +7155,11 @@ impl ResearchReplayEngine {
                 market_id,
                 ..MarketTruth::default()
             });
-        market.start_price = decimal(payload.get("start_price")).or(market.start_price);
-        market.start_source = Some("market_start_price".to_owned());
+        if !apply_exact_market_start(market, payload) {
+            self.warnings.insert(
+                "invalid exact market start price evidence excluded from replay".to_owned(),
+            );
+        }
     }
 
     fn handle_reference(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
@@ -4818,8 +7520,100 @@ impl ResearchReplayEngine {
         }
     }
 
-    fn handle_decision(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
+    fn observe_replay_decision(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
         self.decisions_seen += 1;
+        let action = text(payload, "action");
+        if matches!(action.as_str(), "place" | "cancel_all")
+            && payload
+                .get("decision_batch_schema_version")
+                .and_then(Value::as_u64)
+                == Some(3)
+        {
+            let Some(output) = durable_decision_output_v3(payload) else {
+                self.warnings.insert(
+                    "invalid v3 actionable decision cannot be application-bound for replay"
+                        .to_owned(),
+                );
+                return;
+            };
+            let key = output.key.clone();
+            if let Some(existing) = self.pending_actionable_decisions.get(&key) {
+                if existing.output != output || existing.payload != *payload {
+                    self.warnings.insert(
+                        "conflicting v3 actionable decision output binding blocks replay"
+                            .to_owned(),
+                    );
+                }
+                return;
+            }
+            self.pending_actionable_decisions.insert(
+                key.clone(),
+                PendingReplayDecisionV3 {
+                    output,
+                    payload: payload.clone(),
+                },
+            );
+            self.try_apply_replay_decision(&key);
+            return;
+        }
+        self.handle_decision(payload, recorded_ts, None);
+    }
+
+    fn observe_replay_application(&mut self, payload: &Value, recorded_ts: DateTime<Utc>) {
+        let Some(output) = applied_decision_output_v1(payload) else {
+            self.warnings
+                .insert("invalid paper decision application proof blocks v3 replay".to_owned());
+            return;
+        };
+        let key = output.key.clone();
+        if let Some(existing) = self.pending_decision_applications.get(&key) {
+            if existing.output.event_sha256 != output.event_sha256 {
+                self.warnings.insert(
+                    "conflicting paper decision application proofs block v3 replay".to_owned(),
+                );
+            }
+            return;
+        }
+        self.pending_decision_applications.insert(
+            key.clone(),
+            PendingReplayApplicationV1 {
+                output,
+                recorded_ts,
+            },
+        );
+        self.try_apply_replay_decision(&key);
+    }
+
+    fn try_apply_replay_decision(&mut self, key: &DecisionOutputKeyV3) {
+        if self.applied_actionable_decisions.contains(key) {
+            return;
+        }
+        let Some(decision) = self.pending_actionable_decisions.get(key).cloned() else {
+            return;
+        };
+        let Some(application) = self.pending_decision_applications.get(key).cloned() else {
+            return;
+        };
+        if !application_matches_decision(&application.output, &decision.output) {
+            self.warnings.insert(
+                "paper decision application identity does not match durable output".to_owned(),
+            );
+            return;
+        }
+        self.handle_decision(
+            &decision.payload,
+            application.recorded_ts,
+            application.output.order_id.clone(),
+        );
+        self.applied_actionable_decisions.insert(key.clone());
+    }
+
+    fn handle_decision(
+        &mut self,
+        payload: &Value,
+        recorded_ts: DateTime<Utc>,
+        applied_order_id: Option<String>,
+    ) {
         let action = text(payload, "action");
         if action == "cancel_all" {
             self.cancel_market(&text(payload, "market_id"), recorded_ts);
@@ -4860,6 +7654,7 @@ impl ResearchReplayEngine {
                 order.price = (order.price - order.tick_size).max(order.tick_size);
             }
         }
+        order.applied_order_id = applied_order_id;
         self.orders.push(order);
         let index = self.orders.len() - 1;
         self.orders_seen += 1;
@@ -4904,6 +7699,10 @@ impl ResearchReplayEngine {
             .enumerate()
             .filter(|(_, order)| {
                 order.order_id.is_none()
+                    && order
+                        .applied_order_id
+                        .as_ref()
+                        .is_none_or(|applied_order_id| applied_order_id == &order_id)
                     && order.market_id == market_id
                     && order.token_id == token_id
                     && order.side == side
@@ -5003,6 +7802,7 @@ impl ResearchReplayEngine {
         });
         Some(ReplayOrder {
             order_id: None,
+            applied_order_id: None,
             queue_snapshot_bound: false,
             market_id,
             token_id,
@@ -5036,11 +7836,43 @@ impl ResearchReplayEngine {
         payload: &Value,
         recorded_ts: DateTime<Utc>,
     ) -> bool {
+        let recorded_candidate = payload.pointer("/strategy_metadata/candidate");
+        if matches!(self.request.mode, StrategyProfileMode::DynamicQuoteStyle) {
+            let expected = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+            let same_candidate = recorded_candidate.is_some_and(|candidate| {
+                candidate.get("name").and_then(Value::as_str) == Some(expected.name.as_str())
+                    && candidate.get("version").and_then(Value::as_str)
+                        == Some(expected.version.as_str())
+                    && candidate.get("config_hash").and_then(Value::as_str)
+                        == Some(expected.config_hash.as_str())
+            });
+            if same_candidate {
+                if let Some(regime) = payload
+                    .pointer("/strategy_metadata/regime")
+                    .and_then(Value::as_str)
+                {
+                    *self.regime_frequency.entry(regime.to_owned()).or_insert(0) += 1;
+                }
+                return true;
+            }
+        }
         if matches!(
             self.request.mode,
             StrategyProfileMode::Static | StrategyProfileMode::StaticSweep(_)
         ) {
+            if recorded_candidate.is_some() {
+                self.warnings.insert(
+                    "static counterfactual consumes an already transformed runtime decision; it is diagnostic-only and excluded from profitability authorization"
+                        .to_owned(),
+                );
+            }
             return true;
+        }
+        if recorded_candidate.is_some() {
+            self.warnings.insert(
+                "counterfactual adaptive profile consumes an already transformed runtime decision; it is diagnostic-only and excluded from profitability authorization"
+                    .to_owned(),
+            );
         }
         let features = self.features_for_order(order, recorded_ts);
         let Some(mode) = self.request.mode.frozen_mode() else {
@@ -5344,6 +8176,20 @@ impl ResearchReplayEngine {
     }
 
     fn finish(mut self) -> Value {
+        let actionable_decision_outputs = self.pending_actionable_decisions.len();
+        let applied_decision_outputs = self.applied_actionable_decisions.len();
+        let unbound_actionable_decision_outputs =
+            actionable_decision_outputs.saturating_sub(applied_decision_outputs);
+        let orphan_decision_applications = self
+            .pending_decision_applications
+            .keys()
+            .filter(|key| !self.pending_actionable_decisions.contains_key(*key))
+            .count();
+        if unbound_actionable_decision_outputs > 0 || orphan_decision_applications > 0 {
+            self.warnings.insert(format!(
+                "durable actionable decision application binding below 100%: {applied_decision_outputs}/{actionable_decision_outputs} applied, {unbound_actionable_decision_outputs} unbound, {orphan_decision_applications} orphan applications"
+            ));
+        }
         for market in self.markets.values_mut() {
             market.finalize_flags();
         }
@@ -5464,6 +8310,10 @@ impl ResearchReplayEngine {
             "markets_seen": self.markets.len(),
             "markets_settled": self.markets.values().filter(|market| market.complete_for_simulation()).count(),
             "decisions": self.decisions_seen,
+            "actionable_decision_outputs": actionable_decision_outputs,
+            "applied_decision_outputs": applied_decision_outputs,
+            "unbound_actionable_decision_outputs": unbound_actionable_decision_outputs,
+            "orphan_decision_applications": orphan_decision_applications,
             "orders": self.orders_seen,
             "fills": self.fills,
             "maker_fills": self.maker_fills,
@@ -5699,8 +8549,11 @@ impl CalibrationAccumulator {
             "market_start_price" => {
                 let market_id = text(&event.payload, "market_id");
                 if let Some(market) = self.markets.get_mut(&market_id) {
-                    market.start_price =
-                        decimal(event.payload.get("start_price")).or(market.start_price);
+                    if !apply_exact_market_start(market, &event.payload) {
+                        self.warnings.push(json!(
+                            "invalid exact market start price evidence excluded from calibration"
+                        ));
+                    }
                 }
             }
             "reference" => {
@@ -7183,6 +10036,232 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn observe_quality(
+        quality: &mut ExecutionQualityAccumulator,
+        recorded_ts: DateTime<Utc>,
+        event_type: &str,
+        payload: Value,
+    ) {
+        quality.observe(&EventLine {
+            event_type: event_type.to_owned(),
+            recorded_ts,
+            payload,
+            raw: Value::Null,
+        });
+    }
+
+    fn queue_fill_payload(order_id: &str, fill_ts: DateTime<Utc>) -> Value {
+        json!({
+            "order_id": order_id,
+            "market_id": "market-1",
+            "token_id": "token-1",
+            "side": "buy",
+            "quote_price": "0.50",
+            "trade_ts": fill_ts,
+            "shadow_fill_size": "5",
+            "partial_fill": true,
+            "strict_trade_through": true,
+            "shadow_remaining_after": "2"
+        })
+    }
+
+    fn queue_registration_payload(order_id: &str) -> Value {
+        json!({
+            "order_id": order_id,
+            "market_id": "market-1",
+            "token_id": "token-1",
+            "side": "buy",
+            "quote_price": "0.50",
+            "order_size": "7"
+        })
+    }
+
+    fn bound_v3_place_decision(
+        batch_id: &str,
+        output_index: u64,
+        market_id: &str,
+        token_id: &str,
+        price: &str,
+        size: &str,
+    ) -> Value {
+        let mut payload = json!({
+            "action": "place",
+            "market_id": market_id,
+            "condition_id": format!("condition-{market_id}"),
+            "token_id": token_id,
+            "outcome": "up",
+            "side": "buy",
+            "price": price,
+            "size": size,
+            "quote_amount": (d(price) * d(size)).to_string(),
+            "order_kind": "post_only_gtc",
+            "reason": "test durable place",
+            "ttl_ms": 60000,
+            "post_only": true,
+            "tick_size": "0.01",
+            "neg_risk": false
+        });
+        let hash = canonical_value_sha256(&payload).unwrap();
+        let object = payload.as_object_mut().unwrap();
+        object.insert("decision_batch_schema_version".to_owned(), json!(3));
+        object.insert("strategy_batch_id".to_owned(), json!(batch_id));
+        object.insert(
+            "strategy_batch_output_index".to_owned(),
+            json!(output_index),
+        );
+        object.insert("strategy_decision_sha256".to_owned(), json!(hash));
+        payload
+    }
+
+    fn applied_v3_place_output(decision: &Value, order_id: &str) -> Value {
+        let output = durable_decision_output_v3(decision).unwrap();
+        let application_id = application_id_v1(&output.key, &output.decision_sha256).unwrap();
+        let report = json!({
+            "order_id": order_id,
+            "market_id": output.place_identity.as_ref().unwrap().market_id,
+            "token_id": output.place_identity.as_ref().unwrap().token_id,
+            "status": "paper_resting",
+            "filled_size": "0",
+            "fee": "0",
+            "local_ts": wallet_ts("2026-07-20T12:00:00Z"),
+            "raw": {
+                "decision_application": {
+                    "schema": "polyedge.paper_decision_output_application.v1",
+                    "application_id": application_id,
+                    "strategy_batch_id": output.key.batch_id,
+                    "strategy_batch_output_index": output.key.output_index,
+                    "strategy_decision_sha256": output.decision_sha256
+                }
+            }
+        });
+        let reports = json!([report]);
+        json!({
+            "schema": "polyedge.paper_decision_output_application.v1",
+            "schema_version": 1,
+            "application_id": application_id,
+            "strategy_batch_id": output.key.batch_id,
+            "strategy_batch_output_index": output.key.output_index,
+            "strategy_decision_sha256": output.decision_sha256,
+            "action": "place",
+            "market_id": output.place_identity.as_ref().unwrap().market_id,
+            "token_id": output.place_identity.as_ref().unwrap().token_id,
+            "side": output.place_identity.as_ref().unwrap().side,
+            "price": output.place_identity.as_ref().unwrap().price.to_string(),
+            "size": output.place_identity.as_ref().unwrap().size.to_string(),
+            "order_kind": "post_only_gtc",
+            "order_id": order_id,
+            "execution_report_count": 1,
+            "execution_reports_sha256": canonical_value_sha256(&reports).unwrap(),
+            "execution_reports": reports,
+            "applied": true,
+            "paper_only": true
+        })
+    }
+
+    fn complete_net_markout_payload(
+        fill_id: &str,
+        order_id: &str,
+        fill_ts: DateTime<Utc>,
+        horizon: i64,
+    ) -> Value {
+        json!({
+            "fill_id": fill_id,
+            "fill_source": "queue_shadow_fill",
+            "order_id": order_id,
+            "market_id": "market-1",
+            "token_id": "token-1",
+            "side": "buy",
+            "fill_price": "0.50",
+            "fill_size": "5",
+            "fill_ts": fill_ts,
+            "horizon_seconds": horizon,
+            "mark_price": "0.51",
+            "markout_per_share": "0.01",
+            "markout_pnl": "0.05",
+            "executable_mark_price": "0.505",
+            "executable_markout_per_share": "0.005",
+            "executable_markout_pnl": "0.025",
+            "fee_per_share": "0",
+            "net_markout_per_share": "0.01",
+            "net_markout_pnl": "0.05",
+            "net_executable_markout_per_share": "0.005",
+            "net_executable_markout_pnl": "0.025",
+            "observed_ts": fill_ts + Duration::seconds(horizon) + Duration::milliseconds(3),
+            "observation_delay_ms": 3
+        })
+    }
+
+    fn complete_fee_aware_markout_payload(
+        fill_id: &str,
+        order_id: &str,
+        fill_ts: DateTime<Utc>,
+        horizon: i64,
+    ) -> Value {
+        let mut payload = complete_net_markout_payload(fill_id, order_id, fill_ts, horizon);
+        payload["fee_per_share"] = json!("0.001");
+        payload["net_markout_per_share"] = json!("0.009");
+        payload["net_markout_pnl"] = json!("0.045");
+        payload["net_executable_markout_per_share"] = json!("0.004");
+        payload["net_executable_markout_pnl"] = json!("0.020");
+        payload
+    }
+
+    fn settlement_journal_events(
+        recorded_ts: DateTime<Utc>,
+        events: Vec<(&str, Value)>,
+    ) -> Vec<EventLine> {
+        let journal_id = format!("paper-settlement-{}", "a".repeat(64));
+        let event_count = events.len() as u64;
+        let canonical_events = events
+            .iter()
+            .enumerate()
+            .map(|(event_index, (event_type, payload))| {
+                json!({
+                    "event_index": event_index,
+                    "event_type": event_type,
+                    "payload": payload
+                })
+            })
+            .collect::<Vec<_>>();
+        let journal_sha256 = canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": event_count,
+            "events": canonical_events
+        }))
+        .expect("journal canonical JSON hashes");
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(event_index, (event_type, mut payload))| {
+                let object = payload.as_object_mut().expect("journal payload object");
+                object.insert(
+                    "settlement_journal_schema".to_owned(),
+                    json!("polyedge.paper_settlement_journal.v1"),
+                );
+                object.insert("settlement_journal_id".to_owned(), json!(journal_id));
+                object.insert(
+                    "settlement_journal_event_index".to_owned(),
+                    json!(event_index),
+                );
+                object.insert(
+                    "settlement_journal_event_count".to_owned(),
+                    json!(event_count),
+                );
+                object.insert(
+                    "settlement_journal_sha256".to_owned(),
+                    json!(journal_sha256),
+                );
+                EventLine {
+                    event_type: event_type.to_owned(),
+                    recorded_ts,
+                    payload,
+                    raw: Value::Null,
+                }
+            })
+            .collect()
+    }
+
     fn wallet_market(id: &str, end: &str, winner: &str) -> MarketTruth {
         MarketTruth {
             market_id: id.to_owned(),
@@ -7195,6 +10274,7 @@ mod tests {
     fn wallet_order(id: &str, decision: &str, filled_size: &str) -> ReplayOrder {
         ReplayOrder {
             order_id: None,
+            applied_order_id: None,
             queue_snapshot_bound: false,
             market_id: id.to_owned(),
             token_id: format!("{id}-up"),
@@ -7406,7 +10486,7 @@ mod tests {
         for (event_type, payload) in [
             (
                 "paper_order_queue_registration",
-                json!({"order_id": "order-1"}),
+                queue_registration_payload("order-1"),
             ),
             (
                 "paper_order_queue_snapshot",
@@ -7414,40 +10494,26 @@ mod tests {
             ),
             (
                 "paper_queue_shadow_fill",
-                json!({
-                    "order_id": "order-1",
-                    "partial_fill": true,
-                    "strict_trade_through": true,
-                    "shadow_remaining_after": "2"
-                }),
+                queue_fill_payload("order-1", now),
             ),
             (
                 "paper_cancel_latency",
                 json!({"order_id": "order-1", "cancel_latency_ms": "7.5"}),
             ),
             (
-                "paper_fill_markout",
-                json!({
-                    "fill_id": "fill-1",
-                    "horizon_seconds": 1,
-                    "markout_per_share": "0.01",
-                    "executable_markout_per_share": "0.005",
-                    "markout_pnl": "0.05",
-                    "executable_markout_pnl": "0.025",
-                    "observation_delay_ms": 3
-                }),
-            ),
-            (
                 "paper_order_queue_registration",
                 json!({"order_id": "probe", "probe": true}),
             ),
         ] {
-            quality.observe(&EventLine {
-                event_type: event_type.to_owned(),
-                recorded_ts: now,
-                payload,
-                raw: Value::Null,
-            });
+            observe_quality(&mut quality, now, event_type, payload);
+        }
+        for horizon in MARKOUT_HORIZONS_SECONDS {
+            observe_quality(
+                &mut quality,
+                now + Duration::seconds(horizon),
+                "paper_fill_markout",
+                complete_net_markout_payload("fill-1", "order-1", now, horizon),
+            );
         }
         let result = quality.finish();
         assert_eq!(result["registrations"], 1);
@@ -7455,8 +10521,1722 @@ mod tests {
         assert_eq!(result["partial_fill_events"], 1);
         assert_eq!(result["strict_trade_through_events"], 1);
         assert_eq!(result["markouts"]["1"]["completion_rate"], 1.0);
+        assert_eq!(
+            result["markouts"]["30"]["return_basis"],
+            "net_after_fee_per_share"
+        );
+        assert_eq!(result["markouts"]["30"]["executable"]["mean"], "0.005");
         assert_eq!(result["probe_events_excluded"], 1);
         assert_eq!(result["evidence_gate"], "PASS");
+    }
+
+    #[test]
+    fn unbound_durable_place_is_excluded_from_replay_and_blocks_quality() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let batch_id = format!("strategy-batch-{}", "a".repeat(64));
+        let bound = bound_v3_place_decision(&batch_id, 0, "market-1", "token-1", "0.50", "7");
+        let unbound = bound_v3_place_decision(&batch_id, 1, "market-1", "token-1", "0.49", "7");
+        let application = applied_v3_place_output(&bound, "order-1");
+
+        let request = ReplayRequest {
+            name: "touch".to_owned(),
+            fill_model: FillModel::Touch,
+            mode: StrategyProfileMode::Static,
+            settings: RuntimeSettings::default(),
+        };
+        let mut replay = ResearchReplayEngine::new(request, &[]);
+        for (event_type, payload) in [
+            ("decision", bound.clone()),
+            ("decision", unbound.clone()),
+            ("paper_decision_output_applied", application.clone()),
+        ] {
+            replay.observe(&EventLine {
+                event_type: event_type.to_owned(),
+                recorded_ts: now,
+                payload,
+                raw: Value::Null,
+            });
+        }
+        let replay = replay.finish();
+        assert_eq!(replay["orders"], 1);
+        assert_eq!(replay["fills"], 0);
+        assert_eq!(replay["net_pnl"], "0");
+        assert_eq!(replay["unbound_actionable_decision_outputs"], 1);
+        assert!(replay["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|warning| {
+                warning.as_str().is_some_and(|text| {
+                    text.starts_with("durable actionable decision application binding below 100%")
+                })
+            })
+        }));
+
+        let mut quality = ExecutionQualityAccumulator::default();
+        for (event_type, payload) in [
+            ("decision", bound),
+            ("decision", unbound),
+            ("paper_decision_output_applied", application),
+            (
+                "paper_order_queue_registration",
+                queue_registration_payload("order-1"),
+            ),
+            (
+                "paper_order_queue_snapshot",
+                json!({"order_id": "order-1", "visible_size_ahead_estimate": "12"}),
+            ),
+        ] {
+            observe_quality(&mut quality, now, event_type, payload);
+        }
+        let quality = quality.finish();
+        assert_eq!(quality["applicable_place_outputs"], 2);
+        assert_eq!(quality["applied_place_outputs"], 1);
+        assert_eq!(quality["queue_snapshot_joined_orders"], 1);
+        assert_eq!(quality["queue_snapshot_missing_orders"], 1);
+        assert_eq!(quality["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn delayed_application_retry_uses_frozen_placement_time_for_ttl() {
+        let placed_at = wallet_ts("2026-07-20T12:00:00Z");
+        let after_retry_outage = placed_at + Duration::seconds(61);
+        let batch_id = format!("strategy-batch-{}", "b".repeat(64));
+        let decision = bound_v3_place_decision(&batch_id, 0, "market-1", "token-1", "0.50", "7");
+        let application = applied_v3_place_output(&decision, "order-1");
+        let market = MarketTruth {
+            market_id: "market-1".to_owned(),
+            up_token_id: "token-1".to_owned(),
+            down_token_id: "token-2".to_owned(),
+            start_ts: Some(placed_at - Duration::minutes(1)),
+            end_ts: Some(placed_at + Duration::minutes(15)),
+            ..MarketTruth::default()
+        };
+        let request = ReplayRequest {
+            name: "touch".to_owned(),
+            fill_model: FillModel::Touch,
+            mode: StrategyProfileMode::Static,
+            settings: RuntimeSettings::default(),
+        };
+        let mut replay = ResearchReplayEngine::new(request, &[market]);
+        replay.observe(&EventLine {
+            event_type: "decision".to_owned(),
+            recorded_ts: placed_at,
+            payload: decision,
+            raw: Value::Null,
+        });
+        // The application event may be appended only after storage recovers,
+        // but its frozen runtime timestamp must remain the original placement
+        // time rather than the retry time.
+        replay.observe(&EventLine {
+            event_type: "paper_decision_output_applied".to_owned(),
+            recorded_ts: placed_at,
+            payload: application,
+            raw: Value::Null,
+        });
+        replay.observe(&EventLine {
+            event_type: "book".to_owned(),
+            recorded_ts: after_retry_outage,
+            payload: json!({
+                "token_id": "token-1",
+                "bids": [{"price": "0.48", "size": "10"}],
+                "asks": [{"price": "0.49", "size": "10"}],
+                "local_ts": after_retry_outage
+            }),
+            raw: Value::Null,
+        });
+
+        let result = replay.finish();
+        assert_eq!(result["orders"], 1);
+        assert_eq!(result["fills"], 0);
+        assert_eq!(result["replay_metrics"]["fills_prevented_expired"], 1);
+        assert_eq!(result["net_pnl"], "0");
+    }
+
+    #[test]
+    fn orphan_queue_snapshot_cannot_substitute_for_registered_order() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_registration",
+            queue_registration_payload("registered-order"),
+        );
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_snapshot",
+            json!({
+                "order_id": "different-order",
+                "visible_size_ahead_estimate": "4"
+            }),
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["queue_snapshots"], 1);
+        assert_eq!(result["queue_snapshot_joined_orders"], 0);
+        assert_eq!(result["queue_snapshot_orphan_events"], 1);
+        assert_eq!(result["queue_snapshot_coverage"], 0.0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn duplicate_queue_snapshots_invalidate_the_registered_order() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        for size_ahead in ["4", "3"] {
+            observe_quality(
+                &mut quality,
+                now,
+                "paper_order_queue_snapshot",
+                json!({
+                    "order_id": "order-1",
+                    "visible_size_ahead_estimate": size_ahead
+                }),
+            );
+        }
+
+        let result = quality.finish();
+
+        assert_eq!(result["queue_snapshot_duplicate_events"], 1);
+        assert_eq!(result["queue_snapshot_duplicate_order_ids"], 1);
+        assert_eq!(result["queue_snapshot_joined_orders"], 0);
+        assert_eq!(result["queue_snapshot_coverage"], 0.0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn conflicting_queue_registration_reuse_is_not_collapsed() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        let first = queue_registration_payload("reused-order");
+        let mut conflict = first.clone();
+        conflict["market_id"] = json!("different-market");
+        observe_quality(&mut quality, now, "paper_order_queue_registration", first);
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_registration",
+            conflict,
+        );
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_snapshot",
+            json!({
+                "order_id": "reused-order",
+                "visible_size_ahead_estimate": "4"
+            }),
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["registrations"], 1);
+        assert_eq!(result["registration_conflicting_order_ids"], 1);
+        assert_eq!(result["queue_snapshot_joined_orders"], 0);
+        assert_eq!(result["queue_snapshot_coverage"], 0.0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn conflicting_fill_lifecycle_reuse_is_ineligible() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_queue_shadow_fill",
+            queue_fill_payload("order-1", fill_ts),
+        );
+        let mut conflict = queue_fill_payload("order-1", fill_ts + Duration::seconds(1));
+        conflict["market_id"] = json!("different-market");
+        conflict["token_id"] = json!("different-token");
+        observe_quality(
+            &mut quality,
+            fill_ts + Duration::seconds(1),
+            "paper_queue_shadow_fill",
+            conflict,
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["fill_lifecycles"], 2);
+        assert_eq!(result["lifecycle_conflicting_order_ids"], 1);
+        assert_eq!(result["invalid_lifecycle_join_events"], 2);
+        assert_eq!(result["markouts"]["30"]["observed"], 0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn execution_quality_deduplicates_complete_settlement_journal_retries() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_queue_shadow_fill",
+            queue_fill_payload("order-1", fill_ts),
+        );
+        let mut journal_rows = MARKOUT_HORIZONS_SECONDS
+            .into_iter()
+            .map(|horizon| {
+                let mut payload =
+                    complete_net_markout_payload("fill-1", "order-1", fill_ts, horizon);
+                let object = payload.as_object_mut().expect("markout object");
+                for key in [
+                    "mark_price",
+                    "markout_per_share",
+                    "markout_pnl",
+                    "net_markout_per_share",
+                    "net_markout_pnl",
+                    "executable_mark_price",
+                    "executable_markout_per_share",
+                    "executable_markout_pnl",
+                    "net_executable_markout_per_share",
+                    "net_executable_markout_pnl",
+                    "observed_ts",
+                    "observation_delay_ms",
+                ] {
+                    object.remove(key);
+                }
+                object.insert(
+                    "reason".to_owned(),
+                    json!("market_settled_before_observation"),
+                );
+                ("paper_fill_markout_missing", payload)
+            })
+            .collect::<Vec<_>>();
+        journal_rows.push((
+            "paper_settlement",
+            json!({"market_id": "market-1", "research_only": true}),
+        ));
+        let events = settlement_journal_events(fill_ts + Duration::seconds(30), journal_rows);
+        for event in events.iter().chain(events.iter()) {
+            quality.observe(event);
+        }
+
+        let result = quality.finish();
+
+        assert_eq!(result["settlement_journal_verified"], 1);
+        assert_eq!(result["settlement_journal_retry_duplicates"], 4);
+        assert_eq!(result["invalid_markout_rows"], 3);
+        assert_eq!(result["markouts"]["30"]["expected"], 1);
+        assert_eq!(result["markouts"]["30"]["observed"], 0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn execution_quality_blocks_conflicting_incomplete_or_bad_hash_journals() {
+        let now = Utc::now();
+
+        let mut conflict_quality = ExecutionQualityAccumulator::default();
+        let mut conflict_events = settlement_journal_events(
+            now,
+            vec![("paper_settlement", json!({"market_id": "market-1"}))],
+        );
+        let first = conflict_events[0].clone();
+        conflict_events[0].payload["market_id"] = json!("different-market");
+        conflict_quality.observe(&first);
+        conflict_quality.observe(&conflict_events[0]);
+        let conflict_result = conflict_quality.finish();
+        assert_eq!(conflict_result["settlement_journal_conflicts"], 1);
+        assert_eq!(conflict_result["evidence_gate"], "FAIL");
+
+        let mut incomplete_quality = ExecutionQualityAccumulator::default();
+        let incomplete_events = settlement_journal_events(
+            now,
+            vec![
+                ("paper_fill_markout_missing", json!({"fill_id": "fill-1"})),
+                ("paper_settlement", json!({"market_id": "market-1"})),
+            ],
+        );
+        incomplete_quality.observe(&incomplete_events[0]);
+        let incomplete_result = incomplete_quality.finish();
+        assert_eq!(incomplete_result["settlement_journal_incomplete"], 1);
+        assert_eq!(incomplete_result["evidence_gate"], "FAIL");
+
+        let mut bad_hash_quality = ExecutionQualityAccumulator::default();
+        let mut bad_hash_events = settlement_journal_events(
+            now,
+            vec![("paper_settlement", json!({"market_id": "market-1"}))],
+        );
+        bad_hash_events[0].payload["settlement_journal_sha256"] =
+            json!(format!("sha256:{}", "b".repeat(64)));
+        bad_hash_quality.observe(&bad_hash_events[0]);
+        let bad_hash_result = bad_hash_quality.finish();
+        assert_eq!(bad_hash_result["settlement_journal_conflicts"], 1);
+        assert_eq!(bad_hash_result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn absent_markouts_are_missing_against_actual_fill_lifecycle() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_queue_shadow_fill",
+            queue_fill_payload("order-1", fill_ts),
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["fill_lifecycles"], 1);
+        for horizon in ["1", "5", "30"] {
+            assert_eq!(result["markouts"][horizon]["expected"], 1);
+            assert_eq!(result["markouts"][horizon]["observed"], 0);
+            assert_eq!(result["markouts"][horizon]["missing"], 1);
+            assert_eq!(result["markouts"][horizon]["completion_rate"], 0.0);
+        }
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn null_or_gross_only_markout_is_not_promotion_complete() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_queue_shadow_fill",
+            queue_fill_payload("order-1", fill_ts),
+        );
+        for horizon in MARKOUT_HORIZONS_SECONDS {
+            let mut payload = complete_net_markout_payload("fill-1", "order-1", fill_ts, horizon);
+            if horizon == 30 {
+                let object = payload.as_object_mut().expect("markout payload object");
+                object.remove("net_markout_per_share");
+                object.remove("net_markout_pnl");
+                object.remove("net_executable_markout_per_share");
+                object.remove("net_executable_markout_pnl");
+            }
+            observe_quality(
+                &mut quality,
+                fill_ts + Duration::seconds(horizon),
+                "paper_fill_markout",
+                payload,
+            );
+        }
+
+        let result = quality.finish();
+
+        assert_eq!(result["invalid_markout_rows"], 1);
+        assert_eq!(result["markouts"]["1"]["completion_rate"], 1.0);
+        assert_eq!(result["markouts"]["30"]["completion_rate"], 0.0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn late_markout_is_not_promotion_complete() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_queue_shadow_fill",
+            queue_fill_payload("order-1", fill_ts),
+        );
+        for horizon in MARKOUT_HORIZONS_SECONDS {
+            let mut payload = complete_net_markout_payload("fill-1", "order-1", fill_ts, horizon);
+            if horizon == 30 {
+                payload["observation_delay_ms"] = json!(2_001);
+                payload["observed_ts"] =
+                    json!(fill_ts + Duration::seconds(horizon) + Duration::milliseconds(2_001));
+            }
+            observe_quality(
+                &mut quality,
+                fill_ts + Duration::seconds(horizon),
+                "paper_fill_markout",
+                payload,
+            );
+        }
+
+        let result = quality.finish();
+
+        assert_eq!(result["invalid_markout_rows"], 1);
+        assert_eq!(result["markouts"]["30"]["completion_rate"], 0.0);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn paper_execution_report_creates_touch_fill_markout_denominator() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "execution_report",
+            json!({
+                "order_id": "order-1",
+                "market_id": "market-1",
+                "token_id": "token-1",
+                "side": "buy",
+                "status": "paper_filled_maker",
+                "filled_size": "5",
+                "avg_price": "0.50",
+                "fee": "0.005",
+                "local_ts": fill_ts
+            }),
+        );
+        for horizon in MARKOUT_HORIZONS_SECONDS {
+            let mut payload =
+                complete_fee_aware_markout_payload("touch-fill-1", "order-1", fill_ts, horizon);
+            payload["fill_source"] = json!("touch_fill");
+            observe_quality(
+                &mut quality,
+                fill_ts + Duration::seconds(horizon),
+                "paper_fill_markout",
+                payload,
+            );
+        }
+
+        let result = quality.finish();
+
+        assert_eq!(result["fill_lifecycles"], 1);
+        assert_eq!(result["markouts"]["30"]["completion_rate"], 1.0);
+        assert_eq!(result["markouts"]["30"]["executable"]["mean"], "0.004");
+        assert_eq!(result["evidence_gate"], "PASS");
+    }
+
+    #[test]
+    fn duplicate_markout_invalidates_its_lifecycle_horizon_slot() {
+        let fill_ts = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        observe_quality(
+            &mut quality,
+            fill_ts,
+            "paper_queue_shadow_fill",
+            queue_fill_payload("order-1", fill_ts),
+        );
+        for horizon in MARKOUT_HORIZONS_SECONDS {
+            let payload = complete_net_markout_payload("fill-1", "order-1", fill_ts, horizon);
+            observe_quality(
+                &mut quality,
+                fill_ts + Duration::seconds(horizon),
+                "paper_fill_markout",
+                payload.clone(),
+            );
+            if horizon == 30 {
+                observe_quality(
+                    &mut quality,
+                    fill_ts + Duration::seconds(horizon),
+                    "paper_fill_markout",
+                    payload,
+                );
+            }
+        }
+
+        let result = quality.finish();
+
+        assert_eq!(result["duplicate_markout_rows"], 1);
+        assert_eq!(result["duplicate_markout_slots"], 1);
+        assert_eq!(result["markouts"]["30"]["observed"], 0);
+        assert_eq!(result["markouts"]["30"]["missing"], 1);
+        assert_eq!(result["evidence_gate"], "FAIL");
+    }
+
+    #[test]
+    fn audit_recovers_late_market_truth_from_exact_reference_history() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let mut audit = AuditAccumulator::default();
+        for (recorded_ts, event_type, payload) in [
+            (
+                start + Duration::seconds(1),
+                "reference",
+                json!({
+                    "price": "100000",
+                    "source_ts": start + Duration::seconds(1),
+                    "stale": false,
+                    "exact_resolution_source": true
+                }),
+            ),
+            (
+                end + Duration::seconds(1),
+                "reference",
+                json!({
+                    "price": "100010",
+                    "source_ts": end + Duration::seconds(1),
+                    "stale": false,
+                    "exact_resolution_source": true
+                }),
+            ),
+            (
+                end + Duration::seconds(2),
+                "market",
+                json!({
+                    "market_id": "late-market",
+                    "up_token_id": "up",
+                    "down_token_id": "down",
+                    "start_ts": start,
+                    "end_ts": end
+                }),
+            ),
+        ] {
+            audit.observe(&EventLine {
+                event_type: event_type.to_owned(),
+                recorded_ts,
+                payload,
+                raw: Value::Null,
+            });
+        }
+
+        let result = audit.finish();
+        assert_eq!(result["markets_with_start_price"], 1);
+        assert_eq!(result["markets_settled"], 1);
+        assert_eq!(result["start_price_capture_rate"], 1.0);
+        assert_eq!(result["settlement_rate"], 1.0);
+    }
+
+    #[test]
+    fn audit_excludes_future_discovery_stubs_from_the_observed_day_denominator() {
+        let mut audit = AuditAccumulator::default();
+        for (market_id, start_ts, end_ts, recorded_ts) in [
+            (
+                "in-window",
+                "2026-07-19T23:45:00Z",
+                "2026-07-20T00:00:00Z",
+                "2026-07-19T23:45:00Z",
+            ),
+            (
+                "future-stub",
+                "2026-07-20T00:15:00Z",
+                "2026-07-20T00:30:00Z",
+                "2026-07-19T23:50:00Z",
+            ),
+        ] {
+            audit.observe(&EventLine {
+                event_type: "market".to_owned(),
+                recorded_ts: wallet_ts(recorded_ts),
+                payload: json!({
+                    "market_id": market_id,
+                    "up_token_id": format!("{market_id}-up"),
+                    "down_token_id": format!("{market_id}-down"),
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "start_price": "100000"
+                }),
+                raw: Value::Null,
+            });
+        }
+
+        let result = audit.finish();
+        assert_eq!(result["markets_seen"], 1);
+        assert_eq!(result["market_stubs_excluded_outside_event_window"], 1);
+    }
+
+    #[test]
+    fn market_payload_start_is_descriptive_until_exact_boundary_evidence_arrives() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let mut audit = AuditAccumulator::default();
+        audit.observe(&EventLine {
+            event_type: "market".to_owned(),
+            recorded_ts: start,
+            payload: json!({
+                "market_id": "market-1",
+                "start_ts": start,
+                "end_ts": start + Duration::minutes(15),
+                "start_price": "99999"
+            }),
+            raw: Value::Null,
+        });
+        assert_eq!(
+            audit.markets["market-1"].descriptive_start_price,
+            Some(d("99999"))
+        );
+        assert!(audit.markets["market-1"].start_price.is_none());
+
+        audit.observe(&EventLine {
+            event_type: "market_start_price".to_owned(),
+            recorded_ts: start + Duration::seconds(2),
+            payload: json!({
+                "schema_version": 1,
+                "schema": "polyedge.market_start_price.v1",
+                "market_id": "market-1",
+                "market_start_ts": start,
+                "market_end_ts": start + Duration::minutes(15),
+                "start_price": "100000",
+                "reference_source": "chainlink_rtds",
+                "reference_source_ts": start + Duration::seconds(2),
+                "reference_exact_resolution_source": true,
+                "reference_stale": false
+            }),
+            raw: Value::Null,
+        });
+        assert_eq!(audit.markets["market-1"].start_price, Some(d("100000")));
+        assert_eq!(audit.invalid_market_start_prices, 0);
+    }
+
+    #[test]
+    fn exact_market_start_rejects_missing_inexact_stale_or_out_of_window_sources() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let invalid = [
+            json!({
+                "market_id": "market-1", "start_price": "100000",
+                "reference_source_ts": start + Duration::seconds(1),
+                "reference_exact_resolution_source": true, "reference_stale": false
+            }),
+            json!({
+                "market_id": "market-1", "start_price": "100000",
+                "reference_source": "chainlink_rtds",
+                "reference_source_ts": start + Duration::seconds(1),
+                "reference_exact_resolution_source": false, "reference_stale": false
+            }),
+            json!({
+                "market_id": "market-1", "start_price": "100000",
+                "reference_source": "chainlink_rtds",
+                "reference_source_ts": start + Duration::seconds(1),
+                "reference_exact_resolution_source": true, "reference_stale": true
+            }),
+            json!({
+                "market_id": "market-1", "start_price": "100000",
+                "reference_source": "chainlink_rtds",
+                "reference_source_ts": start + Duration::seconds(6),
+                "reference_exact_resolution_source": true, "reference_stale": false
+            }),
+        ];
+        let mut audit = AuditAccumulator::default();
+        audit.markets.insert(
+            "market-1".to_owned(),
+            MarketTruth {
+                market_id: "market-1".to_owned(),
+                start_ts: Some(start),
+                end_ts: Some(start + Duration::minutes(15)),
+                ..MarketTruth::default()
+            },
+        );
+        for payload in invalid {
+            audit.observe_market_start(&payload);
+        }
+        assert!(audit.markets["market-1"].start_price.is_none());
+        assert_eq!(audit.invalid_market_start_prices, 4);
+    }
+
+    #[test]
+    fn audit_rejects_pre_end_reference_but_accepts_paper_settlement_truth() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let mut market = MarketTruth {
+            market_id: "market-1".to_owned(),
+            start_ts: Some(start),
+            end_ts: Some(end),
+            start_price: Some(d("100000")),
+            ..MarketTruth::default()
+        };
+        market.observe_settlement_reference(end - Duration::seconds(1), d("99999"));
+        assert!(market.final_price.is_none());
+
+        let mut audit = AuditAccumulator::default();
+        audit.markets.insert(market.market_id.clone(), market);
+        audit.observe_paper_settlement(&json!({
+            "market_id": "market-1",
+            "start_ts": start,
+            "end_ts": end,
+            "start_price": "100000",
+            "start_reference_source": "chainlink_rtds",
+            "start_reference_source_ts": start + Duration::seconds(1),
+            "start_reference_exact_resolution_source": true,
+            "start_reference_stale": false,
+            "final_price": "100001",
+            "final_reference_source": "chainlink_rtds",
+            "final_reference_source_ts": end + Duration::seconds(1),
+            "final_reference_exact_resolution_source": true,
+            "final_reference_stale": false,
+            "winning_outcome": "up"
+        }));
+        assert_eq!(audit.markets["market-1"].final_distance_ms, Some(1_000));
+        let result = audit.finish();
+        assert_eq!(result["markets_settled"], 1);
+        assert_eq!(result["settlement_rate"], 1.0);
+    }
+
+    #[test]
+    fn audit_rejects_late_paper_settlement_truth() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let mut audit = AuditAccumulator::default();
+        audit.observe_paper_settlement(&json!({
+            "market_id": "market-late",
+            "start_ts": start,
+            "end_ts": end,
+            "start_price": "100000",
+            "start_reference_source": "chainlink_rtds",
+            "start_reference_source_ts": start + Duration::seconds(1),
+            "start_reference_exact_resolution_source": true,
+            "start_reference_stale": false,
+            "final_price": "100001",
+            "final_reference_source": "chainlink_rtds",
+            "final_reference_source_ts": end + Duration::seconds(16),
+            "final_reference_exact_resolution_source": true,
+            "final_reference_stale": false,
+            "winning_outcome": "up"
+        }));
+        assert!(audit.markets["market-late"].final_price.is_none());
+        let result = audit.finish();
+        assert_eq!(result["invalid_paper_settlements"], 1);
+        assert_eq!(result["markets_settled"], 0);
+    }
+
+    #[test]
+    fn audit_does_not_accept_unproven_start_price_from_terminal_settlement_echo() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let mut audit = AuditAccumulator::default();
+        audit.observe_paper_settlement(&json!({
+            "market_id": "market-unproven-start",
+            "start_ts": start,
+            "end_ts": end,
+            "start_price": "100000",
+            "final_price": "100001",
+            "final_reference_source": "chainlink_rtds",
+            "final_reference_source_ts": end + Duration::seconds(1),
+            "final_reference_exact_resolution_source": true,
+            "final_reference_stale": false
+        }));
+
+        assert!(audit.markets["market-unproven-start"].start_price.is_none());
+        assert!(audit.markets["market-unproven-start"].final_price.is_none());
+        let result = audit.finish();
+        assert_eq!(result["invalid_paper_settlements"], 1);
+    }
+
+    #[test]
+    fn audit_accepts_independently_proven_exact_start_from_settlement_journal() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let mut audit = AuditAccumulator::default();
+        audit.observe_paper_settlement(&json!({
+            "market_id": "market-proven-start",
+            "start_ts": start,
+            "end_ts": end,
+            "start_price": "100000",
+            "start_reference_source": "chainlink_rtds",
+            "start_reference_source_ts": start + Duration::seconds(2),
+            "start_reference_exact_resolution_source": true,
+            "start_reference_stale": false,
+            "final_price": "100001",
+            "final_reference_source": "chainlink_rtds",
+            "final_reference_source_ts": end + Duration::seconds(1),
+            "final_reference_exact_resolution_source": true,
+            "final_reference_stale": false
+        }));
+
+        let market = &audit.markets["market-proven-start"];
+        assert_eq!(market.start_price, Some(d("100000")));
+        assert_eq!(market.final_price, Some(d("100001")));
+        assert_eq!(market.final_distance_ms, Some(1_000));
+        let result = audit.finish();
+        assert_eq!(result["invalid_paper_settlements"], 0);
+        assert_eq!(result["markets_settled"], 1);
+    }
+
+    #[test]
+    fn audit_rejects_stale_or_inexact_terminal_reference_evidence() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        for (exact, stale) in [(false, false), (true, true)] {
+            let mut audit = AuditAccumulator::default();
+            audit.markets.insert(
+                "market-1".to_owned(),
+                MarketTruth {
+                    market_id: "market-1".to_owned(),
+                    start_ts: Some(start),
+                    end_ts: Some(end),
+                    start_price: Some(d("100000")),
+                    ..MarketTruth::default()
+                },
+            );
+            audit.observe_paper_settlement(&json!({
+                "market_id": "market-1",
+                "start_price": "100000",
+                "start_reference_source": "chainlink_rtds",
+                "start_reference_source_ts": start + Duration::seconds(1),
+                "start_reference_exact_resolution_source": true,
+                "start_reference_stale": false,
+                "final_price": "100001",
+                "final_reference_source": "chainlink_rtds",
+                "final_reference_source_ts": end + Duration::seconds(1),
+                "final_reference_exact_resolution_source": exact,
+                "final_reference_stale": stale
+            }));
+
+            assert!(audit.markets["market-1"].final_price.is_none());
+            let result = audit.finish();
+            assert_eq!(result["invalid_paper_settlements"], 1);
+        }
+    }
+
+    #[test]
+    fn audit_deduplicates_settlement_journal_retries_and_blocks_conflicts() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let journal_id = format!("paper-settlement-{}", "a".repeat(64));
+        let frozen_payload = json!({
+            "market_id": "market-1",
+            "start_ts": start,
+            "end_ts": end,
+            "start_price": "100000",
+            "start_reference_source": "chainlink_rtds",
+            "start_reference_source_ts": start + Duration::seconds(1),
+            "start_reference_exact_resolution_source": true,
+            "start_reference_stale": false,
+            "final_price": "100001",
+            "final_reference_source": "chainlink_rtds",
+            "final_reference_source_ts": end + Duration::seconds(1),
+            "final_reference_exact_resolution_source": true,
+            "final_reference_stale": false
+        });
+        let journal_sha256 = canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": 1,
+            "events": [{
+                "event_index": 0,
+                "event_type": "paper_settlement",
+                "payload": frozen_payload
+            }]
+        }))
+        .unwrap();
+        let mut payload = frozen_payload;
+        let binding = payload.as_object_mut().unwrap();
+        binding.insert(
+            "settlement_journal_schema".to_owned(),
+            json!("polyedge.paper_settlement_journal.v1"),
+        );
+        binding.insert("settlement_journal_id".to_owned(), json!(journal_id));
+        binding.insert("settlement_journal_event_index".to_owned(), json!(0));
+        binding.insert("settlement_journal_event_count".to_owned(), json!(1));
+        binding.insert(
+            "settlement_journal_sha256".to_owned(),
+            json!(journal_sha256),
+        );
+        let mut audit = AuditAccumulator::default();
+        audit.markets.insert(
+            "market-1".to_owned(),
+            MarketTruth {
+                market_id: "market-1".to_owned(),
+                start_ts: Some(start),
+                end_ts: Some(end),
+                start_price: Some(d("100000")),
+                ..MarketTruth::default()
+            },
+        );
+        for copy in [payload.clone(), payload.clone()] {
+            audit.observe(&EventLine {
+                event_type: "paper_settlement".to_owned(),
+                recorded_ts: end + Duration::seconds(2),
+                payload: copy,
+                raw: Value::Null,
+            });
+        }
+        let mut conflict = payload.clone();
+        conflict["final_price"] = json!("99999");
+        audit.observe(&EventLine {
+            event_type: "paper_settlement".to_owned(),
+            recorded_ts: end + Duration::seconds(2),
+            payload: conflict,
+            raw: Value::Null,
+        });
+        assert_eq!(audit.paper_settlements, 1);
+        assert_eq!(audit.settlement_journal_retry_duplicates, 1);
+        assert_eq!(audit.settlement_journal_conflicts, 1);
+        assert_eq!(audit.markets["market-1"].final_price, Some(d("100001")));
+        let result = audit.finish();
+        assert!(result["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.starts_with("settlement journal conflicts")))));
+    }
+
+    #[test]
+    fn audit_blocks_incomplete_or_hash_invalid_settlement_journals() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let journal_id = format!("paper-settlement-{}", "b".repeat(64));
+        let settlement = json!({
+            "market_id": "market-1",
+            "start_ts": start,
+            "end_ts": end,
+            "start_price": "100000",
+            "start_reference_source": "chainlink_rtds",
+            "start_reference_source_ts": start + Duration::seconds(1),
+            "start_reference_exact_resolution_source": true,
+            "start_reference_stale": false,
+            "final_price": "100001",
+            "final_reference_source": "chainlink_rtds",
+            "final_reference_source_ts": end + Duration::seconds(1),
+            "final_reference_exact_resolution_source": true,
+            "final_reference_stale": false
+        });
+        let missing_markout = json!({"fill_id": "fill-1", "horizon_seconds": 30});
+        let expected_hash = canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": 2,
+            "events": [
+                {"event_index": 0, "event_type": "paper_fill_markout_missing", "payload": missing_markout},
+                {"event_index": 1, "event_type": "paper_settlement", "payload": settlement}
+            ]
+        }))
+        .unwrap();
+        let bind = |mut payload: Value, count: u64, index: u64, hash: String| {
+            let object = payload.as_object_mut().unwrap();
+            object.insert(
+                "settlement_journal_schema".to_owned(),
+                json!("polyedge.paper_settlement_journal.v1"),
+            );
+            object.insert(
+                "settlement_journal_id".to_owned(),
+                json!(journal_id.clone()),
+            );
+            object.insert("settlement_journal_event_index".to_owned(), json!(index));
+            object.insert("settlement_journal_event_count".to_owned(), json!(count));
+            object.insert("settlement_journal_sha256".to_owned(), json!(hash));
+            payload
+        };
+
+        let mut incomplete = AuditAccumulator::default();
+        incomplete.observe(&EventLine {
+            event_type: "paper_settlement".to_owned(),
+            recorded_ts: end + Duration::seconds(2),
+            payload: bind(settlement.clone(), 2, 1, expected_hash),
+            raw: Value::Null,
+        });
+        let result = incomplete.finish();
+        assert_eq!(result["settlement_journal_invalid"], 1);
+
+        let mut bad_hash = AuditAccumulator::default();
+        bad_hash.observe(&EventLine {
+            event_type: "paper_settlement".to_owned(),
+            recorded_ts: end + Duration::seconds(2),
+            payload: bind(settlement, 1, 0, format!("sha256:{}", "c".repeat(64))),
+            raw: Value::Null,
+        });
+        let result = bad_hash.finish();
+        assert_eq!(result["settlement_journal_invalid"], 1);
+    }
+
+    #[test]
+    fn v3_day_rejects_unjournaled_settlement_even_with_valid_price_bindings() {
+        let start = wallet_ts("2026-07-20T12:00:00Z");
+        let end = start + Duration::minutes(15);
+        let mut audit = AuditAccumulator::default();
+        audit.observe(&EventLine {
+            event_type: "runtime_provenance".to_owned(),
+            recorded_ts: start,
+            payload: json!({
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+                "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation"
+            }),
+            raw: Value::Null,
+        });
+        audit.observe(&EventLine {
+            event_type: "paper_settlement".to_owned(),
+            recorded_ts: end + Duration::seconds(1),
+            payload: json!({
+                "market_id": "market-1", "start_ts": start, "end_ts": end,
+                "start_price": "100000", "start_reference_source": "chainlink_rtds",
+                "start_reference_source_ts": start + Duration::seconds(1),
+                "start_reference_exact_resolution_source": true, "start_reference_stale": false,
+                "final_price": "100001", "final_reference_source": "chainlink_rtds",
+                "final_reference_source_ts": end + Duration::seconds(1),
+                "final_reference_exact_resolution_source": true, "final_reference_stale": false
+            }),
+            raw: Value::Null,
+        });
+        let result = audit.finish();
+        assert_eq!(result["settlement_journal_unbound_settlements"], 1);
+        assert!(result["warnings"]
+            .as_array()
+            .is_some_and(
+                |warnings| warnings
+                    .iter()
+                    .any(|warning| warning.as_str().is_some_and(|text| text
+                        .starts_with("v3 paper settlements missing durable journal binding")))
+            ));
+    }
+
+    fn decision_pipeline_v3_input(now: DateTime<Utc>) -> DecisionPipelineInputV3 {
+        use polyedge_domain::{
+            BookLevel, BookState, FairValue, MarketSpec, MarketStatus, ReferencePrice,
+        };
+        use polyedge_engine::{OrderManager, RegimeFeatureInput, RiskManager};
+
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+        settings.paper.maker_fill_policy = "none".to_owned();
+        settings.strategy.adaptive_regime_enabled = true;
+        settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
+        settings.azure.event_blob_prefix = "shadow-events/test-campaign".to_owned();
+        assert!(settings.validate_runtime_role().is_ok());
+
+        let up_token = TokenId::new("up-token");
+        let down_token = TokenId::new("down-token");
+        let market = MarketSpec {
+            asset: "BTC".to_owned(),
+            horizon: "15m".to_owned(),
+            event_id: None,
+            event_slug: None,
+            market_id: MarketId::new("market-1"),
+            market_slug: None,
+            condition_id: ConditionId::new("condition-1"),
+            question: "test market".to_owned(),
+            description: None,
+            up_token_id: up_token.clone(),
+            down_token_id: down_token.clone(),
+            start_ts: now - Duration::minutes(5),
+            end_ts: now + Duration::minutes(10),
+            start_price: Some(d("100000")),
+            resolution_source: "chainlink_reference".to_owned(),
+            tick_size: d("0.01"),
+            minimum_order_size: Decimal::ONE,
+            neg_risk: false,
+            fees_enabled: true,
+            accepting_orders: true,
+            status: MarketStatus::Tradeable,
+            raw: BTreeMap::new(),
+        };
+        let book = |token_id: TokenId, bid: &str, ask: &str| BookState {
+            token_id,
+            bids: vec![BookLevel {
+                price: d(bid),
+                size: d("20"),
+            }],
+            asks: vec![BookLevel {
+                price: d(ask),
+                size: d("20"),
+            }],
+            last_trade_price: None,
+            exchange_ts: Some(now),
+            local_ts: now,
+            book_hash: Some("book-hash".to_owned()),
+        };
+        let up_book = book(up_token.clone(), "0.45", "0.55");
+        let down_book = book(down_token.clone(), "0.25", "0.45");
+        let books = BTreeMap::from([
+            (up_token.clone(), up_book.clone()),
+            (down_token.clone(), down_book.clone()),
+        ]);
+        let reference = ReferencePrice {
+            source: "chainlink_rtds".to_owned(),
+            price: d("100000"),
+            source_ts: now,
+            local_ts: now,
+            latency_ms: 0.0,
+            stale: false,
+            exact_resolution_source: true,
+            quality_flags: Vec::new(),
+        };
+        let fair_value = FairValue {
+            market_id: market.market_id.clone(),
+            q_up: d("0.60"),
+            q_down: d("0.40"),
+            sigma: 0.3,
+            drift_mu: 0.0,
+            model_error: d("0.01"),
+            computed_ts: now,
+        };
+        let feature_book = |book: &BookState| RegimeBookSnapshot {
+            bid: book.best_bid().map(|level| level.price),
+            ask: book.best_ask().map(|level| level.price),
+            bid_size: book.best_bid().map(|level| level.size),
+            ask_size: book.best_ask().map(|level| level.size),
+            local_ts: Some(book.local_ts),
+        };
+        let regime_feature_input = RegimeFeatureInput {
+            now,
+            market_start_ts: Some(market.start_ts),
+            market_end_ts: Some(market.end_ts),
+            start_price: market.start_price,
+            tick_size: market.tick_size,
+            reference: Some(RegimeReferencePoint {
+                ts: now,
+                price: reference.price,
+                stale: false,
+            }),
+            reference_history: Vec::new(),
+            q_up: Some(fair_value.q_up),
+            q_down: Some(fair_value.q_down),
+            sigma: Some(fair_value.sigma),
+            up_book: Some(feature_book(&up_book)),
+            down_book: Some(feature_book(&down_book)),
+            book_update_rate_10s: None,
+            feed_divergence_bps: None,
+            recent_feed_errors: 0,
+            open_positions: None,
+            open_orders: 0,
+            recent_fill_count: 0,
+            recent_cancel_count: 0,
+            adverse_move_after_fill_bps: None,
+            max_reference_age_ms: settings.risk.max_reference_age_ms,
+            max_book_age_ms: settings.risk.max_book_age_ms,
+            final_no_trade_seconds: settings.strategy.final_no_trade_seconds,
+            quality_flags: Vec::new(),
+        };
+        let market_start_evidence = MarketStartEvidenceV1 {
+            schema_version: 1,
+            market_id: market.market_id.clone(),
+            market_start_ts: market.start_ts,
+            market_end_ts: market.end_ts,
+            start_price: market.start_price.unwrap(),
+            reference_source: "chainlink_rtds".to_owned(),
+            reference_source_ts: market.start_ts + Duration::seconds(1),
+            reference_exact_resolution_source: true,
+            reference_stale: false,
+        };
+        DecisionPipelineInputV3 {
+            schema_version: 3,
+            risk_before: RiskManager::new(settings.clone()).snapshot(),
+            order_manager_before: OrderManager::new().snapshot(),
+            settings,
+            market,
+            market_start_evidence,
+            fair_value,
+            reference,
+            books,
+            decision_ts: now,
+            kill_switch_enabled: false,
+            adaptive_mode: Some(FrozenStrategyMode::DynamicQuoteStyle),
+            regime_feature_input,
+            classifier_before: Some(RegimeClassifier::default().snapshot()),
+        }
+    }
+
+    fn decision_pipeline_v3_evidence(input: &DecisionPipelineInputV3) -> (Value, Vec<Value>) {
+        let output = evaluate_decision_pipeline_v3(input);
+        let input_value = serde_json::to_value(input).unwrap();
+        let output_value = serde_json::to_value(&output).unwrap();
+        let input_sha256 = canonical_value_sha256(&input_value).unwrap();
+        let output_sha256 = canonical_value_sha256(&output_value).unwrap();
+        let batch_id = format!(
+            "strategy-batch-{}",
+            input_sha256.trim_start_matches("sha256:")
+        );
+        let decisions = expected_v3_decision_payloads(&output).unwrap();
+        assert!(decisions
+            .iter()
+            .any(|decision| decision.get("strategy_metadata").is_some()));
+        let bound = decisions
+            .iter()
+            .enumerate()
+            .map(|(index, decision)| {
+                json!({
+                    "output_index": index,
+                    "decision_sha256": canonical_value_sha256(decision).unwrap(),
+                    "decision": decision
+                })
+            })
+            .collect::<Vec<_>>();
+        let batch = json!({
+            "schema_version": 3,
+            "schema": "polyedge.strategy_decision_batch.v3",
+            "parity_scope": "full_decision_pipeline_recomputation",
+            "batch_id": batch_id,
+            "market_id": input.market.market_id,
+            "decision_ts": input.decision_ts,
+            "candidate": FrozenStrategyMode::DynamicQuoteStyle.candidate(),
+            "decision_config_schema": "polyedge.decision_config.v1",
+            "decision_config_sha256": decision_config_sha256(input).unwrap(),
+            "market_start_evidence_sha256": canonical_value_sha256(
+                &serde_json::to_value(&input.market_start_evidence).unwrap()
+            ).unwrap(),
+            "pipeline_input_sha256": input_sha256,
+            "pipeline_output_sha256": output_sha256,
+            "pipeline_input": input_value,
+            "pipeline_output": output_value,
+            "bound_final_decisions": bound
+        });
+        let events = decisions
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut decision)| {
+                let hash = canonical_value_sha256(&decision).unwrap();
+                let object = decision.as_object_mut().unwrap();
+                object.insert("decision_batch_schema_version".to_owned(), json!(3));
+                object.insert("strategy_batch_id".to_owned(), json!(batch_id));
+                object.insert("strategy_batch_output_index".to_owned(), json!(index));
+                object.insert("strategy_decision_sha256".to_owned(), json!(hash));
+                decision
+            })
+            .collect();
+        (batch, events)
+    }
+
+    fn decision_pipeline_v3_strategy_evaluations(input: &DecisionPipelineInputV3) -> Vec<Value> {
+        let output = evaluate_decision_pipeline_v3(input);
+        let input_hash = canonical_value_sha256(&serde_json::to_value(input).unwrap()).unwrap();
+        let batch_id = format!(
+            "strategy-batch-{}",
+            input_hash.trim_start_matches("sha256:")
+        );
+        let features = input.regime_feature_input.clone().build();
+        output
+            .strategy_evaluations
+            .iter()
+            .map(|evaluation| {
+                json!({
+                    "schema_version": 1,
+                    "decision_batch_schema_version": 3,
+                    "strategy_batch_id": batch_id,
+                    "evaluation_index": evaluation.evaluation_index,
+                    "market_id": input.market.market_id,
+                    "decision_ts": input.decision_ts,
+                    "mode": FrozenStrategyMode::DynamicQuoteStyle,
+                    "strategy_config": input.settings.strategy,
+                    "raw_decision": output.raw_decisions.get(evaluation.evaluation_index),
+                    "quote_context": evaluation.quote_context,
+                    "features": features,
+                    "classifier_before": evaluation.classifier_before,
+                    "classifier_after": evaluation.classifier_after,
+                    "evaluated_decision": evaluation.evaluated_decision,
+                    "cancel_existing": evaluation.cancel_existing,
+                    "strategy_metadata": evaluation.metadata
+                })
+            })
+            .collect()
+    }
+
+    fn observe_market_start_evidence(
+        audit: &mut AuditAccumulator,
+        recorded_ts: DateTime<Utc>,
+        start: &MarketStartEvidenceV1,
+    ) {
+        audit.observe(&EventLine {
+            event_type: "market_start_price".to_owned(),
+            recorded_ts,
+            payload: json!({
+                "schema_version": start.schema_version,
+                "schema": "polyedge.market_start_price.v1",
+                "market_id": start.market_id,
+                "market_start_ts": start.market_start_ts,
+                "market_end_ts": start.market_end_ts,
+                "start_price": start.start_price.to_string(),
+                "reference_source": start.reference_source,
+                "reference_source_ts": start.reference_source_ts,
+                "reference_exact_resolution_source": start.reference_exact_resolution_source,
+                "reference_stale": start.reference_stale
+            }),
+            raw: Value::Null,
+        });
+    }
+
+    fn observe_v3_evidence(audit: &mut AuditAccumulator, now: DateTime<Utc>, payload: Value) {
+        if let Some(start) = payload
+            .pointer("/pipeline_input/market_start_evidence")
+            .cloned()
+        {
+            let start: MarketStartEvidenceV1 = serde_json::from_value(start).unwrap();
+            observe_market_start_evidence(audit, now - Duration::seconds(1), &start);
+        }
+        audit.observe(&EventLine {
+            event_type: "strategy_decision_batch".to_owned(),
+            recorded_ts: now,
+            payload,
+            raw: Value::Null,
+        });
+    }
+
+    fn observe_bound_v3_decision(audit: &mut AuditAccumulator, now: DateTime<Utc>, payload: Value) {
+        audit.observe(&EventLine {
+            event_type: "decision".to_owned(),
+            recorded_ts: now,
+            payload,
+            raw: Value::Null,
+        });
+    }
+
+    #[test]
+    fn audit_recomputes_full_v3_pipeline_and_deduplicates_identical_retries() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let (batch, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let semantic_decisions = decisions.len();
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(&mut audit, now, batch.clone());
+        observe_v3_evidence(&mut audit, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut audit, now, decision.clone());
+            observe_bound_v3_decision(&mut audit, now, decision);
+        }
+        let result = audit.finish();
+        assert_eq!(result["decision_parity_rate"], 1.0);
+        assert_eq!(result["decision_pipeline_replay_rate"], 1.0);
+        assert_eq!(result["decision_output_binding_rate"], 1.0);
+        assert_eq!(result["strategy_batch_events"], 2);
+        assert_eq!(result["strategy_batches"], 1);
+        assert_eq!(result["strategy_batch_retry_duplicates"], 1);
+        assert_eq!(result["decision_count"], semantic_decisions);
+        assert!(result["strategy_binding_retry_duplicates"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
+        assert_eq!(result["decision_metadata_coverage"], 1.0);
+        assert_eq!(result["execution_field_coverage"], 1.0);
+        assert!(result["decision_config_sha256"]
+            .as_str()
+            .is_some_and(valid_prefixed_sha256));
+    }
+
+    #[test]
+    fn audit_v3_buffers_late_start_evidence_and_rejects_missing_or_conflicting_evidence() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let input = decision_pipeline_v3_input(now);
+        let (batch, decisions) = decision_pipeline_v3_evidence(&input);
+
+        let mut late = AuditAccumulator::default();
+        late.observe(&EventLine {
+            event_type: "strategy_decision_batch".to_owned(),
+            recorded_ts: now,
+            payload: batch.clone(),
+            raw: Value::Null,
+        });
+        for decision in &decisions {
+            observe_bound_v3_decision(&mut late, now, decision.clone());
+        }
+        observe_market_start_evidence(
+            &mut late,
+            now + Duration::seconds(1),
+            &input.market_start_evidence,
+        );
+        let result = late.finish();
+        assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["decision_parity_rate"], 1.0);
+
+        let mut missing = AuditAccumulator::default();
+        missing.observe(&EventLine {
+            event_type: "strategy_decision_batch".to_owned(),
+            recorded_ts: now,
+            payload: batch.clone(),
+            raw: Value::Null,
+        });
+        let result = missing.finish();
+        assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
+
+        let mut conflicting_start = input.market_start_evidence.clone();
+        conflicting_start.start_price += Decimal::ONE;
+        let mut conflict = AuditAccumulator::default();
+        observe_market_start_evidence(&mut conflict, now, &conflicting_start);
+        conflict.observe(&EventLine {
+            event_type: "strategy_decision_batch".to_owned(),
+            recorded_ts: now,
+            payload: batch,
+            raw: Value::Null,
+        });
+        let result = conflict.finish();
+        assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
+    }
+
+    #[test]
+    fn audit_v3_decision_config_hash_binds_target_and_data_policy() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let input = decision_pipeline_v3_input(now);
+        let baseline = decision_config_sha256(&input).unwrap();
+
+        let mut target = input.clone();
+        target.settings.target.reference_divergence_pause_threshold += d("0.001");
+        assert_ne!(decision_config_sha256(&target).unwrap(), baseline);
+
+        let mut population = input.clone();
+        population.settings.target.horizon = "1h".to_owned();
+        assert_ne!(decision_config_sha256(&population).unwrap(), baseline);
+
+        let mut data_policy = input;
+        data_policy.settings.azure.shadow_book_sample_ms += 1;
+        assert_ne!(decision_config_sha256(&data_policy).unwrap(), baseline);
+    }
+
+    #[test]
+    fn audit_v3_freezes_decision_config_across_provenance_and_batches() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let input = decision_pipeline_v3_input(now);
+        let (batch, decisions) = decision_pipeline_v3_evidence(&input);
+        let mut audit = AuditAccumulator::default();
+        audit.observe(&EventLine {
+            event_type: "runtime_provenance".to_owned(),
+            recorded_ts: now,
+            payload: json!({
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+                "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
+                "decision_config_schema": "polyedge.decision_config.v1",
+                "decision_config_sha256": format!("sha256:{}", "f".repeat(64))
+            }),
+            raw: Value::Null,
+        });
+        observe_v3_evidence(&mut audit, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut audit, now, decision);
+        }
+        let result = audit.finish();
+        assert_eq!(result["decision_config_distinct_hashes"], 2);
+        assert!(result["decision_config_sha256"].is_null());
+        assert!(result["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.starts_with(
+                    "decision config is missing or changed within the eligible day"
+                )))));
+    }
+
+    #[test]
+    fn audit_v3_requires_binding_for_cancel_and_hold_without_metadata() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let (batch, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let mut audit = AuditAccumulator::default();
+        audit.observe(&EventLine {
+            event_type: "runtime_provenance".to_owned(),
+            recorded_ts: now,
+            payload: json!({
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+                "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation"
+            }),
+            raw: Value::Null,
+        });
+        observe_v3_evidence(&mut audit, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut audit, now, decision);
+        }
+        for action in ["cancel_all", "hold"] {
+            observe_bound_v3_decision(
+                &mut audit,
+                now,
+                json!({"market_id": "market-1", "action": action}),
+            );
+        }
+        let result = audit.finish();
+        assert_eq!(result["unbound_strategy_decisions"], 2);
+        assert_eq!(result["decision_parity_rate"], 0.0);
+        assert!(result["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings
+                .iter()
+                .any(|warning| warning.as_str().is_some_and(|text| text
+                    .starts_with("runtime/replay full decision pipeline parity below 100%")))));
+    }
+
+    #[test]
+    fn audit_deduplicates_v3_strategy_evaluations_before_coverage_counting() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let input = decision_pipeline_v3_input(now);
+        let evaluations = decision_pipeline_v3_strategy_evaluations(&input);
+        assert!(!evaluations.is_empty());
+        let mut audit = AuditAccumulator::default();
+        for evaluation in &evaluations {
+            for _ in 0..2 {
+                audit.observe(&EventLine {
+                    event_type: "strategy_evaluation".to_owned(),
+                    recorded_ts: now,
+                    payload: evaluation.clone(),
+                    raw: Value::Null,
+                });
+            }
+        }
+        let result = audit.finish();
+        assert_eq!(result["strategy_evaluations"], evaluations.len());
+        assert_eq!(
+            result["strategy_evaluation_retry_duplicates"],
+            evaluations.len()
+        );
+        assert_eq!(result["strategy_transform_parity_rate"], 1.0);
+
+        let mut audit = AuditAccumulator::default();
+        let evaluation = evaluations[0].clone();
+        audit.observe(&EventLine {
+            event_type: "strategy_evaluation".to_owned(),
+            recorded_ts: now,
+            payload: evaluation.clone(),
+            raw: Value::Null,
+        });
+        let mut conflicting = evaluation;
+        conflicting["cancel_existing"] =
+            json!(!conflicting["cancel_existing"].as_bool().unwrap_or_default());
+        audit.observe(&EventLine {
+            event_type: "strategy_evaluation".to_owned(),
+            recorded_ts: now,
+            payload: conflicting,
+            raw: Value::Null,
+        });
+        let result = audit.finish();
+        assert_eq!(result["strategy_evaluations"], 1);
+        assert_eq!(result["strategy_evaluation_conflicts"], 1);
+        assert_eq!(result["strategy_evaluation_invalid"], 1);
+    }
+
+    #[test]
+    fn audit_v3_rejects_tampered_replay_output_and_secret_bearing_input() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let (mut tampered, _) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        tampered["pipeline_output"]["final_decisions"][0]["reason"] = json!("tampered");
+        tampered["pipeline_output_sha256"] =
+            json!(canonical_value_sha256(&tampered["pipeline_output"]).unwrap());
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(&mut audit, now, tampered);
+        let result = audit.finish();
+        assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
+        assert_eq!(result["decision_parity_rate"], 0.0);
+
+        let (mut secret, _) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        secret["pipeline_input"]["settings"]["live"]["polymarket_private_key"] =
+            json!("must-never-be-recorded");
+        let input_hash = canonical_value_sha256(&secret["pipeline_input"]).unwrap();
+        secret["pipeline_input_sha256"] = json!(input_hash.clone());
+        secret["batch_id"] = json!(format!(
+            "strategy-batch-{}",
+            input_hash.trim_start_matches("sha256:")
+        ));
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(&mut audit, now, secret);
+        let result = audit.finish();
+        assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["decision_parity_rate"], 0.0);
+
+        let mut mismatched_features = decision_pipeline_v3_input(now);
+        mismatched_features.regime_feature_input.q_up = Some(d("0.10"));
+        let (feature_batch, _) = decision_pipeline_v3_evidence(&mismatched_features);
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(&mut audit, now, feature_batch);
+        let result = audit.finish();
+        assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["decision_parity_rate"], 0.0);
+    }
+
+    #[test]
+    fn audit_v3_missing_binding_and_conflicting_retries_fail_closed() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let (batch, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        assert!(decisions.len() >= 2);
+        let mut missing = AuditAccumulator::default();
+        observe_v3_evidence(&mut missing, now, batch.clone());
+        observe_bound_v3_decision(&mut missing, now, decisions[0].clone());
+        let result = missing.finish();
+        assert_eq!(result["decision_parity_rate"], 0.0);
+        assert!(result["decision_output_binding_rate"]
+            .as_f64()
+            .is_some_and(|rate| rate < 1.0));
+
+        let mut conflicting_batch = batch.clone();
+        conflicting_batch["bound_final_decisions"][0]["decision"]["reason"] = json!("conflict");
+        let mut conflict = AuditAccumulator::default();
+        observe_v3_evidence(&mut conflict, now, batch.clone());
+        observe_v3_evidence(&mut conflict, now, conflicting_batch);
+        for decision in &decisions {
+            observe_bound_v3_decision(&mut conflict, now, decision.clone());
+        }
+        let result = conflict.finish();
+        assert_eq!(result["strategy_batches"], 1);
+        assert_eq!(result["strategy_batch_conflicts"], 1);
+        assert_eq!(result["decision_parity_rate"], 0.0);
+
+        let mut conflicting_decision = decisions[0].clone();
+        conflicting_decision["reason"] = json!("conflicting retry");
+        let mut conflict = AuditAccumulator::default();
+        observe_v3_evidence(&mut conflict, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut conflict, now, decision);
+        }
+        observe_bound_v3_decision(&mut conflict, now, conflicting_decision);
+        let result = conflict.finish();
+        assert_eq!(result["strategy_binding_conflicts"], 1);
+        assert_eq!(result["decision_parity_rate"], 0.0);
+    }
+
+    #[test]
+    fn audit_v2_and_orphan_v3_bindings_are_ineligible() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(
+            &mut audit,
+            now,
+            json!({
+                "schema_version": 2,
+                "schema": "polyedge.strategy_decision_batch.v2",
+                "parity_scope": "runtime_output_to_replay_input",
+                "batch_id": format!("strategy-batch-{}", "a".repeat(64))
+            }),
+        );
+        let (_, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        observe_bound_v3_decision(&mut audit, now, decisions[0].clone());
+        let result = audit.finish();
+        assert_eq!(result["strategy_batch_events"], 1);
+        assert_eq!(result["strategy_batches"], 0);
+        assert_eq!(result["strategy_batch_ineligible"], 1);
+        assert_eq!(result["strategy_binding_conflicts"], 1);
+        assert!(result["decision_parity_rate"].is_null());
+    }
+
+    #[test]
+    fn execution_distribution_emits_a_real_confidence_bound() {
+        let result = distribution_summary(&[d("0.01"), d("0.02"), d("0.03")]);
+        assert_eq!(result["count"], 3);
+        assert!(result["ci_95_low"].as_str().is_some());
+        assert!(result["ci_95_high"].as_str().is_some());
+    }
+
+    #[test]
+    fn replay_does_not_apply_dynamic_quote_transform_twice() {
+        let request = ReplayRequest {
+            name: "dynamic_quote_style".to_owned(),
+            fill_model: FillModel::QueueProxyConservative,
+            mode: StrategyProfileMode::DynamicQuoteStyle,
+            settings: RuntimeSettings::default(),
+        };
+        let mut replay = ResearchReplayEngine::new(request, &[]);
+        let mut order = wallet_order("market-1", "2026-07-20T12:00:00Z", "0");
+        order.price = d("0.49");
+        let candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+        let payload = json!({
+            "strategy_metadata": {
+                "candidate": candidate,
+                "regime": "near_strike"
+            }
+        });
+
+        assert!(replay.apply_strategy_mode(
+            &mut order,
+            &payload,
+            wallet_ts("2026-07-20T12:00:00Z")
+        ));
+        assert_eq!(order.price, d("0.49"));
+        assert_eq!(replay.regime_frequency.get("near_strike"), Some(&1));
     }
 
     #[test]
@@ -7521,7 +12301,7 @@ mod tests {
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
         assert!(!market_truth.contains("books.jsonl.gz"));
-        assert!(!market_truth.contains("paper_settlements.jsonl.gz"));
+        assert!(market_truth.contains("paper_settlements.jsonl.gz"));
         assert!(market_truth.contains("other.jsonl.gz"));
         assert!(market_truth.contains("decisions.jsonl.gz"));
 
@@ -7533,6 +12313,15 @@ mod tests {
         assert!(!calibration.contains("decisions.jsonl.gz"));
         assert!(calibration.contains("fair_values.jsonl.gz"));
         assert!(calibration.contains("other.jsonl.gz"));
+
+        let execution_quality =
+            filtered_normalized_event_paths(&paths, EventPathMode::ExecutionQuality)
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect::<BTreeSet<_>>();
+        assert!(execution_quality.contains("decisions.jsonl.gz"));
+        assert!(execution_quality.contains("execution_reports.jsonl.gz"));
+        assert!(execution_quality.contains("other.jsonl.gz"));
     }
 
     #[test]
