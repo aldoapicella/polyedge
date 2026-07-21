@@ -26,6 +26,8 @@ use crate::azure_jobs::{
 use crate::ApiState;
 
 const REPORT_ROOT: &str = "reports/research";
+const PRIMARY_DAILY_ROOT: &str = "reports/research/daily";
+const SHADOW_DAILY_ROOT: &str = "reports/research/shadow/daily";
 const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
 const PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const PROMOTION_MANIFEST_SCHEMA: &str = "promotion_manifest_v1";
@@ -1560,6 +1562,7 @@ async fn start_research_job_by_id(
 
 struct VerifiedDailyBundle {
     date: String,
+    daily_root: String,
     source: String,
     manifest: DailyRunManifest,
     artifact_bytes: BTreeMap<String, Vec<u8>>,
@@ -1568,22 +1571,54 @@ struct VerifiedDailyBundle {
 fn resolve_verified_daily_bundle(
     requested_date: Option<&str>,
 ) -> Result<Option<VerifiedDailyBundle>, String> {
-    if let Some(mut client) = artifact_blob_client("AZURE_RESEARCH_STORAGE_CONTAINER_NAME") {
-        if let Some(bundle) = resolve_azure_verified_daily_bundle(&mut client, requested_date)? {
+    for (daily_root, container_env, expected_runtime_role) in [
+        (
+            SHADOW_DAILY_ROOT,
+            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        ),
+        (
+            PRIMARY_DAILY_ROOT,
+            "AZURE_STORAGE_CONTAINER_NAME",
+            polyedge_config::RuntimeRole::Primary,
+        ),
+    ] {
+        if let Some(mut client) = artifact_blob_client(container_env) {
+            if let Some(bundle) = resolve_azure_verified_daily_bundle(
+                &mut client,
+                daily_root,
+                &expected_runtime_role,
+                requested_date,
+            )? {
+                return Ok(Some(bundle));
+            }
+        }
+    }
+    for (daily_root, expected_runtime_role) in [
+        (
+            SHADOW_DAILY_ROOT,
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        ),
+        (PRIMARY_DAILY_ROOT, polyedge_config::RuntimeRole::Primary),
+    ] {
+        if let Some(bundle) =
+            resolve_local_verified_daily_bundle(daily_root, &expected_runtime_role, requested_date)?
+        {
             return Ok(Some(bundle));
         }
     }
-    resolve_local_verified_daily_bundle(requested_date)
+    Ok(None)
 }
 
 fn resolve_azure_verified_daily_bundle(
     client: &mut AzureBlobClient,
+    daily_root: &str,
+    expected_runtime_role: &polyedge_config::RuntimeRole,
     requested_date: Option<&str>,
 ) -> Result<Option<VerifiedDailyBundle>, String> {
-    let daily_root = format!("{REPORT_ROOT}/daily");
     let pointer_base = requested_date
         .map(|date| format!("{daily_root}/{date}"))
-        .unwrap_or_else(|| daily_root.clone());
+        .unwrap_or_else(|| daily_root.to_owned());
     let pointer_name = format!("{pointer_base}/latest.json");
     let pointer_bytes = match client.download_blob_bytes(&pointer_name) {
         Ok(bytes) => bytes,
@@ -1597,7 +1632,12 @@ fn resolve_azure_verified_daily_bundle(
     let manifest_bytes = client
         .download_blob_bytes(&manifest_name)
         .map_err(|error| format!("Atomic run manifest is unavailable: {error}"))?;
-    let manifest = validate_manifest(&pointer, &manifest_bytes, requested_date)?;
+    let manifest = validate_manifest(
+        &pointer,
+        &manifest_bytes,
+        expected_runtime_role,
+        requested_date,
+    )?;
     let run_prefix = manifest_name
         .strip_suffix("run_manifest.json")
         .ok_or_else(|| "Atomic manifest path must end in run_manifest.json".to_owned())?;
@@ -1616,6 +1656,7 @@ fn resolve_azure_verified_daily_bundle(
     }
     Ok(Some(VerifiedDailyBundle {
         date: pointer.date.to_string(),
+        daily_root: daily_root.to_owned(),
         source: format!("azure://{run_prefix}"),
         manifest,
         artifact_bytes,
@@ -1623,9 +1664,11 @@ fn resolve_azure_verified_daily_bundle(
 }
 
 fn resolve_local_verified_daily_bundle(
+    daily_root: &str,
+    expected_runtime_role: &polyedge_config::RuntimeRole,
     requested_date: Option<&str>,
 ) -> Result<Option<VerifiedDailyBundle>, String> {
-    let daily_root = PathBuf::from(REPORT_ROOT).join("daily");
+    let daily_root = PathBuf::from(daily_root);
     let pointer_base = requested_date
         .map(|date| daily_root.join(date))
         .unwrap_or_else(|| daily_root.clone());
@@ -1641,7 +1684,12 @@ fn resolve_local_verified_daily_bundle(
     let manifest_path = pointer_base.join(&pointer.manifest_path);
     let manifest_bytes = fs::read(&manifest_path)
         .map_err(|error| format!("Atomic run manifest is unavailable: {error}"))?;
-    let manifest = validate_manifest(&pointer, &manifest_bytes, requested_date)?;
+    let manifest = validate_manifest(
+        &pointer,
+        &manifest_bytes,
+        expected_runtime_role,
+        requested_date,
+    )?;
     let run_dir = manifest_path
         .parent()
         .ok_or_else(|| "Atomic run manifest has no parent directory".to_owned())?;
@@ -1659,6 +1707,7 @@ fn resolve_local_verified_daily_bundle(
     }
     Ok(Some(VerifiedDailyBundle {
         date: pointer.date.to_string(),
+        daily_root: daily_root.to_string_lossy().replace('\\', "/"),
         source: run_dir.to_string_lossy().replace('\\', "/"),
         manifest,
         artifact_bytes,
@@ -1690,6 +1739,7 @@ fn validate_pointer(
 fn validate_manifest(
     pointer: &LatestRunPointer,
     bytes: &[u8],
+    expected_runtime_role: &polyedge_config::RuntimeRole,
     requested_date: Option<&str>,
 ) -> Result<DailyRunManifest, String> {
     if sha256_hex(bytes) != pointer.manifest_sha256 {
@@ -1711,8 +1761,18 @@ fn validate_manifest(
     {
         return Err("Atomic run manifest has invalid Git provenance".to_owned());
     }
-    if manifest.schema_version == 2 && manifest.runtime_role.is_none() {
-        return Err("Atomic run manifest has no runtime role provenance".to_owned());
+    if manifest.schema_version == 2 {
+        match manifest.runtime_role.as_ref() {
+            None => {
+                return Err("Atomic run manifest has no runtime role provenance".to_owned());
+            }
+            Some(runtime_role) if runtime_role != expected_runtime_role => {
+                return Err(
+                    "Atomic run manifest runtime role does not match its daily root".to_owned(),
+                );
+            }
+            Some(_) => {}
+        }
     }
     if manifest.date != pointer.date || manifest.run_id != pointer.run_id {
         return Err("Atomic run manifest identity does not match latest.json".to_owned());
@@ -1765,13 +1825,17 @@ fn bundle_json(bundle: &VerifiedDailyBundle, candidates: &[&str]) -> Value {
 }
 
 fn daily_payload_from_bundle(bundle: &VerifiedDailyBundle) -> Value {
+    let daily_root = bundle
+        .daily_root
+        .strip_prefix(&format!("{REPORT_ROOT}/"))
+        .unwrap_or(&bundle.daily_root);
     let artifacts = bundle
         .manifest
         .artifacts
         .values()
         .map(|artifact| {
             json!({
-                "artifact_id": format!("daily~{}~runs~{}~{}", bundle.date, bundle.manifest.run_id, artifact.relative_path.replace('/', "~")),
+                "artifact_id": format!("{}~{}~runs~{}~{}", daily_root.replace('/', "~"), bundle.date, bundle.manifest.run_id, artifact.relative_path.replace('/', "~")),
                 "path": artifact.relative_path,
                 "kind": FsPath::new(&artifact.relative_path).extension().and_then(|value| value.to_str()),
                 "size_bytes": artifact.bytes,
@@ -3175,6 +3239,154 @@ mod tests {
     }
 
     #[test]
+    fn daily_report_payload_prefers_verified_shadow_bundle() {
+        let date = "2099-12-29";
+        let primary_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(date);
+        let shadow_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let _primary_guard = CleanupPath(primary_dir);
+        let _shadow_guard = CleanupPath(shadow_dir);
+        build_atomic_test_bundle_at(
+            PRIMARY_DAILY_ROOT,
+            date,
+            "api-primary-001",
+            polyedge_config::RuntimeRole::Primary,
+        );
+        build_atomic_test_bundle_at(
+            SHADOW_DAILY_ROOT,
+            date,
+            "api-shadow-001",
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        );
+
+        let payload = daily_report_payload(date);
+
+        assert_eq!(payload["status"], "complete");
+        assert_eq!(payload["run_id"], "api-shadow-001");
+        assert!(payload["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("reports/research/shadow/daily")));
+        let artifact_id = payload["artifacts"]
+            .as_array()
+            .and_then(|artifacts| {
+                artifacts
+                    .iter()
+                    .find(|artifact| artifact["path"] == "final_report.json")
+            })
+            .and_then(|artifact| artifact["artifact_id"].as_str())
+            .expect("shadow artifact id");
+        assert!(artifact_id.starts_with("shadow~daily~2099-12-29~runs~api-shadow-001~"));
+        let artifact_path = PathBuf::from(REPORT_ROOT).join(artifact_id.replace('~', "/"));
+        let artifact = artifact_payload(&artifact_path)
+            .expect("read shadow artifact")
+            .expect("shadow artifact exists");
+        assert_eq!(
+            artifact["content"]["result"]["executive_summary"]["recommendation"],
+            "collect"
+        );
+    }
+
+    #[test]
+    fn invalid_shadow_bundle_does_not_fall_back_to_primary() {
+        let date = "2099-12-28";
+        let primary_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(date);
+        let shadow_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let _primary_guard = CleanupPath(primary_dir);
+        let _shadow_guard = CleanupPath(shadow_dir.clone());
+        build_atomic_test_bundle_at(
+            PRIMARY_DAILY_ROOT,
+            date,
+            "api-primary-002",
+            polyedge_config::RuntimeRole::Primary,
+        );
+        build_atomic_test_bundle_at(
+            SHADOW_DAILY_ROOT,
+            date,
+            "api-shadow-002",
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        );
+        fs::write(
+            shadow_dir.join("runs/api-shadow-002/final_report.json"),
+            r#"{"tampered":true}"#,
+        )
+        .expect("tamper shadow artifact");
+
+        let payload = daily_report_payload(date);
+
+        assert_eq!(payload["status"], "atomic_bundle_invalid");
+        assert!(payload["report"].is_null());
+        assert!(payload["artifacts"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn daily_report_payload_rejects_runtime_role_root_mismatch() {
+        let date = "2099-12-27";
+        let shadow_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let _shadow_guard = CleanupPath(shadow_dir);
+        build_atomic_test_bundle_at(
+            SHADOW_DAILY_ROOT,
+            date,
+            "api-shadow-role-mismatch",
+            polyedge_config::RuntimeRole::Primary,
+        );
+
+        let payload = daily_report_payload(date);
+
+        assert_eq!(payload["status"], "atomic_bundle_invalid");
+        assert_eq!(
+            payload["detail"],
+            "Atomic run manifest runtime role does not match its daily root"
+        );
+    }
+
+    #[test]
+    fn latest_report_uses_global_shadow_pointer_and_primary_fallback() {
+        let date = "2099-12-26";
+        let primary_date_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(date);
+        let shadow_date_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(date);
+        let _primary_date_guard = CleanupPath(primary_date_dir);
+        let _shadow_date_guard = CleanupPath(shadow_date_dir.clone());
+        let _primary_pointer_guard =
+            RestoreFile::new(PathBuf::from(PRIMARY_DAILY_ROOT).join("latest.json"));
+        let _shadow_pointer_guard =
+            RestoreFile::new(PathBuf::from(SHADOW_DAILY_ROOT).join("latest.json"));
+        build_atomic_test_bundle_at(
+            PRIMARY_DAILY_ROOT,
+            date,
+            "api-primary-global",
+            polyedge_config::RuntimeRole::Primary,
+        );
+        write_global_pointer(PRIMARY_DAILY_ROOT, date);
+
+        let primary = read_latest_report_payload();
+        assert_eq!(primary["status"], "complete");
+        assert_eq!(primary["run_id"], "api-primary-global");
+
+        build_atomic_test_bundle_at(
+            SHADOW_DAILY_ROOT,
+            date,
+            "api-shadow-global",
+            polyedge_config::RuntimeRole::ProfitabilityShadow,
+        );
+        write_global_pointer(SHADOW_DAILY_ROOT, date);
+
+        let shadow = read_latest_report_payload();
+        assert_eq!(shadow["status"], "complete");
+        assert_eq!(shadow["run_id"], "api-shadow-global");
+        assert!(shadow["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("reports/research/shadow/daily")));
+
+        fs::write(
+            shadow_date_dir.join("runs/api-shadow-global/final_report.json"),
+            r#"{"tampered":true}"#,
+        )
+        .expect("tamper global shadow artifact");
+        let invalid = read_latest_report_payload();
+        assert_eq!(invalid["status"], "atomic_bundle_invalid");
+        assert!(invalid["report"].is_null());
+    }
+
+    #[test]
     fn log_analytics_rows_redact_secret_like_content() {
         let payload = json!({
             "tables": [{
@@ -3290,6 +3502,20 @@ mod tests {
     }
 
     fn build_atomic_test_bundle(date: &str, run_id: &str) {
+        build_atomic_test_bundle_at(
+            PRIMARY_DAILY_ROOT,
+            date,
+            run_id,
+            polyedge_config::RuntimeRole::Primary,
+        );
+    }
+
+    fn build_atomic_test_bundle_at(
+        daily_root: &str,
+        date: &str,
+        run_id: &str,
+        runtime_role: polyedge_config::RuntimeRole,
+    ) {
         use chrono::NaiveDate;
         use polyedge_reporting::research::{
             DailyRunManifest, DataQualitySummary, LatestRunPointer, RunArtifact, RunStatus,
@@ -3298,9 +3524,7 @@ mod tests {
 
         let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
         let quality = DataQualitySummary::new(2, Decimal::ONE, Vec::new(), Vec::new());
-        let date_dir = PathBuf::from(REPORT_ROOT)
-            .join("daily")
-            .join(date.to_string());
+        let date_dir = PathBuf::from(daily_root).join(date.to_string());
         let run_dir = date_dir.join("runs").join(run_id);
         fs::create_dir_all(&run_dir).expect("atomic test run directory");
         let test_artifacts = [
@@ -3332,7 +3556,7 @@ mod tests {
         let manifest = DailyRunManifest {
             schema_version: 2,
             git_sha: Some("a".repeat(40)),
-            runtime_role: Some(polyedge_config::RuntimeRole::Primary),
+            runtime_role: Some(runtime_role),
             date,
             run_id: run_id.to_owned(),
             created_at: now,
@@ -3359,11 +3583,49 @@ mod tests {
         .unwrap();
     }
 
+    fn write_global_pointer(daily_root: &str, date: &str) {
+        let date_pointer_path = PathBuf::from(daily_root).join(date).join("latest.json");
+        let mut pointer: LatestRunPointer = serde_json::from_slice(
+            &fs::read(date_pointer_path).expect("read date pointer for global pointer"),
+        )
+        .expect("parse date pointer for global pointer");
+        pointer.manifest_path = format!("{date}/{}", pointer.manifest_path);
+        let root = PathBuf::from(daily_root);
+        fs::create_dir_all(&root).expect("create global daily root");
+        fs::write(
+            root.join("latest.json"),
+            serde_json::to_vec_pretty(&pointer).unwrap(),
+        )
+        .expect("write global pointer");
+    }
+
     struct CleanupPath(PathBuf);
 
     impl Drop for CleanupPath {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RestoreFile {
+        path: PathBuf,
+        original: Option<Vec<u8>>,
+    }
+
+    impl RestoreFile {
+        fn new(path: PathBuf) -> Self {
+            let original = fs::read(&path).ok();
+            Self { path, original }
+        }
+    }
+
+    impl Drop for RestoreFile {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                let _ = fs::write(&self.path, original);
+            } else {
+                let _ = fs::remove_file(&self.path);
+            }
         }
     }
 }
