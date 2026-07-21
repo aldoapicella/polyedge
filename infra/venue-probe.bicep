@@ -567,6 +567,7 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'EXECUTION_MODE', value: 'paper' }
             { name: 'ALLOW_LIVE', value: 'false' }
             { name: 'RUN_BOT_ON_STARTUP', value: 'true' }
+            { name: 'RUST_LOG', value: 'warn,polyedge_api::runtime=info' }
             { name: 'REQUIRE_API_AUTH', value: 'false' }
             { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
             { name: 'ALLOW_EMERGENCY_ACCOUNT_CANCEL', value: 'false' }

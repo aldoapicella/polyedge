@@ -2029,16 +2029,32 @@ impl RuntimeController {
     }
 
     async fn retry_pending_settlement(&self, market_id: &MarketId) -> PendingSettlementRetry {
-        let _decision_guard = self.inner.decision_gate.lock().await;
-        let mut engine = self.inner.engine.lock().await;
-        let Some(pending) = engine.pending_settlements.get(market_id).cloned() else {
-            return PendingSettlementRetry::NotPending;
+        let decision_guard = self.inner.decision_gate.lock().await;
+        let pending = {
+            let engine = self.inner.engine.lock().await;
+            let Some(pending) = engine.pending_settlements.get(market_id).cloned() else {
+                return PendingSettlementRetry::NotPending;
+            };
+            pending
         };
         if !self.record_required_events(pending.events).await {
             warn!(
                 market_id = %market_id,
                 settlement_journal_id = %pending.journal_id,
                 "paper settlement retained for retry because durable persistence failed"
+            );
+            return PendingSettlementRetry::Retained;
+        }
+        let mut engine = self.inner.engine.lock().await;
+        if engine
+            .pending_settlements
+            .get(market_id)
+            .is_none_or(|current| current.journal_id != pending.journal_id)
+        {
+            warn!(
+                market_id = %market_id,
+                settlement_journal_id = %pending.journal_id,
+                "paper settlement journal changed while durable evidence was persisted"
             );
             return PendingSettlementRetry::Retained;
         }
@@ -2050,6 +2066,7 @@ impl RuntimeController {
         engine.risk.open_order_count = engine.order_manager.open_order_count();
         engine.decision_generation = engine.decision_generation.wrapping_add(1);
         drop(engine);
+        drop(decision_guard);
         let mut data = self.inner.data.write().await;
         if !data.settled_markets.contains(market_id) {
             data.settled_markets.push(market_id.clone());
@@ -2060,9 +2077,12 @@ impl RuntimeController {
 
     async fn retry_pending_decision_application(&self) -> PendingApplicationRetry {
         let decision_guard = self.inner.decision_gate.lock().await;
-        let mut engine = self.inner.engine.lock().await;
-        let Some(pending) = engine.pending_decision_application.clone() else {
-            return PendingApplicationRetry::NotPending;
+        let pending = {
+            let engine = self.inner.engine.lock().await;
+            let Some(pending) = engine.pending_decision_application.clone() else {
+                return PendingApplicationRetry::NotPending;
+            };
+            pending
         };
         if !self
             .record_required_runtime_events(pending.events.clone())
@@ -2071,6 +2091,18 @@ impl RuntimeController {
             warn!(
                 batch_id = %pending.batch_id,
                 "paper decision application journal retained for retry because durable persistence failed"
+            );
+            return PendingApplicationRetry::Retained;
+        }
+        let mut engine = self.inner.engine.lock().await;
+        if engine
+            .pending_decision_application
+            .as_ref()
+            .is_none_or(|current| current.batch_id != pending.batch_id)
+        {
+            warn!(
+                batch_id = %pending.batch_id,
+                "paper decision application changed while durable evidence was persisted"
             );
             return PendingApplicationRetry::Retained;
         }
@@ -3532,6 +3564,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observed.engine, evaluated_generation.engine + 1);
+    }
+
+    #[tokio::test]
+    async fn status_does_not_hold_data_while_waiting_for_engine() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let engine_guard = controller.inner.engine.lock().await;
+        let status_controller = controller.clone();
+        let status_task = tokio::spawn(async move { status_controller.status().await });
+
+        // Give status a chance to block on the intentionally held engine lock.
+        // A data-first implementation holds a read lock here and reproduces the
+        // live telemetry/feed lock inversion.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let data_guard =
+            tokio::time::timeout(Duration::from_millis(250), controller.inner.data.write())
+                .await
+                .expect("status must not hold data while it waits for the engine");
+        drop(data_guard);
+        drop(engine_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), status_task)
+            .await
+            .expect("status should complete after the engine is released")
+            .expect("status task should not panic");
     }
 
     #[tokio::test]

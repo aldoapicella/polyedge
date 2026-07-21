@@ -26,8 +26,12 @@ impl RuntimeController {
     }
 
     pub async fn status(&self) -> Value {
-        let data = self.inner.data.read().await;
+        // Runtime mutation paths acquire the engine before data. Keep the same
+        // order here: telemetry calls status every minute, so taking data first
+        // can deadlock a feed handler that already owns the engine and needs a
+        // data write lock. That deadlock also stops provenance/recorder progress.
         let engine = self.inner.engine.lock().await;
+        let data = self.inner.data.read().await;
         let now = Utc::now();
         let recorder_status = self.recorder_status();
         let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
