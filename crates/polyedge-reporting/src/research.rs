@@ -2384,6 +2384,7 @@ struct AuditAccumulator {
     strategy_batch_invalid: usize,
     strategy_batch_contract_invalid: usize,
     strategy_batch_contract_invalid_reasons: BTreeMap<String, usize>,
+    strategy_batch_contract_invalid_examples: Vec<Value>,
     strategy_batch_missing_independent_start: usize,
     strategy_batch_ineligible: usize,
     strategy_batch_retry_duplicates: usize,
@@ -3109,13 +3110,66 @@ impl AuditAccumulator {
         }
     }
 
-    fn observe_strategy_batch_contract_invalid(&mut self, reason: &'static str) {
+    fn observe_strategy_batch_contract_invalid(&mut self, reason: &'static str, payload: &Value) {
         self.strategy_batch_invalid += 1;
         self.strategy_batch_contract_invalid += 1;
         *self
             .strategy_batch_contract_invalid_reasons
             .entry(reason.to_owned())
             .or_insert(0) += 1;
+        if self.strategy_batch_contract_invalid_examples.len() < 25 {
+            let input = payload.get("pipeline_input");
+            let output = payload.get("pipeline_output");
+            self.strategy_batch_contract_invalid_examples.push(json!({
+                "reason": reason,
+                "batch_id": payload.get("batch_id").and_then(Value::as_str),
+                "decision_ts": payload.get("decision_ts"),
+                "recorded_pipeline_input_sha256": payload
+                    .get("pipeline_input_sha256")
+                    .and_then(Value::as_str),
+                "computed_pipeline_input_sha256": input.and_then(canonical_value_sha256),
+                "recorded_pipeline_output_sha256": payload
+                    .get("pipeline_output_sha256")
+                    .and_then(Value::as_str),
+                "computed_pipeline_output_sha256": output.and_then(canonical_value_sha256),
+                "input_shape": {
+                    "reference_latency_ms": input
+                        .and_then(|value| value.pointer("/reference/latency_ms")),
+                    "fair_value_sigma": input
+                        .and_then(|value| value.pointer("/fair_value/sigma")),
+                    "fair_value_drift_mu": input
+                        .and_then(|value| value.pointer("/fair_value/drift_mu")),
+                    "feed_divergence_bps": input
+                        .and_then(|value| value.pointer("/regime_feature_input/feed_divergence_bps")),
+                    "adverse_move_after_fill_bps": input
+                        .and_then(|value| value.pointer("/regime_feature_input/adverse_move_after_fill_bps"))
+                },
+                "output_shape": {
+                    "raw_count": output
+                        .and_then(|value| value.get("raw_decisions"))
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    "evaluated_count": output
+                        .and_then(|value| value.get("strategy_evaluations"))
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    "strategy_count": output
+                        .and_then(|value| value.get("strategy_decisions"))
+                        .and_then(Value::as_array)
+                        .map(Vec::len),
+                    "risk_allowed": output
+                        .and_then(|value| value.pointer("/risk_assessment/allowed")),
+                    "risk_reasons": output
+                        .and_then(|value| value.pointer("/risk_assessment/reasons")),
+                    "final_reasons": output
+                        .and_then(|value| value.get("final_decisions"))
+                        .and_then(Value::as_array)
+                        .map(|decisions| decisions.iter().filter_map(|decision| {
+                            decision.get("reason").and_then(Value::as_str)
+                        }).collect::<Vec<_>>())
+                }
+            }));
+        }
     }
 
     fn observe_strategy_batch(&mut self, payload: &Value) {
@@ -3130,14 +3184,14 @@ impl AuditAccumulator {
             .filter(|value| valid_strategy_batch_id(value))
             .map(ToOwned::to_owned)
         else {
-            self.observe_strategy_batch_contract_invalid("invalid_batch_id");
+            self.observe_strategy_batch_contract_invalid("invalid_batch_id", payload);
             return;
         };
         let Some(event_sha256) = run_bundle::stable_json(payload)
             .ok()
             .map(|canonical| sha256_prefixed(canonical.as_bytes()))
         else {
-            self.observe_strategy_batch_contract_invalid("batch_canonicalization_failed");
+            self.observe_strategy_batch_contract_invalid("batch_canonicalization_failed", payload);
             return;
         };
         if let Some(existing) = self.strategy_batch_expected.get_mut(&batch_id) {
@@ -3153,7 +3207,7 @@ impl AuditAccumulator {
                 existing.expected_outputs = None;
             }
             if newly_conflicted {
-                self.observe_strategy_batch_contract_invalid("conflicting_batch_retry");
+                self.observe_strategy_batch_contract_invalid("conflicting_batch_retry", payload);
             }
             return;
         }
@@ -3161,7 +3215,7 @@ impl AuditAccumulator {
         let validated = match validate_strategy_batch(payload) {
             Ok(validated) => Some(validated),
             Err(reason) => {
-                self.observe_strategy_batch_contract_invalid(reason);
+                self.observe_strategy_batch_contract_invalid(reason, payload);
                 None
             }
         };
@@ -3636,6 +3690,7 @@ impl AuditAccumulator {
             "strategy_batch_invalid": self.strategy_batch_invalid,
             "strategy_batch_contract_invalid": self.strategy_batch_contract_invalid,
             "strategy_batch_contract_invalid_reasons": self.strategy_batch_contract_invalid_reasons,
+            "strategy_batch_contract_invalid_examples": self.strategy_batch_contract_invalid_examples,
             "strategy_batch_missing_independent_start": self.strategy_batch_missing_independent_start,
             "strategy_batch_ineligible": self.strategy_batch_ineligible,
             "strategy_batch_retry_duplicates": self.strategy_batch_retry_duplicates,
