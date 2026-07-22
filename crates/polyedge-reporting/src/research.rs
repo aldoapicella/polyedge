@@ -3989,7 +3989,9 @@ fn validate_strategy_batch(
     let output_sha256 =
         canonical_value_sha256(output_value).ok_or("pipeline_output_hash_failed")?;
     let start_sha256 = canonical_value_sha256(
-        &serde_json::to_value(start).map_err(|_| "market_start_roundtrip_failed")?,
+        input_value
+            .get("market_start_evidence")
+            .ok_or("missing_market_start_evidence")?,
     )
     .ok_or("market_start_hash_failed")?;
     if payload.get("pipeline_input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str()) {
@@ -4048,7 +4050,13 @@ fn validate_strategy_batch(
             .ok_or("legacy_decision_projection_failed")?
     } else {
         expected_v4_decision_payloads(&replayed_output).ok_or("v4_decision_projection_failed")?
-    };
+    }
+    .into_iter()
+    .map(|decision| {
+        polyedge_storage::wire_normalized_json(&decision)
+            .map_err(|_| "decision_wire_normalization_failed")
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     let bound = payload
         .get("bound_final_decisions")
         .and_then(Value::as_array)

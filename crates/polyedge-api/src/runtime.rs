@@ -26,6 +26,7 @@ use polyedge_engine::{
 };
 use polyedge_execution::{ExecutionClient, PaperExecutionClient};
 use polyedge_feeds::{self, FeedEvent, FeedName};
+use polyedge_storage::{canonical_json_sha256, wire_normalized_json};
 use recorder::RuntimeRecorder;
 use reference::ReferenceAggregator;
 use rust_decimal::Decimal;
@@ -1373,31 +1374,35 @@ impl RuntimeController {
                     risk_before: engine.risk.snapshot(),
                     order_manager_before: engine.order_manager.snapshot(),
                 };
-                let pipeline_input_value = match serde_json::to_value(&pipeline_input) {
+                let pipeline_input_value = match wire_normalized_json(&pipeline_input) {
                     Ok(value @ Value::Object(_)) => value,
                     Ok(_) => {
-                        error!("decision pipeline input did not serialize to an object");
+                        error!("wire-normalized decision pipeline input was not an object");
                         continue;
                     }
                     Err(error) => {
-                        error!("decision pipeline input serialization failed: {error}");
+                        error!("decision pipeline input wire normalization failed: {error}");
                         continue;
                     }
                 };
                 let pipeline_input_sha256 = value_sha256(&pipeline_input_value);
-                let market_start_evidence_sha256 = value_sha256(
-                    &serde_json::to_value(&market_start_evidence).unwrap_or(Value::Null),
-                );
+                let Some(market_start_evidence_value) =
+                    pipeline_input_value.get("market_start_evidence")
+                else {
+                    error!("wire-normalized pipeline input omitted market start evidence");
+                    continue;
+                };
+                let market_start_evidence_sha256 = value_sha256(market_start_evidence_value);
                 let batch_id = decision_batch_id_v4(&pipeline_input_sha256);
                 let pipeline_output = evaluate_decision_pipeline_v3(&pipeline_input);
-                let pipeline_output_value = match serde_json::to_value(&pipeline_output) {
+                let pipeline_output_value = match wire_normalized_json(&pipeline_output) {
                     Ok(value @ Value::Object(_)) => value,
                     Ok(_) => {
-                        error!("decision pipeline output did not serialize to an object");
+                        error!("wire-normalized decision pipeline output was not an object");
                         continue;
                     }
                     Err(error) => {
-                        error!("decision pipeline output serialization failed: {error}");
+                        error!("decision pipeline output wire normalization failed: {error}");
                         continue;
                     }
                 };
@@ -1438,7 +1443,7 @@ impl RuntimeController {
                     .enumerate()
                     .map(|(output_index, (decision, evidence))| {
                         let metadata = evidence.strategy_metadata;
-                        let unbound_payload = evidence.payload;
+                        let unbound_payload = wire_normalized_json(&evidence.payload)?;
                         let binding = DecisionBatchBinding {
                             batch_id: batch_id.clone(),
                             output_index,
@@ -1446,15 +1451,22 @@ impl RuntimeController {
                         };
                         let recorded_payload =
                             bind_decision_event_payload(&unbound_payload, &binding);
-                        PreparedDecision {
+                        Ok::<PreparedDecision, serde_json::Error>(PreparedDecision {
                             decision: decision.clone(),
                             metadata,
                             unbound_payload,
                             binding,
                             payload: recorded_payload,
-                        }
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, _>>();
+                let prepared_decisions = match prepared_decisions {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        error!("final decision evidence wire normalization failed: {error}");
+                        continue;
+                    }
+                };
                 let final_decisions = prepared_decisions
                     .iter()
                     .map(|prepared| {
@@ -1482,6 +1494,21 @@ impl RuntimeController {
                     "pipeline_output": pipeline_output_value,
                     "bound_final_decisions": final_decisions
                 });
+                let strategy_batch = match wire_normalized_json(&strategy_batch) {
+                    Ok(value @ Value::Object(_)) => value,
+                    Ok(_) => {
+                        error!("wire-normalized strategy batch was not an object");
+                        continue;
+                    }
+                    Err(error) => {
+                        error!("strategy batch wire normalization failed: {error}");
+                        continue;
+                    }
+                };
+                if let Err(reason) = validate_decision_batch_content_bindings(&strategy_batch) {
+                    error!(reason, "strategy batch failed content-binding self-check");
+                    continue;
+                }
                 (
                     prepared_decisions,
                     strategy_evidence,
@@ -3326,41 +3353,8 @@ fn bind_applied_decision_output(
     })
 }
 
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        Value::Object(values) => {
-            let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(right.0));
-            format!(
-                "{{{}}}",
-                entries
-                    .into_iter()
-                    .map(|(key, value)| format!(
-                        "{}:{}",
-                        serde_json::to_string(key).expect("JSON key serializes"),
-                        canonical_json(value)
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        }
-        _ => serde_json::to_string(value).expect("JSON value serializes"),
-    }
-}
-
 fn value_sha256(value: &Value) -> String {
-    format!(
-        "sha256:{:x}",
-        Sha256::digest(canonical_json(value).as_bytes())
-    )
+    canonical_json_sha256(value)
 }
 
 fn decision_batch_id_v4(pipeline_input_sha256: &str) -> String {
@@ -3368,6 +3362,58 @@ fn decision_batch_id_v4(pipeline_input_sha256: &str) -> String {
         "strategy-batch-{}",
         pipeline_input_sha256.trim_start_matches("sha256:")
     )
+}
+
+fn validate_decision_batch_content_bindings(payload: &Value) -> Result<(), &'static str> {
+    let input = payload
+        .get("pipeline_input")
+        .ok_or("missing pipeline input")?;
+    let output = payload
+        .get("pipeline_output")
+        .ok_or("missing pipeline output")?;
+    let input_sha256 = value_sha256(input);
+    let output_sha256 = value_sha256(output);
+    let start_sha256 = input
+        .get("market_start_evidence")
+        .map(value_sha256)
+        .ok_or("missing market start evidence")?;
+    if payload.get("pipeline_input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str()) {
+        return Err("pipeline input hash mismatch");
+    }
+    if payload
+        .get("pipeline_output_sha256")
+        .and_then(Value::as_str)
+        != Some(output_sha256.as_str())
+    {
+        return Err("pipeline output hash mismatch");
+    }
+    if payload
+        .get("market_start_evidence_sha256")
+        .and_then(Value::as_str)
+        != Some(start_sha256.as_str())
+    {
+        return Err("market start evidence hash mismatch");
+    }
+    if payload.get("batch_id").and_then(Value::as_str)
+        != Some(decision_batch_id_v4(&input_sha256).as_str())
+    {
+        return Err("strategy batch id mismatch");
+    }
+    let bound = payload
+        .get("bound_final_decisions")
+        .and_then(Value::as_array)
+        .ok_or("missing bound final decisions")?;
+    for (index, entry) in bound.iter().enumerate() {
+        let decision = entry.get("decision").ok_or("missing bound decision")?;
+        let decision_sha256 = value_sha256(decision);
+        if entry.get("output_index").and_then(Value::as_u64) != Some(index as u64)
+            || entry.get("decision_sha256").and_then(Value::as_str)
+                != Some(decision_sha256.as_str())
+        {
+            return Err("bound final decision mismatch");
+        }
+    }
+    Ok(())
 }
 
 fn paper_settlement_journal_id(
@@ -4693,5 +4739,71 @@ mod tests {
             .as_str()
             .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strategy_batch_hashes_bind_the_wire_normalized_payload() {
+        let inputs = [
+            json!({
+                "market_start_evidence": {"price": "100000.0000", "source": "λ-chainlink"},
+                "negative_zero": -0.0,
+                "subnormal": f64::from_bits(1),
+                "large": 1.7976931348623157e308_f64,
+                "small": 2.2250738585072014e-308_f64,
+                "nested": {"z": [3, 2, 1], "a": {"β": true}}
+            }),
+            json!({
+                "market_start_evidence": {"price": "0.500000", "source": "chainlink_rtds"},
+                "negative_zero": 0.0,
+                "subnormal": -f64::from_bits(1),
+                "large": -1.0e250_f64,
+                "small": 1.0e-250_f64,
+                "nested": {"emoji": "🧪", "escaped": "line\nfeed"}
+            }),
+        ];
+
+        for input in inputs {
+            let input = wire_normalized_json(&input).unwrap();
+            let output = wire_normalized_json(&json!({
+                "risk_assessment": {"allowed": true, "reasons": []},
+                "score": input["small"].clone(),
+                "final_decisions": [{"action": "hold", "reason": "no edge Δ"}]
+            }))
+            .unwrap();
+            let input_sha256 = value_sha256(&input);
+            let output_sha256 = value_sha256(&output);
+            let start_sha256 = value_sha256(&input["market_start_evidence"]);
+            let decision = wire_normalized_json(&json!({
+                "action": "hold",
+                "reason": "no edge Δ",
+                "score": output["score"].clone()
+            }))
+            .unwrap();
+            let batch = json!({
+                "batch_id": decision_batch_id_v4(&input_sha256),
+                "pipeline_input_sha256": input_sha256,
+                "pipeline_output_sha256": output_sha256,
+                "market_start_evidence_sha256": start_sha256,
+                "pipeline_input": input,
+                "pipeline_output": output,
+                "bound_final_decisions": [{
+                    "output_index": 0,
+                    "decision_sha256": value_sha256(&decision),
+                    "decision": decision
+                }]
+            });
+            let wire_batch = wire_normalized_json(&batch).unwrap();
+            validate_decision_batch_content_bindings(&wire_batch).unwrap();
+            let reparsed: Value =
+                serde_json::from_slice(&serde_json::to_vec(&wire_batch).unwrap()).unwrap();
+            validate_decision_batch_content_bindings(&reparsed).unwrap();
+
+            let mut tampered = reparsed;
+            tampered["pipeline_output"]["score"] = json!(42.0);
+            assert_eq!(
+                validate_decision_batch_content_bindings(&tampered),
+                Err("pipeline output hash mismatch")
+            );
+        }
     }
 }

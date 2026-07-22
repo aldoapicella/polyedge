@@ -1898,32 +1898,7 @@ struct ProtocolV3MarkoutEconomics {
 }
 
 pub(super) fn stable_json(value: &serde_json::Value) -> Result<String, ResearchError> {
-    match value {
-        serde_json::Value::Array(values) => Ok(format!(
-            "[{}]",
-            values
-                .iter()
-                .map(stable_json)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(",")
-        )),
-        serde_json::Value::Object(values) => {
-            let mut keys = values.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            let fields = keys
-                .into_iter()
-                .map(|key| {
-                    Ok(format!(
-                        "{}:{}",
-                        serde_json::to_string(key)?,
-                        stable_json(&values[key])?
-                    ))
-                })
-                .collect::<Result<Vec<_>, ResearchError>>()?;
-            Ok(format!("{{{}}}", fields.join(",")))
-        }
-        _ => Ok(serde_json::to_string(value)?),
-    }
+    Ok(polyedge_storage::canonical_json(value))
 }
 
 fn protocol_v3_fee_curve(

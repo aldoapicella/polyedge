@@ -69,6 +69,53 @@ pub trait EventRecorder {
     }
 }
 
+/// Canonical JSON shared by producers and independent evidence validators.
+/// Object keys are sorted recursively; arrays retain order.
+pub fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).expect("JSON key serializes"),
+                            canonical_json(value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        _ => serde_json::to_string(value).expect("JSON value serializes"),
+    }
+}
+
+pub fn canonical_json_sha256(value: &Value) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_json(value).as_bytes())
+    )
+}
+
+/// Materialize the exact JSON representation that will cross the recorder
+/// boundary before computing any content binding over it.
+pub fn wire_normalized_json<T: Serialize>(value: &T) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice(&serde_json::to_vec(value)?)
+}
+
 #[derive(Clone, Debug)]
 pub struct JsonlRecorder {
     path: PathBuf,
@@ -2365,6 +2412,36 @@ mod tests {
         remote.extend(&pending[0].1);
         assert_eq!(remote, b"B\nC\n");
         assert!(!starts.contains_key(blob));
+    }
+
+    #[test]
+    fn jsonl_recorder_preserves_wire_normalized_content_bindings() {
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-wire-binding-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let path = dir.join("events.jsonl");
+        let payload = wire_normalized_json(&json!({
+            "unicode": "λ🧪",
+            "negative_zero": -0.0,
+            "subnormal": f64::from_bits(1),
+            "large": 1.7976931348623157e308_f64,
+            "small": 2.2250738585072014e-308_f64,
+            "nested": {"z": [3, 2, 1], "a": {"escaped": "line\nfeed"}}
+        }))
+        .unwrap();
+        let expected_sha256 = canonical_json_sha256(&payload);
+        let event = RuntimeEvent {
+            event_type: "strategy_decision_batch".to_owned(),
+            ts: Utc::now(),
+            data: payload,
+        };
+        JsonlRecorder::new(&path).record(&event).unwrap();
+        let line = fs::read_to_string(&path).unwrap();
+        let recorded: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(canonical_json_sha256(&recorded["payload"]), expected_sha256);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
