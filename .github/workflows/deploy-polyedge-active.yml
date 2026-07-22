@@ -631,7 +631,7 @@ jobs:
           for attempt in $(seq 1 30); do
             curl --fail --silent --show-error -b cookies.txt \
               "https://$fqdn/api/backend/status" -o smoke-status.json
-            if jq -e '.execution_mode == "paper" and .task_health.runtime_loop == "running" and .recorder_metrics.failed_total == 0 and .recorder_metrics.queued <= 1000 and .recorder_status.dropped_count == 0 and .recorder_status.error_count == 0' smoke-status.json >/dev/null; then
+            if jq -e '.execution_mode == "paper" and .task_health.runtime_loop == "running" and .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and .recorder_metrics.queued <= 1000 and .recorder_status.dropped_count == 0' smoke-status.json >/dev/null; then
               status_ready=true
               break
             fi

@@ -7,11 +7,11 @@ use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, thread};
 use thiserror::Error;
 use tracing::warn;
@@ -22,6 +22,8 @@ const AZURE_LEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const AZURE_LEASE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_LEASE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_APPEND_BLOCK_TARGET_BYTES: usize = 4 * 1024 * 1024;
+const AZURE_APPEND_HANDOFF_WINDOW: Duration = Duration::from_secs(120);
+const AZURE_APPEND_RECONCILE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const AZURE_TABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const AZURE_TABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -126,6 +128,8 @@ pub struct AzureAppendBlobRecorder {
     token: ManagedIdentityToken,
     known_append_positions: BTreeMap<String, u64>,
     pending_append_blocks: BufferedAppendBlocks,
+    handoff_unconditional_until: Instant,
+    handoff_ambiguous_starts: BTreeMap<String, u64>,
 }
 
 impl AzureAppendBlobRecorder {
@@ -177,10 +181,17 @@ impl AzureAppendBlobRecorder {
             token: ManagedIdentityToken::new(client_id),
             known_append_positions: BTreeMap::new(),
             pending_append_blocks: BufferedAppendBlocks::new(AZURE_APPEND_BLOCK_TARGET_BYTES),
+            handoff_unconditional_until: Instant::now() + AZURE_APPEND_HANDOFF_WINDOW,
+            handoff_ambiguous_starts: BTreeMap::new(),
         }
     }
 
     fn append_block(&mut self, blob_name: &str, block: &[u8]) -> Result<(), AzureBlobError> {
+        if Instant::now() < self.handoff_unconditional_until
+            || self.handoff_ambiguous_starts.contains_key(blob_name)
+        {
+            return self.append_block_during_handoff(blob_name, block);
+        }
         self.ensure_append_blob(blob_name)?;
         // The shadow recorder is deployed as one replica and is the sole writer
         // for its minute prefix. Binding every append to the last observed byte
@@ -215,14 +226,101 @@ impl AzureAppendBlobRecorder {
                 .reconcile_ambiguous_append(
                     blob_name,
                     expected_position,
-                    block.len(),
+                    block,
                     AzureBlobError::HttpStatus(status),
                 ),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => self.reconcile_ambiguous_append(
                 blob_name,
                 expected_position,
-                block.len(),
+                block,
+                AzureBlobError::Transport(error.to_string()),
+            ),
+        }
+    }
+
+    fn append_block_during_handoff(
+        &mut self,
+        blob_name: &str,
+        block: &[u8],
+    ) -> Result<(), AzureBlobError> {
+        self.ensure_append_blob(blob_name)?;
+        let expected_position = self.append_blob_position(blob_name)?.ok_or_else(|| {
+            AzureBlobError::AppendPosition(format!(
+                "append blob disappeared before handoff append for {blob_name}"
+            ))
+        })?;
+        if let Some(ambiguous_start) = self.handoff_ambiguous_starts.get(blob_name).copied() {
+            let range_outcome = if expected_position > ambiguous_start {
+                self.append_range_contains_block(
+                    blob_name,
+                    ambiguous_start,
+                    expected_position,
+                    block,
+                )
+                .map(|present| {
+                    if present {
+                        HandoffRangeOutcome::ExactBlockPresent
+                    } else {
+                        HandoffRangeOutcome::ExactBlockAbsent
+                    }
+                })
+            } else {
+                Ok(HandoffRangeOutcome::ExactBlockAbsent)
+            };
+            if resolve_handoff_ambiguity(
+                &mut self.handoff_ambiguous_starts,
+                blob_name,
+                expected_position,
+                range_outcome,
+            )? {
+                self.known_append_positions
+                    .insert(blob_name.to_owned(), expected_position);
+                return Ok(());
+            }
+        }
+        self.known_append_positions
+            .insert(blob_name.to_owned(), expected_position);
+        // Retain this exact boundary until either the append returns success or
+        // a later range read proves the canonical block absent/present. If the
+        // reconciliation read itself fails, the next retry must search from
+        // this boundary before it is allowed to append.
+        self.handoff_ambiguous_starts
+            .insert(blob_name.to_owned(), expected_position);
+        let url = self.blob_url(blob_name, Some("comp=appendblock"));
+        let token = self.token.access_token(&self.agent)?;
+        let result = self
+            .agent
+            .put(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .set("content-type", "application/octet-stream")
+            .send_bytes(block);
+        match result {
+            Ok(_) => {
+                self.handoff_ambiguous_starts.remove(blob_name);
+                self.known_append_positions.insert(
+                    blob_name.to_owned(),
+                    expected_position.saturating_add(block.len() as u64),
+                );
+                Ok(())
+            }
+            Err(ureq::Error::Status(status, _)) if is_retryable_azure_status(status) => self
+                .reconcile_ambiguous_append(
+                    blob_name,
+                    expected_position,
+                    block,
+                    AzureBlobError::HttpStatus(status),
+                ),
+            Err(ureq::Error::Status(status, _)) => {
+                self.handoff_ambiguous_starts.remove(blob_name);
+                Err(AzureBlobError::HttpStatus(status))
+            }
+            Err(ureq::Error::Transport(error)) => self.reconcile_ambiguous_append(
+                blob_name,
+                expected_position,
+                block,
                 AzureBlobError::Transport(error.to_string()),
             ),
         }
@@ -294,7 +392,7 @@ impl AzureAppendBlobRecorder {
         &mut self,
         blob_name: &str,
         expected_position: u64,
-        block_len: usize,
+        block: &[u8],
         original_error: AzureBlobError,
     ) -> Result<(), AzureBlobError> {
         let observed_position = self.append_blob_position(blob_name)?.ok_or_else(|| {
@@ -302,22 +400,82 @@ impl AzureAppendBlobRecorder {
                 "append blob disappeared while reconciling {blob_name}"
             ))
         })?;
-        let committed_position = expected_position.saturating_add(block_len as u64);
-        match reconcile_append_position(expected_position, committed_position, observed_position) {
-            Some(true) => {
-                self.known_append_positions
-                    .insert(blob_name.to_owned(), observed_position);
-                Ok(())
-            }
-            Some(false) => {
-                self.known_append_positions
-                    .insert(blob_name.to_owned(), observed_position);
-                Err(original_error)
-            }
-            None => Err(AzureBlobError::AppendPosition(format!(
-                "append position conflict for {blob_name}: expected {expected_position} or {committed_position}, observed {observed_position}"
-            ))),
+        if observed_position < expected_position {
+            return Err(AzureBlobError::AppendPosition(format!(
+                "append position moved backwards for {blob_name}: expected at least {expected_position}, observed {observed_position}"
+            )));
         }
+        if observed_position == expected_position {
+            self.known_append_positions
+                .insert(blob_name.to_owned(), observed_position);
+            return Err(original_error);
+        }
+
+        // A revision handoff can advance the same minute blob between our
+        // HEAD and conditional append. Read only the advanced byte range: if
+        // our exact canonical block is already present, the response was
+        // ambiguous but committed; otherwise the precondition rejected it and
+        // the next retry must append at the newly observed end.
+        let already_committed = self.append_range_contains_block(
+            blob_name,
+            expected_position,
+            observed_position,
+            block,
+        )?;
+        self.known_append_positions
+            .insert(blob_name.to_owned(), observed_position);
+        if already_committed {
+            self.handoff_ambiguous_starts.remove(blob_name);
+            Ok(())
+        } else {
+            Err(original_error)
+        }
+    }
+
+    fn append_range_contains_block(
+        &mut self,
+        blob_name: &str,
+        start: u64,
+        end_exclusive: u64,
+        block: &[u8],
+    ) -> Result<bool, AzureBlobError> {
+        let range_len = end_exclusive.saturating_sub(start);
+        if range_len > AZURE_APPEND_RECONCILE_MAX_BYTES {
+            return Err(AzureBlobError::AppendPosition(format!(
+                "append reconciliation range for {blob_name} is {range_len} bytes, above the {} byte safety limit",
+                AZURE_APPEND_RECONCILE_MAX_BYTES
+            )));
+        }
+        let url = self.blob_url(blob_name, None);
+        let token = self.token.access_token(&self.agent)?;
+        let response = self
+            .agent
+            .get(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .set(
+                "range",
+                &format!("bytes={start}-{}", end_exclusive.saturating_sub(1)),
+            )
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Status(status, _) => AzureBlobError::HttpStatus(status),
+                ureq::Error::Transport(error) => AzureBlobError::Transport(error.to_string()),
+            })?;
+        let mut bytes = Vec::with_capacity(range_len as usize);
+        response
+            .into_reader()
+            .take(range_len.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(AzureBlobError::Io)?;
+        if bytes.len() as u64 != range_len {
+            return Err(AzureBlobError::AppendPosition(format!(
+                "append reconciliation range for {blob_name} returned {} bytes, expected {range_len}",
+                bytes.len()
+            )));
+        }
+        Ok(byte_range_contains_block(&bytes, block))
     }
 
     fn blob_url(&self, blob_name: &str, query: Option<&str>) -> String {
@@ -341,12 +499,10 @@ impl AzureAppendBlobRecorder {
         let mut blocks = blocks.into_iter();
         while let Some((blob_name, block)) = blocks.next() {
             if let Err(error) = self.append_block(&blob_name, &block) {
-                let remaining: Vec<_> = blocks.collect();
-                for (remaining_blob, remaining_block) in remaining.into_iter().rev() {
-                    self.pending_append_blocks
-                        .prepend_chunk(remaining_blob, remaining_block);
-                }
-                self.pending_append_blocks.prepend_chunk(blob_name, block);
+                let mut retry_blocks = vec![(blob_name, block)];
+                retry_blocks.extend(blocks);
+                self.pending_append_blocks
+                    .prepend_retry_blocks(retry_blocks);
                 return Err(error);
             }
         }
@@ -354,17 +510,55 @@ impl AzureAppendBlobRecorder {
     }
 }
 
-fn reconcile_append_position(
-    expected_position: u64,
-    committed_position: u64,
+fn byte_range_contains_block(bytes: &[u8], block: &[u8]) -> bool {
+    if block.is_empty() || block.len() > bytes.len() {
+        return false;
+    }
+    let final_start = bytes.len() - block.len();
+    let mut offset = 0;
+    while offset <= final_start {
+        let Some(relative) = bytes[offset..=final_start]
+            .iter()
+            .position(|byte| *byte == block[0])
+        else {
+            return false;
+        };
+        let start = offset + relative;
+        if bytes[start..start + block.len()] == *block {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffRangeOutcome {
+    ExactBlockPresent,
+    ExactBlockAbsent,
+}
+
+fn resolve_handoff_ambiguity(
+    ambiguous_starts: &mut BTreeMap<String, u64>,
+    blob_name: &str,
     observed_position: u64,
-) -> Option<bool> {
-    if observed_position == committed_position {
-        Some(true)
-    } else if observed_position == expected_position {
-        Some(false)
+    range_outcome: Result<HandoffRangeOutcome, AzureBlobError>,
+) -> Result<bool, AzureBlobError> {
+    let Some(ambiguous_start) = ambiguous_starts.get(blob_name).copied() else {
+        return Ok(false);
+    };
+    if observed_position < ambiguous_start {
+        return Err(AzureBlobError::AppendPosition(format!(
+            "append position moved backwards for {blob_name}: ambiguous handoff started at {ambiguous_start}, observed {observed_position}"
+        )));
+    }
+    let outcome = range_outcome?;
+    if outcome == HandoffRangeOutcome::ExactBlockPresent {
+        ambiguous_starts.remove(blob_name);
+        Ok(true)
     } else {
-        None
+        ambiguous_starts.insert(blob_name.to_owned(), observed_position);
+        Ok(false)
     }
 }
 
@@ -384,12 +578,15 @@ impl EventRecorder for AzureAppendBlobRecorder {
                     .push_line(&self.event_blob_name(event), jsonl_event_line(event)?),
             );
         }
-        self.append_ready_blocks(ready_blocks)?;
+        let mut blocks = self.pending_append_blocks.take_retry_blocks();
+        blocks.extend(ready_blocks);
+        self.append_ready_blocks(blocks)?;
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), StorageError> {
-        let blocks = self.pending_append_blocks.drain();
+        let mut blocks = self.pending_append_blocks.take_retry_blocks();
+        blocks.extend(self.pending_append_blocks.drain());
         self.append_ready_blocks(blocks)?;
         Ok(())
     }
@@ -424,6 +621,8 @@ struct BufferedAppendBlocks {
     max_bytes: usize,
     pending: BTreeMap<String, Vec<u8>>,
     pending_line_sha256: BTreeMap<String, BTreeSet<[u8; 32]>>,
+    retry_blocks: VecDeque<(String, Vec<u8>)>,
+    retry_line_sha256: BTreeMap<String, BTreeSet<[u8; 32]>>,
 }
 
 impl BufferedAppendBlocks {
@@ -432,6 +631,8 @@ impl BufferedAppendBlocks {
             max_bytes: max_bytes.max(1),
             pending: BTreeMap::new(),
             pending_line_sha256: BTreeMap::new(),
+            retry_blocks: VecDeque::new(),
+            retry_line_sha256: BTreeMap::new(),
         }
     }
 
@@ -444,6 +645,10 @@ impl BufferedAppendBlocks {
             .pending_line_sha256
             .get(blob_name)
             .is_some_and(|hashes| hashes.contains(&line_sha256))
+            || self
+                .retry_line_sha256
+                .get(blob_name)
+                .is_some_and(|hashes| hashes.contains(&line_sha256))
         {
             return Vec::new();
         }
@@ -481,27 +686,41 @@ impl BufferedAppendBlocks {
             .collect()
     }
 
-    fn prepend_chunk(&mut self, blob_name: String, chunk: Vec<u8>) {
-        if chunk.is_empty() {
-            return;
-        }
-        let pending = self.pending.remove(&blob_name).unwrap_or_default();
-        let mut merged = Vec::with_capacity(chunk.len() + pending.len());
-        for line in chunk.split_inclusive(|byte| *byte == b'\n') {
-            if !line.is_empty() {
-                self.pending_line_sha256
-                    .entry(blob_name.clone())
-                    .or_default()
-                    .insert(Sha256::digest(line).into());
+    fn prepend_retry_blocks<I>(&mut self, blocks: I)
+    where
+        I: IntoIterator<Item = (String, Vec<u8>)>,
+    {
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|(_, block)| !block.is_empty())
+            .collect();
+        for (blob_name, block) in &blocks {
+            for line in block.split_inclusive(|byte| *byte == b'\n') {
+                if !line.is_empty() {
+                    self.retry_line_sha256
+                        .entry(blob_name.clone())
+                        .or_default()
+                        .insert(Sha256::digest(line).into());
+                }
             }
         }
-        merged.extend(chunk);
-        merged.extend(pending);
-        self.pending.insert(blob_name, merged);
+        for block in blocks.into_iter().rev() {
+            self.retry_blocks.push_front(block);
+        }
+    }
+
+    fn take_retry_blocks(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.retry_line_sha256.clear();
+        self.retry_blocks.drain(..).collect()
     }
 
     fn pending_bytes(&self) -> usize {
-        self.pending.values().map(Vec::len).sum()
+        self.pending.values().map(Vec::len).sum::<usize>()
+            + self
+                .retry_blocks
+                .iter()
+                .map(|(_, block)| block.len())
+                .sum::<usize>()
     }
 
     fn push_pending_if_any(&mut self, blob_name: &str, ready: &mut Vec<(String, Vec<u8>)>) {
@@ -2037,19 +2256,22 @@ mod tests {
     }
 
     #[test]
-    fn buffered_append_blocks_requeues_failed_block_before_pending_data() {
+    fn buffered_append_blocks_freezes_failed_block_before_pending_data() {
         let mut buffer = BufferedAppendBlocks::new(1_024);
-        buffer.prepend_chunk(
+        buffer.prepend_retry_blocks([(
             "events/2026/06/14/12/events.jsonl".to_owned(),
             b"failed\n".to_vec(),
-        );
+        )]);
         assert!(buffer
             .push_line("events/2026/06/14/12/events.jsonl", b"pending\n".to_vec())
             .is_empty());
 
-        let chunks = buffer.drain();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].1, b"failed\npending\n");
+        let retry = buffer.take_retry_blocks();
+        let pending = buffer.drain();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, b"failed\n");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, b"pending\n");
     }
 
     #[test]
@@ -2057,20 +2279,92 @@ mod tests {
         let blob = "events/2026/07/22/02/17.jsonl";
         let line = b"{\"event_type\":\"strategy_decision_batch\"}\n".to_vec();
         let mut buffer = BufferedAppendBlocks::new(1_024);
-        buffer.prepend_chunk(blob.to_owned(), line.clone());
+        buffer.prepend_retry_blocks([(blob.to_owned(), line.clone())]);
 
         assert!(buffer.push_line(blob, line.clone()).is_empty());
-        let chunks = buffer.drain();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].1, line);
+        let retry = buffer.take_retry_blocks();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, line);
+        assert!(buffer.drain().is_empty());
     }
 
     #[test]
-    fn append_position_reconciliation_distinguishes_commit_retry_and_conflict() {
-        assert_eq!(reconcile_append_position(100, 140, 140), Some(true));
-        assert_eq!(reconcile_append_position(100, 140, 100), Some(false));
-        assert_eq!(reconcile_append_position(100, 140, 120), None);
-        assert_eq!(reconcile_append_position(100, 140, 180), None);
+    fn append_reconciliation_finds_only_the_exact_pending_block() {
+        assert!(byte_range_contains_block(b"before-BLOCK-after", b"BLOCK"));
+        assert!(byte_range_contains_block(b"BLOCK", b"BLOCK"));
+        assert!(!byte_range_contains_block(b"before-BLOC-after", b"BLOCK"));
+        assert!(!byte_range_contains_block(b"", b"BLOCK"));
+        assert!(!byte_range_contains_block(b"BLOCK", b""));
+    }
+
+    #[test]
+    fn handoff_ambiguity_boundary_survives_reconciliation_read_failure() {
+        let mut starts = BTreeMap::new();
+        starts.insert("events/minute.jsonl".to_owned(), 100_u64);
+
+        let error = resolve_handoff_ambiguity(
+            &mut starts,
+            "events/minute.jsonl",
+            140,
+            Err(AzureBlobError::Transport(
+                "injected reconciliation GET failure".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected reconciliation"));
+        assert_eq!(starts.get("events/minute.jsonl"), Some(&100));
+
+        let already_committed = resolve_handoff_ambiguity(
+            &mut starts,
+            "events/minute.jsonl",
+            180,
+            Ok(HandoffRangeOutcome::ExactBlockPresent),
+        )
+        .unwrap();
+        assert!(already_committed);
+        assert!(!starts.contains_key("events/minute.jsonl"));
+    }
+
+    #[test]
+    fn ambiguous_committed_block_is_not_coalesced_with_later_same_blob_data() {
+        let blob = "events/minute.jsonl";
+        let block_b = b"B\n".to_vec();
+        let line_c = b"C\n".to_vec();
+        let mut remote = block_b.clone();
+        let mut starts = BTreeMap::new();
+        starts.insert(blob.to_owned(), 100_u64);
+        let mut buffer = BufferedAppendBlocks::new(1_024);
+
+        let error = resolve_handoff_ambiguity(
+            &mut starts,
+            blob,
+            102,
+            Err(AzureBlobError::Transport(
+                "injected reconciliation GET failure".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected reconciliation"));
+        buffer.prepend_retry_blocks([(blob.to_owned(), block_b.clone())]);
+
+        assert!(buffer.push_line(blob, line_c.clone()).is_empty());
+        let retry = buffer.take_retry_blocks();
+        assert_eq!(retry, vec![(blob.to_owned(), block_b.clone())]);
+        assert!(byte_range_contains_block(&remote, &retry[0].1));
+
+        let already_committed = resolve_handoff_ambiguity(
+            &mut starts,
+            blob,
+            102,
+            Ok(HandoffRangeOutcome::ExactBlockPresent),
+        )
+        .unwrap();
+        assert!(already_committed);
+        let pending = buffer.drain();
+        assert_eq!(pending, vec![(blob.to_owned(), line_c)]);
+        remote.extend(&pending[0].1);
+        assert_eq!(remote, b"B\nC\n");
+        assert!(!starts.contains_key(blob));
     }
 
     #[test]

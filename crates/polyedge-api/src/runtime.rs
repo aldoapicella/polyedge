@@ -48,6 +48,7 @@ const RECORDER_BATCH_LIMIT: usize = 500;
 const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 const RECORDER_COMPLETED_DURABLE_BATCH_LIMIT: usize = 10_000;
 const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
+const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
 const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
@@ -514,15 +515,44 @@ impl RuntimeController {
             .recorder_metrics
             .last_batch_size
             .store(1, Ordering::Relaxed);
-        let result = self
-            .inner
-            .recorder
-            .lock()
-            .map_err(|error| format!("runtime recorder lock poisoned: {error}"))
-            .and_then(|mut recorder| {
-                recorder.record_batch(std::slice::from_ref(&event))?;
-                recorder.flush()
-            });
+        let mut authoritative_staged = false;
+        let mut last_error = None;
+        let mut result = Err("startup provenance persistence was not attempted".to_owned());
+        for attempt in 1..=STARTUP_PROVENANCE_ATTEMPTS {
+            result = self
+                .inner
+                .recorder
+                .lock()
+                .map_err(|error| format!("runtime recorder lock poisoned: {error}"))
+                .and_then(|mut recorder| {
+                    if authoritative_staged {
+                        return recorder.retry_pending();
+                    }
+                    let authoritative_remote = recorder.has_authoritative_remote();
+                    let staged = recorder.record_batch(std::slice::from_ref(&event));
+                    if authoritative_remote {
+                        authoritative_staged = true;
+                    }
+                    staged?;
+                    recorder.flush()
+                });
+            if result.is_ok() {
+                break;
+            }
+            last_error = result.as_ref().err().cloned();
+            self.inner
+                .recorder_metrics
+                .failed_total
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                attempt,
+                max_attempts = STARTUP_PROVENANCE_ATTEMPTS,
+                "startup provenance durable persistence failed; retrying"
+            );
+            if attempt < STARTUP_PROVENANCE_ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
         match result {
             Ok(()) => {
                 self.inner
@@ -537,13 +567,7 @@ impl RuntimeController {
                 let _ = self.inner.broadcaster.send(event);
                 Ok(())
             }
-            Err(error) => {
-                self.inner
-                    .recorder_metrics
-                    .failed_total
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(error)
-            }
+            Err(error) => Err(last_error.unwrap_or(error)),
         }
     }
 
@@ -2721,6 +2745,11 @@ fn spawn_recorder_worker(
                     Ok(mut recorder) => recorder.record_batch(&events),
                     Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
                 };
+                // `record_batch` can attempt a previously frozen Azure block.
+                // Keep current health failed while that exact block remains in
+                // the recorder's immutable retry queue, even though these
+                // best-effort requests do not wait for a durable ack.
+                update_recorder_flush_health(&metrics, &result);
                 saturating_sub_atomic(&metrics.queued, event_count);
                 match &result {
                     Ok(()) => {
@@ -3553,6 +3582,7 @@ mod tests {
         pending: Vec<RuntimeEvent>,
         committed_event_types: Vec<Vec<String>>,
         record_batch_calls: Vec<Vec<String>>,
+        best_effort_record_failures_remaining: usize,
         durable_flush_failures_remaining: usize,
     }
 
@@ -3574,15 +3604,19 @@ mod tests {
                     .collect(),
             );
             state.pending.extend_from_slice(events);
+            let best_effort_only = events.iter().all(|event| event.event_type == "book");
+            if best_effort_only && state.best_effort_record_failures_remaining > 0 {
+                state.best_effort_record_failures_remaining -= 1;
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected best-effort record failure",
+                )));
+            }
             Ok(())
         }
 
         fn flush(&mut self) -> Result<(), StorageError> {
             let mut state = self.state.lock().unwrap();
-            let durable_pending = state
-                .pending
-                .iter()
-                .any(|event| event.event_type == "required_evidence");
+            let durable_pending = state.pending.iter().any(|event| event.event_type != "book");
             if durable_pending && state.durable_flush_failures_remaining > 0 {
                 state.durable_flush_failures_remaining -= 1;
                 return Err(StorageError::Io(std::io::Error::other(
@@ -4255,6 +4289,56 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_failure_stays_unrecovered_until_retry_flush_succeeds() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            ..BufferedRecorderTestState::default()
+        }));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
+        let metrics = Arc::new(RecorderMetrics::default());
+        let (sender, receiver) = std_mpsc::channel();
+        spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::best_effort(RuntimeEvent {
+                event_type: "book".to_owned(),
+                ts: Utc::now(),
+                data: json!({"sequence": 1}),
+            }))
+            .unwrap();
+
+        for _ in 0..100 {
+            if metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert_eq!(metrics.snapshot()["queued"], 0);
+        assert_eq!(metrics.snapshot()["flush_unrecovered"], true);
+        assert_eq!(metrics.snapshot()["flush_failed_total"], 1);
+
+        drop(sender);
+        for _ in 0..100 {
+            if metrics.snapshot()["flush_unrecovered"] == false {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert_eq!(metrics.snapshot()["flush_unrecovered"], false);
+        assert_eq!(metrics.snapshot()["flush_recovered_total"], 1);
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
+            vec![vec!["book"]]
+        );
+    }
+
+    #[test]
     fn durable_recorder_ack_fails_then_retries_the_same_journal() {
         let dir = std::env::temp_dir().join(format!(
             "polyedge-recorder-ack-{}-{}",
@@ -4401,6 +4485,54 @@ mod tests {
                 .flatten()
                 .filter(|event_type| event_type.as_str() == "required_evidence")
                 .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_provenance_retries_the_staged_block_without_rerecording() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: 2,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+
+        controller
+            .persist_startup_provenance(json!({"git_sha": "a".repeat(40)}))
+            .unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .record_batch_calls
+                .iter()
+                .filter(|events| events.len() == 1 && events[0].as_str() == "runtime_provenance")
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .committed_event_types
+                .iter()
+                .flatten()
+                .filter(|event_type| event_type.as_str() == "runtime_provenance")
+                .count(),
+            1
+        );
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["failed_total"],
+            2
+        );
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["persisted_total"],
             1
         );
     }
