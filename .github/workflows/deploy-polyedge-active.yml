@@ -8,9 +8,21 @@ on:
         required: true
         default: false
         type: boolean
+      research_job_target:
+        description: Route this dispatch to the isolated research-job deployer without changing the active runtime
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - build-only
+          - polyedge-shadow-daily-neu-job
+          - polyedge-backfill-job
+          - polyedge-prospective-job
+          - polyedge-chart-backfill-job
 
 concurrency:
-  group: polyedge-azure-control-plane
+  group: ${{ inputs.research_job_target != 'none' && 'polyedge-research-deploy-caller' || 'polyedge-azure-control-plane' }}
   cancel-in-progress: false
 
 permissions:
@@ -24,7 +36,15 @@ env:
   GITHUB_DEPLOY_IDENTITY_NAME: id-github-polyedge-dev
 
 jobs:
+  research-job-deploy:
+    if: inputs.research_job_target != 'none'
+    uses: ./.github/workflows/deploy-polyedge-research-jobs.yml
+    with:
+      target_job: ${{ inputs.research_job_target }}
+    secrets: inherit
+
   deploy:
+    if: inputs.research_job_target == 'none'
     runs-on: ubuntu-latest
 
     steps:
