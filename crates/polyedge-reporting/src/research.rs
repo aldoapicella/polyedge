@@ -7,11 +7,12 @@ use polyedge_domain::{
     ConditionId, DecisionAction, MarketId, OrderKind, Outcome, Side, TokenId, TradeDecision,
 };
 use polyedge_engine::{
-    crypto_taker_fee_per_share, evaluate_decision_pipeline_v3, evaluate_frozen_strategy,
-    DecisionPipelineInputV3, DecisionPipelineOutputV3, FrozenStrategyMode, MarketStartEvidenceV1,
-    QuoteStyle, QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier,
-    RegimeClassifierSnapshot, RegimeFeatureInput, RegimeFeatures, RegimePolicy,
-    RegimeReferencePoint, StrategyDecisionMetadata,
+    crypto_taker_fee_per_share, decision_config_projection_v1, evaluate_decision_pipeline_v3,
+    evaluate_frozen_strategy, final_decision_evidence_v1, DecisionPipelineInputV3,
+    DecisionPipelineOutputV3, FrozenStrategyMode, MarketStartEvidenceV1, QuoteStyle,
+    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeClassifierSnapshot,
+    RegimeFeatureInput, RegimeFeatures, RegimePolicy, RegimeReferencePoint,
+    StrategyDecisionMetadata,
 };
 use polyedge_storage::{
     AzureBlobClient, AzureBlobError, AzureBlobItem, ImmutableBlobWrite, VersionedBlobBytes,
@@ -2278,6 +2279,7 @@ struct StrategyBatchOutputV3 {
 
 #[derive(Clone, Debug)]
 struct StrategyBatchAuditV3 {
+    schema_version: u64,
     event_sha256: String,
     expected_outputs: Option<Vec<StrategyBatchOutputV3>>,
     market_start_evidence: Option<MarketStartEvidenceV1>,
@@ -2359,8 +2361,13 @@ struct AuditAccumulator {
     markets: BTreeMap<String, MarketTruth>,
     token_to_market: BTreeMap<String, String>,
     decisions: usize,
+    decision_count_by_action: BTreeMap<String, usize>,
     decisions_with_strategy_metadata: usize,
+    decisions_with_strategy_metadata_by_action: BTreeMap<String, usize>,
+    decisions_with_final_metadata: usize,
+    decisions_with_final_metadata_by_action: BTreeMap<String, usize>,
     decision_grade_decisions: usize,
+    decision_grade_by_action: BTreeMap<String, usize>,
     decision_grade_evaluations: usize,
     place_decisions: usize,
     place_decisions_with_complete_execution_fields: usize,
@@ -2828,7 +2835,7 @@ impl AuditAccumulator {
             && payload
                 .get("decision_batch_schema_version")
                 .and_then(Value::as_u64)
-                == Some(3)
+                .is_some_and(supported_decision_batch_version)
         {
             if let Some(output) = durable_decision_output_v3(payload) {
                 if let Some(existing) = self.actionable_decision_outputs.get(&output.key) {
@@ -2851,7 +2858,7 @@ impl AuditAccumulator {
             if payload
                 .get("decision_batch_schema_version")
                 .and_then(Value::as_u64)
-                != Some(3)
+                .is_none_or(|version| !supported_decision_batch_version(version))
             {
                 self.strategy_binding_ineligible += 1;
             } else if let (Some(output_index), Some(_declared_hash)) = (
@@ -2901,14 +2908,29 @@ impl AuditAccumulator {
             self.unbound_strategy_decisions += 1;
         }
         self.decisions += 1;
-        if let Some(metadata) = payload.get("strategy_metadata") {
+        self.decision_count_by_action
+            .entry(action.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        if payload.get("strategy_metadata").is_some() {
             self.decisions_with_strategy_metadata += 1;
-            if metadata
-                .pointer("/data_quality/decision_grade")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
+            self.decisions_with_strategy_metadata_by_action
+                .entry(action.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        }
+        if let Some(decision_grade) = final_decision_grade_v1(payload) {
+            self.decisions_with_final_metadata += 1;
+            self.decisions_with_final_metadata_by_action
+                .entry(action.clone())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            if decision_grade {
                 self.decision_grade_decisions += 1;
+                self.decision_grade_by_action
+                    .entry(action.clone())
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
             }
         }
         if action == "place" {
@@ -2957,7 +2979,7 @@ impl AuditAccumulator {
         if payload
             .get("decision_batch_schema_version")
             .and_then(Value::as_u64)
-            == Some(3)
+            .is_some_and(supported_decision_batch_version)
         {
             let Some(key) = payload
                 .get("strategy_batch_id")
@@ -3086,15 +3108,10 @@ impl AuditAccumulator {
 
     fn observe_strategy_batch(&mut self, payload: &Value) {
         self.strategy_batch_events += 1;
-        if payload.get("schema_version").and_then(Value::as_u64) != Some(3)
-            || payload.get("schema").and_then(Value::as_str)
-                != Some("polyedge.strategy_decision_batch.v3")
-            || payload.get("parity_scope").and_then(Value::as_str)
-                != Some("full_decision_pipeline_recomputation")
-        {
+        let Some(schema_version) = decision_batch_contract_version(payload) else {
             self.strategy_batch_ineligible += 1;
             return;
-        }
+        };
         let Some(batch_id) = payload
             .get("batch_id")
             .and_then(Value::as_str)
@@ -3125,7 +3142,7 @@ impl AuditAccumulator {
             return;
         }
         self.strategy_batches += 1;
-        let validated = validate_strategy_batch_v3(payload);
+        let validated = validate_strategy_batch(payload);
         if validated.is_none() {
             self.strategy_batch_invalid += 1;
         }
@@ -3138,6 +3155,7 @@ impl AuditAccumulator {
         self.strategy_batch_expected.insert(
             batch_id,
             StrategyBatchAuditV3 {
+                schema_version,
                 event_sha256,
                 expected_outputs,
                 market_start_evidence,
@@ -3201,7 +3219,7 @@ impl AuditAccumulator {
                 let binding_matches = observed_payload
                     .get("decision_batch_schema_version")
                     .and_then(Value::as_u64)
-                    == Some(3)
+                    == Some(batch.schema_version)
                     && observed_payload
                         .get("strategy_batch_id")
                         .and_then(Value::as_str)
@@ -3278,11 +3296,11 @@ impl AuditAccumulator {
     }
 
     fn finish(mut self) -> Value {
-        let v3_provenance_day = self.runtime_provenance.iter().any(|(_, payload)| {
+        let protocol_provenance_day = self.runtime_provenance.iter().any(|(_, payload)| {
             payload
                 .get("decision_pipeline_schema")
                 .and_then(Value::as_str)
-                == Some("polyedge.strategy_decision_batch.v3")
+                .is_some_and(supported_decision_pipeline_schema)
                 && payload
                     .get("decision_pipeline_parity_scope")
                     .and_then(Value::as_str)
@@ -3294,7 +3312,7 @@ impl AuditAccumulator {
                 (payload
                     .get("decision_pipeline_schema")
                     .and_then(Value::as_str)
-                    == Some("polyedge.strategy_decision_batch.v3"))
+                    .is_some_and(supported_decision_pipeline_schema))
                 .then(|| {
                     payload
                         .get("decision_config_sha256")
@@ -3323,7 +3341,7 @@ impl AuditAccumulator {
         let start_price_capture_rate = ratio_f64(markets_with_start, self.markets.len());
         let settlement_rate = ratio_f64(markets_settled, self.markets.len());
         let decision_metadata_coverage =
-            ratio_f64(self.decisions_with_strategy_metadata, self.decisions);
+            ratio_f64(self.decisions_with_final_metadata, self.decisions);
         let final_decision_grade_coverage =
             ratio_f64(self.decision_grade_decisions, self.decisions);
         let decision_grade_coverage =
@@ -3434,13 +3452,19 @@ impl AuditAccumulator {
         if self.decisions > 0 && decision_metadata_coverage.is_none_or(|rate| rate < 0.95) {
             warnings.push(json!(format!(
                 "decision metadata coverage below 95%: {}/{}",
-                self.decisions_with_strategy_metadata, self.decisions
+                self.decisions_with_final_metadata, self.decisions
             )));
         }
         if self.strategy_evaluations > 0 && decision_grade_coverage.is_none_or(|rate| rate < 0.95) {
             warnings.push(json!(format!(
                 "decision-grade evaluation coverage below 95%: {}/{}",
                 self.decision_grade_evaluations, self.strategy_evaluations
+            )));
+        }
+        if self.decisions > 0 && final_decision_grade_coverage.is_none_or(|rate| rate < 0.95) {
+            warnings.push(json!(format!(
+                "final-decision grade coverage below 95%: {}/{}",
+                self.decision_grade_decisions, self.decisions
             )));
         }
         if self.place_decisions > 0 && execution_field_coverage.is_none_or(|rate| rate < 0.95) {
@@ -3464,7 +3488,7 @@ impl AuditAccumulator {
         if self.strategy_batches == 0 {
             warnings.push(json!("runtime/replay decision batch evidence missing"));
         }
-        if (self.strategy_batches > 0 || v3_provenance_day)
+        if (self.strategy_batches > 0 || protocol_provenance_day)
             && (self.strategy_batch_invalid > 0
                 || self.strategy_batch_ineligible > 0
                 || self.strategy_batch_conflicts > 0
@@ -3526,7 +3550,7 @@ impl AuditAccumulator {
                 self.settlement_journal_invalid
             )));
         }
-        if v3_provenance_day && self.settlement_journal_unbound_settlements > 0 {
+        if protocol_provenance_day && self.settlement_journal_unbound_settlements > 0 {
             warnings.push(json!(format!(
                 "v3 paper settlements missing durable journal binding: {}",
                 self.settlement_journal_unbound_settlements
@@ -3563,9 +3587,14 @@ impl AuditAccumulator {
             "missing_start_markets": self.markets.values().filter(|market| market.start_price.is_none()).map(|market| market.market_id.clone()).collect::<Vec<_>>(),
             "missing_final_markets": self.markets.values().filter(|market| market.final_price.is_none()).map(|market| market.market_id.clone()).collect::<Vec<_>>(),
             "decision_count": self.decisions,
+            "decision_count_by_action": self.decision_count_by_action,
             "decisions_with_strategy_metadata": self.decisions_with_strategy_metadata,
+            "decisions_with_strategy_metadata_by_action": self.decisions_with_strategy_metadata_by_action,
+            "decisions_with_final_metadata": self.decisions_with_final_metadata,
+            "decisions_with_final_metadata_by_action": self.decisions_with_final_metadata_by_action,
             "decision_metadata_coverage": decision_metadata_coverage,
             "decision_grade_decisions": self.decision_grade_decisions,
+            "decision_grade_by_action": self.decision_grade_by_action,
             "final_decision_grade_coverage": final_decision_grade_coverage,
             "decision_grade_evaluations": self.decision_grade_evaluations,
             "decision_grade_coverage": decision_grade_coverage,
@@ -3705,6 +3734,34 @@ impl AuditAccumulator {
     }
 }
 
+fn supported_decision_batch_version(version: u64) -> bool {
+    matches!(version, 3 | 4)
+}
+
+fn supported_decision_pipeline_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        "polyedge.strategy_decision_batch.v3" | "polyedge.strategy_decision_batch.v4"
+    )
+}
+
+fn decision_batch_contract_version(payload: &Value) -> Option<u64> {
+    let version = payload.get("schema_version").and_then(Value::as_u64)?;
+    if !supported_decision_batch_version(version)
+        || payload.get("schema").and_then(Value::as_str)
+            != Some(if version == 3 {
+                "polyedge.strategy_decision_batch.v3"
+            } else {
+                "polyedge.strategy_decision_batch.v4"
+            })
+        || payload.get("parity_scope").and_then(Value::as_str)
+            != Some("full_decision_pipeline_recomputation")
+    {
+        return None;
+    }
+    Some(version)
+}
+
 fn valid_strategy_batch_id(value: &str) -> bool {
     value.strip_prefix("strategy-batch-").is_some_and(|hash| {
         hash.len() == 64
@@ -3749,9 +3806,10 @@ fn market_start_evidence_from_event(payload: &Value) -> Option<MarketStartEviden
         .then_some(evidence)
 }
 
-fn validate_strategy_batch_v3(
+fn validate_strategy_batch(
     payload: &Value,
 ) -> Option<(Vec<StrategyBatchOutputV3>, String, MarketStartEvidenceV1)> {
+    let contract_version = decision_batch_contract_version(payload)?;
     let batch_id = payload.get("batch_id")?.as_str()?;
     let input_value = payload.get("pipeline_input")?;
     let output_value = payload.get("pipeline_output")?;
@@ -3839,7 +3897,11 @@ fn validate_strategy_batch_v3(
     if replayed_output != recorded_output {
         return None;
     }
-    let expected_decisions = expected_v3_decision_payloads(&replayed_output)?;
+    let expected_decisions = if contract_version == 3 {
+        expected_legacy_v3_decision_payloads(&replayed_output)?
+    } else {
+        expected_v4_decision_payloads(&replayed_output)?
+    };
     let bound = payload.get("bound_final_decisions")?.as_array()?;
     if bound.len() != expected_decisions.len() {
         return None;
@@ -3863,26 +3925,10 @@ fn validate_strategy_batch_v3(
 }
 
 fn decision_config_sha256(input: &DecisionPipelineInputV3) -> Option<String> {
-    canonical_value_sha256(&json!({
-        "schema": "polyedge.decision_config.v1",
-        "target": input.settings.target,
-        "data_policy": {
-            "compact_shadow_recording": input.settings.azure.compact_shadow_recording,
-            "shadow_book_sample_ms": input.settings.azure.shadow_book_sample_ms
-        },
-        "strategy": input.settings.strategy,
-        "risk": input.settings.risk,
-        "paper_execution": input.settings.paper,
-        "execution_safety": {
-            "execution_mode": input.settings.live.execution_mode,
-            "allow_live": input.settings.live.allow_live,
-            "confirm_non_restricted_location": input.settings.live.confirm_non_restricted_location,
-            "require_exact_resolution_source_for_live": input.settings.live.require_exact_resolution_source_for_live,
-            "allow_emergency_account_cancel": input.settings.live.allow_emergency_account_cancel
-        },
-        "adaptive_mode": input.adaptive_mode,
-        "candidate": input.adaptive_mode.map(FrozenStrategyMode::candidate)
-    }))
+    canonical_value_sha256(&decision_config_projection_v1(
+        &input.settings,
+        input.adaptive_mode,
+    ))
 }
 
 fn canonical_value_sha256(value: &Value) -> Option<String> {
@@ -3892,10 +3938,10 @@ fn canonical_value_sha256(value: &Value) -> Option<String> {
 }
 
 fn durable_decision_output_v3(payload: &Value) -> Option<DurableDecisionOutputV3> {
-    if payload
+    if !payload
         .get("decision_batch_schema_version")
         .and_then(Value::as_u64)
-        != Some(3)
+        .is_some_and(supported_decision_batch_version)
     {
         return None;
     }
@@ -4127,7 +4173,16 @@ fn contains_secret_key(value: &Value) -> bool {
     }
 }
 
-fn expected_v3_decision_payloads(output: &DecisionPipelineOutputV3) -> Option<Vec<Value>> {
+fn expected_v4_decision_payloads(output: &DecisionPipelineOutputV3) -> Option<Vec<Value>> {
+    final_decision_evidence_v1(output).map(|evidence| {
+        evidence
+            .into_iter()
+            .map(|entry| entry.payload)
+            .collect::<Vec<_>>()
+    })
+}
+
+fn expected_legacy_v3_decision_payloads(output: &DecisionPipelineOutputV3) -> Option<Vec<Value>> {
     let lineage = output
         .strategy_evaluations
         .iter()
@@ -4162,7 +4217,7 @@ fn expected_v3_decision_payloads(output: &DecisionPipelineOutputV3) -> Option<Ve
                     .iter()
                     .enumerate()
                     .filter(|(index, (_, _, source, _))| {
-                        !used[*index] && same_place_decision_lineage(source, decision)
+                        !used[*index] && same_place_decision_lineage_v3(source, decision)
                     })
                     .map(|(index, _)| index)
                     .collect::<Vec<_>>();
@@ -4191,7 +4246,7 @@ fn expected_v3_decision_payloads(output: &DecisionPipelineOutputV3) -> Option<Ve
         .collect()
 }
 
-fn same_place_decision_lineage(source: &TradeDecision, final_decision: &TradeDecision) -> bool {
+fn same_place_decision_lineage_v3(source: &TradeDecision, final_decision: &TradeDecision) -> bool {
     source.action == DecisionAction::Place
         && final_decision.action == DecisionAction::Place
         && source.market_id == final_decision.market_id
@@ -4206,6 +4261,57 @@ fn same_place_decision_lineage(source: &TradeDecision, final_decision: &TradeDec
         && source.post_only == final_decision.post_only
         && source.tick_size == final_decision.tick_size
         && source.neg_risk == final_decision.neg_risk
+}
+
+fn final_decision_grade_v1(payload: &Value) -> Option<bool> {
+    let metadata = payload.get("final_decision_metadata")?;
+    if metadata.get("schema").and_then(Value::as_str) != Some("polyedge.final_decision_metadata.v1")
+    {
+        return None;
+    }
+    let source = metadata.get("source").and_then(Value::as_str)?;
+    let decision_grade = metadata.get("decision_grade").and_then(Value::as_bool)?;
+    let contributors = metadata
+        .get("contributing_strategy_evaluation_indices")?
+        .as_array()?;
+    let contributor_indices = contributors
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>()?;
+    if contributor_indices.iter().collect::<BTreeSet<_>>().len() != contributor_indices.len() {
+        return None;
+    }
+    match source {
+        "strategy_evaluation" | "risk_adjusted_strategy_evaluation" => {
+            if contributor_indices.len() != 1
+                || payload
+                    .get("strategy_evaluation_index")
+                    .and_then(Value::as_u64)
+                    != contributor_indices.first().copied()
+                || payload
+                    .get("strategy_output_index")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                || payload
+                    .pointer("/strategy_metadata/data_quality/decision_grade")
+                    .and_then(Value::as_bool)
+                    != Some(decision_grade)
+            {
+                return None;
+            }
+        }
+        "risk_or_order_reconciliation" => {
+            if (decision_grade && contributor_indices.is_empty())
+                || payload.get("strategy_metadata").is_some()
+                || payload.get("strategy_evaluation_index").is_some()
+                || payload.get("strategy_output_index").is_some()
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(decision_grade)
 }
 
 fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Value {
@@ -4449,7 +4555,7 @@ impl ExecutionQualityAccumulator {
                         .payload
                         .get("decision_batch_schema_version")
                         .and_then(Value::as_u64)
-                        == Some(3) =>
+                        .is_some_and(supported_decision_batch_version) =>
             {
                 if let Some(output) = durable_decision_output_v3(&event.payload) {
                     if let Some(existing) = self.applicable_place_outputs.get(&output.key) {
@@ -7614,7 +7720,7 @@ impl ResearchReplayEngine {
             && payload
                 .get("decision_batch_schema_version")
                 .and_then(Value::as_u64)
-                == Some(3)
+                .is_some_and(supported_decision_batch_version)
         {
             let Some(output) = durable_decision_output_v3(payload) else {
                 self.warnings.insert(
@@ -12383,7 +12489,7 @@ mod tests {
             event_type: "runtime_provenance".to_owned(),
             recorded_ts: start,
             payload: json!({
-                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
                 "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation"
             }),
             raw: Value::Null,
@@ -12562,9 +12668,23 @@ mod tests {
         }
     }
 
-    pub(super) fn decision_pipeline_v3_evidence(
+    pub(super) fn decision_pipeline_v4_evidence(
         input: &DecisionPipelineInputV3,
     ) -> (Value, Vec<Value>) {
+        decision_pipeline_evidence(input, 4)
+    }
+
+    fn decision_pipeline_v3_legacy_evidence(
+        input: &DecisionPipelineInputV3,
+    ) -> (Value, Vec<Value>) {
+        decision_pipeline_evidence(input, 3)
+    }
+
+    fn decision_pipeline_evidence(
+        input: &DecisionPipelineInputV3,
+        contract_version: u64,
+    ) -> (Value, Vec<Value>) {
+        assert!(supported_decision_batch_version(contract_version));
         let output = evaluate_decision_pipeline_v3(input);
         let input_value = serde_json::to_value(input).unwrap();
         let output_value = serde_json::to_value(&output).unwrap();
@@ -12574,7 +12694,11 @@ mod tests {
             "strategy-batch-{}",
             input_sha256.trim_start_matches("sha256:")
         );
-        let decisions = expected_v3_decision_payloads(&output).unwrap();
+        let decisions = if contract_version == 3 {
+            expected_legacy_v3_decision_payloads(&output).unwrap()
+        } else {
+            expected_v4_decision_payloads(&output).unwrap()
+        };
         if !input.kill_switch_enabled {
             assert!(decisions
                 .iter()
@@ -12592,8 +12716,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let batch = json!({
-            "schema_version": 3,
-            "schema": "polyedge.strategy_decision_batch.v3",
+            "schema_version": contract_version,
+            "schema": format!("polyedge.strategy_decision_batch.v{contract_version}"),
             "parity_scope": "full_decision_pipeline_recomputation",
             "batch_id": batch_id,
             "market_id": input.market.market_id,
@@ -12616,7 +12740,10 @@ mod tests {
             .map(|(index, mut decision)| {
                 let hash = canonical_value_sha256(&decision).unwrap();
                 let object = decision.as_object_mut().unwrap();
-                object.insert("decision_batch_schema_version".to_owned(), json!(3));
+                object.insert(
+                    "decision_batch_schema_version".to_owned(),
+                    json!(contract_version),
+                );
                 object.insert("strategy_batch_id".to_owned(), json!(batch_id));
                 object.insert("strategy_batch_output_index".to_owned(), json!(index));
                 object.insert("strategy_decision_sha256".to_owned(), json!(hash));
@@ -12626,7 +12753,7 @@ mod tests {
         (batch, events)
     }
 
-    fn decision_pipeline_v3_strategy_evaluations(input: &DecisionPipelineInputV3) -> Vec<Value> {
+    fn decision_pipeline_v4_strategy_evaluations(input: &DecisionPipelineInputV3) -> Vec<Value> {
         let output = evaluate_decision_pipeline_v3(input);
         let input_hash = canonical_value_sha256(&serde_json::to_value(input).unwrap()).unwrap();
         let batch_id = format!(
@@ -12640,7 +12767,7 @@ mod tests {
             .map(|evaluation| {
                 json!({
                     "schema_version": 1,
-                    "decision_batch_schema_version": 3,
+                    "decision_batch_schema_version": 4,
                     "strategy_batch_id": batch_id,
                     "evaluation_index": evaluation.evaluation_index,
                     "market_id": input.market.market_id,
@@ -12712,7 +12839,7 @@ mod tests {
     #[test]
     fn audit_recomputes_full_v3_pipeline_and_deduplicates_identical_retries() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
-        let (batch, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let (batch, decisions) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
         let semantic_decisions = decisions.len();
         let mut audit = AuditAccumulator::default();
         observe_v3_evidence(&mut audit, now, batch.clone());
@@ -12728,11 +12855,15 @@ mod tests {
         assert_eq!(result["strategy_batch_events"], 2);
         assert_eq!(result["strategy_batches"], 1);
         assert_eq!(result["strategy_batch_retry_duplicates"], 1);
+        assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["strategy_batch_replayed"], 1);
+        assert_eq!(result["strategy_binding_conflicts"], 0);
         assert_eq!(result["decision_count"], semantic_decisions);
         assert!(result["strategy_binding_retry_duplicates"]
             .as_u64()
             .is_some_and(|count| count >= 1));
         assert_eq!(result["decision_metadata_coverage"], 1.0);
+        assert_eq!(result["final_decision_grade_coverage"], 1.0);
         assert_eq!(result["execution_field_coverage"], 1.0);
         assert!(result["decision_config_sha256"]
             .as_str()
@@ -12740,10 +12871,29 @@ mod tests {
     }
 
     #[test]
+    fn audit_replays_immutable_legacy_v3_without_retrofitting_final_grade() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let (batch, decisions) =
+            decision_pipeline_v3_legacy_evidence(&decision_pipeline_v3_input(now));
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(&mut audit, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut audit, now, decision);
+        }
+        let result = audit.finish();
+        assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["strategy_batch_replayed"], 1);
+        assert_eq!(result["strategy_binding_conflicts"], 0);
+        assert_eq!(result["decision_parity_rate"], 1.0);
+        assert_eq!(result["decisions_with_final_metadata"], 0);
+        assert_eq!(result["final_decision_grade_coverage"], 0.0);
+    }
+
+    #[test]
     fn audit_v3_buffers_late_start_evidence_and_rejects_missing_or_conflicting_evidence() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
         let input = decision_pipeline_v3_input(now);
-        let (batch, decisions) = decision_pipeline_v3_evidence(&input);
+        let (batch, decisions) = decision_pipeline_v4_evidence(&input);
 
         let mut late = AuditAccumulator::default();
         late.observe(&EventLine {
@@ -12807,19 +12957,77 @@ mod tests {
         let mut data_policy = input;
         data_policy.settings.azure.shadow_book_sample_ms += 1;
         assert_ne!(decision_config_sha256(&data_policy).unwrap(), baseline);
+
+        let routing_mutations: [fn(&mut DecisionPipelineInputV3); 3] = [
+            |input: &mut DecisionPipelineInputV3| {
+                input.settings.azure.event_blob_prefix.push_str("-changed")
+            },
+            |input: &mut DecisionPipelineInputV3| {
+                input.settings.azure.event_blob_prefix_after_cutover =
+                    Some("shadow-events/after".to_owned())
+            },
+            |input: &mut DecisionPipelineInputV3| {
+                input.settings.azure.event_blob_prefix_cutover_utc =
+                    Some(wallet_ts("2026-07-23T00:00:00Z"))
+            },
+        ];
+        for mutate in routing_mutations {
+            let mut routing = decision_pipeline_v3_input(now);
+            mutate(&mut routing);
+            assert_ne!(decision_config_sha256(&routing).unwrap(), baseline);
+        }
+    }
+
+    #[test]
+    fn synthesized_final_decision_has_explicit_conservative_provenance() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let mut output = evaluate_decision_pipeline_v3(&decision_pipeline_v3_input(now));
+        let mut synthesized = output.final_decisions[0].clone();
+        synthesized.action = DecisionAction::Hold;
+        synthesized.token_id = None;
+        synthesized.outcome = None;
+        synthesized.side = None;
+        synthesized.price = None;
+        synthesized.size = None;
+        synthesized.quote_amount = None;
+        synthesized.order_kind = None;
+        synthesized.reason = "reconciled hold".to_owned();
+        synthesized.ttl_ms = None;
+        synthesized.expected_edge = None;
+        synthesized.post_only = false;
+        synthesized.tick_size = None;
+        output.final_decisions = vec![synthesized];
+
+        let evidence = final_decision_evidence_v1(&output).unwrap();
+        assert_eq!(evidence.len(), 1);
+        let payload = &evidence[0].payload;
+        assert_eq!(
+            payload.pointer("/final_decision_metadata/source"),
+            Some(&json!("risk_or_order_reconciliation"))
+        );
+        assert!(payload.get("strategy_metadata").is_none());
+        assert_eq!(
+            final_decision_grade_v1(payload),
+            Some(
+                output
+                    .strategy_evaluations
+                    .iter()
+                    .all(|evaluation| evaluation.metadata.data_quality.decision_grade)
+            )
+        );
     }
 
     #[test]
     fn audit_v3_freezes_decision_config_across_provenance_and_batches() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
         let input = decision_pipeline_v3_input(now);
-        let (batch, decisions) = decision_pipeline_v3_evidence(&input);
+        let (batch, decisions) = decision_pipeline_v4_evidence(&input);
         let mut audit = AuditAccumulator::default();
         audit.observe(&EventLine {
             event_type: "runtime_provenance".to_owned(),
             recorded_ts: now,
             payload: json!({
-                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
                 "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
                 "decision_config_schema": "polyedge.decision_config.v1",
                 "decision_config_sha256": format!("sha256:{}", "f".repeat(64))
@@ -12845,13 +13053,13 @@ mod tests {
     #[test]
     fn audit_v3_requires_binding_for_cancel_and_hold_without_metadata() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
-        let (batch, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let (batch, decisions) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
         let mut audit = AuditAccumulator::default();
         audit.observe(&EventLine {
             event_type: "runtime_provenance".to_owned(),
             recorded_ts: now,
             payload: json!({
-                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
                 "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation"
             }),
             raw: Value::Null,
@@ -12882,7 +13090,7 @@ mod tests {
     fn audit_deduplicates_v3_strategy_evaluations_before_coverage_counting() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
         let input = decision_pipeline_v3_input(now);
-        let evaluations = decision_pipeline_v3_strategy_evaluations(&input);
+        let evaluations = decision_pipeline_v4_strategy_evaluations(&input);
         assert!(!evaluations.is_empty());
         let mut audit = AuditAccumulator::default();
         for evaluation in &evaluations {
@@ -12929,7 +13137,7 @@ mod tests {
     #[test]
     fn audit_v3_rejects_tampered_replay_output_and_secret_bearing_input() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
-        let (mut tampered, _) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let (mut tampered, _) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
         tampered["pipeline_output"]["final_decisions"][0]["reason"] = json!("tampered");
         tampered["pipeline_output_sha256"] =
             json!(canonical_value_sha256(&tampered["pipeline_output"]).unwrap());
@@ -12940,7 +13148,7 @@ mod tests {
         assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
         assert_eq!(result["decision_parity_rate"], 0.0);
 
-        let (mut secret, _) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let (mut secret, _) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
         secret["pipeline_input"]["settings"]["live"]["polymarket_private_key"] =
             json!("must-never-be-recorded");
         let input_hash = canonical_value_sha256(&secret["pipeline_input"]).unwrap();
@@ -12957,7 +13165,7 @@ mod tests {
 
         let mut mismatched_features = decision_pipeline_v3_input(now);
         mismatched_features.regime_feature_input.q_up = Some(d("0.10"));
-        let (feature_batch, _) = decision_pipeline_v3_evidence(&mismatched_features);
+        let (feature_batch, _) = decision_pipeline_v4_evidence(&mismatched_features);
         let mut audit = AuditAccumulator::default();
         observe_v3_evidence(&mut audit, now, feature_batch);
         let result = audit.finish();
@@ -12968,7 +13176,7 @@ mod tests {
     #[test]
     fn audit_v3_missing_binding_and_conflicting_retries_fail_closed() {
         let now = wallet_ts("2026-07-20T12:00:00Z");
-        let (batch, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let (batch, decisions) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
         assert!(decisions.len() >= 2);
         let mut missing = AuditAccumulator::default();
         observe_v3_evidence(&mut missing, now, batch.clone());
@@ -13019,7 +13227,7 @@ mod tests {
                 "batch_id": format!("strategy-batch-{}", "a".repeat(64))
             }),
         );
-        let (_, decisions) = decision_pipeline_v3_evidence(&decision_pipeline_v3_input(now));
+        let (_, decisions) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
         observe_bound_v3_decision(&mut audit, now, decisions[0].clone());
         let result = audit.finish();
         assert_eq!(result["strategy_batch_events"], 1);

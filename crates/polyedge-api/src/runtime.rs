@@ -19,10 +19,10 @@ use polyedge_domain::{
     RuntimeEvent, TokenId, TradeDecision,
 };
 use polyedge_engine::{
-    evaluate_decision_pipeline_v3, DecisionPipelineInputV3, FrozenStrategyMode,
-    LogReturnFairValueModel, MarketStartEvidenceV1, OrderManager, PaperFillEngine,
-    RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput, RegimeReferencePoint,
-    RestingMakerOrder, RiskManager, StrategyDecisionMetadata,
+    decision_config_projection_v1, evaluate_decision_pipeline_v3, final_decision_evidence_v1,
+    DecisionPipelineInputV3, FrozenStrategyMode, LogReturnFairValueModel, MarketStartEvidenceV1,
+    OrderManager, PaperFillEngine, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
+    RegimeReferencePoint, RestingMakerOrder, RiskManager, StrategyDecisionMetadata,
 };
 use polyedge_execution::{ExecutionClient, PaperExecutionClient};
 use polyedge_feeds::{self, FeedEvent, FeedName};
@@ -97,20 +97,6 @@ struct DecisionBatchBinding {
     decision_sha256: String,
 }
 
-#[derive(Clone, Debug)]
-struct StrategyDecisionLineage {
-    evaluation_index: usize,
-    strategy_output_index: usize,
-    decision: TradeDecision,
-    metadata: StrategyDecisionMetadata,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct StrategyLineageBinding {
-    evaluation_index: usize,
-    strategy_output_index: usize,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DecisionStateGeneration {
     data: u64,
@@ -121,7 +107,7 @@ struct DecisionStateGeneration {
 struct PreparedDecision {
     decision: TradeDecision,
     metadata: Option<StrategyDecisionMetadata>,
-    lineage: Option<StrategyLineageBinding>,
+    unbound_payload: Value,
     binding: DecisionBatchBinding,
     payload: Value,
 }
@@ -1402,7 +1388,7 @@ impl RuntimeController {
                 let market_start_evidence_sha256 = value_sha256(
                     &serde_json::to_value(&market_start_evidence).unwrap_or(Value::Null),
                 );
-                let batch_id = decision_batch_id_v3(&pipeline_input_sha256);
+                let batch_id = decision_batch_id_v4(&pipeline_input_sha256);
                 let pipeline_output = evaluate_decision_pipeline_v3(&pipeline_input);
                 let pipeline_output_value = match serde_json::to_value(&pipeline_output) {
                     Ok(value @ Value::Object(_)) => value,
@@ -1418,20 +1404,11 @@ impl RuntimeController {
                 let pipeline_output_sha256 = value_sha256(&pipeline_output_value);
                 let classifier_after = pipeline_output.classifier_after.clone();
                 let features = pipeline_input.regime_feature_input.clone().build();
-                let mut strategy_lineage = Vec::new();
                 let mut strategy_evidence = Vec::new();
                 for evaluated in &pipeline_output.strategy_evaluations {
-                    if let Some(evaluated_decision) = evaluated.evaluated_decision.as_ref() {
-                        strategy_lineage.push(StrategyDecisionLineage {
-                            evaluation_index: evaluated.evaluation_index,
-                            strategy_output_index: strategy_lineage.len(),
-                            decision: evaluated_decision.clone(),
-                            metadata: evaluated.metadata.clone(),
-                        });
-                    }
                     strategy_evidence.push(json!({
                         "schema_version": 1,
-                        "decision_batch_schema_version": 3,
+                        "decision_batch_schema_version": 4,
                         "strategy_batch_id": batch_id.clone(),
                         "evaluation_index": evaluated.evaluation_index,
                         "market_id": market.market_id.clone(),
@@ -1449,38 +1426,30 @@ impl RuntimeController {
                     }));
                 }
                 let decisions = &pipeline_output.final_decisions;
-                let decision_lineage = bind_final_decision_lineage(decisions, &strategy_lineage);
+                let Some(final_decision_evidence) = final_decision_evidence_v1(&pipeline_output)
+                    .filter(|evidence| evidence.len() == decisions.len())
+                else {
+                    error!("final decision evidence did not bind one-to-one with pipeline output");
+                    continue;
+                };
                 let prepared_decisions = decisions
                     .iter()
+                    .zip(final_decision_evidence)
                     .enumerate()
-                    .map(|(output_index, decision)| {
-                        let source = decision_lineage[output_index];
-                        let metadata = source.map(|source| source.metadata.clone());
-                        let lineage = source.map(|source| StrategyLineageBinding {
-                            evaluation_index: source.evaluation_index,
-                            strategy_output_index: source.strategy_output_index,
-                        });
-                        let payload = decision_event_payload(
-                            decision,
-                            metadata.as_ref(),
-                            lineage.as_ref(),
-                            None,
-                        );
+                    .map(|(output_index, (decision, evidence))| {
+                        let metadata = evidence.strategy_metadata;
+                        let unbound_payload = evidence.payload;
                         let binding = DecisionBatchBinding {
                             batch_id: batch_id.clone(),
                             output_index,
-                            decision_sha256: value_sha256(&payload),
+                            decision_sha256: value_sha256(&unbound_payload),
                         };
-                        let recorded_payload = decision_event_payload(
-                            decision,
-                            metadata.as_ref(),
-                            lineage.as_ref(),
-                            Some(&binding),
-                        );
+                        let recorded_payload =
+                            bind_decision_event_payload(&unbound_payload, &binding);
                         PreparedDecision {
                             decision: decision.clone(),
                             metadata,
-                            lineage,
+                            unbound_payload,
                             binding,
                             payload: recorded_payload,
                         }
@@ -1489,22 +1458,16 @@ impl RuntimeController {
                 let final_decisions = prepared_decisions
                     .iter()
                     .map(|prepared| {
-                        let unbound_payload = decision_event_payload(
-                            &prepared.decision,
-                            prepared.metadata.as_ref(),
-                            prepared.lineage.as_ref(),
-                            None,
-                        );
                         json!({
                             "output_index": prepared.binding.output_index,
                             "decision_sha256": prepared.binding.decision_sha256,
-                            "decision": unbound_payload
+                            "decision": prepared.unbound_payload
                         })
                     })
                     .collect::<Vec<_>>();
                 let strategy_batch = json!({
-                    "schema_version": 3,
-                    "schema": "polyedge.strategy_decision_batch.v3",
+                    "schema_version": 4,
+                    "schema": "polyedge.strategy_decision_batch.v4",
                     "parity_scope": "full_decision_pipeline_recomputation",
                     "batch_id": batch_id.clone(),
                     "market_id": market.market_id.clone(),
@@ -1944,7 +1907,7 @@ impl RuntimeController {
             truncate(&mut data.decisions, HISTORY_LIMIT);
         }
         self.record_pre_decision_book(&decision).await;
-        let payload = decision_event_payload(&decision, metadata.as_ref(), None, binding.as_ref());
+        let payload = decision_event_payload(&decision, metadata.as_ref(), binding.as_ref());
         self.record_event("decision", payload, None, None).await;
     }
 
@@ -3168,7 +3131,7 @@ fn runtime_provenance_with_git_sha_at(
         "paper_maker_fill_policy": settings.paper.maker_fill_policy,
         "adaptive_regime_enabled": settings.strategy.adaptive_regime_enabled,
         "adaptive_regime_mode": settings.strategy.adaptive_regime_mode,
-        "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+        "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
         "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
         "decision_config_schema": "polyedge.decision_config.v1",
         "decision_config_sha256": decision_config_sha256,
@@ -3221,31 +3184,7 @@ fn decision_config_projection(
     settings: &RuntimeSettings,
     adaptive_mode: Option<FrozenStrategyMode>,
 ) -> Value {
-    json!({
-        "schema": "polyedge.decision_config.v1",
-        "target": settings.target,
-        "data_policy": {
-            "compact_shadow_recording": settings.azure.compact_shadow_recording,
-            "shadow_book_sample_ms": settings.azure.shadow_book_sample_ms
-        },
-        "strategy": settings.strategy,
-        "risk": settings.risk,
-        "paper_execution": settings.paper,
-        "execution_safety": {
-            "execution_mode": execution_mode(settings),
-            "allow_live": settings.live.allow_live,
-            "confirm_non_restricted_location": settings.live.confirm_non_restricted_location,
-            "require_exact_resolution_source_for_live": settings.live.require_exact_resolution_source_for_live,
-            "allow_emergency_account_cancel": settings.live.allow_emergency_account_cancel
-        },
-        "event_blob_routing": {
-            "before_cutover": settings.azure.event_blob_prefix,
-            "after_cutover": settings.azure.event_blob_prefix_after_cutover,
-            "cutover_utc": settings.azure.event_blob_prefix_cutover_utc
-        },
-        "adaptive_mode": adaptive_mode,
-        "candidate": adaptive_mode.map(FrozenStrategyMode::candidate)
-    })
+    decision_config_projection_v1(settings, adaptive_mode)
 }
 
 fn decision_config_sha256(
@@ -3258,7 +3197,6 @@ fn decision_config_sha256(
 fn decision_event_payload(
     decision: &TradeDecision,
     metadata: Option<&StrategyDecisionMetadata>,
-    lineage: Option<&StrategyLineageBinding>,
     binding: Option<&DecisionBatchBinding>,
 ) -> Value {
     let mut payload = serde_json::to_value(decision).unwrap_or(Value::Null);
@@ -3271,18 +3209,8 @@ fn decision_event_payload(
             serde_json::to_value(metadata).unwrap_or(Value::Null),
         );
     }
-    if let Some(lineage) = lineage {
-        object.insert(
-            "strategy_evaluation_index".to_owned(),
-            json!(lineage.evaluation_index),
-        );
-        object.insert(
-            "strategy_output_index".to_owned(),
-            json!(lineage.strategy_output_index),
-        );
-    }
     if let Some(binding) = binding {
-        object.insert("decision_batch_schema_version".to_owned(), json!(3));
+        object.insert("decision_batch_schema_version".to_owned(), json!(4));
         object.insert("strategy_batch_id".to_owned(), json!(binding.batch_id));
         object.insert(
             "strategy_batch_output_index".to_owned(),
@@ -3296,6 +3224,24 @@ fn decision_event_payload(
     payload
 }
 
+fn bind_decision_event_payload(unbound_payload: &Value, binding: &DecisionBatchBinding) -> Value {
+    let mut payload = unbound_payload.clone();
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    object.insert("decision_batch_schema_version".to_owned(), json!(4));
+    object.insert("strategy_batch_id".to_owned(), json!(binding.batch_id));
+    object.insert(
+        "strategy_batch_output_index".to_owned(),
+        json!(binding.output_index),
+    );
+    object.insert(
+        "strategy_decision_sha256".to_owned(),
+        json!(binding.decision_sha256),
+    );
+    payload
+}
+
 fn bind_applied_decision_output(
     prepared: &PreparedDecision,
     mut reports: Vec<ExecutionReport>,
@@ -3306,13 +3252,7 @@ fn bind_applied_decision_output(
     ) {
         return None;
     }
-    let unbound_decision = decision_event_payload(
-        &prepared.decision,
-        prepared.metadata.as_ref(),
-        prepared.lineage.as_ref(),
-        None,
-    );
-    if value_sha256(&unbound_decision) != prepared.binding.decision_sha256 {
+    if value_sha256(&prepared.unbound_payload) != prepared.binding.decision_sha256 {
         return None;
     }
     if reports.iter().any(|report| {
@@ -3386,62 +3326,6 @@ fn bind_applied_decision_output(
     })
 }
 
-fn bind_final_decision_lineage<'a>(
-    decisions: &[TradeDecision],
-    lineage: &'a [StrategyDecisionLineage],
-) -> Vec<Option<&'a StrategyDecisionLineage>> {
-    let mut used = vec![false; lineage.len()];
-    decisions
-        .iter()
-        .map(|decision| {
-            let exact = lineage
-                .iter()
-                .enumerate()
-                .find(|(index, source)| !used[*index] && source.decision == *decision)
-                .map(|(index, _)| index);
-            let matched = exact.or_else(|| {
-                if decision.action != DecisionAction::Place {
-                    return None;
-                }
-                let candidates = lineage
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, source)| {
-                        !used[*index] && same_place_lineage(&source.decision, decision)
-                    })
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                if candidates.len() == 1 {
-                    Some(candidates[0])
-                } else {
-                    None
-                }
-            });
-            matched.map(|index| {
-                used[index] = true;
-                &lineage[index]
-            })
-        })
-        .collect()
-}
-
-fn same_place_lineage(source: &TradeDecision, final_decision: &TradeDecision) -> bool {
-    source.action == DecisionAction::Place
-        && final_decision.action == DecisionAction::Place
-        && source.market_id == final_decision.market_id
-        && source.condition_id == final_decision.condition_id
-        && source.token_id == final_decision.token_id
-        && source.outcome == final_decision.outcome
-        && source.side == final_decision.side
-        && source.price == final_decision.price
-        && source.order_kind == final_decision.order_kind
-        && source.ttl_ms == final_decision.ttl_ms
-        && source.expected_edge == final_decision.expected_edge
-        && source.post_only == final_decision.post_only
-        && source.tick_size == final_decision.tick_size
-        && source.neg_risk == final_decision.neg_risk
-}
-
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Array(values) => format!(
@@ -3479,7 +3363,7 @@ fn value_sha256(value: &Value) -> String {
     )
 }
 
-fn decision_batch_id_v3(pipeline_input_sha256: &str) -> String {
+fn decision_batch_id_v4(pipeline_input_sha256: &str) -> String {
     format!(
         "strategy-batch-{}",
         pipeline_input_sha256.trim_start_matches("sha256:")
@@ -3570,7 +3454,6 @@ mod tests {
     use polyedge_domain::{
         BookLevel, ConditionId, MarketStatus, OrderId, OrderKind, Outcome, Side,
     };
-    use polyedge_engine::{RegimeLabel, StrategyDataQuality};
     use polyedge_storage::{EventRecorder, StorageError};
     use serde_json::json;
     use std::fs;
@@ -3661,7 +3544,7 @@ mod tests {
         assert_eq!(payload["shadow_book_sample_ms"], 1_000);
         assert_eq!(
             payload["decision_pipeline_schema"],
-            "polyedge.strategy_decision_batch.v3"
+            "polyedge.strategy_decision_batch.v4"
         );
         assert_eq!(
             payload["decision_pipeline_parity_scope"],
@@ -3965,112 +3848,6 @@ mod tests {
     }
 
     #[test]
-    fn final_decision_lineage_is_one_to_one_and_never_borrowed_by_synthesized_cancel() {
-        let place = |price: Decimal| TradeDecision {
-            action: DecisionAction::Place,
-            market_id: MarketId::new("lineage-market"),
-            condition_id: Some(ConditionId::new("lineage-condition")),
-            token_id: Some(TokenId::new("lineage-token")),
-            outcome: Some(Outcome::Up),
-            side: Some(Side::Buy),
-            price: Some(price),
-            size: Some(Decimal::from(10)),
-            quote_amount: Some(price * Decimal::from(10)),
-            order_kind: Some(OrderKind::PostOnlyGtc),
-            reason: "strategy quote".to_owned(),
-            ttl_ms: Some(1_000),
-            expected_edge: Some(Decimal::new(2, 2)),
-            post_only: true,
-            tick_size: Some(Decimal::new(1, 2)),
-            neg_risk: false,
-        };
-        let metadata = StrategyDecisionMetadata {
-            candidate: FrozenStrategyMode::DynamicQuoteStyle.candidate(),
-            regime: RegimeLabel::Normal,
-            q: Some(Decimal::new(55, 2)),
-            expected_edge: Some(Decimal::new(2, 2)),
-            data_quality: StrategyDataQuality {
-                decision_grade: true,
-                reference_stale: false,
-                book_stale: false,
-                market_active: true,
-                has_start_price: true,
-                has_books: true,
-                flags: Vec::new(),
-            },
-            features_summary: json!({}),
-        };
-        let source_a = place(Decimal::new(49, 2));
-        let source_b = place(Decimal::new(48, 2));
-        let lineage = vec![
-            StrategyDecisionLineage {
-                evaluation_index: 3,
-                strategy_output_index: 0,
-                decision: source_a,
-                metadata: metadata.clone(),
-            },
-            StrategyDecisionLineage {
-                evaluation_index: 7,
-                strategy_output_index: 1,
-                decision: source_b.clone(),
-                metadata,
-            },
-        ];
-        let mut risk_clamped = source_b;
-        risk_clamped.size = Some(Decimal::from(5));
-        risk_clamped.quote_amount = Some(Decimal::new(48, 2) * Decimal::from(5));
-        let synthesized_cancel = TradeDecision {
-            action: DecisionAction::CancelAll,
-            market_id: MarketId::new("lineage-market"),
-            condition_id: Some(ConditionId::new("lineage-condition")),
-            token_id: None,
-            outcome: None,
-            side: None,
-            price: None,
-            size: None,
-            quote_amount: None,
-            order_kind: None,
-            reason: "risk denied".to_owned(),
-            ttl_ms: None,
-            expected_edge: None,
-            post_only: false,
-            tick_size: None,
-            neg_risk: false,
-        };
-
-        let bound = bind_final_decision_lineage(&[risk_clamped, synthesized_cancel], &lineage);
-        assert_eq!(bound[0].unwrap().evaluation_index, 7);
-        assert_eq!(bound[0].unwrap().strategy_output_index, 1);
-        assert!(bound[1].is_none());
-
-        let lineage_binding = StrategyLineageBinding {
-            evaluation_index: 7,
-            strategy_output_index: 1,
-        };
-        let unbound = decision_event_payload(
-            &place(Decimal::new(48, 2)),
-            Some(&lineage[1].metadata),
-            Some(&lineage_binding),
-            None,
-        );
-        let binding = DecisionBatchBinding {
-            batch_id: "strategy-batch-v3".to_owned(),
-            output_index: 0,
-            decision_sha256: value_sha256(&unbound),
-        };
-        let payload = decision_event_payload(
-            &place(Decimal::new(48, 2)),
-            Some(&lineage[1].metadata),
-            Some(&lineage_binding),
-            Some(&binding),
-        );
-        assert_eq!(payload["decision_batch_schema_version"], 3);
-        assert_eq!(payload["strategy_evaluation_index"], 7);
-        assert_eq!(payload["strategy_output_index"], 1);
-        assert_eq!(payload["strategy_decision_sha256"], value_sha256(&unbound));
-    }
-
-    #[test]
     fn paper_application_proof_requires_a_successful_bound_place_report() {
         let decision = TradeDecision {
             action: DecisionAction::Place,
@@ -4090,7 +3867,7 @@ mod tests {
             tick_size: Some(Decimal::new(1, 2)),
             neg_risk: false,
         };
-        let unbound = decision_event_payload(&decision, None, None, None);
+        let unbound = decision_event_payload(&decision, None, None);
         let binding = DecisionBatchBinding {
             batch_id: format!("strategy-batch-{}", "a".repeat(64)),
             output_index: 3,
@@ -4099,8 +3876,8 @@ mod tests {
         let prepared = PreparedDecision {
             decision: decision.clone(),
             metadata: None,
-            lineage: None,
-            payload: decision_event_payload(&decision, None, None, Some(&binding)),
+            unbound_payload: unbound.clone(),
+            payload: decision_event_payload(&decision, None, Some(&binding)),
             binding,
         };
         assert!(bind_applied_decision_output(&prepared, Vec::new()).is_none());

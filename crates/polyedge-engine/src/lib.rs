@@ -1,12 +1,13 @@
 use chrono::{DateTime, Duration, Utc};
-use polyedge_config::RuntimeSettings;
+use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
-    BookState, ConditionId, ExecutionReport, FairValue, MarketId, MarketSpec, OrderId, OrderKind,
-    Outcome, ReferencePrice, RiskAssessment, Side, TokenId, TradeDecision,
+    BookState, ConditionId, DecisionAction, ExecutionReport, FairValue, MarketId, MarketSpec,
+    OrderId, OrderKind, Outcome, ReferencePrice, RiskAssessment, Side, TokenId, TradeDecision,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
@@ -889,6 +890,194 @@ pub struct DecisionPipelineOutputV3 {
     pub risk_decisions: Vec<TradeDecision>,
     pub final_decisions: Vec<TradeDecision>,
     pub classifier_after: Option<RegimeClassifierSnapshot>,
+}
+
+/// Canonical, replayable evidence for one final pipeline decision. The
+/// payload is shared by the runtime recorder and the independent reporter so
+/// synthesized risk/reconciliation outputs receive explicit provenance
+/// without being falsely attributed to a single strategy evaluation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalDecisionEvidenceV1 {
+    pub payload: Value,
+    pub strategy_metadata: Option<StrategyDecisionMetadata>,
+    pub strategy_evaluation_index: Option<usize>,
+    pub strategy_output_index: Option<usize>,
+}
+
+/// Secret-free canonical decision configuration shared by the runtime and
+/// the independent replay reporter. Keep routing in this hash because a
+/// prefix cutover changes the authoritative evidence stream.
+pub fn decision_config_projection_v1(
+    settings: &RuntimeSettings,
+    adaptive_mode: Option<FrozenStrategyMode>,
+) -> Value {
+    let execution_mode = match settings.live.execution_mode {
+        ExecutionMode::Paper => "paper",
+        ExecutionMode::Live => "live",
+    };
+    json!({
+        "schema": "polyedge.decision_config.v1",
+        "target": settings.target,
+        "data_policy": {
+            "compact_shadow_recording": settings.azure.compact_shadow_recording,
+            "shadow_book_sample_ms": settings.azure.shadow_book_sample_ms
+        },
+        "strategy": settings.strategy,
+        "risk": settings.risk,
+        "paper_execution": settings.paper,
+        "execution_safety": {
+            "execution_mode": execution_mode,
+            "allow_live": settings.live.allow_live,
+            "confirm_non_restricted_location": settings.live.confirm_non_restricted_location,
+            "require_exact_resolution_source_for_live": settings.live.require_exact_resolution_source_for_live,
+            "allow_emergency_account_cancel": settings.live.allow_emergency_account_cancel
+        },
+        "event_blob_routing": {
+            "before_cutover": settings.azure.event_blob_prefix,
+            "after_cutover": settings.azure.event_blob_prefix_after_cutover,
+            "cutover_utc": settings.azure.event_blob_prefix_cutover_utc
+        },
+        "adaptive_mode": adaptive_mode,
+        "candidate": adaptive_mode.map(FrozenStrategyMode::candidate)
+    })
+}
+
+pub fn final_decision_evidence_v1(
+    output: &DecisionPipelineOutputV3,
+) -> Option<Vec<FinalDecisionEvidenceV1>> {
+    let lineage = output
+        .strategy_evaluations
+        .iter()
+        .filter_map(|evaluation| {
+            evaluation
+                .evaluated_decision
+                .as_ref()
+                .map(|decision| (evaluation.evaluation_index, decision, &evaluation.metadata))
+        })
+        .enumerate()
+        .map(
+            |(strategy_output_index, (evaluation_index, decision, metadata))| {
+                (evaluation_index, strategy_output_index, decision, metadata)
+            },
+        )
+        .collect::<Vec<_>>();
+    let all_evaluation_indices = output
+        .strategy_evaluations
+        .iter()
+        .map(|evaluation| evaluation.evaluation_index)
+        .collect::<Vec<_>>();
+    let all_evaluations_decision_grade = !output.strategy_evaluations.is_empty()
+        && output
+            .strategy_evaluations
+            .iter()
+            .all(|evaluation| evaluation.metadata.data_quality.decision_grade);
+    let mut used = vec![false; lineage.len()];
+
+    output
+        .final_decisions
+        .iter()
+        .map(|decision| {
+            let exact = lineage
+                .iter()
+                .enumerate()
+                .find(|(index, (_, _, source, _))| !used[*index] && **source == *decision)
+                .map(|(index, _)| index);
+            let risk_adjusted = exact
+                .is_none()
+                .then(|| {
+                    if decision.action != DecisionAction::Place {
+                        return None;
+                    }
+                    let candidates = lineage
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, (_, _, source, _))| {
+                            !used[*index] && same_place_decision_lineage(source, decision)
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    (candidates.len() == 1).then_some(candidates[0])
+                })
+                .flatten();
+            let matched = exact.or(risk_adjusted);
+            let (source, metadata, evaluation_index, strategy_output_index, grade, contributors) =
+                if let Some(index) = matched {
+                    used[index] = true;
+                    let (evaluation_index, strategy_output_index, _, metadata) = lineage[index];
+                    (
+                        if exact.is_some() {
+                            "strategy_evaluation"
+                        } else {
+                            "risk_adjusted_strategy_evaluation"
+                        },
+                        Some(metadata.clone()),
+                        Some(evaluation_index),
+                        Some(strategy_output_index),
+                        metadata.data_quality.decision_grade,
+                        vec![evaluation_index],
+                    )
+                } else {
+                    (
+                        "risk_or_order_reconciliation",
+                        None,
+                        None,
+                        None,
+                        all_evaluations_decision_grade,
+                        all_evaluation_indices.clone(),
+                    )
+                };
+            let mut payload = serde_json::to_value(decision).ok()?;
+            let object = payload.as_object_mut()?;
+            object.insert(
+                "final_decision_metadata".to_owned(),
+                json!({
+                    "schema": "polyedge.final_decision_metadata.v1",
+                    "source": source,
+                    "decision_grade": grade,
+                    "contributing_strategy_evaluation_indices": contributors
+                }),
+            );
+            if let (Some(metadata), Some(evaluation_index), Some(strategy_output_index)) =
+                (&metadata, evaluation_index, strategy_output_index)
+            {
+                object.insert(
+                    "strategy_metadata".to_owned(),
+                    serde_json::to_value(metadata).ok()?,
+                );
+                object.insert(
+                    "strategy_evaluation_index".to_owned(),
+                    json!(evaluation_index),
+                );
+                object.insert(
+                    "strategy_output_index".to_owned(),
+                    json!(strategy_output_index),
+                );
+            }
+            Some(FinalDecisionEvidenceV1 {
+                payload,
+                strategy_metadata: metadata,
+                strategy_evaluation_index: evaluation_index,
+                strategy_output_index,
+            })
+        })
+        .collect()
+}
+
+fn same_place_decision_lineage(source: &TradeDecision, final_decision: &TradeDecision) -> bool {
+    source.action == DecisionAction::Place
+        && final_decision.action == DecisionAction::Place
+        && source.market_id == final_decision.market_id
+        && source.condition_id == final_decision.condition_id
+        && source.token_id == final_decision.token_id
+        && source.outcome == final_decision.outcome
+        && source.side == final_decision.side
+        && source.price == final_decision.price
+        && source.order_kind == final_decision.order_kind
+        && source.ttl_ms == final_decision.ttl_ms
+        && source.expected_edge == final_decision.expected_edge
+        && source.post_only == final_decision.post_only
+        && source.tick_size == final_decision.tick_size
+        && source.neg_risk == final_decision.neg_risk
 }
 
 /// Shared pure evaluator used by both the runtime and the promotion reporter.

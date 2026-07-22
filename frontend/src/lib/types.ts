@@ -490,6 +490,7 @@ export type VenueExecutionEvidence = {
         exact_reference_hour_coverage?: string | number | null;
         decision_metadata_coverage?: string | number | null;
         decision_grade_coverage?: string | number | null;
+        final_decision_grade_coverage?: string | number | null;
         execution_field_coverage?: string | number | null;
         decision_parity_rate?: string | number | null;
         queue_snapshot_coverage?: string | number | null;
@@ -536,6 +537,7 @@ export type VenueExecutionEvidence = {
             exact_reference_hour_coverage?: string | number | null;
             decision_metadata_coverage?: string | number | null;
             decision_grade_coverage?: string | number | null;
+            final_decision_grade_coverage?: string | number | null;
             execution_field_coverage?: string | number | null;
             decision_parity_rate?: string | number | null;
             queue_snapshot_coverage?: string | number | null;

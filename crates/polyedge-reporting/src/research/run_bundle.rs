@@ -153,6 +153,12 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
             WarningSeverity::Blocking,
             true,
         )
+    } else if message.starts_with("final-decision grade coverage below 95%: ") {
+        (
+            "final_decision_grade_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
     } else if message.starts_with("place-decision execution-field coverage below 95%: ") {
         (
             "execution_fields_below_95pct",
@@ -395,6 +401,8 @@ pub struct DataQualityCoverageBreakdown {
     #[serde(default)]
     pub decision_grade_coverage: Option<Decimal>,
     #[serde(default)]
+    pub final_decision_grade_coverage: Option<Decimal>,
+    #[serde(default)]
     pub execution_field_coverage: Option<Decimal>,
     #[serde(default)]
     pub decision_parity_rate: Option<Decimal>,
@@ -467,6 +475,7 @@ impl DataQualitySummary {
             && complete(self.coverage_breakdown.exact_reference_hour_coverage)
             && complete(self.coverage_breakdown.decision_metadata_coverage)
             && complete(self.coverage_breakdown.decision_grade_coverage)
+            && complete(self.coverage_breakdown.final_decision_grade_coverage)
             && complete(self.coverage_breakdown.execution_field_coverage)
             && self.coverage_breakdown.decision_parity_rate == Some(Decimal::ONE)
             && complete(self.coverage_breakdown.queue_snapshot_coverage)
@@ -951,6 +960,9 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
             .get("decision_metadata_coverage")
             .and_then(decimal_from_json),
         decision_grade_coverage: explicit_coverage,
+        final_decision_grade_coverage: result
+            .get("final_decision_grade_coverage")
+            .and_then(decimal_from_json),
         execution_field_coverage: result
             .get("execution_field_coverage")
             .and_then(decimal_from_json),
@@ -1270,12 +1282,17 @@ pub(super) fn shadow_runtime_provenance_errors(payload: &serde_json::Value) -> V
         "dynamic_quote_style",
         &mut errors,
     );
-    require_provenance_text(
-        payload,
-        "/decision_pipeline_schema",
-        "polyedge.strategy_decision_batch.v3",
-        &mut errors,
-    );
+    if !matches!(
+        payload
+            .pointer("/decision_pipeline_schema")
+            .and_then(serde_json::Value::as_str),
+        Some("polyedge.strategy_decision_batch.v3" | "polyedge.strategy_decision_batch.v4")
+    ) {
+        errors.push(
+            "/decision_pipeline_schema must equal polyedge.strategy_decision_batch.v3 or .v4"
+                .to_owned(),
+        );
+    }
     require_provenance_text(
         payload,
         "/decision_pipeline_parity_scope",

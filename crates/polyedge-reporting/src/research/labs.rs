@@ -1871,7 +1871,9 @@ fn json_row(
                 .and_then(Value::as_str)
         }),
         "decision_metadata_coverage": audit.and_then(|report| number_at(report, &["/result/decision_metadata_coverage", "/decision_metadata_coverage"])),
-        "decision_grade_decision_coverage": audit.and_then(|report| number_at(report, &["/result/decision_grade_coverage", "/decision_grade_coverage"])),
+        "decision_grade_coverage": audit.and_then(|report| number_at(report, &["/result/decision_grade_coverage", "/decision_grade_coverage"])),
+        "final_decision_grade_coverage": audit.and_then(|report| number_at(report, &["/result/final_decision_grade_coverage", "/final_decision_grade_coverage"])),
+        "decision_grade_decision_coverage": audit.and_then(|report| number_at(report, &["/result/final_decision_grade_coverage", "/final_decision_grade_coverage"])),
         "execution_field_coverage": audit.and_then(|report| number_at(report, &["/result/execution_field_coverage", "/execution_field_coverage"])),
         "markout_30s_ci_low": execution_quality.and_then(|report| {
             report.pointer("/result/markouts/30/executable/ci_95_low")
@@ -2269,6 +2271,9 @@ fn aggregate_profitability_metrics(
             }),
             decision_metadata_coverage: minimum_component(|row| row.decision_metadata_coverage),
             decision_grade_coverage: minimum_component(|row| row.decision_grade_coverage),
+            final_decision_grade_coverage: minimum_component(|row| {
+                row.final_decision_grade_coverage
+            }),
             execution_field_coverage: minimum_component(|row| row.execution_field_coverage),
             decision_parity_rate: minimum_component(|row| row.decision_parity_rate),
             queue_snapshot_coverage: minimum_component(|row| row.queue_snapshot_coverage),
@@ -3145,6 +3150,7 @@ mod wallet_metric_tests {
             exact_reference_hour_coverage: Some(coverage),
             decision_metadata_coverage: Some(coverage),
             decision_grade_coverage: Some(coverage),
+            final_decision_grade_coverage: Some(coverage),
             execution_field_coverage: Some(coverage),
             decision_parity_rate: Some(Decimal::ONE),
             queue_snapshot_coverage: Some(coverage),
@@ -3723,6 +3729,7 @@ mod wallet_metric_tests {
                 "exact_resolution_reference_hour_coverage": 1.0,
                 "decision_metadata_coverage": 1.0,
                 "decision_grade_coverage": 1.0,
+                "final_decision_grade_coverage": 1.0,
                 "execution_field_coverage": 1.0,
                 "decision_parity_rate": 1.0,
                 "fatal_data_quality_issues": [],

@@ -243,6 +243,7 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Settlement Coverage" value={percentage(coverageBreakdown?.settlement_rate)} />
             <Metric label="Exact-source Hour Coverage" value={percentage(coverageBreakdown?.exact_reference_hour_coverage)} />
             <Metric label="Decision Metadata" value={percentage(coverageBreakdown?.decision_metadata_coverage)} />
+            <Metric label="Final Decision Grade" value={percentage(coverageBreakdown?.final_decision_grade_coverage)} />
             <Metric label="Execution Fields" value={percentage(coverageBreakdown?.execution_field_coverage)} />
             <Metric label="Full Decision Replay" value={percentage(coverageBreakdown?.decision_parity_rate)} />
             <Metric label="Queue Snapshots" value={percentage(coverageBreakdown?.queue_snapshot_coverage)} />

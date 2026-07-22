@@ -432,7 +432,7 @@ impl LossDiagnosticsAccumulator {
 
     fn observe_batch(&mut self, event: ObservedEvent) {
         let Some((outputs, decision_config_sha256, start)) =
-            validate_strategy_batch_v3(&event.payload)
+            validate_strategy_batch(&event.payload)
         else {
             self.invalid_v3_batches += 1;
             return;
@@ -488,7 +488,10 @@ impl LossDiagnosticsAccumulator {
 
     fn observe_decision(&mut self, event: ObservedEvent) {
         self.claimed_v3_decision_events += 1;
-        if event.payload["decision_batch_schema_version"].as_u64() != Some(3) {
+        if !event.payload["decision_batch_schema_version"]
+            .as_u64()
+            .is_some_and(supported_decision_batch_version)
+        {
             self.invalid_v3_decisions += 1;
             return;
         }
@@ -3249,7 +3252,7 @@ mod tests {
         let decision_ts = test_ts("2026-07-20T12:00:00Z");
         let mut pipeline = super::super::tests::decision_pipeline_v3_input(decision_ts);
         pipeline.kill_switch_enabled = true;
-        let (batch, decisions) = super::super::tests::decision_pipeline_v3_evidence(&pipeline);
+        let (batch, decisions) = super::super::tests::decision_pipeline_v4_evidence(&pipeline);
         assert!(decisions
             .iter()
             .all(|decision| decision["action"] != "place"));
@@ -3571,7 +3574,7 @@ mod tests {
     fn fully_bound_v3_events() -> Vec<Value> {
         let decision_ts = test_ts("2026-07-20T12:00:00Z");
         let input = super::super::tests::decision_pipeline_v3_input(decision_ts);
-        let (batch, decisions) = super::super::tests::decision_pipeline_v3_evidence(&input);
+        let (batch, decisions) = super::super::tests::decision_pipeline_v4_evidence(&input);
         let decision_config_sha256 = batch["decision_config_sha256"].as_str().unwrap();
         let mut runtime_one = valid_runtime_provenance(decision_config_sha256);
         runtime_one["event_blob_prefix_routing"] = json!({
@@ -3690,7 +3693,7 @@ mod tests {
             "adaptive_regime_mode": "dynamic_quote_style",
             "publish_strategy_canary_intents": true,
             "research_only": true,
-            "decision_pipeline_schema": "polyedge.strategy_decision_batch.v3",
+            "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
             "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
             "decision_config_schema": "polyedge.decision_config.v1",
             "decision_config_sha256": decision_config_sha256,
@@ -3788,7 +3791,7 @@ mod tests {
         let decision_sha256 = canonical_value_sha256(&payload).unwrap();
         let batch_hash = Sha256::digest(batch_label.as_bytes());
         let object = payload.as_object_mut().unwrap();
-        object.insert("decision_batch_schema_version".to_owned(), json!(3));
+        object.insert("decision_batch_schema_version".to_owned(), json!(4));
         object.insert(
             "strategy_batch_id".to_owned(),
             json!(format!("strategy-batch-{batch_hash:x}")),

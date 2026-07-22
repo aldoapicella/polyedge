@@ -166,7 +166,22 @@ overall wallet-constrained equity and drawdown still include the full campaign,
 so excluding a dirty day from statistical evidence cannot hide a real capital
 loss.
 
-### Decision-grade evidence version 3
+### Decision-grade evidence contract v4
+
+The overall shadow campaign remains Protocol v3, but final decision binding
+uses `polyedge.strategy_decision_batch.v4` from the July 23 boundary onward.
+Version 4 adds explicit `final_decision_metadata` to every final output. A
+strategy output keeps its exact evaluation lineage; a risk-adjusted output is
+labeled as such; and a hold/cancel synthesized by risk or order reconciliation
+lists every contributing evaluation and is decision grade only when every
+contributor is decision grade. This prevents a synthesized action from being
+falsely attributed to one strategy evaluation.
+
+The reporter retains the original v3 payload projection and validator for
+immutable historical evidence. It can replay old v3 hashes exactly, but it
+does not retrofit final-decision grade onto bytes that never recorded that
+field. Consequently legacy v3 parity can be measured while its separate final
+metadata/grade component remains missing and promotion-ineligible.
 
 The promotion-facing scalar `decision_grade_coverage` is the fraction of all
 recorded strategy evaluations whose recorded inputs qualify as decision grade.
