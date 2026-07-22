@@ -2382,6 +2382,8 @@ struct AuditAccumulator {
     strategy_batch_replayed: usize,
     strategy_batch_matches: usize,
     strategy_batch_invalid: usize,
+    strategy_batch_contract_invalid: usize,
+    strategy_batch_missing_independent_start: usize,
     strategy_batch_ineligible: usize,
     strategy_batch_retry_duplicates: usize,
     strategy_batch_conflicts: usize,
@@ -3119,6 +3121,7 @@ impl AuditAccumulator {
             .map(ToOwned::to_owned)
         else {
             self.strategy_batch_invalid += 1;
+            self.strategy_batch_contract_invalid += 1;
             return;
         };
         let Some(event_sha256) = run_bundle::stable_json(payload)
@@ -3126,6 +3129,7 @@ impl AuditAccumulator {
             .map(|canonical| sha256_prefixed(canonical.as_bytes()))
         else {
             self.strategy_batch_invalid += 1;
+            self.strategy_batch_contract_invalid += 1;
             return;
         };
         if let Some(existing) = self.strategy_batch_expected.get_mut(&batch_id) {
@@ -3135,6 +3139,7 @@ impl AuditAccumulator {
                 if !existing.conflicted {
                     self.strategy_batch_conflicts += 1;
                     self.strategy_batch_invalid += 1;
+                    self.strategy_batch_contract_invalid += 1;
                 }
                 existing.conflicted = true;
                 existing.expected_outputs = None;
@@ -3145,6 +3150,7 @@ impl AuditAccumulator {
         let validated = validate_strategy_batch(payload);
         if validated.is_none() {
             self.strategy_batch_invalid += 1;
+            self.strategy_batch_contract_invalid += 1;
         }
         let (expected_outputs, decision_config_sha256, market_start_evidence) = validated
             .map(|(outputs, hash, start)| (Some(outputs), Some(hash), Some(start)))
@@ -3181,6 +3187,7 @@ impl AuditAccumulator {
                     });
             if batch.expected_outputs.is_some() && !independent_start_matches {
                 self.strategy_batch_invalid += 1;
+                self.strategy_batch_missing_independent_start += 1;
                 self.strategy_binding_conflicts += observed.len();
                 continue;
             }
@@ -3500,7 +3507,7 @@ impl AuditAccumulator {
                 || self.unbound_strategy_decisions > 0)
         {
             warnings.push(json!(format!(
-                "runtime/replay full decision pipeline parity below 100%: {}/{} replayed, {}/{} fully bound batches, {}/{} outputs, {} invalid, {} ineligible batch events, {} batch conflicts, {} ineligible bindings, {} binding conflicts, {} unbound",
+                "runtime/replay full decision pipeline parity below 100%: {}/{} replayed, {}/{} fully bound batches, {}/{} outputs, {} invalid ({} contract-invalid, {} missing independent start), {} ineligible batch events, {} batch conflicts, {} ineligible bindings, {} binding conflicts, {} unbound",
                 self.strategy_batch_replayed,
                 self.strategy_batches,
                 self.strategy_batch_matches,
@@ -3508,6 +3515,8 @@ impl AuditAccumulator {
                 self.strategy_batch_bound_outputs,
                 self.strategy_batch_expected_outputs,
                 self.strategy_batch_invalid,
+                self.strategy_batch_contract_invalid,
+                self.strategy_batch_missing_independent_start,
                 self.strategy_batch_ineligible,
                 self.strategy_batch_conflicts,
                 self.strategy_binding_ineligible,
@@ -3612,6 +3621,8 @@ impl AuditAccumulator {
             "strategy_batch_replayed": self.strategy_batch_replayed,
             "strategy_batch_matches": self.strategy_batch_matches,
             "strategy_batch_invalid": self.strategy_batch_invalid,
+            "strategy_batch_contract_invalid": self.strategy_batch_contract_invalid,
+            "strategy_batch_missing_independent_start": self.strategy_batch_missing_independent_start,
             "strategy_batch_ineligible": self.strategy_batch_ineligible,
             "strategy_batch_retry_duplicates": self.strategy_batch_retry_duplicates,
             "strategy_batch_conflicts": self.strategy_batch_conflicts,
@@ -12882,6 +12893,8 @@ mod tests {
         }
         let result = audit.finish();
         assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["strategy_batch_contract_invalid"], 0);
+        assert_eq!(result["strategy_batch_missing_independent_start"], 0);
         assert_eq!(result["strategy_batch_replayed"], 1);
         assert_eq!(result["strategy_binding_conflicts"], 0);
         assert_eq!(result["decision_parity_rate"], 1.0);
@@ -12923,6 +12936,8 @@ mod tests {
         });
         let result = missing.finish();
         assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["strategy_batch_contract_invalid"], 0);
+        assert_eq!(result["strategy_batch_missing_independent_start"], 1);
         assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
 
         let mut conflicting_start = input.market_start_evidence.clone();
@@ -12937,6 +12952,8 @@ mod tests {
         });
         let result = conflict.finish();
         assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["strategy_batch_contract_invalid"], 0);
+        assert_eq!(result["strategy_batch_missing_independent_start"], 1);
         assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
     }
 
@@ -13145,6 +13162,8 @@ mod tests {
         observe_v3_evidence(&mut audit, now, tampered);
         let result = audit.finish();
         assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(result["strategy_batch_contract_invalid"], 1);
+        assert_eq!(result["strategy_batch_missing_independent_start"], 0);
         assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
         assert_eq!(result["decision_parity_rate"], 0.0);
 
