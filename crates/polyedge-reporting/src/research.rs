@@ -3937,22 +3937,30 @@ fn validate_strategy_batch(
         &serde_json::to_value(start).map_err(|_| "market_start_roundtrip_failed")?,
     )
     .ok_or("market_start_hash_failed")?;
-    if payload.get("pipeline_input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str())
-        || payload
-            .get("pipeline_output_sha256")
-            .and_then(Value::as_str)
-            != Some(output_sha256.as_str())
-        || payload
-            .get("market_start_evidence_sha256")
-            .and_then(Value::as_str)
-            != Some(start_sha256.as_str())
-        || batch_id
-            != format!(
-                "strategy-batch-{}",
-                input_sha256.trim_start_matches("sha256:")
-            )
+    if payload.get("pipeline_input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str()) {
+        return Err("pipeline_input_hash_mismatch");
+    }
+    if payload
+        .get("pipeline_output_sha256")
+        .and_then(Value::as_str)
+        != Some(output_sha256.as_str())
     {
-        return Err("batch_content_hash_mismatch");
+        return Err("pipeline_output_hash_mismatch");
+    }
+    if payload
+        .get("market_start_evidence_sha256")
+        .and_then(Value::as_str)
+        != Some(start_sha256.as_str())
+    {
+        return Err("market_start_evidence_hash_mismatch");
+    }
+    if batch_id
+        != format!(
+            "strategy-batch-{}",
+            input_sha256.trim_start_matches("sha256:")
+        )
+    {
+        return Err("batch_id_hash_mismatch");
     }
     let expected_candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
     if payload.get("candidate")
@@ -13279,6 +13287,48 @@ mod tests {
             json!({"regime_feature_input_mismatch": 1})
         );
         assert_eq!(result["decision_parity_rate"], 0.0);
+    }
+
+    #[test]
+    fn audit_v3_reports_the_exact_broken_content_binding() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let (batch, _) = decision_pipeline_v4_evidence(&decision_pipeline_v3_input(now));
+        let cases = [
+            (
+                "pipeline_input_sha256",
+                json!(format!("sha256:{}", "a".repeat(64))),
+                "pipeline_input_hash_mismatch",
+            ),
+            (
+                "pipeline_output_sha256",
+                json!(format!("sha256:{}", "a".repeat(64))),
+                "pipeline_output_hash_mismatch",
+            ),
+            (
+                "market_start_evidence_sha256",
+                json!(format!("sha256:{}", "a".repeat(64))),
+                "market_start_evidence_hash_mismatch",
+            ),
+            (
+                "batch_id",
+                json!(format!("strategy-batch-{}", "a".repeat(64))),
+                "batch_id_hash_mismatch",
+            ),
+        ];
+
+        for (field, replacement, expected_reason) in cases {
+            let mut broken = batch.clone();
+            broken[field] = replacement;
+            let mut audit = AuditAccumulator::default();
+            observe_v3_evidence(&mut audit, now, broken);
+            let result = audit.finish();
+            assert_eq!(result["strategy_batch_contract_invalid"], 1, "{field}");
+            assert_eq!(
+                result["strategy_batch_contract_invalid_reasons"],
+                json!({(expected_reason): 1}),
+                "{field}"
+            );
+        }
     }
 
     #[test]
