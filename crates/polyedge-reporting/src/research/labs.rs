@@ -3609,7 +3609,7 @@ mod wallet_metric_tests {
         assert!(row["dynamic_quote_style_net_pnl"].is_null());
         assert!(row["wallet_constrained_net_pnl"].is_null());
         assert_eq!(row["queue_proxy_pnl_eligible"], false);
-        assert!(current_clean_suffix(&[row.clone()]).is_empty());
+        assert!(current_clean_suffix(std::slice::from_ref(&row)).is_empty());
 
         let metrics = aggregate_profitability_metrics(
             &[row],
