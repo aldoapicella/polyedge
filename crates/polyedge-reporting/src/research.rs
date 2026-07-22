@@ -2369,6 +2369,7 @@ struct AuditAccumulator {
     decision_grade_decisions: usize,
     decision_grade_by_action: BTreeMap<String, usize>,
     decision_grade_evaluations: usize,
+    decision_grade_failure_reasons: BTreeMap<String, usize>,
     place_decisions: usize,
     place_decisions_with_complete_execution_fields: usize,
     strategy_evaluations: usize,
@@ -3089,6 +3090,13 @@ impl AuditAccumulator {
         };
         if expected_metadata.data_quality.decision_grade {
             self.decision_grade_evaluations += 1;
+        } else {
+            for reason in decision_grade_failure_reasons(&expected_metadata) {
+                *self
+                    .decision_grade_failure_reasons
+                    .entry(reason)
+                    .or_insert(0) += 1;
+            }
         }
         let mut classifier = RegimeClassifier::from_snapshot(before);
         let policy = RegimePolicy::new(config);
@@ -3673,6 +3681,7 @@ impl AuditAccumulator {
             "decision_grade_by_action": self.decision_grade_by_action,
             "final_decision_grade_coverage": final_decision_grade_coverage,
             "decision_grade_evaluations": self.decision_grade_evaluations,
+            "decision_grade_failure_reasons": self.decision_grade_failure_reasons,
             "decision_grade_coverage": decision_grade_coverage,
             "place_decisions": self.place_decisions,
             "place_decisions_with_complete_execution_fields": self.place_decisions_with_complete_execution_fields,
@@ -4472,6 +4481,39 @@ fn final_decision_grade_v1(payload: &Value) -> Option<bool> {
         _ => return None,
     }
     Some(decision_grade)
+}
+
+fn decision_grade_failure_reasons(metadata: &StrategyDecisionMetadata) -> Vec<String> {
+    let quality = &metadata.data_quality;
+    if quality.decision_grade {
+        return Vec::new();
+    }
+    let mut reasons = Vec::new();
+    if quality.reference_stale {
+        reasons.push("reference_stale".to_owned());
+    }
+    if quality.book_stale {
+        reasons.push("book_stale".to_owned());
+    }
+    if !quality.market_active {
+        reasons.push("market_inactive".to_owned());
+    }
+    if !quality.has_start_price {
+        reasons.push("missing_start_price".to_owned());
+    }
+    if !quality.has_books {
+        reasons.push("missing_books".to_owned());
+    }
+    reasons.extend(
+        quality
+            .flags
+            .iter()
+            .map(|flag| format!("quality_flag:{flag}")),
+    );
+    if reasons.is_empty() {
+        reasons.push("unspecified".to_owned());
+    }
+    reasons
 }
 
 fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Value {
@@ -13302,6 +13344,38 @@ mod tests {
         assert_eq!(result["strategy_evaluations"], 1);
         assert_eq!(result["strategy_evaluation_conflicts"], 1);
         assert_eq!(result["strategy_evaluation_invalid"], 1);
+    }
+
+    #[test]
+    fn audit_counts_decision_grade_failure_reasons() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let mut input = decision_pipeline_v3_input(now);
+        input
+            .regime_feature_input
+            .reference
+            .as_mut()
+            .expect("test input has a reference")
+            .stale = true;
+        let evaluations = decision_pipeline_v4_strategy_evaluations(&input);
+        assert!(!evaluations.is_empty());
+        let mut audit = AuditAccumulator::default();
+        for evaluation in &evaluations {
+            audit.observe(&EventLine {
+                event_type: "strategy_evaluation".to_owned(),
+                recorded_ts: now,
+                payload: evaluation.clone(),
+                raw: Value::Null,
+            });
+        }
+        let result = audit.finish();
+        assert_eq!(result["decision_grade_evaluations"], 0);
+        assert_eq!(
+            result["decision_grade_failure_reasons"]["reference_stale"],
+            evaluations.len()
+        );
+        assert!(result["decision_grade_failure_reasons"]
+            .as_object()
+            .is_some_and(|reasons| reasons.len() == 1));
     }
 
     #[test]
