@@ -77,9 +77,11 @@ jobs:
             -o json)
           active_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$app_json")
           bot_image=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$app_json")
+          frontend_image=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")
           frontend_count=$(jq -r '[.properties.template.containers[] | select(.name == "frontend")] | length' <<<"$app_json")
           test -n "$active_revision"
           test -n "$bot_image"
+          test -n "$frontend_image"
           test "$frontend_count" = "1"
           test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$app_json")" = "paper"
           test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$app_json")" = "false"
@@ -122,6 +124,7 @@ jobs:
 
           echo "active_revision=$active_revision" >> "$GITHUB_OUTPUT"
           echo "bot_image=$bot_image" >> "$GITHUB_OUTPUT"
+          echo "frontend_image=$frontend_image" >> "$GITHUB_OUTPUT"
           echo "shadow_revision=$shadow_revision" >> "$GITHUB_OUTPUT"
           echo "shadow_image=$shadow_image" >> "$GITHUB_OUTPUT"
 
@@ -175,29 +178,43 @@ jobs:
           check_manual_job polyedge-funded-ladder-neu-job FUNDED_LADDER_CONTROLLER_ENABLED false
           check_manual_job polyedge-promotion-neu-job PROMOTION_TRANSITION_ENABLED false
           check_manual_job polyedge-venue-model-job QUEUE_MODEL_TRAINING_ENABLED false
-          az containerapp update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$APP_NAME" \
-            --container-name frontend \
-            --image "$FRONTEND_IMAGE" \
-            --output none
+          current_frontend_image=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")
+          if [ "$current_frontend_image" != "$FRONTEND_IMAGE" ]; then
+            az containerapp update \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$APP_NAME" \
+              --container-name frontend \
+              --image "$FRONTEND_IMAGE" \
+              --output none
+          fi
 
       - name: Verify runtime and campaign were not changed
         env:
           EXPECTED_ACTIVE_REVISION: ${{ steps.safety.outputs.active_revision }}
           EXPECTED_BOT_IMAGE: ${{ steps.safety.outputs.bot_image }}
+          EXPECTED_FRONTEND_IMAGE: ${{ steps.safety.outputs.frontend_image }}
           EXPECTED_SHADOW_REVISION: ${{ steps.safety.outputs.shadow_revision }}
           EXPECTED_SHADOW_IMAGE: ${{ steps.safety.outputs.shadow_image }}
           DASHBOARD_AUTH_PASSWORD: ${{ secrets.DASHBOARD_AUTH_PASSWORD }}
         run: |
           set -euo pipefail
-          app_json=$(az containerapp show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$APP_NAME" \
-            -o json)
-          active_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$app_json")
+          rollout_ready=false
+          for attempt in $(seq 1 30); do
+            app_json=$(az containerapp show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$APP_NAME" \
+              -o json)
+            active_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$app_json")
+            current_frontend_image=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")
+            if [ "$current_frontend_image" = "$FRONTEND_IMAGE" ] \
+              && { [ "$EXPECTED_FRONTEND_IMAGE" = "$FRONTEND_IMAGE" ] || [ "$active_revision" != "$EXPECTED_ACTIVE_REVISION" ]; }; then
+              rollout_ready=true
+              break
+            fi
+            sleep 5
+          done
+          test "$rollout_ready" = true
           test -n "$active_revision"
-          test "$active_revision" != "$EXPECTED_ACTIVE_REVISION"
           test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$app_json")" = "$EXPECTED_BOT_IMAGE"
           test "$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")" = "$FRONTEND_IMAGE"
           test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$app_json")" = "paper"

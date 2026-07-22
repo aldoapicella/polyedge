@@ -89,7 +89,9 @@ and the shadow revision before the update, and verifies both images are
 unchanged afterward. Azure Container Apps revisions are app-wide, so this does
 roll the primary paper bot sidecar process; the workflow therefore verifies
 recorder health, durable-event recovery, replica restart counts, and the Labs
-routes after rollout. It also refuses to deploy while a funded controller is
+routes after rollout. The update is idempotent: if the immutable frontend
+digest is already active, it verifies the existing ready revision without
+rolling it again. It also refuses to deploy while a funded controller is
 running or enabled. A truly process-independent frontend deployment would
 require moving the frontend to a separate Container App.
 
