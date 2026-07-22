@@ -804,6 +804,29 @@ fn daily_manifest_rejects_reported_decision_grade_without_a_denominator() {
 }
 
 #[test]
+fn empty_daily_manifest_with_zero_decision_denominator_fails_cleanly() {
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-19", 0.0)).unwrap();
+    audit["result"]["total_events"] = serde_json::json!(0);
+    audit["result"]["strategy_evaluations"] = serde_json::json!(0);
+    audit["result"]["decision_grade_evaluations"] = serde_json::json!(0);
+
+    let quality = publish_quality_fixture(
+        "publish_empty_zero_decision_denominator",
+        "shadow-2026-07-19-empty-zero-denominator",
+        audit,
+    );
+
+    assert_eq!(quality.total_events, 0);
+    assert_eq!(quality.decision_grade_coverage, Decimal::ZERO);
+    assert!(quality
+        .warnings
+        .iter()
+        .any(|warning| warning.rule_id == "decision_grade_denominator_missing"));
+    assert!(!quality.promotion_allowed());
+}
+
+#[test]
 fn daily_manifest_rejects_inconsistent_decision_grade_ratio() {
     let mut audit: serde_json::Value =
         serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();

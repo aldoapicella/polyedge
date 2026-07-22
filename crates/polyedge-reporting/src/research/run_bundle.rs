@@ -1023,7 +1023,7 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
         decision_grade_evaluations,
         strategy_evaluations,
     ) {
-        (_, _, None | Some(0)) if total_events > 0 => {
+        (_, _, None | Some(0)) => {
             warnings.push(
                 "decision-grade evaluation coverage unavailable: no strategy_evaluation denominator"
                     .to_owned(),
@@ -1060,7 +1060,6 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
             ));
             None
         }
-        _ => None,
     };
     warnings.sort();
     warnings.dedup();
