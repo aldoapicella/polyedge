@@ -67,7 +67,9 @@ jobs:
           set -euo pipefail
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
-          cargo test --workspace --all-features
+          # Several API tests intentionally exercise the same fixed on-disk
+          # report roots, so the complete workspace suite must be serialized.
+          cargo test --workspace --all-features -- --test-threads=1
           cargo build --release -p polyedge-cli
           sh research/test_run_shadow_daily.sh
 
