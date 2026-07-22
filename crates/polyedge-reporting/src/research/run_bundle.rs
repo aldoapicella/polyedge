@@ -1457,6 +1457,11 @@ fn parse_utc_timestamp(value: &str) -> Option<DateTime<Utc>> {
 }
 
 fn collect_publishable_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, ResearchError> {
+    const LOSS_DIAGNOSTIC_FACTS: [&str; 2] = [
+        "loss_diagnostics/order_lifecycle_fact.jsonl",
+        "loss_diagnostics/fill_markout_fact.jsonl",
+    ];
+
     fn visit(
         root: &Path,
         current: &Path,
@@ -1473,7 +1478,10 @@ fn collect_publishable_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>, Res
                 ResearchError::InvalidInput("daily source traversal escaped root".to_owned())
             })?;
             let extension = path.extension().and_then(|value| value.to_str());
-            if matches!(extension, Some("json" | "md"))
+            let diagnostic_fact = LOSS_DIAGNOSTIC_FACTS
+                .iter()
+                .any(|candidate| relative == Path::new(candidate));
+            if (matches!(extension, Some("json" | "md")) || diagnostic_fact)
                 && !matches!(
                     relative.file_name().and_then(|value| value.to_str()),
                     Some(MANIFEST_FILE | LATEST_FILE)

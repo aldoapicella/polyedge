@@ -954,6 +954,97 @@ fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
 }
 
 #[test]
+fn queue_proxy_ignores_valid_opposite_trade_without_poisoning_or_consuming_bid_queue() {
+    let dir = test_dir("queue_proxy_opposite_trade");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line_with_side("up", "0.50", "10", "buy", "2026-06-01T00:01:02+00:00"),
+            trade_line("up", "0.50", "5", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["queue_proxy_pnl_eligible"], true);
+    assert_eq!(report["result"]["fills"], 0);
+    assert_eq!(
+        report["result"]["replay_metrics"]["queue_proxy"]["ignored_opposite_trade_count"],
+        1
+    );
+}
+
+#[test]
+fn queue_proxy_missing_trade_side_blocks_authorization_pnl_even_after_a_fill() {
+    let dir = test_dir("queue_proxy_missing_trade_side");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line_without_side("up", "0.50", "1", "2026-06-01T00:01:02+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 1);
+    assert_eq!(report["result"]["net_pnl"], "2.50");
+    assert_eq!(report["result"]["queue_proxy_pnl_eligible"], false);
+    assert_eq!(report["result"]["ineligible_queue_fills"], 1);
+    assert!(report["result"]["queue_proxy_net_pnl"].is_null());
+    assert!(report["result"]["queue_proxy_wallet_constrained_net_pnl"].is_null());
+    assert_eq!(
+        report["result"]["replay_metrics"]["queue_proxy"]["ineligible_reasons"]
+            ["trade_print_missing_aggressor_side"],
+        1
+    );
+}
+
+#[test]
+fn queue_proxy_below_ninety_five_percent_eligibility_cannot_authorize_positive_pnl() {
+    let dir = test_dir("queue_proxy_low_eligibility");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up-1", "down-1"),
+            market_start_line("m1"),
+            bid_book_line("up-1", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up-1", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up-1", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            market_line("m2", "up-2", "down-2"),
+            market_start_line("m2"),
+            decision_line("m2", "up-2", "up", "2026-06-01T00:01:04+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["net_pnl"], "2.50");
+    assert_eq!(report["result"]["queue_proxy_eligibility_rate"], 0.5);
+    assert_eq!(report["result"]["queue_proxy_pnl_eligible"], false);
+    assert_eq!(report["result"]["ineligible_queue_fills"], 0);
+    assert!(report["result"]["queue_proxy_net_pnl"].is_null());
+}
+
+#[test]
 fn queue_proxy_uses_runtime_full_depth_snapshot_instead_of_compact_top_only_book() {
     let dir = test_dir("queue_proxy_runtime_size_ahead");
     let events = dir.join("events.jsonl");
@@ -1580,8 +1671,18 @@ fn bid_book_no_level_line(token: &str, bid: &str, size: &str, ts: &str) -> Strin
 }
 
 fn trade_line(token: &str, price: &str, size: &str, ts: &str) -> String {
+    trade_line_with_side(token, price, size, "sell", ts)
+}
+
+fn trade_line_with_side(token: &str, price: &str, size: &str, side: &str, ts: &str) -> String {
     format!(
-        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"sell","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"{side}","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn trade_line_without_side(token: &str, price: &str, size: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
     )
 }
 

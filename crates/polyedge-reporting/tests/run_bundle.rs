@@ -651,6 +651,23 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
         complete_execution_quality(),
     )
     .unwrap();
+    let diagnostics = source.join("loss_diagnostics");
+    fs::create_dir_all(&diagnostics).unwrap();
+    fs::write(
+        diagnostics.join("order_lifecycle_fact.jsonl"),
+        "{\"order_id\":\"order-1\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        diagnostics.join("fill_markout_fact.jsonl"),
+        "{\"fill_id\":\"fill-1\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        diagnostics.join("unreviewed_debug_rows.jsonl"),
+        "{\"must_not_publish\":true}\n",
+    )
+    .unwrap();
     let audit = source.join("data_audit.json");
     fs::write(&audit, complete_daily_audit("2026-07-12", 0.97)).unwrap();
 
@@ -665,7 +682,7 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
     )
     .unwrap();
 
-    assert_eq!(published.manifest.artifacts.len(), 5);
+    assert_eq!(published.manifest.artifacts.len(), 7);
     assert_eq!(published.manifest.schema_version, 2);
     assert_eq!(
         published.manifest.runtime_role,
@@ -682,6 +699,26 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
     );
     assert!(published.manifest.data_quality.promotion_allowed());
     assert!(published.bundle_dir.join("final_report.json").is_file());
+    assert!(published
+        .bundle_dir
+        .join("loss_diagnostics/order_lifecycle_fact.jsonl")
+        .is_file());
+    assert!(published
+        .bundle_dir
+        .join("loss_diagnostics/fill_markout_fact.jsonl")
+        .is_file());
+    assert!(!published
+        .bundle_dir
+        .join("loss_diagnostics/unreviewed_debug_rows.jsonl")
+        .exists());
+    assert!(published
+        .manifest
+        .artifacts
+        .contains_key("loss_diagnostics_order_lifecycle_fact_jsonl"));
+    assert!(published
+        .manifest
+        .artifacts
+        .contains_key("loss_diagnostics_fill_markout_fact_jsonl"));
 }
 
 #[test]
@@ -1027,7 +1064,7 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
     .unwrap();
     fs::write(
         source.join("regimes.json"),
-        r#"{"result":{"fill_model":"queue_proxy_conservative","profiles":[{"profile":"dynamic_quote_style","net_pnl":"1.25","wallet_constrained":true,"wallet_constrained_net_pnl":"1.25"},{"profile":"static","net_pnl":"0.25","wallet_constrained":true,"wallet_constrained_net_pnl":"0.25"}]}}"#,
+        r#"{"result":{"fill_model":"queue_proxy_conservative","profiles":[{"profile":"dynamic_quote_style","net_pnl":"1.25","wallet_constrained":true,"wallet_constrained_net_pnl":"1.25","queue_proxy_enabled":true,"queue_proxy_eligibility_rate":"1","queue_proxy_pnl_eligible":true,"queue_proxy_net_pnl":"1.25","queue_proxy_wallet_constrained_net_pnl":"1.25","eligible_queue_fills":2,"ineligible_queue_fills":0},{"profile":"static","net_pnl":"0.25","wallet_constrained":true,"wallet_constrained_net_pnl":"0.25","queue_proxy_enabled":true,"queue_proxy_eligibility_rate":"1","queue_proxy_pnl_eligible":true,"queue_proxy_net_pnl":"0.25","queue_proxy_wallet_constrained_net_pnl":"0.25","eligible_queue_fills":2,"ineligible_queue_fills":0}]}}"#,
     )
     .unwrap();
     fs::write(source.join("final_report.json"), r#"{"result":{}}"#).unwrap();
@@ -1064,7 +1101,14 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
             "wallet_constrained_net_pnl": cumulative_net.to_string(),
             "wallet_constrained_ending_equity": ending_equity.to_string(),
             "wallet_constrained_max_drawdown": "0",
-            "wallet_constrained_unresolved_orders": 0
+            "wallet_constrained_unresolved_orders": 0,
+            "queue_proxy_enabled": true,
+            "queue_proxy_eligibility_rate": "1",
+            "queue_proxy_pnl_eligible": true,
+            "queue_proxy_net_pnl": "1.25",
+            "queue_proxy_wallet_constrained_net_pnl": cumulative_net.to_string(),
+            "eligible_queue_fills": 2,
+            "ineligible_queue_fills": 0
         });
         fs::write(
             source.join("cumulative_wallet.json"),

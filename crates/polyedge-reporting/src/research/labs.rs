@@ -263,6 +263,13 @@ pub fn run_build_cumulative_wallet_snapshot(
         "wallet_constrained_unresolved_orders": profile["wallet_constrained_unresolved_orders"].clone(),
         "wallet_constrained_skip_reasons": profile["wallet_constrained_skip_reasons"].clone(),
         "wallet_constrained_equity_curve": profile["wallet_constrained_equity_curve"].clone(),
+        "queue_proxy_enabled": profile["queue_proxy_enabled"].clone(),
+        "queue_proxy_eligibility_rate": profile["queue_proxy_eligibility_rate"].clone(),
+        "queue_proxy_pnl_eligible": profile["queue_proxy_pnl_eligible"].clone(),
+        "queue_proxy_net_pnl": profile["queue_proxy_net_pnl"].clone(),
+        "queue_proxy_wallet_constrained_net_pnl": profile["queue_proxy_wallet_constrained_net_pnl"].clone(),
+        "eligible_queue_fills": profile["eligible_queue_fills"].clone(),
+        "ineligible_queue_fills": profile["ineligible_queue_fills"].clone(),
         "wallet_constraints": profile["wallet_constraints"].clone()
     });
     bind_campaign_contract(&mut canonical_state, campaign_contract.as_ref())?;
@@ -289,6 +296,13 @@ pub fn run_build_cumulative_wallet_snapshot(
         "wallet_constrained_ending_equity": profile["wallet_constrained_ending_equity"].clone(),
         "wallet_constrained_max_drawdown": profile["wallet_constrained_max_drawdown"].clone(),
         "wallet_constrained_unresolved_orders": profile["wallet_constrained_unresolved_orders"].clone(),
+        "queue_proxy_enabled": profile["queue_proxy_enabled"].clone(),
+        "queue_proxy_eligibility_rate": profile["queue_proxy_eligibility_rate"].clone(),
+        "queue_proxy_pnl_eligible": profile["queue_proxy_pnl_eligible"].clone(),
+        "queue_proxy_net_pnl": profile["queue_proxy_net_pnl"].clone(),
+        "queue_proxy_wallet_constrained_net_pnl": profile["queue_proxy_wallet_constrained_net_pnl"].clone(),
+        "eligible_queue_fills": profile["eligible_queue_fills"].clone(),
+        "ineligible_queue_fills": profile["ineligible_queue_fills"].clone(),
         "research_only": true,
         "funded_execution_allowed": false
     });
@@ -1759,25 +1773,67 @@ fn json_row(
     let source = merge_optional_reports([reports.final_report, reports.regimes, reports.baseline]);
     let sample = sample.unwrap_or(&source);
     let fill_model = text_at(&source, &["/result/fill_model"]).unwrap_or("touch_after_250ms");
-    let static_net = select_regime_profile_net(reports.regimes, "static")
-        .or_else(|| select_regime_profile_net(reports.regimes, "static_baseline"))
-        .or_else(|| select_regime_profile_net(reports.final_report, "static"))
-        .or_else(|| select_regime_profile_net(reports.final_report, "static_baseline"))
-        .or_else(|| select_fill_model_net(reports.baseline, fill_model))
-        .or_else(|| select_fill_model_net(reports.final_report, fill_model));
-    let dynamic_net = select_regime_profile_net(reports.regimes, "dynamic_quote_style")
-        .or_else(|| select_regime_profile_net(reports.final_report, "dynamic_quote_style"));
+    let queue_authorization_required = matches!(
+        fill_model,
+        "queue_proxy_conservative" | "queue_proxy_balanced"
+    );
+    let select_profile_net = |report, profile| {
+        select_regime_profile_authorization_net(report, profile, queue_authorization_required)
+    };
+    let static_net = select_profile_net(reports.regimes, "static")
+        .or_else(|| select_profile_net(reports.regimes, "static_baseline"))
+        .or_else(|| select_profile_net(reports.final_report, "static"))
+        .or_else(|| select_profile_net(reports.final_report, "static_baseline"))
+        .or_else(|| {
+            select_fill_model_authorization_net(
+                reports.baseline,
+                fill_model,
+                queue_authorization_required,
+            )
+        })
+        .or_else(|| {
+            select_fill_model_authorization_net(
+                reports.final_report,
+                fill_model,
+                queue_authorization_required,
+            )
+        });
+    let dynamic_net = select_profile_net(reports.regimes, "dynamic_quote_style")
+        .or_else(|| select_profile_net(reports.final_report, "dynamic_quote_style"));
     // Wallet fields are accepted only from the separately generated
     // cumulative campaign replay. Per-day regime reports reset capital and
     // therefore cannot support a promotion decision.
-    let dynamic_wallet_net =
-        cumulative_wallet.and_then(|wallet| value_to_string(&wallet["wallet_constrained_net_pnl"]));
+    let dynamic_wallet_net = cumulative_wallet.and_then(|wallet| {
+        if queue_authorization_required {
+            (wallet["queue_proxy_pnl_eligible"].as_bool() == Some(true))
+                .then(|| value_to_string(&wallet["queue_proxy_wallet_constrained_net_pnl"]))
+                .flatten()
+        } else {
+            value_to_string(&wallet["wallet_constrained_net_pnl"])
+        }
+    });
     let dynamic_wallet_constrained =
         cumulative_wallet.and_then(|wallet| wallet["wallet_constrained"].as_bool());
-    let full_net = select_regime_profile_net(reports.regimes, "full_deterministic_profile")
-        .or_else(|| select_regime_profile_net(reports.final_report, "full_deterministic_profile"));
-    let safety_net = select_regime_profile_net(reports.regimes, "dynamic_safety_only")
-        .or_else(|| select_regime_profile_net(reports.final_report, "dynamic_safety_only"));
+    let full_net = select_profile_net(reports.regimes, "full_deterministic_profile")
+        .or_else(|| select_profile_net(reports.final_report, "full_deterministic_profile"));
+    let safety_net = select_profile_net(reports.regimes, "dynamic_safety_only")
+        .or_else(|| select_profile_net(reports.final_report, "dynamic_safety_only"));
+    let dynamic_profile = reports
+        .regimes
+        .and_then(|report| find_regime_profile(report, "dynamic_quote_style"))
+        .or_else(|| {
+            reports
+                .final_report
+                .and_then(|report| find_regime_profile(report, "dynamic_quote_style"))
+        });
+    let queue_proxy_pnl_eligible = if queue_authorization_required {
+        dynamic_profile.and_then(|profile| profile["queue_proxy_pnl_eligible"].as_bool())
+            == Some(true)
+            && cumulative_wallet.and_then(|wallet| wallet["queue_proxy_pnl_eligible"].as_bool())
+                == Some(true)
+    } else {
+        false
+    };
     let dynamic_delta = paired_delta(dynamic_net.as_deref(), static_net.as_deref());
     let full_delta = paired_delta(full_net.as_deref(), static_net.as_deref());
     let safety_delta = paired_delta(safety_net.as_deref(), static_net.as_deref());
@@ -1826,6 +1882,13 @@ fn json_row(
         "date": date,
         "settled_markets": settled_markets,
         "fill_model": fill_model,
+        "queue_proxy_enabled": dynamic_profile.and_then(|profile| profile["queue_proxy_enabled"].as_bool()),
+        "queue_proxy_eligibility_rate": dynamic_profile.and_then(|profile| profile.get("queue_proxy_eligibility_rate")).cloned(),
+        "queue_proxy_pnl_eligible": queue_proxy_pnl_eligible,
+        "queue_proxy_net_pnl": dynamic_net,
+        "queue_proxy_wallet_constrained_net_pnl": dynamic_wallet_net,
+        "eligible_queue_fills": dynamic_profile.and_then(|profile| profile["eligible_queue_fills"].as_u64()),
+        "ineligible_queue_fills": dynamic_profile.and_then(|profile| profile["ineligible_queue_fills"].as_u64()),
         "static_net_pnl": static_net,
         "dynamic_quote_style_net_pnl": dynamic_net,
         "wallet_constrained_net_pnl": dynamic_wallet_net,
@@ -2297,14 +2360,15 @@ fn aggregate_profitability_metrics(
         .iter()
         .map(|row| decimal_from_value(&row["dynamic_quote_style_net_pnl"]))
         .collect::<Option<Vec<_>>>();
-    if daily_pnl.is_none() {
+    if daily_pnl.as_ref().is_none_or(Vec::is_empty) {
         missing.push("queue_conservative_net_pnl".to_owned());
     }
     let pnl_values = daily_pnl.unwrap_or_default();
-    let queue_conservative = !evidence_rows.is_empty()
-        && evidence_rows
-            .iter()
-            .all(|row| row["fill_model"] == "queue_proxy_conservative");
+    let queue_conservative =
+        !evidence_rows.is_empty() && evidence_rows.iter().all(queue_profitability_row_eligible);
+    if !queue_conservative {
+        missing.push("queue_proxy_pnl_eligibility".to_owned());
+    }
     let queue_pnl: Decimal = pnl_values.iter().copied().sum();
     let cumulative_wallet = validated_cumulative_wallet_snapshots(rows, campaign_contract);
     if cumulative_wallet.is_none() {
@@ -2691,7 +2755,10 @@ fn current_clean_suffix(rows: &[Value]) -> &[Value] {
         let clean = serde_json::from_value::<DataQualitySummary>(row["data_quality"].clone())
             .ok()
             .is_some_and(|quality| quality.promotion_allowed())
-            && row["runtime_role"].as_str() == Some("profitability_shadow");
+            && row["runtime_role"].as_str() == Some("profitability_shadow")
+            && row["fill_model"]
+                .as_str()
+                .is_none_or(|_| queue_profitability_row_eligible(row));
         if !clean || next_date.is_some_and(|next| date.succ_opt() != Some(next)) {
             break;
         }
@@ -2699,6 +2766,17 @@ fn current_clean_suffix(rows: &[Value]) -> &[Value] {
         next_date = Some(date);
     }
     &rows[start..]
+}
+
+fn queue_profitability_row_eligible(row: &Value) -> bool {
+    row["fill_model"].as_str() == Some("queue_proxy_conservative")
+        && row["queue_proxy_enabled"].as_bool() == Some(true)
+        && row["queue_proxy_pnl_eligible"].as_bool() == Some(true)
+        && decimal_from_value(&row["queue_proxy_eligibility_rate"])
+            .is_some_and(|rate| rate >= Decimal::new(95, 2))
+        && row["ineligible_queue_fills"].as_u64() == Some(0)
+        && decimal_from_value(&row["queue_proxy_net_pnl"]).is_some()
+        && decimal_from_value(&row["queue_proxy_wallet_constrained_net_pnl"]).is_some()
 }
 
 fn observed_campaign_days(snapshots: &[CumulativeWalletSnapshot]) -> u32 {
@@ -3061,6 +3139,25 @@ fn select_regime_profile_net(report: Option<&Value>, profile: &str) -> Option<St
     .find_map(|pointer| profile_net_in_rows(report.pointer(pointer), profile))
 }
 
+fn select_regime_profile_authorization_net(
+    report: Option<&Value>,
+    profile: &str,
+    queue_authorization_required: bool,
+) -> Option<String> {
+    if !queue_authorization_required {
+        return select_regime_profile_net(report, profile);
+    }
+    let report = report?;
+    [
+        "/result/comparisons",
+        "/result/profiles",
+        "/result/regime_conditioned_profiles/result/comparisons",
+        "/result/regime_conditioned_profiles/result/profiles",
+    ]
+    .into_iter()
+    .find_map(|pointer| queue_profile_net_in_rows(report.pointer(pointer), "profile", profile))
+}
+
 fn find_regime_profile<'a>(report: &'a Value, profile: &str) -> Option<&'a Value> {
     [
         "/result/profiles",
@@ -3099,6 +3196,42 @@ fn select_fill_model_net(report: Option<&Value>, fill_model: &str) -> Option<Str
     ]
     .into_iter()
     .find_map(|pointer| fill_model_net_in_rows(report.pointer(pointer), fill_model))
+}
+
+fn select_fill_model_authorization_net(
+    report: Option<&Value>,
+    fill_model: &str,
+    queue_authorization_required: bool,
+) -> Option<String> {
+    if !queue_authorization_required {
+        return select_fill_model_net(report, fill_model);
+    }
+    let report = report?;
+    [
+        "/result/fill_models",
+        "/result/fill_model_sensitivity",
+        "/result/baseline_static_strategy/result/fill_models",
+    ]
+    .into_iter()
+    .find_map(|pointer| {
+        queue_profile_net_in_rows(report.pointer(pointer), "fill_model", fill_model)
+    })
+}
+
+fn queue_profile_net_in_rows(
+    rows: Option<&Value>,
+    identity_key: &str,
+    identity: &str,
+) -> Option<String> {
+    rows?.as_array()?.iter().find_map(|row| {
+        let map = row.as_object()?;
+        if map.get(identity_key).and_then(Value::as_str) != Some(identity)
+            || map.get("queue_proxy_pnl_eligible").and_then(Value::as_bool) != Some(true)
+        {
+            return None;
+        }
+        map.get("queue_proxy_net_pnl").and_then(value_to_string)
+    })
 }
 
 fn fill_model_net_in_rows(rows: Option<&Value>, fill_model: &str) -> Option<String> {
@@ -3330,7 +3463,14 @@ mod wallet_metric_tests {
                     "profile": "dynamic_quote_style",
                     "net_pnl": "100",
                     "wallet_constrained": true,
-                    "wallet_constrained_net_pnl": "0.25"
+                    "wallet_constrained_net_pnl": "0.25",
+                    "queue_proxy_enabled": true,
+                    "queue_proxy_eligibility_rate": "0.99",
+                    "queue_proxy_pnl_eligible": true,
+                    "queue_proxy_net_pnl": "100",
+                    "queue_proxy_wallet_constrained_net_pnl": "0.25",
+                    "eligible_queue_fills": 10,
+                    "ineligible_queue_fills": 0
                 }]
             }
         });
@@ -3349,7 +3489,14 @@ mod wallet_metric_tests {
             "wallet_constrained_net_pnl": "0.25",
             "wallet_constrained_ending_equity": "5.280521",
             "wallet_constrained_max_drawdown": "0",
-            "wallet_constrained_unresolved_orders": 0
+            "wallet_constrained_unresolved_orders": 0,
+            "queue_proxy_enabled": true,
+            "queue_proxy_eligibility_rate": "0.99",
+            "queue_proxy_pnl_eligible": true,
+            "queue_proxy_net_pnl": "100",
+            "queue_proxy_wallet_constrained_net_pnl": "0.25",
+            "eligible_queue_fills": 10,
+            "ineligible_queue_fills": 0
         });
         let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
         let runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
@@ -3372,6 +3519,8 @@ mod wallet_metric_tests {
         .unwrap();
 
         assert_eq!(row["dynamic_quote_style_net_pnl"], "100");
+        assert_eq!(row["queue_proxy_pnl_eligible"], true);
+        assert_eq!(row["queue_proxy_eligibility_rate"], "0.99");
         assert_eq!(row["wallet_constrained"], true);
         assert_eq!(row["wallet_constrained_net_pnl"], "0.25");
 
@@ -3403,6 +3552,83 @@ mod wallet_metric_tests {
     }
 
     #[test]
+    fn generic_positive_pnl_cannot_enter_profitability_without_queue_eligibility() {
+        let regimes = json!({
+            "result": {
+                "fill_model": "queue_proxy_conservative",
+                "comparisons": [{
+                    "profile": "dynamic_quote_style",
+                    "net_pnl": "100",
+                    "wallet_constrained": true,
+                    "wallet_constrained_net_pnl": "100",
+                    "queue_proxy_enabled": false,
+                    "queue_proxy_eligibility_rate": "0.50",
+                    "queue_proxy_pnl_eligible": false,
+                    "queue_proxy_net_pnl": Value::Null,
+                    "queue_proxy_wallet_constrained_net_pnl": Value::Null,
+                    "eligible_queue_fills": 10,
+                    "ineligible_queue_fills": 1
+                }]
+            }
+        });
+        let cumulative_wallet = json!({
+            "wallet_constrained": true,
+            "wallet_constrained_net_pnl": "100",
+            "wallet_constrained_ending_equity": "105.030521",
+            "wallet_constrained_max_drawdown": "0",
+            "wallet_constrained_unresolved_orders": 0,
+            "queue_proxy_enabled": false,
+            "queue_proxy_eligibility_rate": "0.50",
+            "queue_proxy_pnl_eligible": false,
+            "queue_proxy_net_pnl": Value::Null,
+            "queue_proxy_wallet_constrained_net_pnl": Value::Null,
+            "eligible_queue_fills": 10,
+            "ineligible_queue_fills": 1
+        });
+        let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+
+        let row = json_row(
+            "2026-07-13",
+            DailyReportSources {
+                final_report: None,
+                regimes: Some(&regimes),
+                baseline: None,
+            },
+            DailyRowEvidence {
+                sample: None,
+                audit: None,
+                execution_quality: None,
+                cumulative_wallet: Some(&cumulative_wallet),
+                manifest_quality: Some(&quality),
+                runtime_role: Some(&runtime_role),
+            },
+        )
+        .unwrap();
+
+        assert!(row["dynamic_quote_style_net_pnl"].is_null());
+        assert!(row["wallet_constrained_net_pnl"].is_null());
+        assert_eq!(row["queue_proxy_pnl_eligible"], false);
+        assert!(current_clean_suffix(&[row.clone()]).is_empty());
+
+        let metrics = aggregate_profitability_metrics(
+            &[row],
+            &json!({}),
+            &json!({}),
+            &PromotionThresholds::default(),
+            None,
+        );
+        assert!(!metrics.queue_conservative);
+        assert_eq!(metrics.queue_conservative_net_pnl, Decimal::ZERO);
+        assert!(metrics
+            .missing_metrics
+            .contains(&"queue_proxy_pnl_eligibility".to_owned()));
+        assert!(metrics
+            .missing_metrics
+            .contains(&"queue_conservative_net_pnl".to_owned()));
+    }
+
+    #[test]
     fn cumulative_wallet_never_sums_reset_daily_profit_and_blocks_capital_lock() {
         fn row(
             date: &str,
@@ -3420,6 +3646,13 @@ mod wallet_metric_tests {
                 "fill_model": "queue_proxy_conservative",
                 // A reset-per-day implementation would incorrectly sum these to +2.
                 "dynamic_quote_style_net_pnl": "1",
+                "queue_proxy_enabled": true,
+                "queue_proxy_eligibility_rate": "1",
+                "queue_proxy_pnl_eligible": true,
+                "queue_proxy_net_pnl": "1",
+                "queue_proxy_wallet_constrained_net_pnl": pnl,
+                "eligible_queue_fills": 1,
+                "ineligible_queue_fills": 0,
                 "wallet_scope": CUMULATIVE_WALLET_SCOPE,
                 "wallet_campaign_start": WALLET_CAMPAIGN_START,
                 "wallet_snapshot_date": date,
@@ -3629,6 +3862,13 @@ mod wallet_metric_tests {
                 "settled_markets": 10,
                 "fill_model": "queue_proxy_conservative",
                 "dynamic_quote_style_net_pnl": daily_pnl,
+                "queue_proxy_enabled": true,
+                "queue_proxy_eligibility_rate": "1",
+                "queue_proxy_pnl_eligible": true,
+                "queue_proxy_net_pnl": daily_pnl,
+                "queue_proxy_wallet_constrained_net_pnl": wallet_pnl,
+                "eligible_queue_fills": 1,
+                "ineligible_queue_fills": 0,
                 "wallet_scope": CUMULATIVE_WALLET_SCOPE,
                 "wallet_campaign_start": WALLET_CAMPAIGN_START,
                 "wallet_snapshot_date": date,

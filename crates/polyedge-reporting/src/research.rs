@@ -858,6 +858,13 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
                 "wallet_constrained_accepted_orders": row["wallet_constrained_accepted_orders"],
                 "wallet_constrained_skipped_orders": row["wallet_constrained_skipped_orders"],
                 "wallet_constrained_equity_curve": row["wallet_constrained_equity_curve"],
+                "queue_proxy_enabled": row["queue_proxy_enabled"],
+                "queue_proxy_eligibility_rate": row["queue_proxy_eligibility_rate"],
+                "queue_proxy_pnl_eligible": row["queue_proxy_pnl_eligible"],
+                "queue_proxy_net_pnl": row["queue_proxy_net_pnl"],
+                "queue_proxy_wallet_constrained_net_pnl": row["queue_proxy_wallet_constrained_net_pnl"],
+                "eligible_queue_fills": row["eligible_queue_fills"],
+                "ineligible_queue_fills": row["ineligible_queue_fills"],
                 "delta_vs_static": (net - static_net).to_string(),
                 "regime_frequency": row["regime_frequency"],
                 "regime_time_share": row["regime_time_share"],
@@ -7282,6 +7289,10 @@ struct QueueMarketEvidence {
     depletion_event_count: usize,
     order_lifecycle_count: usize,
     size_ahead_samples: Vec<Decimal>,
+    ignored_opposite_trade_count: usize,
+    missing_or_unknown_trade_side_count: usize,
+    queue_fill_event_count: usize,
+    queue_partial_fill_event_count: usize,
     ineligible_reasons: BTreeSet<String>,
 }
 
@@ -7811,16 +7822,33 @@ impl ResearchReplayEngine {
             return;
         }
         let trade_side = text(payload, "side").to_ascii_lowercase();
-        if trade_side != "sell" {
+        if trade_side == "buy" {
+            // `last_trade_price.side` is the taker/aggressor side. A BUY
+            // therefore executes against resting asks and is irrelevant to a
+            // resting maker BUY's bid queue. It is valid market activity, not
+            // corrupt evidence, and must not poison later compatible prints.
             if let Some((market_id, _)) = self.token_to_market.get(&token_id).cloned() {
                 self.queue_market_evidence
                     .entry(market_id)
                     .or_default()
+                    .ignored_opposite_trade_count += 1;
+            }
+            return;
+        }
+        if trade_side != "sell" {
+            // Missing or unknown side cannot be assigned to the bid or ask
+            // queue. Ignoring it is execution-conservative, but not
+            // PnL-conservative: it could selectively hide a losing fill.
+            // Retain a blocking reason even if a later SELL print is usable.
+            if let Some((market_id, _)) = self.token_to_market.get(&token_id).cloned() {
+                let evidence = self.queue_market_evidence.entry(market_id).or_default();
+                evidence.missing_or_unknown_trade_side_count += 1;
+                evidence
                     .ineligible_reasons
                     .insert(if trade_side.is_empty() {
                         "trade_print_missing_aggressor_side".to_owned()
                     } else {
-                        "trade_print_side_not_sell_for_maker_buy".to_owned()
+                        "trade_print_unknown_aggressor_side".to_owned()
                     });
             }
             return;
@@ -7878,9 +7906,11 @@ impl ResearchReplayEngine {
             }
             let fill_size = remaining_order.min(trade_size);
             if fill_size > Decimal::ZERO {
-                if fill_size < remaining_order {
+                let partial = fill_size < remaining_order;
+                if partial {
                     self.queue_partial_fills += 1;
                 }
+                let market_id = self.orders[index].market_id.clone();
                 self.fill_order_size(
                     index,
                     self.orders[index].price,
@@ -7888,6 +7918,11 @@ impl ResearchReplayEngine {
                     recorded_ts,
                     true,
                 );
+                let evidence = self.queue_market_evidence.entry(market_id).or_default();
+                evidence.queue_fill_event_count += 1;
+                if partial {
+                    evidence.queue_partial_fill_event_count += 1;
+                }
                 if self.orders[index].filled_size >= self.orders[index].size {
                     self.open_orders.remove(&index);
                 }
@@ -8679,6 +8714,8 @@ impl ResearchReplayEngine {
             depletion_events: self.depletion_evidence_events,
             queue_fills: self.maker_fills,
             queue_partial_fills: self.queue_partial_fills,
+            net_pnl: net,
+            wallet_constrained_net_pnl: wallet.net_pnl,
             evidence_by_market: &self.queue_market_evidence,
             markets: &self.markets,
         });
@@ -8711,6 +8748,11 @@ impl ResearchReplayEngine {
             "queue_proxy_eligible_markets": queue_proxy["queue_proxy_eligible_markets"].clone(),
             "queue_proxy_ineligible_markets": queue_proxy["queue_proxy_ineligible_markets"].clone(),
             "queue_proxy_eligibility_rate": queue_proxy["queue_proxy_eligibility_rate"].clone(),
+            "queue_proxy_pnl_eligible": queue_proxy["queue_proxy_pnl_eligible"].clone(),
+            "queue_proxy_net_pnl": queue_proxy["queue_proxy_net_pnl"].clone(),
+            "queue_proxy_wallet_constrained_net_pnl": queue_proxy["queue_proxy_wallet_constrained_net_pnl"].clone(),
+            "eligible_queue_fills": queue_proxy["eligible_queue_fills"].clone(),
+            "ineligible_queue_fills": queue_proxy["ineligible_queue_fills"].clone(),
             "queue_proxy_fills": queue_proxy["queue_proxy_fills"].clone(),
             "queue_proxy_partial_fills": queue_proxy["queue_proxy_partial_fills"].clone(),
             "queue_proxy_fill_rate": queue_proxy["queue_proxy_fill_rate"].clone(),
@@ -10154,8 +10196,40 @@ struct QueueProxyReportInput<'a> {
     depletion_events: usize,
     queue_fills: usize,
     queue_partial_fills: usize,
+    net_pnl: Decimal,
+    wallet_constrained_net_pnl: Decimal,
     evidence_by_market: &'a BTreeMap<String, QueueMarketEvidence>,
     markets: &'a BTreeMap<String, MarketTruth>,
+}
+
+fn queue_market_ineligible_reasons(
+    market_id: &str,
+    evidence: &QueueMarketEvidence,
+    markets: &BTreeMap<String, MarketTruth>,
+) -> BTreeSet<String> {
+    let mut reasons = evidence.ineligible_reasons.clone();
+    if !markets
+        .get(market_id)
+        .is_some_and(MarketTruth::complete_for_simulation)
+    {
+        reasons.insert("missing_start_or_final_truth".to_owned());
+    }
+    if evidence.book_snapshot_count == 0 {
+        reasons.insert("missing_book_snapshots".to_owned());
+    }
+    if evidence.price_change_count == 0 && evidence.level_change_count == 0 {
+        reasons.insert("missing_price_change_or_level_update".to_owned());
+    }
+    if evidence.trade_event_count == 0 || evidence.trade_size_count == 0 {
+        reasons.insert("missing_last_trade_price_or_trade_size".to_owned());
+    }
+    if evidence.order_lifecycle_count == 0 {
+        reasons.insert("missing_simulated_order_lifecycle".to_owned());
+    }
+    if evidence.size_ahead_samples.is_empty() {
+        reasons.insert("missing_size_ahead_samples".to_owned());
+    }
+    reasons
 }
 
 fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
@@ -10166,6 +10240,8 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         depletion_events,
         queue_fills,
         queue_partial_fills,
+        net_pnl,
+        wallet_constrained_net_pnl,
         evidence_by_market,
         markets,
     } = input;
@@ -10177,36 +10253,27 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
     };
     let mut eligible_markets = 0usize;
     let mut ineligible_markets = 0usize;
+    let mut eligible_queue_fills = 0usize;
+    let mut ineligible_queue_fills = 0usize;
+    let mut eligible_queue_partial_fills = 0usize;
+    let mut ineligible_queue_partial_fills = 0usize;
+    let mut ignored_opposite_trade_count = 0usize;
+    let mut missing_or_unknown_trade_side_count = 0usize;
     let mut ineligible_reasons = BTreeMap::<String, usize>::new();
     let mut size_ahead_samples = Vec::new();
     for (market_id, evidence) in evidence_by_market {
         size_ahead_samples.extend(evidence.size_ahead_samples.iter().copied());
-        let complete = markets
-            .get(market_id)
-            .is_some_and(MarketTruth::complete_for_simulation);
-        let mut reasons = evidence.ineligible_reasons.clone();
-        if !complete {
-            reasons.insert("missing_start_or_final_truth".to_owned());
-        }
-        if evidence.book_snapshot_count == 0 {
-            reasons.insert("missing_book_snapshots".to_owned());
-        }
-        if evidence.price_change_count == 0 && evidence.level_change_count == 0 {
-            reasons.insert("missing_price_change_or_level_update".to_owned());
-        }
-        if evidence.trade_event_count == 0 || evidence.trade_size_count == 0 {
-            reasons.insert("missing_last_trade_price_or_trade_size".to_owned());
-        }
-        if evidence.order_lifecycle_count == 0 {
-            reasons.insert("missing_simulated_order_lifecycle".to_owned());
-        }
-        if evidence.size_ahead_samples.is_empty() {
-            reasons.insert("missing_size_ahead_samples".to_owned());
-        }
+        ignored_opposite_trade_count += evidence.ignored_opposite_trade_count;
+        missing_or_unknown_trade_side_count += evidence.missing_or_unknown_trade_side_count;
+        let reasons = queue_market_ineligible_reasons(market_id, evidence, markets);
         if reasons.is_empty() {
             eligible_markets += 1;
+            eligible_queue_fills += evidence.queue_fill_event_count;
+            eligible_queue_partial_fills += evidence.queue_partial_fill_event_count;
         } else {
             ineligible_markets += 1;
+            ineligible_queue_fills += evidence.queue_fill_event_count;
+            ineligible_queue_partial_fills += evidence.queue_partial_fill_event_count;
             for reason in reasons {
                 *ineligible_reasons.entry(reason).or_insert(0) += 1;
             }
@@ -10217,6 +10284,11 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         && total_markets > 0
         && eligible_markets.saturating_mul(100) >= total_markets.saturating_mul(80);
     let enabled = is_queue_proxy_shadow_model(fill_model) && evidence_complete;
+    let pnl_eligible = is_queue_proxy_shadow_model(fill_model)
+        && eligible_markets > 0
+        && total_markets > 0
+        && eligible_markets.saturating_mul(100) >= total_markets.saturating_mul(95)
+        && ineligible_queue_fills == 0;
     let status = if !is_queue_proxy_family(fill_model) {
         "not_requested"
     } else if fill_model == FillModel::QueueProxy {
@@ -10243,8 +10315,14 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         "queue_proxy_ineligible_markets": ineligible_markets,
         "queue_proxy_eligibility_rate": ratio_usize(eligible_markets, total_markets),
         "minimum_required_eligibility_rate": "0.80",
+        "minimum_pnl_eligibility_rate": "0.95",
+        "queue_proxy_pnl_eligible": pnl_eligible,
         "queue_proxy_fills": if is_queue_proxy_shadow_model(fill_model) { queue_fills } else { 0 },
         "queue_proxy_partial_fills": if is_queue_proxy_shadow_model(fill_model) { queue_partial_fills } else { 0 },
+        "eligible_queue_fills": if is_queue_proxy_shadow_model(fill_model) { eligible_queue_fills } else { 0 },
+        "ineligible_queue_fills": if is_queue_proxy_shadow_model(fill_model) { ineligible_queue_fills } else { 0 },
+        "eligible_queue_partial_fills": if is_queue_proxy_shadow_model(fill_model) { eligible_queue_partial_fills } else { 0 },
+        "ineligible_queue_partial_fills": if is_queue_proxy_shadow_model(fill_model) { ineligible_queue_partial_fills } else { 0 },
         "queue_proxy_fill_rate": if is_queue_proxy_shadow_model(fill_model) { ratio_usize(queue_fills, evidence_by_market.values().map(|evidence| evidence.order_lifecycle_count).sum::<usize>()) } else { Value::Null },
         "avg_size_ahead": decimal_average_json(&size_ahead_samples),
         "p50_size_ahead": decimal_percentile_json(size_ahead_samples.clone(), 0.50),
@@ -10252,10 +10330,13 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         "queue_evidence_events": queue_events,
         "trade_evidence_events": trade_events,
         "depletion_evidence_events": depletion_events,
+        "ignored_opposite_trade_count": ignored_opposite_trade_count,
+        "missing_or_unknown_trade_side_count": missing_or_unknown_trade_side_count,
         "ineligible_reasons": ineligible_reasons,
         "queue_vs_touch_fill_delta": Value::Null,
         "queue_vs_trade_through_fill_delta": Value::Null,
-        "queue_proxy_net_pnl": Value::Null,
+        "queue_proxy_net_pnl": pnl_eligible.then(|| net_pnl.to_string()),
+        "queue_proxy_wallet_constrained_net_pnl": pnl_eligible.then(|| wallet_constrained_net_pnl.to_string()),
         "required_before_enabling": [
             "resting queue position or size-ahead estimate",
             "trade prints or equivalent executed volume by token/price/time",
