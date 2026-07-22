@@ -250,10 +250,10 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Final Decision Grade" value={percentage(coverageBreakdown?.final_decision_grade_coverage)} />
             <Metric label="Execution Fields" value={percentage(coverageBreakdown?.execution_field_coverage)} />
             <Metric label="Full Decision Replay" value={percentage(coverageBreakdown?.decision_parity_rate)} />
-            <Metric label="Queue Snapshots" value={percentage(coverageBreakdown?.queue_snapshot_coverage)} />
-            <Metric label="1s Markout Completion" value={percentage(coverageBreakdown?.markout_1s_completion)} />
-            <Metric label="5s Markout Completion" value={percentage(coverageBreakdown?.markout_5s_completion)} />
-            <Metric label="30s Markout Completion" value={percentage(coverageBreakdown?.markout_30s_completion)} />
+            <Metric label="Queue Snapshots" value={applicablePercentage(coverageBreakdown?.queue_snapshot_coverage, coverageBreakdown?.queue_snapshot_applicable)} />
+            <Metric label="1s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_1s_completion, coverageBreakdown?.markout_1s_applicable)} />
+            <Metric label="5s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_5s_completion, coverageBreakdown?.markout_5s_applicable)} />
+            <Metric label="30s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_30s_completion, coverageBreakdown?.markout_30s_applicable)} />
             <Metric label="Fatal Warnings" value={profitability?.data_quality?.fatal_warnings ?? promotionQuality?.fatal_issues?.length ?? 0} />
             <Metric label="Blocking Warnings" value={profitability?.data_quality?.blocking_warnings ?? blockingWarnings ?? 0} />
             <Metric label="Unclassified Warnings" value={profitability?.data_quality?.unclassified_warnings ?? unclassifiedWarnings ?? 0} />
@@ -469,6 +469,13 @@ function signedUsd(value: string | number | null | undefined) {
 function percentage(value: string | number | null | undefined) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "pending";
   return `${numberText(Number(value) * 100, 2)}%`;
+}
+
+function applicablePercentage(
+  value: string | number | null | undefined,
+  applicable: boolean | null | undefined
+) {
+  return applicable === false ? "N/A — zero denominator" : percentage(value);
 }
 
 function Overview({

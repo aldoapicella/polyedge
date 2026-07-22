@@ -494,9 +494,13 @@ export type VenueExecutionEvidence = {
         execution_field_coverage?: string | number | null;
         decision_parity_rate?: string | number | null;
         queue_snapshot_coverage?: string | number | null;
+        queue_snapshot_applicable?: boolean | null;
         markout_1s_completion?: string | number | null;
+        markout_1s_applicable?: boolean | null;
         markout_5s_completion?: string | number | null;
+        markout_5s_applicable?: boolean | null;
         markout_30s_completion?: string | number | null;
+        markout_30s_applicable?: boolean | null;
       };
     };
     gates?: Record<string, {
@@ -542,9 +546,13 @@ export type VenueExecutionEvidence = {
             execution_field_coverage?: string | number | null;
             decision_parity_rate?: string | number | null;
             queue_snapshot_coverage?: string | number | null;
+            queue_snapshot_applicable?: boolean | null;
             markout_1s_completion?: string | number | null;
+            markout_1s_applicable?: boolean | null;
             markout_5s_completion?: string | number | null;
+            markout_5s_applicable?: boolean | null;
             markout_30s_completion?: string | number | null;
+            markout_30s_applicable?: boolean | null;
           };
           fatal_issues?: string[];
           warnings?: Array<{
