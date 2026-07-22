@@ -318,6 +318,22 @@ older observations remain visible as legacy evidence but do not count toward
 the v3 threshold or promotion. The model reports out-of-sample Brier score plus
 calibration bins and remains research-only; it cannot promote a strategy.
 
+The separate `research loss-regime-oos` experiment is also fail closed. It may
+only retain or abstain from orders using features captured before submission,
+uses whole UTC market days for chronological validation and a sealed final
+test, and does not publish a lower-95 PnL bound before 28 daily clusters. Its
+outputs live only below `reports/research/experiments/<experiment_id>` and are
+always diagnostic-only.
+
+Standalone order lifecycle facts are not sufficient to call their PnL
+queue-qualified. Market eligibility depends on the complete joined stream of
+book, level, trade-side, lifecycle, size-ahead, and settlement evidence. Replay
+therefore emits a content-hashed per-market eligibility map plus an exact input
+binding. The OOS analyzer requires that artifact, joins it by market ID and
+exact normalized-input hash, and refuses any missing, mismatched, tampered, or
+filled-ineligible market. It must never infer eligibility from an individual
+order or fill row.
+
 The live dashboard exposes the authenticated lifecycle and model under **Labs
 > Venue Execution**. It always labels the value as `inferred_size_ahead` and
 shows that literal FIFO rank is unavailable. It also exposes each selected

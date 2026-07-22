@@ -1013,6 +1013,33 @@ fn queue_proxy_missing_trade_side_blocks_authorization_pnl_even_after_a_fill() {
             ["trade_print_missing_aggressor_side"],
         1
     );
+    let eligibility = &report["result"]["replay_metrics"]["queue_proxy"];
+    assert_eq!(eligibility["market_eligibility"]["m1"]["market_id"], "m1");
+    assert_eq!(eligibility["market_eligibility"]["m1"]["eligible"], false);
+    assert_eq!(
+        eligibility["market_eligibility"]["m1"]["queue_fill_event_count"],
+        1
+    );
+    assert!(eligibility["market_eligibility"]["m1"]["reasons"]
+        .as_array()
+        .is_some_and(|reasons| reasons
+            .iter()
+            .any(|reason| { reason.as_str() == Some("trade_print_missing_aggressor_side") })));
+    assert!(
+        eligibility["market_eligibility"]["m1"]["queue_evidence_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71)
+    );
+    assert!(eligibility["market_eligibility_sha256"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71));
+    assert_eq!(
+        eligibility["input_binding"]["schema"],
+        "polyedge.queue_proxy.input_binding.v1"
+    );
+    assert!(eligibility["input_binding"]["sha256"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71));
 }
 
 #[test]

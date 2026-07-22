@@ -10,19 +10,20 @@ use polyedge_reporting::research::{
     run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
     run_calibration, run_chart_backfill, run_complete_shadow_correction,
     run_evaluate_profitability, run_execution_quality, run_final_report, run_loss_diagnostics,
-    run_materialize_projected_campaign, run_ml_calibrate, run_normalize, run_publish_projected_day,
-    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
-    stop_funded_manifest_from_stage_block, AdvanceFundedLadderOptions,
-    AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions, BackfillOptions,
-    BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions, CalibrationOptions,
-    ChartBackfillOptions, CompleteShadowCorrectionOptions, CumulativeWalletSnapshotOptions,
-    ExcludedTimeWindow, ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel,
-    FinalReportOptions, InitializeFundedManifestOptions, LossDiagnosticsOptions,
-    MaterializeProjectedCampaignOptions, MlCalibrateOptions, NormalizeOptions,
-    ProfitabilityEvaluationOptions, ProspectiveValidationOptions, PublishProjectedDayOptions,
-    QueueAuditOptions, RegimesOptions, ReplayIndexOptions, ReplayOptions, SampleSizeOptions,
-    StopFundedManifestFromStageBlockOptions, SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
+    run_loss_regime_oos, run_materialize_projected_campaign, run_ml_calibrate, run_normalize,
+    run_publish_projected_day, run_queue_audit, run_regimes, run_replay, run_sample_size,
+    run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
+    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
+    BackfillOptions, BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions,
+    CalibrationOptions, ChartBackfillOptions, CompleteShadowCorrectionOptions,
+    CumulativeWalletSnapshotOptions, ExcludedTimeWindow, ExecutionQualityOptions,
+    ExpireFundedManifestOptions, FillModel, FinalReportOptions, InitializeFundedManifestOptions,
+    LossDiagnosticsOptions, LossRegimeOosOptions, MaterializeProjectedCampaignOptions,
+    MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
+    ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
+    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions,
+    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -333,6 +334,20 @@ enum ResearchCommand {
         exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
+    },
+    LossRegimeOos {
+        #[arg(long)]
+        facts: PathBuf,
+        #[arg(long)]
+        queue_evidence: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        source_campaign_id: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        markdown: PathBuf,
     },
     Calibration {
         #[arg(long, default_value = "data/research/normalized")]
@@ -729,6 +744,21 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         ResearchCommand::LossDiagnostics { input, out } => {
             run_loss_diagnostics(LossDiagnosticsOptions { input, out })?
         }
+        ResearchCommand::LossRegimeOos {
+            facts,
+            queue_evidence,
+            config,
+            source_campaign_id,
+            out,
+            markdown,
+        } => run_loss_regime_oos(LossRegimeOosOptions {
+            facts,
+            queue_evidence,
+            config,
+            source_campaign_id,
+            out,
+            markdown,
+        })?,
         ResearchCommand::Normalize {
             input,
             out,
@@ -1723,6 +1753,49 @@ mod tests {
         assert_eq!(input, PathBuf::from("immutable-v3-snapshot"));
         assert_eq!(out, PathBuf::from("loss-diagnostics-out"));
         assert!(Cli::try_parse_from(["polyedge-rs", "research", "loss-diagnostics"]).is_err());
+    }
+
+    #[test]
+    fn loss_regime_oos_cli_requires_explicit_isolated_evidence_inputs() {
+        let cli = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "loss-regime-oos",
+            "--facts",
+            "loss-diagnostics",
+            "--queue-evidence",
+            "baseline.json",
+            "--config",
+            "research/configs/experiments/loss-regime-oos-v1-2026-07-22.yaml",
+            "--source-campaign-id",
+            "campaign-2026-07-23",
+            "--out",
+            "reports/research/experiments/loss-regime-oos-v1/report.json",
+            "--markdown",
+            "reports/research/experiments/loss-regime-oos-v1/report.md",
+        ])
+        .expect("parse loss regime OOS command");
+        let Command::Research {
+            command:
+                ResearchCommand::LossRegimeOos {
+                    facts,
+                    queue_evidence,
+                    config,
+                    source_campaign_id,
+                    out,
+                    markdown,
+                },
+        } = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(facts, PathBuf::from("loss-diagnostics"));
+        assert_eq!(queue_evidence, PathBuf::from("baseline.json"));
+        assert_eq!(source_campaign_id, "campaign-2026-07-23");
+        assert!(config.ends_with("loss-regime-oos-v1-2026-07-22.yaml"));
+        assert!(out.starts_with("reports/research/experiments"));
+        assert!(markdown.starts_with("reports/research/experiments"));
+        assert!(Cli::try_parse_from(["polyedge-rs", "research", "loss-regime-oos"]).is_err());
     }
 
     #[test]

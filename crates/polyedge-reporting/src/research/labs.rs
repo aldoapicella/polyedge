@@ -196,8 +196,63 @@ pub fn run_build_cumulative_wallet_snapshot(
             "cumulative replay is not wallet constrained".to_owned(),
         ));
     }
+    let queue_qualified = campaign_contract.is_some();
+    if queue_qualified {
+        let fill_model = regimes
+            .pointer("/result/fill_model")
+            .and_then(Value::as_str);
+        let eligibility_rate = decimal_from_value(&profile["queue_proxy_eligibility_rate"]);
+        if fill_model != Some("queue_proxy_conservative")
+            || profile["queue_proxy_enabled"].as_bool() != Some(true)
+            || profile["queue_proxy_pnl_eligible"].as_bool() != Some(true)
+            || !eligibility_rate.is_some_and(|rate| rate >= Decimal::new(95, 2))
+            || profile["ineligible_queue_fills"].as_u64() != Some(0)
+        {
+            return Err(ResearchError::InvalidInput(
+                "cumulative replay has no queue-qualified wallet PnL".to_owned(),
+            ));
+        }
+    }
+    let (
+        wallet_net_field,
+        wallet_ending_equity_field,
+        wallet_max_drawdown_field,
+        wallet_accepted_orders_field,
+        wallet_skipped_orders_field,
+        wallet_accepted_filled_orders_field,
+        wallet_unresolved_orders_field,
+        wallet_skip_reasons_field,
+        wallet_equity_curve_field,
+        wallet_constraints_field,
+    ) = if queue_qualified {
+        (
+            "queue_proxy_wallet_constrained_net_pnl",
+            "queue_proxy_wallet_constrained_ending_equity",
+            "queue_proxy_wallet_constrained_max_drawdown",
+            "queue_proxy_wallet_constrained_accepted_orders",
+            "queue_proxy_wallet_constrained_skipped_orders",
+            "queue_proxy_wallet_constrained_accepted_filled_orders",
+            "queue_proxy_wallet_constrained_unresolved_orders",
+            "queue_proxy_wallet_constrained_skip_reasons",
+            "queue_proxy_wallet_constrained_equity_curve",
+            "queue_proxy_wallet_constraints",
+        )
+    } else {
+        (
+            "wallet_constrained_net_pnl",
+            "wallet_constrained_ending_equity",
+            "wallet_constrained_max_drawdown",
+            "wallet_constrained_accepted_orders",
+            "wallet_constrained_skipped_orders",
+            "wallet_constrained_accepted_filled_orders",
+            "wallet_constrained_unresolved_orders",
+            "wallet_constrained_skip_reasons",
+            "wallet_constrained_equity_curve",
+            "wallet_constraints",
+        )
+    };
     if let Some(binding) = &campaign_contract {
-        let constraints = &profile["wallet_constraints"];
+        let constraints = &profile[wallet_constraints_field];
         let contract = &binding.contract;
         if decimal_from_value(&constraints["campaign_baseline"]) != Some(contract.wallet_baseline)
             || decimal_from_value(&constraints["equity_floor"]) != Some(contract.equity_floor)
@@ -219,18 +274,50 @@ pub fn run_build_cumulative_wallet_snapshot(
         ));
     }
     for field in [
-        "wallet_constrained_net_pnl",
-        "wallet_constrained_ending_equity",
-        "wallet_constrained_max_drawdown",
-        "wallet_constrained_unresolved_orders",
+        wallet_net_field,
+        wallet_ending_equity_field,
+        wallet_max_drawdown_field,
+        wallet_unresolved_orders_field,
     ] {
-        if (field == "wallet_constrained_unresolved_orders" && profile[field].as_u64().is_none())
-            || (field != "wallet_constrained_unresolved_orders"
+        if (field == wallet_unresolved_orders_field && profile[field].as_u64().is_none())
+            || (field != wallet_unresolved_orders_field
                 && decimal_from_value(&profile[field]).is_none())
         {
             return Err(ResearchError::InvalidInput(format!(
                 "cumulative replay is missing valid {field}"
             )));
+        }
+    }
+    if queue_qualified
+        && (profile[wallet_accepted_orders_field].as_u64().is_none()
+            || profile[wallet_skipped_orders_field].as_u64().is_none()
+            || profile[wallet_accepted_filled_orders_field]
+                .as_u64()
+                .is_none()
+            || !profile[wallet_skip_reasons_field].is_object()
+            || !profile[wallet_equity_curve_field].is_array()
+            || !profile[wallet_constraints_field].is_object())
+    {
+        return Err(ResearchError::InvalidInput(
+            "cumulative replay has incomplete queue-qualified wallet state".to_owned(),
+        ));
+    }
+    let selected_wallet_net =
+        decimal_from_value(&profile[wallet_net_field]).expect("wallet net validated above");
+    let selected_wallet_ending_equity = decimal_from_value(&profile[wallet_ending_equity_field])
+        .expect("wallet ending equity validated above");
+    let selected_wallet_max_drawdown = decimal_from_value(&profile[wallet_max_drawdown_field])
+        .expect("wallet drawdown validated above");
+    if let Some(binding) = &campaign_contract {
+        let contract = &binding.contract;
+        if selected_wallet_ending_equity != contract.wallet_baseline + selected_wallet_net
+            || selected_wallet_max_drawdown < Decimal::ZERO
+            || selected_wallet_max_drawdown > contract.maximum_drawdown
+        {
+            return Err(ResearchError::InvalidInput(
+                "queue-qualified wallet state is inconsistent with the immutable shadow campaign contract"
+                    .to_owned(),
+            ));
         }
     }
     let schema_version = campaign_contract
@@ -254,23 +341,32 @@ pub fn run_build_cumulative_wallet_snapshot(
         "fill_model": regimes.pointer("/result/fill_model").cloned().unwrap_or(Value::Null),
         "cumulative_events": cumulative_events,
         "wallet_constrained": true,
-        "wallet_constrained_net_pnl": profile["wallet_constrained_net_pnl"].clone(),
-        "wallet_constrained_ending_equity": profile["wallet_constrained_ending_equity"].clone(),
-        "wallet_constrained_max_drawdown": profile["wallet_constrained_max_drawdown"].clone(),
-        "wallet_constrained_accepted_orders": profile["wallet_constrained_accepted_orders"].clone(),
-        "wallet_constrained_skipped_orders": profile["wallet_constrained_skipped_orders"].clone(),
-        "wallet_constrained_accepted_filled_orders": profile["wallet_constrained_accepted_filled_orders"].clone(),
-        "wallet_constrained_unresolved_orders": profile["wallet_constrained_unresolved_orders"].clone(),
-        "wallet_constrained_skip_reasons": profile["wallet_constrained_skip_reasons"].clone(),
-        "wallet_constrained_equity_curve": profile["wallet_constrained_equity_curve"].clone(),
+        "wallet_constrained_net_pnl": profile[wallet_net_field].clone(),
+        "wallet_constrained_ending_equity": profile[wallet_ending_equity_field].clone(),
+        "wallet_constrained_max_drawdown": profile[wallet_max_drawdown_field].clone(),
+        "wallet_constrained_accepted_orders": profile[wallet_accepted_orders_field].clone(),
+        "wallet_constrained_skipped_orders": profile[wallet_skipped_orders_field].clone(),
+        "wallet_constrained_accepted_filled_orders": profile[wallet_accepted_filled_orders_field].clone(),
+        "wallet_constrained_unresolved_orders": profile[wallet_unresolved_orders_field].clone(),
+        "wallet_constrained_skip_reasons": profile[wallet_skip_reasons_field].clone(),
+        "wallet_constrained_equity_curve": profile[wallet_equity_curve_field].clone(),
         "queue_proxy_enabled": profile["queue_proxy_enabled"].clone(),
         "queue_proxy_eligibility_rate": profile["queue_proxy_eligibility_rate"].clone(),
         "queue_proxy_pnl_eligible": profile["queue_proxy_pnl_eligible"].clone(),
         "queue_proxy_net_pnl": profile["queue_proxy_net_pnl"].clone(),
         "queue_proxy_wallet_constrained_net_pnl": profile["queue_proxy_wallet_constrained_net_pnl"].clone(),
+        "queue_proxy_wallet_constrained_ending_equity": profile["queue_proxy_wallet_constrained_ending_equity"].clone(),
+        "queue_proxy_wallet_constrained_max_drawdown": profile["queue_proxy_wallet_constrained_max_drawdown"].clone(),
+        "queue_proxy_wallet_constrained_accepted_orders": profile["queue_proxy_wallet_constrained_accepted_orders"].clone(),
+        "queue_proxy_wallet_constrained_skipped_orders": profile["queue_proxy_wallet_constrained_skipped_orders"].clone(),
+        "queue_proxy_wallet_constrained_accepted_filled_orders": profile["queue_proxy_wallet_constrained_accepted_filled_orders"].clone(),
+        "queue_proxy_wallet_constrained_unresolved_orders": profile["queue_proxy_wallet_constrained_unresolved_orders"].clone(),
+        "queue_proxy_wallet_constrained_skip_reasons": profile["queue_proxy_wallet_constrained_skip_reasons"].clone(),
+        "queue_proxy_wallet_constrained_equity_curve": profile["queue_proxy_wallet_constrained_equity_curve"].clone(),
+        "queue_proxy_wallet_constraints": profile["queue_proxy_wallet_constraints"].clone(),
         "eligible_queue_fills": profile["eligible_queue_fills"].clone(),
         "ineligible_queue_fills": profile["ineligible_queue_fills"].clone(),
-        "wallet_constraints": profile["wallet_constraints"].clone()
+        "wallet_constraints": profile[wallet_constraints_field].clone()
     });
     bind_campaign_contract(&mut canonical_state, campaign_contract.as_ref())?;
     let canonical_state_bytes = serde_json::to_vec(&canonical_state)?;
@@ -292,15 +388,18 @@ pub fn run_build_cumulative_wallet_snapshot(
         "candidate": "dynamic_quote_style",
         "fill_model": regimes.pointer("/result/fill_model").cloned().unwrap_or(Value::Null),
         "wallet_constrained": true,
-        "wallet_constrained_net_pnl": profile["wallet_constrained_net_pnl"].clone(),
-        "wallet_constrained_ending_equity": profile["wallet_constrained_ending_equity"].clone(),
-        "wallet_constrained_max_drawdown": profile["wallet_constrained_max_drawdown"].clone(),
-        "wallet_constrained_unresolved_orders": profile["wallet_constrained_unresolved_orders"].clone(),
+        "wallet_constrained_net_pnl": profile[wallet_net_field].clone(),
+        "wallet_constrained_ending_equity": profile[wallet_ending_equity_field].clone(),
+        "wallet_constrained_max_drawdown": profile[wallet_max_drawdown_field].clone(),
+        "wallet_constrained_unresolved_orders": profile[wallet_unresolved_orders_field].clone(),
         "queue_proxy_enabled": profile["queue_proxy_enabled"].clone(),
         "queue_proxy_eligibility_rate": profile["queue_proxy_eligibility_rate"].clone(),
         "queue_proxy_pnl_eligible": profile["queue_proxy_pnl_eligible"].clone(),
         "queue_proxy_net_pnl": profile["queue_proxy_net_pnl"].clone(),
         "queue_proxy_wallet_constrained_net_pnl": profile["queue_proxy_wallet_constrained_net_pnl"].clone(),
+        "queue_proxy_wallet_constrained_ending_equity": profile["queue_proxy_wallet_constrained_ending_equity"].clone(),
+        "queue_proxy_wallet_constrained_max_drawdown": profile["queue_proxy_wallet_constrained_max_drawdown"].clone(),
+        "queue_proxy_wallet_constrained_unresolved_orders": profile["queue_proxy_wallet_constrained_unresolved_orders"].clone(),
         "eligible_queue_fills": profile["eligible_queue_fills"].clone(),
         "ineligible_queue_fills": profile["ineligible_queue_fills"].clone(),
         "research_only": true,
@@ -1805,7 +1904,7 @@ fn json_row(
     // therefore cannot support a promotion decision.
     let dynamic_wallet_net = cumulative_wallet.and_then(|wallet| {
         if queue_authorization_required {
-            (wallet["queue_proxy_pnl_eligible"].as_bool() == Some(true))
+            queue_wallet_snapshot_eligible(wallet)
                 .then(|| value_to_string(&wallet["queue_proxy_wallet_constrained_net_pnl"]))
                 .flatten()
         } else {
@@ -1826,11 +1925,9 @@ fn json_row(
                 .final_report
                 .and_then(|report| find_regime_profile(report, "dynamic_quote_style"))
         });
-    let queue_proxy_pnl_eligible = if queue_authorization_required {
-        dynamic_profile.and_then(|profile| profile["queue_proxy_pnl_eligible"].as_bool())
-            == Some(true)
-            && cumulative_wallet.and_then(|wallet| wallet["queue_proxy_pnl_eligible"].as_bool())
-                == Some(true)
+    let queue_proxy_pnl_eligible = if fill_model == "queue_proxy_conservative" {
+        dynamic_profile.is_some_and(queue_profile_pnl_eligible)
+            && cumulative_wallet.is_some_and(queue_wallet_snapshot_eligible)
     } else {
         false
     };
@@ -1887,6 +1984,9 @@ fn json_row(
         "queue_proxy_pnl_eligible": queue_proxy_pnl_eligible,
         "queue_proxy_net_pnl": dynamic_net,
         "queue_proxy_wallet_constrained_net_pnl": dynamic_wallet_net,
+        "queue_proxy_wallet_constrained_ending_equity": cumulative_wallet.and_then(|wallet| value_to_string(&wallet["queue_proxy_wallet_constrained_ending_equity"])),
+        "queue_proxy_wallet_constrained_max_drawdown": cumulative_wallet.and_then(|wallet| value_to_string(&wallet["queue_proxy_wallet_constrained_max_drawdown"])),
+        "queue_proxy_wallet_constrained_unresolved_orders": cumulative_wallet.and_then(|wallet| wallet["queue_proxy_wallet_constrained_unresolved_orders"].as_u64()),
         "eligible_queue_fills": dynamic_profile.and_then(|profile| profile["eligible_queue_fills"].as_u64()),
         "ineligible_queue_fills": dynamic_profile.and_then(|profile| profile["ineligible_queue_fills"].as_u64()),
         "static_net_pnl": static_net,
@@ -2733,6 +2833,16 @@ fn validated_cumulative_wallet_snapshots(
         } else {
             true
         };
+        let queue_wallet_valid = expected_contract.is_none()
+            || (queue_wallet_snapshot_eligible(row)
+                && decimal_from_value(&row["queue_proxy_wallet_constrained_net_pnl"])
+                    == Some(snapshot.net_pnl)
+                && decimal_from_value(&row["queue_proxy_wallet_constrained_ending_equity"])
+                    == Some(snapshot.ending_equity)
+                && decimal_from_value(&row["queue_proxy_wallet_constrained_max_drawdown"])
+                    == Some(snapshot.max_drawdown)
+                && row["queue_proxy_wallet_constrained_unresolved_orders"].as_u64()
+                    == Some(snapshot.unresolved_orders));
         if (snapshots.is_empty() && date != expected_first_snapshot)
             || row["wallet_scope"].as_str()
                 != Some(
@@ -2747,6 +2857,7 @@ fn validated_cumulative_wallet_snapshots(
             || schema_version == 0
             || schema_version != expected_schema
             || !contract_valid
+            || !queue_wallet_valid
             || !valid_sha256(input_hash)
             || !valid_sha256(state_hash)
             || (schema_version >= 2
@@ -3285,12 +3396,37 @@ fn queue_profile_net_in_rows(
     rows?.as_array()?.iter().find_map(|row| {
         let map = row.as_object()?;
         if map.get(identity_key).and_then(Value::as_str) != Some(identity)
-            || map.get("queue_proxy_pnl_eligible").and_then(Value::as_bool) != Some(true)
+            || !queue_profile_pnl_eligible(row)
         {
             return None;
         }
         map.get("queue_proxy_net_pnl").and_then(value_to_string)
     })
+}
+
+fn queue_profile_pnl_eligible(profile: &Value) -> bool {
+    profile["queue_proxy_enabled"].as_bool() == Some(true)
+        && profile["queue_proxy_pnl_eligible"].as_bool() == Some(true)
+        && decimal_from_value(&profile["queue_proxy_eligibility_rate"])
+            .is_some_and(|rate| rate >= Decimal::new(95, 2))
+        && profile["ineligible_queue_fills"].as_u64() == Some(0)
+        && decimal_from_value(&profile["queue_proxy_net_pnl"]).is_some()
+}
+
+fn queue_wallet_snapshot_eligible(wallet: &Value) -> bool {
+    wallet["fill_model"].as_str() == Some("queue_proxy_conservative")
+        && wallet["queue_proxy_enabled"].as_bool() == Some(true)
+        && wallet["queue_proxy_pnl_eligible"].as_bool() == Some(true)
+        && decimal_from_value(&wallet["queue_proxy_eligibility_rate"])
+            .is_some_and(|rate| rate >= Decimal::new(95, 2))
+        && wallet["ineligible_queue_fills"].as_u64() == Some(0)
+        && decimal_from_value(&wallet["queue_proxy_net_pnl"]).is_some()
+        && decimal_from_value(&wallet["queue_proxy_wallet_constrained_net_pnl"]).is_some()
+        && decimal_from_value(&wallet["queue_proxy_wallet_constrained_ending_equity"]).is_some()
+        && decimal_from_value(&wallet["queue_proxy_wallet_constrained_max_drawdown"]).is_some()
+        && wallet["queue_proxy_wallet_constrained_unresolved_orders"]
+            .as_u64()
+            .is_some()
 }
 
 fn fill_model_net_in_rows(rows: Option<&Value>, fill_model: &str) -> Option<String> {
@@ -3575,6 +3711,7 @@ mod wallet_metric_tests {
         });
         let cumulative_wallet = json!({
             "wallet_scope": CUMULATIVE_WALLET_SCOPE,
+            "fill_model": "queue_proxy_conservative",
             "campaign_start": WALLET_CAMPAIGN_START,
             "snapshot_date": "2026-07-13",
             "schema_version": 2,
@@ -3594,6 +3731,9 @@ mod wallet_metric_tests {
             "queue_proxy_pnl_eligible": true,
             "queue_proxy_net_pnl": "100",
             "queue_proxy_wallet_constrained_net_pnl": "0.25",
+            "queue_proxy_wallet_constrained_ending_equity": "5.280521",
+            "queue_proxy_wallet_constrained_max_drawdown": "0",
+            "queue_proxy_wallet_constrained_unresolved_orders": 0,
             "eligible_queue_fills": 10,
             "ineligible_queue_fills": 0
         });
@@ -4260,7 +4400,18 @@ mod wallet_metric_tests {
                 "wallet_constrained_net_pnl": pnl,
                 "wallet_constrained_ending_equity": (d("5.030521") + d(pnl)).to_string(),
                 "wallet_constrained_max_drawdown": "0",
-                "wallet_constrained_unresolved_orders": 0
+                "wallet_constrained_unresolved_orders": 0,
+                "fill_model": "queue_proxy_conservative",
+                "queue_proxy_enabled": true,
+                "queue_proxy_eligibility_rate": "1",
+                "queue_proxy_pnl_eligible": true,
+                "queue_proxy_net_pnl": pnl,
+                "queue_proxy_wallet_constrained_net_pnl": pnl,
+                "queue_proxy_wallet_constrained_ending_equity": (d("5.030521") + d(pnl)).to_string(),
+                "queue_proxy_wallet_constrained_max_drawdown": "0",
+                "queue_proxy_wallet_constrained_unresolved_orders": 0,
+                "eligible_queue_fills": 1,
+                "ineligible_queue_fills": 0
             })
         };
         let first_input = hash('a');

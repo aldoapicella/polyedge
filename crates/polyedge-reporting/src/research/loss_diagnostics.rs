@@ -1,6 +1,6 @@
 use super::*;
 
-const ORDER_FACT_SCHEMA: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v1";
+const ORDER_FACT_SCHEMA: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v2";
 const FILL_FACT_SCHEMA: &str = "polyedge.loss_diagnostics.fill_markout_fact.v1";
 const SUMMARY_SCHEMA: &str = "polyedge.loss_diagnostics.summary.v1";
 const ORDER_FACT_FILE: &str = "order_lifecycle_fact.jsonl";
@@ -68,18 +68,29 @@ impl ExactTimestampDuplicateDetector {
 #[derive(Clone, Debug)]
 struct MarketEvidenceRef {
     event_sha256: String,
+    recorded_ts: DateTime<Utc>,
+    market_end_ts: Option<DateTime<Utc>>,
     journal_event_sha256: Option<String>,
     settlement_journal_id: Option<String>,
     settlement_journal_sha256: Option<String>,
+    start_price: Option<Decimal>,
+    final_price: Option<Decimal>,
+    winning_outcome: Option<String>,
 }
 
 impl MarketEvidenceRef {
     fn from_event(event: &ObservedEvent) -> Self {
         Self {
             event_sha256: event.event_sha256.clone(),
+            recorded_ts: event.recorded_ts,
+            market_end_ts: parse_datetime(event.payload.get("end_ts"))
+                .or_else(|| parse_datetime(event.payload.get("market_end_ts"))),
             journal_event_sha256: event.journal_event_sha256.clone(),
             settlement_journal_id: event.settlement_journal_id.clone(),
             settlement_journal_sha256: event.settlement_journal_sha256.clone(),
+            start_price: decimal(event.payload.get("start_price")),
+            final_price: decimal(event.payload.get("final_price")),
+            winning_outcome: optional_text(&event.payload, "winning_outcome"),
         }
     }
 }
@@ -877,9 +888,20 @@ impl LossDiagnosticsAccumulator {
                 decision.map(|decision| pre_send_json(decision, batch, identity, application));
             let start_evidence = valid_start_evidence.get(&identity.market_id);
             let settlement_evidence = valid_settlement_evidence.get(&identity.market_id);
+            let outcome = pre_send
+                .as_ref()
+                .and_then(|value| value["outcome"].as_str());
+            let winning_outcome =
+                settlement_evidence.and_then(|evidence| evidence.winning_outcome.as_deref());
+            let terminal_settled_net_pnl = outcome.zip(winning_outcome).map(|(outcome, winner)| {
+                order_fills
+                    .iter()
+                    .map(|(key, _)| settled_fill_pnl(key, outcome, winner))
+                    .sum::<Decimal>()
+            });
             let mut row = json!({
                 "schema": ORDER_FACT_SCHEMA,
-                "schema_version": 1,
+                "schema_version": 2,
                 "evidence_classification": classification,
                 "diagnostic_only": true,
                 "counts_toward_protocol_v3_evidence": false,
@@ -895,10 +917,17 @@ impl LossDiagnosticsAccumulator {
                 "cancel_event_sha256": cancel.map(|event| event.event_sha256.clone()),
                 "execution_report_event_sha256s": execution_reports.iter().map(|event| event.event_sha256.clone()).collect::<Vec<_>>(),
                 "market_start_event_sha256": start_evidence.map(|evidence| evidence.event_sha256.clone()),
+                "market_start_price": start_evidence.and_then(|evidence| evidence.start_price).map(|value| value.to_string()),
                 "terminal_settlement_event_sha256": settlement_evidence.map(|evidence| evidence.event_sha256.clone()),
                 "terminal_settlement_journal_id": settlement_evidence.and_then(|evidence| evidence.settlement_journal_id.clone()),
                 "terminal_settlement_journal_event_sha256": settlement_evidence.and_then(|evidence| evidence.journal_event_sha256.clone()),
                 "terminal_settlement_journal_sha256": settlement_evidence.and_then(|evidence| evidence.settlement_journal_sha256.clone()),
+                "terminal_start_price": settlement_evidence.and_then(|evidence| evidence.start_price).map(|value| value.to_string()),
+                "terminal_final_price": settlement_evidence.and_then(|evidence| evidence.final_price).map(|value| value.to_string()),
+                "terminal_winning_outcome": settlement_evidence.and_then(|evidence| evidence.winning_outcome.clone()),
+                "terminal_market_end_ts": settlement_evidence.and_then(|evidence| evidence.market_end_ts).map(ts),
+                "terminal_settlement_recorded_ts": settlement_evidence.map(|evidence| ts(evidence.recorded_ts)),
+                "terminal_settled_net_pnl": terminal_settled_net_pnl.map(|value| value.to_string()),
                 "order_id": order_id,
                 "market_id": identity.market_id,
                 "token_id": identity.token_id,
@@ -909,6 +938,7 @@ impl LossDiagnosticsAccumulator {
                 "application_recorded_ts": ts(application.recorded_ts),
                 "submitted_ts": ts(submitted_ts),
                 "pre_send": pre_send,
+                "outcome": outcome,
                 "execution_fields_complete": execution_complete,
                 "queue_position_source": "paper_shadow_lifecycle_plus_public_l2",
                 "queue_position": "inferred_size_ahead",
@@ -1553,6 +1583,20 @@ impl LossDiagnosticsAccumulator {
     }
 }
 
+fn settled_fill_pnl(fill: &FillLifecycleJoinKey, outcome: &str, winning_outcome: &str) -> Decimal {
+    let payout = if outcome.eq_ignore_ascii_case(winning_outcome) {
+        Decimal::ONE
+    } else {
+        Decimal::ZERO
+    };
+    let gross_per_share = if fill.side.eq_ignore_ascii_case("sell") {
+        fill.fill_price - payout
+    } else {
+        payout - fill.fill_price
+    };
+    (gross_per_share - fill.fee_per_share) * fill.fill_size
+}
+
 pub fn run_loss_diagnostics(options: LossDiagnosticsOptions) -> Result<Value, ResearchError> {
     let started = Instant::now();
     if !options.input.is_dir() {
@@ -1682,12 +1726,17 @@ fn validate_snapshot_manifest(
 ) -> Result<Value, ResearchError> {
     let campaign = input.join(projected_cache::PROJECTED_CAMPAIGN_INDEX_FILE);
     if campaign.is_file() {
-        projected_cache::load_campaign_index(input)?;
+        let index = projected_cache::load_campaign_index(input)?.ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "loss diagnostics could not load the projected campaign index".to_owned(),
+            )
+        })?;
         let bytes = fs::read(&campaign)?;
         return Ok(json!({
             "kind": "verified_projected_campaign_index",
             "path": campaign.to_string_lossy(),
-            "sha256": sha256_prefixed(&bytes)
+            "sha256": sha256_prefixed(&bytes),
+            "canonical_sha256": index.canonical_sha256
         }));
     }
     let path = input.join("events_manifest.json");
@@ -2116,6 +2165,18 @@ fn pre_send_json(
             .iter()
             .find(|(token, _)| token.to_string() == identity.token_id)
             .map(|(_, book)| book);
+        let pre_send_public_size_ahead = book.map(|book| {
+            let levels = if identity.side.eq_ignore_ascii_case("sell") {
+                &book.asks
+            } else {
+                &book.bids
+            };
+            levels
+                .iter()
+                .filter(|level| level.price == identity.price)
+                .map(|level| level.size)
+                .sum::<Decimal>()
+        });
         json!({
             "decision_ts": ts(input.decision_ts),
             "decision_config_sha256": batch.decision_config_sha256,
@@ -2131,6 +2192,7 @@ fn pre_send_json(
             "reference_stale": input.reference.stale,
             "best_bid": book.and_then(|book| book.best_bid()).map(|level| level.price.to_string()),
             "best_ask": book.and_then(|book| book.best_ask()).map(|level| level.price.to_string()),
+            "pre_send_public_size_ahead": pre_send_public_size_ahead.map(|value| value.to_string()),
             "book_local_ts": book.map(|book| ts(book.local_ts)),
             "regime_features": serde_json::to_value(features).unwrap_or(Value::Null)
         })
@@ -2140,6 +2202,7 @@ fn pre_send_json(
         "captured_no_later_than": decision.recorded_ts.min(application.recorded_ts).to_rfc3339_opts(SecondsFormat::Millis, true),
         "decision_event_sha256": decision.event_sha256,
         "outcome": decision.payload["outcome"],
+        "pre_send_public_size_ahead": batch_fields.as_ref().and_then(|value| value["pre_send_public_size_ahead"].as_str()),
         "order_kind": decision.payload["order_kind"],
         "expected_edge": decision.payload["expected_edge"],
         "ttl_ms": decision.payload["ttl_ms"],
@@ -2644,12 +2707,55 @@ mod tests {
             assert_fact_hash(row);
         }
         assert!(orders.iter().all(|row| {
-            row["market_start_event_sha256"].is_string()
+            row["schema"] == ORDER_FACT_SCHEMA
+                && row["schema_version"] == 2
+                && row["market_start_event_sha256"].is_string()
+                && row["market_start_price"].is_string()
                 && row["terminal_settlement_event_sha256"].is_string()
                 && row["terminal_settlement_journal_sha256"].is_string()
+                && row["terminal_start_price"].is_string()
+                && row["terminal_final_price"].is_string()
+                && row["terminal_winning_outcome"] == "up"
+                && row["terminal_market_end_ts"].is_string()
+                && row["terminal_settlement_recorded_ts"].is_string()
+                && row["outcome"].is_string()
+                && row["pre_send"]["pre_send_public_size_ahead"].is_string()
+                && row["terminal_settled_net_pnl"] == "0"
         }));
         assert_artifact_manifest(&out);
         assert!(staging_siblings(&out).is_empty());
+    }
+
+    #[test]
+    fn settled_fill_pnl_is_outcome_side_and_fee_aware() {
+        let fill = |side: &str| FillLifecycleJoinKey {
+            source: "queue_shadow_fill".to_owned(),
+            order_id: "order-1".to_owned(),
+            market_id: "market-1".to_owned(),
+            token_id: "token-1".to_owned(),
+            side: side.to_owned(),
+            fill_price: Decimal::new(40, 2),
+            fill_ts: test_ts("2026-07-20T12:00:01Z"),
+            fill_size: Decimal::from(2_u64),
+            fee_per_share: Decimal::new(1, 2),
+        };
+
+        assert_eq!(
+            settled_fill_pnl(&fill("buy"), "up", "up"),
+            Decimal::new(118, 2)
+        );
+        assert_eq!(
+            settled_fill_pnl(&fill("buy"), "up", "down"),
+            Decimal::new(-82, 2)
+        );
+        assert_eq!(
+            settled_fill_pnl(&fill("sell"), "up", "up"),
+            Decimal::new(-122, 2)
+        );
+        assert_eq!(
+            settled_fill_pnl(&fill("sell"), "up", "down"),
+            Decimal::new(78, 2)
+        );
     }
 
     #[test]

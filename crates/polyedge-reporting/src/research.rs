@@ -35,6 +35,7 @@ use thiserror::Error;
 
 mod labs;
 mod loss_diagnostics;
+mod loss_regime_oos;
 mod projected_cache;
 mod run_bundle;
 pub use labs::{
@@ -50,6 +51,7 @@ pub use labs::{
     DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES, WALLET_CAMPAIGN_START,
 };
 pub use loss_diagnostics::{run_loss_diagnostics, LossDiagnosticsOptions};
+pub use loss_regime_oos::{run_loss_regime_oos, LossRegimeOosOptions};
 pub use projected_cache::{
     read_shadow_correction_state, read_verified_campaign_index, run_begin_shadow_correction,
     run_complete_shadow_correction, run_materialize_projected_campaign, run_publish_projected_day,
@@ -863,6 +865,15 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
                 "queue_proxy_pnl_eligible": row["queue_proxy_pnl_eligible"],
                 "queue_proxy_net_pnl": row["queue_proxy_net_pnl"],
                 "queue_proxy_wallet_constrained_net_pnl": row["queue_proxy_wallet_constrained_net_pnl"],
+                "queue_proxy_wallet_constrained_ending_equity": row["queue_proxy_wallet_constrained_ending_equity"],
+                "queue_proxy_wallet_constrained_max_drawdown": row["queue_proxy_wallet_constrained_max_drawdown"],
+                "queue_proxy_wallet_constrained_accepted_orders": row["queue_proxy_wallet_constrained_accepted_orders"],
+                "queue_proxy_wallet_constrained_skipped_orders": row["queue_proxy_wallet_constrained_skipped_orders"],
+                "queue_proxy_wallet_constrained_accepted_filled_orders": row["queue_proxy_wallet_constrained_accepted_filled_orders"],
+                "queue_proxy_wallet_constrained_unresolved_orders": row["queue_proxy_wallet_constrained_unresolved_orders"],
+                "queue_proxy_wallet_constrained_skip_reasons": row["queue_proxy_wallet_constrained_skip_reasons"],
+                "queue_proxy_wallet_constrained_equity_curve": row["queue_proxy_wallet_constrained_equity_curve"],
+                "queue_proxy_wallet_constraints": row["queue_proxy_wallet_constraints"],
                 "eligible_queue_fills": row["eligible_queue_fills"],
                 "ineligible_queue_fills": row["ineligible_queue_fills"],
                 "delta_vs_static": (net - static_net).to_string(),
@@ -8648,11 +8659,20 @@ impl ResearchReplayEngine {
         let wallet =
             wallet_constrained_replay(&self.orders, &self.markets, self.request.fill_model);
         let wallet_json = wallet.as_json();
+        let queue_eligible_market_ids = self
+            .queue_market_evidence
+            .iter()
+            .filter(|(market_id, evidence)| {
+                queue_market_ineligible_reasons(market_id, evidence, &self.markets).is_empty()
+            })
+            .map(|(market_id, _)| market_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut market_results = Vec::new();
         let mut gross = Decimal::ZERO;
         let mut fees = Decimal::ZERO;
         let mut adverse_penalties = Decimal::ZERO;
         let mut notional_cost = Decimal::ZERO;
+        let mut queue_qualified_net = Decimal::ZERO;
         let mut time_bucket_pnl = BTreeMap::<String, Decimal>::new();
         let mut q_bucket_pnl = BTreeMap::<String, Decimal>::new();
         for market in self.markets.values() {
@@ -8693,6 +8713,9 @@ impl ResearchReplayEngine {
             fees += market_fees;
             adverse_penalties += market_penalty;
             notional_cost += market_cost;
+            if queue_eligible_market_ids.contains(&market.market_id) {
+                queue_qualified_net += market_gross - market_fees - market_penalty;
+            }
             market_results.push(json!({
                 "market_id": market.market_id,
                 "market_slug": market.slug,
@@ -8720,8 +8743,11 @@ impl ResearchReplayEngine {
             depletion_events: self.depletion_evidence_events,
             queue_fills: self.maker_fills,
             queue_partial_fills: self.queue_partial_fills,
-            net_pnl: net,
-            wallet_constrained_net_pnl: wallet.net_pnl,
+            net_pnl: queue_qualified_net,
+            // Preserve capital locked by every submitted shadow order, including
+            // ineligible orders that did not fill. Filtering those orders would
+            // free capital retrospectively and could overstate qualified PnL.
+            wallet: &wallet,
             evidence_by_market: &self.queue_market_evidence,
             markets: &self.markets,
         });
@@ -8757,6 +8783,15 @@ impl ResearchReplayEngine {
             "queue_proxy_pnl_eligible": queue_proxy["queue_proxy_pnl_eligible"].clone(),
             "queue_proxy_net_pnl": queue_proxy["queue_proxy_net_pnl"].clone(),
             "queue_proxy_wallet_constrained_net_pnl": queue_proxy["queue_proxy_wallet_constrained_net_pnl"].clone(),
+            "queue_proxy_wallet_constrained_ending_equity": queue_proxy["queue_proxy_wallet_constrained_ending_equity"].clone(),
+            "queue_proxy_wallet_constrained_max_drawdown": queue_proxy["queue_proxy_wallet_constrained_max_drawdown"].clone(),
+            "queue_proxy_wallet_constrained_accepted_orders": queue_proxy["queue_proxy_wallet_constrained_accepted_orders"].clone(),
+            "queue_proxy_wallet_constrained_skipped_orders": queue_proxy["queue_proxy_wallet_constrained_skipped_orders"].clone(),
+            "queue_proxy_wallet_constrained_accepted_filled_orders": queue_proxy["queue_proxy_wallet_constrained_accepted_filled_orders"].clone(),
+            "queue_proxy_wallet_constrained_unresolved_orders": queue_proxy["queue_proxy_wallet_constrained_unresolved_orders"].clone(),
+            "queue_proxy_wallet_constrained_skip_reasons": queue_proxy["queue_proxy_wallet_constrained_skip_reasons"].clone(),
+            "queue_proxy_wallet_constrained_equity_curve": queue_proxy["queue_proxy_wallet_constrained_equity_curve"].clone(),
+            "queue_proxy_wallet_constraints": queue_proxy["queue_proxy_wallet_constraints"].clone(),
             "eligible_queue_fills": queue_proxy["eligible_queue_fills"].clone(),
             "ineligible_queue_fills": queue_proxy["ineligible_queue_fills"].clone(),
             "queue_proxy_fills": queue_proxy["queue_proxy_fills"].clone(),
@@ -8845,6 +8880,7 @@ fn run_replay_requests(
             }
         },
     )?;
+    let queue_input_binding = replay_queue_input_binding(input, &stream)?;
     let mut results = Vec::new();
     for mut engine in engines {
         if stream.malformed_lines > 0 {
@@ -8864,10 +8900,36 @@ fn run_replay_requests(
         let mut result = engine.finish();
         if let Some(object) = result.as_object_mut() {
             insert_exclusion_metadata(object, &stream, exclude_windows);
+            if let Some(queue) = object
+                .get_mut("replay_metrics")
+                .and_then(|metrics| metrics.get_mut("queue_proxy"))
+                .and_then(Value::as_object_mut)
+            {
+                queue.insert("input_binding".to_owned(), queue_input_binding.clone());
+            }
         }
         results.push(result);
     }
     Ok(results)
+}
+
+fn replay_queue_input_binding(input: &Path, stream: &StreamStats) -> Result<Value, ResearchError> {
+    if let Some(index) = projected_cache::load_campaign_index(input)? {
+        return Ok(json!({
+            "schema": "polyedge.queue_proxy.input_binding.v1",
+            "source_kind": "projected_campaign_index",
+            "sha256": index.canonical_sha256,
+        }));
+    }
+    let inventory = match &stream.source_inventory {
+        Some(inventory) => inventory.clone(),
+        None => build_local_source_inventory(input, EventPathMode::PreferEventsJsonl)?,
+    };
+    Ok(json!({
+        "schema": "polyedge.queue_proxy.input_binding.v1",
+        "source_kind": inventory.canonical.source_kind,
+        "sha256": inventory.canonical_sha256,
+    }))
 }
 
 fn empty_replay_result() -> Value {
@@ -10203,7 +10265,7 @@ struct QueueProxyReportInput<'a> {
     queue_fills: usize,
     queue_partial_fills: usize,
     net_pnl: Decimal,
-    wallet_constrained_net_pnl: Decimal,
+    wallet: &'a WalletConstrainedResult,
     evidence_by_market: &'a BTreeMap<String, QueueMarketEvidence>,
     markets: &'a BTreeMap<String, MarketTruth>,
 }
@@ -10247,10 +10309,11 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         queue_fills,
         queue_partial_fills,
         net_pnl,
-        wallet_constrained_net_pnl,
+        wallet,
         evidence_by_market,
         markets,
     } = input;
+    let wallet_json = wallet.as_json();
     let queue_mode = match fill_model {
         FillModel::QueueProxy => "legacy_skip",
         FillModel::QueueProxyConservative => "conservative",
@@ -10266,12 +10329,41 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
     let mut ignored_opposite_trade_count = 0usize;
     let mut missing_or_unknown_trade_side_count = 0usize;
     let mut ineligible_reasons = BTreeMap::<String, usize>::new();
+    let mut market_eligibility = BTreeMap::<String, Value>::new();
     let mut size_ahead_samples = Vec::new();
     for (market_id, evidence) in evidence_by_market {
         size_ahead_samples.extend(evidence.size_ahead_samples.iter().copied());
         ignored_opposite_trade_count += evidence.ignored_opposite_trade_count;
         missing_or_unknown_trade_side_count += evidence.missing_or_unknown_trade_side_count;
         let reasons = queue_market_ineligible_reasons(market_id, evidence, markets);
+        let eligible = reasons.is_empty();
+        let evidence_binding = json!({
+            "book_snapshot_count": evidence.book_snapshot_count,
+            "price_change_count": evidence.price_change_count,
+            "level_change_count": evidence.level_change_count,
+            "trade_event_count": evidence.trade_event_count,
+            "trade_size_count": evidence.trade_size_count,
+            "depletion_event_count": evidence.depletion_event_count,
+            "order_lifecycle_count": evidence.order_lifecycle_count,
+            "size_ahead_samples": evidence.size_ahead_samples.iter().map(Decimal::to_string).collect::<Vec<_>>(),
+            "ignored_opposite_trade_count": evidence.ignored_opposite_trade_count,
+            "missing_or_unknown_trade_side_count": evidence.missing_or_unknown_trade_side_count,
+            "queue_fill_event_count": evidence.queue_fill_event_count,
+            "queue_partial_fill_event_count": evidence.queue_partial_fill_event_count,
+        });
+        let queue_evidence_sha256 = canonical_value_sha256(&evidence_binding);
+        market_eligibility.insert(
+            market_id.clone(),
+            json!({
+                "market_id": market_id,
+                "eligible": eligible,
+                "reasons": reasons.iter().cloned().collect::<Vec<_>>(),
+                "queue_fill_event_count": evidence.queue_fill_event_count,
+                "queue_partial_fill_event_count": evidence.queue_partial_fill_event_count,
+                "queue_evidence": evidence_binding,
+                "queue_evidence_sha256": queue_evidence_sha256,
+            }),
+        );
         if reasons.is_empty() {
             eligible_markets += 1;
             eligible_queue_fills += evidence.queue_fill_event_count;
@@ -10286,6 +10378,8 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         }
     }
     let total_markets = eligible_markets + ineligible_markets;
+    let market_eligibility = Value::Object(market_eligibility.into_iter().collect());
+    let market_eligibility_sha256 = canonical_value_sha256(&market_eligibility);
     let evidence_complete = eligible_markets > 0
         && total_markets > 0
         && eligible_markets.saturating_mul(100) >= total_markets.saturating_mul(80);
@@ -10339,10 +10433,24 @@ fn queue_proxy_report(input: QueueProxyReportInput<'_>) -> Value {
         "ignored_opposite_trade_count": ignored_opposite_trade_count,
         "missing_or_unknown_trade_side_count": missing_or_unknown_trade_side_count,
         "ineligible_reasons": ineligible_reasons,
+        "market_eligibility_schema": "polyedge.queue_proxy.market_eligibility.v1",
+        "market_eligibility": market_eligibility,
+        "market_eligibility_sha256": market_eligibility_sha256,
+        "market_eligibility_diagnostic_only": true,
+        "market_eligibility_counts_toward_protocol_v3_evidence": false,
         "queue_vs_touch_fill_delta": Value::Null,
         "queue_vs_trade_through_fill_delta": Value::Null,
         "queue_proxy_net_pnl": pnl_eligible.then(|| net_pnl.to_string()),
-        "queue_proxy_wallet_constrained_net_pnl": pnl_eligible.then(|| wallet_constrained_net_pnl.to_string()),
+        "queue_proxy_wallet_constrained_net_pnl": pnl_eligible.then(|| wallet_json["wallet_constrained_net_pnl"].clone()),
+        "queue_proxy_wallet_constrained_ending_equity": pnl_eligible.then(|| wallet_json["wallet_constrained_ending_equity"].clone()),
+        "queue_proxy_wallet_constrained_max_drawdown": pnl_eligible.then(|| wallet_json["wallet_constrained_max_drawdown"].clone()),
+        "queue_proxy_wallet_constrained_accepted_orders": pnl_eligible.then(|| wallet_json["wallet_constrained_accepted_orders"].clone()),
+        "queue_proxy_wallet_constrained_skipped_orders": pnl_eligible.then(|| wallet_json["wallet_constrained_skipped_orders"].clone()),
+        "queue_proxy_wallet_constrained_accepted_filled_orders": pnl_eligible.then(|| wallet_json["wallet_constrained_accepted_filled_orders"].clone()),
+        "queue_proxy_wallet_constrained_unresolved_orders": pnl_eligible.then(|| wallet_json["wallet_constrained_unresolved_orders"].clone()),
+        "queue_proxy_wallet_constrained_skip_reasons": pnl_eligible.then(|| wallet_json["wallet_constrained_skip_reasons"].clone()),
+        "queue_proxy_wallet_constrained_equity_curve": pnl_eligible.then(|| wallet_json["wallet_constrained_equity_curve"].clone()),
+        "queue_proxy_wallet_constraints": pnl_eligible.then(|| wallet_json["wallet_constraints"].clone()),
         "required_before_enabling": [
             "resting queue position or size-ahead estimate",
             "trade prints or equivalent executed volume by token/price/time",
@@ -11547,6 +11655,38 @@ mod tests {
             result.skip_reasons["overlapping_unresolved_order_or_position"],
             1
         );
+    }
+
+    #[test]
+    fn queue_qualified_wallet_preserves_capital_lock_from_ineligible_unfilled_order() {
+        let markets = BTreeMap::from([
+            (
+                "ineligible".to_owned(),
+                wallet_market("ineligible", "2026-06-01T00:15:00Z", "down"),
+            ),
+            (
+                "eligible".to_owned(),
+                wallet_market("eligible", "2026-06-01T00:16:00Z", "up"),
+            ),
+        ]);
+        let orders = vec![
+            wallet_order("ineligible", "2026-06-01T00:01:00Z", "0"),
+            wallet_order("eligible", "2026-06-01T00:02:00Z", "5"),
+        ];
+
+        let full_wallet =
+            wallet_constrained_replay(&orders, &markets, FillModel::QueueProxyConservative);
+        let filtered_wallet =
+            wallet_constrained_replay(&orders[1..], &markets, FillModel::QueueProxyConservative);
+
+        assert_eq!(full_wallet.net_pnl, Decimal::ZERO);
+        assert_eq!(full_wallet.accepted_orders, 1);
+        assert_eq!(full_wallet.skipped_orders, 1);
+        assert_eq!(
+            full_wallet.skip_reasons["overlapping_unresolved_order_or_position"],
+            1
+        );
+        assert!(filtered_wallet.net_pnl > full_wallet.net_pnl);
     }
 
     #[test]
