@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 pub(super) struct RuntimeRecorder {
     recorders: Vec<Box<dyn EventRecorder + Send>>,
+    authoritative_remote: bool,
     error_count: usize,
     dropped_count: usize,
     last_error: Option<String>,
@@ -19,6 +20,7 @@ impl RuntimeRecorder {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/events.jsonl"));
         recorders.push(Box::new(JsonlRecorder::new(path)));
+        let authoritative_remote = settings.azure.storage_account_name.is_some();
         if let Some(account) = settings.azure.storage_account_name.as_deref() {
             let client_id = env::var("AZURE_CLIENT_ID").ok();
             recorders.push(Box::new(AzureAppendBlobRecorder::new_with_prefix_cutover(
@@ -32,6 +34,7 @@ impl RuntimeRecorder {
         }
         Self {
             recorders,
+            authoritative_remote,
             error_count: 0,
             dropped_count: 0,
             last_error: None,
@@ -42,10 +45,29 @@ impl RuntimeRecorder {
     pub(super) fn new_for_path(path: PathBuf) -> Self {
         Self {
             recorders: vec![Box::new(JsonlRecorder::new(path))],
+            authoritative_remote: false,
             error_count: 0,
             dropped_count: 0,
             last_error: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test_recorder(
+        recorder: Box<dyn EventRecorder + Send>,
+        authoritative_remote: bool,
+    ) -> Self {
+        Self {
+            recorders: vec![recorder],
+            authoritative_remote,
+            error_count: 0,
+            dropped_count: 0,
+            last_error: None,
+        }
+    }
+
+    pub(super) fn has_authoritative_remote(&self) -> bool {
+        self.authoritative_remote
     }
 
     pub(super) fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), String> {
@@ -78,6 +100,18 @@ impl RuntimeRecorder {
         } else {
             Ok(())
         }
+    }
+
+    /// Resume a previously staged authoritative append without re-recording
+    /// the logical events. Local JSONL recorders do not buffer failed writes,
+    /// so they cannot acknowledge a retry-only durable request.
+    pub(super) fn retry_pending(&mut self) -> Result<(), String> {
+        if !self.authoritative_remote {
+            return Err(
+                "runtime recorder has no authoritative remote pending append to retry".to_owned(),
+            );
+        }
+        self.flush()
     }
 
     pub(super) fn status(&self, busy: bool) -> Value {

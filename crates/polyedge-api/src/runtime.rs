@@ -46,6 +46,7 @@ const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
 const RECORDER_BATCH_LIMIT: usize = 500;
 const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+const RECORDER_COMPLETED_DURABLE_BATCH_LIMIT: usize = 10_000;
 const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
 const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
@@ -78,6 +79,12 @@ struct RecorderMetrics {
     persisted_total: AtomicU64,
     filtered_total: AtomicU64,
     failed_total: AtomicU64,
+    recovered_total: AtomicU64,
+    unrecovered_durable_events: AtomicUsize,
+    flush_failed_total: AtomicU64,
+    flush_recovered_total: AtomicU64,
+    flush_unrecovered: AtomicBool,
+    unrecovered_batches: StdMutex<BTreeMap<String, usize>>,
     batches_total: AtomicU64,
     last_batch_size: AtomicUsize,
 }
@@ -127,7 +134,7 @@ struct AppliedDecisionOutput {
 #[derive(Clone, Debug)]
 struct PendingPaperSettlement {
     journal_id: String,
-    events: Vec<(String, Value)>,
+    events: Vec<RuntimeEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +160,8 @@ enum PendingSettlementRetry {
 
 struct RecorderRequest {
     events: Vec<RuntimeEvent>,
+    durable_batch_key: Option<String>,
+    logical_event_count: usize,
     durable_ack: Option<oneshot::Sender<Result<(), String>>>,
 }
 
@@ -160,6 +169,8 @@ impl RecorderRequest {
     fn best_effort(event: RuntimeEvent) -> Self {
         Self {
             events: vec![event],
+            durable_batch_key: None,
+            logical_event_count: 1,
             durable_ack: None,
         }
     }
@@ -168,9 +179,33 @@ impl RecorderRequest {
         events: Vec<RuntimeEvent>,
         durable_ack: oneshot::Sender<Result<(), String>>,
     ) -> Self {
+        let logical_event_count = events.len();
+        let durable_batch_key = required_recorder_batch_key(&events);
         Self {
             events,
+            durable_batch_key: Some(durable_batch_key),
+            logical_event_count,
             durable_ack: Some(durable_ack),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecorderDurabilityState {
+    pending_batch_key: Option<String>,
+    completed_batch_keys: BTreeSet<String>,
+    completed_batch_order: VecDeque<String>,
+}
+
+impl RecorderDurabilityState {
+    fn remember_completed(&mut self, batch_key: String) {
+        if self.completed_batch_keys.insert(batch_key.clone()) {
+            self.completed_batch_order.push_back(batch_key);
+        }
+        while self.completed_batch_order.len() > RECORDER_COMPLETED_DURABLE_BATCH_LIMIT {
+            if let Some(expired) = self.completed_batch_order.pop_front() {
+                self.completed_batch_keys.remove(&expired);
+            }
         }
     }
 }
@@ -183,9 +218,43 @@ impl RecorderMetrics {
             "persisted_total": self.persisted_total.load(Ordering::Relaxed),
             "filtered_total": self.filtered_total.load(Ordering::Relaxed),
             "failed_total": self.failed_total.load(Ordering::Relaxed),
+            "recovered_total": self.recovered_total.load(Ordering::Relaxed),
+            "unrecovered_durable_events": self.unrecovered_durable_events.load(Ordering::Relaxed),
+            "flush_failed_total": self.flush_failed_total.load(Ordering::Relaxed),
+            "flush_recovered_total": self.flush_recovered_total.load(Ordering::Relaxed),
+            "flush_unrecovered": self.flush_unrecovered.load(Ordering::Relaxed),
             "batches_total": self.batches_total.load(Ordering::Relaxed),
             "last_batch_size": self.last_batch_size.load(Ordering::Relaxed)
         })
+    }
+
+    fn mark_durable_batch_unrecovered(&self, events: &[RuntimeEvent]) {
+        let key = required_recorder_batch_key(events);
+        let Ok(mut batches) = self.unrecovered_batches.lock() else {
+            self.unrecovered_durable_events
+                .store(usize::MAX, Ordering::Relaxed);
+            return;
+        };
+        batches.entry(key).or_insert(events.len());
+        self.unrecovered_durable_events
+            .store(batches.values().copied().sum::<usize>(), Ordering::Relaxed);
+    }
+
+    fn mark_durable_batch_recovered(&self, events: &[RuntimeEvent]) -> bool {
+        let key = required_recorder_batch_key(events);
+        let Ok(mut batches) = self.unrecovered_batches.lock() else {
+            self.unrecovered_durable_events
+                .store(usize::MAX, Ordering::Relaxed);
+            return false;
+        };
+        let recovered = batches.remove(&key).is_some();
+        self.unrecovered_durable_events
+            .store(batches.values().copied().sum::<usize>(), Ordering::Relaxed);
+        if recovered {
+            self.recovered_total
+                .fetch_add(events.len() as u64, Ordering::Relaxed);
+        }
+        recovered
     }
 }
 
@@ -273,7 +342,7 @@ struct RuntimeData {
     exact_references: VecDeque<ReferencePrice>,
     market_start_references: BTreeMap<MarketId, ReferencePrice>,
     market_start_evidence_durable: BTreeSet<MarketId>,
-    pending_market_start_events: BTreeMap<MarketId, Value>,
+    pending_market_start_events: BTreeMap<MarketId, RuntimeEvent>,
     fair_values: BTreeMap<MarketId, Value>,
     chart_samples: BTreeMap<MarketId, VecDeque<Value>>,
     chart_last_persisted_ms: BTreeMap<MarketId, i64>,
@@ -621,6 +690,11 @@ impl RuntimeController {
                         "books": status["books"],
                         "recorder_queued": status["recorder_metrics"]["queued"],
                         "recorder_failed_total": status["recorder_metrics"]["failed_total"],
+                        "recorder_recovered_total": status["recorder_metrics"]["recovered_total"],
+                        "recorder_unrecovered_durable_events": status["recorder_metrics"]["unrecovered_durable_events"],
+                        "recorder_flush_failed_total": status["recorder_metrics"]["flush_failed_total"],
+                        "recorder_flush_recovered_total": status["recorder_metrics"]["flush_recovered_total"],
+                        "recorder_flush_unrecovered": status["recorder_metrics"]["flush_unrecovered"],
                         "recorder_dropped_count": status["recorder_status"]["dropped_count"],
                         "recorder_error_count": status["recorder_status"]["error_count"],
                         "runtime_loop": status["task_health"]["runtime_loop"],
@@ -904,7 +978,11 @@ impl RuntimeController {
                 state
                     .pending_market_start_events
                     .entry(market_id)
-                    .or_insert(recovered_start);
+                    .or_insert_with(|| RuntimeEvent {
+                        event_type: "market_start_price".to_owned(),
+                        ts: Utc::now(),
+                        data: recovered_start,
+                    });
             }
             data = self.inner.data.write().await;
         }
@@ -1995,7 +2073,11 @@ impl RuntimeController {
             for (market_id, update) in &updates {
                 data.pending_market_start_events
                     .entry(market_id.clone())
-                    .or_insert_with(|| update.clone());
+                    .or_insert_with(|| RuntimeEvent {
+                        event_type: "market_start_price".to_owned(),
+                        ts: Utc::now(),
+                        data: update.clone(),
+                    });
             }
             if !updates.is_empty() {
                 data.decision_generation = data.decision_generation.wrapping_add(1);
@@ -2012,7 +2094,7 @@ impl RuntimeController {
         };
         for (market_id, event) in pending {
             if !self
-                .record_required_events(vec![("market_start_price".to_owned(), event.clone())])
+                .record_required_runtime_events(vec![event.clone()])
                 .await
             {
                 continue;
@@ -2037,7 +2119,10 @@ impl RuntimeController {
             };
             pending
         };
-        if !self.record_required_events(pending.events).await {
+        if !self
+            .record_required_runtime_events(pending.events.clone())
+            .await
+        {
             warn!(
                 market_id = %market_id,
                 settlement_journal_id = %pending.journal_id,
@@ -2217,7 +2302,10 @@ impl RuntimeController {
                     "cleared_position": cleared_position.to_string()
                 }),
             ));
-            let events = finalize_settlement_journal(&journal_id, unbound_events);
+            let events = required_runtime_events(
+                finalize_settlement_journal(&journal_id, unbound_events),
+                Utc::now(),
+            );
             engine.pending_settlements.insert(
                 market.market_id.clone(),
                 PendingPaperSettlement { journal_id, events },
@@ -2297,10 +2385,24 @@ impl RuntimeController {
         for attempt in 1..=REQUIRED_RECORDER_ATTEMPTS {
             match self.persist_required_batch(events.clone()).await {
                 Ok(()) => {
+                    if self
+                        .inner
+                        .recorder_metrics
+                        .mark_durable_batch_recovered(&events)
+                    {
+                        info!(
+                            event_count = events.len(),
+                            recovered_on_attempt = attempt,
+                            "required runtime evidence recovered after recorder retry"
+                        );
+                    }
                     self.accept_durable_events(&events).await;
                     return true;
                 }
                 Err(error) => {
+                    self.inner
+                        .recorder_metrics
+                        .mark_durable_batch_unrecovered(&events);
                     warn!(
                         attempt,
                         max_attempts = REQUIRED_RECORDER_ATTEMPTS,
@@ -2534,25 +2636,73 @@ fn spawn_recorder_worker(
         .name("polyedge-recorder".to_owned())
         .spawn(move || {
             let mut last_flush = Instant::now();
+            let mut deferred_request = None;
+            let mut durability = RecorderDurabilityState::default();
             loop {
-                let request = match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
-                    Ok(request) => request,
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                        flush_runtime_recorder(&recorder);
-                        last_flush = Instant::now();
-                        continue;
-                    }
-                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                        flush_runtime_recorder(&recorder);
-                        break;
-                    }
+                let request = match deferred_request.take() {
+                    Some(request) => request,
+                    None => match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
+                        Ok(request) => request,
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                            flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
+                            last_flush = Instant::now();
+                            continue;
+                        }
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                            flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
+                            break;
+                        }
+                    },
                 };
+                if let Some(batch_key) = request.durable_batch_key.as_deref() {
+                    let event_count = request.logical_event_count;
+                    metrics.batches_total.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .last_batch_size
+                        .store(event_count, Ordering::Relaxed);
+                    let result = persist_durable_recorder_request(
+                        &recorder,
+                        &metrics,
+                        &mut durability,
+                        batch_key,
+                        &request.events,
+                    );
+                    saturating_sub_atomic(&metrics.queued, event_count);
+                    match &result {
+                        Ok(()) => {
+                            metrics
+                                .persisted_total
+                                .fetch_add(event_count as u64, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            metrics
+                                .failed_total
+                                .fetch_add(event_count as u64, Ordering::Relaxed);
+                            warn!("runtime recorder durable batch failed: {error}");
+                        }
+                    }
+                    if let Some(ack) = request.durable_ack {
+                        let _ = ack.send(result);
+                    }
+                    continue;
+                }
+                if durability.pending_batch_key.is_some()
+                    && resume_pending_durable(&recorder, &metrics, &mut durability).is_err()
+                {
+                    deferred_request = Some(request);
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
                 let mut requests = vec![request];
-                let mut event_count = requests[0].events.len();
+                let mut event_count = requests[0].logical_event_count;
                 while event_count < RECORDER_BATCH_LIMIT {
                     match receiver.try_recv() {
                         Ok(request) => {
-                            event_count += request.events.len();
+                            if request.durable_batch_key.is_some() {
+                                deferred_request = Some(request);
+                                break;
+                            }
+                            event_count += request.logical_event_count;
                             requests.push(request);
                         }
                         Err(std_mpsc::TryRecvError::Empty) => break,
@@ -2563,19 +2713,12 @@ fn spawn_recorder_worker(
                 metrics
                     .last_batch_size
                     .store(event_count, Ordering::Relaxed);
-                let flush_required = requests.iter().any(|request| request.durable_ack.is_some());
                 let events = requests
                     .iter()
                     .flat_map(|request| request.events.iter().cloned())
                     .collect::<Vec<_>>();
                 let result = match recorder.lock() {
-                    Ok(mut recorder) => recorder.record_batch(&events).and_then(|()| {
-                        if flush_required {
-                            recorder.flush()
-                        } else {
-                            Ok(())
-                        }
-                    }),
+                    Ok(mut recorder) => recorder.record_batch(&events),
                     Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
                 };
                 saturating_sub_atomic(&metrics.queued, event_count);
@@ -2592,13 +2735,9 @@ fn spawn_recorder_worker(
                         warn!("runtime recorder failed: {error}");
                     }
                 }
-                for request in requests {
-                    if let Some(ack) = request.durable_ack {
-                        let _ = ack.send(result.clone());
-                    }
-                }
+                debug_assert!(requests.iter().all(|request| request.durable_ack.is_none()));
                 if last_flush.elapsed() >= RECORDER_FLUSH_INTERVAL {
-                    flush_runtime_recorder(&recorder);
+                    flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
                     last_flush = Instant::now();
                 }
             }
@@ -2608,14 +2747,127 @@ fn spawn_recorder_worker(
     }
 }
 
-fn flush_runtime_recorder(recorder: &Arc<StdMutex<RuntimeRecorder>>) {
-    match recorder.lock() {
+fn persist_durable_recorder_request(
+    recorder: &Arc<StdMutex<RuntimeRecorder>>,
+    metrics: &Arc<RecorderMetrics>,
+    durability: &mut RecorderDurabilityState,
+    batch_key: &str,
+    events: &[RuntimeEvent],
+) -> Result<(), String> {
+    if durability.completed_batch_keys.contains(batch_key) {
+        return Ok(());
+    }
+    if durability.pending_batch_key.is_some() {
+        resume_pending_durable(recorder, metrics, durability)?;
+        if durability.completed_batch_keys.contains(batch_key) {
+            return Ok(());
+        }
+    }
+
+    // Best-effort events may still be buffered. Flush them before assigning
+    // the recorder's pending buffer to this durable batch so unrelated bytes
+    // can never determine the journal's acknowledgment.
+    recorder_flush_result(recorder, metrics, false)?;
+    durability.pending_batch_key = Some(batch_key.to_owned());
+    let (authoritative_remote, result, flush_attempted) = match recorder.lock() {
         Ok(mut recorder) => {
-            if let Err(error) = recorder.flush() {
-                warn!("runtime recorder flush failed: {error}");
+            let authoritative_remote = recorder.has_authoritative_remote();
+            match recorder.record_batch(events) {
+                Ok(()) => (authoritative_remote, recorder.flush(), true),
+                Err(error) => (authoritative_remote, Err(error), false),
             }
         }
-        Err(error) => warn!("runtime recorder lock poisoned during flush: {error}"),
+        Err(error) => (
+            false,
+            Err(format!("runtime recorder lock poisoned: {error}")),
+            false,
+        ),
+    };
+    if flush_attempted {
+        update_recorder_flush_health(metrics, &result);
+    }
+    match result {
+        Ok(()) => {
+            durability.pending_batch_key = None;
+            durability.remember_completed(batch_key.to_owned());
+            Ok(())
+        }
+        Err(error) => {
+            if !authoritative_remote {
+                durability.pending_batch_key = None;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn resume_pending_durable(
+    recorder: &Arc<StdMutex<RuntimeRecorder>>,
+    metrics: &Arc<RecorderMetrics>,
+    durability: &mut RecorderDurabilityState,
+) -> Result<(), String> {
+    let Some(batch_key) = durability.pending_batch_key.clone() else {
+        return Ok(());
+    };
+    recorder_flush_result(recorder, metrics, true)?;
+    durability.pending_batch_key = None;
+    durability.remember_completed(batch_key);
+    Ok(())
+}
+
+fn recorder_flush_result(
+    recorder: &Arc<StdMutex<RuntimeRecorder>>,
+    metrics: &Arc<RecorderMetrics>,
+    pending_only: bool,
+) -> Result<(), String> {
+    let result = match recorder.lock() {
+        Ok(mut recorder) => {
+            if pending_only {
+                recorder.retry_pending()
+            } else {
+                recorder.flush()
+            }
+        }
+        Err(error) => Err(format!(
+            "runtime recorder lock poisoned during flush: {error}"
+        )),
+    };
+    update_recorder_flush_health(metrics, &result);
+    result
+}
+
+fn update_recorder_flush_health(metrics: &Arc<RecorderMetrics>, result: &Result<(), String>) {
+    if result.is_err() {
+        metrics.flush_failed_total.fetch_add(1, Ordering::Relaxed);
+        metrics.flush_unrecovered.store(true, Ordering::Relaxed);
+    } else if metrics.flush_unrecovered.swap(false, Ordering::Relaxed) {
+        metrics
+            .flush_recovered_total
+            .fetch_add(1, Ordering::Relaxed);
+        info!("runtime recorder flush recovered after prior failure");
+    }
+}
+
+fn flush_or_resume_runtime_recorder(
+    recorder: &Arc<StdMutex<RuntimeRecorder>>,
+    metrics: &Arc<RecorderMetrics>,
+    durability: &mut RecorderDurabilityState,
+) {
+    if durability.pending_batch_key.is_some() {
+        if let Err(error) = resume_pending_durable(recorder, metrics, durability) {
+            warn!("runtime recorder pending durable flush failed: {error}");
+        }
+    } else {
+        flush_runtime_recorder(recorder, metrics);
+    }
+}
+
+fn flush_runtime_recorder(
+    recorder: &Arc<StdMutex<RuntimeRecorder>>,
+    metrics: &Arc<RecorderMetrics>,
+) {
+    if let Err(error) = recorder_flush_result(recorder, metrics, false) {
+        warn!("runtime recorder flush failed: {error}");
     }
 }
 
@@ -2637,6 +2889,17 @@ fn required_runtime_events(
             data,
         })
         .collect()
+}
+
+fn required_recorder_batch_key(events: &[RuntimeEvent]) -> String {
+    value_sha256(&json!(events
+        .iter()
+        .map(|event| json!({
+            "event_type": event.event_type,
+            "recorded_ts": event.ts,
+            "payload": event.data
+        }))
+        .collect::<Vec<_>>()))
 }
 
 fn stale_decision_state_generation(
@@ -3279,10 +3542,65 @@ mod tests {
         BookLevel, ConditionId, MarketStatus, OrderId, OrderKind, Outcome, Side,
     };
     use polyedge_engine::{RegimeLabel, StrategyDataQuality};
+    use polyedge_storage::{EventRecorder, StorageError};
     use serde_json::json;
     use std::fs;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    #[derive(Default)]
+    struct BufferedRecorderTestState {
+        pending: Vec<RuntimeEvent>,
+        committed_event_types: Vec<Vec<String>>,
+        record_batch_calls: Vec<Vec<String>>,
+        durable_flush_failures_remaining: usize,
+    }
+
+    struct BufferedRecorderTestDouble {
+        state: Arc<StdMutex<BufferedRecorderTestState>>,
+    }
+
+    impl EventRecorder for BufferedRecorderTestDouble {
+        fn record(&mut self, event: &RuntimeEvent) -> Result<(), StorageError> {
+            self.record_batch(std::slice::from_ref(event))
+        }
+
+        fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), StorageError> {
+            let mut state = self.state.lock().unwrap();
+            state.record_batch_calls.push(
+                events
+                    .iter()
+                    .map(|event| event.event_type.clone())
+                    .collect(),
+            );
+            state.pending.extend_from_slice(events);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), StorageError> {
+            let mut state = self.state.lock().unwrap();
+            let durable_pending = state
+                .pending
+                .iter()
+                .any(|event| event.event_type == "required_evidence");
+            if durable_pending && state.durable_flush_failures_remaining > 0 {
+                state.durable_flush_failures_remaining -= 1;
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected durable flush failure",
+                )));
+            }
+            if !state.pending.is_empty() {
+                let event_types = state
+                    .pending
+                    .iter()
+                    .map(|event| event.event_type.clone())
+                    .collect();
+                state.committed_event_types.push(event_types);
+                state.pending.clear();
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn runtime_provenance_binds_shadow_safety_candidate_and_code() {
@@ -3981,6 +4299,209 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn durable_requests_flush_best_effort_before_staging_the_journal() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
+        let metrics = Arc::new(RecorderMetrics::default());
+        let (sender, receiver) = std_mpsc::channel();
+        let best_effort = RuntimeEvent {
+            event_type: "book".to_owned(),
+            ts: Utc::now(),
+            data: json!({"sequence": 1}),
+        };
+        let durable = RuntimeEvent {
+            event_type: "required_evidence".to_owned(),
+            ts: Utc::now(),
+            data: json!({"journal_id": "exclusive-journal-1"}),
+        };
+        metrics.queued.fetch_add(2, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(2, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::best_effort(best_effort))
+            .unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        sender
+            .send(RecorderRequest::durable(vec![durable], ack_tx))
+            .unwrap();
+        spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
+
+        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
+        drop(sender);
+        for _ in 0..100 {
+            if metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert_eq!(metrics.snapshot()["batches_total"], 2);
+        assert_eq!(metrics.snapshot()["persisted_total"], 2);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.committed_event_types,
+            vec![
+                vec!["book".to_owned()],
+                vec!["required_evidence".to_owned()]
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_same_key_durable_requests_record_once() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
+        let metrics = Arc::new(RecorderMetrics::default());
+        let (sender, receiver) = std_mpsc::channel();
+        let durable = RuntimeEvent {
+            event_type: "required_evidence".to_owned(),
+            ts: Utc::now(),
+            data: json!({"journal_id": "concurrent-same-key-journal-1"}),
+        };
+        let (first_ack_tx, first_ack_rx) = oneshot::channel();
+        let (second_ack_tx, second_ack_rx) = oneshot::channel();
+        metrics.queued.fetch_add(2, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(2, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::durable(
+                vec![durable.clone()],
+                first_ack_tx,
+            ))
+            .unwrap();
+        sender
+            .send(RecorderRequest::durable(vec![durable], second_ack_tx))
+            .unwrap();
+        spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
+
+        assert_eq!(first_ack_rx.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(second_ack_rx.blocking_recv().unwrap(), Ok(()));
+        drop(sender);
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .record_batch_calls
+                .iter()
+                .filter(|events| { events.len() == 1 && events[0].as_str() == "required_evidence" })
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .committed_event_types
+                .iter()
+                .flatten()
+                .filter(|event_type| event_type.as_str() == "required_evidence")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_durable_batch_is_acknowledged_without_resubmission() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
+        let metrics = Arc::new(RecorderMetrics::default());
+        let (sender, receiver) = std_mpsc::channel();
+        spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
+        let durable = RuntimeEvent {
+            event_type: "required_evidence".to_owned(),
+            ts: Utc::now(),
+            data: json!({"journal_id": "delayed-commit-journal-1"}),
+        };
+
+        for _ in 0..REQUIRED_RECORDER_ATTEMPTS {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            metrics.queued.fetch_add(1, Ordering::Relaxed);
+            metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+            sender
+                .send(RecorderRequest::durable(vec![durable.clone()], ack_tx))
+                .unwrap();
+            assert!(ack_rx.blocking_recv().unwrap().is_err());
+        }
+
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::best_effort(RuntimeEvent {
+                event_type: "book".to_owned(),
+                ts: Utc::now(),
+                data: json!({"sequence": 1}),
+            }))
+            .unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::durable(vec![durable], ack_tx))
+            .unwrap();
+        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
+        drop(sender);
+
+        for _ in 0..100 {
+            if metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state
+                .record_batch_calls
+                .iter()
+                .filter(|events| events.as_slice() == ["required_evidence"])
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .committed_event_types
+                .iter()
+                .flatten()
+                .filter(|event_type| event_type.as_str() == "required_evidence")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recorder_health_clears_only_the_exact_frozen_batch() {
+        let metrics = RecorderMetrics::default();
+        let event = |ts: &str| RuntimeEvent {
+            event_type: "required_evidence".to_owned(),
+            ts: DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc),
+            data: json!({"journal_id": "stable-journal-1"}),
+        };
+        let first = vec![event("2026-07-22T02:17:23Z")];
+        let changed_timestamp = vec![event("2026-07-22T02:17:24Z")];
+
+        metrics.mark_durable_batch_unrecovered(&first);
+        assert_eq!(metrics.snapshot()["unrecovered_durable_events"], 1);
+        assert!(!metrics.mark_durable_batch_recovered(&changed_timestamp));
+        assert_eq!(metrics.snapshot()["unrecovered_durable_events"], 1);
+        assert!(metrics.mark_durable_batch_recovered(&first));
+        assert_eq!(metrics.snapshot()["unrecovered_durable_events"], 0);
+        assert_eq!(metrics.snapshot()["recovered_total"], 1);
+    }
+
     #[tokio::test]
     async fn exact_start_evidence_is_frozen_and_retried_after_recorder_recovery() {
         let dir = std::env::temp_dir().join(format!(
@@ -4053,7 +4574,8 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         let persisted: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(persisted["event_type"], "market_start_price");
-        assert_eq!(persisted["payload"], frozen_event);
+        assert_eq!(persisted["recorded_ts"], json!(frozen_event.ts));
+        assert_eq!(persisted["payload"], frozen_event.data);
         let _ = fs::remove_dir_all(dir);
     }
 

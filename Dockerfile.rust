@@ -10,6 +10,10 @@ RUN cargo build --release -p polyedge-cli
 
 FROM debian:bookworm-slim AS runtime
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG GIT_SHA=unknown
 ENV GIT_SHA=${GIT_SHA}
 LABEL org.opencontainers.image.revision=${GIT_SHA}

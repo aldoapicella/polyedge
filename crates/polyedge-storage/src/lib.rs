@@ -6,7 +6,7 @@ use polyedge_domain::RuntimeEvent;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -124,7 +124,7 @@ pub struct AzureAppendBlobRecorder {
     event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
     agent: ureq::Agent,
     token: ManagedIdentityToken,
-    known_append_blobs: BTreeSet<String>,
+    known_append_positions: BTreeMap<String, u64>,
     pending_append_blocks: BufferedAppendBlocks,
 }
 
@@ -175,36 +175,66 @@ impl AzureAppendBlobRecorder {
                 .timeout_write(Duration::from_secs(30))
                 .build(),
             token: ManagedIdentityToken::new(client_id),
-            known_append_blobs: BTreeSet::new(),
+            known_append_positions: BTreeMap::new(),
             pending_append_blocks: BufferedAppendBlocks::new(AZURE_APPEND_BLOCK_TARGET_BYTES),
         }
     }
 
     fn append_block(&mut self, blob_name: &str, block: &[u8]) -> Result<(), AzureBlobError> {
         self.ensure_append_blob(blob_name)?;
+        // The shadow recorder is deployed as one replica and is the sole writer
+        // for its minute prefix. Binding every append to the last observed byte
+        // offset makes an ambiguous response safely reconcilable without
+        // appending the same block twice.
+        let expected_position = *self.known_append_positions.get(blob_name).ok_or_else(|| {
+            AzureBlobError::AppendPosition(format!("missing known append position for {blob_name}"))
+        })?;
         let url = self.blob_url(blob_name, Some("comp=appendblock"));
         let token = self.token.access_token(&self.agent)?;
-        match self
+        let result = self
             .agent
             .put(&url)
             .set("authorization", &format!("Bearer {token}"))
             .set("x-ms-version", AZURE_BLOB_API_VERSION)
             .set("x-ms-date", &rfc1123_now())
+            .set(
+                "x-ms-blob-condition-appendpos",
+                &expected_position.to_string(),
+            )
             .set("content-type", "application/octet-stream")
-            .send_bytes(block)
-        {
-            Ok(_) => Ok(()),
+            .send_bytes(block);
+        match result {
+            Ok(_) => {
+                self.known_append_positions.insert(
+                    blob_name.to_owned(),
+                    expected_position.saturating_add(block.len() as u64),
+                );
+                Ok(())
+            }
+            Err(ureq::Error::Status(status, _)) if status == 412 => self
+                .reconcile_ambiguous_append(
+                    blob_name,
+                    expected_position,
+                    block.len(),
+                    AzureBlobError::HttpStatus(status),
+                ),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
-            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+            Err(ureq::Error::Transport(error)) => self.reconcile_ambiguous_append(
+                blob_name,
+                expected_position,
+                block.len(),
+                AzureBlobError::Transport(error.to_string()),
+            ),
         }
     }
 
     fn ensure_append_blob(&mut self, blob_name: &str) -> Result<(), AzureBlobError> {
-        if self.known_append_blobs.contains(blob_name) {
+        if self.known_append_positions.contains_key(blob_name) {
             return Ok(());
         }
-        if self.append_blob_exists(blob_name)? {
-            self.known_append_blobs.insert(blob_name.to_owned());
+        if let Some(position) = self.append_blob_position(blob_name)? {
+            self.known_append_positions
+                .insert(blob_name.to_owned(), position);
             return Ok(());
         }
         let url = self.blob_url(blob_name, None);
@@ -219,7 +249,9 @@ impl AzureAppendBlobRecorder {
             .send_bytes(&[])
         {
             Ok(_) | Err(ureq::Error::Status(409, _)) => {
-                self.known_append_blobs.insert(blob_name.to_owned());
+                let position = self.append_blob_position(blob_name)?.unwrap_or(0);
+                self.known_append_positions
+                    .insert(blob_name.to_owned(), position);
                 Ok(())
             }
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
@@ -227,7 +259,7 @@ impl AzureAppendBlobRecorder {
         }
     }
 
-    fn append_blob_exists(&mut self, blob_name: &str) -> Result<bool, AzureBlobError> {
+    fn append_blob_position(&mut self, blob_name: &str) -> Result<Option<u64>, AzureBlobError> {
         let url = self.blob_url(blob_name, None);
         let token = self.token.access_token(&self.agent)?;
         match self
@@ -238,10 +270,53 @@ impl AzureAppendBlobRecorder {
             .set("x-ms-date", &rfc1123_now())
             .call()
         {
-            Ok(_) => Ok(true),
-            Err(ureq::Error::Status(404, _)) => Ok(false),
+            Ok(response) => response
+                .header("content-length")
+                .ok_or_else(|| {
+                    AzureBlobError::AppendPosition(format!(
+                        "Azure append blob HEAD omitted content-length for {blob_name}"
+                    ))
+                })?
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| {
+                    AzureBlobError::AppendPosition(format!(
+                        "invalid Azure append blob content-length for {blob_name}: {error}"
+                    ))
+                }),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn reconcile_ambiguous_append(
+        &mut self,
+        blob_name: &str,
+        expected_position: u64,
+        block_len: usize,
+        original_error: AzureBlobError,
+    ) -> Result<(), AzureBlobError> {
+        let observed_position = self.append_blob_position(blob_name)?.ok_or_else(|| {
+            AzureBlobError::AppendPosition(format!(
+                "append blob disappeared while reconciling {blob_name}"
+            ))
+        })?;
+        let committed_position = expected_position.saturating_add(block_len as u64);
+        match reconcile_append_position(expected_position, committed_position, observed_position) {
+            Some(true) => {
+                self.known_append_positions
+                    .insert(blob_name.to_owned(), observed_position);
+                Ok(())
+            }
+            Some(false) => {
+                self.known_append_positions
+                    .insert(blob_name.to_owned(), observed_position);
+                Err(original_error)
+            }
+            None => Err(AzureBlobError::AppendPosition(format!(
+                "append position conflict for {blob_name}: expected {expected_position} or {committed_position}, observed {observed_position}"
+            ))),
         }
     }
 
@@ -276,6 +351,20 @@ impl AzureAppendBlobRecorder {
             }
         }
         Ok(())
+    }
+}
+
+fn reconcile_append_position(
+    expected_position: u64,
+    committed_position: u64,
+    observed_position: u64,
+) -> Option<bool> {
+    if observed_position == committed_position {
+        Some(true)
+    } else if observed_position == expected_position {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -334,6 +423,7 @@ impl Drop for AzureAppendBlobRecorder {
 struct BufferedAppendBlocks {
     max_bytes: usize,
     pending: BTreeMap<String, Vec<u8>>,
+    pending_line_sha256: BTreeMap<String, BTreeSet<[u8; 32]>>,
 }
 
 impl BufferedAppendBlocks {
@@ -341,11 +431,20 @@ impl BufferedAppendBlocks {
         Self {
             max_bytes: max_bytes.max(1),
             pending: BTreeMap::new(),
+            pending_line_sha256: BTreeMap::new(),
         }
     }
 
     fn push_line(&mut self, blob_name: &str, line: Vec<u8>) -> Vec<(String, Vec<u8>)> {
         if line.is_empty() {
+            return Vec::new();
+        }
+        let line_sha256: [u8; 32] = Sha256::digest(&line).into();
+        if self
+            .pending_line_sha256
+            .get(blob_name)
+            .is_some_and(|hashes| hashes.contains(&line_sha256))
+        {
             return Vec::new();
         }
         let blob_name = blob_name.to_owned();
@@ -364,6 +463,10 @@ impl BufferedAppendBlocks {
 
         let current = self.pending.entry(blob_name.clone()).or_default();
         current.extend(line);
+        self.pending_line_sha256
+            .entry(blob_name.clone())
+            .or_default()
+            .insert(line_sha256);
         if current.len() >= self.max_bytes {
             self.push_pending_if_any(&blob_name, &mut ready);
         }
@@ -371,6 +474,7 @@ impl BufferedAppendBlocks {
     }
 
     fn drain(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.pending_line_sha256.clear();
         std::mem::take(&mut self.pending)
             .into_iter()
             .filter(|(_, chunk)| !chunk.is_empty())
@@ -383,6 +487,14 @@ impl BufferedAppendBlocks {
         }
         let pending = self.pending.remove(&blob_name).unwrap_or_default();
         let mut merged = Vec::with_capacity(chunk.len() + pending.len());
+        for line in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if !line.is_empty() {
+                self.pending_line_sha256
+                    .entry(blob_name.clone())
+                    .or_default()
+                    .insert(Sha256::digest(line).into());
+            }
+        }
         merged.extend(chunk);
         merged.extend(pending);
         self.pending.insert(blob_name, merged);
@@ -393,6 +505,7 @@ impl BufferedAppendBlocks {
     }
 
     fn push_pending_if_any(&mut self, blob_name: &str, ready: &mut Vec<(String, Vec<u8>)>) {
+        self.pending_line_sha256.remove(blob_name);
         if let Some(chunk) = self.pending.remove(blob_name) {
             if !chunk.is_empty() {
                 ready.push((blob_name.to_owned(), chunk));
@@ -429,6 +542,8 @@ pub enum AzureBlobError {
     ManagedIdentity(String),
     #[error("Azure Blob HTTP transport error: {0}")]
     Transport(String),
+    #[error("Azure append position error: {0}")]
+    AppendPosition(String),
     #[error("invalid Azure Storage account key: {0}")]
     InvalidStorageKey(String),
     #[error("io error: {0}")]
@@ -1935,6 +2050,27 @@ mod tests {
         let chunks = buffer.drain();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].1, b"failed\npending\n");
+    }
+
+    #[test]
+    fn buffered_append_blocks_deduplicates_an_exact_retried_line() {
+        let blob = "events/2026/07/22/02/17.jsonl";
+        let line = b"{\"event_type\":\"strategy_decision_batch\"}\n".to_vec();
+        let mut buffer = BufferedAppendBlocks::new(1_024);
+        buffer.prepend_chunk(blob.to_owned(), line.clone());
+
+        assert!(buffer.push_line(blob, line.clone()).is_empty());
+        let chunks = buffer.drain();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].1, line);
+    }
+
+    #[test]
+    fn append_position_reconciliation_distinguishes_commit_retry_and_conflict() {
+        assert_eq!(reconcile_append_position(100, 140, 140), Some(true));
+        assert_eq!(reconcile_append_position(100, 140, 100), Some(false));
+        assert_eq!(reconcile_append_position(100, 140, 120), None);
+        assert_eq!(reconcile_append_position(100, 140, 180), None);
     }
 
     #[test]

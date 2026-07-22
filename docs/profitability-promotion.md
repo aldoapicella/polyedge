@@ -17,7 +17,7 @@ The dashboard and reports must never combine:
 4. funded strategy PnL.
 
 The original account baseline is `$9.23`. The protocol-v3 shadow holdout
-`campaign-2026-07-22` uses a virtual wallet baseline of `$5.030521`. Campaign
+`campaign-2026-07-23` uses a virtual wallet baseline of `$5.030521`. Campaign
 PnL is:
 
 ```text
@@ -33,22 +33,24 @@ is not profit.
 ## Protocol-v3 Campaign Boundary
 
 The immutable holdout contract is
-`research/configs/profitability_gate_v3_2026-07-22.yaml`. It binds the campaign
+`research/configs/profitability_gate_v3_2026-07-23.yaml`. It binds the campaign
 ID, candidate, capital limits, source/cache/report/correction/profitability
 roots, lease blob, first eligible date, terminal date, and a canonical SHA-256
 that is repeated in every schema-v3 wallet row and profitability manifest.
 
 - July 13–20 remains under `campaign-2026-07-12`, labeled
   `historical_ineligible`; no data is deleted or relabeled.
-- July 21 is the cutover/bootstrap boundary and is ineligible.
-- July 22 is the first UTC day that can count. Its sealed report can first be
-  published by the July 23 scheduled run at approximately `02:15 UTC`.
-- September 19 is the inclusive 60-day terminal date. Failure to pass every
+- July 21 is the original cutover/bootstrap boundary and is ineligible.
+- July 22 is preserved as `recorder_retry_duplicate_ineligible` after one
+  ambiguous Azure append response produced three exact retry duplicates.
+- July 23 is the first UTC day that can count. Its sealed report can first be
+  published by the July 24 scheduled run at approximately `02:15 UTC`.
+- September 20 is the inclusive 60-day terminal date. Failure to pass every
   gate by then is `stopped_no_go`.
 
 The recorder does not restart at midnight. It routes each event by the event's
-own UTC timestamp: events before `2026-07-22T00:00:00Z` remain in the legacy
-prefix and events at or after the boundary go to the new campaign prefix. This
+own UTC timestamp: events before `2026-07-23T00:00:00Z` remain in the preserved
+July 22 prefix and events at or after the boundary go to the new campaign prefix. This
 prevents a cutover restart gap from dirtying the first day.
 
 A pre-cutover freshness probe on July 21 found a deterministic recorder stall
@@ -84,7 +86,24 @@ warnings remained zero. A paper-only boundary execution
 `polyedge-shadow-daily-neu-job-88harco` then succeeded and logged
 `status=not_started`, `first_eligible_date=2026-07-22`,
 `requested_through=2026-07-21`, child status `0`, and a released campaign
-lease. This proves July 21 was not admitted into the new campaign.
+lease. This proves July 21 was not admitted into the July 22 predecessor campaign.
+
+At `2026-07-22T02:17:23Z`, Azure reset the TCP connection while the runtime
+awaited an Append Block response for a required three-event decision batch.
+The exact minute remained readable (`586` events, zero malformed lines), but
+the retry appended one duplicate strategy evaluation, one duplicate decision
+batch, and one duplicate binding. The next minute contained `657` valid events
+with zero duplicates and the runtime never restarted, so there is no evidence
+of a lost minute; nevertheless July 22 is not warning-free and cannot count.
+
+The repaired recorder now uses Azure's single-writer
+`x-ms-blob-condition-appendpos` condition, reconciles ambiguous responses by
+observing the append position, and deduplicates an exact line retained for
+retry. Runtime health separately reports recovered and currently unrecovered
+durable batches and flush failures. Daily publication fails closed unless loss
+diagnostics are complete and contain zero exact duplicate lines. These changes
+start the separate `campaign-2026-07-23` evidence version; they do not rewrite
+or delete the July 22 bytes.
 
 ## Capital Boundary
 
@@ -316,7 +335,7 @@ future UTC day even when the CLI is called directly; the shell check is not the
 only protection against look-ahead.
 
 Historical cumulative wallet snapshots remain schema version 2 and verifiable
-under the July 12/13 legacy rules. `campaign-2026-07-22` uses schema version 3.
+under the July 12/13 legacy rules. `campaign-2026-07-23` uses schema version 3.
 In addition to the campaign terminal hash, parent hash, exact campaign-index
 bytes, cumulative replay state, and cumulative regimes artifact, schema v3
 binds the immutable campaign ID, contract SHA-256, start/first-eligible/terminal
@@ -324,7 +343,7 @@ dates, wallet scope, and `$5.030521` baseline. A missing date, late first
 snapshot, modified local shard, mixed campaign, schema downgrade, baseline
 mismatch, bad parent, or correction that breaks the existing sequence
 invalidates the entire wallet ledger and blocks promotion. The new sequence
-must begin on July 22 and advance by exactly one UTC day.
+must begin on July 23 and advance by exactly one UTC day.
 
 All scheduled and manual shadow writers run under one renewable Azure Blob
 lease. The child process is killed if renewal or ownership is lost, and the

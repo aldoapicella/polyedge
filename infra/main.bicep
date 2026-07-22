@@ -297,9 +297,9 @@ var logAlerts = [
   }
   {
     name: 'recorder-failed-total-gt-0'
-    displayName: 'PolyEdge recorder failed total > 0'
+    displayName: 'PolyEdge recorder has unrecovered durable evidence'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_failed_total":([0-9]+)\', 1, Log_s)) | where value > 0 or Log_s has "worker_alive=false"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
   }
   {
     name: 'recorder-dropped-count-gt-0'
@@ -671,19 +671,19 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'SHADOW_CAMPAIGN_ID'
-              value: 'campaign-2026-07-22'
+              value: 'campaign-2026-07-23'
             }
             {
               name: 'SHADOW_CAMPAIGN_START'
-              value: '2026-07-22'
+              value: '2026-07-23'
             }
             {
               name: 'SHADOW_CAMPAIGN_REPORT_ROOT'
-              value: 'reports/research/shadow/campaigns/campaign-2026-07-22'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-23'
             }
             {
               name: 'SHADOW_CORRECTION_ROOT'
-              value: 'reports/research/shadow/campaigns/campaign-2026-07-22/corrections'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-23/corrections'
             }
             {
               name: 'AZURE_STORAGE_TABLE_NAME'

@@ -3837,27 +3837,27 @@ mod wallet_metric_tests {
     }
 
     #[test]
-    fn july_22_protocol_v3_campaign_contract_is_hash_bound_and_scoped() {
+    fn july_23_protocol_v3_campaign_contract_is_hash_bound_and_scoped() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../research/configs/profitability_gate_v3_2026-07-22.yaml");
+            .join("../../research/configs/profitability_gate_v3_2026-07-23.yaml");
         let first = load_shadow_campaign_contract(&path).unwrap();
         let second = load_shadow_campaign_contract(&path).unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(first.contract.campaign_id, "campaign-2026-07-22");
+        assert_eq!(first.contract.campaign_id, "campaign-2026-07-23");
         assert_eq!(
             first.contract.start_date,
-            NaiveDate::from_ymd_opt(2026, 7, 22).unwrap()
+            NaiveDate::from_ymd_opt(2026, 7, 23).unwrap()
         );
         assert_eq!(
             first.contract.terminal_date,
-            NaiveDate::from_ymd_opt(2026, 9, 19).unwrap()
+            NaiveDate::from_ymd_opt(2026, 9, 20).unwrap()
         );
         assert_eq!(first.contract.wallet_baseline, d("5.030521"));
         assert_eq!(first.contract.evidence_protocol_version, 3);
         assert_eq!(
             first.contract.daily_root,
-            "reports/research/shadow/campaigns/campaign-2026-07-22/daily"
+            "reports/research/shadow/campaigns/campaign-2026-07-23/daily"
         );
         assert!(valid_sha256(&first.sha256));
     }
@@ -3865,7 +3865,7 @@ mod wallet_metric_tests {
     #[test]
     fn schema_v3_wallet_chain_rejects_mixed_campaign_and_broken_parent() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../research/configs/profitability_gate_v3_2026-07-22.yaml");
+            .join("../../research/configs/profitability_gate_v3_2026-07-23.yaml");
         let binding = load_shadow_campaign_contract(&path).unwrap();
         let hash = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
         let row = |day: u32, input: String, parent: Option<String>, pnl: &str| {
@@ -3875,9 +3875,9 @@ mod wallet_metric_tests {
                 "wallet_scope": binding.contract.wallet_scope,
                 "wallet_campaign_id": binding.contract.campaign_id,
                 "wallet_campaign_contract_sha256": binding.sha256,
-                "wallet_campaign_start": "2026-07-22",
-                "wallet_campaign_first_eligible_date": "2026-07-22",
-                "wallet_campaign_terminal_date": "2026-09-19",
+                "wallet_campaign_start": "2026-07-23",
+                "wallet_campaign_first_eligible_date": "2026-07-23",
+                "wallet_campaign_terminal_date": "2026-09-20",
                 "wallet_campaign_baseline": "5.030521",
                 "wallet_evidence_protocol_version": 3,
                 "wallet_snapshot_date": format!("2026-07-{day:02}"),
@@ -3887,7 +3887,7 @@ mod wallet_metric_tests {
                 "cumulative_input_manifest_sha256": hash('c'),
                 "cumulative_state_sha256": hash('d'),
                 "cumulative_regimes_artifact_sha256": hash('e'),
-                "cumulative_events": u64::from(day - 21) * 100,
+                "cumulative_events": u64::from(day - 22) * 100,
                 "wallet_constrained_net_pnl": pnl,
                 "wallet_constrained_ending_equity": (d("5.030521") + d(pnl)).to_string(),
                 "wallet_constrained_max_drawdown": "0",
@@ -3896,8 +3896,8 @@ mod wallet_metric_tests {
         };
         let first_input = hash('a');
         let valid = vec![
-            row(22, first_input.clone(), None, "0.1"),
-            row(23, hash('b'), Some(first_input), "0.2"),
+            row(23, first_input.clone(), None, "0.1"),
+            row(24, hash('b'), Some(first_input), "0.2"),
         ];
         assert!(validated_cumulative_wallet_snapshots(&valid, Some(&binding)).is_some());
 

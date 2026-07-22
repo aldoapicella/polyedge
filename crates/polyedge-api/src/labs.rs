@@ -30,22 +30,22 @@ const REPORT_ROOT: &str = "reports/research";
 #[cfg(test)]
 const PRIMARY_DAILY_ROOT: &str = "reports/research/daily";
 const SHADOW_DAILY_ROOT: &str = "reports/research/shadow/daily";
-const ACTIVE_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-22";
+const ACTIVE_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-23";
 const LEGACY_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-12";
-const ACTIVE_SHADOW_CAMPAIGN_START: &str = "2026-07-22";
-const ACTIVE_SHADOW_CAMPAIGN_TERMINAL: &str = "2026-09-19";
+const ACTIVE_SHADOW_CAMPAIGN_START: &str = "2026-07-23";
+const ACTIVE_SHADOW_CAMPAIGN_TERMINAL: &str = "2026-09-20";
 const LEGACY_SHADOW_FIRST_DATE: &str = "2026-07-13";
 const LEGACY_SHADOW_LAST_DATE: &str = "2026-07-20";
 const ACTIVE_SHADOW_DAILY_ROOT: &str =
-    "reports/research/shadow/campaigns/campaign-2026-07-22/daily";
+    "reports/research/shadow/campaigns/campaign-2026-07-23/daily";
 const ACTIVE_SHADOW_PROSPECTIVE_PATH: &str =
-    "reports/research/shadow/campaigns/campaign-2026-07-22/prospective/prospective_validation.json";
+    "reports/research/shadow/campaigns/campaign-2026-07-23/prospective/prospective_validation.json";
 const ACTIVE_SHADOW_PROFITABILITY_LATEST: &str =
-    "reports/research/shadow/campaigns/campaign-2026-07-22/profitability/latest.json";
+    "reports/research/shadow/campaigns/campaign-2026-07-23/profitability/latest.json";
 const ACTIVE_SHADOW_CORRECTION_PATH: &str =
-    "reports/research/shadow/campaigns/campaign-2026-07-22/corrections/active.json";
+    "reports/research/shadow/campaigns/campaign-2026-07-23/corrections/active.json";
 const ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH: &str =
-    "research/configs/profitability_gate_v3_2026-07-22.yaml";
+    "research/configs/profitability_gate_v3_2026-07-23.yaml";
 const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
 const PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const PROMOTION_MANIFEST_SCHEMA: &str = "promotion_manifest_v1";
@@ -2018,7 +2018,11 @@ pub(crate) fn daily_report_payload(date: &str) -> Value {
             "campaign_start": ACTIVE_SHADOW_CAMPAIGN_START,
             "evidence_eligibility": "historical_ineligible",
             "report": Value::Null,
-            "detail": if date == "2026-07-21" { "July 21 is the campaign reset boundary and is ineligible." } else { "No eligible legacy shadow report exists for this historical date." },
+            "detail": match date {
+                "2026-07-21" => "July 21 is the original campaign reset boundary and is ineligible.",
+                "2026-07-22" => "July 22 contains three exact recorder-retry duplicates and is preserved as ineligible.",
+                _ => "No eligible legacy shadow report exists for this historical date.",
+            },
             "status": "historical_ineligible",
             "artifacts": []
         }),
@@ -3019,7 +3023,7 @@ mod tests {
             "result": {
                 "status": "tracking",
                 "rows": [{
-                    "date": "2026-07-22",
+                    "date": "2026-07-23",
                     "wallet_schema_version": 3,
                     "wallet_campaign_id": ACTIVE_SHADOW_CAMPAIGN_ID,
                     "wallet_campaign_contract_sha256": contract_sha256,
@@ -3464,7 +3468,7 @@ mod tests {
             .and_then(|artifact| artifact["artifact_id"].as_str())
             .expect("shadow artifact id");
         assert!(artifact_id.starts_with(
-            "shadow~campaigns~campaign-2026-07-22~daily~2099-12-29~runs~api-shadow-001~"
+            "shadow~campaigns~campaign-2026-07-23~daily~2099-12-29~runs~api-shadow-001~"
         ));
         let artifact_path = PathBuf::from(REPORT_ROOT).join(artifact_id.replace('~', "/"));
         let artifact = artifact_payload(&artifact_path)
@@ -3530,7 +3534,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_shadow_is_display_only_and_reset_boundary_is_ineligible() {
+    fn legacy_shadow_and_dirty_cutover_days_are_display_only() {
         let legacy_date = "2026-07-20";
         let legacy_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(legacy_date);
         let _legacy_guard = CleanupPath(legacy_dir);
@@ -3551,12 +3555,22 @@ mod tests {
         let reset = daily_report_payload("2026-07-21");
         assert_eq!(reset["status"], "historical_ineligible");
         assert!(reset["report"].is_null());
+
+        let duplicate_day = daily_report_payload("2026-07-22");
+        assert_eq!(duplicate_day["status"], "historical_ineligible");
+        assert_eq!(
+            duplicate_day["detail"],
+            "July 22 contains three exact recorder-retry duplicates and is preserved as ineligible."
+        );
+        assert!(duplicate_day["report"].is_null());
     }
 
     #[test]
     fn latest_report_awaits_then_uses_only_active_campaign_pointer() {
         let date = "2099-12-26";
-        let legacy_date = "2026-07-20";
+        // Keep this fixture distinct from the display-only legacy test because
+        // Rust runs unit tests concurrently and both clean up their date roots.
+        let legacy_date = "2026-07-19";
         let primary_date_dir = PathBuf::from(PRIMARY_DAILY_ROOT).join(legacy_date);
         let legacy_date_dir = PathBuf::from(SHADOW_DAILY_ROOT).join(legacy_date);
         let active_date_dir = PathBuf::from(ACTIVE_SHADOW_DAILY_ROOT).join(date);

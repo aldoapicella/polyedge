@@ -33,11 +33,11 @@ if [ "$(date -u -d "$CASCADE_THROUGH" +%Y-%m-%d 2>/dev/null || true)" != "$CASCA
   echo "SHADOW_CASCADE_THROUGH must be a sealed UTC date on or after SHADOW_REPORT_DATE" >&2
   exit 1
 fi
-CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:-campaign-2026-07-22}"
-CAMPAIGN_START="${SHADOW_CAMPAIGN_START:-2026-07-22}"
+CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:-campaign-2026-07-23}"
+CAMPAIGN_START="${SHADOW_CAMPAIGN_START:-2026-07-23}"
 CAMPAIGN_PREFIX="${SHADOW_CAMPAIGN_PREFIX:-shadow-events/$CAMPAIGN_ID}"
 CAMPAIGN_ROOT="${SHADOW_CAMPAIGN_REPORT_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID}"
-CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:-research/configs/profitability_gate_v3_2026-07-22.yaml}"
+CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:-research/configs/profitability_gate_v3_2026-07-23.yaml}"
 CORRECTION_ROOT="${SHADOW_CORRECTION_ROOT:-$CAMPAIGN_ROOT/corrections}"
 DAILY_ROOT="$CAMPAIGN_ROOT/daily"
 PROSPECTIVE_ROOT="$CAMPAIGN_ROOT/prospective"
@@ -132,6 +132,14 @@ for artifact in loss_diagnostics.json loss_diagnostics_artifact_manifest.json; d
     exit 1
   fi
 done
+if ! jq -e '
+  .result.status == "complete_diagnostic"
+  and .result.counts.duplicate_event_lines == 0
+  and .result.completion_checks.no_exact_duplicate_event_lines == true
+' "$LOSS_DIAGNOSTICS/loss_diagnostics.json" >/dev/null; then
+  echo "polyedge_shadow_daily stage=loss-diagnostics date=$DATE status=diagnostic-ineligible" >&2
+  exit 1
+fi
 run_stage normalized-audit polyedge-rs research audit --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/data_audit.json" --markdown "$STAGING/data_audit.md"
 run_stage execution-quality polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/execution_quality.json" --markdown "$STAGING/execution_quality.md"
 run_stage build-markets-day polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$MARKETS" --markdown "$STAGING/markets_summary.md"
