@@ -166,6 +166,17 @@ overall wallet-constrained equity and drawdown still include the full campaign,
 so excluding a dirty day from statistical evidence cannot hide a real capital
 loss.
 
+Execution-quality rates use explicit applicability rather than inventing a
+percentage for an empty denominator. If no paper fill lifecycle exists, the
+1/5/30-second markout rates are `null` with `applicable=false`; this is N/A for
+data quality, not a missing markout. A day with placed orders still requires at
+least 95% joined queue snapshots, and every actual fill still requires all
+three timely net markouts. If there are no applicable placed orders at all,
+queue-snapshot coverage is likewise N/A and the execution gate remains
+`COLLECTING`: the day cannot manufacture queue-conservative PnL evidence or
+increase the profitability clean-day suffix. The dashboard must render these
+explicit empty-denominator cases as N/A, never as 0% or 100%.
+
 ### Decision-grade evidence contract v4
 
 The overall shadow campaign remains Protocol v3, but final decision binding

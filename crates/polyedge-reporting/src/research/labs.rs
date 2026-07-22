@@ -1947,9 +1947,13 @@ fn json_row(
         "markout_30s_sample_size": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/count")).cloned(),
         "execution_quality_gate": execution_quality_gate,
         "queue_snapshot_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_coverage")).cloned(),
+        "queue_snapshot_applicable": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_applicable")).cloned(),
         "markout_1s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/1/completion_rate")).cloned(),
+        "markout_1s_applicable": execution_quality.and_then(|report| report.pointer("/result/markouts/1/applicable")).cloned(),
         "markout_5s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/5/completion_rate")).cloned(),
+        "markout_5s_applicable": execution_quality.and_then(|report| report.pointer("/result/markouts/5/applicable")).cloned(),
         "markout_30s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/30/completion_rate")).cloned(),
+        "markout_30s_applicable": execution_quality.and_then(|report| report.pointer("/result/markouts/30/applicable")).cloned(),
         "recommendation": recommendation,
         "decision_gate": dynamic_gate,
         "dynamic_quote_style_decision_gate": dynamic_gate,
@@ -2240,6 +2244,32 @@ fn load_exact_execution_model(
     ))
 }
 
+fn minimum_applicable_component(
+    qualities: &[DataQualitySummary],
+    value_selector: fn(&DataQualityCoverageBreakdown) -> Option<Decimal>,
+    applicable_selector: fn(&DataQualityCoverageBreakdown) -> Option<bool>,
+) -> (Option<Decimal>, Option<bool>) {
+    let mut values = Vec::new();
+    let mut explicit_not_applicable = 0_usize;
+    for quality in qualities {
+        let breakdown = &quality.coverage_breakdown;
+        match (applicable_selector(breakdown), value_selector(breakdown)) {
+            (Some(false), None) => explicit_not_applicable += 1,
+            (Some(true) | None, Some(value)) => values.push(value),
+            // Missing legacy data, an applicable metric without a rate, or a
+            // contradictory N/A rate remains fail closed.
+            _ => return (None, None),
+        }
+    }
+    if values.is_empty() && explicit_not_applicable == qualities.len() {
+        (None, Some(false))
+    } else if values.len() + explicit_not_applicable == qualities.len() {
+        (values.into_iter().min(), Some(true))
+    } else {
+        (None, None)
+    }
+}
+
 fn aggregate_profitability_metrics(
     rows: &[Value],
     _prospective: &Value,
@@ -2313,6 +2343,26 @@ fn aggregate_profitability_metrics(
             .into_iter()
             .min()
     };
+    let (queue_snapshot_coverage, queue_snapshot_applicable) = minimum_applicable_component(
+        &qualities,
+        |row| row.queue_snapshot_coverage,
+        |row| row.queue_snapshot_applicable,
+    );
+    let (markout_1s_completion, markout_1s_applicable) = minimum_applicable_component(
+        &qualities,
+        |row| row.markout_1s_completion,
+        |row| row.markout_1s_applicable,
+    );
+    let (markout_5s_completion, markout_5s_applicable) = minimum_applicable_component(
+        &qualities,
+        |row| row.markout_5s_completion,
+        |row| row.markout_5s_applicable,
+    );
+    let (markout_30s_completion, markout_30s_applicable) = minimum_applicable_component(
+        &qualities,
+        |row| row.markout_30s_completion,
+        |row| row.markout_30s_applicable,
+    );
     let quality = DataQualitySummary {
         registry_version: WARNING_REGISTRY_VERSION.to_owned(),
         total_events,
@@ -2339,10 +2389,14 @@ fn aggregate_profitability_metrics(
             }),
             execution_field_coverage: minimum_component(|row| row.execution_field_coverage),
             decision_parity_rate: minimum_component(|row| row.decision_parity_rate),
-            queue_snapshot_coverage: minimum_component(|row| row.queue_snapshot_coverage),
-            markout_1s_completion: minimum_component(|row| row.markout_1s_completion),
-            markout_5s_completion: minimum_component(|row| row.markout_5s_completion),
-            markout_30s_completion: minimum_component(|row| row.markout_30s_completion),
+            queue_snapshot_coverage,
+            queue_snapshot_applicable,
+            markout_1s_completion,
+            markout_1s_applicable,
+            markout_5s_completion,
+            markout_5s_applicable,
+            markout_30s_completion,
+            markout_30s_applicable,
         },
     };
     let clean_days = consecutive_clean_day_streak(rows);
@@ -2756,6 +2810,11 @@ fn current_clean_suffix(rows: &[Value]) -> &[Value] {
             .ok()
             .is_some_and(|quality| quality.promotion_allowed())
             && row["runtime_role"].as_str() == Some("profitability_shadow")
+            && row["fill_model"].as_str().is_none_or(|_| {
+                row["execution_quality_gate"]
+                    .as_str()
+                    .is_none_or(|gate| gate == "PASS")
+            })
             && row["fill_model"]
                 .as_str()
                 .is_none_or(|_| queue_profitability_row_eligible(row));
@@ -3287,11 +3346,51 @@ mod wallet_metric_tests {
             execution_field_coverage: Some(coverage),
             decision_parity_rate: Some(Decimal::ONE),
             queue_snapshot_coverage: Some(coverage),
+            queue_snapshot_applicable: Some(true),
             markout_1s_completion: Some(coverage),
+            markout_1s_applicable: Some(true),
             markout_5s_completion: Some(coverage),
+            markout_5s_applicable: Some(true),
             markout_30s_completion: Some(coverage),
+            markout_30s_applicable: Some(true),
         };
         quality
+    }
+
+    #[test]
+    fn applicability_aggregation_ignores_only_proven_empty_denominators() {
+        let measured = measured_quality(100, Decimal::new(97, 2), Vec::new(), Vec::new());
+        let mut not_applicable = measured.clone();
+        not_applicable.coverage_breakdown.markout_30s_completion = None;
+        not_applicable.coverage_breakdown.markout_30s_applicable = Some(false);
+
+        assert_eq!(
+            minimum_applicable_component(
+                &[measured.clone(), not_applicable.clone()],
+                |row| row.markout_30s_completion,
+                |row| row.markout_30s_applicable,
+            ),
+            (Some(Decimal::new(97, 2)), Some(true))
+        );
+        assert_eq!(
+            minimum_applicable_component(
+                &[not_applicable.clone(), not_applicable.clone()],
+                |row| row.markout_30s_completion,
+                |row| row.markout_30s_applicable,
+            ),
+            (None, Some(false))
+        );
+
+        let mut contradictory = not_applicable;
+        contradictory.coverage_breakdown.markout_30s_completion = Some(Decimal::ONE);
+        assert_eq!(
+            minimum_applicable_component(
+                &[measured, contradictory],
+                |row| row.markout_30s_completion,
+                |row| row.markout_30s_applicable,
+            ),
+            (None, None)
+        );
     }
 
     #[test]
@@ -3500,6 +3599,7 @@ mod wallet_metric_tests {
         });
         let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
         let runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+        let execution_quality = json!({"result": {"evidence_gate": "PASS"}});
         let row = json_row(
             "2026-07-13",
             DailyReportSources {
@@ -3510,7 +3610,7 @@ mod wallet_metric_tests {
             DailyRowEvidence {
                 sample: None,
                 audit: None,
-                execution_quality: None,
+                execution_quality: Some(&execution_quality),
                 cumulative_wallet: Some(&cumulative_wallet),
                 manifest_quality: Some(&quality),
                 runtime_role: Some(&runtime_role),
@@ -3837,6 +3937,28 @@ mod wallet_metric_tests {
             "dynamic_quote_style_net_pnl"
         )
         .is_none());
+    }
+
+    #[test]
+    fn collecting_execution_day_cannot_increment_profitability_clean_suffix() {
+        let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let mut row = json!({
+            "date": "2026-07-23",
+            "runtime_role": "profitability_shadow",
+            "data_quality": quality,
+            "fill_model": "queue_proxy_conservative",
+            "execution_quality_gate": "COLLECTING",
+            "queue_proxy_enabled": true,
+            "queue_proxy_pnl_eligible": true,
+            "queue_proxy_eligibility_rate": "1",
+            "ineligible_queue_fills": 0,
+            "queue_proxy_net_pnl": "0",
+            "queue_proxy_wallet_constrained_net_pnl": "0"
+        });
+
+        assert!(current_clean_suffix(std::slice::from_ref(&row)).is_empty());
+        row["execution_quality_gate"] = json!("PASS");
+        assert_eq!(current_clean_suffix(std::slice::from_ref(&row)).len(), 1);
     }
 
     #[test]

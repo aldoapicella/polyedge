@@ -5368,6 +5368,7 @@ impl ExecutionQualityAccumulator {
         }
         let missing_snapshot_orders = expected_queue_orders.saturating_sub(joined_snapshot_orders);
         let snapshot_coverage = ratio_f64(joined_snapshot_orders, expected_queue_orders);
+        let queue_snapshot_applicable = expected_queue_orders > 0;
         let mut warnings = Vec::new();
         let mut notices = Vec::new();
         if strict_v3_place_denominator
@@ -5642,6 +5643,8 @@ impl ExecutionQualityAccumulator {
                     horizon.to_string(),
                     json!({
                         "horizon_seconds": horizon,
+                        "applicable": expected > 0,
+                        "completion_status": if expected > 0 { "measured" } else { "not_applicable" },
                         "expected": expected,
                         "observed": observed,
                         "missing": missing,
@@ -5695,6 +5698,7 @@ impl ExecutionQualityAccumulator {
             "queue_snapshots": self.snapshot_events,
             "queue_snapshot_joined_orders": joined_snapshot_orders,
             "queue_snapshot_missing_orders": missing_snapshot_orders,
+            "queue_snapshot_expected_orders": expected_queue_orders,
             "queue_registration_orphan_order_ids": orphan_registration_order_ids,
             "queue_snapshot_orphan_events": orphan_snapshot_events,
             "queue_snapshot_orphan_order_ids": orphan_snapshot_ids,
@@ -5702,6 +5706,8 @@ impl ExecutionQualityAccumulator {
             "queue_snapshot_duplicate_order_ids": duplicate_snapshot_ids,
             "queue_snapshot_invalid_size_events": invalid_snapshot_events,
             "queue_snapshot_coverage": snapshot_coverage,
+            "queue_snapshot_applicable": queue_snapshot_applicable,
+            "queue_snapshot_coverage_status": if queue_snapshot_applicable { "measured" } else { "not_applicable" },
             "visible_size_ahead": distribution_summary(&size_ahead),
             "queue_shadow_fill_events": self.queue_fill_events,
             "queue_shadow_filled_orders": self.queue_fill_orders.len(),
@@ -11738,6 +11744,53 @@ mod tests {
         );
         assert_eq!(result["markouts"]["30"]["executable"]["mean"], "0.005");
         assert_eq!(result["probe_events_excluded"], 1);
+        assert_eq!(result["evidence_gate"], "PASS");
+    }
+
+    #[test]
+    fn execution_quality_marks_empty_denominators_not_applicable() {
+        let result = ExecutionQualityAccumulator::default().finish();
+
+        assert_eq!(result["queue_snapshot_applicable"], false);
+        assert!(result["queue_snapshot_coverage"].is_null());
+        assert_eq!(result["queue_snapshot_coverage_status"], "not_applicable");
+        for horizon in ["1", "5", "30"] {
+            assert_eq!(result["markouts"][horizon]["applicable"], false);
+            assert!(result["markouts"][horizon]["completion_rate"].is_null());
+            assert_eq!(
+                result["markouts"][horizon]["completion_status"],
+                "not_applicable"
+            );
+        }
+        assert_eq!(result["evidence_gate"], "COLLECTING");
+        assert!(result["warnings"].as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn complete_queue_day_without_fills_has_not_applicable_markouts() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_registration",
+            queue_registration_payload("order-1"),
+        );
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_snapshot",
+            json!({"order_id": "order-1", "visible_size_ahead_estimate": "12"}),
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["queue_snapshot_applicable"], true);
+        assert_eq!(result["queue_snapshot_coverage"], 1.0);
+        for horizon in ["1", "5", "30"] {
+            assert_eq!(result["markouts"][horizon]["applicable"], false);
+            assert!(result["markouts"][horizon]["completion_rate"].is_null());
+        }
         assert_eq!(result["evidence_gate"], "PASS");
     }
 
