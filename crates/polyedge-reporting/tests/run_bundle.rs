@@ -722,6 +722,103 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
 }
 
 #[test]
+fn daily_manifest_accepts_complete_queue_day_with_no_fill_markout_denominator() {
+    let root = test_dir("publish_no_fill_execution_quality");
+    let source = root.join("generated");
+    fs::create_dir_all(&source).unwrap();
+    for name in ["baseline.json", "regimes.json", "final_report.json"] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        source.join("execution_quality.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "result": {
+                "evidence_gate": "PASS",
+                "queue_snapshot_coverage": 1.0,
+                "queue_snapshot_applicable": true,
+                "queue_snapshot_expected_orders": 1,
+                "markouts": {
+                    "1": {"completion_rate": null, "applicable": false, "expected": 0},
+                    "5": {"completion_rate": null, "applicable": false, "expected": 0},
+                    "30": {"completion_rate": null, "applicable": false, "expected": 0}
+                },
+                "warnings": []
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let audit = source.join("data_audit.json");
+    fs::write(&audit, complete_daily_audit("2026-07-16", 1.0)).unwrap();
+
+    let published = publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+        "daily-20260716-no-fills",
+        "e".repeat(64),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit,
+    )
+    .unwrap();
+
+    let breakdown = &published.manifest.data_quality.coverage_breakdown;
+    assert_eq!(breakdown.queue_snapshot_applicable, Some(true));
+    assert_eq!(breakdown.queue_snapshot_coverage, Some(Decimal::ONE));
+    assert_eq!(breakdown.markout_1s_applicable, Some(false));
+    assert_eq!(breakdown.markout_5s_applicable, Some(false));
+    assert_eq!(breakdown.markout_30s_applicable, Some(false));
+    assert_eq!(breakdown.markout_30s_completion, None);
+    assert!(published.manifest.data_quality.promotion_allowed());
+}
+
+#[test]
+fn daily_manifest_rejects_applicability_that_contradicts_denominator() {
+    let root = test_dir("reject_contradictory_execution_applicability");
+    let source = root.join("generated");
+    fs::create_dir_all(&source).unwrap();
+    for name in ["baseline.json", "regimes.json", "final_report.json"] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        source.join("execution_quality.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "result": {
+                "evidence_gate": "PASS",
+                "queue_snapshot_coverage": null,
+                "queue_snapshot_applicable": false,
+                "queue_snapshot_expected_orders": 1,
+                "markouts": {
+                    "1": {"completion_rate": null, "applicable": false, "expected": 0},
+                    "5": {"completion_rate": null, "applicable": false, "expected": 0},
+                    "30": {"completion_rate": null, "applicable": false, "expected": 0}
+                },
+                "warnings": []
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let audit = source.join("data_audit.json");
+    fs::write(&audit, complete_daily_audit("2026-07-17", 1.0)).unwrap();
+
+    let error = publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+        "daily-20260717-contradiction",
+        "f".repeat(64),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit,
+    )
+    .expect_err("contradictory queue applicability must fail closed");
+
+    assert!(error
+        .to_string()
+        .contains("queue snapshot coverage applicability contradicts denominator 1"));
+}
+
+#[test]
 fn partial_or_materially_gapped_utc_day_is_published_but_never_clean() {
     let root = test_dir("partial_daily_capture");
     let source = root.join("generated");
@@ -1053,6 +1150,25 @@ fn scalar_quality_without_measured_components_cannot_pass_open() {
 }
 
 #[test]
+fn explicit_empty_execution_denominators_are_data_quality_not_applicable() {
+    let mut quality = measured_quality(100_000, Decimal::ONE, Vec::new(), Vec::<String>::new());
+    quality.coverage_breakdown.queue_snapshot_coverage = None;
+    quality.coverage_breakdown.queue_snapshot_applicable = Some(false);
+    quality.coverage_breakdown.markout_1s_completion = None;
+    quality.coverage_breakdown.markout_1s_applicable = Some(false);
+    quality.coverage_breakdown.markout_5s_completion = None;
+    quality.coverage_breakdown.markout_5s_applicable = Some(false);
+    quality.coverage_breakdown.markout_30s_completion = None;
+    quality.coverage_breakdown.markout_30s_applicable = Some(false);
+
+    assert!(quality.promotion_allowed());
+
+    // A producer cannot label a non-empty or measured denominator N/A.
+    quality.coverage_breakdown.markout_30s_completion = Some(Decimal::ONE);
+    assert!(!quality.promotion_allowed());
+}
+
+#[test]
 fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
     let root = test_dir("evaluate_profitability");
     let source = root.join("generated");
@@ -1215,9 +1331,13 @@ fn measured_quality(
         execution_field_coverage: Some(coverage),
         decision_parity_rate: Some(Decimal::ONE),
         queue_snapshot_coverage: Some(coverage),
+        queue_snapshot_applicable: Some(true),
         markout_1s_completion: Some(coverage),
+        markout_1s_applicable: Some(true),
         markout_5s_completion: Some(coverage),
+        markout_5s_applicable: Some(true),
         markout_30s_completion: Some(coverage),
+        markout_30s_applicable: Some(true),
     };
     quality
 }
@@ -2789,12 +2909,17 @@ fn valid_runtime_provenance_identity(git_sha: &str) -> serde_json::Value {
 fn complete_execution_quality() -> Vec<u8> {
     serde_json::to_vec_pretty(&serde_json::json!({
         "result": {
+            "evidence_gate": "PASS",
             "queue_snapshot_coverage": 1.0,
+            "queue_snapshot_applicable": true,
+            "queue_snapshot_expected_orders": 1,
             "markouts": {
-                "1": {"completion_rate": 1.0},
-                "5": {"completion_rate": 1.0},
+                "1": {"completion_rate": 1.0, "applicable": true, "expected": 1},
+                "5": {"completion_rate": 1.0, "applicable": true, "expected": 1},
                 "30": {
                     "completion_rate": 1.0,
+                    "applicable": true,
+                    "expected": 1,
                     "executable": {
                         "count": 10,
                         "mean": "0.02",

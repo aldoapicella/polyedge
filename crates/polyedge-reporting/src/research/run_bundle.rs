@@ -409,11 +409,19 @@ pub struct DataQualityCoverageBreakdown {
     #[serde(default)]
     pub queue_snapshot_coverage: Option<Decimal>,
     #[serde(default)]
+    pub queue_snapshot_applicable: Option<bool>,
+    #[serde(default)]
     pub markout_1s_completion: Option<Decimal>,
+    #[serde(default)]
+    pub markout_1s_applicable: Option<bool>,
     #[serde(default)]
     pub markout_5s_completion: Option<Decimal>,
     #[serde(default)]
+    pub markout_5s_applicable: Option<bool>,
+    #[serde(default)]
     pub markout_30s_completion: Option<Decimal>,
+    #[serde(default)]
+    pub markout_30s_applicable: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -467,6 +475,13 @@ impl DataQualitySummary {
     pub fn promotion_allowed(&self) -> bool {
         let minimum = Decimal::new(95, 2);
         let complete = |value: Option<Decimal>| value.is_some_and(|value| value >= minimum);
+        let complete_or_not_applicable =
+            |value: Option<Decimal>, applicable: Option<bool>| match applicable {
+                // An explicitly empty denominator is complete for data-quality
+                // purposes only when no contradictory rate was published.
+                Some(false) => value.is_none(),
+                Some(true) | None => complete(value),
+            };
         self.total_events > 0
             && self.registry_version == WARNING_REGISTRY_VERSION
             && self.decision_grade_coverage >= minimum
@@ -478,10 +493,22 @@ impl DataQualitySummary {
             && complete(self.coverage_breakdown.final_decision_grade_coverage)
             && complete(self.coverage_breakdown.execution_field_coverage)
             && self.coverage_breakdown.decision_parity_rate == Some(Decimal::ONE)
-            && complete(self.coverage_breakdown.queue_snapshot_coverage)
-            && complete(self.coverage_breakdown.markout_1s_completion)
-            && complete(self.coverage_breakdown.markout_5s_completion)
-            && complete(self.coverage_breakdown.markout_30s_completion)
+            && complete_or_not_applicable(
+                self.coverage_breakdown.queue_snapshot_coverage,
+                self.coverage_breakdown.queue_snapshot_applicable,
+            )
+            && complete_or_not_applicable(
+                self.coverage_breakdown.markout_1s_completion,
+                self.coverage_breakdown.markout_1s_applicable,
+            )
+            && complete_or_not_applicable(
+                self.coverage_breakdown.markout_5s_completion,
+                self.coverage_breakdown.markout_5s_applicable,
+            )
+            && complete_or_not_applicable(
+                self.coverage_breakdown.markout_30s_completion,
+                self.coverage_breakdown.markout_30s_applicable,
+            )
             && self.fatal_issues.is_empty()
             && self.event_time_ordering_restored
             && Decimal::from(self.out_of_order_events) / Decimal::from(self.total_events)
@@ -762,18 +789,42 @@ pub fn publish_daily_directory(
         let result = execution_quality
             .get("result")
             .unwrap_or(&execution_quality);
-        quality.coverage_breakdown.queue_snapshot_coverage = result
-            .get("queue_snapshot_coverage")
-            .and_then(decimal_from_json);
-        quality.coverage_breakdown.markout_1s_completion = result
-            .pointer("/markouts/1/completion_rate")
-            .and_then(decimal_from_json);
-        quality.coverage_breakdown.markout_5s_completion = result
-            .pointer("/markouts/5/completion_rate")
-            .and_then(decimal_from_json);
-        quality.coverage_breakdown.markout_30s_completion = result
-            .pointer("/markouts/30/completion_rate")
-            .and_then(decimal_from_json);
+        let (queue_snapshot_coverage, queue_snapshot_applicable) = execution_completion_metric(
+            result,
+            "/queue_snapshot_coverage",
+            "/queue_snapshot_applicable",
+            "/queue_snapshot_expected_orders",
+            "queue snapshot coverage",
+        )?;
+        quality.coverage_breakdown.queue_snapshot_coverage = queue_snapshot_coverage;
+        quality.coverage_breakdown.queue_snapshot_applicable = queue_snapshot_applicable;
+        let (markout_1s_completion, markout_1s_applicable) = execution_completion_metric(
+            result,
+            "/markouts/1/completion_rate",
+            "/markouts/1/applicable",
+            "/markouts/1/expected",
+            "1s markout completion",
+        )?;
+        quality.coverage_breakdown.markout_1s_completion = markout_1s_completion;
+        quality.coverage_breakdown.markout_1s_applicable = markout_1s_applicable;
+        let (markout_5s_completion, markout_5s_applicable) = execution_completion_metric(
+            result,
+            "/markouts/5/completion_rate",
+            "/markouts/5/applicable",
+            "/markouts/5/expected",
+            "5s markout completion",
+        )?;
+        quality.coverage_breakdown.markout_5s_completion = markout_5s_completion;
+        quality.coverage_breakdown.markout_5s_applicable = markout_5s_applicable;
+        let (markout_30s_completion, markout_30s_applicable) = execution_completion_metric(
+            result,
+            "/markouts/30/completion_rate",
+            "/markouts/30/applicable",
+            "/markouts/30/expected",
+            "30s markout completion",
+        )?;
+        quality.coverage_breakdown.markout_30s_completion = markout_30s_completion;
+        quality.coverage_breakdown.markout_30s_applicable = markout_30s_applicable;
         for warning in execution_quality
             .pointer("/result/warnings")
             .and_then(serde_json::Value::as_array)
@@ -1513,6 +1564,50 @@ fn decimal_from_json(value: &serde_json::Value) -> Option<Decimal> {
         .map(Decimal::from)
         .or_else(|| value.as_u64().map(Decimal::from))
         .or_else(|| value.as_f64().and_then(Decimal::from_f64))
+}
+
+fn execution_completion_metric(
+    result: &serde_json::Value,
+    rate_pointer: &str,
+    applicable_pointer: &str,
+    denominator_pointer: &str,
+    label: &str,
+) -> Result<(Option<Decimal>, Option<bool>), ResearchError> {
+    let rate = result.pointer(rate_pointer).and_then(decimal_from_json);
+    let declared = result
+        .pointer(applicable_pointer)
+        .and_then(serde_json::Value::as_bool);
+    let denominator = result
+        .pointer(denominator_pointer)
+        .and_then(serde_json::Value::as_u64);
+    let Some(denominator) = denominator else {
+        if declared.is_some() {
+            return Err(ResearchError::InvalidInput(format!(
+                "execution quality declares {label} applicability without its canonical denominator"
+            )));
+        }
+        // Legacy measured artifacts did not carry applicability counts. They
+        // remain readable only through their concrete rate; a legacy null can
+        // never acquire N/A status retroactively.
+        return Ok((rate, None));
+    };
+    let applicable = denominator > 0;
+    if declared.is_some_and(|declared| declared != applicable) {
+        return Err(ResearchError::InvalidInput(format!(
+            "execution quality {label} applicability contradicts denominator {denominator}"
+        )));
+    }
+    if applicable && rate.is_none() {
+        return Err(ResearchError::InvalidInput(format!(
+            "execution quality {label} is applicable but has no completion rate"
+        )));
+    }
+    if !applicable && rate.is_some() {
+        return Err(ResearchError::InvalidInput(format!(
+            "execution quality {label} is not applicable but publishes a completion rate"
+        )));
+    }
+    Ok((rate, Some(applicable)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
