@@ -34,7 +34,7 @@ env:
   ACR_NAME: crpolyedge6urdjr5nmwx7w
   ACR_LOGIN_SERVER: crpolyedge6urdjr5nmwx7w.azurecr.io
   SHADOW_APP: polyedge-shadow-neu
-  CAMPAIGN_RUNTIME_SHA: 4b459dc2c203b637640ea9a87ce9baa4b2d07ab2
+  CAMPAIGN_RUNTIME_SHA: fc23909a173a2283e5060cac4aa3ac66d19a01d8
 
 jobs:
   deploy:

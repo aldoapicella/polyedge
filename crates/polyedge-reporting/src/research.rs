@@ -2383,6 +2383,7 @@ struct AuditAccumulator {
     strategy_batch_matches: usize,
     strategy_batch_invalid: usize,
     strategy_batch_contract_invalid: usize,
+    strategy_batch_contract_invalid_reasons: BTreeMap<String, usize>,
     strategy_batch_missing_independent_start: usize,
     strategy_batch_ineligible: usize,
     strategy_batch_retry_duplicates: usize,
@@ -3108,6 +3109,15 @@ impl AuditAccumulator {
         }
     }
 
+    fn observe_strategy_batch_contract_invalid(&mut self, reason: &'static str) {
+        self.strategy_batch_invalid += 1;
+        self.strategy_batch_contract_invalid += 1;
+        *self
+            .strategy_batch_contract_invalid_reasons
+            .entry(reason.to_owned())
+            .or_insert(0) += 1;
+    }
+
     fn observe_strategy_batch(&mut self, payload: &Value) {
         self.strategy_batch_events += 1;
         let Some(schema_version) = decision_batch_contract_version(payload) else {
@@ -3120,38 +3130,41 @@ impl AuditAccumulator {
             .filter(|value| valid_strategy_batch_id(value))
             .map(ToOwned::to_owned)
         else {
-            self.strategy_batch_invalid += 1;
-            self.strategy_batch_contract_invalid += 1;
+            self.observe_strategy_batch_contract_invalid("invalid_batch_id");
             return;
         };
         let Some(event_sha256) = run_bundle::stable_json(payload)
             .ok()
             .map(|canonical| sha256_prefixed(canonical.as_bytes()))
         else {
-            self.strategy_batch_invalid += 1;
-            self.strategy_batch_contract_invalid += 1;
+            self.observe_strategy_batch_contract_invalid("batch_canonicalization_failed");
             return;
         };
         if let Some(existing) = self.strategy_batch_expected.get_mut(&batch_id) {
+            let mut newly_conflicted = false;
             if existing.event_sha256 == event_sha256 {
                 self.strategy_batch_retry_duplicates += 1;
             } else {
                 if !existing.conflicted {
                     self.strategy_batch_conflicts += 1;
-                    self.strategy_batch_invalid += 1;
-                    self.strategy_batch_contract_invalid += 1;
+                    newly_conflicted = true;
                 }
                 existing.conflicted = true;
                 existing.expected_outputs = None;
             }
+            if newly_conflicted {
+                self.observe_strategy_batch_contract_invalid("conflicting_batch_retry");
+            }
             return;
         }
         self.strategy_batches += 1;
-        let validated = validate_strategy_batch(payload);
-        if validated.is_none() {
-            self.strategy_batch_invalid += 1;
-            self.strategy_batch_contract_invalid += 1;
-        }
+        let validated = match validate_strategy_batch(payload) {
+            Ok(validated) => Some(validated),
+            Err(reason) => {
+                self.observe_strategy_batch_contract_invalid(reason);
+                None
+            }
+        };
         let (expected_outputs, decision_config_sha256, market_start_evidence) = validated
             .map(|(outputs, hash, start)| (Some(outputs), Some(hash), Some(start)))
             .unwrap_or((None, None, None));
@@ -3622,6 +3635,7 @@ impl AuditAccumulator {
             "strategy_batch_matches": self.strategy_batch_matches,
             "strategy_batch_invalid": self.strategy_batch_invalid,
             "strategy_batch_contract_invalid": self.strategy_batch_contract_invalid,
+            "strategy_batch_contract_invalid_reasons": self.strategy_batch_contract_invalid_reasons,
             "strategy_batch_missing_independent_start": self.strategy_batch_missing_independent_start,
             "strategy_batch_ineligible": self.strategy_batch_ineligible,
             "strategy_batch_retry_duplicates": self.strategy_batch_retry_duplicates,
@@ -3819,17 +3833,26 @@ fn market_start_evidence_from_event(payload: &Value) -> Option<MarketStartEviden
 
 fn validate_strategy_batch(
     payload: &Value,
-) -> Option<(Vec<StrategyBatchOutputV3>, String, MarketStartEvidenceV1)> {
-    let contract_version = decision_batch_contract_version(payload)?;
-    let batch_id = payload.get("batch_id")?.as_str()?;
-    let input_value = payload.get("pipeline_input")?;
-    let output_value = payload.get("pipeline_output")?;
+) -> Result<(Vec<StrategyBatchOutputV3>, String, MarketStartEvidenceV1), &'static str> {
+    let contract_version =
+        decision_batch_contract_version(payload).ok_or("unsupported_batch_contract")?;
+    let batch_id = payload
+        .get("batch_id")
+        .and_then(Value::as_str)
+        .ok_or("missing_batch_id")?;
+    let input_value = payload
+        .get("pipeline_input")
+        .ok_or("missing_pipeline_input")?;
+    let output_value = payload
+        .get("pipeline_output")
+        .ok_or("missing_pipeline_output")?;
     if contains_secret_key(input_value) {
-        return None;
+        return Err("secret_bearing_pipeline_input");
     }
-    let input = serde_json::from_value::<DecisionPipelineInputV3>(input_value.clone()).ok()?;
-    let recorded_output =
-        serde_json::from_value::<DecisionPipelineOutputV3>(output_value.clone()).ok()?;
+    let input = serde_json::from_value::<DecisionPipelineInputV3>(input_value.clone())
+        .map_err(|_| "pipeline_input_decode_failed")?;
+    let recorded_output = serde_json::from_value::<DecisionPipelineOutputV3>(output_value.clone())
+        .map_err(|_| "pipeline_output_decode_failed")?;
     let start = &input.market_start_evidence;
     let start_deadline = input.market.start_ts
         + Duration::milliseconds(
@@ -3837,39 +3860,83 @@ fn validate_strategy_batch(
                 .round()
                 .max(0.0) as i64,
         );
-    if input.schema_version != 3
-        || input.settings.deploy.runtime_role != polyedge_config::RuntimeRole::ProfitabilityShadow
-        || input.settings.live.execution_mode != polyedge_config::ExecutionMode::Paper
-        || input.settings.live.allow_live
+    if input.schema_version != 3 {
+        return Err("pipeline_input_schema_mismatch");
+    }
+    if input.settings.deploy.runtime_role != polyedge_config::RuntimeRole::ProfitabilityShadow {
+        return Err("runtime_role_not_profitability_shadow");
+    }
+    if input.settings.live.execution_mode != polyedge_config::ExecutionMode::Paper {
+        return Err("execution_mode_not_paper");
+    }
+    if input.settings.live.allow_live
         || input.settings.live.polymarket_private_key.is_some()
         || input.settings.strategy.enable_taker_orders
         || input.settings.live.allow_emergency_account_cancel
-        || input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle)
-        || input.settings.validate_runtime_role().is_err()
-        || input.fair_value.market_id != input.market.market_id
-        || start.schema_version != 1
+    {
+        return Err("unsafe_execution_settings");
+    }
+    if input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle) {
+        return Err("adaptive_mode_mismatch");
+    }
+    if input.settings.validate_runtime_role().is_err() {
+        return Err("runtime_settings_invalid");
+    }
+    if input.fair_value.market_id != input.market.market_id {
+        return Err("fair_value_market_mismatch");
+    }
+    if start.schema_version != 1
         || start.market_id != input.market.market_id
         || start.market_start_ts != input.market.start_ts
         || start.market_end_ts != input.market.end_ts
         || input.market.start_price != Some(start.start_price)
-        || start.reference_source.is_empty()
+    {
+        return Err("market_start_identity_mismatch");
+    }
+    if start.reference_source.is_empty()
         || !start.reference_exact_resolution_source
         || start.reference_stale
-        || start.reference_source_ts < input.market.start_ts
+    {
+        return Err("market_start_quality_invalid");
+    }
+    if start.reference_source_ts < input.market.start_ts
         || start.reference_source_ts > start_deadline
-        || input.risk_before.open_order_count != input.order_manager_before.quotes.len()
-        || !regime_feature_input_matches_pipeline_state(&input)
-        || serde_json::to_value(&input).ok()?.as_object() != input_value.as_object()
-        || serde_json::to_value(&recorded_output).ok()?.as_object() != output_value.as_object()
-        || payload.get("market_id") != Some(&json!(input.market.market_id))
+    {
+        return Err("market_start_timing_invalid");
+    }
+    if input.risk_before.open_order_count != input.order_manager_before.quotes.len() {
+        return Err("risk_order_count_mismatch");
+    }
+    if !regime_feature_input_matches_pipeline_state(&input) {
+        return Err("regime_feature_input_mismatch");
+    }
+    if serde_json::to_value(&input)
+        .map_err(|_| "pipeline_input_roundtrip_failed")?
+        .as_object()
+        != input_value.as_object()
+    {
+        return Err("pipeline_input_roundtrip_mismatch");
+    }
+    if serde_json::to_value(&recorded_output)
+        .map_err(|_| "pipeline_output_roundtrip_failed")?
+        .as_object()
+        != output_value.as_object()
+    {
+        return Err("pipeline_output_roundtrip_mismatch");
+    }
+    if payload.get("market_id") != Some(&json!(input.market.market_id))
         || payload.get("decision_ts") != Some(&json!(input.decision_ts))
     {
-        return None;
+        return Err("batch_envelope_identity_mismatch");
     }
 
-    let input_sha256 = canonical_value_sha256(input_value)?;
-    let output_sha256 = canonical_value_sha256(output_value)?;
-    let start_sha256 = canonical_value_sha256(&serde_json::to_value(start).ok()?)?;
+    let input_sha256 = canonical_value_sha256(input_value).ok_or("pipeline_input_hash_failed")?;
+    let output_sha256 =
+        canonical_value_sha256(output_value).ok_or("pipeline_output_hash_failed")?;
+    let start_sha256 = canonical_value_sha256(
+        &serde_json::to_value(start).map_err(|_| "market_start_roundtrip_failed")?,
+    )
+    .ok_or("market_start_hash_failed")?;
     if payload.get("pipeline_input_sha256").and_then(Value::as_str) != Some(input_sha256.as_str())
         || payload
             .get("pipeline_output_sha256")
@@ -3885,13 +3952,18 @@ fn validate_strategy_batch(
                 input_sha256.trim_start_matches("sha256:")
             )
     {
-        return None;
+        return Err("batch_content_hash_mismatch");
     }
     let expected_candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
-    if payload.get("candidate") != Some(&serde_json::to_value(expected_candidate).ok()?) {
-        return None;
+    if payload.get("candidate")
+        != Some(
+            &serde_json::to_value(expected_candidate).map_err(|_| "candidate_roundtrip_failed")?,
+        )
+    {
+        return Err("candidate_mismatch");
     }
-    let decision_config_sha256 = decision_config_sha256(&input)?;
+    let decision_config_sha256 =
+        decision_config_sha256(&input).ok_or("decision_config_hash_failed")?;
     if payload
         .get("decision_config_schema")
         .and_then(Value::as_str)
@@ -3901,38 +3973,42 @@ fn validate_strategy_batch(
             .and_then(Value::as_str)
             != Some(decision_config_sha256.as_str())
     {
-        return None;
+        return Err("decision_config_mismatch");
     }
 
     let replayed_output = evaluate_decision_pipeline_v3(&input);
     if replayed_output != recorded_output {
-        return None;
+        return Err("pipeline_replay_output_mismatch");
     }
     let expected_decisions = if contract_version == 3 {
-        expected_legacy_v3_decision_payloads(&replayed_output)?
+        expected_legacy_v3_decision_payloads(&replayed_output)
+            .ok_or("legacy_decision_projection_failed")?
     } else {
-        expected_v4_decision_payloads(&replayed_output)?
+        expected_v4_decision_payloads(&replayed_output).ok_or("v4_decision_projection_failed")?
     };
-    let bound = payload.get("bound_final_decisions")?.as_array()?;
+    let bound = payload
+        .get("bound_final_decisions")
+        .and_then(Value::as_array)
+        .ok_or("missing_bound_final_decisions")?;
     if bound.len() != expected_decisions.len() {
-        return None;
+        return Err("bound_final_decision_count_mismatch");
     }
     let mut outputs = Vec::with_capacity(bound.len());
     for (index, (entry, decision)) in bound.iter().zip(expected_decisions).enumerate() {
-        let decision_sha256 = canonical_value_sha256(&decision)?;
+        let decision_sha256 = canonical_value_sha256(&decision).ok_or("decision_hash_failed")?;
         if entry.get("output_index").and_then(Value::as_u64) != Some(index as u64)
             || entry.get("decision_sha256").and_then(Value::as_str)
                 != Some(decision_sha256.as_str())
             || entry.get("decision") != Some(&decision)
         {
-            return None;
+            return Err("bound_final_decision_mismatch");
         }
         outputs.push(StrategyBatchOutputV3 {
             decision_sha256,
             decision,
         });
     }
-    Some((outputs, decision_config_sha256, input.market_start_evidence))
+    Ok((outputs, decision_config_sha256, input.market_start_evidence))
 }
 
 fn decision_config_sha256(input: &DecisionPipelineInputV3) -> Option<String> {
@@ -12867,6 +12943,7 @@ mod tests {
         assert_eq!(result["strategy_batches"], 1);
         assert_eq!(result["strategy_batch_retry_duplicates"], 1);
         assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["strategy_batch_contract_invalid_reasons"], json!({}));
         assert_eq!(result["strategy_batch_replayed"], 1);
         assert_eq!(result["strategy_binding_conflicts"], 0);
         assert_eq!(result["decision_count"], semantic_decisions);
@@ -13163,6 +13240,10 @@ mod tests {
         let result = audit.finish();
         assert_eq!(result["strategy_batch_invalid"], 1);
         assert_eq!(result["strategy_batch_contract_invalid"], 1);
+        assert_eq!(
+            result["strategy_batch_contract_invalid_reasons"],
+            json!({"pipeline_replay_output_mismatch": 1})
+        );
         assert_eq!(result["strategy_batch_missing_independent_start"], 0);
         assert_eq!(result["decision_pipeline_replay_rate"], 0.0);
         assert_eq!(result["decision_parity_rate"], 0.0);
@@ -13180,6 +13261,10 @@ mod tests {
         observe_v3_evidence(&mut audit, now, secret);
         let result = audit.finish();
         assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(
+            result["strategy_batch_contract_invalid_reasons"],
+            json!({"secret_bearing_pipeline_input": 1})
+        );
         assert_eq!(result["decision_parity_rate"], 0.0);
 
         let mut mismatched_features = decision_pipeline_v3_input(now);
@@ -13189,6 +13274,10 @@ mod tests {
         observe_v3_evidence(&mut audit, now, feature_batch);
         let result = audit.finish();
         assert_eq!(result["strategy_batch_invalid"], 1);
+        assert_eq!(
+            result["strategy_batch_contract_invalid_reasons"],
+            json!({"regime_feature_input_mismatch": 1})
+        );
         assert_eq!(result["decision_parity_rate"], 0.0);
     }
 
@@ -13217,6 +13306,10 @@ mod tests {
         let result = conflict.finish();
         assert_eq!(result["strategy_batches"], 1);
         assert_eq!(result["strategy_batch_conflicts"], 1);
+        assert_eq!(
+            result["strategy_batch_contract_invalid_reasons"],
+            json!({"conflicting_batch_retry": 1})
+        );
         assert_eq!(result["decision_parity_rate"], 0.0);
 
         let mut conflicting_decision = decisions[0].clone();

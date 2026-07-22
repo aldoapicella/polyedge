@@ -431,8 +431,7 @@ impl LossDiagnosticsAccumulator {
     }
 
     fn observe_batch(&mut self, event: ObservedEvent) {
-        let Some((outputs, decision_config_sha256, start)) =
-            validate_strategy_batch(&event.payload)
+        let Ok((outputs, decision_config_sha256, start)) = validate_strategy_batch(&event.payload)
         else {
             self.invalid_v3_batches += 1;
             return;
