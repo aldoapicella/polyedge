@@ -109,6 +109,7 @@ CUMULATIVE_INPUT_MANIFEST="$STAGING/cumulative_input_manifest.json"
 MARKETS="$STAGING/markets_summary.json"
 CUMULATIVE_MARKETS="$STAGING/cumulative_markets_summary.json"
 CUMULATIVE_REGIMES="$STAGING/cumulative_regimes.json"
+LOSS_DIAGNOSTICS="$STAGING/loss_diagnostics"
 
 mkdir -p "$STAGING" "$NORMALIZED" "$CUMULATIVE_NORMALIZED"
 
@@ -124,6 +125,13 @@ run_stage raw-audit polyedge-rs research audit --input "$INPUT" --exclude-file d
 run_stage normalize-day polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true --decision-grade-projection true
 run_stage publish-projected-day polyedge-rs research publish-projected-day --normalized "$NORMALIZED" --date "$DATE" --campaign-id "$CAMPAIGN_ID" --cache-root "$CACHE_ROOT" --out "$CACHE_DAY_MANIFEST" --require-azure-source true --expected-source-container "$SOURCE_CONTAINER"
 run_stage materialize-projected-campaign polyedge-rs research materialize-projected-campaign --since "$PROJECTED_DATA_START" --through "$DATE" --campaign-id "$CAMPAIGN_ID" --cache-root "$CACHE_ROOT" --out "$CUMULATIVE_NORMALIZED" --manifest "$CUMULATIVE_INPUT_MANIFEST" --require-azure-source true --expected-source-container "$SOURCE_CONTAINER"
+run_stage loss-diagnostics polyedge-rs research loss-diagnostics --input "$CUMULATIVE_NORMALIZED" --out "$LOSS_DIAGNOSTICS"
+for artifact in loss_diagnostics.json loss_diagnostics_artifact_manifest.json; do
+  if [ ! -f "$LOSS_DIAGNOSTICS/$artifact" ]; then
+    echo "polyedge_shadow_daily stage=loss-diagnostics date=$DATE status=missing-$artifact" >&2
+    exit 1
+  fi
+done
 run_stage normalized-audit polyedge-rs research audit --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/data_audit.json" --markdown "$STAGING/data_audit.md"
 run_stage execution-quality polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$STAGING/execution_quality.json" --markdown "$STAGING/execution_quality.md"
 run_stage build-markets-day polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file data_quality/exclusion_windows.yaml --out "$MARKETS" --markdown "$STAGING/markets_summary.md"

@@ -54,6 +54,35 @@ crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend:<git-sha>
 
 Do not deploy by local `az acr build` or `az containerapp update`; use the workflow so validation and deployment evidence stay attached to the commit.
 
+### Research-only job deployment
+
+During a frozen shadow campaign, reporting changes must use
+`.github/workflows/deploy-polyedge-research-jobs.yml` instead of the active
+runtime workflow. The workflow accepts only the shadow daily reporter and the
+three existing manual research jobs; `build-only` validates and publishes an
+image without updating a job.
+
+```bash
+gh workflow run deploy-polyedge-research-jobs.yml \
+  --ref <branch-or-sha> \
+  -f target_job=polyedge-shadow-daily-neu-job
+```
+
+The workflow limits source changes to reporting, the research CLI entry point,
+the two checked shadow-daily scripts, documentation, and the deployment
+workflows. It runs the full Rust validation suite, publishes a uniquely tagged
+image, resolves it to an immutable digest, and updates only the selected job.
+Before and after the update it verifies the job identity, trigger, command,
+paper-only environment, and absence of funded credentials. It also proves that
+the frozen `polyedge-shadow-neu` revision and image did not change. Updating
+the shadow daily reporter is refused from 02:00 through 02:30 UTC so a
+deployment cannot overlap its 02:15 UTC schedule.
+
+This workflow updates the selected job definition; it does not start a manual
+job or grant funded execution. The active deployment workflow separately
+requires an explicit campaign-runtime authorization before it may touch the
+shadow runtime during the frozen evidence window.
+
 After deployment the workflow logs into the dashboard without exposing the
 password, verifies authenticated health/status/snapshot/market/order/fill/
 decision/report routes, asserts paper-only recorder health, runs the

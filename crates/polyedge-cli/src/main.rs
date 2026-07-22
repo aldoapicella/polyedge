@@ -9,7 +9,7 @@ use polyedge_reporting::research::{
     run_audit, run_azure_freshness, run_backfill, run_baseline, run_begin_shadow_correction,
     run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
     run_calibration, run_chart_backfill, run_complete_shadow_correction,
-    run_evaluate_profitability, run_execution_quality, run_final_report,
+    run_evaluate_profitability, run_execution_quality, run_final_report, run_loss_diagnostics,
     run_materialize_projected_campaign, run_ml_calibrate, run_normalize, run_publish_projected_day,
     run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
     stop_funded_manifest_from_stage_block, AdvanceFundedLadderOptions,
@@ -17,12 +17,12 @@ use polyedge_reporting::research::{
     BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions, CalibrationOptions,
     ChartBackfillOptions, CompleteShadowCorrectionOptions, CumulativeWalletSnapshotOptions,
     ExcludedTimeWindow, ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel,
-    FinalReportOptions, InitializeFundedManifestOptions, MaterializeProjectedCampaignOptions,
-    MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
-    ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
-    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions,
-    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
-    DEFAULT_PROSPECTIVE_SINCE,
+    FinalReportOptions, InitializeFundedManifestOptions, LossDiagnosticsOptions,
+    MaterializeProjectedCampaignOptions, MlCalibrateOptions, NormalizeOptions,
+    ProfitabilityEvaluationOptions, ProspectiveValidationOptions, PublishProjectedDayOptions,
+    QueueAuditOptions, RegimesOptions, ReplayIndexOptions, ReplayOptions, SampleSizeOptions,
+    StopFundedManifestFromStageBlockOptions, SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -172,6 +172,14 @@ enum ResearchCommand {
         exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
+    },
+    /// Build diagnostic-only, one-row-per-lifecycle facts from an explicit
+    /// immutable normalized Protocol-v3 snapshot.
+    LossDiagnostics {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
     },
     Normalize {
         #[arg(long, default_value = "data/events.jsonl")]
@@ -718,6 +726,9 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             markdown,
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
+        ResearchCommand::LossDiagnostics { input, out } => {
+            run_loss_diagnostics(LossDiagnosticsOptions { input, out })?
+        }
         ResearchCommand::Normalize {
             input,
             out,
@@ -1686,10 +1697,33 @@ fn profitability_authorization_flags(
 #[cfg(test)]
 mod tests {
     use super::{
-        profitability_authorization_flags, terminate_lease_child_tree, Cli, Command,
+        profitability_authorization_flags, terminate_lease_child_tree, Cli, Command, PathBuf,
         ResearchCommand,
     };
     use clap::Parser;
+
+    #[test]
+    fn loss_diagnostics_cli_requires_explicit_snapshot_and_output_directory() {
+        let cli = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "loss-diagnostics",
+            "--input",
+            "immutable-v3-snapshot",
+            "--out",
+            "loss-diagnostics-out",
+        ])
+        .expect("parse loss diagnostics command");
+        let Command::Research {
+            command: ResearchCommand::LossDiagnostics { input, out },
+        } = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(input, PathBuf::from("immutable-v3-snapshot"));
+        assert_eq!(out, PathBuf::from("loss-diagnostics-out"));
+        assert!(Cli::try_parse_from(["polyedge-rs", "research", "loss-diagnostics"]).is_err());
+    }
 
     #[test]
     fn publish_daily_bundle_cli_binds_explicit_shadow_runtime_role() {

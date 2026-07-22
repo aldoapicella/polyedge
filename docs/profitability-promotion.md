@@ -63,6 +63,29 @@ advanced through minute blobs `16`, `18`, and `21` with `0–1` second age and n
 warnings. This repairs the forward recorder; the stalled predecessor interval
 remains part of the ineligible July 21 boundary and is not backfilled.
 
+The live midnight acceptance completed on revision
+`polyedge-shadow-neu--0000019` without a restart. Managed-identity probes found
+the new prefix minute blobs `00` through `03` consecutively, with expected and
+observed counts equal, `0–1` second freshness, and no warnings. Normalizing the
+first closed minute read exactly one Azure AppendBlob, `5,473,453` bytes, with
+byte hash
+`sha256:75f02b6b566db4dbec23d24bc855d8be39b677472448e7aec4a77fd07e5e665a`,
+zero malformed lines, and first/last event times `00:00:00Z`/`00:00:59Z`.
+Its runtime provenance evaluated the cutover after the boundary and bound
+`effective_prefix=shadow-events/campaign-2026-07-22`, paper-only execution,
+runtime Git SHA `4b459dc2c203b637640ea9a87ce9baa4b2d07ab2`, decision-config hash
+`sha256:a610964a4a6e828473c4f98535e8dc75178711cec86e5ca3ed87e12d641854eb`,
+and the frozen conservative execution-model hash
+`sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4`.
+The first `00:15 UTC` market rollover and former `00:18 UTC` failure point also
+remained fresh: minute `18` arrived one second before the check, all `19`
+expected minute blobs existed, and recorder failures, drops, errors, and
+warnings remained zero. A paper-only boundary execution
+`polyedge-shadow-daily-neu-job-88harco` then succeeded and logged
+`status=not_started`, `first_eligible_date=2026-07-22`,
+`requested_through=2026-07-21`, child status `0`, and a released campaign
+lease. This proves July 21 was not admitted into the new campaign.
+
 ## Capital Boundary
 
 Funded execution remains manual and disabled by default. Before any future order:

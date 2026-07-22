@@ -33,6 +33,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 mod labs;
+mod loss_diagnostics;
 mod projected_cache;
 mod run_bundle;
 pub use labs::{
@@ -47,6 +48,7 @@ pub use labs::{
     CUMULATIVE_WALLET_SCOPE, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
     DEFAULT_PROSPECTIVE_SINCE, FROZEN_CANDIDATE_NAMES, WALLET_CAMPAIGN_START,
 };
+pub use loss_diagnostics::{run_loss_diagnostics, LossDiagnosticsOptions};
 pub use projected_cache::{
     read_shadow_correction_state, read_verified_campaign_index, run_begin_shadow_correction,
     run_complete_shadow_correction, run_materialize_projected_campaign, run_publish_projected_day,
@@ -12412,7 +12414,7 @@ mod tests {
             ));
     }
 
-    fn decision_pipeline_v3_input(now: DateTime<Utc>) -> DecisionPipelineInputV3 {
+    pub(super) fn decision_pipeline_v3_input(now: DateTime<Utc>) -> DecisionPipelineInputV3 {
         use polyedge_domain::{
             BookLevel, BookState, FairValue, MarketSpec, MarketStatus, ReferencePrice,
         };
@@ -12560,7 +12562,9 @@ mod tests {
         }
     }
 
-    fn decision_pipeline_v3_evidence(input: &DecisionPipelineInputV3) -> (Value, Vec<Value>) {
+    pub(super) fn decision_pipeline_v3_evidence(
+        input: &DecisionPipelineInputV3,
+    ) -> (Value, Vec<Value>) {
         let output = evaluate_decision_pipeline_v3(input);
         let input_value = serde_json::to_value(input).unwrap();
         let output_value = serde_json::to_value(&output).unwrap();
@@ -12571,9 +12575,11 @@ mod tests {
             input_sha256.trim_start_matches("sha256:")
         );
         let decisions = expected_v3_decision_payloads(&output).unwrap();
-        assert!(decisions
-            .iter()
-            .any(|decision| decision.get("strategy_metadata").is_some()));
+        if !input.kill_switch_enabled {
+            assert!(decisions
+                .iter()
+                .any(|decision| decision.get("strategy_metadata").is_some()));
+        }
         let bound = decisions
             .iter()
             .enumerate()

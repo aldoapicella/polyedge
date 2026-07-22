@@ -2,6 +2,16 @@ name: Deploy PolyEdge to Azure
 
 on:
   workflow_dispatch:
+    inputs:
+      authorize_shadow_runtime_change:
+        description: Explicitly authorize changing the frozen shadow runtime during the active evidence campaign
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: polyedge-azure-control-plane
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -72,6 +82,18 @@ jobs:
       - name: Validate resource group
         run: |
           az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
+
+      - name: Protect the frozen profitability campaign
+        env:
+          AUTHORIZE_SHADOW_RUNTIME_CHANGE: ${{ inputs.authorize_shadow_runtime_change }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          if [[ "$today" > "2026-07-21" && "$today" < "2026-09-20" ]] \
+            && [ "$AUTHORIZE_SHADOW_RUNTIME_CHANGE" != "true" ]; then
+            echo "The active Protocol-v3 campaign freezes polyedge-shadow-neu. Re-dispatch with explicit authorization only for a reviewed runtime repair." >&2
+            exit 1
+          fi
 
       - name: Validate required deployment secrets
         run: |

@@ -1,0 +1,294 @@
+name: Deploy PolyEdge research job image
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_job:
+        description: Azure Container Apps Job to update
+        required: true
+        default: build-only
+        type: choice
+        options:
+          - build-only
+          - polyedge-shadow-daily-neu-job
+          - polyedge-backfill-job
+          - polyedge-prospective-job
+          - polyedge-chart-backfill-job
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: polyedge-azure-control-plane
+  cancel-in-progress: false
+
+env:
+  AZURE_RESOURCE_GROUP: rg-polyedge-dev
+  ACR_NAME: crpolyedge6urdjr5nmwx7w
+  ACR_LOGIN_SERVER: crpolyedge6urdjr5nmwx7w.azurecr.io
+  SHADOW_APP: polyedge-shadow-neu
+  CAMPAIGN_RUNTIME_SHA: 4b459dc2c203b637640ea9a87ce9baa4b2d07ab2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce research-only source scope
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$CAMPAIGN_RUNTIME_SHA" HEAD
+          while IFS= read -r path; do
+            case "$path" in
+              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/run_shadow_daily.sh|research/test_run_shadow_daily.sh|docs/*|.github/workflows/deploy-polyedge-research-jobs.yml|.github/workflows/deploy-polyedge-active.yml) ;;
+              *) echo "Research image contains an out-of-scope change: $path" >&2; exit 1 ;;
+            esac
+          done < <(git diff --name-only "$CAMPAIGN_RUNTIME_SHA"...HEAD)
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate research build
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+          cargo build --release -p polyedge-cli
+          sh research/test_run_shadow_daily.sh
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate target and freeze shadow identity
+        id: safety
+        env:
+          TARGET_JOB: ${{ inputs.target_job }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_JOB" in
+            build-only|polyedge-shadow-daily-neu-job|polyedge-backfill-job|polyedge-prospective-job|polyedge-chart-backfill-job) ;;
+            *) echo "Unsupported research job: $TARGET_JOB" >&2; exit 1 ;;
+          esac
+
+          shadow_json=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$SHADOW_APP" \
+            -o json)
+          shadow_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$shadow_json")
+          shadow_image=$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .image' <<<"$shadow_json")
+          test -n "$shadow_revision"
+          test "$shadow_image" = "$ACR_LOGIN_SERVER/polyedge-rust-backend:$CAMPAIGN_RUNTIME_SHA"
+          echo "shadow_revision=$shadow_revision" >> "$GITHUB_OUTPUT"
+          echo "shadow_image=$shadow_image" >> "$GITHUB_OUTPUT"
+
+          if [ "$TARGET_JOB" = "build-only" ]; then
+            exit 0
+          fi
+
+          running=$(az containerapp job execution list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$TARGET_JOB" \
+            --query "[?properties.status=='Running'] | length(@)" \
+            -o tsv)
+          test "$running" = "0"
+
+          job_json=$(az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$TARGET_JOB" \
+            -o json)
+          if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
+            expected_identity_name="polyedge-shadow-research-neu-id"
+            expected_container="shadow-daily"
+            expected_trigger="Schedule"
+            expected_location="northeurope"
+            expected_command="polyedge-rs research with-azure-lease --account stpolyedge6urdjr5nmwx7w --container polyedge-research --blob data/research/shadow/campaign-2026-07-22/control/replay.lock -- /bin/sh /app/research/run_shadow_daily.sh"
+          else
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Manual"
+            expected_location="eastus"
+            case "$TARGET_JOB" in
+              polyedge-backfill-job) expected_command_fragment="polyedge-rs research backfill" ;;
+              polyedge-prospective-job) expected_command_fragment="polyedge-rs research validate-prospective" ;;
+              polyedge-chart-backfill-job) expected_command_fragment="polyedge-rs research chart-backfill" ;;
+            esac
+          fi
+          expected_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$expected_identity_name" --query id -o tsv)
+          container_name=$(jq -r '.properties.template.containers | if length == 1 then .[0].name else empty end' <<<"$job_json")
+          actual_identity=$(jq -r '.identity.userAssignedIdentities | keys | if length == 1 then .[0] else empty end' <<<"$job_json")
+          trigger=$(jq -r '.properties.configuration.triggerType' <<<"$job_json")
+          location=$(jq -r '.location | ascii_downcase | gsub(" "; "")' <<<"$job_json")
+          command_line=$(jq -r '([.properties.template.containers[0].command[]?] + [.properties.template.containers[0].args[]?]) | join(" ")' <<<"$job_json")
+          allow_live=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ALLOW_LIVE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
+          execution_mode=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "EXECUTION_MODE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
+          run_bot=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "RUN_BOT_ON_STARTUP") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
+          enable_taker=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ENABLE_TAKER_ORDERS") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
+          secret_names=$(jq -c '[(.properties.configuration.secrets // [])[].name] | sort' <<<"$job_json")
+          secret_refs=$(jq -c '[.properties.template.containers[0].env[]? | select(.secretRef != null) | {name, secretRef}] | sort_by(.name)' <<<"$job_json")
+          funded_env_count=$(jq -r '[.properties.template.containers[0].env[]?.name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length' <<<"$job_json")
+          key_vault_secret_count=$(jq -r '[(.properties.configuration.secrets // [])[] | select(.keyVaultUrl != null or .identity != null)] | length' <<<"$job_json")
+          test "$container_name" = "$expected_container"
+          test "$actual_identity" = "$expected_identity"
+          test "$trigger" = "$expected_trigger"
+          test "$location" = "$expected_location"
+          if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
+            test "$command_line" = "$expected_command"
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "15 2 * * *"
+          else
+            case "$command_line" in
+              *"$expected_command_fragment"*) ;;
+              *) echo "Unexpected research command for $TARGET_JOB" >&2; exit 1 ;;
+            esac
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig == null' <<<"$job_json")" = "true"
+          fi
+          test "$allow_live" = "false"
+          test "$execution_mode" = "paper"
+          test "$run_bot" = "false"
+          test "$enable_taker" = "false"
+          test "$key_vault_secret_count" = "0"
+          if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
+            test "$secret_names" = "[]"
+            test "$secret_refs" = "[]"
+          else
+            test "$secret_names" = '["api-bearer-token"]'
+            test "$secret_refs" = '[{"name":"API_BEARER_TOKEN","secretRef":"api-bearer-token"}]'
+          fi
+          test "$funded_env_count" = "0"
+          echo "container_name=$container_name" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push immutable research image
+        run: |
+          set -euo pipefail
+          test "${#GITHUB_SHA}" = "40"
+          image_tag="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          tagged_image="$ACR_LOGIN_SERVER/polyedge-rust-research:$image_tag"
+          az acr login --name "$ACR_NAME"
+          docker build \
+            --build-arg GIT_SHA="$GITHUB_SHA" \
+            -f Dockerfile.rust \
+            -t "$tagged_image" \
+            .
+          docker push "$tagged_image"
+          digest=$(az acr manifest show-metadata \
+            --registry "$ACR_NAME" \
+            --name "polyedge-rust-research:$image_tag" \
+            --query digest \
+            -o tsv)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "RESEARCH_IMAGE=$ACR_LOGIN_SERVER/polyedge-rust-research@$digest" >> "$GITHUB_ENV"
+
+      - name: Update only the selected research job
+        if: inputs.target_job != 'build-only'
+        env:
+          TARGET_JOB: ${{ inputs.target_job }}
+          CONTAINER_NAME: ${{ steps.safety.outputs.container_name }}
+        run: |
+          set -euo pipefail
+          running=$(az containerapp job execution list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$TARGET_JOB" \
+            --query "[?properties.status=='Running'] | length(@)" \
+            -o tsv)
+          test "$running" = "0"
+          if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
+            utc_hhmm=$(date -u +%H%M)
+            if (( 10#$utc_hhmm >= 200 && 10#$utc_hhmm <= 230 )); then
+              echo "Refusing to update the scheduled reporter near its 02:15 UTC execution" >&2
+              exit 1
+            fi
+          fi
+          az containerapp job update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$TARGET_JOB" \
+            --container-name "$CONTAINER_NAME" \
+            --image "$RESEARCH_IMAGE" \
+            --output none
+
+          job_json=$(az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$TARGET_JOB" \
+            -o json)
+          test "$(jq -r --arg name "$CONTAINER_NAME" '.properties.template.containers[] | select(.name == $name) | .image' <<<"$job_json")" = "$RESEARCH_IMAGE"
+          if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
+            expected_identity_name="polyedge-shadow-research-neu-id"
+            expected_container="shadow-daily"
+            expected_trigger="Schedule"
+            expected_command_fragment="polyedge-rs research with-azure-lease"
+          else
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Manual"
+            case "$TARGET_JOB" in
+              polyedge-backfill-job) expected_command_fragment="polyedge-rs research backfill" ;;
+              polyedge-prospective-job) expected_command_fragment="polyedge-rs research validate-prospective" ;;
+              polyedge-chart-backfill-job) expected_command_fragment="polyedge-rs research chart-backfill" ;;
+            esac
+          fi
+          expected_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$expected_identity_name" --query id -o tsv)
+          test "$(jq -r '.properties.template.containers | if length == 1 then .[0].name else empty end' <<<"$job_json")" = "$expected_container"
+          test "$(jq -r '.identity.userAssignedIdentities | keys | if length == 1 then .[0] else empty end' <<<"$job_json")" = "$expected_identity"
+          test "$(jq -r '.properties.configuration.triggerType' <<<"$job_json")" = "$expected_trigger"
+          command_line=$(jq -r '([.properties.template.containers[0].command[]?] + [.properties.template.containers[0].args[]?]) | join(" ")' <<<"$job_json")
+          case "$command_line" in
+            *"$expected_command_fragment"*) ;;
+            *) echo "Research command drifted during update" >&2; exit 1 ;;
+          esac
+          test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ALLOW_LIVE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "false"
+          test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "EXECUTION_MODE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "paper"
+          test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "RUN_BOT_ON_STARTUP") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "false"
+          test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ENABLE_TAKER_ORDERS") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "false"
+          test "$(jq -r '[.properties.template.containers[0].env[]?.name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length' <<<"$job_json")" = "0"
+          test "$(jq -r '[(.properties.configuration.secrets // [])[] | select(.keyVaultUrl != null or .identity != null)] | length' <<<"$job_json")" = "0"
+          secret_names=$(jq -c '[(.properties.configuration.secrets // [])[].name] | sort' <<<"$job_json")
+          secret_refs=$(jq -c '[.properties.template.containers[0].env[]? | select(.secretRef != null) | {name, secretRef}] | sort_by(.name)' <<<"$job_json")
+          if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
+            test "$secret_names" = "[]"
+            test "$secret_refs" = "[]"
+          else
+            test "$secret_names" = '["api-bearer-token"]'
+            test "$secret_refs" = '[{"name":"API_BEARER_TOKEN","secretRef":"api-bearer-token"}]'
+          fi
+
+      - name: Prove recorder was not changed
+        env:
+          EXPECTED_REVISION: ${{ steps.safety.outputs.shadow_revision }}
+          EXPECTED_IMAGE: ${{ steps.safety.outputs.shadow_image }}
+        run: |
+          set -euo pipefail
+          shadow_json=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$SHADOW_APP" \
+            -o json)
+          actual_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$shadow_json")
+          actual_image=$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .image' <<<"$shadow_json")
+          test "$actual_revision" = "$EXPECTED_REVISION"
+          test "$actual_image" = "$EXPECTED_IMAGE"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$shadow_json")" = "paper"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$shadow_json")" = "false"
+
+      - name: Publish deployment summary
+        env:
+          TARGET_JOB: ${{ inputs.target_job }}
+          SHADOW_REVISION: ${{ steps.safety.outputs.shadow_revision }}
+        run: |
+          {
+            echo "## PolyEdge research image"
+            echo
+            echo "- Target: \`$TARGET_JOB\`"
+            echo "- Image: \`$RESEARCH_IMAGE\`"
+            echo "- Frozen shadow revision (unchanged): \`$SHADOW_REVISION\`"
+            echo "- Funded execution: not targeted"
+          } >> "$GITHUB_STEP_SUMMARY"

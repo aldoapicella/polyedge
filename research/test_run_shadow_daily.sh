@@ -21,6 +21,8 @@ for argument in "$@"; do
     command="normalize"
   elif [ "$argument" = "materialize-projected-campaign" ]; then
     command="materialize"
+  elif [ "$argument" = "loss-diagnostics" ]; then
+    command="loss-diagnostics"
   fi
   previous="$argument"
 done
@@ -30,6 +32,10 @@ if [ -n "$out" ]; then
     printf '%s\n' '{"events":1}' >"$out/events_manifest.json"
   elif [ "$command" = "materialize" ]; then
     mkdir -p "$out"
+  elif [ "$command" = "loss-diagnostics" ]; then
+    mkdir -p "$out"
+    printf '%s\n' '{}' >"$out/loss_diagnostics.json"
+    printf '%s\n' '{}' >"$out/loss_diagnostics_artifact_manifest.json"
   else
     mkdir -p "$(dirname "$out")"
     printf '%s\n' '{}' >"$out"
@@ -69,6 +75,7 @@ fi
 grep -F 'research publish-projected-day ' "$TMP/args" >/dev/null
 grep -F -- '--require-azure-source true --expected-source-container polyedge-shadow-events' "$TMP/args" >/dev/null
 grep -F 'research materialize-projected-campaign --since 2026-07-22 --through 2026-07-22 ' "$TMP/args" >/dev/null
+grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-22/cumulative/2026-07-22/normalized --out reports/research/shadow/campaigns/campaign-2026-07-22/staging/' "$TMP/args" >/dev/null
 grep -F 'research build-cumulative-wallet ' "$TMP/args" | grep -F -- '--campaign-contract research/configs/profitability_gate_v3_2026-07-22.yaml' >/dev/null
 grep -F 'research publish-daily-bundle ' "$TMP/args" | grep -F -- '--output-root reports/research/shadow/campaigns/campaign-2026-07-22/daily' >/dev/null
 grep -F 'research validate-prospective ' "$TMP/args" | grep -F -- '--reports-dir reports/research/shadow/campaigns/campaign-2026-07-22/daily' >/dev/null
@@ -113,6 +120,7 @@ fi
   sh "$REPO/research/run_shadow_daily.sh" >"$TMP/stdout-cascade"
 )
 test "$(grep -c '^research normalize ' "$TMP/args-cascade")" -eq 2
+test "$(grep -c '^research loss-diagnostics ' "$TMP/args-cascade")" -eq 2
 test "$(grep -c '^research begin-shadow-correction ' "$TMP/args-cascade")" -eq 1
 test "$(grep -c '^research complete-shadow-correction ' "$TMP/args-cascade")" -eq 1
 test "$(grep -c '^research validate-prospective ' "$TMP/args-cascade")" -eq 1
