@@ -18,7 +18,7 @@ import {
   getLabVenueExecution
 } from "@/lib/api";
 import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow, VenueExecutionEvidence } from "@/lib/types";
-import { compact, dateTime, numberText } from "@/lib/format";
+import { compact, dateTime, decisionGradeCoverageText, numberText } from "@/lib/format";
 import {
   CALIBRATION_COLUMNS,
   FILL_MODEL_COLUMNS,
@@ -241,7 +241,10 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
         <Panel>
           <PanelHeader title="Promotion Data Quality" meta={profitability?.data_quality?.status ?? promotionQuality?.registry_version ?? "collecting"} />
           <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3">
-            <Metric label="Decision-grade Evaluations" value={percentage(profitability?.data_quality?.decision_grade_coverage ?? promotionQuality?.decision_grade_coverage)} />
+            <Metric
+              label="Decision-grade Evaluations"
+              value={decisionGradeCoverageText(coverageBreakdown?.decision_grade_coverage)}
+            />
             <Metric label="Minimum Coverage" value={percentage(profitability?.data_quality?.minimum_coverage ?? 0.95)} />
             <Metric label="Start-price Coverage" value={percentage(coverageBreakdown?.start_price_capture_rate)} />
             <Metric label="Settlement Coverage" value={percentage(coverageBreakdown?.settlement_rate)} />

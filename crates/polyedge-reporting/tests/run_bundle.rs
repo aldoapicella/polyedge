@@ -722,6 +722,143 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
 }
 
 #[test]
+fn daily_manifest_does_not_mislabel_lifecycle_coverage_as_decision_grade() {
+    let root = test_dir("publish_missing_decision_grade_denominator");
+    let source = root.join("generated");
+    fs::create_dir_all(&source).unwrap();
+    for name in ["baseline.json", "regimes.json", "final_report.json"] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
+
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();
+    let result = audit["result"].as_object_mut().unwrap();
+    result.remove("decision_grade_coverage");
+    result.remove("decision_grade_evaluations");
+    result.insert(
+        "start_price_capture_rate".to_owned(),
+        serde_json::json!(52.0 / 99.0),
+    );
+    result.insert("settlement_rate".to_owned(), serde_json::json!(55.0 / 99.0));
+    result.insert("strategy_evaluations".to_owned(), serde_json::json!(0));
+    result.insert("decision_count".to_owned(), serde_json::json!(46_347));
+    let audit_path = source.join("data_audit.json");
+    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+
+    let published = publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+        "shadow-2026-07-19-legacy-denominator",
+        "f".repeat(64),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit_path,
+    )
+    .unwrap();
+
+    let quality = &published.manifest.data_quality;
+    assert_eq!(quality.decision_grade_coverage, Decimal::ZERO);
+    assert_eq!(
+        quality.coverage_breakdown.start_price_capture_rate,
+        Some(Decimal::from_str_exact("0.525252525252525").unwrap())
+    );
+    assert_eq!(
+        quality.coverage_breakdown.settlement_rate,
+        Some(Decimal::from_str_exact("0.555555555555556").unwrap())
+    );
+    assert_eq!(quality.coverage_breakdown.decision_grade_coverage, None);
+    assert!(quality.warnings.iter().any(|warning| {
+        warning.rule_id == "decision_grade_denominator_missing"
+            && warning.severity == WarningSeverity::Blocking
+            && warning.known
+    }));
+    assert!(!quality.promotion_allowed());
+}
+
+#[test]
+fn daily_manifest_rejects_reported_decision_grade_without_a_denominator() {
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();
+    audit["result"]["strategy_evaluations"] = serde_json::json!(0);
+    audit["result"]["decision_grade_evaluations"] = serde_json::json!(0);
+
+    let quality = publish_quality_fixture(
+        "publish_reported_grade_without_denominator",
+        "shadow-2026-07-19-zero-denominator",
+        audit,
+    );
+
+    assert_eq!(quality.decision_grade_coverage, Decimal::ZERO);
+    assert_eq!(quality.coverage_breakdown.decision_grade_coverage, None);
+    assert!(quality.warnings.iter().any(|warning| {
+        warning.rule_id == "decision_grade_denominator_missing"
+            && warning.severity == WarningSeverity::Blocking
+            && warning.known
+    }));
+    assert!(!quality.promotion_allowed());
+}
+
+#[test]
+fn daily_manifest_rejects_inconsistent_decision_grade_ratio() {
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();
+    audit["result"]["decision_grade_evaluations"] = serde_json::json!(90);
+
+    let quality = publish_quality_fixture(
+        "publish_inconsistent_decision_grade_ratio",
+        "shadow-2026-07-19-inconsistent-ratio",
+        audit,
+    );
+
+    assert_eq!(quality.decision_grade_coverage, Decimal::ZERO);
+    assert_eq!(quality.coverage_breakdown.decision_grade_coverage, None);
+    assert!(quality.warnings.iter().any(|warning| {
+        warning.rule_id == "decision_grade_evidence_invalid"
+            && warning.severity == WarningSeverity::Blocking
+            && warning.known
+    }));
+    assert!(!quality.promotion_allowed());
+}
+
+fn publish_quality_fixture(
+    root_name: &str,
+    run_id: &str,
+    audit: serde_json::Value,
+) -> DataQualitySummary {
+    let root = test_dir(root_name);
+    let source = root.join("generated");
+    fs::create_dir_all(&source).unwrap();
+    for name in ["baseline.json", "regimes.json", "final_report.json"] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
+    let audit_path = source.join("data_audit.json");
+    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+
+    publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+        run_id,
+        "a".repeat(64),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit_path,
+    )
+    .unwrap()
+    .manifest
+    .data_quality
+}
+
+#[test]
 fn daily_manifest_accepts_complete_queue_day_with_no_fill_markout_denominator() {
     let root = test_dir("publish_no_fill_execution_quality");
     let source = root.join("generated");
@@ -2850,6 +2987,8 @@ fn complete_daily_audit(date: &str, coverage: f64) -> Vec<u8> {
             "exact_resolution_reference_hour_coverage": coverage,
             "decision_metadata_coverage": coverage,
             "decision_grade_coverage": coverage,
+            "decision_grade_evaluations": (coverage * 100.0).round() as u64,
+            "strategy_evaluations": 100,
             "final_decision_grade_coverage": coverage,
             "execution_field_coverage": coverage,
             "decision_parity_rate": 1.0,

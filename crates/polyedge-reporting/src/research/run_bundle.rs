@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v3";
+pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v4";
 pub const DEFAULT_PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const DAILY_PROVENANCE_CUTOFF: &str = "2026-07-12";
 const MANIFEST_FILE: &str = "run_manifest.json";
@@ -144,6 +144,20 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
     } else if message.starts_with("decision metadata coverage below 95%: ") {
         (
             "decision_metadata_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message
+        == "decision-grade evaluation coverage unavailable: no strategy_evaluation denominator"
+    {
+        (
+            "decision_grade_denominator_missing",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("decision-grade evaluation evidence invalid: ") {
+        (
+            "decision_grade_evidence_invalid",
             WarningSeverity::Blocking,
             true,
         )
@@ -965,19 +979,19 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
         .get("total_events")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let explicit_coverage = result
+    let reported_coverage = result
         .get("decision_grade_coverage")
         .and_then(decimal_from_json);
+    let decision_grade_evaluations = result
+        .get("decision_grade_evaluations")
+        .and_then(serde_json::Value::as_u64);
+    let strategy_evaluations = result
+        .get("strategy_evaluations")
+        .and_then(serde_json::Value::as_u64);
     let start_capture = result
         .get("start_price_capture_rate")
         .and_then(decimal_from_json);
     let settlement = result.get("settlement_rate").and_then(decimal_from_json);
-    let coverage = explicit_coverage
-        .or_else(|| match (start_capture, settlement) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            _ => None,
-        })
-        .unwrap_or(Decimal::ZERO);
     let fatal_issues = result
         .get("fatal_data_quality_issues")
         .and_then(serde_json::Value::as_array)
@@ -1000,6 +1014,57 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
     }
     warnings.sort();
     warnings.dedup();
+    // Start-price and settlement coverage are separate lifecycle gates. They
+    // cannot stand in for strategy-evaluation coverage because their
+    // numerators and denominators measure different populations. The rate is
+    // accepted only when its canonical counts exist and reconcile with it.
+    let explicit_coverage = match (
+        reported_coverage,
+        decision_grade_evaluations,
+        strategy_evaluations,
+    ) {
+        (_, _, None | Some(0)) if total_events > 0 => {
+            warnings.push(
+                "decision-grade evaluation coverage unavailable: no strategy_evaluation denominator"
+                    .to_owned(),
+            );
+            None
+        }
+        (Some(reported), Some(numerator), Some(denominator)) if numerator <= denominator => {
+            let canonical = Decimal::from(numerator) / Decimal::from(denominator);
+            let tolerance = Decimal::new(1, 12);
+            if (reported - canonical).abs() <= tolerance {
+                Some(canonical)
+            } else {
+                warnings.push(format!(
+                    "decision-grade evaluation evidence invalid: reported rate {reported} does not match {numerator}/{denominator}"
+                ));
+                None
+            }
+        }
+        (None, Some(numerator), Some(denominator)) => {
+            warnings.push(format!(
+                "decision-grade evaluation evidence invalid: reported rate missing for {numerator}/{denominator}"
+            ));
+            None
+        }
+        (_, None, Some(denominator)) => {
+            warnings.push(format!(
+                "decision-grade evaluation evidence invalid: numerator missing for denominator {denominator}"
+            ));
+            None
+        }
+        (_, Some(numerator), Some(denominator)) => {
+            warnings.push(format!(
+                "decision-grade evaluation evidence invalid: numerator {numerator} exceeds denominator {denominator}"
+            ));
+            None
+        }
+        _ => None,
+    };
+    warnings.sort();
+    warnings.dedup();
+    let coverage = explicit_coverage.unwrap_or(Decimal::ZERO);
     let mut quality = DataQualitySummary::new(total_events, coverage, fatal_issues, warnings);
     quality.coverage_breakdown = DataQualityCoverageBreakdown {
         start_price_capture_rate: start_capture,
