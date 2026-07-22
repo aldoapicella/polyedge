@@ -78,6 +78,7 @@ var keyVaultName = take('kv${safeAppName}${suffix}', 24)
 var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix}', 63)
 var managedEnvironmentName = '${appName}-${environmentName}-env'
 var containerAppName = '${appName}-${environmentName}'
+var shadowContainerAppName = 'polyedge-shadow-neu'
 var storageContainerName = 'bot-events'
 var researchStorageContainerName = 'polyedge-research'
 var fundedEvidenceContainerName = 'polyedge-funded-evidence'
@@ -299,25 +300,31 @@ var logAlerts = [
     name: 'recorder-failed-total-gt-0'
     displayName: 'PolyEdge recorder has unrecovered durable evidence'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
   }
   {
     name: 'recorder-dropped-count-gt-0'
     displayName: 'PolyEdge recorder dropped count > 0'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
   }
   {
     name: 'recorder-queue-over-1000'
     displayName: 'PolyEdge recorder queue over 1000 events'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
   }
   {
     name: 'runtime-container-restarted'
     displayName: 'PolyEdge runtime container restarted or backed off'
     severity: 0
-    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
+    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
+  }
+  {
+    name: 'shadow-runtime-health-missing'
+    displayName: 'PolyEdge shadow runtime health heartbeat missing'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${shadowContainerAppName}" | where Log_s has "runtime_health" | summarize heartbeat_count = count() | where heartbeat_count == 0'
   }
   {
     name: 'job-failed'

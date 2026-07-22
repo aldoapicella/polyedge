@@ -54,6 +54,22 @@ crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend:<git-sha>
 
 Do not deploy by local `az acr build` or `az containerapp update`; use the workflow so validation and deployment evidence stay attached to the commit.
 
+During a frozen evidence campaign, Azure Monitor recorder and restart coverage
+can be updated with the `monitoring-only` target. This path compiles an isolated
+template containing only the five scheduled-query rules, snapshots both the
+primary and frozen shadow Container Apps, deploys the rules, and proves both
+protected runtime definitions and revisions are unchanged. Four rules watch
+both `polyedge-dev` and `polyedge-shadow-neu`; a fifth fails closed when the
+shadow runtime-health heartbeat is absent. They do not claim literal FIFO
+visibility and do not enable any funded job.
+
+```bash
+gh workflow run deploy-polyedge-active.yml \
+  --ref <branch-or-sha> \
+  -f research_job_target=monitoring-only \
+  -f authorize_shadow_runtime_change=false
+```
+
 ### Research-only job deployment
 
 During a frozen shadow campaign, reporting changes must use

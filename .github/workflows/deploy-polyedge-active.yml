@@ -16,6 +16,7 @@ on:
         options:
           - none
           - frontend-only
+          - monitoring-only
           - build-only
           - polyedge-shadow-daily-neu-job
           - polyedge-backfill-job
@@ -23,7 +24,7 @@ on:
           - polyedge-chart-backfill-job
 
 concurrency:
-  group: ${{ inputs.research_job_target == 'none' && 'polyedge-azure-control-plane' || inputs.research_job_target == 'frontend-only' && 'polyedge-frontend-deploy-caller' || 'polyedge-research-deploy-caller' }}
+  group: ${{ (inputs.research_job_target == 'none' || inputs.research_job_target == 'monitoring-only') && 'polyedge-azure-control-plane' || inputs.research_job_target == 'frontend-only' && 'polyedge-frontend-deploy-caller' || 'polyedge-research-deploy-caller' }}
   cancel-in-progress: false
 
 permissions:
@@ -38,7 +39,7 @@ env:
 
 jobs:
   research-job-deploy:
-    if: inputs.research_job_target != 'none' && inputs.research_job_target != 'frontend-only'
+    if: inputs.research_job_target != 'none' && inputs.research_job_target != 'frontend-only' && inputs.research_job_target != 'monitoring-only'
     uses: ./.github/workflows/deploy-polyedge-research-jobs.yml
     with:
       target_job: ${{ inputs.research_job_target }}
@@ -48,6 +49,144 @@ jobs:
     if: inputs.research_job_target == 'frontend-only'
     uses: ./.github/workflows/deploy-polyedge-frontend-only.yml
     secrets: inherit
+
+  monitoring-only-deploy:
+    if: inputs.research_job_target == 'monitoring-only'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate isolated monitoring template
+        run: |
+          set -euo pipefail
+          az bicep build --file infra/monitoring-alerts.bicep --outfile monitoring-alerts.json
+          test "$(jq '[.resources[] | select(.type != "Microsoft.Insights/scheduledQueryRules")] | length' monitoring-alerts.json)" = "0"
+          test "$(jq '[.resources[] | select(.type == "Microsoft.Insights/scheduledQueryRules")] | length' monitoring-alerts.json)" = "1"
+          test "$(jq -r '.resources[0].copy.count' monitoring-alerts.json)" = "[length(variables('recorderAlerts'))]"
+          test "$(jq '.variables.recorderAlerts | length' monitoring-alerts.json)" = "5"
+          test "$(jq '[.variables.recorderAlerts[] | select(.name != "shadow-runtime-health-missing") | select(.query | contains("ContainerAppName_s in") and contains("variables(\u0027containerAppName\u0027)") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "4"
+          test "$(jq '[.variables.recorderAlerts[] | select(.name == "shadow-runtime-health-missing") | select(.query | contains("runtime_health") and contains("heartbeat_count == 0") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "1"
+          test "$(jq -r '.parameters.shadowContainerAppName.defaultValue' monitoring-alerts.json)" = "polyedge-shadow-neu"
+
+      - name: Snapshot protected runtime state
+        env:
+          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
+          test "$(az account show --query id -o tsv)" = "$EXPECTED_SUBSCRIPTION_ID"
+          expected_client_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query clientId -o tsv)
+          authenticated_client_id=$(az account show --query user.name -o tsv)
+          test "$(echo "$authenticated_client_id" | tr 'A-F' 'a-f')" = "$(echo "$expected_client_id" | tr 'A-F' 'a-f')"
+          for app in polyedge-dev polyedge-shadow-neu; do
+            az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
+              > "before-$app.json"
+          done
+          for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
+              > "before-$job.json"
+          done
+
+      - name: Prove the deployment plan is alert-only
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/monitoring-alerts.bicep \
+            --result-format ResourceIdOnly \
+            --no-pretty-print \
+            -o json > monitoring-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore")
+              | select((.resourceId | ascii_downcase | contains("/microsoft.insights/scheduledqueryrules/")) | not)
+            ] | length == 0
+          ' monitoring-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore")
+              | (.resourceId | ascii_downcase | split("/") | .[-1])
+              | select(. as $name | [
+                  "polyedge-dev-recorder-failed-total-gt-0",
+                  "polyedge-dev-recorder-dropped-count-gt-0",
+                  "polyedge-dev-recorder-queue-over-1000",
+                  "polyedge-dev-runtime-container-restarted",
+                  "polyedge-dev-shadow-runtime-health-missing"
+                ] | index($name) | not)
+            ] | length == 0
+          ' monitoring-what-if.json
+
+      - name: Deploy recorder and restart alerts only
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name "$APP_NAME-monitoring-alerts" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/monitoring-alerts.bicep
+
+      - name: Verify alerts and unchanged runtimes
+        run: |
+          set -euo pipefail
+          for app in polyedge-dev polyedge-shadow-neu; do
+            az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
+              > "after-$app.json"
+            cmp -s "before-$app.json" "after-$app.json" || {
+              echo "Protected Container App definition changed: $app" >&2
+              exit 1
+            }
+          done
+          for suffix in recorder-failed-total-gt-0 recorder-dropped-count-gt-0 recorder-queue-over-1000 runtime-container-restarted shadow-runtime-health-missing; do
+            rule="$APP_NAME-dev-$suffix"
+            az monitor scheduled-query show --resource-group "$AZURE_RESOURCE_GROUP" --name "$rule" -o json > "rule-$suffix.json"
+            test "$(jq -r '.enabled' "rule-$suffix.json")" = "true"
+            test "$(jq -r '.evaluationFrequency' "rule-$suffix.json")" = "0:05:00"
+            test "$(jq -r '.windowSize' "rule-$suffix.json")" = "0:10:00"
+            query=$(jq -r '.criteria.allOf[0].query' "rule-$suffix.json")
+            grep -Fq 'polyedge-shadow-neu' <<< "$query"
+            if [ "$suffix" != "shadow-runtime-health-missing" ]; then
+              grep -Fq 'polyedge-dev' <<< "$query"
+            fi
+          done
+          for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
+              > "after-$job.json"
+            cmp -s "before-$job.json" "after-$job.json" || {
+              echo "Protected funded-job definition changed: $job" >&2
+              exit 1
+            }
+            test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" --query properties.configuration.triggerType -o tsv)" = "Manual"
+            test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
+          done
+          env_value() {
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$1" -o json \
+              | jq -r --arg name "$2" '[.properties.template.containers[].env[]? | select(.name == $name) | .value] | first // empty'
+          }
+          test "$(env_value polyedge-venue-probe-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-venue-probe-neu-job VENUE_PROBE_DRY_RUN)" = "true"
+          test "$(env_value polyedge-redeem-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-redeem-neu-job VENUE_REDEMPTION_ENABLED)" = "false"
+          test "$(env_value polyedge-redeem-neu-job VENUE_REDEMPTION_DRY_RUN)" = "true"
+          test "$(env_value polyedge-strategy-canary-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-strategy-canary-neu-job STRATEGY_CANARY_CONTROLLER_ENABLED)" = "false"
+          test "$(env_value polyedge-strategy-canary-neu-job STRATEGY_CANARY_DRY_RUN)" = "true"
+          test "$(env_value polyedge-funded-ladder-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-funded-ladder-neu-job FUNDED_LADDER_CONTROLLER_ENABLED)" = "false"
+          test "$(env_value polyedge-funded-ladder-neu-job FUNDED_LADDER_DRY_RUN)" = "true"
+          test "$(env_value polyedge-promotion-neu-job PROMOTION_TRANSITION_ENABLED)" = "false"
+          test "$(env_value polyedge-venue-model-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-venue-model-job QUEUE_MODEL_TRAINING_ENABLED)" = "false"
 
   deploy:
     if: inputs.research_job_target == 'none'
