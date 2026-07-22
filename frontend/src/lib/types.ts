@@ -519,6 +519,7 @@ export type VenueExecutionEvidence = {
         clean_days?: number;
         settled_markets?: number;
         wallet_constrained_net_pnl?: string | number;
+        queue_conservative?: boolean;
         queue_conservative_net_pnl?: string | number;
         pnl_ci_95_low?: string | number;
         consecutive_positive_weekly_blocks?: number;

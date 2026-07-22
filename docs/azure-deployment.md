@@ -83,6 +83,16 @@ job or grant funded execution. The active deployment workflow separately
 requires an explicit campaign-runtime authorization before it may touch the
 shadow runtime during the frozen evidence window.
 
+Dashboard-only changes use the `frontend-only` target on the active workflow.
+That path changes only the `frontend` image, freezes the active backend image
+and the shadow revision before the update, and verifies both images are
+unchanged afterward. Azure Container Apps revisions are app-wide, so this does
+roll the primary paper bot sidecar process; the workflow therefore verifies
+recorder health, durable-event recovery, replica restart counts, and the Labs
+routes after rollout. It also refuses to deploy while a funded controller is
+running or enabled. A truly process-independent frontend deployment would
+require moving the frontend to a separate Container App.
+
 After deployment the workflow logs into the dashboard without exposing the
 password, verifies authenticated health/status/snapshot/market/order/fill/
 decision/report routes, asserts paper-only recorder health, runs the

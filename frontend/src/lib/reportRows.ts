@@ -49,8 +49,13 @@ export const QUEUE_PROXY_COLUMNS: ReportColumn[] = [
   { key: "queue_proxy_eligible_markets", label: "Eligible Markets" },
   { key: "queue_proxy_ineligible_markets", label: "Ineligible Markets" },
   { key: "queue_proxy_eligibility_rate", label: "Eligibility Rate" },
+  { key: "queue_proxy_pnl_eligible", label: "PnL Eligible" },
+  { key: "queue_proxy_net_pnl", label: "Eligible Queue PnL" },
+  { key: "eligible_queue_fills", label: "Eligible Queue Fills" },
+  { key: "ineligible_queue_fills", label: "Ineligible Queue Fills" },
   { key: "queue_proxy_fills", label: "Queue Fills" },
   { key: "queue_proxy_fill_rate", label: "Fill Rate" },
+  { key: "ignored_opposite_trade_count", label: "Ignored Opposite Prints" },
   { key: "avg_size_ahead", label: "Avg Size Ahead" },
   { key: "ineligible_reasons", label: "Ineligible Reasons" }
 ];
@@ -147,8 +152,13 @@ export function selectQueueProxyRows(report: unknown): JsonRecord[] {
         queue_proxy_eligible_markets: firstDefined(row.queue_proxy_eligible_markets, queue.queue_proxy_eligible_markets),
         queue_proxy_ineligible_markets: firstDefined(row.queue_proxy_ineligible_markets, queue.queue_proxy_ineligible_markets),
         queue_proxy_eligibility_rate: firstDefined(row.queue_proxy_eligibility_rate, queue.queue_proxy_eligibility_rate),
+        queue_proxy_pnl_eligible: firstDefined(row.queue_proxy_pnl_eligible, queue.queue_proxy_pnl_eligible),
+        queue_proxy_net_pnl: firstDefined(row.queue_proxy_net_pnl, queue.queue_proxy_net_pnl),
+        eligible_queue_fills: firstDefined(row.eligible_queue_fills, queue.eligible_queue_fills),
+        ineligible_queue_fills: firstDefined(row.ineligible_queue_fills, queue.ineligible_queue_fills),
         queue_proxy_fills: firstDefined(row.queue_proxy_fills, queue.queue_proxy_fills),
         queue_proxy_fill_rate: firstDefined(row.queue_proxy_fill_rate, queue.queue_proxy_fill_rate),
+        ignored_opposite_trade_count: firstDefined(row.ignored_opposite_trade_count, queue.ignored_opposite_trade_count),
         avg_size_ahead: firstDefined(row.avg_size_ahead, queue.avg_size_ahead),
         ineligible_reasons: firstDefined(row.ineligible_reasons, queue.ineligible_reasons)
       };

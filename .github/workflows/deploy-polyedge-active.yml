@@ -9,12 +9,13 @@ on:
         default: false
         type: boolean
       research_job_target:
-        description: Route this dispatch to the isolated research-job deployer without changing the active runtime
+        description: Route this dispatch to an isolated target without changing the frozen shadow runtime
         required: true
         default: none
         type: choice
         options:
           - none
+          - frontend-only
           - build-only
           - polyedge-shadow-daily-neu-job
           - polyedge-backfill-job
@@ -22,7 +23,7 @@ on:
           - polyedge-chart-backfill-job
 
 concurrency:
-  group: ${{ inputs.research_job_target != 'none' && 'polyedge-research-deploy-caller' || 'polyedge-azure-control-plane' }}
+  group: ${{ inputs.research_job_target == 'none' && 'polyedge-azure-control-plane' || inputs.research_job_target == 'frontend-only' && 'polyedge-frontend-deploy-caller' || 'polyedge-research-deploy-caller' }}
   cancel-in-progress: false
 
 permissions:
@@ -37,10 +38,15 @@ env:
 
 jobs:
   research-job-deploy:
-    if: inputs.research_job_target != 'none'
+    if: inputs.research_job_target != 'none' && inputs.research_job_target != 'frontend-only'
     uses: ./.github/workflows/deploy-polyedge-research-jobs.yml
     with:
       target_job: ${{ inputs.research_job_target }}
+    secrets: inherit
+
+  frontend-only-deploy:
+    if: inputs.research_job_target == 'frontend-only'
+    uses: ./.github/workflows/deploy-polyedge-frontend-only.yml
     secrets: inherit
 
   deploy:

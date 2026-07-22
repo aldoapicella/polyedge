@@ -229,9 +229,13 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Settled Markets" value={`${profitability?.shadow?.settled_markets ?? promotionMetrics?.settled_markets ?? 0} / ${profitability?.shadow?.required_settled_markets ?? 1000}`} />
             <Metric label="Wallet-constrained PnL" value={signedUsd(profitability?.shadow?.wallet_constrained_net_pnl ?? promotionMetrics?.wallet_constrained_net_pnl)} />
             <Metric label="Queue-conservative PnL (all intents)" value={signedUsd(profitability?.shadow?.queue_conservative_net_pnl ?? promotionMetrics?.queue_conservative_net_pnl)} />
+            <Metric label="Queue PnL Evidence" value={promotionMetrics?.queue_conservative === true ? "eligible — ≥95% queue evidence, zero ineligible fills" : "blocked / awaiting eligible queue evidence"} />
             <Metric label="Daily Wallet PnL L95" value={signedUsd(profitability?.shadow?.pnl_ci_lower_95 ?? promotionMetrics?.pnl_ci_95_low)} />
             <Metric label="Positive Weekly Blocks" value={`${profitability?.shadow?.positive_weekly_blocks ?? promotionMetrics?.consecutive_positive_weekly_blocks ?? 0} / ${profitability?.shadow?.required_positive_weekly_blocks ?? 4}`} />
             <Metric label="Full Decision Replay Parity" value={percentage(profitability?.shadow?.decision_parity_rate ?? promotionMetrics?.decision_parity_rate)} />
+          </div>
+          <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+            A dollar PnL is admission-grade only when the conservative queue model is enabled, at least 95% of markets are eligible, and no fill comes from an ineligible market. Other PnL remains diagnostic only.
           </div>
         </Panel>
         <Panel>
