@@ -4042,7 +4042,9 @@ fn validate_strategy_batch(
     }
 
     let replayed_output = evaluate_decision_pipeline_v3(&input);
-    if replayed_output != recorded_output {
+    let replayed_output_value = polyedge_storage::wire_normalized_json(&replayed_output)
+        .map_err(|_| "pipeline_replay_output_wire_normalization_failed")?;
+    if replayed_output_value != *output_value {
         return Err("pipeline_replay_output_mismatch");
     }
     let expected_decisions = if contract_version == 3 {
@@ -12844,10 +12846,11 @@ mod tests {
     ) -> (Value, Vec<Value>) {
         assert!(supported_decision_batch_version(contract_version));
         let output = evaluate_decision_pipeline_v3(input);
-        let input_value = serde_json::to_value(input).unwrap();
-        let output_value = serde_json::to_value(&output).unwrap();
+        let input_value = polyedge_storage::wire_normalized_json(input).unwrap();
+        let output_value = polyedge_storage::wire_normalized_json(&output).unwrap();
         let input_sha256 = canonical_value_sha256(&input_value).unwrap();
         let output_sha256 = canonical_value_sha256(&output_value).unwrap();
+        let start_sha256 = canonical_value_sha256(&input_value["market_start_evidence"]).unwrap();
         let batch_id = format!(
             "strategy-batch-{}",
             input_sha256.trim_start_matches("sha256:")
@@ -12856,7 +12859,10 @@ mod tests {
             expected_legacy_v3_decision_payloads(&output).unwrap()
         } else {
             expected_v4_decision_payloads(&output).unwrap()
-        };
+        }
+        .into_iter()
+        .map(|decision| polyedge_storage::wire_normalized_json(&decision).unwrap())
+        .collect::<Vec<_>>();
         if !input.kill_switch_enabled {
             assert!(decisions
                 .iter()
@@ -12873,7 +12879,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let batch = json!({
+        let batch = polyedge_storage::wire_normalized_json(&json!({
             "schema_version": contract_version,
             "schema": format!("polyedge.strategy_decision_batch.v{contract_version}"),
             "parity_scope": "full_decision_pipeline_recomputation",
@@ -12883,15 +12889,14 @@ mod tests {
             "candidate": FrozenStrategyMode::DynamicQuoteStyle.candidate(),
             "decision_config_schema": "polyedge.decision_config.v1",
             "decision_config_sha256": decision_config_sha256(input).unwrap(),
-            "market_start_evidence_sha256": canonical_value_sha256(
-                &serde_json::to_value(&input.market_start_evidence).unwrap()
-            ).unwrap(),
+            "market_start_evidence_sha256": start_sha256,
             "pipeline_input_sha256": input_sha256,
             "pipeline_output_sha256": output_sha256,
             "pipeline_input": input_value,
             "pipeline_output": output_value,
             "bound_final_decisions": bound
-        });
+        }))
+        .unwrap();
         let events = decisions
             .into_iter()
             .enumerate()
