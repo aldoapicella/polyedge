@@ -1365,6 +1365,7 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
         let wallet = serde_json::json!({
             "schema_version": 2,
             "wallet_scope": "cumulative_since_2026-07-12",
+            "fill_model": "queue_proxy_conservative",
             "campaign_start": "2026-07-12",
             "snapshot_date": date.format("%Y-%m-%d").to_string(),
             "cumulative_input_sha256": format!("sha256:{input}"),
@@ -1383,6 +1384,9 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
             "queue_proxy_pnl_eligible": true,
             "queue_proxy_net_pnl": "1.25",
             "queue_proxy_wallet_constrained_net_pnl": cumulative_net.to_string(),
+            "queue_proxy_wallet_constrained_ending_equity": ending_equity.to_string(),
+            "queue_proxy_wallet_constrained_max_drawdown": "0",
+            "queue_proxy_wallet_constrained_unresolved_orders": 0,
             "eligible_queue_fills": 2,
             "ineligible_queue_fills": 0
         });
