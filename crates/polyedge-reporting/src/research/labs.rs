@@ -4223,7 +4223,16 @@ mod wallet_metric_tests {
         let observed_hours = (0..24)
             .map(|hour| (format!("2026-07-14T{hour:02}"), 100_u64))
             .collect::<BTreeMap<_, _>>();
+        let normalized = root.join("normalized");
+        std::fs::create_dir_all(&normalized).unwrap();
+        let events_manifest = serde_json::to_vec_pretty(&json!({
+            "date": "2026-07-14",
+            "normalized_events": 2400
+        }))
+        .unwrap();
+        std::fs::write(normalized.join("events_manifest.json"), &events_manifest).unwrap();
         let audit = json!({
+            "input_path": normalized,
             "result": {
                 "total_events": 2400,
                 "start_price_capture_rate": 1.0,
@@ -4253,7 +4262,7 @@ mod wallet_metric_tests {
         let published = super::super::run_bundle::publish_daily_directory(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
             "shadow-blocked-20260714",
-            "4".repeat(64),
+            format!("sha256:{}", sha256_hex(&events_manifest)),
             polyedge_config::RuntimeRole::ProfitabilityShadow,
             &source,
             &daily_root,
