@@ -86,6 +86,11 @@ const DEFAULT_AZURE_PREFETCH_BLOBS: usize = 4;
 const MAX_AZURE_PREFETCH_BLOBS: usize = 32;
 const DEFAULT_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 8_192;
 const MAX_EVENT_TIME_REORDER_BUFFER_EVENTS: usize = 1_048_576;
+const DEFAULT_EVENT_TIME_REORDER_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+const MIN_EVENT_TIME_REORDER_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_TIME_REORDER_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
+const PENDING_EVENT_DECODED_SIZE_MULTIPLIER: usize = 4;
+const PENDING_EVENT_FIXED_OVERHEAD_BYTES: usize = 512;
 const NORMALIZE_PROGRESS_INTERVAL_EVENTS: usize = 100_000;
 const RAW_SOURCE_INVENTORY_SCHEMA_VERSION: u32 = 1;
 const RAW_SOURCE_INVENTORY_DOMAIN: &str = "polyedge.raw-source-inventory.v1";
@@ -1385,6 +1390,7 @@ struct PendingEventKey {
 struct PendingEventLine {
     key: PendingEventKey,
     event: EventLine,
+    estimated_heap_bytes: usize,
 }
 
 struct EventReaderState {
@@ -1393,6 +1399,32 @@ struct EventReaderState {
     line_index: u64,
     pending: BTreeMap<PendingEventKey, PendingEventLine>,
     exhausted: bool,
+}
+
+struct PendingBufferBudget {
+    limit: usize,
+    estimated_bytes: usize,
+}
+
+impl PendingBufferBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            estimated_bytes: 0,
+        }
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.estimated_bytes < self.limit
+    }
+
+    fn insert(&mut self, bytes: usize) {
+        self.estimated_bytes = self.estimated_bytes.saturating_add(bytes);
+    }
+
+    fn remove(&mut self, bytes: usize) {
+        self.estimated_bytes = self.estimated_bytes.saturating_sub(bytes);
+    }
 }
 
 fn stream_merged_event_paths<F>(
@@ -1418,22 +1450,26 @@ where
         })
         .collect::<Result<Vec<_>, ResearchError>>()?;
     let reorder_window = event_time_reorder_buffer_events();
-    for (reader_index, reader) in readers.iter_mut().enumerate() {
-        fill_reader_pending_window(
-            reader_index,
-            reader,
-            exclude_windows,
-            stats,
-            seen_hashes,
-            reorder_window,
-        )?;
-    }
+    let reorder_byte_cap = event_time_reorder_buffer_bytes();
+    let mut pending_budget = PendingBufferBudget::new(reorder_byte_cap);
+    stats.notices.push(format!(
+        "event-time merge pending lookahead capped at {reorder_window} events per reader and {reorder_byte_cap} estimated decoded bytes globally"
+    ));
+    fill_pending_windows(
+        &mut readers,
+        exclude_windows,
+        stats,
+        seen_hashes,
+        reorder_window,
+        &mut pending_budget,
+    )?;
     let mut previous_ts = None;
     while let Some(reader_index) = next_reader_with_earliest_event(&readers) {
         let (_, line) = readers[reader_index]
             .pending
             .pop_first()
             .expect("reader selected with a pending event");
+        pending_budget.remove(line.estimated_heap_bytes);
         let source = readers[reader_index].source.as_str();
         if let Some(prior) = previous_ts.filter(|prior| line.event.recorded_ts < *prior) {
             stats.out_of_order_timestamps += 1;
@@ -1447,13 +1483,13 @@ where
         previous_ts = Some(line.event.recorded_ts);
         stats.events += 1;
         visitor(&line.event);
-        fill_reader_pending_window(
-            reader_index,
-            &mut readers[reader_index],
+        fill_pending_windows(
+            &mut readers,
             exclude_windows,
             stats,
             seen_hashes,
             reorder_window,
+            &mut pending_budget,
         )?;
     }
     Ok(())
@@ -1465,6 +1501,17 @@ fn event_time_reorder_buffer_events() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_EVENT_TIME_REORDER_BUFFER_EVENTS)
         .clamp(1, MAX_EVENT_TIME_REORDER_BUFFER_EVENTS)
+}
+
+fn event_time_reorder_buffer_bytes() -> usize {
+    std::env::var("POLYEDGE_RESEARCH_REORDER_BUFFER_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_EVENT_TIME_REORDER_BUFFER_BYTES)
+        .clamp(
+            MIN_EVENT_TIME_REORDER_BUFFER_BYTES,
+            MAX_EVENT_TIME_REORDER_BUFFER_BYTES,
+        )
 }
 
 fn next_reader_with_earliest_event(readers: &[EventReaderState]) -> Option<usize> {
@@ -1481,21 +1528,51 @@ fn next_reader_with_earliest_event(readers: &[EventReaderState]) -> Option<usize
         .map(|(index, _)| index)
 }
 
-fn fill_reader_pending_window(
-    reader_index: usize,
-    state: &mut EventReaderState,
+fn fill_pending_windows(
+    readers: &mut [EventReaderState],
     exclude_windows: &[ExcludedTimeWindow],
     stats: &mut StreamStats,
     seen_hashes: &mut BTreeSet<u64>,
     reorder_window: usize,
+    budget: &mut PendingBufferBudget,
 ) -> Result<(), ResearchError> {
-    while state.pending.len() < reorder_window && !state.exhausted {
+    // A head row per nonempty reader is required for a correct k-way merge.
+    // This minimum is retained even when a single unusually large row exceeds
+    // the global budget.
+    for (reader_index, state) in readers.iter_mut().enumerate() {
+        if !state.pending.is_empty() || state.exhausted {
+            continue;
+        }
         let Some(line) =
             read_next_pending_event(reader_index, state, exclude_windows, stats, seen_hashes)?
         else {
-            break;
+            continue;
         };
+        budget.insert(line.estimated_heap_bytes);
         state.pending.insert(line.key.clone(), line);
+    }
+
+    while budget.has_capacity() {
+        let mut filled_any = false;
+        for (reader_index, state) in readers.iter_mut().enumerate() {
+            if state.pending.len() >= reorder_window || state.exhausted {
+                continue;
+            }
+            let Some(line) =
+                read_next_pending_event(reader_index, state, exclude_windows, stats, seen_hashes)?
+            else {
+                continue;
+            };
+            budget.insert(line.estimated_heap_bytes);
+            state.pending.insert(line.key.clone(), line);
+            filled_any = true;
+            if !budget.has_capacity() {
+                return Ok(());
+            }
+        }
+        if !filled_any {
+            break;
+        }
     }
     Ok(())
 }
@@ -1569,8 +1646,15 @@ fn read_next_pending_event(
                 payload,
                 raw: Value::Null,
             },
+            estimated_heap_bytes: estimated_pending_event_bytes(bytes),
         }));
     }
+}
+
+fn estimated_pending_event_bytes(serialized_bytes: usize) -> usize {
+    serialized_bytes
+        .saturating_mul(PENDING_EVENT_DECODED_SIZE_MULTIPLIER)
+        .saturating_add(PENDING_EVENT_FIXED_OVERHEAD_BYTES)
 }
 
 fn process_event_line<F>(
@@ -13889,6 +13973,103 @@ mod tests {
 
         assert_eq!(source.prefetch_blobs, MAX_AZURE_PREFETCH_BLOBS);
         assert_eq!(source.worker_count(3), 3);
+    }
+
+    #[test]
+    fn pending_merge_budget_keeps_one_head_per_reader_and_stops_extra_lookahead() {
+        let mut readers = vec![
+            pending_test_reader("books", 3, 16 * 1024),
+            pending_test_reader("raw-market-events", 3, 16 * 1024),
+        ];
+        let mut stats = StreamStats::default();
+        let mut seen_hashes = BTreeSet::new();
+        let mut budget = PendingBufferBudget::new(1);
+
+        fill_pending_windows(
+            &mut readers,
+            &[],
+            &mut stats,
+            &mut seen_hashes,
+            8_192,
+            &mut budget,
+        )
+        .unwrap();
+
+        assert_eq!(readers[0].pending.len(), 1);
+        assert_eq!(readers[1].pending.len(), 1);
+        assert!(budget.estimated_bytes > budget.limit);
+
+        let (_, consumed) = readers[0].pending.pop_first().unwrap();
+        budget.remove(consumed.estimated_heap_bytes);
+        fill_pending_windows(
+            &mut readers,
+            &[],
+            &mut stats,
+            &mut seen_hashes,
+            8_192,
+            &mut budget,
+        )
+        .unwrap();
+
+        assert_eq!(readers[0].pending.len(), 1);
+        assert_eq!(readers[1].pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_merge_budget_preserves_the_existing_event_count_ceiling() {
+        let mut readers = vec![
+            pending_test_reader("books", 5, 16),
+            pending_test_reader("references", 5, 16),
+        ];
+        let mut stats = StreamStats::default();
+        let mut seen_hashes = BTreeSet::new();
+        let mut budget = PendingBufferBudget::new(usize::MAX);
+
+        fill_pending_windows(
+            &mut readers,
+            &[],
+            &mut stats,
+            &mut seen_hashes,
+            3,
+            &mut budget,
+        )
+        .unwrap();
+
+        assert_eq!(readers[0].pending.len(), 3);
+        assert_eq!(readers[1].pending.len(), 3);
+    }
+
+    #[test]
+    fn pending_event_memory_estimate_is_conservative_and_saturating() {
+        assert_eq!(
+            estimated_pending_event_bytes(1_024),
+            1_024 * PENDING_EVENT_DECODED_SIZE_MULTIPLIER + PENDING_EVENT_FIXED_OVERHEAD_BYTES
+        );
+        assert_eq!(estimated_pending_event_bytes(usize::MAX), usize::MAX);
+    }
+
+    fn pending_test_reader(name: &str, events: usize, payload_bytes: usize) -> EventReaderState {
+        let payload = "x".repeat(payload_bytes);
+        let mut input = String::new();
+        for sequence in 0..events {
+            let row = json!({
+                "sequence": sequence,
+                "event_type": name,
+                "recorded_ts": format!("2026-07-23T00:00:{sequence:02}Z"),
+                "raw_payload": {
+                    "payload": payload
+                }
+            });
+            input.push_str(&serde_json::to_string(&row).unwrap());
+            input.push('\n');
+        }
+        EventReaderState {
+            source: name.to_owned(),
+            reader: Box::new(BufReader::new(std::io::Cursor::new(input.into_bytes()))),
+            line_index: 0,
+            pending: BTreeMap::new(),
+            exhausted: false,
+        }
     }
 
     #[test]

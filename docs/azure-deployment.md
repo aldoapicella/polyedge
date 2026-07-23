@@ -80,6 +80,12 @@ normalized audit is terminated with exit code 137 before it can emit its
 command envelope. Keep the bound job-specific, preserve the audit's
 out-of-order warning gate, and treat any resulting ordering warning as a failed
 daily bundle rather than increasing the buffer past available memory.
+The reader also enforces a global 256 MiB estimated-decoded-byte lookahead cap
+(`POLYEDGE_RESEARCH_REORDER_BUFFER_BYTES`, clamped to 1 MiB–1 GiB) while
+retaining the 8,192-event per-reader ceiling. One head row per nonempty shard is
+always required for a correct merge, so the byte cap is an estimate rather than
+a literal process-memory guarantee; unusually large individual rows must still
+fail closed through the job memory limit and alerting.
 
 During a frozen shadow campaign, reporting changes must use
 `.github/workflows/deploy-polyedge-research-jobs.yml` instead of the active
