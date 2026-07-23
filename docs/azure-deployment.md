@@ -89,9 +89,9 @@ fail closed through the job memory limit and alerting.
 
 During a frozen shadow campaign, reporting changes must use
 `.github/workflows/deploy-polyedge-research-jobs.yml` instead of the active
-runtime workflow. The workflow accepts only the shadow daily reporter and the
-three existing manual research jobs; `build-only` validates and publishes an
-image without updating a job.
+runtime workflow. The workflow accepts only the primary and shadow daily
+reporters plus the three existing manual research jobs; `build-only` validates
+and publishes an image without updating a job.
 
 ```bash
 gh workflow run deploy-polyedge-research-jobs.yml \
@@ -108,6 +108,8 @@ paper-only environment, and absence of funded credentials. It also proves that
 the frozen `polyedge-shadow-neu` revision and image did not change. Updating
 the shadow daily reporter is refused from 02:00 through 02:30 UTC so a
 deployment cannot overlap its 02:15 UTC schedule.
+The same guard rejects primary-daily updates from 00:15 through 00:45 UTC, and
+both scheduled targets must have zero running executions before any update.
 
 This workflow updates the selected job definition; it does not start a manual
 job or grant funded execution. The active deployment workflow separately

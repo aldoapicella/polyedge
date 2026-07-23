@@ -10,6 +10,7 @@ on:
         type: choice
         options:
           - build-only
+          - polyedge-daily-research-job
           - polyedge-shadow-daily-neu-job
           - polyedge-backfill-job
           - polyedge-prospective-job
@@ -87,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$TARGET_JOB" in
-            build-only|polyedge-shadow-daily-neu-job|polyedge-backfill-job|polyedge-prospective-job|polyedge-chart-backfill-job) ;;
+            build-only|polyedge-daily-research-job|polyedge-shadow-daily-neu-job|polyedge-backfill-job|polyedge-prospective-job|polyedge-chart-backfill-job) ;;
             *) echo "Unsupported research job: $TARGET_JOB" >&2; exit 1 ;;
           esac
 
@@ -123,6 +124,12 @@ jobs:
             expected_trigger="Schedule"
             expected_location="northeurope"
             expected_command="polyedge-rs research with-azure-lease --account stpolyedge6urdjr5nmwx7w --container polyedge-research --blob data/research/shadow/campaign-2026-07-23/control/replay.lock -- /bin/sh /app/research/run_shadow_daily.sh"
+          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Schedule"
+            expected_location="eastus"
+            expected_command_fragment="publish-daily-bundle"
           else
             expected_identity_name="polyedge-dev-id"
             expected_container="research-job"
@@ -155,6 +162,12 @@ jobs:
           if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
             test "$command_line" = "$expected_command"
             test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "15 2 * * *"
+          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+            case "$command_line" in
+              *"$expected_command_fragment"*) ;;
+              *) echo "Unexpected primary daily research command" >&2; exit 1 ;;
+            esac
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "30 0 * * *"
           else
             case "$command_line" in
               *"$expected_command_fragment"*) ;;
@@ -217,6 +230,12 @@ jobs:
               echo "Refusing to update the scheduled reporter near its 02:15 UTC execution" >&2
               exit 1
             fi
+          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+            utc_hhmm=$(date -u +%H%M)
+            if (( 10#$utc_hhmm >= 15 && 10#$utc_hhmm <= 45 )); then
+              echo "Refusing to update the primary reporter near its 00:30 UTC execution" >&2
+              exit 1
+            fi
           fi
           az containerapp job update \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -235,6 +254,11 @@ jobs:
             expected_container="shadow-daily"
             expected_trigger="Schedule"
             expected_command_fragment="polyedge-rs research with-azure-lease"
+          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Schedule"
+            expected_command_fragment="publish-daily-bundle"
           else
             expected_identity_name="polyedge-dev-id"
             expected_container="research-job"
