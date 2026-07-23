@@ -318,12 +318,35 @@ older observations remain visible as legacy evidence but do not count toward
 the v3 threshold or promotion. The model reports out-of-sample Brier score plus
 calibration bins and remains research-only; it cannot promote a strategy.
 
-The separate `research loss-regime-oos` experiment is also fail closed. It may
-only retain or abstain from orders using features captured before submission,
-uses whole UTC market days for chronological validation and a sealed final
-test, and does not publish a lower-95 PnL bound before 28 daily clusters. Its
-outputs live only below `reports/research/experiments/<experiment_id>` and are
-always diagnostic-only.
+The separate `research loss-regime-oos` experiment is also fail closed. Schema
+v1 is retained only as a deprecated historical contract and the command refuses
+to execute it. Schema v2 requires `frozen_at` to be strictly before the
+evaluation start at 00:00 UTC (`2026-07-23T23:59:59Z` for this version), before
+eligible observations exist, then uses exactly 28 consecutive whole UTC
+market-end days for candidate
+selection and the next 28 consecutive days for one sealed test. The v2
+experiment starting 2026-07-24 therefore uses 2026-07-24 through 2026-08-20 for
+selection and 2026-08-21 through 2026-09-17 for test. Every calendar day must be
+present with complete terminal facts; the command writes no immutable output
+before all 56 days exist.
+
+Each raw window must contain at least 100 whole orders, 10 filled orders, and
+10 unfilled orders. A candidate may enter selection only when its accepted
+subset independently meets those same minima. Candidates are ranked using the
+selection window only. The sealed test is opened only for that winner; if its
+test subset misses a minimum, the result is explicitly insufficient and the
+analyzer never falls back to another candidate. Both settled PnL and net
+executable 30-second markout publish deterministic lower-95 bounds from a
+10,000-resample seven-day circular-block bootstrap over the 28 test daily
+clusters. Only pre-submission features may retain or abstain from an order.
+Outputs live only below
+`reports/research/experiments/<experiment_id>` and remain diagnostic-only.
+
+The chronological 80/20 rule above applies to separately trained queue
+probability/calibration models. It is not mixed with the fixed-filter
+loss-regime v2 experiment. Likewise, the older order-ordinal 1--100/101--200
+proposal is superseded because it could split a UTC market day and could not
+support a 28-cluster lower bound.
 
 Standalone order lifecycle facts are not sufficient to call their PnL
 queue-qualified. Market eligibility depends on the complete joined stream of

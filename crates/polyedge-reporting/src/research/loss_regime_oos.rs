@@ -1,11 +1,12 @@
 use super::*;
+use chrono::NaiveDate;
 use std::path::Component;
 
 const ORDER_FACT_SCHEMA_V2: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v2";
 const FILL_FACT_SCHEMA_V1: &str = "polyedge.loss_diagnostics.fill_markout_fact.v1";
 const SUMMARY_SCHEMA_V1: &str = "polyedge.loss_diagnostics.summary.v1";
 const ARTIFACT_MANIFEST_SCHEMA_V1: &str = "polyedge.loss_diagnostics.artifact_manifest.v1";
-const OOS_SCHEMA_V1: &str = "polyedge.loss_regime_oos.v1";
+const OOS_SCHEMA_V2: &str = "polyedge.loss_regime_oos.v2";
 const ORDER_FACT_FILE: &str = "order_lifecycle_fact.jsonl";
 const FILL_FACT_FILE: &str = "fill_markout_fact.jsonl";
 const SUMMARY_FILE: &str = "loss_diagnostics.json";
@@ -32,6 +33,14 @@ struct LossRegimeConfig {
     frozen_at: DateTime<Utc>,
     source_campaign_id: String,
     research_only: bool,
+    evaluation_start_day: Option<NaiveDate>,
+    selection_day_count: usize,
+    test_day_count: usize,
+    minimum_orders_per_window: usize,
+    minimum_filled_orders_per_window: usize,
+    minimum_unfilled_orders_per_window: usize,
+    bootstrap_block_days: usize,
+    bootstrap_resamples: usize,
     candidates: Vec<LossRegimeCandidate>,
     sha256: String,
 }
@@ -137,6 +146,8 @@ struct OrderObservation {
 struct CandidateEvidence {
     candidate: LossRegimeCandidate,
     validation: Value,
+    selection_sample_eligible: bool,
+    selection_sample_reasons: Vec<String>,
     validation_net_pnl: Decimal,
     validation_markout_30s_net_pnl: Decimal,
 }
@@ -156,6 +167,11 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
     }
 
     let config = load_config(&options.config)?;
+    if config.schema_version != 2 {
+        return Err(invalid(
+            "loss-regime OOS config schema_version 1 is deprecated and cannot be executed; use a frozen schema_version 2 fixed-window config",
+        ));
+    }
     if config.source_campaign_id != options.source_campaign_id {
         return Err(invalid(format!(
             "config source_campaign_id {} does not match requested {}",
@@ -168,31 +184,60 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
     let facts = verify_facts(&options.facts)?;
     let queue_eligibility =
         verify_queue_eligibility(&options.queue_evidence, &facts.input_binding_sha256)?;
-    let observations = derive_observations(&facts, &queue_eligibility, config.frozen_at)?;
-    let days = observations
+    let all_observations = derive_observations(&facts, &queue_eligibility, config.frozen_at)?;
+    let evaluation_start_day = config
+        .evaluation_start_day
+        .ok_or_else(|| invalid("schema v2 evaluation_start_day is missing"))?;
+    let days = fixed_window_days(
+        evaluation_start_day,
+        config.selection_day_count + config.test_day_count,
+    )?;
+    let day_set = days.iter().cloned().collect::<BTreeSet<_>>();
+    let observations = all_observations
+        .into_iter()
+        .filter(|row| day_set.contains(&row.day))
+        .collect::<Vec<_>>();
+    let observed_days = observations
         .iter()
         .map(|row| row.day.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let missing_days = days
+        .iter()
+        .filter(|day| !observed_days.contains(*day))
+        .cloned()
         .collect::<Vec<_>>();
-    if days.len() < 3 {
-        return Err(invalid(
-            "loss-regime OOS requires at least three sealed market days",
-        ));
+    if !missing_days.is_empty() {
+        return Err(invalid(format!(
+            "loss-regime OOS v2 is not mature: all 56 fixed consecutive sealed UTC market days are required; missing {}",
+            missing_days.join(",")
+        )));
     }
 
-    let validation_days = days[1..days.len() - 1].to_vec();
-    let final_test_day = days
-        .last()
-        .cloned()
-        .ok_or_else(|| invalid("final test day is missing"))?;
-    let folds = chronological_folds(&days);
+    let selection_days = days[..config.selection_day_count].to_vec();
+    let test_days = days[config.selection_day_count..].to_vec();
+    let raw_candidate = LossRegimeCandidate {
+        name: "raw_window".to_owned(),
+        ..LossRegimeCandidate::default()
+    };
+    let raw_selection = candidate_metrics(&raw_candidate, &observations, &selection_days);
+    let raw_test = candidate_metrics(&raw_candidate, &observations, &test_days);
+    let raw_selection_reasons = sample_reasons(&raw_selection, &config);
+    let raw_test_reasons = sample_reasons(&raw_test, &config);
+    if !raw_selection_reasons.is_empty() || !raw_test_reasons.is_empty() {
+        return Err(invalid(format!(
+            "loss-regime OOS v2 fixed raw windows are insufficient; selection=[{}]; test=[{}]",
+            raw_selection_reasons.join("; "),
+            raw_test_reasons.join("; ")
+        )));
+    }
+
     let mut evidence = config
         .candidates
         .iter()
         .cloned()
         .map(|candidate| {
-            let validation = candidate_metrics(&candidate, &observations, &validation_days);
+            let validation = candidate_metrics(&candidate, &observations, &selection_days);
+            let selection_sample_reasons = sample_reasons(&validation, &config);
             let validation_net_pnl =
                 value_decimal(&validation["queue_qualified_settled_net_pnl"]).unwrap_or_default();
             let validation_markout_30s_net_pnl =
@@ -200,6 +245,8 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
             CandidateEvidence {
                 candidate,
                 validation,
+                selection_sample_eligible: selection_sample_reasons.is_empty(),
+                selection_sample_reasons,
                 validation_net_pnl,
                 validation_markout_30s_net_pnl,
             }
@@ -207,8 +254,9 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
         .collect::<Vec<_>>();
     evidence.sort_by(|left, right| {
         right
-            .validation_net_pnl
-            .cmp(&left.validation_net_pnl)
+            .selection_sample_eligible
+            .cmp(&left.selection_sample_eligible)
+            .then(right.validation_net_pnl.cmp(&left.validation_net_pnl))
             .then(
                 right
                     .validation_markout_30s_net_pnl
@@ -217,32 +265,48 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
             .then(left.candidate.name.cmp(&right.candidate.name))
     });
     let selected_name = evidence
-        .first()
+        .iter()
+        .find(|row| row.selection_sample_eligible)
         .map(|row| row.candidate.name.clone())
-        .ok_or_else(|| invalid("loss-regime OOS has no candidates"))?;
+        .ok_or_else(|| {
+            invalid(
+                "loss-regime OOS v2 has no candidate meeting the frozen selection sample minima",
+            )
+        })?;
+    let selected_candidate = evidence
+        .iter()
+        .find(|row| row.candidate.name == selected_name)
+        .map(|row| row.candidate.clone())
+        .ok_or_else(|| invalid("selected candidate is missing"))?;
+    let selected_test_metrics = candidate_metrics(&selected_candidate, &observations, &test_days);
+    let selected_test_reasons = sample_reasons(&selected_test_metrics, &config);
+    let selected_test_status = if selected_test_reasons.is_empty() {
+        "opened_after_winner_fixed"
+    } else {
+        "insufficient_selected_candidate_sample"
+    };
     let candidate_rows = evidence
         .iter()
         .enumerate()
         .map(|(index, row)| {
             let selected = row.candidate.name == selected_name;
             let test = if selected {
-                let metrics = candidate_metrics(
-                    &row.candidate,
-                    &observations,
-                    std::slice::from_ref(&final_test_day),
-                );
                 json!({
-                    "status": "opened_after_winner_fixed",
-                    "day": final_test_day,
-                    "metrics": metrics
+                    "status": selected_test_status,
+                    "days": test_days,
+                    "sample_eligible": selected_test_reasons.is_empty(),
+                    "sample_reasons": selected_test_reasons,
+                    "metrics": selected_test_metrics
                 })
             } else {
-                json!({"status": "sealed_not_selected", "day": Value::Null, "metrics": Value::Null})
+                json!({"status": "sealed_not_selected", "days": Value::Null, "sample_eligible": Value::Null, "sample_reasons": [], "metrics": Value::Null})
             };
             json!({
                 "candidate": row.candidate.as_json(),
                 "validation_rank": index + 1,
                 "selected": selected,
+                "selection_sample_eligible": row.selection_sample_eligible,
+                "selection_sample_reasons": row.selection_sample_reasons,
                 "validation": row.validation,
                 "sealed_test": test
             })
@@ -250,8 +314,8 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
         .collect::<Vec<_>>();
 
     let result = json!({
-        "schema": OOS_SCHEMA_V1,
-        "schema_version": 1,
+        "schema": OOS_SCHEMA_V2,
+        "schema_version": 2,
         "experiment_id": config.experiment_id,
         "evidence_version": config.evidence_version,
         "config_schema_version": config.schema_version,
@@ -293,18 +357,30 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
             "candidate_count": config.candidates.len()
         },
         "split": {
-            "method": "strict_chronological_market_day_walk_forward",
+            "method": "frozen_fixed_consecutive_utc_market_day_windows",
             "grouping": "whole UTC market-end day; every market and order remains in exactly one day",
             "market_days": days,
-            "folds": folds,
-            "aggregate_validation_days": validation_days,
-            "final_test_day": final_test_day,
-            "selection_uses_final_test": false
+            "evaluation_start_day": evaluation_start_day.to_string(),
+            "selection_days": selection_days,
+            "sealed_test_days": test_days,
+            "selection_day_count": config.selection_day_count,
+            "test_day_count": config.test_day_count,
+            "selection_uses_test": false,
+            "endpoint_depends_on_outcomes": false,
+            "raw_selection_sample": raw_selection,
+            "raw_test_sample": raw_test,
+            "minimum_orders_per_window": config.minimum_orders_per_window,
+            "minimum_filled_orders_per_window": config.minimum_filled_orders_per_window,
+            "minimum_unfilled_orders_per_window": config.minimum_unfilled_orders_per_window,
+            "bootstrap_block_days": config.bootstrap_block_days,
+            "bootstrap_resamples": config.bootstrap_resamples
         },
         "selection": {
             "status": "winner_fixed_before_test_open",
             "candidate": selected_name,
-            "rule": "validation queue-qualified settled PnL descending, then 30-second net executable markout PnL descending, then candidate name",
+            "rule": "eligible selection-window queue-qualified settled PnL descending, then 30-second net executable markout PnL descending, then candidate name",
+            "selected_test_status": selected_test_status,
+            "selected_test_sample_reasons": selected_test_reasons,
             "promotion_eligible": false
         },
         "candidates": candidate_rows,
@@ -317,7 +393,7 @@ pub fn run_loss_regime_oos(options: LossRegimeOosOptions) -> Result<Value, Resea
         "polyedge-rs research loss-regime-oos",
         &options.facts,
         "observed_queue_shadow_fill",
-        "strict_chronological_market_day_walk_forward",
+        "frozen_fixed_consecutive_utc_market_day_windows",
         started.elapsed(),
         vec![json!(
             "diagnostic-only isolated experiment; never promotion evidence"
@@ -361,6 +437,14 @@ fn parse_config(text: &str, sha256: String) -> Result<LossRegimeConfig, Research
     let mut frozen_at = None;
     let mut source_campaign_id = None;
     let mut research_only = None;
+    let mut evaluation_start_day = None;
+    let mut selection_day_count = None;
+    let mut test_day_count = None;
+    let mut minimum_orders_per_window = None;
+    let mut minimum_filled_orders_per_window = None;
+    let mut minimum_unfilled_orders_per_window = None;
+    let mut bootstrap_block_days = None;
+    let mut bootstrap_resamples = None;
     let mut candidates = Vec::new();
     let mut current: Option<CandidateBuilder> = None;
     let mut in_candidates = false;
@@ -421,6 +505,20 @@ fn parse_config(text: &str, sha256: String) -> Result<LossRegimeConfig, Research
             "frozen_at" => frozen_at = parse_utc(&value),
             "source_campaign_id" => source_campaign_id = Some(value),
             "research_only" => research_only = parse_bool(&value),
+            "evaluation_start_day" => {
+                evaluation_start_day = NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()
+            }
+            "selection_day_count" => selection_day_count = value.parse::<usize>().ok(),
+            "test_day_count" => test_day_count = value.parse::<usize>().ok(),
+            "minimum_orders_per_window" => minimum_orders_per_window = value.parse::<usize>().ok(),
+            "minimum_filled_orders_per_window" => {
+                minimum_filled_orders_per_window = value.parse::<usize>().ok()
+            }
+            "minimum_unfilled_orders_per_window" => {
+                minimum_unfilled_orders_per_window = value.parse::<usize>().ok()
+            }
+            "bootstrap_block_days" => bootstrap_block_days = value.parse::<usize>().ok(),
+            "bootstrap_resamples" => bootstrap_resamples = value.parse::<usize>().ok(),
             _ => {
                 return Err(invalid(format!(
                     "unsupported loss-regime config field {key}"
@@ -431,8 +529,10 @@ fn parse_config(text: &str, sha256: String) -> Result<LossRegimeConfig, Research
     if let Some(builder) = current.take() {
         candidates.push(finish_candidate(builder)?);
     }
-    if schema_version != Some(1) {
-        return Err(invalid("loss-regime config schema_version must equal 1"));
+    if !matches!(schema_version, Some(1 | 2)) {
+        return Err(invalid(
+            "loss-regime config schema_version must equal 1 or 2",
+        ));
     }
     if research_only != Some(true) {
         return Err(invalid("loss-regime config research_only must equal true"));
@@ -460,6 +560,29 @@ fn parse_config(text: &str, sha256: String) -> Result<LossRegimeConfig, Research
     if experiment_id.starts_with("campaign-") {
         return Err(invalid("experiment_id cannot be a campaign identifier"));
     }
+    let frozen_before_evaluation = frozen_at
+        .as_ref()
+        .zip(evaluation_start_day.as_ref())
+        .is_some_and(|(frozen, start)| {
+            start
+                .and_hms_opt(0, 0, 0)
+                .is_some_and(|start| *frozen < start.and_utc())
+        });
+    if schema_version == Some(2)
+        && (selection_day_count != Some(28)
+            || test_day_count != Some(28)
+            || minimum_orders_per_window != Some(100)
+            || minimum_filled_orders_per_window != Some(10)
+            || minimum_unfilled_orders_per_window != Some(10)
+            || bootstrap_block_days != Some(BLOCK_DAYS)
+            || bootstrap_resamples != Some(BOOTSTRAP_RESAMPLES)
+            || evaluation_start_day.is_none()
+            || !frozen_before_evaluation)
+    {
+        return Err(invalid(
+            "loss-regime config schema_version 2 requires frozen_at strictly before evaluation_start_day 00:00 UTC, 28 selection days, 28 test days, 100 orders, 10 filled orders, 10 unfilled orders, 7-day blocks, and 10000 resamples",
+        ));
+    }
     Ok(LossRegimeConfig {
         schema_version: schema_version.unwrap_or_default(),
         experiment_id,
@@ -471,6 +594,14 @@ fn parse_config(text: &str, sha256: String) -> Result<LossRegimeConfig, Research
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid("source_campaign_id is required"))?,
         research_only: research_only.unwrap_or(false),
+        evaluation_start_day,
+        selection_day_count: selection_day_count.unwrap_or_default(),
+        test_day_count: test_day_count.unwrap_or_default(),
+        minimum_orders_per_window: minimum_orders_per_window.unwrap_or_default(),
+        minimum_filled_orders_per_window: minimum_filled_orders_per_window.unwrap_or_default(),
+        minimum_unfilled_orders_per_window: minimum_unfilled_orders_per_window.unwrap_or_default(),
+        bootstrap_block_days: bootstrap_block_days.unwrap_or_default(),
+        bootstrap_resamples: bootstrap_resamples.unwrap_or_default(),
         candidates,
         sha256,
     })
@@ -550,6 +681,46 @@ fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|value| value.with_timezone(&Utc))
+}
+
+fn fixed_window_days(start: NaiveDate, count: usize) -> Result<Vec<String>, ResearchError> {
+    let mut days = Vec::with_capacity(count);
+    let mut day = start;
+    for index in 0..count {
+        days.push(day.format("%Y-%m-%d").to_string());
+        if index + 1 < count {
+            day = day
+                .succ_opt()
+                .ok_or_else(|| invalid("loss-regime fixed window exceeds the calendar"))?;
+        }
+    }
+    Ok(days)
+}
+
+fn sample_reasons(metrics: &Value, config: &LossRegimeConfig) -> Vec<String> {
+    let accepted_orders = metrics["accepted_orders"].as_u64().unwrap_or_default() as usize;
+    let filled_orders = metrics["filled_orders"].as_u64().unwrap_or_default() as usize;
+    let unfilled_orders = metrics["unfilled_orders"].as_u64().unwrap_or_default() as usize;
+    let mut reasons = Vec::new();
+    if accepted_orders < config.minimum_orders_per_window {
+        reasons.push(format!(
+            "accepted_orders {accepted_orders} < {}",
+            config.minimum_orders_per_window
+        ));
+    }
+    if filled_orders < config.minimum_filled_orders_per_window {
+        reasons.push(format!(
+            "filled_orders {filled_orders} < {}",
+            config.minimum_filled_orders_per_window
+        ));
+    }
+    if unfilled_orders < config.minimum_unfilled_orders_per_window {
+        reasons.push(format!(
+            "unfilled_orders {unfilled_orders} < {}",
+            config.minimum_unfilled_orders_per_window
+        ));
+    }
+    reasons
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -1134,23 +1305,6 @@ fn value_decimal(value: &Value) -> Option<Decimal> {
         .and_then(|value| Decimal::from_str(&value).ok())
 }
 
-fn chronological_folds(days: &[String]) -> Vec<Value> {
-    if days.len() < 3 {
-        return Vec::new();
-    }
-    (1..days.len() - 1)
-        .map(|validation_index| {
-            json!({
-                "fold_index": validation_index - 1,
-                "train_days": days[..validation_index].to_vec(),
-                "validation_day": days[validation_index],
-                "test_day": days[validation_index + 1],
-                "strictly_chronological": true
-            })
-        })
-        .collect()
-}
-
 fn candidate_metrics(
     candidate: &LossRegimeCandidate,
     observations: &[OrderObservation],
@@ -1163,6 +1317,8 @@ fn candidate_metrics(
         .collect::<BTreeMap<_, _>>();
     let mut total_orders = 0usize;
     let mut accepted_orders = 0usize;
+    let mut filled_orders = 0usize;
+    let mut unfilled_orders = 0usize;
     let mut fill_rows = 0usize;
     let mut markets = BTreeSet::new();
     let mut settled_pnl = Decimal::ZERO;
@@ -1178,6 +1334,13 @@ fn candidate_metrics(
             continue;
         }
         accepted_orders += 1;
+        if row.fill_count > 0 {
+            filled_orders += 1;
+            day.filled_orders += 1;
+        } else {
+            unfilled_orders += 1;
+            day.unfilled_orders += 1;
+        }
         fill_rows += row.fill_count;
         markets.insert(row.market_id.clone());
         settled_pnl += row.settled_net_pnl;
@@ -1199,10 +1362,17 @@ fn candidate_metrics(
         .map(|metrics| metrics.settled_pnl)
         .collect::<Vec<_>>();
     let lower = block_bootstrap_daily_lower_95(&daily_pnl);
+    let daily_markout = daily
+        .values()
+        .map(|metrics| metrics.markout_pnl)
+        .collect::<Vec<_>>();
+    let markout_lower = block_bootstrap_daily_lower_95(&daily_markout);
     json!({
         "days": days,
         "total_orders": total_orders,
         "accepted_orders": accepted_orders,
+        "filled_orders": filled_orders,
+        "unfilled_orders": unfilled_orders,
         "filtered_orders": total_orders.saturating_sub(accepted_orders),
         "acceptance_rate": ratio_json(accepted_orders, total_orders),
         "markets": markets.len(),
@@ -1212,10 +1382,14 @@ fn candidate_metrics(
         "net_executable_markout_30s_pnl": markout_pnl.to_string(),
         "net_executable_markout_30s_count": markout_count,
         "net_executable_markout_30s_mean": (markout_count > 0).then(|| (markout_pnl / Decimal::from(markout_count as u64)).to_string()),
+        "net_executable_markout_30s_lower_95_mean_daily_pnl": markout_lower.map(|value| value.to_string()),
+        "net_executable_markout_30s_lower_95_available": markout_lower.is_some(),
         "daily_increments": daily_rows,
         "pnl_lower_95": lower.map(|value| value.to_string()),
         "pnl_lower_95_available": lower.is_some(),
         "pnl_lower_95_minimum_daily_clusters": BLOCK_DAYS * MIN_BLOCKS,
+        "pnl_lower_95_estimand": "mean_daily_queue_qualified_settled_net_pnl",
+        "markout_30s_lower_95_estimand": "mean_daily_net_executable_markout_30s_pnl",
         "pnl_lower_95_method": "seven_day_circular_block_bootstrap_10000_resamples"
     })
 }
@@ -1224,6 +1398,8 @@ fn candidate_metrics(
 struct DailyMetrics {
     total_orders: usize,
     accepted_orders: usize,
+    filled_orders: usize,
+    unfilled_orders: usize,
     fill_rows: usize,
     markets: BTreeSet<String>,
     settled_pnl: Decimal,
@@ -1237,6 +1413,8 @@ impl DailyMetrics {
             "date": date,
             "total_orders": self.total_orders,
             "accepted_orders": self.accepted_orders,
+            "filled_orders": self.filled_orders,
+            "unfilled_orders": self.unfilled_orders,
             "filtered_orders": self.total_orders.saturating_sub(self.accepted_orders),
             "markets": self.markets.len(),
             "queue_shadow_fill_rows": self.fill_rows,
@@ -1292,7 +1470,7 @@ fn block_bootstrap_daily_lower_95(values: &[Decimal]) -> Option<Decimal> {
 fn render_markdown(report: &Value) -> String {
     let result = &report["result"];
     format!(
-        "# Loss-Regime OOS Experiment\n\n- Experiment: **{}**\n- Source campaign: **{}**\n- Evidence: **diagnostic only / never promotion eligible**\n- Frozen at: **{}**\n- Sealed market days: **{}**\n- Selected validation candidate: **{}**\n- Queue source: `paper_shadow_lifecycle_plus_public_l2`\n- Queue position: `inferred_size_ahead` (literal FIFO unavailable)\n\nThe final market day is exposed only for the validation-selected candidate. A selected policy requires a new, separately frozen future campaign.\n",
+        "# Loss-Regime OOS Experiment\n\n- Experiment: **{}**\n- Source campaign: **{}**\n- Evidence: **diagnostic only / never promotion eligible**\n- Frozen at: **{}**\n- Sealed market days: **{}**\n- Selected validation candidate: **{}**\n- Queue source: `paper_shadow_lifecycle_plus_public_l2`\n- Queue position: `inferred_size_ahead` (literal FIFO unavailable)\n\nThe fixed 28-day sealed test window is exposed only for the candidate selected on the preceding fixed 28-day window. A selected policy requires a new, separately frozen future campaign.\n",
         result["experiment_id"].as_str().unwrap_or("unknown"),
         result["source_campaign_id"].as_str().unwrap_or("unknown"),
         result["frozen_at"].as_str().unwrap_or("unknown"),
@@ -1341,6 +1519,7 @@ mod tests {
     struct OrderSpec {
         day_offset: i64,
         suffix: &'static str,
+        filled: bool,
         edge: &'static str,
         outcome: &'static str,
         winner: &'static str,
@@ -1362,7 +1541,7 @@ mod tests {
 
     fn config_text(experiment_id: &str) -> String {
         format!(
-            "schema_version: 1\nexperiment_id: {experiment_id}\nevidence_version: loss-regime-oos-v1\nfrozen_at: \"2026-07-22T00:00:00Z\"\nsource_campaign_id: campaign-2026-07-23\nresearch_only: true\ncandidates:\n  - name: baseline_no_abstention\n  - name: high_edge\n    minimum_expected_edge: \"0.02\"\n"
+            "schema_version: 2\nexperiment_id: {experiment_id}\nevidence_version: loss-regime-oos-v2\nfrozen_at: \"2026-07-23T23:59:59Z\"\nsource_campaign_id: campaign-2026-07-23\nresearch_only: true\nevaluation_start_day: 2026-07-24\nselection_day_count: 28\ntest_day_count: 28\nminimum_orders_per_window: 100\nminimum_filled_orders_per_window: 10\nminimum_unfilled_orders_per_window: 10\nbootstrap_block_days: 7\nbootstrap_resamples: 10000\ncandidates:\n  - name: baseline_no_abstention\n  - name: high_edge\n    minimum_expected_edge: \"0.02\"\n"
         )
     }
 
@@ -1374,8 +1553,8 @@ mod tests {
         row
     }
 
-    fn order_and_fill(spec: &OrderSpec) -> (Value, Value) {
-        let base = parse_utc("2026-07-23T00:00:00Z").unwrap() + Duration::days(spec.day_offset);
+    fn order_and_fill(spec: &OrderSpec) -> (Value, Option<Value>) {
+        let base = parse_utc("2026-07-24T00:00:00Z").unwrap() + Duration::days(spec.day_offset);
         let submitted = base + Duration::minutes(1);
         let end = base + Duration::minutes(10);
         let recorded = base + Duration::minutes(11);
@@ -1388,22 +1567,28 @@ mod tests {
         } else {
             Decimal::ZERO
         };
-        let settled = (payout - price) * fill_size;
-        let fill = fact_hash(json!({
-            "schema": FILL_FACT_SCHEMA_V1,
-            "schema_version": 1,
-            "fill_lifecycle_id": format!("fill-{order_id}"),
-            "fill_source": "queue_shadow_fill",
-            "order_id": order_id,
-            "market_id": market_id,
-            "token_id": format!("token-{}", spec.suffix),
-            "side": "buy",
-            "fill_price": spec.price,
-            "fill_size": spec.size,
-            "fee_per_share": "0",
-            "markout_30s_status": "observed",
-            "net_executable_markout_30s_pnl": spec.markout
-        }));
+        let settled = if spec.filled {
+            (payout - price) * fill_size
+        } else {
+            Decimal::ZERO
+        };
+        let fill = spec.filled.then(|| {
+            fact_hash(json!({
+                "schema": FILL_FACT_SCHEMA_V1,
+                "schema_version": 1,
+                "fill_lifecycle_id": format!("fill-{order_id}"),
+                "fill_source": "queue_shadow_fill",
+                "order_id": order_id,
+                "market_id": market_id,
+                "token_id": format!("token-{}", spec.suffix),
+                "side": "buy",
+                "fill_price": spec.price,
+                "fill_size": spec.size,
+                "fee_per_share": "0",
+                "markout_30s_status": "observed",
+                "net_executable_markout_30s_pnl": spec.markout
+            }))
+        });
         let order = fact_hash(json!({
             "schema": ORDER_FACT_SCHEMA_V2,
             "schema_version": 2,
@@ -1423,7 +1608,7 @@ mod tests {
             "token_id": format!("token-{}", spec.suffix),
             "side": "buy",
             "order_size": spec.size,
-            "fill_count": 1,
+            "fill_count": usize::from(spec.filled),
             "submitted_ts": ts(submitted),
             "terminal_market_end_ts": ts(end),
             "terminal_settlement_recorded_ts": ts(recorded),
@@ -1459,7 +1644,13 @@ mod tests {
     fn write_facts(root: &Path, specs: &[OrderSpec]) -> PathBuf {
         let facts = root.join("facts");
         fs::create_dir_all(&facts).unwrap();
-        let (orders, fills): (Vec<_>, Vec<_>) = specs.iter().map(order_and_fill).unzip();
+        let mut orders = Vec::with_capacity(specs.len());
+        let mut fills = Vec::new();
+        for spec in specs {
+            let (order, fill) = order_and_fill(spec);
+            orders.push(order);
+            fills.extend(fill);
+        }
         let order_bytes = jsonl_bytes(&orders);
         let fill_bytes = jsonl_bytes(&fills);
         let summary = json!({
@@ -1516,6 +1707,7 @@ mod tests {
         {
             let order: Value = serde_json::from_str(line).unwrap();
             let market_id = order["market_id"].as_str().unwrap();
+            let queue_fill_event_count = order["fill_count"].as_u64().unwrap();
             let evidence = json!({
                 "book_snapshot_count": 1,
                 "price_change_count": 1,
@@ -1527,7 +1719,7 @@ mod tests {
                 "size_ahead_samples": ["10"],
                 "ignored_opposite_trade_count": 0,
                 "missing_or_unknown_trade_side_count": 0,
-                "queue_fill_event_count": 1,
+                "queue_fill_event_count": queue_fill_event_count,
                 "queue_partial_fill_event_count": 0
             });
             market_eligibility.insert(
@@ -1536,7 +1728,7 @@ mod tests {
                     "market_id": market_id,
                     "eligible": true,
                     "reasons": [],
-                    "queue_fill_event_count": 1,
+                    "queue_fill_event_count": queue_fill_event_count,
                     "queue_partial_fill_event_count": 0,
                     "queue_evidence_sha256": canonical_value_sha256(&evidence),
                     "queue_evidence": evidence
@@ -1631,6 +1823,7 @@ mod tests {
             &[OrderSpec {
                 day_offset: 0,
                 suffix: "one",
+                filled: true,
                 edge: "0.03",
                 outcome: "up",
                 winner: "up",
@@ -1663,6 +1856,7 @@ mod tests {
             &[OrderSpec {
                 day_offset: 0,
                 suffix: "one",
+                filled: true,
                 edge: "0.03",
                 outcome: "up",
                 winner: "up",
@@ -1690,6 +1884,16 @@ mod tests {
     }
 
     #[test]
+    fn v2_config_rejects_freeze_at_or_after_evaluation_start() {
+        let text = config_text("experiment-bad-freeze")
+            .replace("2026-07-23T23:59:59Z", "2026-07-24T00:00:00Z");
+        let error = parse_config(&text, sha256_prefixed(text.as_bytes())).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("frozen_at strictly before evaluation_start_day"));
+    }
+
+    #[test]
     fn partial_fill_settlement_arithmetic_is_outcome_side_and_fee_aware() {
         let first = settled_fill_pnl(
             "buy",
@@ -1710,57 +1914,67 @@ mod tests {
         assert_eq!(first + second, Decimal::new(4425, 4));
     }
 
-    #[test]
-    fn final_test_outcome_cannot_change_validation_selection() {
-        let common = [
-            OrderSpec {
-                day_offset: 0,
-                suffix: "train",
-                edge: "0.03",
+    fn leaked(value: String) -> &'static str {
+        Box::leak(value.into_boxed_str())
+    }
+
+    fn mature_specs(test_winner: &'static str, test_high_edge_available: bool) -> Vec<OrderSpec> {
+        let mut specs = Vec::new();
+        for day_offset in 0..56 {
+            let in_test = day_offset >= 28;
+            let high_edge = if in_test && !test_high_edge_available {
+                "0.01"
+            } else {
+                "0.03"
+            };
+            specs.push(OrderSpec {
+                day_offset,
+                suffix: leaked(format!("high-fill-{day_offset}")),
+                filled: true,
+                edge: high_edge,
                 outcome: "up",
-                winner: "up",
+                winner: if in_test { test_winner } else { "up" },
                 price: "0.40",
                 size: "1",
-                markout: "0.01",
-            },
-            OrderSpec {
-                day_offset: 1,
-                suffix: "low",
+                markout: if in_test && test_winner == "down" {
+                    "-0.04"
+                } else {
+                    "0.04"
+                },
+            });
+            for index in 0..3 {
+                specs.push(OrderSpec {
+                    day_offset,
+                    suffix: leaked(format!("high-unfilled-{day_offset}-{index}")),
+                    filled: false,
+                    edge: high_edge,
+                    outcome: "up",
+                    winner: "up",
+                    price: "0.40",
+                    size: "1",
+                    markout: "0",
+                });
+            }
+            specs.push(OrderSpec {
+                day_offset,
+                suffix: leaked(format!("low-fill-{day_offset}")),
+                filled: true,
                 edge: "0.01",
                 outcome: "up",
                 winner: "down",
                 price: "0.40",
                 size: "1",
                 markout: "-0.02",
-            },
-            OrderSpec {
-                day_offset: 1,
-                suffix: "high",
-                edge: "0.03",
-                outcome: "up",
-                winner: "up",
-                price: "0.40",
-                size: "1",
-                markout: "0.03",
-            },
-        ];
-        let run = |name: &str, final_winner: &'static str| {
-            let root = test_root(name);
-            let mut specs = common.to_vec();
-            specs.push(OrderSpec {
-                day_offset: 2,
-                suffix: "test",
-                edge: "0.03",
-                outcome: "up",
-                winner: final_winner,
-                price: "0.40",
-                size: "1",
-                markout: if final_winner == "up" {
-                    "0.04"
-                } else {
-                    "-0.04"
-                },
             });
+        }
+        specs
+    }
+
+    #[test]
+    fn final_test_outcome_cannot_change_fixed_window_selection() {
+        let run = |name: &str, test_winner: &'static str| {
+            let root = test_root(name);
+            let specs = mature_specs(test_winner, true);
             let facts = write_facts(&root, &specs);
             run_loss_regime_oos(options(&root, facts, name)).unwrap()
         };
@@ -1775,12 +1989,140 @@ mod tests {
             positive["result"]["candidates"][0]["sealed_test"],
             negative["result"]["candidates"][0]["sealed_test"]
         );
+        assert_eq!(
+            positive["result"]["split"]["selection_day_count"],
+            json!(28)
+        );
+        assert_eq!(positive["result"]["split"]["test_day_count"], json!(28));
+        assert_eq!(
+            positive["result"]["candidates"][0]["sealed_test"]["metrics"]["pnl_lower_95_available"],
+            json!(true)
+        );
+        assert_eq!(
+            positive["result"]["candidates"][0]["sealed_test"]["metrics"]
+                ["net_executable_markout_30s_lower_95_available"],
+            json!(true)
+        );
         assert!(positive["result"]["candidates"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|row| row["selected"] == false)
             .all(|row| row["sealed_test"]["status"] == "sealed_not_selected"));
+    }
+
+    #[test]
+    fn immature_fixed_window_fails_without_creating_outputs() {
+        let root = test_root("experiment-immature");
+        let specs = mature_specs("up", true)
+            .into_iter()
+            .filter(|spec| spec.day_offset < 55)
+            .collect::<Vec<_>>();
+        let facts = write_facts(&root, &specs);
+        let options = options(&root, facts, "experiment-immature");
+        let out = options.out.clone();
+        let markdown = options.markdown.clone();
+        let error = run_loss_regime_oos(options).unwrap_err();
+        assert!(error.to_string().contains("not mature"));
+        assert!(!out.exists());
+        assert!(!markdown.exists());
+    }
+
+    #[test]
+    fn complete_calendar_with_raw_window_below_one_hundred_orders_fails_closed() {
+        let root = test_root("experiment-raw-insufficient");
+        let specs = mature_specs("up", true)
+            .into_iter()
+            .filter(|spec| spec.suffix.contains("high-fill") || spec.suffix.ends_with("-0"))
+            .collect::<Vec<_>>();
+        let facts = write_facts(&root, &specs);
+        let options = options(&root, facts, "experiment-raw-insufficient");
+        let out = options.out.clone();
+        let error = run_loss_regime_oos(options).unwrap_err();
+        assert!(error.to_string().contains("raw windows are insufficient"));
+        assert!(error.to_string().contains("accepted_orders 56 < 100"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn candidate_below_selection_sample_minimum_cannot_win() {
+        let root = test_root("experiment-candidate-insufficient");
+        let mut specs = mature_specs("up", true);
+        for spec in &mut specs {
+            if spec.day_offset < 10 && !spec.filled && spec.edge == "0.03" {
+                spec.edge = "0.01";
+            }
+        }
+        let facts = write_facts(&root, &specs);
+        let report =
+            run_loss_regime_oos(options(&root, facts, "experiment-candidate-insufficient"))
+                .unwrap();
+        assert_eq!(
+            report["result"]["selection"]["candidate"],
+            "baseline_no_abstention"
+        );
+        let high_edge = report["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["candidate"]["name"] == "high_edge")
+            .unwrap();
+        assert_eq!(high_edge["selection_sample_eligible"], json!(false));
+        assert!(high_edge["selection_sample_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .is_some_and(|reason| reason.contains("accepted_orders 82 < 100"))));
+    }
+
+    #[test]
+    fn selected_winner_with_insufficient_test_subset_does_not_fall_back() {
+        let root = test_root("experiment-test-insufficient");
+        let specs = mature_specs("up", false);
+        let facts = write_facts(&root, &specs);
+        let report =
+            run_loss_regime_oos(options(&root, facts, "experiment-test-insufficient")).unwrap();
+        assert_eq!(report["result"]["selection"]["candidate"], "high_edge");
+        assert_eq!(
+            report["result"]["selection"]["selected_test_status"],
+            "insufficient_selected_candidate_sample"
+        );
+        let selected = report["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["selected"] == true)
+            .unwrap();
+        assert_eq!(
+            selected["sealed_test"]["status"],
+            "insufficient_selected_candidate_sample"
+        );
+        assert_eq!(
+            report["result"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["selected"] == true)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn deprecated_v1_config_cannot_execute() {
+        let root = test_root("experiment-v1-deprecated");
+        let facts = write_facts(&root, &mature_specs("up", true));
+        let options = options(&root, facts, "experiment-v1-deprecated");
+        fs::write(
+            &options.config,
+            "schema_version: 1\nexperiment_id: experiment-v1-deprecated\nevidence_version: loss-regime-oos-v1\nfrozen_at: \"2026-07-22T00:00:00Z\"\nsource_campaign_id: campaign-2026-07-23\nresearch_only: true\ncandidates:\n  - name: baseline\n",
+        )
+        .unwrap();
+        let error = run_loss_regime_oos(options.clone()).unwrap_err();
+        assert!(error.to_string().contains("deprecated"));
+        assert!(!options.out.exists());
     }
 
     #[test]

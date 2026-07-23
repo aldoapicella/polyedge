@@ -52,7 +52,7 @@ jobs:
           git merge-base --is-ancestor "$CAMPAIGN_RUNTIME_SHA" HEAD
           while IFS= read -r path; do
             case "$path" in
-              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/run_shadow_daily.sh|research/test_run_shadow_daily.sh|docs/*|.github/workflows/deploy-polyedge-research-jobs.yml|.github/workflows/deploy-polyedge-active.yml) ;;
+              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/configs/experiments/loss-regime-oos-v*.yaml|research/run_shadow_daily.sh|research/test_run_shadow_daily.sh|docs/*|.github/workflows/deploy-polyedge-research-jobs.yml|.github/workflows/deploy-polyedge-active.yml) ;;
               *) echo "Research image contains an out-of-scope change: $path" >&2; exit 1 ;;
             esac
           done < <(git diff --name-only "$CAMPAIGN_RUNTIME_SHA"...HEAD)

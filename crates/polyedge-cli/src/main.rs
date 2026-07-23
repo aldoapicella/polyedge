@@ -1766,13 +1766,13 @@ mod tests {
             "--queue-evidence",
             "baseline.json",
             "--config",
-            "research/configs/experiments/loss-regime-oos-v1-2026-07-22.yaml",
+            "research/configs/experiments/loss-regime-oos-v2-2026-07-23.yaml",
             "--source-campaign-id",
             "campaign-2026-07-23",
             "--out",
-            "reports/research/experiments/loss-regime-oos-v1/report.json",
+            "reports/research/experiments/experiment-loss-regime-oos-v2-2026-07-23/report.json",
             "--markdown",
-            "reports/research/experiments/loss-regime-oos-v1/report.md",
+            "reports/research/experiments/experiment-loss-regime-oos-v2-2026-07-23/report.md",
         ])
         .expect("parse loss regime OOS command");
         let Command::Research {
@@ -1792,7 +1792,7 @@ mod tests {
         assert_eq!(facts, PathBuf::from("loss-diagnostics"));
         assert_eq!(queue_evidence, PathBuf::from("baseline.json"));
         assert_eq!(source_campaign_id, "campaign-2026-07-23");
-        assert!(config.ends_with("loss-regime-oos-v1-2026-07-22.yaml"));
+        assert!(config.ends_with("loss-regime-oos-v2-2026-07-23.yaml"));
         assert!(out.starts_with("reports/research/experiments"));
         assert!(markdown.starts_with("reports/research/experiments"));
         assert!(Cli::try_parse_from(["polyedge-rs", "research", "loss-regime-oos"]).is_err());
