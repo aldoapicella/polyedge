@@ -177,6 +177,38 @@ queue-snapshot coverage is likewise N/A and the execution gate remains
 increase the profitability clean-day suffix. The dashboard must render these
 explicit empty-denominator cases as N/A, never as 0% or 100%.
 
+### Historical 52.53% forensic baseline
+
+The displayed July 19 historical rate of `52/99 = 52.53%` mixed 96 markets
+whose `start_ts` belonged to July 19 with three July 20 discovery stubs. The
+corrected sealed-day denominator is 96, so exact-start coverage is
+`52/96 = 54.17%`; 44 markets lack an exact start. This correction fixes the
+denominator but does not make the historical day eligible.
+
+The authoritative corrected atomic bundle
+`shadow-2026-07-19-20260721T201047Z` separates the remaining components:
+
+- settlement coverage is `53/96 = 55.21%`, leaving 43 markets without valid
+  terminal evidence;
+- all 46,347 recorded decisions contain strategy metadata, but only 40,721
+  qualify for final decision grade (`87.86%`), leaving 5,626 below grade;
+- full decision replay parity is unavailable because the legacy day contains
+  no runtime/replay strategy-batch evidence and all 46,347 decisions are
+  unbound to the later batch contract;
+- execution fields are complete for `1,039/1,039` place decisions, so
+  execution-field capture is not the source of the 52.53% display;
+- queue snapshots join `1,037/1,039` registered orders (`99.81%`), leaving two
+  missing exact order-ID joins;
+- ten fill lifecycles require one 1/5/30-second markout each. Thirty legacy
+  markout rows exist, but none contains the supported horizon and lifecycle
+  binding, so usable completion is `0/10` at every horizon and the 30-second
+  confidence bound is unavailable.
+
+The day therefore remains `historical_ineligible` even though execution-field
+and queue-snapshot capture are high. Missing exact starts, terminal evidence,
+batch parity, and lifecycle-bound markouts cannot be reconstructed honestly by
+rerunning a newer reporter over legacy bytes.
+
 ### Decision-grade evidence contract v4
 
 The overall shadow campaign remains Protocol v3, but final decision binding
