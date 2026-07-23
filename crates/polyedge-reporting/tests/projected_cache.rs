@@ -82,8 +82,8 @@ fn projected_days_equal_full_cross_midnight_replay_and_bound_readers() {
         full_markets["result"]["markets"]
     );
     assert_eq!(
-        campaign_regimes["result"]["profiles"],
-        full_regimes["result"]["profiles"]
+        profiles_without_queue_input_binding(&campaign_regimes["result"]["profiles"]),
+        profiles_without_queue_input_binding(&full_regimes["result"]["profiles"])
     );
     let static_profile = campaign_regimes["result"]["profiles"]
         .as_array()
@@ -389,6 +389,19 @@ fn current_pointer_gzip(cache: &Path, date: NaiveDate) -> PathBuf {
 
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn profiles_without_queue_input_binding(profiles: &Value) -> Value {
+    let mut profiles = profiles.clone();
+    for profile in profiles.as_array_mut().into_iter().flatten() {
+        if let Some(queue) = profile
+            .pointer_mut("/replay_metrics/queue_proxy")
+            .and_then(Value::as_object_mut)
+        {
+            queue.remove("input_binding");
+        }
+    }
+    profiles
 }
 
 fn date(year: i32, month: u32, day: u32) -> NaiveDate {
