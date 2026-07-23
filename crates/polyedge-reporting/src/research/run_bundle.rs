@@ -129,9 +129,21 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
             WarningSeverity::Blocking,
             true,
         )
+    } else if message.starts_with("start price capture evidence invalid: ") {
+        (
+            "start_price_capture_evidence_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
     } else if message.starts_with("settlement coverage below 95%: ") {
         (
             "settlement_coverage_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("settlement coverage evidence invalid: ") {
+        (
+            "settlement_coverage_evidence_invalid",
             WarningSeverity::Blocking,
             true,
         )
@@ -176,6 +188,18 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
     } else if message.starts_with("place-decision execution-field coverage below 95%: ") {
         (
             "execution_fields_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("place-decision execution-field evidence invalid: ") {
+        (
+            "execution_field_evidence_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
+    } else if message.starts_with("exact raw duplicate events are promotion-blocking: ") {
+        (
+            "raw_event_duplicate",
             WarningSeverity::Blocking,
             true,
         )
@@ -763,6 +787,7 @@ pub fn publish_daily_directory(
     output_root: &Path,
     data_audit_path: &Path,
 ) -> Result<PublishedDailyBundle, ResearchError> {
+    let input_sha256 = input_sha256.into();
     if !source_dir.is_dir() {
         return Err(ResearchError::InvalidInput(format!(
             "daily source directory does not exist: {}",
@@ -796,6 +821,7 @@ pub fn publish_daily_directory(
     ));
     artifacts.sort_by(|left, right| left.0.cmp(&right.0));
     let audit_value: serde_json::Value = read_json(data_audit_path)?;
+    verify_daily_input_manifest(&audit_value, &input_sha256)?;
     let mut quality = quality_from_audit_for_date(&audit_value, date, &expected_runtime_role);
     let execution_quality_path = source_dir.join("execution_quality.json");
     if execution_quality_path.is_file() {
@@ -988,10 +1014,6 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
     let strategy_evaluations = result
         .get("strategy_evaluations")
         .and_then(serde_json::Value::as_u64);
-    let start_capture = result
-        .get("start_price_capture_rate")
-        .and_then(decimal_from_json);
-    let settlement = result.get("settlement_rate").and_then(decimal_from_json);
     let fatal_issues = result
         .get("fatal_data_quality_issues")
         .and_then(serde_json::Value::as_array)
@@ -1011,6 +1033,42 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
                 .flatten()
                 .filter_map(value_as_message),
         );
+    }
+    let start_capture = reconciled_coverage_rate(
+        result,
+        "start_price_capture_rate",
+        "markets_with_start_price",
+        "markets_seen",
+        false,
+        "start price capture",
+        &mut warnings,
+    );
+    let settlement = reconciled_coverage_rate(
+        result,
+        "settlement_rate",
+        "markets_settled",
+        "markets_seen",
+        false,
+        "settlement coverage",
+        &mut warnings,
+    );
+    let execution_field_coverage = reconciled_coverage_rate(
+        result,
+        "execution_field_coverage",
+        "place_decisions_with_complete_execution_fields",
+        "place_decisions",
+        true,
+        "place-decision execution-field",
+        &mut warnings,
+    );
+    if let Some(duplicates) = result
+        .get("duplicate_estimate")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|duplicates| *duplicates > 0)
+    {
+        warnings.push(format!(
+            "exact raw duplicate events are promotion-blocking: {duplicates}"
+        ));
     }
     warnings.sort();
     warnings.dedup();
@@ -1078,9 +1136,7 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
         final_decision_grade_coverage: result
             .get("final_decision_grade_coverage")
             .and_then(decimal_from_json),
-        execution_field_coverage: result
-            .get("execution_field_coverage")
-            .and_then(decimal_from_json),
+        execution_field_coverage,
         decision_parity_rate: result
             .get("decision_parity_rate")
             .and_then(decimal_from_json),
@@ -1628,6 +1684,119 @@ fn decimal_from_json(value: &serde_json::Value) -> Option<Decimal> {
         .map(Decimal::from)
         .or_else(|| value.as_u64().map(Decimal::from))
         .or_else(|| value.as_f64().and_then(Decimal::from_f64))
+}
+
+fn reconciled_coverage_rate(
+    result: &serde_json::Value,
+    rate_field: &str,
+    numerator_field: &str,
+    denominator_field: &str,
+    zero_denominator_is_complete: bool,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Option<Decimal> {
+    let reported = result.get(rate_field).and_then(decimal_from_json);
+    let numerator = result
+        .get(numerator_field)
+        .and_then(serde_json::Value::as_u64);
+    let denominator = result
+        .get(denominator_field)
+        .and_then(serde_json::Value::as_u64);
+    let invalid = |detail: String, warnings: &mut Vec<String>| {
+        warnings.push(format!("{label} evidence invalid: {detail}"));
+        None
+    };
+    let (Some(numerator), Some(denominator)) = (numerator, denominator) else {
+        return invalid(
+            format!(
+                "canonical counts missing ({numerator_field}={numerator:?}, {denominator_field}={denominator:?})"
+            ),
+            warnings,
+        );
+    };
+    if numerator > denominator {
+        return invalid(
+            format!("numerator {numerator} exceeds denominator {denominator}"),
+            warnings,
+        );
+    }
+    if denominator == 0 {
+        let expected = zero_denominator_is_complete.then_some(Decimal::ONE);
+        return if reported == expected {
+            expected
+        } else {
+            invalid(
+                format!(
+                    "reported rate {} contradicts empty denominator",
+                    reported
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "missing".to_owned())
+                ),
+                warnings,
+            )
+        };
+    }
+    let Some(reported) = reported else {
+        return invalid(
+            format!("reported rate missing for {numerator}/{denominator}"),
+            warnings,
+        );
+    };
+    if !(Decimal::ZERO..=Decimal::ONE).contains(&reported) {
+        return invalid(
+            format!("reported rate {reported} is outside [0,1]"),
+            warnings,
+        );
+    }
+    let canonical = Decimal::from(numerator) / Decimal::from(denominator);
+    if (reported - canonical).abs() > Decimal::new(1, 12) {
+        return invalid(
+            format!("reported rate {reported} does not match {numerator}/{denominator}"),
+            warnings,
+        );
+    }
+    Some(canonical)
+}
+
+fn verify_daily_input_manifest(
+    audit: &serde_json::Value,
+    expected_sha256: &str,
+) -> Result<(), ResearchError> {
+    validate_sha256("input_sha256", expected_sha256)?;
+    let input_path = audit
+        .get("input_path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "daily data audit is missing the normalized input_path required to verify input_sha256"
+                    .to_owned(),
+            )
+        })?;
+    if input_path.starts_with("azure://") {
+        return Err(ResearchError::InvalidInput(
+            "daily data audit input_path must name the local normalized snapshot whose events_manifest.json is being bound"
+                .to_owned(),
+        ));
+    }
+    let manifest_path = Path::new(input_path).join("events_manifest.json");
+    let bytes = fs::read(&manifest_path).map_err(|error| {
+        ResearchError::InvalidInput(format!(
+            "daily normalized input manifest is not readable at {}: {error}",
+            manifest_path.display()
+        ))
+    })?;
+    let observed = sha256_bytes(&bytes);
+    let expected = expected_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(expected_sha256);
+    if observed != expected {
+        return Err(ResearchError::InvalidInput(format!(
+            "daily input_sha256 does not match {}",
+            manifest_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn execution_completion_metric(

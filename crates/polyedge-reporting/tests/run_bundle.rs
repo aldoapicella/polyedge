@@ -668,13 +668,14 @@ fn generated_daily_directory_is_packaged_with_required_artifacts_and_quality() {
         "{\"must_not_publish\":true}\n",
     )
     .unwrap();
-    let audit = source.join("data_audit.json");
-    fs::write(&audit, complete_daily_audit("2026-07-12", 0.97)).unwrap();
+    let mut audit_value: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-12", 0.97)).unwrap();
+    let (audit, input_sha256) = write_bound_daily_audit(&source, &mut audit_value);
 
     let published = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 12).unwrap(),
         "daily-20260712",
-        "d".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -745,15 +746,17 @@ fn daily_manifest_does_not_mislabel_lifecycle_coverage_as_decision_grade() {
         serde_json::json!(52.0 / 99.0),
     );
     result.insert("settlement_rate".to_owned(), serde_json::json!(55.0 / 99.0));
+    result.insert("markets_seen".to_owned(), serde_json::json!(99));
+    result.insert("markets_with_start_price".to_owned(), serde_json::json!(52));
+    result.insert("markets_settled".to_owned(), serde_json::json!(55));
     result.insert("strategy_evaluations".to_owned(), serde_json::json!(0));
     result.insert("decision_count".to_owned(), serde_json::json!(46_347));
-    let audit_path = source.join("data_audit.json");
-    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+    let (audit_path, input_sha256) = write_bound_daily_audit(&source, &mut audit);
 
     let published = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
         "shadow-2026-07-19-legacy-denominator",
-        "f".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -765,11 +768,11 @@ fn daily_manifest_does_not_mislabel_lifecycle_coverage_as_decision_grade() {
     assert_eq!(quality.decision_grade_coverage, Decimal::ZERO);
     assert_eq!(
         quality.coverage_breakdown.start_price_capture_rate,
-        Some(Decimal::from_str_exact("0.525252525252525").unwrap())
+        Some(Decimal::from(52_u64) / Decimal::from(99_u64))
     );
     assert_eq!(
         quality.coverage_breakdown.settlement_rate,
-        Some(Decimal::from_str_exact("0.555555555555556").unwrap())
+        Some(Decimal::from(55_u64) / Decimal::from(99_u64))
     );
     assert_eq!(quality.coverage_breakdown.decision_grade_coverage, None);
     assert!(quality.warnings.iter().any(|warning| {
@@ -848,10 +851,103 @@ fn daily_manifest_rejects_inconsistent_decision_grade_ratio() {
     assert!(!quality.promotion_allowed());
 }
 
+#[test]
+fn direct_daily_publisher_rejects_false_normalized_manifest_hash() {
+    let root = test_dir("publish_false_input_hash");
+    let source = root.join("generated");
+    fs::create_dir_all(&source).unwrap();
+    for name in ["baseline.json", "regimes.json", "final_report.json"] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-23", 1.0)).unwrap();
+    let (audit_path, valid_input_sha256) = write_bound_daily_audit(&source, &mut audit);
+    assert_ne!(valid_input_sha256, format!("sha256:{}", "f".repeat(64)));
+
+    let error = publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+        "shadow-2026-07-23-false-input",
+        format!("sha256:{}", "f".repeat(64)),
+        polyedge_config::RuntimeRole::ProfitabilityShadow,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit_path,
+    )
+    .expect_err("a false input binding must fail before publication");
+
+    assert!(error
+        .to_string()
+        .contains("daily input_sha256 does not match"));
+}
+
+#[test]
+fn direct_daily_publisher_blocks_inconsistent_lifecycle_and_execution_rates() {
+    let cases = [
+        (
+            "start",
+            "start_price_capture_rate",
+            serde_json::json!(1.1),
+            "start_price_capture_evidence_invalid",
+        ),
+        (
+            "settlement",
+            "settlement_rate",
+            serde_json::json!(0.99),
+            "settlement_coverage_evidence_invalid",
+        ),
+        (
+            "execution",
+            "execution_field_coverage",
+            serde_json::json!(0.50),
+            "execution_field_evidence_invalid",
+        ),
+    ];
+    for (name, field, value, expected_rule) in cases {
+        let mut audit: serde_json::Value =
+            serde_json::from_slice(&complete_daily_audit("2026-07-23", 1.0)).unwrap();
+        audit["result"][field] = value;
+        let quality = publish_quality_fixture(
+            &format!("publish_inconsistent_{name}_coverage"),
+            &format!("shadow-2026-07-23-{name}-coverage"),
+            audit,
+        );
+        assert!(!quality.promotion_allowed());
+        assert!(quality
+            .warnings
+            .iter()
+            .any(|warning| warning.rule_id == expected_rule && warning.known));
+    }
+}
+
+#[test]
+fn direct_daily_publisher_blocks_exact_raw_duplicates() {
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-23", 1.0)).unwrap();
+    audit["result"]["duplicate_estimate"] = serde_json::json!(3);
+
+    let quality = publish_quality_fixture(
+        "publish_exact_raw_duplicates",
+        "shadow-2026-07-23-duplicates",
+        audit,
+    );
+
+    assert!(!quality.promotion_allowed());
+    assert!(quality.warnings.iter().any(|warning| {
+        warning.rule_id == "raw_event_duplicate"
+            && warning.severity == WarningSeverity::Blocking
+            && warning.known
+    }));
+}
+
 fn publish_quality_fixture(
     root_name: &str,
     run_id: &str,
-    audit: serde_json::Value,
+    mut audit: serde_json::Value,
 ) -> DataQualitySummary {
     let root = test_dir(root_name);
     let source = root.join("generated");
@@ -864,13 +960,12 @@ fn publish_quality_fixture(
         complete_execution_quality(),
     )
     .unwrap();
-    let audit_path = source.join("data_audit.json");
-    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+    let (audit_path, input_sha256) = write_bound_daily_audit(&source, &mut audit);
 
     publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
         run_id,
-        "a".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -908,13 +1003,14 @@ fn daily_manifest_accepts_complete_queue_day_with_no_fill_markout_denominator() 
         .unwrap(),
     )
     .unwrap();
-    let audit = source.join("data_audit.json");
-    fs::write(&audit, complete_daily_audit("2026-07-16", 1.0)).unwrap();
+    let mut audit_value: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-16", 1.0)).unwrap();
+    let (audit, input_sha256) = write_bound_daily_audit(&source, &mut audit_value);
 
     let published = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
         "daily-20260716-no-fills",
-        "e".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -959,13 +1055,14 @@ fn daily_manifest_rejects_applicability_that_contradicts_denominator() {
         .unwrap(),
     )
     .unwrap();
-    let audit = source.join("data_audit.json");
-    fs::write(&audit, complete_daily_audit("2026-07-17", 1.0)).unwrap();
+    let mut audit_value: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-17", 1.0)).unwrap();
+    let (audit, input_sha256) = write_bound_daily_audit(&source, &mut audit_value);
 
     let error = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
         "daily-20260717-contradiction",
-        "f".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -991,34 +1088,29 @@ fn partial_or_materially_gapped_utc_day_is_published_but_never_clean() {
     ] {
         fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
     }
-    let audit = source.join("data_audit.json");
     let observed_hours = (9..24)
         .map(|hour| (format!("2026-07-12T{hour:02}"), 100_u64))
         .collect::<BTreeMap<_, _>>();
-    fs::write(
-        &audit,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "result": {
-                "total_events": 1000,
-                "decision_grade_coverage": 1.0,
-                "fatal_data_quality_issues": [],
-                "warnings": [],
-                "event_time_ordering_restored": true,
-                "out_of_order_timestamps": 0,
-                "first_event_timestamp": "2026-07-12T09:44:20Z",
-                "last_event_timestamp": "2026-07-12T23:59:59Z",
-                "event_count_by_hour": observed_hours,
-                "largest_time_gaps": [{"gap_ms": 600001}]
-            }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let mut audit_value = serde_json::json!({
+        "result": {
+            "total_events": 1000,
+            "decision_grade_coverage": 1.0,
+            "fatal_data_quality_issues": [],
+            "warnings": [],
+            "event_time_ordering_restored": true,
+            "out_of_order_timestamps": 0,
+            "first_event_timestamp": "2026-07-12T09:44:20Z",
+            "last_event_timestamp": "2026-07-12T23:59:59Z",
+            "event_count_by_hour": observed_hours,
+            "largest_time_gaps": [{"gap_ms": 600001}]
+        }
+    });
+    let (audit, input_sha256) = write_bound_daily_audit(&source, &mut audit_value);
 
     let published = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 12).unwrap(),
         "partial-20260712",
-        "f".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -1062,15 +1154,14 @@ fn empty_or_malformed_gap_evidence_is_blocking() {
         ] {
             fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
         }
-        let audit = source.join("data_audit.json");
         let mut audit_value: serde_json::Value =
             serde_json::from_slice(&complete_daily_audit("2026-07-14", 1.0)).unwrap();
         audit_value["result"]["largest_time_gaps"] = gaps;
-        fs::write(&audit, serde_json::to_vec_pretty(&audit_value).unwrap()).unwrap();
+        let (audit, input_sha256) = write_bound_daily_audit(&source, &mut audit_value);
         let published = publish_daily_directory(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
             run_id,
-            "1".repeat(64),
+            input_sha256,
             polyedge_config::RuntimeRole::ProfitabilityShadow,
             &source,
             &root.join("reports/research/daily"),
@@ -1150,12 +1241,11 @@ fn runtime_provenance_missing_unknown_or_changed_is_blocking() {
             }
             _ => unreachable!(),
         }
-        let audit_path = source.join("data_audit.json");
-        fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+        let (audit_path, input_sha256) = write_bound_daily_audit(&source, &mut audit);
         let published = publish_daily_directory(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
             run_id,
-            "2".repeat(64),
+            input_sha256,
             polyedge_config::RuntimeRole::ProfitabilityShadow,
             &source,
             &root.join("reports/research/daily"),
@@ -1200,13 +1290,12 @@ fn historical_reporter_sha_difference_is_informational_lineage() {
         serde_json::from_slice(&complete_daily_audit("2026-07-14", 1.0)).unwrap();
     audit["result"]["runtime_provenance"]["identities"][0]["git_sha"] =
         serde_json::json!(runtime_sha.clone());
-    let audit_path = source.join("data_audit.json");
-    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+    let (audit_path, input_sha256) = write_bound_daily_audit(&source, &mut audit);
 
     let published = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
         "historical-reporter",
-        "2".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::ProfitabilityShadow,
         &source,
         &root.join("reports/research/daily"),
@@ -1258,12 +1347,11 @@ fn primary_daily_role_uses_its_own_provenance_contract() {
         serde_json::from_slice(&complete_daily_audit("2026-07-14", 1.0)).unwrap();
     audit["result"]["runtime_provenance"]["identities"][0] =
         valid_primary_runtime_provenance_identity(&current_git_sha());
-    let audit_path = source.join("data_audit.json");
-    fs::write(&audit_path, serde_json::to_vec_pretty(&audit).unwrap()).unwrap();
+    let (audit_path, input_sha256) = write_bound_daily_audit(&source, &mut audit);
     let published = publish_daily_directory(
         NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
         "primary-20260714",
-        "3".repeat(64),
+        input_sha256,
         polyedge_config::RuntimeRole::Primary,
         &source,
         &root.join("reports/research/daily"),
@@ -1349,7 +1437,6 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
         complete_execution_quality(),
     )
     .unwrap();
-    let audit = source.join("data_audit.json");
     let daily_root = root.join("reports/research/shadow/daily");
     let first_date = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
     let mut prior_input: Option<String> = None;
@@ -1396,11 +1483,13 @@ fn profitability_cli_core_passes_complete_metrics_but_never_arms_execution() {
         )
         .unwrap();
         let date_text = date.format("%Y-%m-%d").to_string();
-        fs::write(&audit, complete_daily_audit(&date_text, 1.0)).unwrap();
+        let mut audit_value: serde_json::Value =
+            serde_json::from_slice(&complete_daily_audit(&date_text, 1.0)).unwrap();
+        let (audit, input_sha256) = write_bound_daily_audit(&source, &mut audit_value);
         publish_daily_directory(
             date,
             format!("shadow-{}", date.format("%Y%m%d")),
-            format!("{:064x}", 4_000 + index),
+            input_sha256,
             polyedge_config::RuntimeRole::ProfitabilityShadow,
             &source,
             &daily_root,
@@ -3009,6 +3098,9 @@ fn complete_daily_audit(date: &str, coverage: f64) -> Vec<u8> {
     serde_json::to_vec_pretty(&serde_json::json!({
         "result": {
             "total_events": 1000,
+            "markets_seen": 100,
+            "markets_with_start_price": (coverage * 100.0).round() as u64,
+            "markets_settled": (coverage * 100.0).round() as u64,
             "start_price_capture_rate": coverage,
             "settlement_rate": coverage,
             "exact_resolution_reference_hour_coverage": coverage,
@@ -3017,11 +3109,14 @@ fn complete_daily_audit(date: &str, coverage: f64) -> Vec<u8> {
             "decision_grade_evaluations": (coverage * 100.0).round() as u64,
             "strategy_evaluations": 100,
             "final_decision_grade_coverage": coverage,
+            "place_decisions": 100,
+            "place_decisions_with_complete_execution_fields": (coverage * 100.0).round() as u64,
             "execution_field_coverage": coverage,
             "decision_parity_rate": 1.0,
             "decision_config_sha256": format!("sha256:{}", "d".repeat(64)),
             "fatal_data_quality_issues": [],
             "warnings": [],
+            "duplicate_estimate": 0,
             "event_time_ordering_restored": true,
             "out_of_order_timestamps": 0,
             "first_event_timestamp": format!("{date}T00:00:01Z"),
@@ -3032,6 +3127,27 @@ fn complete_daily_audit(date: &str, coverage: f64) -> Vec<u8> {
         }
     }))
     .unwrap()
+}
+
+fn write_bound_daily_audit(source: &Path, audit: &mut serde_json::Value) -> (PathBuf, String) {
+    let normalized = source.parent().unwrap().join(format!(
+        ".{}-normalized",
+        source.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir_all(&normalized).unwrap();
+    let manifest_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": "test.events_manifest.v1",
+        "first_event_timestamp": audit["result"]["first_event_timestamp"]
+    }))
+    .unwrap();
+    fs::write(normalized.join("events_manifest.json"), &manifest_bytes).unwrap();
+    audit["input_path"] = serde_json::json!(normalized.to_string_lossy());
+    let audit_path = source.join("data_audit.json");
+    fs::write(&audit_path, serde_json::to_vec_pretty(audit).unwrap()).unwrap();
+    (
+        audit_path,
+        format!("sha256:{:x}", Sha256::digest(&manifest_bytes)),
+    )
 }
 
 fn valid_runtime_provenance_identity(git_sha: &str) -> serde_json::Value {
