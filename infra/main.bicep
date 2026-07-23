@@ -841,7 +841,18 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
           args: [
             job.command
           ]
-          env: jobCommonEnv
+          env: concat(jobCommonEnv, job.id == 'daily-research-report' ? [
+            {
+              // A full day contains enough large book events for the default
+              // 8,192-event per-shard merge window to exceed the legacy
+              // Consumption environment's 4 GiB replica limit. Normalized
+              // shards preserve recorder order; this bounded window still
+              // corrects nearby timestamp inversions while keeping the audit
+              // fail-closed on any ordering warning.
+              name: 'POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS'
+              value: '64'
+            }
+          ] : [])
           resources: {
             cpu: json(job.cpu)
             memory: job.memory

@@ -210,6 +210,8 @@ jobs:
           sh research/test_run_shadow_daily.sh
           grep -Fq -- '--expected-runtime-role profitability_shadow' research/run_shadow_daily.sh
           grep -Fq -- '--expected-runtime-role primary' infra/main.bicep
+          grep -Fq -- "name: 'POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS'" infra/main.bicep
+          grep -Fq -- "value: '64'" infra/main.bicep
           grep -Fq -- 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)' infra/main.bicep
           ! grep -Fq -- 'HOUR=$(date -u -d "10 minutes ago" +%H)' infra/main.bicep
           test "$(grep -Fc -- 'validate-prospective --since "2026-07-13T00:00:00Z"' infra/main.bicep)" -eq 2

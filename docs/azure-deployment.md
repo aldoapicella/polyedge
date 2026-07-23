@@ -72,6 +72,15 @@ gh workflow run deploy-polyedge-active.yml \
 
 ### Research-only job deployment
 
+The primary daily research job remains within the legacy East US Consumption
+environment's 2 vCPU / 4 GiB per-replica limit. Its normalized event merge uses
+the job-specific `POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS=64` bound. The
+unbounded-default symptom is distinctive: normalization completes, then the
+normalized audit is terminated with exit code 137 before it can emit its
+command envelope. Keep the bound job-specific, preserve the audit's
+out-of-order warning gate, and treat any resulting ordering warning as a failed
+daily bundle rather than increasing the buffer past available memory.
+
 During a frozen shadow campaign, reporting changes must use
 `.github/workflows/deploy-polyedge-research-jobs.yml` instead of the active
 runtime workflow. The workflow accepts only the shadow daily reporter and the
