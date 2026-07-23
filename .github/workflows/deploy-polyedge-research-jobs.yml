@@ -53,8 +53,14 @@ jobs:
           git merge-base --is-ancestor "$CAMPAIGN_RUNTIME_SHA" HEAD
           while IFS= read -r path; do
             case "$path" in
-              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/configs/experiments/loss-regime-oos-v*.yaml|research/run_shadow_daily.sh|research/test_run_shadow_daily.sh|docs/*|.github/workflows/deploy-polyedge-research-jobs.yml|.github/workflows/deploy-polyedge-active.yml) ;;
-              *) echo "Research image contains an out-of-scope change: $path" >&2; exit 1 ;;
+              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/configs/experiments/loss-regime-oos-v*.yaml|research/run_shadow_daily.sh|research/test_run_shadow_daily.sh) ;;
+              Cargo.toml|Dockerfile.rust|crates/*|data_quality/*|research/*|tests/fixtures/*)
+                echo "Research image contains an out-of-scope change: $path" >&2
+                exit 1
+                ;;
+              # Files outside Dockerfile.rust's COPY inputs cannot change the
+              # immutable research image and are intentionally ignored here.
+              *) ;;
             esac
           done < <(git diff --name-only "$CAMPAIGN_RUNTIME_SHA"...HEAD)
 
