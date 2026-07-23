@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use polyedge_engine::crypto_taker_fee_per_share;

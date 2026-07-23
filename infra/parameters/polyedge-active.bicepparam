@@ -13,6 +13,7 @@ param frontendMemory = '1Gi'
 param frontendBackendApiBaseUrl = 'http://127.0.0.1:8081/api/v1'
 param frontendBackendWsUrl = 'ws://127.0.0.1:8081/api/v1/ws/live'
 param frontendBackendSseUrl = ''
+param venueProbeImage = ''
 param apiBearerToken = readEnvironmentVariable('API_BEARER_TOKEN')
 param dashboardAuthPassword = readEnvironmentVariable('DASHBOARD_AUTH_PASSWORD')
 param dashboardSessionSecret = readEnvironmentVariable('DASHBOARD_SESSION_SECRET')

@@ -571,7 +571,8 @@ Alerts:
 no_new_blob_for_3_minutes
 tiny_blob_anomaly
 hour_missing_minute_blobs
-recorder_failed_total_gt_0
+recorder_unrecovered_durable_events_gt_0
+recorder_flush_unrecovered_true
 recorder_dropped_count_gt_0
 job_failed
 job_duration_too_long

@@ -47,11 +47,12 @@ struct PendingMarkout {
     side: Side,
     fill_price: Decimal,
     fill_size: Decimal,
+    fee_per_share: Decimal,
     fill_ts: DateTime<Utc>,
     horizon_seconds: i64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ExecutionQualityTracker {
     orders: BTreeMap<OrderId, TrackedOrder>,
     pending_markouts: Vec<PendingMarkout>,
@@ -228,6 +229,7 @@ impl ExecutionQualityTracker {
                     Side::Buy => mark_price - markout.fill_price,
                     Side::Sell => markout.fill_price - mark_price,
                 };
+                let net_per_share = per_share - markout.fee_per_share;
                 let executable_mark_price = match markout.side {
                     Side::Buy => book.best_bid().map(|level| level.price),
                     Side::Sell => book.best_ask().map(|level| level.price),
@@ -237,6 +239,8 @@ impl ExecutionQualityTracker {
                         Side::Buy => executable - markout.fill_price,
                         Side::Sell => markout.fill_price - executable,
                     });
+                let net_executable_per_share =
+                    executable_per_share.map(|gross| gross - markout.fee_per_share);
                 due.push(QualityEvent {
                     event_type: "paper_fill_markout",
                     payload: json!({
@@ -248,14 +252,19 @@ impl ExecutionQualityTracker {
                         "side": markout.side,
                         "fill_price": markout.fill_price.to_string(),
                         "fill_size": markout.fill_size.to_string(),
+                        "fee_per_share": markout.fee_per_share.to_string(),
                         "fill_ts": markout.fill_ts,
                         "horizon_seconds": markout.horizon_seconds,
                         "mark_price": mark_price.to_string(),
                         "markout_per_share": per_share.to_string(),
                         "markout_pnl": (per_share * markout.fill_size).to_string(),
+                        "net_markout_per_share": net_per_share.to_string(),
+                        "net_markout_pnl": (net_per_share * markout.fill_size).to_string(),
                         "executable_mark_price": executable_mark_price.map(|value| value.to_string()),
                         "executable_markout_per_share": executable_per_share.map(|value| value.to_string()),
                         "executable_markout_pnl": executable_per_share.map(|value| (value * markout.fill_size).to_string()),
+                        "net_executable_markout_per_share": net_executable_per_share.map(|value| value.to_string()),
+                        "net_executable_markout_pnl": net_executable_per_share.map(|value| (value * markout.fill_size).to_string()),
                         "best_bid": book.best_bid().map(|level| level.price.to_string()),
                         "best_ask": book.best_ask().map(|level| level.price.to_string()),
                         "observed_ts": observed_ts,
@@ -297,6 +306,11 @@ impl ExecutionQualityTracker {
                     side,
                     fill_price,
                     report.filled_size,
+                    if report.filled_size > Decimal::ZERO {
+                        report.fee / report.filled_size
+                    } else {
+                        Decimal::ZERO
+                    },
                     report.local_ts,
                 );
             }
@@ -351,6 +365,7 @@ impl ExecutionQualityTracker {
                         "side": markout.side,
                         "fill_price": markout.fill_price.to_string(),
                         "fill_size": markout.fill_size.to_string(),
+                        "fee_per_share": markout.fee_per_share.to_string(),
                         "fill_ts": markout.fill_ts,
                         "horizon_seconds": markout.horizon_seconds,
                         "reason": "market_settled_before_observation",
@@ -497,6 +512,7 @@ impl ExecutionQualityTracker {
                 side,
                 price,
                 size,
+                Decimal::ZERO,
                 ts,
             );
         }
@@ -555,10 +571,11 @@ impl ExecutionQualityTracker {
         side: Side,
         fill_price: Decimal,
         fill_size: Decimal,
+        fee_per_share: Decimal,
         fill_ts: DateTime<Utc>,
     ) {
         self.next_fill_id += 1;
-        let fill_id = format!("paper-quality-{}", self.next_fill_id);
+        let fill_id = format!("paper-quality-{}-{}", order_id, self.next_fill_id);
         self.pending_markouts
             .extend(
                 MARKOUT_HORIZONS_SECONDS
@@ -572,6 +589,7 @@ impl ExecutionQualityTracker {
                         side: side.clone(),
                         fill_price,
                         fill_size,
+                        fee_per_share,
                         fill_ts,
                         horizon_seconds,
                     }),
@@ -945,6 +963,12 @@ mod tests {
         assert!(later.iter().any(|event| {
             event.payload["horizon_seconds"] == 30 && event.event_type == "paper_fill_markout"
         }));
+        let fill_ids = later
+            .iter()
+            .filter_map(|event| event.payload["fill_id"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(fill_ids.contains("paper-quality-paper-1-1"));
+        assert!(fill_ids.contains("paper-quality-paper-1-2"));
     }
 
     #[test]
@@ -981,6 +1005,28 @@ mod tests {
             event.event_type == "paper_fill_markout_missing"
                 && event.payload["reason"] == "market_settled_before_observation"
         }));
+    }
+
+    #[test]
+    fn executable_markouts_are_net_of_fill_fees() {
+        let mut tracker = ExecutionQualityTracker::default();
+        let decision = decision();
+        let resting = report("paper_resting", Decimal::ZERO, None, ts(0));
+        tracker.register_order(&decision, &resting, None, 250);
+        tracker.observe_book(&book("0.50", "4", "0.51", "4", ts(1)));
+        let mut filled = report("paper_filled", dec("5"), Some(dec("0.50")), ts(2));
+        filled.fee = dec("0.05");
+        tracker.observe_execution_report(&filled);
+
+        let markouts = tracker.observe_book(&book("0.52", "4", "0.53", "4", ts(33)));
+        let thirty = markouts
+            .iter()
+            .find(|event| event.payload["horizon_seconds"] == 30)
+            .expect("30-second markout");
+        assert_eq!(thirty.payload["executable_markout_per_share"], "0.02");
+        assert_eq!(thirty.payload["fee_per_share"], "0.01");
+        assert_eq!(thirty.payload["net_executable_markout_per_share"], "0.01");
+        assert_eq!(thirty.payload["net_executable_markout_pnl"], "0.05");
     }
 
     #[test]

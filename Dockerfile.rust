@@ -1,5 +1,7 @@
 FROM rust:1.82-slim AS builder
 
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -8,6 +10,13 @@ RUN cargo build --release -p polyedge-cli
 
 FROM debian:bookworm-slim AS runtime
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+LABEL org.opencontainers.image.revision=${GIT_SHA}
 WORKDIR /app
 COPY --from=builder /app/target/release/polyedge-rs /usr/local/bin/polyedge-rs
 COPY data_quality ./data_quality

@@ -2,6 +2,31 @@ name: Deploy PolyEdge to Azure
 
 on:
   workflow_dispatch:
+    inputs:
+      authorize_shadow_runtime_change:
+        description: Explicitly authorize changing the frozen shadow runtime during the active evidence campaign
+        required: true
+        default: false
+        type: boolean
+      research_job_target:
+        description: Route this dispatch to an isolated target without changing the frozen shadow runtime
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - frontend-only
+          - monitoring-only
+          - build-only
+          - polyedge-daily-research-job
+          - polyedge-shadow-daily-neu-job
+          - polyedge-backfill-job
+          - polyedge-prospective-job
+          - polyedge-chart-backfill-job
+
+concurrency:
+  group: ${{ (inputs.research_job_target == 'none' || inputs.research_job_target == 'monitoring-only') && 'polyedge-azure-control-plane' || inputs.research_job_target == 'frontend-only' && 'polyedge-frontend-deploy-caller' || 'polyedge-research-deploy-caller' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -14,7 +39,158 @@ env:
   GITHUB_DEPLOY_IDENTITY_NAME: id-github-polyedge-dev
 
 jobs:
+  research-job-deploy:
+    if: inputs.research_job_target != 'none' && inputs.research_job_target != 'frontend-only' && inputs.research_job_target != 'monitoring-only'
+    uses: ./.github/workflows/deploy-polyedge-research-jobs.yml
+    with:
+      target_job: ${{ inputs.research_job_target }}
+    secrets: inherit
+
+  frontend-only-deploy:
+    if: inputs.research_job_target == 'frontend-only'
+    uses: ./.github/workflows/deploy-polyedge-frontend-only.yml
+    secrets: inherit
+
+  monitoring-only-deploy:
+    if: inputs.research_job_target == 'monitoring-only'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate isolated monitoring template
+        run: |
+          set -euo pipefail
+          az bicep build --file infra/monitoring-alerts.bicep --outfile monitoring-alerts.json
+          test "$(jq '[.resources[] | select(.type != "Microsoft.Insights/scheduledQueryRules")] | length' monitoring-alerts.json)" = "0"
+          test "$(jq '[.resources[] | select(.type == "Microsoft.Insights/scheduledQueryRules")] | length' monitoring-alerts.json)" = "1"
+          test "$(jq -r '.resources[0].copy.count' monitoring-alerts.json)" = "[length(variables('recorderAlerts'))]"
+          test "$(jq '.variables.recorderAlerts | length' monitoring-alerts.json)" = "5"
+          test "$(jq '[.variables.recorderAlerts[] | select(.name != "shadow-runtime-health-missing") | select(.query | contains("ContainerAppName_s in") and contains("variables(\u0027containerAppName\u0027)") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "4"
+          test "$(jq '[.variables.recorderAlerts[] | select(.name == "shadow-runtime-health-missing") | select(.query | contains("runtime_health") and contains("heartbeat_count == 0") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "1"
+          test "$(jq -r '.parameters.shadowContainerAppName.defaultValue' monitoring-alerts.json)" = "polyedge-shadow-neu"
+
+      - name: Snapshot protected runtime state
+        env:
+          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
+          test "$(az account show --query id -o tsv)" = "$EXPECTED_SUBSCRIPTION_ID"
+          expected_client_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query clientId -o tsv)
+          authenticated_client_id=$(az account show --query user.name -o tsv)
+          test "$(echo "$authenticated_client_id" | tr 'A-F' 'a-f')" = "$(echo "$expected_client_id" | tr 'A-F' 'a-f')"
+          for app in polyedge-dev polyedge-shadow-neu; do
+            az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
+              > "before-$app.json"
+          done
+          for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
+              > "before-$job.json"
+          done
+
+      - name: Prove the deployment plan is alert-only
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/monitoring-alerts.bicep \
+            --result-format ResourceIdOnly \
+            --no-pretty-print \
+            -o json > monitoring-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore")
+              | select((.resourceId | ascii_downcase | contains("/microsoft.insights/scheduledqueryrules/")) | not)
+            ] | length == 0
+          ' monitoring-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore")
+              | (.resourceId | ascii_downcase | split("/") | .[-1])
+              | select(. as $name | [
+                  "polyedge-dev-recorder-failed-total-gt-0",
+                  "polyedge-dev-recorder-dropped-count-gt-0",
+                  "polyedge-dev-recorder-queue-over-1000",
+                  "polyedge-dev-runtime-container-restarted",
+                  "polyedge-dev-shadow-runtime-health-missing"
+                ] | index($name) | not)
+            ] | length == 0
+          ' monitoring-what-if.json
+
+      - name: Deploy recorder and restart alerts only
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name "$APP_NAME-monitoring-alerts" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/monitoring-alerts.bicep
+
+      - name: Verify alerts and unchanged runtimes
+        run: |
+          set -euo pipefail
+          for app in polyedge-dev polyedge-shadow-neu; do
+            az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
+              > "after-$app.json"
+            cmp -s "before-$app.json" "after-$app.json" || {
+              echo "Protected Container App definition changed: $app" >&2
+              exit 1
+            }
+          done
+          for suffix in recorder-failed-total-gt-0 recorder-dropped-count-gt-0 recorder-queue-over-1000 runtime-container-restarted shadow-runtime-health-missing; do
+            rule="$APP_NAME-dev-$suffix"
+            az monitor scheduled-query show --resource-group "$AZURE_RESOURCE_GROUP" --name "$rule" -o json > "rule-$suffix.json"
+            test "$(jq -r '.enabled' "rule-$suffix.json")" = "true"
+            test "$(jq -r '.evaluationFrequency' "rule-$suffix.json")" = "0:05:00"
+            test "$(jq -r '.windowSize' "rule-$suffix.json")" = "0:10:00"
+            query=$(jq -r '.criteria.allOf[0].query' "rule-$suffix.json")
+            grep -Fq 'polyedge-shadow-neu' <<< "$query"
+            if [ "$suffix" != "shadow-runtime-health-missing" ]; then
+              grep -Fq 'polyedge-dev' <<< "$query"
+            fi
+          done
+          for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
+              > "after-$job.json"
+            cmp -s "before-$job.json" "after-$job.json" || {
+              echo "Protected funded-job definition changed: $job" >&2
+              exit 1
+            }
+            test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" --query properties.configuration.triggerType -o tsv)" = "Manual"
+            test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
+          done
+          env_value() {
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$1" -o json \
+              | jq -r --arg name "$2" '[.properties.template.containers[].env[]? | select(.name == $name) | .value] | first // empty'
+          }
+          test "$(env_value polyedge-venue-probe-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-venue-probe-neu-job VENUE_PROBE_DRY_RUN)" = "true"
+          test "$(env_value polyedge-redeem-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-redeem-neu-job VENUE_REDEMPTION_ENABLED)" = "false"
+          test "$(env_value polyedge-redeem-neu-job VENUE_REDEMPTION_DRY_RUN)" = "true"
+          test "$(env_value polyedge-strategy-canary-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-strategy-canary-neu-job STRATEGY_CANARY_CONTROLLER_ENABLED)" = "false"
+          test "$(env_value polyedge-strategy-canary-neu-job STRATEGY_CANARY_DRY_RUN)" = "true"
+          test "$(env_value polyedge-funded-ladder-neu-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-funded-ladder-neu-job FUNDED_LADDER_CONTROLLER_ENABLED)" = "false"
+          test "$(env_value polyedge-funded-ladder-neu-job FUNDED_LADDER_DRY_RUN)" = "true"
+          test "$(env_value polyedge-promotion-neu-job PROMOTION_TRANSITION_ENABLED)" = "false"
+          test "$(env_value polyedge-venue-model-job ALLOW_LIVE)" = "false"
+          test "$(env_value polyedge-venue-model-job QUEUE_MODEL_TRAINING_ENABLED)" = "false"
+
   deploy:
+    if: inputs.research_job_target == 'none'
     runs-on: ubuntu-latest
 
     steps:
@@ -32,6 +208,17 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --all-features
           cargo build --release -p polyedge-cli
+          sh research/test_run_shadow_daily.sh
+          grep -Fq -- '--expected-runtime-role profitability_shadow' research/run_shadow_daily.sh
+          grep -Fq -- '--expected-runtime-role primary' infra/main.bicep
+          grep -Fq -- "name: 'POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS'" infra/main.bicep
+          grep -Fq -- "value: '64'" infra/main.bicep
+          grep -Fq -- 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)' infra/main.bicep
+          ! grep -Fq -- 'HOUR=$(date -u -d "10 minutes ago" +%H)' infra/main.bicep
+          test "$(grep -Fc -- 'validate-prospective --since "2026-07-13T00:00:00Z"' infra/main.bicep)" -eq 2
+          test "$(date -u -d '2026-07-20 19:10 UTC - 1 hour' +%Y/%m/%d/%H)" = "2026/07/20/18"
+          test "$(date -u -d '2026-07-21 00:10 UTC - 1 hour' +%Y/%m/%d/%H)" = "2026/07/20/23"
+          az bicep build --file infra/main.bicep --outfile /tmp/polyedge-main.json
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -47,6 +234,12 @@ jobs:
           npm run typecheck
           npm run build
 
+      - name: Install and test funded worker
+        working-directory: venue-probe
+        run: |
+          npm ci
+          npm test
+
       - name: Azure login
         uses: azure/login@v2
         with:
@@ -57,6 +250,18 @@ jobs:
       - name: Validate resource group
         run: |
           az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
+
+      - name: Protect the frozen profitability campaign
+        env:
+          AUTHORIZE_SHADOW_RUNTIME_CHANGE: ${{ inputs.authorize_shadow_runtime_change }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%F)
+          if [[ "$today" > "2026-07-22" && "$today" < "2026-09-21" ]] \
+            && [ "$AUTHORIZE_SHADOW_RUNTIME_CHANGE" != "true" ]; then
+            echo "The active Protocol-v3 campaign freezes polyedge-shadow-neu. Re-dispatch with explicit authorization only for a reviewed runtime repair." >&2
+            exit 1
+          fi
 
       - name: Validate required deployment secrets
         run: |
@@ -106,6 +311,9 @@ jobs:
       - name: Grant workflow ACR push
         run: |
           principal_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query principalId -o tsv)
+          expected_client_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query clientId -o tsv)
+          authenticated_client_id=$(az account show --query user.name -o tsv)
+          test "$(echo "$authenticated_client_id" | tr 'A-F' 'a-f')" = "$(echo "$expected_client_id" | tr 'A-F' 'a-f')"
           acr_id=$(az acr show \
             --name "${{ steps.deploy_outputs.outputs.acr_name }}" \
             --query id \
@@ -122,12 +330,16 @@ jobs:
           az acr login --name "${{ steps.deploy_outputs.outputs.acr_name }}"
           backend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-rust-backend:${{ github.sha }}"
           frontend_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-frontend:${{ github.sha }}"
-          docker build -f Dockerfile.rust -t "$backend_image" .
+          venue_probe_image="${{ steps.deploy_outputs.outputs.acr_login_server }}/polyedge-venue-probe:${{ github.sha }}"
+          docker build --build-arg GIT_SHA="${{ github.sha }}" -f Dockerfile.rust -t "$backend_image" .
           docker build -f Dockerfile.frontend -t "$frontend_image" .
+          docker build -f Dockerfile.venue-probe -t "$venue_probe_image" .
           docker push "$backend_image"
           docker push "$frontend_image"
+          docker push "$venue_probe_image"
           echo "BACKEND_IMAGE=$backend_image" >> "$GITHUB_ENV"
           echo "FRONTEND_IMAGE=$frontend_image" >> "$GITHUB_ENV"
+          echo "VENUE_PROBE_IMAGE=$venue_probe_image" >> "$GITHUB_ENV"
 
       - name: Deploy active images
         env:
@@ -140,7 +352,96 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/main.bicep \
             --parameters infra/parameters/polyedge-active.bicepparam \
-            --parameters image="$BACKEND_IMAGE" frontendImage="$FRONTEND_IMAGE" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}" dashboardAuthPassword="${{ secrets.DASHBOARD_AUTH_PASSWORD }}" dashboardSessionSecret="${{ secrets.DASHBOARD_SESSION_SECRET }}"
+            --parameters image="$BACKEND_IMAGE" frontendImage="$FRONTEND_IMAGE" venueProbeImage="$VENUE_PROBE_IMAGE" apiBearerToken="${{ secrets.API_BEARER_TOKEN }}" dashboardAuthPassword="${{ secrets.DASHBOARD_AUTH_PASSWORD }}" dashboardSessionSecret="${{ secrets.DASHBOARD_SESSION_SECRET }}"
+
+      - name: Deploy North Europe evidence worker
+        run: |
+          az deployment group create \
+            --name "$APP_NAME-venue-probe-neu" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/venue-probe.bicep \
+            --parameters venueProbeImage="$VENUE_PROBE_IMAGE" backendImage="$BACKEND_IMAGE"
+
+      - name: Pin prior, migrate evidence, and revoke legacy broad access
+        run: |
+          set -euo pipefail
+          storage_name="stpolyedge6urdjr5nmwx7w"
+          research_container="polyedge-research"
+          funded_container="polyedge-funded-evidence"
+          prior_file="research/configs/conservative_execution_prior_v1.json"
+          prior_sha="91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4"
+          prior_blob="reports/research/venue-probe/models/conservative-execution-prior-v1-${prior_sha}.json"
+          test "$(sha256sum "$prior_file" | cut -d' ' -f1)" = "$prior_sha"
+          data_plane_ready=false
+          for attempt in $(seq 1 30); do
+            if az storage container show --account-name "$storage_name" --name bot-events --auth-mode login --only-show-errors -o none \
+              && az storage container show --account-name "$storage_name" --name "$research_container" --auth-mode login --only-show-errors -o none \
+              && az storage container show --account-name "$storage_name" --name "$funded_container" --auth-mode login --only-show-errors -o none; then
+              data_plane_ready=true
+              break
+            fi
+            sleep 10
+          done
+          test "$data_plane_ready" = "true"
+          exists=$(az storage blob exists --account-name "$storage_name" --container-name "$research_container" --name "$prior_blob" --auth-mode login --query exists -o tsv)
+          if [ "$exists" = "true" ]; then
+            az storage blob download --account-name "$storage_name" --container-name "$research_container" --name "$prior_blob" --file pinned-prior.json --auth-mode login --overwrite --only-show-errors -o none
+            test "$(sha256sum pinned-prior.json | cut -d' ' -f1)" = "$prior_sha"
+          else
+            az storage blob upload --account-name "$storage_name" --container-name "$research_container" --name "$prior_blob" --file "$prior_file" --auth-mode login --overwrite false --content-type application/json --metadata sha256="$prior_sha" immutable_content="true" --only-show-errors -o none
+          fi
+          storage_id=$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name "$storage_name" --query id -o tsv)
+          migration_manifest_blob="migration/bot-events-venue-probe-v1.manifest.json"
+          migrated=$(az storage blob exists --account-name "$storage_name" --container-name "$funded_container" --name "$migration_manifest_blob" --auth-mode login --query exists -o tsv)
+          if [ "$migrated" != "true" ]; then
+            az storage blob list --account-name "$storage_name" --container-name bot-events --prefix "reports/research/venue-probe/" --auth-mode login -o json | jq '[.[].name] | sort' > migration-source-names.json
+            source_count=$(jq 'length' migration-source-names.json)
+            test "$source_count" -gt "0"
+            : > migration-hashes.ndjson
+            while IFS= read -r blob; do
+              az storage blob download --account-name "$storage_name" --container-name bot-events --name "$blob" --file migration-source.bin --auth-mode login --overwrite --only-show-errors -o none
+              source_sha=$(sha256sum migration-source.bin | cut -d' ' -f1)
+              destination_exists=$(az storage blob exists --account-name "$storage_name" --container-name "$funded_container" --name "$blob" --auth-mode login --query exists -o tsv)
+              if [ "$destination_exists" != "true" ]; then
+                az storage blob upload --account-name "$storage_name" --container-name "$funded_container" --name "$blob" --file migration-source.bin --auth-mode login --overwrite false --only-show-errors -o none
+              fi
+              az storage blob download --account-name "$storage_name" --container-name "$funded_container" --name "$blob" --file migration-destination.bin --auth-mode login --overwrite --only-show-errors -o none
+              destination_sha=$(sha256sum migration-destination.bin | cut -d' ' -f1)
+              test "$source_sha" = "$destination_sha"
+              jq -nc --arg name "$blob" --arg sha256 "sha256:$source_sha" '{name:$name,sha256:$sha256}' >> migration-hashes.ndjson
+            done < <(jq -r '.[]' migration-source-names.json)
+            az storage blob list --account-name "$storage_name" --container-name "$funded_container" --prefix "reports/research/venue-probe/" --auth-mode login -o json | jq '[.[].name] | sort' > migration-destination-names.json
+            test "$(jq -n --slurpfile source migration-source-names.json --slurpfile destination migration-destination-names.json '$source[0] - $destination[0] | length')" = "0"
+            jq -s --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{schema:"polyedge.storage_migration_manifest.v1",source_container:"bot-events",destination_container:"polyedge-funded-evidence",generated_at:$generated_at,artifacts:.}' migration-hashes.ndjson > migration-manifest.json
+            migration_manifest_sha=$(sha256sum migration-manifest.json | cut -d' ' -f1)
+            az storage blob upload --account-name "$storage_name" --container-name "$funded_container" --name "$migration_manifest_blob" --file migration-manifest.json --auth-mode login --overwrite false --content-type application/json --metadata sha256="$migration_manifest_sha" --only-show-errors -o none
+          fi
+          az storage blob download --account-name "$storage_name" --container-name "$funded_container" --name "$migration_manifest_blob" --file migration-manifest-verified.json --auth-mode login --overwrite --only-show-errors -o none
+          migration_manifest_sha=$(sha256sum migration-manifest-verified.json | cut -d' ' -f1)
+          test "$(az storage blob show --account-name "$storage_name" --container-name "$funded_container" --name "$migration_manifest_blob" --auth-mode login --query metadata.sha256 -o tsv)" = "$migration_manifest_sha"
+          test "$(jq -r '.schema' migration-manifest-verified.json)" = "polyedge.storage_migration_manifest.v1"
+          test "$(jq -r '.source_container' migration-manifest-verified.json)" = "bot-events"
+          test "$(jq -r '.destination_container' migration-manifest-verified.json)" = "polyedge-funded-evidence"
+          test "$(jq '.artifacts | length' migration-manifest-verified.json)" -gt "0"
+          while IFS=$'\t' read -r blob expected_sha; do
+            az storage blob download --account-name "$storage_name" --container-name "$funded_container" --name "$blob" --file migration-destination.bin --auth-mode login --overwrite --only-show-errors -o none
+            test "sha256:$(sha256sum migration-destination.bin | cut -d' ' -f1)" = "$expected_sha"
+          done < <(jq -r '.artifacts[] | [.name,.sha256] | @tsv' migration-manifest-verified.json)
+          shadow_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-neu-id --query principalId -o tsv)
+          funded_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-neu-id --query principalId -o tsv)
+          app_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-dev-id --query principalId -o tsv)
+          model_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-dev-venue-model-id --query principalId -o tsv)
+          key_vault_id=$(az keyvault show --resource-group "$AZURE_RESOURCE_GROUP" --name kvpolyedge6urdjr5nmwx7w --query id -o tsv)
+          bot_events_scope="$storage_id/blobServices/default/containers/bot-events"
+          az role assignment delete --assignee "$shadow_principal" --role "Storage Blob Data Contributor" --scope "$storage_id" || true
+          az role assignment delete --assignee "$shadow_principal" --role "Storage Table Data Contributor" --scope "$storage_id" || true
+          az role assignment delete --assignee "$funded_principal" --role "Storage Blob Data Contributor" --scope "$storage_id" || true
+          az role assignment delete --assignee "$funded_principal" --role "Storage Table Data Contributor" --scope "$storage_id" || true
+          az role assignment delete --assignee "$app_principal" --role "Storage Blob Data Contributor" --scope "$storage_id" || true
+          az role assignment delete --assignee "$app_principal" --role "Storage Table Data Contributor" --scope "$storage_id" || true
+          az role assignment delete --assignee "$app_principal" --role "Key Vault Secrets User" --scope "$key_vault_id" || true
+          az role assignment delete --assignee "$funded_principal" --role "Key Vault Secrets User" --scope "$key_vault_id" || true
+          az role assignment delete --assignee "$model_principal" --role "Storage Blob Data Contributor" --scope "$bot_events_scope" || true
 
       - name: Verify active writer configuration
         run: |
@@ -153,10 +454,300 @@ jobs:
           azure_client_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_CLIENT_ID") | .value' containerapp.json)
           backend_base=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' containerapp.json)
           dashboard_secret=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "DASHBOARD_SESSION_SECRET") | .secretRef' containerapp.json)
+          research_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_RESEARCH_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
+          funded_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_FUNDED_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
+          model_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
+          shadow_campaign_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' containerapp.json)
+          shadow_correction_root=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value' containerapp.json)
+          event_index_types=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value' containerapp.json)
           test "$run_on_startup" = "true"
           test -n "$azure_client_id"
           test "$backend_base" = "http://127.0.0.1:8081/api/v1"
           test "$dashboard_secret" = "dashboard-session-secret"
+          test "$research_container" = "polyedge-research"
+          test "$funded_container" = "polyedge-funded-evidence"
+          test "$model_container" = "polyedge-models"
+          test "$shadow_campaign_id" = "campaign-2026-07-23"
+          test "$shadow_correction_root" = "reports/research/shadow/campaigns/campaign-2026-07-23/corrections"
+          test "$(echo "$event_index_types" | grep -c 'runtime_provenance')" = "1"
+          test "$(jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length' containerapp.json)" = "0"
+          test "$(jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length' containerapp.json)" = "0"
+          for research_job_name in polyedge-data-freshness-job polyedge-hourly-quality-job polyedge-daily-research-job polyedge-prospective-job polyedge-replay-index-job polyedge-chart-backfill-job polyedge-adx-ingestion-job polyedge-backfill-job; do
+            research_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$research_job_name" -o json)
+            test "$(echo "$research_job" | jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length')" = "0"
+            test "$(echo "$research_job" | jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length')" = "0"
+          done
+          venue_model_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-model-job -o json)
+          test "$(echo "$venue_model_job" | jq -r '.properties.configuration.triggerType')" = "Manual"
+          test "$(echo "$venue_model_job" | jq -r '.properties.configuration.replicaRetryLimit')" = "0"
+          test "$(echo "$venue_model_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "QUEUE_MODEL_TRAINING_ENABLED") | .value')" = "false"
+          test "$(echo "$venue_model_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "QUEUE_MODEL_SOURCE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
+          test "$(echo "$venue_model_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "QUEUE_MODEL_OUTPUT_CONTAINER_NAME") | .value')" = "polyedge-models"
+          test "$(echo "$venue_model_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^QUEUE_MODEL_CHECKPOINT_(BLOB_NAME|SHA256)$")) | .value == ""] | all')" = "true"
+          test "$(echo "$venue_model_job" | jq -r '(.properties.configuration.secrets // []) | length')" = "0"
+          probe_dry_run=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='VENUE_PROBE_DRY_RUN'].value | [0]" -o tsv)
+          probe_country=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='VENUE_PROBE_EXPECTED_COUNTRY'].value | [0]" -o tsv)
+          probe_location=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query location -o tsv)
+          probe_container=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='AZURE_STORAGE_CONTAINER_NAME'].value | [0]" -o tsv)
+          test "$probe_dry_run" = "true"
+          test "$probe_country" = "IE"
+          test "$probe_location" = "North Europe"
+          test "$probe_container" = "polyedge-funded-evidence"
+          canary_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-strategy-canary-neu-job -o json)
+          test "$(echo "$canary_job" | jq -r '.location')" = "North Europe"
+          test "$(echo "$canary_job" | jq -r '.properties.configuration.triggerType')" = "Manual"
+          test "$(echo "$canary_job" | jq -r '.properties.configuration.replicaRetryLimit')" = "0"
+          test "$(echo "$canary_job" | jq -r '.properties.configuration.manualTriggerConfig.parallelism')" = "1"
+          test "$(echo "$canary_job" | jq -r '.properties.configuration.scheduleTriggerConfig == null')" = "true"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "node src/canary-controller.mjs"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_DRY_RUN") | .value')" = "true"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_CONTROLLER_ENABLED") | .value')" = "false"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_STRATEGY_CANARY") | .value')" = "false"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_LIVE") | .value')" = "false"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ENABLE_TAKER_ORDERS") | .value')" = "false"
+          test "$(echo "$canary_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^STRATEGY_CANARY_(INTENT|PROMOTION_MANIFEST|AUTHORIZATION)_(BLOB_NAME|SHA256)$"))] | length')" = "6"
+          test "$(echo "$canary_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^STRATEGY_CANARY_(INTENT|PROMOTION_MANIFEST|AUTHORIZATION)_(BLOB_NAME|SHA256)$")) | .value == ""] | all')" = "true"
+          test "$(echo "$canary_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^STRATEGY_CANARY_HUMAN_GRANT_(BLOB_NAME|SHA256)$"))] | length')" = "2"
+          test "$(echo "$canary_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^STRATEGY_CANARY_HUMAN_GRANT_(BLOB_NAME|SHA256)$")) | .value == ""] | all')" = "true"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_CONTAINER_NAME") | .value')" = "polyedge-shadow-events"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_MANIFEST_CONTAINER_NAME") | .value')" = "polyedge-research"
+          test "$(echo "$canary_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
+          funded_ladder_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-funded-ladder-neu-job -o json)
+          test "$(echo "$funded_ladder_job" | jq -r '.location')" = "North Europe"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.configuration.triggerType')" = "Manual"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.configuration.replicaRetryLimit')" = "0"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.configuration.scheduleTriggerConfig == null')" = "true"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "node src/funded-ladder-controller.mjs"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_LADDER_CONTROLLER_ENABLED") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_FUNDED_LADDER") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_LADDER_DRY_RUN") | .value')" = "true"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_LIVE") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_STRATEGY_CANARY") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ENABLE_TAKER_ORDERS") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^FUNDED_LADDER_(MANIFEST|GRANT|CONSUMPTION)_(BLOB_NAME|SHA256)$"))] | length')" = "6"
+          test "$(echo "$funded_ladder_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^FUNDED_LADDER_(MANIFEST|GRANT|CONSUMPTION)_(BLOB_NAME|SHA256)$")) | .value == ""] | all')" = "true"
+          test "$(echo "$funded_ladder_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^FUNDED_LADDER_TERMINAL_RISK_"))] | length')" = "0"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_LADDER_RESEARCH_CONTAINER_NAME") | .value')" = "polyedge-research"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_LADDER_INTENT_CONTAINER_NAME") | .value')" = "polyedge-shadow-events"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
+          promotion_transition_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-promotion-neu-job -o json)
+          test "$(echo "$promotion_transition_job" | jq -r '.location')" = "North Europe"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.configuration.triggerType')" = "Manual"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.configuration.replicaRetryLimit')" = "0"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.configuration.scheduleTriggerConfig == null')" = "true"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "/bin/sh /app/research/run_promotion_transition.sh"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "PROMOTION_TRANSITION_ENABLED") | .value')" = "false"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "PROMOTION_TRANSITION_MODE") | .value')" = ""
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "PROMOTION_TRANSITION_EXPECTED_CANONICAL_SHA256") | .value')" = ""
+          test "$(echo "$promotion_transition_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^PROMOTION_(SHADOW|CANARY|TERMINAL|PRIOR|CHECKPOINT|NEXT_MODEL)_")) | .value == ""] | all')" = "true"
+          test "$(echo "$promotion_transition_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^PROMOTION_STAGE_BLOCK_(URI|SHA256)$"))] | length')" = "2"
+          test "$(echo "$promotion_transition_job" | jq -r '[.properties.template.containers[0].env[] | select(.name | test("^PROMOTION_STAGE_BLOCK_(URI|SHA256)$")) | .value == ""] | all')" = "true"
+          test "$(echo "$promotion_transition_job" | jq -r '(.properties.configuration.secrets // []) | length')" = "0"
+          test "$(echo "$promotion_transition_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
+          redemption_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-redeem-neu-job -o json)
+          test "$(echo "$redemption_job" | jq -r '.properties.configuration.triggerType')" = "Manual"
+          test "$(echo "$redemption_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "VENUE_REDEMPTION_ENABLED") | .value')" = "false"
+          test "$(echo "$redemption_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "VENUE_REDEMPTION_DRY_RUN") | .value')" = "true"
+          test "$(echo "$redemption_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
+          shadow_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-neu -o json)
+          test "$(echo "$shadow_json" | jq -r '.properties.configuration.ingress.external // false')" = "false"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "RUNTIME_ROLE") | .value')" = "profitability_shadow"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "EXECUTION_MODE") | .value')" = "paper"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_LIVE") | .value')" = "false"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "PAPER_MAKER_FILL_POLICY") | .value')" = "none"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "ADAPTIVE_REGIME_MODE") | .value')" = "dynamic_quote_style"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX") | .value')" = "shadow-events/campaign-2026-07-22"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER") | .value')" = "shadow-events/campaign-2026-07-23"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC") | .value')" = "2026-07-23T00:00:00Z"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "PUBLISH_STRATEGY_CANARY_INTENTS") | .value')" = "true"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_PREFIX") | .value')" = "reports/research/venue-probe/control/strategy-canary/intents"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-shadow-events"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_TABLE_NAME") | .value')" = "ShadowBotEventIndex"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_CHART_TABLE_NAME") | .value')" = "ShadowBotChartSeries"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_MARKET_TABLE_NAME") | .value')" = "ShadowBotMarketCatalog"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_FUNDED_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-funded-evidence"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-models"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION") | .value')" = "conservative-execution-prior-v1"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_EXECUTION_MODEL_SHA256") | .value')" = "sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4"
+          test "$(echo "$shadow_json" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value | contains("runtime_provenance")')" = "true"
+          test "$(echo "$shadow_json" | jq -r '[.properties.template.containers[0].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length')" = "0"
+          test "$(echo "$shadow_json" | jq -r '(.properties.configuration.secrets // []) | length')" = "0"
+          shadow_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-daily-neu-job -o json)
+          test "$(echo "$shadow_job" | jq -r '.properties.configuration.triggerType')" = "Schedule"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "polyedge-rs"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].args | join(" ")')" = "research with-azure-lease --account stpolyedge6urdjr5nmwx7w --container polyedge-research --blob data/research/shadow/campaign-2026-07-23/control/replay.lock -- /bin/sh /app/research/run_shadow_daily.sh"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_LIVE") | .value')" = "false"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value')" = "polyedge-research"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_SOURCE_CONTAINER_NAME") | .value')" = "polyedge-shadow-events"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value')" = "campaign-2026-07-23"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_START") | .value')" = "2026-07-23"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_PREFIX") | .value')" = "shadow-events/campaign-2026-07-23"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_CONTRACT") | .value')" = "research/configs/profitability_gate_v3_2026-07-23.yaml"
+          test "$(echo "$shadow_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value')" = "reports/research/shadow/campaigns/campaign-2026-07-23/corrections"
+          test "$(echo "$shadow_job" | jq -r '[.properties.template.containers[0].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length')" = "0"
+          test "$(echo "$shadow_job" | jq -r '(.properties.configuration.secrets // []) | length')" = "0"
+
+      - name: Verify least-privilege identities and storage scopes
+        run: |
+          shadow_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-neu -o json)
+          shadow_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-daily-neu-job -o json)
+          promotion_transition_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-promotion-neu-job -o json)
+          funded_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-neu-id -o json)
+          shadow_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-neu-id -o json)
+          shadow_research_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-research-neu-id -o json)
+          app_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-dev-id -o json)
+          model_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-dev-venue-model-id -o json)
+          promotion_transition_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-promotion-transition-neu-id -o json)
+          github_deploy_identity=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" -o json)
+          funded_principal=$(echo "$funded_identity" | jq -r '.principalId')
+          shadow_principal=$(echo "$shadow_identity" | jq -r '.principalId')
+          shadow_research_principal=$(echo "$shadow_research_identity" | jq -r '.principalId')
+          app_principal=$(echo "$app_identity" | jq -r '.principalId')
+          model_principal=$(echo "$model_identity" | jq -r '.principalId')
+          promotion_transition_principal=$(echo "$promotion_transition_identity" | jq -r '.principalId')
+          github_deploy_principal=$(echo "$github_deploy_identity" | jq -r '.principalId')
+          shadow_identity_id=$(echo "$shadow_identity" | jq -r '.id')
+          shadow_research_identity_id=$(echo "$shadow_research_identity" | jq -r '.id')
+          promotion_transition_identity_id=$(echo "$promotion_transition_identity" | jq -r '.id')
+          test -n "$funded_principal"
+          test -n "$shadow_principal"
+          test "$funded_principal" != "$shadow_principal"
+          test "$funded_principal" != "$shadow_research_principal"
+          test "$shadow_principal" != "$shadow_research_principal"
+          test "$app_principal" != "$funded_principal"
+          test "$model_principal" != "$funded_principal"
+          test "$model_principal" != "$app_principal"
+          test "$promotion_transition_principal" != "$funded_principal"
+          test "$promotion_transition_principal" != "$app_principal"
+          test "$(echo "$shadow_json" | jq -r --arg id "$shadow_identity_id" '.identity.userAssignedIdentities | keys == [$id]')" = "true"
+          test "$(echo "$shadow_job" | jq -r --arg id "$shadow_research_identity_id" '.identity.userAssignedIdentities | keys == [$id]')" = "true"
+          test "$(echo "$promotion_transition_job" | jq -r --arg id "$promotion_transition_identity_id" '.identity.userAssignedIdentities | keys == [$id]')" = "true"
+          key_vault_id=$(az keyvault show --resource-group "$AZURE_RESOURCE_GROUP" --name kvpolyedge6urdjr5nmwx7w --query id -o tsv)
+          shadow_key_vault_roles=$(az role assignment list --scope "$key_vault_id" --assignee "$shadow_principal" --include-inherited --query 'length(@)' -o tsv)
+          test "$shadow_key_vault_roles" = "0"
+          shadow_research_key_vault_roles=$(az role assignment list --scope "$key_vault_id" --assignee "$shadow_research_principal" --include-inherited --query 'length(@)' -o tsv)
+          test "$shadow_research_key_vault_roles" = "0"
+          test "$(az role assignment list --scope "$key_vault_id" --assignee "$app_principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
+          test "$(az role assignment list --scope "$key_vault_id" --assignee "$model_principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
+          test "$(az role assignment list --scope "$key_vault_id" --assignee "$promotion_transition_principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
+          test "$(az role assignment list --scope "$key_vault_id" --assignee "$funded_principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
+          for secret_name in polymarket-private-key polymarket-api-key polymarket-api-secret polymarket-api-passphrase; do
+            secret_scope="$key_vault_id/secrets/$secret_name"
+            test "$(az role assignment list --scope "$secret_scope" --assignee "$funded_principal" --query "[?roleDefinitionName=='Key Vault Secrets User'] | length(@)" -o tsv)" = "1"
+          done
+          dashboard_secret_scope="$key_vault_id/secrets/dashboard-auth-password"
+          test "$(az role assignment list --scope "$dashboard_secret_scope" --assignee "$funded_principal" --query 'length(@)' -o tsv)" = "0"
+          storage_id=$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name stpolyedge6urdjr5nmwx7w --query id -o tsv)
+          test "$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name stpolyedge6urdjr5nmwx7w --query allowSharedKeyAccess -o tsv)" = "false"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Table Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$app_principal" --query "[?roleDefinitionName=='Storage Table Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$app_principal" --include-inherited --query "[?roleDefinitionName=='Storage Table Data Contributor'] | length(@)" -o tsv)" = "0"
+          shadow_events_scope="$storage_id/blobServices/default/containers/polyedge-shadow-events"
+          research_scope="$storage_id/blobServices/default/containers/polyedge-research"
+          bot_events_scope="$storage_id/blobServices/default/containers/bot-events"
+          funded_evidence_scope="$storage_id/blobServices/default/containers/polyedge-funded-evidence"
+          model_scope="$storage_id/blobServices/default/containers/polyedge-models"
+          test "$(az role assignment list --scope "$shadow_events_scope" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$research_scope" --assignee "$shadow_research_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$shadow_events_scope" --assignee "$shadow_research_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$shadow_principal" --query 'length(@)' -o tsv)" = "0"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$shadow_research_principal" --query 'length(@)' -o tsv)" = "0"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$funded_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$funded_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$research_scope" --assignee "$funded_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$shadow_events_scope" --assignee "$funded_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$funded_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$app_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$app_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$research_scope" --assignee "$app_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$app_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$app_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$model_principal" --query 'length(@)' -o tsv)" = "0"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$model_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$model_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$model_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$research_scope" --assignee "$promotion_transition_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$promotion_transition_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$promotion_transition_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$storage_id" --assignee "$promotion_transition_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$github_deploy_principal" --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$research_scope" --assignee "$github_deploy_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$github_deploy_principal" --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          # Effective-role assertions include parent/RG/subscription grants, so
+          # an inherited broad role cannot hide behind the direct-scope checks.
+          test "$(az role assignment list --scope "$shadow_events_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Reader'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$funded_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$funded_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$app_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$app_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$model_scope" --assignee "$model_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$model_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+          test "$(az role assignment list --scope "$funded_evidence_scope" --assignee "$promotion_transition_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$bot_events_scope" --assignee "$promotion_transition_principal" --include-inherited --query "[?roleDefinitionName=='Storage Blob Data Contributor'] | length(@)" -o tsv)" = "0"
+
+          # The app identity backs the API and research jobs. Its complete Table
+          # Contributor scope set must exactly match the tables exported by the
+          # deployed main.bicep template: no account/parent grant and no extra
+          # table grant anywhere in the subscription.
+          deployment_outputs=$(az deployment group show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$APP_NAME-active-infra" \
+            --query properties.outputs \
+            -o json)
+          mapfile -t app_table_names < <(echo "$deployment_outputs" | jq -r \
+            '[.storageTableName.value, .chartTableName.value, .marketTableName.value] + .labTableNames.value | unique[]')
+          test "${#app_table_names[@]}" -gt "0"
+          : > expected-app-table-scopes.txt
+          for table in "${app_table_names[@]}"; do
+            echo "$storage_id/tableServices/default/tables/$table" | tr '[:upper:]' '[:lower:]' >> expected-app-table-scopes.txt
+          done
+          sort -u -o expected-app-table-scopes.txt expected-app-table-scopes.txt
+          test "$(wc -l < expected-app-table-scopes.txt)" = "${#app_table_names[@]}"
+          az role assignment list --assignee "$app_principal" --all -o json \
+            | jq -r '.[] | select(.roleDefinitionName == "Storage Table Data Contributor") | .scope | ascii_downcase' \
+            | sort > actual-app-table-scopes.txt
+          diff -u expected-app-table-scopes.txt actual-app-table-scopes.txt
+
+          table_scope_prefix=$(echo "$storage_id/tableServices/default/tables/" | tr '[:upper:]' '[:lower:]')
+          az rest \
+            --method get \
+            --url "https://management.azure.com${storage_id}/tableServices/default/tables?api-version=2023-05-01" \
+            -o json \
+            | jq -r --arg prefix "$table_scope_prefix" \
+              '.value[] | (.id | ascii_downcase) as $id | select($id | startswith($prefix)) | $id' \
+            | sort -u > existing-app-account-table-scopes.txt
+          while IFS= read -r expected_scope; do
+            grep -Fqx "$expected_scope" existing-app-account-table-scopes.txt
+          done < expected-app-table-scopes.txt
+          while IFS= read -r table_scope; do
+            effective_count=$(az role assignment list \
+              --scope "$table_scope" \
+              --assignee "$app_principal" \
+              --include-inherited \
+              --query "[?roleDefinitionName=='Storage Table Data Contributor'] | length(@)" \
+              -o tsv)
+            if grep -Fqx "$table_scope" expected-app-table-scopes.txt; then
+              test "$effective_count" = "1"
+            else
+              test "$effective_count" = "0"
+            fi
+          done < existing-app-account-table-scopes.txt
+
+          for table in ShadowBotEventIndex ShadowBotChartSeries ShadowBotMarketCatalog; do
+            table_scope="$storage_id/tableServices/default/tables/$table"
+            test "$(az role assignment list --scope "$table_scope" --assignee "$shadow_principal" --query "[?roleDefinitionName=='Storage Table Data Contributor'] | length(@)" -o tsv)" = "1"
+            test "$(az role assignment list --scope "$table_scope" --assignee "$shadow_principal" --include-inherited --query "[?roleDefinitionName=='Storage Table Data Contributor'] | length(@)" -o tsv)" = "1"
+          done
 
       - name: Authenticated post-deploy smoke and paper probe
         env:
@@ -188,7 +779,7 @@ jobs:
           for attempt in $(seq 1 30); do
             curl --fail --silent --show-error -b cookies.txt \
               "https://$fqdn/api/backend/status" -o smoke-status.json
-            if jq -e '.execution_mode == "paper" and .task_health.runtime_loop == "running" and .recorder_metrics.failed_total == 0 and .recorder_metrics.queued <= 1000 and .recorder_status.dropped_count == 0 and .recorder_status.error_count == 0' smoke-status.json >/dev/null; then
+            if jq -e '.execution_mode == "paper" and .task_health.runtime_loop == "running" and .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and .recorder_metrics.queued <= 1000 and .recorder_status.dropped_count == 0' smoke-status.json >/dev/null; then
               status_ready=true
               break
             fi
@@ -201,6 +792,7 @@ jobs:
           curl --fail --silent --show-error -b cookies.txt -X POST \
             "https://$fqdn/api/backend/execution-quality/probe" -o probe.json
           jq -e '.status == "pass" and .venue_contacted == false and .live_order_placed == false and .markout_1s == 2 and .markout_5s == 2 and .markout_30s == 2' probe.json
+          jq -e --arg expected_sha "${{ github.sha }}" '.git_sha == $expected_sha' smoke-status.json
           revision=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --query properties.latestReadyRevisionName -o tsv)
           az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --revision "$revision" -o json > replicas.json
           jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' replicas.json

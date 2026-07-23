@@ -64,6 +64,17 @@ export function pctText(value: unknown) {
   return `${(numeric * 100).toFixed(1)}%`;
 }
 
+export function decisionGradeCoverageText(value: string | number | null | undefined) {
+  if (value === null || value === undefined) {
+    return "pending — no evaluation denominator";
+  }
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "pending — invalid coverage";
+  }
+  return `${numberText(numeric * 100, 2)}%`;
+}
+
 export function dateTime(value?: string | null) {
   if (!value) {
     return "n/a";

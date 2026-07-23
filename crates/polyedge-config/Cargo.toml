@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 polyedge-domain.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true

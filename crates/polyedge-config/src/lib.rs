@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use polyedge_domain::decimal_string;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,12 @@ pub enum ConfigError {
     LiveBlocked(String),
     #[error("invalid decimal for {name}: {value}")]
     InvalidDecimal { name: String, value: String },
+    #[error("invalid adaptive strategy configuration: {0}")]
+    InvalidAdaptiveStrategy(String),
+    #[error("invalid runtime role configuration: {0}")]
+    InvalidRuntimeRole(String),
+    #[error("invalid event blob prefix cutover: {0}")]
+    InvalidEventBlobPrefixCutover(String),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -21,9 +28,42 @@ pub enum ExecutionMode {
     Live,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRole {
+    #[default]
+    Primary,
+    ProfitabilityShadow,
+}
+
+impl RuntimeRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::ProfitabilityShadow => "profitability_shadow",
+        }
+    }
+
+    pub fn is_shadow(&self) -> bool {
+        matches!(self, Self::ProfitabilityShadow)
+    }
+}
+
+pub fn embedded_git_sha() -> Option<&'static str> {
+    option_env!("GIT_SHA").filter(|value| is_full_git_sha(value))
+}
+
+pub fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployConfig {
     pub app_name: String,
+    pub runtime_role: RuntimeRole,
     pub run_bot_on_startup: bool,
     pub require_api_auth: bool,
     pub rust_proxy_runtime_api: bool,
@@ -37,6 +77,7 @@ impl Default for DeployConfig {
     fn default() -> Self {
         Self {
             app_name: "polyedge".to_owned(),
+            runtime_role: RuntimeRole::Primary,
             run_bot_on_startup: false,
             require_api_auth: false,
             rust_proxy_runtime_api: false,
@@ -69,6 +110,7 @@ pub struct TargetConfig {
     pub enable_polymarket_rtds_binance: bool,
     pub enable_direct_binance_book_ticker: bool,
     pub rtds_ping_interval_seconds: f64,
+    pub rtds_chainlink_watchdog_seconds: f64,
     pub start_price_capture_grace_seconds: f64,
     #[serde(with = "decimal_string")]
     pub reference_divergence_pause_threshold: Decimal,
@@ -96,6 +138,7 @@ impl Default for TargetConfig {
             enable_polymarket_rtds_binance: true,
             enable_direct_binance_book_ticker: false,
             rtds_ping_interval_seconds: 5.0,
+            rtds_chainlink_watchdog_seconds: 30.0,
             start_price_capture_grace_seconds: 5.0,
             reference_divergence_pause_threshold: Decimal::new(15, 4),
         }
@@ -235,6 +278,16 @@ pub struct AzureConfig {
     pub storage_table_name: String,
     pub chart_table_name: String,
     pub market_table_name: String,
+    pub event_blob_prefix: String,
+    pub event_blob_prefix_after_cutover: Option<String>,
+    pub event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
+    pub compact_shadow_recording: bool,
+    pub shadow_book_sample_ms: usize,
+    pub publish_strategy_canary_intents: bool,
+    pub strategy_canary_intent_prefix: String,
+    pub strategy_canary_fill_model_version: String,
+    pub strategy_canary_execution_model_blob_uri: String,
+    pub strategy_canary_execution_model_sha256: String,
 }
 
 impl Default for AzureConfig {
@@ -245,6 +298,29 @@ impl Default for AzureConfig {
             storage_table_name: "BotEventIndex".to_owned(),
             chart_table_name: "BotChartSeries".to_owned(),
             market_table_name: "BotMarketCatalog".to_owned(),
+            event_blob_prefix: "events".to_owned(),
+            event_blob_prefix_after_cutover: None,
+            event_blob_prefix_cutover_utc: None,
+            compact_shadow_recording: false,
+            shadow_book_sample_ms: 1_000,
+            publish_strategy_canary_intents: false,
+            strategy_canary_intent_prefix:
+                "reports/research/venue-probe/control/strategy-canary/intents".to_owned(),
+            strategy_canary_fill_model_version: "conservative-execution-prior-v1".to_owned(),
+            strategy_canary_execution_model_blob_uri: String::new(),
+            strategy_canary_execution_model_sha256: String::new(),
+        }
+    }
+}
+
+impl AzureConfig {
+    pub fn event_blob_prefix_at(&self, event_ts: DateTime<Utc>) -> &str {
+        match (
+            self.event_blob_prefix_after_cutover.as_deref(),
+            self.event_blob_prefix_cutover_utc,
+        ) {
+            (Some(prefix), Some(cutover)) if event_ts >= cutover => prefix,
+            _ => &self.event_blob_prefix,
         }
     }
 }
@@ -265,6 +341,17 @@ impl RuntimeSettings {
         let mut settings = Self::default();
         if let Ok(app_name) = env::var("APP_NAME") {
             settings.deploy.app_name = app_name;
+        }
+        if let Ok(role) = env::var("RUNTIME_ROLE") {
+            settings.deploy.runtime_role = match role.trim().to_ascii_lowercase().as_str() {
+                "primary" => RuntimeRole::Primary,
+                "profitability_shadow" => RuntimeRole::ProfitabilityShadow,
+                value => {
+                    return Err(ConfigError::InvalidRuntimeRole(format!(
+                        "unsupported RUNTIME_ROLE {value}"
+                    )))
+                }
+            };
         }
         settings.deploy.run_bot_on_startup =
             env_bool("RUN_BOT_ON_STARTUP", settings.deploy.run_bot_on_startup);
@@ -325,6 +412,10 @@ impl RuntimeSettings {
             "RTDS_PING_INTERVAL_SECONDS",
             settings.target.rtds_ping_interval_seconds,
         );
+        settings.target.rtds_chainlink_watchdog_seconds = env_f64(
+            "RTDS_CHAINLINK_WATCHDOG_SECONDS",
+            settings.target.rtds_chainlink_watchdog_seconds,
+        );
         settings.target.start_price_capture_grace_seconds = env_f64(
             "START_PRICE_CAPTURE_GRACE_SECONDS",
             settings.target.start_price_capture_grace_seconds,
@@ -375,6 +466,58 @@ impl RuntimeSettings {
             env_string("AZURE_CHART_TABLE_NAME", settings.azure.chart_table_name);
         settings.azure.market_table_name =
             env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
+        settings.azure.event_blob_prefix =
+            env_string("AZURE_EVENT_BLOB_PREFIX", settings.azure.event_blob_prefix);
+        settings.azure.event_blob_prefix_after_cutover =
+            env_non_empty("AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER");
+        settings.azure.event_blob_prefix_cutover_utc =
+            match env_non_empty("AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC") {
+                Some(value) => Some(
+                    DateTime::parse_from_rfc3339(&value)
+                        .map_err(|error| {
+                            ConfigError::InvalidEventBlobPrefixCutover(error.to_string())
+                        })?
+                        .with_timezone(&Utc),
+                ),
+                None => None,
+            };
+        if settings.azure.event_blob_prefix_after_cutover.is_some()
+            != settings.azure.event_blob_prefix_cutover_utc.is_some()
+        {
+            return Err(ConfigError::InvalidEventBlobPrefixCutover(
+                "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER and AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC must be configured together"
+                    .to_owned(),
+            ));
+        }
+        settings.azure.compact_shadow_recording = env_bool(
+            "COMPACT_SHADOW_RECORDING",
+            settings.azure.compact_shadow_recording,
+        );
+        settings.azure.shadow_book_sample_ms = env_usize(
+            "SHADOW_BOOK_SAMPLE_MS",
+            settings.azure.shadow_book_sample_ms,
+        )
+        .max(1);
+        settings.azure.publish_strategy_canary_intents = env_bool(
+            "PUBLISH_STRATEGY_CANARY_INTENTS",
+            settings.azure.publish_strategy_canary_intents,
+        );
+        settings.azure.strategy_canary_intent_prefix = env_string(
+            "STRATEGY_CANARY_INTENT_PREFIX",
+            settings.azure.strategy_canary_intent_prefix,
+        );
+        settings.azure.strategy_canary_fill_model_version = env_string(
+            "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION",
+            settings.azure.strategy_canary_fill_model_version,
+        );
+        settings.azure.strategy_canary_execution_model_blob_uri = env_string(
+            "STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI",
+            settings.azure.strategy_canary_execution_model_blob_uri,
+        );
+        settings.azure.strategy_canary_execution_model_sha256 = env_string(
+            "STRATEGY_CANARY_EXECUTION_MODEL_SHA256",
+            settings.azure.strategy_canary_execution_model_sha256,
+        );
         settings.strategy.taker_min_edge =
             env_decimal("TAKER_MIN_EDGE", settings.strategy.taker_min_edge)?;
         settings.strategy.enable_taker_orders =
@@ -430,11 +573,98 @@ impl RuntimeSettings {
             "PAPER_ORDER_LIVE_AFTER_MS",
             settings.paper.order_live_after_ms,
         );
+        settings.validate_adaptive_strategy()?;
+        settings.validate_runtime_role()?;
         Ok(settings)
     }
 
     pub fn live_requested(&self) -> bool {
         self.live.execution_mode == ExecutionMode::Live
+    }
+
+    pub fn validate_adaptive_strategy(&self) -> Result<(), ConfigError> {
+        if !self.strategy.adaptive_regime_enabled {
+            return Ok(());
+        }
+        if self.live_requested() {
+            return Err(ConfigError::InvalidAdaptiveStrategy(
+                "frozen adaptive candidates are paper-only".to_owned(),
+            ));
+        }
+        if !matches!(
+            self.strategy.adaptive_regime_mode.as_str(),
+            "paper_only"
+                | "dynamic_quote_style"
+                | "dynamic_safety_only"
+                | "full_deterministic_profile"
+                | "full_deterministic"
+        ) {
+            return Err(ConfigError::InvalidAdaptiveStrategy(format!(
+                "unsupported ADAPTIVE_REGIME_MODE {}",
+                self.strategy.adaptive_regime_mode
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_runtime_role(&self) -> Result<(), ConfigError> {
+        if !self.deploy.runtime_role.is_shadow() {
+            return Ok(());
+        }
+        let mut reasons = Vec::new();
+        if self.live_requested() {
+            reasons.push("EXECUTION_MODE must be paper");
+        }
+        if self.live.allow_live {
+            reasons.push("ALLOW_LIVE must be false");
+        }
+        if self.live.polymarket_private_key.is_some() {
+            reasons.push("POLYMARKET_PRIVATE_KEY must not be configured");
+        }
+        if self.strategy.enable_taker_orders {
+            reasons.push("ENABLE_TAKER_ORDERS must be false");
+        }
+        if self.live.allow_emergency_account_cancel {
+            reasons.push("ALLOW_EMERGENCY_ACCOUNT_CANCEL must be false");
+        }
+        if self.paper.maker_fill_policy != "none" {
+            reasons.push("PAPER_MAKER_FILL_POLICY must be none");
+        }
+        if !self.strategy.adaptive_regime_enabled {
+            reasons.push("ADAPTIVE_REGIME_ENABLED must be true");
+        }
+        if self.strategy.adaptive_regime_mode != "dynamic_quote_style" {
+            reasons.push("ADAPTIVE_REGIME_MODE must be dynamic_quote_style");
+        }
+        if !self.azure.publish_strategy_canary_intents {
+            reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
+        }
+        if self.azure.storage_container_name != "polyedge-shadow-events" {
+            reasons.push("AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events");
+        }
+        if !self.azure.event_blob_prefix.starts_with("shadow-events/") {
+            reasons.push("AZURE_EVENT_BLOB_PREFIX must start with shadow-events/");
+        }
+        if self.azure.event_blob_prefix_after_cutover.is_some()
+            != self.azure.event_blob_prefix_cutover_utc.is_some()
+        {
+            reasons.push(
+                "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER and AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC must be configured together",
+            );
+        }
+        if self
+            .azure
+            .event_blob_prefix_after_cutover
+            .as_deref()
+            .is_some_and(|prefix| !prefix.starts_with("shadow-events/"))
+        {
+            reasons.push("AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER must start with shadow-events/");
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::InvalidRuntimeRole(reasons.join("; ")))
+        }
     }
 
     pub fn validate_live_gates(&self, exact_resolution_source: bool) -> Result<(), ConfigError> {
@@ -489,6 +719,9 @@ impl RuntimeSettings {
                 "paper_order_live_after_ms": self.paper.order_live_after_ms
             },
             "read_only": {
+                "app_name": self.deploy.app_name,
+                "runtime_role": self.deploy.runtime_role.as_str(),
+                "shadow_only": self.deploy.runtime_role.is_shadow(),
                 "execution_mode": match self.live.execution_mode {
                     ExecutionMode::Paper => "paper",
                     ExecutionMode::Live => "live"
@@ -508,6 +741,18 @@ impl RuntimeSettings {
                 "api_bearer_token_configured": self.deploy.api_bearer_token.is_some(),
                 "polymarket_private_key_configured": self.live.polymarket_private_key.is_some(),
                 "azure_storage_configured": self.azure.storage_account_name.is_some()
+            },
+            "azure": {
+                "event_blob_prefix": self.azure.event_blob_prefix,
+                "event_blob_prefix_after_cutover": self.azure.event_blob_prefix_after_cutover,
+                "event_blob_prefix_cutover_utc": self.azure.event_blob_prefix_cutover_utc,
+                "compact_shadow_recording": self.azure.compact_shadow_recording,
+                "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
+                "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
+                "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
+                "strategy_canary_fill_model_version": self.azure.strategy_canary_fill_model_version
+                ,"strategy_canary_execution_model_blob_uri_configured": !self.azure.strategy_canary_execution_model_blob_uri.is_empty()
+                ,"strategy_canary_execution_model_sha256_configured": !self.azure.strategy_canary_execution_model_sha256.is_empty()
             }
         })
     }
@@ -603,5 +848,111 @@ fn env_decimal(name: &str, default: Decimal) -> Result<Decimal, ConfigError> {
             value,
         }),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_full_git_sha, ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings};
+    use chrono::{DateTime, Utc};
+
+    fn safe_shadow_settings() -> RuntimeSettings {
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
+        settings.paper.maker_fill_policy = "none".to_owned();
+        settings.strategy.adaptive_regime_enabled = true;
+        settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
+        settings.azure.event_blob_prefix = "shadow-events/test-campaign".to_owned();
+        settings
+    }
+
+    #[test]
+    fn profitability_shadow_accepts_fail_closed_configuration() {
+        let settings = safe_shadow_settings();
+        assert!(settings.validate_runtime_role().is_ok());
+        assert!(settings.deploy.runtime_role.is_shadow());
+        assert_eq!(
+            settings.deploy.runtime_role.as_str(),
+            "profitability_shadow"
+        );
+    }
+
+    #[test]
+    fn event_blob_prefix_cutover_is_paired_and_uses_event_time_boundary() {
+        let mut settings = safe_shadow_settings();
+        settings.azure.event_blob_prefix = "shadow-events/old".to_owned();
+        settings.azure.event_blob_prefix_after_cutover = Some("shadow-events/new".to_owned());
+        settings.azure.event_blob_prefix_cutover_utc = Some(
+            DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        assert_eq!(
+            settings.azure.event_blob_prefix_at(
+                DateTime::parse_from_rfc3339("2026-07-21T23:59:59.999Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+            "shadow-events/old"
+        );
+        assert_eq!(
+            settings.azure.event_blob_prefix_at(
+                DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ),
+            "shadow-events/new"
+        );
+        assert!(settings.validate_runtime_role().is_ok());
+
+        settings.azure.event_blob_prefix_cutover_utc = None;
+        let error = settings.validate_runtime_role().unwrap_err().to_string();
+        assert!(error.contains("must be configured together"));
+    }
+
+    #[test]
+    fn profitability_shadow_rejects_live_or_non_shadow_configuration() {
+        let mut settings = safe_shadow_settings();
+        settings.live.execution_mode = ExecutionMode::Live;
+        settings.live.allow_live = true;
+        settings.live.polymarket_private_key = Some("redacted-test-key".to_owned());
+        settings.strategy.enable_taker_orders = true;
+        settings.live.allow_emergency_account_cancel = true;
+        settings.paper.maker_fill_policy = "touch_after_quote_was_live".to_owned();
+        settings.strategy.adaptive_regime_enabled = false;
+        settings.strategy.adaptive_regime_mode = "paper_only".to_owned();
+        settings.azure.publish_strategy_canary_intents = false;
+        settings.azure.storage_container_name = "bot-events".to_owned();
+        settings.azure.event_blob_prefix = "events".to_owned();
+
+        let error = settings.validate_runtime_role().unwrap_err();
+        let ConfigError::InvalidRuntimeRole(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        for expected in [
+            "EXECUTION_MODE must be paper",
+            "ALLOW_LIVE must be false",
+            "POLYMARKET_PRIVATE_KEY must not be configured",
+            "ENABLE_TAKER_ORDERS must be false",
+            "ALLOW_EMERGENCY_ACCOUNT_CANCEL must be false",
+            "PAPER_MAKER_FILL_POLICY must be none",
+            "ADAPTIVE_REGIME_ENABLED must be true",
+            "ADAPTIVE_REGIME_MODE must be dynamic_quote_style",
+            "PUBLISH_STRATEGY_CANARY_INTENTS must be true",
+            "AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events",
+            "AZURE_EVENT_BLOB_PREFIX must start with shadow-events/",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+    }
+
+    #[test]
+    fn full_git_sha_accepts_only_canonical_lowercase_commit_ids() {
+        assert!(is_full_git_sha("c40d9093783808b010eabd9c43697e9dcceb667b"));
+        assert!(!is_full_git_sha("unknown"));
+        assert!(!is_full_git_sha("C40D9093783808B010EABD9C43697E9DCCEB667B"));
+        assert!(!is_full_git_sha("c40d909"));
     }
 }

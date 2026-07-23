@@ -12,6 +12,9 @@ param image string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:lates
 @description('Frontend container image. Leave empty for backend-only bootstrap deployments.')
 param frontendImage string = ''
 
+@description('Authenticated venue probe image. Leave empty to omit the isolated manual probe and model jobs.')
+param venueProbeImage string = ''
+
 @description('Bearer token required to access the public API.')
 @secure()
 param apiBearerToken string
@@ -71,10 +74,15 @@ var suffix = uniqueString(subscription().id, resourceGroup().id, appName)
 var safeAppName = toLower(replace(appName, '-', ''))
 var storageName = take('st${safeAppName}${suffix}', 24)
 var acrName = take('cr${safeAppName}${suffix}', 50)
+var keyVaultName = take('kv${safeAppName}${suffix}', 24)
 var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix}', 63)
 var managedEnvironmentName = '${appName}-${environmentName}-env'
 var containerAppName = '${appName}-${environmentName}'
+var shadowContainerAppName = 'polyedge-shadow-neu'
 var storageContainerName = 'bot-events'
+var researchStorageContainerName = 'polyedge-research'
+var fundedEvidenceContainerName = 'polyedge-funded-evidence'
+var modelStorageContainerName = 'polyedge-models'
 var storageTableName = 'BotEventIndex'
 var chartTableName = 'BotChartSeries'
 var marketTableName = 'BotMarketCatalog'
@@ -88,6 +96,9 @@ var labTableNames = [
 ]
 var frontendEnabled = !empty(frontendImage)
 var containerAppIdentityName = '${containerAppName}-id'
+var venueModelIdentityName = '${containerAppName}-venue-model-id'
+var githubDeployIdentityName = 'id-github-polyedge-dev'
+var venueProbeEnabled = !empty(venueProbeImage)
 var tags = {
   app: appName
   environment: environmentName
@@ -143,10 +154,6 @@ var jobCommonEnv = [
     value: storageTableName
   }
   {
-    name: 'AZURE_STORAGE_ACCOUNT_KEY'
-    secretRef: 'storage-account-key'
-  }
-  {
     name: 'AZURE_CHART_TABLE_NAME'
     value: chartTableName
   }
@@ -182,27 +189,27 @@ var researchJobDefinitions = [
     replicaTimeout: 1800
     cpu: cpu
     memory: memory
-    command: 'DAY=$(date -u +%Y/%m/%d); HOUR=$(date -u -d "10 minutes ago" +%H); polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "reports/research/hourly/$DAY/$HOUR/audit.json" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+    command: 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=\${TARGET%/*}; HOUR=\${TARGET##*/}; polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "reports/research/hourly/$DAY/$HOUR/audit.json" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
   }
   {
     id: 'daily-research-report'
     name: 'polyedge-daily-research-job'
     triggerType: 'Schedule'
     cron: '30 0 * * *'
-    replicaTimeout: 43200
+    replicaTimeout: 46800
     cpu: '2'
     memory: '4Gi'
-    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; MARKETS="reports/research/daily/$DATE/markets_summary.json"; mkdir -p "reports/research/daily/$DATE" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/data_audit.json" --markdown "reports/research/daily/$DATE/data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/execution_quality.json" --markdown "reports/research/daily/$DATE/execution_quality.md"; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "reports/research/daily/$DATE/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/baseline.json" --markdown "reports/research/daily/$DATE/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/regimes.json" --markdown "reports/research/daily/$DATE/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/daily/$DATE/calibration.json" --markdown "reports/research/daily/$DATE/calibration.md"; polyedge-rs research sample-size --results "reports/research/daily/$DATE/baseline.json" --out "reports/research/daily/$DATE/sample_size.json" --markdown "reports/research/daily/$DATE/sample_size.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/daily/$DATE/final_report.json" --markdown "reports/research/daily/$DATE/final_report.md"; polyedge-rs research report --reports-dir "reports/research/daily/$DATE" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"'
+    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); RUN_ID="daily-$DATE-$(date -u +%Y%m%dT%H%M%SZ)"; INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; STAGING="reports/research/staging/$RUN_ID"; MARKETS="$STAGING/markets_summary.json"; mkdir -p "$STAGING" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/raw_data_audit.json" --markdown "$STAGING/raw_data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research audit --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/data_audit.json" --markdown "$STAGING/data_audit.md"; polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/execution_quality.json" --markdown "$STAGING/execution_quality.md"; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "$STAGING/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/baseline.json" --markdown "$STAGING/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --fill-model queue_proxy_conservative --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/regimes.json" --markdown "$STAGING/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/calibration.json" --markdown "$STAGING/calibration.md"; polyedge-rs research sample-size --results "$STAGING/baseline.json" --out "$STAGING/sample_size.json" --markdown "$STAGING/sample_size.md"; polyedge-rs research report --reports-dir "$STAGING" --out "$STAGING/final_report.json" --markdown "$STAGING/final_report.md"; INPUT_SHA="sha256:$(sha256sum "$NORMALIZED/events_manifest.json" | cut -d" " -f1)"; polyedge-rs research publish-daily-bundle --date "$DATE" --run-id "$RUN_ID" --input-sha256 "$INPUT_SHA" --expected-runtime-role primary --source-dir "$STAGING" --output-root "reports/research/daily" --data-audit "$STAGING/data_audit.json"; polyedge-rs research report --reports-dir "$STAGING" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"; polyedge-rs research validate-prospective --since "2026-07-13T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --expected-daily-date "$DATE" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
   }
   {
     id: 'prospective-validation'
     name: 'polyedge-prospective-job'
-    triggerType: 'Schedule'
-    cron: '15 1 * * *'
+    triggerType: 'Manual'
+    cron: ''
     replicaTimeout: 1800
     cpu: cpu
     memory: memory
-    command: 'polyedge-rs research validate-prospective --since "2026-06-14T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
+    command: 'polyedge-rs research validate-prospective --since "2026-07-13T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
   }
   {
     id: 'compact-replay-index'
@@ -291,27 +298,33 @@ var logAlerts = [
   }
   {
     name: 'recorder-failed-total-gt-0'
-    displayName: 'PolyEdge recorder failed total > 0'
+    displayName: 'PolyEdge recorder has unrecovered durable evidence'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_failed_total":([0-9]+)\', 1, Log_s)) | where value > 0 or Log_s has "worker_alive=false"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
   }
   {
     name: 'recorder-dropped-count-gt-0'
     displayName: 'PolyEdge recorder dropped count > 0'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
   }
   {
     name: 'recorder-queue-over-1000'
     displayName: 'PolyEdge recorder queue over 1000 events'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${containerAppName}" | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
   }
   {
     name: 'runtime-container-restarted'
     displayName: 'PolyEdge runtime container restarted or backed off'
     severity: 0
-    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s == "${containerAppName}" | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
+    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
+  }
+  {
+    name: 'shadow-runtime-health-missing'
+    displayName: 'PolyEdge shadow runtime health heartbeat missing'
+    severity: 0
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${shadowContainerAppName}" | where Log_s has "runtime_health" | summarize heartbeat_count = count() | where heartbeat_count == 0'
   }
   {
     name: 'job-failed'
@@ -344,7 +357,7 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   properties: {
     accessTier: 'Hot'
     allowBlobPublicAccess: false
-    allowSharedKeyAccess: true
+    allowSharedKeyAccess: false
     defaultToOAuthAuthentication: true
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
@@ -354,6 +367,20 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
+  properties: {
+    changeFeed: {
+      enabled: true
+      retentionInDays: 30
+    }
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
+    containerDeleteRetentionPolicy: {
+      enabled: true
+      days: 14
+    }
+  }
 }
 
 resource eventContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
@@ -361,6 +388,58 @@ resource eventContainer 'Microsoft.Storage/storageAccounts/blobServices/containe
   name: storageContainerName
   properties: {
     publicAccess: 'None'
+  }
+}
+
+resource researchContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: researchStorageContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource fundedEvidenceContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: fundedEvidenceContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource modelContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: modelStorageContainerName
+  properties: { publicAccess: 'None' }
+}
+
+resource githubDeployIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
+  name: githubDeployIdentityName
+}
+
+resource githubDeployEventReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(eventContainer.id, githubDeployIdentity.id, 'github-deploy-blob-reader')
+  scope: eventContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: githubDeployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource githubDeployResearchContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(researchContainer.id, githubDeployIdentity.id, 'github-deploy-blob-contributor')
+  scope: researchContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: githubDeployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource githubDeployFundedContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(fundedEvidenceContainer.id, githubDeployIdentity.id, 'github-deploy-blob-contributor')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: githubDeployIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -401,6 +480,26 @@ resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   }
 }
 
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: keyVaultName
+  location: location
+  tags: union(tags, {
+    purpose: 'venue-probe-credentials'
+  })
+  properties: {
+    tenantId: tenant().tenantId
+    enableRbacAuthorization: true
+    enablePurgeProtection: true
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 90
+    publicNetworkAccess: 'Enabled'
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+  }
+}
+
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logAnalyticsWorkspaceName
   location: location
@@ -430,6 +529,14 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
 
 resource containerAppIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: containerAppIdentityName
+  location: location
+  tags: tags
+}
+
+// Research-only identity for checkpoint-100 queue calibration. It is never
+// granted Key Vault access and therefore cannot obtain venue credentials.
+resource venueModelIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (venueProbeEnabled) {
+  name: venueModelIdentityName
   location: location
   tags: tags
 }
@@ -466,10 +573,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'dashboard-session-secret'
           value: dashboardSessionSecret
-        }
-        {
-          name: 'storage-account-key'
-          value: storage.listKeys().keys[0].value
         }
       ]
       registries: [
@@ -562,12 +665,36 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: storageContainerName
             }
             {
-              name: 'AZURE_STORAGE_TABLE_NAME'
-              value: storageTableName
+              name: 'AZURE_RESEARCH_STORAGE_CONTAINER_NAME'
+              value: researchStorageContainerName
             }
             {
-              name: 'AZURE_STORAGE_ACCOUNT_KEY'
-              secretRef: 'storage-account-key'
+              name: 'AZURE_FUNDED_STORAGE_CONTAINER_NAME'
+              value: fundedEvidenceContainerName
+            }
+            {
+              name: 'AZURE_MODEL_STORAGE_CONTAINER_NAME'
+              value: modelStorageContainerName
+            }
+            {
+              name: 'SHADOW_CAMPAIGN_ID'
+              value: 'campaign-2026-07-23'
+            }
+            {
+              name: 'SHADOW_CAMPAIGN_START'
+              value: '2026-07-23'
+            }
+            {
+              name: 'SHADOW_CAMPAIGN_REPORT_ROOT'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-23'
+            }
+            {
+              name: 'SHADOW_CORRECTION_ROOT'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-23/corrections'
+            }
+            {
+              name: 'AZURE_STORAGE_TABLE_NAME'
+              value: storageTableName
             }
             {
               name: 'AZURE_CHART_TABLE_NAME'
@@ -579,7 +706,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'AZURE_EVENT_INDEX_TYPES'
-              value: 'market,market_start_price,paper_settlement,fair_value,decision,execution_report,feed_error,reference,live_heartbeat'
+              value: 'runtime_provenance,market,market_start_price,paper_settlement,fair_value,decision,execution_report,feed_error,reference,live_heartbeat'
             }
             {
               name: 'ENABLE_TAKER_ORDERS'
@@ -689,10 +816,6 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
           name: 'api-bearer-token'
           value: apiBearerToken
         }
-        {
-          name: 'storage-account-key'
-          value: storage.listKeys().keys[0].value
-        }
       ]
     }, job.triggerType == 'Schedule' ? {
       scheduleTriggerConfig: {
@@ -718,7 +841,18 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
           args: [
             job.command
           ]
-          env: jobCommonEnv
+          env: concat(jobCommonEnv, job.id == 'daily-research-report' ? [
+            {
+              // A full day contains enough large book events for the default
+              // 8,192-event per-shard merge window to exceed the legacy
+              // Consumption environment's 4 GiB replica limit. Normalized
+              // shards preserve recorder order; this bounded window still
+              // corrects nearby timestamp inversions while keeping the audit
+              // fail-closed on any ordering warning.
+              name: 'POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS'
+              value: '64'
+            }
+          ] : [])
           resources: {
             cpu: json(job.cpu)
             memory: job.memory
@@ -729,9 +863,131 @@ resource researchJobs 'Microsoft.App/jobs@2024-03-01' = [for job in researchJobD
   }
 }]
 
+resource venueModelJob 'Microsoft.App/jobs@2024-03-01' = if (venueProbeEnabled) {
+  name: 'polyedge-venue-model-job'
+  location: location
+  tags: union(tags, {
+    researchJob: 'venue-fill-model'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${venueModelIdentity!.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaRetryLimit: 0
+      replicaTimeout: 300
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: venueModelIdentity!.id
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'venue-model'
+          image: venueProbeImage
+          command: [
+            'node'
+          ]
+          args: [
+            'src/train.mjs'
+          ]
+          env: [
+            {
+              name: 'AZURE_CLIENT_ID'
+              value: venueModelIdentity!.properties.clientId
+            }
+            {
+              name: 'AZURE_STORAGE_ACCOUNT_NAME'
+              value: storage.name
+            }
+            {
+              name: 'AZURE_STORAGE_CONTAINER_NAME'
+              value: fundedEvidenceContainerName
+            }
+            {
+              name: 'QUEUE_MODEL_SOURCE_CONTAINER_NAME'
+              value: fundedEvidenceContainerName
+            }
+            {
+              name: 'QUEUE_MODEL_OUTPUT_CONTAINER_NAME'
+              value: modelStorageContainerName
+            }
+            {
+              name: 'QUEUE_MODEL_TRAINING_ENABLED'
+              value: 'false'
+            }
+            {
+              name: 'QUEUE_MODEL_CHECKPOINT_BLOB_NAME'
+              value: ''
+            }
+            {
+              name: 'QUEUE_MODEL_CHECKPOINT_SHA256'
+              value: ''
+            }
+            {
+              name: 'ALLOW_LIVE'
+              value: 'false'
+            }
+            {
+              name: 'ENABLE_TAKER_ORDERS'
+              value: 'false'
+            }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+
+resource venueModelFundedEvidenceReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (venueProbeEnabled) {
+  name: guid(fundedEvidenceContainer.id, venueModelIdentity!.id, 'venue-model-funded-reader')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: venueModelIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource venueModelOutputContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (venueProbeEnabled) {
+  name: guid(modelContainer.id, venueModelIdentity!.id, 'venue-model-output-contributor')
+  scope: modelContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: venueModelIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource venueModelAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (venueProbeEnabled) {
+  name: guid(acr.id, venueModelIdentity!.id, 'venue-model-acr-pull')
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+    principalId: venueModelIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, containerAppIdentity.id, 'blob-data-contributor')
-  scope: storage
+  name: guid(eventContainer.id, containerAppIdentity.id, 'blob-data-contributor')
+  scope: eventContainer
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
     principalId: containerAppIdentity.properties.principalId
@@ -739,15 +995,75 @@ resource blobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01
   }
 }
 
-resource tableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, containerAppIdentity.id, 'table-data-contributor')
-  scope: storage
+resource appFundedEvidenceReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(fundedEvidenceContainer.id, containerAppIdentity.id, 'app-funded-evidence-reader')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource appModelReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(modelContainer.id, containerAppIdentity.id, 'app-model-reader')
+  scope: modelContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource appResearchReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(researchContainer.id, containerAppIdentity.id, 'app-research-reader')
+  scope: researchContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource eventIndexTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(eventIndexTable.id, containerAppIdentity.id, 'table-data-contributor')
+  scope: eventIndexTable
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
     principalId: containerAppIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
+
+resource chartSeriesTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(chartSeriesTable.id, containerAppIdentity.id, 'table-data-contributor')
+  scope: chartSeriesTable
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource marketCatalogTableContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(marketCatalogTable.id, containerAppIdentity.id, 'table-data-contributor')
+  scope: marketCatalogTable
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource labTableContributors 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (tableName, index) in labTableNames: {
+  name: guid(labTables[index].id, containerAppIdentity.id, 'table-data-contributor')
+  scope: labTables[index]
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3')
+    principalId: containerAppIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}]
 
 resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(acr.id, containerAppIdentity.id, 'acr-pull')
@@ -940,6 +1256,7 @@ resource logAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = [fo
 
 output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
+output keyVaultName string = keyVault.name
 output containerAppName string = containerApp.name
 output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
 output containerAppIdentityName string = containerAppIdentity.name
@@ -951,3 +1268,5 @@ output chartTableName string = chartTableName
 output marketTableName string = marketTableName
 output labTableNames array = labTableNames
 output researchJobNames array = [for job in researchJobDefinitions: job.name]
+output venueModelJobName string = venueProbeEnabled ? venueModelJob.name : ''
+output venueModelIdentityName string = venueProbeEnabled ? venueModelIdentity!.name : ''

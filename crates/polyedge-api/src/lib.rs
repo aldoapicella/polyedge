@@ -39,6 +39,9 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(settings: RuntimeSettings) -> Self {
+        settings.validate_runtime_role().unwrap_or_else(|error| {
+            panic!("refusing API startup with unsafe runtime role: {error}")
+        });
         let runtime = RuntimeController::new(settings.clone());
         runtime.start_if_configured();
         Self {
@@ -533,6 +536,7 @@ pub fn smoke_paths() -> Vec<&'static str> {
         "/api/v1/labs/reports/latest",
         "/api/v1/labs/jobs",
         "/api/v1/labs/prospective",
+        "/api/v1/labs/venue-execution",
         "/api/v1/data-quality/timeline",
         "/api/v1/jobs",
         "/api/v1/config/current",

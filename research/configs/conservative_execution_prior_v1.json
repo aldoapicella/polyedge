@@ -1,0 +1,27 @@
+{
+  "model_version": "conservative-execution-prior-v1",
+  "status": "frozen_conservative_prior",
+  "generated_at": "2026-07-12T00:00:00Z",
+  "evidence_protocol_version": 3,
+  "target": "probability_of_fill_within_horizon",
+  "queue_position_source": "authenticated_lifecycle_plus_public_l2",
+  "queue_position_metric": "inferred_size_ahead",
+  "literal_fifo_rank_available": false,
+  "prediction_policy": "zero_fill_probability_until_authenticated_calibration",
+  "horizon_fill_probabilities": {
+    "1": 0,
+    "5": 0,
+    "30": 0,
+    "60": 0
+  },
+  "sample_size": 0,
+  "positive_fills": 0,
+  "negative_non_fills": 0,
+  "brier_improvement_fraction": 0,
+  "expected_calibration_error": 1,
+  "net_executable_markout_30s_lower_confidence_bound_95": 0,
+  "promotion_ready": false,
+  "research_only": true,
+  "promotion_allowed": false,
+  "funded_execution_allowed": false
+}

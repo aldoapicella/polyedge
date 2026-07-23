@@ -33,6 +33,62 @@ fn audit_counts_fixture_and_malformed_lines() {
 }
 
 #[test]
+fn normalized_audit_preserves_and_summarizes_runtime_provenance() {
+    let dir = test_dir("runtime_provenance_audit");
+    let events = dir.join("events.jsonl");
+    let identity = valid_runtime_provenance_identity();
+    let lines = [
+        "2026-07-14T00:00:01Z",
+        "2026-07-14T00:01:01Z",
+        "2026-07-14T00:02:01Z",
+    ]
+    .into_iter()
+    .map(|recorded_ts| {
+        serde_json::json!({
+            "event_type": "runtime_provenance",
+            "recorded_ts": recorded_ts,
+            "payload": identity
+        })
+        .to_string()
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    write_events(&events, &format!("{lines}\n"));
+
+    let normalized = dir.join("normalized");
+    let normalize = run_normalize(NormalizeOptions {
+        input: events,
+        out: normalized.clone(),
+        format: "jsonl-indexed-gzip-sharded".to_owned(),
+        overwrite: true,
+        decision_grade_projection: false,
+    })
+    .unwrap();
+    assert_eq!(
+        normalize["result"]["files"]["runtime_provenance"]["rows"],
+        3
+    );
+
+    let audit = run_audit(AuditOptions {
+        input: normalized,
+        out: dir.join("data_audit.json"),
+        markdown: dir.join("data_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(audit["result"]["runtime_provenance"]["observations"], 3);
+    assert_eq!(
+        audit["result"]["runtime_provenance"]["valid_observations"],
+        3
+    );
+    assert_eq!(
+        audit["result"]["runtime_provenance"]["distinct_identity_count"],
+        1
+    );
+    assert_eq!(audit["result"]["runtime_provenance"]["max_gap_ms"], 60_000);
+}
+
+#[test]
 fn exclusion_registry_loads_put_bug_window_by_default() {
     let dir = test_dir("exclusion_registry");
     let registry = dir.join("exclusion_windows.yaml");
@@ -94,6 +150,7 @@ fn prospective_and_backfill_reports_keep_research_safety_flags() {
         candidates,
         out: dir.join("prospective.json"),
         markdown: dir.join("prospective.md"),
+        expected_daily_date: None,
     })
     .unwrap();
 
@@ -188,6 +245,7 @@ fn normalize_and_build_markets_preserve_incomplete_markets() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
     let report = run_build_markets(BuildMarketsOptions {
@@ -208,14 +266,54 @@ fn normalize_and_build_markets_preserve_incomplete_markets() {
 }
 
 #[test]
+fn explicit_build_markets_outputs_do_not_overwrite_each_other() {
+    let dir = test_dir("explicit_market_outputs");
+    let daily_input = dir.join("daily.jsonl");
+    let cumulative_input = dir.join("cumulative.jsonl");
+    write_events(
+        &daily_input,
+        &format!("{}\n", market_line("m1", "up-1", "down-1")),
+    );
+    write_events(
+        &cumulative_input,
+        &format!(
+            "{}\n{}\n",
+            market_line("m1", "up-1", "down-1"),
+            market_line("m2", "up-2", "down-2")
+        ),
+    );
+    let daily_out = dir.join("markets_summary.json");
+    let cumulative_out = dir.join("cumulative_markets_summary.json");
+
+    run_build_markets(BuildMarketsOptions {
+        input: daily_input,
+        out: daily_out.clone(),
+        markdown: dir.join("markets_summary.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    run_build_markets(BuildMarketsOptions {
+        input: cumulative_input,
+        out: cumulative_out,
+        markdown: dir.join("cumulative_markets_summary.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+
+    let daily: Value = serde_json::from_slice(&fs::read(daily_out).unwrap()).unwrap();
+    assert_eq!(daily["result"]["summary"]["markets"], 1);
+}
+
+#[test]
 fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
     let dir = test_dir("queue_audit");
     let raw = dir.join("raw.jsonl");
     write_events(
         &raw,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
             raw_price_change_line("up", "0.50", "5", "2026-06-01T00:00:45+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
@@ -230,14 +328,16 @@ fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
-    assert!(normalized.join("book_snapshots.jsonl").is_file());
-    assert!(normalized.join("price_changes.jsonl").is_file());
+    assert!(normalized.join("books.jsonl").is_file());
+    assert!(normalized.join("raw_market_events.jsonl").is_file());
     assert!(normalized.join("last_trades.jsonl").is_file());
-    assert_eq!(manifest["result"]["files"]["book_snapshot"]["rows"], 1);
-    assert_eq!(manifest["result"]["files"]["price_change"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["book"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["raw_market_event"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["price_change"]["rows"], 0);
     assert_eq!(manifest["result"]["files"]["last_trade"]["rows"], 1);
 
     let markets_path = dir.join("markets.json");
@@ -264,6 +364,101 @@ fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
 }
 
 #[test]
+fn decision_grade_projection_bounds_books_and_preserves_pre_decision_state_and_trades() {
+    let dir = test_dir("decision_grade_projection");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            bid_book_line("up", "0.48", "5", "2026-06-01T00:00:30.100+00:00"),
+            bid_book_line("up", "0.49", "5", "2026-06-01T00:00:30.500+00:00"),
+            raw_price_change_line("up", "0.49", "5", "2026-06-01T00:00:30.600+00:00"),
+            trade_line("up", "0.49", "2", "2026-06-01T00:00:30.700+00:00"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:31.100+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:00:31.200+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+
+    let manifest = run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+        decision_grade_projection: true,
+    })
+    .unwrap();
+
+    assert_eq!(manifest["result"]["input_events"], 9);
+    assert_eq!(manifest["result"]["events"], 8);
+    assert_eq!(manifest["result"]["files"]["book"]["rows"], 2);
+    assert_eq!(manifest["result"]["files"]["raw_market_event"]["rows"], 1);
+    assert_eq!(manifest["result"]["files"]["last_trade"]["rows"], 1);
+    let books = fs::read_to_string(normalized.join("books.jsonl")).unwrap();
+    assert!(!books.contains("\"0.48\""));
+    assert!(books.contains("\"0.49\""));
+    assert!(books.contains("\"0.50\""));
+
+    let markets = dir.join("markets.json");
+    run_build_markets(BuildMarketsOptions {
+        input: normalized.clone(),
+        out: markets.clone(),
+        markdown: dir.join("markets.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let queue_audit = run_queue_audit(QueueAuditOptions {
+        input: normalized,
+        markets,
+        out: dir.join("queue_audit.json"),
+        markdown: dir.join("queue_audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(queue_audit["result"]["queue_proxy_eligible_markets"], 1);
+}
+
+#[test]
+fn decision_grade_projection_flushes_sparse_tokens_in_global_time_order() {
+    let dir = test_dir("decision_grade_projection_ordering");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            bid_book_line("up", "0.48", "5", "2026-06-01T00:00:30.100+00:00"),
+            bid_book_line("down", "0.51", "5", "2026-06-01T00:00:30.200+00:00"),
+            bid_book_line("up", "0.49", "5", "2026-06-01T00:00:31.100+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:00:31.200+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+    let normalized = dir.join("normalized");
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed".to_owned(),
+        overwrite: false,
+        decision_grade_projection: true,
+    })
+    .unwrap();
+
+    let audit = run_audit(AuditOptions {
+        input: normalized,
+        out: dir.join("audit.json"),
+        markdown: dir.join("audit.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(audit["result"]["out_of_order_timestamps"], 0);
+}
+
+#[test]
 fn chart_backfill_writes_read_only_chart_artifact() {
     let dir = test_dir("chart_backfill");
     let raw = dir.join("raw.jsonl");
@@ -284,6 +479,7 @@ fn chart_backfill_writes_read_only_chart_artifact() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -320,6 +516,7 @@ fn gzip_normalized_outputs_feed_build_markets_and_replay() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -362,6 +559,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip-sharded".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -375,7 +573,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
     )
     .unwrap();
     assert_eq!(progress["status"], "completed");
-    assert_eq!(progress["events"], 4);
+    assert_eq!(progress["events"], 5);
 
     let markets_path = dir.join("markets.json");
     let markets = run_build_markets(BuildMarketsOptions {
@@ -421,6 +619,7 @@ fn sharded_gzip_reader_reorders_local_shard_timestamp_inversions() {
         out: normalized.clone(),
         format: "jsonl-indexed-gzip-sharded".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
 
@@ -449,6 +648,7 @@ fn normalize_rejects_unknown_format_without_removing_output() {
         out: normalized.clone(),
         format: "parquet-ish".to_owned(),
         overwrite: true,
+        decision_grade_projection: false,
     })
     .unwrap_err()
     .to_string();
@@ -534,8 +734,9 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             fair_value_line("m1", "0.60", "2026-06-01T00:00:30+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             book_line("up", "0.50", "2026-06-01T00:01:01+00:00"),
@@ -639,6 +840,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
         candidates,
         out: reports.join("prospective_validation.json"),
         markdown: reports.join("prospective_validation.md"),
+        expected_daily_date: None,
     })
     .unwrap();
     assert_eq!(prospective["result"]["status"], "tracking");
@@ -703,8 +905,9 @@ fn queue_proxy_remains_skipped_without_validated_depletion_semantics() {
     write_events(
         &with_evidence,
         &format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             queue_evidence_book_line("up", "0.50", "2026-06-01T00:01:01+00:00"),
             book_line("up", "0.50", "2026-06-01T00:01:02+00:00"),
@@ -731,8 +934,9 @@ fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
@@ -750,14 +954,161 @@ fn queue_proxy_conservative_requires_trade_prints_to_cross_size_ahead() {
 }
 
 #[test]
+fn queue_proxy_ignores_valid_opposite_trade_without_poisoning_or_consuming_bid_queue() {
+    let dir = test_dir("queue_proxy_opposite_trade");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line_with_side("up", "0.50", "10", "buy", "2026-06-01T00:01:02+00:00"),
+            trade_line("up", "0.50", "5", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["queue_proxy_pnl_eligible"], true);
+    assert_eq!(report["result"]["fills"], 0);
+    assert_eq!(
+        report["result"]["replay_metrics"]["queue_proxy"]["ignored_opposite_trade_count"],
+        1
+    );
+}
+
+#[test]
+fn queue_proxy_missing_trade_side_blocks_authorization_pnl_even_after_a_fill() {
+    let dir = test_dir("queue_proxy_missing_trade_side");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            bid_book_line("up", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line_without_side("up", "0.50", "1", "2026-06-01T00:01:02+00:00"),
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["fills"], 1);
+    assert_eq!(report["result"]["net_pnl"], "2.50");
+    assert_eq!(report["result"]["queue_proxy_pnl_eligible"], false);
+    assert_eq!(report["result"]["ineligible_queue_fills"], 1);
+    assert!(report["result"]["queue_proxy_net_pnl"].is_null());
+    assert!(report["result"]["queue_proxy_wallet_constrained_net_pnl"].is_null());
+    assert_eq!(
+        report["result"]["replay_metrics"]["queue_proxy"]["ineligible_reasons"]
+            ["trade_print_missing_aggressor_side"],
+        1
+    );
+    let eligibility = &report["result"]["replay_metrics"]["queue_proxy"];
+    assert_eq!(eligibility["market_eligibility"]["m1"]["market_id"], "m1");
+    assert_eq!(eligibility["market_eligibility"]["m1"]["eligible"], false);
+    assert_eq!(
+        eligibility["market_eligibility"]["m1"]["queue_fill_event_count"],
+        1
+    );
+    assert!(eligibility["market_eligibility"]["m1"]["reasons"]
+        .as_array()
+        .is_some_and(|reasons| reasons
+            .iter()
+            .any(|reason| { reason.as_str() == Some("trade_print_missing_aggressor_side") })));
+    assert!(
+        eligibility["market_eligibility"]["m1"]["queue_evidence_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71)
+    );
+    assert!(eligibility["market_eligibility_sha256"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71));
+    assert_eq!(
+        eligibility["input_binding"]["schema"],
+        "polyedge.queue_proxy.input_binding.v1"
+    );
+    assert!(eligibility["input_binding"]["sha256"]
+        .as_str()
+        .is_some_and(|hash| hash.starts_with("sha256:") && hash.len() == 71));
+}
+
+#[test]
+fn queue_proxy_below_ninety_five_percent_eligibility_cannot_authorize_positive_pnl() {
+    let dir = test_dir("queue_proxy_low_eligibility");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up-1", "down-1"),
+            market_start_line("m1"),
+            bid_book_line("up-1", "0.50", "5", "2026-06-01T00:00:30+00:00"),
+            decision_line("m1", "up-1", "up", "2026-06-01T00:01:00+00:00"),
+            trade_line("up-1", "0.50", "10", "2026-06-01T00:01:03+00:00"),
+            market_line("m2", "up-2", "down-2"),
+            market_start_line("m2"),
+            decision_line("m2", "up-2", "up", "2026-06-01T00:01:04+00:00"),
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["net_pnl"], "2.50");
+    assert_eq!(report["result"]["queue_proxy_eligibility_rate"], 0.5);
+    assert_eq!(report["result"]["queue_proxy_pnl_eligible"], false);
+    assert_eq!(report["result"]["ineligible_queue_fills"], 0);
+    assert!(report["result"]["queue_proxy_net_pnl"].is_null());
+}
+
+#[test]
+fn queue_proxy_uses_runtime_full_depth_snapshot_instead_of_compact_top_only_book() {
+    let dir = test_dir("queue_proxy_runtime_size_ahead");
+    let events = dir.join("events.jsonl");
+    write_events(
+        &events,
+        &format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            bid_book_no_level_line("up", "0.50", "2", "2026-06-01T00:00:30+00:00"),
+            raw_price_change_line("up", "0.50", "2", "2026-06-01T00:00:45+00:00"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
+            r#"{"event_type":"paper_order_queue_registration","payload":{"order_id":"order-1","market_id":"m1","token_id":"up","side":"buy","quote_price":"0.50","order_size":"5"},"recorded_ts":"2026-06-01T00:01:00.010+00:00"}"#,
+            trade_line("up", "0.50", "10", "2026-06-01T00:01:00.300+00:00"),
+            bid_book_no_level_line("up", "0.50", "2", "2026-06-01T00:01:00.400+00:00"),
+            r#"{"event_type":"paper_order_queue_snapshot","payload":{"order_id":"order-1","market_id":"m1","token_id":"up","side":"buy","quote_price":"0.50","order_size":"5","visible_size_ahead_estimate":"12"},"recorded_ts":"2026-06-01T00:01:00.401+00:00"}"#,
+            reference_line("101", "2026-06-01T00:15:01+00:00")
+        ),
+    );
+
+    let report = replay(&dir, &events, FillModel::QueueProxyConservative);
+
+    assert_eq!(report["result"]["queue_proxy_enabled"], true);
+    assert_eq!(report["result"]["avg_size_ahead"], "12");
+    assert_eq!(report["result"]["fills"], 0);
+}
+
+#[test]
 fn queue_proxy_uses_raw_price_change_size_for_size_ahead() {
     let dir = test_dir("queue_proxy_price_change_size");
     let events = dir.join("events.jsonl");
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_no_level_line("up", "0.49", "10", "2026-06-01T00:00:30+00:00"),
             raw_price_change_line("up", "0.50", "5", "2026-06-01T00:00:45+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
@@ -780,8 +1131,9 @@ fn queue_proxy_counts_better_bid_depth_as_size_ahead() {
     write_events(
         &events,
         &format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             market_line("m1", "up", "down"),
+            market_start_line("m1"),
             bid_book_line("up", "0.55", "7", "2026-06-01T00:00:30+00:00"),
             decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
             trade_line("up", "0.50", "12", "2026-06-01T00:01:03+00:00"),
@@ -959,6 +1311,7 @@ fn normalize_redacts_secret_fields_without_redacting_public_token_ids() {
         out: normalized.clone(),
         format: "jsonl-indexed".to_owned(),
         overwrite: false,
+        decision_grade_projection: false,
     })
     .unwrap();
     let normalized_events = fs::read_to_string(normalized.join("events.jsonl")).unwrap();
@@ -1006,6 +1359,258 @@ fn sweep_reports_walk_forward_and_leave_one_day_splits() {
             .unwrap()
             > 0
     );
+    assert_eq!(
+        report["result"]["selection"]["status"],
+        "winner_fixed_before_test_open"
+    );
+    assert_eq!(report["result"]["candidates"][0]["selected"], true);
+    assert!(report["result"]["fold_results"].as_array().unwrap().len() >= 3);
+}
+
+#[test]
+fn sweep_parses_and_applies_supported_search_space() {
+    let dir = test_dir("sweep_search_applied");
+    let events = dir.join("events.jsonl");
+    let search = dir.join("search_space.yaml");
+    write_events(&events, &filled_five_day_fixture("101"));
+    fs::write(
+        &search,
+        r#"version: 1
+maker_min_edge: [0.030]
+ttl_seconds: [2]
+final_no_trade_seconds: [90]
+quote_style: [fair_minus_margin_only]
+"#,
+    )
+    .unwrap();
+
+    let report = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: Some(search.clone()),
+        split: "walk_forward".to_owned(),
+        max_experiments: 2,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let candidates = report["result"]["candidates"].as_array().unwrap();
+    let configured = candidates
+        .iter()
+        .find(|row| row["candidate"] != "baseline")
+        .unwrap();
+    let baseline = candidates
+        .iter()
+        .find(|row| row["candidate"] == "baseline")
+        .unwrap();
+
+    assert_eq!(
+        report["result"]["search"],
+        search.to_string_lossy().as_ref()
+    );
+    assert_eq!(report["result"]["search_space"]["configured"], true);
+    assert_eq!(configured["parameters"]["maker_min_edge"], "0.030");
+    assert_eq!(configured["parameters"]["ttl_seconds"], 2);
+    assert_eq!(configured["parameters"]["final_no_trade_seconds"], 90);
+    assert_eq!(
+        configured["parameters"]["quote_style"],
+        "fair_minus_margin_only"
+    );
+    let touch_validation_pnl = |candidate: &Value| {
+        candidate["fill_model_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["fill_model"] == "touch_after_250ms")
+            .unwrap()["validation"]["net_pnl"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+    };
+    assert!(touch_validation_pnl(baseline) > 0.0);
+    assert_eq!(touch_validation_pnl(configured), 0.0);
+}
+
+#[test]
+fn sweep_rejects_search_parameters_that_are_not_applied() {
+    let dir = test_dir("sweep_search_rejects_unused");
+    let events = dir.join("events.jsonl");
+    let search = dir.join("search_space.yaml");
+    write_events(&events, &five_day_fixture());
+    fs::write(&search, "version: 1\nmaker_margin: [0.01, 0.02]\n").unwrap();
+
+    let error = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: Some(search),
+        split: "walk_forward".to_owned(),
+        max_experiments: 2,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("unsupported sweep search parameter maker_margin"));
+}
+
+#[test]
+fn sweep_search_rejects_zero_configured_runs_duplicate_json_and_multiple_versions() {
+    let dir = test_dir("sweep_search_fail_closed");
+    let events = dir.join("events.jsonl");
+    write_events(&events, &five_day_fixture());
+
+    for (name, text, max_experiments, expected) in [
+        (
+            "zero-configured.yaml",
+            "version: 1\nmaker_min_edge: [0.01]\n",
+            1,
+            "requires max_experiments >= 2",
+        ),
+        (
+            "duplicate.json",
+            r#"{"version":1,"maker_min_edge":[0.01],"maker_min_edge":[0.02]}"#,
+            2,
+            "duplicate sweep search JSON parameter maker_min_edge",
+        ),
+        (
+            "versions.yaml",
+            "version: [1, 2]\nmaker_min_edge: [0.01]\n",
+            2,
+            "version must contain exactly one scalar",
+        ),
+    ] {
+        let search = dir.join(name);
+        fs::write(&search, text).unwrap();
+        let error = run_sweep(SweepOptions {
+            input: events.clone(),
+            markets: None,
+            search: Some(search),
+            split: "walk_forward".to_owned(),
+            max_experiments,
+            out: dir.join(format!("{name}.out.json")),
+            markdown: dir.join(format!("{name}.out.md")),
+            exclude_windows: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn sweep_selection_is_invariant_to_the_sealed_final_test_day() {
+    let first = run_leakage_sweep("sweep_leakage_up", "101");
+    let second = run_leakage_sweep("sweep_leakage_down", "99");
+
+    assert_eq!(
+        first["result"]["selection"]["candidate"],
+        second["result"]["selection"]["candidate"]
+    );
+    assert_eq!(
+        first["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (
+                &row["candidate"],
+                &row["validation_rank"],
+                &row["validation_total_fill_model_net_pnl"]
+            ))
+            .collect::<Vec<_>>(),
+        second["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (
+                &row["candidate"],
+                &row["validation_rank"],
+                &row["validation_total_fill_model_net_pnl"]
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        first["result"]["selection"]["sealed_test"],
+        second["result"]["selection"]["sealed_test"]
+    );
+    assert!(first["result"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["selected"] == false)
+        .all(|row| row["sealed_test"].is_null()));
+    for report in [&first, &second] {
+        let aggregate_winner = &report["result"]["selection"]["candidate"];
+        let final_day = &report["result"]["split_plan"]["latest_walk_forward"]["test_day"];
+        let final_fold = report["result"]["fold_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fold| &fold["test_day"] == final_day)
+            .unwrap();
+        let fold_test_status = final_fold["sealed_test"]["status"].as_str().unwrap();
+        if fold_test_status == "opened_after_winner_fixed" {
+            assert_eq!(&final_fold["selected_candidate"], aggregate_winner);
+        } else {
+            assert_eq!(
+                fold_test_status,
+                "sealed_fold_winner_differs_from_fixed_aggregate_winner"
+            );
+            assert!(final_fold["sealed_test"]["fill_model_results"].is_null());
+        }
+    }
+}
+
+#[test]
+fn sweep_report_rule_text_matches_fail_closed_computation() {
+    let dir = test_dir("sweep_rule_contract");
+    let events = dir.join("events.jsonl");
+    let markdown = dir.join("sweep.md");
+    write_events(&events, &filled_five_day_fixture("101"));
+
+    let report = run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: None,
+        split: "walk_forward".to_owned(),
+        max_experiments: 1,
+        out: dir.join("sweep.json"),
+        markdown: markdown.clone(),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    let robust_rule = report["result"]["robust_candidate_rule"].as_str().unwrap();
+    let rendered = fs::read_to_string(markdown).unwrap();
+
+    assert!(robust_rule.contains("7-day circular block-bootstrap lower 95% bound"));
+    assert!(robust_rule.contains("10000 resamples, at least 28 daily clusters"));
+    assert!(robust_rule.contains("non-negative net PnL under both models"));
+    assert!(rendered.contains(robust_rule));
+    assert!(report["result"]["test_sealing_rule"]
+        .as_str()
+        .unwrap()
+        .contains("final aggregate test remains sealed"));
+    assert!(report["result"]["fold_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|fold| fold["selection_rule"]
+            .as_str()
+            .unwrap()
+            .contains("single validation day")));
+    assert_eq!(report["result"]["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(report["result"]["selection"]["robust_candidate"], false);
+    assert!(report["result"]["candidates"][0]["fill_model_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| {
+            row["validation"]["block_confidence_lower_95"].is_null()
+                && row["net_pnl"] == row["validation"]["net_pnl"]
+        }));
 }
 
 fn replay(dir: &Path, events: &Path, fill_model: FillModel) -> Value {
@@ -1036,6 +1641,30 @@ fn market_line(market_id: &str, up: &str, down: &str) -> String {
     format!(
         r#"{{"event_type":"market","payload":{{"market_id":"{market_id}","condition_id":"c-{market_id}","market_slug":"slug-{market_id}","question":"BTC Up or Down","asset":"BTC","horizon":"15m","up_token_id":"{up}","down_token_id":"{down}","start_ts":"2026-06-01T00:00:00Z","end_ts":"2026-06-01T00:15:00Z","start_price":"100","tick_size":"0.01"}},"recorded_ts":"2026-06-01T00:00:00+00:00"}}"#
     )
+}
+
+fn market_start_line(market_id: &str) -> String {
+    market_start_line_at(market_id, "2026-06-01")
+}
+
+fn market_start_line_at(market_id: &str, date: &str) -> String {
+    serde_json::json!({
+        "event_type": "market_start_price",
+        "payload": {
+            "schema_version": 1,
+            "schema": "polyedge.market_start_price.v1",
+            "market_id": market_id,
+            "market_start_ts": format!("{date}T00:00:00Z"),
+            "market_end_ts": format!("{date}T00:15:00Z"),
+            "start_price": "100",
+            "reference_source": "polymarket_rtds_chainlink_btc_usd",
+            "reference_source_ts": format!("{date}T00:00:01Z"),
+            "reference_exact_resolution_source": true,
+            "reference_stale": false
+        },
+        "recorded_ts": format!("{date}T00:00:01+00:00")
+    })
+    .to_string()
 }
 
 fn decision_line(market_id: &str, token: &str, outcome: &str, ts: &str) -> String {
@@ -1069,8 +1698,18 @@ fn bid_book_no_level_line(token: &str, bid: &str, size: &str, ts: &str) -> Strin
 }
 
 fn trade_line(token: &str, price: &str, size: &str, ts: &str) -> String {
+    trade_line_with_side(token, price, size, "sell", ts)
+}
+
+fn trade_line_with_side(token: &str, price: &str, size: &str, side: &str, ts: &str) -> String {
     format!(
-        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"sell","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","side":"{side}","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
+    )
+}
+
+fn trade_line_without_side(token: &str, price: &str, size: &str, ts: &str) -> String {
+    format!(
+        r#"{{"event_type":"last_trade_price","payload":{{"token_id":"{token}","price":"{price}","size":"{size}","local_ts":"{ts}"}},"recorded_ts":"{ts}"}}"#
     )
 }
 
@@ -1112,7 +1751,7 @@ candidates:
   - name: "dynamic_quote_style"
     profile: "dynamic_quote_style"
     candidate_version: "dynamic_quote_style@2026-06-14"
-    config_hash: "sha256:dynamic-quote-style-profile-v1"
+    config_hash: "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
     created_at: "2026-06-14T00:00:00Z"
     frozen_since: "2026-06-14T00:00:00Z"
     reason: "Frozen quote-style candidate."
@@ -1139,9 +1778,43 @@ candidates:
 "#
 }
 
+fn valid_runtime_provenance_identity() -> Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "backend_impl": "rust",
+        "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+        "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+        "app_name": "polyedge-shadow-neu",
+        "runtime_role": "profitability_shadow",
+        "shadow_only": true,
+        "execution_mode": "paper",
+        "allow_live": false,
+        "enable_taker_orders": false,
+        "allow_emergency_account_cancel": false,
+        "paper_maker_fill_policy": "none",
+        "adaptive_regime_enabled": true,
+        "adaptive_regime_mode": "dynamic_quote_style",
+        "candidate": {
+            "name": "dynamic_quote_style",
+            "version": "dynamic_quote_style@2026-06-14",
+            "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+        },
+        "storage_account": "stpolyedgedev",
+        "storage_container": "polyedge-shadow-events",
+        "event_blob_prefix": "shadow-events/campaign-2026-07-12",
+        "publish_strategy_canary_intents": true,
+        "execution_model": {
+            "version": "conservative-execution-prior-v1",
+            "blob_uri": "azure://stpolyedgedev/polyedge-models/conservative-execution-prior-v1.json",
+            "sha256": format!("sha256:{}", "b".repeat(64))
+        },
+        "research_only": true
+    })
+}
+
 fn reference_line(price: &str, ts: &str) -> String {
     format!(
-        r#"{{"event_type":"reference","payload":{{"source":"polymarket_rtds_chainlink_btc_usd","price":"{price}","source_ts":"{ts}","stale":false}},"recorded_ts":"{ts}"}}"#
+        r#"{{"event_type":"reference","payload":{{"source":"polymarket_rtds_chainlink_btc_usd","price":"{price}","source_ts":"{ts}","stale":false,"exact_resolution_source":true}},"recorded_ts":"{ts}"}}"#
     )
 }
 
@@ -1154,12 +1827,53 @@ fn fair_value_line(market_id: &str, q_up: &str, ts: &str) -> String {
 
 fn filled_touch_fixture(book_ts: &str) -> String {
     format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         market_line("m1", "up", "down"),
+        market_start_line("m1"),
         decision_line("m1", "up", "up", "2026-06-01T00:01:00+00:00"),
         book_line("up", "0.50", book_ts),
         reference_line("101", "2026-06-01T00:15:01+00:00")
     )
+}
+
+fn run_leakage_sweep(name: &str, final_day_price: &str) -> Value {
+    let dir = test_dir(name);
+    let events = dir.join("events.jsonl");
+    write_events(&events, &filled_five_day_fixture(final_day_price));
+    run_sweep(SweepOptions {
+        input: events,
+        markets: None,
+        search: None,
+        split: "walk_forward".to_owned(),
+        max_experiments: 4,
+        out: dir.join("sweep.json"),
+        markdown: dir.join("sweep.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn filled_five_day_fixture(final_day_price: &str) -> String {
+    (1..=5)
+        .map(|day| {
+            let date = format!("2026-06-{day:02}");
+            let market = format!("filled-m{day}");
+            let up = format!("filled-up{day}");
+            let down = format!("filled-down{day}");
+            let final_price = if day == 5 { final_day_price } else { "101" };
+            format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                market_line_at(&market, &up, &down, &date),
+                market_start_line_at(&market, &date),
+                fair_value_line(&market, "0.60", &format!("{date}T00:00:30+00:00")),
+                decision_line(&market, &up, "up", &format!("{date}T00:01:00+00:00")),
+                book_line(&up, "0.50", &format!("{date}T00:01:01+00:00")),
+                book_line(&down, "0.50", &format!("{date}T00:01:01+00:00")),
+                reference_line(final_price, &format!("{date}T00:15:01+00:00"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn five_day_fixture() -> String {
@@ -1170,8 +1884,9 @@ fn five_day_fixture() -> String {
             let up = format!("up{day}");
             let down = format!("down{day}");
             format!(
-                "{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 market_line_at(&market, &up, &down, &date),
+                market_start_line_at(&market, &date),
                 fair_value_line(&market, "0.60", &format!("{date}T00:00:30+00:00")),
                 book_line(&up, "0.50", &format!("{date}T00:00:45+00:00")),
                 book_line(&down, "0.50", &format!("{date}T00:00:45+00:00")),

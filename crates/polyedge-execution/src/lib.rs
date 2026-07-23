@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use std::collections::BTreeMap;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
@@ -34,10 +35,21 @@ pub struct PaperRestingOrder {
     pub report: ExecutionReport,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PaperExecutionClient {
+    session_id: String,
     next_id: u64,
     pub resting_orders: BTreeMap<OrderId, PaperRestingOrder>,
+}
+
+impl Default for PaperExecutionClient {
+    fn default() -> Self {
+        Self {
+            session_id: Uuid::new_v4().simple().to_string(),
+            next_id: 0,
+            resting_orders: BTreeMap::new(),
+        }
+    }
 }
 
 impl PaperExecutionClient {
@@ -88,7 +100,7 @@ impl PaperExecutionClient {
 
     fn next_order_id(&mut self) -> OrderId {
         self.next_id += 1;
-        OrderId::new(format!("paper-{}", self.next_id))
+        OrderId::new(format!("paper-{}-{}", self.session_id, self.next_id))
     }
 }
 
@@ -267,4 +279,26 @@ pub struct PaperFillStatus {
     pub paper_open_resting_orders: usize,
     #[serde(with = "decimal_string")]
     pub total_resting_notional: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paper_order_ids_are_session_unique_and_monotonic() {
+        let mut first_process = PaperExecutionClient::new();
+        let mut restarted_process = PaperExecutionClient::new();
+
+        let first = first_process.next_order_id();
+        let second = first_process.next_order_id();
+        let after_restart = restarted_process.next_order_id();
+
+        assert_ne!(first, second);
+        assert_ne!(first, after_restart);
+        assert_ne!(second, after_restart);
+        assert!(first.as_ref().starts_with("paper-"));
+        assert!(first.as_ref().ends_with("-1"));
+        assert!(second.as_ref().ends_with("-2"));
+    }
 }

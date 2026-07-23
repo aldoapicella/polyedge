@@ -19,6 +19,7 @@ import type { JsonRecord, LabArtifact, LabArtifactPayload, LabReportBundle, Pros
 import { compact, dateTime, numberText } from "@/lib/format";
 import { selectFillModelSummaryRows, selectRegimeProfileRows } from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
+import { CorrectionGateNotice } from "@/components/CorrectionGateNotice";
 
 export function ReportsPage() {
   const queryClient = useQueryClient();
@@ -43,6 +44,8 @@ export function ReportsPage() {
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
+
+      <CorrectionGateNotice correction={prospective.data?.correction} />
 
       <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
         {cards.map((card) => (

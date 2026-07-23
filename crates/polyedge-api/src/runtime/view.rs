@@ -1,6 +1,6 @@
 use super::{
-    active_markets, execution_mode, feed_summary, report_status, RuntimeController, RuntimeData,
-    RuntimeRecorder,
+    active_markets, execution_mode, feed_summary, report_status, runtime_git_sha,
+    RuntimeController, RuntimeData, RuntimeRecorder,
 };
 use chrono::{SecondsFormat, Utc};
 use polyedge_domain::{ExecutionReport, MarketId, MarketSpec, RuntimeEvent, TradeDecision};
@@ -12,27 +12,35 @@ use std::sync::atomic::Ordering;
 impl RuntimeController {
     pub async fn health(&self) -> Value {
         let data = self.inner.data.read().await;
+        let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
         json!({
             "ok": true,
             "backend_impl": "rust",
-            "shadow_only": false,
+            "runtime_role": self.inner.settings.deploy.runtime_role.as_str(),
+            "shadow_only": shadow_only,
             "runtime_active": self.inner.started.load(Ordering::SeqCst),
             "execution_mode": execution_mode(&self.inner.settings),
             "kill_switch": data.kill_switch,
-            "reports": report_status(false)
+            "reports": report_status(shadow_only)
         })
     }
 
     pub async fn status(&self) -> Value {
-        let data = self.inner.data.read().await;
+        // Runtime mutation paths acquire the engine before data. Keep the same
+        // order here: telemetry calls status every minute, so taking data first
+        // can deadlock a feed handler that already owns the engine and needs a
+        // data write lock. That deadlock also stops provenance/recorder progress.
         let engine = self.inner.engine.lock().await;
+        let data = self.inner.data.read().await;
         let now = Utc::now();
         let recorder_status = self.recorder_status();
+        let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
         json!({
             "app": self.inner.settings.deploy.app_name,
             "backend_impl": "rust",
-            "shadow_only": false,
-            "git_sha": option_env!("GIT_SHA").unwrap_or("unknown"),
+            "runtime_role": self.inner.settings.deploy.runtime_role.as_str(),
+            "shadow_only": shadow_only,
+            "git_sha": runtime_git_sha(),
             "version": env!("CARGO_PKG_VERSION"),
             "execution_mode": execution_mode(&self.inner.settings),
             "started_at": data.started_at.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -77,7 +85,7 @@ impl RuntimeController {
             "live_heartbeat": Value::Null,
             "recorder": recorder_status,
             "reference": data.reference,
-            "reports": report_status(false),
+            "reports": report_status(shadow_only),
             "latest_decisions": latest_chronological(&data.decisions, 20),
             "latest_execution_reports": latest_chronological(&data.execution_reports, 20)
         })

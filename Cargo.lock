@@ -1160,6 +1160,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tower",
@@ -1176,6 +1177,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "libc",
  "percent-encoding",
  "polyedge-api",
  "polyedge-config",
@@ -1194,6 +1196,7 @@ dependencies = [
 name = "polyedge-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "polyedge-domain",
  "rust_decimal",
  "serde",
@@ -1223,6 +1226,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -1269,12 +1273,15 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "flate2",
+ "libc",
  "polyedge-config",
+ "polyedge-domain",
  "polyedge-engine",
  "polyedge-storage",
  "rust_decimal",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

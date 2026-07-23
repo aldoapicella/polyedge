@@ -87,6 +87,8 @@ test("research pages render without console errors", async ({ page }) => {
     await expect(page.locator("h1")).toBeVisible();
   }
   await page.goto("/labs");
+  await expect(page.getByRole("alert")).toContainText("Shadow correction in progress — NO-GO");
+  await expect(page.getByRole("alert")).toContainText("Blocker: Corrected artifacts are still being republished.");
   await page.getByRole("button", { name: "Regime Profiles" }).click();
   await expect(page.getByRole("cell", { name: "static", exact: true })).toBeVisible();
   await expect(page.getByRole("cell", { name: "dynamic_safety_only", exact: true })).toBeVisible();
@@ -206,8 +208,33 @@ async function installApiMocks(page: Page) {
   await page.route("**/api/backend/labs/prospective", async (route) => {
     await route.fulfill({
       json: {
+        correction: {
+          journal_path: "reports/research/shadow/corrections/active.json",
+          available: true,
+          status: "in_progress",
+          blocks_promotion: true,
+          decision: "NO-GO",
+          blocker: "Corrected artifacts are still being republished.",
+          validation_error: false,
+          state: {
+            schema_version: 1,
+            campaign_id: "shadow-profitability-2026-07-12",
+            correction_id: "corr-2026-07-13",
+            from: "2026-07-13",
+            through: "2026-07-13",
+            reason: "repair projected cache lineage",
+            status: "in_progress",
+            started_at: "2026-07-14T00:00:00Z"
+          }
+        },
+        promotion_decision: "NO-GO",
+        promotion_blocker: "Corrected artifacts are still being republished.",
         result: {
-          status: "collecting",
+          status: "correction_blocked_no_go",
+          decision: "NO-GO",
+          blocker: "Corrected artifacts are still being republished.",
+          promotion_allowed: false,
+          live_deployment_allowed: false,
           rows: [],
           frozen_candidates: {
             candidates: [

@@ -106,5 +106,6 @@ docs/api-access.md
 docs/backtesting.md
 docs/chainlink-source.md
 docs/execution-quality-limitations.md
+docs/profitability-promotion.md
 docs/rust-migration-status.md
 ```

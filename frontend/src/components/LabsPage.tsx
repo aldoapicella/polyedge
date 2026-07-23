@@ -14,10 +14,11 @@ import {
   getLabProspective,
   getLabRegimesLatest,
   getLabSampleSizeLatest,
-  getLabSummary
+  getLabSummary,
+  getLabVenueExecution
 } from "@/lib/api";
-import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow } from "@/lib/types";
-import { compact, numberText } from "@/lib/format";
+import type { JsonRecord, LabArtifactPayload, LabCandidateEvidence, LabSummary, ProspectiveValidationRow, VenueExecutionEvidence } from "@/lib/types";
+import { compact, dateTime, decisionGradeCoverageText, numberText } from "@/lib/format";
 import {
   CALIBRATION_COLUMNS,
   FILL_MODEL_COLUMNS,
@@ -30,8 +31,9 @@ import {
   selectRegimeProfileRows
 } from "@/lib/reportRows";
 import { EmptyState, IconButton, Panel, PanelHeader, Pill } from "@/components/ui";
+import { CorrectionGateNotice } from "@/components/CorrectionGateNotice";
 
-const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "QueueProxy / Fill Realism", "Sample Size", "Artifacts"] as const;
+const tabs = ["Overview", "Prospective Validation", "Regime Profiles", "Calibration", "Fill Models", "QueueProxy / Fill Realism", "Venue Execution", "Sample Size", "Artifacts"] as const;
 
 export function LabsPage() {
   const [tab, setTab] = useState<(typeof tabs)[number]>("Overview");
@@ -42,10 +44,12 @@ export function LabsPage() {
   const calibration = useQuery({ queryKey: ["labs", "calibration"], queryFn: getLabCalibrationLatest, retry: false });
   const fillModels = useQuery({ queryKey: ["labs", "fill-models"], queryFn: getLabFillModelsLatest, retry: false });
   const sampleSize = useQuery({ queryKey: ["labs", "sample-size"], queryFn: getLabSampleSizeLatest, retry: false });
+  const venueExecution = useQuery({ queryKey: ["labs", "venue-execution"], queryFn: getLabVenueExecution, retry: false });
   const artifacts = useQuery({ queryKey: ["labs", "artifacts", "labs"], queryFn: () => getLabArtifacts(""), retry: false });
 
   const rows = prospective.data?.result?.rows ?? [];
   const frozenCandidates = candidateRows(prospective.data?.result?.frozen_candidates);
+  const correction = venueExecution.data?.correction ?? prospective.data?.correction;
 
   return (
     <div className="space-y-5">
@@ -53,10 +57,12 @@ export function LabsPage() {
         <div>
           <h1 className="text-xl font-semibold text-ink">Labs</h1>
         </div>
-        <IconButton label="Refresh labs" onClick={() => void Promise.all([labSummary.refetch(), candidateEvidence.refetch(), prospective.refetch(), regimes.refetch(), calibration.refetch(), fillModels.refetch(), sampleSize.refetch(), artifacts.refetch()])}>
+        <IconButton label="Refresh labs" onClick={() => void Promise.all([labSummary.refetch(), candidateEvidence.refetch(), prospective.refetch(), regimes.refetch(), calibration.refetch(), fillModels.refetch(), venueExecution.refetch(), sampleSize.refetch(), artifacts.refetch()])}>
           <RefreshCw className="h-4 w-4" />
         </IconButton>
       </div>
+
+      <CorrectionGateNotice correction={correction} />
 
       <div className="flex flex-wrap gap-1 border border-line bg-white p-1 shadow-hairline">
         {tabs.map((item) => (
@@ -115,10 +121,364 @@ export function LabsPage() {
           emptyLabel="No QueueProxy fill-realism rows found. Run queue-audit or a fill-model report with queue_proxy_conservative/balanced evidence."
         />
       ) : null}
+      {tab === "Venue Execution" ? <VenueExecutionPanel evidence={venueExecution.data} loading={venueExecution.isLoading} error={venueExecution.error} /> : null}
       {tab === "Sample Size" ? <SampleSizePanel report={sampleSize.data?.report} /> : null}
       {tab === "Artifacts" ? <ArtifactsPanel artifacts={artifacts.data?.artifacts ?? []} loading={artifacts.isLoading} /> : null}
     </div>
   );
+}
+
+function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExecutionEvidence; loading: boolean; error: Error | null }) {
+  if (!evidence) {
+    return <Panel><EmptyState label={loading ? "Loading authenticated venue evidence" : error?.message ?? "No authenticated venue evidence yet"} /></Panel>;
+  }
+  const latest = evidence.latest;
+  const correction = evidence.correction;
+  const correctionBlocked = correction?.blocks_promotion === true;
+  const lifecycle = latest?.lifecycle;
+  const order = latest?.order;
+  const model = evidence.model;
+  const profitabilityProvenance = evidence.artifact_provenance?.profitability;
+  const selectedProfitability = profitabilityProvenance?.selected;
+  const latestProvenance = evidence.artifact_provenance?.latest;
+  const evidenceEligibility = latest?.evidence_eligibility;
+  const latestAttempt = evidence.latest_attempt;
+  const portfolio = evidence.redemption?.portfolio ?? evidence.preflight?.portfolio ?? latestAttempt?.portfolio ?? latest?.portfolio;
+  const redemption = evidence.redemption;
+  const profitability = evidence.profitability;
+  const promotionMetrics = profitability?.gate_metrics?.metrics;
+  const fundedLadder = profitability?.funded_ladder;
+  const fundedHoldout = fundedLadder?.holdout_evaluation;
+  const queueTransition = fundedLadder?.queue_model_transition;
+  const promotionQuality = promotionMetrics?.data_quality;
+  const coverageBreakdown = profitability?.data_quality?.coverage_breakdown ?? promotionQuality?.coverage_breakdown;
+  const blockingWarnings = promotionQuality?.warnings?.filter((warning) => warning.severity === "blocking").length;
+  const unclassifiedWarnings = promotionQuality?.warnings?.filter((warning) => warning.known === false).length;
+  const durableRisk = evidence.preflight?.risk_at_end ?? latestAttempt?.risk_at_end ?? latest?.risk_at_end;
+  const campaignRisk = durableRisk?.campaign;
+  const dailyTurnover = durableRisk?.daily_turnover ?? durableRisk;
+  const mostRecentRedemption = redemption?.recent_redemptions?.[0];
+  const globalUnresolvedRisk = dailyTurnover?.global_unresolved_risk_reservations ??
+    dailyTurnover?.unresolved_risk_reservations ?? campaignRisk?.unresolved_risk_reservation_count ?? 0;
+  const markouts = latest?.markouts ?? [];
+  const latestLegacyProtocolOrders = latest?.order_submitted && latest?.evidence_protocol_version !== 3
+    ? latest.submitted_order_count ?? 1
+    : 0;
+  return (
+    <div className="space-y-5">
+      <Panel>
+        <PanelHeader title="Profitability Path" meta={profitability?.generated_at ?? profitability?.created_at ?? "awaiting Azure promotion manifest"} />
+        <div className="grid gap-3 p-4 md:grid-cols-4">
+          <Metric label="Phase" value={correctionBlocked ? "risk_repair — correction NO-GO" : profitability?.phase ?? "risk repair / funded freeze"} />
+          <Metric label="Selected Source" value={profitabilityProvenance?.selected_source ?? "API fallback"} />
+          <Metric label="Selection Reason" value={profitabilityProvenance?.selection_reason ?? "no valid artifact"} />
+          <Metric label="Artifact Freshness" value={selectedProfitability?.freshness ?? (selectedProfitability?.fresh ? "fresh" : "unknown")} />
+          <Metric label="Artifact Time" value={dateTime(selectedProfitability?.authoritative_ts)} />
+          <Metric label="Candidate" value={profitability?.candidate?.name ?? "dynamic_quote_style (frozen)"} />
+          <Metric label="Candidate Version" value={profitability?.candidate?.version ?? profitability?.candidate?.candidate_version ?? "2026-06-14"} />
+          <Metric label="Promotion" value={correctionBlocked ? "NO-GO — shadow correction blocks promotion" : fundedLadder?.phase === "profitable_go" ? "terminal validated GO — execution still unarmed" : fundedLadder?.phase === "stopped_no_go" || profitability?.phase === "stopped_no_go" ? "terminal NO-GO" : fundedLadder?.human_grant_required ? "awaiting exact human stage grant" : fundedLadder?.stage_authorized ? "stage authorized — collecting evidence" : profitability?.phase === "shadow_collecting" ? "shadow evidence collecting" : profitability?.promotion_allowed ? "armed" : "blocked — human authorization required"} />
+          <Metric label="Funded Ladder" value={fundedLadder ? `${fundedLadder.phase ?? "evidence_collecting"} — ${fundedLadder.metrics?.cumulative_funded_orders ?? 0} / ${fundedLadder.active_target_orders ?? 1}` : "not started"} />
+          <Metric label="Next Stage Grant" value={correctionBlocked ? "disabled — correction must complete" : fundedLadder?.phase === "profitable_go" ? "validated GO — still not automatically armed" : fundedLadder?.phase === "stopped_no_go" ? "terminal NO-GO — immutable stop" : fundedLadder?.human_grant_required ? "exact one-shot human grant required" : fundedLadder?.terminal ? "terminal" : "stage grant consumed"} />
+          <Metric label="Eligible Evidence" value={`${fundedLadder?.metrics?.cumulative_eligible_orders ?? 0} eligible orders`} />
+          <Metric label="Filled Markout Samples" value={`${fundedLadder?.metrics?.markout_sample_size ?? 0} (non-fills remain fill labels)`} />
+          <Metric label="Funded Markout L95" value={signedUsd(fundedLadder?.metrics?.net_markout_30s_lower_95)} />
+          <Metric label="Intent Model" value={queueTransition?.model_quality_passed ? `${queueTransition.binding?.model_version ?? "queue model"} — checkpoint 100 bound` : profitability?.execution_model?.model_version ?? "frozen conservative prior"} />
+          <Metric label="Campaign Expiry" value={dateTime(profitability?.expires_at)} />
+          <Metric label="Campaign Equity" value={usd(profitability?.capital?.current_equity ?? campaignRisk?.account_equity ?? portfolio?.account_equity)} />
+          <Metric label="Campaign PnL" value={signedUsd(profitability?.capital?.campaign_net_pnl)} />
+          <Metric label="Lifetime Account PnL" value={signedUsd(profitability?.capital?.lifetime_net_pnl ?? portfolio?.account_net_pnl)} />
+          <Metric label="Equity Floor" value={usd(profitability?.capital?.equity_floor ?? campaignRisk?.equity_floor)} />
+          <Metric label="Current Drawdown" value={usd(profitability?.capital?.current_drawdown ?? campaignRisk?.campaign_drawdown)} />
+          <Metric label="Locked Principal" value={usd(profitability?.capital?.locked_principal)} />
+          <Metric label="Unresolved Exposure" value={usd(profitability?.capital?.unresolved_exposure)} />
+          <Metric label="Blocking Reason" value={correction?.blocker ?? profitability?.blocking_reason ?? campaignRisk?.blockers?.join(", ") ?? "funded execution remains disabled"} />
+        </div>
+        <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+          Historical simulation, execution-probe cost, shadow PnL, and live-strategy PnL are separate ledgers. A profitable post-reset campaign does not erase the lifetime account loss, and no phase automatically arms a real order.
+        </div>
+      </Panel>
+
+      {queueTransition || fundedHoldout ? (
+        <Panel>
+          <PanelHeader title="Orders 101–200 Holdout" meta={fundedHoldout?.passed ? "terminal holdout passed" : queueTransition?.model_quality_passed ? "frozen model active — collecting later orders" : "awaiting checkpoint 100"} />
+          <div className="grid gap-3 p-4 md:grid-cols-4">
+            <Metric label="Frozen Model" value={queueTransition?.binding?.model_version ?? "pending"} />
+            <Metric label="Training Cutoff" value={dateTime(queueTransition?.training_cutoff)} />
+            <Metric label="Exact Holdout Orders" value={`${fundedHoldout?.exact_order_count ?? 0} / 100`} />
+            <Metric label="Fill / Non-fill Labels" value={`${fundedHoldout?.filled_order_count ?? 0} / ${fundedHoldout?.non_filled_order_count ?? 0}`} />
+            <Metric label="Holdout Net PnL" value={signedUsd(fundedHoldout?.holdout_net_pnl)} />
+            <Metric label="PnL / Order L95" value={signedUsd(fundedHoldout?.holdout_net_pnl_per_order_lower_95)} />
+            <Metric label="Holdout Max Drawdown" value={usd(fundedHoldout?.holdout_max_drawdown)} />
+            <Metric label="Holdout Markout L95" value={signedUsd(fundedHoldout?.net_markout_30s_lower_95)} />
+            <Metric label="Brier Improvement" value={fundedHoldout?.brier_improvement_fraction === undefined ? "pending" : percentage(fundedHoldout.brier_improvement_fraction)} />
+            <Metric label="Calibration Error" value={fundedHoldout?.expected_calibration_error ?? "pending"} />
+            <Metric label="Decision" value={fundedHoldout?.passed ? "passed" : "not yet passed"} />
+          </div>
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            GO requires the later 101–200 orders themselves to be profitable with a positive per-order 95% lower bound; gains from orders 1–100 cannot mask a losing holdout.
+          </div>
+        </Panel>
+      ) : null}
+
+      <div className="grid gap-5 xl:grid-cols-2">
+        <Panel>
+          <PanelHeader title="Shadow Profitability Gate" meta="30 clean days and 1,000 settled markets" />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Clean Days" value={`${profitability?.shadow?.clean_days ?? promotionMetrics?.clean_days ?? 0} / ${profitability?.shadow?.required_clean_days ?? 30}`} />
+            <Metric label="Campaign Window" value={`${promotionMetrics?.observed_calendar_days ?? 0} / 60 calendar days`} />
+            <Metric label="Settled Markets" value={`${profitability?.shadow?.settled_markets ?? promotionMetrics?.settled_markets ?? 0} / ${profitability?.shadow?.required_settled_markets ?? 1000}`} />
+            <Metric label="Wallet-constrained PnL" value={signedUsd(profitability?.shadow?.wallet_constrained_net_pnl ?? promotionMetrics?.wallet_constrained_net_pnl)} />
+            <Metric label="Queue-conservative PnL (all intents)" value={signedUsd(profitability?.shadow?.queue_conservative_net_pnl ?? promotionMetrics?.queue_conservative_net_pnl)} />
+            <Metric label="Queue PnL Evidence" value={promotionMetrics?.queue_conservative === true ? "eligible — ≥95% queue evidence, zero ineligible fills" : "blocked / awaiting eligible queue evidence"} />
+            <Metric label="Daily Wallet PnL L95" value={signedUsd(profitability?.shadow?.pnl_ci_lower_95 ?? promotionMetrics?.pnl_ci_95_low)} />
+            <Metric label="Positive Weekly Blocks" value={`${profitability?.shadow?.positive_weekly_blocks ?? promotionMetrics?.consecutive_positive_weekly_blocks ?? 0} / ${profitability?.shadow?.required_positive_weekly_blocks ?? 4}`} />
+            <Metric label="Full Decision Replay Parity" value={percentage(profitability?.shadow?.decision_parity_rate ?? promotionMetrics?.decision_parity_rate)} />
+          </div>
+          <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+            A dollar PnL is admission-grade only when the conservative queue model is enabled, at least 95% of markets are eligible, and no fill comes from an ineligible market. Other PnL remains diagnostic only.
+          </div>
+        </Panel>
+        <Panel>
+          <PanelHeader title="Promotion Data Quality" meta={profitability?.data_quality?.status ?? promotionQuality?.registry_version ?? "collecting"} />
+          <div className="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3">
+            <Metric
+              label="Decision-grade Evaluations"
+              value={decisionGradeCoverageText(coverageBreakdown?.decision_grade_coverage)}
+            />
+            <Metric label="Minimum Coverage" value={percentage(profitability?.data_quality?.minimum_coverage ?? 0.95)} />
+            <Metric label="Start-price Coverage" value={percentage(coverageBreakdown?.start_price_capture_rate)} />
+            <Metric label="Settlement Coverage" value={percentage(coverageBreakdown?.settlement_rate)} />
+            <Metric label="Exact-source Hour Coverage" value={percentage(coverageBreakdown?.exact_reference_hour_coverage)} />
+            <Metric label="Decision Metadata" value={percentage(coverageBreakdown?.decision_metadata_coverage)} />
+            <Metric label="Final Decision Grade" value={percentage(coverageBreakdown?.final_decision_grade_coverage)} />
+            <Metric label="Execution Fields" value={percentage(coverageBreakdown?.execution_field_coverage)} />
+            <Metric label="Full Decision Replay" value={percentage(coverageBreakdown?.decision_parity_rate)} />
+            <Metric label="Queue Snapshots" value={applicablePercentage(coverageBreakdown?.queue_snapshot_coverage, coverageBreakdown?.queue_snapshot_applicable)} />
+            <Metric label="1s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_1s_completion, coverageBreakdown?.markout_1s_applicable)} />
+            <Metric label="5s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_5s_completion, coverageBreakdown?.markout_5s_applicable)} />
+            <Metric label="30s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_30s_completion, coverageBreakdown?.markout_30s_applicable)} />
+            <Metric label="Fatal Warnings" value={profitability?.data_quality?.fatal_warnings ?? promotionQuality?.fatal_issues?.length ?? 0} />
+            <Metric label="Blocking Warnings" value={profitability?.data_quality?.blocking_warnings ?? blockingWarnings ?? 0} />
+            <Metric label="Unclassified Warnings" value={profitability?.data_quality?.unclassified_warnings ?? unclassifiedWarnings ?? 0} />
+            <Metric label="Unknown Warnings" value={(profitability?.data_quality?.unclassified_warnings ?? unclassifiedWarnings ?? 0) > 0 ? "promotion blocked" : "none"} />
+          </div>
+        </Panel>
+      </div>
+
+      <Panel>
+        <PanelHeader title="Authenticated Venue Evidence" meta={latest?.finished_ts ?? evidence.generated_ts} />
+        <div className="grid gap-3 p-4 md:grid-cols-4">
+          <Metric label="Probe Status" value={latest?.status ?? "not run"} />
+          <Metric label="Evidence Protocol" value={latest?.evidence_protocol_version ? `v${latest.evidence_protocol_version}` : "legacy"} />
+          <Metric label="Protocol Admission" value={evidenceEligibility?.counts_toward_protocol_evidence ? "eligible" : "display-only — terminal validator required"} />
+          <Metric label="Evidence Freshness" value={latestProvenance?.freshness ?? (latestProvenance?.fresh ? "fresh" : "unknown")} />
+          <Metric label="Evidence Time" value={dateTime(latestProvenance?.authoritative_ts)} />
+          <Metric label="Execution Origin" value={latest?.execution_country ? `${latest.execution_country} / Azure North Europe` : latest?.execution_origin ?? "not verified"} />
+          <Metric label="Static Egress Verified" value={latest?.static_egress_verified ? "yes" : "no"} />
+          <Metric label="Campaign Progress" value={`${latest?.completed_probe_count ?? 0} / ${latest?.submitted_order_count ?? 0} reconciled`} />
+          <Metric label="Order Submitted" value={latest?.order_submitted ? "yes" : "no"} />
+          <Metric label="Venue Ack" value={milliseconds(lifecycle?.client_to_http_ack_ms)} />
+          <Metric label="Cancel Round Trip" value={milliseconds(lifecycle?.client_cancel_round_trip_ms)} />
+          <Metric label="User Cancel Ack" value={milliseconds(lifecycle?.client_to_user_cancel_ack_ms)} />
+          <Metric label="Matched Size" value={lifecycle?.actual_matched_size ?? 0} />
+          <Metric label="Partial Fill" value={lifecycle?.partial_fill ? "yes" : "no"} />
+          <Metric label="Cancel Race Fill" value={lifecycle?.fill_raced_cancellation ? "yes" : "no"} />
+          <Metric label="Strict Trade-throughs" value={lifecycle?.public_strict_trade_through_count ?? 0} />
+          <Metric label="Trade-throughs Without Fill" value={lifecycle?.public_trade_through_without_fill_count ?? 0} />
+          <Metric label="Planned Rest" value={lifecycle?.planned_rest_seconds === undefined ? "not observed" : `${lifecycle.planned_rest_seconds}s`} />
+          <Metric label="Zero Open Orders" value={lifecycle?.zero_open_orders_confirmed ? "confirmed" : "not confirmed"} />
+          <Metric label="Data Gap" value={lifecycle?.data_gap_detected ? "ineligible" : "none detected"} />
+          <Metric label="Markouts Complete" value={lifecycle?.markout_capture_complete ? "yes" : "not applicable / incomplete"} />
+          <Metric label="Matched-size Agreement" value={lifecycle?.matched_size_source_agreement ? "REST = user channel" : "not confirmed"} />
+          <Metric label="Trade-ID Agreement" value={lifecycle?.trade_id_source_agreement ? "REST = user channel" : "not confirmed"} />
+          <Metric label="WS Reconnects" value={(lifecycle?.authenticated_user_channel_reconnects ?? 0) + (lifecycle?.public_market_channel_reconnects ?? 0)} />
+          <Metric label="Campaign Risk" value={campaignRisk?.passed ? "passed" : campaignRisk?.blockers?.join(", ") ?? "legacy evidence"} />
+          <Metric label="Campaign Drawdown" value={usd(campaignRisk?.campaign_drawdown)} />
+          <Metric label="Legacy Daily Turnover" value={dailyTurnover?.conservative_loss_budget_consumed ?? 0} />
+          <Metric label="Global Unresolved Risk Reservations" value={globalUnresolvedRisk} />
+        </div>
+        {latest?.stop_reason ? <div className="border-t border-line px-4 py-3 text-sm text-ink/70">Campaign stop reason: {latest.stop_reason}.</div> : null}
+        {latest?.order_submitted && !evidenceEligibility?.counts_toward_protocol_evidence ? (
+          <div className="border-t border-line bg-sky-50 px-4 py-3 text-sm leading-relaxed text-sky-950">
+            Labs is showing this artifact for audit only. Protocol admission is decided by the terminal identity-bound controller and reporting validators, not by this dashboard response.
+          </div>
+        ) : null}
+        {latestLegacyProtocolOrders > 0 ? (
+          <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+            These {latestLegacyProtocolOrders} real funded order{latestLegacyProtocolOrders === 1 ? "" : "s"} remain included in lifetime account PnL, but cannot count toward protocol-v3 promotion evidence. Their artifacts predate the immutable v3 lifecycle contract, and missing guarantees cannot be asserted retroactively. No spend or PnL is erased or reclassified.
+          </div>
+        ) : null}
+        {latestAttempt?.run_id && latestAttempt.run_id !== latest?.run_id ? (
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            Latest attempt: {latestAttempt.status ?? "unknown"} at {latestAttempt.finished_ts ?? "unknown time"}. {latestAttempt.error ?? "No additional error reported."}
+          </div>
+        ) : null}
+      </Panel>
+
+      <Panel>
+        <PanelHeader title="Portfolio Settlement" meta={portfolio?.captured_ts ?? "awaiting Azure portfolio snapshot"} />
+        {portfolio?.status === "available" ? (
+          <>
+            <div className="grid gap-3 p-4 md:grid-cols-4">
+              <Metric label="Liquid Collateral" value={usd(portfolio.liquid_collateral)} />
+              <Metric label="Gross Redeemable Payout" value={usd(portfolio.gross_redeemable_value)} />
+              <Metric label="Resolved Position Cost" value={usd(portfolio.resolved_position_cost)} />
+              <Metric label="Resolved Losing Cost" value={usd(portfolio.resolved_losing_cost)} />
+              <Metric label="Current Position Value" value={usd(portfolio.current_position_value)} />
+              <Metric label="Account Equity" value={usd(portfolio.account_equity)} />
+              <Metric label="Starting Capital" value={usd(portfolio.starting_capital)} />
+              <Metric label="True Net Account PnL" value={signedUsd(portfolio.account_net_pnl)} />
+              <Metric label="Redeemable Winners" value={portfolio.redeemable_winner_count ?? 0} />
+              <Metric label="Redemption Worker" value={redemption?.status ?? "not run"} />
+              <Metric label="Selected Payout" value={usd(redemption?.selection?.selected_gross_payout)} />
+              <Metric label="Realized Payout" value={usd(redemption?.realized_payout)} />
+              <Metric label="Gasless Submission" value={redemption?.redemption_submitted ? "confirmed" : redemption?.dry_run ? "dry-run only" : "not submitted"} />
+              <Metric label="Most Recent Redemption" value={usd(mostRecentRedemption?.gross_payout)} />
+              <Metric label="Redemption Attribution" value={mostRecentRedemption?.attribution === "azure_redemption_worker" ? "Azure worker" : mostRecentRedemption ? "external / manual" : "none observed"} />
+              <Metric label="Redeemed At" value={dateTime(mostRecentRedemption?.redeemed_ts)} />
+              <Metric label="Redemption Open Orders" value={redemption?.zero_open_orders_confirmed ? "zero confirmed" : "not confirmed"} />
+            </div>
+            <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+              Gross payout is not profit. True account PnL equals liquid collateral plus current position value minus starting capital; losing resolved positions remain included in the calculation.
+            </div>
+            {redemption ? (
+              <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+                Azure redemption: {redemption.status ?? "unknown"}. Wallet derivation {redemption.derived_wallet_match ? "verified" : "not verified"}; {redemption.planned_calls?.length ?? 0} bounded call(s) planned. Redemption only converts resolved outcome tokens into liquid collateral and does not reset the UTC trading-risk budget.
+                {mostRecentRedemption ? ` Most recent observed payout: ${usd(mostRecentRedemption.gross_payout)} via ${mostRecentRedemption.attribution === "azure_redemption_worker" ? "the Azure worker" : "an external/manual relayer transaction"}.` : ""}
+              </div>
+            ) : null}
+          </>
+        ) : <EmptyState label="No current Azure portfolio snapshot is available." />}
+      </Panel>
+
+      <div className="grid gap-5 xl:grid-cols-2">
+        <Panel>
+          <PanelHeader title="Effective Queue Evidence" meta={evidence.queue_position_source} />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Queue Metric" value={evidence.queue_position_metric} />
+            <Metric label="Inferred Size Ahead" value={order?.inferredSizeAhead ?? "not observed"} />
+            <Metric label="Same-price Public Size" value={order?.samePricePublicSize ?? "not observed"} />
+            <Metric label="Better-price Public Size" value={order?.betterPricePublicSize ?? "not observed"} />
+            <Metric label="Probe Notional" value={order?.notional ?? "not submitted"} />
+            <Metric label="Literal FIFO Rank" value="unavailable from venue feeds" />
+          </div>
+          <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+            This is not exact FIFO queue position. It combines your authenticated order/fill lifecycle with public aggregated L2 depth. {evidence.remaining_limitation}
+          </div>
+        </Panel>
+
+        <Panel>
+          <PanelHeader title="Empirical Fill Model" meta={model?.status ?? "not trained"} />
+          <div className="grid gap-3 p-4 md:grid-cols-2">
+            <Metric label="Target" value="P(fill within 1/5/30/60s)" />
+            <Metric label="Model Version" value={model?.model_version ?? evidence.profitability?.execution_model?.model_version ?? "pending"} />
+            <Metric label="Promotion-bound Model SHA-256" value={evidence.profitability?.execution_model?.sha256 ?? "not bound"} />
+            <Metric label="Eligible Order Probes" value={model?.sample_size ?? 0} />
+            <Metric label="Eligible Horizon Labels" value={model?.label_sample_size ?? 0} />
+            <Metric label="Filled Probes" value={model?.positive_fills ?? 0} />
+            <Metric label="Non-filled Probes" value={model?.negative_non_fills ?? 0} />
+            <Metric label="Excluded Probes" value={model?.excluded_observations ?? 0} />
+            <Metric label="Legacy Protocol Probes" value={model?.legacy_protocol_observations ?? latestLegacyProtocolOrders} />
+            <Metric label="Minimum Eligible Probes" value={model?.minimum_samples ?? 100} />
+            <Metric label="Temporal Holdout" value={model?.temporal_split ?? "required before training"} />
+            <Metric label="OOS Brier Score" value={model?.out_of_sample_brier_score ?? "pending"} />
+            <Metric label="Naive Brier Score" value={model?.naive_horizon_base_rate_brier_score ?? "pending"} />
+            <Metric label="Brier Improvement" value={model?.brier_improvement_fraction === undefined ? "pending" : percentage(model.brier_improvement_fraction)} />
+            <Metric label="Expected Calibration Error" value={model?.expected_calibration_error ?? "pending"} />
+            <Metric label="Quality Gates" value={model?.quality_gates?.passed ? "passed" : "collecting / failed"} />
+            <Metric label="Excluded Data-gap Probes" value={model?.quality_gates?.excluded_data_gap_observations ?? 0} />
+            <Metric label="Early Markout Exclusions" value={model?.quality_gates?.early_markout_observations ?? 0} />
+            <Metric label="Net 30s Markout" value={model?.net_markout_30s_sample_size ? numberText(model.mean_net_executable_markout_30s_per_share) : "pending"} />
+            <Metric label="Net 30s Markout 95% Lower" value={model?.net_executable_markout_30s_lower_confidence_bound_95 ?? "pending"} />
+            <Metric label="Promotion Ready" value={model?.promotion_ready ? "yes — human approval required" : "no"} />
+          </div>
+          <div className="border-t border-line px-4 py-3 text-sm text-ink/70">
+            {model?.reason ?? model?.promotion_block_reason ?? "The model stays research-only and cannot be promoted until temporal out-of-sample validation is available."}
+          </div>
+          {(model?.legacy_protocol_observations ?? 0) > 0 ? (
+            <div className="border-t border-line bg-amber-50 px-4 py-3 text-sm leading-relaxed text-amber-950">
+              Legacy protocol observations remain visible but do not qualify for promotion. Protocol v3 requires durable pre-send risk accounting, single-campaign leasing, REST/user-channel agreement, and one timely 1/5/30-second markout triplet per authenticated fill.
+            </div>
+          ) : null}
+        </Panel>
+      </div>
+
+      <Panel>
+        <PanelHeader title="Post-fill Markouts" meta="1 / 5 / 30 seconds" />
+        <div className="border-b border-line px-4 py-2 text-xs leading-relaxed text-ink/60">
+          Shadow net executable markout subtracts the recorded entry fee only. It is an adverse-selection diagnostic, not round-trip liquidation PnL; a round-trip fee is shown only when explicitly recorded.
+        </div>
+        {markouts.length ? (
+          <div className="overflow-auto">
+            <table className="w-full min-w-[1050px] text-left text-sm">
+              <thead className="border-b border-line bg-panel text-xs uppercase text-ink/50">
+                <tr>{["Fill ID", "Fill Size", "Horizon", "Gross Midpoint / Share", "Gross Executable / Share", "Recorded / Entry Fee / Share", "Explicit Round-trip Fee / Share", "Recorded Net Executable / Share", "Observation Delay"].map((header) => <th key={header} className="px-3 py-2">{header}</th>)}</tr>
+              </thead>
+              <tbody>{markouts.map((markout) => {
+                const delay = optionalNumeric(markout.observation_delay_ms);
+                const recordedFee = optionalNumeric(markout.fee_per_share ?? markout.entry_fee_per_share);
+                const explicitRoundTripFee = optionalNumeric(markout.round_trip_fee_per_share);
+                const recordedNetExecutable = optionalNumeric(markout.net_executable_markout_per_share);
+                const invalid = markout.observation_delay_ms === null || markout.observation_delay_ms === undefined ||
+                  !Number.isFinite(delay) || delay < 0 || delay > 2000 ||
+                  markout.midpoint_markout_per_share === null || markout.midpoint_markout_per_share === undefined ||
+                  markout.executable_markout_per_share === null || markout.executable_markout_per_share === undefined ||
+                  !Number.isFinite(recordedFee) || !Number.isFinite(recordedNetExecutable);
+                return (
+                <tr key={`${markout.fill_id ?? "legacy"}-${markout.horizon_seconds}`} className={`border-b border-line last:border-b-0 ${invalid ? "bg-amber-50" : ""}`}>
+                  <td className="px-3 py-2 font-mono text-xs">{markout.fill_id ? `${markout.fill_id.slice(0, 10)}…` : "legacy"}</td>
+                  <td className="px-3 py-2">{numberText(markout.fill_size)}</td>
+                  <td className="px-3 py-2">{markout.horizon_seconds}s</td>
+                  <td className="px-3 py-2">{numberText(markout.midpoint_markout_per_share)}</td>
+                  <td className="px-3 py-2">{numberText(markout.executable_markout_per_share)}</td>
+                  <td className="px-3 py-2">{Number.isFinite(recordedFee) ? numberText(recordedFee) : "missing"}</td>
+                  <td className="px-3 py-2">{Number.isFinite(explicitRoundTripFee) ? numberText(explicitRoundTripFee) : "not recorded"}</td>
+                  <td className="px-3 py-2">{Number.isFinite(recordedNetExecutable) ? numberText(recordedNetExecutable) : "missing"}</td>
+                  <td className="px-3 py-2">{milliseconds(markout.observation_delay_ms)}{invalid ? " — excluded from v3 model" : ""}</td>
+                </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        ) : <EmptyState label="No real fill occurred, so no markout can honestly be reported yet." />}
+      </Panel>
+    </div>
+  );
+}
+
+function milliseconds(value: number | null | undefined) {
+  return value === null || value === undefined ? "not observed" : `${numberText(value)} ms`;
+}
+
+function optionalNumeric(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === "") return Number.NaN;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function usd(value: number | null | undefined) {
+  return value === null || value === undefined ? "n/a" : `$${numberText(value, 6)}`;
+}
+
+function signedUsd(value: string | number | null | undefined) {
+  if (value === null || value === undefined) return "n/a";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "n/a";
+  if (numeric > 0) return `+$${numberText(numeric, 6)}`;
+  if (numeric < 0) return `-$${numberText(Math.abs(numeric), 6)}`;
+  return "$0";
+}
+
+function percentage(value: string | number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "pending";
+  return `${numberText(Number(value) * 100, 2)}%`;
+}
+
+function applicablePercentage(
+  value: string | number | null | undefined,
+  applicable: boolean | null | undefined
+) {
+  return applicable === false ? "N/A — zero denominator" : percentage(value);
 }
 
 function Overview({

@@ -1,0 +1,32 @@
+schema_version: 2
+experiment_id: experiment-loss-regime-oos-v2-2026-07-23
+evidence_version: loss-regime-oos-v2
+frozen_at: "2026-07-23T23:59:59Z"
+source_campaign_id: campaign-2026-07-23
+research_only: true
+evaluation_start_day: 2026-07-24
+selection_day_count: 28
+test_day_count: 28
+minimum_orders_per_window: 100
+minimum_filled_orders_per_window: 10
+minimum_unfilled_orders_per_window: 10
+bootstrap_block_days: 7
+bootstrap_resamples: 10000
+candidates:
+  - name: baseline_no_abstention
+  - name: minimum_edge_002
+    minimum_expected_edge: "0.02"
+  - name: maximum_visible_size_ahead_25
+    maximum_pre_send_public_size_ahead: "25"
+  - name: maximum_spread_2_ticks
+    maximum_spread_ticks: 2
+  - name: maximum_sigma_060
+    maximum_sigma: "0.60"
+  - name: maximum_model_error_002
+    maximum_model_error: "0.02"
+  - name: exclude_final_120_seconds
+    minimum_seconds_to_expiry: 120
+  - name: edge_spread_and_expiry
+    minimum_expected_edge: "0.02"
+    maximum_spread_ticks: 2
+    minimum_seconds_to_expiry: 120

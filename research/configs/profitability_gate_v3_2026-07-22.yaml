@@ -1,0 +1,86 @@
+version: 2
+updated_at: "2026-07-21T00:00:00Z"
+
+# Immutable protocol-v3 shadow holdout. The contract hash is computed from the
+# typed campaign section below; historical campaign configuration remains in
+# profitability_gate.yaml and is not rewritten by this cutover.
+campaign:
+  schema_version: 1
+  evidence_protocol_version: 3
+  id: campaign-2026-07-22
+  start_date: 2026-07-22
+  first_eligible_date: 2026-07-22
+  terminal_date: 2026-09-19
+  wallet_scope: cumulative_since_2026-07-22
+  wallet_baseline: 5.030521
+  equity_floor: 4.03
+  maximum_drawdown: 1.00
+  event_blob_prefix: shadow-events/campaign-2026-07-22
+  projected_cache_root: data/research/shadow/campaign-2026-07-22/projected-cache
+  daily_root: reports/research/shadow/campaigns/campaign-2026-07-22/daily
+  prospective_path: reports/research/shadow/campaigns/campaign-2026-07-22/prospective/prospective_validation.json
+  correction_root: reports/research/shadow/campaigns/campaign-2026-07-22/corrections
+  profitability_path: reports/research/shadow/campaigns/campaign-2026-07-22/profitability/latest.json
+  lease_blob: data/research/shadow/campaign-2026-07-22/control/replay.lock
+
+candidate:
+  name: dynamic_quote_style
+  version: dynamic_quote_style@2026-06-14
+  config_hash: sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c
+  frozen: true
+
+capital:
+  original_starting_capital: 9.23
+  campaign_starting_equity: 5.030521
+  maximum_campaign_drawdown: 1.00
+  equity_floor: 4.03
+  maximum_order_notional: 1.00
+  maximum_open_orders: 1
+  maximum_unresolved_positions: 1
+  maximum_account_ledger_difference: 0.01
+  allow_external_deposit: false
+  allow_automatic_replenishment: false
+
+shadow:
+  required_clean_days: 30
+  maximum_extension_days: 60
+  required_settled_markets: 1000
+  maximum_extension_markets: 2000
+  required_positive_weekly_blocks: 4
+  minimum_decision_parity_rate: 1.0
+  minimum_decision_grade_coverage: 0.95
+  maximum_modeled_drawdown: 1.00
+  require_queue_conservative_positive_pnl: true
+  require_pnl_lower_95_above_zero: true
+  require_net_executable_markout_30s_lower_95_above_zero: true
+  maximum_fatal_warnings: 0
+  maximum_blocking_warnings: 0
+  maximum_unclassified_warnings: 0
+  maximum_out_of_order_event_rate: 0.0001
+
+execution_model:
+  shadow_prior_model_version: conservative-execution-prior-v1
+  shadow_prior_sha256: sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4
+  evidence_protocol_version: 3
+  minimum_eligible_orders: 100
+  minimum_filled_orders: 10
+  minimum_non_filled_orders: 10
+  minimum_brier_improvement_over_base_rate: 0.05
+  maximum_expected_calibration_error: 0.10
+  validation: rolling_temporal_walk_forward_grouped_by_order
+  complex_model_minimum_observations: 500
+
+funded_ladder:
+  automatically_armed: false
+  human_authorization_required: true
+  stages: [1, 5, 25, 100, 200]
+  maximum_eligible_orders: 200
+  maximum_elapsed_days: 60
+  post_only: true
+  taker_orders: false
+  require_terminal_settlement_or_redemption_before_next_order: true
+
+terminal_states:
+  go: profitable_go
+  no_go: stopped_no_go
+  inconclusive_after_extension: stopped_no_go

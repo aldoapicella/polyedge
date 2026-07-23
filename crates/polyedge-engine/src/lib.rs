@@ -1,19 +1,24 @@
 use chrono::{DateTime, Duration, Utc};
-use polyedge_config::RuntimeSettings;
+use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
-    BookState, ConditionId, ExecutionReport, FairValue, MarketId, MarketSpec, OrderId, OrderKind,
-    Outcome, ReferencePrice, RiskAssessment, Side, TokenId, TradeDecision,
+    BookState, ConditionId, DecisionAction, ExecutionReport, FairValue, MarketId, MarketSpec,
+    OrderId, OrderKind, Outcome, ReferencePrice, RiskAssessment, Side, TokenId, TradeDecision,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 pub mod regime;
 pub use regime::{
-    AdaptiveStrategyResult, ProfiledStrategyConfig, QuoteStyle, RegimeClassifier, RegimeFeatures,
-    RegimeLabel, RegimePolicy, RegimeProfile,
+    evaluate_frozen_strategy, AdaptiveStrategyResult, FrozenCandidateIdentity,
+    FrozenStrategyEvaluation, FrozenStrategyMode, ProfiledStrategyConfig, QuoteStyle,
+    QuoteTransformContext, RegimeBookSnapshot, RegimeClassifier, RegimeClassifierSnapshot,
+    RegimeFeatureInput, RegimeFeatures, RegimeLabel, RegimePolicy, RegimeProfile,
+    RegimeReferencePoint, StrategyDataQuality, StrategyDecisionEnvelope, StrategyDecisionMetadata,
+    DYNAMIC_QUOTE_STYLE_POLICY_CANONICAL_JSON, DYNAMIC_QUOTE_STYLE_POLICY_SHA256,
 };
 
 pub const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 60.0 * 60.0;
@@ -352,6 +357,14 @@ pub struct RiskManager {
     pub open_order_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RiskManagerSnapshot {
+    pub positions_by_market: BTreeMap<MarketId, Decimal>,
+    pub total_position: Decimal,
+    pub daily_pnl: Decimal,
+    pub open_order_count: usize,
+}
+
 impl RiskManager {
     pub fn new(settings: RuntimeSettings) -> Self {
         Self {
@@ -360,6 +373,25 @@ impl RiskManager {
             total_position: Decimal::ZERO,
             daily_pnl: Decimal::ZERO,
             open_order_count: 0,
+        }
+    }
+
+    pub fn snapshot(&self) -> RiskManagerSnapshot {
+        RiskManagerSnapshot {
+            positions_by_market: self.positions_by_market.clone(),
+            total_position: self.total_position,
+            daily_pnl: self.daily_pnl,
+            open_order_count: self.open_order_count,
+        }
+    }
+
+    pub fn from_snapshot(settings: RuntimeSettings, snapshot: RiskManagerSnapshot) -> Self {
+        Self {
+            settings,
+            positions_by_market: snapshot.positions_by_market,
+            total_position: snapshot.total_position,
+            daily_pnl: snapshot.daily_pnl,
+            open_order_count: snapshot.open_order_count,
         }
     }
 
@@ -552,9 +584,72 @@ pub struct OrderManager {
     quotes: HashMap<QuoteKey, ManagedQuote>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManagedQuoteSnapshot {
+    pub market_id: MarketId,
+    pub token_id: TokenId,
+    pub side: Side,
+    pub decision: TradeDecision,
+    pub placed_ts: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub order_id: Option<OrderId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrderManagerSnapshot {
+    pub quotes: Vec<ManagedQuoteSnapshot>,
+}
+
 impl OrderManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn snapshot(&self) -> OrderManagerSnapshot {
+        let mut quotes = self
+            .quotes
+            .values()
+            .map(|quote| ManagedQuoteSnapshot {
+                market_id: quote.key.market_id.clone(),
+                token_id: quote.key.token_id.clone(),
+                side: quote.key.side.clone(),
+                decision: quote.decision.clone(),
+                placed_ts: quote.placed_ts,
+                expires_at: quote.expires_at,
+                order_id: quote.order_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        quotes.sort_by(|left, right| {
+            left.market_id
+                .to_string()
+                .cmp(&right.market_id.to_string())
+                .then(left.token_id.to_string().cmp(&right.token_id.to_string()))
+                .then(format!("{:?}", left.side).cmp(&format!("{:?}", right.side)))
+        });
+        OrderManagerSnapshot { quotes }
+    }
+
+    pub fn from_snapshot(snapshot: OrderManagerSnapshot) -> Self {
+        let quotes = snapshot
+            .quotes
+            .into_iter()
+            .map(|quote| {
+                let key = QuoteKey {
+                    market_id: quote.market_id,
+                    token_id: quote.token_id,
+                    side: quote.side,
+                };
+                let managed = ManagedQuote {
+                    key: key.clone(),
+                    decision: quote.decision,
+                    placed_ts: quote.placed_ts,
+                    expires_at: quote.expires_at,
+                    order_id: quote.order_id,
+                };
+                (key, managed)
+            })
+            .collect();
+        Self { quotes }
     }
 
     pub fn open_order_count(&self) -> usize {
@@ -739,6 +834,339 @@ impl OrderManager {
             .filter(|quote| &quote.key.market_id == market_id)
             .cloned()
             .collect()
+    }
+}
+
+/// Complete, secret-free state required to independently recompute the
+/// strategy, risk, and reconciliation pipeline for one market evaluation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MarketStartEvidenceV1 {
+    pub schema_version: u32,
+    pub market_id: MarketId,
+    pub market_start_ts: DateTime<Utc>,
+    pub market_end_ts: DateTime<Utc>,
+    pub start_price: Decimal,
+    pub reference_source: String,
+    pub reference_source_ts: DateTime<Utc>,
+    pub reference_exact_resolution_source: bool,
+    pub reference_stale: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DecisionPipelineInputV3 {
+    pub schema_version: u32,
+    pub settings: RuntimeSettings,
+    pub market: MarketSpec,
+    pub market_start_evidence: MarketStartEvidenceV1,
+    pub fair_value: FairValue,
+    pub reference: ReferencePrice,
+    pub books: BTreeMap<TokenId, BookState>,
+    pub decision_ts: DateTime<Utc>,
+    pub kill_switch_enabled: bool,
+    pub adaptive_mode: Option<FrozenStrategyMode>,
+    pub regime_feature_input: RegimeFeatureInput,
+    pub classifier_before: Option<RegimeClassifierSnapshot>,
+    pub risk_before: RiskManagerSnapshot,
+    pub order_manager_before: OrderManagerSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPipelineStrategyEvaluationV3 {
+    pub evaluation_index: usize,
+    pub quote_context: QuoteTransformContext,
+    pub classifier_before: RegimeClassifierSnapshot,
+    pub classifier_after: RegimeClassifierSnapshot,
+    pub evaluated_decision: Option<TradeDecision>,
+    pub cancel_existing: bool,
+    pub metadata: StrategyDecisionMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionPipelineOutputV3 {
+    pub raw_decisions: Vec<TradeDecision>,
+    pub strategy_evaluations: Vec<DecisionPipelineStrategyEvaluationV3>,
+    pub strategy_decisions: Vec<TradeDecision>,
+    pub risk_assessment: RiskAssessment,
+    pub risk_decisions: Vec<TradeDecision>,
+    pub final_decisions: Vec<TradeDecision>,
+    pub classifier_after: Option<RegimeClassifierSnapshot>,
+}
+
+/// Canonical, replayable evidence for one final pipeline decision. The
+/// payload is shared by the runtime recorder and the independent reporter so
+/// synthesized risk/reconciliation outputs receive explicit provenance
+/// without being falsely attributed to a single strategy evaluation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalDecisionEvidenceV1 {
+    pub payload: Value,
+    pub strategy_metadata: Option<StrategyDecisionMetadata>,
+    pub strategy_evaluation_index: Option<usize>,
+    pub strategy_output_index: Option<usize>,
+}
+
+/// Secret-free canonical decision configuration shared by the runtime and
+/// the independent replay reporter. Keep routing in this hash because a
+/// prefix cutover changes the authoritative evidence stream.
+pub fn decision_config_projection_v1(
+    settings: &RuntimeSettings,
+    adaptive_mode: Option<FrozenStrategyMode>,
+) -> Value {
+    let execution_mode = match settings.live.execution_mode {
+        ExecutionMode::Paper => "paper",
+        ExecutionMode::Live => "live",
+    };
+    json!({
+        "schema": "polyedge.decision_config.v1",
+        "target": settings.target,
+        "data_policy": {
+            "compact_shadow_recording": settings.azure.compact_shadow_recording,
+            "shadow_book_sample_ms": settings.azure.shadow_book_sample_ms
+        },
+        "strategy": settings.strategy,
+        "risk": settings.risk,
+        "paper_execution": settings.paper,
+        "execution_safety": {
+            "execution_mode": execution_mode,
+            "allow_live": settings.live.allow_live,
+            "confirm_non_restricted_location": settings.live.confirm_non_restricted_location,
+            "require_exact_resolution_source_for_live": settings.live.require_exact_resolution_source_for_live,
+            "allow_emergency_account_cancel": settings.live.allow_emergency_account_cancel
+        },
+        "event_blob_routing": {
+            "before_cutover": settings.azure.event_blob_prefix,
+            "after_cutover": settings.azure.event_blob_prefix_after_cutover,
+            "cutover_utc": settings.azure.event_blob_prefix_cutover_utc
+        },
+        "adaptive_mode": adaptive_mode,
+        "candidate": adaptive_mode.map(FrozenStrategyMode::candidate)
+    })
+}
+
+pub fn final_decision_evidence_v1(
+    output: &DecisionPipelineOutputV3,
+) -> Option<Vec<FinalDecisionEvidenceV1>> {
+    let lineage = output
+        .strategy_evaluations
+        .iter()
+        .filter_map(|evaluation| {
+            evaluation
+                .evaluated_decision
+                .as_ref()
+                .map(|decision| (evaluation.evaluation_index, decision, &evaluation.metadata))
+        })
+        .enumerate()
+        .map(
+            |(strategy_output_index, (evaluation_index, decision, metadata))| {
+                (evaluation_index, strategy_output_index, decision, metadata)
+            },
+        )
+        .collect::<Vec<_>>();
+    let all_evaluation_indices = output
+        .strategy_evaluations
+        .iter()
+        .map(|evaluation| evaluation.evaluation_index)
+        .collect::<Vec<_>>();
+    let all_evaluations_decision_grade = !output.strategy_evaluations.is_empty()
+        && output
+            .strategy_evaluations
+            .iter()
+            .all(|evaluation| evaluation.metadata.data_quality.decision_grade);
+    let mut used = vec![false; lineage.len()];
+
+    output
+        .final_decisions
+        .iter()
+        .map(|decision| {
+            let exact = lineage
+                .iter()
+                .enumerate()
+                .find(|(index, (_, _, source, _))| !used[*index] && **source == *decision)
+                .map(|(index, _)| index);
+            let risk_adjusted = exact
+                .is_none()
+                .then(|| {
+                    if decision.action != DecisionAction::Place {
+                        return None;
+                    }
+                    let candidates = lineage
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, (_, _, source, _))| {
+                            !used[*index] && same_place_decision_lineage(source, decision)
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    (candidates.len() == 1).then_some(candidates[0])
+                })
+                .flatten();
+            let matched = exact.or(risk_adjusted);
+            let (source, metadata, evaluation_index, strategy_output_index, grade, contributors) =
+                if let Some(index) = matched {
+                    used[index] = true;
+                    let (evaluation_index, strategy_output_index, _, metadata) = lineage[index];
+                    (
+                        if exact.is_some() {
+                            "strategy_evaluation"
+                        } else {
+                            "risk_adjusted_strategy_evaluation"
+                        },
+                        Some(metadata.clone()),
+                        Some(evaluation_index),
+                        Some(strategy_output_index),
+                        metadata.data_quality.decision_grade,
+                        vec![evaluation_index],
+                    )
+                } else {
+                    (
+                        "risk_or_order_reconciliation",
+                        None,
+                        None,
+                        None,
+                        all_evaluations_decision_grade,
+                        all_evaluation_indices.clone(),
+                    )
+                };
+            let mut payload = serde_json::to_value(decision).ok()?;
+            let object = payload.as_object_mut()?;
+            object.insert(
+                "final_decision_metadata".to_owned(),
+                json!({
+                    "schema": "polyedge.final_decision_metadata.v1",
+                    "source": source,
+                    "decision_grade": grade,
+                    "contributing_strategy_evaluation_indices": contributors
+                }),
+            );
+            if let (Some(metadata), Some(evaluation_index), Some(strategy_output_index)) =
+                (&metadata, evaluation_index, strategy_output_index)
+            {
+                object.insert(
+                    "strategy_metadata".to_owned(),
+                    serde_json::to_value(metadata).ok()?,
+                );
+                object.insert(
+                    "strategy_evaluation_index".to_owned(),
+                    json!(evaluation_index),
+                );
+                object.insert(
+                    "strategy_output_index".to_owned(),
+                    json!(strategy_output_index),
+                );
+            }
+            Some(FinalDecisionEvidenceV1 {
+                payload,
+                strategy_metadata: metadata,
+                strategy_evaluation_index: evaluation_index,
+                strategy_output_index,
+            })
+        })
+        .collect()
+}
+
+fn same_place_decision_lineage(source: &TradeDecision, final_decision: &TradeDecision) -> bool {
+    source.action == DecisionAction::Place
+        && final_decision.action == DecisionAction::Place
+        && source.market_id == final_decision.market_id
+        && source.condition_id == final_decision.condition_id
+        && source.token_id == final_decision.token_id
+        && source.outcome == final_decision.outcome
+        && source.side == final_decision.side
+        && source.price == final_decision.price
+        && source.order_kind == final_decision.order_kind
+        && source.ttl_ms == final_decision.ttl_ms
+        && source.expected_edge == final_decision.expected_edge
+        && source.post_only == final_decision.post_only
+        && source.tick_size == final_decision.tick_size
+        && source.neg_risk == final_decision.neg_risk
+}
+
+/// Shared pure evaluator used by both the runtime and the promotion reporter.
+/// It intentionally stops before execution or any state mutation.
+pub fn evaluate_decision_pipeline_v3(input: &DecisionPipelineInputV3) -> DecisionPipelineOutputV3 {
+    let regime_features = input.regime_feature_input.clone().build();
+    let raw_decisions = MakerFirstStrategy::new(input.settings.clone()).evaluate(
+        &input.market,
+        &input.fair_value,
+        &input.books,
+    );
+    let mut strategy_evaluations = Vec::new();
+    let (strategy_decisions, classifier_after) = match input.adaptive_mode {
+        Some(mode) => {
+            let mut classifier = RegimeClassifier::from_snapshot(
+                input
+                    .classifier_before
+                    .clone()
+                    .unwrap_or_else(|| RegimeClassifier::default().snapshot()),
+            );
+            let policy = RegimePolicy::new(input.settings.strategy.clone());
+            let decisions = raw_decisions
+                .iter()
+                .enumerate()
+                .filter_map(|(evaluation_index, decision)| {
+                    let q = match decision.outcome.as_ref() {
+                        Some(Outcome::Up) => Some(input.fair_value.q_up),
+                        Some(Outcome::Down) => Some(input.fair_value.q_down),
+                        None => None,
+                    };
+                    let best_bid = decision
+                        .token_id
+                        .as_ref()
+                        .and_then(|token| input.books.get(token))
+                        .and_then(BookState::best_bid)
+                        .map(|level| level.price);
+                    let quote_context = QuoteTransformContext { best_bid, q };
+                    let classifier_before = classifier.snapshot();
+                    let evaluated = evaluate_frozen_strategy(
+                        mode,
+                        &mut classifier,
+                        &policy,
+                        &regime_features,
+                        input.decision_ts,
+                        decision,
+                        &quote_context,
+                    );
+                    let classifier_after = classifier.snapshot();
+                    strategy_evaluations.push(DecisionPipelineStrategyEvaluationV3 {
+                        evaluation_index,
+                        quote_context,
+                        classifier_before,
+                        classifier_after,
+                        evaluated_decision: evaluated.decision.clone(),
+                        cancel_existing: evaluated.cancel_existing,
+                        metadata: evaluated.metadata,
+                    });
+                    evaluated.decision
+                })
+                .collect::<Vec<_>>();
+            (decisions, Some(classifier.snapshot()))
+        }
+        None => (raw_decisions.clone(), None),
+    };
+    let risk = RiskManager::from_snapshot(input.settings.clone(), input.risk_before.clone());
+    let risk_assessment = risk.assess_market(
+        &input.market,
+        &input.reference,
+        &input.books,
+        input.decision_ts,
+        input.kill_switch_enabled,
+    );
+    let risk_decisions =
+        risk.filter_decisions(&strategy_decisions, &input.market, &risk_assessment);
+    let order_manager = OrderManager::from_snapshot(input.order_manager_before.clone());
+    let final_decisions = order_manager.reconcile(
+        &input.market.market_id,
+        &risk_decisions,
+        Some(input.market.condition_id.clone()),
+        input.decision_ts,
+    );
+    DecisionPipelineOutputV3 {
+        raw_decisions,
+        strategy_evaluations,
+        strategy_decisions,
+        risk_assessment,
+        risk_decisions,
+        final_decisions,
+        classifier_after,
     }
 }
 

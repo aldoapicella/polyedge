@@ -1,7 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use polyedge_api::{app, smoke_paths};
-use polyedge_config::RuntimeSettings;
+use polyedge_config::{RuntimeRole, RuntimeSettings};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -16,6 +16,38 @@ async fn smoke_paths_return_success() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
+}
+
+#[tokio::test]
+async fn shadow_role_is_reported_explicitly() {
+    let mut settings = RuntimeSettings::default();
+    settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
+    settings.paper.maker_fill_policy = "none".to_owned();
+    settings.strategy.adaptive_regime_enabled = true;
+    settings.strategy.adaptive_regime_mode = "dynamic_quote_style".to_owned();
+    settings.azure.publish_strategy_canary_intents = true;
+    settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
+    settings.azure.event_blob_prefix = "shadow-events/test-campaign".to_owned();
+    let app = app(settings);
+
+    let response = app
+        .oneshot(json_request(Method::GET, "/api/v1/health", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["runtime_role"], "profitability_shadow");
+    assert_eq!(payload["shadow_only"], true);
+    assert_eq!(payload["reports"]["store"]["shadow_only"], true);
+}
+
+#[test]
+#[should_panic(expected = "refusing API startup with unsafe runtime role")]
+fn unsafe_shadow_role_is_rejected_before_api_start() {
+    let mut settings = RuntimeSettings::default();
+    settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
+    let _ = app(settings);
 }
 
 #[tokio::test]
@@ -83,6 +115,12 @@ async fn api_contract_routes_remain_reachable() {
         (Method::GET, "/api/v1/query/templates", None, StatusCode::OK),
         (Method::GET, "/api/v1/labs/summary", None, StatusCode::OK),
         (Method::GET, "/api/v1/labs/candidates", None, StatusCode::OK),
+        (
+            Method::GET,
+            "/api/v1/labs/venue-execution",
+            None,
+            StatusCode::OK,
+        ),
         (
             Method::GET,
             "/api/v1/labs/candidates/static_baseline",

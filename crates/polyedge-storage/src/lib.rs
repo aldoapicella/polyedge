@@ -6,19 +6,24 @@ use polyedge_domain::RuntimeEvent;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
-use std::collections::{BTreeMap, BTreeSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, thread};
 use thiserror::Error;
 use tracing::warn;
 
 const AZURE_BLOB_API_VERSION: &str = "2023-11-03";
 const AZURE_BLOB_MAX_ATTEMPTS: usize = 5;
+const AZURE_LEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const AZURE_LEASE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const AZURE_LEASE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_APPEND_BLOCK_TARGET_BYTES: usize = 4 * 1024 * 1024;
+const AZURE_APPEND_HANDOFF_WINDOW: Duration = Duration::from_secs(120);
+const AZURE_APPEND_RECONCILE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const AZURE_TABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const AZURE_TABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +67,53 @@ pub trait EventRecorder {
     fn flush(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
+}
+
+/// Canonical JSON shared by producers and independent evidence validators.
+/// Object keys are sorted recursively; arrays retain order.
+pub fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(key).expect("JSON key serializes"),
+                            canonical_json(value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        _ => serde_json::to_string(value).expect("JSON value serializes"),
+    }
+}
+
+pub fn canonical_json_sha256(value: &Value) -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_json(value).as_bytes())
+    )
+}
+
+/// Materialize the exact JSON representation that will cross the recorder
+/// boundary before computing any content binding over it.
+pub fn wire_normalized_json<T: Serialize>(value: &T) -> Result<Value, serde_json::Error> {
+    serde_json::from_slice(&serde_json::to_vec(value)?)
 }
 
 #[derive(Clone, Debug)]
@@ -116,10 +168,15 @@ impl EventRecorder for AzureBlobRecorder {
 pub struct AzureAppendBlobRecorder {
     account: String,
     container: String,
+    event_blob_prefix: String,
+    event_blob_prefix_after_cutover: Option<String>,
+    event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
     agent: ureq::Agent,
     token: ManagedIdentityToken,
-    known_append_blobs: BTreeSet<String>,
+    known_append_positions: BTreeMap<String, u64>,
     pending_append_blocks: BufferedAppendBlocks,
+    handoff_unconditional_until: Instant,
+    handoff_ambiguous_starts: BTreeMap<String, u64>,
 }
 
 impl AzureAppendBlobRecorder {
@@ -128,45 +185,201 @@ impl AzureAppendBlobRecorder {
         container: impl Into<String>,
         client_id: Option<String>,
     ) -> Self {
+        Self::new_with_prefix(account, container, client_id, "events")
+    }
+
+    pub fn new_with_prefix(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+        event_blob_prefix: impl Into<String>,
+    ) -> Self {
+        Self::new_with_prefix_cutover(
+            account,
+            container,
+            client_id,
+            event_blob_prefix,
+            None::<String>,
+            None,
+        )
+    }
+
+    pub fn new_with_prefix_cutover(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+        event_blob_prefix: impl Into<String>,
+        event_blob_prefix_after_cutover: Option<impl Into<String>>,
+        event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             account: account.into(),
             container: container.into(),
+            event_blob_prefix: normalize_blob_prefix(event_blob_prefix.into()),
+            event_blob_prefix_after_cutover: event_blob_prefix_after_cutover
+                .map(Into::into)
+                .map(normalize_blob_prefix),
+            event_blob_prefix_cutover_utc,
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
                 .timeout_read(Duration::from_secs(30))
                 .timeout_write(Duration::from_secs(30))
                 .build(),
             token: ManagedIdentityToken::new(client_id),
-            known_append_blobs: BTreeSet::new(),
+            known_append_positions: BTreeMap::new(),
             pending_append_blocks: BufferedAppendBlocks::new(AZURE_APPEND_BLOCK_TARGET_BYTES),
+            handoff_unconditional_until: Instant::now() + AZURE_APPEND_HANDOFF_WINDOW,
+            handoff_ambiguous_starts: BTreeMap::new(),
         }
     }
 
     fn append_block(&mut self, blob_name: &str, block: &[u8]) -> Result<(), AzureBlobError> {
+        if Instant::now() < self.handoff_unconditional_until
+            || self.handoff_ambiguous_starts.contains_key(blob_name)
+        {
+            return self.append_block_during_handoff(blob_name, block);
+        }
         self.ensure_append_blob(blob_name)?;
+        // The shadow recorder is deployed as one replica and is the sole writer
+        // for its minute prefix. Binding every append to the last observed byte
+        // offset makes an ambiguous response safely reconcilable without
+        // appending the same block twice.
+        let expected_position = *self.known_append_positions.get(blob_name).ok_or_else(|| {
+            AzureBlobError::AppendPosition(format!("missing known append position for {blob_name}"))
+        })?;
         let url = self.blob_url(blob_name, Some("comp=appendblock"));
         let token = self.token.access_token(&self.agent)?;
-        match self
+        let result = self
+            .agent
+            .put(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .set(
+                "x-ms-blob-condition-appendpos",
+                &expected_position.to_string(),
+            )
+            .set("content-type", "application/octet-stream")
+            .send_bytes(block);
+        match result {
+            Ok(_) => {
+                self.known_append_positions.insert(
+                    blob_name.to_owned(),
+                    expected_position.saturating_add(block.len() as u64),
+                );
+                Ok(())
+            }
+            Err(ureq::Error::Status(status, _)) if status == 412 => self
+                .reconcile_ambiguous_append(
+                    blob_name,
+                    expected_position,
+                    block,
+                    AzureBlobError::HttpStatus(status),
+                ),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => self.reconcile_ambiguous_append(
+                blob_name,
+                expected_position,
+                block,
+                AzureBlobError::Transport(error.to_string()),
+            ),
+        }
+    }
+
+    fn append_block_during_handoff(
+        &mut self,
+        blob_name: &str,
+        block: &[u8],
+    ) -> Result<(), AzureBlobError> {
+        self.ensure_append_blob(blob_name)?;
+        let expected_position = self.append_blob_position(blob_name)?.ok_or_else(|| {
+            AzureBlobError::AppendPosition(format!(
+                "append blob disappeared before handoff append for {blob_name}"
+            ))
+        })?;
+        if let Some(ambiguous_start) = self.handoff_ambiguous_starts.get(blob_name).copied() {
+            let range_outcome = if expected_position > ambiguous_start {
+                self.append_range_contains_block(
+                    blob_name,
+                    ambiguous_start,
+                    expected_position,
+                    block,
+                )
+                .map(|present| {
+                    if present {
+                        HandoffRangeOutcome::ExactBlockPresent
+                    } else {
+                        HandoffRangeOutcome::ExactBlockAbsent
+                    }
+                })
+            } else {
+                Ok(HandoffRangeOutcome::ExactBlockAbsent)
+            };
+            if resolve_handoff_ambiguity(
+                &mut self.handoff_ambiguous_starts,
+                blob_name,
+                expected_position,
+                range_outcome,
+            )? {
+                self.known_append_positions
+                    .insert(blob_name.to_owned(), expected_position);
+                return Ok(());
+            }
+        }
+        self.known_append_positions
+            .insert(blob_name.to_owned(), expected_position);
+        // Retain this exact boundary until either the append returns success or
+        // a later range read proves the canonical block absent/present. If the
+        // reconciliation read itself fails, the next retry must search from
+        // this boundary before it is allowed to append.
+        self.handoff_ambiguous_starts
+            .insert(blob_name.to_owned(), expected_position);
+        let url = self.blob_url(blob_name, Some("comp=appendblock"));
+        let token = self.token.access_token(&self.agent)?;
+        let result = self
             .agent
             .put(&url)
             .set("authorization", &format!("Bearer {token}"))
             .set("x-ms-version", AZURE_BLOB_API_VERSION)
             .set("x-ms-date", &rfc1123_now())
             .set("content-type", "application/octet-stream")
-            .send_bytes(block)
-        {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
-            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+            .send_bytes(block);
+        match result {
+            Ok(_) => {
+                self.handoff_ambiguous_starts.remove(blob_name);
+                self.known_append_positions.insert(
+                    blob_name.to_owned(),
+                    expected_position.saturating_add(block.len() as u64),
+                );
+                Ok(())
+            }
+            Err(ureq::Error::Status(status, _)) if is_retryable_azure_status(status) => self
+                .reconcile_ambiguous_append(
+                    blob_name,
+                    expected_position,
+                    block,
+                    AzureBlobError::HttpStatus(status),
+                ),
+            Err(ureq::Error::Status(status, _)) => {
+                self.handoff_ambiguous_starts.remove(blob_name);
+                Err(AzureBlobError::HttpStatus(status))
+            }
+            Err(ureq::Error::Transport(error)) => self.reconcile_ambiguous_append(
+                blob_name,
+                expected_position,
+                block,
+                AzureBlobError::Transport(error.to_string()),
+            ),
         }
     }
 
     fn ensure_append_blob(&mut self, blob_name: &str) -> Result<(), AzureBlobError> {
-        if self.known_append_blobs.contains(blob_name) {
+        if self.known_append_positions.contains_key(blob_name) {
             return Ok(());
         }
-        if self.append_blob_exists(blob_name)? {
-            self.known_append_blobs.insert(blob_name.to_owned());
+        if let Some(position) = self.append_blob_position(blob_name)? {
+            self.known_append_positions
+                .insert(blob_name.to_owned(), position);
             return Ok(());
         }
         let url = self.blob_url(blob_name, None);
@@ -181,7 +394,9 @@ impl AzureAppendBlobRecorder {
             .send_bytes(&[])
         {
             Ok(_) | Err(ureq::Error::Status(409, _)) => {
-                self.known_append_blobs.insert(blob_name.to_owned());
+                let position = self.append_blob_position(blob_name)?.unwrap_or(0);
+                self.known_append_positions
+                    .insert(blob_name.to_owned(), position);
                 Ok(())
             }
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
@@ -189,7 +404,7 @@ impl AzureAppendBlobRecorder {
         }
     }
 
-    fn append_blob_exists(&mut self, blob_name: &str) -> Result<bool, AzureBlobError> {
+    fn append_blob_position(&mut self, blob_name: &str) -> Result<Option<u64>, AzureBlobError> {
         let url = self.blob_url(blob_name, None);
         let token = self.token.access_token(&self.agent)?;
         match self
@@ -200,11 +415,114 @@ impl AzureAppendBlobRecorder {
             .set("x-ms-date", &rfc1123_now())
             .call()
         {
-            Ok(_) => Ok(true),
-            Err(ureq::Error::Status(404, _)) => Ok(false),
+            Ok(response) => response
+                .header("content-length")
+                .ok_or_else(|| {
+                    AzureBlobError::AppendPosition(format!(
+                        "Azure append blob HEAD omitted content-length for {blob_name}"
+                    ))
+                })?
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| {
+                    AzureBlobError::AppendPosition(format!(
+                        "invalid Azure append blob content-length for {blob_name}: {error}"
+                    ))
+                }),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
+    }
+
+    fn reconcile_ambiguous_append(
+        &mut self,
+        blob_name: &str,
+        expected_position: u64,
+        block: &[u8],
+        original_error: AzureBlobError,
+    ) -> Result<(), AzureBlobError> {
+        let observed_position = self.append_blob_position(blob_name)?.ok_or_else(|| {
+            AzureBlobError::AppendPosition(format!(
+                "append blob disappeared while reconciling {blob_name}"
+            ))
+        })?;
+        if observed_position < expected_position {
+            return Err(AzureBlobError::AppendPosition(format!(
+                "append position moved backwards for {blob_name}: expected at least {expected_position}, observed {observed_position}"
+            )));
+        }
+        if observed_position == expected_position {
+            self.known_append_positions
+                .insert(blob_name.to_owned(), observed_position);
+            return Err(original_error);
+        }
+
+        // A revision handoff can advance the same minute blob between our
+        // HEAD and conditional append. Read only the advanced byte range: if
+        // our exact canonical block is already present, the response was
+        // ambiguous but committed; otherwise the precondition rejected it and
+        // the next retry must append at the newly observed end.
+        let already_committed = self.append_range_contains_block(
+            blob_name,
+            expected_position,
+            observed_position,
+            block,
+        )?;
+        self.known_append_positions
+            .insert(blob_name.to_owned(), observed_position);
+        if already_committed {
+            self.handoff_ambiguous_starts.remove(blob_name);
+            Ok(())
+        } else {
+            Err(original_error)
+        }
+    }
+
+    fn append_range_contains_block(
+        &mut self,
+        blob_name: &str,
+        start: u64,
+        end_exclusive: u64,
+        block: &[u8],
+    ) -> Result<bool, AzureBlobError> {
+        let range_len = end_exclusive.saturating_sub(start);
+        if range_len > AZURE_APPEND_RECONCILE_MAX_BYTES {
+            return Err(AzureBlobError::AppendPosition(format!(
+                "append reconciliation range for {blob_name} is {range_len} bytes, above the {} byte safety limit",
+                AZURE_APPEND_RECONCILE_MAX_BYTES
+            )));
+        }
+        let url = self.blob_url(blob_name, None);
+        let token = self.token.access_token(&self.agent)?;
+        let response = self
+            .agent
+            .get(&url)
+            .set("authorization", &format!("Bearer {token}"))
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &rfc1123_now())
+            .set(
+                "range",
+                &format!("bytes={start}-{}", end_exclusive.saturating_sub(1)),
+            )
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Status(status, _) => AzureBlobError::HttpStatus(status),
+                ureq::Error::Transport(error) => AzureBlobError::Transport(error.to_string()),
+            })?;
+        let mut bytes = Vec::with_capacity(range_len as usize);
+        response
+            .into_reader()
+            .take(range_len.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(AzureBlobError::Io)?;
+        if bytes.len() as u64 != range_len {
+            return Err(AzureBlobError::AppendPosition(format!(
+                "append reconciliation range for {blob_name} returned {} bytes, expected {range_len}",
+                bytes.len()
+            )));
+        }
+        Ok(byte_range_contains_block(&bytes, block))
     }
 
     fn blob_url(&self, blob_name: &str, query: Option<&str>) -> String {
@@ -228,16 +546,66 @@ impl AzureAppendBlobRecorder {
         let mut blocks = blocks.into_iter();
         while let Some((blob_name, block)) = blocks.next() {
             if let Err(error) = self.append_block(&blob_name, &block) {
-                let remaining: Vec<_> = blocks.collect();
-                for (remaining_blob, remaining_block) in remaining.into_iter().rev() {
-                    self.pending_append_blocks
-                        .prepend_chunk(remaining_blob, remaining_block);
-                }
-                self.pending_append_blocks.prepend_chunk(blob_name, block);
+                let mut retry_blocks = vec![(blob_name, block)];
+                retry_blocks.extend(blocks);
+                self.pending_append_blocks
+                    .prepend_retry_blocks(retry_blocks);
                 return Err(error);
             }
         }
         Ok(())
+    }
+}
+
+fn byte_range_contains_block(bytes: &[u8], block: &[u8]) -> bool {
+    if block.is_empty() || block.len() > bytes.len() {
+        return false;
+    }
+    let final_start = bytes.len() - block.len();
+    let mut offset = 0;
+    while offset <= final_start {
+        let Some(relative) = bytes[offset..=final_start]
+            .iter()
+            .position(|byte| *byte == block[0])
+        else {
+            return false;
+        };
+        let start = offset + relative;
+        if bytes[start..start + block.len()] == *block {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandoffRangeOutcome {
+    ExactBlockPresent,
+    ExactBlockAbsent,
+}
+
+fn resolve_handoff_ambiguity(
+    ambiguous_starts: &mut BTreeMap<String, u64>,
+    blob_name: &str,
+    observed_position: u64,
+    range_outcome: Result<HandoffRangeOutcome, AzureBlobError>,
+) -> Result<bool, AzureBlobError> {
+    let Some(ambiguous_start) = ambiguous_starts.get(blob_name).copied() else {
+        return Ok(false);
+    };
+    if observed_position < ambiguous_start {
+        return Err(AzureBlobError::AppendPosition(format!(
+            "append position moved backwards for {blob_name}: ambiguous handoff started at {ambiguous_start}, observed {observed_position}"
+        )));
+    }
+    let outcome = range_outcome?;
+    if outcome == HandoffRangeOutcome::ExactBlockPresent {
+        ambiguous_starts.remove(blob_name);
+        Ok(true)
+    } else {
+        ambiguous_starts.insert(blob_name.to_owned(), observed_position);
+        Ok(false)
     }
 }
 
@@ -254,17 +622,33 @@ impl EventRecorder for AzureAppendBlobRecorder {
         for event in events {
             ready_blocks.extend(
                 self.pending_append_blocks
-                    .push_line(&event_blob_name(event), jsonl_event_line(event)?),
+                    .push_line(&self.event_blob_name(event), jsonl_event_line(event)?),
             );
         }
-        self.append_ready_blocks(ready_blocks)?;
+        let mut blocks = self.pending_append_blocks.take_retry_blocks();
+        blocks.extend(ready_blocks);
+        self.append_ready_blocks(blocks)?;
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), StorageError> {
-        let blocks = self.pending_append_blocks.drain();
+        let mut blocks = self.pending_append_blocks.take_retry_blocks();
+        blocks.extend(self.pending_append_blocks.drain());
         self.append_ready_blocks(blocks)?;
         Ok(())
+    }
+}
+
+impl AzureAppendBlobRecorder {
+    fn event_blob_name(&self, event: &RuntimeEvent) -> String {
+        let prefix = match (
+            self.event_blob_prefix_after_cutover.as_deref(),
+            self.event_blob_prefix_cutover_utc,
+        ) {
+            (Some(prefix), Some(cutover)) if event.ts >= cutover => prefix,
+            _ => &self.event_blob_prefix,
+        };
+        event_blob_name(prefix, event)
     }
 }
 
@@ -283,6 +667,9 @@ impl Drop for AzureAppendBlobRecorder {
 struct BufferedAppendBlocks {
     max_bytes: usize,
     pending: BTreeMap<String, Vec<u8>>,
+    pending_line_sha256: BTreeMap<String, BTreeSet<[u8; 32]>>,
+    retry_blocks: VecDeque<(String, Vec<u8>)>,
+    retry_line_sha256: BTreeMap<String, BTreeSet<[u8; 32]>>,
 }
 
 impl BufferedAppendBlocks {
@@ -290,11 +677,26 @@ impl BufferedAppendBlocks {
         Self {
             max_bytes: max_bytes.max(1),
             pending: BTreeMap::new(),
+            pending_line_sha256: BTreeMap::new(),
+            retry_blocks: VecDeque::new(),
+            retry_line_sha256: BTreeMap::new(),
         }
     }
 
     fn push_line(&mut self, blob_name: &str, line: Vec<u8>) -> Vec<(String, Vec<u8>)> {
         if line.is_empty() {
+            return Vec::new();
+        }
+        let line_sha256: [u8; 32] = Sha256::digest(&line).into();
+        if self
+            .pending_line_sha256
+            .get(blob_name)
+            .is_some_and(|hashes| hashes.contains(&line_sha256))
+            || self
+                .retry_line_sha256
+                .get(blob_name)
+                .is_some_and(|hashes| hashes.contains(&line_sha256))
+        {
             return Vec::new();
         }
         let blob_name = blob_name.to_owned();
@@ -313,6 +715,10 @@ impl BufferedAppendBlocks {
 
         let current = self.pending.entry(blob_name.clone()).or_default();
         current.extend(line);
+        self.pending_line_sha256
+            .entry(blob_name.clone())
+            .or_default()
+            .insert(line_sha256);
         if current.len() >= self.max_bytes {
             self.push_pending_if_any(&blob_name, &mut ready);
         }
@@ -320,28 +726,52 @@ impl BufferedAppendBlocks {
     }
 
     fn drain(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.pending_line_sha256.clear();
         std::mem::take(&mut self.pending)
             .into_iter()
             .filter(|(_, chunk)| !chunk.is_empty())
             .collect()
     }
 
-    fn prepend_chunk(&mut self, blob_name: String, chunk: Vec<u8>) {
-        if chunk.is_empty() {
-            return;
+    fn prepend_retry_blocks<I>(&mut self, blocks: I)
+    where
+        I: IntoIterator<Item = (String, Vec<u8>)>,
+    {
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter(|(_, block)| !block.is_empty())
+            .collect();
+        for (blob_name, block) in &blocks {
+            for line in block.split_inclusive(|byte| *byte == b'\n') {
+                if !line.is_empty() {
+                    self.retry_line_sha256
+                        .entry(blob_name.clone())
+                        .or_default()
+                        .insert(Sha256::digest(line).into());
+                }
+            }
         }
-        let pending = self.pending.remove(&blob_name).unwrap_or_default();
-        let mut merged = Vec::with_capacity(chunk.len() + pending.len());
-        merged.extend(chunk);
-        merged.extend(pending);
-        self.pending.insert(blob_name, merged);
+        for block in blocks.into_iter().rev() {
+            self.retry_blocks.push_front(block);
+        }
+    }
+
+    fn take_retry_blocks(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.retry_line_sha256.clear();
+        self.retry_blocks.drain(..).collect()
     }
 
     fn pending_bytes(&self) -> usize {
-        self.pending.values().map(Vec::len).sum()
+        self.pending.values().map(Vec::len).sum::<usize>()
+            + self
+                .retry_blocks
+                .iter()
+                .map(|(_, block)| block.len())
+                .sum::<usize>()
     }
 
     fn push_pending_if_any(&mut self, blob_name: &str, ready: &mut Vec<(String, Vec<u8>)>) {
+        self.pending_line_sha256.remove(blob_name);
         if let Some(chunk) = self.pending.remove(blob_name) {
             if !chunk.is_empty() {
                 ready.push((blob_name.to_owned(), chunk));
@@ -350,8 +780,17 @@ impl BufferedAppendBlocks {
     }
 }
 
-fn event_blob_name(event: &RuntimeEvent) -> String {
-    format!("events/{}.jsonl", event.ts.format("%Y/%m/%d/%H/%M"))
+fn normalize_blob_prefix(prefix: String) -> String {
+    let prefix = prefix.trim().trim_matches('/');
+    if prefix.is_empty() {
+        "events".to_owned()
+    } else {
+        prefix.to_owned()
+    }
+}
+
+fn event_blob_name(prefix: &str, event: &RuntimeEvent) -> String {
+    format!("{prefix}/{}.jsonl", event.ts.format("%Y/%m/%d/%H/%M"))
 }
 
 fn jsonl_event_line(event: &RuntimeEvent) -> Result<Vec<u8>, StorageError> {
@@ -369,6 +808,8 @@ pub enum AzureBlobError {
     ManagedIdentity(String),
     #[error("Azure Blob HTTP transport error: {0}")]
     Transport(String),
+    #[error("Azure append position error: {0}")]
+    AppendPosition(String),
     #[error("invalid Azure Storage account key: {0}")]
     InvalidStorageKey(String),
     #[error("io error: {0}")]
@@ -381,6 +822,28 @@ pub enum AzureBlobError {
     Xml(#[from] quick_xml::Error),
     #[error("failed to parse Azure blob list XML: {0}")]
     XmlMessage(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImmutableBlobWrite {
+    Created,
+    AlreadyExists,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobLeaseAcquireResult {
+    Acquired(String),
+    AlreadyLeased,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedBlobBytes {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+    pub version_id: Option<String>,
+    pub content_md5: Option<String>,
+    pub blob_type: Option<String>,
+    pub sealed: Option<bool>,
 }
 
 impl AzureBlobError {
@@ -505,9 +968,18 @@ fn rfc1123_now() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AzureBlobItem {
     pub name: String,
+    /// Strong validator returned by Azure for the exact listed blob version.
+    /// This is kept together with size and modification time so callers can
+    /// fail closed if a sealed source blob changes while it is being read.
+    pub etag: String,
+    pub version_id: Option<String>,
+    pub is_current_version: Option<bool>,
+    pub content_md5: Option<String>,
+    pub blob_type: Option<String>,
+    pub sealed: Option<bool>,
     pub content_length: u64,
     pub last_modified: Option<DateTime<Utc>>,
 }
@@ -557,6 +1029,26 @@ impl AzureBlobClient {
                 .timeout_connect(Duration::from_secs(10))
                 .timeout_read(Duration::from_secs(120))
                 .timeout_write(Duration::from_secs(30))
+                .build(),
+        }
+    }
+
+    /// Build a client whose individual network operations are short enough for
+    /// a finite Azure lease watchdog. Lease renewal is additionally single-shot
+    /// so a transient outage cannot keep a protected child alive past expiry.
+    pub fn with_managed_identity_for_lease(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            container: container.into(),
+            auth: AzureBlobAuth::ManagedIdentity(ManagedIdentityToken::new(client_id)),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(AZURE_LEASE_CONNECT_TIMEOUT)
+                .timeout_read(AZURE_LEASE_READ_TIMEOUT)
+                .timeout_write(AZURE_LEASE_WRITE_TIMEOUT)
                 .build(),
         }
     }
@@ -646,6 +1138,60 @@ impl AzureBlobClient {
         self.get_bytes_with_retry(&url)
     }
 
+    /// Reads the exact blob bytes together with the Azure ETag needed for a
+    /// subsequent compare-and-swap update.
+    pub fn download_blob_bytes_with_etag(
+        &mut self,
+        name: &str,
+    ) -> Result<VersionedBlobBytes, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        let response = self.get_response(&url)?;
+        read_versioned_blob_response(response)
+    }
+
+    /// Reads a blob only if it is still the exact ETag returned by the prior
+    /// exhaustive listing. A 412 response proves the source changed before it
+    /// could be admitted into a sealed-day inventory.
+    pub fn download_blob_bytes_if_match(
+        &mut self,
+        name: &str,
+        expected_etag: &str,
+    ) -> Result<VersionedBlobBytes, AzureBlobError> {
+        if expected_etag.trim().is_empty()
+            || expected_etag
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(AzureBlobError::Transport(
+                "conditional Azure Blob read requires a valid ETag".to_owned(),
+            ));
+        }
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let result = self
+                .get_response_if_match(&url, expected_etag)
+                .and_then(read_versioned_blob_response);
+            match result {
+                Ok(versioned) => return Ok(versioned),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob conditional read retry loop always returns")
+    }
+
     pub fn upload_block_blob_bytes(
         &mut self,
         name: &str,
@@ -661,8 +1207,200 @@ impl AzureBlobClient {
         self.put_block_blob_with_retry(&url, bytes, content_type)
     }
 
+    /// Creates a block blob exactly once. An existing name is reported without
+    /// replacing its bytes, which makes the caller's artifact path immutable.
+    pub fn upload_block_blob_bytes_if_absent(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<ImmutableBlobWrite, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        self.put_block_blob_if_absent(&url, bytes, content_type)
+    }
+
+    /// Replaces a block blob only while it still has `expected_etag`.
+    /// Returns `false` for an Azure 409/412 precondition conflict; callers can
+    /// then re-read the pointer and fail closed or recognize an idempotent win.
+    pub fn upload_block_blob_bytes_if_match(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        content_type: &str,
+        expected_etag: &str,
+    ) -> Result<bool, AzureBlobError> {
+        if expected_etag.trim().is_empty()
+            || expected_etag
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(AzureBlobError::Transport(
+                "conditional Azure Blob upload requires a valid ETag".to_owned(),
+            ));
+        }
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self.put_block_blob_if_match(&url, bytes, content_type, expected_etag) {
+                Ok(updated) => return Ok(updated),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob conditional upload retry loop always returns");
+    }
+
+    /// Acquires a finite Azure lease on a dedicated block blob. The lock blob
+    /// is created once if it does not yet exist. Finite leases expire after a
+    /// crashed worker stops renewing, preventing a permanent campaign lock.
+    pub fn acquire_blob_lease(
+        &mut self,
+        name: &str,
+        duration_seconds: u32,
+    ) -> Result<BlobLeaseAcquireResult, AzureBlobError> {
+        if !(15..=60).contains(&duration_seconds) {
+            return Err(AzureBlobError::Transport(
+                "Azure finite lease duration must be between 15 and 60 seconds".to_owned(),
+            ));
+        }
+        let _ = self.upload_block_blob_bytes_if_absent(
+            name,
+            b"polyedge campaign lease\n",
+            "text/plain",
+        )?;
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}?comp=lease",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        match self.lease_request(&url, "acquire", None, Some(duration_seconds)) {
+            Ok(response) => response
+                .header("x-ms-lease-id")
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| BlobLeaseAcquireResult::Acquired(value.to_owned()))
+                .ok_or_else(|| {
+                    AzureBlobError::Transport(
+                        "Azure lease acquire response omitted x-ms-lease-id".to_owned(),
+                    )
+                }),
+            Err(AzureBlobError::HttpStatus(409 | 412)) => Ok(BlobLeaseAcquireResult::AlreadyLeased),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn renew_blob_lease(&mut self, name: &str, lease_id: &str) -> Result<bool, AzureBlobError> {
+        validate_lease_id(lease_id)?;
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}?comp=lease",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        match self.lease_request_once(&url, "renew", Some(lease_id), None) {
+            Ok(_) => Ok(true),
+            Err(AzureBlobError::HttpStatus(409 | 412)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn release_blob_lease(
+        &mut self,
+        name: &str,
+        lease_id: &str,
+    ) -> Result<bool, AzureBlobError> {
+        validate_lease_id(lease_id)?;
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}?comp=lease",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        match self.lease_request(&url, "release", Some(lease_id), None) {
+            Ok(_) => Ok(true),
+            Err(AzureBlobError::HttpStatus(409 | 412)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn get_text(&mut self, url: &str) -> Result<String, AzureBlobError> {
         Ok(String::from_utf8(self.get_bytes_with_retry(url)?)?)
+    }
+
+    fn lease_request(
+        &mut self,
+        url: &str,
+        action: &str,
+        lease_id: Option<&str>,
+        duration_seconds: Option<u32>,
+    ) -> Result<ureq::Response, AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self.lease_request_once(url, action, lease_id, duration_seconds) {
+                Ok(response) => return Ok(response),
+                Err(AzureBlobError::HttpStatus(status)) => {
+                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(AzureBlobError::Transport(message)) => {
+                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::Transport(message));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure lease retry loop always returns");
+    }
+
+    fn lease_request_once(
+        &mut self,
+        url: &str,
+        action: &str,
+        lease_id: Option<&str>,
+        duration_seconds: Option<u32>,
+    ) -> Result<ureq::Response, AzureBlobError> {
+        let date = rfc1123_now();
+        let mut request = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self.agent.put(&append_sas(url, sas)),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+            }
+        };
+        request = request
+            .set("x-ms-version", AZURE_BLOB_API_VERSION)
+            .set("x-ms-date", &date)
+            .set("x-ms-lease-action", action)
+            .set("content-length", "0");
+        if let Some(lease_id) = lease_id {
+            request = request.set("x-ms-lease-id", lease_id);
+        }
+        if let Some(duration) = duration_seconds {
+            request = request.set("x-ms-lease-duration", &duration.to_string());
+        }
+        match request.call() {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
     }
 
     fn get_bytes_with_retry(&mut self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
@@ -727,6 +1465,53 @@ impl AzureBlobClient {
         unreachable!("Azure Blob retry loop always returns");
     }
 
+    fn get_response_if_match(
+        &mut self,
+        url: &str,
+        expected_etag: &str,
+    ) -> Result<ureq::Response, AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let date = rfc1123_now();
+            let response = match &mut self.auth {
+                AzureBlobAuth::Sas(sas) => self
+                    .agent
+                    .get(&append_sas(url, sas))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("if-match", expected_etag)
+                    .call(),
+                AzureBlobAuth::ManagedIdentity(token) => {
+                    let access_token = token.access_token(&self.agent)?;
+                    self.agent
+                        .get(url)
+                        .set("authorization", &format!("Bearer {access_token}"))
+                        .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                        .set("x-ms-date", &date)
+                        .set("if-match", expected_etag)
+                        .call()
+                }
+            };
+            match response {
+                Ok(response) => return Ok(response),
+                Err(ureq::Error::Status(status, _)) => {
+                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(ureq::Error::Transport(error)) => {
+                    let message = error.to_string();
+                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                        thread::sleep(retry_delay(attempt));
+                        continue;
+                    }
+                    return Err(AzureBlobError::Transport(message));
+                }
+            }
+        }
+        unreachable!("Azure Blob conditional read retry loop always returns");
+    }
+
     fn put_block_blob_with_retry(
         &mut self,
         url: &str,
@@ -776,6 +1561,83 @@ impl AzureBlobClient {
         };
         match response {
             Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn put_block_blob_if_absent(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<ImmutableBlobWrite, AzureBlobError> {
+        let date = rfc1123_now();
+        let response = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self
+                .agent
+                .put(&append_sas(url, sas))
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .set("x-ms-date", &date)
+                .set("x-ms-blob-type", "BlockBlob")
+                .set("content-type", content_type)
+                .set("if-none-match", "*")
+                .send_bytes(bytes),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("x-ms-date", &date)
+                    .set("x-ms-blob-type", "BlockBlob")
+                    .set("content-type", content_type)
+                    .set("if-none-match", "*")
+                    .send_bytes(bytes)
+            }
+        };
+        match response {
+            Ok(_) => Ok(ImmutableBlobWrite::Created),
+            Err(ureq::Error::Status(409 | 412, _)) => Ok(ImmutableBlobWrite::AlreadyExists),
+            Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
+            Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
+        }
+    }
+
+    fn put_block_blob_if_match(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+        expected_etag: &str,
+    ) -> Result<bool, AzureBlobError> {
+        let date = rfc1123_now();
+        let response = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self
+                .agent
+                .put(&append_sas(url, sas))
+                .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                .set("x-ms-date", &date)
+                .set("x-ms-blob-type", "BlockBlob")
+                .set("content-type", content_type)
+                .set("if-match", expected_etag)
+                .send_bytes(bytes),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("x-ms-date", &date)
+                    .set("x-ms-blob-type", "BlockBlob")
+                    .set("content-type", content_type)
+                    .set("if-match", expected_etag)
+                    .send_bytes(bytes)
+            }
+        };
+        match response {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(409 | 412, _)) => Ok(false),
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
@@ -1080,6 +1942,61 @@ fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(250 * 2_u64.pow(attempt.min(4) as u32))
 }
 
+fn validate_lease_id(lease_id: &str) -> Result<(), AzureBlobError> {
+    if lease_id.trim().is_empty()
+        || lease_id.len() > 128
+        || lease_id.chars().any(|character| character.is_control())
+    {
+        return Err(AzureBlobError::Transport(
+            "Azure lease ID is empty or invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_versioned_blob_response(
+    response: ureq::Response,
+) -> Result<VersionedBlobBytes, AzureBlobError> {
+    let etag = response
+        .header("etag")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AzureBlobError::Transport("Azure Blob response omitted ETag".to_owned()))?
+        .to_owned();
+    let version_id = response
+        .header("x-ms-version-id")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let content_md5 = response
+        .header("content-md5")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let blob_type = response
+        .header("x-ms-blob-type")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let reported_sealed = response
+        .header("x-ms-blob-sealed")
+        .and_then(|value| value.parse::<bool>().ok());
+    // Azure omits x-ms-blob-sealed for an unsealed append blob. Normalize
+    // that documented wire representation so downstream evidence records the
+    // physical state explicitly instead of confusing false with unknown.
+    let sealed = if blob_type.as_deref() == Some("AppendBlob") {
+        Some(reported_sealed.unwrap_or(false))
+    } else {
+        reported_sealed
+    };
+    let mut bytes = Vec::new();
+    response.into_reader().read_to_end(&mut bytes)?;
+    Ok(VersionedBlobBytes {
+        bytes,
+        etag,
+        version_id,
+        content_md5,
+        blob_type,
+        sealed,
+    })
+}
+
 #[derive(Default)]
 struct BlobListPage {
     blobs: Vec<AzureBlobItem>,
@@ -1094,6 +2011,12 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
     let mut current_tag = String::new();
     let mut in_blob = false;
     let mut name = String::new();
+    let mut etag = String::new();
+    let mut version_id = None;
+    let mut is_current_version = None;
+    let mut content_md5 = None;
+    let mut blob_type = None;
+    let mut sealed = None;
     let mut content_length = 0_u64;
     let mut last_modified = None;
     loop {
@@ -1103,6 +2026,12 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                 if current_tag == "Blob" {
                     in_blob = true;
                     name.clear();
+                    etag.clear();
+                    version_id = None;
+                    is_current_version = None;
+                    content_md5 = None;
+                    blob_type = None;
+                    sealed = None;
                     content_length = 0;
                     last_modified = None;
                 }
@@ -1110,8 +2039,27 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
             Event::End(event) => {
                 let tag = String::from_utf8_lossy(event.name().as_ref()).into_owned();
                 if tag == "Blob" && in_blob {
+                    if name.is_empty() || etag.trim().is_empty() {
+                        return Err(AzureBlobError::XmlMessage(
+                            "Azure blob listing omitted Name or ETag".to_owned(),
+                        ));
+                    }
+                    // List Blobs returns Sealed only when an append blob is
+                    // sealed. Its absence on AppendBlob therefore means false,
+                    // not an unavailable physical-seal state.
+                    let normalized_sealed = if blob_type.as_deref() == Some("AppendBlob") {
+                        Some(sealed.unwrap_or(false))
+                    } else {
+                        sealed
+                    };
                     page.blobs.push(AzureBlobItem {
                         name: name.clone(),
+                        etag: etag.clone(),
+                        version_id: version_id.clone(),
+                        is_current_version,
+                        content_md5: content_md5.clone(),
+                        blob_type: blob_type.clone(),
+                        sealed: normalized_sealed,
                         content_length,
                         last_modified,
                     });
@@ -1126,6 +2074,18 @@ fn parse_blob_list(xml: &str) -> Result<BlobListPage, AzureBlobError> {
                     .into_owned();
                 if in_blob && current_tag == "Name" {
                     name = text;
+                } else if in_blob && current_tag == "Etag" {
+                    etag = text;
+                } else if in_blob && current_tag == "VersionId" {
+                    version_id = (!text.is_empty()).then_some(text);
+                } else if in_blob && current_tag == "IsCurrentVersion" {
+                    is_current_version = text.parse::<bool>().ok();
+                } else if in_blob && current_tag == "Content-MD5" {
+                    content_md5 = (!text.is_empty()).then_some(text);
+                } else if in_blob && current_tag == "BlobType" {
+                    blob_type = (!text.is_empty()).then_some(text);
+                } else if in_blob && current_tag == "Sealed" {
+                    sealed = text.parse::<bool>().ok();
                 } else if in_blob && current_tag == "Content-Length" {
                     content_length = text.parse().unwrap_or(0);
                 } else if in_blob && current_tag == "Last-Modified" {
@@ -1234,6 +2194,64 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn event_blob_prefix_is_configurable_and_defaults_to_events() {
+        let event = RuntimeEvent {
+            event_type: "decision".to_owned(),
+            ts: DateTime::parse_from_rfc3339("2026-07-12T12:34:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            data: Value::Null,
+        };
+        assert_eq!(
+            event_blob_name("events", &event),
+            "events/2026/07/12/12/34.jsonl"
+        );
+        assert_eq!(
+            event_blob_name("shadow-events", &event),
+            "shadow-events/2026/07/12/12/34.jsonl"
+        );
+        assert_eq!(
+            normalize_blob_prefix(" /shadow-events/ ".to_owned()),
+            "shadow-events"
+        );
+        assert_eq!(normalize_blob_prefix("///".to_owned()), "events");
+    }
+
+    #[test]
+    fn append_blob_prefix_cutover_routes_by_event_timestamp() {
+        let cutover = DateTime::parse_from_rfc3339("2026-07-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recorder = AzureAppendBlobRecorder::new_with_prefix_cutover(
+            "account",
+            "container",
+            None,
+            "shadow-events/old",
+            Some("shadow-events/new"),
+            Some(cutover),
+        );
+        let event = |ts: &str| RuntimeEvent {
+            event_type: "decision".to_owned(),
+            ts: DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc),
+            data: Value::Null,
+        };
+        assert_eq!(
+            recorder.event_blob_name(&event("2026-07-21T23:59:59.999Z")),
+            "shadow-events/old/2026/07/21/23/59.jsonl"
+        );
+        assert_eq!(
+            recorder.event_blob_name(&event("2026-07-22T00:00:00Z")),
+            "shadow-events/new/2026/07/22/00/00.jsonl"
+        );
+        assert_eq!(
+            recorder.event_blob_name(&event("2026-07-22T00:00:00.001Z")),
+            "shadow-events/new/2026/07/22/00/00.jsonl"
+        );
+    }
+
+    #[test]
     fn buffered_append_blocks_preserves_lines_and_caps_chunks() {
         let events: Vec<_> = (0..5)
             .map(|index| RuntimeEvent {
@@ -1285,18 +2303,195 @@ mod tests {
     }
 
     #[test]
-    fn buffered_append_blocks_requeues_failed_block_before_pending_data() {
+    fn buffered_append_blocks_freezes_failed_block_before_pending_data() {
         let mut buffer = BufferedAppendBlocks::new(1_024);
-        buffer.prepend_chunk(
+        buffer.prepend_retry_blocks([(
             "events/2026/06/14/12/events.jsonl".to_owned(),
             b"failed\n".to_vec(),
-        );
+        )]);
         assert!(buffer
             .push_line("events/2026/06/14/12/events.jsonl", b"pending\n".to_vec())
             .is_empty());
 
-        let chunks = buffer.drain();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].1, b"failed\npending\n");
+        let retry = buffer.take_retry_blocks();
+        let pending = buffer.drain();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, b"failed\n");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, b"pending\n");
+    }
+
+    #[test]
+    fn buffered_append_blocks_deduplicates_an_exact_retried_line() {
+        let blob = "events/2026/07/22/02/17.jsonl";
+        let line = b"{\"event_type\":\"strategy_decision_batch\"}\n".to_vec();
+        let mut buffer = BufferedAppendBlocks::new(1_024);
+        buffer.prepend_retry_blocks([(blob.to_owned(), line.clone())]);
+
+        assert!(buffer.push_line(blob, line.clone()).is_empty());
+        let retry = buffer.take_retry_blocks();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].1, line);
+        assert!(buffer.drain().is_empty());
+    }
+
+    #[test]
+    fn append_reconciliation_finds_only_the_exact_pending_block() {
+        assert!(byte_range_contains_block(b"before-BLOCK-after", b"BLOCK"));
+        assert!(byte_range_contains_block(b"BLOCK", b"BLOCK"));
+        assert!(!byte_range_contains_block(b"before-BLOC-after", b"BLOCK"));
+        assert!(!byte_range_contains_block(b"", b"BLOCK"));
+        assert!(!byte_range_contains_block(b"BLOCK", b""));
+    }
+
+    #[test]
+    fn handoff_ambiguity_boundary_survives_reconciliation_read_failure() {
+        let mut starts = BTreeMap::new();
+        starts.insert("events/minute.jsonl".to_owned(), 100_u64);
+
+        let error = resolve_handoff_ambiguity(
+            &mut starts,
+            "events/minute.jsonl",
+            140,
+            Err(AzureBlobError::Transport(
+                "injected reconciliation GET failure".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected reconciliation"));
+        assert_eq!(starts.get("events/minute.jsonl"), Some(&100));
+
+        let already_committed = resolve_handoff_ambiguity(
+            &mut starts,
+            "events/minute.jsonl",
+            180,
+            Ok(HandoffRangeOutcome::ExactBlockPresent),
+        )
+        .unwrap();
+        assert!(already_committed);
+        assert!(!starts.contains_key("events/minute.jsonl"));
+    }
+
+    #[test]
+    fn ambiguous_committed_block_is_not_coalesced_with_later_same_blob_data() {
+        let blob = "events/minute.jsonl";
+        let block_b = b"B\n".to_vec();
+        let line_c = b"C\n".to_vec();
+        let mut remote = block_b.clone();
+        let mut starts = BTreeMap::new();
+        starts.insert(blob.to_owned(), 100_u64);
+        let mut buffer = BufferedAppendBlocks::new(1_024);
+
+        let error = resolve_handoff_ambiguity(
+            &mut starts,
+            blob,
+            102,
+            Err(AzureBlobError::Transport(
+                "injected reconciliation GET failure".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected reconciliation"));
+        buffer.prepend_retry_blocks([(blob.to_owned(), block_b.clone())]);
+
+        assert!(buffer.push_line(blob, line_c.clone()).is_empty());
+        let retry = buffer.take_retry_blocks();
+        assert_eq!(retry, vec![(blob.to_owned(), block_b.clone())]);
+        assert!(byte_range_contains_block(&remote, &retry[0].1));
+
+        let already_committed = resolve_handoff_ambiguity(
+            &mut starts,
+            blob,
+            102,
+            Ok(HandoffRangeOutcome::ExactBlockPresent),
+        )
+        .unwrap();
+        assert!(already_committed);
+        let pending = buffer.drain();
+        assert_eq!(pending, vec![(blob.to_owned(), line_c)]);
+        remote.extend(&pending[0].1);
+        assert_eq!(remote, b"B\nC\n");
+        assert!(!starts.contains_key(blob));
+    }
+
+    #[test]
+    fn jsonl_recorder_preserves_wire_normalized_content_bindings() {
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-wire-binding-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let path = dir.join("events.jsonl");
+        let payload = wire_normalized_json(&json!({
+            "unicode": "λ🧪",
+            "negative_zero": -0.0,
+            "subnormal": f64::from_bits(1),
+            "large": 1.7976931348623157e308_f64,
+            "small": 2.2250738585072014e-308_f64,
+            "nested": {"z": [3, 2, 1], "a": {"escaped": "line\nfeed"}}
+        }))
+        .unwrap();
+        let expected_sha256 = canonical_json_sha256(&payload);
+        let event = RuntimeEvent {
+            event_type: "strategy_decision_batch".to_owned(),
+            ts: Utc::now(),
+            data: payload,
+        };
+        JsonlRecorder::new(&path).record(&event).unwrap();
+        let line = fs::read_to_string(&path).unwrap();
+        let recorded: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(canonical_json_sha256(&recorded["payload"]), expected_sha256);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn blob_listing_requires_and_preserves_strong_identity_metadata() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults>
+  <Blobs>
+    <Blob>
+      <Name>shadow-events/campaign-2026-07-12/2026/07/13/00/00.jsonl</Name>
+      <Properties>
+        <Last-Modified>Mon, 13 Jul 2026 00:01:00 GMT</Last-Modified>
+        <Etag>&quot;0x8DB123&quot;</Etag>
+        <Content-MD5>YWJjZA==</Content-MD5>
+        <Content-Length>123</Content-Length>
+        <BlobType>AppendBlob</BlobType>
+        <Sealed>true</Sealed>
+      </Properties>
+      <VersionId>2026-07-13T00:01:00.0000000Z</VersionId>
+      <IsCurrentVersion>true</IsCurrentVersion>
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+        let page = parse_blob_list(xml).unwrap();
+        assert_eq!(page.blobs.len(), 1);
+        assert_eq!(page.blobs[0].etag, "\"0x8DB123\"");
+        assert_eq!(page.blobs[0].content_length, 123);
+        assert_eq!(page.blobs[0].content_md5.as_deref(), Some("YWJjZA=="));
+        assert_eq!(page.blobs[0].blob_type.as_deref(), Some("AppendBlob"));
+        assert_eq!(page.blobs[0].sealed, Some(true));
+        assert_eq!(
+            page.blobs[0].version_id.as_deref(),
+            Some("2026-07-13T00:01:00.0000000Z")
+        );
+        assert_eq!(page.blobs[0].is_current_version, Some(true));
+        assert_eq!(
+            page.blobs[0].name,
+            "shadow-events/campaign-2026-07-12/2026/07/13/00/00.jsonl"
+        );
+
+        let missing_etag = xml.replace("<Etag>&quot;0x8DB123&quot;</Etag>", "<Etag></Etag>");
+        assert!(parse_blob_list(&missing_etag).is_err());
+
+        let unsealed = xml.replace("        <Sealed>true</Sealed>\n", "");
+        let unsealed_page = parse_blob_list(&unsealed).unwrap();
+        assert_eq!(
+            unsealed_page.blobs[0].blob_type.as_deref(),
+            Some("AppendBlob")
+        );
+        assert_eq!(unsealed_page.blobs[0].sealed, Some(false));
+        assert!(unsealed_page.blobs[0].last_modified.is_some());
     }
 }
