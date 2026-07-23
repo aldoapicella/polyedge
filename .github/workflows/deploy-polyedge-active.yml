@@ -18,6 +18,7 @@ on:
           - frontend-only
           - monitoring-only
           - build-only
+          - polyedge-daily-research-job
           - polyedge-shadow-daily-neu-job
           - polyedge-backfill-job
           - polyedge-prospective-job
