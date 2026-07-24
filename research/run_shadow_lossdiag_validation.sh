@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-CONFIG="${LOSSDIAG_VALIDATION_CONFIG:-/app/research/configs/shadow_lossdiag_validation_2026-07-23_v2.json}"
+CONFIG="${LOSSDIAG_VALIDATION_CONFIG:-/app/research/configs/shadow_lossdiag_validation_2026-07-23_v3.json}"
 test -f "$CONFIG"
 jq -e '
   .schema == "polyedge.shadow_lossdiag_validation.v1"
   and .schema_version == 1
-  and .validation_id == "campaign-2026-07-23-lossdiag-v2"
+  and .validation_id == "campaign-2026-07-23-lossdiag-v3"
   and .promotion_eligible == false
   and .counts_toward_protocol_v3_evidence == false
   and .date == "2026-07-23"
@@ -15,11 +15,11 @@ jq -e '
   and .source.campaign_id == "campaign-2026-07-23"
   and .source.prefix == "shadow-events/campaign-2026-07-23/2026/07/23/"
   and .output.container == "polyedge-research-validation"
-  and (.output.work_root | contains("campaign-2026-07-23-lossdiag-v2"))
-  and (.output.projected_cache_root | contains("campaign-2026-07-23-lossdiag-v2"))
-  and (.output.report_root | contains("campaign-2026-07-23-lossdiag-v2"))
-  and (.output.correction_root | contains("campaign-2026-07-23-lossdiag-v2"))
-  and (.output.lease_blob | contains("campaign-2026-07-23-lossdiag-v2"))
+  and (.output.work_root | contains("campaign-2026-07-23-lossdiag-v3"))
+  and (.output.projected_cache_root | contains("campaign-2026-07-23-lossdiag-v3"))
+  and (.output.report_root | contains("campaign-2026-07-23-lossdiag-v3"))
+  and (.output.correction_root | contains("campaign-2026-07-23-lossdiag-v3"))
+  and (.output.lease_blob | contains("campaign-2026-07-23-lossdiag-v3"))
   and .limits.cpu == 4
   and .limits.memory == "8Gi"
   and .limits.max_loss_diagnostics_rss_kib == 6815744
@@ -47,7 +47,7 @@ test -n "${EXPECTED_GIT_SHA:-}"
 test "${#EXPECTED_GIT_SHA}" -eq 40
 test "${GIT_SHA:-}" = "$EXPECTED_GIT_SHA"
 test -n "${EXPECTED_RAW_SOURCE_INVENTORY_SHA256:-}"
-test -n "${EXPECTED_PROJECTED_FILESET_SHA256:-}"
+test -n "${SOURCE_PROJECTED_FILESET_SHA256:-}"
 
 VALIDATION_ID="$(jq -r '.validation_id' "$CONFIG")"
 DATE="$(jq -r '.date' "$CONFIG")"
@@ -92,7 +92,7 @@ run_stage begin-correction polyedge-rs research begin-shadow-correction \
   --correction-id "$RUN_ID" \
   --from "$DATE" \
   --through "$DATE" \
-  --reason "isolated loss-diagnostics v2 memory and semantic validation; promotion ineligible" \
+  --reason "isolated loss-diagnostics v3 timestamp-precision, memory, and semantic validation; promotion ineligible" \
   --out "$CORRECTION_ROOT/active.json"
 run_stage raw-audit polyedge-rs research audit \
   --input "$INPUT" \
@@ -133,7 +133,10 @@ run_stage publish-projected-day polyedge-rs research publish-projected-day \
 PROJECTED_INVENTORY="$(jq -r '.canonical.raw_source_inventory.canonical_sha256' "$PROJECTED_DAY_MANIFEST")"
 PROJECTED_FILESET_SHA256="sha256:$(jq -cS '[.canonical.files[] | {relative_path,rows,bytes,sha256}] | sort_by(.relative_path)' "$PROJECTED_DAY_MANIFEST" | sha256sum | cut -d' ' -f1)"
 test "$PROJECTED_INVENTORY" = "$EXPECTED_RAW_SOURCE_INVENTORY_SHA256"
-test "$PROJECTED_FILESET_SHA256" = "$EXPECTED_PROJECTED_FILESET_SHA256"
+for fileset_sha in "$PROJECTED_FILESET_SHA256" "$SOURCE_PROJECTED_FILESET_SHA256"; do
+  test "$(jq -nr --arg value "$fileset_sha" '$value | test("^sha256:[0-9a-f]{64}$")')" = "true"
+done
+test "$PROJECTED_FILESET_SHA256" != "$SOURCE_PROJECTED_FILESET_SHA256"
 
 run_stage materialize polyedge-rs research materialize-projected-campaign \
   --since "$DATE" \
@@ -214,6 +217,7 @@ jq -n \
   --arg git_sha "$GIT_SHA" \
   --arg config_sha256 "$CONFIG_SHA256" \
   --arg source_inventory_sha256 "$EXPECTED_RAW_SOURCE_INVENTORY_SHA256" \
+  --arg source_projected_fileset_sha256 "$SOURCE_PROJECTED_FILESET_SHA256" \
   --arg projected_fileset_sha256 "$PROJECTED_FILESET_SHA256" \
   --arg campaign_index_sha256 "$CAMPAIGN_INDEX_SHA256" \
   --arg semantic_sha256 "$SEMANTIC_SHA256" \
@@ -230,7 +234,9 @@ jq -n \
     git_sha: $git_sha,
     config_sha256: $config_sha256,
     source_inventory_sha256: $source_inventory_sha256,
+    source_projected_fileset_sha256: $source_projected_fileset_sha256,
     projected_fileset_sha256: $projected_fileset_sha256,
+    normalized_timestamp_precision: "rfc3339_autosi",
     campaign_index_sha256: $campaign_index_sha256,
     semantic_sha256: $semantic_sha256,
     order_fact_sha256: $order_fact_sha256,
