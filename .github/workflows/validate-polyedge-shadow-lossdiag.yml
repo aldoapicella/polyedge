@@ -163,7 +163,9 @@ jobs:
             exit 1
           }
           jq -e '
-            .schema_version == 1
+            .schema_version == 2
+            and .canonical.schema_version == 2
+            and .canonical.domain == "polyedge.projected-day-cache.v2"
             and .canonical.campaign_id == "campaign-2026-07-23"
             and .canonical.date == "2026-07-23"
             and .canonical.raw_source_inventory.canonical.source_kind == "azure_blob"
