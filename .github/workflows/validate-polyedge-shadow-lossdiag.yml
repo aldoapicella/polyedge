@@ -284,7 +284,7 @@ jobs:
           az role assignment list \
             --assignee-object-id "$identity_principal" \
             --all -o json |
-            jq -cS '[.[] | {role:roleDefinitionName,scope:(scope | ascii_downcase)}] | sort_by(.scope,.role)' \
+            jq -cS '[.[] | {role:.roleDefinitionName,scope:(.scope | ascii_downcase)}] | sort_by(.scope,.role)' \
             > validation-identity-roles.json
           test "$(jq 'length' validation-identity-roles.json)" = "3"
           jq -e '
