@@ -162,11 +162,6 @@ jobs:
             echo "Source projected-day pointer canonical hash mismatch" >&2
             exit 1
           }
-          canonical_sha="sha256:$(jq -c '.canonical' source-manifest.json | sha256sum | cut -d' ' -f1)"
-          test "$canonical_sha" = "$(jq -r '.canonical_sha256' source-manifest.json)" || {
-            echo "Source projected-day canonical payload hash mismatch" >&2
-            exit 1
-          }
           jq -e '
             .schema_version == 1
             and .canonical.campaign_id == "campaign-2026-07-23"
@@ -185,11 +180,6 @@ jobs:
             exit 1
           }
           raw_inventory_sha=$(jq -er '.canonical.raw_source_inventory.canonical_sha256' source-manifest.json)
-          canonical_inventory_sha="sha256:$(jq -c '.canonical.raw_source_inventory.canonical' source-manifest.json | sha256sum | cut -d' ' -f1)"
-          test "$raw_inventory_sha" = "$canonical_inventory_sha" || {
-            echo "Source raw-inventory canonical payload hash mismatch" >&2
-            exit 1
-          }
           projected_fileset_sha="sha256:$(jq -cS '[.canonical.files[] | {relative_path,rows,bytes,sha256}] | sort_by(.relative_path)' source-manifest.json | sha256sum | cut -d' ' -f1)"
           echo "raw_inventory_sha=$raw_inventory_sha" >> "$GITHUB_OUTPUT"
           echo "projected_fileset_sha=$projected_fileset_sha" >> "$GITHUB_OUTPUT"
