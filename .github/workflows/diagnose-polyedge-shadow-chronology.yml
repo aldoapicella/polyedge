@@ -221,22 +221,62 @@ jobs:
             done
           SCRIPT
           )
+          jq -n \
+            --arg image "$VALIDATION_IMAGE" \
+            --arg script "$diagnostic_script" \
+            --arg azure_client_id "$AZURE_CLIENT_ID" '
+            {
+              containers: [
+                {
+                  name: "lossdiag-validation",
+                  image: $image,
+                  command: ["/bin/sh"],
+                  args: ["-c", $script],
+                  env: [
+                    {name: "APP_NAME", value: "polyedge-shadow-chronology-diagnostic"},
+                    {name: "EXECUTION_MODE", value: "paper"},
+                    {name: "ALLOW_LIVE", value: "false"},
+                    {name: "RUN_BOT_ON_STARTUP", value: "false"},
+                    {name: "ENABLE_TAKER_ORDERS", value: "false"},
+                    {name: "AZURE_CLIENT_ID", value: $azure_client_id}
+                  ],
+                  resources: {cpu: 2, memory: "4Gi"}
+                }
+              ]
+            }
+          ' > diagnostic-execution.json
+          jq -e \
+            --arg image "$VALIDATION_IMAGE" \
+            --arg script "$diagnostic_script" \
+            --arg azure_client_id "$AZURE_CLIENT_ID" '
+            (keys == ["containers"])
+            and (.containers | length == 1)
+            and .containers[0].name == "lossdiag-validation"
+            and .containers[0].image == $image
+            and .containers[0].command == ["/bin/sh"]
+            and .containers[0].args == ["-c", $script]
+            and .containers[0].resources == {cpu: 2, memory: "4Gi"}
+            and (.containers[0].env | length == 6)
+            and ([.containers[0].env[].name] | sort) == [
+              "ALLOW_LIVE",
+              "APP_NAME",
+              "AZURE_CLIENT_ID",
+              "ENABLE_TAKER_ORDERS",
+              "EXECUTION_MODE",
+              "RUN_BOT_ON_STARTUP"
+            ]
+            and ([.containers[0].env[] | select(.name == "EXECUTION_MODE" and .value == "paper")] | length == 1)
+            and ([.containers[0].env[] | select(.name == "ALLOW_LIVE" and .value == "false")] | length == 1)
+            and ([.containers[0].env[] | select(.name == "RUN_BOT_ON_STARTUP" and .value == "false")] | length == 1)
+            and ([.containers[0].env[] | select(.name == "ENABLE_TAKER_ORDERS" and .value == "false")] | length == 1)
+            and ([.containers[0].env[] | select(.name == "AZURE_CLIENT_ID" and .value == $azure_client_id)] | length == 1)
+            and ([.. | objects | select(has("secretRef") or has("secretref"))] | length == 0)
+            and ([.containers[0].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length == 0)
+          ' diagnostic-execution.json >/dev/null
           execution=$(az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$VALIDATION_JOB" \
-            --container-name lossdiag-validation \
-            --image "$VALIDATION_IMAGE" \
-            --cpu 2 \
-            --memory 4Gi \
-            --command /bin/sh \
-            --args "-c" "$diagnostic_script" \
-            --env-vars \
-              APP_NAME=polyedge-shadow-chronology-diagnostic \
-              EXECUTION_MODE=paper \
-              ALLOW_LIVE=false \
-              RUN_BOT_ON_STARTUP=false \
-              ENABLE_TAKER_ORDERS=false \
-              AZURE_CLIENT_ID="$AZURE_CLIENT_ID" \
+            --yaml diagnostic-execution.json \
             --query name -o tsv)
           test -n "$execution"
           echo "name=$execution" >> "$GITHUB_OUTPUT"
