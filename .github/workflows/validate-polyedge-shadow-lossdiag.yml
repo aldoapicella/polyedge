@@ -320,7 +320,7 @@ jobs:
           az role assignment list \
             --assignee-object-id "$VALIDATION_PROOF_PRINCIPAL_ID" \
             --scope "$validation_container_scope" \
-            --all -o json |
+            -o json |
             jq -cS '[.[] | {role:.roleDefinitionName,scope:(.scope | ascii_downcase)}] | sort_by(.scope,.role)' \
             > validation-proof-roles.json
           test "$(jq '[.[] | select(.role == "Storage Blob Data Reader")] | length' validation-proof-roles.json)" = "1"
