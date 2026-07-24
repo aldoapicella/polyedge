@@ -1,0 +1,632 @@
+name: Validate PolyEdge shadow loss diagnostics v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type campaign-2026-07-23-lossdiag-v2
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: polyedge-shadow-lossdiag-validation
+  cancel-in-progress: false
+
+env:
+  AZURE_RESOURCE_GROUP: rg-polyedge-dev
+  AZURE_LOCATION: northeurope
+  ACR_NAME: crpolyedge6urdjr5nmwx7w
+  ACR_LOGIN_SERVER: crpolyedge6urdjr5nmwx7w.azurecr.io
+  STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
+  SOURCE_CONTAINER: polyedge-shadow-events
+  CANONICAL_CONTAINER: polyedge-research
+  VALIDATION_CONTAINER: polyedge-research-validation
+  VALIDATION_JOB: polyedge-shadow-val-neu-job
+  CANONICAL_JOB: polyedge-shadow-daily-neu-job
+  SHADOW_APP: polyedge-shadow-neu
+  VALIDATION_ID: campaign-2026-07-23-lossdiag-v2
+  VALIDATION_DATE: 2026-07-23
+  REPAIR_PARENT_SHA: 06a699dbebef5765fe29e3a16dce909d5148fd26
+  REQUIRED_REPAIR_SHA: d8be68c2c5b46b9ba0cfbc283e0061da022355e1
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm scope and fail-closed safety contract
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "$VALIDATION_ID"
+          test "${#GITHUB_SHA}" = "40"
+          git merge-base --is-ancestor "$REPAIR_PARENT_SHA" HEAD
+          git merge-base --is-ancestor "$REQUIRED_REPAIR_SHA" HEAD
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/validate-polyedge-shadow-lossdiag.yml|\
+              Dockerfile.research-validation|\
+              crates/polyedge-reporting/src/research/loss_diagnostics.rs|\
+              infra/shadow-lossdiag-validation.bicep|\
+              research/configs/shadow_lossdiag_validation_2026-07-23_v2.json|\
+              research/run_shadow_lossdiag_validation.sh|\
+              research/test_shadow_lossdiag_validation.sh) ;;
+              *)
+                echo "Validation revision contains an out-of-scope change: $path" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git diff --name-only "$REPAIR_PARENT_SHA"...HEAD)
+          test "$(jq -r '.promotion_eligible' research/configs/shadow_lossdiag_validation_2026-07-23_v2.json)" = "false"
+          test "$(jq -r '.counts_toward_protocol_v3_evidence' research/configs/shadow_lossdiag_validation_2026-07-23_v2.json)" = "false"
+          test "$(jq -r '.safety.queue_position_source' research/configs/shadow_lossdiag_validation_2026-07-23_v2.json)" = "inferred_size_ahead"
+          test "$(jq -r '.safety.literal_fifo_available' research/configs/shadow_lossdiag_validation_2026-07-23_v2.json)" = "false"
+          sh -n research/run_shadow_lossdiag_validation.sh
+          sh research/test_shadow_lossdiag_validation.sh
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate repair and isolated runner
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test -p polyedge-reporting loss_diagnostics -- --test-threads=1
+          cargo test -p polyedge-reporting --test projected_cache -- --test-threads=1
+          cargo test -p polyedge-reporting --test run_bundle -- --test-threads=1
+          az bicep build --file infra/shadow-lossdiag-validation.bicep --stdout > validation-template.json
+          test "$(jq '.resources | length' validation-template.json)" = "6"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Freeze canonical state and bind immutable source
+        id: source
+        run: |
+          set -euo pipefail
+          utc_hhmm=$(date -u +%H%M)
+          if (( 10#$utc_hhmm >= 200 && 10#$utc_hhmm <= 400 )); then
+            echo "Refusing validation during the canonical 02:15 UTC reporter window" >&2
+            exit 1
+          fi
+          running=$(az containerapp job execution list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CANONICAL_JOB" \
+            --query "[?properties.status=='Running'] | length(@)" -o tsv)
+          test "$running" = "0"
+
+          az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n "$CANONICAL_JOB" -o json |
+            jq -S 'del(.systemData,.properties.provisioningState,.properties.eventStreamEndpoint)' \
+            > canonical-job-before.json
+          az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$SHADOW_APP" -o json |
+            jq -S 'del(.systemData,.properties.provisioningState,.properties.eventStreamEndpoint)' \
+            > shadow-app-before.json
+          sha256sum canonical-job-before.json shadow-app-before.json > canonical-resources-before.sha256
+
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CANONICAL_CONTAINER" \
+            --prefix "data/research/shadow/campaign-2026-07-23/" \
+            --auth-mode login -o json |
+            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            > canonical-data-before.json
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CANONICAL_CONTAINER" \
+            --prefix "reports/research/shadow/campaigns/campaign-2026-07-23/" \
+            --auth-mode login -o json |
+            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            > canonical-reports-before.json
+          sha256sum canonical-data-before.json canonical-reports-before.json > canonical-blobs-before.sha256
+
+          cache_root="data/research/shadow/campaign-2026-07-23/projected-cache"
+          pointer_blob="$cache_root/days/$VALIDATION_DATE/latest.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CANONICAL_CONTAINER" \
+            --name "$pointer_blob" \
+            --file source-pointer.json \
+            --auth-mode login --overwrite --only-show-errors -o none
+          manifest_relative=$(jq -er '.manifest_path' source-pointer.json)
+          manifest_blob="$cache_root/$manifest_relative"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CANONICAL_CONTAINER" \
+            --name "$manifest_blob" \
+            --file source-manifest.json \
+            --auth-mode login --overwrite --only-show-errors -o none
+          manifest_sha="sha256:$(sha256sum source-manifest.json | cut -d' ' -f1)"
+          test "$manifest_sha" = "$(jq -r '.manifest_sha256' source-pointer.json)"
+          test "$(jq -r '.canonical_sha256' source-pointer.json)" = "$(jq -r '.canonical_sha256' source-manifest.json)"
+          canonical_sha="sha256:$(jq -c '.canonical' source-manifest.json | sha256sum | cut -d' ' -f1)"
+          test "$canonical_sha" = "$(jq -r '.canonical_sha256' source-manifest.json)"
+          jq -e '
+            .schema_version == 1
+            and .canonical.campaign_id == "campaign-2026-07-23"
+            and .canonical.date == "2026-07-23"
+            and .canonical.raw_source_inventory.canonical.source_kind == "azure_blob"
+            and .canonical.raw_source_inventory.canonical.account == "stpolyedge6urdjr5nmwx7w"
+            and .canonical.raw_source_inventory.canonical.container == "polyedge-shadow-events"
+            and .canonical.raw_source_inventory.canonical.prefix == "shadow-events/campaign-2026-07-23/2026/07/23/"
+            and .canonical.raw_source_inventory.canonical.exhaustive_listing == true
+            and .canonical.raw_source_inventory.canonical.max_blobs == null
+            and .canonical.raw_source_inventory.canonical.max_bytes == null
+            and ([.canonical.raw_source_inventory.canonical.blobs[] |
+              (.etag != null and .sha256 != null and .content_length >= 0 and .sealed == true)] | all)
+          ' source-manifest.json >/dev/null
+          raw_inventory_sha=$(jq -er '.canonical.raw_source_inventory.canonical_sha256' source-manifest.json)
+          canonical_inventory_sha="sha256:$(jq -c '.canonical.raw_source_inventory.canonical' source-manifest.json | sha256sum | cut -d' ' -f1)"
+          test "$raw_inventory_sha" = "$canonical_inventory_sha"
+          projected_fileset_sha="sha256:$(jq -cS '[.canonical.files[] | {relative_path,rows,bytes,sha256}] | sort_by(.relative_path)' source-manifest.json | sha256sum | cut -d' ' -f1)"
+          echo "raw_inventory_sha=$raw_inventory_sha" >> "$GITHUB_OUTPUT"
+          echo "projected_fileset_sha=$projected_fileset_sha" >> "$GITHUB_OUTPUT"
+          echo "source_manifest_sha=$manifest_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push immutable standard and validation images
+        id: image
+        run: |
+          set -euo pipefail
+          az acr login --name "$ACR_NAME"
+          standard_tag="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          standard_tagged="$ACR_LOGIN_SERVER/polyedge-rust-research:$standard_tag"
+          docker build --build-arg GIT_SHA="$GITHUB_SHA" -f Dockerfile.rust -t "$standard_tagged" .
+          docker push "$standard_tagged"
+          standard_digest=$(az acr manifest show-metadata \
+            --registry "$ACR_NAME" \
+            --name "polyedge-rust-research:$standard_tag" \
+            --query digest -o tsv)
+          [[ "$standard_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          standard_image="$ACR_LOGIN_SERVER/polyedge-rust-research@$standard_digest"
+
+          validation_tagged="$ACR_LOGIN_SERVER/polyedge-rust-research-validation:$standard_tag"
+          docker build \
+            --build-arg BASE_IMAGE="$standard_image" \
+            -f Dockerfile.research-validation \
+            -t "$validation_tagged" .
+          docker push "$validation_tagged"
+          validation_digest=$(az acr manifest show-metadata \
+            --registry "$ACR_NAME" \
+            --name "polyedge-rust-research-validation:$standard_tag" \
+            --query digest -o tsv)
+          [[ "$validation_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          validation_image="$ACR_LOGIN_SERVER/polyedge-rust-research-validation@$validation_digest"
+          echo "standard_image=$standard_image" >> "$GITHUB_OUTPUT"
+          echo "validation_image=$validation_image" >> "$GITHUB_OUTPUT"
+
+      - name: Prove isolated infrastructure change and deploy manual validator
+        env:
+          VALIDATION_IMAGE: ${{ steps.image.outputs.validation_image }}
+          RAW_INVENTORY_SHA: ${{ steps.source.outputs.raw_inventory_sha }}
+          PROJECTED_FILESET_SHA: ${{ steps.source.outputs.projected_fileset_sha }}
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "polyedge-lossdiag-v2-$GITHUB_RUN_ID" \
+            --template-file infra/shadow-lossdiag-validation.bicep \
+            --parameters \
+              validationImage="$VALIDATION_IMAGE" \
+              expectedGitSha="$GITHUB_SHA" \
+              expectedRawSourceInventorySha256="$RAW_INVENTORY_SHA" \
+              expectedProjectedFilesetSha256="$PROJECTED_FILESET_SHA" \
+            --result-format FullResourcePayloads -o json > validation-what-if.json
+          jq -e '
+            [.changes[] |
+              select(.changeType != "Ignore") |
+              select(
+                (.resourceId | contains("/polyedge-research-validation"))
+                or (.resourceId | contains("/polyedge-shadow-validation-neu-id"))
+                or (.resourceId | contains("/polyedge-shadow-val-neu-job"))
+                or (.resourceId | contains("/roleAssignments/"))
+                | not
+              )] | length == 0
+          ' validation-what-if.json >/dev/null
+          jq -e '[.changes[] | select(.changeType == "Delete")] | length == 0' validation-what-if.json >/dev/null
+
+          az deployment group create \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "polyedge-lossdiag-v2-$GITHUB_RUN_ID" \
+            --template-file infra/shadow-lossdiag-validation.bicep \
+            --parameters \
+              validationImage="$VALIDATION_IMAGE" \
+              expectedGitSha="$GITHUB_SHA" \
+              expectedRawSourceInventorySha256="$RAW_INVENTORY_SHA" \
+              expectedProjectedFilesetSha256="$PROJECTED_FILESET_SHA" \
+            --mode Incremental --only-show-errors -o json > validation-deployment.json
+
+          job=$(az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n "$VALIDATION_JOB" -o json)
+          test "$(jq -r '.properties.configuration.triggerType' <<<"$job")" = "Manual"
+          test "$(jq -r '.properties.configuration.replicaRetryLimit' <<<"$job")" = "0"
+          test "$(jq -r '.properties.configuration.manualTriggerConfig.parallelism' <<<"$job")" = "1"
+          test "$(jq -r '.properties.configuration.manualTriggerConfig.replicaCompletionCount' <<<"$job")" = "1"
+          test "$(jq -r '.properties.template.containers | length' <<<"$job")" = "1"
+          test "$(jq -r '.properties.template.containers[0].resources.cpu' <<<"$job")" = "4"
+          test "$(jq -r '.properties.template.containers[0].resources.memory' <<<"$job")" = "8Gi"
+          test "$(jq -r '.properties.template.containers[0].image' <<<"$job")" = "$VALIDATION_IMAGE"
+          test "$(jq -r '(.properties.configuration.secrets // []) | length' <<<"$job")" = "0"
+          test "$(jq -r '[.properties.template.containers[0].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length' <<<"$job")" = "0"
+          for pair in EXECUTION_MODE=paper ALLOW_LIVE=false RUN_BOT_ON_STARTUP=false ENABLE_TAKER_ORDERS=false; do
+            name=${pair%%=*}
+            value=${pair#*=}
+            test "$(jq -r --arg name "$name" '.properties.template.containers[0].env[] | select(.name == $name) | .value' <<<"$job")" = "$value"
+          done
+          identity_principal=$(az identity show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n polyedge-shadow-validation-neu-id \
+            --query principalId -o tsv)
+          az role assignment list \
+            --assignee-object-id "$identity_principal" \
+            --all -o json |
+            jq -cS '[.[] | {role:roleDefinitionName,scope:(scope | ascii_downcase)}] | sort_by(.scope,.role)' \
+            > validation-identity-roles.json
+          test "$(jq 'length' validation-identity-roles.json)" = "3"
+          jq -e '
+            ([.[].role] | sort) == ["AcrPull","Storage Blob Data Contributor","Storage Blob Data Reader"]
+            and ([.[].scope | select(endswith("/containers/polyedge-shadow-events"))] | length) == 1
+            and ([.[].scope | select(endswith("/containers/polyedge-research-validation"))] | length) == 1
+            and ([.[].scope | select(
+              contains("/microsoft.keyvault/")
+              or endswith("/containers/polyedge-research")
+              or endswith("/containers/polyedge-funded-evidence")
+            )] | length) == 0
+          ' validation-identity-roles.json >/dev/null
+          # Allow the newly scoped data-plane grants to propagate before the
+          # single zero-retry execution is created.
+          sleep 60
+
+      - name: Start exactly one isolated validation execution
+        id: execution
+        run: |
+          set -euo pipefail
+          execution=$(az containerapp job start \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$VALIDATION_JOB" \
+            --query name -o tsv)
+          test -n "$execution"
+          echo "name=$execution" >> "$GITHUB_OUTPUT"
+          echo "started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for isolated validation
+        env:
+          EXECUTION_NAME: ${{ steps.execution.outputs.name }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 480); do
+            status=$(az containerapp job execution show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$VALIDATION_JOB" \
+              --job-execution-name "$EXECUTION_NAME" \
+              --query properties.status -o tsv)
+            case "$status" in
+              Succeeded) exit 0 ;;
+              Failed|Stopped|Degraded)
+                echo "Validation execution reached terminal status $status" >&2
+                exit 1
+                ;;
+              Running|Processing|"") sleep 30 ;;
+              *) echo "Unknown validation status: $status" >&2; exit 1 ;;
+            esac
+          done
+          echo "Validation execution exceeded four hours" >&2
+          exit 1
+
+      - name: Verify durable bundle, memory, logs, and unchanged canonical state
+        id: proof
+        env:
+          EXECUTION_NAME: ${{ steps.execution.outputs.name }}
+          STARTED_AT: ${{ steps.execution.outputs.started_at }}
+          STANDARD_IMAGE: ${{ steps.image.outputs.standard_image }}
+          VALIDATION_IMAGE: ${{ steps.image.outputs.validation_image }}
+          RAW_INVENTORY_SHA: ${{ steps.source.outputs.raw_inventory_sha }}
+          PROJECTED_FILESET_SHA: ${{ steps.source.outputs.projected_fileset_sha }}
+          SOURCE_MANIFEST_SHA: ${{ steps.source.outputs.source_manifest_sha }}
+        run: |
+          set -euo pipefail
+          bundle_root="reports/research/shadow/validations/$VALIDATION_ID/daily"
+          pointer_blob="$bundle_root/$VALIDATION_DATE/latest.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$VALIDATION_CONTAINER" \
+            --name "$pointer_blob" \
+            --file validation-pointer.json \
+            --auth-mode login --overwrite --only-show-errors -o none
+          manifest_relative=$(jq -er '.manifest_path' validation-pointer.json)
+          manifest_blob="$bundle_root/$VALIDATION_DATE/$manifest_relative"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$VALIDATION_CONTAINER" \
+            --name "$manifest_blob" \
+            --file validation-manifest.json \
+            --auth-mode login --overwrite --only-show-errors -o none
+          manifest_sha="sha256:$(sha256sum validation-manifest.json | cut -d' ' -f1)"
+          test "$manifest_sha" = "$(jq -r '.manifest_sha256' validation-pointer.json)"
+          test "$(jq -r '.status' validation-manifest.json)" = "complete"
+          test "$(jq -r '.git_sha' validation-manifest.json)" = "$GITHUB_SHA"
+          run_prefix="$(dirname "$manifest_blob")"
+          mkdir -p validation-bundle
+          while IFS=$'\t' read -r relative expected_sha expected_bytes; do
+            mkdir -p "validation-bundle/$(dirname "$relative")"
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$VALIDATION_CONTAINER" \
+              --name "$run_prefix/$relative" \
+              --file "validation-bundle/$relative" \
+              --auth-mode login --overwrite --only-show-errors -o none
+            test "sha256:$(sha256sum "validation-bundle/$relative" | cut -d' ' -f1)" = "$expected_sha"
+            test "$(stat -c %s "validation-bundle/$relative")" = "$expected_bytes"
+          done < <(jq -r '.artifacts[] | [.relative_path,.sha256,(.bytes|tostring)] | @tsv' validation-manifest.json)
+
+          metrics_path=$(jq -r '.artifacts[] | select(.relative_path == "loss_diagnostics_metrics.json") | .relative_path' validation-manifest.json)
+          test "$metrics_path" = "loss_diagnostics_metrics.json"
+          metrics="validation-bundle/$metrics_path"
+          test "$(jq -r '.promotion_eligible' "$metrics")" = "false"
+          test "$(jq -r '.counts_toward_protocol_v3_evidence' "$metrics")" = "false"
+          test "$(jq -r '.git_sha' "$metrics")" = "$GITHUB_SHA"
+          test "$(jq -r '.source_inventory_sha256' "$metrics")" = "$RAW_INVENTORY_SHA"
+          test "$(jq -r '.projected_fileset_sha256' "$metrics")" = "$PROJECTED_FILESET_SHA"
+          test "$(jq -r '.queue_position_source' "$metrics")" = "inferred_size_ahead"
+          test "$(jq -r '.literal_fifo_available' "$metrics")" = "false"
+          test "$(jq -r '.max_rss_kib' "$metrics")" -le 6815744
+          if [ "$(jq -r '.cgroup_peak_available' "$metrics")" = "true" ]; then
+            test "$(jq -r '.cgroup_peak_bytes' "$metrics")" -le 7301448704
+          else
+            test "$(jq -r '.cgroup_peak_bytes' "$metrics")" = "null"
+          fi
+
+          job_id=$(az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n "$VALIDATION_JOB" --query id -o tsv)
+          end_at=$(date -u -d '+10 minutes' +%Y-%m-%dT%H:%M:%SZ)
+          usage_bytes=""
+          restart_count=""
+          for _ in $(seq 1 20); do
+            az monitor metrics list \
+              --resource "$job_id" \
+              --metric UsageBytes \
+              --interval PT1M \
+              --aggregation Maximum \
+              --filter "executionName eq '$EXECUTION_NAME'" \
+              --start-time "$STARTED_AT" \
+              --end-time "$end_at" \
+              -o json > usage-metric.json 2>/dev/null || true
+            usage_bytes=$(jq -r '[.value[].timeseries[].data[].maximum // empty] | if length > 0 then max else empty end' usage-metric.json 2>/dev/null || true)
+            az monitor metrics list \
+              --resource "$job_id" \
+              --metric RestartCount \
+              --interval PT1M \
+              --aggregation Maximum \
+              --filter "executionName eq '$EXECUTION_NAME'" \
+              --start-time "$STARTED_AT" \
+              --end-time "$end_at" \
+              -o json > restart-metric.json 2>/dev/null || true
+            restart_count=$(jq -r '[.value[].timeseries[].data[].maximum // empty] | if length > 0 then max else empty end' restart-metric.json 2>/dev/null || true)
+            if [ -n "$usage_bytes" ]; then break; fi
+            sleep 30
+          done
+          test -n "$usage_bytes"
+          # Azure emits no RestartCount sample at all for a healthy zero-restart
+          # execution. Retry limit zero plus a successful terminal execution
+          # makes that empty series authoritative zero.
+          restart_count="${restart_count:-0}"
+          awk -v value="$usage_bytes" 'BEGIN { exit !(value <= 7301448704) }'
+          awk -v value="$restart_count" 'BEGIN { exit !(value == 0) }'
+
+          workspace_id=$(az monitor log-analytics workspace show \
+            -g "$AZURE_RESOURCE_GROUP" \
+            -n log-polyedge-dev-6urdjr5nmwx7w \
+            --query customerId -o tsv)
+          for _ in $(seq 1 20); do
+            az monitor log-analytics query \
+              --workspace "$workspace_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL | where ContainerJobName_s == '$VALIDATION_JOB' and ContainerGroupName_s startswith '$EXECUTION_NAME' | project TimeGenerated, Log_s | order by TimeGenerated asc" \
+              --timespan P1D -o json > validation-logs.json
+            if jq -e '[.[].Log_s | select(contains("polyedge_lossdiag_validation status=succeeded"))] | length == 1' validation-logs.json >/dev/null; then break; fi
+            sleep 30
+          done
+          jq -e '[.[].Log_s | select(contains("polyedge_lossdiag_validation status=succeeded"))] | length == 1' validation-logs.json >/dev/null
+          jq -e '[.[].Log_s | select(test("Killed|exit status: 137|status=failed"))] | length == 0' validation-logs.json >/dev/null
+
+          az containerapp job show -g "$AZURE_RESOURCE_GROUP" -n "$CANONICAL_JOB" -o json |
+            jq -S 'del(.systemData,.properties.provisioningState,.properties.eventStreamEndpoint)' \
+            > canonical-job-after.json
+          az containerapp show -g "$AZURE_RESOURCE_GROUP" -n "$SHADOW_APP" -o json |
+            jq -S 'del(.systemData,.properties.provisioningState,.properties.eventStreamEndpoint)' \
+            > shadow-app-after.json
+          cmp canonical-job-before.json canonical-job-after.json
+          cmp shadow-app-before.json shadow-app-after.json
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CANONICAL_CONTAINER" \
+            --prefix "data/research/shadow/campaign-2026-07-23/" \
+            --auth-mode login -o json |
+            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            > canonical-data-after.json
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CANONICAL_CONTAINER" \
+            --prefix "reports/research/shadow/campaigns/campaign-2026-07-23/" \
+            --auth-mode login -o json |
+            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            > canonical-reports-after.json
+          cmp canonical-data-before.json canonical-data-after.json
+          cmp canonical-reports-before.json canonical-reports-after.json
+
+          config_sha="sha256:$(sha256sum research/configs/shadow_lossdiag_validation_2026-07-23_v2.json | cut -d' ' -f1)"
+          canonical_job_sha="sha256:$(sha256sum canonical-job-before.json | cut -d' ' -f1)"
+          shadow_app_sha="sha256:$(sha256sum shadow-app-before.json | cut -d' ' -f1)"
+          canonical_data_sha="sha256:$(sha256sum canonical-data-before.json | cut -d' ' -f1)"
+          canonical_reports_sha="sha256:$(sha256sum canonical-reports-before.json | cut -d' ' -f1)"
+          logs_sha="sha256:$(sha256sum validation-logs.json | cut -d' ' -f1)"
+          usage_metric_sha="sha256:$(sha256sum usage-metric.json | cut -d' ' -f1)"
+          restart_metric_sha="sha256:$(sha256sum restart-metric.json | cut -d' ' -f1)"
+          jq -cnS \
+            --arg schema "polyedge.shadow_lossdiag_validation_attestation.v1" \
+            --arg validation_id "$VALIDATION_ID" \
+            --arg execution_name "$EXECUTION_NAME" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg standard_image "$STANDARD_IMAGE" \
+            --arg validation_image "$VALIDATION_IMAGE" \
+            --arg config_sha256 "$config_sha" \
+            --arg source_manifest_sha256 "$SOURCE_MANIFEST_SHA" \
+            --arg source_inventory_sha256 "$RAW_INVENTORY_SHA" \
+            --arg projected_fileset_sha256 "$PROJECTED_FILESET_SHA" \
+            --arg bundle_manifest_sha256 "$manifest_sha" \
+            --arg semantic_sha256 "$(jq -r '.semantic_sha256' "$metrics")" \
+            --arg order_fact_sha256 "$(jq -r '.order_fact_sha256' "$metrics")" \
+            --arg fill_fact_sha256 "$(jq -r '.fill_fact_sha256' "$metrics")" \
+            --arg canonical_job_sha256 "$canonical_job_sha" \
+            --arg shadow_app_sha256 "$shadow_app_sha" \
+            --arg canonical_data_inventory_sha256 "$canonical_data_sha" \
+            --arg canonical_report_inventory_sha256 "$canonical_reports_sha" \
+            --arg logs_sha256 "$logs_sha" \
+            --arg usage_metric_payload_sha256 "$usage_metric_sha" \
+            --arg restart_metric_payload_sha256 "$restart_metric_sha" \
+            --argjson process_max_rss_kib "$(jq '.max_rss_kib' "$metrics")" \
+            --argjson cgroup_peak_available "$(jq '.cgroup_peak_available' "$metrics")" \
+            --argjson cgroup_peak_bytes "$(jq '.cgroup_peak_bytes' "$metrics")" \
+            --argjson azure_usage_bytes_max "$usage_bytes" \
+            --argjson restart_count "$restart_count" \
+            '{
+              schema: $schema,
+              validation_id: $validation_id,
+              promotion_eligible: false,
+              counts_toward_protocol_v3_evidence: false,
+              execution_name: $execution_name,
+              execution_status: "Succeeded",
+              git_sha: $git_sha,
+              standard_image: $standard_image,
+              validation_image: $validation_image,
+              config_sha256: $config_sha256,
+              source_manifest_sha256: $source_manifest_sha256,
+              source_inventory_sha256: $source_inventory_sha256,
+              projected_fileset_sha256: $projected_fileset_sha256,
+              bundle_manifest_sha256: $bundle_manifest_sha256,
+              semantic_sha256: $semantic_sha256,
+              order_fact_sha256: $order_fact_sha256,
+              fill_fact_sha256: $fill_fact_sha256,
+              canonical_job_sha256: $canonical_job_sha256,
+              shadow_app_sha256: $shadow_app_sha256,
+              canonical_data_inventory_sha256: $canonical_data_inventory_sha256,
+              canonical_report_inventory_sha256: $canonical_report_inventory_sha256,
+              logs_sha256: $logs_sha256,
+              usage_metric_payload_sha256: $usage_metric_payload_sha256,
+              restart_metric_payload_sha256: $restart_metric_payload_sha256,
+              process_max_rss_kib: $process_max_rss_kib,
+              cgroup_peak_available: $cgroup_peak_available,
+              cgroup_peak_bytes: $cgroup_peak_bytes,
+              azure_usage_bytes_max: $azure_usage_bytes_max,
+              restart_count: $restart_count,
+              canonical_campaign_unchanged: true,
+              queue_position_source: "inferred_size_ahead",
+              literal_fifo_available: false
+            }' > validation-attestation.json
+          attestation_sha="sha256:$(sha256sum validation-attestation.json | cut -d' ' -f1)"
+          attestation_blob="reports/research/shadow/validations/$VALIDATION_ID/attestations/${attestation_sha#sha256:}/attestation.json"
+          az storage blob upload \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$VALIDATION_CONTAINER" \
+            --name "$attestation_blob" \
+            --file validation-attestation.json \
+            --auth-mode login --overwrite false \
+            --content-type application/json \
+            --metadata sha256="$attestation_sha" immutable_content=true \
+            --only-show-errors -o none
+          echo "attestation_sha=$attestation_sha" >> "$GITHUB_OUTPUT"
+          echo "usage_bytes=$usage_bytes" >> "$GITHUB_OUTPUT"
+
+      - name: Stop any failed validation execution
+        if: ${{ failure() && steps.execution.outputs.name != '' }}
+        env:
+          EXECUTION_NAME: ${{ steps.execution.outputs.name }}
+        run: |
+          set -euo pipefail
+          status=$(az containerapp job execution show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$VALIDATION_JOB" \
+            --job-execution-name "$EXECUTION_NAME" \
+            --query properties.status -o tsv 2>/dev/null || true)
+          case "$status" in
+            Running|Processing|"")
+              az containerapp job stop \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$VALIDATION_JOB" \
+                --job-execution-name "$EXECUTION_NAME" \
+                --only-show-errors -o none || true
+              ;;
+          esac
+          for _ in $(seq 1 30); do
+            status=$(az containerapp job execution show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$VALIDATION_JOB" \
+              --job-execution-name "$EXECUTION_NAME" \
+              --query properties.status -o tsv 2>/dev/null || true)
+            case "$status" in
+              Running|Processing|"") sleep 10 ;;
+              *) exit 0 ;;
+            esac
+          done
+          echo "Failed validation execution did not stop" >&2
+          exit 1
+
+      - name: Upload validation proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: polyedge-shadow-lossdiag-${{ steps.execution.outputs.name }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            source-pointer.json
+            source-manifest.json
+            validation-pointer.json
+            validation-manifest.json
+            validation-bundle/
+            validation-logs.json
+            validation-attestation.json
+            validation-what-if.json
+            validation-deployment.json
+            canonical-resources-before.sha256
+            canonical-blobs-before.sha256
+            canonical-job-before.json
+            canonical-job-after.json
+            shadow-app-before.json
+            shadow-app-after.json
+            canonical-data-before.json
+            canonical-data-after.json
+            canonical-reports-before.json
+            canonical-reports-after.json
+            usage-metric.json
+            restart-metric.json
+            validation-identity-roles.json
+
+      - name: Publish validation summary
+        env:
+          EXECUTION_NAME: ${{ steps.execution.outputs.name }}
+          ATTESTATION_SHA: ${{ steps.proof.outputs.attestation_sha }}
+          USAGE_BYTES: ${{ steps.proof.outputs.usage_bytes }}
+        run: |
+          {
+            echo "## PolyEdge loss-diagnostics v2 validation"
+            echo
+            echo "- Execution: \`$EXECUTION_NAME\`"
+            echo "- Attestation: \`$ATTESTATION_SHA\`"
+            echo "- Azure peak UsageBytes: \`$USAGE_BYTES\`"
+            echo "- Promotion evidence: **false**"
+            echo "- Canonical campaign/job/app changed: **false**"
+            echo "- Funded execution: **not present**"
+          } >> "$GITHUB_STEP_SUMMARY"
