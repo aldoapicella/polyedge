@@ -1,7 +1,7 @@
 {
   "schema": "polyedge.shadow_lossdiag_validation.v1",
   "schema_version": 1,
-  "validation_id": "campaign-2026-07-23-lossdiag-v2",
+  "validation_id": "campaign-2026-07-23-lossdiag-v3",
   "promotion_eligible": false,
   "counts_toward_protocol_v3_evidence": false,
   "date": "2026-07-23",
@@ -13,11 +13,11 @@
   },
   "output": {
     "container": "polyedge-research-validation",
-    "work_root": "data/research/shadow/campaign-2026-07-23-lossdiag-v2",
-    "projected_cache_root": "data/research/shadow/campaign-2026-07-23-lossdiag-v2/projected-cache",
-    "report_root": "reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v2",
-    "correction_root": "reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v2/corrections",
-    "lease_blob": "data/research/shadow/campaign-2026-07-23-lossdiag-v2/control/validation.lock"
+    "work_root": "data/research/shadow/campaign-2026-07-23-lossdiag-v3",
+    "projected_cache_root": "data/research/shadow/campaign-2026-07-23-lossdiag-v3/projected-cache",
+    "report_root": "reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v3",
+    "correction_root": "reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v3/corrections",
+    "lease_blob": "data/research/shadow/campaign-2026-07-23-lossdiag-v3/control/validation.lock"
   },
   "limits": {
     "cpu": 4,

@@ -8,9 +8,10 @@ mkdir -p "$TMP/bin" "$TMP/work"
 
 RAW_SHA="sha256:$(printf 'b%.0s' $(seq 1 64))"
 FILE_SHA="sha256:$(printf 'c%.0s' $(seq 1 64))"
-FILESET_SHA="sha256:$(jq -cnS --arg sha "$FILE_SHA" \
+PROJECTED_FILESET_SHA="sha256:$(jq -cnS --arg sha "$FILE_SHA" \
   '[{relative_path:"events.jsonl.gz",rows:1,bytes:2,sha256:$sha}] | sort_by(.relative_path)' |
   sha256sum | cut -d' ' -f1)"
+SOURCE_PROJECTED_FILESET_SHA="sha256:$(printf 'd%.0s' $(seq 1 64))"
 export RAW_SHA FILE_SHA
 
 cat >"$TMP/bin/polyedge-rs" <<'EOF'
@@ -149,7 +150,7 @@ chmod +x "$TMP/bin/polyedge-rs"
   POLYEDGE_TEST_ARGS="$TMP/args" \
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
-  POLYEDGE_CAMPAIGN_LEASE_BLOB=data/research/shadow/campaign-2026-07-23-lossdiag-v2/control/validation.lock \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=data/research/shadow/campaign-2026-07-23-lossdiag-v3/control/validation.lock \
   EXECUTION_MODE=paper \
   ALLOW_LIVE=false \
   RUN_BOT_ON_STARTUP=false \
@@ -160,21 +161,32 @@ chmod +x "$TMP/bin/polyedge-rs"
   EXPECTED_GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   EXPECTED_RAW_SOURCE_INVENTORY_SHA256="$RAW_SHA" \
-  EXPECTED_PROJECTED_FILESET_SHA256="$FILESET_SHA" \
-  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v2.json" \
+  SOURCE_PROJECTED_FILESET_SHA256="$SOURCE_PROJECTED_FILESET_SHA" \
+  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v3.json" \
   sh "$REPO/research/run_shadow_lossdiag_validation.sh" >"$TMP/stdout"
 )
 
 grep -F 'research audit --input azure://stpolyedge6urdjr5nmwx7w/polyedge-shadow-events/shadow-events/campaign-2026-07-23/2026/07/23/?prefetch_blobs=16' "$TMP/args" >/dev/null
-grep -F -- '--cache-root azure://stpolyedge6urdjr5nmwx7w/polyedge-research-validation/data/research/shadow/campaign-2026-07-23-lossdiag-v2/projected-cache' "$TMP/args" >/dev/null
-grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-23-lossdiag-v2/cumulative/2026-07-23/normalized' "$TMP/args" >/dev/null
+grep -F -- '--cache-root azure://stpolyedge6urdjr5nmwx7w/polyedge-research-validation/data/research/shadow/campaign-2026-07-23-lossdiag-v3/projected-cache' "$TMP/args" >/dev/null
+grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-23-lossdiag-v3/cumulative/2026-07-23/normalized' "$TMP/args" >/dev/null
 grep -F 'research publish-daily-bundle ' "$TMP/args" |
-  grep -F -- '--output-root reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v2/daily' >/dev/null
+  grep -F -- '--output-root reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v3/daily' >/dev/null
 if grep -E '^research (validate-prospective|evaluate-profitability|loss-regime-oos|venue-model|funded|canary|probe|redeem|promotion)' "$TMP/args" >/dev/null; then
   echo "isolated loss-diagnostics validation invoked a forbidden command" >&2
   exit 1
 fi
-grep -F 'polyedge_lossdiag_validation status=succeeded validation_id=campaign-2026-07-23-lossdiag-v2' "$TMP/stdout" >/dev/null
+grep -F 'polyedge_lossdiag_validation status=succeeded validation_id=campaign-2026-07-23-lossdiag-v3' "$TMP/stdout" >/dev/null
+METRICS="$(find "$TMP/work/reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v3" \
+  -type f -name loss_diagnostics_metrics.json -print -quit)"
+test -n "$METRICS"
+jq -e \
+  --arg source "$SOURCE_PROJECTED_FILESET_SHA" \
+  --arg projected "$PROJECTED_FILESET_SHA" '
+  .source_projected_fileset_sha256 == $source
+  and .projected_fileset_sha256 == $projected
+  and .projected_fileset_sha256 != .source_projected_fileset_sha256
+  and .normalized_timestamp_precision == "rfc3339_autosi"
+' "$METRICS" >/dev/null
 
 if (
   cd "$TMP/work"
@@ -192,8 +204,8 @@ if (
   EXPECTED_GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   EXPECTED_RAW_SOURCE_INVENTORY_SHA256="$RAW_SHA" \
-  EXPECTED_PROJECTED_FILESET_SHA256="$FILESET_SHA" \
-  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v2.json" \
+  SOURCE_PROJECTED_FILESET_SHA256="$SOURCE_PROJECTED_FILESET_SHA" \
+  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v3.json" \
   sh "$REPO/research/run_shadow_lossdiag_validation.sh" >/dev/null 2>&1
 ); then
   echo "isolated validation accepted the canonical campaign lease" >&2

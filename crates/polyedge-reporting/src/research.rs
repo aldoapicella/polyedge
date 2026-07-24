@@ -6231,10 +6231,10 @@ fn normalized_row(event: &EventLine, sequence: u64) -> Value {
     json!({
         "sequence": sequence,
         "event_type": event.event_type,
-        "recorded_ts": ts(event.recorded_ts),
-        "source_ts": parse_datetime(payload.get("source_ts")).map(ts)
-            .or_else(|| parse_datetime(payload.get("exchange_ts")).map(ts))
-            .or_else(|| parse_datetime(payload.get("local_ts")).map(ts)),
+        "recorded_ts": normalized_event_ts(event.recorded_ts),
+        "source_ts": parse_datetime(payload.get("source_ts")).map(normalized_event_ts)
+            .or_else(|| parse_datetime(payload.get("exchange_ts")).map(normalized_event_ts))
+            .or_else(|| parse_datetime(payload.get("local_ts")).map(normalized_event_ts)),
         "market_id": text(payload, "market_id"),
         "token_id": text(payload, "token_id"),
         "condition_id": text(payload, "condition_id"),
@@ -11292,6 +11292,10 @@ fn ts(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn normalized_event_ts(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
 fn now_ts() -> String {
     ts(Utc::now())
 }
@@ -11407,6 +11411,28 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_rows_preserve_subsecond_event_chronology() {
+        let recorded_ts = DateTime::parse_from_rfc3339("2026-07-23T01:11:07.417210355Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let source_ts = DateTime::parse_from_rfc3339("2026-07-23T01:11:07.008601951Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let row = normalized_row(
+            &EventLine {
+                event_type: "strategy_decision_batch".to_owned(),
+                recorded_ts,
+                payload: json!({"local_ts": source_ts}),
+                raw: Value::Null,
+            },
+            7,
+        );
+
+        assert_eq!(row["recorded_ts"], "2026-07-23T01:11:07.417210355Z");
+        assert_eq!(row["source_ts"], "2026-07-23T01:11:07.008601951Z");
+    }
 
     #[test]
     fn sweep_block_bound_is_fail_closed_deterministic_and_positive_only_with_enough_days() {
