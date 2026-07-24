@@ -1,0 +1,37 @@
+{
+  "schema": "polyedge.shadow_lossdiag_validation.v1",
+  "schema_version": 1,
+  "validation_id": "campaign-2026-07-23-lossdiag-v4",
+  "promotion_eligible": false,
+  "counts_toward_protocol_v3_evidence": false,
+  "date": "2026-07-23",
+  "source": {
+    "account": "stpolyedge6urdjr5nmwx7w",
+    "container": "polyedge-shadow-events",
+    "campaign_id": "campaign-2026-07-23",
+    "prefix": "shadow-events/campaign-2026-07-23/2026/07/23/"
+  },
+  "output": {
+    "container": "polyedge-research-validation",
+    "work_root": "data/research/shadow/campaign-2026-07-23-lossdiag-v4",
+    "projected_cache_root": "data/research/shadow/campaign-2026-07-23-lossdiag-v4/projected-cache",
+    "report_root": "reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v4",
+    "correction_root": "reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v4/corrections",
+    "lease_blob": "data/research/shadow/campaign-2026-07-23-lossdiag-v4/control/validation.lock"
+  },
+  "limits": {
+    "cpu": 4,
+    "memory": "8Gi",
+    "max_loss_diagnostics_rss_kib": 6815744,
+    "max_container_peak_bytes": 7301448704,
+    "replica_retry_limit": 0
+  },
+  "safety": {
+    "execution_mode": "paper",
+    "allow_live": false,
+    "run_bot_on_startup": false,
+    "enable_taker_orders": false,
+    "literal_fifo_available": false,
+    "queue_position_source": "inferred_size_ahead"
+  }
+}
