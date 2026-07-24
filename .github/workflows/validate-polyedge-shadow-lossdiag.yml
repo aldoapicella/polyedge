@@ -126,14 +126,14 @@ jobs:
             --container-name "$CANONICAL_CONTAINER" \
             --prefix "data/research/shadow/campaign-2026-07-23/" \
             --auth-mode login -o json |
-            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            jq -cS '[.[] | {name,etag:.properties.etag,bytes:.properties.contentLength}] | sort_by(.name)' \
             > canonical-data-before.json
           az storage blob list \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$CANONICAL_CONTAINER" \
             --prefix "reports/research/shadow/campaigns/campaign-2026-07-23/" \
             --auth-mode login -o json |
-            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            jq -cS '[.[] | {name,etag:.properties.etag,bytes:.properties.contentLength}] | sort_by(.name)' \
             > canonical-reports-before.json
           sha256sum canonical-data-before.json canonical-reports-before.json > canonical-blobs-before.sha256
 
@@ -455,14 +455,14 @@ jobs:
             --container-name "$CANONICAL_CONTAINER" \
             --prefix "data/research/shadow/campaign-2026-07-23/" \
             --auth-mode login -o json |
-            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            jq -cS '[.[] | {name,etag:.properties.etag,bytes:.properties.contentLength}] | sort_by(.name)' \
             > canonical-data-after.json
           az storage blob list \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$CANONICAL_CONTAINER" \
             --prefix "reports/research/shadow/campaigns/campaign-2026-07-23/" \
             --auth-mode login -o json |
-            jq -cS '[.[] | {name,etag:properties.etag,bytes:properties.contentLength}] | sort_by(.name)' \
+            jq -cS '[.[] | {name,etag:.properties.etag,bytes:.properties.contentLength}] | sort_by(.name)' \
             > canonical-reports-after.json
           cmp canonical-data-before.json canonical-data-after.json
           cmp canonical-reports-before.json canonical-reports-after.json
