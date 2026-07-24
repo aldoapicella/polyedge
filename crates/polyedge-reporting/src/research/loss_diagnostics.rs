@@ -1598,6 +1598,16 @@ fn settled_fill_pnl(fill: &FillLifecycleJoinKey, outcome: &str, winning_outcome:
 }
 
 pub fn run_loss_diagnostics(options: LossDiagnosticsOptions) -> Result<Value, ResearchError> {
+    run_loss_diagnostics_with_after_audit(options, |_| Ok(()))
+}
+
+fn run_loss_diagnostics_with_after_audit<F>(
+    options: LossDiagnosticsOptions,
+    after_audit: F,
+) -> Result<Value, ResearchError>
+where
+    F: FnOnce(&Path) -> Result<(), ResearchError>,
+{
     let started = Instant::now();
     if !options.input.is_dir() {
         return Err(ResearchError::InvalidInput(
@@ -1618,22 +1628,43 @@ pub fn run_loss_diagnostics(options: LossDiagnosticsOptions) -> Result<Value, Re
     }
     let inventory_before =
         build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
+    let pinned_campaign_index = projected_cache::load_campaign_index(&options.input)?;
     let snapshot_manifest = validate_snapshot_manifest(&options.input, &inventory_before)?;
-    let mut diagnostics = LossDiagnosticsAccumulator::default();
     let mut audit = AuditAccumulator::default();
-    let stream = stream_events(
-        &options.input,
-        EventPathMode::PreferEventsJsonl,
-        &[],
-        |event| {
+    let audit_stream =
+        stream_loss_diagnostic_events(&options.input, pinned_campaign_index.as_ref(), |event| {
             audit.observe(event);
-            diagnostics.observe(event);
-        },
-    )?;
+        })?;
+    if audit_stream.malformed_lines > 0 || audit_stream.out_of_order_timestamps > 0 {
+        return Err(ResearchError::InvalidInput(format!(
+            "loss diagnostics refuses malformed or out-of-order input: {} malformed, {} out of order",
+            audit_stream.malformed_lines, audit_stream.out_of_order_timestamps
+        )));
+    }
     let audit = audit.finish();
+    after_audit(&options.input)?;
+    let inventory_after_audit =
+        build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
+    let manifest_after_audit = validate_snapshot_manifest(&options.input, &inventory_after_audit)?;
+    if inventory_before != inventory_after_audit || snapshot_manifest != manifest_after_audit {
+        return Err(ResearchError::InvalidInput(
+            "immutable normalized snapshot changed while loss diagnostics was reading it"
+                .to_owned(),
+        ));
+    }
+
+    // Keep the full audit accumulator and lifecycle accumulator out of memory at
+    // the same time. Reference history dominates the audit pass while lifecycle
+    // payloads dominate the diagnostics pass on a full projected day.
+    let mut diagnostics = LossDiagnosticsAccumulator::default();
+    let stream =
+        stream_loss_diagnostic_events(&options.input, pinned_campaign_index.as_ref(), |event| {
+            diagnostics.observe(event)
+        })?;
     let inventory_after =
         build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
-    if inventory_before != inventory_after {
+    let manifest_after = validate_snapshot_manifest(&options.input, &inventory_after)?;
+    if inventory_after_audit != inventory_after || manifest_after_audit != manifest_after {
         return Err(ResearchError::InvalidInput(
             "immutable normalized snapshot changed while loss diagnostics was reading it"
                 .to_owned(),
@@ -1718,6 +1749,26 @@ pub fn run_loss_diagnostics(options: LossDiagnosticsOptions) -> Result<Value, Re
         let _ = sync_directory(parent);
     }
     Ok(report)
+}
+
+fn stream_loss_diagnostic_events<F>(
+    input: &Path,
+    pinned_campaign_index: Option<&projected_cache::ProjectedCampaignIndex>,
+    mut visitor: F,
+) -> Result<StreamStats, ResearchError>
+where
+    F: FnMut(&EventLine),
+{
+    match pinned_campaign_index {
+        Some(index) => stream_projected_campaign_events(
+            input,
+            index,
+            EventPathMode::PreferEventsJsonl,
+            &[],
+            &mut visitor,
+        ),
+        None => stream_events(input, EventPathMode::PreferEventsJsonl, &[], visitor),
+    }
 }
 
 fn validate_snapshot_manifest(
@@ -2594,6 +2645,37 @@ mod tests {
             .all(|row| row.get("markout_1s_status").is_some()));
         assert!(out.join(SUMMARY_FILE).is_file());
         assert!(out.join(MARKDOWN_FILE).is_file());
+
+        // Frozen from the exact one-pass parent 06a699d. This fixture exercises
+        // partial fills, a fill/cancel race, complete and missing markouts, and
+        // invalid/orphan lifecycle rows. The two-pass memory repair must not
+        // change any decision-relevant output.
+        let mut semantic_result = report["result"].clone();
+        semantic_result.as_object_mut().unwrap().remove("artifacts");
+        semantic_result
+            .as_object_mut()
+            .unwrap()
+            .remove("snapshot_identity");
+        let semantic = json!({
+            "config": report["config"],
+            "fill_model": report["fill_model"],
+            "split_method": report["split_method"],
+            "warnings": report["warnings"],
+            "data_window": report["data_window"],
+            "result": semantic_result
+        });
+        assert_eq!(
+            canonical_value_sha256(&semantic).as_deref(),
+            Some("sha256:1a14aece4447e736bd70799fdd204af16993eac1160b45aa912cc3258de8016f")
+        );
+        assert_eq!(
+            sha256_prefixed(&fs::read(out.join(ORDER_FACT_FILE)).unwrap()),
+            "sha256:f7a18308bbdc5b3623b828172a30b4bab62ec720be90697cd155ffe53f93f79d"
+        );
+        assert_eq!(
+            sha256_prefixed(&fs::read(out.join(FILL_FACT_FILE)).unwrap()),
+            "sha256:8b6a982527bae60e627d347c1989b16e77e9fac883432467d825a8622cb77ae1"
+        );
     }
 
     #[test]
@@ -4058,6 +4140,67 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn manifest_change_between_passes_fails_closed() {
+        let root = test_root("manifest-change-between-passes");
+        let input = root.join("input");
+        let out = root.join("out");
+        write_snapshot(&input, &[]);
+
+        let error = run_loss_diagnostics_with_after_audit(
+            LossDiagnosticsOptions {
+                input: input.clone(),
+                out: out.clone(),
+            },
+            |snapshot| {
+                let path = snapshot.join("events_manifest.json");
+                let mut manifest: Value =
+                    serde_json::from_slice(&fs::read(&path)?).map_err(ResearchError::Json)?;
+                manifest["test_mutation"] = json!(true);
+                fs::write(path, serde_json::to_vec(&manifest)?)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("immutable normalized snapshot changed"));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn pinned_campaign_index_is_not_reloaded_while_streaming() {
+        let root = test_root("pinned-campaign-index");
+        fs::write(
+            root.join(projected_cache::PROJECTED_CAMPAIGN_INDEX_FILE),
+            b"invalid",
+        )
+        .unwrap();
+        let pinned = projected_cache::ProjectedCampaignIndex {
+            schema_version: 1,
+            campaign_id: "campaign-test".to_owned(),
+            since: chrono::NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+            through: chrono::NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+            cutoff_exclusive: "2026-07-24T00:00:00Z".to_owned(),
+            source_policy: "test".to_owned(),
+            source_container: None,
+            canonical_sha256: format!("sha256:{}", "0".repeat(64)),
+            total_events: 0,
+            segments: Vec::new(),
+        };
+
+        let stream =
+            stream_loss_diagnostic_events(&root, Some(&pinned), |_| panic!("unexpected event"))
+                .unwrap();
+
+        assert_eq!(stream.events, 0);
+        assert!(stream
+            .notices
+            .iter()
+            .any(|notice| notice.contains("0 sealed day segment(s)")));
     }
 
     fn read_jsonl(path: &Path) -> Vec<Value> {

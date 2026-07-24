@@ -1,0 +1,9 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends time \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["/bin/sh", "/app/research/run_shadow_lossdiag_validation.sh"]
