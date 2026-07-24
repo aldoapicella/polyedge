@@ -234,7 +234,9 @@ jobs:
               expectedGitSha="$GITHUB_SHA" \
               expectedRawSourceInventorySha256="$RAW_INVENTORY_SHA" \
               expectedProjectedFilesetSha256="$PROJECTED_FILESET_SHA" \
-            --result-format FullResourcePayloads -o json > validation-what-if.json
+            --result-format FullResourcePayloads \
+            --no-pretty-print \
+            -o json > validation-what-if.json
           jq -e '
             [.changes[] |
               select(.changeType != "Ignore") |
