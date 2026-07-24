@@ -1557,27 +1557,72 @@ impl LossDiagnosticsAccumulator {
         batch: &BatchRecord,
     ) -> Result<(), ResearchError> {
         let input = &batch.input;
-        let feature_timestamps_valid = input.fair_value.computed_ts <= input.decision_ts
-            && input.reference.source_ts <= input.decision_ts
-            && input.reference.local_ts <= input.decision_ts
-            && input
-                .books
-                .values()
-                .all(|book| book.local_ts <= input.decision_ts)
-            && input
-                .regime_feature_input
-                .reference_history
-                .iter()
-                .all(|point| point.ts <= input.decision_ts);
-        if !feature_timestamps_valid
-            || input.decision_ts > batch.recorded_ts
-            || batch.recorded_ts > decision.recorded_ts
-            || decision.recorded_ts > application.recorded_ts
+        let violation = |field: &str, observed: DateTime<Utc>, required_lte: DateTime<Utc>| {
+            ResearchError::InvalidInput(format!(
+                    "loss diagnostics failed closed: chronology_violation={field} observed_ts={observed} required_lte={required_lte} for {}/{}",
+                    decision.parsed.key.batch_id, decision.parsed.key.output_index
+                ))
+        };
+        if input.fair_value.computed_ts > input.decision_ts {
+            return Err(violation(
+                "fair_value.computed_ts",
+                input.fair_value.computed_ts,
+                input.decision_ts,
+            ));
+        }
+        if input.reference.source_ts > input.decision_ts {
+            return Err(violation(
+                "reference.source_ts",
+                input.reference.source_ts,
+                input.decision_ts,
+            ));
+        }
+        if input.reference.local_ts > input.decision_ts {
+            return Err(violation(
+                "reference.local_ts",
+                input.reference.local_ts,
+                input.decision_ts,
+            ));
+        }
+        if let Some(book) = input
+            .books
+            .values()
+            .find(|book| book.local_ts > input.decision_ts)
         {
-            return Err(ResearchError::InvalidInput(format!(
-                "loss diagnostics failed closed: post-decision feature or invalid chronology for {}/{}",
-                decision.parsed.key.batch_id, decision.parsed.key.output_index
-            )));
+            return Err(violation("book.local_ts", book.local_ts, input.decision_ts));
+        }
+        if let Some(point) = input
+            .regime_feature_input
+            .reference_history
+            .iter()
+            .find(|point| point.ts > input.decision_ts)
+        {
+            return Err(violation(
+                "reference_history.ts",
+                point.ts,
+                input.decision_ts,
+            ));
+        }
+        if input.decision_ts > batch.recorded_ts {
+            return Err(violation(
+                "decision_ts",
+                input.decision_ts,
+                batch.recorded_ts,
+            ));
+        }
+        if batch.recorded_ts > decision.recorded_ts {
+            return Err(violation(
+                "batch.recorded_ts",
+                batch.recorded_ts,
+                decision.recorded_ts,
+            ));
+        }
+        if decision.recorded_ts > application.recorded_ts {
+            return Err(violation(
+                "decision.recorded_ts",
+                decision.recorded_ts,
+                application.recorded_ts,
+            ));
         }
         Ok(())
     }
@@ -3429,6 +3474,52 @@ mod tests {
             report["result"]["market_evidence"]["missing_start_market_ids"],
             json!(["market-1"])
         );
+    }
+
+    #[test]
+    fn pre_send_chronology_error_identifies_the_exact_failed_boundary() {
+        let decision_ts = test_ts("2026-07-20T12:00:00Z");
+        let mut input = super::super::tests::decision_pipeline_v3_input(decision_ts);
+        let (_, decisions) = super::super::tests::decision_pipeline_v4_evidence(&input);
+        let decision_payload = decisions
+            .into_iter()
+            .find(|decision| decision["action"] == "place")
+            .expect("fixture place decision");
+        let parsed_decision = durable_decision_output_v3(&decision_payload).unwrap();
+        let application_ts = decision_ts + Duration::milliseconds(2);
+        let application_payload =
+            applied_place(&decision_payload, "chronology-order", application_ts);
+        let parsed_application = applied_decision_output_v1(&application_payload).unwrap();
+        input.reference.source_ts = decision_ts + Duration::milliseconds(1);
+        let batch = BatchRecord {
+            recorded_ts: decision_ts,
+            event_sha256: "sha256:batch".to_owned(),
+            decision_config_sha256: "sha256:config".to_owned(),
+            input,
+            output_hashes: BTreeMap::new(),
+            place_output_hashes: BTreeMap::new(),
+            market_start_evidence_sha256: "sha256:start".to_owned(),
+        };
+        let decision = DecisionRecord {
+            parsed: parsed_decision,
+            recorded_ts: decision_ts + Duration::milliseconds(1),
+            event_sha256: "sha256:decision".to_owned(),
+            payload: decision_payload,
+        };
+        let application = ApplicationRecord {
+            parsed: parsed_application,
+            recorded_ts: application_ts,
+            payload: application_payload,
+        };
+
+        let error = LossDiagnosticsAccumulator::default()
+            .validate_pre_send_chronology(&decision, &application, &batch)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("chronology_violation=reference.source_ts"));
+        assert!(message.contains("observed_ts=2026-07-20 12:00:00.001 UTC"));
+        assert!(message.contains("required_lte=2026-07-20 12:00:00 UTC"));
+        assert!(message.contains(&decision.parsed.key.batch_id));
     }
 
     #[test]

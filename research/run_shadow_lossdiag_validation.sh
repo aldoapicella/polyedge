@@ -152,7 +152,15 @@ echo "polyedge_lossdiag_validation stage=loss-diagnostics status=starting"
 if ! /usr/bin/time -f '{"exit_status":%x,"elapsed_seconds":%e,"user_seconds":%U,"system_seconds":%S,"max_rss_kib":%M}' \
   -o "$TIME_JSON" \
   polyedge-rs research loss-diagnostics --input "$CUMULATIVE" --out "$LOSS_DIAGNOSTICS" >/dev/null; then
-  echo "polyedge_lossdiag_validation stage=loss-diagnostics status=failed" >&2
+  FAILURE_MAX_RSS_KIB=unknown
+  if [ -s "$TIME_JSON" ]; then
+    FAILURE_MAX_RSS_KIB="$(jq -r '.max_rss_kib // "unknown"' "$TIME_JSON" 2>/dev/null || echo unknown)"
+  fi
+  FAILURE_CGROUP_PEAK_BYTES=unavailable
+  if [ -r /sys/fs/cgroup/memory.peak ]; then
+    FAILURE_CGROUP_PEAK_BYTES="$(cat /sys/fs/cgroup/memory.peak)"
+  fi
+  echo "polyedge_lossdiag_validation stage=loss-diagnostics status=failed max_rss_kib=$FAILURE_MAX_RSS_KIB cgroup_peak_bytes=$FAILURE_CGROUP_PEAK_BYTES" >&2
   exit 1
 fi
 echo "polyedge_lossdiag_validation stage=loss-diagnostics status=completed"
