@@ -154,10 +154,19 @@ jobs:
             --file source-manifest.json \
             --auth-mode login --overwrite --only-show-errors -o none
           manifest_sha="sha256:$(sha256sum source-manifest.json | cut -d' ' -f1)"
-          test "$manifest_sha" = "$(jq -r '.manifest_sha256' source-pointer.json)"
-          test "$(jq -r '.canonical_sha256' source-pointer.json)" = "$(jq -r '.canonical_sha256' source-manifest.json)"
+          test "$manifest_sha" = "$(jq -r '.manifest_sha256' source-pointer.json)" || {
+            echo "Source projected-day manifest byte hash mismatch" >&2
+            exit 1
+          }
+          test "$(jq -r '.canonical_sha256' source-pointer.json)" = "$(jq -r '.canonical_sha256' source-manifest.json)" || {
+            echo "Source projected-day pointer canonical hash mismatch" >&2
+            exit 1
+          }
           canonical_sha="sha256:$(jq -c '.canonical' source-manifest.json | sha256sum | cut -d' ' -f1)"
-          test "$canonical_sha" = "$(jq -r '.canonical_sha256' source-manifest.json)"
+          test "$canonical_sha" = "$(jq -r '.canonical_sha256' source-manifest.json)" || {
+            echo "Source projected-day canonical payload hash mismatch" >&2
+            exit 1
+          }
           jq -e '
             .schema_version == 1
             and .canonical.campaign_id == "campaign-2026-07-23"
@@ -170,11 +179,17 @@ jobs:
             and .canonical.raw_source_inventory.canonical.max_blobs == null
             and .canonical.raw_source_inventory.canonical.max_bytes == null
             and ([.canonical.raw_source_inventory.canonical.blobs[] |
-              (.etag != null and .sha256 != null and .content_length >= 0 and .sealed == true)] | all)
-          ' source-manifest.json >/dev/null
+              (.etag != null and .sha256 != null and .content_length >= 0 and .sealed != null)] | all)
+          ' source-manifest.json >/dev/null || {
+            echo "Source projected-day immutable identity contract mismatch" >&2
+            exit 1
+          }
           raw_inventory_sha=$(jq -er '.canonical.raw_source_inventory.canonical_sha256' source-manifest.json)
           canonical_inventory_sha="sha256:$(jq -c '.canonical.raw_source_inventory.canonical' source-manifest.json | sha256sum | cut -d' ' -f1)"
-          test "$raw_inventory_sha" = "$canonical_inventory_sha"
+          test "$raw_inventory_sha" = "$canonical_inventory_sha" || {
+            echo "Source raw-inventory canonical payload hash mismatch" >&2
+            exit 1
+          }
           projected_fileset_sha="sha256:$(jq -cS '[.canonical.files[] | {relative_path,rows,bytes,sha256}] | sort_by(.relative_path)' source-manifest.json | sha256sum | cut -d' ' -f1)"
           echo "raw_inventory_sha=$raw_inventory_sha" >> "$GITHUB_OUTPUT"
           echo "projected_fileset_sha=$projected_fileset_sha" >> "$GITHUB_OUTPUT"

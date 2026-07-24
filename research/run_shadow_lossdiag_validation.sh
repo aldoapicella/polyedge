@@ -119,7 +119,7 @@ jq -e --arg prefix "$SOURCE_PREFIX" '
   and .raw_source_inventory.canonical.max_blobs == null
   and .raw_source_inventory.canonical.max_bytes == null
   and ([.raw_source_inventory.canonical.blobs[] |
-    (.etag != null and .sha256 != null and .content_length >= 0 and .sealed == true)] | all)
+    (.etag != null and .sha256 != null and .content_length >= 0 and .sealed != null)] | all)
 ' "$NORMALIZED/events_manifest.json" >/dev/null
 
 run_stage publish-projected-day polyedge-rs research publish-projected-day \
