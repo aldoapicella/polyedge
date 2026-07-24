@@ -30,7 +30,7 @@ param validationContainerName string = 'polyedge-research-validation'
 param validationIdentityName string = 'polyedge-shadow-validation-neu-id'
 param validationJobName string = 'polyedge-shadow-val-neu-job'
 
-var validationId = 'campaign-2026-07-23-lossdiag-v3'
+var validationId = 'campaign-2026-07-23-lossdiag-v4'
 var validationLeaseBlob = 'data/research/shadow/${validationId}/control/validation.lock'
 var blobDataReaderRoleId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
@@ -200,7 +200,7 @@ resource validationJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'EXPECTED_GIT_SHA', value: expectedGitSha }
             { name: 'EXPECTED_RAW_SOURCE_INVENTORY_SHA256', value: expectedRawSourceInventorySha256 }
             { name: 'SOURCE_PROJECTED_FILESET_SHA256', value: sourceProjectedFilesetSha256 }
-            { name: 'LOSSDIAG_VALIDATION_CONFIG', value: '/app/research/configs/shadow_lossdiag_validation_2026-07-23_v3.json' }
+            { name: 'LOSSDIAG_VALIDATION_CONFIG', value: '/app/research/configs/shadow_lossdiag_validation_2026-07-23_v4.json' }
           ]
           resources: {
             cpu: json('4')

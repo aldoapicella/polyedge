@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-CONFIG="${LOSSDIAG_VALIDATION_CONFIG:-/app/research/configs/shadow_lossdiag_validation_2026-07-23_v3.json}"
+CONFIG="${LOSSDIAG_VALIDATION_CONFIG:-/app/research/configs/shadow_lossdiag_validation_2026-07-23_v4.json}"
 test -f "$CONFIG"
 jq -e '
   .schema == "polyedge.shadow_lossdiag_validation.v1"
   and .schema_version == 1
-  and .validation_id == "campaign-2026-07-23-lossdiag-v3"
+  and .validation_id == "campaign-2026-07-23-lossdiag-v4"
   and .promotion_eligible == false
   and .counts_toward_protocol_v3_evidence == false
   and .date == "2026-07-23"
@@ -15,11 +15,11 @@ jq -e '
   and .source.campaign_id == "campaign-2026-07-23"
   and .source.prefix == "shadow-events/campaign-2026-07-23/2026/07/23/"
   and .output.container == "polyedge-research-validation"
-  and (.output.work_root | contains("campaign-2026-07-23-lossdiag-v3"))
-  and (.output.projected_cache_root | contains("campaign-2026-07-23-lossdiag-v3"))
-  and (.output.report_root | contains("campaign-2026-07-23-lossdiag-v3"))
-  and (.output.correction_root | contains("campaign-2026-07-23-lossdiag-v3"))
-  and (.output.lease_blob | contains("campaign-2026-07-23-lossdiag-v3"))
+  and (.output.work_root | contains("campaign-2026-07-23-lossdiag-v4"))
+  and (.output.projected_cache_root | contains("campaign-2026-07-23-lossdiag-v4"))
+  and (.output.report_root | contains("campaign-2026-07-23-lossdiag-v4"))
+  and (.output.correction_root | contains("campaign-2026-07-23-lossdiag-v4"))
+  and (.output.lease_blob | contains("campaign-2026-07-23-lossdiag-v4"))
   and .limits.cpu == 4
   and .limits.memory == "8Gi"
   and .limits.max_loss_diagnostics_rss_kib == 6815744
@@ -92,7 +92,7 @@ run_stage begin-correction polyedge-rs research begin-shadow-correction \
   --correction-id "$RUN_ID" \
   --from "$DATE" \
   --through "$DATE" \
-  --reason "isolated loss-diagnostics v3 timestamp-precision, memory, and semantic validation; promotion ineligible" \
+  --reason "isolated loss-diagnostics v4 post-check, timestamp-precision, memory, and semantic validation; promotion ineligible" \
   --out "$CORRECTION_ROOT/active.json"
 run_stage raw-audit polyedge-rs research audit \
   --input "$INPUT" \
@@ -169,12 +169,21 @@ fi
 echo "polyedge_lossdiag_validation stage=loss-diagnostics status=completed"
 
 MAX_RSS_ACTUAL="$(jq -r '.max_rss_kib' "$TIME_JSON")"
-test "$MAX_RSS_ACTUAL" -le "$MAX_RSS_KIB"
 CGROUP_PEAK_BYTES=null
 CGROUP_PEAK_AVAILABLE=false
 if [ -r /sys/fs/cgroup/memory.peak ]; then
   CGROUP_PEAK_BYTES="$(cat /sys/fs/cgroup/memory.peak)"
   CGROUP_PEAK_AVAILABLE=true
+fi
+LOSS_STATUS="$(jq -r '.result.status // "missing"' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+DUPLICATE_EVENT_LINES="$(jq -r '.result.counts.duplicate_event_lines // "missing"' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+NO_EXACT_DUPLICATES="$(jq -r '.result.completion_checks.no_exact_duplicate_event_lines // "missing"' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+STABLE_SNAPSHOT="$(jq -r '.result.snapshot_identity.stable_before_after_read // "missing"' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+QUEUE_POSITION_FIELD="$(jq -r '.result.queue_position_field // "missing"' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+LITERAL_FIFO_AVAILABLE="$(jq -r 'if .result.literal_fifo_rank_available == null then "missing" else (.result.literal_fifo_rank_available | tostring) end' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+echo "polyedge_lossdiag_validation postcheck max_rss_kib=$MAX_RSS_ACTUAL max_rss_limit_kib=$MAX_RSS_KIB cgroup_peak_available=$CGROUP_PEAK_AVAILABLE cgroup_peak_bytes=$CGROUP_PEAK_BYTES cgroup_peak_limit_bytes=$MAX_CONTAINER_PEAK_BYTES result_status=$LOSS_STATUS duplicate_event_lines=$DUPLICATE_EVENT_LINES no_exact_duplicates=$NO_EXACT_DUPLICATES stable_snapshot=$STABLE_SNAPSHOT queue_position_field=$QUEUE_POSITION_FIELD literal_fifo_available=$LITERAL_FIFO_AVAILABLE"
+test "$MAX_RSS_ACTUAL" -le "$MAX_RSS_KIB"
+if [ "$CGROUP_PEAK_AVAILABLE" = "true" ]; then
   test "$CGROUP_PEAK_BYTES" -le "$MAX_CONTAINER_PEAK_BYTES"
 fi
 jq -e '
