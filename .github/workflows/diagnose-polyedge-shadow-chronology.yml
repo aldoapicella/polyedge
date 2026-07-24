@@ -1,0 +1,356 @@
+name: Diagnose PolyEdge shadow chronology
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type campaign-2026-07-23-lossdiag-v2-read-only
+        required: true
+        type: string
+      batch_id:
+        description: Exact failed strategy batch
+        required: true
+        type: string
+      output_index:
+        description: Exact failed output index
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
+  VALIDATION_CONTAINER: polyedge-research-validation
+  CACHE_ROOT: data/research/shadow/campaign-2026-07-23-lossdiag-v2/projected-cache
+  DATE: 2026-07-23
+  SOURCE_CAMPAIGN_ID: campaign-2026-07-23
+  EXPECTED_RAW_SOURCE_INVENTORY_SHA256: sha256:f74a9e80b5d7178ab811e9b7d3822985e334823917f43a0cccdcb15c2026a565
+  EXPECTED_PROJECTED_FILESET_SHA256: sha256:241d55a187c89139ec385efe64728c9c8e49691fee93ac789c32bc2e40dd1b2a
+  REQUIRED_REPAIR_SHA: d8be68c2c5b46b9ba0cfbc283e0061da022355e1
+  REPAIR_PARENT_SHA: 06a699dbebef5765fe29e3a16dce909d5148fd26
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm fixed read-only scope
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          BATCH_ID: ${{ inputs.batch_id }}
+          OUTPUT_INDEX: ${{ inputs.output_index }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "campaign-2026-07-23-lossdiag-v2-read-only"
+          test "$BATCH_ID" = "strategy-batch-019b2df9e8220ff60a3b9860cf8fab00660d737b93649909b8732c16d6284b68"
+          test "$OUTPUT_INDEX" = "0"
+          git merge-base --is-ancestor "$REQUIRED_REPAIR_SHA" HEAD
+          while IFS= read -r path; do
+            case "$path" in
+              .github/workflows/diagnose-polyedge-shadow-chronology.yml|\
+              .github/workflows/validate-polyedge-shadow-lossdiag.yml|\
+              Dockerfile.research-validation|\
+              crates/polyedge-reporting/src/research/loss_diagnostics.rs|\
+              infra/shadow-lossdiag-validation.bicep|\
+              research/configs/shadow_lossdiag_validation_2026-07-23_v2.json|\
+              research/run_shadow_lossdiag_validation.sh|\
+              research/test_shadow_lossdiag_validation.sh) ;;
+              *)
+                echo "Diagnostic revision contains an out-of-scope change: $path" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git diff --name-only "$REPAIR_PARENT_SHA"...HEAD)
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download only hash-bound isolated cache files
+        id: source
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          pointer_blob="$CACHE_ROOT/days/$DATE/latest.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$VALIDATION_CONTAINER" \
+            --name "$pointer_blob" \
+            --file diagnostic/pointer-before.json \
+            --auth-mode login \
+            --overwrite true \
+            --only-show-errors
+          pointer_before_sha="sha256:$(sha256sum diagnostic/pointer-before.json | cut -d' ' -f1)"
+          jq -e --arg date "$DATE" '
+            .schema_version == 2
+            and .date == $date
+            and (.canonical_sha256 | test("^sha256:[0-9a-f]{64}$"))
+            and (.manifest_sha256 | test("^sha256:[0-9a-f]{64}$"))
+            and (.manifest_path | startswith("days/" + $date + "/runs/"))
+            and (.manifest_path | endswith("/manifest.json"))
+            and (.manifest_path | contains("..") | not)
+          ' diagnostic/pointer-before.json >/dev/null
+
+          manifest_relative="$(jq -r '.manifest_path' diagnostic/pointer-before.json)"
+          manifest_blob="$CACHE_ROOT/$manifest_relative"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$VALIDATION_CONTAINER" \
+            --name "$manifest_blob" \
+            --file diagnostic/manifest.json \
+            --auth-mode login \
+            --overwrite true \
+            --only-show-errors
+          test "sha256:$(sha256sum diagnostic/manifest.json | cut -d' ' -f1)" = \
+            "$(jq -r '.manifest_sha256' diagnostic/pointer-before.json)"
+          jq -e \
+            --slurpfile pointer diagnostic/pointer-before.json \
+            --arg date "$DATE" \
+            --arg campaign "$SOURCE_CAMPAIGN_ID" \
+            --arg inventory "$EXPECTED_RAW_SOURCE_INVENTORY_SHA256" '
+            .schema_version == 2
+            and .canonical.schema_version == 2
+            and .canonical.domain == "polyedge.projected-day-cache.v2"
+            and .canonical.date == $date
+            and .canonical.campaign_id == $campaign
+            and .canonical.decision_grade_projection == true
+            and .canonical.raw_source_inventory.canonical_sha256 == $inventory
+            and .canonical.raw_source_inventory.canonical.source_kind == "azure_blob"
+            and .canonical.raw_source_inventory.canonical.account == "stpolyedge6urdjr5nmwx7w"
+            and .canonical.raw_source_inventory.canonical.container == "polyedge-shadow-events"
+            and .canonical.raw_source_inventory.canonical.prefix == "shadow-events/campaign-2026-07-23/2026/07/23/"
+            and .canonical.raw_source_inventory.canonical.exhaustive_listing == true
+            and .canonical.raw_source_inventory.canonical.max_blobs == null
+            and .canonical.raw_source_inventory.canonical.max_bytes == null
+            and .canonical_sha256 == $pointer[0].canonical_sha256
+          ' diagnostic/manifest.json >/dev/null
+          fileset_sha="sha256:$(jq -cS \
+            '[.canonical.files[] | {relative_path,rows,bytes,sha256}] | sort_by(.relative_path)' \
+            diagnostic/manifest.json | sha256sum | cut -d' ' -f1)"
+          test "$fileset_sha" = "$EXPECTED_PROJECTED_FILESET_SHA256"
+
+          run_prefix="${manifest_relative%manifest.json}"
+          for logical_name in other decision; do
+            binding="$(jq -c --arg logical "$logical_name" \
+              '.canonical.files[] | select(.logical_name == $logical)' \
+              diagnostic/manifest.json)"
+            test -n "$binding"
+            relative_path="$(jq -r '.relative_path' <<<"$binding")"
+            case "$relative_path" in
+              *.jsonl.gz) ;;
+              *) echo "Unexpected projected shard path: $relative_path" >&2; exit 1 ;;
+            esac
+            case "$relative_path" in
+              */*|*".."*) echo "Unsafe projected shard path: $relative_path" >&2; exit 1 ;;
+            esac
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$VALIDATION_CONTAINER" \
+              --name "$CACHE_ROOT/$run_prefix$relative_path" \
+              --file "diagnostic/$relative_path" \
+              --auth-mode login \
+              --overwrite true \
+              --only-show-errors
+            test "$(wc -c <"diagnostic/$relative_path")" = "$(jq -r '.bytes' <<<"$binding")"
+            test "sha256:$(sha256sum "diagnostic/$relative_path" | cut -d' ' -f1)" = \
+              "$(jq -r '.sha256' <<<"$binding")"
+            gzip -t "diagnostic/$relative_path"
+          done
+
+          echo "pointer_before_sha=$pointer_before_sha" >> "$GITHUB_OUTPUT"
+          echo "manifest_sha=$(jq -r '.manifest_sha256' diagnostic/pointer-before.json)" >> "$GITHUB_OUTPUT"
+          echo "fileset_sha=$fileset_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Extract scalar chronology evidence
+        env:
+          BATCH_ID: ${{ inputs.batch_id }}
+          OUTPUT_INDEX: ${{ inputs.output_index }}
+        run: |
+          set -euo pipefail
+          gzip -cd diagnostic/other.jsonl.gz |
+            jq -c --arg batch "$BATCH_ID" '
+              select(
+                .event_type == "strategy_decision_batch"
+                and .raw_payload.batch_id == $batch
+              )
+            ' > diagnostic/batch.jsonl
+          gzip -cd diagnostic/decisions.jsonl.gz |
+            jq -c --arg batch "$BATCH_ID" --argjson index "$OUTPUT_INDEX" '
+              select(
+                .event_type == "decision"
+                and .raw_payload.strategy_batch_id == $batch
+                and .raw_payload.strategy_batch_output_index == $index
+              )
+            ' > diagnostic/decision.jsonl
+          gzip -cd diagnostic/other.jsonl.gz |
+            jq -c --arg batch "$BATCH_ID" --argjson index "$OUTPUT_INDEX" '
+              select(
+                .event_type == "paper_decision_output_applied"
+                and .raw_payload.strategy_batch_id == $batch
+                and .raw_payload.strategy_batch_output_index == $index
+              )
+            ' > diagnostic/application.jsonl
+          test "$(wc -l < diagnostic/batch.jsonl)" = "1"
+          test "$(wc -l < diagnostic/decision.jsonl)" = "1"
+          test "$(wc -l < diagnostic/application.jsonl)" = "1"
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          from datetime import datetime
+          from decimal import Decimal
+          from pathlib import Path
+
+          root = Path("diagnostic")
+          batch = json.loads((root / "batch.jsonl").read_text())
+          decision = json.loads((root / "decision.jsonl").read_text())
+          application = json.loads((root / "application.jsonl").read_text())
+          pipeline = batch["raw_payload"]["pipeline_input"]
+          decision_ts = pipeline["decision_ts"]
+
+          def instant_ns(value):
+              match = re.fullmatch(
+                  r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})",
+                  value,
+              )
+              if not match:
+                  raise ValueError(f"invalid RFC3339 timestamp: {value}")
+              zone = "+00:00" if match.group(3) == "Z" else match.group(3)
+              seconds = int(datetime.fromisoformat(match.group(1) + zone).timestamp())
+              nanoseconds = int((match.group(2) or "").ljust(9, "0"))
+              return seconds * 1_000_000_000 + nanoseconds
+
+          def comparison(field, observed, required_lte):
+              if observed is None:
+                  return {
+                      "field": field,
+                      "observed_ts": None,
+                      "required_lte": required_lte,
+                      "delta_ns": None,
+                      "delta_ms": None,
+                      "valid": True,
+                  }
+              delta_ns = instant_ns(observed) - instant_ns(required_lte)
+              return {
+                  "field": field,
+                  "observed_ts": observed,
+                  "required_lte": required_lte,
+                  "delta_ns": delta_ns,
+                  "delta_ms": str(Decimal(delta_ns) / Decimal(1_000_000)),
+                  "valid": delta_ns <= 0,
+              }
+
+          book_times = [
+              value["local_ts"]
+              for value in pipeline.get("books", {}).values()
+              if value.get("local_ts")
+          ]
+          history_times = [
+              point["ts"]
+              for point in pipeline["regime_feature_input"].get("reference_history", [])
+              if point.get("ts")
+          ]
+          max_book_time = max(book_times, key=instant_ns, default=None)
+          max_history_time = max(history_times, key=instant_ns, default=None)
+          comparisons = [
+              comparison("fair_value.computed_ts", pipeline["fair_value"]["computed_ts"], decision_ts),
+              comparison("reference.source_ts", pipeline["reference"]["source_ts"], decision_ts),
+              comparison("reference.local_ts", pipeline["reference"]["local_ts"], decision_ts),
+              comparison("book.local_ts.max", max_book_time, decision_ts),
+              comparison("reference_history.ts.max", max_history_time, decision_ts),
+              comparison("decision_ts", decision_ts, batch["recorded_ts"]),
+              comparison("batch.recorded_ts", batch["recorded_ts"], decision["recorded_ts"]),
+              comparison("decision.recorded_ts", decision["recorded_ts"], application["recorded_ts"]),
+          ]
+          result = {
+              "schema": "polyedge.shadow_chronology_diagnostic.v1",
+              "source": {
+                  "container": "polyedge-research-validation",
+                  "date": "2026-07-23",
+                  "raw_source_inventory_sha256": "sha256:f74a9e80b5d7178ab811e9b7d3822985e334823917f43a0cccdcb15c2026a565",
+                  "projected_fileset_sha256": "sha256:241d55a187c89139ec385efe64728c9c8e49691fee93ac789c32bc2e40dd1b2a",
+              },
+              "batch_id": batch["raw_payload"]["batch_id"],
+              "output_index": decision["raw_payload"]["strategy_batch_output_index"],
+              "comparisons": comparisons,
+              "future_reference_history_points": [
+                  value
+                  for value in sorted(history_times, key=instant_ns)
+                  if instant_ns(value) > instant_ns(decision_ts)
+              ],
+              "invalid_fields": [value["field"] for value in comparisons if not value["valid"]],
+          }
+          if not result["invalid_fields"]:
+              raise SystemExit("expected at least one failed chronology comparison")
+          encoded = json.dumps(result, indent=2, sort_keys=True).encode() + b"\n"
+          (root / "chronology-diagnostic.json").write_bytes(encoded)
+          (root / "chronology-diagnostic.sha256").write_text(
+              "sha256:" + hashlib.sha256(encoded).hexdigest() + "\n"
+          )
+          PY
+          jq -e '
+            .schema == "polyedge.shadow_chronology_diagnostic.v1"
+            and .batch_id == "strategy-batch-019b2df9e8220ff60a3b9860cf8fab00660d737b93649909b8732c16d6284b68"
+            and .output_index == 0
+            and (.comparisons | length) == 8
+            and (.invalid_fields | length) >= 1
+          ' diagnostic/chronology-diagnostic.json >/dev/null
+          jq '{batch_id,output_index,comparisons,future_reference_history_points,invalid_fields}' \
+            diagnostic/chronology-diagnostic.json
+
+      - name: Prove isolated cache did not change
+        env:
+          POINTER_BEFORE_SHA: ${{ steps.source.outputs.pointer_before_sha }}
+        run: |
+          set -euo pipefail
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$VALIDATION_CONTAINER" \
+            --name "$CACHE_ROOT/days/$DATE/latest.json" \
+            --file diagnostic/pointer-after.json \
+            --auth-mode login \
+            --overwrite true \
+            --only-show-errors
+          test "sha256:$(sha256sum diagnostic/pointer-after.json | cut -d' ' -f1)" = \
+            "$POINTER_BEFORE_SHA"
+          cmp diagnostic/pointer-before.json diagnostic/pointer-after.json
+
+      - name: Upload scalar diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: polyedge-shadow-chronology-diagnostic
+          path: |
+            diagnostic/chronology-diagnostic.json
+            diagnostic/chronology-diagnostic.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish diagnostic summary
+        env:
+          MANIFEST_SHA: ${{ steps.source.outputs.manifest_sha }}
+          FILESET_SHA: ${{ steps.source.outputs.fileset_sha }}
+        run: |
+          {
+            echo "## Read-only July 23 chronology diagnostic"
+            echo
+            echo "- Manifest: \`$MANIFEST_SHA\`"
+            echo "- Projected fileset: \`$FILESET_SHA\`"
+            echo "- Diagnostic: \`$(cat diagnostic/chronology-diagnostic.sha256)\`"
+            echo "- Invalid fields: \`$(jq -c '.invalid_fields' diagnostic/chronology-diagnostic.json)\`"
+            echo "- Azure writes: **none**"
+            echo "- Canonical campaign writes: **none**"
+            echo "- Funded execution: **not present**"
+          } >> "$GITHUB_STEP_SUMMARY"
