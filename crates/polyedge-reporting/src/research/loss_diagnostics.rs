@@ -1619,21 +1619,44 @@ pub fn run_loss_diagnostics(options: LossDiagnosticsOptions) -> Result<Value, Re
     let inventory_before =
         build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
     let snapshot_manifest = validate_snapshot_manifest(&options.input, &inventory_before)?;
-    let mut diagnostics = LossDiagnosticsAccumulator::default();
     let mut audit = AuditAccumulator::default();
-    let stream = stream_events(
+    let audit_stream = stream_events(
         &options.input,
         EventPathMode::PreferEventsJsonl,
         &[],
         |event| {
             audit.observe(event);
-            diagnostics.observe(event);
         },
     )?;
+    if audit_stream.malformed_lines > 0 || audit_stream.out_of_order_timestamps > 0 {
+        return Err(ResearchError::InvalidInput(format!(
+            "loss diagnostics refuses malformed or out-of-order input: {} malformed, {} out of order",
+            audit_stream.malformed_lines, audit_stream.out_of_order_timestamps
+        )));
+    }
     let audit = audit.finish();
+    let inventory_after_audit =
+        build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
+    if inventory_before != inventory_after_audit {
+        return Err(ResearchError::InvalidInput(
+            "immutable normalized snapshot changed while loss diagnostics was reading it"
+                .to_owned(),
+        ));
+    }
+
+    // Keep the full audit accumulator and lifecycle accumulator out of memory at
+    // the same time. Reference history dominates the audit pass while lifecycle
+    // payloads dominate the diagnostics pass on a full projected day.
+    let mut diagnostics = LossDiagnosticsAccumulator::default();
+    let stream = stream_events(
+        &options.input,
+        EventPathMode::PreferEventsJsonl,
+        &[],
+        |event| diagnostics.observe(event),
+    )?;
     let inventory_after =
         build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
-    if inventory_before != inventory_after {
+    if inventory_after_audit != inventory_after {
         return Err(ResearchError::InvalidInput(
             "immutable normalized snapshot changed while loss diagnostics was reading it"
                 .to_owned(),
