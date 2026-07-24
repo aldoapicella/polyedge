@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-CONFIG="${LOSSDIAG_VALIDATION_CONFIG:-/app/research/configs/shadow_lossdiag_validation_2026-07-23_v5.json}"
+CONFIG="${LOSSDIAG_VALIDATION_CONFIG:-/app/research/configs/shadow_lossdiag_validation_2026-07-23_v6.json}"
 test -f "$CONFIG"
 jq -e '
   .schema == "polyedge.shadow_lossdiag_validation.v1"
   and .schema_version == 1
-  and .validation_id == "campaign-2026-07-23-lossdiag-v5"
+  and .validation_id == "campaign-2026-07-23-lossdiag-v6"
   and .promotion_eligible == false
   and .counts_toward_protocol_v3_evidence == false
   and .date == "2026-07-23"
@@ -15,11 +15,11 @@ jq -e '
   and .source.campaign_id == "campaign-2026-07-23"
   and .source.prefix == "shadow-events/campaign-2026-07-23/2026/07/23/"
   and .output.container == "polyedge-research-validation"
-  and (.output.work_root | contains("campaign-2026-07-23-lossdiag-v5"))
-  and (.output.projected_cache_root | contains("campaign-2026-07-23-lossdiag-v5"))
-  and (.output.report_root | contains("campaign-2026-07-23-lossdiag-v5"))
-  and (.output.correction_root | contains("campaign-2026-07-23-lossdiag-v5"))
-  and (.output.lease_blob | contains("campaign-2026-07-23-lossdiag-v5"))
+  and (.output.work_root | contains("campaign-2026-07-23-lossdiag-v6"))
+  and (.output.projected_cache_root | contains("campaign-2026-07-23-lossdiag-v6"))
+  and (.output.report_root | contains("campaign-2026-07-23-lossdiag-v6"))
+  and (.output.correction_root | contains("campaign-2026-07-23-lossdiag-v6"))
+  and (.output.lease_blob | contains("campaign-2026-07-23-lossdiag-v6"))
   and .limits.cpu == 4
   and .limits.memory == "8Gi"
   and .limits.max_loss_diagnostics_rss_kib == 6815744
@@ -92,7 +92,7 @@ run_stage begin-correction polyedge-rs research begin-shadow-correction \
   --correction-id "$RUN_ID" \
   --from "$DATE" \
   --through "$DATE" \
-  --reason "isolated loss-diagnostics v5 eligibility-detail, timestamp-precision, memory, and semantic validation; promotion ineligible" \
+  --reason "isolated loss-diagnostics v6 coverage-gap trace, timestamp-precision, memory, and semantic validation; promotion ineligible" \
   --out "$CORRECTION_ROOT/active.json"
 run_stage raw-audit polyedge-rs research audit \
   --input "$INPUT" \
@@ -191,6 +191,32 @@ ELIGIBILITY_DETAILS="$(jq -cS '.result | {
   coverage
 }' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
 echo "polyedge_lossdiag_validation eligibility_details=$ELIGIBILITY_DETAILS"
+MISSING_SETTLEMENTS="$(jq -cS '.result.market_evidence.missing_terminal_settlement_market_ids // []' "$LOSS_DIAGNOSTICS/loss_diagnostics.json")"
+MISSING_QUEUE_ORDERS="$(jq -csS '[.[] | select(
+  .queue_registration_event_sha256 == null
+  or .queue_snapshot_event_sha256 == null
+  or .inferred_size_ahead == null
+) | {
+  application_id,
+  strategy_batch_id,
+  strategy_batch_output_index,
+  market_id,
+  queue_registration_present: (.queue_registration_event_sha256 != null),
+  queue_snapshot_present: (.queue_snapshot_event_sha256 != null),
+  inferred_size_ahead_present: (.inferred_size_ahead != null),
+  execution_report_count: (.execution_report_event_sha256s | length),
+  fill_count,
+  no_fill,
+  partial_fill,
+  full_fill,
+  cancelled,
+  cancel_state
+}]' "$LOSS_DIAGNOSTICS/order_lifecycle_fact.jsonl")"
+COVERAGE_GAP_DETAILS="$(jq -cnS \
+  --argjson missing_settlements "$MISSING_SETTLEMENTS" \
+  --argjson missing_queue_orders "$MISSING_QUEUE_ORDERS" \
+  '{missing_terminal_settlement_market_ids:$missing_settlements,missing_queue_orders:$missing_queue_orders}')"
+echo "polyedge_lossdiag_validation coverage_gap_details=$COVERAGE_GAP_DETAILS"
 test "$MAX_RSS_ACTUAL" -le "$MAX_RSS_KIB"
 if [ "$CGROUP_PEAK_AVAILABLE" = "true" ]; then
   test "$CGROUP_PEAK_BYTES" -le "$MAX_CONTAINER_PEAK_BYTES"

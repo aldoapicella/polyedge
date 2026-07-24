@@ -150,7 +150,7 @@ chmod +x "$TMP/bin/polyedge-rs"
   POLYEDGE_TEST_ARGS="$TMP/args" \
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
-  POLYEDGE_CAMPAIGN_LEASE_BLOB=data/research/shadow/campaign-2026-07-23-lossdiag-v5/control/validation.lock \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=data/research/shadow/campaign-2026-07-23-lossdiag-v6/control/validation.lock \
   EXECUTION_MODE=paper \
   ALLOW_LIVE=false \
   RUN_BOT_ON_STARTUP=false \
@@ -162,15 +162,15 @@ chmod +x "$TMP/bin/polyedge-rs"
   GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   EXPECTED_RAW_SOURCE_INVENTORY_SHA256="$RAW_SHA" \
   SOURCE_PROJECTED_FILESET_SHA256="$SOURCE_PROJECTED_FILESET_SHA" \
-  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v5.json" \
+  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v6.json" \
   sh "$REPO/research/run_shadow_lossdiag_validation.sh" >"$TMP/stdout"
 )
 
 grep -F 'research audit --input azure://stpolyedge6urdjr5nmwx7w/polyedge-shadow-events/shadow-events/campaign-2026-07-23/2026/07/23/?prefetch_blobs=16' "$TMP/args" >/dev/null
-grep -F -- '--cache-root azure://stpolyedge6urdjr5nmwx7w/polyedge-research-validation/data/research/shadow/campaign-2026-07-23-lossdiag-v5/projected-cache' "$TMP/args" >/dev/null
-grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-23-lossdiag-v5/cumulative/2026-07-23/normalized' "$TMP/args" >/dev/null
+grep -F -- '--cache-root azure://stpolyedge6urdjr5nmwx7w/polyedge-research-validation/data/research/shadow/campaign-2026-07-23-lossdiag-v6/projected-cache' "$TMP/args" >/dev/null
+grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-23-lossdiag-v6/cumulative/2026-07-23/normalized' "$TMP/args" >/dev/null
 grep -F 'research publish-daily-bundle ' "$TMP/args" |
-  grep -F -- '--output-root reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v5/daily' >/dev/null
+  grep -F -- '--output-root reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v6/daily' >/dev/null
 if grep -E '^research (validate-prospective|evaluate-profitability|loss-regime-oos|venue-model|funded|canary|probe|redeem|promotion)' "$TMP/args" >/dev/null; then
   echo "isolated loss-diagnostics validation invoked a forbidden command" >&2
   exit 1
@@ -179,8 +179,9 @@ grep -F 'polyedge_lossdiag_validation postcheck ' "$TMP/stdout" |
   grep -F 'result_status=complete_diagnostic duplicate_event_lines=0 no_exact_duplicates=true stable_snapshot=true queue_position_field=inferred_size_ahead literal_fifo_available=false' >/dev/null
 grep -F 'polyedge_lossdiag_validation eligibility_details=' "$TMP/stdout" |
   grep -F '"completion_checks":{"no_exact_duplicate_event_lines":true}' >/dev/null
-grep -F 'polyedge_lossdiag_validation status=succeeded validation_id=campaign-2026-07-23-lossdiag-v5' "$TMP/stdout" >/dev/null
-METRICS="$(find "$TMP/work/reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v5" \
+grep -F 'polyedge_lossdiag_validation coverage_gap_details={"missing_queue_orders":[],"missing_terminal_settlement_market_ids":[]}' "$TMP/stdout" >/dev/null
+grep -F 'polyedge_lossdiag_validation status=succeeded validation_id=campaign-2026-07-23-lossdiag-v6' "$TMP/stdout" >/dev/null
+METRICS="$(find "$TMP/work/reports/research/shadow/validations/campaign-2026-07-23-lossdiag-v6" \
   -type f -name loss_diagnostics_metrics.json -print -quit)"
 test -n "$METRICS"
 jq -e \
@@ -200,7 +201,7 @@ if (
   POLYEDGE_TEST_LOSS_STATUS=incomplete_diagnostic \
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
-  POLYEDGE_CAMPAIGN_LEASE_BLOB=data/research/shadow/campaign-2026-07-23-lossdiag-v5/control/validation.lock \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=data/research/shadow/campaign-2026-07-23-lossdiag-v6/control/validation.lock \
   EXECUTION_MODE=paper \
   ALLOW_LIVE=false \
   RUN_BOT_ON_STARTUP=false \
@@ -212,7 +213,7 @@ if (
   GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   EXPECTED_RAW_SOURCE_INVENTORY_SHA256="$RAW_SHA" \
   SOURCE_PROJECTED_FILESET_SHA256="$SOURCE_PROJECTED_FILESET_SHA" \
-  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v5.json" \
+  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v6.json" \
   sh "$REPO/research/run_shadow_lossdiag_validation.sh" >"$TMP/postcheck-failure-stdout" 2>&1
 ); then
   echo "isolated validation accepted an incomplete loss-diagnostics result" >&2
@@ -222,6 +223,7 @@ grep -F 'polyedge_lossdiag_validation postcheck ' "$TMP/postcheck-failure-stdout
   grep -F 'result_status=incomplete_diagnostic' >/dev/null
 grep -F 'polyedge_lossdiag_validation eligibility_details=' "$TMP/postcheck-failure-stdout" |
   grep -F '"status":"incomplete_diagnostic"' >/dev/null
+grep -F 'polyedge_lossdiag_validation coverage_gap_details=' "$TMP/postcheck-failure-stdout" >/dev/null
 
 if (
   cd "$TMP/work"
@@ -240,7 +242,7 @@ if (
   GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   EXPECTED_RAW_SOURCE_INVENTORY_SHA256="$RAW_SHA" \
   SOURCE_PROJECTED_FILESET_SHA256="$SOURCE_PROJECTED_FILESET_SHA" \
-  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v5.json" \
+  LOSSDIAG_VALIDATION_CONFIG="$REPO/research/configs/shadow_lossdiag_validation_2026-07-23_v6.json" \
   sh "$REPO/research/run_shadow_lossdiag_validation.sh" >/dev/null 2>&1
 ); then
   echo "isolated validation accepted the canonical campaign lease" >&2

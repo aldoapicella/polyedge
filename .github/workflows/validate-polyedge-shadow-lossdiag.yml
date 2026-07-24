@@ -1,10 +1,10 @@
-name: Validate PolyEdge shadow loss diagnostics v5
+name: Validate PolyEdge shadow loss diagnostics v6
 
 on:
   workflow_dispatch:
     inputs:
       confirmation:
-        description: Type campaign-2026-07-23-lossdiag-v5
+        description: Type campaign-2026-07-23-lossdiag-v6
         required: true
         type: string
 
@@ -29,7 +29,7 @@ env:
   CANONICAL_JOB: polyedge-shadow-daily-neu-job
   SHADOW_APP: polyedge-shadow-neu
   GITHUB_DEPLOY_IDENTITY_NAME: id-github-polyedge-dev
-  VALIDATION_ID: campaign-2026-07-23-lossdiag-v5
+  VALIDATION_ID: campaign-2026-07-23-lossdiag-v6
   VALIDATION_DATE: 2026-07-23
   REPAIR_PARENT_SHA: 06a699dbebef5765fe29e3a16dce909d5148fd26
   REQUIRED_REPAIR_SHA: d8be68c2c5b46b9ba0cfbc283e0061da022355e1
@@ -64,6 +64,7 @@ jobs:
               research/configs/shadow_lossdiag_validation_2026-07-23_v3.json|\
               research/configs/shadow_lossdiag_validation_2026-07-23_v4.json|\
               research/configs/shadow_lossdiag_validation_2026-07-23_v5.json|\
+              research/configs/shadow_lossdiag_validation_2026-07-23_v6.json|\
               research/run_shadow_lossdiag_validation.sh|\
               research/test_shadow_lossdiag_validation.sh) ;;
               *)
@@ -72,10 +73,10 @@ jobs:
                 ;;
             esac
           done < <(git diff --name-only "$REPAIR_PARENT_SHA"...HEAD)
-          test "$(jq -r '.promotion_eligible' research/configs/shadow_lossdiag_validation_2026-07-23_v5.json)" = "false"
-          test "$(jq -r '.counts_toward_protocol_v3_evidence' research/configs/shadow_lossdiag_validation_2026-07-23_v5.json)" = "false"
-          test "$(jq -r '.safety.queue_position_source' research/configs/shadow_lossdiag_validation_2026-07-23_v5.json)" = "inferred_size_ahead"
-          test "$(jq -r '.safety.literal_fifo_available' research/configs/shadow_lossdiag_validation_2026-07-23_v5.json)" = "false"
+          test "$(jq -r '.promotion_eligible' research/configs/shadow_lossdiag_validation_2026-07-23_v6.json)" = "false"
+          test "$(jq -r '.counts_toward_protocol_v3_evidence' research/configs/shadow_lossdiag_validation_2026-07-23_v6.json)" = "false"
+          test "$(jq -r '.safety.queue_position_source' research/configs/shadow_lossdiag_validation_2026-07-23_v6.json)" = "inferred_size_ahead"
+          test "$(jq -r '.safety.literal_fifo_available' research/configs/shadow_lossdiag_validation_2026-07-23_v6.json)" = "false"
           sh -n research/run_shadow_lossdiag_validation.sh
           sh research/test_shadow_lossdiag_validation.sh
 
@@ -238,7 +239,7 @@ jobs:
           set -euo pipefail
           az deployment group what-if \
             --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "polyedge-lossdiag-v5-$GITHUB_RUN_ID" \
+            --name "polyedge-lossdiag-v6-$GITHUB_RUN_ID" \
             --template-file infra/shadow-lossdiag-validation.bicep \
             --parameters \
               validationImage="$VALIDATION_IMAGE" \
@@ -270,7 +271,7 @@ jobs:
 
           az deployment group create \
             --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "polyedge-lossdiag-v5-$GITHUB_RUN_ID" \
+            --name "polyedge-lossdiag-v6-$GITHUB_RUN_ID" \
             --template-file infra/shadow-lossdiag-validation.bicep \
             --parameters \
               validationImage="$VALIDATION_IMAGE" \
@@ -327,7 +328,7 @@ jobs:
             > validation-proof-roles.json
           test "$(jq '[.[] | select(.role == "Storage Blob Data Reader")] | length' validation-proof-roles.json)" = "1"
           test "$(jq -r '.[] | select(.role == "Storage Blob Data Reader") | .scope' validation-proof-roles.json)" = "$(tr '[:upper:]' '[:lower:]' <<<"$validation_container_scope")"
-          # Wait for the proof-reader grant before proving both v5 roots are
+          # Wait for the proof-reader grant before proving both v6 roots are
           # empty. Any failed/partial prior attempt makes this version unusable.
           for _ in $(seq 1 20); do
             if az storage blob list \
@@ -602,7 +603,7 @@ jobs:
           cmp canonical-data-before.json canonical-data-after.json
           cmp canonical-reports-before.json canonical-reports-after.json
 
-          config_sha="sha256:$(sha256sum research/configs/shadow_lossdiag_validation_2026-07-23_v5.json | cut -d' ' -f1)"
+          config_sha="sha256:$(sha256sum research/configs/shadow_lossdiag_validation_2026-07-23_v6.json | cut -d' ' -f1)"
           canonical_job_sha="sha256:$(sha256sum canonical-job-before.json | cut -d' ' -f1)"
           shadow_app_sha="sha256:$(sha256sum shadow-app-before.json | cut -d' ' -f1)"
           canonical_data_sha="sha256:$(sha256sum canonical-data-before.json | cut -d' ' -f1)"
@@ -760,7 +761,7 @@ jobs:
           USAGE_BYTES: ${{ steps.proof.outputs.usage_bytes }}
         run: |
           {
-            echo "## PolyEdge loss-diagnostics v5 validation"
+            echo "## PolyEdge loss-diagnostics v6 validation"
             echo
             echo "- Execution: \`$EXECUTION_NAME\`"
             echo "- Attestation: \`$ATTESTATION_SHA\`"
