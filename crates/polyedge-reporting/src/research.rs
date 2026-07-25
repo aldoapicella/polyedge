@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, SecondsFormat, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Timelike, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -307,6 +307,7 @@ pub struct AuditOptions {
     pub out: PathBuf,
     pub markdown: PathBuf,
     pub exclude_windows: Vec<ExcludedTimeWindow>,
+    pub settlement_carry: Option<SettlementCarryOptions>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +342,17 @@ pub struct BuildMarketsOptions {
     pub out: PathBuf,
     pub markdown: PathBuf,
     pub exclude_windows: Vec<ExcludedTimeWindow>,
+    pub settlement_carry: Option<SettlementCarryOptions>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettlementCarryOptions {
+    pub input: PathBuf,
+    pub published_manifest: PathBuf,
+    pub market_day: NaiveDate,
+    pub campaign_id: String,
+    pub source_account: String,
+    pub source_container: String,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +429,11 @@ pub struct MlCalibrateOptions {
 
 pub fn run_audit(options: AuditOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let settlement_carry = options
+        .settlement_carry
+        .as_ref()
+        .map(load_boundary_settlement_carry)
+        .transpose()?;
     let mut audit = AuditAccumulator::default();
     let stream = stream_events(
         &options.input,
@@ -426,6 +443,11 @@ pub fn run_audit(options: AuditOptions) -> Result<Value, ResearchError> {
             audit.observe(event);
         },
     )?;
+    if let Some(carry) = &settlement_carry {
+        for event in &carry.events {
+            audit.observe(event);
+        }
+    }
     audit.malformed_lines = stream.malformed_lines;
     audit.duplicate_estimate = stream.duplicate_estimate;
     let stream_warnings = stream
@@ -467,6 +489,9 @@ pub fn run_audit(options: AuditOptions) -> Result<Value, ResearchError> {
                 "raw_source_inventory".to_owned(),
                 serde_json::to_value(inventory)?,
             );
+        }
+        if let Some(carry) = &settlement_carry {
+            object.insert("settlement_carry".to_owned(), carry.evidence.clone());
         }
         insert_exclusion_metadata(object, &stream, &options.exclude_windows);
     }
@@ -705,7 +730,16 @@ pub fn run_queue_audit(options: QueueAuditOptions) -> Result<Value, ResearchErro
 
 pub fn run_build_markets(options: BuildMarketsOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
-    let market_rows = build_market_rows(&options.input, &options.exclude_windows)?;
+    let settlement_carry = options
+        .settlement_carry
+        .as_ref()
+        .map(load_boundary_settlement_carry)
+        .transpose()?;
+    let market_rows = build_market_rows(
+        &options.input,
+        &options.exclude_windows,
+        settlement_carry.as_ref(),
+    )?;
     let rows = market_rows.rows;
     let summary = market_summary(&rows);
     let result = json!({
@@ -713,6 +747,7 @@ pub fn run_build_markets(options: BuildMarketsOptions) -> Result<Value, Research
         "summary": summary,
         "excluded_event_count": market_rows.stream.excluded_events,
         "excluded_time_windows": exclusion_windows_json(&options.exclude_windows),
+        "settlement_carry": settlement_carry.as_ref().map(|carry| carry.evidence.clone()),
     });
     let mut warnings = result["summary"]["warnings"]
         .as_array()
@@ -1188,6 +1223,7 @@ enum EventPathMode {
     PreferEventsJsonl,
     AllJsonl,
     MarketTruth,
+    SettlementCarry,
     QueueAudit,
     ChartBackfill,
     Calibration,
@@ -1726,6 +1762,282 @@ fn finalize_stream_stats(stats: &mut StreamStats) {
             stats.out_of_order_timestamps
         ));
     }
+}
+
+#[derive(Clone, Debug)]
+struct SettlementCarry {
+    events: Vec<EventLine>,
+    evidence: Value,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementCarryJournal {
+    event_count: u64,
+    journal_sha256: String,
+    events: BTreeMap<u64, EventLine>,
+}
+
+fn load_boundary_settlement_carry(
+    options: &SettlementCarryOptions,
+) -> Result<SettlementCarry, ResearchError> {
+    let source_day = options.market_day.succ_opt().ok_or_else(|| {
+        ResearchError::InvalidInput("settlement carry market day overflow".to_owned())
+    })?;
+    if source_day >= Utc::now().date_naive() {
+        return Err(ResearchError::InvalidInput(format!(
+            "settlement carry source day {source_day} must be sealed before today"
+        )));
+    }
+    let manifest_path = &options.published_manifest;
+    let manifest_before = fs::read(manifest_path)?;
+    let manifest: ProjectedDayManifest = serde_json::from_slice(&manifest_before)?;
+    projected_cache::validate_day_manifest(&manifest, source_day, &options.campaign_id)?;
+    projected_cache::validate_projected_day_source(
+        &manifest.canonical,
+        source_day,
+        true,
+        Some(&options.source_container),
+    )?;
+    if manifest
+        .canonical
+        .raw_source_inventory
+        .canonical
+        .account
+        .as_deref()
+        != Some(options.source_account.as_str())
+    {
+        return Err(ResearchError::InvalidInput(format!(
+            "settlement carry source account does not match campaign {}",
+            options.campaign_id
+        )));
+    }
+    for binding in &manifest.canonical.files {
+        let bytes = fs::read(options.input.join(&binding.relative_path))?;
+        projected_cache::verify_binding_bytes(binding, &bytes)?;
+    }
+    let first = parse_rfc3339_utc(&manifest.canonical.first_recorded_ts);
+    let last = parse_rfc3339_utc(&manifest.canonical.last_recorded_ts);
+    let source_start = source_day.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let source_end = source_day
+        .succ_opt()
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .unwrap()
+        .and_utc();
+    if first.is_none_or(|value| value < source_start || value >= source_end)
+        || last.is_none_or(|value| value < source_start || value >= source_end)
+    {
+        return Err(ResearchError::InvalidInput(format!(
+            "settlement carry timestamps are not bound to sealed UTC day {source_day}"
+        )));
+    }
+    let raw_inventory = manifest.canonical.raw_source_inventory.clone();
+    validate_raw_source_inventory(&raw_inventory)?;
+    let expected_suffix = format!("{}/", source_day.format("%Y/%m/%d"));
+    if raw_inventory.canonical.source_kind != "azure_blob"
+        || raw_inventory.canonical.account.as_deref() != Some(options.source_account.as_str())
+        || raw_inventory.canonical.container.as_deref() != Some(options.source_container.as_str())
+        || !raw_inventory.canonical.exhaustive_listing
+        || raw_inventory.canonical.max_blobs.is_some()
+        || raw_inventory.canonical.max_bytes.is_some()
+        || !raw_inventory.canonical.prefix.ends_with(&expected_suffix)
+        || raw_inventory.canonical.blobs.iter().any(|blob| {
+            !blob.name.starts_with(&raw_inventory.canonical.prefix) || blob.sealed != Some(true)
+        })
+    {
+        return Err(ResearchError::InvalidInput(format!(
+            "settlement carry requires an exhaustive Azure inventory for {source_day}"
+        )));
+    }
+
+    let inventory_before =
+        build_local_source_inventory(&options.input, EventPathMode::SettlementCarry)?;
+    let mut journals = BTreeMap::<String, SettlementCarryJournal>::new();
+    let stream = stream_events(
+        &options.input,
+        EventPathMode::SettlementCarry,
+        &[],
+        |event| {
+            let payload = &event.payload;
+            let Some(journal_id) = optional_text(payload, "settlement_journal_id") else {
+                return;
+            };
+            if payload["settlement_journal_schema"].as_str()
+                != Some("polyedge.paper_settlement_journal.v1")
+            {
+                return;
+            }
+            let Some(event_index) = payload["settlement_journal_event_index"].as_u64() else {
+                return;
+            };
+            let Some(event_count) = payload["settlement_journal_event_count"].as_u64() else {
+                return;
+            };
+            let Some(journal_sha256) = optional_text(payload, "settlement_journal_sha256") else {
+                return;
+            };
+            let journal = journals
+                .entry(journal_id)
+                .or_insert_with(|| SettlementCarryJournal {
+                    event_count,
+                    journal_sha256: journal_sha256.clone(),
+                    events: BTreeMap::new(),
+                });
+            if journal.event_count != event_count
+                || journal.journal_sha256 != journal_sha256
+                || journal.events.insert(event_index, event.clone()).is_some()
+            {
+                journal.event_count = 0;
+            }
+        },
+    )?;
+    if stream.malformed_lines > 0 || stream.out_of_order_timestamps > 0 {
+        return Err(ResearchError::InvalidInput(format!(
+            "settlement carry refuses malformed or out-of-order input: {} malformed, {} out of order",
+            stream.malformed_lines, stream.out_of_order_timestamps
+        )));
+    }
+    let manifest_after = fs::read(manifest_path)?;
+    let inventory_after =
+        build_local_source_inventory(&options.input, EventPathMode::SettlementCarry)?;
+    if manifest_before != manifest_after || inventory_before != inventory_after {
+        return Err(ResearchError::InvalidInput(
+            "settlement carry source changed while it was being read".to_owned(),
+        ));
+    }
+
+    let mut carried_events = Vec::new();
+    let mut carried_market_ids = BTreeSet::new();
+    let mut carried_journal_ids = Vec::new();
+    let mut carried_journal_sha256s = Vec::new();
+    let mut late_mid_day = BTreeSet::new();
+    for (journal_id, journal) in journals {
+        let settlements = journal
+            .events
+            .values()
+            .filter(|event| event.event_type == "paper_settlement")
+            .collect::<Vec<_>>();
+        let Some(settlement) = (settlements.len() == 1).then(|| settlements[0]) else {
+            continue;
+        };
+        let Some(start_ts) = parse_datetime(settlement.payload.get("start_ts")) else {
+            continue;
+        };
+        if start_ts.date_naive() != options.market_day {
+            continue;
+        }
+        let market_id = optional_text(&settlement.payload, "market_id").ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "settlement carry boundary journal is missing market_id".to_owned(),
+            )
+        })?;
+        let end_ts = parse_datetime(settlement.payload.get("end_ts")).ok_or_else(|| {
+            ResearchError::InvalidInput(format!(
+                "settlement carry journal {journal_id} is missing end_ts"
+            ))
+        })?;
+        if end_ts < source_start {
+            late_mid_day.insert(market_id);
+            continue;
+        }
+        if end_ts != source_start {
+            continue;
+        }
+        if journal.event_count == 0
+            || journal.events.len() != journal.event_count as usize
+            || !(0..journal.event_count).all(|index| journal.events.contains_key(&index))
+        {
+            return Err(ResearchError::InvalidInput(format!(
+                "settlement carry journal {journal_id} is incomplete or conflicting"
+            )));
+        }
+        if journal.events.values().any(|event| {
+            !matches!(
+                event.event_type.as_str(),
+                "paper_settlement" | "paper_fill_markout_missing"
+            )
+        }) {
+            return Err(ResearchError::InvalidInput(format!(
+                "settlement carry journal {journal_id} contains a non-settlement event type"
+            )));
+        }
+        let projection_events = journal
+            .events
+            .iter()
+            .map(|(event_index, event)| {
+                let mut payload = event.payload.clone();
+                if let Some(object) = payload.as_object_mut() {
+                    for field in [
+                        "settlement_journal_schema",
+                        "settlement_journal_id",
+                        "settlement_journal_event_index",
+                        "settlement_journal_event_count",
+                        "settlement_journal_sha256",
+                    ] {
+                        object.remove(field);
+                    }
+                }
+                json!({
+                    "event_index": event_index,
+                    "event_type": event.event_type,
+                    "payload": payload
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": journal.event_count,
+            "events": projection_events
+        }));
+        if expected.as_deref() != Some(journal.journal_sha256.as_str()) {
+            return Err(ResearchError::InvalidInput(format!(
+                "settlement carry journal {journal_id} failed SHA-256 validation"
+            )));
+        }
+        if journal
+            .events
+            .values()
+            .any(|event| event.recorded_ts < source_start || event.recorded_ts >= source_end)
+        {
+            return Err(ResearchError::InvalidInput(format!(
+                "settlement carry journal {journal_id} escapes source day {source_day}"
+            )));
+        }
+        carried_market_ids.insert(market_id);
+        carried_journal_ids.push(journal_id);
+        carried_journal_sha256s.push(journal.journal_sha256);
+        carried_events.extend(journal.events.into_values());
+    }
+    if !late_mid_day.is_empty() {
+        return Err(ResearchError::InvalidInput(format!(
+            "settlement carry found next-day mid-day settlements, which remain fatal: {}",
+            late_mid_day.into_iter().collect::<Vec<_>>().join(",")
+        )));
+    }
+    carried_events.sort_by_key(|event| event.recorded_ts);
+    let evidence = json!({
+        "schema": "polyedge.settlement_carry.v1",
+        "market_day": options.market_day,
+        "source_recorded_day": source_day,
+        "source_manifest_sha256": sha256_prefixed(&manifest_before),
+        "projected_day_canonical_sha256": manifest.canonical_sha256,
+        "source_campaign_id": options.campaign_id,
+        "source_account": options.source_account,
+        "source_container": options.source_container,
+        "source_inventory_canonical_sha256": raw_inventory.canonical_sha256,
+        "settlement_input_inventory_canonical_sha256": inventory_before.canonical_sha256,
+        "stable_before_after_read": true,
+        "journal_ids": carried_journal_ids,
+        "journal_sha256s": carried_journal_sha256s,
+        "market_ids": carried_market_ids,
+        "events_scanned": carried_events.len(),
+        "decision_time_features_imported": false,
+        "allowed_event_types": ["paper_settlement", "paper_fill_markout_missing"]
+    });
+    Ok(SettlementCarry {
+        events: carried_events,
+        evidence,
+    })
 }
 
 fn is_excluded_ts(timestamp: DateTime<Utc>, windows: &[ExcludedTimeWindow]) -> bool {
@@ -2290,6 +2602,7 @@ fn collect_jsonl_path_set(
 fn filtered_normalized_event_paths(paths: &[PathBuf], mode: EventPathMode) -> Vec<PathBuf> {
     let allowed = match mode {
         EventPathMode::PreferEventsJsonl | EventPathMode::AllJsonl => return paths.to_vec(),
+        EventPathMode::SettlementCarry => &["paper_settlements.jsonl", "other.jsonl"][..],
         EventPathMode::MarketTruth => &[
             "markets.jsonl",
             "references.jsonl",
@@ -4713,7 +5026,124 @@ impl QueueRegistrationIdentity {
 #[derive(Clone, Debug)]
 struct QueueRegistrationRecord {
     identity: Option<QueueRegistrationIdentity>,
+    queue_capture: QueueRegistrationCapture,
     event_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+enum QueueRegistrationCapture {
+    Legacy,
+    Available {
+        inferred_size_ahead: Decimal,
+        capture_ts: DateTime<Utc>,
+    },
+    Unavailable {
+        reason: String,
+    },
+    Invalid,
+}
+
+impl QueueRegistrationCapture {
+    fn from_payload(payload: &Value) -> Self {
+        let Some(schema) = payload
+            .get("registration_queue_position_schema")
+            .and_then(Value::as_str)
+        else {
+            return Self::Legacy;
+        };
+        if schema != "polyedge.paper_registration_queue_position.v1"
+            || payload["registration_queue_position_source"].as_str() != Some("public_l2_shadow")
+            || payload["registration_queue_position_metric"].as_str() != Some("inferred_size_ahead")
+            || payload["registration_queue_position_method"].as_str()
+                != Some("public_l2_at_registration_plus_earlier_shadow_orders")
+            || payload["literal_fifo_rank_available"].as_bool() != Some(false)
+        {
+            return Self::Invalid;
+        }
+        let Some(capture_ts) =
+            parse_datetime(payload.get("registration_queue_position_capture_ts"))
+        else {
+            return Self::Invalid;
+        };
+        if parse_datetime(payload.get("submitted_ts")) != Some(capture_ts) {
+            return Self::Invalid;
+        }
+        match payload["registration_queue_position_status"].as_str() {
+            Some("available") => {
+                let values = (
+                    decimal(payload.get("registration_inferred_size_ahead")),
+                    decimal(payload.get("registration_same_price_public_size_ahead")),
+                    decimal(payload.get("registration_better_price_public_size_ahead")),
+                    decimal(payload.get("registration_earlier_shadow_order_size_ahead")),
+                );
+                let (Some(total), Some(same), Some(better), Some(earlier)) = values else {
+                    return Self::Invalid;
+                };
+                let Some(book_ts) = parse_datetime(payload.get("book_ts")) else {
+                    return Self::Invalid;
+                };
+                if total < Decimal::ZERO
+                    || same < Decimal::ZERO
+                    || better < Decimal::ZERO
+                    || earlier < Decimal::ZERO
+                    || total != same + better + earlier
+                    || payload
+                        .get("registration_inferred_size_ahead_unavailable_reason")
+                        .is_some_and(|value| !value.is_null())
+                    || book_ts > capture_ts
+                {
+                    return Self::Invalid;
+                }
+                Self::Available {
+                    inferred_size_ahead: total,
+                    capture_ts,
+                }
+            }
+            Some("unavailable") => {
+                let reason = optional_text(
+                    payload,
+                    "registration_inferred_size_ahead_unavailable_reason",
+                );
+                if reason.as_deref() != Some("public_l2_book_unavailable_at_registration")
+                    || payload
+                        .get("registration_inferred_size_ahead")
+                        .is_some_and(|value| !value.is_null())
+                    || payload
+                        .get("registration_same_price_public_size_ahead")
+                        .is_some_and(|value| !value.is_null())
+                    || payload
+                        .get("registration_better_price_public_size_ahead")
+                        .is_some_and(|value| !value.is_null())
+                    || payload.get("book_ts").is_some_and(|value| !value.is_null())
+                {
+                    return Self::Invalid;
+                }
+                Self::Unavailable {
+                    reason: reason.expect("validated unavailable reason"),
+                }
+            }
+            _ => Self::Invalid,
+        }
+    }
+
+    fn available(&self) -> Option<(Decimal, DateTime<Utc>)> {
+        match self {
+            Self::Available {
+                inferred_size_ahead,
+                capture_ts,
+            } => Some((*inferred_size_ahead, *capture_ts)),
+            _ => None,
+        }
+    }
+
+    fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unavailable { reason } => Some(reason),
+            Self::Invalid => Some("invalid_atomic_registration_capture"),
+            Self::Legacy => Some("atomic_registration_capture_not_recorded"),
+            Self::Available { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4899,7 +5329,11 @@ impl ExecutionQualityAccumulator {
                     let event_sha256 = canonical_value_sha256(&event.payload)
                         .unwrap_or_else(|| "invalid-registration-payload".to_owned());
                     let identity = QueueRegistrationIdentity::from_payload(&event.payload);
+                    let queue_capture = QueueRegistrationCapture::from_payload(&event.payload);
                     if identity.is_none() {
+                        self.registration_invalid_order_ids.insert(order_id.clone());
+                    }
+                    if matches!(queue_capture, QueueRegistrationCapture::Invalid) {
                         self.registration_invalid_order_ids.insert(order_id.clone());
                     }
                     if let Some(existing) = self.registrations.get(&order_id) {
@@ -4914,6 +5348,7 @@ impl ExecutionQualityAccumulator {
                             order_id,
                             QueueRegistrationRecord {
                                 identity,
+                                queue_capture,
                                 event_sha256,
                             },
                         );
@@ -5422,47 +5857,60 @@ impl ExecutionQualityAccumulator {
             self.registrations.len()
         };
         let mut joined_snapshot_orders = 0_usize;
+        let mut joined_registration_fallback_orders = 0_usize;
+        let mut joined_queue_position_orders = 0_usize;
         let mut size_ahead = Vec::new();
-        if strict_v3_place_denominator {
-            for (identity, order_id) in valid_applied_places.values() {
-                let registration_matches = self
-                    .registrations
-                    .get(order_id)
-                    .and_then(|record| record.identity.as_ref())
-                    .is_some_and(|registration| registration.matches_place_output(identity));
-                if registration_matches
-                    && !self.registration_conflicting_order_ids.contains(order_id)
-                    && !self.registration_invalid_order_ids.contains(order_id)
-                {
-                    if let Some(rows) = self.snapshots.get(order_id) {
-                        if rows.len() == 1 {
-                            if let Some(value) = rows[0] {
-                                joined_snapshot_orders += 1;
-                                size_ahead.push(value);
-                            }
+        let mut observe_queue_position =
+            |order_id: &str, registration: &QueueRegistrationRecord| {
+                if let Some(rows) = self.snapshots.get(order_id) {
+                    if rows.len() == 1 {
+                        if let Some(value) = rows[0] {
+                            joined_snapshot_orders += 1;
+                            joined_queue_position_orders += 1;
+                            size_ahead.push(value);
                         }
                     }
+                    return;
                 }
+                if let Some((value, _)) = registration.queue_capture.available() {
+                    joined_registration_fallback_orders += 1;
+                    joined_queue_position_orders += 1;
+                    size_ahead.push(value);
+                }
+            };
+        if strict_v3_place_denominator {
+            for (identity, order_id) in valid_applied_places.values() {
+                let Some(registration) = self.registrations.get(order_id) else {
+                    continue;
+                };
+                let registration_matches = registration
+                    .identity
+                    .as_ref()
+                    .is_some_and(|registration| registration.matches_place_output(identity));
+                if !registration_matches
+                    || self.registration_conflicting_order_ids.contains(order_id)
+                    || self.registration_invalid_order_ids.contains(order_id)
+                {
+                    continue;
+                }
+                observe_queue_position(order_id, registration);
             }
         } else {
-            for order_id in self.registrations.keys() {
+            for (order_id, registration) in &self.registrations {
                 if self.registration_conflicting_order_ids.contains(order_id)
                     || self.registration_invalid_order_ids.contains(order_id)
                 {
                     continue;
                 }
-                if let Some(rows) = self.snapshots.get(order_id) {
-                    if rows.len() == 1 {
-                        if let Some(value) = rows[0] {
-                            joined_snapshot_orders += 1;
-                            size_ahead.push(value);
-                        }
-                    }
-                }
+                observe_queue_position(order_id, registration);
             }
         }
         let missing_snapshot_orders = expected_queue_orders.saturating_sub(joined_snapshot_orders);
         let snapshot_coverage = ratio_f64(joined_snapshot_orders, expected_queue_orders);
+        let missing_queue_position_orders =
+            expected_queue_orders.saturating_sub(joined_queue_position_orders);
+        let queue_position_coverage =
+            ratio_f64(joined_queue_position_orders, expected_queue_orders);
         let queue_snapshot_applicable = expected_queue_orders > 0;
         let mut warnings = Vec::new();
         let mut notices = Vec::new();
@@ -5527,10 +5975,15 @@ impl ExecutionQualityAccumulator {
         }
         if expected_queue_orders == 0 {
             notices.push(json!("no real paper order queue registrations observed"));
-        } else if snapshot_coverage.is_some_and(|value| value < 0.95) {
+        } else if queue_position_coverage.is_some_and(|value| value < 0.95) {
             warnings.push(json!(format!(
-                "queue snapshot coverage below 95%: {}/{}",
-                joined_snapshot_orders, expected_queue_orders
+                "bound inferred-size-ahead coverage below 95%: {}/{}",
+                joined_queue_position_orders, expected_queue_orders
+            )));
+        }
+        if joined_registration_fallback_orders > 0 {
+            notices.push(json!(format!(
+                "{joined_registration_fallback_orders} orders used atomic registration-time inferred_size_ahead because no post-live snapshot event existed"
             )));
         }
 
@@ -5803,6 +6256,14 @@ impl ExecutionQualityAccumulator {
             "queue_snapshot_coverage": snapshot_coverage,
             "queue_snapshot_applicable": queue_snapshot_applicable,
             "queue_snapshot_coverage_status": if queue_snapshot_applicable { "measured" } else { "not_applicable" },
+            "queue_snapshot_coverage_required_for_gate": false,
+            "queue_registration_fallback_orders": joined_registration_fallback_orders,
+            "queue_position_joined_orders": joined_queue_position_orders,
+            "queue_position_missing_orders": missing_queue_position_orders,
+            "queue_position_expected_orders": expected_queue_orders,
+            "queue_position_coverage": queue_position_coverage,
+            "queue_position_applicable": queue_snapshot_applicable,
+            "queue_position_coverage_status": if queue_snapshot_applicable { "measured" } else { "not_applicable" },
             "visible_size_ahead": distribution_summary(&size_ahead),
             "queue_shadow_fill_events": self.queue_fill_events,
             "queue_shadow_filled_orders": self.queue_fill_orders.len(),
@@ -5828,7 +6289,7 @@ impl ExecutionQualityAccumulator {
             "settlement_journal_invalid_events": self.settlement_journal_invalid_events,
             "markouts": Value::Object(horizons),
             "probe_events_excluded": self.probe_events_excluded,
-            "minimum_queue_snapshot_coverage": 0.95,
+            "minimum_queue_position_coverage": 0.95,
             "minimum_markout_completion": 0.95,
             "maximum_markout_observation_delay_ms": MAX_MARKOUT_OBSERVATION_DELAY_MS,
             "warnings": warnings,
@@ -5880,12 +6341,14 @@ fn execution_quality_markdown(report: &Value) -> String {
     let result = &report["result"];
     let markouts = &result["markouts"];
     format!(
-        "# Execution Quality Report\n\n- Evidence gate: **{}**\n- Applicable / applied place outputs: **{} / {}**\n- Queue registrations / joined snapshots: **{} / {}**\n- Queue snapshot coverage: **{}**\n- Partial / completed shadow fills: **{} / {}**\n- Strict trade-through events: **{}**\n- Cancel latency p50 / p95 ms: **{} / {}**\n- 1s markout completion: **{}**\n- 5s markout completion: **{}**\n- 30s markout completion: **{}**\n\nProbe events are excluded. Metrics are research-only public-L2 shadow evidence and do not establish true venue FIFO rank.\n",
+        "# Execution Quality Report\n\n- Evidence gate: **{}**\n- Applicable / applied place outputs: **{} / {}**\n- Queue registrations / bound inferred positions: **{} / {}**\n- Atomic registration fallbacks: **{}**\n- Bound queue-position coverage: **{}**\n- Raw post-live snapshot coverage: **{}**\n- Partial / completed shadow fills: **{} / {}**\n- Strict trade-through events: **{}**\n- Cancel latency p50 / p95 ms: **{} / {}**\n- 1s markout completion: **{}**\n- 5s markout completion: **{}**\n- 30s markout completion: **{}**\n\nProbe events are excluded. Metrics are research-only public-L2 shadow evidence and do not establish true venue FIFO rank.\n",
         result["evidence_gate"].as_str().unwrap_or("COLLECTING"),
         result["applicable_place_outputs"],
         result["applied_place_outputs"],
         result["registrations"],
-        result["queue_snapshot_joined_orders"],
+        result["queue_position_joined_orders"],
+        result["queue_registration_fallback_orders"],
+        result["queue_position_coverage"],
         result["queue_snapshot_coverage"],
         result["partial_fill_events"],
         result["completed_fill_events"],
@@ -6716,6 +7179,7 @@ struct MarketRowsResult {
 fn build_market_rows(
     input: &Path,
     exclude_windows: &[ExcludedTimeWindow],
+    settlement_carry: Option<&SettlementCarry>,
 ) -> Result<MarketRowsResult, ResearchError> {
     let mut audit = AuditAccumulator::default();
     let stream = stream_events(
@@ -6726,6 +7190,11 @@ fn build_market_rows(
             audit.observe(event);
         },
     )?;
+    if let Some(carry) = settlement_carry {
+        for event in &carry.events {
+            audit.observe(event);
+        }
+    }
     audit.malformed_lines = stream.malformed_lines;
     audit.finalize_market_truth();
     let mut rows = audit.markets.into_values().collect::<Vec<_>>();
@@ -11412,6 +11881,371 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    fn settlement_carry_fixture(
+        name: &str,
+        end_ts: &str,
+        event_count: u64,
+    ) -> (PathBuf, SettlementCarryOptions) {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-settlement-carry-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let journal_id = format!("paper-settlement-{}", "a".repeat(64));
+        let unbound = json!({
+            "market_id": "boundary-market",
+            "start_ts": "2026-07-22T23:45:00Z",
+            "end_ts": end_ts
+        });
+        let journal_sha256 = canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": event_count,
+            "events": [{
+                "event_index": 0,
+                "event_type": "paper_settlement",
+                "payload": unbound
+            }]
+        }))
+        .unwrap();
+        let mut payload = unbound;
+        let object = payload.as_object_mut().unwrap();
+        object.insert(
+            "settlement_journal_schema".to_owned(),
+            json!("polyedge.paper_settlement_journal.v1"),
+        );
+        object.insert("settlement_journal_id".to_owned(), json!(journal_id));
+        object.insert("settlement_journal_event_index".to_owned(), json!(0));
+        object.insert(
+            "settlement_journal_event_count".to_owned(),
+            json!(event_count),
+        );
+        object.insert(
+            "settlement_journal_sha256".to_owned(),
+            json!(journal_sha256),
+        );
+        fs::write(
+            root.join("paper_settlements.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "event_type": "paper_settlement",
+                    "recorded_ts": "2026-07-23T00:00:16Z",
+                    "payload": payload
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(root.join("other.jsonl"), "").unwrap();
+        let prefix = "shadow-events/campaign/2026/07/23/".to_owned();
+        let raw_inventory = build_raw_source_inventory(
+            "azure_blob",
+            Some("account".to_owned()),
+            Some("container".to_owned()),
+            prefix.clone(),
+            None,
+            None,
+            vec![RawSourceBlobBinding {
+                ordinal: 0,
+                name: format!("{prefix}00/00.jsonl"),
+                etag: Some("etag".to_owned()),
+                version_id: None,
+                content_md5: None,
+                blob_type: Some("AppendBlob".to_owned()),
+                sealed: Some(true),
+                content_length: 1,
+                last_modified: Some("2026-07-24T00:00:00Z".to_owned()),
+                sha256: sha256_prefixed(b"x"),
+            }],
+        )
+        .unwrap();
+        let files = ["other.jsonl", "paper_settlements.jsonl"]
+            .into_iter()
+            .map(|name| {
+                let bytes = fs::read(root.join(name)).unwrap();
+                projected_cache::ProjectedFileBinding {
+                    logical_name: name.trim_end_matches(".jsonl").to_owned(),
+                    relative_path: name.to_owned(),
+                    rows: u64::from(name == "paper_settlements.jsonl"),
+                    bytes: bytes.len() as u64,
+                    sha256: sha256_prefixed(&bytes),
+                }
+            })
+            .collect::<Vec<_>>();
+        let canonical = projected_cache::ProjectedDayCanonical {
+            domain: "polyedge.projected-day-cache.v2".to_owned(),
+            schema_version: 2,
+            campaign_id: "campaign".to_owned(),
+            builder_git_sha: None,
+            date: NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+            event_time_start: "2026-07-23T00:00:00Z".to_owned(),
+            event_time_end_exclusive: "2026-07-24T00:00:00Z".to_owned(),
+            format: "jsonl-indexed-gzip-sharded".to_owned(),
+            decision_grade_projection: true,
+            events: 1,
+            input_events: 1,
+            malformed_lines: 0,
+            raw_source_inventory: raw_inventory,
+            first_recorded_ts: "2026-07-23T00:00:16Z".to_owned(),
+            last_recorded_ts: "2026-07-23T00:00:16Z".to_owned(),
+            event_counts: BTreeMap::from([("paper_settlement".to_owned(), 1)]),
+            files,
+        };
+        let manifest = ProjectedDayManifest {
+            schema_version: 2,
+            canonical_sha256: sha256_prefixed(&serde_json::to_vec(&canonical).unwrap()),
+            canonical,
+        };
+        let published_manifest = root.join("projected_day_manifest.json");
+        fs::write(&published_manifest, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        (
+            root.clone(),
+            SettlementCarryOptions {
+                input: root,
+                published_manifest,
+                market_day: NaiveDate::from_ymd_opt(2026, 7, 22).unwrap(),
+                campaign_id: "campaign".to_owned(),
+                source_account: "account".to_owned(),
+                source_container: "container".to_owned(),
+            },
+        )
+    }
+
+    fn add_disallowed_boundary_journal_event(root: &Path, options: &SettlementCarryOptions) {
+        let first_line = fs::read_to_string(root.join("paper_settlements.jsonl")).unwrap();
+        let mut settlement: Value = serde_json::from_str(first_line.trim()).unwrap();
+        let journal_id = settlement["payload"]["settlement_journal_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut settlement_unbound = settlement["payload"].clone();
+        for field in [
+            "settlement_journal_schema",
+            "settlement_journal_id",
+            "settlement_journal_event_index",
+            "settlement_journal_event_count",
+            "settlement_journal_sha256",
+        ] {
+            settlement_unbound.as_object_mut().unwrap().remove(field);
+        }
+        let extra_unbound = json!({"market_id": "boundary-market"});
+        let journal_sha256 = canonical_value_sha256(&json!({
+            "schema": "polyedge.paper_settlement_journal.v1",
+            "settlement_journal_id": journal_id,
+            "settlement_journal_event_count": 2,
+            "events": [
+                {
+                    "event_index": 0,
+                    "event_type": "paper_settlement",
+                    "payload": settlement_unbound
+                },
+                {
+                    "event_index": 1,
+                    "event_type": "strategy_decision",
+                    "payload": extra_unbound
+                }
+            ]
+        }))
+        .unwrap();
+        let mut settlement_payload = settlement["payload"].clone();
+        for field in [
+            "settlement_journal_event_count",
+            "settlement_journal_sha256",
+        ] {
+            settlement_payload.as_object_mut().unwrap().insert(
+                field.to_owned(),
+                if field == "settlement_journal_event_count" {
+                    json!(2)
+                } else {
+                    json!(journal_sha256)
+                },
+            );
+        }
+        settlement["payload"] = settlement_payload;
+        let extra = json!({
+            "event_type": "strategy_decision",
+            "recorded_ts": "2026-07-23T00:00:17Z",
+            "payload": {
+                "market_id": "boundary-market",
+                "settlement_journal_schema": "polyedge.paper_settlement_journal.v1",
+                "settlement_journal_id": journal_id,
+                "settlement_journal_event_index": 1,
+                "settlement_journal_event_count": 2,
+                "settlement_journal_sha256": journal_sha256
+            }
+        });
+        let bytes = format!("{settlement}\n{extra}\n").into_bytes();
+        fs::write(root.join("paper_settlements.jsonl"), &bytes).unwrap();
+
+        let mut manifest: ProjectedDayManifest =
+            serde_json::from_slice(&fs::read(&options.published_manifest).unwrap()).unwrap();
+        manifest.canonical.events = 2;
+        manifest.canonical.input_events = 2;
+        manifest
+            .canonical
+            .event_counts
+            .insert("strategy_decision".to_owned(), 1);
+        let binding = manifest
+            .canonical
+            .files
+            .iter_mut()
+            .find(|binding| binding.relative_path == "paper_settlements.jsonl")
+            .unwrap();
+        binding.rows = 2;
+        binding.bytes = bytes.len() as u64;
+        binding.sha256 = sha256_prefixed(&bytes);
+        manifest.canonical_sha256 =
+            sha256_prefixed(&serde_json::to_vec(&manifest.canonical).unwrap());
+        fs::write(
+            &options.published_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn settlement_carry_accepts_only_complete_midnight_boundary_journal() {
+        let (root, options) = settlement_carry_fixture("complete", "2026-07-23T00:00:00Z", 1);
+        let carry = load_boundary_settlement_carry(&options).unwrap();
+        assert_eq!(carry.events.len(), 1);
+        assert_eq!(carry.evidence["market_ids"], json!(["boundary-market"]));
+        assert_eq!(carry.evidence["decision_time_features_imported"], false);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settlement_carry_rejects_incomplete_relevant_boundary_journal() {
+        let (root, options) = settlement_carry_fixture("incomplete", "2026-07-23T00:00:00Z", 2);
+        let error = load_boundary_settlement_carry(&options).unwrap_err();
+        assert!(error.to_string().contains("incomplete or conflicting"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settlement_carry_rejects_next_day_mid_day_settlement() {
+        let (root, options) = settlement_carry_fixture("late-mid-day", "2026-07-22T18:15:00Z", 1);
+        let error = load_boundary_settlement_carry(&options).unwrap_err();
+        assert!(error.to_string().contains("next-day mid-day settlements"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settlement_carry_rejects_tampered_published_manifest() {
+        let (root, options) = settlement_carry_fixture("tampered", "2026-07-23T00:00:00Z", 1);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&options.published_manifest).unwrap()).unwrap();
+        manifest["canonical"]["events"] = json!(2);
+        fs::write(
+            &options.published_manifest,
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_boundary_settlement_carry(&options).unwrap_err();
+
+        assert!(error.to_string().contains("canonical hash mismatch"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn settlement_carry_rejects_non_settlement_journal_events() {
+        let (root, options) =
+            settlement_carry_fixture("disallowed-event", "2026-07-23T00:00:00Z", 1);
+        add_disallowed_boundary_journal_event(&root, &options);
+
+        let error = load_boundary_settlement_carry(&options).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("contains a non-settlement event type"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalized_published_next_day_is_consumable_as_settlement_carry() {
+        let (root, fixture_options) =
+            settlement_carry_fixture("normalize-publish", "2026-07-23T00:00:00Z", 1);
+        let raw = root.join("raw");
+        let normalized = root.join("normalized");
+        let cache = root.join("carry-cache");
+        let published_manifest = root.join("verified_projected_day_manifest.json");
+        fs::create_dir_all(&raw).unwrap();
+        fs::copy(
+            root.join("paper_settlements.jsonl"),
+            raw.join("events.jsonl"),
+        )
+        .unwrap();
+        run_normalize(NormalizeOptions {
+            input: raw,
+            out: normalized.clone(),
+            format: "jsonl-indexed-gzip-sharded".to_owned(),
+            overwrite: true,
+            decision_grade_projection: true,
+        })
+        .unwrap();
+        let mut normalize_manifest: Value =
+            serde_json::from_slice(&fs::read(normalized.join("events_manifest.json")).unwrap())
+                .unwrap();
+        let raw_inventory = build_raw_source_inventory(
+            "azure_blob",
+            Some("account".to_owned()),
+            Some("container".to_owned()),
+            "shadow-events/campaign/2026/07/23/".to_owned(),
+            None,
+            None,
+            vec![RawSourceBlobBinding {
+                ordinal: 0,
+                name: "shadow-events/campaign/2026/07/23/00/events.jsonl".to_owned(),
+                etag: Some("etag".to_owned()),
+                version_id: None,
+                content_md5: None,
+                blob_type: Some("AppendBlob".to_owned()),
+                sealed: Some(true),
+                content_length: 1,
+                last_modified: Some("2026-07-24T00:00:00Z".to_owned()),
+                sha256: sha256_prefixed(b"x"),
+            }],
+        )
+        .unwrap();
+        normalize_manifest["raw_source_inventory"] = serde_json::to_value(raw_inventory).unwrap();
+        fs::write(
+            normalized.join("events_manifest.json"),
+            serde_json::to_vec(&normalize_manifest).unwrap(),
+        )
+        .unwrap();
+        run_publish_projected_day(PublishProjectedDayOptions {
+            normalized: normalized.clone(),
+            date: NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+            campaign_id: "campaign".to_owned(),
+            cache_root: cache.to_string_lossy().into_owned(),
+            out: published_manifest.clone(),
+            require_azure_source: true,
+            expected_source_container: Some("container".to_owned()),
+        })
+        .unwrap();
+
+        let carry = load_boundary_settlement_carry(&SettlementCarryOptions {
+            input: normalized,
+            published_manifest,
+            market_day: fixture_options.market_day,
+            campaign_id: "campaign".to_owned(),
+            source_account: "account".to_owned(),
+            source_container: "container".to_owned(),
+        })
+        .unwrap();
+
+        assert_eq!(carry.events.len(), 1);
+        assert_eq!(
+            carry.evidence["projected_day_canonical_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            71
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn normalized_rows_preserve_subsecond_event_chronology() {
         let recorded_ts = DateTime::parse_from_rfc3339("2026-07-23T01:11:07.417210355Z")
@@ -11509,6 +12343,27 @@ mod tests {
             "quote_price": "0.50",
             "order_size": "7"
         })
+    }
+
+    fn atomic_queue_registration_payload(order_id: &str, captured_at: DateTime<Utc>) -> Value {
+        let mut payload = queue_registration_payload(order_id);
+        payload["submitted_ts"] = json!(captured_at);
+        payload["registration_queue_position_schema"] =
+            json!("polyedge.paper_registration_queue_position.v1");
+        payload["registration_queue_position_status"] = json!("available");
+        payload["registration_queue_position_source"] = json!("public_l2_shadow");
+        payload["registration_queue_position_metric"] = json!("inferred_size_ahead");
+        payload["registration_queue_position_method"] =
+            json!("public_l2_at_registration_plus_earlier_shadow_orders");
+        payload["registration_inferred_size_ahead"] = json!("12");
+        payload["registration_inferred_size_ahead_unavailable_reason"] = Value::Null;
+        payload["registration_same_price_public_size_ahead"] = json!("4");
+        payload["registration_better_price_public_size_ahead"] = json!("6");
+        payload["registration_earlier_shadow_order_size_ahead"] = json!("2");
+        payload["registration_queue_position_capture_ts"] = json!(captured_at);
+        payload["book_ts"] = json!(captured_at - Duration::milliseconds(1));
+        payload["literal_fifo_rank_available"] = json!(false);
+        payload
     }
 
     fn bound_v3_place_decision(
@@ -12042,6 +12897,57 @@ mod tests {
             assert!(result["markouts"][horizon]["completion_rate"].is_null());
         }
         assert_eq!(result["evidence_gate"], "PASS");
+    }
+
+    #[test]
+    fn atomic_registration_capture_fills_only_an_absent_snapshot() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_registration",
+            atomic_queue_registration_payload("order-1", now),
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["queue_snapshot_joined_orders"], 0);
+        assert_eq!(result["queue_snapshot_coverage"], 0.0);
+        assert_eq!(result["queue_registration_fallback_orders"], 1);
+        assert_eq!(result["queue_position_joined_orders"], 1);
+        assert_eq!(result["queue_position_coverage"], 1.0);
+        assert_eq!(result["visible_size_ahead"]["mean"], "12");
+        assert_eq!(result["evidence_gate"], "PASS");
+    }
+
+    #[test]
+    fn invalid_snapshot_cannot_be_masked_by_atomic_registration_capture() {
+        let now = Utc::now();
+        let mut quality = ExecutionQualityAccumulator::default();
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_registration",
+            atomic_queue_registration_payload("order-1", now),
+        );
+        observe_quality(
+            &mut quality,
+            now,
+            "paper_order_queue_snapshot",
+            json!({
+                "order_id": "order-1",
+                "visible_size_ahead_estimate": null
+            }),
+        );
+
+        let result = quality.finish();
+
+        assert_eq!(result["queue_registration_fallback_orders"], 0);
+        assert_eq!(result["queue_position_joined_orders"], 0);
+        assert_eq!(result["queue_position_coverage"], 0.0);
+        assert_eq!(result["queue_snapshot_invalid_size_events"], 1);
+        assert_eq!(result["evidence_gate"], "FAIL");
     }
 
     #[test]

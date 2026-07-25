@@ -2048,6 +2048,8 @@ fn json_row(
         "execution_quality_gate": execution_quality_gate,
         "queue_snapshot_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_coverage")).cloned(),
         "queue_snapshot_applicable": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_applicable")).cloned(),
+        "queue_position_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_position_coverage")).cloned(),
+        "queue_position_applicable": execution_quality.and_then(|report| report.pointer("/result/queue_position_applicable")).cloned(),
         "markout_1s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/1/completion_rate")).cloned(),
         "markout_1s_applicable": execution_quality.and_then(|report| report.pointer("/result/markouts/1/applicable")).cloned(),
         "markout_5s_completion": execution_quality.and_then(|report| report.pointer("/result/markouts/5/completion_rate")).cloned(),
@@ -2448,6 +2450,11 @@ fn aggregate_profitability_metrics(
         |row| row.queue_snapshot_coverage,
         |row| row.queue_snapshot_applicable,
     );
+    let (queue_position_coverage, queue_position_applicable) = minimum_applicable_component(
+        &qualities,
+        |row| row.queue_position_coverage,
+        |row| row.queue_position_applicable,
+    );
     let (markout_1s_completion, markout_1s_applicable) = minimum_applicable_component(
         &qualities,
         |row| row.markout_1s_completion,
@@ -2491,6 +2498,8 @@ fn aggregate_profitability_metrics(
             decision_parity_rate: minimum_component(|row| row.decision_parity_rate),
             queue_snapshot_coverage,
             queue_snapshot_applicable,
+            queue_position_coverage,
+            queue_position_applicable,
             markout_1s_completion,
             markout_1s_applicable,
             markout_5s_completion,
@@ -3483,6 +3492,8 @@ mod wallet_metric_tests {
             decision_parity_rate: Some(Decimal::ONE),
             queue_snapshot_coverage: Some(coverage),
             queue_snapshot_applicable: Some(true),
+            queue_position_coverage: Some(coverage),
+            queue_position_applicable: Some(true),
             markout_1s_completion: Some(coverage),
             markout_1s_applicable: Some(true),
             markout_5s_completion: Some(coverage),

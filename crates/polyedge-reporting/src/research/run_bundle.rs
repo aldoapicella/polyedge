@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v4";
+pub const WARNING_REGISTRY_VERSION: &str = "research-data-quality-v5";
 pub const DEFAULT_PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const DAILY_PROVENANCE_CUTOFF: &str = "2026-07-12";
 const MANIFEST_FILE: &str = "run_manifest.json";
@@ -354,6 +354,12 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
             WarningSeverity::Blocking,
             true,
         )
+    } else if message.starts_with("bound inferred-size-ahead coverage below 95%: ") {
+        (
+            "queue_position_coverage_below_95pct",
+            WarningSeverity::Blocking,
+            true,
+        )
     } else if message
         .ends_with(" eligible fill lifecycle events lack the fields required for markout joins")
     {
@@ -449,6 +455,10 @@ pub struct DataQualityCoverageBreakdown {
     #[serde(default)]
     pub queue_snapshot_applicable: Option<bool>,
     #[serde(default)]
+    pub queue_position_coverage: Option<Decimal>,
+    #[serde(default)]
+    pub queue_position_applicable: Option<bool>,
+    #[serde(default)]
     pub markout_1s_completion: Option<Decimal>,
     #[serde(default)]
     pub markout_1s_applicable: Option<bool>,
@@ -532,8 +542,8 @@ impl DataQualitySummary {
             && complete(self.coverage_breakdown.execution_field_coverage)
             && self.coverage_breakdown.decision_parity_rate == Some(Decimal::ONE)
             && complete_or_not_applicable(
-                self.coverage_breakdown.queue_snapshot_coverage,
-                self.coverage_breakdown.queue_snapshot_applicable,
+                self.coverage_breakdown.queue_position_coverage,
+                self.coverage_breakdown.queue_position_applicable,
             )
             && complete_or_not_applicable(
                 self.coverage_breakdown.markout_1s_completion,
@@ -838,6 +848,15 @@ pub fn publish_daily_directory(
         )?;
         quality.coverage_breakdown.queue_snapshot_coverage = queue_snapshot_coverage;
         quality.coverage_breakdown.queue_snapshot_applicable = queue_snapshot_applicable;
+        let (queue_position_coverage, queue_position_applicable) = execution_completion_metric(
+            result,
+            "/queue_position_coverage",
+            "/queue_position_applicable",
+            "/queue_position_expected_orders",
+            "bound inferred-size-ahead coverage",
+        )?;
+        quality.coverage_breakdown.queue_position_coverage = queue_position_coverage;
+        quality.coverage_breakdown.queue_position_applicable = queue_position_applicable;
         let (markout_1s_completion, markout_1s_applicable) = execution_completion_metric(
             result,
             "/markouts/1/completion_rate",

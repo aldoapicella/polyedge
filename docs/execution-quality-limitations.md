@@ -21,6 +21,19 @@ visible_size_ahead_estimate = better-price public depth
                             + earlier PolyEdge shadow size
 ```
 
+The registration event also captures this estimate atomically with the durable
+paper-order registration. It records the public same-price and better-price
+components, earlier shadow size, capture and book timestamps, and
+`registration_inferred_size_ahead`. If no public book is available at that
+instant, the estimate remains null and the event records the typed reason
+`public_l2_book_unavailable_at_registration`.
+
+The later post-live queue snapshot remains the preferred measurement because it
+matches the point when the shadow order becomes fill-eligible. Reporting may use
+the atomic registration estimate only when no post-live snapshot event exists.
+It must not use that fallback to hide a malformed, conflicting, or duplicate
+snapshot. Registration capture also does not activate the fill model early.
+
 This estimate cannot determine:
 
 - whether same-price orders were added ahead of or behind the shadow order;
@@ -64,16 +77,49 @@ fills, strict trade-through, local cancel latency, and all three markout
 horizons. Daily evidence reports exclude probe events so a passing probe cannot
 be mistaken for real coverage.
 
-The daily `execution_quality.json` artifact reports queue-snapshot coverage,
-size-ahead distributions, partial/full shadow fills, trade-through counts,
-cancel-latency percentiles, markout completion and observation delay, and both
-midpoint and executable markout distributions. Its gate is:
+The daily `execution_quality.json` artifact reports bound queue-position
+coverage, diagnostic post-live snapshot coverage, size-ahead distributions,
+partial/full shadow fills, trade-through counts, cancel-latency percentiles,
+markout completion and observation delay, and both midpoint and executable
+markout distributions. Its gate is:
 
 ```text
 COLLECTING  no real paper lifecycles yet
-PASS        queue snapshots and every observed markout horizon are >= 95%
+PASS        inferred_size_ahead and every observed markout horizon are >= 95%
 FAIL        an observed coverage requirement is below 95%
 ```
+
+`queue_position_coverage` is the formal metric. It prefers the post-live
+snapshot and uses the atomic registration capture only when the snapshot event
+is absent. `queue_snapshot_coverage` remains visible as a diagnostic and is not
+the promotion gate.
+
+## UTC-Boundary Settlement Reconciliation
+
+Settlement events retain their real recorder timestamp and raw partition. They
+are never retimestamped, moved, or rewritten to make a daily report complete.
+For a market originating on UTC day `D` and ending exactly at `D+1 00:00:00Z`,
+the daily research pipeline may reconcile its settlement from sealed day
+`D+1`. The carry is accepted only when the next-day normalized shards match a
+verified projected-day manifest bound to the exact campaign, Azure
+account/container, raw source inventory, and UTC prefix. The complete settlement
+journal must have contiguous indices, one settlement event, a valid canonical
+SHA-256, and no event types other than `paper_settlement` and
+`paper_fill_markout_missing`.
+
+This exception is intentionally limited to the midnight boundary. A settlement
+recorded on `D+1` for a market that ended during day `D` is still classified as
+a missing mid-day settlement and fails closed. Reports retain both the market's
+originating UTC day and whether terminal evidence came from the same recorded
+day or the reconciled next-day partition. The daily job therefore reports only
+`D` after `D+1` is sealed; it never reads an open current-day partition or
+imports next-day decision-time features.
+
+This evidence-contract change uses
+`polyedge.loss_diagnostics.order_lifecycle_fact.v3` and warning registry
+`research-data-quality-v5`. It must begin in a fresh paper/shadow campaign and
+fresh report/cache/correction roots. Existing campaign artifacts and pointers
+must not be rewritten or mixed with v3 facts.
 
 ## How to Obtain Venue-Real Measurements
 

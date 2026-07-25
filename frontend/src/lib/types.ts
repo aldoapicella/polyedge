@@ -495,6 +495,8 @@ export type VenueExecutionEvidence = {
         decision_parity_rate?: string | number | null;
         queue_snapshot_coverage?: string | number | null;
         queue_snapshot_applicable?: boolean | null;
+        queue_position_coverage?: string | number | null;
+        queue_position_applicable?: boolean | null;
         markout_1s_completion?: string | number | null;
         markout_1s_applicable?: boolean | null;
         markout_5s_completion?: string | number | null;
@@ -547,6 +549,8 @@ export type VenueExecutionEvidence = {
             decision_parity_rate?: string | number | null;
             queue_snapshot_coverage?: string | number | null;
             queue_snapshot_applicable?: boolean | null;
+            queue_position_coverage?: string | number | null;
+            queue_position_applicable?: boolean | null;
             markout_1s_completion?: string | number | null;
             markout_1s_applicable?: boolean | null;
             markout_5s_completion?: string | number | null;

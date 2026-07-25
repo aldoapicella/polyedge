@@ -1,6 +1,6 @@
 use super::*;
 
-const ORDER_FACT_SCHEMA: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v2";
+const ORDER_FACT_SCHEMA: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v3";
 const FILL_FACT_SCHEMA: &str = "polyedge.loss_diagnostics.fill_markout_fact.v1";
 const SUMMARY_SCHEMA: &str = "polyedge.loss_diagnostics.summary.v1";
 const ORDER_FACT_FILE: &str = "order_lifecycle_fact.jsonl";
@@ -14,6 +14,7 @@ const ARTIFACT_MANIFEST_SCHEMA: &str = "polyedge.loss_diagnostics.artifact_manif
 pub struct LossDiagnosticsOptions {
     pub input: PathBuf,
     pub out: PathBuf,
+    pub settlement_carry: Option<SettlementCarryOptions>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +71,7 @@ struct MarketEvidenceRef {
     event_sha256: String,
     recorded_ts: DateTime<Utc>,
     market_end_ts: Option<DateTime<Utc>>,
+    market_start_ts: Option<DateTime<Utc>>,
     journal_event_sha256: Option<String>,
     settlement_journal_id: Option<String>,
     settlement_journal_sha256: Option<String>,
@@ -85,6 +87,8 @@ impl MarketEvidenceRef {
             recorded_ts: event.recorded_ts,
             market_end_ts: parse_datetime(event.payload.get("end_ts"))
                 .or_else(|| parse_datetime(event.payload.get("market_end_ts"))),
+            market_start_ts: parse_datetime(event.payload.get("start_ts"))
+                .or_else(|| parse_datetime(event.payload.get("market_start_ts"))),
             journal_event_sha256: event.journal_event_sha256.clone(),
             settlement_journal_id: event.settlement_journal_id.clone(),
             settlement_journal_sha256: event.settlement_journal_sha256.clone(),
@@ -658,6 +662,7 @@ impl LossDiagnosticsAccumulator {
         let mut order_rows = Vec::new();
         let mut order_execution_complete = 0_usize;
         let mut order_queue_complete = 0_usize;
+        let mut order_queue_registration_fallback = 0_usize;
         let mut applied_decision_joins = 0_usize;
         for application in self.applications.values() {
             let Some(order_id) = application.parsed.order_id.as_ref() else {
@@ -700,15 +705,28 @@ impl LossDiagnosticsAccumulator {
                     "queue snapshot identity mismatch",
                 ));
             }
+            let raw_snapshot_present = self
+                .snapshots
+                .get(order_id)
+                .is_some_and(|rows| !rows.is_empty());
+            let registration_capture =
+                registration.map(|event| QueueRegistrationCapture::from_payload(&event.payload));
+            let snapshot_size_ahead = snapshot
+                .and_then(|snapshot| decimal(snapshot.payload.get("visible_size_ahead_estimate")));
+            let registration_fallback = (!raw_snapshot_present)
+                .then(|| {
+                    registration_capture
+                        .as_ref()
+                        .and_then(QueueRegistrationCapture::available)
+                })
+                .flatten();
             let queue_complete = registration.is_some()
-                && snapshot.is_some()
-                && snapshot
-                    .and_then(|snapshot| {
-                        decimal(snapshot.payload.get("visible_size_ahead_estimate"))
-                    })
-                    .is_some();
+                && (snapshot_size_ahead.is_some() || registration_fallback.is_some());
             if queue_complete && protocol_v3_bound {
                 order_queue_complete += 1;
+                if snapshot_size_ahead.is_none() && registration_fallback.is_some() {
+                    order_queue_registration_fallback += 1;
+                }
             }
             let application_report = application
                 .payload
@@ -857,6 +875,43 @@ impl LossDiagnosticsAccumulator {
                     "queue snapshot chronology is invalid",
                 ));
             }
+            let (
+                inferred_size_ahead,
+                queue_position_capture_method,
+                queue_position_event_sha256,
+                queue_position_capture_ts,
+                inferred_size_ahead_unavailable_reason,
+            ) = if let (Some(snapshot), Some(size_ahead), Some(snapshot_ts)) =
+                (snapshot, snapshot_size_ahead, queue_snapshot_ts)
+            {
+                (
+                    Some(size_ahead),
+                    Some("post_live_snapshot"),
+                    Some(snapshot.event_sha256.clone()),
+                    Some(snapshot_ts),
+                    None,
+                )
+            } else if let (Some(registration), Some((size_ahead, capture_ts))) =
+                (registration, registration_fallback)
+            {
+                (
+                    Some(size_ahead),
+                    Some("atomic_registration_fallback"),
+                    Some(registration.event_sha256.clone()),
+                    Some(capture_ts),
+                    None,
+                )
+            } else {
+                let reason = if raw_snapshot_present {
+                    "invalid_post_live_snapshot"
+                } else {
+                    registration_capture
+                        .as_ref()
+                        .and_then(QueueRegistrationCapture::unavailable_reason)
+                        .unwrap_or("queue_registration_missing")
+                };
+                (None, None, None, None, Some(reason))
+            };
             let cancelled_report = execution_reports
                 .iter()
                 .any(|event| event.payload["status"].as_str() == Some("paper_cancelled"));
@@ -901,7 +956,7 @@ impl LossDiagnosticsAccumulator {
             });
             let mut row = json!({
                 "schema": ORDER_FACT_SCHEMA,
-                "schema_version": 2,
+                "schema_version": 3,
                 "evidence_classification": classification,
                 "diagnostic_only": true,
                 "counts_toward_protocol_v3_evidence": false,
@@ -925,7 +980,12 @@ impl LossDiagnosticsAccumulator {
                 "terminal_start_price": settlement_evidence.and_then(|evidence| evidence.start_price).map(|value| value.to_string()),
                 "terminal_final_price": settlement_evidence.and_then(|evidence| evidence.final_price).map(|value| value.to_string()),
                 "terminal_winning_outcome": settlement_evidence.and_then(|evidence| evidence.winning_outcome.clone()),
+                "terminal_market_start_ts": settlement_evidence.and_then(|evidence| evidence.market_start_ts).map(ts),
                 "terminal_market_end_ts": settlement_evidence.and_then(|evidence| evidence.market_end_ts).map(ts),
+                "market_origin_utc_day": settlement_evidence.and_then(|evidence| evidence.market_start_ts).map(|value| value.date_naive().to_string()),
+                "terminal_settlement_partition": settlement_evidence.and_then(|evidence| evidence.market_start_ts.map(|start| {
+                    if evidence.recorded_ts.date_naive() == start.date_naive() { "same_recorded_day" } else { "reconciled_next_day" }
+                })),
                 "terminal_settlement_recorded_ts": settlement_evidence.map(|evidence| ts(evidence.recorded_ts)),
                 "terminal_settled_net_pnl": terminal_settled_net_pnl.map(|value| value.to_string()),
                 "order_id": order_id,
@@ -942,7 +1002,12 @@ impl LossDiagnosticsAccumulator {
                 "execution_fields_complete": execution_complete,
                 "queue_position_source": "paper_shadow_lifecycle_plus_public_l2",
                 "queue_position": "inferred_size_ahead",
-                "inferred_size_ahead": snapshot.and_then(|event| decimal(event.payload.get("visible_size_ahead_estimate"))).map(|value| value.to_string()),
+                "literal_fifo_rank_available": false,
+                "inferred_size_ahead": inferred_size_ahead.map(|value| value.to_string()),
+                "inferred_size_ahead_unavailable_reason": inferred_size_ahead_unavailable_reason,
+                "queue_position_capture_method": queue_position_capture_method,
+                "queue_position_event_sha256": queue_position_event_sha256,
+                "queue_position_capture_ts": queue_position_capture_ts.map(ts),
                 "queue_snapshot_ts": queue_snapshot_ts.map(ts),
                 "fill_count": order_fills.len(),
                 "fill_lifecycle_ids": order_fills.iter().map(|(key, _)| fill_lifecycle_id(key)).collect::<Vec<_>>(),
@@ -1096,12 +1161,40 @@ impl LossDiagnosticsAccumulator {
             .difference(&valid_settlement_evidence.keys().cloned().collect())
             .cloned()
             .collect::<BTreeSet<_>>();
+        let expected_market_times = self
+            .batches
+            .values()
+            .filter(|batch| !batch.place_output_hashes.is_empty())
+            .map(|batch| {
+                (
+                    batch.input.market.market_id.to_string(),
+                    (batch.input.market.start_ts, batch.input.market.end_ts),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let missing_boundary_settlement_market_ids = missing_settlement_market_ids
+            .iter()
+            .filter(|market_id| {
+                expected_market_times
+                    .get(*market_id)
+                    .is_some_and(|(start, end)| {
+                        end.time() == chrono::NaiveTime::MIN
+                            && end.date_naive()
+                                == start.date_naive().succ_opt().unwrap_or(end.date_naive())
+                    })
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let missing_mid_day_settlement_market_ids = missing_settlement_market_ids
+            .difference(&missing_boundary_settlement_market_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let coverage = json!({
             "market_starts": coverage_row(valid_start_evidence.len(), expected_markets.len(), "authoritative validated-batch place markets with exact typed start evidence"),
             "market_settlements": coverage_row(valid_settlement_evidence.len(), expected_markets.len(), "authoritative validated-batch place markets with one locally validated terminal settlement"),
             "decisions": coverage_row(applied_decision_joins, expected_place_outputs, "authoritative validated-batch place outputs joined through durable decision and application"),
             "execution_fields": coverage_row(order_execution_complete, expected_place_outputs, "authoritative validated-batch place outputs with complete immutable decision and initial execution fields"),
-            "queue_fields": coverage_row(order_queue_complete, expected_place_outputs, "authoritative validated-batch place outputs with one exact registration and inferred_size_ahead snapshot"),
+            "queue_fields": coverage_row(order_queue_complete, expected_place_outputs, "authoritative validated-batch place outputs with one exact registration and inferred_size_ahead bound from the preferred post-live snapshot or, only when absent, a valid atomic registration capture"),
             "markout_1s": coverage_row(observed_markouts.get(&1).copied().unwrap_or(0), fill_rows.len(), "fill lifecycles with one valid entry-fee-net executable 1-second markout"),
             "markout_5s": coverage_row(observed_markouts.get(&5).copied().unwrap_or(0), fill_rows.len(), "fill lifecycles with one valid entry-fee-net executable 5-second markout"),
             "markout_30s": coverage_row(observed_markouts.get(&30).copied().unwrap_or(0), fill_rows.len(), "fill lifecycles with one valid entry-fee-net executable 30-second markout")
@@ -1182,7 +1275,9 @@ impl LossDiagnosticsAccumulator {
                 "valid_start_evidence": market_evidence_json(&valid_start_evidence),
                 "valid_terminal_settlement_evidence": market_evidence_json(&valid_settlement_evidence),
                 "missing_start_market_ids": missing_start_market_ids,
-                "missing_terminal_settlement_market_ids": missing_settlement_market_ids
+                "missing_terminal_settlement_market_ids": missing_settlement_market_ids,
+                "missing_boundary_settlement_market_ids": missing_boundary_settlement_market_ids,
+                "missing_mid_day_settlement_market_ids": missing_mid_day_settlement_market_ids
             },
             "coverage": coverage,
             "completion_checks": {
@@ -1197,6 +1292,7 @@ impl LossDiagnosticsAccumulator {
             "counts": {
                 "order_lifecycle_rows": order_rows.len(),
                 "fill_markout_rows": fill_rows.len(),
+                "queue_position_registration_fallback_orders": order_queue_registration_fallback,
                 "valid_v3_batches": self.batches.len(),
                 "expected_v3_place_outputs": expected_place_outputs,
                 "valid_v3_place_decisions": self.decisions.len(),
@@ -1291,7 +1387,12 @@ impl LossDiagnosticsAccumulator {
             .iter()
             .filter_map(|(order_id, rows)| {
                 let event = rows.first()?;
-                if QueueRegistrationIdentity::from_payload(&event.payload).is_none() {
+                if QueueRegistrationIdentity::from_payload(&event.payload).is_none()
+                    || matches!(
+                        QueueRegistrationCapture::from_payload(&event.payload),
+                        QueueRegistrationCapture::Invalid
+                    )
+                {
                     invalid += 1;
                     return None;
                 }
@@ -1654,6 +1755,11 @@ where
     F: FnOnce(&Path) -> Result<(), ResearchError>,
 {
     let started = Instant::now();
+    let settlement_carry = options
+        .settlement_carry
+        .as_ref()
+        .map(load_boundary_settlement_carry)
+        .transpose()?;
     if !options.input.is_dir() {
         return Err(ResearchError::InvalidInput(
             "loss diagnostics requires an explicitly supplied local normalized snapshot directory"
@@ -1680,6 +1786,11 @@ where
         stream_loss_diagnostic_events(&options.input, pinned_campaign_index.as_ref(), |event| {
             audit.observe(event);
         })?;
+    if let Some(carry) = &settlement_carry {
+        for event in &carry.events {
+            audit.observe(event);
+        }
+    }
     if audit_stream.malformed_lines > 0 || audit_stream.out_of_order_timestamps > 0 {
         return Err(ResearchError::InvalidInput(format!(
             "loss diagnostics refuses malformed or out-of-order input: {} malformed, {} out of order",
@@ -1706,6 +1817,11 @@ where
         stream_loss_diagnostic_events(&options.input, pinned_campaign_index.as_ref(), |event| {
             diagnostics.observe(event)
         })?;
+    if let Some(carry) = &settlement_carry {
+        for event in &carry.events {
+            diagnostics.observe(event);
+        }
+    }
     let inventory_after =
         build_local_source_inventory(&options.input, EventPathMode::PreferEventsJsonl)?;
     let manifest_after = validate_snapshot_manifest(&options.input, &inventory_after)?;
@@ -1731,7 +1847,8 @@ where
         "events_scanned": stream.events,
         "duplicate_line_estimate": stream.duplicate_estimate,
         "duplicate_line_estimate_authority": "shared_capped_stream_informational_only",
-        "stream_notices": stream.notices
+        "stream_notices": stream.notices,
+        "settlement_carry": settlement_carry.as_ref().map(|carry| carry.evidence.clone())
     });
     let facts = diagnostics.finish(&audit, &snapshot)?;
     let mut staging = StagingDirectory::create(&options.out)?;
@@ -2652,6 +2769,7 @@ mod tests {
         let report = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap();
 
@@ -2691,10 +2809,9 @@ mod tests {
         assert!(out.join(SUMMARY_FILE).is_file());
         assert!(out.join(MARKDOWN_FILE).is_file());
 
-        // Frozen from the exact one-pass parent 06a699d. This fixture exercises
-        // partial fills, a fill/cancel race, complete and missing markouts, and
-        // invalid/orphan lifecycle rows. The two-pass memory repair must not
-        // change any decision-relevant output.
+        // Frozen from the atomic queue-registration and settlement-reconciliation
+        // evidence schema. This fixture exercises partial fills, a fill/cancel
+        // race, complete and missing markouts, and invalid/orphan lifecycle rows.
         let mut semantic_result = report["result"].clone();
         semantic_result.as_object_mut().unwrap().remove("artifacts");
         semantic_result
@@ -2711,11 +2828,11 @@ mod tests {
         });
         assert_eq!(
             canonical_value_sha256(&semantic).as_deref(),
-            Some("sha256:1a14aece4447e736bd70799fdd204af16993eac1160b45aa912cc3258de8016f")
+            Some("sha256:62c236b142c0550926ba3349f657ca0d4f73b329a8677809ffc1ad3f9dfb8ddf")
         );
         assert_eq!(
             sha256_prefixed(&fs::read(out.join(ORDER_FACT_FILE)).unwrap()),
-            "sha256:f7a18308bbdc5b3623b828172a30b4bab62ec720be90697cd155ffe53f93f79d"
+            "sha256:f64ce7787f09994b8459f854610a59216b35bee2fb1f96c5d5161407f6fe274a"
         );
         assert_eq!(
             sha256_prefixed(&fs::read(out.join(FILL_FACT_FILE)).unwrap()),
@@ -2768,7 +2885,12 @@ mod tests {
                 ),
             ],
         );
-        let error = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap_err();
+        let error = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("duplicate fill lifecycle identity"));
@@ -2787,7 +2909,12 @@ mod tests {
                 test_ts("2026-07-20T12:00:00Z"),
             )],
         );
-        let error = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap_err();
+        let error = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("requires explicit valid Protocol-v3 decision-output identity"));
@@ -2803,6 +2930,7 @@ mod tests {
         let report = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap();
         assert_eq!(report["result"]["status"], "complete_diagnostic");
@@ -2835,7 +2963,7 @@ mod tests {
         }
         assert!(orders.iter().all(|row| {
             row["schema"] == ORDER_FACT_SCHEMA
-                && row["schema_version"] == 2
+                && row["schema_version"] == 3
                 && row["market_start_event_sha256"].is_string()
                 && row["market_start_price"].is_string()
                 && row["terminal_settlement_event_sha256"].is_string()
@@ -2851,6 +2979,178 @@ mod tests {
         }));
         assert_artifact_manifest(&out);
         assert!(staging_siblings(&out).is_empty());
+    }
+
+    #[test]
+    fn loss_diagnostics_uses_valid_atomic_registration_only_when_snapshot_is_absent() {
+        let root = test_root("atomic-registration-fallback");
+        let input = root.join("snapshot");
+        let out = root.join("out");
+        let mut events = fully_bound_v3_events();
+        events.retain(|event| event["event_type"] != "paper_order_queue_snapshot");
+        for event in &mut events {
+            if event["event_type"] != "paper_order_queue_registration" {
+                continue;
+            }
+            let submitted_ts = parse_datetime(event.pointer("/payload/submitted_ts")).unwrap();
+            let payload = event["payload"].as_object_mut().unwrap();
+            payload.insert(
+                "registration_queue_position_schema".to_owned(),
+                json!("polyedge.paper_registration_queue_position.v1"),
+            );
+            payload.insert(
+                "registration_queue_position_status".to_owned(),
+                json!("available"),
+            );
+            payload.insert(
+                "registration_queue_position_source".to_owned(),
+                json!("public_l2_shadow"),
+            );
+            payload.insert(
+                "registration_queue_position_metric".to_owned(),
+                json!("inferred_size_ahead"),
+            );
+            payload.insert(
+                "registration_queue_position_method".to_owned(),
+                json!("public_l2_at_registration_plus_earlier_shadow_orders"),
+            );
+            payload.insert("registration_inferred_size_ahead".to_owned(), json!("10"));
+            payload.insert(
+                "registration_inferred_size_ahead_unavailable_reason".to_owned(),
+                Value::Null,
+            );
+            payload.insert(
+                "registration_same_price_public_size_ahead".to_owned(),
+                json!("4"),
+            );
+            payload.insert(
+                "registration_better_price_public_size_ahead".to_owned(),
+                json!("6"),
+            );
+            payload.insert(
+                "registration_earlier_shadow_order_size_ahead".to_owned(),
+                json!("0"),
+            );
+            payload.insert(
+                "registration_queue_position_capture_ts".to_owned(),
+                json!(submitted_ts),
+            );
+            payload.insert(
+                "book_ts".to_owned(),
+                json!(submitted_ts - Duration::milliseconds(1)),
+            );
+            payload.insert("literal_fifo_rank_available".to_owned(), json!(false));
+        }
+        write_snapshot(&input, &events);
+
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out: out.clone(),
+            settlement_carry: None,
+        })
+        .unwrap();
+
+        assert_eq!(report["result"]["status"], "complete_diagnostic");
+        assert_eq!(
+            report["result"]["counts"]["queue_position_registration_fallback_orders"],
+            report["result"]["counts"]["order_lifecycle_rows"]
+        );
+        for row in read_jsonl(&out.join(ORDER_FACT_FILE)) {
+            assert_eq!(
+                row["queue_position_capture_method"],
+                "atomic_registration_fallback"
+            );
+            assert_eq!(row["inferred_size_ahead"], "10");
+            assert!(row["inferred_size_ahead_unavailable_reason"].is_null());
+            assert!(row["queue_snapshot_event_sha256"].is_null());
+            assert_eq!(
+                row["queue_position_event_sha256"],
+                row["queue_registration_event_sha256"]
+            );
+            assert_fact_hash(&row);
+        }
+    }
+
+    #[test]
+    fn loss_diagnostics_does_not_mask_invalid_snapshot_with_registration_capture() {
+        let root = test_root("atomic-registration-invalid-snapshot");
+        let input = root.join("snapshot");
+        let out = root.join("out");
+        let mut events = fully_bound_v3_events();
+        for event in &mut events {
+            if event["event_type"] == "paper_order_queue_registration" {
+                let submitted_ts = parse_datetime(event.pointer("/payload/submitted_ts")).unwrap();
+                let payload = event["payload"].as_object_mut().unwrap();
+                payload.extend([
+                    (
+                        "registration_queue_position_schema".to_owned(),
+                        json!("polyedge.paper_registration_queue_position.v1"),
+                    ),
+                    (
+                        "registration_queue_position_status".to_owned(),
+                        json!("available"),
+                    ),
+                    (
+                        "registration_queue_position_source".to_owned(),
+                        json!("public_l2_shadow"),
+                    ),
+                    (
+                        "registration_queue_position_metric".to_owned(),
+                        json!("inferred_size_ahead"),
+                    ),
+                    (
+                        "registration_queue_position_method".to_owned(),
+                        json!("public_l2_at_registration_plus_earlier_shadow_orders"),
+                    ),
+                    ("registration_inferred_size_ahead".to_owned(), json!("10")),
+                    (
+                        "registration_inferred_size_ahead_unavailable_reason".to_owned(),
+                        Value::Null,
+                    ),
+                    (
+                        "registration_same_price_public_size_ahead".to_owned(),
+                        json!("4"),
+                    ),
+                    (
+                        "registration_better_price_public_size_ahead".to_owned(),
+                        json!("6"),
+                    ),
+                    (
+                        "registration_earlier_shadow_order_size_ahead".to_owned(),
+                        json!("0"),
+                    ),
+                    (
+                        "registration_queue_position_capture_ts".to_owned(),
+                        json!(submitted_ts),
+                    ),
+                    (
+                        "book_ts".to_owned(),
+                        json!(submitted_ts - Duration::milliseconds(1)),
+                    ),
+                    ("literal_fifo_rank_available".to_owned(), json!(false)),
+                ]);
+            } else if event["event_type"] == "paper_order_queue_snapshot" {
+                event["payload"]["visible_size_ahead_estimate"] = Value::Null;
+            }
+        }
+        write_snapshot(&input, &events);
+
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
+
+        assert_eq!(report["result"]["status"], "diagnostic_ineligible");
+        assert_eq!(report["result"]["coverage"]["queue_fields"]["observed"], 0);
+        assert_eq!(
+            report["result"]["counts"]["queue_position_registration_fallback_orders"],
+            0
+        );
+        assert!(report["result"]["counts"]["invalid_snapshots"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
     }
 
     #[test]
@@ -2904,7 +3204,12 @@ mod tests {
         events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
         write_snapshot(&input, &events);
 
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         assert_eq!(report["result"]["eligible_protocol_v3_identity"], false);
         assert_eq!(
@@ -2924,7 +3229,12 @@ mod tests {
         second_runtime["payload"]["decision_config_sha256"] =
             json!(format!("sha256:{}", "e".repeat(64)));
         write_snapshot(&input, &events);
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         assert_eq!(
             report["result"]["runtime_provenance_stable_identity"]["distinct_identity_count"],
@@ -2968,7 +3278,12 @@ mod tests {
                 ),
             ],
         );
-        let error = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap_err();
+        let error = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("execution report identity or chronology is invalid"));
@@ -3082,6 +3397,7 @@ mod tests {
             let error = run_loss_diagnostics(LossDiagnosticsOptions {
                 input,
                 out: out.clone(),
+                settlement_carry: None,
             })
             .unwrap_err();
             assert!(
@@ -3131,6 +3447,7 @@ mod tests {
         let error = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap_err();
         assert!(
@@ -3187,6 +3504,7 @@ mod tests {
         let error = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap_err();
         assert!(
@@ -3262,6 +3580,7 @@ mod tests {
         let report = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap();
         assert_eq!(report["result"]["counts"]["invalid_execution_reports"], 0);
@@ -3288,7 +3607,12 @@ mod tests {
         events.push(batch);
         events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
         write_snapshot(&input, &events);
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         assert_eq!(
             report["result"]["counts"]["duplicate_batch_retries_deduplicated"],
@@ -3316,7 +3640,12 @@ mod tests {
         events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
         write_snapshot(&input, &events);
 
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         assert_eq!(report["result"]["counts"]["duplicate_event_lines"], 1);
         assert_eq!(
@@ -3366,7 +3695,12 @@ mod tests {
                 && event["payload"]["strategy_batch_output_index"].as_u64() == Some(missing_index))
         });
         write_snapshot(&input, &events);
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         for field in ["decisions", "execution_fields", "queue_fields"] {
             assert_eq!(report["result"]["coverage"][field]["denominator"], 2);
@@ -3394,7 +3728,12 @@ mod tests {
         ));
         events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
         write_snapshot(&input, &events);
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(
             report["result"]["coverage"]["market_settlements"]["denominator"],
             1
@@ -3439,7 +3778,12 @@ mod tests {
             events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
             write_snapshot(&input, &events);
 
-            let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+            let report = run_loss_diagnostics(LossDiagnosticsOptions {
+                input,
+                out,
+                settlement_carry: None,
+            })
+            .unwrap();
             assert_eq!(report["result"]["status"], "diagnostic_ineligible");
             assert_eq!(
                 report["result"]["coverage"]["market_settlements"]["observed"],
@@ -3467,7 +3811,12 @@ mod tests {
         events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
         write_snapshot(&input, &events);
 
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         assert_eq!(report["result"]["coverage"]["market_starts"]["observed"], 0);
         assert_eq!(
@@ -3551,7 +3900,12 @@ mod tests {
             ));
         }
         write_snapshot(&input, &events);
-        let report = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap();
+        let report = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
         assert_eq!(report["result"]["counts"]["expected_v3_place_outputs"], 0);
         for field in ["decisions", "execution_fields", "queue_fields"] {
@@ -3571,6 +3925,7 @@ mod tests {
         let error = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("never overwrites"));
@@ -3672,7 +4027,12 @@ mod tests {
             ];
             events.sort_by_key(|event| parse_datetime(event.get("recorded_ts")).unwrap());
             write_snapshot(&input, &events);
-            let error = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap_err();
+            let error = run_loss_diagnostics(LossDiagnosticsOptions {
+                input,
+                out,
+                settlement_carry: None,
+            })
+            .unwrap_err();
             assert!(error.to_string().contains(expected), "{error}");
         }
     }
@@ -3717,7 +4077,12 @@ mod tests {
             ),
         ];
         write_snapshot(&input, &events);
-        let error = run_loss_diagnostics(LossDiagnosticsOptions { input, out }).unwrap_err();
+        let error = run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: None,
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("mixes alternative fill sources"));
     }
 
@@ -3754,6 +4119,7 @@ mod tests {
         let report = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap();
         assert_eq!(report["result"]["counts"]["invalid_markouts"], 1);
@@ -3796,6 +4162,7 @@ mod tests {
         let report = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: out.clone(),
+            settlement_carry: None,
         })
         .unwrap();
         assert_eq!(report["result"]["status"], "diagnostic_ineligible");
@@ -3828,6 +4195,7 @@ mod tests {
         let report = run_loss_diagnostics(LossDiagnosticsOptions {
             input: input.clone(),
             out,
+            settlement_carry: None,
         })
         .unwrap();
         assert_eq!(report["result"]["coverage"]["market_starts"]["observed"], 0);
@@ -3844,6 +4212,7 @@ mod tests {
         let error = run_loss_diagnostics(LossDiagnosticsOptions {
             input,
             out: root.join("out-unsealed"),
+            settlement_carry: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("sealed decision-grade"));
@@ -4244,6 +4613,7 @@ mod tests {
             LossDiagnosticsOptions {
                 input: input.clone(),
                 out: out.clone(),
+                settlement_carry: None,
             },
             |snapshot| {
                 let path = snapshot.join("events_manifest.json");

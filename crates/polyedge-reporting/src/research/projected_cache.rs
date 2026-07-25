@@ -808,7 +808,7 @@ fn normalized_file_bindings(
     Ok(bindings)
 }
 
-fn validate_day_manifest(
+pub(super) fn validate_day_manifest(
     manifest: &ProjectedDayManifest,
     expected_date: NaiveDate,
     expected_campaign: &str,
@@ -850,7 +850,7 @@ fn validate_day_manifest(
     Ok(())
 }
 
-fn validate_projected_day_source(
+pub(super) fn validate_projected_day_source(
     canonical: &ProjectedDayCanonical,
     expected_date: NaiveDate,
     require_azure_source: bool,
@@ -1084,7 +1084,10 @@ fn campaign_chain_hash(parent: Option<&str>, date: NaiveDate, day_sha256: &str) 
     sha256_prefixed(&serde_json::to_vec(&value).expect("campaign chain value serializes"))
 }
 
-fn verify_binding_bytes(binding: &ProjectedFileBinding, bytes: &[u8]) -> Result<(), ResearchError> {
+pub(super) fn verify_binding_bytes(
+    binding: &ProjectedFileBinding,
+    bytes: &[u8],
+) -> Result<(), ResearchError> {
     if bytes.len() as u64 != binding.bytes || sha256_prefixed(bytes) != binding.sha256 {
         return Err(ResearchError::InvalidInput(format!(
             "projected shard {} failed size or SHA-256 verification",
