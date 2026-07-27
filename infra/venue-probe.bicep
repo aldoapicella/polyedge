@@ -969,8 +969,12 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
       containers: [{
         name: 'funded-ladder'
         image: venueProbeImage
-        command: ['node', 'src/funded-ladder-controller.mjs']
+        command: ['node', 'src/funded-dynamic-quote-worker.mjs']
         env: [
+          { name: 'FUNDED_DYNAMIC_QUOTE_WORKER_ENABLED', value: 'false' }
+          { name: 'FUNDED_DYNAMIC_QUOTE_MAX_ITERATIONS', value: '200' }
+          { name: 'FUNDED_DYNAMIC_QUOTE_POLL_INTERVAL_MS', value: '5000' }
+          { name: 'FUNDED_DYNAMIC_QUOTE_MAX_IDLE_MS', value: '300000' }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
