@@ -56,6 +56,8 @@ jobs:
     steps:
       - name: Checkout exact source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.operation == 'deploy-frozen-campaign' && github.sha || '298fc76da0f7cc482883b6503dd06d0a582f6ac6' }}
 
       - name: Fail closed on identity or operation mismatch
         env:
@@ -618,8 +620,8 @@ jobs:
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$QSET_CONTROL_CONTAINER" \
             -o json)
-          test "$(jq -r '.properties.state' <<<"$policy_json")" = "Unlocked"
-          test "$(jq -r '.properties.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" = "90"
+          test "$(jq -r '.state' <<<"$policy_json")" = "Unlocked"
+          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" = "90"
           etag=$(jq -r '.etag' <<<"$policy_json")
           test -n "$etag"
           az storage container immutability-policy lock \
@@ -634,8 +636,8 @@ jobs:
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$QSET_CONTROL_CONTAINER" \
             -o json)
-          test "$(jq -r '.properties.state' <<<"$locked_json")" = "Locked"
-          test "$(jq -r '.properties.immutabilityPeriodSinceCreationInDays' <<<"$locked_json")" = "90"
+          test "$(jq -r '.state' <<<"$locked_json")" = "Locked"
+          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$locked_json")" = "90"
 
       - name: Load and verify frozen live binding
         if: inputs.operation != 'deploy-frozen-campaign'
@@ -646,8 +648,8 @@ jobs:
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$QSET_CONTROL_CONTAINER" \
             -o json)
-          test "$(jq -r '.properties.state' <<<"$policy_json")" = "Locked"
-          test "$(jq -r '.properties.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" -ge 90
+          test "$(jq -r '.state' <<<"$policy_json")" = "Locked"
+          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" -ge 90
           active_path="reports/research/shadow/campaigns/$CAMPAIGN_ID/control/code-freeze/active.json"
           az storage blob download --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$active_path" --file active-freeze.json --auth-mode login --overwrite --only-show-errors -o none
           jq -e --arg id "$CAMPAIGN_ID" '.schema == "polyedge.shadow_code_freeze_pointer.v1" and .campaign_id == $id and .code_frozen == true' active-freeze.json
