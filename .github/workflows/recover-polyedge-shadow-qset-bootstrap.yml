@@ -478,22 +478,23 @@ jobs:
           fqdn=$(jq -r '.properties.configuration.ingress.fqdn' <<<"$app_json")
           login_body=$(jq -nc --arg password "$DASHBOARD_AUTH_PASSWORD" '{password:$password}')
           ready=false
-          for attempt in $(seq 1 40); do
+          for attempt in $(seq 1 60); do
             code=$(curl -sS -o login.json -c cookies.txt -w '%{http_code}' -H 'content-type: application/json' --data "$login_body" "https://$fqdn/api/auth/login" || true)
             if [ "$code" = 200 ]; then
-              ready=true
-              break
+              if curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/status" -o live-status.json \
+                && curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/labs/reports/latest" -o live-labs-latest.json \
+                && curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/labs/reports/daily/2026-07-23" -o live-labs-archived.json \
+                && jq -e --arg sha "$FROZEN_SOURCE_COMMIT" '.execution_mode == "paper" and .git_sha == $sha' live-status.json >/dev/null \
+                && jq -e --arg id "$CAMPAIGN_ID" '.campaign_id == $id and .status == "awaiting_first_sealed_day"' live-labs-latest.json >/dev/null \
+                && jq -e --arg id "$LEGACY_CAMPAIGN_ID" '.campaign_id == $id and .status == "historical_ineligible"' live-labs-archived.json >/dev/null; then
+                ready=true
+                break
+              fi
             fi
             sleep 10
           done
           unset login_body
           test "$ready" = "true"
-          curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/status" -o live-status.json
-          curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/labs/reports/latest" -o live-labs-latest.json
-          curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/labs/reports/daily/2026-07-23" -o live-labs-archived.json
-          jq -e --arg sha "$FROZEN_SOURCE_COMMIT" '.execution_mode == "paper" and .git_sha == $sha' live-status.json
-          jq -e --arg id "$CAMPAIGN_ID" '.campaign_id == $id and .status == "awaiting_first_sealed_day"' live-labs-latest.json
-          jq -e --arg id "$LEGACY_CAMPAIGN_ID" '.campaign_id == $id and .status == "historical_ineligible"' live-labs-archived.json
 
       - name: Re-prove predecessor state and seal freeze pointer
         run: |
