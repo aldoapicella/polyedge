@@ -146,12 +146,12 @@ jobs:
             test "$(jq -r '.properties.configuration.triggerType' <<<"$job_json")" = "Manual"
             test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
           done
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query \"properties.template.containers[0].env[?name=='ALLOW_LIVE'].value | [0]\" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-redeem-neu-job --query \"properties.template.containers[0].env[?name=='VENUE_REDEMPTION_ENABLED'].value | [0]\" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-strategy-canary-neu-job --query \"properties.template.containers[0].env[?name=='STRATEGY_CANARY_CONTROLLER_ENABLED'].value | [0]\" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-funded-ladder-neu-job --query \"properties.template.containers[0].env[?name=='FUNDED_LADDER_CONTROLLER_ENABLED'].value | [0]\" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-promotion-neu-job --query \"properties.template.containers[0].env[?name=='PROMOTION_TRANSITION_ENABLED'].value | [0]\" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-model-job --query \"properties.template.containers[0].env[?name=='QUEUE_MODEL_TRAINING_ENABLED'].value | [0]\" -o tsv)" = "false"
+          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='ALLOW_LIVE'].value | [0]" -o tsv)" = "false"
+          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-redeem-neu-job --query "properties.template.containers[0].env[?name=='VENUE_REDEMPTION_ENABLED'].value | [0]" -o tsv)" = "false"
+          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-strategy-canary-neu-job --query "properties.template.containers[0].env[?name=='STRATEGY_CANARY_CONTROLLER_ENABLED'].value | [0]" -o tsv)" = "false"
+          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-funded-ladder-neu-job --query "properties.template.containers[0].env[?name=='FUNDED_LADDER_CONTROLLER_ENABLED'].value | [0]" -o tsv)" = "false"
+          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-promotion-neu-job --query "properties.template.containers[0].env[?name=='PROMOTION_TRANSITION_ENABLED'].value | [0]" -o tsv)" = "false"
+          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-model-job --query "properties.template.containers[0].env[?name=='QUEUE_MODEL_TRAINING_ENABLED'].value | [0]" -o tsv)" = "false"
 
       - name: Snapshot immutable predecessor resources and artifacts
         if: inputs.operation == 'deploy-frozen-campaign'
