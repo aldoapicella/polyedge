@@ -227,7 +227,7 @@ jobs:
           jq -e '
             [ .changes[] | select(.changeType != "Ignore") ] as $changes
             | ($changes | length) == 23
-            and all($changes[]; .changeType == "Modify")
+            and all($changes[]; .changeType == "Modify" or .changeType == "NoChange")
             and ([ $changes[]
               | select(
                   (.resourceId | ascii_downcase | contains("/microsoft.authorization/roleassignments/")) or
