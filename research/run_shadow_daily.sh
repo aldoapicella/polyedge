@@ -33,15 +33,31 @@ if [ "$(date -u -d "$CASCADE_THROUGH" +%Y-%m-%d 2>/dev/null || true)" != "$CASCA
   echo "SHADOW_CASCADE_THROUGH must be a sealed UTC date on or after SHADOW_REPORT_DATE" >&2
   exit 1
 fi
-CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:-campaign-2026-07-23}"
-CAMPAIGN_START="${SHADOW_CAMPAIGN_START:-2026-07-23}"
+CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:-campaign-2026-07-28-qset-v1}"
+CAMPAIGN_START="${SHADOW_CAMPAIGN_START:-2026-07-28}"
 CAMPAIGN_PREFIX="${SHADOW_CAMPAIGN_PREFIX:-shadow-events/$CAMPAIGN_ID}"
 CAMPAIGN_ROOT="${SHADOW_CAMPAIGN_REPORT_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID}"
-CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:-research/configs/profitability_gate_v3_2026-07-23.yaml}"
+CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:-research/configs/profitability_gate_v3_2026-07-28_qset_v1.yaml}"
 CORRECTION_ROOT="${SHADOW_CORRECTION_ROOT:-$CAMPAIGN_ROOT/corrections}"
 DAILY_ROOT="$CAMPAIGN_ROOT/daily"
 PROSPECTIVE_ROOT="$CAMPAIGN_ROOT/prospective"
 PROFITABILITY_ROOT="$CAMPAIGN_ROOT/profitability"
+CODE_FREEZE_SHA256="${SHADOW_CODE_FREEZE_SHA256:-}"
+CODE_FREEZE_MANIFEST="${SHADOW_CODE_FREEZE_MANIFEST:-}"
+
+if [ "$CAMPAIGN_ID" = "campaign-2026-07-28-qset-v1" ]; then
+  if ! printf '%s\n' "$CODE_FREEZE_SHA256" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "SHADOW_CODE_FREEZE_SHA256 must bind qset-v1 to an immutable source manifest" >&2
+    exit 1
+  fi
+  case "$CODE_FREEZE_MANIFEST" in
+    azure://*/polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/control/code-freeze/source-*.json) ;;
+    *)
+      echo "SHADOW_CODE_FREEZE_MANIFEST must stay in the isolated qset-v1 freeze-control container" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 if [ "$(date -u -d "$CAMPAIGN_START" +%Y-%m-%d 2>/dev/null || true)" != "$CAMPAIGN_START" ]; then
   echo "SHADOW_CAMPAIGN_START must be a valid YYYY-MM-DD UTC date" >&2
@@ -61,7 +77,7 @@ fi
 # DATE == CASCADE_THROUGH and therefore execute exactly once.
 if [ "${POLYEDGE_SHADOW_CASCADE_CHILD:-false}" != "true" ]; then
   CORRECTION_ID="${SHADOW_CORRECTION_ID:-shadow-$DATE-through-$CASCADE_THROUGH}"
-  CORRECTION_REASON="${SHADOW_CORRECTION_REASON:-chronological protocol-v3 evidence build}"
+  CORRECTION_REASON="${SHADOW_CORRECTION_REASON:-chronological protocol-v3 qset-v1 evidence build}"
   polyedge-rs research begin-shadow-correction \
     --campaign-id "$CAMPAIGN_ID" \
     --correction-id "$CORRECTION_ID" \
@@ -118,6 +134,21 @@ CUMULATIVE_REGIMES="$STAGING/cumulative_regimes.json"
 LOSS_DIAGNOSTICS="$STAGING/loss_diagnostics"
 
 mkdir -p "$STAGING" "$NORMALIZED" "$CARRY_NORMALIZED" "$CUMULATIVE_NORMALIZED"
+
+if [ -n "$CODE_FREEZE_SHA256" ]; then
+  jq -n \
+    --arg campaign_id "$CAMPAIGN_ID" \
+    --arg evidence_version "${SHADOW_EVIDENCE_VERSION:-protocol-v3}" \
+    --arg manifest_path "$CODE_FREEZE_MANIFEST" \
+    --arg manifest_sha256 "$CODE_FREEZE_SHA256" \
+    '{
+      schema: "polyedge.shadow_code_freeze_binding.v1",
+      campaign_id: $campaign_id,
+      evidence_version: $evidence_version,
+      manifest_path: $manifest_path,
+      manifest_sha256: $manifest_sha256
+    }' >"$STAGING/code_freeze_binding.json"
+fi
 
 run_stage() {
   label="$1"

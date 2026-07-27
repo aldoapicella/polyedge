@@ -5,6 +5,8 @@ REPO="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/work"
+export SHADOW_CODE_FREEZE_SHA256=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+export SHADOW_CODE_FREEZE_MANIFEST=azure://stpolyedge/polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json
 
 cat >"$TMP/bin/polyedge-rs" <<'EOF'
 #!/bin/sh
@@ -58,41 +60,43 @@ chmod +x "$TMP/bin/polyedge-rs"
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
-  POLYEDGE_UTC_TODAY=2026-07-25 \
-  SHADOW_REPORT_DATE=2026-07-23 \
-  SHADOW_CASCADE_THROUGH=2026-07-23 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-30 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_CASCADE_THROUGH=2026-07-28 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >"$TMP/stdout"
 )
 
 test "$(grep -c '^research normalize ' "$TMP/args")" -eq 2
 test "$(grep -c '^research begin-shadow-correction ' "$TMP/args")" -eq 1
 test "$(grep -c '^research complete-shadow-correction ' "$TMP/args")" -eq 1
-grep -F 'research begin-shadow-correction --campaign-id campaign-2026-07-23 --correction-id shadow-2026-07-23-through-2026-07-23 --from 2026-07-23 --through 2026-07-23 ' "$TMP/args" >/dev/null
-grep -F -- '--out reports/research/shadow/campaigns/campaign-2026-07-23/corrections/active.json' "$TMP/args" >/dev/null
-grep -F 'research normalize --input azure://stpolyedge/polyedge-shadow-events/shadow-events/campaign-2026-07-23/2026/07/23/' "$TMP/args" >/dev/null
-grep -F 'research normalize --input azure://stpolyedge/polyedge-shadow-events/shadow-events/campaign-2026-07-23/2026/07/24/' "$TMP/args" >/dev/null
-if grep -E 'research normalize --input .*campaign-2026-07-23/\?prefetch' "$TMP/args" >/dev/null; then
+grep -F 'research begin-shadow-correction --campaign-id campaign-2026-07-28-qset-v1 --correction-id shadow-2026-07-28-through-2026-07-28 --from 2026-07-28 --through 2026-07-28 ' "$TMP/args" >/dev/null
+grep -F -- '--out reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/corrections/active.json' "$TMP/args" >/dev/null
+grep -F 'research normalize --input azure://stpolyedge/polyedge-shadow-qset-events/shadow-events/campaign-2026-07-28-qset-v1/2026/07/28/' "$TMP/args" >/dev/null
+grep -F 'research normalize --input azure://stpolyedge/polyedge-shadow-qset-events/shadow-events/campaign-2026-07-28-qset-v1/2026/07/29/' "$TMP/args" >/dev/null
+if grep -E 'research normalize --input .*campaign-2026-07-28-qset-v1/\?prefetch' "$TMP/args" >/dev/null; then
   echo "campaign-wide raw normalization was invoked" >&2
   exit 1
 fi
 grep -F 'research publish-projected-day ' "$TMP/args" >/dev/null
-grep -F -- '--require-azure-source true --expected-source-container polyedge-shadow-events' "$TMP/args" >/dev/null
-grep -F 'research publish-projected-day --normalized data/research/shadow/campaign-2026-07-23/2026-07-24/settlement-carry-normalized --date 2026-07-24 --campaign-id campaign-2026-07-23 --cache-root reports/research/shadow/campaigns/campaign-2026-07-23/staging/' "$TMP/args" | grep -F '/settlement-carry-verified-cache ' >/dev/null
-grep -F 'research materialize-projected-campaign --since 2026-07-23 --through 2026-07-23 ' "$TMP/args" >/dev/null
-grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-23/cumulative/2026-07-23/normalized --settlement-carry-input data/research/shadow/campaign-2026-07-23/2026-07-24/settlement-carry-normalized --settlement-carry-manifest reports/research/shadow/campaigns/campaign-2026-07-23/staging/' "$TMP/args" | grep -F -- '--settlement-carry-campaign-id campaign-2026-07-23 --settlement-carry-source-account stpolyedge --settlement-carry-source-container polyedge-shadow-events --market-day 2026-07-23 --out reports/research/shadow/campaigns/campaign-2026-07-23/staging/' >/dev/null
-test "$(grep -c -- '--settlement-carry-campaign-id campaign-2026-07-23 --settlement-carry-source-account stpolyedge --settlement-carry-source-container polyedge-shadow-events --market-day 2026-07-23' "$TMP/args")" -eq 4
+grep -F -- '--require-azure-source true --expected-source-container polyedge-shadow-qset-events' "$TMP/args" >/dev/null
+grep -F 'research publish-projected-day --normalized data/research/shadow/campaign-2026-07-28-qset-v1/2026-07-29/settlement-carry-normalized --date 2026-07-29 --campaign-id campaign-2026-07-28-qset-v1 --cache-root reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/staging/' "$TMP/args" | grep -F '/settlement-carry-verified-cache ' >/dev/null
+grep -F 'research materialize-projected-campaign --since 2026-07-28 --through 2026-07-28 ' "$TMP/args" >/dev/null
+grep -F 'research loss-diagnostics --input data/research/shadow/campaign-2026-07-28-qset-v1/cumulative/2026-07-28/normalized --settlement-carry-input data/research/shadow/campaign-2026-07-28-qset-v1/2026-07-29/settlement-carry-normalized --settlement-carry-manifest reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/staging/' "$TMP/args" | grep -F -- '--settlement-carry-campaign-id campaign-2026-07-28-qset-v1 --settlement-carry-source-account stpolyedge --settlement-carry-source-container polyedge-shadow-qset-events --market-day 2026-07-28 --out reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/staging/' >/dev/null
+test "$(grep -c -- '--settlement-carry-campaign-id campaign-2026-07-28-qset-v1 --settlement-carry-source-account stpolyedge --settlement-carry-source-container polyedge-shadow-qset-events --market-day 2026-07-28' "$TMP/args")" -eq 4
 grep -F '.result.status == "complete_diagnostic"' research/run_shadow_daily.sh >/dev/null
 grep -F '.result.counts.duplicate_event_lines == 0' research/run_shadow_daily.sh >/dev/null
 grep -F '.result.completion_checks.no_exact_duplicate_event_lines == true' research/run_shadow_daily.sh >/dev/null
-grep -F 'research build-cumulative-wallet ' "$TMP/args" | grep -F -- '--campaign-contract research/configs/profitability_gate_v3_2026-07-23.yaml' >/dev/null
-grep -F 'research publish-daily-bundle ' "$TMP/args" | grep -F -- '--output-root reports/research/shadow/campaigns/campaign-2026-07-23/daily' >/dev/null
-grep -F 'research validate-prospective ' "$TMP/args" | grep -F -- '--reports-dir reports/research/shadow/campaigns/campaign-2026-07-23/daily' >/dev/null
-grep -F 'research evaluate-profitability ' "$TMP/args" | grep -F -- '--out reports/research/shadow/campaigns/campaign-2026-07-23/profitability/latest.json' >/dev/null
-grep -F 'stage=normalize-day date=2026-07-23 status=starting' "$TMP/stdout" >/dev/null
+grep -F 'research build-cumulative-wallet ' "$TMP/args" | grep -F -- '--campaign-contract research/configs/profitability_gate_v3_2026-07-28_qset_v1.yaml' >/dev/null
+grep -F 'research publish-daily-bundle ' "$TMP/args" | grep -F -- '--output-root reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/daily' >/dev/null
+grep -F 'research validate-prospective ' "$TMP/args" | grep -F -- '--reports-dir reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/daily' >/dev/null
+grep -F 'research evaluate-profitability ' "$TMP/args" | grep -F -- '--out reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/profitability/latest.json' >/dev/null
+test "$(jq -r '.manifest_sha256' "$TMP/work/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/staging/"*/code_freeze_binding.json)" = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+test "$(jq -r '.manifest_path' "$TMP/work/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/staging/"*/code_freeze_binding.json)" = "azure://stpolyedge/polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+grep -F 'stage=normalize-day date=2026-07-28 status=starting' "$TMP/stdout" >/dev/null
 if grep -F '{' "$TMP/stdout" >/dev/null; then
   echo "shadow daily emitted verbose JSON instead of stage markers" >&2
   exit 1
@@ -102,16 +106,38 @@ if (
   cd "$TMP/work"
   PATH="$TMP/bin:$PATH" \
   POLYEDGE_TEST_ARGS="$TMP/args-no-lease" \
-  POLYEDGE_UTC_TODAY=2026-07-25 \
-  SHADOW_REPORT_DATE=2026-07-23 \
-  SHADOW_CASCADE_THROUGH=2026-07-23 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-30 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_CASCADE_THROUGH=2026-07-28 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
 ); then
   echo "shadow daily accepted a direct writer without the Azure campaign lease" >&2
+  exit 1
+fi
+
+if (
+  cd "$TMP/work"
+  PATH="$TMP/bin:$PATH" \
+  POLYEDGE_TEST_ARGS="$TMP/args-no-freeze" \
+  POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
+  POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
+  POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
+  POLYEDGE_UTC_TODAY=2026-07-30 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_CASCADE_THROUGH=2026-07-28 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
+  SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
+  AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
+  SHADOW_CODE_FREEZE_SHA256= \
+  SHADOW_CODE_FREEZE_MANIFEST= \
+  sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
+); then
+  echo "qset-v1 shadow daily accepted an unbound code freeze" >&2
   exit 1
 fi
 
@@ -122,13 +148,13 @@ fi
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
-  POLYEDGE_UTC_TODAY=2026-07-26 \
-  SHADOW_REPORT_DATE=2026-07-23 \
-  SHADOW_CASCADE_THROUGH=2026-07-24 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-31 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_CASCADE_THROUGH=2026-07-29 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >"$TMP/stdout-cascade"
 )
 test "$(grep -c '^research normalize ' "$TMP/args-cascade")" -eq 4
@@ -137,8 +163,8 @@ test "$(grep -c '^research begin-shadow-correction ' "$TMP/args-cascade")" -eq 1
 test "$(grep -c '^research complete-shadow-correction ' "$TMP/args-cascade")" -eq 1
 test "$(grep -c '^research validate-prospective ' "$TMP/args-cascade")" -eq 1
 test "$(grep -c '^research evaluate-profitability ' "$TMP/args-cascade")" -eq 1
-grep -F 'cascade date=2026-07-23 through=2026-07-24 status=starting' "$TMP/stdout-cascade" >/dev/null
-grep -F 'cascade date=2026-07-24 through=2026-07-24 status=completed' "$TMP/stdout-cascade" >/dev/null
+grep -F 'cascade date=2026-07-28 through=2026-07-29 status=starting' "$TMP/stdout-cascade" >/dev/null
+grep -F 'cascade date=2026-07-29 through=2026-07-29 status=completed' "$TMP/stdout-cascade" >/dev/null
 
 (
   cd "$TMP/work"
@@ -147,17 +173,17 @@ grep -F 'cascade date=2026-07-24 through=2026-07-24 status=completed' "$TMP/stdo
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
-  POLYEDGE_UTC_TODAY=2026-07-24 \
-  SHADOW_REPORT_DATE=2026-07-22 \
-  SHADOW_CASCADE_THROUGH=2026-07-22 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-29 \
+  SHADOW_REPORT_DATE=2026-07-27 \
+  SHADOW_CASCADE_THROUGH=2026-07-27 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >"$TMP/stdout-prestart"
 )
 test ! -s "$TMP/args-prestart"
-grep -F 'status=not_started first_eligible_date=2026-07-23 requested_through=2026-07-22' "$TMP/stdout-prestart" >/dev/null
+grep -F 'status=not_started first_eligible_date=2026-07-28 requested_through=2026-07-27' "$TMP/stdout-prestart" >/dev/null
 
 if (
   cd "$TMP/work"
@@ -165,12 +191,12 @@ if (
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
-  POLYEDGE_UTC_TODAY=2026-07-25 \
-  SHADOW_REPORT_DATE=2026-07-23 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-30 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
 ); then
   echo "shadow daily accepted the test-only clock override without the test harness" >&2
@@ -185,10 +211,10 @@ if (
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
   SHADOW_REPORT_DATE="$(date -u +%Y-%m-%d)" \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
 ); then
   echo "shadow daily accepted an unsealed current UTC day" >&2
@@ -203,13 +229,13 @@ if (
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
-  POLYEDGE_UTC_TODAY=2026-07-25 \
-  SHADOW_REPORT_DATE=2026-07-23 \
-  SHADOW_CASCADE_THROUGH=2026-07-23 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-30 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_CASCADE_THROUGH=2026-07-28 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
 ); then
   echo "shadow daily published diagnostic-ineligible evidence" >&2
@@ -228,13 +254,13 @@ if (
   POLYEDGE_CAMPAIGN_LEASE_ACTIVE=true \
   POLYEDGE_CAMPAIGN_LEASE_ID=test-lease \
   POLYEDGE_CAMPAIGN_LEASE_BLOB=test/replay.lock \
-  POLYEDGE_UTC_TODAY=2026-07-25 \
-  SHADOW_REPORT_DATE=2026-07-23 \
-  SHADOW_CASCADE_THROUGH=2026-07-23 \
-  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-events \
+  POLYEDGE_UTC_TODAY=2026-07-30 \
+  SHADOW_REPORT_DATE=2026-07-28 \
+  SHADOW_CASCADE_THROUGH=2026-07-28 \
+  SHADOW_SOURCE_CONTAINER_NAME=polyedge-shadow-qset-events \
   SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json \
   AZURE_STORAGE_ACCOUNT_NAME=stpolyedge \
-  AZURE_STORAGE_CONTAINER_NAME=polyedge-research \
+  AZURE_STORAGE_CONTAINER_NAME=polyedge-research-qset \
   sh "$REPO/research/run_shadow_daily.sh" >/dev/null 2>&1
 ); then
   echo "shadow daily published malformed loss diagnostics" >&2

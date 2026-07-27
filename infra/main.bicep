@@ -669,6 +669,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: researchStorageContainerName
             }
             {
+              name: 'AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME'
+              value: 'polyedge-research-qset'
+            }
+            {
               name: 'AZURE_FUNDED_STORAGE_CONTAINER_NAME'
               value: fundedEvidenceContainerName
             }
@@ -678,19 +682,19 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'SHADOW_CAMPAIGN_ID'
-              value: 'campaign-2026-07-23'
+              value: 'campaign-2026-07-28-qset-v1'
             }
             {
               name: 'SHADOW_CAMPAIGN_START'
-              value: '2026-07-23'
+              value: '2026-07-28'
             }
             {
               name: 'SHADOW_CAMPAIGN_REPORT_ROOT'
-              value: 'reports/research/shadow/campaigns/campaign-2026-07-23'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1'
             }
             {
               name: 'SHADOW_CORRECTION_ROOT'
-              value: 'reports/research/shadow/campaigns/campaign-2026-07-23/corrections'
+              value: 'reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/corrections'
             }
             {
               name: 'AZURE_STORAGE_TABLE_NAME'

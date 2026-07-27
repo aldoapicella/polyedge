@@ -639,8 +639,12 @@ impl RuntimeSettings {
         if !self.azure.publish_strategy_canary_intents {
             reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
         }
-        if self.azure.storage_container_name != "polyedge-shadow-events" {
-            reasons.push("AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events");
+        if !matches!(
+            self.azure.storage_container_name.as_str(),
+            "polyedge-shadow-events" | "polyedge-shadow-qset-events"
+        ) {
+            reasons
+                .push("AZURE_STORAGE_CONTAINER_NAME must be an approved shadow evidence container");
         }
         if !self.azure.event_blob_prefix.starts_with("shadow-events/") {
             reasons.push("AZURE_EVENT_BLOB_PREFIX must start with shadow-events/");
@@ -880,6 +884,13 @@ mod tests {
     }
 
     #[test]
+    fn profitability_shadow_accepts_isolated_qset_evidence_container() {
+        let mut settings = safe_shadow_settings();
+        settings.azure.storage_container_name = "polyedge-shadow-qset-events".to_owned();
+        assert!(settings.validate_runtime_role().is_ok());
+    }
+
+    #[test]
     fn event_blob_prefix_cutover_is_paired_and_uses_event_time_boundary() {
         let mut settings = safe_shadow_settings();
         settings.azure.event_blob_prefix = "shadow-events/old".to_owned();
@@ -941,7 +952,7 @@ mod tests {
             "ADAPTIVE_REGIME_ENABLED must be true",
             "ADAPTIVE_REGIME_MODE must be dynamic_quote_style",
             "PUBLISH_STRATEGY_CANARY_INTENTS must be true",
-            "AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events",
+            "AZURE_STORAGE_CONTAINER_NAME must be an approved shadow evidence container",
             "AZURE_EVENT_BLOB_PREFIX must start with shadow-events/",
         ] {
             assert!(message.contains(expected), "missing {expected}: {message}");

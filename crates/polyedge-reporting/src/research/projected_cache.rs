@@ -547,9 +547,14 @@ fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
         .filter(|value| !value.trim().is_empty())
     {
         Some(account) => {
-            let container = std::env::var("AZURE_RESEARCH_STORAGE_CONTAINER_NAME")
+            let container = std::env::var("AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("AZURE_RESEARCH_STORAGE_CONTAINER_NAME")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
                 .or_else(|| {
                     std::env::var("AZURE_STORAGE_CONTAINER_NAME")
                         .ok()
@@ -557,7 +562,7 @@ fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
                 })
                 .ok_or_else(|| {
                     ResearchError::InvalidInput(
-                        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME or AZURE_STORAGE_CONTAINER_NAME is required for the shadow correction journal".to_owned(),
+                        "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME, AZURE_RESEARCH_STORAGE_CONTAINER_NAME, or AZURE_STORAGE_CONTAINER_NAME is required for the shadow correction journal".to_owned(),
                     )
                 })?;
             format!("azure://{account}/{container}/{correction_root}")
