@@ -547,9 +547,14 @@ fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
         .filter(|value| !value.trim().is_empty())
     {
         Some(account) => {
-            let container = std::env::var("AZURE_RESEARCH_STORAGE_CONTAINER_NAME")
+            let container = std::env::var("AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("AZURE_RESEARCH_STORAGE_CONTAINER_NAME")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
                 .or_else(|| {
                     std::env::var("AZURE_STORAGE_CONTAINER_NAME")
                         .ok()
@@ -557,7 +562,7 @@ fn shadow_correction_store() -> Result<ProjectedCacheStore, ResearchError> {
                 })
                 .ok_or_else(|| {
                     ResearchError::InvalidInput(
-                        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME or AZURE_STORAGE_CONTAINER_NAME is required for the shadow correction journal".to_owned(),
+                        "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME, AZURE_RESEARCH_STORAGE_CONTAINER_NAME, or AZURE_STORAGE_CONTAINER_NAME is required for the shadow correction journal".to_owned(),
                     )
                 })?;
             format!("azure://{account}/{container}/{correction_root}")
@@ -808,7 +813,7 @@ fn normalized_file_bindings(
     Ok(bindings)
 }
 
-fn validate_day_manifest(
+pub(super) fn validate_day_manifest(
     manifest: &ProjectedDayManifest,
     expected_date: NaiveDate,
     expected_campaign: &str,
@@ -850,7 +855,7 @@ fn validate_day_manifest(
     Ok(())
 }
 
-fn validate_projected_day_source(
+pub(super) fn validate_projected_day_source(
     canonical: &ProjectedDayCanonical,
     expected_date: NaiveDate,
     require_azure_source: bool,
@@ -1084,7 +1089,10 @@ fn campaign_chain_hash(parent: Option<&str>, date: NaiveDate, day_sha256: &str) 
     sha256_prefixed(&serde_json::to_vec(&value).expect("campaign chain value serializes"))
 }
 
-fn verify_binding_bytes(binding: &ProjectedFileBinding, bytes: &[u8]) -> Result<(), ResearchError> {
+pub(super) fn verify_binding_bytes(
+    binding: &ProjectedFileBinding,
+    bytes: &[u8],
+) -> Result<(), ResearchError> {
     if bytes.len() as u64 != binding.bytes || sha256_prefixed(bytes) != binding.sha256 {
         return Err(ResearchError::InvalidInput(format!(
             "projected shard {} failed size or SHA-256 verification",

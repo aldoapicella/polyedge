@@ -219,6 +219,10 @@ fn execution_quality_join_warnings_are_known_and_remain_promotion_blocking() {
             "queue_snapshot_coverage_below_95pct",
         ),
         (
+            "bound inferred-size-ahead coverage below 95%: 94/100",
+            "queue_position_coverage_below_95pct",
+        ),
+        (
             "1 eligible fill lifecycle events lack the fields required for markout joins",
             "markout_fill_lifecycle_join_fields_missing",
         ),
@@ -977,7 +981,7 @@ fn publish_quality_fixture(
 }
 
 #[test]
-fn daily_manifest_accepts_complete_queue_day_with_no_fill_markout_denominator() {
+fn daily_manifest_accepts_atomic_queue_fallback_without_post_live_snapshot() {
     let root = test_dir("publish_no_fill_execution_quality");
     let source = root.join("generated");
     fs::create_dir_all(&source).unwrap();
@@ -989,9 +993,12 @@ fn daily_manifest_accepts_complete_queue_day_with_no_fill_markout_denominator() 
         serde_json::to_vec_pretty(&serde_json::json!({
             "result": {
                 "evidence_gate": "PASS",
-                "queue_snapshot_coverage": 1.0,
+                "queue_snapshot_coverage": 0.0,
                 "queue_snapshot_applicable": true,
                 "queue_snapshot_expected_orders": 1,
+                "queue_position_coverage": 1.0,
+                "queue_position_applicable": true,
+                "queue_position_expected_orders": 1,
                 "markouts": {
                     "1": {"completion_rate": null, "applicable": false, "expected": 0},
                     "5": {"completion_rate": null, "applicable": false, "expected": 0},
@@ -1020,7 +1027,9 @@ fn daily_manifest_accepts_complete_queue_day_with_no_fill_markout_denominator() 
 
     let breakdown = &published.manifest.data_quality.coverage_breakdown;
     assert_eq!(breakdown.queue_snapshot_applicable, Some(true));
-    assert_eq!(breakdown.queue_snapshot_coverage, Some(Decimal::ONE));
+    assert_eq!(breakdown.queue_snapshot_coverage, Some(Decimal::ZERO));
+    assert_eq!(breakdown.queue_position_applicable, Some(true));
+    assert_eq!(breakdown.queue_position_coverage, Some(Decimal::ONE));
     assert_eq!(breakdown.markout_1s_applicable, Some(false));
     assert_eq!(breakdown.markout_5s_applicable, Some(false));
     assert_eq!(breakdown.markout_30s_applicable, Some(false));
@@ -1044,6 +1053,9 @@ fn daily_manifest_rejects_applicability_that_contradicts_denominator() {
                 "queue_snapshot_coverage": null,
                 "queue_snapshot_applicable": false,
                 "queue_snapshot_expected_orders": 1,
+                "queue_position_coverage": 1.0,
+                "queue_position_applicable": true,
+                "queue_position_expected_orders": 1,
                 "markouts": {
                     "1": {"completion_rate": null, "applicable": false, "expected": 0},
                     "5": {"completion_rate": null, "applicable": false, "expected": 0},
@@ -1585,6 +1597,8 @@ fn measured_quality(
         decision_parity_rate: Some(Decimal::ONE),
         queue_snapshot_coverage: Some(coverage),
         queue_snapshot_applicable: Some(true),
+        queue_position_coverage: Some(coverage),
+        queue_position_applicable: Some(true),
         markout_1s_completion: Some(coverage),
         markout_1s_applicable: Some(true),
         markout_5s_completion: Some(coverage),
@@ -3195,6 +3209,9 @@ fn complete_execution_quality() -> Vec<u8> {
             "queue_snapshot_coverage": 1.0,
             "queue_snapshot_applicable": true,
             "queue_snapshot_expected_orders": 1,
+            "queue_position_coverage": 1.0,
+            "queue_position_applicable": true,
+            "queue_position_expected_orders": 1,
             "markouts": {
                 "1": {"completion_rate": 1.0, "applicable": true, "expected": 1},
                 "5": {"completion_rate": 1.0, "applicable": true, "expected": 1},

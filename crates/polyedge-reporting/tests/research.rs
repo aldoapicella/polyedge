@@ -25,6 +25,7 @@ fn audit_counts_fixture_and_malformed_lines() {
         out: dir.join("data_audit.json"),
         markdown: dir.join("data_audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
 
@@ -74,6 +75,7 @@ fn normalized_audit_preserves_and_summarizes_runtime_provenance() {
         out: dir.join("data_audit.json"),
         markdown: dir.join("data_audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     assert_eq!(audit["result"]["runtime_provenance"]["observations"], 3);
@@ -207,6 +209,7 @@ fn exclude_window_skips_events_and_prevents_contaminated_fills() {
         out: dir.join("audit.json"),
         markdown: dir.join("audit.md"),
         exclude_windows: excluded.clone(),
+        settlement_carry: None,
     })
     .unwrap();
     assert_eq!(audit["result"]["total_events"], 1);
@@ -253,6 +256,7 @@ fn normalize_and_build_markets_preserve_incomplete_markets() {
         out: dir.join("markets.json"),
         markdown: dir.join("markets.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
 
@@ -290,6 +294,7 @@ fn explicit_build_markets_outputs_do_not_overwrite_each_other() {
         out: daily_out.clone(),
         markdown: dir.join("markets_summary.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     run_build_markets(BuildMarketsOptions {
@@ -297,6 +302,7 @@ fn explicit_build_markets_outputs_do_not_overwrite_each_other() {
         out: cumulative_out,
         markdown: dir.join("cumulative_markets_summary.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
 
@@ -346,6 +352,7 @@ fn normalize_writes_queue_evidence_and_queue_audit_marks_eligibility() {
         out: markets_path.clone(),
         markdown: dir.join("markets.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     let audit = run_queue_audit(QueueAuditOptions {
@@ -409,6 +416,7 @@ fn decision_grade_projection_bounds_books_and_preserves_pre_decision_state_and_t
         out: markets.clone(),
         markdown: dir.join("markets.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     let queue_audit = run_queue_audit(QueueAuditOptions {
@@ -453,6 +461,7 @@ fn decision_grade_projection_flushes_sparse_tokens_in_global_time_order() {
         out: dir.join("audit.json"),
         markdown: dir.join("audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     assert_eq!(audit["result"]["out_of_order_timestamps"], 0);
@@ -530,6 +539,7 @@ fn gzip_normalized_outputs_feed_build_markets_and_replay() {
         out: markets_path.clone(),
         markdown: dir.join("markets.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
@@ -581,6 +591,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
         out: markets_path.clone(),
         markdown: dir.join("markets.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
@@ -628,6 +639,7 @@ fn sharded_gzip_reader_reorders_local_shard_timestamp_inversions() {
         out: dir.join("audit.json"),
         markdown: dir.join("audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
 
@@ -751,6 +763,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
         out: reports.join("data_audit.json"),
         markdown: reports.join("data_audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     let baseline = run_baseline(BaselineOptions {

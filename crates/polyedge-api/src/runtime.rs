@@ -1242,13 +1242,15 @@ impl RuntimeController {
                     .token_id
                     .as_ref()
                     .and_then(|token_id| books.get(token_id));
-                if let Some(snapshot) = engine.execution_quality.register_order(
+                if let Some(registration) = engine.execution_quality.register_order(
                     decision,
                     report,
                     book,
                     self.inner.settings.paper.order_live_after_ms,
                 ) {
-                    report.raw.insert("execution_quality".to_owned(), snapshot);
+                    report
+                        .raw
+                        .insert("execution_quality".to_owned(), registration);
                 }
             }
             engine.order_manager.on_execution_report(decision, report);
@@ -1649,10 +1651,10 @@ impl RuntimeController {
                         "execution_report".to_owned(),
                         serde_json::to_value(report).unwrap_or(Value::Null),
                     ));
-                    if let Some(snapshot) = report.raw.get("execution_quality") {
+                    if let Some(registration) = report.raw.get("execution_quality") {
                         applied_events.push((
                             "paper_order_queue_registration".to_owned(),
-                            snapshot.clone(),
+                            registration.clone(),
                         ));
                     }
                 }
@@ -1959,8 +1961,8 @@ impl RuntimeController {
         }
         self.record_event("execution_report", &report, None, None)
             .await;
-        if let Some(snapshot) = report.raw.get("execution_quality") {
-            self.record_event("paper_order_queue_registration", snapshot, None, None)
+        if let Some(registration) = report.raw.get("execution_quality") {
+            self.record_event("paper_order_queue_registration", registration, None, None)
                 .await;
         }
         for event in quality_events {

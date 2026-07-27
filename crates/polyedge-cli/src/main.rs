@@ -21,9 +21,9 @@ use polyedge_reporting::research::{
     LossDiagnosticsOptions, LossRegimeOosOptions, MaterializeProjectedCampaignOptions,
     MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
     ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
-    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, StopFundedManifestFromStageBlockOptions,
-    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
-    DEFAULT_PROSPECTIVE_SINCE,
+    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, SettlementCarryOptions,
+    StopFundedManifestFromStageBlockOptions, SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -161,6 +161,18 @@ enum ResearchCommand {
         exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
+        #[arg(long)]
+        settlement_carry_input: Option<PathBuf>,
+        #[arg(long)]
+        settlement_carry_manifest: Option<PathBuf>,
+        #[arg(long)]
+        settlement_carry_campaign_id: Option<String>,
+        #[arg(long)]
+        settlement_carry_source_account: Option<String>,
+        #[arg(long)]
+        settlement_carry_source_container: Option<String>,
+        #[arg(long)]
+        market_day: Option<String>,
     },
     ExecutionQuality {
         #[arg(long, default_value = "data/research/normalized")]
@@ -181,6 +193,18 @@ enum ResearchCommand {
         input: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        #[arg(long)]
+        settlement_carry_input: Option<PathBuf>,
+        #[arg(long)]
+        settlement_carry_manifest: Option<PathBuf>,
+        #[arg(long)]
+        settlement_carry_campaign_id: Option<String>,
+        #[arg(long)]
+        settlement_carry_source_account: Option<String>,
+        #[arg(long)]
+        settlement_carry_source_container: Option<String>,
+        #[arg(long)]
+        market_day: Option<String>,
     },
     Normalize {
         #[arg(long, default_value = "data/events.jsonl")]
@@ -258,6 +282,18 @@ enum ResearchCommand {
         exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
+        #[arg(long)]
+        settlement_carry_input: Option<PathBuf>,
+        #[arg(long)]
+        settlement_carry_manifest: Option<PathBuf>,
+        #[arg(long)]
+        settlement_carry_campaign_id: Option<String>,
+        #[arg(long)]
+        settlement_carry_source_account: Option<String>,
+        #[arg(long)]
+        settlement_carry_source_container: Option<String>,
+        #[arg(long)]
+        market_day: Option<String>,
     },
     Replay {
         #[arg(long, default_value = "data/research/normalized")]
@@ -723,11 +759,25 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             markdown,
             exclude_file,
             exclude_window,
+            settlement_carry_input,
+            settlement_carry_manifest,
+            settlement_carry_campaign_id,
+            settlement_carry_source_account,
+            settlement_carry_source_container,
+            market_day,
         } => run_audit(AuditOptions {
             input,
             out,
             markdown,
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
+            settlement_carry: parse_settlement_carry(
+                settlement_carry_input,
+                settlement_carry_manifest,
+                settlement_carry_campaign_id,
+                settlement_carry_source_account,
+                settlement_carry_source_container,
+                market_day,
+            )?,
         })?,
         ResearchCommand::ExecutionQuality {
             input,
@@ -741,9 +791,27 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             markdown,
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
-        ResearchCommand::LossDiagnostics { input, out } => {
-            run_loss_diagnostics(LossDiagnosticsOptions { input, out })?
-        }
+        ResearchCommand::LossDiagnostics {
+            input,
+            out,
+            settlement_carry_input,
+            settlement_carry_manifest,
+            settlement_carry_campaign_id,
+            settlement_carry_source_account,
+            settlement_carry_source_container,
+            market_day,
+        } => run_loss_diagnostics(LossDiagnosticsOptions {
+            input,
+            out,
+            settlement_carry: parse_settlement_carry(
+                settlement_carry_input,
+                settlement_carry_manifest,
+                settlement_carry_campaign_id,
+                settlement_carry_source_account,
+                settlement_carry_source_container,
+                market_day,
+            )?,
+        })?,
         ResearchCommand::LossRegimeOos {
             facts,
             queue_evidence,
@@ -828,11 +896,25 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             markdown,
             exclude_file,
             exclude_window,
+            settlement_carry_input,
+            settlement_carry_manifest,
+            settlement_carry_campaign_id,
+            settlement_carry_source_account,
+            settlement_carry_source_container,
+            market_day,
         } => run_build_markets(BuildMarketsOptions {
             input,
             out,
             markdown,
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
+            settlement_carry: parse_settlement_carry(
+                settlement_carry_input,
+                settlement_carry_manifest,
+                settlement_carry_campaign_id,
+                settlement_carry_source_account,
+                settlement_carry_source_container,
+                market_day,
+            )?,
         })?,
         ResearchCommand::Replay {
             input,
@@ -1384,6 +1466,46 @@ fn parse_date_arg(value: &str) -> Result<NaiveDate> {
         .with_context(|| format!("invalid UTC date (expected YYYY-MM-DD): {value}"))
 }
 
+fn parse_settlement_carry(
+    input: Option<PathBuf>,
+    published_manifest: Option<PathBuf>,
+    campaign_id: Option<String>,
+    source_account: Option<String>,
+    source_container: Option<String>,
+    market_day: Option<String>,
+) -> Result<Option<SettlementCarryOptions>> {
+    match (
+        input,
+        published_manifest,
+        campaign_id,
+        source_account,
+        source_container,
+        market_day,
+    ) {
+        (None, None, None, None, None, None) => Ok(None),
+        (
+            Some(input),
+            Some(published_manifest),
+            Some(campaign_id),
+            Some(source_account),
+            Some(source_container),
+            Some(market_day),
+        ) => Ok(Some(SettlementCarryOptions {
+            input,
+            published_manifest,
+            market_day: parse_date_arg(&market_day)?,
+            campaign_id,
+            source_account,
+            source_container,
+        })),
+        _ => bail!(
+            "--settlement-carry-input, --settlement-carry-manifest, \
+             --settlement-carry-campaign-id, --settlement-carry-source-account, \
+             --settlement-carry-source-container, and --market-day must be supplied together"
+        ),
+    }
+}
+
 fn parse_runtime_role_arg(value: &str) -> Result<RuntimeRole> {
     match value.trim().to_ascii_lowercase().as_str() {
         "primary" => Ok(RuntimeRole::Primary),
@@ -1745,7 +1867,7 @@ mod tests {
         ])
         .expect("parse loss diagnostics command");
         let Command::Research {
-            command: ResearchCommand::LossDiagnostics { input, out },
+            command: ResearchCommand::LossDiagnostics { input, out, .. },
         } = cli.command
         else {
             panic!("unexpected command");

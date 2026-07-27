@@ -2,7 +2,7 @@ use super::*;
 use chrono::NaiveDate;
 use std::path::Component;
 
-const ORDER_FACT_SCHEMA_V2: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v2";
+const ORDER_FACT_SCHEMA_V3: &str = "polyedge.loss_diagnostics.order_lifecycle_fact.v3";
 const FILL_FACT_SCHEMA_V1: &str = "polyedge.loss_diagnostics.fill_markout_fact.v1";
 const SUMMARY_SCHEMA_V1: &str = "polyedge.loss_diagnostics.summary.v1";
 const ARTIFACT_MANIFEST_SCHEMA_V1: &str = "polyedge.loss_diagnostics.artifact_manifest.v1";
@@ -826,7 +826,7 @@ fn verify_facts(root: &Path) -> Result<VerifiedFacts, ResearchError> {
 
     let orders = read_fact_rows(
         &root.join(ORDER_FACT_FILE),
-        ORDER_FACT_SCHEMA_V2,
+        ORDER_FACT_SCHEMA_V3,
         manifest_row_count(artifacts, ORDER_FACT_FILE)?,
     )?;
     let fills = read_fact_rows(
@@ -932,7 +932,7 @@ fn read_fact_rows(
         row.as_object_mut()
             .ok_or_else(|| invalid("fact row must be an object"))?
             .insert("fact_sha256".to_owned(), Value::String(fact_sha256));
-        let identity_field = if expected_schema == ORDER_FACT_SCHEMA_V2 {
+        let identity_field = if expected_schema == ORDER_FACT_SCHEMA_V3 {
             "order_id"
         } else {
             "fill_lifecycle_id"
@@ -1085,7 +1085,7 @@ fn derive_observations(
     let mut observations = Vec::with_capacity(facts.orders.len());
     let mut market_days = BTreeMap::<String, String>::new();
     for order in &facts.orders {
-        if order["schema_version"].as_u64() != Some(2)
+        if order["schema_version"].as_u64() != Some(3)
             || order["evidence_classification"].as_str() != Some("protocol_v3_bound_diagnostic")
             || order["diagnostic_only"].as_bool() != Some(true)
             || order["counts_toward_protocol_v3_evidence"].as_bool() != Some(false)
@@ -1093,8 +1093,9 @@ fn derive_observations(
             || order["queue_position_source"].as_str()
                 != Some("paper_shadow_lifecycle_plus_public_l2")
             || order["queue_position"].as_str() != Some("inferred_size_ahead")
+            || order["literal_fifo_rank_available"].as_bool() != Some(false)
             || !nonempty_text(&order["queue_registration_event_sha256"])
-            || !nonempty_text(&order["queue_snapshot_event_sha256"])
+            || !nonempty_text(&order["queue_position_event_sha256"])
             || !nonempty_text(&order["terminal_settlement_event_sha256"])
             || !nonempty_text(&order["terminal_settlement_journal_sha256"])
         {
@@ -1103,6 +1104,29 @@ fn derive_observations(
             ));
         }
         let order_id = required_text(order, "order_id")?;
+        let registration_sha256 = required_text(order, "queue_registration_event_sha256")?;
+        let queue_position_sha256 = required_text(order, "queue_position_event_sha256")?;
+        match order["queue_position_capture_method"].as_str() {
+            Some("post_live_snapshot")
+                if nonempty_text(&order["queue_snapshot_event_sha256"])
+                    && order["queue_snapshot_event_sha256"].as_str()
+                        == Some(queue_position_sha256.as_str()) => {}
+            Some("atomic_registration_fallback")
+                if order["queue_snapshot_event_sha256"].is_null()
+                    && registration_sha256 == queue_position_sha256 => {}
+            _ => {
+                return Err(invalid(format!(
+                    "order {order_id} queue-position evidence binding is invalid"
+                )))
+            }
+        }
+        if required_decimal(&order["inferred_size_ahead"], "inferred_size_ahead")? < Decimal::ZERO
+            || !order["inferred_size_ahead_unavailable_reason"].is_null()
+        {
+            return Err(invalid(format!(
+                "order {order_id} inferred size ahead is invalid"
+            )));
+        }
         let market_id = required_text(order, "market_id")?;
         if !queue_eligibility.eligible_markets.contains(&market_id) {
             return Err(invalid(format!(
@@ -1110,6 +1134,22 @@ fn derive_observations(
             )));
         }
         let submitted_ts = parse_required_ts(&order["submitted_ts"], "submitted_ts")?;
+        let queue_position_capture_ts = parse_required_ts(
+            &order["queue_position_capture_ts"],
+            "queue_position_capture_ts",
+        )?;
+        if queue_position_capture_ts < submitted_ts {
+            return Err(invalid(format!(
+                "order {order_id} queue-position capture predates submission"
+            )));
+        }
+        if order["queue_position_capture_method"].as_str() == Some("atomic_registration_fallback")
+            && queue_position_capture_ts != submitted_ts
+        {
+            return Err(invalid(format!(
+                "order {order_id} atomic queue-position capture is not bound to submission"
+            )));
+        }
         if submitted_ts <= frozen_at {
             return Err(invalid(format!(
                 "order {order_id} is not out of sample because it is at or before frozen_at"
@@ -1117,19 +1157,45 @@ fn derive_observations(
         }
         let market_end_ts =
             parse_required_ts(&order["terminal_market_end_ts"], "terminal_market_end_ts")?;
+        let market_start_ts = parse_required_ts(
+            &order["terminal_market_start_ts"],
+            "terminal_market_start_ts",
+        )?;
         let settlement_recorded_ts = parse_required_ts(
             &order["terminal_settlement_recorded_ts"],
             "terminal_settlement_recorded_ts",
         )?;
-        if submitted_ts >= market_end_ts || market_end_ts > settlement_recorded_ts {
+        if market_start_ts > submitted_ts
+            || submitted_ts >= market_end_ts
+            || market_end_ts > settlement_recorded_ts
+        {
             return Err(invalid(format!(
                 "order {order_id} settlement chronology is invalid"
             )));
         }
-        let day = ts(market_end_ts)
-            .get(0..10)
-            .ok_or_else(|| invalid("market-end timestamp has no UTC day"))?
-            .to_owned();
+        let day = required_text(order, "market_origin_utc_day")?;
+        if day != market_start_ts.date_naive().to_string() {
+            return Err(invalid(format!(
+                "order {order_id} market origin UTC day is invalid"
+            )));
+        }
+        match order["terminal_settlement_partition"].as_str() {
+            Some("same_recorded_day")
+                if settlement_recorded_ts.date_naive() == market_start_ts.date_naive() => {}
+            Some("reconciled_next_day")
+                if market_end_ts.time() == chrono::NaiveTime::MIN
+                    && market_end_ts.date_naive()
+                        == market_start_ts
+                            .date_naive()
+                            .succ_opt()
+                            .unwrap_or(market_start_ts.date_naive())
+                    && settlement_recorded_ts.date_naive() == market_end_ts.date_naive() => {}
+            _ => {
+                return Err(invalid(format!(
+                    "order {order_id} terminal settlement partition is invalid"
+                )))
+            }
+        }
         if market_days
             .insert(market_id.clone(), day.clone())
             .is_some_and(|existing| existing != day)
@@ -1556,6 +1622,7 @@ mod tests {
     fn order_and_fill(spec: &OrderSpec) -> (Value, Option<Value>) {
         let base = parse_utc("2026-07-24T00:00:00Z").unwrap() + Duration::days(spec.day_offset);
         let submitted = base + Duration::minutes(1);
+        let start = base;
         let end = base + Duration::minutes(10);
         let recorded = base + Duration::minutes(11);
         let order_id = format!("order-{}-{}", spec.day_offset, spec.suffix);
@@ -1590,17 +1657,23 @@ mod tests {
             }))
         });
         let order = fact_hash(json!({
-            "schema": ORDER_FACT_SCHEMA_V2,
-            "schema_version": 2,
+            "schema": ORDER_FACT_SCHEMA_V3,
+            "schema_version": 3,
             "evidence_classification": "protocol_v3_bound_diagnostic",
             "diagnostic_only": true,
             "counts_toward_protocol_v3_evidence": false,
             "execution_fields_complete": true,
             "queue_position_source": "paper_shadow_lifecycle_plus_public_l2",
             "queue_position": "inferred_size_ahead",
+            "literal_fifo_rank_available": false,
+            "inferred_size_ahead": "10",
+            "inferred_size_ahead_unavailable_reason": null,
+            "queue_position_capture_method": "post_live_snapshot",
             "queue_proxy_pnl_eligible": true,
             "queue_registration_event_sha256": format!("sha256:registration-{order_id}"),
             "queue_snapshot_event_sha256": format!("sha256:snapshot-{order_id}"),
+            "queue_position_event_sha256": format!("sha256:snapshot-{order_id}"),
+            "queue_position_capture_ts": ts(submitted + Duration::milliseconds(1)),
             "terminal_settlement_event_sha256": format!("sha256:settlement-{order_id}"),
             "terminal_settlement_journal_sha256": format!("sha256:journal-{order_id}"),
             "order_id": order_id,
@@ -1610,7 +1683,10 @@ mod tests {
             "order_size": spec.size,
             "fill_count": usize::from(spec.filled),
             "submitted_ts": ts(submitted),
+            "terminal_market_start_ts": ts(start),
             "terminal_market_end_ts": ts(end),
+            "market_origin_utc_day": start.date_naive().to_string(),
+            "terminal_settlement_partition": "same_recorded_day",
             "terminal_settlement_recorded_ts": ts(recorded),
             "terminal_winning_outcome": spec.winner,
             "terminal_settled_net_pnl": settled.to_string(),
@@ -1686,7 +1762,7 @@ mod tests {
             "schema": ARTIFACT_MANIFEST_SCHEMA_V1,
             "schema_version": 1,
             "artifacts": [
-                artifact(ORDER_FACT_FILE, ORDER_FACT_SCHEMA_V2, &order_bytes, Some(orders.len())),
+                artifact(ORDER_FACT_FILE, ORDER_FACT_SCHEMA_V3, &order_bytes, Some(orders.len())),
                 artifact(FILL_FACT_FILE, FILL_FACT_SCHEMA_V1, &fill_bytes, Some(fills.len())),
                 artifact(SUMMARY_FILE, SUMMARY_SCHEMA_V1, &summary_bytes, None)
             ]
@@ -1813,6 +1889,98 @@ mod tests {
             "experiment-safe"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn atomic_registration_queue_binding_is_accepted_without_snapshot_hash() {
+        let (mut order, fill) = order_and_fill(&OrderSpec {
+            day_offset: 0,
+            suffix: "registration-fallback",
+            filled: false,
+            edge: "0.03",
+            outcome: "up",
+            winner: "up",
+            price: "0.50",
+            size: "5",
+            markout: "0",
+        });
+        assert!(fill.is_none());
+        order.as_object_mut().unwrap().remove("fact_sha256");
+        order["queue_position_capture_method"] = json!("atomic_registration_fallback");
+        order["queue_snapshot_event_sha256"] = Value::Null;
+        order["queue_position_event_sha256"] = order["queue_registration_event_sha256"].clone();
+        order["queue_position_capture_ts"] = order["submitted_ts"].clone();
+        order = fact_hash(order);
+        let market_id = required_text(&order, "market_id").unwrap();
+        let facts = VerifiedFacts {
+            orders: vec![order],
+            fills: Vec::new(),
+            input_binding_sha256: TEST_INPUT_SHA256.to_owned(),
+            artifact_manifest_sha256: format!("sha256:{}", "a".repeat(64)),
+            artifact_manifest: Value::Null,
+            summary_sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        let queue = VerifiedQueueEligibility {
+            eligible_markets: BTreeSet::from([market_id]),
+            artifact_sha256: format!("sha256:{}", "c".repeat(64)),
+            market_eligibility_sha256: format!("sha256:{}", "d".repeat(64)),
+        };
+
+        let observations =
+            derive_observations(&facts, &queue, parse_utc("2026-07-23T23:59:59Z").unwrap())
+                .unwrap();
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].day, "2026-07-24");
+    }
+
+    #[test]
+    fn reconciled_midnight_settlement_remains_on_market_origin_day() {
+        let (mut order, fill) = order_and_fill(&OrderSpec {
+            day_offset: 0,
+            suffix: "midnight-boundary",
+            filled: false,
+            edge: "0.03",
+            outcome: "up",
+            winner: "up",
+            price: "0.50",
+            size: "5",
+            markout: "0",
+        });
+        assert!(fill.is_none());
+        let start = parse_utc("2026-07-24T23:45:00Z").unwrap();
+        let submitted = start + Duration::minutes(1);
+        let end = parse_utc("2026-07-25T00:00:00Z").unwrap();
+        order.as_object_mut().unwrap().remove("fact_sha256");
+        order["submitted_ts"] = json!(ts(submitted));
+        order["queue_position_capture_ts"] = json!(ts(submitted + Duration::milliseconds(1)));
+        order["terminal_market_start_ts"] = json!(ts(start));
+        order["terminal_market_end_ts"] = json!(ts(end));
+        order["market_origin_utc_day"] = json!("2026-07-24");
+        order["terminal_settlement_recorded_ts"] = json!(ts(end + Duration::seconds(16)));
+        order["terminal_settlement_partition"] = json!("reconciled_next_day");
+        order = fact_hash(order);
+        let market_id = required_text(&order, "market_id").unwrap();
+        let facts = VerifiedFacts {
+            orders: vec![order],
+            fills: Vec::new(),
+            input_binding_sha256: TEST_INPUT_SHA256.to_owned(),
+            artifact_manifest_sha256: format!("sha256:{}", "a".repeat(64)),
+            artifact_manifest: Value::Null,
+            summary_sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        let queue = VerifiedQueueEligibility {
+            eligible_markets: BTreeSet::from([market_id]),
+            artifact_sha256: format!("sha256:{}", "c".repeat(64)),
+            market_eligibility_sha256: format!("sha256:{}", "d".repeat(64)),
+        };
+
+        let observations =
+            derive_observations(&facts, &queue, parse_utc("2026-07-23T23:59:59Z").unwrap())
+                .unwrap();
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].day, "2026-07-24");
     }
 
     #[test]

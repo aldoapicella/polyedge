@@ -136,6 +136,7 @@ fn projected_days_equal_full_cross_midnight_replay_and_bound_readers() {
         out: dir.join("audit.json"),
         markdown: dir.join("audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap();
     let notice = audit["result"]["stream_notices"]
@@ -237,6 +238,7 @@ fn projected_day_rerun_is_canonical_and_materialization_rejects_gap_or_corruptio
         out: dir.join("corrupt-replay-audit.json"),
         markdown: dir.join("corrupt-replay-audit.md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap_err();
     assert!(replay_error.to_string().contains("failed size or SHA-256"));
@@ -305,6 +307,7 @@ fn build_markets(input: &Path, out: &Path) -> Value {
         out: out.to_path_buf(),
         markdown: out.with_extension("md"),
         exclude_windows: Vec::new(),
+        settlement_carry: None,
     })
     .unwrap()
 }

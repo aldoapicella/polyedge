@@ -253,7 +253,8 @@ function VenueExecutionPanel({ evidence, loading, error }: { evidence?: VenueExe
             <Metric label="Final Decision Grade" value={percentage(coverageBreakdown?.final_decision_grade_coverage)} />
             <Metric label="Execution Fields" value={percentage(coverageBreakdown?.execution_field_coverage)} />
             <Metric label="Full Decision Replay" value={percentage(coverageBreakdown?.decision_parity_rate)} />
-            <Metric label="Queue Snapshots" value={applicablePercentage(coverageBreakdown?.queue_snapshot_coverage, coverageBreakdown?.queue_snapshot_applicable)} />
+            <Metric label="Inferred Size Ahead" value={applicablePercentage(coverageBreakdown?.queue_position_coverage, coverageBreakdown?.queue_position_applicable)} />
+            <Metric label="Post-live Queue Snapshots (diagnostic)" value={applicablePercentage(coverageBreakdown?.queue_snapshot_coverage, coverageBreakdown?.queue_snapshot_applicable)} />
             <Metric label="1s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_1s_completion, coverageBreakdown?.markout_1s_applicable)} />
             <Metric label="5s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_5s_completion, coverageBreakdown?.markout_5s_applicable)} />
             <Metric label="30s Markout Completion" value={applicablePercentage(coverageBreakdown?.markout_30s_completion, coverageBreakdown?.markout_30s_applicable)} />
