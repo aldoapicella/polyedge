@@ -36,6 +36,7 @@ export function loadCanaryConfig(env = process.env) {
     executionModelBlobUri: clean(env.STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI),
     executionModelHash: normalizeHash(env.STRATEGY_CANARY_EXECUTION_MODEL_SHA256),
     requiredResolutionSource: clean(env.STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE || "chainlink_reference"),
+    executionOrigin: clean(env.VENUE_PROBE_EXECUTION_ORIGIN || "azure_north_europe_static_egress"),
     expectedCountry: clean(env.VENUE_PROBE_EXPECTED_COUNTRY).toUpperCase(),
     expectedEgressIp: clean(env.VENUE_PROBE_EXPECTED_EGRESS_IP),
     maxClockDriftMs: integer(env.VENUE_PROBE_MAX_CLOCK_DRIFT_MS, 5000),

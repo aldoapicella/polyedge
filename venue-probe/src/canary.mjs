@@ -218,7 +218,7 @@ async function main() {
       terminal_evidence_blob_name: terminalEvidence?.blob_name || null,
       terminal_evidence_sha256: terminalEvidence?.sha256 || null
     },
-    execution_origin: "azure_north_europe_static_egress",
+    execution_origin: config.executionOrigin,
     execution_country: runtime.geoblock.country,
     funder_address: config.funderAddress,
     static_egress_verified: runtime.geoblock.ip === config.expectedEgressIp,

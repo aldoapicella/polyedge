@@ -30,6 +30,8 @@ param fundedDirectTargetOrderNotional string = '10.5'
 param fundedDirectMaxOrderNotional string = '10.5'
 param fundedDirectMinSecondsToExpiry string = '360'
 param fundedDirectMaxSecondsToExpiry string = '900'
+@description('Static public IP resource used by the authenticated North Europe NAT egress.')
+param publicIpName string = 'pip-polyedge-venue-neu-egress'
 
 var environmentName = 'polyedge-venue-neu-env'
 var identityName = 'polyedge-venue-neu-id'
@@ -50,7 +52,6 @@ var shadowCampaignReportRoot = 'reports/research/shadow/campaigns/${shadowCampai
 var shadowCampaignLeaseBlobName = 'data/research/shadow/${shadowCampaignId}/control/replay.lock'
 var vnetName = 'vnet-polyedge-venue-neu'
 var natName = 'nat-polyedge-venue-neu'
-var publicIpName = 'pip-polyedge-venue-neu-egress'
 var tags = {
   app: 'polyedge'
   environment: 'dev'
