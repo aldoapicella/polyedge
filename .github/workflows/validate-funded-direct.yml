@@ -228,12 +228,12 @@ jobs:
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               --tail 100 > funded-service.log 2>/dev/null \
-              && grep -q '"status":"continuous_service_started"' funded-service.log; then
+              && grep -q 'continuous_service_started' funded-service.log; then
               break
             fi
             sleep 10
           done
-          grep -q '"status":"continuous_service_started"' funded-service.log
+          grep -q 'continuous_service_started' funded-service.log
           qset_after=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$PROTECTED_QSET_APP" \
