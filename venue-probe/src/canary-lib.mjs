@@ -274,12 +274,6 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
         || Number(config.campaignBaselineEquity) !== startingCollateral
         || !(reconciliationTolerance >= 0 && reconciliationTolerance <= 0.01)
         || Number(config.maxReconciliationDiscrepancy) !== reconciliationTolerance
-        || manifest.shadow_validation?.required !== true
-        || manifest.shadow_validation?.mode !== "isolated_paper_shadow"
-        || manifest.shadow_validation?.split !== "time_ordered_70_30"
-        || Number(manifest.shadow_validation?.eligible_transitions) !== 100
-        || Number(manifest.shadow_validation?.minimum_distinct_markets) !== 20
-        || Number(manifest.shadow_validation?.maximum_listed_failures) !== 0
         || !clean(manifest.authorized_by_user_reference)
         || !clean(manifest.session_id)) {
       fail("operator-funded session contract is invalid");

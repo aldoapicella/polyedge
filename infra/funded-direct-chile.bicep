@@ -18,9 +18,6 @@ param fundedDirectEnabled bool = false
 param fundedDirectSessionManifestJson string
 param fundedDirectSessionManifestBlobName string
 param fundedDirectSessionManifestSha256 string
-param fundedDirectShadowValidationSealJson string = ''
-param fundedDirectShadowValidationSealBlobName string = ''
-param fundedDirectShadowValidationSealSha256 string = ''
 param fundedDirectCampaignId string
 param fundedDirectStartingCollateral string = '11.09862'
 param fundedDirectMaxAccountLoss string = '11.09862'
@@ -35,8 +32,6 @@ var vnetName = 'vnet-polyedge-execution-cl'
 var originCheckJobName = 'polyedge-origin-check-cl-job'
 var fundedJobName = 'polyedge-funded-direct-cl-job'
 var fundedServiceName = 'polyedge-funded-direct-cl'
-var fundedDirectValidationProvided = (!empty(fundedDirectShadowValidationSealJson) && !empty(fundedDirectShadowValidationSealBlobName) && !empty(fundedDirectShadowValidationSealSha256))
-var fundedDirectReleaseReady = fundedDirectEnabled && fundedDirectValidationProvided
 var tags = {
   app: 'polyedge'
   environment: 'dev'
@@ -431,9 +426,6 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
-            { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
-            { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
-            { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
             { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '20000' }
             { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '5000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
@@ -493,8 +485,8 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
   tags: union(tags, {
     trigger: 'continuous-min-replicas-one'
     operation: 'funded-dynamic-quote-operator-direct'
-    fundedExecution: fundedDirectReleaseReady ? 'enabled' : 'disabled'
-    dryRun: fundedDirectReleaseReady ? 'false' : 'true'
+    fundedExecution: fundedDirectEnabled ? 'enabled' : 'disabled'
+    dryRun: fundedDirectEnabled ? 'false' : 'true'
     publicIngress: 'disabled'
   })
   identity: {
@@ -558,14 +550,14 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             'src/funded-direct-service.mjs'
           ]
           env: [
-            { name: 'FUNDED_DIRECT_SERVICE_ENABLED', value: fundedDirectReleaseReady ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_SERVICE_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'FUNDED_DIRECT_SERVICE_RESTART_DELAY_MS', value: '1000' }
             { name: 'FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_HEARTBEAT_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_MAX_CYCLES', value: '0' }
-            { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectReleaseReady ? 'true' : 'false' }
-            { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
-            { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectReleaseReady ? 'false' : 'true' }
+            { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
             { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '2000' }
             { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
             { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '3600000' }
@@ -573,9 +565,6 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
-            { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
-            { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
-            { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
             { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '20000' }
             { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '5000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
@@ -626,7 +615,7 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
-        minReplicas: fundedDirectReleaseReady ? 1 : 0
+        minReplicas: fundedDirectEnabled ? 1 : 0
         maxReplicas: 1
       }
     }

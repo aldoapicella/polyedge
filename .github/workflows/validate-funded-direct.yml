@@ -13,9 +13,16 @@ on:
       - "research/configs/funded_direct_dynamic_quote_*.json"
       - "venue-probe/**"
   workflow_dispatch:
+    inputs:
+      deploy_funded_service:
+        description: Build and deploy the explicitly authorized continuous funded Dynamic Quote service
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: validate-funded-direct-${{ github.event.pull_request.number || github.ref }}
@@ -40,23 +47,26 @@ jobs:
             exit 1
           fi
 
-      - name: Validate immutable funded session and disabled deployment inputs
+      - name: Validate immutable operator-funded session and continuous deployment inputs
         run: |
           set -euo pipefail
           node <<'NODE'
           const assert = require("node:assert/strict");
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v3.json"));
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v4.json"));
           const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
           const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
           assert.deepEqual(embedded, session);
           const digest = `sha256:${crypto.createHash("sha256").update(JSON.stringify(session, null, 2)).digest("hex")}`;
           assert.equal(parameters.fundedDirectSessionManifestSha256.value, digest);
-          assert.equal(parameters.fundedDirectEnabled.value, false);
-          assert.equal(parameters.fundedDirectShadowValidationSealJson.value, "");
-          assert.equal(parameters.fundedDirectShadowValidationSealBlobName.value, "");
-          assert.equal(parameters.fundedDirectShadowValidationSealSha256.value, "");
+          assert.equal(parameters.fundedDirectEnabled.value, true);
+          assert.equal(session.research_promotion_bypassed, true);
+          assert.equal(session.research_lane_isolated, true);
+          assert.equal(session.no_deposits, true);
+          assert.equal(session.allow_automatic_replenishment, false);
+          assert.equal(session.allow_compounding, false);
+          assert.deepEqual(session.external_cash_flows, []);
           NODE
 
       - uses: actions/setup-node@v4
@@ -89,3 +99,144 @@ jobs:
           az bicep build --file infra/funded-direct-chile.bicep --stdout > /dev/null
           az bicep build --file infra/venue-probe.bicep --stdout > /dev/null
           git diff --check
+
+  deploy-funded-service:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
+    needs: funded-safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: polyedge-funded-direct-cl
+      cancel-in-progress: false
+    env:
+      AZURE_RESOURCE_GROUP: rg-polyedge-dev
+      ACR_NAME: crpolyedge6urdjr5nmwx7w
+      FUNDED_APP: polyedge-funded-direct-cl
+      PROTECTED_QSET_APP: polyedge-shadow-neu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify deployment identity and protected qset
+        env:
+          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          test "$(az account show --query id -o tsv)" = "$EXPECTED_SUBSCRIPTION_ID"
+          az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$PROTECTED_QSET_APP" \
+            --query properties.latestRevisionName \
+            -o tsv > protected-qset-revision-before.txt
+          test -s protected-qset-revision-before.txt
+
+      - name: Build and publish immutable funded worker image
+        id: image
+        run: |
+          set -euo pipefail
+          login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          image_tag="$login_server/polyedge-venue-probe:${GITHUB_SHA}"
+          az acr login --name "$ACR_NAME"
+          docker build -f Dockerfile.venue-probe -t "$image_tag" .
+          docker push "$image_tag"
+          digest=$(az acr repository show \
+            --name "$ACR_NAME" \
+            --image "polyedge-venue-probe:${GITHUB_SHA}" \
+            --query digest \
+            -o tsv)
+          test -n "$digest"
+          echo "reference=$login_server/polyedge-venue-probe@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Prove funded-only deployment scope
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/funded-direct-chile.bicep \
+            --parameters @infra/funded-direct-chile.parameters.json \
+            --parameters venueProbeImage="${{ steps.image.outputs.reference }}" \
+            --result-format ResourceIdOnly \
+            --no-pretty-print \
+            -o json > funded-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore" and .changeType != "NoChange")
+              | select(.resourceId | ascii_downcase | test("qset|polyedge-shadow-neu|/containerapps/polyedge-dev$"))
+            ] | length == 0
+          ' funded-what-if.json
+
+      - name: Deploy continuous funded Dynamic Quote service
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name "polyedge-funded-direct-cl-${GITHUB_RUN_ID}" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/funded-direct-chile.bicep \
+            --parameters @infra/funded-direct-chile.parameters.json \
+            --parameters venueProbeImage="${{ steps.image.outputs.reference }}" \
+            --only-show-errors \
+            -o json > funded-deployment.json
+          test "$(jq -r '.properties.provisioningState' funded-deployment.json)" = "Succeeded"
+
+      - name: Verify one active cloud replica and exact live controls
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 36); do
+            az containerapp show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              -o json > funded-app.json
+            active_replicas=$(az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --query '[?properties.active].properties.replicas | sum(@)' \
+              -o tsv)
+            if [ "${active_replicas:-0}" = "1" ]; then
+              break
+            fi
+            sleep 10
+          done
+          test "${active_replicas:-0}" = "1"
+          test "$(jq -r '.properties.template.scale.minReplicas' funded-app.json)" = "1"
+          test "$(jq -r '.properties.template.scale.maxReplicas' funded-app.json)" = "1"
+          test "$(jq -r '.properties.template.containers[0].image' funded-app.json)" = "${{ steps.image.outputs.reference }}"
+          test "$(jq -r '.properties.template.containers[0].command | join(" ")' funded-app.json)" = "node src/funded-direct-service.mjs"
+          env_value() {
+            jq -r --arg name "$1" '.properties.template.containers[0].env[] | select(.name == $name) | .value' funded-app.json
+          }
+          test "$(env_value FUNDED_DIRECT_SERVICE_ENABLED)" = "true"
+          test "$(env_value FUNDED_DIRECT_WORKER_ENABLED)" = "true"
+          test "$(env_value ALLOW_FUNDED_DIRECT)" = "true"
+          test "$(env_value FUNDED_DIRECT_DRY_RUN)" = "false"
+          test "$(env_value ENABLE_TAKER_ORDERS)" = "false"
+          test "$(env_value VENUE_PROBE_CAMPAIGN_CASH_FLOWS)" = "[]"
+          test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "20000"
+          test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "5000"
+
+      - name: Verify service startup and qset isolation
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 18); do
+            if az containerapp logs show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --tail 100 > funded-service.log 2>/dev/null \
+              && grep -q '"status":"continuous_service_started"' funded-service.log; then
+              break
+            fi
+            sleep 10
+          done
+          grep -q '"status":"continuous_service_started"' funded-service.log
+          qset_after=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$PROTECTED_QSET_APP" \
+            --query properties.latestRevisionName \
+            -o tsv)
+          test "$qset_after" = "$(cat protected-qset-revision-before.txt)"

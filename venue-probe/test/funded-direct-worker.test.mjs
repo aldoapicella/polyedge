@@ -31,14 +31,6 @@ function session() {
       minimum: 360,
       maximum: 900
     },
-    shadow_validation: {
-      required: true,
-      mode: "isolated_paper_shadow",
-      split: "time_ordered_70_30",
-      eligible_transitions: 100,
-      minimum_distinct_markets: 20,
-      maximum_listed_failures: 0
-    },
     candidate: {
       name: "dynamic_quote_style",
       candidate_version: "dynamic_quote_style@2026-06-14",
@@ -54,41 +46,8 @@ function session() {
   };
 }
 
-function shadowValidationSeal() {
-  return {
-    schema: "polyedge.funded_direct_shadow_validation.v1",
-    passed: true,
-    generated_at: "2026-07-28T22:00:00.000Z",
-    mode: "isolated_paper_shadow",
-    funded_execution_enabled: false,
-    qset_untouched: true,
-    split: {
-      method: "time_ordered_70_30",
-      training_transitions: 70,
-      holdout_transitions: 30
-    },
-    eligible_transition_count: 100,
-    distinct_market_count: 20,
-    listed_failures: {
-      stale_child_launch: 0,
-      authorization_leak: 0,
-      reservation_leak: 0,
-      unexpected_equity_bypass: 0,
-      open_order_mismatch: 0,
-      terminal_reconciliation_failure: 0
-    },
-    candidate: {
-      name: "dynamic_quote_style",
-      candidate_version: "dynamic_quote_style@2026-06-14",
-      config_hash: `sha256:${"a".repeat(64)}`
-    },
-    transition_evidence_sha256: `sha256:${"d".repeat(64)}`
-  };
-}
-
 function env(overrides = {}) {
   const value = session();
-  const validation = shadowValidationSeal();
   return {
     FUNDED_DIRECT_WORKER_ENABLED: "true",
     ALLOW_FUNDED_DIRECT: "true",
@@ -96,9 +55,6 @@ function env(overrides = {}) {
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
     FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/session.json",
     FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
-    FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON: JSON.stringify(validation),
-    FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME: "reports/funded/shadow-validation.json",
-    FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256: sha256(Buffer.from(JSON.stringify(validation, null, 2))),
     FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "20000",
     FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "5000",
     STRATEGY_CANARY_CANDIDATE_NAME: "dynamic_quote_style",

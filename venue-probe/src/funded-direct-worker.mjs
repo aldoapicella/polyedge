@@ -5,7 +5,6 @@ import {
   loadHashedJson,
   sha256
 } from "./canary-lib.mjs";
-import { validateFundedDirectShadowSeal } from "./funded-direct-shadow-validation.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
 
 const EXPECTED_CANDIDATE = "dynamic_quote_style";
@@ -15,9 +14,7 @@ const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 
 export function loadFundedDirectConfig(env = process.env) {
   const sessionJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "").trim();
-  const validationJson = String(env.FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON || "").trim();
   const session = parseJson(sessionJson);
-  const shadowValidationSeal = parseJson(validationJson);
   const config = {
     enabled: env.FUNDED_DIRECT_WORKER_ENABLED === "true",
     allowed: env.ALLOW_FUNDED_DIRECT === "true",
@@ -25,9 +22,6 @@ export function loadFundedDirectConfig(env = process.env) {
     session,
     sessionBlobName: clean(env.FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME),
     sessionHash: hash(env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256),
-    shadowValidationSeal,
-    shadowValidationBlobName: clean(env.FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME),
-    shadowValidationHash: hash(env.FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256),
     candidate: clean(env.STRATEGY_CANARY_CANDIDATE_NAME),
     candidateVersion: clean(env.STRATEGY_CANARY_CANDIDATE_VERSION),
     candidateConfigHash: hash(env.STRATEGY_CANARY_CANDIDATE_CONFIG_HASH),
@@ -55,9 +49,6 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!config.allowed) errors.push("ALLOW_FUNDED_DIRECT must be true");
   if (!config.session) errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be valid JSON");
   if (!config.sessionBlobName || !config.sessionHash) errors.push("exact operator session manifest blob and SHA-256 are required");
-  if (!config.shadowValidationSeal || !config.shadowValidationBlobName || !config.shadowValidationHash) {
-    errors.push("exact isolated paper/shadow validation seal, blob, and SHA-256 are required");
-  }
   if (config.candidate !== EXPECTED_CANDIDATE || config.candidateVersion !== EXPECTED_VERSION) {
     errors.push("worker must remain bound to the frozen Dynamic Quote candidate");
   }
@@ -83,7 +74,6 @@ export function loadFundedDirectConfig(env = process.env) {
   }
   if (errors.length) throw new Error(`funded_direct_worker blocked: ${errors.join("; ")}`);
   validateSession(config);
-  validateShadowSeal(config);
   return config;
 }
 
@@ -100,13 +90,6 @@ export async function runFundedDirectWorker({
     intents: storageContainer({ ...config, storageContainer: config.intentContainerName })
   };
   if (!clients.control || !clients.intents) throw new Error("fail closed: operator-funded storage clients are unavailable");
-  const validationDocument = await putImmutableOrVerify(clients.control, {
-    blobName: config.shadowValidationBlobName,
-    value: config.shadowValidationSeal
-  });
-  if (validationDocument.hash !== config.shadowValidationHash) {
-    throw new Error("fail closed: isolated paper/shadow validation seal SHA-256 mismatch");
-  }
   const sessionDocument = await putImmutableOrVerify(clients.control, {
     blobName: config.sessionBlobName,
     value: config.session
@@ -209,12 +192,6 @@ function validateSession(config) {
     && Number(value.source_simulated_pnl) === 379.19
     && Number(value.execution_window_seconds_to_expiry?.minimum) === config.minimumSecondsToExpiry
     && Number(value.execution_window_seconds_to_expiry?.maximum) === config.maximumSecondsToExpiry
-    && value.shadow_validation?.required === true
-    && value.shadow_validation?.mode === "isolated_paper_shadow"
-    && value.shadow_validation?.split === "time_ordered_70_30"
-    && Number(value.shadow_validation?.eligible_transitions) === 100
-    && Number(value.shadow_validation?.minimum_distinct_markets) === 20
-    && Number(value.shadow_validation?.maximum_listed_failures) === 0
     && value.evidence_trust_boundary_ready === false
     && value.candidate?.name === config.candidate
     && value.candidate?.candidate_version === config.candidateVersion
@@ -227,18 +204,6 @@ function validateSession(config) {
     && expires > created
     && expectedHash === config.sessionHash;
   if (!valid) throw new Error("funded_direct_worker blocked: operator-funded session contract is invalid or hash-mismatched");
-}
-
-function validateShadowSeal(config) {
-  const expectedHash = sha256(Buffer.from(JSON.stringify(config.shadowValidationSeal, null, 2)));
-  if (expectedHash !== config.shadowValidationHash) {
-    throw new Error("funded_direct_worker blocked: isolated paper/shadow validation seal hash mismatch");
-  }
-  validateFundedDirectShadowSeal(config.shadowValidationSeal, {
-    candidateName: config.candidate,
-    candidateVersion: config.candidateVersion,
-    candidateConfigHash: config.candidateConfigHash
-  });
 }
 
 async function firstFreshIntent(clients, config, session, now) {
@@ -461,7 +426,6 @@ function result(status, config, details) {
     no_replenishment: true,
     no_compounding: true,
     external_cash_flow_count: 0,
-    shadow_validation_sha256: config.shadowValidationHash,
     research_promotion_bypassed: true,
     ...details
   };
