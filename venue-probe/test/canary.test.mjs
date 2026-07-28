@@ -238,6 +238,72 @@ test("funded-stage child explicitly accepts exact stage consumption and limited-
   assert.deepEqual(controls.calls, { reserve: 0, consume: 0, execute: 0, finalize: 0 });
 });
 
+test("operator-funded child executes above the old one-dollar cap without claiming research promotion", async () => {
+  const input = fixture(false);
+  input.config.operatorDirect = true;
+  input.config.trustBoundaryReady = false;
+  input.config.maxOrderNotional = 10.5;
+  input.documents.intent.shares = "20";
+  input.documents.intent.notional = "4.00";
+  input.documents.manifest = {
+    schema_version: "polyedge.operator_funded_session.v1",
+    session_id: "dynamic-quote-funded-2026-07-27",
+    authorization_mode: "operator_direct",
+    authorized_by_user_reference: "Codex task 2026-07-27 funded Dynamic Quote",
+    research_promotion_bypassed: true,
+    research_lane_isolated: true,
+    maker_only: true,
+    no_deposits: true,
+    max_open_orders: 1,
+    max_order_notional: 10.5,
+    max_account_loss: 11.09862,
+    candidate: {
+      name: input.config.candidateName,
+      candidate_version: input.config.candidateVersion,
+      config_hash: input.config.candidateConfigHash
+    },
+    execution_model: {
+      blob_uri: input.config.executionModelBlobUri,
+      sha256: input.config.executionModelHash,
+      model_version: input.config.requiredFillModelVersion
+    },
+    created_at: "2026-07-12T11:00:00.000Z",
+    expires_at: "2026-07-12T13:00:00.000Z"
+  };
+  input.documents.authorization = {
+    schema: "polyedge.operator_funded_intent_authorization.v1",
+    authorization_id: "operator-funded-decision-1",
+    authorization_mode: "operator_direct",
+    session_id: input.documents.manifest.session_id,
+    decision_id: input.documents.intent.decision_id,
+    intent_blob_name: input.config.intentBlobName,
+    intent_sha256: input.config.intentBlobHash,
+    promotion_manifest_blob_name: input.config.manifestBlobName,
+    promotion_manifest_sha256: input.config.manifestBlobHash,
+    operator_session_manifest_blob_name: input.config.manifestBlobName,
+    operator_session_manifest_sha256: input.config.manifestBlobHash,
+    research_promotion_bypassed: true,
+    candidate_name: input.config.candidateName,
+    candidate_version: input.config.candidateVersion,
+    candidate_config_hash: input.config.candidateConfigHash,
+    required_fill_model_version: input.config.requiredFillModelVersion,
+    execution_model_blob_uri: input.config.executionModelBlobUri,
+    execution_model_sha256: input.config.executionModelHash,
+    execution_model_container_name: "polyedge-research",
+    execution_model_blob_name: "reports/research/venue-probe/conservative_execution_prior_v1.json",
+    max_order_notional: 10.5,
+    human_authorization_reference: "Codex task 2026-07-27 funded Dynamic Quote",
+    authorized_at: "2026-07-12T12:00:10.000Z",
+    expires_at: "2026-07-12T12:00:30.000Z",
+    single_use: true
+  };
+  const controls = spies();
+  const result = await executeStrategyCanary({ ...input, ...controls });
+  assert.equal(result.status, "funded_direct_executed");
+  assert.deepEqual(controls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
+  assert.equal(input.documents.manifest.research_promotion_bypassed, true);
+});
+
 test("stale, book-hash, geoblock, clock, equity, model, and authorization failures send no order", async (t) => {
   const cases = [
     ["stale intent", (value) => { value.now = new Date("2026-07-12T12:03:00Z"); }, /stale/],

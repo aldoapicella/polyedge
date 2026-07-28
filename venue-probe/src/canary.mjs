@@ -52,7 +52,8 @@ import {
 } from "./canary-lifecycle-lib.mjs";
 
 const config = loadCanaryConfig();
-const runId = process.env.STRATEGY_CANARY_RUN_ID || `strategy-canary-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
+const runKind = config.operatorDirect ? "funded-direct" : "strategy-canary";
+const runId = process.env.STRATEGY_CANARY_RUN_ID || `${runKind}-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
 const ledger = new EventLedger(runId);
 let lease;
 let userChannel;
@@ -186,7 +187,13 @@ async function main() {
     },
     provenance: {
       decision_id: documents.intent.decision_id,
-      authorization_kind: documents.authorization.schema === "polyedge.funded_stage_intent_authorization.v1" ? "funded_stage" : "checkpoint_1_canary",
+      authorization_kind: documents.authorization.schema === "polyedge.operator_funded_intent_authorization.v1"
+        ? "operator_direct"
+        : documents.authorization.schema === "polyedge.funded_stage_intent_authorization.v1"
+          ? "funded_stage"
+          : "checkpoint_1_canary",
+      operator_session_id: documents.authorization.session_id || null,
+      research_promotion_bypassed: documents.authorization.research_promotion_bypassed === true,
       human_grant_id: documents.authorization.human_grant_id || null,
       human_grant_consumption_blob_name: documents.authorization.human_grant_consumption_blob_name || null,
       human_grant_consumption_sha256: documents.authorization.human_grant_consumption_sha256 || null,
@@ -225,8 +232,9 @@ async function main() {
     queue_position_source: "authenticated_lifecycle_plus_public_l2",
     queue_position_metric: "inferred_size_ahead",
     literal_fifo_rank_available: false,
-    research_only: true,
-    live_trading_enabled: false
+    research_only: !config.operatorDirect,
+    live_trading_enabled: config.operatorDirect,
+    evidence_trust_boundary_ready: config.trustBoundaryReady
   };
   ledger.record("strategy_canary_protocol_v3_completed", {
     probe_id: evidenceProbe.probe_id,
@@ -755,8 +763,9 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     queue_position_source: "authenticated_lifecycle_plus_public_l2",
     queue_position_metric: "inferred_size_ahead",
     literal_fifo_rank_available: false,
-    research_only: true,
-    live_trading_enabled: false
+    research_only: !config.operatorDirect,
+    live_trading_enabled: config.operatorDirect,
+    evidence_trust_boundary_ready: config.trustBoundaryReady
   };
   return uploadEvidence(config, runId, summary, ledger);
 }

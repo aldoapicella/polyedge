@@ -3,15 +3,19 @@ import { createHash } from "node:crypto";
 const EXECUTION_INTENT_SCHEMA = "polyedge.execution_intent.v1";
 const AUTHORIZATION_SCHEMA = "polyedge.strategy_canary_authorization.v1";
 const FUNDED_AUTHORIZATION_SCHEMA = "polyedge.funded_stage_intent_authorization.v1";
+const OPERATOR_DIRECT_AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
+const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
 const VENUE_GTD_SECURITY_BUFFER_MS = 60_000;
 const MAX_ACTIVE_INTENT_TTL_MS = 30_000;
 
 export function loadCanaryConfig(env = process.env) {
   const config = {
     executionMode: env.EXECUTION_MODE || "strategy_canary",
+    operatorDirect: env.EXECUTION_MODE === "funded_direct",
     allowLive: boolean(env.ALLOW_LIVE),
     allowCanary: boolean(env.ALLOW_STRATEGY_CANARY),
+    allowFundedDirect: boolean(env.ALLOW_FUNDED_DIRECT),
     enableTakerOrders: boolean(env.ENABLE_TAKER_ORDERS),
     dryRun: env.STRATEGY_CANARY_DRY_RUN !== "false",
     trustBoundaryReady: boolean(env.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY),
@@ -69,12 +73,17 @@ export function loadCanaryConfig(env = process.env) {
 
 export function validateCanaryConfig(config) {
   const errors = [];
-  if (config.executionMode !== "strategy_canary") errors.push("EXECUTION_MODE must equal strategy_canary");
-  if (!config.dryRun && config.trustBoundaryReady !== true) errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control isolation");
+  if (!["strategy_canary", "funded_direct"].includes(config.executionMode)) errors.push("EXECUTION_MODE must equal strategy_canary or funded_direct");
+  if (!config.operatorDirect && !config.dryRun && config.trustBoundaryReady !== true) errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control isolation");
   if (config.allowLive) errors.push("ALLOW_LIVE must remain false");
-  if (!config.allowCanary) errors.push("ALLOW_STRATEGY_CANARY must be true");
+  if (config.operatorDirect ? !config.allowFundedDirect : !config.allowCanary) {
+    errors.push(config.operatorDirect ? "ALLOW_FUNDED_DIRECT must be true" : "ALLOW_STRATEGY_CANARY must be true");
+  }
   if (config.enableTakerOrders) errors.push("ENABLE_TAKER_ORDERS must remain false");
-  if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= 1)) errors.push("STRATEGY_CANARY_MAX_ORDER_NOTIONAL must be in (0, 1]");
+  const maxAllowedNotional = config.operatorDirect ? 100 : 1;
+  if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= maxAllowedNotional)) {
+    errors.push(`STRATEGY_CANARY_MAX_ORDER_NOTIONAL must be in (0, ${maxAllowedNotional}]`);
+  }
   if (!config.candidateConfigHash) errors.push("STRATEGY_CANARY_CANDIDATE_CONFIG_HASH is required");
   if (!config.requiredFillModelVersion) errors.push("STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION is required");
   if (!config.executionModelBlobUri) errors.push("STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI is required");
@@ -86,10 +95,12 @@ export function validateCanaryConfig(config) {
     ["STRATEGY_CANARY_PROMOTION_MANIFEST_SHA256", config.manifestBlobHash],
     ["STRATEGY_CANARY_AUTHORIZATION_BLOB_NAME", config.authorizationBlobName],
     ["STRATEGY_CANARY_AUTHORIZATION_SHA256", config.authorizationBlobHash],
-    ["STRATEGY_CANARY_HUMAN_GRANT_ID", config.humanGrantId],
-    ["STRATEGY_CANARY_HUMAN_GRANT_SHA256", config.humanGrantHash],
-    ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_BLOB_NAME", config.humanGrantConsumptionBlobName],
-    ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_SHA256", config.humanGrantConsumptionHash]
+    ...(!config.operatorDirect ? [
+      ["STRATEGY_CANARY_HUMAN_GRANT_ID", config.humanGrantId],
+      ["STRATEGY_CANARY_HUMAN_GRANT_SHA256", config.humanGrantHash],
+      ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_BLOB_NAME", config.humanGrantConsumptionBlobName],
+      ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_SHA256", config.humanGrantConsumptionHash]
+    ] : [])
   ]) if (!value) errors.push(`${name} is required`);
   if (!config.expectedCountry) errors.push("VENUE_PROBE_EXPECTED_COUNTRY is required");
   if (!config.expectedEgressIp) errors.push("VENUE_PROBE_EXPECTED_EGRESS_IP is required");
@@ -187,7 +198,9 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   const intentMinimumOrderSize = finite(intent.minimum_order_size, "minimum_order_size");
   if (!(price > 0 && price < 1 && shares > 0 && notional > 0)) fail("execution intent price, shares, and notional must be positive");
   if (Math.abs(price * shares - notional) > 1e-9) fail("execution intent notional does not reconcile");
-  if (notional > config.maxOrderNotional + 1e-9 || notional > 1 + 1e-9) fail("execution intent exceeds the one-dollar notional cap");
+  if (notional > config.maxOrderNotional + 1e-9 || (!config.operatorDirect && notional > 1 + 1e-9)) {
+    fail(config.operatorDirect ? "execution intent exceeds the operator-funded order cap" : "execution intent exceeds the one-dollar notional cap");
+  }
   if (!(intentMinimumOrderSize > 0) || shares + 1e-9 < intentMinimumOrderSize) fail("execution intent is below its bound venue minimum_order_size");
   const decisionMs = Date.parse(intent.decision_ts);
   const validUntilMs = Date.parse(intent.valid_until);
@@ -224,25 +237,52 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (intent.exact_resolution_source !== true || intent.resolution_source !== config.requiredResolutionSource || runtime.exactResolutionSource !== true || runtime.resolutionSource !== config.requiredResolutionSource) fail("exact resolution source is not confirmed");
 
   const fundedStage = authorization?.schema === FUNDED_AUTHORIZATION_SCHEMA;
-  const manifestPhaseValid = fundedStage
-    ? manifest?.phase === "limited_live" && manifest?.gate_metrics?.phase === "shadow_passed" && manifest?.funded_ladder?.phase === "limited_live" && manifest?.funded_ladder?.stage_authorized === true && manifest?.funded_ladder?.human_grant_required === false
-    : manifest?.phase === "canary_ready" && manifest?.gate_metrics?.phase === "canary_ready";
-  if (manifest?.schema_version !== PROMOTION_MANIFEST_SCHEMA || !manifestPhaseValid) fail("promotion manifest phase or funded-stage authorization state is invalid");
-  if (manifest.promotion_allowed !== false || manifest.gate_metrics?.promotion_allowed !== true || manifest.human_authorization_required !== true) fail("promotion manifest gates are not passing or the research manifest is directly executable");
+  const operatorDirect = authorization?.schema === OPERATOR_DIRECT_AUTHORIZATION_SCHEMA;
+  if (Boolean(config.operatorDirect) !== operatorDirect) fail("execution mode and authorization kind disagree");
+  if (operatorDirect) {
+    if (manifest?.schema_version !== OPERATOR_DIRECT_MANIFEST_SCHEMA
+        || manifest.authorization_mode !== "operator_direct"
+        || manifest.research_promotion_bypassed !== true
+        || manifest.research_lane_isolated !== true
+        || manifest.maker_only !== true
+        || manifest.no_deposits !== true
+        || Number(manifest.max_open_orders) !== 1
+        || Number(manifest.max_order_notional) !== Number(config.maxOrderNotional)
+        || !(Number(manifest.max_account_loss) > 0)
+        || !clean(manifest.authorized_by_user_reference)
+        || !clean(manifest.session_id)) {
+      fail("operator-funded session contract is invalid");
+    }
+  } else {
+    const manifestPhaseValid = fundedStage
+      ? manifest?.phase === "limited_live" && manifest?.gate_metrics?.phase === "shadow_passed" && manifest?.funded_ladder?.phase === "limited_live" && manifest?.funded_ladder?.stage_authorized === true && manifest?.funded_ladder?.human_grant_required === false
+      : manifest?.phase === "canary_ready" && manifest?.gate_metrics?.phase === "canary_ready";
+    if (manifest?.schema_version !== PROMOTION_MANIFEST_SCHEMA || !manifestPhaseValid) fail("promotion manifest phase or funded-stage authorization state is invalid");
+    if (manifest.promotion_allowed !== false || manifest.gate_metrics?.promotion_allowed !== true || manifest.human_authorization_required !== true) fail("promotion manifest gates are not passing or the research manifest is directly executable");
+  }
   const manifestCreatedMs = Date.parse(manifest.created_at);
   const manifestExpiresMs = Date.parse(manifest.expires_at);
   if (!Number.isFinite(manifestCreatedMs) || !Number.isFinite(manifestExpiresMs) || manifestCreatedMs > nowMs || manifestExpiresMs <= nowMs || manifestExpiresMs <= manifestCreatedMs) fail("promotion manifest is expired or has an invalid validity window");
-  if (manifest.candidate?.name !== intent.candidate_name || manifest.candidate?.candidate_version !== intent.candidate_version || manifest.candidate?.config_hash !== intent.candidate_config_hash) fail("promotion manifest candidate mismatch");
-  if (manifest.execution_model?.blob_uri !== config.executionModelBlobUri || normalizeHash(manifest.execution_model?.sha256) !== config.executionModelHash || manifest.execution_model?.model_version !== config.requiredFillModelVersion) fail("promotion manifest exact model artifact binding mismatch");
+  if (manifest.candidate?.name !== intent.candidate_name || manifest.candidate?.candidate_version !== intent.candidate_version || manifest.candidate?.config_hash !== intent.candidate_config_hash) fail("execution manifest candidate mismatch");
+  if (manifest.execution_model?.blob_uri !== config.executionModelBlobUri || normalizeHash(manifest.execution_model?.sha256) !== config.executionModelHash || manifest.execution_model?.model_version !== config.requiredFillModelVersion) fail("execution manifest exact model artifact binding mismatch");
 
-  if (![AUTHORIZATION_SCHEMA, FUNDED_AUTHORIZATION_SCHEMA].includes(authorization?.schema) || authorization.single_use !== true) fail("invalid one-shot authorization");
+  if (![AUTHORIZATION_SCHEMA, FUNDED_AUTHORIZATION_SCHEMA, OPERATOR_DIRECT_AUTHORIZATION_SCHEMA].includes(authorization?.schema) || authorization.single_use !== true) fail("invalid one-shot authorization");
   for (const field of ["authorization_id", "human_authorization_reference", "authorized_at", "expires_at"]) if (!clean(authorization?.[field])) fail(`authorization ${field} is required`);
   if (authorization.decision_id !== intent.decision_id) fail("authorization decision mismatch");
   const authorizationStartedMs = Date.parse(authorization.authorized_at);
   const authorizationExpiresMs = Date.parse(authorization.expires_at);
   if (!Number.isFinite(authorizationStartedMs) || !Number.isFinite(authorizationExpiresMs) || authorizationStartedMs > nowMs || authorizationExpiresMs <= nowMs || authorizationExpiresMs <= authorizationStartedMs) fail("authorization is stale, not yet valid, or has an invalid validity window");
   if (authorization.intent_blob_name !== config.intentBlobName || normalizeHash(authorization.intent_sha256) !== config.intentBlobHash || authorization.promotion_manifest_blob_name !== config.manifestBlobName || normalizeHash(authorization.promotion_manifest_sha256) !== config.manifestBlobHash) fail("authorization artifact binding mismatch");
-  if (fundedStage) {
+  if (operatorDirect) {
+    if (authorization.session_id !== manifest.session_id
+        || authorization.authorization_mode !== "operator_direct"
+        || authorization.operator_session_manifest_blob_name !== config.manifestBlobName
+        || normalizeHash(authorization.operator_session_manifest_sha256) !== config.manifestBlobHash
+        || authorization.research_promotion_bypassed !== true
+        || Number(authorization.max_order_notional) !== Number(config.maxOrderNotional)) {
+      fail("operator-funded authorization session binding mismatch");
+    }
+  } else if (fundedStage) {
     if (authorization.funded_stage_consumption_blob_name !== config.humanGrantConsumptionBlobName || normalizeHash(authorization.funded_stage_consumption_sha256) !== config.humanGrantConsumptionHash || !normalizeHash(authorization.funded_stage_source_state_sha256) || Number(authorization.funded_stage_target_orders) !== Number(manifest.funded_ladder?.active_target_orders)) fail("funded-stage consumption, state, or target binding mismatch");
   } else if (authorization.human_grant_id !== config.humanGrantId || normalizeHash(authorization.human_grant_sha256) !== config.humanGrantHash || authorization.human_grant_consumption_blob_name !== config.humanGrantConsumptionBlobName || normalizeHash(authorization.human_grant_consumption_sha256) !== config.humanGrantConsumptionHash) fail("authorization human-grant consumption binding mismatch");
   if (authorization.candidate_name !== intent.candidate_name || authorization.candidate_version !== intent.candidate_version || authorization.candidate_config_hash !== intent.candidate_config_hash || authorization.required_fill_model_version !== intent.required_fill_model_version) fail("authorization candidate or fill-model binding mismatch");
@@ -319,7 +359,7 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
   );
   const reservation = await reserveRisk({
     run_id: runId,
-    probe_id: `strategy-canary-${documents.intent.decision_id}`,
+    probe_id: `${config.operatorDirect ? "funded-direct" : "strategy-canary"}-${documents.intent.decision_id}`,
     reserved_notional: validated.notional + feeRiskUpperBound,
     principal_notional: validated.notional,
     fee_model: "polymarket_clob_v2_curve",
@@ -346,7 +386,13 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
     throw error;
   }
   const lifecycle = await executeLifecycle({ intent: documents.intent, documents, runtime, reservation, consumption, validated });
-  return { status: "strategy_canary_executed", order_submission_attempted: true, authorization_consumed: true, decision_id: documents.intent.decision_id, lifecycle };
+  return {
+    status: config.operatorDirect ? "funded_direct_executed" : "strategy_canary_executed",
+    order_submission_attempted: true,
+    authorization_consumed: true,
+    decision_id: documents.intent.decision_id,
+    lifecycle
+  };
 }
 
 export function beginFillMarkoutCapture(client, tokenId, currentFills, options = {}) {

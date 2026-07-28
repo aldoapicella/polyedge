@@ -18,6 +18,15 @@ param funderAddress string = '0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8'
 param relayerApiKeyAddress string = '0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921'
 @description('Set true only after polymarket-relayer-api-key exists in Key Vault.')
 param relayerApiKeySecretConfigured bool = false
+@description('Explicit operator switch for the scheduled funded Dynamic Quote lane.')
+param fundedDirectEnabled bool = false
+param fundedDirectSessionManifestJson string = ''
+param fundedDirectSessionManifestBlobName string = ''
+param fundedDirectSessionManifestSha256 string = ''
+param fundedDirectCampaignId string = 'dynamic-quote-funded-disabled'
+param fundedDirectStartingCollateral string = '11.09862'
+param fundedDirectMaxAccountLoss string = '11.09862'
+param fundedDirectMaxOrderNotional string = '10.5'
 
 var environmentName = 'polyedge-venue-neu-env'
 var identityName = 'polyedge-venue-neu-id'
@@ -581,6 +590,7 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'MAX_TOTAL_POSITION', value: '1' }
             { name: 'MAX_DAILY_LOSS', value: '1' }
             { name: 'MAX_OPEN_ORDERS', value: '1' }
+            { name: 'STRATEGY_INTENT_MAX_ORDER_NOTIONAL', value: fundedDirectEnabled ? fundedDirectMaxOrderNotional : '1' }
             { name: 'TARGET_ASSET', value: 'BTC' }
             { name: 'TARGET_ASSET_NAME', value: 'Bitcoin' }
             { name: 'TARGET_HORIZON', value: '15m' }
@@ -941,10 +951,10 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   name: fundedLadderJobName
   location: location
   tags: union(tags, {
-    trigger: 'manual-only'
-    operation: 'funded-ladder-5-25-100-200'
-    fundedExecution: 'disabled'
-    dryRun: 'true'
+    trigger: fundedDirectEnabled ? 'schedule-every-5-minutes' : 'manual-only'
+    operation: 'funded-dynamic-quote-operator-direct'
+    fundedExecution: fundedDirectEnabled ? 'enabled' : 'disabled'
+    dryRun: fundedDirectEnabled ? 'false' : 'true'
   })
   identity: {
     type: 'UserAssigned'
@@ -952,11 +962,10 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   }
   properties: {
     environmentId: managedEnvironment.id
-    configuration: {
-      triggerType: 'Manual'
+    configuration: union({
+      triggerType: fundedDirectEnabled ? 'Schedule' : 'Manual'
       replicaRetryLimit: 0
-      replicaTimeout: 3600
-      manualTriggerConfig: { parallelism: 1, replicaCompletionCount: 1 }
+      replicaTimeout: 290
       registries: [{ server: registry.properties.loginServer, identity: identity.id }]
       secrets: [
         { name: 'polymarket-private-key', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-private-key', identity: identity.id }
@@ -964,17 +973,34 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
         { name: 'polymarket-api-secret', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret', identity: identity.id }
         { name: 'polymarket-api-passphrase', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase', identity: identity.id }
       ]
-    }
+    }, fundedDirectEnabled ? {
+      scheduleTriggerConfig: {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    } : {
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    })
     template: {
       containers: [{
         name: 'funded-ladder'
         image: venueProbeImage
-        command: ['node', 'src/funded-dynamic-quote-worker.mjs']
+        command: ['node', 'src/funded-direct-worker.mjs']
         env: [
-          { name: 'FUNDED_DYNAMIC_QUOTE_WORKER_ENABLED', value: 'false' }
-          { name: 'FUNDED_DYNAMIC_QUOTE_MAX_ITERATIONS', value: '200' }
-          { name: 'FUNDED_DYNAMIC_QUOTE_POLL_INTERVAL_MS', value: '5000' }
-          { name: 'FUNDED_DYNAMIC_QUOTE_MAX_IDLE_MS', value: '300000' }
+          { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
+          { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
+          { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
+          { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
+          { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
+          { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
+          { name: 'FUNDED_DIRECT_CONTROL_PREFIX', value: 'reports/funded/dynamic-quote' }
+          { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
+          { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
+          { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
@@ -999,15 +1025,15 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'STRATEGY_CANARY_CANDIDATE_CONFIG_HASH', value: 'sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c' }
           { name: 'STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION', value: 'conservative-execution-prior-v1' }
           { name: 'STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE', value: 'chainlink_reference' }
-          { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: '1' }
+          { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: fundedDirectMaxOrderNotional }
           { name: 'STRATEGY_CANARY_MAX_REFERENCE_AGE_MS', value: '2000' }
           { name: 'STRATEGY_CANARY_MAX_BOOK_AGE_MS', value: '1000' }
           { name: 'STRATEGY_CANARY_REST_SECONDS', value: '30' }
           { name: 'MAX_OPEN_ORDERS', value: '1' }
-          { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: 'funded-campaign-2026-07-12' }
-          { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: '5.030521' }
-          { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '4.03' }
-          { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: '1' }
+          { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: fundedDirectCampaignId }
+          { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: fundedDirectStartingCollateral }
+          { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '0' }
+          { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: fundedDirectMaxAccountLoss }
           { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
           { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
           { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }

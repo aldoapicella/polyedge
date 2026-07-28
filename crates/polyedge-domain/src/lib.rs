@@ -517,7 +517,6 @@ impl ExecutionIntentV1 {
             || self.price >= Decimal::ONE
             || self.shares <= Decimal::ZERO
             || self.notional != self.price * self.shares
-            || self.notional > Decimal::ONE
             || self.minimum_order_size <= Decimal::ZERO
             || self.shares < self.minimum_order_size
         {
@@ -826,7 +825,7 @@ mod tests {
         invalid.exact_resolution_source = true;
         invalid.notional = Decimal::new(101, 2);
         invalid.shares = invalid.notional / invalid.price;
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate().is_ok());
         invalid.notional = Decimal::new(80, 2);
         invalid.shares = Decimal::from(2);
         invalid.net_edge_lower_bound = Decimal::ZERO;

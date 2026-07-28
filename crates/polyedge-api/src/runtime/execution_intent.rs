@@ -218,13 +218,18 @@ pub(super) fn build_execution_intent_with_model(
     }
     let shares = requested_shares.max(market.minimum_order_size);
     let notional = price * shares;
+    let max_intent_notional = settings.azure.strategy_intent_max_order_notional;
+    if max_intent_notional <= Decimal::ZERO {
+        return Err("configured execution-intent notional cap must be positive".to_owned());
+    }
     if price <= Decimal::ZERO
         || price >= Decimal::ONE
         || shares <= Decimal::ZERO
-        || notional > Decimal::ONE
+        || notional > max_intent_notional
     {
         return Err(
-            "decision price, size, or notional violates the one-dollar canary cap".to_owned(),
+            "decision price, size, or notional violates the configured execution-intent cap"
+                .to_owned(),
         );
     }
     let best_ask = book
@@ -1079,14 +1084,14 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_when_notional_exceeds_one_dollar_or_candidate_changes() {
+    fn fails_closed_when_notional_exceeds_configured_cap_or_candidate_changes() {
         let (settings, market, fair, reference, book, mut decision, mut metadata, now) = fixture();
         decision.size = Some(Decimal::from(3));
         assert!(build_execution_intent(
             &settings, &market, &fair, &reference, &book, &decision, &metadata, now
         )
         .unwrap_err()
-        .contains("one-dollar"));
+        .contains("configured execution-intent cap"));
 
         decision.size = Some(Decimal::ONE);
         metadata.candidate = FrozenStrategyMode::DynamicSafetyOnly.candidate();
@@ -1098,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn derives_venue_feasible_minimum_shares_without_exceeding_one_dollar() {
+    fn derives_venue_feasible_minimum_shares_without_exceeding_configured_cap() {
         let (settings, mut market, fair, reference, book, mut decision, metadata, now) = fixture();
         market.minimum_order_size = Decimal::from(5);
         decision.price = Some(Decimal::new(20, 2));
@@ -1116,6 +1121,18 @@ mod tests {
             &settings, &market, &fair, &reference, &book, &decision, &metadata, now
         )
         .unwrap_err()
-        .contains("one-dollar"));
+        .contains("configured execution-intent cap"));
+    }
+
+    #[test]
+    fn funded_intent_cap_allows_the_frozen_strategy_to_publish_larger_maker_orders() {
+        let (mut settings, market, fair, reference, book, mut decision, metadata, now) = fixture();
+        settings.azure.strategy_intent_max_order_notional = Decimal::from(5);
+        decision.size = Some(Decimal::from(10));
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(intent.notional, Decimal::new(45, 1));
     }
 }

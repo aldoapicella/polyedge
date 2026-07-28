@@ -11,7 +11,7 @@
     "canary": "node src/canary.mjs",
     "canary-controller": "node src/canary-controller.mjs",
     "funded-ladder-controller": "node src/funded-ladder-controller.mjs",
-    "funded-dynamic-quote-worker": "node src/funded-dynamic-quote-worker.mjs",
+    "funded-direct-worker": "node src/funded-direct-worker.mjs",
     "redeem": "node src/redeem.mjs",
     "train": "node src/train.mjs",
     "test": "node --test test/*.test.mjs"
