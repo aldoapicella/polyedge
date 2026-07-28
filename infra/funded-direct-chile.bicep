@@ -31,6 +31,7 @@ var natName = 'nat-polyedge-execution-cl'
 var vnetName = 'vnet-polyedge-execution-cl'
 var originCheckJobName = 'polyedge-origin-check-cl-job'
 var fundedJobName = 'polyedge-funded-direct-cl-job'
+var fundedServiceName = 'polyedge-funded-direct-cl'
 var tags = {
   app: 'polyedge'
   environment: 'dev'
@@ -343,10 +344,11 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
   name: fundedJobName
   location: location
   tags: union(tags, {
-    trigger: fundedDirectEnabled ? 'schedule-every-5-minutes' : 'manual-only'
+    trigger: 'manual-only'
     operation: 'funded-dynamic-quote-operator-direct'
-    fundedExecution: fundedDirectEnabled ? 'enabled' : 'disabled'
-    dryRun: fundedDirectEnabled ? 'false' : 'true'
+    fundedExecution: 'disabled'
+    dryRun: 'true'
+    retiredReason: 'replaced-by-continuous-service'
   })
   identity: {
     type: 'UserAssigned'
@@ -367,8 +369,8 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
   ]
   properties: {
     environmentId: managedEnvironment.id
-    configuration: union({
-      triggerType: fundedDirectEnabled ? 'Schedule' : 'Manual'
+    configuration: {
+      triggerType: 'Manual'
       replicaRetryLimit: 0
       replicaTimeout: 290
       registries: [
@@ -399,18 +401,11 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
           identity: identity.id
         }
       ]
-    }, fundedDirectEnabled ? {
-      scheduleTriggerConfig: {
-        cronExpression: '*/5 * * * *'
-        parallelism: 1
-        replicaCompletionCount: 1
-      }
-    } : {
       manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1
       }
-    })
+    }
     template: {
       containers: [
         {
@@ -421,9 +416,9 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
             'src/funded-direct-worker.mjs'
           ]
           env: [
-            { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
-            { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
-            { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
+            { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: 'false' }
+            { name: 'ALLOW_FUNDED_DIRECT', value: 'false' }
+            { name: 'FUNDED_DIRECT_DRY_RUN', value: 'true' }
             { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
             { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
             { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
@@ -481,8 +476,149 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
   }
 }
 
+resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
+  name: fundedServiceName
+  location: location
+  tags: union(tags, {
+    trigger: 'continuous-min-replicas-one'
+    operation: 'funded-dynamic-quote-operator-direct'
+    fundedExecution: fundedDirectEnabled ? 'enabled' : 'disabled'
+    dryRun: fundedDirectEnabled ? 'false' : 'true'
+    publicIngress: 'disabled'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  dependsOn: [
+    fundedJob
+    privateKeySecretReader
+    apiKeySecretReader
+    apiSecretReader
+    apiPassphraseSecretReader
+    fundedEvidenceContributor
+    shadowEventsReader
+    researchReader
+    modelReader
+    acrPull
+  ]
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      activeRevisionsMode: 'Single'
+      registries: [
+        {
+          server: registry.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          name: 'polymarket-private-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-private-key'
+          identity: identity.id
+        }
+        {
+          name: 'polymarket-api-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-key'
+          identity: identity.id
+        }
+        {
+          name: 'polymarket-api-secret'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret'
+          identity: identity.id
+        }
+        {
+          name: 'polymarket-api-passphrase'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase'
+          identity: identity.id
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'funded-direct'
+          image: venueProbeImage
+          command: [
+            'node'
+            'src/funded-direct-service.mjs'
+          ]
+          env: [
+            { name: 'FUNDED_DIRECT_SERVICE_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_SERVICE_RESTART_DELAY_MS', value: '1000' }
+            { name: 'FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS', value: '60000' }
+            { name: 'FUNDED_DIRECT_SERVICE_HEARTBEAT_MS', value: '60000' }
+            { name: 'FUNDED_DIRECT_SERVICE_MAX_CYCLES', value: '0' }
+            { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
+            { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '2000' }
+            { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
+            { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '3600000' }
+            { name: 'FUNDED_DIRECT_CONTROL_PREFIX', value: 'reports/funded/dynamic-quote' }
+            { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
+            { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
+            { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
+            { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
+            { name: 'ALLOW_LIVE', value: 'false' }
+            { name: 'ALLOW_STRATEGY_CANARY', value: 'false' }
+            { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
+            { name: 'STRATEGY_CANARY_INTENT_PREFIX', value: 'reports/research/venue-probe/control/strategy-canary/intents' }
+            { name: 'STRATEGY_CANARY_INTENT_CONTAINER_NAME', value: shadowEventsContainer.name }
+            { name: 'STRATEGY_CANARY_MANIFEST_CONTAINER_NAME', value: fundedEvidenceContainer.name }
+            { name: 'STRATEGY_CANARY_CANDIDATE_NAME', value: 'dynamic_quote_style' }
+            { name: 'STRATEGY_CANARY_CANDIDATE_VERSION', value: 'dynamic_quote_style@2026-06-14' }
+            { name: 'STRATEGY_CANARY_CANDIDATE_CONFIG_HASH', value: 'sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c' }
+            { name: 'STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION', value: 'conservative-execution-prior-v1' }
+            { name: 'STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE', value: 'chainlink_reference' }
+            { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectTargetOrderNotional }
+            { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: fundedDirectMaxOrderNotional }
+            { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: '360' }
+            { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: '900' }
+            { name: 'STRATEGY_CANARY_MAX_REFERENCE_AGE_MS', value: '2000' }
+            { name: 'STRATEGY_CANARY_MAX_BOOK_AGE_MS', value: '1000' }
+            { name: 'STRATEGY_CANARY_REST_SECONDS', value: '30' }
+            { name: 'MAX_OPEN_ORDERS', value: '1' }
+            { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: fundedDirectCampaignId }
+            { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: fundedDirectStartingCollateral }
+            { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '0' }
+            { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: fundedDirectMaxAccountLoss }
+            { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
+            { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
+            { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }
+            { name: 'VENUE_PROBE_EXECUTION_ORIGIN', value: 'azure_chile_central_static_egress' }
+            { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: expectedCountry }
+            { name: 'VENUE_PROBE_EXPECTED_EGRESS_IP', value: publicIp.properties.ipAddress }
+            { name: 'POLYMARKET_FUNDER_ADDRESS', value: funderAddress }
+            { name: 'POLYMARKET_SIGNATURE_TYPE', value: '3' }
+            { name: 'POLYMARKET_PRIVATE_KEY', secretRef: 'polymarket-private-key' }
+            { name: 'POLYMARKET_API_KEY', secretRef: 'polymarket-api-key' }
+            { name: 'POLYMARKET_API_SECRET', secretRef: 'polymarket-api-secret' }
+            { name: 'POLYMARKET_API_PASSPHRASE', secretRef: 'polymarket-api-passphrase' }
+            { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
+            { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storage.name }
+            { name: 'AZURE_STORAGE_CONTAINER_NAME', value: fundedEvidenceContainer.name }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+      scale: {
+        minReplicas: fundedDirectEnabled ? 1 : 0
+        maxReplicas: 1
+      }
+    }
+  }
+}
+
 output environmentName string = managedEnvironment.name
 output originCheckJobName string = originCheckJob.name
 output fundedJobName string = fundedJob.name
+output fundedServiceName string = fundedService.name
 output staticEgressIp string = publicIp.properties.ipAddress
 output fundedIdentityClientId string = identity.properties.clientId

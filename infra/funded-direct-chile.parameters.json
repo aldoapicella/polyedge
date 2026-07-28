@@ -3,7 +3,7 @@
   "contentVersion": "1.0.0.0",
   "parameters": {
     "venueProbeImage": {
-      "value": "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-venue-probe:dynamic-quote-cloud-cl-20260728-2"
+      "value": "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-venue-probe:dynamic-quote-continuous-cl-20260728"
     },
     "fundedDirectEnabled": {
       "value": true

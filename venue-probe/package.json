@@ -12,6 +12,7 @@
     "canary-controller": "node src/canary-controller.mjs",
     "funded-ladder-controller": "node src/funded-ladder-controller.mjs",
     "funded-direct-worker": "node src/funded-direct-worker.mjs",
+    "funded-direct-service": "node src/funded-direct-service.mjs",
     "redeem": "node src/redeem.mjs",
     "train": "node src/train.mjs",
     "test": "node --test test/*.test.mjs"
