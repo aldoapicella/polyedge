@@ -17,15 +17,27 @@ function session() {
     research_lane_isolated: true,
     maker_only: true,
     no_deposits: true,
+    allow_automatic_replenishment: false,
+    allow_compounding: false,
+    external_cash_flows: [],
     max_open_orders: 1,
     target_order_notional: 10.5,
     max_order_notional: 10.5,
     max_account_loss: 11.09862,
     starting_collateral: 11.09862,
+    max_reconciliation_discrepancy: 0.01,
     evidence_trust_boundary_ready: false,
     execution_window_seconds_to_expiry: {
       minimum: 360,
       maximum: 900
+    },
+    shadow_validation: {
+      required: true,
+      mode: "isolated_paper_shadow",
+      split: "time_ordered_70_30",
+      eligible_transitions: 100,
+      minimum_distinct_markets: 20,
+      maximum_listed_failures: 0
     },
     candidate: {
       name: "dynamic_quote_style",
@@ -42,8 +54,41 @@ function session() {
   };
 }
 
+function shadowValidationSeal() {
+  return {
+    schema: "polyedge.funded_direct_shadow_validation.v1",
+    passed: true,
+    generated_at: "2026-07-28T22:00:00.000Z",
+    mode: "isolated_paper_shadow",
+    funded_execution_enabled: false,
+    qset_untouched: true,
+    split: {
+      method: "time_ordered_70_30",
+      training_transitions: 70,
+      holdout_transitions: 30
+    },
+    eligible_transition_count: 100,
+    distinct_market_count: 20,
+    listed_failures: {
+      stale_child_launch: 0,
+      authorization_leak: 0,
+      reservation_leak: 0,
+      unexpected_equity_bypass: 0,
+      open_order_mismatch: 0,
+      terminal_reconciliation_failure: 0
+    },
+    candidate: {
+      name: "dynamic_quote_style",
+      candidate_version: "dynamic_quote_style@2026-06-14",
+      config_hash: `sha256:${"a".repeat(64)}`
+    },
+    transition_evidence_sha256: `sha256:${"d".repeat(64)}`
+  };
+}
+
 function env(overrides = {}) {
   const value = session();
+  const validation = shadowValidationSeal();
   return {
     FUNDED_DIRECT_WORKER_ENABLED: "true",
     ALLOW_FUNDED_DIRECT: "true",
@@ -51,6 +96,11 @@ function env(overrides = {}) {
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
     FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/session.json",
     FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
+    FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON: JSON.stringify(validation),
+    FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME: "reports/funded/shadow-validation.json",
+    FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256: sha256(Buffer.from(JSON.stringify(validation, null, 2))),
+    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "20000",
+    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "5000",
     STRATEGY_CANARY_CANDIDATE_NAME: "dynamic_quote_style",
     STRATEGY_CANARY_CANDIDATE_VERSION: "dynamic_quote_style@2026-06-14",
     STRATEGY_CANARY_CANDIDATE_CONFIG_HASH: `sha256:${"a".repeat(64)}`,
@@ -162,12 +212,58 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
       calls += 1;
       assert.equal(childEnv.EXECUTION_MODE, "funded_direct");
       assert.equal(childEnv.STRATEGY_CANARY_MAX_ORDER_NOTIONAL, "10.5");
+      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "5000");
+      assert.equal(childEnv.VENUE_PROBE_CAMPAIGN_CASH_FLOWS, "[]");
       return { exitCode: 0, error: "" };
     }
   });
   assert.equal(calls, 1);
   assert.equal(output.status, "iteration_limit_reached");
   assert.equal(output.childInvocations, 1);
+});
+
+test("stale handoff is rejected before authorization and creates no reservation", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "1".repeat(64));
+  const control = new Container();
+  let clockCalls = 0;
+  const output = await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: {
+      control,
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => clockCalls++ === 0 ? now : new Date(now.getTime() + 15_000),
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("stale handoff must not launch a child")
+  });
+  assert.equal(output.childInvocations, 0);
+  assert.equal([...control.values.keys()].some((name) => name.includes("/authorizations/")), false);
+  assert.equal([...control.values.keys()].some((name) => name.includes("risk-reservations")), false);
+});
+
+test("authorization that loses launch TTL is terminally sealed with no reservation", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "2".repeat(64));
+  const control = new Container();
+  const times = [now, now, new Date(now.getTime() + 25_000)];
+  const output = await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: {
+      control,
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => times.shift() || times.at(-1) || now,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("expired authorization must not launch a child")
+  });
+  assert.equal(output.childInvocations, 0);
+  const completionName = [...control.values.keys()].find((name) => name.includes("/completed/"));
+  const completion = JSON.parse(control.values.get(completionName).toString("utf8"));
+  assert.equal(completion.status, "expired_before_child_launch");
+  assert.equal(completion.authorization_consumed, false);
+  assert.equal(completion.risk_reservation_created, false);
+  assert.equal([...control.values.keys()].some((name) => name.includes("risk-reservations")), false);
 });
 
 test("worker rejects an otherwise valid intent inside the final six minutes", async () => {

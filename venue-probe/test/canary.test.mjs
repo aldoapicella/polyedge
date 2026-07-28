@@ -56,6 +56,7 @@ function fixture(dryRun = true) {
     maxReferenceAgeMs: 2000,
     maxBookAgeMs: 1000,
     maxClockDriftMs: 5000,
+    minRemainingTtlMs: 5000,
     expectedCountry: "IE",
     expectedEgressIp: "203.0.113.8",
     intentBlobName: "intents/decision-1.json",
@@ -243,6 +244,8 @@ test("operator-funded child executes above the old one-dollar cap without claimi
   input.config.operatorDirect = true;
   input.config.trustBoundaryReady = false;
   input.config.maxOrderNotional = 10.5;
+  input.config.campaignBaselineEquity = 11.09862;
+  input.config.maxReconciliationDiscrepancy = 0.01;
   input.documents.intent.shares = "20";
   input.documents.intent.notional = "4.00";
   input.documents.manifest = {
@@ -257,6 +260,19 @@ test("operator-funded child executes above the old one-dollar cap without claimi
     max_open_orders: 1,
     max_order_notional: 10.5,
     max_account_loss: 11.09862,
+    starting_collateral: 11.09862,
+    max_reconciliation_discrepancy: 0.01,
+    allow_automatic_replenishment: false,
+    allow_compounding: false,
+    external_cash_flows: [],
+    shadow_validation: {
+      required: true,
+      mode: "isolated_paper_shadow",
+      split: "time_ordered_70_30",
+      eligible_transitions: 100,
+      minimum_distinct_markets: 20,
+      maximum_listed_failures: 0
+    },
     candidate: {
       name: input.config.candidateName,
       candidate_version: input.config.candidateVersion,
@@ -304,11 +320,120 @@ test("operator-funded child executes above the old one-dollar cap without claimi
     ...book,
     bids: [{ price: "0.19", size: "11" }]
   };
+  input.runtime.risk = {
+    passed: true,
+    blockers: [],
+    baseline_equity: 11.09862,
+    cash_flow_adjusted_baseline: 11.09862,
+    authorized_starting_collateral: 11.09862,
+    no_replenishment: true,
+    no_compounding: true,
+    net_external_cash_flow: 0,
+    cash_flow_count: 0,
+    cash_flow_ids: [],
+    maximum_reconciliation_discrepancy: 0.01,
+    account_equity: 11.09862
+  };
   const controls = spies();
   const result = await executeStrategyCanary({ ...input, ...controls });
   assert.equal(result.status, "funded_direct_executed");
   assert.deepEqual(controls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
   assert.equal(input.documents.manifest.research_promotion_bypassed, true);
+});
+
+test("operator-funded preflight blocks unexpected capital and cash-flow records before reservation", async (t) => {
+  for (const [name, mutate] of [
+    ["unexpected deposit or profit", (input) => { input.runtime.risk.account_equity = 11.108622; }],
+    ["cash-flow record", (input) => {
+      input.runtime.risk.cash_flow_count = 1;
+      input.runtime.risk.cash_flow_ids = ["deposit-1"];
+    }]
+  ]) {
+    await t.test(name, async () => {
+      const input = fixture(false);
+      input.config.operatorDirect = true;
+      input.config.trustBoundaryReady = false;
+      input.config.maxOrderNotional = 10.5;
+      input.config.campaignBaselineEquity = 11.09862;
+      input.config.maxReconciliationDiscrepancy = 0.01;
+      input.documents.intent.shares = "20";
+      input.documents.intent.notional = "4.00";
+      input.documents.manifest = {
+        schema_version: "polyedge.operator_funded_session.v1",
+        session_id: "dynamic-quote-funded-2026-07-28-v3",
+        authorization_mode: "operator_direct",
+        authorized_by_user_reference: "Codex task 2026-07-27 funded Dynamic Quote",
+        research_promotion_bypassed: true,
+        research_lane_isolated: true,
+        maker_only: true,
+        no_deposits: true,
+        allow_automatic_replenishment: false,
+        allow_compounding: false,
+        external_cash_flows: [],
+        shadow_validation: {
+          required: true,
+          mode: "isolated_paper_shadow",
+          split: "time_ordered_70_30",
+          eligible_transitions: 100,
+          minimum_distinct_markets: 20,
+          maximum_listed_failures: 0
+        },
+        max_open_orders: 1,
+        max_order_notional: 10.5,
+        max_account_loss: 11.09862,
+        starting_collateral: 11.09862,
+        max_reconciliation_discrepancy: 0.01,
+        candidate: {
+          name: input.config.candidateName,
+          candidate_version: input.config.candidateVersion,
+          config_hash: input.config.candidateConfigHash
+        },
+        execution_model: {
+          blob_uri: input.config.executionModelBlobUri,
+          sha256: input.config.executionModelHash,
+          model_version: input.config.requiredFillModelVersion
+        },
+        created_at: "2026-07-12T11:00:00.000Z",
+        expires_at: "2026-07-12T13:00:00.000Z"
+      };
+      input.documents.authorization = {
+        ...input.documents.authorization,
+        schema: "polyedge.operator_funded_intent_authorization.v1",
+        authorization_mode: "operator_direct",
+        session_id: input.documents.manifest.session_id,
+        operator_session_manifest_blob_name: input.config.manifestBlobName,
+        operator_session_manifest_sha256: input.config.manifestBlobHash,
+        research_promotion_bypassed: true,
+        max_order_notional: 10.5,
+        expires_at: input.documents.intent.valid_until
+      };
+      delete input.documents.authorization.human_grant_id;
+      delete input.documents.authorization.human_grant_sha256;
+      delete input.documents.authorization.human_grant_consumption_blob_name;
+      delete input.documents.authorization.human_grant_consumption_sha256;
+      input.runtime.risk = {
+        passed: true,
+        blockers: [],
+        baseline_equity: 11.09862,
+        cash_flow_adjusted_baseline: 11.09862,
+        authorized_starting_collateral: 11.09862,
+        no_replenishment: true,
+        no_compounding: true,
+        net_external_cash_flow: 0,
+        cash_flow_count: 0,
+        cash_flow_ids: [],
+        maximum_reconciliation_discrepancy: 0.01,
+        account_equity: 11.09862
+      };
+      mutate(input);
+      const controls = spies();
+      await assert.rejects(
+        executeStrategyCanary({ ...input, ...controls }),
+        /no-replenishment\/no-compounding/
+      );
+      assert.deepEqual(controls.calls, { reserve: 0, consume: 0, execute: 0, finalize: 0 });
+    });
+  }
 });
 
 test("stale, book-hash, geoblock, clock, equity, model, and authorization failures send no order", async (t) => {

@@ -1,0 +1,91 @@
+name: Validate funded Dynamic Quote safety
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/validate-funded-direct.yml"
+      - "crates/polyedge-api/**"
+      - "crates/polyedge-config/**"
+      - "crates/polyedge-domain/**"
+      - "infra/funded-direct-chile.bicep"
+      - "infra/funded-direct-chile.parameters.json"
+      - "infra/venue-probe.bicep"
+      - "research/configs/funded_direct_dynamic_quote_*.json"
+      - "venue-probe/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-funded-direct-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  funded-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preserve isolated qset
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > changed-files.txt
+          if grep -E '(^research/configs/.*qset|^infra/shadow-profitability-qset-v1\.bicep$|^\.github/workflows/deploy-polyedge-shadow-qset\.yml$)' changed-files.txt; then
+            echo "Funded repair must not modify the frozen qset lane" >&2
+            exit 1
+          fi
+
+      - name: Validate immutable funded session and disabled deployment inputs
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const assert = require("node:assert/strict");
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v3.json"));
+          const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
+          const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
+          assert.deepEqual(embedded, session);
+          const digest = `sha256:${crypto.createHash("sha256").update(JSON.stringify(session, null, 2)).digest("hex")}`;
+          assert.equal(parameters.fundedDirectSessionManifestSha256.value, digest);
+          assert.equal(parameters.fundedDirectEnabled.value, false);
+          assert.equal(parameters.fundedDirectShadowValidationSealJson.value, "");
+          assert.equal(parameters.fundedDirectShadowValidationSealBlobName.value, "");
+          assert.equal(parameters.fundedDirectShadowValidationSealSha256.value, "");
+          NODE
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: venue-probe/package-lock.json
+
+      - name: Test funded worker and adversarial controls
+        working-directory: venue-probe
+        run: |
+          npm ci
+          npm test
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Validate intent producer contracts
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo test -p polyedge-api
+          cargo test -p polyedge-config
+          cargo test -p polyedge-domain
+
+      - name: Build fail-closed Azure templates
+        run: |
+          set -euo pipefail
+          az bicep build --file infra/funded-direct-chile.bicep --stdout > /dev/null
+          az bicep build --file infra/venue-probe.bicep --stdout > /dev/null
+          git diff --check

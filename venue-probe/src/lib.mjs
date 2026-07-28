@@ -192,7 +192,9 @@ export function summarizeCampaignRisk({
   unresolvedPositionCount = 0,
   unresolvedReservationCount = 0,
   proposedNotional = 0,
-  orderNotional = proposedNotional
+  orderNotional = proposedNotional,
+  authorizedStartingCollateral = null,
+  requireZeroExternalCashFlows = false
 }) {
   const liquid = Math.max(0, number(liquidCollateral, 0));
   const summed = Math.max(0, number(summedPositionValue, 0));
@@ -206,14 +208,37 @@ export function summarizeCampaignRisk({
   const equityFloor = number(control?.equity_floor, DEFAULT_CAMPAIGN_EQUITY_FLOOR) +
     number(control?.net_external_cash_flow, 0);
   const maximumDrawdown = number(control?.max_campaign_drawdown, DEFAULT_MAX_CAMPAIGN_DRAWDOWN);
+  const reconciliationTolerance = number(
+    control?.max_reconciliation_discrepancy,
+    DEFAULT_MAX_RECONCILIATION_DISCREPANCY
+  );
+  const cashFlowCount = Number(control?.cash_flow_count ?? (control?.cash_flow_ids || []).length);
+  const cashFlowIds = Array.isArray(control?.cash_flow_ids) ? [...control.cash_flow_ids].sort() : [];
+  const startingCollateral = authorizedStartingCollateral === null
+    ? null
+    : number(authorizedStartingCollateral, NaN);
   const reserved = Math.max(0, number(proposedNotional, 0));
   const principal = Math.max(0, number(orderNotional, 0));
   const campaignDrawdown = Math.max(0, adjustedBaseline - accountEquity);
   const projectedEquity = accountEquity - reserved;
   const projectedDrawdown = Math.max(0, adjustedBaseline - projectedEquity);
   const blockers = [];
-  if (discrepancy > number(control?.max_reconciliation_discrepancy, DEFAULT_MAX_RECONCILIATION_DISCREPANCY) + 1e-9) {
+  if (discrepancy > reconciliationTolerance + 1e-9) {
     blockers.push("account_reconciliation_discrepancy");
+  }
+  if (requireZeroExternalCashFlows &&
+      (number(control?.net_external_cash_flow, 0) !== 0 || cashFlowCount !== 0 || cashFlowIds.length !== 0)) {
+    blockers.push("external_cash_flow_record_present");
+  }
+  if (startingCollateral !== null) {
+    if (!(startingCollateral > 0) ||
+        Math.abs(number(control?.baseline_equity, NaN) - startingCollateral) > reconciliationTolerance + 1e-9 ||
+        Math.abs(adjustedBaseline - startingCollateral) > reconciliationTolerance + 1e-9) {
+      blockers.push("authorized_starting_collateral_mismatch");
+    }
+    if (accountEquity > startingCollateral + reconciliationTolerance + 1e-9) {
+      blockers.push("authorized_starting_collateral_exceeded");
+    }
   }
   if (Number(openOrderCount) > 0) blockers.push("open_orders_present");
   if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
@@ -229,7 +254,12 @@ export function summarizeCampaignRisk({
     campaign_id: control?.campaign_id || null,
     baseline_equity: roundMoney(number(control?.baseline_equity, DEFAULT_CAMPAIGN_BASELINE_EQUITY)),
     net_external_cash_flow: roundMoney(number(control?.net_external_cash_flow, 0)),
+    cash_flow_count: Number.isFinite(cashFlowCount) ? cashFlowCount : null,
+    cash_flow_ids: cashFlowIds,
     cash_flow_adjusted_baseline: roundMoney(adjustedBaseline),
+    authorized_starting_collateral: startingCollateral === null ? null : roundMoney(startingCollateral),
+    no_replenishment: startingCollateral !== null,
+    no_compounding: startingCollateral !== null,
     equity_floor: roundMoney(equityFloor),
     max_campaign_drawdown: roundMoney(maximumDrawdown),
     liquid_collateral: roundMoney(liquid),
@@ -243,7 +273,7 @@ export function summarizeCampaignRisk({
     projected_equity: roundMoney(projectedEquity),
     projected_campaign_drawdown: roundMoney(projectedDrawdown),
     account_reconciliation_discrepancy: roundMoney(discrepancy),
-    maximum_reconciliation_discrepancy: roundMoney(number(control?.max_reconciliation_discrepancy, DEFAULT_MAX_RECONCILIATION_DISCREPANCY)),
+    maximum_reconciliation_discrepancy: roundMoney(reconciliationTolerance),
     open_order_count: Number(openOrderCount),
     unresolved_position_count: Number(unresolvedPositionCount),
     unresolved_risk_reservation_count: Number(unresolvedReservationCount),

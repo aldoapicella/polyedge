@@ -67,7 +67,8 @@ export function loadCanaryConfig(env = process.env) {
     campaignEquityFloor: number(env.VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR, 4.03),
     maxCampaignDrawdown: number(env.VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN, 1),
     maxReconciliationDiscrepancy: number(env.VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY, 0.01),
-    campaignCashFlows: parseJson(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]")
+    campaignCashFlows: parseJson(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]"),
+    minRemainingTtlMs: integer(env.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, 5_000)
   };
   validateCanaryConfig(config);
   return config;
@@ -109,6 +110,17 @@ export function validateCanaryConfig(config) {
   if (!config.storageAccount) errors.push("AZURE_STORAGE_ACCOUNT_NAME is required");
   if (!config.intentContainerName) errors.push("STRATEGY_CANARY_INTENT_CONTAINER_NAME is required");
   if (!config.manifestContainerName) errors.push("STRATEGY_CANARY_MANIFEST_CONTAINER_NAME is required");
+  if (!(config.maxReconciliationDiscrepancy >= 0 && config.maxReconciliationDiscrepancy <= 0.01)) {
+    errors.push("VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY must be in [0, 0.01]");
+  }
+  if (!Array.isArray(config.campaignCashFlows)) {
+    errors.push("VENUE_PROBE_CAMPAIGN_CASH_FLOWS must be a JSON array");
+  } else if (config.operatorDirect && config.campaignCashFlows.length !== 0) {
+    errors.push("operator-funded execution requires explicit zero external cash flows");
+  }
+  if (!(config.minRemainingTtlMs >= 1_000 && config.minRemainingTtlMs <= MAX_ACTIVE_INTENT_TTL_MS)) {
+    errors.push(`STRATEGY_CANARY_MIN_REMAINING_TTL_MS must be in [1000, ${MAX_ACTIVE_INTENT_TTL_MS}]`);
+  }
   for (const [name, value] of [
     ["POLYMARKET_PRIVATE_KEY", config.privateKey],
     ["POLYMARKET_API_KEY", config.apiKey],
@@ -209,6 +221,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   const expiryMs = Date.parse(intent.gtd_expiry_ts);
   if (![decisionMs, validUntilMs, expiryMs].every(Number.isFinite)) fail("execution intent timestamps are invalid");
   if (nowMs < decisionMs || nowMs >= validUntilMs) fail("execution intent is stale or not yet valid");
+  if (validUntilMs - nowMs < config.minRemainingTtlMs) fail("execution intent has insufficient remaining TTL");
   if (Number(intent.ttl_ms) !== validUntilMs - decisionMs || Number(intent.ttl_ms) > MAX_ACTIVE_INTENT_TTL_MS) fail("active intent TTL does not reconcile or exceeds the short-lifecycle limit");
   if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 60-second security buffer");
   const referenceAgeMs = Number(intent.reference_age_ms);
@@ -242,15 +255,31 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   const operatorDirect = authorization?.schema === OPERATOR_DIRECT_AUTHORIZATION_SCHEMA;
   if (Boolean(config.operatorDirect) !== operatorDirect) fail("execution mode and authorization kind disagree");
   if (operatorDirect) {
+    const startingCollateral = Number(manifest?.starting_collateral);
+    const reconciliationTolerance = Number(manifest?.max_reconciliation_discrepancy);
     if (manifest?.schema_version !== OPERATOR_DIRECT_MANIFEST_SCHEMA
         || manifest.authorization_mode !== "operator_direct"
         || manifest.research_promotion_bypassed !== true
         || manifest.research_lane_isolated !== true
         || manifest.maker_only !== true
         || manifest.no_deposits !== true
+        || manifest.allow_automatic_replenishment !== false
+        || manifest.allow_compounding !== false
+        || !Array.isArray(manifest.external_cash_flows)
+        || manifest.external_cash_flows.length !== 0
         || Number(manifest.max_open_orders) !== 1
         || Number(manifest.max_order_notional) !== Number(config.maxOrderNotional)
-        || !(Number(manifest.max_account_loss) > 0)
+        || !(startingCollateral > 0)
+        || Number(manifest.max_account_loss) !== startingCollateral
+        || Number(config.campaignBaselineEquity) !== startingCollateral
+        || !(reconciliationTolerance >= 0 && reconciliationTolerance <= 0.01)
+        || Number(config.maxReconciliationDiscrepancy) !== reconciliationTolerance
+        || manifest.shadow_validation?.required !== true
+        || manifest.shadow_validation?.mode !== "isolated_paper_shadow"
+        || manifest.shadow_validation?.split !== "time_ordered_70_30"
+        || Number(manifest.shadow_validation?.eligible_transitions) !== 100
+        || Number(manifest.shadow_validation?.minimum_distinct_markets) !== 20
+        || Number(manifest.shadow_validation?.maximum_listed_failures) !== 0
         || !clean(manifest.authorized_by_user_reference)
         || !clean(manifest.session_id)) {
       fail("operator-funded session contract is invalid");
@@ -301,6 +330,23 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
     fail("clock uncertainty exceeds limit");
   }
   if (runtime.risk?.passed !== true) fail(`campaign equity/risk gate failed (${(runtime.risk?.blockers || ["unknown"]).join(", ")})`);
+  if (operatorDirect) {
+    const startingCollateral = Number(manifest.starting_collateral);
+    const reconciliationTolerance = Number(manifest.max_reconciliation_discrepancy);
+    if (Number(runtime.risk?.baseline_equity) !== startingCollateral
+        || Number(runtime.risk?.cash_flow_adjusted_baseline) !== startingCollateral
+        || Number(runtime.risk?.authorized_starting_collateral) !== startingCollateral
+        || runtime.risk?.no_replenishment !== true
+        || runtime.risk?.no_compounding !== true
+        || Number(runtime.risk?.net_external_cash_flow) !== 0
+        || Number(runtime.risk?.cash_flow_count) !== 0
+        || !Array.isArray(runtime.risk?.cash_flow_ids)
+        || runtime.risk.cash_flow_ids.length !== 0
+        || Number(runtime.risk?.maximum_reconciliation_discrepancy) !== reconciliationTolerance
+        || Number(runtime.risk?.account_equity) > startingCollateral + reconciliationTolerance + 1e-9) {
+      fail("operator-funded no-replenishment/no-compounding reconciliation failed");
+    }
+  }
   if (Number(runtime.openOrderCount) !== 0) fail("account has open orders");
   if (String(runtime.market?.marketId) !== String(intent.market_id) || String(runtime.market?.conditionId) !== String(intent.condition_id) || String(runtime.market?.tokenId) !== String(intent.token_id)) fail("market, condition, or token identity mismatch");
   if (runtime.market?.closed === true || runtime.market?.acceptingOrders !== true) fail("market is not accepting orders");

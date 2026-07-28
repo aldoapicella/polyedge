@@ -112,7 +112,7 @@ async function main() {
     throwOnError: true
   });
   if (!config.dryRun) lease = await acquireCampaignLease(config, runId);
-  const runtime = await capturePreflight(client, documents.intent);
+  const runtime = await capturePreflight(client, documents.intent, documents.manifest);
   const result = await executeStrategyCanary({
     config,
     documents,
@@ -133,7 +133,7 @@ async function main() {
   if (!evidenceProbe) return result;
   let terminalEvidence = null;
   if (Number(evidenceProbe.lifecycle.actual_matched_size) === 0) {
-    const terminalRuntime = await capturePreflight(client, documents.intent);
+    const terminalRuntime = await capturePreflight(client, documents.intent, documents.manifest);
     const campaign = await loadCampaignRiskControl(config);
     terminalEvidence = await publishTerminalRiskPortfolioEvidence(container, {
       reservation: {
@@ -247,7 +247,7 @@ async function main() {
   return { ...result, lifecycle: publicLifecycle, evidence_upload: evidenceUpload };
 }
 
-async function capturePreflight(client, intent, ignoredReservationId = null) {
+async function capturePreflight(client, intent, manifest, ignoredReservationId = null) {
   const geoblock = await fetchJson("https://polymarket.com/api/geoblock");
   assertEligibleOrigin(geoblock, config);
   const requestStarted = Date.now();
@@ -309,7 +309,9 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
     unresolvedPositionCount: positions.filter((row) => Number(row.size) > 1e-9 && row.redeemable !== true).length,
     unresolvedReservationCount: reservations.filter((row) => String(row.probe_id) !== String(ignoredReservationId || "")).length,
     proposedNotional: principal + feeRisk,
-    orderNotional: principal
+    orderNotional: principal,
+    authorizedStartingCollateral: config.operatorDirect ? Number(manifest?.starting_collateral) : null,
+    requireZeroExternalCashFlows: config.operatorDirect
   });
   return {
     geoblock,
@@ -361,7 +363,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       ledger,
       eventType: "venue_market_channel"
     });
-    refreshed = await capturePreflight(client, intent, reservation.probe_id);
+    refreshed = await capturePreflight(client, intent, documents.manifest, reservation.probe_id);
     // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
     // authorization contract immediately before the only signing call.
     const preSendValidation = validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });

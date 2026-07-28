@@ -6,19 +6,28 @@
       "value": "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-venue-probe:dynamic-quote-continuous-cl-20260728"
     },
     "fundedDirectEnabled": {
-      "value": true
+      "value": false
     },
     "fundedDirectSessionManifestJson": {
-      "value": "{\n  \"schema_version\": \"polyedge.operator_funded_session.v1\",\n  \"session_id\": \"dynamic-quote-funded-2026-07-28-v2\",\n  \"authorization_mode\": \"operator_direct\",\n  \"authorized_by_user_reference\": \"Codex task 2026-07-27 funded Dynamic Quote\",\n  \"source_simulated_pnl\": 379.19,\n  \"research_promotion_bypassed\": true,\n  \"research_lane_isolated\": true,\n  \"maker_only\": true,\n  \"no_deposits\": true,\n  \"max_open_orders\": 1,\n  \"target_order_notional\": 10.5,\n  \"max_order_notional\": 10.5,\n  \"max_account_loss\": 11.09862,\n  \"starting_collateral\": 11.09862,\n  \"evidence_trust_boundary_ready\": false,\n  \"execution_window_seconds_to_expiry\": {\n    \"minimum\": 360,\n    \"maximum\": 900\n  },\n  \"candidate\": {\n    \"name\": \"dynamic_quote_style\",\n    \"candidate_version\": \"dynamic_quote_style@2026-06-14\",\n    \"config_hash\": \"sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c\"\n  },\n  \"execution_model\": {\n    \"model_version\": \"conservative-execution-prior-v1\",\n    \"blob_uri\": \"azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json\",\n    \"sha256\": \"sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4\"\n  },\n  \"created_at\": \"2026-07-28T14:50:00Z\",\n  \"expires_at\": \"2026-08-28T14:50:00Z\"\n}"
+      "value": "{\n  \"schema_version\": \"polyedge.operator_funded_session.v1\",\n  \"session_id\": \"dynamic-quote-funded-2026-07-28-v3\",\n  \"authorization_mode\": \"operator_direct\",\n  \"authorized_by_user_reference\": \"Codex task 2026-07-27 funded Dynamic Quote\",\n  \"source_simulated_pnl\": 379.19,\n  \"research_promotion_bypassed\": true,\n  \"research_lane_isolated\": true,\n  \"maker_only\": true,\n  \"no_deposits\": true,\n  \"allow_automatic_replenishment\": false,\n  \"allow_compounding\": false,\n  \"external_cash_flows\": [],\n  \"max_open_orders\": 1,\n  \"target_order_notional\": 10.5,\n  \"max_order_notional\": 10.5,\n  \"max_account_loss\": 11.09862,\n  \"starting_collateral\": 11.09862,\n  \"max_reconciliation_discrepancy\": 0.01,\n  \"evidence_trust_boundary_ready\": false,\n  \"execution_window_seconds_to_expiry\": {\n    \"minimum\": 360,\n    \"maximum\": 900\n  },\n  \"shadow_validation\": {\n    \"required\": true,\n    \"mode\": \"isolated_paper_shadow\",\n    \"split\": \"time_ordered_70_30\",\n    \"eligible_transitions\": 100,\n    \"minimum_distinct_markets\": 20,\n    \"maximum_listed_failures\": 0\n  },\n  \"candidate\": {\n    \"name\": \"dynamic_quote_style\",\n    \"candidate_version\": \"dynamic_quote_style@2026-06-14\",\n    \"config_hash\": \"sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c\"\n  },\n  \"execution_model\": {\n    \"model_version\": \"conservative-execution-prior-v1\",\n    \"blob_uri\": \"azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json\",\n    \"sha256\": \"sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4\"\n  },\n  \"created_at\": \"2026-07-28T22:00:00Z\",\n  \"expires_at\": \"2026-08-28T22:00:00Z\"\n}"
     },
     "fundedDirectSessionManifestBlobName": {
-      "value": "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-28-v2/session.json"
+      "value": "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-28-v3/session.json"
     },
     "fundedDirectSessionManifestSha256": {
-      "value": "sha256:d1941f7d593e8a46728e90a226af1c41bf1842b1a8d2d3b84a32afd2be585901"
+      "value": "sha256:485b7ecda7d2591662d15031811cc4048d59634744105f962c48287d7091a79c"
     },
     "fundedDirectCampaignId": {
-      "value": "dynamic-quote-funded-2026-07-28-v2"
+      "value": "dynamic-quote-funded-2026-07-28-v3"
+    },
+    "fundedDirectShadowValidationSealJson": {
+      "value": ""
+    },
+    "fundedDirectShadowValidationSealBlobName": {
+      "value": ""
+    },
+    "fundedDirectShadowValidationSealSha256": {
+      "value": ""
     }
   }
 }

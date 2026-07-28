@@ -5,6 +5,7 @@ import {
   loadHashedJson,
   sha256
 } from "./canary-lib.mjs";
+import { validateFundedDirectShadowSeal } from "./funded-direct-shadow-validation.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
 
 const EXPECTED_CANDIDATE = "dynamic_quote_style";
@@ -14,12 +15,9 @@ const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 
 export function loadFundedDirectConfig(env = process.env) {
   const sessionJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "").trim();
-  let session;
-  try {
-    session = JSON.parse(sessionJson);
-  } catch {
-    session = null;
-  }
+  const validationJson = String(env.FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON || "").trim();
+  const session = parseJson(sessionJson);
+  const shadowValidationSeal = parseJson(validationJson);
   const config = {
     enabled: env.FUNDED_DIRECT_WORKER_ENABLED === "true",
     allowed: env.ALLOW_FUNDED_DIRECT === "true",
@@ -27,6 +25,9 @@ export function loadFundedDirectConfig(env = process.env) {
     session,
     sessionBlobName: clean(env.FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME),
     sessionHash: hash(env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256),
+    shadowValidationSeal,
+    shadowValidationBlobName: clean(env.FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME),
+    shadowValidationHash: hash(env.FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256),
     candidate: clean(env.STRATEGY_CANARY_CANDIDATE_NAME),
     candidateVersion: clean(env.STRATEGY_CANARY_CANDIDATE_VERSION),
     candidateConfigHash: hash(env.STRATEGY_CANARY_CANDIDATE_CONFIG_HASH),
@@ -45,13 +46,18 @@ export function loadFundedDirectConfig(env = process.env) {
     azureClientId: env.AZURE_CLIENT_ID,
     maxIterations: integer(env.FUNDED_DIRECT_MAX_ITERATIONS, 200),
     pollIntervalMs: integer(env.FUNDED_DIRECT_POLL_INTERVAL_MS, 5_000),
-    maxIdleMs: integer(env.FUNDED_DIRECT_MAX_IDLE_MS, 300_000)
+    maxIdleMs: integer(env.FUNDED_DIRECT_MAX_IDLE_MS, 300_000),
+    minRemainingTtlMs: integer(env.FUNDED_DIRECT_MIN_REMAINING_TTL_MS, 20_000),
+    childMinRemainingTtlMs: integer(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS, 5_000)
   };
   const errors = [];
   if (!config.enabled) errors.push("FUNDED_DIRECT_WORKER_ENABLED must be true");
   if (!config.allowed) errors.push("ALLOW_FUNDED_DIRECT must be true");
   if (!config.session) errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be valid JSON");
   if (!config.sessionBlobName || !config.sessionHash) errors.push("exact operator session manifest blob and SHA-256 are required");
+  if (!config.shadowValidationSeal || !config.shadowValidationBlobName || !config.shadowValidationHash) {
+    errors.push("exact isolated paper/shadow validation seal, blob, and SHA-256 are required");
+  }
   if (config.candidate !== EXPECTED_CANDIDATE || config.candidateVersion !== EXPECTED_VERSION) {
     errors.push("worker must remain bound to the frozen Dynamic Quote candidate");
   }
@@ -69,8 +75,15 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!(config.maxIterations >= 1 && config.maxIterations <= 2_000)) errors.push("FUNDED_DIRECT_MAX_ITERATIONS must be in [1, 2000]");
   if (!(config.pollIntervalMs >= 1_000 && config.pollIntervalMs <= 60_000)) errors.push("FUNDED_DIRECT_POLL_INTERVAL_MS must be in [1000, 60000]");
   if (!(config.maxIdleMs >= config.pollIntervalMs && config.maxIdleMs <= 3_600_000)) errors.push("FUNDED_DIRECT_MAX_IDLE_MS must be between the poll interval and 3600000");
+  if (!(config.minRemainingTtlMs >= 10_000 && config.minRemainingTtlMs <= 30_000)) {
+    errors.push("FUNDED_DIRECT_MIN_REMAINING_TTL_MS must be in [10000, 30000]");
+  }
+  if (!(config.childMinRemainingTtlMs >= 1_000 && config.childMinRemainingTtlMs <= config.minRemainingTtlMs)) {
+    errors.push("FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS must be in [1000, FUNDED_DIRECT_MIN_REMAINING_TTL_MS]");
+  }
   if (errors.length) throw new Error(`funded_direct_worker blocked: ${errors.join("; ")}`);
   validateSession(config);
+  validateShadowSeal(config);
   return config;
 }
 
@@ -87,6 +100,13 @@ export async function runFundedDirectWorker({
     intents: storageContainer({ ...config, storageContainer: config.intentContainerName })
   };
   if (!clients.control || !clients.intents) throw new Error("fail closed: operator-funded storage clients are unavailable");
+  const validationDocument = await putImmutableOrVerify(clients.control, {
+    blobName: config.shadowValidationBlobName,
+    value: config.shadowValidationSeal
+  });
+  if (validationDocument.hash !== config.shadowValidationHash) {
+    throw new Error("fail closed: isolated paper/shadow validation seal SHA-256 mismatch");
+  }
   const sessionDocument = await putImmutableOrVerify(clients.control, {
     blobName: config.sessionBlobName,
     value: config.session
@@ -106,10 +126,12 @@ export async function runFundedDirectWorker({
       continue;
     }
     idleSince = null;
+    const authorizationNow = clock();
+    if (!hasMinimumRemainingTtl(selected.value, authorizationNow, config.minRemainingTtlMs)) continue;
     const childRunId = runId();
     const authorization = await putImmutableOrVerify(
       clients.control,
-      buildAuthorization(config, sessionDocument, selected, childRunId, clock())
+      buildAuthorization(config, sessionDocument, selected, childRunId, authorizationNow)
     );
     if (config.dryRun) {
       return result("dry_run_validated", config, {
@@ -119,10 +141,27 @@ export async function runFundedDirectWorker({
         authorizationHash: authorization.hash
       });
     }
+    const launchNow = clock();
+    if (!hasMinimumRemainingTtl(selected.value, launchNow, config.childMinRemainingTtlMs)) {
+      await writeCompletion(clients.control, config, selected, authorization, childRunId, launchNow, {
+        status: "expired_before_child_launch",
+        order_submission_attempted: false,
+        authorization_consumed: false,
+        risk_reservation_created: false
+      });
+      continue;
+    }
     const child = await invokeChild(childEnvironment(env, config, sessionDocument, selected, authorization, childRunId));
     childInvocations += 1;
     if (child.exitCode !== 0) {
-      if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted/.test(child.error || "")) {
+      if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
+        await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+          status: "child_failed_closed_pre_submission",
+          order_submission_attempted: false,
+          authorization_consumed: false,
+          risk_reservation_created: false,
+          error: child.error
+        });
         return result("paused_by_account_risk_state", config, {
           iteration,
           childInvocations,
@@ -132,17 +171,11 @@ export async function runFundedDirectWorker({
       }
       throw new Error(`fail closed: funded Dynamic Quote child exited ${child.exitCode} (${child.error || "unknown"})`);
     }
-    await putImmutableOrVerify(clients.control, {
-      blobName: `${config.controlPrefix}/sessions/${config.session.session_id}/completed/${selected.value.decision_id}.json`,
-      value: {
-        schema: "polyedge.operator_funded_intent_completion.v1",
-        session_id: config.session.session_id,
-        decision_id: selected.value.decision_id,
-        authorization_blob_name: authorization.blobName,
-        authorization_sha256: authorization.hash,
-        child_run_id: childRunId,
-        completed_at: clock().toISOString()
-      }
+    await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+      status: "child_completed",
+      order_submission_attempted: child.orderSubmissionAttempted === true,
+      authorization_consumed: true,
+      risk_reservation_created: true
     });
   }
   return result("iteration_limit_reached", config, { iteration: config.maxIterations, childInvocations });
@@ -161,14 +194,27 @@ function validateSession(config) {
     && value.research_lane_isolated === true
     && value.maker_only === true
     && value.no_deposits === true
+    && value.allow_automatic_replenishment === false
+    && value.allow_compounding === false
+    && Array.isArray(value.external_cash_flows)
+    && value.external_cash_flows.length === 0
     && Number(value.max_open_orders) === 1
     && Number(value.target_order_notional) === config.targetOrderNotional
     && Number(value.max_order_notional) === config.maxOrderNotional
     && Number(value.max_account_loss) === Number(value.starting_collateral)
+    && Number(value.starting_collateral) > 0
+    && Number(value.max_reconciliation_discrepancy) >= 0
+    && Number(value.max_reconciliation_discrepancy) <= 0.01
     && Number(value.max_account_loss) > config.maxOrderNotional
     && Number(value.source_simulated_pnl) === 379.19
     && Number(value.execution_window_seconds_to_expiry?.minimum) === config.minimumSecondsToExpiry
     && Number(value.execution_window_seconds_to_expiry?.maximum) === config.maximumSecondsToExpiry
+    && value.shadow_validation?.required === true
+    && value.shadow_validation?.mode === "isolated_paper_shadow"
+    && value.shadow_validation?.split === "time_ordered_70_30"
+    && Number(value.shadow_validation?.eligible_transitions) === 100
+    && Number(value.shadow_validation?.minimum_distinct_markets) === 20
+    && Number(value.shadow_validation?.maximum_listed_failures) === 0
     && value.evidence_trust_boundary_ready === false
     && value.candidate?.name === config.candidate
     && value.candidate?.candidate_version === config.candidateVersion
@@ -181,6 +227,18 @@ function validateSession(config) {
     && expires > created
     && expectedHash === config.sessionHash;
   if (!valid) throw new Error("funded_direct_worker blocked: operator-funded session contract is invalid or hash-mismatched");
+}
+
+function validateShadowSeal(config) {
+  const expectedHash = sha256(Buffer.from(JSON.stringify(config.shadowValidationSeal, null, 2)));
+  if (expectedHash !== config.shadowValidationHash) {
+    throw new Error("funded_direct_worker blocked: isolated paper/shadow validation seal hash mismatch");
+  }
+  validateFundedDirectShadowSeal(config.shadowValidationSeal, {
+    candidateName: config.candidate,
+    candidateVersion: config.candidateVersion,
+    candidateConfigHash: config.candidateConfigHash
+  });
 }
 
 async function firstFreshIntent(clients, config, session, now) {
@@ -236,7 +294,7 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && decisionMs >= sessionStartMs
     && decisionMs <= nowMs
     && Number.isFinite(validUntilMs)
-    && validUntilMs > nowMs
+    && validUntilMs - nowMs >= config.minRemainingTtlMs
     && validUntilMs <= sessionExpiryMs
     && Number.isFinite(venueExpiryMs)
     && venueExpiryMs === validUntilMs + 60_000
@@ -319,7 +377,9 @@ function childEnvironment(env, config, session, intent, authorization, childRunI
     STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI: session.value.execution_model.blob_uri,
     STRATEGY_CANARY_EXECUTION_MODEL_SHA256: session.value.execution_model.sha256,
     STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION: session.value.execution_model.model_version,
-    STRATEGY_CANARY_MAX_ORDER_NOTIONAL: String(config.maxOrderNotional)
+    STRATEGY_CANARY_MAX_ORDER_NOTIONAL: String(config.maxOrderNotional),
+    STRATEGY_CANARY_MIN_REMAINING_TTL_MS: String(config.childMinRemainingTtlMs),
+    VENUE_PROBE_CAMPAIGN_CASH_FLOWS: "[]"
   };
 }
 
@@ -336,14 +396,34 @@ function invokeCanaryChild(env) {
     child.once("error", reject);
     child.once("exit", (code, signal) => {
       if (signal) return reject(new Error(`funded Dynamic Quote child terminated by ${signal}`));
-      const error = [...stderr.trim().split("\n"), ...stdout.trim().split("\n")]
+      const records = [...stderr.trim().split("\n"), ...stdout.trim().split("\n")]
         .reverse()
         .map((line) => {
-          try { return JSON.parse(line)?.error || ""; } catch { return ""; }
+          try { return JSON.parse(line); } catch { return null; }
         })
-        .find(Boolean) || "";
-      resolve({ exitCode: code ?? 1, error });
+        .filter(Boolean);
+      resolve({
+        exitCode: code ?? 1,
+        error: records.find((record) => record.error)?.error || "",
+        orderSubmissionAttempted: records.some((record) => record.order_submission_attempted === true)
+      });
     });
+  });
+}
+
+async function writeCompletion(container, config, selected, authorization, childRunId, now, details) {
+  return putImmutableOrVerify(container, {
+    blobName: `${config.controlPrefix}/sessions/${config.session.session_id}/completed/${selected.value.decision_id}.json`,
+    value: {
+      schema: "polyedge.operator_funded_intent_completion.v1",
+      session_id: config.session.session_id,
+      decision_id: selected.value.decision_id,
+      authorization_blob_name: authorization.blobName,
+      authorization_sha256: authorization.hash,
+      child_run_id: childRunId,
+      completed_at: now.toISOString(),
+      ...details
+    }
   });
 }
 
@@ -378,6 +458,10 @@ function result(status, config, details) {
       maximum: config.maximumSecondsToExpiry
     },
     no_deposits: true,
+    no_replenishment: true,
+    no_compounding: true,
+    external_cash_flow_count: 0,
+    shadow_validation_sha256: config.shadowValidationHash,
     research_promotion_bypassed: true,
     ...details
   };
@@ -397,6 +481,12 @@ function hash(value) {
 }
 function integer(value, fallback) { const parsed = Number(value); return Number.isInteger(parsed) ? parsed : fallback; }
 function number(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : 0; }
+function parseJson(value) {
+  try { return JSON.parse(value); } catch { return null; }
+}
+function hasMinimumRemainingTtl(intent, now, minimumMs) {
+  return Date.parse(intent?.valid_until) - now.getTime() >= minimumMs;
+}
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 function runId() { return `funded-direct-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`; }
 

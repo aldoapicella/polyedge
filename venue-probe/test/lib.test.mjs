@@ -101,6 +101,65 @@ test("campaign risk is cash-flow aware and blocks discrepancies above one cent",
   assert.ok(risk.blockers.includes("account_reconciliation_discrepancy"));
 });
 
+test("operator-funded risk rejects unexpected deposit or profit above the authorized boundary", () => {
+  const control = {
+    campaign_id: "dynamic-quote-funded-2026-07-28-v3",
+    baseline_equity: 11.09862,
+    equity_floor: 0,
+    max_campaign_drawdown: 11.09862,
+    max_order_notional: 10.5,
+    max_reconciliation_discrepancy: 0.01,
+    net_external_cash_flow: 0,
+    cash_flow_count: 0,
+    cash_flow_ids: []
+  };
+  const boundary = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 11.10862,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true
+  });
+  assert.equal(boundary.passed, true);
+  assert.equal(boundary.no_replenishment, true);
+  assert.equal(boundary.no_compounding, true);
+
+  const unexpectedCapital = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 11.108622,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true
+  });
+  assert.equal(unexpectedCapital.passed, false);
+  assert.ok(unexpectedCapital.blockers.includes("authorized_starting_collateral_exceeded"));
+});
+
+test("operator-funded risk rejects any durable cash-flow record even when net flow is zero", () => {
+  const risk = summarizeCampaignRisk({
+    control: {
+      campaign_id: "dynamic-quote-funded-2026-07-28-v3",
+      baseline_equity: 11.09862,
+      equity_floor: 0,
+      max_campaign_drawdown: 11.09862,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 2,
+      cash_flow_ids: ["deposit-1", "withdrawal-1"]
+    },
+    liquidCollateral: 11.09862,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true
+  });
+  assert.equal(risk.passed, false);
+  assert.ok(risk.blockers.includes("external_cash_flow_record_present"));
+});
+
 test("one unresolved position is tolerated for reconciliation but blocks another submission", () => {
   const control = {
     campaign_id: "funded-campaign-2026-07-12",

@@ -23,6 +23,9 @@ param fundedDirectEnabled bool = false
 param fundedDirectSessionManifestJson string = ''
 param fundedDirectSessionManifestBlobName string = ''
 param fundedDirectSessionManifestSha256 string = ''
+param fundedDirectShadowValidationSealJson string = ''
+param fundedDirectShadowValidationSealBlobName string = ''
+param fundedDirectShadowValidationSealSha256 string = ''
 param fundedDirectCampaignId string = 'dynamic-quote-funded-disabled'
 param fundedDirectStartingCollateral string = '11.09862'
 param fundedDirectMaxAccountLoss string = '11.09862'
@@ -30,6 +33,9 @@ param fundedDirectTargetOrderNotional string = '10.5'
 param fundedDirectMaxOrderNotional string = '10.5'
 param fundedDirectMinSecondsToExpiry string = '360'
 param fundedDirectMaxSecondsToExpiry string = '900'
+
+var fundedDirectValidationProvided = (!empty(fundedDirectShadowValidationSealJson) && !empty(fundedDirectShadowValidationSealBlobName) && !empty(fundedDirectShadowValidationSealSha256))
+var fundedDirectReleaseReady = fundedDirectEnabled && fundedDirectValidationProvided
 @description('Static public IP resource used by the authenticated North Europe NAT egress.')
 param publicIpName string = 'pip-polyedge-venue-neu-egress'
 
@@ -594,11 +600,11 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'MAX_TOTAL_POSITION', value: '1' }
             { name: 'MAX_DAILY_LOSS', value: '1' }
             { name: 'MAX_OPEN_ORDERS', value: '1' }
-            { name: 'STRATEGY_INTENT_OPERATOR_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
-            { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectEnabled ? fundedDirectTargetOrderNotional : '0' }
-            { name: 'STRATEGY_INTENT_MAX_ORDER_NOTIONAL', value: fundedDirectEnabled ? fundedDirectMaxOrderNotional : '1' }
-            { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectEnabled ? fundedDirectMinSecondsToExpiry : '0' }
-            { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: fundedDirectEnabled ? fundedDirectMaxSecondsToExpiry : '86400' }
+            { name: 'STRATEGY_INTENT_OPERATOR_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
+            { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectReleaseReady ? fundedDirectTargetOrderNotional : '0' }
+            { name: 'STRATEGY_INTENT_MAX_ORDER_NOTIONAL', value: fundedDirectReleaseReady ? fundedDirectMaxOrderNotional : '1' }
+            { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectReleaseReady ? fundedDirectMinSecondsToExpiry : '0' }
+            { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: fundedDirectReleaseReady ? fundedDirectMaxSecondsToExpiry : '86400' }
             { name: 'TARGET_ASSET', value: 'BTC' }
             { name: 'TARGET_ASSET_NAME', value: 'Bitcoin' }
             { name: 'TARGET_HORIZON', value: '15m' }
@@ -959,10 +965,10 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   name: fundedLadderJobName
   location: location
   tags: union(tags, {
-    trigger: fundedDirectEnabled ? 'schedule-every-5-minutes' : 'manual-only'
+    trigger: fundedDirectReleaseReady ? 'schedule-every-5-minutes' : 'manual-only'
     operation: 'funded-dynamic-quote-operator-direct'
-    fundedExecution: fundedDirectEnabled ? 'enabled' : 'disabled'
-    dryRun: fundedDirectEnabled ? 'false' : 'true'
+    fundedExecution: fundedDirectReleaseReady ? 'enabled' : 'disabled'
+    dryRun: fundedDirectReleaseReady ? 'false' : 'true'
   })
   identity: {
     type: 'UserAssigned'
@@ -971,7 +977,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   properties: {
     environmentId: managedEnvironment.id
     configuration: union({
-      triggerType: fundedDirectEnabled ? 'Schedule' : 'Manual'
+      triggerType: fundedDirectReleaseReady ? 'Schedule' : 'Manual'
       replicaRetryLimit: 0
       replicaTimeout: 290
       registries: [{ server: registry.properties.loginServer, identity: identity.id }]
@@ -981,7 +987,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
         { name: 'polymarket-api-secret', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret', identity: identity.id }
         { name: 'polymarket-api-passphrase', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase', identity: identity.id }
       ]
-    }, fundedDirectEnabled ? {
+    }, fundedDirectReleaseReady ? {
       scheduleTriggerConfig: {
         cronExpression: '*/5 * * * *'
         parallelism: 1
@@ -999,9 +1005,9 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
         image: venueProbeImage
         command: ['node', 'src/funded-direct-worker.mjs']
         env: [
-          { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
-          { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
-          { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
+          { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectReleaseReady ? 'true' : 'false' }
+          { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
+          { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectReleaseReady ? 'false' : 'true' }
           { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
           { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
           { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
@@ -1009,6 +1015,11 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
           { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
           { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
+          { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
+          { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
+          { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
+          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '20000' }
+          { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '5000' }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
@@ -1046,6 +1057,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '0' }
           { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: fundedDirectMaxAccountLoss }
           { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
+          { name: 'VENUE_PROBE_CAMPAIGN_CASH_FLOWS', value: '[]' }
           { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
           { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }
           { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: 'IE' }
