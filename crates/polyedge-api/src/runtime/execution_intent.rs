@@ -7,7 +7,7 @@ use polyedge_domain::{
 use polyedge_engine::{crypto_taker_fee_per_share, FrozenStrategyMode, StrategyDecisionMetadata};
 use polyedge_reporting::research::{parse_azure_artifact_uri, PromotionManifestV1, PromotionPhase};
 use polyedge_storage::{AzureBlobClient, AzureBlobError, ImmutableBlobWrite};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -210,18 +210,42 @@ pub(super) fn build_execution_intent_with_model(
     let price = decision
         .price
         .ok_or_else(|| "decision price is missing".to_owned())?;
+    if price <= Decimal::ZERO || price >= Decimal::ONE {
+        return Err("decision price must be strictly between zero and one".to_owned());
+    }
     let requested_shares = decision
         .size
         .ok_or_else(|| "decision share size is missing".to_owned())?;
+    let minimum_seconds_to_expiry = settings.azure.strategy_intent_min_seconds_to_expiry;
+    let maximum_seconds_to_expiry = settings.azure.strategy_intent_max_seconds_to_expiry;
+    if minimum_seconds_to_expiry < 0 || maximum_seconds_to_expiry <= minimum_seconds_to_expiry {
+        return Err("configured execution-intent expiry window is invalid".to_owned());
+    }
+    let time_to_expiry_ms = (market.end_ts - decision_ts).num_milliseconds();
+    if time_to_expiry_ms < minimum_seconds_to_expiry * 1_000
+        || time_to_expiry_ms > maximum_seconds_to_expiry * 1_000
+    {
+        return Err("decision is outside the configured execution-intent expiry window".to_owned());
+    }
     if market.minimum_order_size <= Decimal::ZERO {
         return Err("venue minimum_order_size must be positive".to_owned());
     }
-    let shares = requested_shares.max(market.minimum_order_size);
-    let notional = price * shares;
+    let target_intent_notional = settings.azure.strategy_intent_target_order_notional;
     let max_intent_notional = settings.azure.strategy_intent_max_order_notional;
-    if max_intent_notional <= Decimal::ZERO {
-        return Err("configured execution-intent notional cap must be positive".to_owned());
+    if target_intent_notional < Decimal::ZERO
+        || max_intent_notional <= Decimal::ZERO
+        || target_intent_notional > max_intent_notional
+    {
+        return Err("configured execution-intent target and cap are invalid".to_owned());
     }
+    let shares = if target_intent_notional > Decimal::ZERO {
+        (target_intent_notional / price)
+            .round_dp_with_strategy(2, RoundingStrategy::ToZero)
+            .max(market.minimum_order_size)
+    } else {
+        requested_shares.max(market.minimum_order_size)
+    };
+    let notional = price * shares;
     if price <= Decimal::ZERO
         || price >= Decimal::ONE
         || shares <= Decimal::ZERO
@@ -289,6 +313,7 @@ pub(super) fn build_execution_intent_with_model(
         "side": "buy",
         "price": price.to_string(),
         "shares": shares.to_string(),
+        "market_end_ts": market.end_ts,
         "decision_ts": decision_ts,
         "valid_until": valid_until,
         "gtd_expiry_ts": gtd_expiry_ts,
@@ -320,6 +345,7 @@ pub(super) fn build_execution_intent_with_model(
         order_kind: OrderKind::PostOnlyGtd,
         ttl_ms,
         decision_ts,
+        market_end_ts: Some(market.end_ts),
         valid_until,
         gtd_expiry_ts: Some(gtd_expiry_ts),
         book_hash,
@@ -346,6 +372,9 @@ pub(super) fn resolve_execution_model(
     settings: &RuntimeSettings,
     decision_ts: DateTime<Utc>,
 ) -> Result<IntentExecutionModel, String> {
+    if settings.azure.strategy_intent_operator_direct {
+        return validated_conservative_prior(settings);
+    }
     let account = settings
         .azure
         .storage_account_name
@@ -1134,5 +1163,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(intent.notional, Decimal::new(45, 1));
+    }
+
+    #[test]
+    fn operator_direct_scales_to_funded_notional_only_inside_six_to_fifteen_minutes() {
+        let (mut settings, mut market, fair, reference, book, decision, metadata, now) = fixture();
+        settings.azure.strategy_intent_target_order_notional = Decimal::new(105, 1);
+        settings.azure.strategy_intent_max_order_notional = Decimal::new(105, 1);
+        settings.azure.strategy_intent_min_seconds_to_expiry = 360;
+        settings.azure.strategy_intent_max_seconds_to_expiry = 900;
+
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(intent.shares, Decimal::new(2333, 2));
+        assert_eq!(intent.notional, Decimal::new(104985, 4));
+        assert_eq!(intent.market_end_ts, Some(market.end_ts));
+
+        market.end_ts = now + Duration::seconds(359);
+        assert!(build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now
+        )
+        .unwrap_err()
+        .contains("outside the configured execution-intent expiry window"));
+
+        market.end_ts = now + Duration::seconds(901);
+        assert!(build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now
+        )
+        .unwrap_err()
+        .contains("outside the configured execution-intent expiry window"));
+    }
+
+    #[test]
+    fn operator_direct_uses_the_exact_conservative_prior_without_promotion_control() {
+        let (mut settings, ..) = fixture();
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.strategy_canary_execution_model_sha256 =
+            CONSERVATIVE_PRIOR_SHA256.to_owned();
+        let model = resolve_execution_model(&settings, Utc::now()).unwrap();
+        assert_eq!(model.version, CONSERVATIVE_PRIOR_VERSION);
+        assert_eq!(model.sha256, CONSERVATIVE_PRIOR_SHA256);
     }
 }

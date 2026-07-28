@@ -32,7 +32,10 @@ export function loadFundedDirectConfig(env = process.env) {
     candidateConfigHash: hash(env.STRATEGY_CANARY_CANDIDATE_CONFIG_HASH),
     requiredFillModelVersion: clean(env.STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION),
     requiredResolutionSource: clean(env.STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE || "chainlink_reference"),
+    targetOrderNotional: number(env.STRATEGY_INTENT_TARGET_ORDER_NOTIONAL),
     maxOrderNotional: number(env.STRATEGY_CANARY_MAX_ORDER_NOTIONAL),
+    minimumSecondsToExpiry: integer(env.STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY, 360),
+    maximumSecondsToExpiry: integer(env.STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY, 900),
     intentPrefix: clean(env.STRATEGY_CANARY_INTENT_PREFIX).replace(/^\/+|\/+$/g, ""),
     controlPrefix: clean(env.FUNDED_DIRECT_CONTROL_PREFIX || "reports/funded/dynamic-quote").replace(/^\/+|\/+$/g, ""),
     intentContainerName: clean(env.STRATEGY_CANARY_INTENT_CONTAINER_NAME),
@@ -53,7 +56,13 @@ export function loadFundedDirectConfig(env = process.env) {
     errors.push("worker must remain bound to the frozen Dynamic Quote candidate");
   }
   if (!config.candidateConfigHash || !config.requiredFillModelVersion) errors.push("candidate config and execution-model version are required");
+  if (!(config.targetOrderNotional > 1 && config.targetOrderNotional <= config.maxOrderNotional)) {
+    errors.push("operator-funded target notional must be in (1, max order notional]");
+  }
   if (!(config.maxOrderNotional > 1 && config.maxOrderNotional <= 100)) errors.push("operator-funded order cap must be in (1, 100]");
+  if (!(config.minimumSecondsToExpiry === 360 && config.maximumSecondsToExpiry === 900)) {
+    errors.push("operator-funded Dynamic Quote window must be exactly 360-900 seconds to expiry");
+  }
   if (!config.intentPrefix || !config.intentContainerName || !config.controlContainerName || !config.storageAccount) {
     errors.push("isolated intent/control storage configuration is required");
   }
@@ -153,10 +162,13 @@ function validateSession(config) {
     && value.maker_only === true
     && value.no_deposits === true
     && Number(value.max_open_orders) === 1
+    && Number(value.target_order_notional) === config.targetOrderNotional
     && Number(value.max_order_notional) === config.maxOrderNotional
     && Number(value.max_account_loss) === Number(value.starting_collateral)
     && Number(value.max_account_loss) > config.maxOrderNotional
     && Number(value.source_simulated_pnl) === 379.19
+    && Number(value.execution_window_seconds_to_expiry?.minimum) === config.minimumSecondsToExpiry
+    && Number(value.execution_window_seconds_to_expiry?.maximum) === config.maximumSecondsToExpiry
     && value.evidence_trust_boundary_ready === false
     && value.candidate?.name === config.candidate
     && value.candidate?.candidate_version === config.candidateVersion
@@ -198,6 +210,7 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
   const decisionMs = Date.parse(intent?.decision_ts);
   const validUntilMs = Date.parse(intent?.valid_until);
   const venueExpiryMs = Date.parse(intent?.gtd_expiry_ts);
+  const marketEndMs = Date.parse(intent?.market_end_ts);
   const sessionStartMs = Date.parse(session.created_at);
   const sessionExpiryMs = Date.parse(session.expires_at);
   const nowMs = now.getTime();
@@ -227,6 +240,10 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && validUntilMs <= sessionExpiryMs
     && Number.isFinite(venueExpiryMs)
     && venueExpiryMs === validUntilMs + 60_000
+    && Number.isFinite(marketEndMs)
+    && marketEndMs - decisionMs >= config.minimumSecondsToExpiry * 1_000
+    && marketEndMs - decisionMs <= config.maximumSecondsToExpiry * 1_000
+    && venueExpiryMs < marketEndMs
     && Number(intent.ttl_ms) > 0
     && Number(intent.ttl_ms) <= 30_000
     && validUntilMs === decisionMs + Number(intent.ttl_ms)
@@ -234,6 +251,7 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && Number.isFinite(shares)
     && Number.isFinite(notional)
     && notional > 1 + 1e-9
+    && notional >= config.targetOrderNotional - 0.01 - 1e-9
     && notional <= config.maxOrderNotional
     && Math.abs(price * shares - notional) <= 1e-9
     && shares >= Number(intent.minimum_order_size)
@@ -353,7 +371,12 @@ function result(status, config, details) {
     candidate: config.candidate,
     candidate_version: config.candidateVersion,
     max_account_loss: config.session.max_account_loss,
+    target_order_notional: config.targetOrderNotional,
     max_order_notional: config.maxOrderNotional,
+    execution_window_seconds_to_expiry: {
+      minimum: config.minimumSecondsToExpiry,
+      maximum: config.maximumSecondsToExpiry
+    },
     no_deposits: true,
     research_promotion_bypassed: true,
     ...details

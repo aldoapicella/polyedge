@@ -26,7 +26,10 @@ param fundedDirectSessionManifestSha256 string = ''
 param fundedDirectCampaignId string = 'dynamic-quote-funded-disabled'
 param fundedDirectStartingCollateral string = '11.09862'
 param fundedDirectMaxAccountLoss string = '11.09862'
+param fundedDirectTargetOrderNotional string = '10.5'
 param fundedDirectMaxOrderNotional string = '10.5'
+param fundedDirectMinSecondsToExpiry string = '360'
+param fundedDirectMaxSecondsToExpiry string = '900'
 
 var environmentName = 'polyedge-venue-neu-env'
 var identityName = 'polyedge-venue-neu-id'
@@ -590,7 +593,11 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'MAX_TOTAL_POSITION', value: '1' }
             { name: 'MAX_DAILY_LOSS', value: '1' }
             { name: 'MAX_OPEN_ORDERS', value: '1' }
+            { name: 'STRATEGY_INTENT_OPERATOR_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectEnabled ? fundedDirectTargetOrderNotional : '0' }
             { name: 'STRATEGY_INTENT_MAX_ORDER_NOTIONAL', value: fundedDirectEnabled ? fundedDirectMaxOrderNotional : '1' }
+            { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectEnabled ? fundedDirectMinSecondsToExpiry : '0' }
+            { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: fundedDirectEnabled ? fundedDirectMaxSecondsToExpiry : '86400' }
             { name: 'TARGET_ASSET', value: 'BTC' }
             { name: 'TARGET_ASSET_NAME', value: 'Bitcoin' }
             { name: 'TARGET_HORIZON', value: '15m' }
@@ -1025,7 +1032,10 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'STRATEGY_CANARY_CANDIDATE_CONFIG_HASH', value: 'sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c' }
           { name: 'STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION', value: 'conservative-execution-prior-v1' }
           { name: 'STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE', value: 'chainlink_reference' }
+          { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectTargetOrderNotional }
           { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: fundedDirectMaxOrderNotional }
+          { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectMinSecondsToExpiry }
+          { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: fundedDirectMaxSecondsToExpiry }
           { name: 'STRATEGY_CANARY_MAX_REFERENCE_AGE_MS', value: '2000' }
           { name: 'STRATEGY_CANARY_MAX_BOOK_AGE_MS', value: '1000' }
           { name: 'STRATEGY_CANARY_REST_SECONDS', value: '30' }

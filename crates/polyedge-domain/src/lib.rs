@@ -423,6 +423,8 @@ pub struct ExecutionIntentV1 {
     pub order_kind: OrderKind,
     pub ttl_ms: i64,
     pub decision_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub market_end_ts: Option<DateTime<Utc>>,
     pub valid_until: DateTime<Utc>,
     #[serde(default)]
     pub gtd_expiry_ts: Option<DateTime<Utc>>,
@@ -530,6 +532,15 @@ impl ExecutionIntentV1 {
         }
         if self.valid_until != self.decision_ts + chrono::Duration::milliseconds(self.ttl_ms) {
             return Err("valid_until must equal decision_ts plus ttl_ms".to_owned());
+        }
+        if self.market_end_ts.is_some_and(|market_end_ts| {
+            market_end_ts <= self.decision_ts
+                || self.valid_until >= market_end_ts
+                || self
+                    .gtd_expiry_ts
+                    .is_some_and(|expiry| expiry >= market_end_ts)
+        }) {
+            return Err("execution intent validity must end before market expiry".to_owned());
         }
         if self.order_kind == OrderKind::PostOnlyGtd
             && self.gtd_expiry_ts != Some(self.valid_until + chrono::Duration::seconds(60))
@@ -793,6 +804,7 @@ mod tests {
             order_kind: OrderKind::PostOnlyGtd,
             ttl_ms: 5_000,
             decision_ts,
+            market_end_ts: Some(decision_ts + Duration::minutes(10)),
             valid_until: decision_ts + Duration::seconds(5),
             gtd_expiry_ts: Some(decision_ts + Duration::seconds(65)),
             book_hash: "sha256:book".to_owned(),

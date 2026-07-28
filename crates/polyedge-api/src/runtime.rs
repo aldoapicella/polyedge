@@ -1787,6 +1787,12 @@ impl RuntimeController {
         {
             Ok(model) => model,
             Err(reason) => {
+                warn!(
+                    market_id = %market.market_id,
+                    candidate_version = %metadata.candidate.version,
+                    reason = %reason,
+                    "execution intent not published"
+                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1817,6 +1823,12 @@ impl RuntimeController {
         ) {
             Ok(intent) => intent,
             Err(reason) => {
+                warn!(
+                    market_id = %market.market_id,
+                    candidate_version = %metadata.candidate.version,
+                    reason = %reason,
+                    "execution intent not published"
+                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1837,6 +1849,12 @@ impl RuntimeController {
         let publisher = match IntentPublisherConfig::from_settings(&self.inner.settings) {
             Ok(publisher) => publisher,
             Err(reason) => {
+                warn!(
+                    decision_id = %intent.decision_id,
+                    market_id = %intent.market_id,
+                    reason = %reason,
+                    "execution intent not published"
+                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1859,6 +1877,14 @@ impl RuntimeController {
                 tokio::task::spawn_blocking(move || publisher.publish(&publish_intent)).await;
             match result {
                 Ok(Ok(published)) => {
+                    info!(
+                        decision_id = %intent.decision_id,
+                        market_id = %intent.market_id,
+                        market_end_ts = ?intent.market_end_ts,
+                        notional = %intent.notional,
+                        blob_name = %published.blob_name,
+                        "execution intent published"
+                    );
                     runtime
                         .record_event(
                             "execution_intent_published",
@@ -1880,6 +1906,12 @@ impl RuntimeController {
                         .await;
                 }
                 Ok(Err(reason)) => {
+                    warn!(
+                        decision_id = %intent.decision_id,
+                        market_id = %intent.market_id,
+                        reason = %reason,
+                        "execution intent not published"
+                    );
                     runtime
                         .record_event(
                             "execution_intent_not_published",
@@ -1896,6 +1928,12 @@ impl RuntimeController {
                         .await;
                 }
                 Err(error) => {
+                    warn!(
+                        decision_id = %intent.decision_id,
+                        market_id = %intent.market_id,
+                        error = %error,
+                        "execution intent not published"
+                    );
                     runtime
                         .record_event(
                             "execution_intent_not_published",

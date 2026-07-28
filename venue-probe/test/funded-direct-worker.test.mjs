@@ -18,10 +18,15 @@ function session() {
     maker_only: true,
     no_deposits: true,
     max_open_orders: 1,
+    target_order_notional: 10.5,
     max_order_notional: 10.5,
     max_account_loss: 11.09862,
     starting_collateral: 11.09862,
     evidence_trust_boundary_ready: false,
+    execution_window_seconds_to_expiry: {
+      minimum: 360,
+      maximum: 900
+    },
     candidate: {
       name: "dynamic_quote_style",
       candidate_version: "dynamic_quote_style@2026-06-14",
@@ -51,7 +56,10 @@ function env(overrides = {}) {
     STRATEGY_CANARY_CANDIDATE_CONFIG_HASH: `sha256:${"a".repeat(64)}`,
     STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION: "conservative-execution-prior-v1",
     STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE: "chainlink_reference",
+    STRATEGY_INTENT_TARGET_ORDER_NOTIONAL: "10.5",
     STRATEGY_CANARY_MAX_ORDER_NOTIONAL: "10.5",
+    STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY: "360",
+    STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY: "900",
     STRATEGY_CANARY_INTENT_PREFIX: "intents",
     STRATEGY_CANARY_INTENT_CONTAINER_NAME: "shadow",
     AZURE_STORAGE_ACCOUNT_NAME: "storage",
@@ -109,11 +117,12 @@ function intent(now, id = "c".repeat(64)) {
     post_only: true,
     order_kind: "post_only_gtd",
     price: "0.45",
-    shares: "10",
-    notional: "4.5",
+    shares: "23.33",
+    notional: "10.4985",
     minimum_order_size: "5",
     net_edge_lower_bound: "0.02",
     decision_ts: decision.toISOString(),
+    market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 60_000).toISOString(),
     ttl_ms: 30_000
@@ -128,6 +137,13 @@ test("operator-funded config rejects the old one-dollar cap", () => {
   assert.throws(
     () => loadFundedDirectConfig(env({ STRATEGY_CANARY_MAX_ORDER_NOTIONAL: "1" })),
     /must be in \(1, 100\]/
+  );
+});
+
+test("operator-funded config requires the profitable 6-15 minute window", () => {
+  assert.throws(
+    () => loadFundedDirectConfig(env({ STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY: "30" })),
+    /exactly 360-900 seconds/
   );
 });
 
@@ -152,6 +168,24 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
   assert.equal(calls, 1);
   assert.equal(output.status, "iteration_limit_reached");
   assert.equal(output.childInvocations, 1);
+});
+
+test("worker rejects an otherwise valid intent inside the final six minutes", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "e".repeat(64));
+  value.market_end_ts = new Date(Date.parse(value.decision_ts) + 359_000).toISOString();
+  const output = await runFundedDirectWorker({
+    env: env(),
+    containers: {
+      control: new Container(),
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("out-of-window intent must not execute")
+  });
+  assert.equal(output.status, "iteration_limit_reached");
+  assert.equal(output.childInvocations, 0);
 });
 
 test("worker reports an account-risk pause without retrying a funded child", async () => {
