@@ -271,9 +271,13 @@ pub(super) fn build_execution_intent_with_model(
     if book_age_ms > settings.risk.max_book_age_ms {
         return Err("captured order book is stale".to_owned());
     }
-    if !reference.exact_resolution_source
-        || reference.source != market.resolution_source
-        || reference.source != settings.target.resolution_source
+    let canonical_resolution_source = settings.target.resolution_source.as_str();
+    let reference_is_exact_resolution_source = reference.exact_resolution_source
+        && (reference.source == canonical_resolution_source
+            || (settings.target.enable_polymarket_rtds_chainlink
+                && reference.source == settings.rtds_chainlink_source_name()));
+    if !reference_is_exact_resolution_source
+        || market.resolution_source != canonical_resolution_source
     {
         return Err("exact market resolution source is not confirmed".to_owned());
     }
@@ -321,6 +325,8 @@ pub(super) fn build_execution_intent_with_model(
         "book_hash": book_hash,
         "features_digest": features_digest,
         "reference_source_ts": reference.source_ts,
+        "reference_source": reference.source,
+        "resolution_source": canonical_resolution_source,
         "execution_model_blob_uri": execution_model.blob_uri,
         "execution_model_sha256": execution_model.sha256,
     });
@@ -360,7 +366,7 @@ pub(super) fn build_execution_intent_with_model(
         reference_age_ms,
         book_age_ms,
         exact_resolution_source: true,
-        resolution_source: reference.source.clone(),
+        resolution_source: canonical_resolution_source.to_owned(),
         required_fill_model_version: execution_model.version.clone(),
         execution_model_blob_uri: execution_model.blob_uri.clone(),
         execution_model_sha256: execution_model.sha256.clone(),
@@ -1110,6 +1116,29 @@ mod tests {
         )
         .unwrap_err()
         .contains("net-edge"));
+    }
+
+    #[test]
+    fn canonicalizes_exact_polymarket_rtds_chainlink_source() {
+        let (settings, market, fair, mut reference, book, decision, metadata, now) = fixture();
+        reference.source = settings.rtds_chainlink_source_name();
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(intent.resolution_source, "chainlink_reference");
+        assert!(intent.exact_resolution_source);
+    }
+
+    #[test]
+    fn rejects_unrecognized_source_even_when_marked_exact() {
+        let (settings, market, fair, mut reference, book, decision, metadata, now) = fixture();
+        reference.source = "unrecognized_exact_source".to_owned();
+        assert!(build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now
+        )
+        .unwrap_err()
+        .contains("exact market resolution"));
     }
 
     #[test]
