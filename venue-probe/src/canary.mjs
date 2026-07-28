@@ -364,7 +364,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     refreshed = await capturePreflight(client, intent, reservation.probe_id);
     // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
     // authorization contract immediately before the only signing call.
-    validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
+    const preSendValidation = validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
     lease.assertHealthy();
     await Promise.all([userChannel.ensureOpen(), marketChannel.ensureOpen()]);
     if (userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
@@ -375,7 +375,10 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     preSendContext = {
       ...marketContext(marketMessagesThrough(marketChannel.messages, preSendCapturedWallMs)),
       source: "public_market_channel_before_submission",
-      captured_wall_ms: preSendCapturedWallMs
+      captured_wall_ms: preSendCapturedWallMs,
+      intent_book_hash: intent.book_hash,
+      current_book_hash: preSendValidation.actualBookHash,
+      intent_book_hash_matched: preSendValidation.bookHashMatched
     };
   } catch (error) {
     try {

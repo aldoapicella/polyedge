@@ -297,6 +297,13 @@ test("operator-funded child executes above the old one-dollar cap without claimi
     expires_at: "2026-07-12T12:00:30.000Z",
     single_use: true
   };
+  // Full-depth churn is expected on the live BTC book. Operator-direct may
+  // tolerate it only inside the short bound while the current book still
+  // passes the post-only price, tick, and venue minimum checks.
+  input.runtime.book = {
+    ...book,
+    bids: [{ price: "0.19", size: "11" }]
+  };
   const controls = spies();
   const result = await executeStrategyCanary({ ...input, ...controls });
   assert.equal(result.status, "funded_direct_executed");

@@ -8,6 +8,7 @@ const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
 const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
 const VENUE_GTD_SECURITY_BUFFER_MS = 60_000;
 const MAX_ACTIVE_INTENT_TTL_MS = 30_000;
+const OPERATOR_DIRECT_BOOK_DRIFT_MAX_MS = 20_000;
 
 export function loadCanaryConfig(env = process.env) {
   const config = {
@@ -304,7 +305,10 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (String(runtime.market?.marketId) !== String(intent.market_id) || String(runtime.market?.conditionId) !== String(intent.condition_id) || String(runtime.market?.tokenId) !== String(intent.token_id)) fail("market, condition, or token identity mismatch");
   if (runtime.market?.closed === true || runtime.market?.acceptingOrders !== true) fail("market is not accepting orders");
   const actualBookHash = canonicalBookHash(runtime.book, intent.token_id);
-  if (actualBookHash !== normalizeHash(intent.book_hash)) fail("current order book hash disagrees with the intent");
+  const bookHashMatched = actualBookHash === normalizeHash(intent.book_hash);
+  if (!bookHashMatched && (!operatorDirect || nowMs - decisionMs > OPERATOR_DIRECT_BOOK_DRIFT_MAX_MS)) {
+    fail("current order book hash disagrees with the intent");
+  }
   const bestAsk = Math.min(...(runtime.book?.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
   if (!Number.isFinite(bestAsk) || price >= bestAsk) fail("post-only BUY would cross the current ask");
   const tick = Number(runtime.book?.tick_size ?? runtime.book?.tickSize);
@@ -321,7 +325,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       (feeRate > 0 && runtime.feeTakerOnly !== true)) {
     fail("exact Polymarket V2 fee rate/exponent/taker-only parameters are required");
   }
-  return { price, shares, notional, validUntilMs, venueExpiryMs: expiryMs, actualBookHash };
+  return { price, shares, notional, validUntilMs, venueExpiryMs: expiryMs, actualBookHash, bookHashMatched };
 }
 
 export async function consumeOneShotAuthorization(container, { authorization, authorizationHash, decisionId, runId, now = new Date() }) {
