@@ -848,7 +848,7 @@ resource serviceBusDeadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' 
           metricNamespace: 'Microsoft.ServiceBus/namespaces'
           operator: 'GreaterThan'
           threshold: 0
-          timeAggregation: 'Total'
+          timeAggregation: 'Maximum'
           criterionType: 'StaticThresholdCriterion'
           dimensions: [
             {

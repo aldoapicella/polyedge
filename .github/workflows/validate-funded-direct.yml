@@ -114,9 +114,11 @@ jobs:
               and .properties.duplicateDetectionHistoryTimeWindow == "PT10M"
               and .properties.defaultMessageTimeToLive == "PT30S"
               and .properties.lockDuration == "PT30S"
-              and .properties.deadLetteringOnMessageExpiration == true
-              and .properties.maxDeliveryCount == 3)
-            and ([.resources[]
+            and .properties.deadLetteringOnMessageExpiration == true
+            and .properties.maxDeliveryCount == 3)
+          and ([.resources[] | select(.type == "Microsoft.Insights/metricAlerts" and .name == "polyedge-funded-direct-dead-letters")][0]
+            | .properties.criteria.allOf[0].timeAggregation == "Maximum")
+          and ([.resources[]
               | select(.type == "Microsoft.Authorization/roleAssignments")
               | .properties.roleDefinitionId
               | ascii_downcase
