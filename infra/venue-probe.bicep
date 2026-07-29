@@ -39,7 +39,7 @@ param fundedDirectServiceBusQueue string = 'funded-dynamic-quote-intents'
 var fundedDirectValidationProvided = (!empty(fundedDirectShadowValidationSealJson) && !empty(fundedDirectShadowValidationSealBlobName) && !empty(fundedDirectShadowValidationSealSha256))
 var fundedDirectReleaseReady = fundedDirectEnabled && fundedDirectValidationProvided
 @description('Static public IP resource used by the authenticated North Europe NAT egress.')
-param publicIpName string = 'pip-polyedge-venue-neu-egress'
+param publicIpName string = 'pip-polyedge-venue-neu-egress-2'
 
 var environmentName = 'polyedge-venue-neu-env'
 var identityName = 'polyedge-venue-neu-id'

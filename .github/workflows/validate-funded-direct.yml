@@ -133,6 +133,7 @@ jobs:
           const assert = require("node:assert/strict");
           const fs = require("node:fs");
           const template = JSON.parse(fs.readFileSync("funded-direct-chile.json"));
+          assert.equal(template.parameters.producerPublicIpName.defaultValue, "pip-polyedge-venue-neu-egress-2");
           const app = template.resources.find((resource) =>
             resource.type === "Microsoft.App/containerApps" &&
             resource.properties.template.containers[0].name === "funded-direct");
@@ -149,6 +150,10 @@ jobs:
           assert.ok("FUNDED_DIRECT_SERVICE_BUS_ENABLED" in producerEnv);
           assert.ok("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE" in producerEnv);
           assert.ok("FUNDED_DIRECT_SERVICE_BUS_QUEUE" in producerEnv);
+          assert.equal(
+            JSON.parse(fs.readFileSync("venue-probe.json")).parameters.publicIpName.defaultValue,
+            "pip-polyedge-venue-neu-egress-2"
+          );
           const warmup = template.resources.find((resource) =>
             resource.type === "Microsoft.App/jobs" &&
             resource.properties.template.containers[0].name === "funded-warmup");
@@ -410,6 +415,17 @@ jobs:
             -o json > service-bus-network.json
           test "$(jq -r '.defaultAction' service-bus-network.json)" = "Deny"
           test "$(jq '.ipRules | length' service-bus-network.json)" = "2"
+          producer_egress_ip=$(az network public-ip show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name pip-polyedge-venue-neu-egress-2 \
+            --query ipAddress -o tsv)
+          executor_egress_ip=$(az network public-ip show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name pip-polyedge-execution-cl-egress \
+            --query ipAddress -o tsv)
+          jq -e --arg producer "$producer_egress_ip" --arg executor "$executor_egress_ip" '
+            ([.ipRules[].ipMask] | sort) == ([$producer, $executor] | sort)
+          ' service-bus-network.json
           queue_id=$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
