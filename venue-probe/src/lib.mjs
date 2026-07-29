@@ -1006,6 +1006,8 @@ export async function finalizeProbeRisk(config, reservation, result) {
     matched_notional: Math.max(0, number(result.matched_notional, 0)),
     reconciliation_complete: result.reconciliation_complete === true,
     zero_open_orders_confirmed: result.zero_open_orders_confirmed === true,
+    reconciliation_reason: result.reconciliation_reason || reservation.reconciliation_reason || null,
+    reconciliation_evidence: result.reconciliation_evidence || reservation.reconciliation_evidence || null,
     updated_ts: new Date().toISOString()
   };
   await container

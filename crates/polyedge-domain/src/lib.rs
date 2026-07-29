@@ -543,10 +543,10 @@ impl ExecutionIntentV1 {
             return Err("execution intent validity must end before market expiry".to_owned());
         }
         if self.order_kind == OrderKind::PostOnlyGtd
-            && self.gtd_expiry_ts != Some(self.valid_until + chrono::Duration::seconds(60))
+            && self.gtd_expiry_ts != Some(self.valid_until + chrono::Duration::seconds(90))
         {
             return Err(
-                "post-only GTD venue expiry must equal active valid_until plus 60 seconds"
+                "post-only GTD venue expiry must equal active valid_until plus 90 seconds"
                     .to_owned(),
             );
         }
@@ -806,7 +806,7 @@ mod tests {
             decision_ts,
             market_end_ts: Some(decision_ts + Duration::minutes(10)),
             valid_until: decision_ts + Duration::seconds(5),
-            gtd_expiry_ts: Some(decision_ts + Duration::seconds(65)),
+            gtd_expiry_ts: Some(decision_ts + Duration::seconds(95)),
             book_hash: "sha256:book".to_owned(),
             q: Decimal::new(46, 2),
             gross_edge: Decimal::new(6, 2),

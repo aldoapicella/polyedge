@@ -26,10 +26,12 @@ import {
   consumeOneShotAuthorization,
   beginFillMarkoutCapture,
   artifactLocationFromUri,
+  deterministicNoOrderRejection,
   executeStrategyCanary,
   loadCanaryConfig,
   loadHashedJson,
   polymarketV2FeePerShare,
+  validateDeterministicNoOrderReconciliation,
   validateCanaryPreflight
 } from "./canary-lib.mjs";
 import {
@@ -467,6 +469,17 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       true
     );
   } catch (error) {
+    const rejection = deterministicNoOrderRejection(error);
+    if (rejection) {
+      await releaseDeterministicRejectedOrder(client, {
+        intent,
+        manifest: documents.manifest,
+        reservation,
+        sentAt,
+        rejection
+      });
+      throw new Error(`fail closed: venue rejected the order without acknowledgement; no-order risk was reconciled and released (${rejection.code}: ${rejection.message})`);
+    }
     await cancelAllAndConfirm(client);
     throw new Error(`fail closed: ambiguous strategy-canary submission; authorization is consumed and risk remains reserved (${error.message})`);
   }
@@ -887,6 +900,55 @@ async function loadExactMarket(intent) {
 async function cancelAllAndConfirm(client) {
   await client.cancelAll().catch(() => null);
   if ((await getOpenOrdersStrict(client)).length) throw new Error("fail closed: emergency cancellation did not produce zero open orders");
+}
+
+async function releaseDeterministicRejectedOrder(client, {
+  intent,
+  manifest,
+  reservation,
+  sentAt,
+  rejection
+}) {
+  await cancelAllAndConfirm(client);
+  await sleep(250);
+  await userChannel.ensureOpen();
+  const postSendTrades = userChannel.messages.filter((message) =>
+    Number(message?._received_wall_ms) >= sentAt.getTime() &&
+    String(message?.event_type || message?.type || "").toLowerCase().includes("trade")
+  );
+  if (userChannel.gapCount() > 0 || userChannel.unparsedCount() > 0 || postSendTrades.length > 0) {
+    throw new Error("fail closed: deterministic venue rejection could not prove an authenticated zero-fill window; risk remains reserved");
+  }
+  const reconciled = await capturePreflight(client, intent, manifest, reservation.probe_id);
+  validateDeterministicNoOrderReconciliation({
+    error: rejection.message,
+    openOrderCount: reconciled.openOrderCount,
+    unresolvedPositionCount: reconciled.risk?.unresolved_position_count,
+    userChannelGapCount: userChannel.gapCount(),
+    userChannelUnparsedCount: userChannel.unparsedCount(),
+    postSendTradeCount: postSendTrades.length
+  });
+  ledger.record("venue_order_rejected_no_order", {
+    probe_id: reservation.probe_id,
+    rejection_code: rejection.code,
+    venue_message: rejection.message,
+    zero_open_orders_confirmed: true,
+    zero_unresolved_positions_confirmed: true
+  });
+  await finalizeProbeRisk(config, reservation, {
+    state: "released_no_order",
+    order_submitted: false,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true,
+    reconciliation_reason: rejection.code,
+    reconciliation_evidence: {
+      source: "authenticated_clob_and_user_channel",
+      zero_open_orders: true,
+      zero_unresolved_positions: true,
+      post_send_authenticated_trade_count: 0
+    }
+  });
 }
 
 async function getOpenOrdersStrict(client) {

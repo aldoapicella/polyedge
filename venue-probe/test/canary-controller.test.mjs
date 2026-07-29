@@ -48,7 +48,7 @@ function fixture() {
   };
   const intent = (decisionId, decisionTs) => {
     const validUntil = new Date(Date.parse(decisionTs) + 30_000).toISOString();
-    const venueExpiry = new Date(Date.parse(validUntil) + 60_000).toISOString();
+    const venueExpiry = new Date(Date.parse(validUntil) + 90_000).toISOString();
     return ({
     schema: "polyedge.execution_intent.v1", decision_id: decisionId,
     decision_ts: decisionTs, valid_until: validUntil, gtd_expiry_ts: venueExpiry, ttl_ms: 30_000,

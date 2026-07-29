@@ -3,7 +3,8 @@ import { pathToFileURL } from "node:url";
 import {
   artifactLocationFromUri,
   loadHashedJson,
-  sha256
+  sha256,
+  VENUE_GTD_SECURITY_BUFFER_MS
 } from "./canary-lib.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
 
@@ -265,7 +266,7 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && validUntilMs - nowMs >= config.minRemainingTtlMs
     && validUntilMs <= sessionExpiryMs
     && Number.isFinite(venueExpiryMs)
-    && venueExpiryMs === validUntilMs + 60_000
+    && venueExpiryMs === validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS
     && Number.isFinite(marketEndMs)
     && marketEndMs - decisionMs >= config.minimumSecondsToExpiry * 1_000
     && marketEndMs - decisionMs <= config.maximumSecondsToExpiry * 1_000

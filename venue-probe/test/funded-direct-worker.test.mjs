@@ -130,7 +130,7 @@ function intent(now, id = "c".repeat(64)) {
     decision_ts: decision.toISOString(),
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
-    gtd_expiry_ts: new Date(valid.getTime() + 60_000).toISOString(),
+    gtd_expiry_ts: new Date(valid.getTime() + 90_000).toISOString(),
     ttl_ms: 10_000
   };
 }

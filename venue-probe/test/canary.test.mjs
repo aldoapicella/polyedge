@@ -6,9 +6,11 @@ import {
   artifactLocationFromUri,
   canonicalBookHash,
   consumeOneShotAuthorization,
+  deterministicNoOrderRejection,
   executeStrategyCanary,
   loadHashedJson,
-  sha256
+  sha256,
+  validateDeterministicNoOrderReconciliation
 } from "../src/canary-lib.mjs";
 
 const now = new Date("2026-07-12T12:00:20.000Z");
@@ -88,7 +90,7 @@ function fixture(dryRun = true) {
     ttl_ms: 30000,
     decision_ts: "2026-07-12T12:00:00.000Z",
     valid_until: "2026-07-12T12:00:30.000Z",
-    gtd_expiry_ts: "2026-07-12T12:01:30.000Z",
+    gtd_expiry_ts: "2026-07-12T12:02:00.000Z",
     book_hash: canonicalBookHash(book, "token-1"),
     q: "0.25",
     gross_edge: "0.05",
@@ -439,7 +441,7 @@ test("operator-funded preflight blocks unexpected capital and cash-flow records 
 test("stale, book-hash, geoblock, clock, equity, model, and authorization failures send no order", async (t) => {
   const cases = [
     ["stale intent", (value) => { value.now = new Date("2026-07-12T12:03:00Z"); }, /stale/],
-    ["missing GTD security buffer", (value) => { value.documents.intent.gtd_expiry_ts = value.documents.intent.valid_until; }, /60-second security buffer/],
+    ["missing GTD security buffer", (value) => { value.documents.intent.gtd_expiry_ts = value.documents.intent.valid_until; }, /90-second security buffer/],
     ["book hash", (value) => { value.documents.intent.book_hash = `sha256:${"f".repeat(64)}`; }, /book hash/],
     ["geoblock", (value) => { value.runtime.geoblock.blocked = true; }, /geoblock/],
     ["clock", (value) => { value.runtime.clockDriftMs = 6000; }, /clock drift/],
@@ -461,6 +463,46 @@ test("stale, book-hash, geoblock, clock, equity, model, and authorization failur
       assert.equal(controls.calls.consume, 0);
     });
   }
+});
+
+test("only the exact venue GTD rejection is classified as deterministic no-order", () => {
+  assert.deepEqual(
+    deterministicNoOrderRejection(new Error("invalid expiration value, must be in the future for GTD orders")),
+    {
+      code: "invalid_gtd_expiration",
+      message: "invalid expiration value, must be in the future for GTD orders"
+    }
+  );
+  assert.equal(deterministicNoOrderRejection(new Error("request timed out after signing")), null);
+  assert.equal(deterministicNoOrderRejection({ response: { data: { error: "gateway unavailable" } } }), null);
+});
+
+test("deterministic no-order release requires complete zero-order, zero-position, zero-fill proof", () => {
+  const proof = {
+    error: new Error("invalid expiration value, must be in the future for GTD orders"),
+    openOrderCount: 0,
+    unresolvedPositionCount: 0,
+    userChannelGapCount: 0,
+    userChannelUnparsedCount: 0,
+    postSendTradeCount: 0
+  };
+  assert.equal(validateDeterministicNoOrderReconciliation(proof).code, "invalid_gtd_expiration");
+  for (const field of [
+    "openOrderCount",
+    "unresolvedPositionCount",
+    "userChannelGapCount",
+    "userChannelUnparsedCount",
+    "postSendTradeCount"
+  ]) {
+    assert.throws(
+      () => validateDeterministicNoOrderReconciliation({ ...proof, [field]: 1 }),
+      /did not prove zero orders/
+    );
+  }
+  assert.equal(
+    validateDeterministicNoOrderReconciliation({ ...proof, error: new Error("signed request timed out") }),
+    null
+  );
 });
 
 test("blob content hash mismatch fails before JSON can reach execution", async () => {

@@ -6,7 +6,9 @@ const FUNDED_AUTHORIZATION_SCHEMA = "polyedge.funded_stage_intent_authorization.
 const OPERATOR_DIRECT_AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
 const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
-const VENUE_GTD_SECURITY_BUFFER_MS = 60_000;
+export const VENUE_GTD_SECURITY_BUFFER_MS = 90_000;
+const VENUE_GTD_MINIMUM_LIFETIME_MS = 60_000;
+const VENUE_GTD_SEND_MARGIN_MS = 5_000;
 const MAX_ACTIVE_INTENT_TTL_MS = 30_000;
 const OPERATOR_DIRECT_BOOK_DRIFT_MAX_MS = 20_000;
 
@@ -223,7 +225,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (nowMs < decisionMs || nowMs >= validUntilMs) fail("execution intent is stale or not yet valid");
   if (validUntilMs - nowMs < config.minRemainingTtlMs) fail("execution intent has insufficient remaining TTL");
   if (Number(intent.ttl_ms) !== validUntilMs - decisionMs || Number(intent.ttl_ms) > MAX_ACTIVE_INTENT_TTL_MS) fail("active intent TTL does not reconcile or exceeds the short-lifecycle limit");
-  if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 60-second security buffer");
+  if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 90-second security buffer");
   const referenceAgeMs = Number(intent.reference_age_ms);
   const bookAgeMs = Number(intent.book_age_ms);
   if (!Number.isFinite(referenceAgeMs) || referenceAgeMs < 0 || referenceAgeMs > config.maxReferenceAgeMs) fail("reference source is stale");
@@ -323,6 +325,10 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       || runtime.clockUncertaintyMs < 0 || runtime.clockUncertaintyMs > config.maxClockUncertaintyMs) {
     fail("clock uncertainty exceeds limit");
   }
+  const venueNowMs = nowMs + Number(runtime.clockServerMinusLocalMs);
+  if (expiryMs - venueNowMs < VENUE_GTD_MINIMUM_LIFETIME_MS + VENUE_GTD_SEND_MARGIN_MS) {
+    fail("venue GTD expiry is inside the one-minute security threshold plus send margin");
+  }
   if (runtime.risk?.passed !== true) fail(`campaign equity/risk gate failed (${(runtime.risk?.blockers || ["unknown"]).join(", ")})`);
   if (operatorDirect) {
     const startingCollateral = Number(manifest.starting_collateral);
@@ -366,6 +372,41 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
     fail("exact Polymarket V2 fee rate/exponent/taker-only parameters are required");
   }
   return { price, shares, notional, validUntilMs, venueExpiryMs: expiryMs, actualBookHash, bookHashMatched };
+}
+
+export function deterministicNoOrderRejection(error) {
+  const message = String(
+    error?.response?.data?.error ??
+    error?.response?.data?.message ??
+    error?.errorMsg ??
+    error?.message ??
+    error ??
+    ""
+  ).trim();
+  if (/invalid expiration value, must be in the future for GTD orders/i.test(message)) {
+    return { code: "invalid_gtd_expiration", message };
+  }
+  return null;
+}
+
+export function validateDeterministicNoOrderReconciliation({
+  error,
+  openOrderCount,
+  unresolvedPositionCount,
+  userChannelGapCount,
+  userChannelUnparsedCount,
+  postSendTradeCount
+}) {
+  const rejection = deterministicNoOrderRejection(error);
+  if (!rejection) return null;
+  if (Number(openOrderCount) !== 0 ||
+      Number(unresolvedPositionCount) !== 0 ||
+      Number(userChannelGapCount) !== 0 ||
+      Number(userChannelUnparsedCount) !== 0 ||
+      Number(postSendTradeCount) !== 0) {
+    throw new Error("fail closed: deterministic venue rejection did not prove zero orders, zero positions, and an authenticated zero-fill window");
+  }
+  return rejection;
 }
 
 export async function consumeOneShotAuthorization(container, { authorization, authorizationHash, decisionId, runId, now = new Date() }) {

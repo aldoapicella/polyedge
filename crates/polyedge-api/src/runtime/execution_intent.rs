@@ -13,7 +13,11 @@ use sha2::{Digest, Sha256};
 use std::env;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
-const VENUE_GTD_SECURITY_BUFFER_SECONDS: i64 = 60;
+// Polymarket rejects GTD expirations that are less than 60 seconds in the
+// future at submission time. Intents stay live for only 10 seconds, so bind an
+// additional 30 seconds to survive authorization, preflight, and signing
+// latency without extending the strategy's active decision window.
+const VENUE_GTD_SECURITY_BUFFER_SECONDS: i64 = 90;
 const FUNDED_CANONICAL_MANIFEST_BLOB: &str = "reports/research/profitability/latest.json";
 const CONSERVATIVE_PRIOR_VERSION: &str = "conservative-execution-prior-v1";
 const CONSERVATIVE_PRIOR_SHA256: &str =
@@ -1064,7 +1068,7 @@ mod tests {
         assert_eq!(intent.order_kind, OrderKind::PostOnlyGtd);
         assert_eq!(
             intent.gtd_expiry_ts,
-            Some(intent.valid_until + Duration::seconds(60))
+            Some(intent.valid_until + Duration::seconds(90))
         );
         assert_eq!(intent.notional, Decimal::new(90, 2));
         assert_eq!(intent.resolution_source, "chainlink_reference");
