@@ -281,7 +281,7 @@ jobs:
               --query '[?properties.active].properties.replicas | sum(@)' \
               -o tsv)
             if [ "${active_replicas:-0}" = "1" ] \
-              && az containerapp logs show \
+              && timeout 20s az containerapp logs show \
                 --resource-group "$AZURE_RESOURCE_GROUP" \
                 --name "$FUNDED_APP" \
                 --tail 100 > funded-before-rehearsal.log 2>/dev/null \
@@ -292,7 +292,7 @@ jobs:
           done
           test "${active_replicas:-0}" = "1"
           grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log
-          execution=$(az containerapp job start \
+          execution=$(timeout 180s az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_WARMUP_JOB" \
             --query name -o tsv)
@@ -312,7 +312,7 @@ jobs:
           done
           test "$status" = "Succeeded"
           for attempt in $(seq 1 18); do
-            if az containerapp logs show \
+            if timeout 20s az containerapp logs show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               --tail 100 > funded-rehearsal.log 2>/dev/null \
@@ -442,7 +442,7 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in $(seq 1 18); do
-            if az containerapp logs show \
+            if timeout 20s az containerapp logs show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               --tail 100 > funded-service.log 2>/dev/null \
