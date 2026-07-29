@@ -55,7 +55,7 @@ jobs:
           const assert = require("node:assert/strict");
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v4.json"));
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-29_v6.json"));
           const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
           const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
           assert.deepEqual(embedded, session);
@@ -68,6 +68,10 @@ jobs:
           assert.equal(session.allow_automatic_replenishment, false);
           assert.equal(session.allow_compounding, false);
           assert.deepEqual(session.external_cash_flows, []);
+          assert.equal(session.profit_quarantine.enabled, true);
+          assert.equal(session.profit_quarantine.risk_headroom, "starting_collateral_only");
+          assert.equal(session.verified_internal_settlements.length, 1);
+          assert.equal(session.verified_internal_settlements[0].realized_pnl, 6.806);
           NODE
 
       - uses: actions/setup-node@v4

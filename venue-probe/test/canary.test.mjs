@@ -373,6 +373,46 @@ test("operator-funded child executes above the old one-dollar cap without claimi
   assert.equal(result.status, "funded_direct_executed");
   assert.deepEqual(controls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
   assert.equal(input.documents.manifest.research_promotion_bypassed, true);
+
+  const quarantined = structuredClone(input);
+  quarantined.documents.manifest.session_id = "dynamic-quote-funded-test-v6";
+  quarantined.documents.manifest.profit_quarantine = {
+    enabled: true,
+    mode: "verified_internal_profit_quarantine",
+    risk_headroom: "starting_collateral_only",
+    settlement_ledger_prefix:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v6/verified-internal-profits"
+  };
+  quarantined.documents.manifest.verified_internal_settlements = [{
+    id: "manual-redeem-1",
+    type: "internal_manual_settlement",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    condition_id: `0x${"b".repeat(64)}`,
+    payout: 17.015,
+    principal: 10.209,
+    realized_pnl: 6.806,
+    fill_transaction_hashes: [`0x${"c".repeat(64)}`],
+    settled_at: "2026-07-12T11:30:00Z"
+  }];
+  quarantined.documents.authorization.session_id = quarantined.documents.manifest.session_id;
+  quarantined.runtime.risk = {
+    ...quarantined.runtime.risk,
+    account_equity: 17.90462,
+    authorized_equity_ceiling: 17.90462,
+    risk_eligible_equity: 11.09862,
+    profit_quarantine_enabled: true,
+    verified_internal_realized_pnl: 6.806,
+    verified_internal_settlement_ids: ["manual-redeem-1"],
+    quarantined_internal_profit: 6.806,
+    risk_headroom: "starting_collateral_only"
+  };
+  const quarantineControls = spies();
+  const quarantineResult = await executeStrategyCanary({
+    ...quarantined,
+    ...quarantineControls
+  });
+  assert.equal(quarantineResult.status, "funded_direct_executed");
+  assert.deepEqual(quarantineControls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
 });
 
 test("operator-funded preflight blocks unexpected capital and cash-flow records before reservation", async (t) => {

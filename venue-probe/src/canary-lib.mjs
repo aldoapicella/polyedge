@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateProfitQuarantineManifest } from "./profit-quarantine.mjs";
 
 const EXECUTION_INTENT_SCHEMA = "polyedge.execution_intent.v1";
 const AUTHORIZATION_SCHEMA = "polyedge.strategy_canary_authorization.v1";
@@ -259,6 +260,16 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (operatorDirect) {
     const startingCollateral = Number(manifest?.starting_collateral);
     const reconciliationTolerance = Number(manifest?.max_reconciliation_discrepancy);
+    const profitQuarantineEnabled = manifest?.profit_quarantine?.enabled === true;
+    if (profitQuarantineEnabled) {
+      try {
+        validateProfitQuarantineManifest(manifest);
+      } catch {
+        fail("operator-funded profit quarantine contract is invalid");
+      }
+    } else if (manifest?.verified_internal_settlements !== undefined) {
+      fail("operator-funded settlements require an explicit profit quarantine");
+    }
     if (manifest?.schema_version !== OPERATOR_DIRECT_MANIFEST_SCHEMA
         || manifest.authorization_mode !== "operator_direct"
         || manifest.research_promotion_bypassed !== true
@@ -333,6 +344,13 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (operatorDirect) {
     const startingCollateral = Number(manifest.starting_collateral);
     const reconciliationTolerance = Number(manifest.max_reconciliation_discrepancy);
+    const profitQuarantineEnabled = manifest?.profit_quarantine?.enabled === true;
+    const verifiedProfit = (manifest?.verified_internal_settlements || [])
+      .reduce((total, row) => total + Number(row?.realized_pnl || 0), 0);
+    const verifiedSettlementIds = (manifest?.verified_internal_settlements || [])
+      .map((row) => row.id)
+      .sort();
+    const expectedEquityCeiling = startingCollateral + verifiedProfit;
     if (Number(runtime.risk?.baseline_equity) !== startingCollateral
         || Number(runtime.risk?.cash_flow_adjusted_baseline) !== startingCollateral
         || Number(runtime.risk?.authorized_starting_collateral) !== startingCollateral
@@ -343,7 +361,18 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
         || !Array.isArray(runtime.risk?.cash_flow_ids)
         || runtime.risk.cash_flow_ids.length !== 0
         || Number(runtime.risk?.maximum_reconciliation_discrepancy) !== reconciliationTolerance
-        || Number(runtime.risk?.account_equity) > startingCollateral + reconciliationTolerance + 1e-9) {
+        || (profitQuarantineEnabled
+          ? runtime.risk?.profit_quarantine_enabled !== true
+            || runtime.risk?.risk_headroom !== "starting_collateral_only"
+            || Number(runtime.risk?.verified_internal_realized_pnl) !== verifiedProfit
+            || JSON.stringify(runtime.risk?.verified_internal_settlement_ids) !==
+              JSON.stringify(verifiedSettlementIds)
+            || Number(runtime.risk?.quarantined_internal_profit) !== verifiedProfit
+            || Number(runtime.risk?.authorized_equity_ceiling) !== expectedEquityCeiling
+            || Number(runtime.risk?.risk_eligible_equity) > startingCollateral + reconciliationTolerance + 1e-9
+            || Number(runtime.risk?.account_equity) > expectedEquityCeiling + reconciliationTolerance + 1e-9
+          : runtime.risk?.profit_quarantine_enabled === true
+            || Number(runtime.risk?.account_equity) > startingCollateral + reconciliationTolerance + 1e-9)) {
       fail("operator-funded no-replenishment/no-compounding reconciliation failed");
     }
   }

@@ -165,6 +165,44 @@ test("worker TTL gates reserve time for the authenticated child preflight", () =
   );
 });
 
+test("operator-funded config accepts only an explicit non-compounding profit quarantine", () => {
+  const value = session();
+  value.session_id = "dynamic-quote-funded-test-v6";
+  value.profit_quarantine = {
+    enabled: true,
+    mode: "verified_internal_profit_quarantine",
+    risk_headroom: "starting_collateral_only",
+    settlement_ledger_prefix:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v6/verified-internal-profits"
+  };
+  value.verified_internal_settlements = [{
+    id: "manual-redeem-1",
+    type: "internal_manual_settlement",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    condition_id: `0x${"b".repeat(64)}`,
+    payout: 17.015,
+    principal: 10.209,
+    realized_pnl: 6.806,
+    fill_transaction_hashes: [`0x${"c".repeat(64)}`],
+    settled_at: "2026-07-29T19:47:17Z"
+  }];
+  const manifestJson = JSON.stringify(value);
+  const fundedEnv = env({
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: manifestJson,
+    FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2)))
+  });
+  assert.equal(loadFundedDirectConfig(fundedEnv).session.allow_compounding, false);
+  value.profit_quarantine.risk_headroom = "verified_profit";
+  assert.throws(
+    () => loadFundedDirectConfig({
+      ...fundedEnv,
+      FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+      FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2)))
+    }),
+    /operator-funded session contract/
+  );
+});
+
 test("worker executes a fresh Dynamic Quote intent under the operator session", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now);

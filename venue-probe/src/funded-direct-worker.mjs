@@ -7,6 +7,7 @@ import {
   VENUE_GTD_SECURITY_BUFFER_MS
 } from "./canary-lib.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
+import { validateProfitQuarantineManifest } from "./profit-quarantine.mjs";
 
 const EXPECTED_CANDIDATE = "dynamic_quote_style";
 const EXPECTED_VERSION = "dynamic_quote_style@2026-06-14";
@@ -383,6 +384,16 @@ function validateSession(config) {
   const created = Date.parse(value?.created_at);
   const expires = Date.parse(value?.expires_at);
   const expectedHash = sha256(Buffer.from(JSON.stringify(value, null, 2)));
+  let profitQuarantineValid = value?.profit_quarantine === undefined
+    && value?.verified_internal_settlements === undefined;
+  if (value?.profit_quarantine?.enabled === true) {
+    try {
+      validateProfitQuarantineManifest(value);
+      profitQuarantineValid = true;
+    } catch {
+      profitQuarantineValid = false;
+    }
+  }
   const valid = value?.schema_version === SESSION_SCHEMA
     && clean(value.session_id)
     && value.authorization_mode === "operator_direct"
@@ -393,6 +404,7 @@ function validateSession(config) {
     && value.no_deposits === true
     && value.allow_automatic_replenishment === false
     && value.allow_compounding === false
+    && profitQuarantineValid
     && Array.isArray(value.external_cash_flows)
     && value.external_cash_flows.length === 0
     && Number(value.max_open_orders) === 1

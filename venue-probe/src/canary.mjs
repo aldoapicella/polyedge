@@ -53,6 +53,7 @@ import {
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
+import { initializeProfitQuarantine } from "./profit-quarantine.mjs";
 
 let config;
 let runKind;
@@ -98,6 +99,16 @@ async function initializeResources({ persistent = false } = {}) {
     useServerTime: true,
     throwOnError: true
   });
+  const profitQuarantineSnapshot = manifestDocument.value?.profit_quarantine?.enabled === true
+    ? await initializeProfitQuarantine({
+        container,
+        manifest: manifestDocument.value,
+        activity: await fetchJson(
+          `https://data-api.polymarket.com/activity?user=${encodeURIComponent(config.funderAddress)}&limit=500`
+        ),
+        getTransactionReceipt: confirmedPolygonReceipt
+      })
+    : null;
   const resourceLease = !config.dryRun ? await acquireCampaignLease(config, persistent ? `funded-direct-service-${crypto.randomUUID()}` : runId) : null;
   const ledgerMultiplexer = {
     current: ledger,
@@ -123,6 +134,7 @@ async function initializeResources({ persistent = false } = {}) {
     intentContainer,
     manifestDocument,
     executionModelDocument,
+    profitQuarantineSnapshot,
     client,
     lease: resourceLease,
     ledgerMultiplexer,
@@ -614,7 +626,8 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     proposedNotional: principal + feeRisk,
     orderNotional: principal,
     authorizedStartingCollateral: config.operatorDirect ? Number(manifest?.starting_collateral) : null,
-    requireZeroExternalCashFlows: config.operatorDirect
+    requireZeroExternalCashFlows: config.operatorDirect,
+    profitQuarantineSnapshot: activeResources?.profitQuarantineSnapshot || null
   });
   const capturedCompletedWallMs = Date.now();
   const captureDurationMs = Math.max(0, performance.now() - capturedStartedMonotonicMs);
@@ -1377,6 +1390,47 @@ function normalizeFillClock(fills, serverMinusLocalMs) {
 function normalizePrivateKey(value) { const clean = String(value || "").trim(); return clean.startsWith("0x") ? clean : `0x${clean}`; }
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }
+async function confirmedPolygonReceipt(transactionHash) {
+  const [receipt, latestBlock] = await Promise.all([
+    polygonRpc("eth_getTransactionReceipt", [transactionHash]),
+    polygonRpc("eth_blockNumber", [])
+  ]);
+  if (!receipt?.blockNumber || !latestBlock) {
+    throw new Error("fail closed: Polygon profit-settlement receipt is unavailable");
+  }
+  const receiptBlock = BigInt(receipt.blockNumber);
+  const head = BigInt(latestBlock);
+  return {
+    status: receipt.status === "0x1" ? "success" : "failed",
+    chain_id: 137,
+    block_number: receiptBlock.toString(),
+    confirmations: Number(head >= receiptBlock ? head - receiptBlock + 1n : 0n)
+  };
+}
+async function polygonRpc(method, params) {
+  for (const url of [
+    "https://polygon.drpc.org",
+    "https://tenderly.rpc.polygon.community",
+    "https://polygon.publicnode.com"
+  ]) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!response.ok) continue;
+      const payload = await response.json();
+      if (!payload?.error && payload?.result !== undefined && payload.result !== null) {
+        return payload.result;
+      }
+    } catch {
+      // Try the next independent endpoint. All failures remain fail-closed.
+    }
+  }
+  throw new Error(`fail closed: Polygon RPC ${method} failed`);
+}
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

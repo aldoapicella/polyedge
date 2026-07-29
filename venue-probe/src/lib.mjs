@@ -194,7 +194,8 @@ export function summarizeCampaignRisk({
   proposedNotional = 0,
   orderNotional = proposedNotional,
   authorizedStartingCollateral = null,
-  requireZeroExternalCashFlows = false
+  requireZeroExternalCashFlows = false,
+  profitQuarantineSnapshot = null
 }) {
   const liquid = Math.max(0, number(liquidCollateral, 0));
   const summed = Math.max(0, number(summedPositionValue, 0));
@@ -217,10 +218,21 @@ export function summarizeCampaignRisk({
   const startingCollateral = authorizedStartingCollateral === null
     ? null
     : number(authorizedStartingCollateral, NaN);
+  const quarantinedProfit = Math.max(
+    0,
+    number(profitQuarantineSnapshot?.quarantined_internal_profit, 0)
+  );
+  const profitQuarantineEnabled = profitQuarantineSnapshot !== null;
+  const authorizedEquityCeiling = profitQuarantineEnabled
+    ? number(profitQuarantineSnapshot?.authorized_equity_ceiling, NaN)
+    : startingCollateral;
+  // Verified profit remains in the wallet but never becomes loss headroom.
+  // Risk eligibility therefore tracks only the original session capital.
+  const riskEligibleEquity = Math.max(0, accountEquity - quarantinedProfit);
   const reserved = Math.max(0, number(proposedNotional, 0));
   const principal = Math.max(0, number(orderNotional, 0));
-  const campaignDrawdown = Math.max(0, adjustedBaseline - accountEquity);
-  const projectedEquity = accountEquity - reserved;
+  const campaignDrawdown = Math.max(0, adjustedBaseline - riskEligibleEquity);
+  const projectedEquity = riskEligibleEquity - reserved;
   const projectedDrawdown = Math.max(0, adjustedBaseline - projectedEquity);
   const blockers = [];
   if (discrepancy > reconciliationTolerance + 1e-9) {
@@ -236,7 +248,13 @@ export function summarizeCampaignRisk({
         Math.abs(adjustedBaseline - startingCollateral) > reconciliationTolerance + 1e-9) {
       blockers.push("authorized_starting_collateral_mismatch");
     }
-    if (accountEquity > startingCollateral + reconciliationTolerance + 1e-9) {
+    if (profitQuarantineEnabled &&
+        (!(authorizedEquityCeiling >= startingCollateral) ||
+         profitQuarantineSnapshot?.allow_compounding !== false ||
+         profitQuarantineSnapshot?.risk_headroom !== "starting_collateral_only")) {
+      blockers.push("invalid_profit_quarantine");
+    }
+    if (accountEquity > authorizedEquityCeiling + reconciliationTolerance + 1e-9) {
       blockers.push("authorized_starting_collateral_exceeded");
     }
   }
@@ -244,7 +262,7 @@ export function summarizeCampaignRisk({
   if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
   if (Number(unresolvedPositionCount) > 1) blockers.push("unresolved_position_limit_exceeded");
   if (reserved > 0 && Number(unresolvedPositionCount) > 0) blockers.push("existing_unresolved_position_blocks_submission");
-  if (accountEquity + 1e-9 < equityFloor) blockers.push("equity_floor_breached");
+  if (riskEligibleEquity + 1e-9 < equityFloor) blockers.push("equity_floor_breached");
   if (campaignDrawdown > maximumDrawdown + 1e-9) blockers.push("campaign_drawdown_exhausted");
   if (principal > number(control?.max_order_notional, 1) + 1e-9) blockers.push("order_notional_limit_exceeded");
   if (projectedEquity + 1e-9 < equityFloor) blockers.push("projected_equity_floor_breach");
@@ -258,8 +276,23 @@ export function summarizeCampaignRisk({
     cash_flow_ids: cashFlowIds,
     cash_flow_adjusted_baseline: roundMoney(adjustedBaseline),
     authorized_starting_collateral: startingCollateral === null ? null : roundMoney(startingCollateral),
+    authorized_equity_ceiling: authorizedEquityCeiling === null
+      ? null
+      : roundMoney(authorizedEquityCeiling),
     no_replenishment: startingCollateral !== null,
     no_compounding: startingCollateral !== null,
+    profit_quarantine_enabled: profitQuarantineEnabled,
+    verified_internal_realized_pnl: roundMoney(
+      number(profitQuarantineSnapshot?.verified_internal_realized_pnl, 0)
+    ),
+    verified_internal_settlement_ids: Array.isArray(
+      profitQuarantineSnapshot?.verified_settlement_ids
+    ) ? [...profitQuarantineSnapshot.verified_settlement_ids].sort() : [],
+    quarantined_internal_profit: roundMoney(quarantinedProfit),
+    risk_eligible_equity: roundMoney(riskEligibleEquity),
+    risk_headroom: profitQuarantineEnabled
+      ? profitQuarantineSnapshot?.risk_headroom || null
+      : null,
     equity_floor: roundMoney(equityFloor),
     max_campaign_drawdown: roundMoney(maximumDrawdown),
     liquid_collateral: roundMoney(liquid),
