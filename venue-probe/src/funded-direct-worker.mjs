@@ -43,7 +43,7 @@ export function loadFundedDirectConfig(env = process.env) {
     pollIntervalMs: integer(env.FUNDED_DIRECT_POLL_INTERVAL_MS, 1_000),
     maxIdleMs: integer(env.FUNDED_DIRECT_MAX_IDLE_MS, 300_000),
     minRemainingTtlMs: integer(env.FUNDED_DIRECT_MIN_REMAINING_TTL_MS, 7_000),
-    childMinRemainingTtlMs: integer(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS, 5_000)
+    childMinRemainingTtlMs: integer(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS, 2_000)
   };
   const errors = [];
   if (!config.enabled) errors.push("FUNDED_DIRECT_WORKER_ENABLED must be true");

@@ -56,7 +56,7 @@ function env(overrides = {}) {
     FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/session.json",
     FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
     FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "7000",
-    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "5000",
+    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "2000",
     STRATEGY_CANARY_CANDIDATE_NAME: "dynamic_quote_style",
     STRATEGY_CANARY_CANDIDATE_VERSION: "dynamic_quote_style@2026-06-14",
     STRATEGY_CANARY_CANDIDATE_CONFIG_HASH: `sha256:${"a".repeat(64)}`,
@@ -156,7 +156,7 @@ test("operator-funded config requires the profitable 6-15 minute window", () => 
 test("worker TTL gates are compatible with the frozen strategy's ten-second intent", () => {
   const config = loadFundedDirectConfig(env());
   assert.equal(config.minRemainingTtlMs, 7_000);
-  assert.equal(config.childMinRemainingTtlMs, 5_000);
+  assert.equal(config.childMinRemainingTtlMs, 2_000);
   assert.throws(
     () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "4000" })),
     /must be in \[5000, 30000\]/
@@ -178,7 +178,7 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
       calls += 1;
       assert.equal(childEnv.EXECUTION_MODE, "funded_direct");
       assert.equal(childEnv.STRATEGY_CANARY_MAX_ORDER_NOTIONAL, "10.5");
-      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "5000");
+      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "2000");
       assert.equal(childEnv.VENUE_PROBE_CAMPAIGN_CASH_FLOWS, "[]");
       return { exitCode: 0, error: "" };
     }

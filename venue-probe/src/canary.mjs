@@ -284,7 +284,8 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     riskControl,
     balance,
     positionsResponse,
-    valueResponse
+    valueResponse,
+    unresolvedReservations
   ] = await Promise.all([
     fetchJson("https://polymarket.com/api/geoblock"),
     clock(),
@@ -295,7 +296,8 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     loadCampaignRiskControl(config),
     client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
-    fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) })
+    fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) }),
+    loadUnresolvedRiskReservations(config)
   ]);
   assertEligibleOrigin(geoblock, config);
   const {
@@ -322,15 +324,21 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
   const terminalConditionIds = [...new Set(positions
     .filter((row) => row.redeemable === true && row.conditionId)
     .map((row) => String(row.conditionId)))];
-  if (terminalConditionIds.length) {
+  let reservations = unresolvedReservations;
+  const terminalConditions = new Set(terminalConditionIds.map((value) => value.toLowerCase()));
+  const terminalRiskNeedsSettlement = reservations.some((reservation) =>
+    Number(reservation?.matched_notional) > 0
+      && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase())
+  );
+  if (terminalRiskNeedsSettlement) {
     await settleProbeRiskReservations(config, {
       condition_ids: terminalConditionIds,
       terminal_settlement_verified: true,
       evidence_source: "polymarket_data_api_redeemable",
       run_id: runId
     });
+    reservations = await loadUnresolvedRiskReservations(config);
   }
-  const reservations = await loadUnresolvedRiskReservations(config);
   const principal = Number(intent.notional);
   const feeRisk = Number(intent.shares) * polymarketV2FeePerShare(intent.price, feeRate, feeExponent);
   const risk = summarizeCampaignRisk({
