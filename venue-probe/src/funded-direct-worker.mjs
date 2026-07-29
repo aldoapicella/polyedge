@@ -74,6 +74,10 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!(config.childMinRemainingTtlMs >= 1_000 && config.childMinRemainingTtlMs <= config.minRemainingTtlMs)) {
     errors.push("FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS must be in [1000, FUNDED_DIRECT_MIN_REMAINING_TTL_MS]");
   }
+  if (String(env.FUNDED_DIRECT_ENGINE || "") === "persistent_v1" &&
+      (config.minRemainingTtlMs < 15_000 || config.childMinRemainingTtlMs < 15_000)) {
+    errors.push("persistent_v1 requires at least 15000ms before authorization and child execution");
+  }
   if (errors.length) throw new Error(`funded_direct_worker blocked: ${errors.join("; ")}`);
   validateSession(config);
   return config;
@@ -111,59 +115,267 @@ export async function runFundedDirectWorker({
       continue;
     }
     idleSince = null;
-    const authorizationNow = clock();
-    if (!hasMinimumRemainingTtl(selected.value, authorizationNow, config.minRemainingTtlMs)) continue;
-    const childRunId = runId();
-    const authorization = await putImmutableOrVerify(
-      clients.control,
-      buildAuthorization(config, sessionDocument, selected, childRunId, authorizationNow)
-    );
-    if (config.dryRun) {
-      return result("dry_run_validated", config, {
+    const executed = await executeSelectedIntent({
+      env,
+      config,
+      clients,
+      sessionDocument,
+      selected,
+      invokeChild,
+      clock,
+      iteration,
+      childInvocations
+    });
+    childInvocations = executed.childInvocations;
+    if (executed.result) return executed.result;
+  }
+  return result("iteration_limit_reached", config, { iteration: config.maxIterations, childInvocations });
+}
+
+export async function createFundedDirectProcessor({
+  env = process.env,
+  containers,
+  executeCanary,
+  clock = () => new Date()
+} = {}) {
+  if (typeof executeCanary !== "function") throw new Error("fail closed: persistent canary executor is required");
+  const config = loadFundedDirectConfig(env);
+  const clients = containers || {
+    control: storageContainer({ ...config, storageContainer: config.controlContainerName }),
+    intents: storageContainer({ ...config, storageContainer: config.intentContainerName })
+  };
+  if (!clients.control || !clients.intents) throw new Error("fail closed: operator-funded storage clients are unavailable");
+  const sessionDocument = await putImmutableOrVerify(clients.control, {
+    blobName: config.sessionBlobName,
+    value: config.session
+  });
+  if (sessionDocument.hash !== config.sessionHash) throw new Error("fail closed: operator session manifest SHA-256 mismatch");
+  return {
+    async process(handoff) {
+      const processorStartedWallMs = Date.now();
+      const processorStartedMonotonicMs = performance.now();
+      const selected = await selectedFromHandoff(clients, config, sessionDocument.value, handoff, clock());
+      const executionTiming = {
+        processor_started_wall_ms: processorStartedWallMs,
+        processor_started_monotonic_ms: processorStartedMonotonicMs,
+        ...selected.handoffTiming
+      };
+      if (selected.duplicateCompletion) {
+        return result("already_completed_idempotent", config, {
+          iteration: 1,
+          childInvocations: 0,
+          decisionId: selected.value.decision_id,
+          completion: selected.duplicateCompletion,
+          execution_timing: executionTiming
+        });
+      }
+      const executed = await executeSelectedIntent({
+        env,
+        config,
+        clients,
+        sessionDocument,
+        selected,
+        invokeChild: async (childEnv) => {
+          try {
+            const value = await executeCanary(childEnv);
+            return {
+              exitCode: 0,
+              error: "",
+              orderSubmissionAttempted: value?.order_submission_attempted === true,
+              value
+            };
+          } catch (error) {
+            return {
+              exitCode: 1,
+              error: error.message,
+              orderSubmissionAttempted: error?.orderSubmissionAttempted === true
+            };
+          }
+        },
+        clock,
+        iteration: 1,
+        childInvocations: 0,
+        executionTiming
+      });
+      if (executed.result) return { ...executed.result, execution_timing: executionTiming };
+      return result("persistent_intent_completed", config, {
+        iteration: 1,
+        childInvocations: executed.childInvocations,
+        decisionId: selected.value.decision_id,
+        execution: executed.execution || null,
+        execution_timing: executionTiming
+      });
+    }
+  };
+}
+
+async function executeSelectedIntent({
+  env,
+  config,
+  clients,
+  sessionDocument,
+  selected,
+  invokeChild,
+  clock,
+  iteration,
+  childInvocations,
+  executionTiming = {}
+}) {
+  const authorizationNow = clock();
+  if (!hasMinimumRemainingTtl(selected.value, authorizationNow, config.minRemainingTtlMs)) {
+    return {
+      childInvocations,
+      result: result("stale_handoff_rejected", config, {
+        iteration,
+        childInvocations,
+        decisionId: selected.value.decision_id
+      })
+    };
+  }
+  const childRunId = runId();
+  executionTiming.authorization_started_wall_ms = Date.now();
+  executionTiming.authorization_started_monotonic_ms = performance.now();
+  const authorization = await putImmutableOrVerify(
+    clients.control,
+    buildAuthorization(config, sessionDocument, selected, childRunId, authorizationNow)
+  );
+  executionTiming.authorization_persisted_wall_ms = Date.now();
+  executionTiming.authorization_persisted_monotonic_ms = performance.now();
+  if (config.dryRun) {
+    return {
+      childInvocations,
+      result: result("dry_run_validated", config, {
         iteration,
         childInvocations,
         decisionId: selected.value.decision_id,
         authorizationHash: authorization.hash
-      });
-    }
-    const launchNow = clock();
-    if (!hasMinimumRemainingTtl(selected.value, launchNow, config.childMinRemainingTtlMs)) {
-      await writeCompletion(clients.control, config, selected, authorization, childRunId, launchNow, {
-        status: "expired_before_child_launch",
+      })
+    };
+  }
+  const launchNow = clock();
+  if (!hasMinimumRemainingTtl(selected.value, launchNow, config.childMinRemainingTtlMs)) {
+    await writeCompletion(clients.control, config, selected, authorization, childRunId, launchNow, {
+      status: "expired_before_child_launch",
+      order_submission_attempted: false,
+      authorization_consumed: false,
+      risk_reservation_created: false
+    });
+    return {
+      childInvocations,
+      result: result("expired_before_child_launch", config, {
+        iteration,
+        childInvocations,
+        decisionId: selected.value.decision_id
+      })
+    };
+  }
+  executionTiming.child_launch_wall_ms = Date.now();
+  executionTiming.child_launch_monotonic_ms = performance.now();
+  const child = await invokeChild(childEnvironment(env, config, sessionDocument, selected, authorization, childRunId));
+  executionTiming.child_completed_wall_ms = Date.now();
+  executionTiming.child_completed_monotonic_ms = performance.now();
+  childInvocations += 1;
+  if (child.exitCode !== 0) {
+    if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
+      await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+        status: "child_failed_closed_pre_submission",
         order_submission_attempted: false,
         authorization_consumed: false,
-        risk_reservation_created: false
+        risk_reservation_created: false,
+        error: child.error
       });
-      continue;
-    }
-    const child = await invokeChild(childEnvironment(env, config, sessionDocument, selected, authorization, childRunId));
-    childInvocations += 1;
-    if (child.exitCode !== 0) {
-      if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
-        await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
-          status: "child_failed_closed_pre_submission",
-          order_submission_attempted: false,
-          authorization_consumed: false,
-          risk_reservation_created: false,
-          error: child.error
-        });
-        return result("paused_by_account_risk_state", config, {
+      return {
+        childInvocations,
+        result: result("paused_by_account_risk_state", config, {
           iteration,
           childInvocations,
           decisionId: selected.value.decision_id,
           error: child.error
-        });
-      }
-      throw new Error(`fail closed: funded Dynamic Quote child exited ${child.exitCode} (${child.error || "unknown"})`);
+        })
+      };
     }
-    await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
-      status: "child_completed",
-      order_submission_attempted: child.orderSubmissionAttempted === true,
-      authorization_consumed: true,
-      risk_reservation_created: true
-    });
+    throw new Error(`fail closed: funded Dynamic Quote child exited ${child.exitCode} (${child.error || "unknown"})`);
   }
-  return result("iteration_limit_reached", config, { iteration: config.maxIterations, childInvocations });
+  await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+    status: "child_completed",
+    order_submission_attempted: child.orderSubmissionAttempted === true,
+    authorization_consumed: true,
+    risk_reservation_created: true
+  });
+  executionTiming.completion_persisted_wall_ms = Date.now();
+  executionTiming.completion_persisted_monotonic_ms = performance.now();
+  return { childInvocations, result: null, execution: child.value || null };
+}
+
+async function selectedFromHandoff(clients, config, session, handoff, now) {
+  const verificationStartedWallMs = Date.now();
+  const verificationStartedMonotonicMs = performance.now();
+  if (handoff?.schema !== "polyedge.funded_intent_handoff.v1") {
+    throw new Error("fail closed: unsupported funded intent handoff schema");
+  }
+  const decisionId = clean(handoff.decision_id);
+  const blobName = clean(handoff.intent_blob_name);
+  const expectedHash = hash(handoff.intent_sha256);
+  if (!/^[0-9a-f]{64}$/.test(decisionId) ||
+      blobName !== `${config.intentPrefix}/${decisionId}.json` ||
+      !expectedHash ||
+      Date.parse(handoff.decision_ts) > now.getTime() ||
+      Date.parse(handoff.valid_until) - now.getTime() < config.minRemainingTtlMs) {
+    throw new Error("fail closed: funded intent handoff binding or TTL is invalid");
+  }
+  const response = await clients.intents.getBlobClient(blobName).download();
+  const bytes = await streamToBuffer(response.readableStreamBody);
+  const actualHash = sha256(bytes);
+  if (actualHash !== expectedHash) throw new Error("fail closed: funded intent handoff SHA-256 mismatch");
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error("fail closed: funded intent handoff blob is not valid JSON"); }
+  if (value.decision_id !== decisionId ||
+      value.decision_ts !== handoff.decision_ts ||
+      value.valid_until !== handoff.valid_until ||
+      !qualifies(value, blobName, actualHash, config, session, now)) {
+    throw new Error("fail closed: funded intent handoff does not qualify for execution");
+  }
+  const authorizationName = authorizationBlobName(config, session, value);
+  if (await clients.control.getBlobClient(authorizationName).exists()) {
+    const completionName = completionBlobName(config, session, value);
+    if (await clients.control.getBlobClient(completionName).exists()) {
+      const completion = await readJsonBlob(clients.control, completionName);
+      if (completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
+          completion.session_id === session.session_id &&
+          completion.decision_id === value.decision_id &&
+          completion.authorization_blob_name === authorizationName &&
+          ["child_completed", "expired_before_child_launch", "child_failed_closed_pre_submission"].includes(completion.status)) {
+        return {
+          value,
+          blobName,
+          hash: actualHash,
+          decisionMs: Date.parse(value.decision_ts),
+          duplicateCompletion: completion,
+          handoffTiming: {
+            hash_verification_started_wall_ms: verificationStartedWallMs,
+            hash_verification_started_monotonic_ms: verificationStartedMonotonicMs,
+            hash_verified_wall_ms: Date.now(),
+            hash_verified_monotonic_ms: performance.now()
+          }
+        };
+      }
+      throw new Error("fail closed: funded intent completion is not bound to its authorization");
+    }
+    throw new Error("fail closed: funded intent handoff already has an authorization");
+  }
+  return {
+    value,
+    blobName,
+    hash: actualHash,
+    decisionMs: Date.parse(value.decision_ts),
+    handoffTiming: {
+      hash_verification_started_wall_ms: verificationStartedWallMs,
+      hash_verification_started_monotonic_ms: verificationStartedMonotonicMs,
+      hash_verified_wall_ms: Date.now(),
+      hash_verified_monotonic_ms: performance.now()
+    }
+  };
 }
 
 function validateSession(config) {
@@ -332,6 +544,10 @@ function authorizationBlobName(config, session, intent) {
   return `${config.controlPrefix}/sessions/${session.session_id}/authorizations/${intent.decision_id}.json`;
 }
 
+function completionBlobName(config, session, intent) {
+  return `${config.controlPrefix}/sessions/${session.session_id}/completed/${intent.decision_id}.json`;
+}
+
 function childEnvironment(env, config, session, intent, authorization, childRunId) {
   return {
     ...env,
@@ -343,6 +559,10 @@ function childEnvironment(env, config, session, intent, authorization, childRunI
     FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "false",
     STRATEGY_CANARY_DRY_RUN: "false",
     STRATEGY_CANARY_RUN_ID: childRunId,
+    STRATEGY_CANARY_MARKET_ID: intent.value.market_id,
+    STRATEGY_CANARY_CONDITION_ID: intent.value.condition_id,
+    STRATEGY_CANARY_TOKEN_ID: intent.value.token_id,
+    STRATEGY_CANARY_MARKET_END_TS: intent.value.market_end_ts,
     STRATEGY_CANARY_INTENT_BLOB_NAME: intent.blobName,
     STRATEGY_CANARY_INTENT_SHA256: intent.hash,
     STRATEGY_CANARY_PROMOTION_MANIFEST_BLOB_NAME: session.blobName,
@@ -388,7 +608,7 @@ function invokeCanaryChild(env) {
 
 async function writeCompletion(container, config, selected, authorization, childRunId, now, details) {
   return putImmutableOrVerify(container, {
-    blobName: `${config.controlPrefix}/sessions/${config.session.session_id}/completed/${selected.value.decision_id}.json`,
+    blobName: completionBlobName(config, config.session, selected.value),
     value: {
       schema: "polyedge.operator_funded_intent_completion.v1",
       session_id: config.session.session_id,
@@ -400,6 +620,13 @@ async function writeCompletion(container, config, selected, authorization, child
       ...details
     }
   });
+}
+
+async function readJsonBlob(container, blobName) {
+  const response = await container.getBlobClient(blobName).download();
+  const bytes = await streamToBuffer(response.readableStreamBody);
+  try { return JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error(`fail closed: durable funded control blob is not valid JSON (${blobName})`); }
 }
 
 async function putImmutableOrVerify(container, document) {

@@ -37,6 +37,8 @@ export async function connectLifecycleChannel({
   let duplicates = 0;
   let unparsed = 0;
   let reconnectPromise = null;
+  let requiresReconciliation = false;
+  let currentSubscription = structuredClone(subscription);
   const messages = [];
   const fingerprints = new Set();
 
@@ -64,6 +66,7 @@ export async function connectLifecycleChannel({
     open = false;
     if (!stopped && countGap) {
       gaps += 1;
+      requiresReconciliation = true;
       reconnectPromise ||= reconnect().finally(() => { reconnectPromise = null; });
     }
   }
@@ -87,32 +90,38 @@ export async function connectLifecycleChannel({
       return Promise.reject(new Error("fail closed: websocket is unavailable for heartbeat"));
     }
     if (state.pendingPong) {
-      return Promise.reject(new Error("fail closed: overlapping websocket heartbeat"));
+      return state.pendingPong.promise;
     }
-    return new Promise((resolve, reject) => {
-      const pongSequenceAtSend = state.pongSequence;
-      const pending = {
-        pongSequenceAtSend,
-        resolve,
-        reject,
-        timeoutTimer: null
-      };
-      state.pendingPong = pending;
-      pending.timeoutTimer = setTimer(() => {
-        if (state.pendingPong !== pending) return;
-        state.pendingPong = null;
-        reject(new Error("fail closed: websocket heartbeat timeout"));
-      }, heartbeatResponseTimeoutMs);
-      try {
-        state.lastPingWallMs = nowMs();
-        state.ws.send("PING");
-        ledger?.record(`${eventType}_ping`);
-      } catch (error) {
-        if (state.pendingPong === pending) state.pendingPong = null;
-        clearTimer(pending.timeoutTimer);
-        reject(error);
-      }
+    let resolvePending;
+    let rejectPending;
+    const promise = new Promise((resolve, reject) => {
+      resolvePending = resolve;
+      rejectPending = reject;
     });
+    const pongSequenceAtSend = state.pongSequence;
+    const pending = {
+      pongSequenceAtSend,
+      resolve: resolvePending,
+      reject: rejectPending,
+      promise,
+      timeoutTimer: null
+    };
+    state.pendingPong = pending;
+    pending.timeoutTimer = setTimer(() => {
+      if (state.pendingPong !== pending) return;
+      state.pendingPong = null;
+      rejectPending(new Error("fail closed: websocket heartbeat timeout"));
+    }, heartbeatResponseTimeoutMs);
+    try {
+      state.lastPingWallMs = nowMs();
+      state.ws.send("PING");
+      ledger?.record(`${eventType}_ping`);
+    } catch (error) {
+      if (state.pendingPong === pending) state.pendingPong = null;
+      clearTimer(pending.timeoutTimer);
+      rejectPending(error);
+    }
+    return promise;
   }
 
   function scheduleHeartbeat(state) {
@@ -212,7 +221,7 @@ export async function connectLifecycleChannel({
         ws.once("error", onOpenError);
         ws.once("close", onOpenClose);
       });
-      ws.send(JSON.stringify(subscription));
+      ws.send(JSON.stringify(currentSubscription));
       await sleep(settleMs);
       await sendHeartbeat(state);
       state.ready = true;
@@ -271,6 +280,75 @@ export async function connectLifecycleChannel({
     reconnectCount: () => reconnects,
     duplicateCount: () => duplicates,
     unparsedCount: () => unparsed,
+    requiresReconciliation: () => requiresReconciliation,
+    markReconciled: () => {
+      if (!open || socket?.readyState !== WebSocketImpl.OPEN) {
+        throw new Error("fail closed: disconnected websocket cannot be marked reconciled");
+      }
+      requiresReconciliation = false;
+      gaps = 0;
+      unparsed = 0;
+    },
+    lastPongWallMs: () => {
+      const values = messages
+        .filter((message) => message?._pong === true)
+        .map((message) => Number(message._received_wall_ms))
+        .filter(Number.isFinite);
+      return values.length ? Math.max(...values) : null;
+    },
+    forceHeartbeat: async () => {
+      if (reconnectPromise) await reconnectPromise;
+      if (!open || socket?.readyState !== WebSocketImpl.OPEN) {
+        throw new Error("fail closed: websocket is unavailable for forced heartbeat");
+      }
+      if (socketState.heartbeatTimer !== null) {
+        clearTimer(socketState.heartbeatTimer);
+        socketState.heartbeatTimer = null;
+      }
+      await sendHeartbeat(socketState);
+      scheduleHeartbeat(socketState);
+      return true;
+    },
+    updateSubscription: async ({ operation, markets = [], assets_ids = [] }) => {
+      if (!["subscribe", "unsubscribe"].includes(operation)) {
+        throw new Error("fail closed: websocket subscription operation is invalid");
+      }
+      if (reconnectPromise) await reconnectPromise;
+      if (!open || socket?.readyState !== WebSocketImpl.OPEN) {
+        throw new Error("fail closed: websocket is unavailable for subscription update");
+      }
+      const marketValues = [...new Set(markets.map(String).filter(Boolean))];
+      const assetValues = [...new Set(assets_ids.map(String).filter(Boolean))];
+      if (!marketValues.length && !assetValues.length) {
+        throw new Error("fail closed: websocket subscription update is empty");
+      }
+      const frame = { operation };
+      if (marketValues.length) frame.markets = marketValues;
+      if (assetValues.length) frame.assets_ids = assetValues;
+      socket.send(JSON.stringify(frame));
+      for (const [field, additions] of [["markets", marketValues], ["assets_ids", assetValues]]) {
+        if (!additions.length) continue;
+        const existing = new Set((currentSubscription[field] || []).map(String));
+        if (operation === "subscribe") additions.forEach((value) => existing.add(value));
+        else additions.forEach((value) => existing.delete(value));
+        currentSubscription[field] = [...existing];
+      }
+      ledger?.record(`${eventType}_subscription_updated`, {
+        operation,
+        markets: marketValues,
+        assets_ids: assetValues
+      });
+    },
+    waitForMessage: async (predicate, timeoutMs = openTimeoutMs) => {
+      const started = nowMs();
+      while (nowMs() - started <= timeoutMs) {
+        const match = messages.find(predicate);
+        if (match) return match;
+        await sleep(10);
+      }
+      throw new Error("fail closed: websocket subscription did not produce required evidence");
+    },
+    subscription: () => structuredClone(currentSubscription),
     close: () => {
       stopped = true;
       open = false;
@@ -305,7 +383,11 @@ export async function cancelOrderWithMetrics(client, orderId, ledger, options = 
   const sleep = options.sleep || defaultSleep;
   const cancelSendWallMs = nowMs();
   const cancelMono = nowMonotonic();
-  ledger?.record("venue_cancel_send", { order_id: orderId });
+  ledger?.record("venue_cancel_send", {
+    order_id: orderId,
+    wall_ms: cancelSendWallMs,
+    monotonic_ms: cancelMono
+  });
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {

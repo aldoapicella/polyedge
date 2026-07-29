@@ -1,4 +1,5 @@
 import { AssetType, Chain, ClobClient, OrderType, Side } from "@polymarket/clob-client-v2";
+import { pathToFileURL } from "node:url";
 import { createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
@@ -53,31 +54,25 @@ import {
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
 
-const config = loadCanaryConfig();
-const runKind = config.operatorDirect ? "funded-direct" : "strategy-canary";
-const runId = process.env.STRATEGY_CANARY_RUN_ID || `${runKind}-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
-const ledger = new EventLedger(runId);
+let config;
+let runKind;
+let runId;
+let ledger;
 let lease;
 let userChannel;
 let marketChannel;
 let orderSubmissionAttempted = false;
+let activeResources = null;
 
-try {
-  const result = await main();
-  console.log(JSON.stringify(sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...result })));
-} catch (error) {
-  process.exitCode = 1;
-  console.error(JSON.stringify({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, status: "failed_closed", order_submission_attempted: orderSubmissionAttempted, error: error.message }));
-} finally {
-  userChannel?.close();
-  marketChannel?.close();
-  if (lease) await lease.release().catch((error) => {
-    process.exitCode = 1;
-    console.error(JSON.stringify({ status: "failed_closed", error: `campaign lease release failed: ${error.message}` }));
-  });
+function setExecutionContext(env) {
+  config = loadCanaryConfig(env);
+  runKind = config.operatorDirect ? "funded-direct" : "strategy-canary";
+  runId = env.STRATEGY_CANARY_RUN_ID || `${runKind}-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
+  ledger = new EventLedger(runId);
+  orderSubmissionAttempted = false;
 }
 
-async function main() {
+async function initializeResources({ persistent = false } = {}) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable Azure Blob storage is unavailable");
   await container.createIfNotExists();
@@ -87,13 +82,10 @@ async function main() {
   const modelArtifact = artifactLocationFromUri(config.executionModelBlobUri, config.storageAccount);
   const modelContainer = storageContainer({ ...config, storageContainer: modelArtifact.container });
   if (!modelContainer) throw new Error("fail closed: execution model source container is unavailable");
-  const documentPromises = [
-    loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
+  const [manifestDocument, executionModelDocument] = await Promise.all([
     loadHashedJson(manifestContainer, config.manifestBlobName, config.manifestBlobHash),
-    loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash),
     loadHashedJson(modelContainer, modelArtifact.blobName, config.executionModelHash)
-  ];
-  const documentsPromise = Promise.all(documentPromises);
+  ]);
   const account = privateKeyToAccount(normalizePrivateKey(config.privateKey));
   const signer = createWalletClient({ account, chain: polygon, transport: http("https://polygon-bor-rpc.publicnode.com") });
   const client = new ClobClient({
@@ -106,15 +98,250 @@ async function main() {
     useServerTime: true,
     throwOnError: true
   });
-  const [intentDocument, manifestDocument] = await Promise.all(documentPromises.slice(0, 2));
-  if (!config.dryRun) lease = await acquireCampaignLease(config, runId);
-  const [
-    [, , authorizationDocument, executionModelDocument],
-    runtime
-  ] = await Promise.all([
-    documentsPromise,
-    capturePreflight(client, intentDocument.value, manifestDocument.value)
+  const resourceLease = !config.dryRun ? await acquireCampaignLease(config, persistent ? `funded-direct-service-${crypto.randomUUID()}` : runId) : null;
+  const ledgerMultiplexer = {
+    current: ledger,
+    record(event, payload) {
+      this.current?.record(event, payload);
+    }
+  };
+  let persistentUserChannel = null;
+  if (persistent) {
+    persistentUserChannel = await connectLifecycleChannel({
+      url: config.userWsUrl,
+      subscription: {
+        auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
+        type: "user"
+      },
+      ledger: ledgerMultiplexer,
+      eventType: "venue_user_channel"
+    });
+  }
+  return {
+    persistent,
+    container,
+    intentContainer,
+    manifestDocument,
+    executionModelDocument,
+    client,
+    lease: resourceLease,
+    ledgerMultiplexer,
+    userChannel: persistentUserChannel,
+    marketChannel: null,
+    warmedMarket: null,
+    busy: false,
+    baseBinding: {
+      manifestBlobName: config.manifestBlobName,
+      manifestBlobHash: config.manifestBlobHash,
+      executionModelBlobUri: config.executionModelBlobUri,
+      executionModelHash: config.executionModelHash,
+      candidateName: config.candidateName,
+      candidateVersion: config.candidateVersion,
+      candidateConfigHash: config.candidateConfigHash
+    }
+  };
+}
+
+async function closeResources(resources) {
+  resources?.userChannel?.close();
+  resources?.marketChannel?.close();
+  if (resources?.lease) await resources.lease.release();
+}
+
+function validatePersistentBinding(resources) {
+  const expected = resources.baseBinding;
+  const actual = {
+    manifestBlobName: config.manifestBlobName,
+    manifestBlobHash: config.manifestBlobHash,
+    executionModelBlobUri: config.executionModelBlobUri,
+    executionModelHash: config.executionModelHash,
+    candidateName: config.candidateName,
+    candidateVersion: config.candidateVersion,
+    candidateConfigHash: config.candidateConfigHash
+  };
+  for (const [field, value] of Object.entries(expected)) {
+    if (actual[field] !== value) throw new Error(`fail closed: persistent executor binding drifted for ${field}`);
+  }
+}
+
+async function ensurePersistentMarket(resources, { market_id, condition_id, token_id, token_ids, market_end_ts }) {
+  const requestedTokens = [...new Set(
+    (Array.isArray(token_ids) ? token_ids : [token_id]).map(String).filter(Boolean)
+  )];
+  const next = {
+    market_id: String(market_id || ""),
+    condition_id: String(condition_id || ""),
+    token_id: String(token_id || requestedTokens[0] || ""),
+    token_ids: requestedTokens,
+    market_end_ts: String(market_end_ts || "")
+  };
+  if (!next.market_id || !next.condition_id || !next.token_id || !Number.isFinite(Date.parse(next.market_end_ts))) {
+    throw new Error("fail closed: persistent market warmup is incomplete");
+  }
+  const subscriptionStartedWallMs = Date.now();
+  let needsFreshBook = false;
+  if (!resources.marketChannel) {
+    needsFreshBook = true;
+    resources.marketChannel = await connectLifecycleChannel({
+      url: config.marketWsUrl,
+      subscription: {
+        assets_ids: next.token_ids,
+        type: "market",
+        custom_feature_enabled: true
+      },
+      ledger: resources.ledgerMultiplexer,
+      eventType: "venue_market_channel"
+    });
+  } else if (!resources.warmedMarket ||
+      resources.warmedMarket.condition_id !== next.condition_id ||
+      !next.token_ids.every((value) => resources.warmedMarket.token_ids.includes(value))) {
+    needsFreshBook = true;
+    await resources.marketChannel.updateSubscription({ operation: "subscribe", assets_ids: next.token_ids });
+    if (resources.warmedMarket?.token_ids?.length &&
+        resources.warmedMarket.condition_id !== next.condition_id) {
+      await resources.marketChannel.updateSubscription({
+        operation: "unsubscribe",
+        assets_ids: resources.warmedMarket.token_ids
+      });
+    }
+  } else {
+    const latest = [...resources.marketChannel.messages].reverse().find((message) =>
+      String(message?.event_type || message?.type || "").toLowerCase() === "book" &&
+      String(message?.asset_id || message?.token_id || message?.tokenId || "") === next.token_id
+    );
+    if (!latest) {
+      needsFreshBook = true;
+      await resources.marketChannel.updateSubscription({ operation: "subscribe", assets_ids: [next.token_id] });
+    }
+  }
+  if (needsFreshBook) {
+    await resources.marketChannel.waitForMessage((message) =>
+      Number(message?._received_wall_ms) >= subscriptionStartedWallMs &&
+      String(message?.event_type || message?.type || "").toLowerCase() === "book" &&
+      String(message?.asset_id || message?.token_id || message?.tokenId || "") === next.token_id
+    , 2_000);
+  }
+  resources.warmedMarket = next;
+  return next;
+}
+
+async function reconcilePersistentChannels(resources, market) {
+  if (!resources.userChannel.requiresReconciliation() &&
+      !resources.marketChannel.requiresReconciliation()) return;
+  const [openOrders, trades] = await Promise.all([
+    getOpenOrdersStrict(resources.client),
+    resources.client.getTrades({ market: market.condition_id })
   ]);
+  if (openOrders.length !== 0 || !Array.isArray(trades)) {
+    throw new Error("fail closed: websocket reconnect reconciliation did not prove a coherent account");
+  }
+  resources.userChannel.markReconciled();
+  resources.marketChannel.markReconciled();
+}
+
+export async function createPersistentCanaryExecutor({ env = process.env } = {}) {
+  setExecutionContext(env);
+  const resources = await initializeResources({ persistent: true });
+  return {
+    async warmMarket(value) {
+      const warmed = await ensurePersistentMarket(resources, value);
+      const warmupStartedMonotonicMs = performance.now();
+      const [geoblock, serverTime, book] = await Promise.all([
+        fetchJson("https://polymarket.com/api/geoblock"),
+        resources.client.getServerTime(),
+        resources.client.getOrderBook(String(warmed.token_id))
+      ]);
+      assertEligibleOrigin(geoblock, config);
+      const venueClock = Number(serverTime?.server_time ?? serverTime?.time ?? serverTime);
+      const restBestAsk = Math.min(...(book?.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
+      const streamEvidence = streamBookEvidence(resources.marketChannel.messages, warmed.token_id);
+      if (!Number.isFinite(venueClock) ||
+          !Number.isFinite(restBestAsk) ||
+          !Number.isFinite(streamEvidence?.bestAsk) ||
+          Math.abs(restBestAsk - streamEvidence.bestAsk) > 1e-9) {
+        throw new Error("fail closed: persistent warmup REST, clock, and public stream evidence disagree");
+      }
+      return {
+        ...warmed,
+        no_sign: true,
+        rest_stream_book_agreement: true,
+        warmup_duration_ms: performance.now() - warmupStartedMonotonicMs
+      };
+    },
+    async execute(executionEnv) {
+      if (resources.busy) throw new Error("fail closed: persistent executor is already processing an intent");
+      resources.busy = true;
+      try {
+        setExecutionContext(executionEnv);
+        validatePersistentBinding(resources);
+        resources.ledgerMultiplexer.current = ledger;
+        const warmedMarket = await ensurePersistentMarket(resources, {
+          market_id: executionEnv.STRATEGY_CANARY_MARKET_ID,
+          condition_id: executionEnv.STRATEGY_CANARY_CONDITION_ID,
+          token_id: executionEnv.STRATEGY_CANARY_TOKEN_ID,
+          market_end_ts: executionEnv.STRATEGY_CANARY_MARKET_END_TS
+        });
+        await reconcilePersistentChannels(resources, warmedMarket);
+        lease = resources.lease;
+        userChannel = resources.userChannel;
+        marketChannel = resources.marketChannel;
+        activeResources = resources;
+        const result = await main(resources);
+        return sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...result });
+      } finally {
+        activeResources = null;
+        resources.busy = false;
+      }
+    },
+    async close() {
+      await closeResources(resources);
+    },
+    status() {
+      return {
+        user_channel_ready: resources.userChannel?.isOpen() === true,
+        market_channel_ready: resources.marketChannel?.isOpen() === true,
+        user_channel_gaps: resources.userChannel?.gapCount() || 0,
+        market_channel_gaps: resources.marketChannel?.gapCount() || 0,
+        user_channel_reconnects: resources.userChannel?.reconnectCount() || 0,
+        market_channel_reconnects: resources.marketChannel?.reconnectCount() || 0,
+        reconnect_reconciliation_required:
+          resources.userChannel?.requiresReconciliation() === true ||
+          resources.marketChannel?.requiresReconciliation() === true,
+        warmed_market: resources.warmedMarket,
+        busy: resources.busy
+      };
+    }
+  };
+}
+
+export async function runCanaryOnce({ env = process.env } = {}) {
+  setExecutionContext(env);
+  const resources = await initializeResources({ persistent: false });
+  lease = resources.lease;
+  activeResources = resources;
+  try {
+    return sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...await main(resources) });
+  } finally {
+    activeResources = null;
+    userChannel?.close();
+    marketChannel?.close();
+    await closeResources(resources);
+  }
+}
+
+async function main(resources) {
+  const {
+    container,
+    intentContainer,
+    manifestDocument,
+    executionModelDocument,
+    client
+  } = resources;
+  const [intentDocument, authorizationDocument] = await Promise.all([
+    loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
+    loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash)
+  ]);
+  const runtime = await capturePreflight(client, intentDocument.value, manifestDocument.value);
   const documents = {
     intent: intentDocument.value,
     manifest: manifestDocument.value,
@@ -128,7 +355,23 @@ async function main() {
     documents,
     runtime,
     runId,
-    reserveRisk: (reservation) => reserveProbeRisk(config, reservation),
+    reserveRisk: async (reservation) => {
+      const startedWallMs = Date.now();
+      const startedMonotonicMs = performance.now();
+      ledger.record("funded_risk_reservation_started", {
+        wall_ms: startedWallMs,
+        monotonic_ms: startedMonotonicMs,
+        decision_id: documents.intent.decision_id
+      });
+      const value = await reserveProbeRisk(config, reservation);
+      ledger.record("funded_risk_reservation_completed", {
+        wall_ms: Date.now(),
+        monotonic_ms: performance.now(),
+        duration_ms: performance.now() - startedMonotonicMs,
+        probe_id: value.probe_id
+      });
+      return value;
+    },
     finalizeNoOrder: (reservation) => finalizeProbeRisk(config, reservation, {
       state: "released_no_order",
       order_submitted: false,
@@ -136,7 +379,22 @@ async function main() {
       reconciliation_complete: true,
       zero_open_orders_confirmed: true
     }),
-    consumeAuthorization: (value) => consumeOneShotAuthorization(container, value),
+    consumeAuthorization: async (value) => {
+      const startedMonotonicMs = performance.now();
+      ledger.record("funded_authorization_consumption_started", {
+        wall_ms: Date.now(),
+        monotonic_ms: startedMonotonicMs,
+        decision_id: documents.intent.decision_id
+      });
+      const consumed = await consumeOneShotAuthorization(container, value);
+      ledger.record("funded_authorization_consumed", {
+        wall_ms: Date.now(),
+        monotonic_ms: performance.now(),
+        duration_ms: performance.now() - startedMonotonicMs,
+        decision_id: documents.intent.decision_id
+      });
+      return consumed;
+    },
     executeLifecycle: (value) => executeLifecycle(client, value)
   });
   const evidenceProbe = result.lifecycle?.evidence_probe;
@@ -258,6 +516,8 @@ async function main() {
 }
 
 async function capturePreflight(client, intent, manifest, ignoredReservationId = null) {
+  const capturedStartedWallMs = Date.now();
+  const capturedStartedMonotonicMs = performance.now();
   const clock = async () => {
     const requestStarted = Date.now();
     const serverTimeResponse = await client.getServerTime();
@@ -356,6 +616,16 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     authorizedStartingCollateral: config.operatorDirect ? Number(manifest?.starting_collateral) : null,
     requireZeroExternalCashFlows: config.operatorDirect
   });
+  const capturedCompletedWallMs = Date.now();
+  const captureDurationMs = Math.max(0, performance.now() - capturedStartedMonotonicMs);
+  ledger?.record("funded_safety_snapshot_completed", {
+    wall_ms: capturedCompletedWallMs,
+    monotonic_ms: performance.now(),
+    duration_ms: captureDurationMs,
+    decision_id: intent.decision_id,
+    open_order_count: openOrders.length,
+    risk_passed: risk.passed === true
+  });
   return {
     geoblock,
     clockDriftMs,
@@ -374,6 +644,9 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     fillModelVersion: config.requiredFillModelVersion,
     exactResolutionSource: intent.exact_resolution_source === true,
     resolutionSource: intent.resolution_source,
+    capturedStartedWallMs,
+    capturedCompletedWallMs,
+    captureDurationMs,
     client
   };
 }
@@ -386,36 +659,42 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     lease.assertHealthy();
     // Both channels are opened before signing so partial fills, cancellation races,
     // public trade-through, and markout evidence have no intentional blind window.
-    const userChannelPromise = connectLifecycleChannel({
-      url: config.userWsUrl,
-      subscription: {
-        auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
-        markets: [intent.condition_id],
-        type: "user"
-      },
-      ledger,
-      eventType: "venue_user_channel"
-    }).then((channel) => {
-      userChannel = channel;
-      return channel;
-    });
-    const marketChannelPromise = connectLifecycleChannel({
-      url: config.marketWsUrl,
-      subscription: {
-        assets_ids: [intent.token_id],
-        type: "market",
-        custom_feature_enabled: true
-      },
-      ledger,
-      eventType: "venue_market_channel"
-    }).then((channel) => {
-      marketChannel = channel;
-      return channel;
-    });
+    const userChannelPromise = activeResources?.persistent
+      ? Promise.resolve(userChannel)
+      : connectLifecycleChannel({
+          url: config.userWsUrl,
+          subscription: {
+            auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
+            markets: [intent.condition_id],
+            type: "user"
+          },
+          ledger,
+          eventType: "venue_user_channel"
+        }).then((channel) => {
+          userChannel = channel;
+          return channel;
+        });
+    const marketChannelPromise = activeResources?.persistent
+      ? Promise.resolve(marketChannel)
+      : connectLifecycleChannel({
+          url: config.marketWsUrl,
+          subscription: {
+            assets_ids: [intent.token_id],
+            type: "market",
+            custom_feature_enabled: true
+          },
+          ledger,
+          eventType: "venue_market_channel"
+        }).then((channel) => {
+          marketChannel = channel;
+          return channel;
+        });
     [, , refreshed] = await Promise.all([
       userChannelPromise,
       marketChannelPromise,
-      capturePreflight(client, intent, documents.manifest, reservation.probe_id)
+      activeResources?.persistent
+        ? captureFinalGate(client, intent, runtime)
+        : capturePreflight(client, intent, documents.manifest, reservation.probe_id)
     ]);
     // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
     // authorization contract immediately before the only signing call.
@@ -425,6 +704,19 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     if (userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
         userChannel.unparsedCount() > 0 || marketChannel.unparsedCount() > 0) {
       throw new Error("fail closed: authenticated/public websocket completeness was lost before submission");
+    }
+    if (activeResources?.persistent) {
+      const snapshotAgeMs = Date.now() - Number(runtime.capturedCompletedWallMs);
+      const finalGateAgeMs = Date.now() - Number(refreshed.finalGateCompletedWallMs);
+      if (!Number.isFinite(snapshotAgeMs) || snapshotAgeMs > 1_500) {
+        throw new Error(`fail closed: full safety snapshot exceeded 1500ms at signing (${snapshotAgeMs}ms)`);
+      }
+      if (!Number.isFinite(finalGateAgeMs) || finalGateAgeMs > 500) {
+        throw new Error(`fail closed: final volatile gate exceeded 500ms at signing (${finalGateAgeMs}ms)`);
+      }
+      if (Date.parse(intent.valid_until) - Date.now() < 15_000) {
+        throw new Error("fail closed: persistent executor has less than 15 seconds of intent TTL before signing");
+      }
     }
     preSendCapturedWallMs = Date.now();
     preSendContext = {
@@ -458,6 +750,8 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     orderSubmissionAttempted = true;
     ledger.record("venue_order_send", {
       probe_id: reservation.probe_id,
+      wall_ms: Date.now(),
+      monotonic_ms: sentMonotonicMs,
       active_valid_until: intent.valid_until,
       venue_gtd_expiry_ts: intent.gtd_expiry_ts,
       order: { token_id: intent.token_id, price: intent.price, shares: intent.shares, post_only: true }
@@ -489,8 +783,16 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
   }
   const acknowledgedAt = new Date();
   const acknowledgementLatencyMs = Math.max(0, performance.now() - sentMonotonicMs);
+  const acknowledgedMonotonicMs = performance.now();
   const orderId = String(response.orderID);
-  ledger.record("venue_order_http_ack", { probe_id: reservation.probe_id, order_id: orderId, response, client_to_http_ack_ms: acknowledgementLatencyMs });
+  ledger.record("venue_order_http_ack", {
+    probe_id: reservation.probe_id,
+    order_id: orderId,
+    response,
+    wall_ms: acknowledgedAt.getTime(),
+    monotonic_ms: acknowledgedMonotonicMs,
+    client_to_http_ack_ms: acknowledgementLatencyMs
+  });
   let markoutCapture;
   try {
     markoutCapture = beginFillMarkoutCapture(
@@ -538,6 +840,12 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       response: cancellation.cancelResponse,
       client_cancel_round_trip_ms: cancellation.cancelRoundTripMs
     });
+    const reconciliationStartedMonotonicMs = performance.now();
+    ledger.record("funded_terminal_reconciliation_started", {
+      wall_ms: Date.now(),
+      monotonic_ms: reconciliationStartedMonotonicMs,
+      order_id: orderId
+    });
     const reconciliation = await waitForStablePostCancelReconciliation({
       client,
       conditionId: intent.condition_id,
@@ -568,6 +876,14 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     const restOrderReturned = Boolean(reconciliation.finalOrder);
     const reconciliationComplete = reconciliation.zeroOpenOrders && reconciliation.stableFinality &&
       reconciliation.terminalConfirmed && restOrderReturned && matchedSizeSourceAgreement && tradeIdSourceAgreement;
+    ledger.record("funded_terminal_reconciliation_completed", {
+      wall_ms: Date.now(),
+      monotonic_ms: performance.now(),
+      duration_ms: performance.now() - reconciliationStartedMonotonicMs,
+      order_id: orderId,
+      reconciliation_complete: reconciliationComplete,
+      zero_open_orders_confirmed: reconciliation.zeroOpenOrders
+    });
     const matchedRisk = matchedShares * (Number(intent.price) +
       polymarketV2FeePerShare(intent.price, refreshed.feeRate, refreshed.feeExponent));
     await finalizeProbeRisk(config, reservation, {
@@ -753,6 +1069,90 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     }
     throw new Error(`fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (${error.message})`);
   }
+}
+
+async function captureFinalGate(client, intent, runtime) {
+  const gateStartedWallMs = Date.now();
+  const gateStartedMonotonicMs = performance.now();
+  const clock = async () => {
+    const requestStarted = Date.now();
+    const serverTimeResponse = await client.getServerTime();
+    const requestFinished = Date.now();
+    const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
+    const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
+    const clockRoundTripMs = requestFinished - requestStarted;
+    const localMidpointMs = (requestStarted + requestFinished) / 2;
+    const clockServerMinusLocalMs = serverMs - localMidpointMs;
+    const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
+    return {
+      clockDriftMs: Math.abs(clockServerMinusLocalMs),
+      clockServerMinusLocalMs,
+      clockRoundTripMs,
+      clockUncertaintyMs: clockRoundTripMs / 2 + serverClockQuantizationMs
+    };
+  };
+  const [book, openOrders, clockEvidence] = await Promise.all([
+    client.getOrderBook(String(intent.token_id)),
+    getOpenOrdersStrict(client),
+    clock(),
+    userChannel.forceHeartbeat(),
+    marketChannel.forceHeartbeat()
+  ]);
+  if (openOrders.length !== 0) throw new Error("fail closed: final volatile gate found an open order");
+  const streamEvidence = streamBookEvidence(marketChannel.messages, intent.token_id);
+  if (!streamEvidence) throw new Error("fail closed: final volatile gate lacks public stream top-of-book evidence");
+  const restBestAsk = Math.min(...(book.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
+  const streamBestAsk = Number(streamEvidence.bestAsk);
+  const restTick = Number(book.tick_size ?? book.tickSize);
+  if (![restBestAsk, streamBestAsk, restTick].every(Number.isFinite) ||
+      Math.abs(restBestAsk - streamBestAsk) > 1e-9) {
+    throw new Error("fail closed: REST and public stream book disagree at the final volatile gate");
+  }
+  const finalGateCompletedWallMs = Date.now();
+  const finalGateDurationMs = Math.max(0, performance.now() - gateStartedMonotonicMs);
+  ledger?.record("funded_final_volatile_gate_completed", {
+    wall_ms: finalGateCompletedWallMs,
+    monotonic_ms: performance.now(),
+    duration_ms: finalGateDurationMs,
+    decision_id: intent.decision_id,
+    rest_best_ask: restBestAsk,
+    stream_best_ask: streamBestAsk,
+    open_order_count: 0
+  });
+  return {
+    ...runtime,
+    ...clockEvidence,
+    book,
+    openOrderCount: 0,
+    finalGateStartedWallMs: gateStartedWallMs,
+    finalGateCompletedWallMs,
+    finalGateDurationMs
+  };
+}
+
+export function streamBookEvidence(messages, tokenId) {
+  const expectedToken = String(tokenId);
+  for (const message of [...(messages || [])].reverse()) {
+    const type = String(message?.event_type || message?.type || "").toLowerCase();
+    if (type === "best_bid_ask" &&
+        String(message?.asset_id || message?.token_id || message?.tokenId || "") === expectedToken) {
+      const bestAsk = Number(message.best_ask ?? message.bestAsk);
+      if (Number.isFinite(bestAsk)) return { bestAsk, source: type, receivedWallMs: Number(message._received_wall_ms) };
+    }
+    if (type === "price_change") {
+      const change = [...(message.price_changes || [])].reverse().find((value) =>
+        String(value?.asset_id || value?.token_id || value?.tokenId || "") === expectedToken
+      );
+      const bestAsk = Number(change?.best_ask ?? change?.bestAsk);
+      if (Number.isFinite(bestAsk)) return { bestAsk, source: type, receivedWallMs: Number(message._received_wall_ms) };
+    }
+    if (type === "book" &&
+        String(message?.asset_id || message?.token_id || message?.tokenId || "") === expectedToken) {
+      const bestAsk = Math.min(...(message.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
+      if (Number.isFinite(bestAsk)) return { bestAsk, source: type, receivedWallMs: Number(message._received_wall_ms) };
+    }
+  }
+  return null;
 }
 
 async function uploadFailedPostAckEvidence({ intent, runtime, reservation, orderId, acknowledgedAt, sentAt, acknowledgementLatencyMs, preSendContext, emergency, originalError }) {
@@ -978,3 +1378,19 @@ function normalizePrivateKey(value) { const clean = String(value || "").trim(); 
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  runCanaryOnce().then((result) => {
+    console.log(JSON.stringify(result));
+  }).catch((error) => {
+    process.exitCode = 1;
+    console.error(JSON.stringify({
+      schema: "polyedge.strategy_canary_run.v1",
+      run_id: runId || null,
+      status: "failed_closed",
+      order_submission_attempted: orderSubmissionAttempted,
+      error: error.message
+    }));
+  });
+}

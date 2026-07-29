@@ -285,6 +285,9 @@ pub struct AzureConfig {
     pub shadow_book_sample_ms: usize,
     pub publish_strategy_canary_intents: bool,
     pub strategy_canary_intent_prefix: String,
+    pub funded_direct_service_bus_enabled: bool,
+    pub funded_direct_service_bus_namespace: String,
+    pub funded_direct_service_bus_queue: String,
     pub strategy_intent_operator_direct: bool,
     pub strategy_intent_target_order_notional: Decimal,
     pub strategy_intent_max_order_notional: Decimal,
@@ -311,6 +314,9 @@ impl Default for AzureConfig {
             publish_strategy_canary_intents: false,
             strategy_canary_intent_prefix:
                 "reports/research/venue-probe/control/strategy-canary/intents".to_owned(),
+            funded_direct_service_bus_enabled: false,
+            funded_direct_service_bus_namespace: String::new(),
+            funded_direct_service_bus_queue: String::new(),
             strategy_intent_operator_direct: false,
             strategy_intent_target_order_notional: Decimal::ZERO,
             strategy_intent_max_order_notional: Decimal::ONE,
@@ -516,6 +522,18 @@ impl RuntimeSettings {
             "STRATEGY_CANARY_INTENT_PREFIX",
             settings.azure.strategy_canary_intent_prefix,
         );
+        settings.azure.funded_direct_service_bus_enabled = env_bool(
+            "FUNDED_DIRECT_SERVICE_BUS_ENABLED",
+            settings.azure.funded_direct_service_bus_enabled,
+        );
+        settings.azure.funded_direct_service_bus_namespace = env_string(
+            "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE",
+            settings.azure.funded_direct_service_bus_namespace,
+        );
+        settings.azure.funded_direct_service_bus_queue = env_string(
+            "FUNDED_DIRECT_SERVICE_BUS_QUEUE",
+            settings.azure.funded_direct_service_bus_queue,
+        );
         settings.azure.strategy_intent_operator_direct = env_bool(
             "STRATEGY_INTENT_OPERATOR_DIRECT",
             settings.azure.strategy_intent_operator_direct,
@@ -669,6 +687,19 @@ impl RuntimeSettings {
         if !self.azure.publish_strategy_canary_intents {
             reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
         }
+        if self.azure.strategy_intent_operator_direct
+            && (!self.azure.funded_direct_service_bus_enabled
+                || self
+                    .azure
+                    .funded_direct_service_bus_namespace
+                    .trim()
+                    .is_empty()
+                || self.azure.funded_direct_service_bus_queue.trim().is_empty())
+        {
+            reasons.push(
+                "operator-direct intent publication requires the managed-identity Service Bus handoff",
+            );
+        }
         if !matches!(
             self.azure.storage_container_name.as_str(),
             "polyedge-shadow-events" | "polyedge-shadow-qset-events"
@@ -784,6 +815,9 @@ impl RuntimeSettings {
                 "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
                 "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
                 "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
+                "funded_direct_service_bus_enabled": self.azure.funded_direct_service_bus_enabled,
+                "funded_direct_service_bus_namespace": self.azure.funded_direct_service_bus_namespace,
+                "funded_direct_service_bus_queue": self.azure.funded_direct_service_bus_queue,
                 "strategy_intent_operator_direct": self.azure.strategy_intent_operator_direct,
                 "strategy_intent_target_order_notional": self.azure.strategy_intent_target_order_notional.to_string(),
                 "strategy_intent_max_order_notional": self.azure.strategy_intent_max_order_notional.to_string(),

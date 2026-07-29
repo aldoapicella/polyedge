@@ -6,11 +6,14 @@ use polyedge_domain::{
 };
 use polyedge_engine::{crypto_taker_fee_per_share, FrozenStrategyMode, StrategyDecisionMetadata};
 use polyedge_reporting::research::{parse_azure_artifact_uri, PromotionManifestV1, PromotionPhase};
-use polyedge_storage::{AzureBlobClient, AzureBlobError, ImmutableBlobWrite};
+use polyedge_storage::{
+    AzureBlobClient, AzureBlobError, AzureServiceBusSender, ImmutableBlobWrite,
+};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
+use std::time::Instant;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
 // The frozen strategy's quote TTL controls how long a maker order may rest.
@@ -34,12 +37,26 @@ pub(super) struct IntentPublisherConfig {
     container: String,
     client_id: Option<String>,
     prefix: String,
+    operator_direct: bool,
+    service_bus_namespace: String,
+    service_bus_queue: String,
+}
+
+pub(super) struct IntentPublisher {
+    blob_client: AzureBlobClient,
+    service_bus_sender: Option<AzureServiceBusSender>,
+    prefix: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PublishedIntent {
     pub blob_name: String,
     pub artifact_sha256: String,
+    pub queue_handoff_sent: bool,
+    pub blob_commit_wall_ts: DateTime<Utc>,
+    pub blob_commit_elapsed_ms: u64,
+    pub queue_send_wall_ts: Option<DateTime<Utc>>,
+    pub queue_send_elapsed_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,32 +107,155 @@ impl IntentPublisherConfig {
             container: settings.azure.storage_container_name.clone(),
             client_id: env::var("AZURE_CLIENT_ID").ok(),
             prefix,
+            operator_direct: settings.azure.strategy_intent_operator_direct,
+            service_bus_namespace: settings
+                .azure
+                .funded_direct_service_bus_namespace
+                .trim()
+                .to_owned(),
+            service_bus_queue: settings
+                .azure
+                .funded_direct_service_bus_queue
+                .trim()
+                .to_owned(),
         })
     }
 
-    pub(super) fn publish(&self, intent: &ExecutionIntentV1) -> Result<PublishedIntent, String> {
+    pub(super) fn connect(self) -> Result<IntentPublisher, String> {
+        let service_bus_sender = if self.operator_direct {
+            if self.service_bus_namespace.is_empty() || self.service_bus_queue.is_empty() {
+                return Err(
+                    "operator-direct intent publisher requires an exact Service Bus binding"
+                        .to_owned(),
+                );
+            }
+            Some(AzureServiceBusSender::with_managed_identity(
+                self.service_bus_namespace,
+                self.service_bus_queue,
+                self.client_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(IntentPublisher {
+            blob_client: AzureBlobClient::with_managed_identity(
+                self.account,
+                self.container,
+                self.client_id,
+            ),
+            service_bus_sender,
+            prefix: self.prefix,
+        })
+    }
+}
+
+impl IntentPublisher {
+    pub(super) fn publish(
+        &mut self,
+        intent: &ExecutionIntentV1,
+    ) -> Result<PublishedIntent, String> {
+        let publish_started = Instant::now();
         intent.validate()?;
         let bytes = serde_json::to_vec_pretty(intent).map_err(|error| error.to_string())?;
         let artifact_sha256 = sha256_bytes(&bytes);
         let blob_name = intent_blob_name(&self.prefix, &intent.decision_id)?;
-        let mut client = AzureBlobClient::with_managed_identity(
-            self.account.clone(),
-            self.container.clone(),
-            self.client_id.clone(),
-        );
-        match client
+        match self
+            .blob_client
             .upload_block_blob_bytes_if_absent(&blob_name, &bytes, "application/json")
             .map_err(|error| error.to_string())?
         {
-            ImmutableBlobWrite::Created => Ok(PublishedIntent {
-                blob_name,
-                artifact_sha256,
-            }),
-            ImmutableBlobWrite::AlreadyExists => Err(format!(
-                "immutable strategy canary intent already exists: {blob_name}"
-            )),
+            ImmutableBlobWrite::Created => {}
+            ImmutableBlobWrite::AlreadyExists => {
+                let existing = self
+                    .blob_client
+                    .download_blob_bytes(&blob_name)
+                    .map_err(|error| error.to_string())?;
+                if existing != bytes {
+                    return Err(format!(
+                        "immutable strategy canary intent collision: {blob_name}"
+                    ));
+                }
+            }
         }
+        let blob_commit_wall_ts = Utc::now();
+        let blob_commit_elapsed_ms = publish_started.elapsed().as_millis() as u64;
+        let mut queue_send_wall_ts = None;
+        let mut queue_send_elapsed_ms = None;
+        let queue_handoff_sent = if let Some(sender) = &mut self.service_bus_sender {
+            let remaining_ms = (intent.valid_until - Utc::now()).num_milliseconds();
+            if remaining_ms < 1_000 {
+                return Err(
+                    "funded intent expired before the Service Bus handoff could be sent".to_owned(),
+                );
+            }
+            let queue_send_started = Instant::now();
+            sender
+                .send_json(
+                    &intent.decision_id,
+                    ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64,
+                    &funded_intent_handoff(intent, &blob_name, &artifact_sha256),
+                )
+                .map_err(|error| error.to_string())?;
+            queue_send_wall_ts = Some(Utc::now());
+            queue_send_elapsed_ms = Some(queue_send_started.elapsed().as_millis() as u64);
+            true
+        } else {
+            false
+        };
+        Ok(PublishedIntent {
+            blob_name,
+            artifact_sha256,
+            queue_handoff_sent,
+            blob_commit_wall_ts,
+            blob_commit_elapsed_ms,
+            queue_send_wall_ts,
+            queue_send_elapsed_ms,
+        })
     }
+
+    pub(super) fn warm_market(&mut self, market: &MarketSpec) -> Result<bool, String> {
+        let Some(sender) = &mut self.service_bus_sender else {
+            return Ok(false);
+        };
+        let message = funded_market_warmup(market, Utc::now());
+        let message_id = format!(
+            "warmup-{}",
+            sha256_hex(
+                format!("{}:{}", market.condition_id, market.end_ts.to_rfc3339()).as_bytes()
+            )
+        );
+        sender
+            .send_json(&message_id, 30, &message)
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+}
+
+fn funded_intent_handoff(
+    intent: &ExecutionIntentV1,
+    blob_name: &str,
+    artifact_sha256: &str,
+) -> Value {
+    json!({
+        "schema": "polyedge.funded_intent_handoff.v1",
+        "decision_id": intent.decision_id,
+        "intent_blob_name": blob_name,
+        "intent_sha256": artifact_sha256,
+        "decision_ts": intent.decision_ts,
+        "valid_until": intent.valid_until
+    })
+}
+
+fn funded_market_warmup(market: &MarketSpec, producer_ts: DateTime<Utc>) -> Value {
+    json!({
+        "schema": "polyedge.funded_market_warmup.v1",
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "token_id": market.up_token_id,
+        "token_ids": [market.up_token_id, market.down_token_id],
+        "market_end_ts": market.end_ts,
+        "producer_ts": producer_ts
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -755,7 +895,7 @@ mod tests {
         FundedLadderStateV1, ImmutableArtifactBindingV1, ProfitabilityMetrics, PromotionEvaluation,
         QueueModelTransitionV1,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn fixture() -> (
         RuntimeSettings,
@@ -1091,6 +1231,74 @@ mod tests {
             intent_blob_name("reports/intents", &intent.decision_id).unwrap(),
             format!("reports/intents/{}.json", intent.decision_id)
         );
+    }
+
+    #[test]
+    fn funded_handoff_contains_only_immutable_binding_and_timing_fields() {
+        let (settings, market, fair, reference, book, decision, metadata, now) = fixture();
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        let blob_name = format!("reports/intents/{}.json", intent.decision_id);
+        let handoff =
+            funded_intent_handoff(&intent, &blob_name, &format!("sha256:{}", "f".repeat(64)));
+        let keys = handoff
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "schema",
+                "decision_id",
+                "intent_blob_name",
+                "intent_sha256",
+                "decision_ts",
+                "valid_until"
+            ])
+        );
+        assert_eq!(
+            handoff["schema"],
+            Value::String("polyedge.funded_intent_handoff.v1".to_owned())
+        );
+        assert!(handoff.get("price").is_none());
+        assert!(handoff.get("notional").is_none());
+    }
+
+    #[test]
+    fn market_warmup_is_non_executable_and_covers_both_tokens() {
+        let (_, market, _, _, _, _, _, now) = fixture();
+        let warmup = funded_market_warmup(&market, now);
+        assert_eq!(
+            warmup["schema"],
+            Value::String("polyedge.funded_market_warmup.v1".to_owned())
+        );
+        assert_eq!(
+            warmup["token_ids"],
+            json!([market.up_token_id, market.down_token_id])
+        );
+        assert!(warmup.get("decision_id").is_none());
+        assert!(warmup.get("price").is_none());
+        assert!(warmup.get("side").is_none());
+    }
+
+    #[test]
+    fn operator_direct_publisher_requires_exact_service_bus_binding() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_account_name = Some("storage".to_owned());
+        settings.azure.storage_container_name = "shadow".to_owned();
+        settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
+        settings.azure.strategy_intent_operator_direct = true;
+        let error = IntentPublisherConfig::from_settings(&settings)
+            .unwrap()
+            .connect()
+            .err()
+            .expect("missing Service Bus binding must fail");
+        assert!(error.contains("exact Service Bus binding"));
     }
 
     #[test]

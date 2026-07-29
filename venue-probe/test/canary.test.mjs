@@ -12,6 +12,7 @@ import {
   sha256,
   validateDeterministicNoOrderReconciliation
 } from "../src/canary-lib.mjs";
+import { streamBookEvidence } from "../src/canary.mjs";
 
 const now = new Date("2026-07-12T12:00:20.000Z");
 const book = {
@@ -40,6 +41,37 @@ test("execution model URI resolves its exact cross-container artifact", () => {
     () => artifactLocationFromUri("azure://different/polyedge-research/prior.json", "storage"),
     /outside configured Azure storage account/
   );
+});
+
+test("final stream evidence follows the newest token-specific top-of-book update", () => {
+  const messages = [
+    {
+      event_type: "book",
+      asset_id: "token-up",
+      asks: [{ price: "0.52", size: "5" }],
+      _received_wall_ms: 1
+    },
+    {
+      event_type: "price_change",
+      price_changes: [
+        { asset_id: "token-down", best_ask: "0.61" },
+        { asset_id: "token-up", best_ask: "0.53" }
+      ],
+      _received_wall_ms: 2
+    },
+    {
+      event_type: "best_bid_ask",
+      asset_id: "token-up",
+      best_ask: "0.54",
+      _received_wall_ms: 3
+    }
+  ];
+  assert.deepEqual(streamBookEvidence(messages, "token-up"), {
+    bestAsk: 0.54,
+    source: "best_bid_ask",
+    receivedWallMs: 3
+  });
+  assert.equal(streamBookEvidence(messages, "unknown"), null);
 });
 
 function fixture(dryRun = true) {

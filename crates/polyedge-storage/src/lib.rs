@@ -859,14 +859,20 @@ impl AzureBlobError {
 #[derive(Clone, Debug, Default)]
 struct ManagedIdentityToken {
     client_id: Option<String>,
+    resource: String,
     access_token: Option<String>,
     expires_on_epoch: Option<i64>,
 }
 
 impl ManagedIdentityToken {
     fn new(client_id: Option<String>) -> Self {
+        Self::for_resource(client_id, "https://storage.azure.com/")
+    }
+
+    fn for_resource(client_id: Option<String>, resource: impl Into<String>) -> Self {
         Self {
             client_id,
+            resource: resource.into(),
             access_token: None,
             expires_on_epoch: None,
         }
@@ -879,7 +885,8 @@ impl ManagedIdentityToken {
                 return Ok(token.clone());
             }
         }
-        let payload = fetch_managed_identity_token(agent, self.client_id.as_deref())?;
+        let payload =
+            fetch_managed_identity_token(agent, self.client_id.as_deref(), &self.resource)?;
         let token = payload
             .get("access_token")
             .and_then(Value::as_str)
@@ -898,8 +905,9 @@ impl ManagedIdentityToken {
 fn fetch_managed_identity_token(
     agent: &ureq::Agent,
     client_id: Option<&str>,
+    resource: &str,
 ) -> Result<Value, AzureBlobError> {
-    let resource = "https%3A%2F%2Fstorage.azure.com%2F";
+    let resource = utf8_percent_encode(resource, NON_ALPHANUMERIC).to_string();
     if let (Ok(endpoint), Ok(header)) = (env::var("IDENTITY_ENDPOINT"), env::var("IDENTITY_HEADER"))
     {
         let mut url = format!("{endpoint}?api-version=2019-08-01&resource={resource}");
@@ -962,6 +970,94 @@ fn jsonl_event_envelope(event: &RuntimeEvent) -> Value {
         "event_type": event.event_type,
         "payload": event.data
     })
+}
+
+#[derive(Clone)]
+pub struct AzureServiceBusSender {
+    namespace: String,
+    queue: String,
+    token: ManagedIdentityToken,
+    agent: ureq::Agent,
+}
+
+impl AzureServiceBusSender {
+    pub fn with_managed_identity(
+        namespace: impl Into<String>,
+        queue: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            queue: queue.into(),
+            token: ManagedIdentityToken::for_resource(client_id, "https://servicebus.azure.net/"),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(5))
+                .timeout_read(Duration::from_secs(10))
+                .timeout_write(Duration::from_secs(10))
+                .build(),
+        }
+    }
+
+    pub fn send_json(
+        &mut self,
+        message_id: &str,
+        ttl_seconds: u64,
+        value: &Value,
+    ) -> Result<(), AzureBlobError> {
+        if self.namespace.trim().is_empty()
+            || self.queue.trim().is_empty()
+            || message_id.trim().is_empty()
+            || ttl_seconds == 0
+        {
+            return Err(AzureBlobError::Transport(
+                "Service Bus sender binding is incomplete".to_owned(),
+            ));
+        }
+        let body = serde_json::to_vec(value)?;
+        let queue = utf8_percent_encode(self.queue.trim(), NON_ALPHANUMERIC).to_string();
+        let url = format!(
+            "https://{}.servicebus.windows.net/{queue}/messages",
+            self.namespace.trim()
+        );
+        let broker_properties = serde_json::to_string(&serde_json::json!({
+            "MessageId": message_id,
+            "TimeToLive": ttl_seconds
+        }))?;
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let access_token = self.token.access_token(&self.agent)?;
+            let response = self
+                .agent
+                .post(&url)
+                .set("authorization", &format!("Bearer {access_token}"))
+                .set("content-type", "application/json; charset=utf-8")
+                .set("brokerproperties", &broker_properties)
+                .send_bytes(&body);
+            match response {
+                Ok(_) => return Ok(()),
+                Err(ureq::Error::Status(status, _))
+                    if is_retryable_azure_status(status)
+                        && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS =>
+                {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(ureq::Error::Status(status, _)) => {
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(ureq::Error::Transport(error)) if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %error,
+                        "retrying managed-identity Service Bus send"
+                    );
+                }
+                Err(ureq::Error::Transport(error)) => {
+                    return Err(AzureBlobError::Transport(error.to_string()));
+                }
+            }
+        }
+        unreachable!("Service Bus retry loop always returns");
+    }
 }
 
 fn rfc1123_now() -> String {

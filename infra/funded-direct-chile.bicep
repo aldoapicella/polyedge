@@ -12,6 +12,11 @@ param fundedEvidenceContainerName string = 'polyedge-funded-evidence'
 param modelContainerName string = 'polyedge-models'
 param keyVaultName string = 'kvpolyedge6urdjr5nmwx7w'
 param logAnalyticsWorkspaceName string = 'log-polyedge-dev-6urdjr5nmwx7w'
+param serviceBusNamespaceName string = 'sb-polyedge-funded-cl-6urdjr5nmwx7w'
+param serviceBusQueueName string = 'funded-dynamic-quote-intents'
+param producerIdentityName string = 'polyedge-shadow-neu-id'
+param producerPublicIpName string = 'pip-polyedge-venue-neu-egress'
+param alertActionGroupName string = 'polyedge-dev-research-alerts'
 param funderAddress string = '0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8'
 param fundedDirectEnabled bool = false
 @secure()
@@ -32,6 +37,7 @@ var vnetName = 'vnet-polyedge-execution-cl'
 var originCheckJobName = 'polyedge-origin-check-cl-job'
 var fundedJobName = 'polyedge-funded-direct-cl-job'
 var fundedServiceName = 'polyedge-funded-direct-cl'
+var fundedWarmupJobName = 'polyedge-funded-warmup-cl'
 var tags = {
   app: 'polyedge'
   environment: 'dev'
@@ -102,10 +108,95 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09
   name: logAnalyticsWorkspaceName
 }
 
+resource alertActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' existing = {
+  name: alertActionGroupName
+}
+
+resource producerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
+  name: producerIdentityName
+}
+
+resource producerPublicIp 'Microsoft.Network/publicIPAddresses@2023-09-01' existing = {
+  name: producerPublicIpName
+}
+
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: identityName
   location: location
   tags: tags
+}
+
+resource serviceBusNamespace 'Microsoft.ServiceBus/namespaces@2024-01-01' = {
+  name: serviceBusNamespaceName
+  location: location
+  tags: tags
+  sku: {
+    name: 'Standard'
+    tier: 'Standard'
+  }
+  properties: {
+    disableLocalAuth: true
+    minimumTlsVersion: '1.2'
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource serviceBusNetworkRules 'Microsoft.ServiceBus/namespaces/networkRuleSets@2024-01-01' = {
+  parent: serviceBusNamespace
+  name: 'default'
+  properties: {
+    publicNetworkAccess: 'Enabled'
+    defaultAction: 'Deny'
+    trustedServiceAccessEnabled: false
+    virtualNetworkRules: []
+    ipRules: [
+      {
+        ipMask: producerPublicIp.properties.ipAddress
+        action: 'Allow'
+      }
+      {
+        ipMask: publicIp.properties.ipAddress
+        action: 'Allow'
+      }
+    ]
+  }
+}
+
+resource serviceBusQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
+  parent: serviceBusNamespace
+  name: serviceBusQueueName
+  properties: {
+    status: 'Active'
+    lockDuration: 'PT30S'
+    defaultMessageTimeToLive: 'PT30S'
+    deadLetteringOnMessageExpiration: true
+    maxDeliveryCount: 3
+    requiresDuplicateDetection: true
+    duplicateDetectionHistoryTimeWindow: 'PT10M'
+    enableExpress: false
+    enablePartitioning: false
+    maxSizeInMegabytes: 1024
+  }
+}
+
+resource producerServiceBusSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(serviceBusQueue.id, producerIdentity.id, 'service-bus-data-sender')
+  scope: serviceBusQueue
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '69a216fc-b8fb-44d8-bc22-1f3c2cd27a39')
+    principalId: producerIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource executorServiceBusReceiver 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(serviceBusQueue.id, identity.id, 'service-bus-data-receiver')
+  scope: serviceBusQueue
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 
 resource publicIp 'Microsoft.Network/publicIPAddresses@2023-09-01' = {
@@ -366,6 +457,8 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
     researchReader
     modelReader
     acrPull
+    serviceBusNetworkRules
+    executorServiceBusReceiver
   ]
   properties: {
     environmentId: managedEnvironment.id
@@ -551,6 +644,11 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
           ]
           env: [
             { name: 'FUNDED_DIRECT_SERVICE_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_ENGINE', value: 'persistent_v1' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_ENABLED', value: 'true' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE', value: serviceBusNamespace.name }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_QUEUE', value: serviceBusQueue.name }
+            { name: 'FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS', value: '2000' }
             { name: 'FUNDED_DIRECT_SERVICE_RESTART_DELAY_MS', value: '1000' }
             { name: 'FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_HEARTBEAT_MS', value: '60000' }
@@ -622,9 +720,162 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+resource fundedWarmupJob 'Microsoft.App/jobs@2024-03-01' = {
+  name: fundedWarmupJobName
+  location: location
+  tags: union(tags, {
+    trigger: 'manual-only'
+    operation: 'funded-cloud-no-sign-rehearsal'
+    fundedExecution: 'disabled'
+    noSign: 'true'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${producerIdentity.id}': {}
+    }
+  }
+  dependsOn: [
+    producerServiceBusSender
+    serviceBusNetworkRules
+  ]
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaRetryLimit: 1
+      replicaTimeout: 60
+      registries: [
+        {
+          server: registry.properties.loginServer
+          identity: producerIdentity.id
+        }
+      ]
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: 'funded-warmup'
+          image: venueProbeImage
+          command: [
+            'node'
+            'src/funded-direct-warmup.mjs'
+          ]
+          env: [
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE', value: serviceBusNamespace.name }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_QUEUE', value: serviceBusQueue.name }
+            { name: 'AZURE_CLIENT_ID', value: producerIdentity.properties.clientId }
+          ]
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+
+resource fundedServiceLogAlert 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = {
+  name: 'polyedge-funded-direct-safety-or-latency'
+  location: location
+  kind: 'LogAlert'
+  tags: tags
+  properties: {
+    displayName: 'PolyEdge funded executor safety or latency alert'
+    description: 'Funded execution paused, breached latency, lost WebSocket continuity, or failed a durable safety invariant.'
+    severity: 0
+    enabled: true
+    scopes: [
+      logAnalyticsWorkspace.id
+    ]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    autoMitigate: false
+    criteria: {
+      allOf: [
+        {
+          query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${fundedServiceName}" | where Log_s has_any ("rolling_p95_slo_breached\\":true", "engine_paused_by_consecutive_latency_breaches", "websocket", "reconnect reconciliation", "dead letter", "authorization", "reservation", "duplicate", "paused_by_account_risk_state", "equity", "cash flow", "position", "open order") | where Log_s !has "\\"status\\":\\"persistent_service_heartbeat\\""'
+          timeAggregation: 'Count'
+          operator: 'GreaterThan'
+          threshold: 0
+          failingPeriods: {
+            numberOfEvaluationPeriods: 1
+            minFailingPeriodsToAlert: 1
+          }
+        }
+      ]
+    }
+    actions: {
+      actionGroups: [
+        alertActionGroup.id
+      ]
+      customProperties: {
+        funded_app: fundedServiceName
+        service_bus_queue: serviceBusQueue.name
+        recommended_action: 'Keep funded execution paused; reconcile orders, trades, authorization, reservation, account equity, and WebSocket continuity.'
+      }
+    }
+  }
+}
+
+resource serviceBusDeadLetterAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
+  name: 'polyedge-funded-direct-dead-letters'
+  location: 'global'
+  tags: tags
+  properties: {
+    description: 'Funded intent queue has one or more dead-lettered messages.'
+    severity: 0
+    enabled: true
+    scopes: [
+      serviceBusNamespace.id
+    ]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    autoMitigate: false
+    targetResourceType: 'Microsoft.ServiceBus/namespaces'
+    targetResourceRegion: location
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: 'DeadletteredMessages'
+          metricName: 'DeadletteredMessages'
+          metricNamespace: 'Microsoft.ServiceBus/namespaces'
+          operator: 'GreaterThan'
+          threshold: 0
+          timeAggregation: 'Total'
+          criterionType: 'StaticThresholdCriterion'
+          dimensions: [
+            {
+              name: 'EntityName'
+              operator: 'Include'
+              values: [
+                serviceBusQueue.name
+              ]
+            }
+          ]
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: alertActionGroup.id
+      }
+    ]
+  }
+}
+
 output environmentName string = managedEnvironment.name
 output originCheckJobName string = originCheckJob.name
 output fundedJobName string = fundedJob.name
 output fundedServiceName string = fundedService.name
+output fundedWarmupJobName string = fundedWarmupJob.name
 output staticEgressIp string = publicIp.properties.ipAddress
 output fundedIdentityClientId string = identity.properties.clientId
+output serviceBusNamespaceName string = serviceBusNamespace.name
+output serviceBusQueueName string = serviceBusQueue.name

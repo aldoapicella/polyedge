@@ -20,9 +20,14 @@
   },
   "dependencies": {
     "@azure/identity": "^4.11.1",
+    "@azure/service-bus": "^7.9.5",
     "@azure/storage-blob": "^12.28.0",
     "@polymarket/clob-client-v2": "1.0.8",
     "viem": "^2.33.3",
     "ws": "^8.18.3"
+  },
+  "overrides": {
+    "fast-xml-parser": "5.10.1",
+    "ws": "$ws"
   }
 }

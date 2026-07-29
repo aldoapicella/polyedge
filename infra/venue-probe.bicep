@@ -33,6 +33,8 @@ param fundedDirectTargetOrderNotional string = '10.5'
 param fundedDirectMaxOrderNotional string = '10.5'
 param fundedDirectMinSecondsToExpiry string = '360'
 param fundedDirectMaxSecondsToExpiry string = '900'
+param fundedDirectServiceBusNamespace string = 'sb-polyedge-funded-cl-6urdjr5nmwx7w'
+param fundedDirectServiceBusQueue string = 'funded-dynamic-quote-intents'
 
 var fundedDirectValidationProvided = (!empty(fundedDirectShadowValidationSealJson) && !empty(fundedDirectShadowValidationSealBlobName) && !empty(fundedDirectShadowValidationSealSha256))
 var fundedDirectReleaseReady = fundedDirectEnabled && fundedDirectValidationProvided
@@ -601,6 +603,9 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'MAX_DAILY_LOSS', value: '1' }
             { name: 'MAX_OPEN_ORDERS', value: '1' }
             { name: 'STRATEGY_INTENT_OPERATOR_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_ENABLED', value: fundedDirectReleaseReady ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE', value: fundedDirectReleaseReady ? fundedDirectServiceBusNamespace : '' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_QUEUE', value: fundedDirectReleaseReady ? fundedDirectServiceBusQueue : '' }
             { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectReleaseReady ? fundedDirectTargetOrderNotional : '0' }
             { name: 'STRATEGY_INTENT_MAX_ORDER_NOTIONAL', value: fundedDirectReleaseReady ? fundedDirectMaxOrderNotional : '1' }
             { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectReleaseReady ? fundedDirectMinSecondsToExpiry : '0' }

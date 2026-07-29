@@ -7,6 +7,7 @@ on:
       - "crates/polyedge-api/**"
       - "crates/polyedge-config/**"
       - "crates/polyedge-domain/**"
+      - "crates/polyedge-storage/**"
       - "infra/funded-direct-chile.bicep"
       - "infra/funded-direct-chile.parameters.json"
       - "infra/venue-probe.bicep"
@@ -92,12 +93,66 @@ jobs:
           cargo test -p polyedge-api
           cargo test -p polyedge-config
           cargo test -p polyedge-domain
+          cargo test -p polyedge-storage
 
       - name: Build fail-closed Azure templates
         run: |
           set -euo pipefail
-          az bicep build --file infra/funded-direct-chile.bicep --stdout > /dev/null
-          az bicep build --file infra/venue-probe.bicep --stdout > /dev/null
+          az bicep build --file infra/funded-direct-chile.bicep --stdout > funded-direct-chile.json
+          az bicep build --file infra/venue-probe.bicep --stdout > venue-probe.json
+          jq -e '
+            ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces")] | length) == 1
+            and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces")][0]
+              | .sku.name == "Standard"
+              and .properties.disableLocalAuth == true
+              and .properties.publicNetworkAccess == "Enabled")
+            and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/networkRuleSets")][0]
+              | .properties.defaultAction == "Deny"
+              and (.properties.ipRules | length) == 2)
+            and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/queues")][0]
+              | .properties.requiresDuplicateDetection == true
+              and .properties.duplicateDetectionHistoryTimeWindow == "PT10M"
+              and .properties.defaultMessageTimeToLive == "PT30S"
+              and .properties.lockDuration == "PT30S"
+              and .properties.deadLetteringOnMessageExpiration == true
+              and .properties.maxDeliveryCount == 3)
+            and ([.resources[]
+              | select(.type == "Microsoft.Authorization/roleAssignments")
+              | .properties.roleDefinitionId
+              | ascii_downcase
+              | select(endswith("/69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"))] | length) == 1
+            and ([.resources[]
+              | select(.type == "Microsoft.Authorization/roleAssignments")
+              | .properties.roleDefinitionId
+              | ascii_downcase
+              | select(endswith("/4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0"))] | length) == 1
+          ' funded-direct-chile.json
+          node <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const template = JSON.parse(fs.readFileSync("funded-direct-chile.json"));
+          const app = template.resources.find((resource) =>
+            resource.type === "Microsoft.App/containerApps" &&
+            resource.properties.template.containers[0].name === "funded-direct");
+          const env = Object.fromEntries(app.properties.template.containers[0].env.map((entry) => [entry.name, entry.value]));
+          assert.equal(env.FUNDED_DIRECT_ENGINE, "persistent_v1");
+          assert.equal(env.FUNDED_DIRECT_SERVICE_BUS_ENABLED, "true");
+          assert.equal(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, "2000");
+          assert.equal(app.properties.template.scale.maxReplicas, 1);
+          assert.match(JSON.stringify(app.properties.template.scale.minReplicas), /fundedDirectEnabled/);
+          const producer = JSON.parse(fs.readFileSync("venue-probe.json")).resources.find((resource) =>
+            resource.type === "Microsoft.App/containerApps" &&
+            resource.properties.template.containers[0].name === "shadow-runtime");
+          const producerEnv = Object.fromEntries(producer.properties.template.containers[0].env.map((entry) => [entry.name, entry.value]));
+          assert.ok("FUNDED_DIRECT_SERVICE_BUS_ENABLED" in producerEnv);
+          assert.ok("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE" in producerEnv);
+          assert.ok("FUNDED_DIRECT_SERVICE_BUS_QUEUE" in producerEnv);
+          const warmup = template.resources.find((resource) =>
+            resource.type === "Microsoft.App/jobs" &&
+            resource.properties.template.containers[0].name === "funded-warmup");
+          assert.equal(warmup.properties.template.containers[0].command.join(" "), "node src/funded-direct-warmup.mjs");
+          assert.equal(warmup.properties.template.containers[0].env.some((entry) => entry.name === "POLYMARKET_PRIVATE_KEY"), false);
+          NODE
           git diff --check
 
   deploy-funded-service:
@@ -114,6 +169,9 @@ jobs:
       FUNDED_APP: polyedge-funded-direct-cl
       INTENT_PRODUCER_APP: polyedge-shadow-neu
       PROTECTED_QSET_APP: polyedge-shadow-qset-neu
+      SERVICE_BUS_NAMESPACE: sb-polyedge-funded-cl-6urdjr5nmwx7w
+      SERVICE_BUS_QUEUE: funded-dynamic-quote-intents
+      FUNDED_WARMUP_JOB: polyedge-funded-warmup-cl
     steps:
       - uses: actions/checkout@v4
 
@@ -202,6 +260,58 @@ jobs:
             -o json > funded-deployment.json
           test "$(jq -r '.properties.provisioningState' funded-deployment.json)" = "Succeeded"
 
+      - name: Run real cloud queue, REST, storage, and WebSocket no-sign rehearsal
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 36); do
+            active_replicas=$(az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --query '[?properties.active].properties.replicas | sum(@)' \
+              -o tsv)
+            if [ "${active_replicas:-0}" = "1" ] \
+              && az containerapp logs show \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$FUNDED_APP" \
+                --tail 100 > funded-before-rehearsal.log 2>/dev/null \
+              && grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log; then
+              break
+            fi
+            sleep 10
+          done
+          test "${active_replicas:-0}" = "1"
+          grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log
+          execution=$(az containerapp job start \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_WARMUP_JOB" \
+            --query name -o tsv)
+          test -n "$execution"
+          status=""
+          for attempt in $(seq 1 18); do
+            status=$(az containerapp job execution show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_WARMUP_JOB" \
+              --job-execution-name "$execution" \
+              --query properties.status -o tsv)
+            case "$status" in
+              Succeeded) break ;;
+              Failed|Stopped|Degraded) exit 1 ;;
+            esac
+            sleep 10
+          done
+          test "$status" = "Succeeded"
+          for attempt in $(seq 1 18); do
+            if az containerapp logs show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --tail 100 > funded-rehearsal.log 2>/dev/null \
+              && grep -q '"status":"market_warmed"' funded-rehearsal.log; then
+              break
+            fi
+            sleep 10
+          done
+          grep -q '"status":"market_warmed"' funded-rehearsal.log
+
       - name: Deploy compatible Dynamic Quote intent producer
         run: |
           set -euo pipefail
@@ -209,6 +319,10 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
             --image "${{ steps.images.outputs.producer_reference }}" \
+            --set-env-vars \
+              FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+              FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
+              FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
             --only-show-errors \
             -o none
 
@@ -239,6 +353,11 @@ jobs:
             jq -r --arg name "$1" '.properties.template.containers[0].env[] | select(.name == $name) | .value' funded-app.json
           }
           test "$(env_value FUNDED_DIRECT_SERVICE_ENABLED)" = "true"
+          test "$(env_value FUNDED_DIRECT_ENGINE)" = "persistent_v1"
+          test "$(env_value FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
+          test "$(env_value FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
+          test "$(env_value FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
+          test "$(env_value FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS)" = "2000"
           test "$(env_value FUNDED_DIRECT_WORKER_ENABLED)" = "true"
           test "$(env_value ALLOW_FUNDED_DIRECT)" = "true"
           test "$(env_value FUNDED_DIRECT_DRY_RUN)" = "false"
@@ -253,6 +372,49 @@ jobs:
             --query properties.template.containers[0].image \
             -o tsv)
           test "$producer_image" = "${{ steps.images.outputs.producer_reference }}"
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer.json
+          producer_env_value() {
+            jq -r --arg name "$1" '.properties.template.containers[0].env[] | select(.name == $name) | .value' intent-producer.json
+          }
+          test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
+          test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
+          test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
+
+      - name: Verify Service Bus security and delivery contract
+        run: |
+          set -euo pipefail
+          az servicebus namespace show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$SERVICE_BUS_NAMESPACE" \
+            -o json > service-bus-namespace.json
+          test "$(jq -r '.sku.name' service-bus-namespace.json)" = "Standard"
+          test "$(jq -r '.disableLocalAuth' service-bus-namespace.json)" = "true"
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > service-bus-queue.json
+          test "$(jq -r '.requiresDuplicateDetection' service-bus-queue.json)" = "true"
+          test "$(jq -r '.duplicateDetectionHistoryTimeWindow' service-bus-queue.json)" = "PT10M"
+          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT30S"
+          test "$(jq -r '.deadLetteringOnMessageExpiration' service-bus-queue.json)" = "true"
+          test "$(jq -r '.maxDeliveryCount' service-bus-queue.json)" = "3"
+          az servicebus namespace network-rule-set show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            -o json > service-bus-network.json
+          test "$(jq -r '.defaultAction' service-bus-network.json)" = "Deny"
+          test "$(jq '.ipRules | length' service-bus-network.json)" = "2"
+          queue_id=$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --query id -o tsv)
+          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Sender'] | length(@)" -o tsv)" = "1"
+          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Receiver'] | length(@)" -o tsv)" = "1"
 
       - name: Verify service startup and qset isolation
         run: |
@@ -262,12 +424,12 @@ jobs:
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               --tail 100 > funded-service.log 2>/dev/null \
-              && grep -q 'continuous_service_started' funded-service.log; then
+              && grep -q 'persistent_service_started' funded-service.log; then
               break
             fi
             sleep 10
           done
-          grep -q 'continuous_service_started' funded-service.log
+          grep -q 'persistent_service_started' funded-service.log
           qset_after=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$PROTECTED_QSET_APP" \

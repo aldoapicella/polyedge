@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { sha256 } from "../src/canary-lib.mjs";
 import {
+  createFundedDirectProcessor,
   loadFundedDirectConfig,
   runFundedDirectWorker
 } from "../src/funded-direct-worker.mjs";
@@ -323,4 +324,81 @@ test("worker reports an account-risk pause without retrying a funded child", asy
   });
   assert.equal(output.status, "paused_by_account_risk_state");
   assert.equal(output.childInvocations, 1);
+});
+
+test("persistent handoff verifies the immutable hash and executes exactly once across duplicate delivery", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "8".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  const intents = new Container({ [`intents/${value.decision_id}.json`]: bytes });
+  let executions = 0;
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: { control, intents },
+    clock: () => now,
+    executeCanary: async () => {
+      executions += 1;
+      return { order_submission_attempted: true, lifecycle: { send_wall_ms: now.getTime() + 500 } };
+    }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
+  };
+  const first = await processor.process(handoff);
+  const duplicate = await processor.process(handoff);
+  assert.equal(first.status, "persistent_intent_completed");
+  assert.equal(duplicate.status, "already_completed_idempotent");
+  assert.equal(executions, 1);
+});
+
+test("persistent handoff rejects expired, tampered, and authorization-leak deliveries before execution", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "9".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  const intents = new Container({ [`intents/${value.decision_id}.json`]: bytes });
+  let executions = 0;
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: { control, intents },
+    clock: () => now,
+    executeCanary: async () => { executions += 1; }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
+  };
+  await assert.rejects(
+    processor.process({ ...handoff, intent_sha256: `sha256:${"0".repeat(64)}` }),
+    /SHA-256 mismatch/
+  );
+  await assert.rejects(
+    createFundedDirectProcessor({
+      env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+      containers: { control: new Container(), intents },
+      clock: () => new Date(now.getTime() + 31_000),
+      executeCanary: async () => { executions += 1; }
+    }).then((expired) => expired.process(handoff)),
+    /binding or TTL is invalid/
+  );
+  const authorizationName = `reports/funded/dynamic-quote/sessions/${session().session_id}/authorizations/${value.decision_id}.json`;
+  control.values.set(authorizationName, Buffer.from("{}"));
+  await assert.rejects(processor.process(handoff), /already has an authorization/);
+  assert.equal(executions, 0);
 });

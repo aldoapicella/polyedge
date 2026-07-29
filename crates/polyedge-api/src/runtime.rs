@@ -10,7 +10,8 @@ use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
 use execution_intent::{
-    build_execution_intent_with_model, resolve_execution_model, IntentPublisherConfig,
+    build_execution_intent_with_model, resolve_execution_model, IntentPublisher,
+    IntentPublisherConfig,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
@@ -70,6 +71,7 @@ struct RuntimeInner {
     recorder_tx: std_mpsc::Sender<RecorderRequest>,
     recorder_metrics: Arc<RecorderMetrics>,
     persistence_filter: StdMutex<PersistenceFilter>,
+    intent_publisher: Option<StdMutex<IntentPublisher>>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
 }
@@ -367,6 +369,10 @@ impl RuntimeController {
 
     fn new_with_recorder(settings: RuntimeSettings, recorder: RuntimeRecorder) -> Self {
         let (broadcaster, _) = broadcast::channel(1_000);
+        let intent_publisher = IntentPublisherConfig::from_settings(&settings)
+            .and_then(IntentPublisherConfig::connect)
+            .ok()
+            .map(StdMutex::new);
         let data = RuntimeData {
             decision_generation: 0,
             started_at: Utc::now(),
@@ -425,6 +431,7 @@ impl RuntimeController {
                 recorder_tx,
                 recorder_metrics,
                 persistence_filter: StdMutex::new(PersistenceFilter::default()),
+                intent_publisher,
                 broadcaster,
                 started: AtomicBool::new(false),
             }),
@@ -918,6 +925,7 @@ impl RuntimeController {
         let _decision_guard = self.inner.decision_gate.lock().await;
         let mut data = self.inner.data.write().await;
         let existing = data.markets.clone();
+        let mut warmup_markets = Vec::new();
         let now = Utc::now();
         let settled = data.settled_markets.clone();
         data.markets = existing
@@ -979,6 +987,14 @@ impl RuntimeController {
                     ));
                 }
             }
+            if existing.get(&market.market_id).is_none_or(|prior| {
+                prior.condition_id != market.condition_id
+                    || prior.up_token_id != market.up_token_id
+                    || prior.down_token_id != market.down_token_id
+                    || prior.end_ts != market.end_ts
+            }) {
+                warmup_markets.push(market.clone());
+            }
             let payload = serde_json::to_value(&market).unwrap_or(Value::Null);
             data.markets.insert(market.market_id.clone(), market);
             drop(data);
@@ -1001,6 +1017,69 @@ impl RuntimeController {
         drop(data);
         drop(_decision_guard);
         self.retry_pending_market_start_events().await;
+        for market in warmup_markets {
+            self.maybe_publish_market_warmup(market).await;
+        }
+    }
+
+    async fn maybe_publish_market_warmup(&self, market: MarketSpec) {
+        if !self.inner.settings.azure.strategy_intent_operator_direct {
+            return;
+        }
+        let publisher_runtime = self.clone();
+        let publish_market = market.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let publisher = publisher_runtime
+                .inner
+                .intent_publisher
+                .as_ref()
+                .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
+            publisher
+                .lock()
+                .map_err(|_| "persistent intent publisher lock is poisoned".to_owned())?
+                .warm_market(&publish_market)
+        })
+        .await
+        .map_err(|error| format!("market warmup task failed: {error}"))
+        .and_then(|result| result);
+        match result {
+            Ok(true) => {
+                self.record_event(
+                    "funded_market_warmup_sent",
+                    json!({
+                        "market_id": market.market_id,
+                        "condition_id": market.condition_id,
+                        "token_ids": [market.up_token_id, market.down_token_id],
+                        "market_end_ts": market.end_ts,
+                        "executable": false
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                warn!(
+                    market_id = %market.market_id,
+                    reason = %reason,
+                    "funded market warmup not sent"
+                );
+                self.record_event(
+                    "funded_market_warmup_not_sent",
+                    json!({
+                        "market_id": market.market_id,
+                        "condition_id": market.condition_id,
+                        "reason": reason,
+                        "fail_closed": true,
+                        "executable": false
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
     }
 
     async fn handle_reference(&self, reference: ReferencePrice) {
@@ -1846,35 +1925,22 @@ impl RuntimeController {
                 return;
             }
         };
-        let publisher = match IntentPublisherConfig::from_settings(&self.inner.settings) {
-            Ok(publisher) => publisher,
-            Err(reason) => {
-                warn!(
-                    decision_id = %intent.decision_id,
-                    market_id = %intent.market_id,
-                    reason = %reason,
-                    "execution intent not published"
-                );
-                self.record_event(
-                    "execution_intent_not_published",
-                    json!({
-                        "decision_id": intent.decision_id,
-                        "market_id": intent.market_id,
-                        "reason": reason,
-                        "fail_closed": true
-                    }),
-                    None,
-                    None,
-                )
-                .await;
-                return;
-            }
-        };
         let runtime = self.clone();
         tokio::spawn(async move {
             let publish_intent = intent.clone();
-            let result =
-                tokio::task::spawn_blocking(move || publisher.publish(&publish_intent)).await;
+            let publisher_runtime = runtime.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let publisher = publisher_runtime
+                    .inner
+                    .intent_publisher
+                    .as_ref()
+                    .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
+                publisher
+                    .lock()
+                    .map_err(|_| "persistent intent publisher lock is poisoned".to_owned())?
+                    .publish(&publish_intent)
+            })
+            .await;
             match result {
                 Ok(Ok(published)) => {
                     info!(
@@ -1896,6 +1962,12 @@ impl RuntimeController {
                                 "candidate_version": intent.candidate_version,
                                 "blob_name": published.blob_name,
                                 "artifact_sha256": published.artifact_sha256,
+                                "queue_handoff_sent": published.queue_handoff_sent,
+                                "intent_created_wall_ts": intent.decision_ts,
+                                "blob_commit_wall_ts": published.blob_commit_wall_ts,
+                                "blob_commit_elapsed_ms": published.blob_commit_elapsed_ms,
+                                "queue_send_wall_ts": published.queue_send_wall_ts,
+                                "queue_send_elapsed_ms": published.queue_send_elapsed_ms,
                                 "valid_until": intent.valid_until,
                                 "order_submission_attempted": false,
                                 "credential_free": true
