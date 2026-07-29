@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use std::env;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
+// The frozen strategy's quote TTL controls how long a maker order may rest.
+// Funded execution also needs a bounded handoff envelope for blob discovery,
+// authorization, process launch, and the full authenticated preflight. Keep
+// those semantics separate and use the existing schema maximum for handoff.
+const EXECUTION_HANDOFF_TTL_MS: i64 = MAX_INTENT_TTL_MS;
 // Polymarket rejects GTD expirations that are less than 60 seconds in the
 // future at submission time. Intents stay live for only 10 seconds, so bind an
 // additional 30 seconds to survive authorization, preflight, and signing
@@ -300,10 +305,11 @@ pub(super) fn build_execution_intent_with_model(
     if net_edge_lower_bound <= Decimal::ZERO {
         return Err("conservative net-edge lower bound is not positive".to_owned());
     }
-    let ttl_ms = decision
+    let strategy_ttl_ms = decision
         .ttl_ms
         .unwrap_or(settings.strategy.order_ttl_seconds * 1_000)
         .clamp(1, MAX_INTENT_TTL_MS);
+    let ttl_ms = strategy_ttl_ms.max(EXECUTION_HANDOFF_TTL_MS);
     let valid_until = decision_ts + Duration::milliseconds(ttl_ms);
     let gtd_expiry_ts = valid_until + Duration::seconds(VENUE_GTD_SECURITY_BUFFER_SECONDS);
     let book_hash = canonical_book_hash(market, book);
@@ -1066,6 +1072,7 @@ mod tests {
         .unwrap();
         intent.validate().unwrap();
         assert_eq!(intent.order_kind, OrderKind::PostOnlyGtd);
+        assert_eq!(intent.ttl_ms, EXECUTION_HANDOFF_TTL_MS);
         assert_eq!(
             intent.gtd_expiry_ts,
             Some(intent.valid_until + Duration::seconds(90))

@@ -55,8 +55,8 @@ function env(overrides = {}) {
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
     FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/session.json",
     FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
-    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "7000",
-    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "2000",
+    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "25000",
+    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "15000",
     STRATEGY_CANARY_CANDIDATE_NAME: "dynamic_quote_style",
     STRATEGY_CANARY_CANDIDATE_VERSION: "dynamic_quote_style@2026-06-14",
     STRATEGY_CANARY_CANDIDATE_CONFIG_HASH: `sha256:${"a".repeat(64)}`,
@@ -107,7 +107,7 @@ class Container {
 function intent(now, id = "c".repeat(64)) {
   const value = session();
   const decision = new Date(now.getTime() - 1_000);
-  const valid = new Date(decision.getTime() + 10_000);
+  const valid = new Date(decision.getTime() + 30_000);
   return {
     schema: "polyedge.execution_intent.v1",
     decision_id: id,
@@ -131,7 +131,7 @@ function intent(now, id = "c".repeat(64)) {
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 90_000).toISOString(),
-    ttl_ms: 10_000
+    ttl_ms: 30_000
   };
 }
 
@@ -153,10 +153,10 @@ test("operator-funded config requires the profitable 6-15 minute window", () => 
   );
 });
 
-test("worker TTL gates are compatible with the frozen strategy's ten-second intent", () => {
+test("worker TTL gates reserve time for the authenticated child preflight", () => {
   const config = loadFundedDirectConfig(env());
-  assert.equal(config.minRemainingTtlMs, 7_000);
-  assert.equal(config.childMinRemainingTtlMs, 2_000);
+  assert.equal(config.minRemainingTtlMs, 25_000);
+  assert.equal(config.childMinRemainingTtlMs, 15_000);
   assert.throws(
     () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "4000" })),
     /must be in \[5000, 30000\]/
@@ -178,7 +178,7 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
       calls += 1;
       assert.equal(childEnv.EXECUTION_MODE, "funded_direct");
       assert.equal(childEnv.STRATEGY_CANARY_MAX_ORDER_NOTIONAL, "10.5");
-      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "2000");
+      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "15000");
       assert.equal(childEnv.VENUE_PROBE_CAMPAIGN_CASH_FLOWS, "[]");
       return { exitCode: 0, error: "" };
     }

@@ -426,8 +426,8 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
-            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
-            { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
+            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '25000' }
+            { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '15000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'ALLOW_LIVE', value: 'false' }
             { name: 'ALLOW_STRATEGY_CANARY', value: 'false' }
@@ -565,8 +565,8 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
-            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
-            { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
+            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '25000' }
+            { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '15000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'ALLOW_LIVE', value: 'false' }
             { name: 'ALLOW_STRATEGY_CANARY', value: 'false' }

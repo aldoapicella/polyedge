@@ -1018,8 +1018,8 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
-          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
-          { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
+          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '25000' }
+          { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '15000' }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
