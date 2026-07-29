@@ -1095,6 +1095,10 @@ export async function settleProbeRiskReservations(config, settlement) {
       const reservation = matchedReservations.find((row) =>
         String(row.condition_id || "").toLowerCase() === conditionId
       );
+      // The Data API can keep zero-payout positions from earlier campaigns in
+      // the wallet indefinitely. They are terminal for account reconciliation,
+      // but must not create a loss settlement inside the current session.
+      if (!reservation) continue;
       const payout = number(settlement?.payout_by_condition?.[conditionId], NaN);
       const principal = number(
         settlement?.principal_by_condition?.[conditionId],
