@@ -420,13 +420,13 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'ALLOW_FUNDED_DIRECT', value: 'false' }
             { name: 'FUNDED_DIRECT_DRY_RUN', value: 'true' }
             { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
-            { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
+            { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '1000' }
             { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
             { name: 'FUNDED_DIRECT_CONTROL_PREFIX', value: 'reports/funded/dynamic-quote' }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
-            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '20000' }
+            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
             { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '5000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'ALLOW_LIVE', value: 'false' }
@@ -559,13 +559,13 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
             { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '2000' }
-            { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
+            { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '1000' }
             { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '3600000' }
             { name: 'FUNDED_DIRECT_CONTROL_PREFIX', value: 'reports/funded/dynamic-quote' }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
-            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '20000' }
+            { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
             { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '5000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
             { name: 'ALLOW_LIVE', value: 'false' }

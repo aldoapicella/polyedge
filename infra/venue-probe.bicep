@@ -1009,7 +1009,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
           { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectReleaseReady ? 'false' : 'true' }
           { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
-          { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '5000' }
+          { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '1000' }
           { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
           { name: 'FUNDED_DIRECT_CONTROL_PREFIX', value: 'reports/funded/dynamic-quote' }
           { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
@@ -1018,7 +1018,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
-          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '20000' }
+          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
           { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '5000' }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }

@@ -217,7 +217,8 @@ jobs:
           test "$(env_value FUNDED_DIRECT_DRY_RUN)" = "false"
           test "$(env_value ENABLE_TAKER_ORDERS)" = "false"
           test "$(env_value VENUE_PROBE_CAMPAIGN_CASH_FLOWS)" = "[]"
-          test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "20000"
+          test "$(env_value FUNDED_DIRECT_POLL_INTERVAL_MS)" = "1000"
+          test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
           test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "5000"
 
       - name: Verify service startup and qset isolation

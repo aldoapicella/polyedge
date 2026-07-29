@@ -11,6 +11,7 @@ const EXPECTED_CANDIDATE = "dynamic_quote_style";
 const EXPECTED_VERSION = "dynamic_quote_style@2026-06-14";
 const SESSION_SCHEMA = "polyedge.operator_funded_session.v1";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
+const MAX_INTENT_TTL_MS = 30_000;
 
 export function loadFundedDirectConfig(env = process.env) {
   const sessionJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "").trim();
@@ -39,9 +40,9 @@ export function loadFundedDirectConfig(env = process.env) {
     storageAccountKey: env.AZURE_STORAGE_ACCOUNT_KEY,
     azureClientId: env.AZURE_CLIENT_ID,
     maxIterations: integer(env.FUNDED_DIRECT_MAX_ITERATIONS, 200),
-    pollIntervalMs: integer(env.FUNDED_DIRECT_POLL_INTERVAL_MS, 5_000),
+    pollIntervalMs: integer(env.FUNDED_DIRECT_POLL_INTERVAL_MS, 1_000),
     maxIdleMs: integer(env.FUNDED_DIRECT_MAX_IDLE_MS, 300_000),
-    minRemainingTtlMs: integer(env.FUNDED_DIRECT_MIN_REMAINING_TTL_MS, 20_000),
+    minRemainingTtlMs: integer(env.FUNDED_DIRECT_MIN_REMAINING_TTL_MS, 7_000),
     childMinRemainingTtlMs: integer(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS, 5_000)
   };
   const errors = [];
@@ -66,8 +67,8 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!(config.maxIterations >= 1 && config.maxIterations <= 2_000)) errors.push("FUNDED_DIRECT_MAX_ITERATIONS must be in [1, 2000]");
   if (!(config.pollIntervalMs >= 1_000 && config.pollIntervalMs <= 60_000)) errors.push("FUNDED_DIRECT_POLL_INTERVAL_MS must be in [1000, 60000]");
   if (!(config.maxIdleMs >= config.pollIntervalMs && config.maxIdleMs <= 3_600_000)) errors.push("FUNDED_DIRECT_MAX_IDLE_MS must be between the poll interval and 3600000");
-  if (!(config.minRemainingTtlMs >= 10_000 && config.minRemainingTtlMs <= 30_000)) {
-    errors.push("FUNDED_DIRECT_MIN_REMAINING_TTL_MS must be in [10000, 30000]");
+  if (!(config.minRemainingTtlMs >= 5_000 && config.minRemainingTtlMs <= MAX_INTENT_TTL_MS)) {
+    errors.push("FUNDED_DIRECT_MIN_REMAINING_TTL_MS must be in [5000, 30000]");
   }
   if (!(config.childMinRemainingTtlMs >= 1_000 && config.childMinRemainingTtlMs <= config.minRemainingTtlMs)) {
     errors.push("FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS must be in [1000, FUNDED_DIRECT_MIN_REMAINING_TTL_MS]");
@@ -210,10 +211,12 @@ async function firstFreshIntent(clients, config, session, now) {
   const candidates = [];
   let currentSessionCandidates = 0;
   const sessionStartMs = Date.parse(session.created_at);
+  const freshBlobFloorMs = now.getTime() - MAX_INTENT_TTL_MS;
   for await (const blob of clients.intents.listBlobsFlat({ prefix: `${config.intentPrefix}/` })) {
     if (!blob.name.endsWith(".json")) continue;
     const createdMs = Date.parse(blob.properties?.createdOn);
     if (Number.isFinite(createdMs) && createdMs < sessionStartMs) continue;
+    if (Number.isFinite(createdMs) && createdMs < freshBlobFloorMs) continue;
     currentSessionCandidates += 1;
     if (currentSessionCandidates > 10_000) throw new Error("fail closed: operator-funded session exceeded the bounded intent scan");
     const response = await clients.intents.getBlobClient(blob.name).download();
@@ -225,7 +228,7 @@ async function firstFreshIntent(clients, config, session, now) {
     if (await clients.control.getBlobClient(authorizationName).exists()) continue;
     candidates.push({ value, blobName: blob.name, hash: sha256(bytes), decisionMs: Date.parse(value.decision_ts) });
   }
-  candidates.sort((left, right) => left.decisionMs - right.decisionMs || left.blobName.localeCompare(right.blobName));
+  candidates.sort((left, right) => right.decisionMs - left.decisionMs || left.blobName.localeCompare(right.blobName));
   return candidates[0] || null;
 }
 
@@ -268,7 +271,7 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && marketEndMs - decisionMs <= config.maximumSecondsToExpiry * 1_000
     && venueExpiryMs < marketEndMs
     && Number(intent.ttl_ms) > 0
-    && Number(intent.ttl_ms) <= 30_000
+    && Number(intent.ttl_ms) <= MAX_INTENT_TTL_MS
     && validUntilMs === decisionMs + Number(intent.ttl_ms)
     && Number.isFinite(price)
     && Number.isFinite(shares)

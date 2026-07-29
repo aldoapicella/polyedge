@@ -55,7 +55,7 @@ function env(overrides = {}) {
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
     FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/session.json",
     FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
-    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "20000",
+    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "7000",
     FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "5000",
     STRATEGY_CANARY_CANDIDATE_NAME: "dynamic_quote_style",
     STRATEGY_CANARY_CANDIDATE_VERSION: "dynamic_quote_style@2026-06-14",
@@ -107,7 +107,7 @@ class Container {
 function intent(now, id = "c".repeat(64)) {
   const value = session();
   const decision = new Date(now.getTime() - 1_000);
-  const valid = new Date(now.getTime() + 29_000);
+  const valid = new Date(decision.getTime() + 10_000);
   return {
     schema: "polyedge.execution_intent.v1",
     decision_id: id,
@@ -131,7 +131,7 @@ function intent(now, id = "c".repeat(64)) {
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 60_000).toISOString(),
-    ttl_ms: 30_000
+    ttl_ms: 10_000
   };
 }
 
@@ -150,6 +150,16 @@ test("operator-funded config requires the profitable 6-15 minute window", () => 
   assert.throws(
     () => loadFundedDirectConfig(env({ STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY: "30" })),
     /exactly 360-900 seconds/
+  );
+});
+
+test("worker TTL gates are compatible with the frozen strategy's ten-second intent", () => {
+  const config = loadFundedDirectConfig(env());
+  assert.equal(config.minRemainingTtlMs, 7_000);
+  assert.equal(config.childMinRemainingTtlMs, 5_000);
+  assert.throws(
+    () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "4000" })),
+    /must be in \[5000, 30000\]/
   );
 });
 
@@ -238,6 +248,42 @@ test("worker rejects an otherwise valid intent inside the final six minutes", as
   });
   assert.equal(output.status, "iteration_limit_reached");
   assert.equal(output.childInvocations, 0);
+});
+
+test("worker downloads only blob bodies that can still contain a fresh intent", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "3".repeat(64));
+  let downloads = 0;
+  const old = {
+    name: `intents/${"4".repeat(64)}.json`,
+    properties: { createdOn: new Date(now.getTime() - 31_000) }
+  };
+  const fresh = {
+    name: `intents/${value.decision_id}.json`,
+    properties: { createdOn: now }
+  };
+  const intents = {
+    async *listBlobsFlat() {
+      yield old;
+      yield fresh;
+    },
+    getBlobClient(name) {
+      return {
+        download: async () => {
+          downloads += 1;
+          return { readableStreamBody: stream(name === fresh.name ? JSON.stringify(value) : "{}") };
+        }
+      };
+    }
+  };
+  await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: { control: new Container(), intents },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => ({ exitCode: 0, error: "" })
+  });
+  assert.equal(downloads, 1);
 });
 
 test("worker reports an account-risk pause without retrying a funded child", async () => {
