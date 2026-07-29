@@ -155,7 +155,10 @@ async function initializeResources({ persistent = false } = {}) {
       timer: null,
       inFlight: 0,
       latest: null,
-      lastError: null
+      lastError: null,
+      market_id: null,
+      condition_id: null,
+      token_id: null
     },
     busy: false,
     baseBinding: {
@@ -772,11 +775,20 @@ const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
 
 function startSafetySnapshotCache(resources, market) {
   const cache = resources.safetyCache;
+  if (cache.timer &&
+      cache.market_id === String(market.market_id) &&
+      cache.condition_id === String(market.condition_id) &&
+      cache.token_id === String(market.token_id)) {
+    return;
+  }
   if (cache.timer) clearInterval(cache.timer);
   cache.generation += 1;
   cache.inFlight = 0;
   cache.latest = null;
   cache.lastError = null;
+  cache.market_id = String(market.market_id);
+  cache.condition_id = String(market.condition_id);
+  cache.token_id = String(market.token_id);
   const generation = cache.generation;
   const syntheticIntent = conservativeWarmIntent(market);
   const refresh = async () => {

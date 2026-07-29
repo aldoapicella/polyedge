@@ -238,18 +238,29 @@ impl IntentPublisher {
                 }
             }
         }
-        let message = funded_market_warmup(market, Utc::now());
-        let message_id = format!(
-            "warmup-{}",
-            sha256_hex(
-                format!("{}:{}", market.condition_id, market.end_ts.to_rfc3339()).as_bytes()
-            )
-        );
+        let producer_ts = Utc::now();
+        let message = funded_market_warmup(market, producer_ts);
+        let message_id = funded_market_warmup_message_id(market, producer_ts);
         sender
             .send_json(&message_id, 30, &message)
             .map_err(|error| error.to_string())?;
         Ok(true)
     }
+}
+
+fn funded_market_warmup_message_id(market: &MarketSpec, producer_ts: DateTime<Utc>) -> String {
+    format!(
+        "warmup-{}",
+        sha256_hex(
+            format!(
+                "{}:{}:{}",
+                market.condition_id,
+                market.end_ts.to_rfc3339(),
+                producer_ts.timestamp() / 60
+            )
+            .as_bytes()
+        )
+    )
 }
 
 fn funded_market_warmup_blob_name(
@@ -1347,6 +1358,16 @@ mod tests {
             .starts_with("reports/research/venue-probe/control/strategy-canary/warmups/"));
         assert!(marker_name.ends_with(".json"));
         assert!(funded_market_warmup_blob_name("intents", &market).is_err());
+        let minute = DateTime::<Utc>::from_timestamp((now.timestamp() / 60) * 60, 0).unwrap();
+        let message_id = funded_market_warmup_message_id(&market, minute);
+        assert_eq!(
+            message_id,
+            funded_market_warmup_message_id(&market, minute + Duration::seconds(30))
+        );
+        assert_ne!(
+            message_id,
+            funded_market_warmup_message_id(&market, minute + Duration::seconds(60))
+        );
     }
 
     #[test]
