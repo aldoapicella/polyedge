@@ -14,6 +14,7 @@ import {
 } from "../src/canary-lib.mjs";
 import {
   putOperatorSessionManifest,
+  requireExecutionModelArtifact,
   streamBookEvidence
 } from "../src/canary.mjs";
 
@@ -44,6 +45,32 @@ test("execution model URI resolves its exact cross-container artifact", () => {
     () => artifactLocationFromUri("azure://different/polyedge-research/prior.json", "storage"),
     /outside configured Azure storage account/
   );
+});
+
+test("persistent executor rejects missing execution-model provenance before execution", () => {
+  assert.deepEqual(
+    requireExecutionModelArtifact({
+      account: "storage",
+      container: "polyedge-research",
+      blobName: "reports/research/venue-probe/conservative_execution_prior_v1.json"
+    }),
+    {
+      account: "storage",
+      container: "polyedge-research",
+      blobName: "reports/research/venue-probe/conservative_execution_prior_v1.json"
+    }
+  );
+  for (const value of [
+    null,
+    {},
+    { container: "polyedge-research", blobName: "../model.json" },
+    { container: "INVALID", blobName: "model.json" }
+  ]) {
+    assert.throws(
+      () => requireExecutionModelArtifact(value),
+      /execution-model artifact provenance is unavailable/
+    );
+  }
 });
 
 test("final stream evidence follows the newest token-specific top-of-book update", () => {

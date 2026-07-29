@@ -140,6 +140,7 @@ async function initializeResources({ persistent = false } = {}) {
     persistent,
     container,
     intentContainer,
+    modelArtifact,
     manifestDocument,
     executionModelDocument,
     profitQuarantineSnapshot,
@@ -160,6 +161,19 @@ async function initializeResources({ persistent = false } = {}) {
       candidateConfigHash: config.candidateConfigHash
     }
   };
+}
+
+export function requireExecutionModelArtifact(value) {
+  const container = String(value?.container || "").trim();
+  const blobName = String(value?.blobName || "").trim();
+  if (!/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/.test(container) ||
+      !blobName ||
+      blobName.startsWith("/") ||
+      blobName.includes("\\") ||
+      blobName.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new Error("fail closed: persistent execution-model artifact provenance is unavailable");
+  }
+  return { ...value, container, blobName };
 }
 
 async function closeResources(resources) {
@@ -329,8 +343,16 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
         userChannel = resources.userChannel;
         marketChannel = resources.marketChannel;
         activeResources = resources;
-        const result = await main(resources);
-        return sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...result });
+        try {
+          const result = await main(resources);
+          return sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...result });
+        } catch (error) {
+          // The persistent worker must distinguish a pre-submit failure from a
+          // post-submit evidence failure. It may only seal the latter after
+          // independently verifying the durable terminal risk reservation.
+          error.orderSubmissionAttempted = orderSubmissionAttempted;
+          throw error;
+        }
       } finally {
         activeResources = null;
         resources.busy = false;
@@ -376,10 +398,14 @@ async function main(resources) {
   const {
     container,
     intentContainer,
+    modelArtifact: rawModelArtifact,
     manifestDocument,
     executionModelDocument,
     client
   } = resources;
+  // Provenance is needed after venue reconciliation to publish the immutable
+  // summary. Validate it before any reservation, authorization, or signing.
+  const modelArtifact = requireExecutionModelArtifact(rawModelArtifact);
   const [intentDocument, authorizationDocument] = await Promise.all([
     loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
     loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash)

@@ -398,6 +398,63 @@ test("persistent handoff verifies the immutable hash and executes exactly once a
   assert.equal(executions, 1);
 });
 
+test("persistent handoff seals a post-submit evidence failure only from exact terminal no-fill risk", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "7".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  const intents = new Container({ [`intents/${value.decision_id}.json`]: bytes });
+  let executions = 0;
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: { control, intents },
+    clock: () => now,
+    executeCanary: async (childEnv) => {
+      executions += 1;
+      const reservationName =
+        `reports/research/venue-probe/risk-reservations/2026-07-27/funded-direct-${value.decision_id}.json`;
+      control.values.set(reservationName, Buffer.from(JSON.stringify({
+        schema_version: 1,
+        state: "finalized_no_fill",
+        run_id: childEnv.STRATEGY_CANARY_RUN_ID,
+        probe_id: `funded-direct-${value.decision_id}`,
+        market_id: value.market_id,
+        condition_id: value.condition_id,
+        token_id: value.token_id,
+        order_submission_intended: true,
+        order_submitted: true,
+        order_id: `0x${"6".repeat(64)}`,
+        matched_notional: 0,
+        reconciliation_complete: true,
+        zero_open_orders_confirmed: true,
+        updated_ts: now.toISOString()
+      })));
+      const error = new Error("summary evidence serialization failed");
+      error.orderSubmissionAttempted = true;
+      throw error;
+    }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
+  };
+  const first = await processor.process(handoff);
+  const duplicate = await processor.process(handoff);
+  assert.equal(first.status, "persistent_intent_completed");
+  assert.equal(first.execution.status, "terminal_no_fill_evidence_degraded");
+  assert.equal(first.execution.lifecycle.zero_open_orders_confirmed, true);
+  assert.equal(duplicate.status, "already_completed_idempotent");
+  assert.equal(duplicate.completion.evidence_upload_status, "degraded_post_submission");
+  assert.equal(executions, 1);
+});
+
 test("persistent handoff rejects expired, tampered, and authorization-leak deliveries before execution", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "9".repeat(64));

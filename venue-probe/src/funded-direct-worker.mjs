@@ -277,6 +277,47 @@ async function executeSelectedIntent({
   executionTiming.child_completed_monotonic_ms = performance.now();
   childInvocations += 1;
   if (child.exitCode !== 0) {
+    if (child.orderSubmissionAttempted === true) {
+      const terminalReservation = await loadTerminalNoFillReservation(
+        clients.control,
+        selected,
+        authorization,
+        clock()
+      );
+      if (terminalReservation) {
+        await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+          status: "child_completed",
+          order_submission_attempted: true,
+          authorization_consumed: true,
+          risk_reservation_created: true,
+          evidence_upload_status: "degraded_post_submission",
+          terminal_risk_state: terminalReservation.state,
+          order_id: terminalReservation.order_id,
+          matched_notional: 0,
+          reconciliation_complete: true,
+          zero_open_orders_confirmed: true,
+          post_submission_error: child.error
+        });
+        executionTiming.completion_persisted_wall_ms = Date.now();
+        executionTiming.completion_persisted_monotonic_ms = performance.now();
+        return {
+          childInvocations,
+          result: null,
+          execution: {
+            status: "terminal_no_fill_evidence_degraded",
+            order_submission_attempted: true,
+            order_submitted: true,
+            lifecycle: {
+              order_id: terminalReservation.order_id,
+              send_wall_ms: null,
+              matched_notional: 0,
+              reconciliation_complete: true,
+              zero_open_orders_confirmed: true
+            }
+          }
+        };
+      }
+    }
     if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
       await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
         status: "child_failed_closed_pre_submission",
@@ -362,6 +403,54 @@ async function selectedFromHandoff(clients, config, session, handoff, now) {
         };
       }
       throw new Error("fail closed: funded intent completion is not bound to its authorization");
+    }
+    const authorization = await readJsonBlobDocument(clients.control, authorizationName);
+    assertExistingAuthorizationBinding(authorization, config, session, {
+      value,
+      blobName,
+      hash: actualHash
+    });
+    const terminalReservation = await loadTerminalNoFillReservation(
+      clients.control,
+      { value, blobName, hash: actualHash },
+      authorization,
+      now
+    );
+    if (terminalReservation) {
+      const completion = await writeCompletion(
+        clients.control,
+        config,
+        { value, blobName, hash: actualHash },
+        authorization,
+        authorization.value.child_run_id,
+        now,
+        {
+          status: "child_completed",
+          order_submission_attempted: true,
+          authorization_consumed: true,
+          risk_reservation_created: true,
+          evidence_upload_status: "degraded_post_submission",
+          terminal_risk_state: terminalReservation.state,
+          order_id: terminalReservation.order_id,
+          matched_notional: 0,
+          reconciliation_complete: true,
+          zero_open_orders_confirmed: true,
+          post_submission_error: "recovered from durable terminal reservation after incomplete handoff"
+        }
+      );
+      return {
+        value,
+        blobName,
+        hash: actualHash,
+        decisionMs: Date.parse(value.decision_ts),
+        duplicateCompletion: completion.value,
+        handoffTiming: {
+          hash_verification_started_wall_ms: verificationStartedWallMs,
+          hash_verification_started_monotonic_ms: verificationStartedMonotonicMs,
+          hash_verified_wall_ms: Date.now(),
+          hash_verified_monotonic_ms: performance.now()
+        }
+      };
     }
     throw new Error("fail closed: funded intent handoff already has an authorization");
   }
@@ -634,10 +723,71 @@ async function writeCompletion(container, config, selected, authorization, child
   });
 }
 
+function assertExistingAuthorizationBinding(authorization, config, session, selected) {
+  const value = authorization?.value;
+  if (authorization?.blobName !== authorizationBlobName(config, session, selected.value) ||
+      value?.schema !== AUTHORIZATION_SCHEMA ||
+      value?.session_id !== session.session_id ||
+      value?.decision_id !== selected.value.decision_id ||
+      value?.intent_blob_name !== selected.blobName ||
+      hash(value?.intent_sha256) !== hash(selected.hash) ||
+      value?.candidate_name !== config.candidate ||
+      value?.candidate_version !== config.candidateVersion ||
+      hash(value?.candidate_config_hash) !== config.candidateConfigHash ||
+      value?.single_use !== true ||
+      !clean(value?.child_run_id)) {
+    throw new Error("fail closed: funded intent handoff already has an authorization that is not exactly bound");
+  }
+}
+
+async function loadTerminalNoFillReservation(container, selected, authorization, now) {
+  const decisionId = selected.value.decision_id;
+  const probeId = `funded-direct-${decisionId}`;
+  const dates = [...new Set([
+    String(selected.value.decision_ts || "").slice(0, 10),
+    now.toISOString().slice(0, 10)
+  ].filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value)))];
+  for (const date of dates) {
+    const blobName = `reports/research/venue-probe/risk-reservations/${date}/${probeId}.json`;
+    if (!await container.getBlobClient(blobName).exists()) continue;
+    const reservation = await readJsonBlob(container, blobName);
+    const updatedMs = Date.parse(reservation?.updated_ts);
+    if (reservation?.schema_version === 1 &&
+        reservation?.probe_id === probeId &&
+        reservation?.run_id === authorization.value.child_run_id &&
+        reservation?.market_id === selected.value.market_id &&
+        reservation?.condition_id === selected.value.condition_id &&
+        reservation?.token_id === selected.value.token_id &&
+        reservation?.order_submission_intended === true &&
+        reservation?.order_submitted === true &&
+        reservation?.state === "finalized_no_fill" &&
+        /^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || "")) &&
+        Number(reservation?.matched_notional) === 0 &&
+        reservation?.reconciliation_complete === true &&
+        reservation?.zero_open_orders_confirmed === true &&
+        Number.isFinite(updatedMs) &&
+        updatedMs >= Date.parse(selected.value.decision_ts) &&
+        updatedMs <= now.getTime() + 60_000) {
+      return reservation;
+    }
+  }
+  return null;
+}
+
 async function readJsonBlob(container, blobName) {
+  return (await readJsonBlobDocument(container, blobName)).value;
+}
+
+async function readJsonBlobDocument(container, blobName) {
   const response = await container.getBlobClient(blobName).download();
   const bytes = await streamToBuffer(response.readableStreamBody);
-  try { return JSON.parse(bytes.toString("utf8")); }
+  try {
+    return {
+      value: JSON.parse(bytes.toString("utf8")),
+      blobName,
+      hash: sha256(bytes)
+    };
+  }
   catch { throw new Error(`fail closed: durable funded control blob is not valid JSON (${blobName})`); }
 }
 
