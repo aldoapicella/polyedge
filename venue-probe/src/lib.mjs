@@ -1059,7 +1059,8 @@ export async function settleProbeRiskReservations(config, settlement) {
     const blob = container.getBlockBlobClient(item.name);
     const response = await blob.download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
-    if ((reservation?.campaign_id && reservation.campaign_id !== config.campaignId)
+    if ((settlement?.settlement_kind && reservation?.campaign_id !== config.campaignId)
+        || (reservation?.campaign_id && reservation.campaign_id !== config.campaignId)
         || number(reservation?.matched_notional, 0) <= 0
         || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
     matchedReservations.push(reservation);
@@ -1418,6 +1419,7 @@ export async function loadUnresolvedRiskReservations(config) {
     if (!blob.name.endsWith(".json")) continue;
     const response = await container.getBlobClient(blob.name).download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
+    if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
     if (!isRiskReservationResolved(reservation)) unresolved.push(reservation);
   }
   return unresolved;
