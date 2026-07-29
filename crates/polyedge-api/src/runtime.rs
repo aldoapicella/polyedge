@@ -340,6 +340,7 @@ struct RuntimeData {
     execution_reports: VecDeque<ExecutionReport>,
     recent_events: VecDeque<RuntimeEvent>,
     settled_markets: Vec<MarketId>,
+    funded_warmup_market_id: Option<MarketId>,
     feed_status: BTreeMap<String, Value>,
     feed_events: usize,
     runtime_events: usize,
@@ -359,6 +360,17 @@ struct RuntimeEngine {
     regime_classifiers: BTreeMap<MarketId, RegimeClassifier>,
     pending_settlements: BTreeMap<MarketId, PendingPaperSettlement>,
     pending_decision_application: Option<PendingDecisionApplication>,
+}
+
+fn select_funded_warmup_market<'a>(
+    markets: impl Iterator<Item = &'a MarketSpec>,
+    now: DateTime<Utc>,
+    minimum_seconds_to_expiry: i64,
+) -> Option<&'a MarketSpec> {
+    let minimum_seconds_to_expiry = minimum_seconds_to_expiry.max(0);
+    markets
+        .filter(|market| (market.end_ts - now).num_seconds() >= minimum_seconds_to_expiry)
+        .min_by_key(|market| market.end_ts)
 }
 
 impl RuntimeController {
@@ -394,6 +406,7 @@ impl RuntimeController {
             execution_reports: VecDeque::new(),
             recent_events: VecDeque::new(),
             settled_markets: Vec::new(),
+            funded_warmup_market_id: None,
             feed_status: BTreeMap::new(),
             feed_events: 0,
             runtime_events: 0,
@@ -925,7 +938,6 @@ impl RuntimeController {
         let _decision_guard = self.inner.decision_gate.lock().await;
         let mut data = self.inner.data.write().await;
         let existing = data.markets.clone();
-        let mut warmup_markets = Vec::new();
         let now = Utc::now();
         let settled = data.settled_markets.clone();
         data.markets = existing
@@ -987,14 +999,6 @@ impl RuntimeController {
                     ));
                 }
             }
-            if existing.get(&market.market_id).is_none_or(|prior| {
-                prior.condition_id != market.condition_id
-                    || prior.up_token_id != market.up_token_id
-                    || prior.down_token_id != market.down_token_id
-                    || prior.end_ts != market.end_ts
-            }) {
-                warmup_markets.push(market.clone());
-            }
             let payload = serde_json::to_value(&market).unwrap_or(Value::Null);
             data.markets.insert(market.market_id.clone(), market);
             drop(data);
@@ -1013,18 +1017,30 @@ impl RuntimeController {
             }
             data = self.inner.data.write().await;
         }
+        let warmup_market = select_funded_warmup_market(
+            data.markets.values(),
+            now,
+            self.inner
+                .settings
+                .azure
+                .strategy_intent_min_seconds_to_expiry,
+        )
+        .filter(|market| data.funded_warmup_market_id.as_ref() != Some(&market.market_id))
+        .cloned();
         data.decision_generation = data.decision_generation.wrapping_add(1);
         drop(data);
         drop(_decision_guard);
         self.retry_pending_market_start_events().await;
-        for market in warmup_markets {
-            self.maybe_publish_market_warmup(market).await;
+        if let Some(market) = warmup_market {
+            if self.maybe_publish_market_warmup(market.clone()).await {
+                self.inner.data.write().await.funded_warmup_market_id = Some(market.market_id);
+            }
         }
     }
 
-    async fn maybe_publish_market_warmup(&self, market: MarketSpec) {
+    async fn maybe_publish_market_warmup(&self, market: MarketSpec) -> bool {
         if !self.inner.settings.azure.strategy_intent_operator_direct {
-            return;
+            return false;
         }
         let publisher_runtime = self.clone();
         let publish_market = market.clone();
@@ -1057,8 +1073,9 @@ impl RuntimeController {
                     None,
                 )
                 .await;
+                true
             }
-            Ok(false) => {}
+            Ok(false) => false,
             Err(reason) => {
                 warn!(
                     market_id = %market.market_id,
@@ -1078,6 +1095,7 @@ impl RuntimeController {
                     None,
                 )
                 .await;
+                false
             }
         }
     }
@@ -3903,6 +3921,58 @@ mod tests {
             vec!["a-down-token".to_owned(), "z-up-token".to_owned()]
         );
         assert!(!scoped.contains_key(&TokenId::new("unrelated-token")));
+    }
+
+    #[test]
+    fn funded_warmup_tracks_the_nearest_market_outside_the_final_six_minutes() {
+        let now = Utc::now();
+        let market = |id: &str, seconds_to_expiry: i64| MarketSpec {
+            asset: "BTC".to_owned(),
+            horizon: "15m".to_owned(),
+            event_id: None,
+            event_slug: None,
+            market_id: MarketId::new(id),
+            market_slug: None,
+            condition_id: ConditionId::new(format!("{id}-condition")),
+            question: "BTC up?".to_owned(),
+            description: None,
+            up_token_id: TokenId::new(format!("{id}-up")),
+            down_token_id: TokenId::new(format!("{id}-down")),
+            start_ts: now,
+            end_ts: now + chrono::Duration::seconds(seconds_to_expiry),
+            start_price: Some(Decimal::from(100)),
+            resolution_source: "chainlink_reference".to_owned(),
+            tick_size: Decimal::new(1, 2),
+            minimum_order_size: Decimal::from(5),
+            neg_risk: false,
+            fees_enabled: true,
+            accepting_orders: true,
+            status: MarketStatus::Tradeable,
+            raw: BTreeMap::new(),
+        };
+        let markets = [
+            market("final-six", 300),
+            market("active-window", 840),
+            market("future", 1_740),
+        ]
+        .into_iter()
+        .map(|market| (market.market_id.clone(), market))
+        .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            select_funded_warmup_market(markets.values(), now, 360)
+                .map(|market| market.market_id.to_string()),
+            Some("active-window".to_owned())
+        );
+        assert_eq!(
+            select_funded_warmup_market(
+                markets.values(),
+                now + chrono::Duration::seconds(500),
+                360,
+            )
+            .map(|market| market.market_id.to_string()),
+            Some("future".to_owned())
+        );
     }
 
     #[tokio::test]
