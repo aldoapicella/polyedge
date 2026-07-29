@@ -32,6 +32,7 @@ import {
   loadCanaryConfig,
   loadHashedJson,
   polymarketV2FeePerShare,
+  sha256,
   validateDeterministicNoOrderReconciliation,
   validateCanaryPreflight
 } from "./canary-lib.mjs";
@@ -80,6 +81,13 @@ async function initializeResources({ persistent = false } = {}) {
   const intentContainer = storageContainer({ ...config, storageContainer: config.intentContainerName });
   const manifestContainer = storageContainer({ ...config, storageContainer: config.manifestContainerName });
   if (!intentContainer || !manifestContainer) throw new Error("fail closed: intent or manifest source container is unavailable");
+  if (config.operatorDirect) {
+    await putOperatorSessionManifest(manifestContainer, {
+      blobName: config.manifestBlobName,
+      expectedHash: config.manifestBlobHash,
+      value: config.operatorSessionManifest
+    });
+  }
   const modelArtifact = artifactLocationFromUri(config.executionModelBlobUri, config.storageAccount);
   const modelContainer = storageContainer({ ...config, storageContainer: modelArtifact.container });
   if (!modelContainer) throw new Error("fail closed: execution model source container is unavailable");
@@ -158,6 +166,29 @@ async function closeResources(resources) {
   resources?.userChannel?.close();
   resources?.marketChannel?.close();
   if (resources?.lease) await resources.lease.release();
+}
+
+export async function putOperatorSessionManifest(container, {
+  blobName,
+  expectedHash,
+  value
+}) {
+  if (!container || !blobName || !value) {
+    throw new Error("fail closed: operator session manifest bootstrap is incomplete");
+  }
+  const bytes = Buffer.from(JSON.stringify(value, null, 2));
+  if (sha256(bytes) !== expectedHash) {
+    throw new Error("fail closed: embedded operator session manifest SHA-256 mismatch");
+  }
+  try {
+    await container.getBlockBlobClient(blobName).uploadData(bytes, {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+  } catch (error) {
+    if (![409, 412].includes(Number(error?.statusCode))) throw error;
+  }
+  return loadHashedJson(container, blobName, expectedHash);
 }
 
 function validatePersistentBinding(resources) {

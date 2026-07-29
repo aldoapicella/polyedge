@@ -71,6 +71,9 @@ export function loadCanaryConfig(env = process.env) {
     maxCampaignDrawdown: number(env.VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN, 1),
     maxReconciliationDiscrepancy: number(env.VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY, 0.01),
     campaignCashFlows: parseJson(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]"),
+    operatorSessionManifest: parseOptionalObject(
+      env.FUNDED_DIRECT_SESSION_MANIFEST_JSON
+    ),
     minRemainingTtlMs: integer(env.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, 5_000)
   };
   validateCanaryConfig(config);
@@ -113,6 +116,9 @@ export function validateCanaryConfig(config) {
   if (!config.storageAccount) errors.push("AZURE_STORAGE_ACCOUNT_NAME is required");
   if (!config.intentContainerName) errors.push("STRATEGY_CANARY_INTENT_CONTAINER_NAME is required");
   if (!config.manifestContainerName) errors.push("STRATEGY_CANARY_MANIFEST_CONTAINER_NAME is required");
+  if (config.operatorDirect && !config.operatorSessionManifest) {
+    errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be a valid object");
+  }
   if (!(config.maxReconciliationDiscrepancy >= 0 && config.maxReconciliationDiscrepancy <= 0.01)) {
     errors.push("VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY must be in [0, 0.01]");
   }
@@ -746,3 +752,12 @@ function boolean(value) { return String(value || "").toLowerCase() === "true"; }
 function integer(value, fallback) { const parsed = Number.parseInt(value, 10); return Number.isFinite(parsed) ? parsed : fallback; }
 function number(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
 function parseJson(value) { try { return JSON.parse(value); } catch { throw new Error("strategy_canary blocked: campaign cash flows must be valid JSON"); } }
+function parseOptionalObject(value) {
+  if (!clean(value)) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}

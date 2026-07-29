@@ -12,7 +12,10 @@ import {
   sha256,
   validateDeterministicNoOrderReconciliation
 } from "../src/canary-lib.mjs";
-import { streamBookEvidence } from "../src/canary.mjs";
+import {
+  putOperatorSessionManifest,
+  streamBookEvidence
+} from "../src/canary.mjs";
 
 const now = new Date("2026-07-12T12:00:20.000Z");
 const book = {
@@ -582,6 +585,38 @@ test("blob content hash mismatch fails before JSON can reach execution", async (
   const container = { getBlobClient: () => ({ download: async () => ({ readableStreamBody: Readable.from([bytes]) }) }) };
   await assert.rejects(loadHashedJson(container, "intent.json", `sha256:${"0".repeat(64)}`), /SHA-256 mismatch/);
   assert.equal((await loadHashedJson(container, "intent.json", sha256(bytes))).value.decision_id, "decision-1");
+});
+
+test("persistent startup atomically bootstraps or verifies the exact funded session manifest", async () => {
+  const values = new Map();
+  const container = {
+    getBlockBlobClient: (name) => ({
+      uploadData: async (bytes, options) => {
+        assert.equal(options.conditions.ifNoneMatch, "*");
+        if (values.has(name)) {
+          throw Object.assign(new Error("exists"), { statusCode: 412 });
+        }
+        values.set(name, Buffer.from(bytes));
+      }
+    }),
+    getBlobClient: (name) => ({
+      download: async () => {
+        if (!values.has(name)) {
+          throw Object.assign(new Error("missing"), { statusCode: 404 });
+        }
+        return { readableStreamBody: Readable.from([values.get(name)]) };
+      }
+    })
+  };
+  const value = { schema_version: "polyedge.operator_funded_session.v1", session_id: "session-v6" };
+  const expectedHash = sha256(Buffer.from(JSON.stringify(value, null, 2)));
+  const input = { blobName: "sessions/v6/session.json", expectedHash, value };
+  assert.deepEqual((await putOperatorSessionManifest(container, input)).value, value);
+  assert.deepEqual((await putOperatorSessionManifest(container, input)).value, value);
+  await assert.rejects(
+    putOperatorSessionManifest(container, { ...input, value: { ...value, session_id: "tampered" } }),
+    /SHA-256 mismatch/
+  );
 });
 
 test("shares below the venue minimum_order_size fail before risk reservation", async () => {
