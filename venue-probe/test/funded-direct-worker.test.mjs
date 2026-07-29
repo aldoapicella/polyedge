@@ -77,6 +77,30 @@ function env(overrides = {}) {
   };
 }
 
+function compoundingEnv(overrides = {}) {
+  const value = {
+    ...session(),
+    schema_version: "polyedge.operator_funded_session.v2",
+    session_id: "dynamic-quote-funded-2026-07-29-v5",
+    allow_compounding: true,
+    capital_policy: {
+      reserve_ratio: 0.3,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      high_water_update: "full_reconciliation_only",
+      reserve_monotonic: true,
+      state_blob_name: "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
+    },
+    internal_settlements: []
+  };
+  return env({
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+    FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/session.json",
+    FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
+    ...overrides
+  });
+}
+
 class Container {
   constructor(values = {}) {
     this.values = new Map(Object.entries(values));
@@ -162,6 +186,12 @@ test("worker TTL gates reserve time for the authenticated child preflight", () =
     () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "4000" })),
     /must be in \[5000, 30000\]/
   );
+});
+
+test("worker accepts the v2 monotonic protected-compounding contract", () => {
+  const config = loadFundedDirectConfig(compoundingEnv());
+  assert.equal(config.session.allow_compounding, true);
+  assert.equal(config.session.capital_policy.reserve_ratio, 0.3);
 });
 
 test("worker executes a fresh Dynamic Quote intent under the operator session", async () => {

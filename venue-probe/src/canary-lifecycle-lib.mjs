@@ -550,7 +550,7 @@ function normalizeTradeFills(trades, orderId) {
     // but preserve explicitly unit-labelled decimal fields if the venue adds one.
     // Ambiguous integer/micro-unit fields remain raw and are never used as money.
     const authenticatedFeeAmount = optionalNumber(
-      trade.fee_amount_usdc_decimal ?? trade.feeAmountUsdcDecimal ?? trade.fee_amount ?? trade.feeAmount
+      trade.fee_amount_usdc_decimal ?? trade.feeAmountUsdcDecimal
     );
     fills.push({
       id, size, price, timestampMs, traderSide, orderRole,
@@ -558,6 +558,7 @@ function normalizeTradeFills(trades, orderId) {
       authenticatedFeeAmount,
       authenticatedFeeRaw: {
         fee_rate_bps: maker?.fee_rate_bps ?? maker?.feeRateBps ?? trade.fee_rate_bps ?? trade.feeRateBps ?? null,
+        fee_amount: trade.fee_amount ?? trade.feeAmount ?? null,
         fee: trade.fee ?? null,
         fee_usdc: trade.fee_usdc ?? trade.feeUsdc ?? null,
         builder_fee: maker?.builder_fee ?? trade.builder_fee ?? trade.builderFee ?? null

@@ -75,11 +75,32 @@ test("nested maker_orders user trades produce authenticated maker fills", () => 
     authenticatedFeeAmount: null,
     authenticatedFeeRaw: {
       fee_rate_bps: "0",
+      fee_amount: null,
       fee: null,
       fee_usdc: null,
       builder_fee: null
     }
   }]);
+});
+
+test("ambiguous integer fee_amount remains raw and cannot become a false maker fee", () => {
+  const fills = tradeFillsFromUserEvents([{
+    event_type: "trade",
+    id: "winning-maker-fill",
+    match_time: "2026-07-29T19:30:00.000Z",
+    trader_side: "MAKER",
+    fee_amount: "12345",
+    maker_orders: [{
+      order_id: "maker-order-2",
+      matched_amount: "17.015",
+      price: "0.60",
+      fee_rate_bps: "700"
+    }]
+  }], "maker-order-2");
+
+  assert.equal(fills[0].authenticatedFeeRateBps, 700);
+  assert.equal(fills[0].authenticatedFeeAmount, null);
+  assert.equal(fills[0].authenticatedFeeRaw.fee_amount, "12345");
 });
 
 test("a later partial fill after cancel is classified as a cancellation race", () => {

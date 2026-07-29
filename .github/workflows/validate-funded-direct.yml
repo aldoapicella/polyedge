@@ -54,7 +54,7 @@ jobs:
           const assert = require("node:assert/strict");
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v4.json"));
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-29_v5.json"));
           const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
           const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
           assert.deepEqual(embedded, session);
@@ -65,8 +65,14 @@ jobs:
           assert.equal(session.research_lane_isolated, true);
           assert.equal(session.no_deposits, true);
           assert.equal(session.allow_automatic_replenishment, false);
-          assert.equal(session.allow_compounding, false);
+          assert.equal(session.allow_compounding, true);
+          assert.equal(session.capital_policy.reserve_ratio, 0.3);
+          assert.equal(session.capital_policy.operating_buffer_ratio, 0.01);
+          assert.equal(session.capital_policy.high_water_update, "full_reconciliation_only");
+          assert.equal(session.capital_policy.reserve_monotonic, true);
+          assert.equal(session.internal_settlements[0].type, "internal_manual_settlement");
           assert.deepEqual(session.external_cash_flows, []);
+          assert.equal(parameters.automaticRedemptionEnabled.value, false);
           NODE
 
       - uses: actions/setup-node@v4

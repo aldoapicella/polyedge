@@ -7,10 +7,12 @@ import {
   VENUE_GTD_SECURITY_BUFFER_MS
 } from "./canary-lib.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
+import { validateProtectedCompoundingManifest } from "./compounding-risk.mjs";
 
 const EXPECTED_CANDIDATE = "dynamic_quote_style";
 const EXPECTED_VERSION = "dynamic_quote_style@2026-06-14";
-const SESSION_SCHEMA = "polyedge.operator_funded_session.v1";
+const SESSION_SCHEMA_V1 = "polyedge.operator_funded_session.v1";
+const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const MAX_INTENT_TTL_MS = 30_000;
 
@@ -171,16 +173,30 @@ function validateSession(config) {
   const created = Date.parse(value?.created_at);
   const expires = Date.parse(value?.expires_at);
   const expectedHash = sha256(Buffer.from(JSON.stringify(value, null, 2)));
-  const valid = value?.schema_version === SESSION_SCHEMA
+  let compoundingPolicyValid = false;
+  if (value?.schema_version === SESSION_SCHEMA_V2) {
+    try {
+      validateProtectedCompoundingManifest(value);
+      compoundingPolicyValid = true;
+    } catch {
+      compoundingPolicyValid = false;
+    }
+  }
+  const compoundingModeValid = value?.schema_version === SESSION_SCHEMA_V1
+    ? value.allow_compounding === false
+    : value?.schema_version === SESSION_SCHEMA_V2
+      && value.allow_compounding === true
+      && compoundingPolicyValid;
+  const valid = [SESSION_SCHEMA_V1, SESSION_SCHEMA_V2].includes(value?.schema_version)
     && clean(value.session_id)
     && value.authorization_mode === "operator_direct"
-    && value.authorized_by_user_reference === "Codex task 2026-07-27 funded Dynamic Quote"
+    && clean(value.authorized_by_user_reference)
     && value.research_promotion_bypassed === true
     && value.research_lane_isolated === true
     && value.maker_only === true
     && value.no_deposits === true
     && value.allow_automatic_replenishment === false
-    && value.allow_compounding === false
+    && compoundingModeValid
     && Array.isArray(value.external_cash_flows)
     && value.external_cash_flows.length === 0
     && Number(value.max_open_orders) === 1
@@ -434,7 +450,10 @@ function result(status, config, details) {
     },
     no_deposits: true,
     no_replenishment: true,
-    no_compounding: true,
+    no_compounding: config.session.allow_compounding !== true,
+    allow_compounding: config.session.allow_compounding === true,
+    reserve_ratio: config.session.capital_policy?.reserve_ratio ?? null,
+    operating_buffer_ratio: config.session.capital_policy?.operating_buffer_ratio ?? null,
     external_cash_flow_count: 0,
     research_promotion_bypassed: true,
     ...details

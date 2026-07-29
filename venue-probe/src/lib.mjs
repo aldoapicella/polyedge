@@ -4,6 +4,10 @@ import {
   BlobServiceClient,
   StorageSharedKeyCredential
 } from "@azure/storage-blob";
+import {
+  protectedCapitalSnapshot,
+  putVerifiedInternalSettlement
+} from "./compounding-risk.mjs";
 
 export const HORIZONS_SECONDS = [1, 5, 30, 60];
 export const MARKOUT_HORIZONS_SECONDS = [1, 5, 30];
@@ -194,7 +198,8 @@ export function summarizeCampaignRisk({
   proposedNotional = 0,
   orderNotional = proposedNotional,
   authorizedStartingCollateral = null,
-  requireZeroExternalCashFlows = false
+  requireZeroExternalCashFlows = false,
+  protectedCompoundingState = null
 }) {
   const liquid = Math.max(0, number(liquidCollateral, 0));
   const summed = Math.max(0, number(summedPositionValue, 0));
@@ -223,6 +228,13 @@ export function summarizeCampaignRisk({
   const projectedEquity = accountEquity - reserved;
   const projectedDrawdown = Math.max(0, adjustedBaseline - projectedEquity);
   const blockers = [];
+  const protectedCapital = protectedCompoundingState
+    ? protectedCapitalSnapshot({
+        state: protectedCompoundingState,
+        accountEquity,
+        proposedNotional: reserved
+      })
+    : null;
   if (discrepancy > reconciliationTolerance + 1e-9) {
     blockers.push("account_reconciliation_discrepancy");
   }
@@ -236,10 +248,11 @@ export function summarizeCampaignRisk({
         Math.abs(adjustedBaseline - startingCollateral) > reconciliationTolerance + 1e-9) {
       blockers.push("authorized_starting_collateral_mismatch");
     }
-    if (accountEquity > startingCollateral + reconciliationTolerance + 1e-9) {
+    if (!protectedCapital && accountEquity > startingCollateral + reconciliationTolerance + 1e-9) {
       blockers.push("authorized_starting_collateral_exceeded");
     }
   }
+  if (protectedCapital) blockers.push(...protectedCapital.blockers);
   if (Number(openOrderCount) > 0) blockers.push("open_orders_present");
   if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
   if (Number(unresolvedPositionCount) > 1) blockers.push("unresolved_position_limit_exceeded");
@@ -259,7 +272,14 @@ export function summarizeCampaignRisk({
     cash_flow_adjusted_baseline: roundMoney(adjustedBaseline),
     authorized_starting_collateral: startingCollateral === null ? null : roundMoney(startingCollateral),
     no_replenishment: startingCollateral !== null,
-    no_compounding: startingCollateral !== null,
+    no_compounding: startingCollateral !== null && !protectedCapital,
+    allow_compounding: Boolean(protectedCapital),
+    high_water_equity: protectedCapital?.high_water_equity ?? null,
+    protected_reserve: protectedCapital?.protected_reserve ?? null,
+    operating_buffer_ratio: protectedCapital?.operating_buffer_ratio ?? null,
+    operating_buffer: protectedCapital?.operating_buffer ?? null,
+    operable_capital: protectedCapital?.operable_capital ?? null,
+    minimum_order_notional: protectedCapital?.minimum_order_notional ?? null,
     equity_floor: roundMoney(equityFloor),
     max_campaign_drawdown: roundMoney(maximumDrawdown),
     liquid_collateral: roundMoney(liquid),
@@ -972,6 +992,7 @@ export async function reserveProbeRisk(config, reservation) {
     evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
     state: "reserved",
     date,
+    campaign_id: config.campaignId,
     run_id: reservation.run_id,
     probe_id: reservation.probe_id,
     reserved_notional: number(reservation.reserved_notional, 0),
@@ -1022,7 +1043,8 @@ export async function settleProbeRiskReservations(config, settlement) {
   const conditionIds = new Set((settlement?.condition_ids || []).map((value) => String(value).toLowerCase()));
   const redemptionVerified = settlement?.settlement_verified === true && Boolean(settlement?.transaction_hash);
   const terminalVerified = settlement?.terminal_settlement_verified === true &&
-    settlement?.evidence_source === "polymarket_data_api_redeemable";
+    ["polymarket_data_api_redeemable", "polymarket_data_api_resolved_zero_payout"]
+      .includes(settlement?.evidence_source);
   if (!conditionIds.size || (!redemptionVerified && !terminalVerified)) {
     throw new Error("fail closed: verified settlement evidence is required to release filled risk reservations");
   }
@@ -1031,12 +1053,16 @@ export async function settleProbeRiskReservations(config, settlement) {
   const campaign = settlement?.terminal_portfolio ? await loadCampaignRiskControl(config) : null;
   let settled = 0;
   const terminalReservations = [];
+  const matchedReservations = [];
   for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
     if (!item.name.endsWith(".json")) continue;
     const blob = container.getBlockBlobClient(item.name);
     const response = await blob.download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
-    if (number(reservation?.matched_notional, 0) <= 0 || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
+    if ((reservation?.campaign_id && reservation.campaign_id !== config.campaignId)
+        || number(reservation?.matched_notional, 0) <= 0
+        || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
+    matchedReservations.push(reservation);
     // A previous redemption pass may already have moved the reservation to
     // position_settled before terminal portfolio evidence was available.  Do
     // not skip that reservation: the trusted redemption path must still be
@@ -1058,6 +1084,41 @@ export async function settleProbeRiskReservations(config, settlement) {
     });
     if (settlement?.terminal_portfolio) terminalReservations.push(payload);
     settled += 1;
+  }
+  const durableAutomaticSettlement = redemptionVerified
+    && settlement?.settlement_kind === "internal_automatic_settlement";
+  const durableResolvedLoss = terminalVerified
+    && settlement?.settlement_kind === "internal_resolved_loss";
+  if (durableAutomaticSettlement || durableResolvedLoss) {
+    for (const conditionId of conditionIds) {
+      const reservation = matchedReservations.find((row) =>
+        String(row.condition_id || "").toLowerCase() === conditionId
+      );
+      const payout = number(settlement?.payout_by_condition?.[conditionId], NaN);
+      const principal = number(
+        settlement?.principal_by_condition?.[conditionId],
+        number(reservation?.matched_notional, NaN)
+      );
+      if (![payout, principal].every(Number.isFinite) || payout < 0 || principal < 0) {
+        throw new Error(`fail closed: verified settlement accounting is incomplete for ${conditionId}`);
+      }
+      await putVerifiedInternalSettlement(container, {
+        id: `${settlement.settlement_kind}:${String(settlement.transaction_hash || "resolution").toLowerCase()}:${conditionId}`,
+        type: settlement.settlement_kind,
+        session_id: config.campaignId,
+        transaction_hash: settlement.transaction_hash || `0x${"0".repeat(64)}`,
+        condition_id: conditionId,
+        payout,
+        principal,
+        realized_pnl: payout - principal,
+        fill_transaction_hashes: settlement?.fill_transaction_hashes_by_condition?.[conditionId],
+        settled_ts: settlement.settled_ts || new Date().toISOString(),
+        evidence_source: settlement.evidence_source || "verified_onchain_redemption",
+        receipt_block_number: String(settlement.transaction_block_number || ""),
+        receipt_confirmations: Number(settlement.transaction_receipt_confirmations),
+        resolution_verified: durableResolvedLoss
+      });
+    }
   }
   // Publish terminal artifacts only after every reservation covered by this
   // verified atomic settlement has been durably updated. Otherwise the first

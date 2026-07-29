@@ -52,6 +52,12 @@ import {
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
+import {
+  loadDurableInternalSettlements,
+  putVerifiedInternalSettlement,
+  reconcileProtectedCompoundingState,
+  verifyConfiguredInternalSettlements
+} from "./compounding-risk.mjs";
 
 const config = loadCanaryConfig();
 const runKind = config.operatorDirect ? "funded-direct" : "strategy-canary";
@@ -287,6 +293,7 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     balance,
     positionsResponse,
     valueResponse,
+    activityResponse,
     unresolvedReservations
   ] = await Promise.all([
     fetchJson("https://polymarket.com/api/geoblock"),
@@ -299,6 +306,7 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
     fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) }),
+    fetch(`https://data-api.polymarket.com/activity?user=${encodeURIComponent(config.funderAddress)}&limit=200`, { signal: AbortSignal.timeout(10_000) }),
     loadUnresolvedRiskReservations(config)
   ]);
   assertEligibleOrigin(geoblock, config);
@@ -319,42 +327,120 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
       (feeRate > 0 && !feeTakerOnly)) {
     throw new Error("fail closed: Polymarket V2 market fee rate/exponent/taker-only parameters are invalid");
   }
-  if (!positionsResponse.ok || !valueResponse.ok) throw new Error("fail closed: account reconciliation endpoint failed");
+  if (!positionsResponse.ok || !valueResponse.ok || !activityResponse.ok) {
+    throw new Error("fail closed: account reconciliation endpoint failed");
+  }
   const positions = await positionsResponse.json();
   const reportedValues = await valueResponse.json();
-  if (!Array.isArray(positions) || !Array.isArray(reportedValues)) throw new Error("fail closed: account reconciliation payload is invalid");
-  const terminalConditionIds = [...new Set(positions
-    .filter((row) => row.redeemable === true && row.conditionId)
-    .map((row) => String(row.conditionId)))];
+  const activity = await activityResponse.json();
+  if (!Array.isArray(positions) || !Array.isArray(reportedValues) || !Array.isArray(activity)) {
+    throw new Error("fail closed: account reconciliation payload is invalid");
+  }
   let reservations = unresolvedReservations;
-  const terminalConditions = new Set(terminalConditionIds.map((value) => value.toLowerCase()));
-  const terminalRiskNeedsSettlement = reservations.some((reservation) =>
-    Number(reservation?.matched_notional) > 0
-      && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase())
-  );
-  if (terminalRiskNeedsSettlement) {
+  const zeroPayoutTerminalConditionIds = [...new Set(positions
+    .filter((row) =>
+      row.redeemable === true
+      && Number(row.size) > 1e-9
+      && Math.max(0, Number(row.currentValue) || 0) <= 1e-9
+      && row.conditionId
+    )
+    .map((row) => String(row.conditionId)))];
+  if (zeroPayoutTerminalConditionIds.length > 0) {
     await settleProbeRiskReservations(config, {
-      condition_ids: terminalConditionIds,
+      condition_ids: zeroPayoutTerminalConditionIds,
       terminal_settlement_verified: true,
-      evidence_source: "polymarket_data_api_redeemable",
+      settlement_kind: "internal_resolved_loss",
+      payout_by_condition: Object.fromEntries(
+        zeroPayoutTerminalConditionIds.map((conditionId) => [conditionId.toLowerCase(), 0])
+      ),
+      evidence_source: "polymarket_data_api_resolved_zero_payout",
       run_id: runId
     });
     reservations = await loadUnresolvedRiskReservations(config);
   }
+  let verifiedConfiguredSettlements = [];
+  if (config.operatorDirect && manifest?.allow_compounding === true) {
+    const compoundingContainer = storageContainer(config);
+    const durableSettlements = await loadDurableInternalSettlements(
+      compoundingContainer,
+      manifest.session_id
+    );
+    verifiedConfiguredSettlements = await verifyConfiguredInternalSettlements({
+      manifest,
+      activity,
+      getTransactionReceipt: confirmedPolygonReceipt,
+      durableSettlements
+    });
+    for (const settlement of verifiedConfiguredSettlements) {
+      if (!durableSettlements.some((row) => row.id === settlement.id)) {
+        await putVerifiedInternalSettlement(compoundingContainer, {
+          ...settlement,
+          session_id: manifest.session_id
+        });
+      }
+      const conditionId = settlement.condition_id.toLowerCase();
+      await settleProbeRiskReservations(config, {
+        condition_ids: [conditionId],
+        settlement_verified: true,
+        settlement_kind: "internal_manual_settlement",
+        payout_by_condition: { [conditionId]: settlement.payout },
+        principal_by_condition: { [conditionId]: settlement.principal },
+        fill_transaction_hashes_by_condition: {
+          [conditionId]: settlement.fill_transaction_hashes
+        },
+        transaction_hash: settlement.transaction_hash,
+        polygon_chain_id: 137,
+        transaction_receipt_status: "success",
+        transaction_block_number: settlement.receipt_block_number,
+        transaction_receipt_confirmations: settlement.receipt_confirmations,
+        settlement_wallet: config.funderAddress,
+        run_id: runId,
+        settled_ts: settlement.settled_at,
+        evidence_source: settlement.evidence_source
+      });
+    }
+    reservations = await loadUnresolvedRiskReservations(config);
+  }
+  const liquidCollateral = Number(balance.balance) / 1_000_000;
+  const summedPositionValue = positions.reduce((sum, row) => sum + Math.max(0, Number(row.currentValue) || 0), 0);
+  const reportedPositionValue = reportedValues.reduce((sum, row) => sum + Math.max(0, Number(row.value) || 0), 0);
+  const accountEquity = liquidCollateral + Math.min(summedPositionValue, reportedPositionValue);
+  const unresolvedPositionCount = positions.filter((row) =>
+    Number(row.size) > 1e-9
+    && !(row.redeemable === true && Math.max(0, Number(row.currentValue) || 0) <= 1e-9)
+  ).length;
+  const relevantReservations = reservations.filter((row) =>
+    String(row.probe_id) !== String(ignoredReservationId || "")
+  );
+  const reconciliationDiscrepancy = Math.abs(summedPositionValue - reportedPositionValue);
+  const fullyReconciled = reconciliationDiscrepancy <= Number(manifest?.max_reconciliation_discrepancy ?? 0.01) + 1e-9
+    && openOrders.length === 0
+    && unresolvedPositionCount === 0
+    && relevantReservations.length === 0;
+  const protectedCompoundingState = config.operatorDirect && manifest?.allow_compounding === true
+    ? await reconcileProtectedCompoundingState({
+        container: storageContainer(config),
+        manifest,
+        accountEquity,
+        fullyReconciled,
+        verifiedConfiguredSettlements
+      })
+    : null;
   const principal = Number(intent.notional);
   const feeRisk = Number(intent.shares) * polymarketV2FeePerShare(intent.price, feeRate, feeExponent);
   const risk = summarizeCampaignRisk({
     control: riskControl,
-    liquidCollateral: Number(balance.balance) / 1_000_000,
-    summedPositionValue: positions.reduce((sum, row) => sum + Math.max(0, Number(row.currentValue) || 0), 0),
-    reportedPositionValue: reportedValues.reduce((sum, row) => sum + Math.max(0, Number(row.value) || 0), 0),
+    liquidCollateral,
+    summedPositionValue,
+    reportedPositionValue,
     openOrderCount: openOrders.length,
-    unresolvedPositionCount: positions.filter((row) => Number(row.size) > 1e-9 && row.redeemable !== true).length,
-    unresolvedReservationCount: reservations.filter((row) => String(row.probe_id) !== String(ignoredReservationId || "")).length,
+    unresolvedPositionCount,
+    unresolvedReservationCount: relevantReservations.length,
     proposedNotional: principal + feeRisk,
     orderNotional: principal,
     authorizedStartingCollateral: config.operatorDirect ? Number(manifest?.starting_collateral) : null,
-    requireZeroExternalCashFlows: config.operatorDirect
+    requireZeroExternalCashFlows: config.operatorDirect,
+    protectedCompoundingState
   });
   return {
     geoblock,
@@ -977,4 +1063,42 @@ function normalizeFillClock(fills, serverMinusLocalMs) {
 function normalizePrivateKey(value) { const clean = String(value || "").trim(); return clean.startsWith("0x") ? clean : `0x${clean}`; }
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }
+async function confirmedPolygonReceipt(transactionHash) {
+  const [receipt, latestBlock] = await Promise.all([
+    polygonRpc("eth_getTransactionReceipt", [transactionHash]),
+    polygonRpc("eth_blockNumber", [])
+  ]);
+  if (!receipt?.blockNumber || !latestBlock) {
+    throw new Error("fail closed: Polygon settlement receipt is unavailable");
+  }
+  const receiptBlock = BigInt(receipt.blockNumber);
+  const head = BigInt(latestBlock);
+  return {
+    status: receipt.status === "0x1" ? "success" : "failed",
+    chain_id: 137,
+    block_number: receiptBlock.toString(),
+    confirmations: Number(head >= receiptBlock ? head - receiptBlock + 1n : 0n)
+  };
+}
+async function polygonRpc(method, params) {
+  for (const url of [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon-rpc.com"
+  ]) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!response.ok) continue;
+      const payload = await response.json();
+      if (!payload?.error && payload?.result !== undefined) return payload.result;
+    } catch {
+      // Try the next independent Polygon endpoint; all failures remain fail-closed.
+    }
+  }
+  throw new Error(`fail closed: Polygon RPC ${method} failed`);
+}
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }

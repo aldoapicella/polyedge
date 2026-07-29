@@ -14,6 +14,8 @@ param keyVaultName string = 'kvpolyedge6urdjr5nmwx7w'
 param logAnalyticsWorkspaceName string = 'log-polyedge-dev-6urdjr5nmwx7w'
 param funderAddress string = '0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8'
 param fundedDirectEnabled bool = false
+param automaticRedemptionEnabled bool = false
+param relayerApiKeyAddress string = '0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921'
 @secure()
 param fundedDirectSessionManifestJson string
 param fundedDirectSessionManifestBlobName string
@@ -32,6 +34,8 @@ var vnetName = 'vnet-polyedge-execution-cl'
 var originCheckJobName = 'polyedge-origin-check-cl-job'
 var fundedJobName = 'polyedge-funded-direct-cl-job'
 var fundedServiceName = 'polyedge-funded-direct-cl'
+var redemptionJobName = 'polyedge-funded-redeem-cl-job'
+var redemptionIdentityName = 'polyedge-redemption-cl-id'
 var tags = {
   app: 'polyedge'
   environment: 'dev'
@@ -98,6 +102,11 @@ resource polymarketApiPassphraseSecret 'Microsoft.KeyVault/vaults/secrets@2023-0
   name: 'polymarket-api-passphrase'
 }
 
+resource polymarketRelayerApiKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+  parent: keyVault
+  name: 'polymarket-relayer-api-key'
+}
+
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: logAnalyticsWorkspaceName
 }
@@ -106,6 +115,14 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
   name: identityName
   location: location
   tags: tags
+}
+
+resource redemptionIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = if (automaticRedemptionEnabled) {
+  name: redemptionIdentityName
+  location: location
+  tags: union(tags, {
+    operation: 'resolved-position-redemption'
+  })
 }
 
 resource publicIp 'Microsoft.Network/publicIPAddresses@2023-09-01' = {
@@ -283,6 +300,76 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
     principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionPrivateKeySecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(polymarketPrivateKeySecret.id, redemptionIdentity!.id, 'redemption-private-key-reader')
+  scope: polymarketPrivateKeySecret
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    principalId: redemptionIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionApiKeySecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(polymarketApiKeySecret.id, redemptionIdentity!.id, 'redemption-api-key-reader')
+  scope: polymarketApiKeySecret
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    principalId: redemptionIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionApiSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(polymarketApiSecretSecret.id, redemptionIdentity!.id, 'redemption-api-secret-reader')
+  scope: polymarketApiSecretSecret
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    principalId: redemptionIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionApiPassphraseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(polymarketApiPassphraseSecret.id, redemptionIdentity!.id, 'redemption-api-passphrase-reader')
+  scope: polymarketApiPassphraseSecret
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    principalId: redemptionIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionRelayerSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(polymarketRelayerApiKeySecret.id, redemptionIdentity!.id, 'redemption-relayer-key-reader')
+  scope: polymarketRelayerApiKeySecret
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    principalId: redemptionIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionEvidenceContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(fundedEvidenceContainer.id, redemptionIdentity!.id, 'redemption-blob-contributor')
+  scope: fundedEvidenceContainer
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: redemptionIdentity!.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource redemptionAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (automaticRedemptionEnabled) {
+  name: guid(registry.id, redemptionIdentity!.id, 'redemption-acr-pull')
+  scope: registry
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+    principalId: redemptionIdentity!.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -622,9 +709,131 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// Redemption never cancels or pauses unrelated orders. The single-exposure
+// funded policy prevents a new order while a winning position remains, and
+// this job converts only already-resolved positions back to pUSD.
+resource redemptionJob 'Microsoft.App/jobs@2024-03-01' = if (automaticRedemptionEnabled) {
+  name: redemptionJobName
+  location: location
+  tags: union(tags, {
+    trigger: 'scheduled-every-minute'
+    operation: 'resolved-position-redemption'
+    fundedExecution: 'settlement-only'
+  })
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${redemptionIdentity!.id}': {}
+    }
+  }
+  dependsOn: [
+    redemptionPrivateKeySecretReader
+    redemptionApiKeySecretReader
+    redemptionApiSecretReader
+    redemptionApiPassphraseSecretReader
+    redemptionRelayerSecretReader
+    redemptionEvidenceContributor
+    redemptionAcrPull
+  ]
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaRetryLimit: 0
+      replicaTimeout: 240
+      registries: [
+        {
+          server: registry.properties.loginServer
+          identity: redemptionIdentity!.id
+        }
+      ]
+      secrets: [
+        {
+          name: 'polymarket-private-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-private-key'
+          identity: redemptionIdentity!.id
+        }
+        {
+          name: 'polymarket-api-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-key'
+          identity: redemptionIdentity!.id
+        }
+        {
+          name: 'polymarket-api-secret'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret'
+          identity: redemptionIdentity!.id
+        }
+        {
+          name: 'polymarket-api-passphrase'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase'
+          identity: redemptionIdentity!.id
+        }
+        {
+          name: 'polymarket-relayer-api-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-relayer-api-key'
+          identity: redemptionIdentity!.id
+        }
+      ]
+      scheduleTriggerConfig: {
+        cronExpression: '* * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+    }
+    template: {
+      containers: [
+        {
+          name: 'funded-redemption'
+          image: venueProbeImage
+          command: [
+            'node'
+            'src/redeem.mjs'
+          ]
+          env: [
+            { name: 'EXECUTION_MODE', value: 'venue_redemption' }
+            { name: 'ALLOW_LIVE', value: 'false' }
+            { name: 'ENABLE_TAKER_ORDERS', value: 'false' }
+            { name: 'VENUE_REDEMPTION_ENABLED', value: 'true' }
+            { name: 'VENUE_REDEMPTION_DRY_RUN', value: 'false' }
+            { name: 'VENUE_REDEMPTION_MAX_PAYOUT', value: '25' }
+            { name: 'VENUE_REDEMPTION_MAX_CONDITIONS', value: '1' }
+            { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'true' }
+            { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: expectedCountry }
+            { name: 'VENUE_PROBE_EXPECTED_EGRESS_IP', value: publicIp.properties.ipAddress }
+            { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: fundedDirectCampaignId }
+            { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: fundedDirectStartingCollateral }
+            { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '0' }
+            { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: fundedDirectMaxAccountLoss }
+            { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
+            { name: 'VENUE_PROBE_CAMPAIGN_CASH_FLOWS', value: '[]' }
+            { name: 'VENUE_PROBE_STARTING_CAPITAL', value: fundedDirectStartingCollateral }
+            { name: 'POLYMARKET_FUNDER_ADDRESS', value: funderAddress }
+            { name: 'POLYMARKET_SIGNATURE_TYPE', value: '3' }
+            { name: 'POLYMARKET_RELAYER_API_KEY_ADDRESS', value: relayerApiKeyAddress }
+            { name: 'POLYMARKET_PRIVATE_KEY', secretRef: 'polymarket-private-key' }
+            { name: 'POLYMARKET_API_KEY', secretRef: 'polymarket-api-key' }
+            { name: 'POLYMARKET_API_SECRET', secretRef: 'polymarket-api-secret' }
+            { name: 'POLYMARKET_API_PASSPHRASE', secretRef: 'polymarket-api-passphrase' }
+            { name: 'POLYMARKET_RELAYER_API_KEY', secretRef: 'polymarket-relayer-api-key' }
+            { name: 'AZURE_CLIENT_ID', value: redemptionIdentity!.properties.clientId }
+            { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storage.name }
+            { name: 'AZURE_STORAGE_CONTAINER_NAME', value: fundedEvidenceContainer.name }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+
 output environmentName string = managedEnvironment.name
 output originCheckJobName string = originCheckJob.name
 output fundedJobName string = fundedJob.name
 output fundedServiceName string = fundedService.name
+output fundedRedemptionJobName string = redemptionJobName
+output automaticRedemptionEnabled bool = automaticRedemptionEnabled
 output staticEgressIp string = publicIp.properties.ipAddress
 output fundedIdentityClientId string = identity.properties.clientId

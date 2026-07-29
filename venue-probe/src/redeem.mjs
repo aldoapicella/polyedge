@@ -253,6 +253,11 @@ async function run() {
     await settleProbeRiskReservations(config, {
       condition_ids: selection.selected.map((row) => row.condition_id),
       settlement_verified: true,
+      settlement_kind: "internal_automatic_settlement",
+      payout_by_condition: Object.fromEntries(selection.selected.map((row) => [
+        row.condition_id.toLowerCase(),
+        row.gross_payout
+      ])),
       trust_boundary_ready: config.trustBoundaryReady,
       transaction_hash: transaction.transactionHash,
       polygon_chain_id: polygon.id,

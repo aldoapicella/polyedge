@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateProtectedCompoundingManifest } from "./compounding-risk.mjs";
 
 const EXECUTION_INTENT_SCHEMA = "polyedge.execution_intent.v1";
 const AUTHORIZATION_SCHEMA = "polyedge.strategy_canary_authorization.v1";
@@ -6,6 +7,7 @@ const FUNDED_AUTHORIZATION_SCHEMA = "polyedge.funded_stage_intent_authorization.
 const OPERATOR_DIRECT_AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
 const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
+const OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v2";
 export const VENUE_GTD_SECURITY_BUFFER_MS = 300_000;
 const VENUE_GTD_MINIMUM_LIFETIME_MS = 60_000;
 const VENUE_GTD_SEND_MARGIN_MS = 5_000;
@@ -259,14 +261,28 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (operatorDirect) {
     const startingCollateral = Number(manifest?.starting_collateral);
     const reconciliationTolerance = Number(manifest?.max_reconciliation_discrepancy);
-    if (manifest?.schema_version !== OPERATOR_DIRECT_MANIFEST_SCHEMA
+    let compoundingPolicyValid = false;
+    if (manifest?.schema_version === OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA) {
+      try {
+        validateProtectedCompoundingManifest(manifest);
+        compoundingPolicyValid = true;
+      } catch {
+        compoundingPolicyValid = false;
+      }
+    }
+    const compoundingModeValid = manifest?.schema_version === OPERATOR_DIRECT_MANIFEST_SCHEMA
+      ? manifest.allow_compounding === false
+      : manifest?.schema_version === OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA
+        && manifest.allow_compounding === true
+        && compoundingPolicyValid;
+    if (![OPERATOR_DIRECT_MANIFEST_SCHEMA, OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA].includes(manifest?.schema_version)
         || manifest.authorization_mode !== "operator_direct"
         || manifest.research_promotion_bypassed !== true
         || manifest.research_lane_isolated !== true
         || manifest.maker_only !== true
         || manifest.no_deposits !== true
         || manifest.allow_automatic_replenishment !== false
-        || manifest.allow_compounding !== false
+        || !compoundingModeValid
         || !Array.isArray(manifest.external_cash_flows)
         || manifest.external_cash_flows.length !== 0
         || Number(manifest.max_open_orders) !== 1
@@ -333,18 +349,37 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (operatorDirect) {
     const startingCollateral = Number(manifest.starting_collateral);
     const reconciliationTolerance = Number(manifest.max_reconciliation_discrepancy);
+    const riskEquity = Number(runtime.risk?.account_equity);
+    const highWater = Number(runtime.risk?.high_water_equity);
+    const protectedReserve = Number(runtime.risk?.protected_reserve);
+    const operatingBuffer = Number(runtime.risk?.operating_buffer);
+    const operableCapital = Number(runtime.risk?.operable_capital);
+    const reserveRatio = Number(manifest.capital_policy?.reserve_ratio);
+    const operatingBufferRatio = Number(manifest.capital_policy?.operating_buffer_ratio);
+    const protectedCapitalMathValid = manifest.allow_compounding !== true
+      || (highWater + 1e-9 >= riskEquity
+        && Math.abs(protectedReserve - highWater * reserveRatio) <= 0.0000011
+        && Math.abs(operatingBuffer - riskEquity * operatingBufferRatio) <= 0.0000011
+        && Math.abs(operableCapital - Math.max(0, riskEquity - protectedReserve - operatingBuffer)) <= 0.0000011);
     if (Number(runtime.risk?.baseline_equity) !== startingCollateral
         || Number(runtime.risk?.cash_flow_adjusted_baseline) !== startingCollateral
         || Number(runtime.risk?.authorized_starting_collateral) !== startingCollateral
         || runtime.risk?.no_replenishment !== true
-        || runtime.risk?.no_compounding !== true
+        || (manifest.allow_compounding === true
+          ? runtime.risk?.allow_compounding !== true
+            || runtime.risk?.no_compounding !== false
+            || Number(runtime.risk?.high_water_equity) < startingCollateral
+            || !protectedCapitalMathValid
+            || Number(runtime.risk?.operable_capital) < Number(intent.notional) - 1e-9
+          : runtime.risk?.no_compounding !== true)
         || Number(runtime.risk?.net_external_cash_flow) !== 0
         || Number(runtime.risk?.cash_flow_count) !== 0
         || !Array.isArray(runtime.risk?.cash_flow_ids)
         || runtime.risk.cash_flow_ids.length !== 0
         || Number(runtime.risk?.maximum_reconciliation_discrepancy) !== reconciliationTolerance
-        || Number(runtime.risk?.account_equity) > startingCollateral + reconciliationTolerance + 1e-9) {
-      fail("operator-funded no-replenishment/no-compounding reconciliation failed");
+        || (manifest.allow_compounding !== true
+          && Number(runtime.risk?.account_equity) > startingCollateral + reconciliationTolerance + 1e-9)) {
+      fail("operator-funded capital reconciliation failed (no-replenishment/no-compounding or protected compounding)");
     }
   }
   if (Number(runtime.openOrderCount) !== 0) fail("account has open orders");

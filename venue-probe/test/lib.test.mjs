@@ -137,6 +137,66 @@ test("operator-funded risk rejects unexpected deposit or profit above the author
   assert.ok(unexpectedCapital.blockers.includes("authorized_starting_collateral_exceeded"));
 });
 
+test("operator-funded protected compounding uses the persisted high-water reserve on every order", () => {
+  const risk = summarizeCampaignRisk({
+    control: {
+      campaign_id: "dynamic-quote-funded-2026-07-29-v5",
+      baseline_equity: 11.09862,
+      equity_floor: 0,
+      max_campaign_drawdown: 11.09862,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 0,
+      cash_flow_ids: []
+    },
+    liquidCollateral: 17.90462,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    proposedNotional: 10.8,
+    orderNotional: 10.5,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true,
+    protectedCompoundingState: {
+      high_water_equity: 17.90462,
+      protected_reserve: 5.371386,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1
+    }
+  });
+  assert.equal(risk.passed, true);
+  assert.equal(risk.allow_compounding, true);
+  assert.equal(risk.no_compounding, false);
+  assert.equal(risk.high_water_equity, 17.90462);
+  assert.equal(risk.protected_reserve, 5.371386);
+  assert.equal(risk.operating_buffer, 0.179046);
+  assert.equal(risk.operable_capital, 12.354188);
+  assert.ok(!risk.blockers.includes("authorized_starting_collateral_exceeded"));
+
+  const tooLarge = summarizeCampaignRisk({
+    control: {
+      campaign_id: "dynamic-quote-funded-2026-07-29-v5",
+      baseline_equity: 11.09862,
+      equity_floor: 0,
+      max_campaign_drawdown: 11.09862,
+      max_order_notional: 100,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0
+    },
+    liquidCollateral: 17.90462,
+    proposedNotional: 12.354189,
+    orderNotional: 12,
+    authorizedStartingCollateral: 11.09862,
+    protectedCompoundingState: {
+      high_water_equity: 17.90462,
+      protected_reserve: 5.371386,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1
+    }
+  });
+  assert.ok(tooLarge.blockers.includes("operable_capital_exceeded"));
+});
+
 test("operator-funded risk rejects any durable cash-flow record even when net flow is zero", () => {
   const risk = summarizeCampaignRisk({
     control: {
