@@ -85,20 +85,13 @@ async function main() {
   const modelArtifact = artifactLocationFromUri(config.executionModelBlobUri, config.storageAccount);
   const modelContainer = storageContainer({ ...config, storageContainer: modelArtifact.container });
   if (!modelContainer) throw new Error("fail closed: execution model source container is unavailable");
-  const [intentDocument, manifestDocument, authorizationDocument, executionModelDocument] = await Promise.all([
+  const documentPromises = [
     loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
     loadHashedJson(manifestContainer, config.manifestBlobName, config.manifestBlobHash),
     loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash),
     loadHashedJson(modelContainer, modelArtifact.blobName, config.executionModelHash)
-  ]);
-  const documents = {
-    intent: intentDocument.value,
-    manifest: manifestDocument.value,
-    authorization: authorizationDocument.value,
-    authorizationHash: authorizationDocument.hash,
-    executionModel: executionModelDocument.value,
-    executionModelHash: executionModelDocument.hash
-  };
+  ];
+  const documentsPromise = Promise.all(documentPromises);
   const account = privateKeyToAccount(normalizePrivateKey(config.privateKey));
   const signer = createWalletClient({ account, chain: polygon, transport: http("https://polygon-bor-rpc.publicnode.com") });
   const client = new ClobClient({
@@ -111,8 +104,23 @@ async function main() {
     useServerTime: true,
     throwOnError: true
   });
+  const [intentDocument, manifestDocument] = await Promise.all(documentPromises.slice(0, 2));
   if (!config.dryRun) lease = await acquireCampaignLease(config, runId);
-  const runtime = await capturePreflight(client, documents.intent, documents.manifest);
+  const [
+    [, , authorizationDocument, executionModelDocument],
+    runtime
+  ] = await Promise.all([
+    documentsPromise,
+    capturePreflight(client, intentDocument.value, manifestDocument.value)
+  ]);
+  const documents = {
+    intent: intentDocument.value,
+    manifest: manifestDocument.value,
+    authorization: authorizationDocument.value,
+    authorizationHash: authorizationDocument.hash,
+    executionModel: executionModelDocument.value,
+    executionModelHash: executionModelDocument.hash
+  };
   const result = await executeStrategyCanary({
     config,
     documents,
@@ -248,21 +256,39 @@ async function main() {
 }
 
 async function capturePreflight(client, intent, manifest, ignoredReservationId = null) {
-  const geoblock = await fetchJson("https://polymarket.com/api/geoblock");
-  assertEligibleOrigin(geoblock, config);
-  const requestStarted = Date.now();
-  const serverTimeResponse = await client.getServerTime();
-  const requestFinished = Date.now();
-  const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
-  const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
-  const clockRoundTripMs = requestFinished - requestStarted;
-  const localMidpointMs = (requestStarted + requestFinished) / 2;
-  const clockServerMinusLocalMs = serverMs - localMidpointMs;
-  const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
-  const clockUncertaintyMs = clockRoundTripMs / 2 + serverClockQuantizationMs;
-  const clockDriftMs = Math.abs(clockServerMinusLocalMs);
-  const market = await loadExactMarket(intent);
-  const [book, clobMarketInfo, openOrders, riskControl, balance, positionsResponse, valueResponse] = await Promise.all([
+  const clock = async () => {
+    const requestStarted = Date.now();
+    const serverTimeResponse = await client.getServerTime();
+    const requestFinished = Date.now();
+    const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
+    const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
+    const clockRoundTripMs = requestFinished - requestStarted;
+    const localMidpointMs = (requestStarted + requestFinished) / 2;
+    const clockServerMinusLocalMs = serverMs - localMidpointMs;
+    const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
+    const clockUncertaintyMs = clockRoundTripMs / 2 + serverClockQuantizationMs;
+    return {
+      clockDriftMs: Math.abs(clockServerMinusLocalMs),
+      clockServerMinusLocalMs,
+      clockRoundTripMs,
+      clockUncertaintyMs
+    };
+  };
+  const [
+    geoblock,
+    clockEvidence,
+    market,
+    book,
+    clobMarketInfo,
+    openOrders,
+    riskControl,
+    balance,
+    positionsResponse,
+    valueResponse
+  ] = await Promise.all([
+    fetchJson("https://polymarket.com/api/geoblock"),
+    clock(),
+    loadExactMarket(intent),
     client.getOrderBook(String(intent.token_id)),
     client.getClobMarketInfo(String(intent.condition_id)),
     getOpenOrdersStrict(client),
@@ -271,6 +297,13 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
     fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) })
   ]);
+  assertEligibleOrigin(geoblock, config);
+  const {
+    clockDriftMs,
+    clockServerMinusLocalMs,
+    clockRoundTripMs,
+    clockUncertaintyMs
+  } = clockEvidence;
   if (!Number.isFinite(clockDriftMs)) throw new Error("fail closed: venue clock is invalid");
   const feeRate = Number(clobMarketInfo?.fd?.r ?? 0);
   const feeExponent = Number(clobMarketInfo?.fd?.e ?? 0);
@@ -343,7 +376,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     lease.assertHealthy();
     // Both channels are opened before signing so partial fills, cancellation races,
     // public trade-through, and markout evidence have no intentional blind window.
-    userChannel = await connectLifecycleChannel({
+    const userChannelPromise = connectLifecycleChannel({
       url: config.userWsUrl,
       subscription: {
         auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
@@ -352,8 +385,11 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       },
       ledger,
       eventType: "venue_user_channel"
+    }).then((channel) => {
+      userChannel = channel;
+      return channel;
     });
-    marketChannel = await connectLifecycleChannel({
+    const marketChannelPromise = connectLifecycleChannel({
       url: config.marketWsUrl,
       subscription: {
         assets_ids: [intent.token_id],
@@ -362,8 +398,15 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       },
       ledger,
       eventType: "venue_market_channel"
+    }).then((channel) => {
+      marketChannel = channel;
+      return channel;
     });
-    refreshed = await capturePreflight(client, intent, documents.manifest, reservation.probe_id);
+    [, , refreshed] = await Promise.all([
+      userChannelPromise,
+      marketChannelPromise,
+      capturePreflight(client, intent, documents.manifest, reservation.probe_id)
+    ]);
     // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
     // authorization contract immediately before the only signing call.
     const preSendValidation = validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
