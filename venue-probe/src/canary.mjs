@@ -150,6 +150,13 @@ async function initializeResources({ persistent = false } = {}) {
     userChannel: persistentUserChannel,
     marketChannel: null,
     warmedMarket: null,
+    safetyCache: {
+      generation: 0,
+      timer: null,
+      inFlight: 0,
+      latest: null,
+      lastError: null
+    },
     busy: false,
     baseBinding: {
       manifestBlobName: config.manifestBlobName,
@@ -177,6 +184,7 @@ export function requireExecutionModelArtifact(value) {
 }
 
 async function closeResources(resources) {
+  if (resources?.safetyCache?.timer) clearInterval(resources.safetyCache.timer);
   resources?.userChannel?.close();
   resources?.marketChannel?.close();
   if (resources?.lease) await resources.lease.release();
@@ -318,6 +326,7 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
           Math.abs(restBestAsk - streamEvidence.bestAsk) > 1e-9) {
         throw new Error("fail closed: persistent warmup REST, clock, and public stream evidence disagree");
       }
+      startSafetySnapshotCache(resources, warmed);
       return {
         ...warmed,
         no_sign: true,
@@ -362,6 +371,9 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
       await closeResources(resources);
     },
     status() {
+      const safetySnapshotCompletedWallMs = Number(
+        resources.safetyCache?.latest?.runtime?.capturedCompletedWallMs
+      );
       return {
         user_channel_ready: resources.userChannel?.isOpen() === true,
         market_channel_ready: resources.marketChannel?.isOpen() === true,
@@ -373,6 +385,12 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
           resources.userChannel?.requiresReconciliation() === true ||
           resources.marketChannel?.requiresReconciliation() === true,
         warmed_market: resources.warmedMarket,
+        safety_snapshot_cache_ready: Number.isFinite(safetySnapshotCompletedWallMs),
+        safety_snapshot_cache_age_ms: Number.isFinite(safetySnapshotCompletedWallMs)
+          ? Math.max(0, Date.now() - safetySnapshotCompletedWallMs)
+          : null,
+        safety_snapshot_cache_in_flight: resources.safetyCache?.inFlight || 0,
+        safety_snapshot_cache_error: resources.safetyCache?.lastError || null,
         busy: resources.busy
       };
     }
@@ -410,7 +428,23 @@ async function main(resources) {
     loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
     loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash)
   ]);
-  const runtime = await capturePreflight(client, intentDocument.value, manifestDocument.value);
+  const cachedRuntime = selectFreshCachedSafetySnapshot(
+    resources,
+    intentDocument.value,
+    Date.now()
+  );
+  const runtime = cachedRuntime || await capturePreflight(
+    client,
+    intentDocument.value,
+    manifestDocument.value
+  );
+  ledger.record(cachedRuntime ? "funded_safety_snapshot_cache_hit" : "funded_safety_snapshot_cache_miss", {
+    wall_ms: Date.now(),
+    monotonic_ms: performance.now(),
+    decision_id: intentDocument.value.decision_id,
+    snapshot_completed_wall_ms: runtime.capturedCompletedWallMs,
+    snapshot_age_ms: Date.now() - Number(runtime.capturedCompletedWallMs)
+  });
   const documents = {
     intent: intentDocument.value,
     manifest: manifestDocument.value,
@@ -584,7 +618,16 @@ async function main(resources) {
   return { ...result, lifecycle: publicLifecycle, evidence_upload: evidenceUpload };
 }
 
-async function capturePreflight(client, intent, manifest, ignoredReservationId = null) {
+async function capturePreflight(
+  client,
+  intent,
+  manifest,
+  ignoredReservationId = null,
+  {
+    recordLedger = true,
+    profitQuarantineSnapshot = activeResources?.profitQuarantineSnapshot || null
+  } = {}
+) {
   const capturedStartedWallMs = Date.now();
   const capturedStartedMonotonicMs = performance.now();
   const clock = async () => {
@@ -684,18 +727,20 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     orderNotional: principal,
     authorizedStartingCollateral: config.operatorDirect ? Number(manifest?.starting_collateral) : null,
     requireZeroExternalCashFlows: config.operatorDirect,
-    profitQuarantineSnapshot: activeResources?.profitQuarantineSnapshot || null
+    profitQuarantineSnapshot
   });
   const capturedCompletedWallMs = Date.now();
   const captureDurationMs = Math.max(0, performance.now() - capturedStartedMonotonicMs);
-  ledger?.record("funded_safety_snapshot_completed", {
-    wall_ms: capturedCompletedWallMs,
-    monotonic_ms: performance.now(),
-    duration_ms: captureDurationMs,
-    decision_id: intent.decision_id,
-    open_order_count: openOrders.length,
-    risk_passed: risk.passed === true
-  });
+  if (recordLedger) {
+    ledger?.record("funded_safety_snapshot_completed", {
+      wall_ms: capturedCompletedWallMs,
+      monotonic_ms: performance.now(),
+      duration_ms: captureDurationMs,
+      decision_id: intent.decision_id,
+      open_order_count: openOrders.length,
+      risk_passed: risk.passed === true
+    });
+  }
   return {
     geoblock,
     clockDriftMs,
@@ -719,6 +764,83 @@ async function capturePreflight(client, intent, manifest, ignoredReservationId =
     captureDurationMs,
     client
   };
+}
+
+const SAFETY_CACHE_REFRESH_MS = 700;
+const SAFETY_CACHE_MAX_IN_FLIGHT = 3;
+const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
+
+function startSafetySnapshotCache(resources, market) {
+  const cache = resources.safetyCache;
+  if (cache.timer) clearInterval(cache.timer);
+  cache.generation += 1;
+  cache.inFlight = 0;
+  cache.latest = null;
+  cache.lastError = null;
+  const generation = cache.generation;
+  const syntheticIntent = conservativeWarmIntent(market);
+  const refresh = async () => {
+    if (resources.busy || cache.generation !== generation ||
+        cache.inFlight >= SAFETY_CACHE_MAX_IN_FLIGHT) return;
+    cache.inFlight += 1;
+    try {
+      const runtime = await capturePreflight(
+        resources.client,
+        syntheticIntent,
+        resources.manifestDocument.value,
+        null,
+        {
+          recordLedger: false,
+          profitQuarantineSnapshot: resources.profitQuarantineSnapshot
+        }
+      );
+      if (cache.generation === generation) {
+        cache.latest = {
+          market_id: String(market.market_id),
+          condition_id: String(market.condition_id),
+          token_id: String(market.token_id),
+          runtime
+        };
+        cache.lastError = null;
+      }
+    } catch (error) {
+      if (cache.generation === generation) cache.lastError = error.message;
+    } finally {
+      if (cache.generation === generation) cache.inFlight -= 1;
+    }
+  };
+  void refresh();
+  cache.timer = setInterval(() => { void refresh(); }, SAFETY_CACHE_REFRESH_MS);
+  cache.timer.unref?.();
+}
+
+function conservativeWarmIntent(market) {
+  const price = 0.5;
+  const notional = Number(config.maxOrderNotional);
+  return {
+    market_id: String(market.market_id),
+    condition_id: String(market.condition_id),
+    token_id: String(market.token_id),
+    price: String(price),
+    shares: String(notional / price),
+    notional: String(notional),
+    decision_id: `non-executable-warm-snapshot-${market.market_id}`
+  };
+}
+
+export function selectFreshCachedSafetySnapshot(resources, intent, nowMs = Date.now()) {
+  const cached = resources?.safetyCache?.latest;
+  const completedWallMs = Number(cached?.runtime?.capturedCompletedWallMs);
+  if (!cached ||
+      cached.market_id !== String(intent?.market_id || "") ||
+      cached.condition_id !== String(intent?.condition_id || "") ||
+      cached.token_id !== String(intent?.token_id || "") ||
+      !Number.isFinite(completedWallMs) ||
+      nowMs < completedWallMs ||
+      nowMs - completedWallMs > SAFETY_CACHE_MAX_SELECTION_AGE_MS) {
+    return null;
+  }
+  return cached.runtime;
 }
 
 async function executeLifecycle(client, { intent, documents, runtime, reservation }) {

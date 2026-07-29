@@ -217,6 +217,27 @@ impl IntentPublisher {
         let Some(sender) = &mut self.service_bus_sender else {
             return Ok(false);
         };
+        let marker = funded_market_warmup_marker(market);
+        let marker_bytes = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
+        let marker_name = funded_market_warmup_blob_name(&self.prefix, market)?;
+        match self
+            .blob_client
+            .upload_block_blob_bytes_if_absent(&marker_name, &marker_bytes, "application/json")
+            .map_err(|error| error.to_string())?
+        {
+            ImmutableBlobWrite::Created => {}
+            ImmutableBlobWrite::AlreadyExists => {
+                let existing = self
+                    .blob_client
+                    .download_blob_bytes(&marker_name)
+                    .map_err(|error| error.to_string())?;
+                if existing != marker_bytes {
+                    return Err(format!(
+                        "immutable funded market warmup collision: {marker_name}"
+                    ));
+                }
+            }
+        }
         let message = funded_market_warmup(market, Utc::now());
         let message_id = format!(
             "warmup-{}",
@@ -229,6 +250,34 @@ impl IntentPublisher {
             .map_err(|error| error.to_string())?;
         Ok(true)
     }
+}
+
+fn funded_market_warmup_blob_name(
+    intent_prefix: &str,
+    market: &MarketSpec,
+) -> Result<String, String> {
+    let (parent, leaf) = intent_prefix
+        .trim_matches('/')
+        .rsplit_once('/')
+        .ok_or_else(|| "funded intent prefix has no isolated parent".to_owned())?;
+    if parent.is_empty() || leaf != "intents" {
+        return Err("funded intent prefix is not the exact isolated intents path".to_owned());
+    }
+    Ok(format!(
+        "{parent}/warmups/{}.json",
+        sha256_hex(format!("{}:{}", market.condition_id, market.end_ts.to_rfc3339()).as_bytes())
+    ))
+}
+
+fn funded_market_warmup_marker(market: &MarketSpec) -> Value {
+    json!({
+        "schema": "polyedge.funded_market_warmup_marker.v1",
+        "executable": false,
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "token_ids": [market.up_token_id, market.down_token_id],
+        "market_end_ts": market.end_ts
+    })
 }
 
 fn funded_intent_handoff(
@@ -1283,6 +1332,21 @@ mod tests {
         assert!(warmup.get("decision_id").is_none());
         assert!(warmup.get("price").is_none());
         assert!(warmup.get("side").is_none());
+        let marker = funded_market_warmup_marker(&market);
+        assert_eq!(
+            marker["schema"],
+            Value::String("polyedge.funded_market_warmup_marker.v1".to_owned())
+        );
+        assert_eq!(marker["executable"], Value::Bool(false));
+        let marker_name = funded_market_warmup_blob_name(
+            "reports/research/venue-probe/control/strategy-canary/intents",
+            &market,
+        )
+        .unwrap();
+        assert!(marker_name
+            .starts_with("reports/research/venue-probe/control/strategy-canary/warmups/"));
+        assert!(marker_name.ends_with(".json"));
+        assert!(funded_market_warmup_blob_name("intents", &market).is_err());
     }
 
     #[test]

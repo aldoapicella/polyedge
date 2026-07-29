@@ -15,6 +15,7 @@ import {
 import {
   putOperatorSessionManifest,
   requireExecutionModelArtifact,
+  selectFreshCachedSafetySnapshot,
   streamBookEvidence
 } from "../src/canary.mjs";
 
@@ -71,6 +72,31 @@ test("persistent executor rejects missing execution-model provenance before exec
       /execution-model artifact provenance is unavailable/
     );
   }
+});
+
+test("persistent executor selects only a fresh exact-market safety snapshot", () => {
+  const runtime = { capturedCompletedWallMs: 10_000, risk: { passed: true } };
+  const resources = {
+    safetyCache: {
+      latest: {
+        market_id: "market-1",
+        condition_id: "condition-1",
+        token_id: "token-up",
+        runtime
+      }
+    }
+  };
+  const intent = {
+    market_id: "market-1",
+    condition_id: "condition-1",
+    token_id: "token-up"
+  };
+  assert.equal(selectFreshCachedSafetySnapshot(resources, intent, 10_600), runtime);
+  assert.equal(selectFreshCachedSafetySnapshot(resources, intent, 10_651), null);
+  assert.equal(
+    selectFreshCachedSafetySnapshot(resources, { ...intent, token_id: "token-down" }, 10_600),
+    null
+  );
 });
 
 test("final stream evidence follows the newest token-specific top-of-book update", () => {
