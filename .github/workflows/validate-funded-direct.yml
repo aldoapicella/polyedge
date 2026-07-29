@@ -112,7 +112,8 @@ jobs:
       AZURE_RESOURCE_GROUP: rg-polyedge-dev
       ACR_NAME: crpolyedge6urdjr5nmwx7w
       FUNDED_APP: polyedge-funded-direct-cl
-      PROTECTED_QSET_APP: polyedge-shadow-neu
+      INTENT_PRODUCER_APP: polyedge-shadow-neu
+      PROTECTED_QSET_APP: polyedge-shadow-qset-neu
     steps:
       - uses: actions/checkout@v4
 
@@ -123,7 +124,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Verify deployment identity and protected qset
+      - name: Verify deployment identity, intent producer, and protected qset
         env:
           EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         run: |
@@ -132,27 +133,43 @@ jobs:
           az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
           az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query properties.latestRevisionName \
+            -o tsv > intent-producer-revision-before.txt
+          test -s intent-producer-revision-before.txt
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$PROTECTED_QSET_APP" \
             --query properties.latestRevisionName \
             -o tsv > protected-qset-revision-before.txt
           test -s protected-qset-revision-before.txt
 
-      - name: Build and publish immutable funded worker image
-        id: image
+      - name: Build and publish immutable producer and funded worker images
+        id: images
         run: |
           set -euo pipefail
           login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
-          image_tag="$login_server/polyedge-venue-probe:${GITHUB_SHA}"
+          producer_tag="$login_server/polyedge-rust-backend:${GITHUB_SHA}"
+          funded_tag="$login_server/polyedge-venue-probe:${GITHUB_SHA}"
           az acr login --name "$ACR_NAME"
-          docker build -f Dockerfile.venue-probe -t "$image_tag" .
-          docker push "$image_tag"
-          digest=$(az acr repository show \
+          docker build --build-arg GIT_SHA="$GITHUB_SHA" -f Dockerfile.rust -t "$producer_tag" .
+          docker build -f Dockerfile.venue-probe -t "$funded_tag" .
+          docker push "$producer_tag"
+          docker push "$funded_tag"
+          producer_digest=$(az acr repository show \
+            --name "$ACR_NAME" \
+            --image "polyedge-rust-backend:${GITHUB_SHA}" \
+            --query digest \
+            -o tsv)
+          funded_digest=$(az acr repository show \
             --name "$ACR_NAME" \
             --image "polyedge-venue-probe:${GITHUB_SHA}" \
             --query digest \
             -o tsv)
-          test -n "$digest"
-          echo "reference=$login_server/polyedge-venue-probe@$digest" >> "$GITHUB_OUTPUT"
+          test -n "$producer_digest"
+          test -n "$funded_digest"
+          echo "producer_reference=$login_server/polyedge-rust-backend@$producer_digest" >> "$GITHUB_OUTPUT"
+          echo "funded_reference=$login_server/polyedge-venue-probe@$funded_digest" >> "$GITHUB_OUTPUT"
 
       - name: Prove funded-only deployment scope
         run: |
@@ -161,7 +178,7 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/funded-direct-chile.bicep \
             --parameters @infra/funded-direct-chile.parameters.json \
-            --parameters venueProbeImage="${{ steps.image.outputs.reference }}" \
+            --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
             --result-format ResourceIdOnly \
             --no-pretty-print \
             -o json > funded-what-if.json
@@ -180,10 +197,20 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --template-file infra/funded-direct-chile.bicep \
             --parameters @infra/funded-direct-chile.parameters.json \
-            --parameters venueProbeImage="${{ steps.image.outputs.reference }}" \
+            --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
             --only-show-errors \
             -o json > funded-deployment.json
           test "$(jq -r '.properties.provisioningState' funded-deployment.json)" = "Succeeded"
+
+      - name: Deploy compatible Dynamic Quote intent producer
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --image "${{ steps.images.outputs.producer_reference }}" \
+            --only-show-errors \
+            -o none
 
       - name: Verify one active cloud replica and exact live controls
         run: |
@@ -206,7 +233,7 @@ jobs:
           test "${active_replicas:-0}" = "1"
           test "$(jq -r '.properties.template.scale.minReplicas' funded-app.json)" = "1"
           test "$(jq -r '.properties.template.scale.maxReplicas' funded-app.json)" = "1"
-          test "$(jq -r '.properties.template.containers[0].image' funded-app.json)" = "${{ steps.image.outputs.reference }}"
+          test "$(jq -r '.properties.template.containers[0].image' funded-app.json)" = "${{ steps.images.outputs.funded_reference }}"
           test "$(jq -r '.properties.template.containers[0].command | join(" ")' funded-app.json)" = "node src/funded-direct-service.mjs"
           env_value() {
             jq -r --arg name "$1" '.properties.template.containers[0].env[] | select(.name == $name) | .value' funded-app.json
@@ -220,6 +247,12 @@ jobs:
           test "$(env_value FUNDED_DIRECT_POLL_INTERVAL_MS)" = "1000"
           test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
           test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "2000"
+          producer_image=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query properties.template.containers[0].image \
+            -o tsv)
+          test "$producer_image" = "${{ steps.images.outputs.producer_reference }}"
 
       - name: Verify service startup and qset isolation
         run: |
