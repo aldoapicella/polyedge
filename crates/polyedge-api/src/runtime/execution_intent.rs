@@ -18,11 +18,11 @@ const MAX_INTENT_TTL_MS: i64 = 30_000;
 // authorization, process launch, and the full authenticated preflight. Keep
 // those semantics separate and use the existing schema maximum for handoff.
 const EXECUTION_HANDOFF_TTL_MS: i64 = MAX_INTENT_TTL_MS;
-// Polymarket rejects GTD expirations that are less than 60 seconds in the
-// future at submission time. Intents stay live for only 10 seconds, so bind an
-// additional 30 seconds to survive authorization, preflight, and signing
-// latency without extending the strategy's active decision window.
-const VENUE_GTD_SECURITY_BUFFER_SECONDS: i64 = 90;
+// Keep the signed venue expiry well beyond the documented minimum. Live V2
+// rejected a correctly serialized order 107 seconds before its expiry, so the
+// immutable intent carries a five-minute fail-safe while the lifecycle still
+// cancels the maker quote after its configured rest period.
+const VENUE_GTD_SECURITY_BUFFER_SECONDS: i64 = 300;
 const FUNDED_CANONICAL_MANIFEST_BLOB: &str = "reports/research/profitability/latest.json";
 const CONSERVATIVE_PRIOR_VERSION: &str = "conservative-execution-prior-v1";
 const CONSERVATIVE_PRIOR_SHA256: &str =
@@ -247,8 +247,15 @@ pub(super) fn build_execution_intent_with_model(
     {
         return Err("configured execution-intent target and cap are invalid".to_owned());
     }
+    let fee_allowance = if market.fees_enabled {
+        crypto_taker_fee_per_share(price).map_err(|error| error.to_string())?
+    } else {
+        Decimal::ZERO
+    };
     let shares = if target_intent_notional > Decimal::ZERO {
-        (target_intent_notional / price)
+        // Size the total risk reservation (principal plus venue fee), so low
+        // prices cannot exceed the operator-authorized account loss envelope.
+        (target_intent_notional / (price + fee_allowance))
             .round_dp_with_strategy(2, RoundingStrategy::ToZero)
             .max(market.minimum_order_size)
     } else {
@@ -294,11 +301,6 @@ pub(super) fn build_execution_intent_with_model(
         .q
         .ok_or_else(|| "strategy probability q is missing".to_owned())?;
     let gross_edge = q - price;
-    let fee_allowance = if market.fees_enabled {
-        crypto_taker_fee_per_share(price).map_err(|error| error.to_string())?
-    } else {
-        Decimal::ZERO
-    };
     let slippage_allowance = settings.strategy.slippage_buffer;
     let toxicity_allowance = settings.strategy.adverse_selection_buffer + fair_value.model_error;
     let net_edge_lower_bound = gross_edge - fee_allowance - slippage_allowance - toxicity_allowance;
@@ -1075,7 +1077,7 @@ mod tests {
         assert_eq!(intent.ttl_ms, EXECUTION_HANDOFF_TTL_MS);
         assert_eq!(
             intent.gtd_expiry_ts,
-            Some(intent.valid_until + Duration::seconds(90))
+            Some(intent.valid_until + Duration::seconds(300))
         );
         assert_eq!(intent.notional, Decimal::new(90, 2));
         assert_eq!(intent.resolution_source, "chainlink_reference");
@@ -1212,13 +1214,16 @@ mod tests {
         settings.azure.strategy_intent_max_order_notional = Decimal::new(105, 1);
         settings.azure.strategy_intent_min_seconds_to_expiry = 360;
         settings.azure.strategy_intent_max_seconds_to_expiry = 900;
+        market.fees_enabled = true;
 
         let intent = build_execution_intent(
             &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
         )
         .unwrap();
-        assert_eq!(intent.shares, Decimal::new(2333, 2));
-        assert_eq!(intent.notional, Decimal::new(104985, 4));
+        let reserved_notional = intent.notional + intent.shares * intent.fee_allowance;
+        assert!(reserved_notional <= Decimal::new(105, 1));
+        assert!(reserved_notional >= Decimal::new(1049, 2));
+        assert!(intent.notional < Decimal::new(105, 1));
         assert_eq!(intent.market_end_ts, Some(market.end_ts));
 
         market.end_ts = now + Duration::seconds(359);

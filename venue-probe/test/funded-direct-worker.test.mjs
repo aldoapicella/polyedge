@@ -123,14 +123,15 @@ function intent(now, id = "c".repeat(64)) {
     post_only: true,
     order_kind: "post_only_gtd",
     price: "0.45",
-    shares: "23.33",
-    notional: "10.4985",
+    shares: "22.46",
+    notional: "10.107",
+    fee_allowance: "0.017325",
     minimum_order_size: "5",
     net_edge_lower_bound: "0.02",
     decision_ts: decision.toISOString(),
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
-    gtd_expiry_ts: new Date(valid.getTime() + 90_000).toISOString(),
+    gtd_expiry_ts: new Date(valid.getTime() + 300_000).toISOString(),
     ttl_ms: 30_000
   };
 }
@@ -186,6 +187,24 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
   assert.equal(calls, 1);
   assert.equal(output.status, "iteration_limit_reached");
   assert.equal(output.childInvocations, 1);
+});
+
+test("worker rejects principal-only sizing that exceeds the funded target after fees", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "f".repeat(64));
+  value.shares = "23.33";
+  value.notional = "10.4985";
+  const output = await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: {
+      control: new Container(),
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("fee-excess intent must not execute")
+  });
+  assert.equal(output.childInvocations, 0);
 });
 
 test("stale handoff is rejected before authorization and creates no reservation", async () => {

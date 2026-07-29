@@ -90,7 +90,7 @@ function fixture(dryRun = true) {
     ttl_ms: 30000,
     decision_ts: "2026-07-12T12:00:00.000Z",
     valid_until: "2026-07-12T12:00:30.000Z",
-    gtd_expiry_ts: "2026-07-12T12:02:00.000Z",
+    gtd_expiry_ts: "2026-07-12T12:05:30.000Z",
     book_hash: canonicalBookHash(book, "token-1"),
     q: "0.25",
     gross_edge: "0.05",
@@ -441,7 +441,7 @@ test("operator-funded preflight blocks unexpected capital and cash-flow records 
 test("stale, book-hash, geoblock, clock, equity, model, and authorization failures send no order", async (t) => {
   const cases = [
     ["stale intent", (value) => { value.now = new Date("2026-07-12T12:03:00Z"); }, /stale/],
-    ["missing GTD security buffer", (value) => { value.documents.intent.gtd_expiry_ts = value.documents.intent.valid_until; }, /90-second security buffer/],
+    ["missing GTD security buffer", (value) => { value.documents.intent.gtd_expiry_ts = value.documents.intent.valid_until; }, /300-second security buffer/],
     ["book hash", (value) => { value.documents.intent.book_hash = `sha256:${"f".repeat(64)}`; }, /book hash/],
     ["geoblock", (value) => { value.runtime.geoblock.blocked = true; }, /geoblock/],
     ["clock", (value) => { value.runtime.clockDriftMs = 6000; }, /clock drift/],

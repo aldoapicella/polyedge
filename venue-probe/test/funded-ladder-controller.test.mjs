@@ -797,7 +797,7 @@ test("checkpoint-100 target-200 queue-model authorization passes funded prefligh
     ttl_ms: 30_000,
     decision_ts: decisionTs.toISOString(),
     valid_until: validUntil.toISOString(),
-    gtd_expiry_ts: new Date(validUntil.getTime() + 90_000).toISOString(),
+    gtd_expiry_ts: new Date(validUntil.getTime() + 300_000).toISOString(),
     book_hash: canonicalBookHash(book, "token-200"),
     q: "0.25",
     gross_edge: "0.05",

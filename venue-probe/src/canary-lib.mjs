@@ -6,7 +6,7 @@ const FUNDED_AUTHORIZATION_SCHEMA = "polyedge.funded_stage_intent_authorization.
 const OPERATOR_DIRECT_AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
 const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
-export const VENUE_GTD_SECURITY_BUFFER_MS = 90_000;
+export const VENUE_GTD_SECURITY_BUFFER_MS = 300_000;
 const VENUE_GTD_MINIMUM_LIFETIME_MS = 60_000;
 const VENUE_GTD_SEND_MARGIN_MS = 5_000;
 const MAX_ACTIVE_INTENT_TTL_MS = 30_000;
@@ -225,7 +225,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (nowMs < decisionMs || nowMs >= validUntilMs) fail("execution intent is stale or not yet valid");
   if (validUntilMs - nowMs < config.minRemainingTtlMs) fail("execution intent has insufficient remaining TTL");
   if (Number(intent.ttl_ms) !== validUntilMs - decisionMs || Number(intent.ttl_ms) > MAX_ACTIVE_INTENT_TTL_MS) fail("active intent TTL does not reconcile or exceeds the short-lifecycle limit");
-  if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 90-second security buffer");
+  if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 300-second security buffer");
   const referenceAgeMs = Number(intent.reference_age_ms);
   const bookAgeMs = Number(intent.book_age_ms);
   if (!Number.isFinite(referenceAgeMs) || referenceAgeMs < 0 || referenceAgeMs > config.maxReferenceAgeMs) fail("reference source is stale");

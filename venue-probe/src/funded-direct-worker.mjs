@@ -244,6 +244,8 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
   const price = Number(intent?.price);
   const shares = Number(intent?.shares);
   const notional = Number(intent?.notional);
+  const feeAllowance = Number(intent?.fee_allowance);
+  const reservedNotional = notional + shares * feeAllowance;
   return intent?.schema === "polyedge.execution_intent.v1"
     && /^[0-9a-f]{64}$/.test(String(intent?.decision_id || ""))
     && blobName === `${config.intentPrefix}/${intent.decision_id}.json`
@@ -277,8 +279,12 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && Number.isFinite(price)
     && Number.isFinite(shares)
     && Number.isFinite(notional)
+    && Number.isFinite(feeAllowance)
+    && feeAllowance >= 0
+    && Number.isFinite(reservedNotional)
     && notional > 1 + 1e-9
-    && notional >= config.targetOrderNotional - 0.01 - 1e-9
+    && reservedNotional >= config.targetOrderNotional - 0.01 - 1e-9
+    && reservedNotional <= config.targetOrderNotional + 1e-9
     && notional <= config.maxOrderNotional
     && Math.abs(price * shares - notional) <= 1e-9
     && shares >= Number(intent.minimum_order_size)
