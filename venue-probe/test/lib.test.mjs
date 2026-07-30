@@ -160,6 +160,42 @@ test("operator-funded risk rejects any durable cash-flow record even when net fl
   assert.ok(risk.blockers.includes("external_cash_flow_record_present"));
 });
 
+test("protected compounding uses current equity only above the monotonic reserve", () => {
+  const risk = summarizeCampaignRisk({
+    control: {
+      campaign_id: "dynamic-quote-funded-2026-07-29-v5",
+      baseline_equity: 11.09862,
+      equity_floor: 0,
+      max_campaign_drawdown: 11.09862,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 0,
+      cash_flow_ids: []
+    },
+    liquidCollateral: 7.57122,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    proposedNotional: 2.124,
+    orderNotional: 2.124,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true,
+    protectedCompoundingState: {
+      high_water_equity: 17.90462,
+      protected_reserve: 5.371386,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      authorized_equity_ceiling: 17.90462
+    }
+  });
+  assert.equal(risk.passed, true);
+  assert.equal(risk.no_compounding, false);
+  assert.equal(risk.allow_compounding, true);
+  assert.equal(risk.protected_reserve, 5.371386);
+  assert.equal(risk.operable_capital, 2.124122);
+  assert.equal(risk.projected_equity, 5.44722);
+});
+
 test("one unresolved position is tolerated for reconciliation but blocks another submission", () => {
   const control = {
     campaign_id: "funded-campaign-2026-07-12",

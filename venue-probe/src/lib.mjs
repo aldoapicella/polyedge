@@ -4,6 +4,7 @@ import {
   BlobServiceClient,
   StorageSharedKeyCredential
 } from "@azure/storage-blob";
+import { protectedCapitalSnapshot } from "./compounding-risk.mjs";
 
 export const HORIZONS_SECONDS = [1, 5, 30, 60];
 export const MARKOUT_HORIZONS_SECONDS = [1, 5, 30];
@@ -195,7 +196,9 @@ export function summarizeCampaignRisk({
   orderNotional = proposedNotional,
   authorizedStartingCollateral = null,
   requireZeroExternalCashFlows = false,
-  profitQuarantineSnapshot = null
+  profitQuarantineSnapshot = null,
+  protectedCompoundingState = null,
+  additionalBlockers = []
 }) {
   const liquid = Math.max(0, number(liquidCollateral, 0));
   const summed = Math.max(0, number(summedPositionValue, 0));
@@ -218,17 +221,28 @@ export function summarizeCampaignRisk({
   const startingCollateral = authorizedStartingCollateral === null
     ? null
     : number(authorizedStartingCollateral, NaN);
-  const quarantinedProfit = Math.max(
+  const protectedCapital = protectedCompoundingState
+    ? protectedCapitalSnapshot({
+        state: protectedCompoundingState,
+        accountEquity,
+        proposedNotional
+      })
+    : null;
+  const quarantinedProfit = protectedCapital ? 0 : Math.max(
     0,
     number(profitQuarantineSnapshot?.quarantined_internal_profit, 0)
   );
-  const profitQuarantineEnabled = profitQuarantineSnapshot !== null;
-  const authorizedEquityCeiling = profitQuarantineEnabled
+  const profitQuarantineEnabled = !protectedCapital && profitQuarantineSnapshot !== null;
+  const authorizedEquityCeiling = protectedCapital
+    ? number(protectedCapital.authorized_equity_ceiling, NaN)
+    : profitQuarantineEnabled
     ? number(profitQuarantineSnapshot?.authorized_equity_ceiling, NaN)
     : startingCollateral;
-  // Verified profit remains in the wallet but never becomes loss headroom.
-  // Risk eligibility therefore tracks only the original session capital.
-  const riskEligibleEquity = Math.max(0, accountEquity - quarantinedProfit);
+  // Legacy v1 sessions quarantine verified profit. A v2 session instead uses
+  // the fully reconciled account equity while preserving its monotonic reserve.
+  const riskEligibleEquity = protectedCapital
+    ? accountEquity
+    : Math.max(0, accountEquity - quarantinedProfit);
   const reserved = Math.max(0, number(proposedNotional, 0));
   const principal = Math.max(0, number(orderNotional, 0));
   const campaignDrawdown = Math.max(0, adjustedBaseline - riskEligibleEquity);
@@ -248,7 +262,7 @@ export function summarizeCampaignRisk({
         Math.abs(adjustedBaseline - startingCollateral) > reconciliationTolerance + 1e-9) {
       blockers.push("authorized_starting_collateral_mismatch");
     }
-    if (profitQuarantineEnabled &&
+    if (!protectedCapital && profitQuarantineEnabled &&
         (!(authorizedEquityCeiling >= startingCollateral) ||
          profitQuarantineSnapshot?.allow_compounding !== false ||
          profitQuarantineSnapshot?.risk_headroom !== "starting_collateral_only")) {
@@ -258,6 +272,8 @@ export function summarizeCampaignRisk({
       blockers.push("authorized_starting_collateral_exceeded");
     }
   }
+  if (protectedCapital) blockers.push(...protectedCapital.blockers);
+  blockers.push(...additionalBlockers.map(String));
   if (Number(openOrderCount) > 0) blockers.push("open_orders_present");
   if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
   if (Number(unresolvedPositionCount) > 1) blockers.push("unresolved_position_limit_exceeded");
@@ -280,7 +296,8 @@ export function summarizeCampaignRisk({
       ? null
       : roundMoney(authorizedEquityCeiling),
     no_replenishment: startingCollateral !== null,
-    no_compounding: startingCollateral !== null,
+    no_compounding: startingCollateral !== null && !protectedCapital,
+    allow_compounding: Boolean(protectedCapital),
     profit_quarantine_enabled: profitQuarantineEnabled,
     verified_internal_realized_pnl: roundMoney(
       number(profitQuarantineSnapshot?.verified_internal_realized_pnl, 0)
@@ -293,6 +310,12 @@ export function summarizeCampaignRisk({
     risk_headroom: profitQuarantineEnabled
       ? profitQuarantineSnapshot?.risk_headroom || null
       : null,
+    high_water_equity: protectedCapital?.high_water_equity ?? null,
+    protected_reserve: protectedCapital?.protected_reserve ?? null,
+    operating_buffer_ratio: protectedCapital?.operating_buffer_ratio ?? null,
+    operating_buffer: protectedCapital?.operating_buffer ?? null,
+    operable_capital: protectedCapital?.operable_capital ?? null,
+    minimum_order_notional: protectedCapital?.minimum_order_notional ?? null,
     equity_floor: roundMoney(equityFloor),
     max_campaign_drawdown: roundMoney(maximumDrawdown),
     liquid_collateral: roundMoney(liquid),
@@ -310,7 +333,7 @@ export function summarizeCampaignRisk({
     open_order_count: Number(openOrderCount),
     unresolved_position_count: Number(unresolvedPositionCount),
     unresolved_risk_reservation_count: Number(unresolvedReservationCount),
-    blockers,
+    blockers: [...new Set(blockers)],
     passed: blockers.length === 0
   };
 }
@@ -1005,6 +1028,7 @@ export async function reserveProbeRisk(config, reservation) {
     evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
     state: "reserved",
     date,
+    campaign_id: config.campaignId,
     run_id: reservation.run_id,
     probe_id: reservation.probe_id,
     reserved_notional: number(reservation.reserved_notional, 0),
@@ -1069,7 +1093,9 @@ export async function settleProbeRiskReservations(config, settlement) {
     const blob = container.getBlockBlobClient(item.name);
     const response = await blob.download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
-    if (number(reservation?.matched_notional, 0) <= 0 || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
+    if ((config.operatorDirect === true && reservation?.campaign_id !== config.campaignId)
+        || number(reservation?.matched_notional, 0) <= 0
+        || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
     // A previous redemption pass may already have moved the reservation to
     // position_settled before terminal portfolio evidence was available.  Do
     // not skip that reservation: the trusted redemption path must still be
@@ -1390,6 +1416,7 @@ export async function loadUnresolvedRiskReservations(config) {
     if (!blob.name.endsWith(".json")) continue;
     const response = await container.getBlobClient(blob.name).download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
+    if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
     if (!isRiskReservationResolved(reservation)) unresolved.push(reservation);
   }
   return unresolved;

@@ -6,12 +6,14 @@ import {
   sha256,
   VENUE_GTD_SECURITY_BUFFER_MS
 } from "./canary-lib.mjs";
+import { validateProtectedCompoundingManifest } from "./compounding-risk.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
 import { validateProfitQuarantineManifest } from "./profit-quarantine.mjs";
 
 const EXPECTED_CANDIDATE = "dynamic_quote_style";
 const EXPECTED_VERSION = "dynamic_quote_style@2026-06-14";
-const SESSION_SCHEMA = "polyedge.operator_funded_session.v1";
+const SESSION_SCHEMA_V1 = "polyedge.operator_funded_session.v1";
+const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const MAX_INTENT_TTL_MS = 30_000;
 
@@ -348,7 +350,7 @@ async function executeSelectedIntent({
         })
       };
     }
-    if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|projected_equity_floor_breach|projected_campaign_drawdown_breach|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
+    if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|projected_equity_floor_breach|projected_campaign_drawdown_breach|authorized_starting_collateral|external_cash_flow_record|protected_reserve|protected_order|operable_capital/.test(child.error || "")) {
       await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
         status: "child_failed_closed_pre_submission",
         order_submission_attempted: false,
@@ -525,27 +527,37 @@ function validateSession(config) {
   const created = Date.parse(value?.created_at);
   const expires = Date.parse(value?.expires_at);
   const expectedHash = sha256(Buffer.from(JSON.stringify(value, null, 2)));
-  let profitQuarantineValid = value?.profit_quarantine === undefined
-    && value?.verified_internal_settlements === undefined;
-  if (value?.profit_quarantine?.enabled === true) {
+  let capitalModeValid = false;
+  if (value?.schema_version === SESSION_SCHEMA_V2) {
     try {
-      validateProfitQuarantineManifest(value);
-      profitQuarantineValid = true;
+      validateProtectedCompoundingManifest(value);
+      capitalModeValid = value.allow_compounding === true;
     } catch {
-      profitQuarantineValid = false;
+      capitalModeValid = false;
     }
+  } else if (value?.schema_version === SESSION_SCHEMA_V1) {
+    let profitQuarantineValid = value?.profit_quarantine === undefined
+      && value?.verified_internal_settlements === undefined;
+    if (value?.profit_quarantine?.enabled === true) {
+      try {
+        validateProfitQuarantineManifest(value);
+        profitQuarantineValid = true;
+      } catch {
+        profitQuarantineValid = false;
+      }
+    }
+    capitalModeValid = value.allow_compounding === false && profitQuarantineValid;
   }
-  const valid = value?.schema_version === SESSION_SCHEMA
+  const valid = [SESSION_SCHEMA_V1, SESSION_SCHEMA_V2].includes(value?.schema_version)
     && clean(value.session_id)
     && value.authorization_mode === "operator_direct"
-    && value.authorized_by_user_reference === "Codex task 2026-07-27 funded Dynamic Quote"
+    && clean(value.authorized_by_user_reference)
     && value.research_promotion_bypassed === true
     && value.research_lane_isolated === true
     && value.maker_only === true
     && value.no_deposits === true
     && value.allow_automatic_replenishment === false
-    && value.allow_compounding === false
-    && profitQuarantineValid
+    && capitalModeValid
     && Array.isArray(value.external_cash_flows)
     && value.external_cash_flows.length === 0
     && Number(value.max_open_orders) === 1
@@ -875,7 +887,10 @@ function result(status, config, details) {
     },
     no_deposits: true,
     no_replenishment: true,
-    no_compounding: true,
+    no_compounding: config.session.allow_compounding !== true,
+    allow_compounding: config.session.allow_compounding === true,
+    reserve_ratio: config.session.capital_policy?.reserve_ratio ?? null,
+    operating_buffer_ratio: config.session.capital_policy?.operating_buffer_ratio ?? null,
     external_cash_flow_count: 0,
     research_promotion_bypassed: true,
     ...details

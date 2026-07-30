@@ -55,7 +55,7 @@ jobs:
           const assert = require("node:assert/strict");
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v4.json"));
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-29_v5.json"));
           const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
           const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
           assert.deepEqual(embedded, session);
@@ -66,20 +66,26 @@ jobs:
           assert.equal(session.research_lane_isolated, true);
           assert.equal(session.no_deposits, true);
           assert.equal(session.allow_automatic_replenishment, false);
-          assert.equal(session.allow_compounding, false);
+          assert.equal(session.allow_compounding, true);
+          assert.equal(session.capital_policy.reserve_ratio, 0.3);
+          assert.equal(session.capital_policy.operating_buffer_ratio, 0.01);
+          assert.equal(session.capital_policy.minimum_order_notional, 1);
+          assert.equal(session.capital_policy.high_water_update, "full_reconciliation_only");
+          assert.equal(session.capital_policy.reserve_monotonic, true);
+          assert.equal(session.internal_settlements[0].type, "internal_manual_settlement");
           assert.deepEqual(session.external_cash_flows, []);
-          assert.equal(session.session_id, "dynamic-quote-funded-2026-07-28-v4");
+          assert.equal(session.session_id, "dynamic-quote-funded-2026-07-29-v5");
           assert.equal(session.starting_collateral, 11.09862);
           assert.equal(session.max_account_loss, 11.09862);
           assert.equal(session.target_order_notional, 10.5);
           assert.equal(session.max_order_notional, 10.5);
           assert.equal(
             parameters.fundedDirectSessionManifestBlobName.value,
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-28-v4/session.json"
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/session.json"
           );
           assert.equal(
             parameters.fundedDirectSessionManifestSha256.value,
-            "sha256:4833c6f23c1762e2328a1cef40e24a749d94e0152b4a8e6fe25b9e1b7853a6c7"
+            "sha256:b8877f266f1e68d846ad2fd3ae8732c2d533cc7ccc14482ac5f76d0d1c1f58f9"
           );
           NODE
 
@@ -466,16 +472,18 @@ jobs:
           test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
           test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "2000"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME)" = \
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-28-v4/session.json"
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/session.json"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = \
-            "sha256:4833c6f23c1762e2328a1cef40e24a749d94e0152b4a8e6fe25b9e1b7853a6c7"
+            "sha256:b8877f266f1e68d846ad2fd3ae8732c2d533cc7ccc14482ac5f76d0d1c1f58f9"
           test "$(env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = \
-            "dynamic-quote-funded-2026-07-28-v4"
+            "dynamic-quote-funded-2026-07-29-v5"
           session_json=$(env_value FUNDED_DIRECT_SESSION_MANIFEST_JSON)
-          test "$(jq -r '.session_id' <<<"$session_json")" = "dynamic-quote-funded-2026-07-28-v4"
+          test "$(jq -r '.session_id' <<<"$session_json")" = "dynamic-quote-funded-2026-07-29-v5"
           test "$(jq -r '.no_deposits' <<<"$session_json")" = "true"
           test "$(jq -r '.allow_automatic_replenishment' <<<"$session_json")" = "false"
-          test "$(jq -r '.allow_compounding' <<<"$session_json")" = "false"
+          test "$(jq -r '.allow_compounding' <<<"$session_json")" = "true"
+          test "$(jq -r '.capital_policy.reserve_ratio' <<<"$session_json")" = "0.3"
+          test "$(jq -r '.capital_policy.operating_buffer_ratio' <<<"$session_json")" = "0.01"
           test "$(jq -c '.external_cash_flows' <<<"$session_json")" = "[]"
           producer_image=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \

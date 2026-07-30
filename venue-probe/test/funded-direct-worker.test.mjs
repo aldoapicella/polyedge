@@ -203,6 +203,42 @@ test("operator-funded config accepts only an explicit non-compounding profit qua
   );
 });
 
+test("operator-funded config accepts the reviewed monotonic 30% reserve contract", () => {
+  const value = session();
+  value.schema_version = "polyedge.operator_funded_session.v2";
+  value.session_id = "dynamic-quote-funded-test-v5";
+  value.authorized_by_user_reference = "Codex task protected compounding";
+  value.allow_compounding = true;
+  value.capital_policy = {
+    reserve_ratio: 0.3,
+    operating_buffer_ratio: 0.01,
+    minimum_order_notional: 1,
+    high_water_update: "full_reconciliation_only",
+    reserve_monotonic: true,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json"
+  };
+  value.internal_settlements = [];
+  const fundedEnv = env({
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+    FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+      sha256(Buffer.from(JSON.stringify(value, null, 2)))
+  });
+  const config = loadFundedDirectConfig(fundedEnv);
+  assert.equal(config.session.allow_compounding, true);
+  assert.equal(config.session.capital_policy.reserve_ratio, 0.3);
+  value.capital_policy.reserve_ratio = 0.29;
+  assert.throws(
+    () => loadFundedDirectConfig({
+      ...fundedEnv,
+      FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+      FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+        sha256(Buffer.from(JSON.stringify(value, null, 2)))
+    }),
+    /operator-funded session contract/
+  );
+});
+
 test("worker executes a fresh Dynamic Quote intent under the operator session", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now);

@@ -54,6 +54,13 @@ import {
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
+import {
+  loadDurableInternalSettlements,
+  putVerifiedInternalSettlement,
+  reconcileProtectedCompoundingState,
+  sizeProtectedOrder,
+  verifyConfiguredInternalSettlements
+} from "./compounding-risk.mjs";
 import { initializeProfitQuarantine } from "./profit-quarantine.mjs";
 
 let config;
@@ -107,6 +114,12 @@ async function initializeResources({ persistent = false } = {}) {
     useServerTime: true,
     throwOnError: true
   });
+  const protectedCompoundingContext = manifestDocument.value?.allow_compounding === true
+    ? await initializeProtectedCompounding({
+        container,
+        manifest: manifestDocument.value
+      })
+    : null;
   const profitQuarantineSnapshot = manifestDocument.value?.profit_quarantine?.enabled === true
     ? await initializeProfitQuarantine({
         container,
@@ -144,6 +157,7 @@ async function initializeResources({ persistent = false } = {}) {
     manifestDocument,
     executionModelDocument,
     profitQuarantineSnapshot,
+    protectedCompoundingContext,
     client,
     lease: resourceLease,
     ledgerMultiplexer,
@@ -170,6 +184,34 @@ async function initializeResources({ persistent = false } = {}) {
       candidateVersion: config.candidateVersion,
       candidateConfigHash: config.candidateConfigHash
     }
+  };
+}
+
+async function initializeProtectedCompounding({ container, manifest }) {
+  const durableSettlements = await loadDurableInternalSettlements(
+    container,
+    manifest.session_id
+  );
+  const activity = await fetchJson(
+    `https://data-api.polymarket.com/activity?user=${encodeURIComponent(config.funderAddress)}&limit=500`
+  );
+  const verifiedConfiguredSettlements = await verifyConfiguredInternalSettlements({
+    manifest,
+    activity,
+    getTransactionReceipt: confirmedPolygonReceipt,
+    durableSettlements
+  });
+  for (const settlement of verifiedConfiguredSettlements) {
+    if (!durableSettlements.some((row) => row.id === settlement.id)) {
+      await putVerifiedInternalSettlement(container, {
+        ...settlement,
+        session_id: manifest.session_id
+      });
+    }
+  }
+  return {
+    state: null,
+    verifiedConfiguredSettlements
   };
 }
 
@@ -653,7 +695,9 @@ async function capturePreflight(
   ignoredReservationId = null,
   {
     recordLedger = true,
-    profitQuarantineSnapshot = activeResources?.profitQuarantineSnapshot || null
+    profitQuarantineSnapshot = activeResources?.profitQuarantineSnapshot || null,
+    protectedCompoundingContext =
+      activeResources?.protectedCompoundingContext || null
   } = {}
 ) {
   const capturedStartedWallMs = Date.now();
@@ -741,35 +785,52 @@ async function capturePreflight(
     });
     reservations = await loadUnresolvedRiskReservations(config);
   }
-  const principal = Number(intent.notional);
-  const feeRisk = Number(intent.shares) * polymarketV2FeePerShare(intent.price, feeRate, feeExponent);
-  const risk = summarizeCampaignRisk({
-    control: riskControl,
-    liquidCollateral: Number(balance.balance) / 1_000_000,
-    summedPositionValue: positions.reduce((sum, row) => sum + Math.max(0, Number(row.currentValue) || 0), 0),
-    reportedPositionValue: reportedValues.reduce((sum, row) => sum + Math.max(0, Number(row.value) || 0), 0),
-    openOrderCount: openOrders.length,
-    unresolvedPositionCount: positions.filter((row) => Number(row.size) > 1e-9 && row.redeemable !== true).length,
-    unresolvedReservationCount: reservations.filter((row) => String(row.probe_id) !== String(ignoredReservationId || "")).length,
-    proposedNotional: principal + feeRisk,
-    orderNotional: principal,
-    authorizedStartingCollateral: config.operatorDirect ? Number(manifest?.starting_collateral) : null,
-    requireZeroExternalCashFlows: config.operatorDirect,
-    profitQuarantineSnapshot
-  });
+  const liquidCollateral = Number(balance.balance) / 1_000_000;
+  const summedPositionValue = positions.reduce(
+    (sum, row) => sum + Math.max(0, Number(row.currentValue) || 0),
+    0
+  );
+  const reportedPositionValue = reportedValues.reduce(
+    (sum, row) => sum + Math.max(0, Number(row.value) || 0),
+    0
+  );
+  const unresolvedPositionCount = positions.filter(
+    (row) => Number(row.size) > 1e-9 && row.redeemable !== true
+  ).length;
+  const relevantReservations = reservations.filter(
+    (row) => String(row.probe_id) !== String(ignoredReservationId || "")
+  );
+  const accountEquity =
+    liquidCollateral + Math.min(summedPositionValue, reportedPositionValue);
+  let protectedCompoundingState = null;
+  if (config.operatorDirect && manifest?.allow_compounding === true) {
+    if (!protectedCompoundingContext) {
+      throw new Error("fail closed: protected compounding startup verification is unavailable");
+    }
+    const fullyReconciled =
+      Math.abs(summedPositionValue - reportedPositionValue) <=
+        Number(manifest.max_reconciliation_discrepancy) + 1e-9
+      && openOrders.length === 0
+      && unresolvedPositionCount === 0
+      && relevantReservations.length === 0;
+    const cachedState = protectedCompoundingContext.state;
+    const stateMatchesEquity = cachedState
+      && Math.abs(Number(cachedState.last_reconciled_equity) - accountEquity) <= 0.0000011;
+    if ((fullyReconciled && !stateMatchesEquity) || !cachedState) {
+      protectedCompoundingContext.state = await reconcileProtectedCompoundingState({
+        container: storageContainer(config),
+        manifest,
+        accountEquity,
+        fullyReconciled,
+        verifiedConfiguredSettlements:
+          protectedCompoundingContext.verifiedConfiguredSettlements
+      });
+    }
+    protectedCompoundingState = protectedCompoundingContext.state;
+  }
   const capturedCompletedWallMs = Date.now();
   const captureDurationMs = Math.max(0, performance.now() - capturedStartedMonotonicMs);
-  if (recordLedger) {
-    ledger?.record("funded_safety_snapshot_completed", {
-      wall_ms: capturedCompletedWallMs,
-      monotonic_ms: performance.now(),
-      duration_ms: captureDurationMs,
-      decision_id: intent.decision_id,
-      open_order_count: openOrders.length,
-      risk_passed: risk.passed === true
-    });
-  }
-  return {
+  const boundRuntime = bindIntentSizingAndRisk({
     geoblock,
     clockDriftMs,
     clockServerMinusLocalMs,
@@ -782,7 +843,6 @@ async function capturePreflight(
     feeRateBps,
     feeExponent,
     feeTakerOnly,
-    risk,
     openOrderCount: openOrders.length,
     fillModelVersion: config.requiredFillModelVersion,
     exactResolutionSource: intent.exact_resolution_source === true,
@@ -790,7 +850,84 @@ async function capturePreflight(
     capturedStartedWallMs,
     capturedCompletedWallMs,
     captureDurationMs,
+    riskBasis: {
+      control: riskControl,
+      liquidCollateral,
+      summedPositionValue,
+      reportedPositionValue,
+      unresolvedPositionCount,
+      unresolvedReservationCount: relevantReservations.length,
+      accountEquity,
+      profitQuarantineSnapshot,
+      protectedCompoundingState
+    },
     client
+  }, intent, manifest);
+  if (recordLedger) {
+    ledger?.record("funded_safety_snapshot_completed", {
+      wall_ms: capturedCompletedWallMs,
+      monotonic_ms: performance.now(),
+      duration_ms: captureDurationMs,
+      decision_id: intent.decision_id,
+      open_order_count: openOrders.length,
+      risk_passed: boundRuntime.risk.passed === true,
+      submitted_notional: boundRuntime.executionSizing?.notional ??
+        Number(intent.notional),
+      current_funds_scaled:
+        Number(boundRuntime.executionSizing?.notional) < Number(intent.notional) - 1e-9
+    });
+  }
+  return boundRuntime;
+}
+
+function bindIntentSizingAndRisk(runtime, intent, manifest) {
+  const basis = runtime.riskBasis;
+  if (!basis) throw new Error("fail closed: account risk basis is unavailable");
+  const feePerShare = polymarketV2FeePerShare(
+    intent.price,
+    runtime.feeRate,
+    runtime.feeExponent
+  );
+  const executionSizing = basis.protectedCompoundingState
+    ? sizeProtectedOrder({
+        state: basis.protectedCompoundingState,
+        accountEquity: basis.accountEquity,
+        price: intent.price,
+        requestedShares: intent.shares,
+        requestedNotional: intent.notional,
+        minimumOrderSize:
+          runtime.book?.min_order_size ?? runtime.book?.minOrderSize,
+        maximumOrderNotional: config.maxOrderNotional,
+        feePerShare
+      })
+    : null;
+  const principal = executionSizing
+    ? executionSizing.notional
+    : Number(intent.notional);
+  const feeRisk = executionSizing
+    ? executionSizing.fee_risk_upper_bound
+    : Number(intent.shares) * feePerShare;
+  const risk = summarizeCampaignRisk({
+    control: basis.control,
+    liquidCollateral: basis.liquidCollateral,
+    summedPositionValue: basis.summedPositionValue,
+    reportedPositionValue: basis.reportedPositionValue,
+    openOrderCount: runtime.openOrderCount,
+    unresolvedPositionCount: basis.unresolvedPositionCount,
+    unresolvedReservationCount: basis.unresolvedReservationCount,
+    proposedNotional: principal + feeRisk,
+    orderNotional: principal,
+    authorizedStartingCollateral:
+      config.operatorDirect ? Number(manifest?.starting_collateral) : null,
+    requireZeroExternalCashFlows: config.operatorDirect,
+    profitQuarantineSnapshot: basis.profitQuarantineSnapshot,
+    protectedCompoundingState: basis.protectedCompoundingState,
+    additionalBlockers: executionSizing?.blockers || []
+  });
+  return {
+    ...runtime,
+    risk,
+    executionSizing
   };
 }
 
@@ -833,7 +970,8 @@ export function startSafetySnapshotCache(resources, market, {
         null,
         {
           recordLedger: false,
-          profitQuarantineSnapshot: resources.profitQuarantineSnapshot
+          profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
+          protectedCompoundingContext: resources.protectedCompoundingContext
         }
       );
       if (cache.generation === generation) {
@@ -886,11 +1024,17 @@ export function selectFreshCachedSafetySnapshot(resources, intent, nowMs = Date.
   // synthetic intent. Rebind only the immutable resolution provenance from
   // the verified executable intent; all volatile venue/account evidence
   // remains the independently captured warm snapshot.
-  return {
+  const rebound = {
     ...cached.runtime,
     exactResolutionSource: intent.exact_resolution_source === true,
     resolutionSource: intent.resolution_source
   };
+  if (!rebound.riskBasis || !resources?.manifestDocument?.value) return rebound;
+  return bindIntentSizingAndRisk(
+    rebound,
+    intent,
+    resources.manifestDocument.value
+  );
 }
 
 async function executeLifecycle(client, { intent, documents, runtime, reservation }) {
@@ -936,11 +1080,20 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       marketChannelPromise,
       activeResources?.persistent
         ? captureFinalGate(client, intent, runtime)
-        : capturePreflight(client, intent, documents.manifest, reservation.probe_id)
+        : capturePreflight(
+            client,
+            documents.intent,
+            documents.manifest,
+            reservation.probe_id
+          )
     ]);
     // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
     // authorization contract immediately before the only signing call.
     const preSendValidation = validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
+    if (Number(intent.shares) !== Number(preSendValidation.shares)
+        || Number(intent.notional) !== Number(preSendValidation.notional)) {
+      throw new Error("fail closed: current-funds execution sizing changed after reservation");
+    }
     lease.assertHealthy();
     await Promise.all([userChannel.ensureOpen(), marketChannel.ensureOpen()]);
     if (userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
@@ -999,7 +1152,16 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       monotonic_ms: sentMonotonicMs,
       active_valid_until: intent.valid_until,
       venue_gtd_expiry_ts: intent.gtd_expiry_ts,
-      order: { token_id: intent.token_id, price: intent.price, shares: intent.shares, post_only: true }
+      order: {
+        token_id: intent.token_id,
+        price: intent.price,
+        shares: intent.shares,
+        notional: intent.notional,
+        source_requested_shares: intent.source_requested_shares,
+        source_requested_notional: intent.source_requested_notional,
+        current_funds_scaled: intent.current_funds_scaled === true,
+        post_only: true
+      }
     });
     response = await client.createAndPostOrder(
       { tokenID: intent.token_id, price: Number(intent.price), size: Number(intent.shares), side: Side.BUY, expiration },
@@ -1527,6 +1689,9 @@ function evidenceOrder(intent, book) {
     price,
     size: Number(intent.shares),
     notional: Number(intent.notional),
+    source_requested_size: Number(intent.source_requested_shares ?? intent.shares),
+    source_requested_notional: Number(intent.source_requested_notional ?? intent.notional),
+    current_funds_scaled: intent.current_funds_scaled === true,
     post_only: true,
     spread: bestBid === null || bestAsk === null ? null : bestAsk - bestBid,
     samePricePublicSize: samePrice,

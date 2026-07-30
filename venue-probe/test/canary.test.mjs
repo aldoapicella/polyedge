@@ -573,6 +573,129 @@ test("operator-funded child executes above the old one-dollar cap without claimi
   assert.deepEqual(quarantineControls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
 });
 
+test("protected compounding submits only the current-funds size bound to the source intent", async () => {
+  const input = fixture(false);
+  input.config.operatorDirect = true;
+  input.config.trustBoundaryReady = false;
+  input.config.maxOrderNotional = 10.5;
+  input.config.campaignBaselineEquity = 11.09862;
+  input.config.maxReconciliationDiscrepancy = 0.01;
+  input.documents.intent.shares = "20";
+  input.documents.intent.notional = "4";
+  input.documents.manifest = {
+    schema_version: "polyedge.operator_funded_session.v2",
+    session_id: "dynamic-quote-funded-test-v5",
+    authorization_mode: "operator_direct",
+    authorized_by_user_reference: "Codex task protected compounding",
+    research_promotion_bypassed: true,
+    research_lane_isolated: true,
+    maker_only: true,
+    no_deposits: true,
+    allow_automatic_replenishment: false,
+    allow_compounding: true,
+    external_cash_flows: [],
+    max_open_orders: 1,
+    target_order_notional: 10.5,
+    max_order_notional: 10.5,
+    max_account_loss: 11.09862,
+    starting_collateral: 11.09862,
+    max_reconciliation_discrepancy: 0.01,
+    capital_policy: {
+      reserve_ratio: 0.3,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      high_water_update: "full_reconciliation_only",
+      reserve_monotonic: true,
+      state_blob_name:
+        "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json"
+    },
+    internal_settlements: [],
+    candidate: {
+      name: input.config.candidateName,
+      candidate_version: input.config.candidateVersion,
+      config_hash: input.config.candidateConfigHash
+    },
+    execution_model: {
+      blob_uri: input.config.executionModelBlobUri,
+      sha256: input.config.executionModelHash,
+      model_version: input.config.requiredFillModelVersion
+    },
+    created_at: "2026-07-12T11:00:00.000Z",
+    expires_at: "2026-07-12T13:00:00.000Z"
+  };
+  input.documents.authorization = {
+    ...input.documents.authorization,
+    schema: "polyedge.operator_funded_intent_authorization.v1",
+    authorization_mode: "operator_direct",
+    session_id: input.documents.manifest.session_id,
+    operator_session_manifest_blob_name: input.config.manifestBlobName,
+    operator_session_manifest_sha256: input.config.manifestBlobHash,
+    research_promotion_bypassed: true,
+    max_order_notional: 10.5,
+    expires_at: input.documents.intent.valid_until
+  };
+  delete input.documents.authorization.human_grant_id;
+  delete input.documents.authorization.human_grant_sha256;
+  delete input.documents.authorization.human_grant_consumption_blob_name;
+  delete input.documents.authorization.human_grant_consumption_sha256;
+  input.runtime.risk = {
+    passed: true,
+    blockers: [],
+    baseline_equity: 11.09862,
+    cash_flow_adjusted_baseline: 11.09862,
+    authorized_starting_collateral: 11.09862,
+    authorized_equity_ceiling: 17.90462,
+    no_replenishment: true,
+    no_compounding: false,
+    allow_compounding: true,
+    net_external_cash_flow: 0,
+    cash_flow_count: 0,
+    cash_flow_ids: [],
+    maximum_reconciliation_discrepancy: 0.01,
+    account_equity: 7.57122,
+    high_water_equity: 17.90462,
+    protected_reserve: 5.371386,
+    operating_buffer: 0.075712,
+    operable_capital: 2.124122,
+    order_notional: 2.124,
+    proposed_notional: 2.124
+  };
+  input.runtime.executionSizing = {
+    schema: "polyedge.protected_order_sizing.v1",
+    executable: true,
+    source_shares: 20,
+    source_notional: 4,
+    price: 0.2,
+    shares: 10.62,
+    notional: 2.124,
+    fee_risk_upper_bound: 0,
+    reserved_notional: 2.124,
+    blockers: []
+  };
+  let submittedIntent;
+  let reservation;
+  const controls = spies();
+  controls.reserveRisk = async (value) => {
+    controls.calls.reserve += 1;
+    reservation = value;
+    return value;
+  };
+  controls.executeLifecycle = async (value) => {
+    controls.calls.execute += 1;
+    submittedIntent = value.intent;
+    return { order_id: "order-1" };
+  };
+  const result = await executeStrategyCanary({ ...input, ...controls });
+  assert.equal(result.status, "funded_direct_executed");
+  assert.equal(result.execution_sizing.scaled_to_current_funds, true);
+  assert.equal(submittedIntent.shares, "10.62");
+  assert.equal(submittedIntent.notional, "2.124");
+  assert.equal(submittedIntent.source_requested_notional, "4");
+  assert.equal(reservation.principal_notional, 2.124);
+  assert.equal(reservation.reserved_notional, 2.124);
+  assert.deepEqual(controls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
+});
+
 test("operator-funded preflight blocks unexpected capital and cash-flow records before reservation", async (t) => {
   for (const [name, mutate] of [
     ["unexpected deposit or profit", (input) => { input.runtime.risk.account_equity = 11.108622; }],
