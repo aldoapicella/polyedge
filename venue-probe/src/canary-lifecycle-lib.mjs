@@ -1,8 +1,10 @@
 import WebSocket from "ws";
 
 const TERMINAL_ORDER_STATES = ["CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXPIRED"];
-const DEFAULT_MAX_MESSAGE_HISTORY = 2_048;
-const DEFAULT_MAX_MESSAGE_HISTORY_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_MESSAGE_HISTORY = 32_768;
+const DEFAULT_MAX_MESSAGE_HISTORY_BYTES = 64 * 1024 * 1024;
+const DEFAULT_EVIDENCE_BASELINE_MESSAGES = 4_096;
+const DEFAULT_EVIDENCE_BASELINE_BYTES = 8 * 1024 * 1024;
 
 export async function connectLifecycleChannel({
   url,
@@ -12,6 +14,8 @@ export async function connectLifecycleChannel({
   recordMessages = true,
   maxMessageHistory = DEFAULT_MAX_MESSAGE_HISTORY,
   maxMessageHistoryBytes = DEFAULT_MAX_MESSAGE_HISTORY_BYTES,
+  evidenceBaselineMessages = DEFAULT_EVIDENCE_BASELINE_MESSAGES,
+  evidenceBaselineBytes = DEFAULT_EVIDENCE_BASELINE_BYTES,
   WebSocketImpl = WebSocket,
   reconnectAttempts = 5,
   heartbeatIntervalMs = 10_000,
@@ -34,6 +38,14 @@ export async function connectLifecycleChannel({
   }
   const historyLimit = positiveInteger(maxMessageHistory, "websocket message history limit");
   const historyByteLimit = positiveInteger(maxMessageHistoryBytes, "websocket message history byte limit");
+  const evidenceBaselineLimit = Math.min(
+    historyLimit,
+    positiveInteger(evidenceBaselineMessages, "websocket evidence baseline message limit")
+  );
+  const evidenceBaselineByteLimit = Math.min(
+    historyByteLimit,
+    positiveInteger(evidenceBaselineBytes, "websocket evidence baseline byte limit")
+  );
   const heartbeatResponseTimeoutMs = Math.min(heartbeatEveryMs, configuredHeartbeatTimeoutMs);
   let open = false;
   let stopped = false;
@@ -72,12 +84,16 @@ export async function connectLifecycleChannel({
       releasedBytes += messageMetadata.get(messages[count])?.bytes || 0;
       count += 1;
     }
+    releaseOldest(count, releasedBytes, true);
+  }
+
+  function releaseOldest(count, releasedBytes, trackEvictions) {
     const evicted = messages.splice(0, count);
     for (const message of evicted) {
       const fingerprint = messageMetadata.get(message)?.fingerprint;
       if (fingerprint) fingerprints.delete(fingerprint);
     }
-    historyEvictions += evicted.length;
+    if (trackEvictions) historyEvictions += evicted.length;
     messageHistoryBytes = Math.max(0, messageHistoryBytes - releasedBytes);
   }
 
@@ -89,6 +105,15 @@ export async function connectLifecycleChannel({
   }
 
   function beginEvidenceWindow() {
+    let count = 0;
+    let releasedBytes = 0;
+    while (count < messages.length &&
+      (messages.length - count > evidenceBaselineLimit ||
+        messageHistoryBytes - releasedBytes > evidenceBaselineByteLimit)) {
+      releasedBytes += messageMetadata.get(messages[count])?.bytes || 0;
+      count += 1;
+    }
+    if (count > 0) releaseOldest(count, releasedBytes, false);
     historyEvictions = 0;
   }
 

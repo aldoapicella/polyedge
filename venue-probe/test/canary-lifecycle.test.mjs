@@ -244,6 +244,8 @@ test("persistent channel bounds frame and dedupe retention across repeated warm 
     recordMessages: false,
     maxMessageHistory: 8,
     maxMessageHistoryBytes: 1_024,
+    evidenceBaselineMessages: 4,
+    evidenceBaselineBytes: 512,
     WebSocketImpl: FakeWebSocket,
     settleMs: 0,
     openTimeoutMs: 100,
@@ -277,10 +279,21 @@ test("persistent channel bounds frame and dedupe retention across repeated warm 
   assert.equal(channel.duplicateCount(), 0);
   assert.equal(ledgerEvents.some(({ event }) => event === "test_market_channel"), false);
 
-  const retainedCount = channel.messages.length;
   channel.beginEvidenceWindow();
-  assert.equal(channel.messages.length, retainedCount, "a new evidence window must retain the warm book context");
+  assert.ok(channel.messages.length <= 4, "a new evidence window must leave headroom for the active lifecycle");
+  assert.equal(channel.messages.at(-1)?.sequence, "reusable", "recent warm book context must be retained");
+  assert.ok(channel.historyStats().approximate_bytes <= 512);
   assert.equal(channel.historyStats().evicted_count, 0);
+
+  for (let update = 0; update < 10; update += 1) {
+    emit({
+      event_type: "price_change",
+      asset_id: "token",
+      sequence: `active-${update}`,
+      payload: "x".repeat(128)
+    });
+  }
+  assert.ok(channel.historyStats().evicted_count > 0, "active-window overflow must remain fail-closed");
 
   channel.clearHistory();
   emit(reusable);
