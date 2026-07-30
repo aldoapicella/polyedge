@@ -625,9 +625,12 @@ function normalizeTradeFills(trades, orderId) {
     if (!(size > 0) || !(price > 0) || !Number.isFinite(timestampMs)) continue;
     const traderSide = String(trade.trader_side || trade.traderSide || "").trim().toUpperCase() || null;
     const orderRole = isTaker ? "TAKER" : (maker || directMaker ? "MAKER" : null);
-    const authenticatedFeeRateBps = optionalNumber(
-      maker?.fee_rate_bps ?? maker?.feeRateBps ?? trade.fee_rate_bps ?? trade.feeRateBps
-    );
+    const authenticatedFeeRateBps = optionalNumber(firstNonBlank(
+      maker?.fee_rate_bps,
+      maker?.feeRateBps,
+      trade.fee_rate_bps,
+      trade.feeRateBps
+    ));
     // The authenticated trade endpoint does not currently promise a fee amount,
     // but preserve explicitly unit-labelled decimal fields if the venue adds one.
     // Ambiguous integer/micro-unit fields remain raw and are never used as money.
@@ -639,7 +642,12 @@ function normalizeTradeFills(trades, orderId) {
       authenticatedFeeRateBps,
       authenticatedFeeAmount,
       authenticatedFeeRaw: {
-        fee_rate_bps: maker?.fee_rate_bps ?? maker?.feeRateBps ?? trade.fee_rate_bps ?? trade.feeRateBps ?? null,
+        fee_rate_bps: firstNonBlank(
+          maker?.fee_rate_bps,
+          maker?.feeRateBps,
+          trade.fee_rate_bps,
+          trade.feeRateBps
+        ),
         fee: trade.fee ?? null,
         fee_usdc: trade.fee_usdc ?? trade.feeUsdc ?? null,
         builder_fee: maker?.builder_fee ?? trade.builder_fee ?? trade.builderFee ?? null
@@ -653,6 +661,10 @@ function optionalNumber(value) {
   if (value === null || value === undefined || value === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function firstNonBlank(...values) {
+  return values.find((value) => value !== null && value !== undefined && String(value).trim() !== "") ?? null;
 }
 
 function orderIds(row) {

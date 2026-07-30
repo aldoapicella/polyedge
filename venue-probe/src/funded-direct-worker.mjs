@@ -189,7 +189,8 @@ export async function createFundedDirectProcessor({
             return {
               exitCode: 1,
               error: error.message,
-              orderSubmissionAttempted: error?.orderSubmissionAttempted === true
+              orderSubmissionAttempted: error?.orderSubmissionAttempted === true,
+              executionEvidence: error?.executionEvidence || null
             };
           }
         },
@@ -317,6 +318,35 @@ async function executeSelectedIntent({
           }
         };
       }
+      const evidence = child.executionEvidence;
+      await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+        status: "child_failed_closed_post_submission_unresolved",
+        order_submission_attempted: true,
+        authorization_consumed: true,
+        risk_reservation_created: true,
+        order_id: evidence?.lifecycle?.order_id || null,
+        matched_notional: Number(evidence?.lifecycle?.matched_notional || 0),
+        reconciliation_complete: false,
+        zero_open_orders_confirmed: evidence?.lifecycle?.zero_open_orders_confirmed === true,
+        post_submission_error: child.error || "unknown post-submission failure"
+      });
+      executionTiming.completion_persisted_wall_ms = Date.now();
+      executionTiming.completion_persisted_monotonic_ms = performance.now();
+      return {
+        childInvocations,
+        result: result("paused_by_account_risk_state", config, {
+          iteration,
+          childInvocations,
+          decisionId: selected.value.decision_id,
+          error: child.error || "unknown post-submission failure",
+          execution: evidence || {
+            status: "post_submission_unresolved",
+            order_submission_attempted: true,
+            order_submitted: true,
+            lifecycle: null
+          }
+        })
+      };
     }
     if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
       await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
@@ -404,7 +434,12 @@ async function selectedFromHandoff(clients, config, session, handoff, now) {
           completion.session_id === session.session_id &&
           completion.decision_id === value.decision_id &&
           completion.authorization_blob_name === authorizationName &&
-          ["child_completed", "expired_before_child_launch", "child_failed_closed_pre_submission"].includes(completion.status)) {
+          [
+            "child_completed",
+            "expired_before_child_launch",
+            "child_failed_closed_pre_submission",
+            "child_failed_closed_post_submission_unresolved"
+          ].includes(completion.status)) {
         return {
           value,
           blobName,

@@ -237,6 +237,8 @@ export async function runPersistentFundedDirectService({
             rolling_p95_slo_breached: rollingP95Ms !== null && rollingP95Ms > config.signalToSendSloMs,
             consecutive_latency_breaches: consecutiveLatencyBreaches,
             order_submission_attempted: result?.execution?.order_submission_attempted === true,
+            worker_status: result?.status || null,
+            worker_error: result?.error || null,
             execution_timing: result?.execution_timing || null
           });
           if (result?.status === "paused_by_account_risk_state") {

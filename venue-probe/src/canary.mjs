@@ -1273,13 +1273,26 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     }).catch((uploadError) => {
       ledger.record("strategy_canary_failed_evidence_upload", { error: uploadError.message });
     });
-    if (reservationPersistenceError) {
-      throw new Error(`fail closed: post-ack error and unresolved reservation persistence failed; prior durable reservation remains blocking (${error.message}; ${reservationPersistenceError.message})`);
-    }
-    if (!emergency.zeroOpenOrders) {
-      throw new Error(`fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved (${error.message})`);
-    }
-    throw new Error(`fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (${error.message})`);
+    const failure = reservationPersistenceError
+      ? new Error(`fail closed: post-ack error and unresolved reservation persistence failed; prior durable reservation remains blocking (${error.message}; ${reservationPersistenceError.message})`)
+      : !emergency.zeroOpenOrders
+        ? new Error(`fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved (${error.message})`)
+        : new Error(`fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (${error.message})`);
+    failure.executionEvidence = {
+      status: "post_submission_unresolved",
+      order_submission_attempted: true,
+      order_submitted: true,
+      lifecycle: {
+        order_id: orderId,
+        send_wall_ms: sentAt.getTime(),
+        ack_wall_ms: acknowledgedAt.getTime(),
+        client_to_http_ack_ms: acknowledgementLatencyMs,
+        matched_notional: matchedRisk,
+        reconciliation_complete: false,
+        zero_open_orders_confirmed: emergency.zeroOpenOrders
+      }
+    };
+    throw failure;
   }
 }
 

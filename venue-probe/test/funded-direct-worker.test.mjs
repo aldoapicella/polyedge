@@ -494,6 +494,63 @@ test("persistent handoff seals a post-submit evidence failure only from exact te
   assert.equal(executions, 1);
 });
 
+test("persistent post-submit unresolved risk is accurately sealed and paused", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "5".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  const orderId = `0x${"5".repeat(64)}`;
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: {
+      control,
+      intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+    },
+    clock: () => now,
+    executeCanary: async () => {
+      const error = new Error("post-ack evidence failed closed");
+      error.orderSubmissionAttempted = true;
+      error.executionEvidence = {
+        status: "post_submission_unresolved",
+        order_submission_attempted: true,
+        order_submitted: true,
+        lifecycle: {
+          order_id: orderId,
+          send_wall_ms: now.getTime() + 500,
+          matched_notional: 10.5,
+          reconciliation_complete: false,
+          zero_open_orders_confirmed: true
+        }
+      };
+      throw error;
+    }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
+  };
+
+  const first = await processor.process(handoff);
+  const duplicate = await processor.process(handoff);
+
+  assert.equal(first.status, "paused_by_account_risk_state");
+  assert.equal(first.execution.lifecycle.order_id, orderId);
+  assert.equal(first.execution.order_submission_attempted, true);
+  assert.equal(duplicate.status, "already_completed_idempotent");
+  assert.equal(duplicate.completion.status, "child_failed_closed_post_submission_unresolved");
+  assert.equal(duplicate.completion.authorization_consumed, true);
+  assert.equal(duplicate.completion.risk_reservation_created, true);
+  assert.equal(duplicate.completion.order_submission_attempted, true);
+  assert.equal(duplicate.completion.reconciliation_complete, false);
+});
+
 test("persistent handoff rejects expired, tampered, and authorization-leak deliveries before execution", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "9".repeat(64));

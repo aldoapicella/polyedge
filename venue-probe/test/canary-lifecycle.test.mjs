@@ -82,6 +82,27 @@ test("nested maker_orders user trades produce authenticated maker fills", () => 
   }]);
 });
 
+test("empty maker fee field falls back to the authenticated trade fee", () => {
+  const fills = tradeFillsFromUserEvents([{
+    event_type: "trade",
+    id: "trade-empty-maker-fee",
+    match_time: "2026-07-13T12:00:01.000Z",
+    trader_side: "MAKER",
+    fee_rate_bps: "0",
+    maker_orders: [{
+      order_id: "maker-order-empty-fee",
+      matched_amount: "13.42",
+      price: "0.77",
+      fee_rate_bps: ""
+    }]
+  }], "maker-order-empty-fee");
+
+  assert.equal(fills[0].authenticatedFeeRateBps, 0);
+  assert.equal(fills[0].authenticatedFeeRaw.fee_rate_bps, "0");
+  assert.equal(fills[0].traderSide, "MAKER");
+  assert.equal(fills[0].orderRole, "MAKER");
+});
+
 test("a later partial fill after cancel is classified as a cancellation race", () => {
   const cancelSendWallMs = 2_000;
   const fills = [
