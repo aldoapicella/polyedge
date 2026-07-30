@@ -210,6 +210,54 @@ test("channel disconnect is counted as a gap and reconnects before reuse", async
   channel.close();
 });
 
+test("an unparsed websocket frame requires REST reconciliation before reuse", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { type: "user" },
+    eventType: "test_user_channel",
+    WebSocketImpl: FakeWebSocket,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: async () => {}
+  });
+
+  FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"));
+
+  assert.equal(channel.gapCount(), 0);
+  assert.equal(channel.unparsedCount(), 1);
+  assert.equal(channel.requiresReconciliation(), true);
+
+  channel.markReconciled();
+  assert.equal(channel.unparsedCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
+  channel.close();
+});
+
 test("persistent channel bounds frame and dedupe retention across repeated warm safety refreshes", async () => {
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;

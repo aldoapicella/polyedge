@@ -260,6 +260,7 @@ export async function connectLifecycleChannel({
         }
       } catch {
         unparsed += 1;
+        requiresReconciliation = true;
         if (recordMessages) ledger?.record(`${eventType}_unparsed`, { unparsed_count: unparsed });
       }
     });
