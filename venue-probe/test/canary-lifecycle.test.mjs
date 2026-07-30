@@ -210,6 +210,150 @@ test("channel disconnect is counted as a gap and reconnects before reuse", async
   channel.close();
 });
 
+test("persistent channel bounds frame and dedupe retention across repeated warm safety refreshes", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const ledgerEvents = [];
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { type: "market" },
+    eventType: "test_market_channel",
+    ledger: { record: (event, fields) => ledgerEvents.push({ event, fields }) },
+    recordMessages: false,
+    maxMessageHistory: 8,
+    maxMessageHistoryBytes: 1_024,
+    WebSocketImpl: FakeWebSocket,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: async () => {}
+  });
+  const socket = FakeWebSocket.instances[0];
+  const emit = (value) => socket.emit("message", Buffer.from(JSON.stringify(value)));
+
+  channel.clearHistory();
+  const reusable = { event_type: "book", asset_id: "token", sequence: "reusable", payload: "x".repeat(128) };
+  emit(reusable);
+  for (let cycle = 0; cycle < 100; cycle += 1) {
+    for (let update = 0; update < 10; update += 1) {
+      emit({
+        event_type: "price_change",
+        asset_id: "token",
+        sequence: `${cycle}-${update}`,
+        payload: "x".repeat(128)
+      });
+    }
+    const stats = channel.historyStats();
+    assert.ok(stats.message_count <= 8);
+    assert.ok(stats.fingerprint_count <= 8);
+    assert.ok(stats.approximate_bytes <= 1_024);
+    assert.ok(stats.evicted_count > 0);
+  }
+  emit(reusable);
+
+  assert.equal(channel.messages.at(-1)?.sequence, "reusable", "evicting a frame must also evict its dedupe key");
+  assert.equal(channel.duplicateCount(), 0);
+  assert.equal(ledgerEvents.some(({ event }) => event === "test_market_channel"), false);
+
+  const retainedCount = channel.messages.length;
+  channel.beginEvidenceWindow();
+  assert.equal(channel.messages.length, retainedCount, "a new evidence window must retain the warm book context");
+  assert.equal(channel.historyStats().evicted_count, 0);
+
+  channel.clearHistory();
+  emit(reusable);
+  assert.equal(channel.messages.length, 1, "a new warm window must accept frames from the prior window");
+  assert.equal(channel.historyStats().fingerprint_count, 1);
+  channel.close();
+  assert.deepEqual(channel.historyStats(), {
+    message_count: 0,
+    fingerprint_count: 0,
+    approximate_bytes: 0,
+    evicted_count: 0
+  });
+});
+
+test("persistent channels record lifecycle frames only while the execution ledger is attached", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const events = [];
+  const ledgerMultiplexer = {
+    current: null,
+    record(event, fields) {
+      this.current?.record(event, fields);
+    }
+  };
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { type: "market" },
+    eventType: "test_market_channel",
+    ledger: ledgerMultiplexer,
+    WebSocketImpl: FakeWebSocket,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: async () => {}
+  });
+  const socket = FakeWebSocket.instances[0];
+  ledgerMultiplexer.current = { record: (event, fields) => events.push({ event, fields }) };
+  socket.emit("message", Buffer.from(JSON.stringify({ event_type: "book", asset_id: "active-token" })));
+  await flushMicrotasks();
+  const activeFrame = events.find(({ event }) => event === "test_market_channel");
+  assert.equal(activeFrame?.fields?.event_type, "book");
+  assert.equal(activeFrame?.fields?.asset_id, "active-token");
+  assert.ok(Number.isFinite(activeFrame?.fields?._received_wall_ms));
+
+  ledgerMultiplexer.current = null;
+  socket.emit("message", Buffer.from(JSON.stringify({ event_type: "book", asset_id: "idle-token" })));
+  await flushMicrotasks();
+  assert.equal(events.filter(({ event }) => event === "test_market_channel").length, 1);
+  channel.close();
+});
+
 test("each socket sends one non-overlapping heartbeat at least every ten seconds and close clears it", async () => {
   const scheduler = new ManualScheduler();
   class FakeWebSocket extends EventEmitter {

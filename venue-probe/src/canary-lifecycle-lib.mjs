@@ -1,12 +1,17 @@
 import WebSocket from "ws";
 
 const TERMINAL_ORDER_STATES = ["CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXPIRED"];
+const DEFAULT_MAX_MESSAGE_HISTORY = 2_048;
+const DEFAULT_MAX_MESSAGE_HISTORY_BYTES = 8 * 1024 * 1024;
 
 export async function connectLifecycleChannel({
   url,
   subscription,
   ledger,
   eventType,
+  recordMessages = true,
+  maxMessageHistory = DEFAULT_MAX_MESSAGE_HISTORY,
+  maxMessageHistoryBytes = DEFAULT_MAX_MESSAGE_HISTORY_BYTES,
   WebSocketImpl = WebSocket,
   reconnectAttempts = 5,
   heartbeatIntervalMs = 10_000,
@@ -27,6 +32,8 @@ export async function connectLifecycleChannel({
   if (!Number.isFinite(configuredHeartbeatTimeoutMs) || configuredHeartbeatTimeoutMs <= 0) {
     throw new Error("fail closed: websocket heartbeat timeout must be positive");
   }
+  const historyLimit = positiveInteger(maxMessageHistory, "websocket message history limit");
+  const historyByteLimit = positiveInteger(maxMessageHistoryBytes, "websocket message history byte limit");
   const heartbeatResponseTimeoutMs = Math.min(heartbeatEveryMs, configuredHeartbeatTimeoutMs);
   let open = false;
   let stopped = false;
@@ -41,6 +48,49 @@ export async function connectLifecycleChannel({
   let currentSubscription = structuredClone(subscription);
   const messages = [];
   const fingerprints = new Set();
+  const messageMetadata = new WeakMap();
+  let messageHistoryBytes = 0;
+  let historyEvictions = 0;
+
+  function appendMessage(message, fingerprint = null) {
+    const bytes = fingerprint ? Buffer.byteLength(fingerprint, "utf8") : 64;
+    messages.push(message);
+    messageMetadata.set(message, { fingerprint, bytes });
+    if (fingerprint) fingerprints.add(fingerprint);
+    messageHistoryBytes += bytes;
+    trimMessageHistory();
+  }
+
+  function trimMessageHistory() {
+    if (messages.length <= historyLimit && messageHistoryBytes <= historyByteLimit) return;
+    const targetLength = Math.max(1, Math.floor(historyLimit * 0.75));
+    const targetBytes = Math.max(1, Math.floor(historyByteLimit * 0.75));
+    let count = 0;
+    let releasedBytes = 0;
+    while (count < messages.length &&
+      (messages.length - count > targetLength || messageHistoryBytes - releasedBytes > targetBytes)) {
+      releasedBytes += messageMetadata.get(messages[count])?.bytes || 0;
+      count += 1;
+    }
+    const evicted = messages.splice(0, count);
+    for (const message of evicted) {
+      const fingerprint = messageMetadata.get(message)?.fingerprint;
+      if (fingerprint) fingerprints.delete(fingerprint);
+    }
+    historyEvictions += evicted.length;
+    messageHistoryBytes = Math.max(0, messageHistoryBytes - releasedBytes);
+  }
+
+  function clearHistory() {
+    messages.length = 0;
+    fingerprints.clear();
+    messageHistoryBytes = 0;
+    historyEvictions = 0;
+  }
+
+  function beginEvidenceWindow() {
+    historyEvictions = 0;
+  }
 
   function clearSocketHeartbeat(state, error = null) {
     if (!state) return;
@@ -160,8 +210,8 @@ export async function connectLifecycleChannel({
       const text = buffer.toString();
       if (text === "PONG") {
         state.pongSequence += 1;
-        messages.push({ _pong: true, _received_wall_ms: nowMs() });
-        ledger?.record(`${eventType}_pong`);
+        appendMessage({ _pong: true, _received_wall_ms: nowMs() });
+        if (recordMessages) ledger?.record(`${eventType}_pong`);
         const pending = state.pendingPong;
         if (pending && state.pongSequence > pending.pongSequenceAtSend) {
           state.pendingPong = null;
@@ -176,17 +226,16 @@ export async function connectLifecycleChannel({
           const fingerprint = JSON.stringify(value);
           if (fingerprints.has(fingerprint)) {
             duplicates += 1;
-            ledger?.record(`${eventType}_duplicate_ignored`, { duplicate_count: duplicates });
+            if (recordMessages) ledger?.record(`${eventType}_duplicate_ignored`, { duplicate_count: duplicates });
             continue;
           }
-          fingerprints.add(fingerprint);
           const captured = { ...value, _received_wall_ms: nowMs() };
-          messages.push(captured);
-          ledger?.record(eventType, captured);
+          appendMessage(captured, fingerprint);
+          if (recordMessages) ledger?.record(eventType, captured);
         }
       } catch {
         unparsed += 1;
-        ledger?.record(`${eventType}_unparsed`, { unparsed_count: unparsed });
+        if (recordMessages) ledger?.record(`${eventType}_unparsed`, { unparsed_count: unparsed });
       }
     });
     ws.on("close", (code, reason) => {
@@ -264,6 +313,14 @@ export async function connectLifecycleChannel({
   }
   return {
     messages,
+    beginEvidenceWindow,
+    clearHistory,
+    historyStats: () => ({
+      message_count: messages.length,
+      fingerprint_count: fingerprints.size,
+      approximate_bytes: messageHistoryBytes,
+      evicted_count: historyEvictions
+    }),
     isOpen: () => open && socket?.readyState === WebSocketImpl.OPEN,
     ensureOpen: async () => {
       if (open && socket?.readyState === WebSocketImpl.OPEN) return true;
@@ -352,6 +409,7 @@ export async function connectLifecycleChannel({
     close: () => {
       stopped = true;
       open = false;
+      clearHistory();
       if (socketState) {
         socketState.ready = false;
         clearSocketHeartbeat(socketState, new Error("websocket channel closed"));
@@ -714,6 +772,14 @@ async function waitUntil(predicate, timeoutMs, message, sleep) {
     await sleep(Math.min(50, Math.max(1, deadline - Date.now())));
   }
   throw new Error(`fail closed: ${message}`);
+}
+
+function positiveInteger(value, label) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`fail closed: ${label} must be a positive integer`);
+  }
+  return parsed;
 }
 
 function defaultSleep(ms) {

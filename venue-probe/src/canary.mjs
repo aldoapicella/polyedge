@@ -119,7 +119,7 @@ async function initializeResources({ persistent = false } = {}) {
     : null;
   const resourceLease = !config.dryRun ? await acquireCampaignLease(config, persistent ? `funded-direct-service-${crypto.randomUUID()}` : runId) : null;
   const ledgerMultiplexer = {
-    current: ledger,
+    current: persistent ? null : ledger,
     record(event, payload) {
       this.current?.record(event, payload);
     }
@@ -188,6 +188,14 @@ export function requireExecutionModelArtifact(value) {
 
 async function closeResources(resources) {
   if (resources?.safetyCache?.timer) clearInterval(resources.safetyCache.timer);
+  if (resources?.safetyCache) {
+    resources.safetyCache.timer = null;
+    resources.safetyCache.generation += 1;
+    resources.safetyCache.latest = null;
+  }
+  if (resources?.ledgerMultiplexer) resources.ledgerMultiplexer.current = null;
+  resources?.userChannel?.clearHistory?.();
+  resources?.marketChannel?.clearHistory?.();
   resources?.userChannel?.close();
   resources?.marketChannel?.close();
   if (resources?.lease) await resources.lease.release();
@@ -312,6 +320,8 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
   const resources = await initializeResources({ persistent: true });
   return {
     async warmMarket(value) {
+      resources.userChannel?.beginEvidenceWindow?.();
+      resources.marketChannel?.beginEvidenceWindow?.();
       const warmed = await ensurePersistentMarket(resources, value);
       const warmupStartedMonotonicMs = performance.now();
       const [geoblock, serverTime, book] = await Promise.all([
@@ -330,6 +340,8 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
         throw new Error("fail closed: persistent warmup REST, clock, and public stream evidence disagree");
       }
       startSafetySnapshotCache(resources, warmed);
+      resources.userChannel?.beginEvidenceWindow?.();
+      resources.marketChannel?.beginEvidenceWindow?.();
       return {
         ...warmed,
         no_sign: true,
@@ -344,6 +356,8 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
         setExecutionContext(executionEnv);
         validatePersistentBinding(resources);
         resources.ledgerMultiplexer.current = ledger;
+        resources.userChannel?.beginEvidenceWindow?.();
+        resources.marketChannel?.beginEvidenceWindow?.();
         const warmedMarket = await ensurePersistentMarket(resources, {
           market_id: executionEnv.STRATEGY_CANARY_MARKET_ID,
           condition_id: executionEnv.STRATEGY_CANARY_CONDITION_ID,
@@ -366,6 +380,9 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
           throw error;
         }
       } finally {
+        resources.ledgerMultiplexer.current = null;
+        resources.userChannel?.beginEvidenceWindow?.();
+        resources.marketChannel?.beginEvidenceWindow?.();
         activeResources = null;
         resources.busy = false;
       }
@@ -377,6 +394,8 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
       const safetySnapshotCompletedWallMs = Number(
         resources.safetyCache?.latest?.runtime?.capturedCompletedWallMs
       );
+      const userChannelHistory = resources.userChannel?.historyStats?.();
+      const marketChannelHistory = resources.marketChannel?.historyStats?.();
       return {
         user_channel_ready: resources.userChannel?.isOpen() === true,
         market_channel_ready: resources.marketChannel?.isOpen() === true,
@@ -394,6 +413,12 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
           : null,
         safety_snapshot_cache_in_flight: resources.safetyCache?.inFlight || 0,
         safety_snapshot_cache_error: resources.safetyCache?.lastError || null,
+        user_channel_history_entries: userChannelHistory?.message_count || 0,
+        user_channel_history_bytes: userChannelHistory?.approximate_bytes || 0,
+        user_channel_history_evictions: userChannelHistory?.evicted_count || 0,
+        market_channel_history_entries: marketChannelHistory?.message_count || 0,
+        market_channel_history_bytes: marketChannelHistory?.approximate_bytes || 0,
+        market_channel_history_evictions: marketChannelHistory?.evicted_count || 0,
         busy: resources.busy
       };
     }
@@ -773,7 +798,12 @@ const SAFETY_CACHE_REFRESH_MS = 700;
 const SAFETY_CACHE_MAX_IN_FLIGHT = 3;
 const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
 
-function startSafetySnapshotCache(resources, market) {
+export function startSafetySnapshotCache(resources, market, {
+  capture = capturePreflight,
+  createIntent = conservativeWarmIntent,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval
+} = {}) {
   const cache = resources.safetyCache;
   if (cache.timer &&
       cache.market_id === String(market.market_id) &&
@@ -781,22 +811,22 @@ function startSafetySnapshotCache(resources, market) {
       cache.token_id === String(market.token_id)) {
     return;
   }
-  if (cache.timer) clearInterval(cache.timer);
+  if (cache.timer) clearIntervalFn(cache.timer);
+  cache.timer = null;
   cache.generation += 1;
-  cache.inFlight = 0;
   cache.latest = null;
   cache.lastError = null;
   cache.market_id = String(market.market_id);
   cache.condition_id = String(market.condition_id);
   cache.token_id = String(market.token_id);
   const generation = cache.generation;
-  const syntheticIntent = conservativeWarmIntent(market);
+  const syntheticIntent = createIntent(market);
   const refresh = async () => {
     if (resources.busy || cache.generation !== generation ||
         cache.inFlight >= SAFETY_CACHE_MAX_IN_FLIGHT) return;
     cache.inFlight += 1;
     try {
-      const runtime = await capturePreflight(
+      const runtime = await capture(
         resources.client,
         syntheticIntent,
         resources.manifestDocument.value,
@@ -818,11 +848,11 @@ function startSafetySnapshotCache(resources, market) {
     } catch (error) {
       if (cache.generation === generation) cache.lastError = error.message;
     } finally {
-      if (cache.generation === generation) cache.inFlight -= 1;
+      cache.inFlight = Math.max(0, cache.inFlight - 1);
     }
   };
   void refresh();
-  cache.timer = setInterval(() => { void refresh(); }, SAFETY_CACHE_REFRESH_MS);
+  cache.timer = setIntervalFn(() => { void refresh(); }, SAFETY_CACHE_REFRESH_MS);
   cache.timer.unref?.();
 }
 
@@ -918,6 +948,11 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       throw new Error("fail closed: authenticated/public websocket completeness was lost before submission");
     }
     if (activeResources?.persistent) {
+      const userChannelHistory = userChannel.historyStats?.();
+      const marketChannelHistory = marketChannel.historyStats?.();
+      if (userChannelHistory?.evicted_count > 0 || marketChannelHistory?.evicted_count > 0) {
+        throw new Error("fail closed: websocket evidence history was truncated before submission");
+      }
       const snapshotAgeMs = Date.now() - Number(runtime.capturedCompletedWallMs);
       const finalGateAgeMs = Date.now() - Number(refreshed.finalGateCompletedWallMs);
       if (!Number.isFinite(snapshotAgeMs) || snapshotAgeMs > 1_500) {
@@ -926,9 +961,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       if (!Number.isFinite(finalGateAgeMs) || finalGateAgeMs > 500) {
         throw new Error(`fail closed: final volatile gate exceeded 500ms at signing (${finalGateAgeMs}ms)`);
       }
-      if (Date.parse(intent.valid_until) - Date.now() < 15_000) {
-        throw new Error("fail closed: persistent executor has less than 15 seconds of intent TTL before signing");
-      }
+      assertPersistentIntentRemainingTtl(intent, config.minRemainingTtlMs);
     }
     preSendCapturedWallMs = Date.now();
     preSendContext = {
@@ -1123,9 +1156,14 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     );
     const cancelRace = postCancelFillStats(fills, cancellation.cancelSendWallMs);
     const fullContext = marketContext(marketChannel.messages);
+    const userChannelHistory = userChannel.historyStats?.();
+    const marketChannelHistory = marketChannel.historyStats?.();
+    const channelHistoryTruncated = userChannelHistory?.evicted_count > 0 ||
+      marketChannelHistory?.evicted_count > 0;
     const dataGapDetected = !reconciliation.stableFinality ||
       userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
       userChannel.unparsedCount() > 0 || marketChannel.unparsedCount() > 0 ||
+      channelHistoryTruncated ||
       (cancellation.cancelSendWallMs !== null && cancellationReceivedWallMs === null) ||
       (cancellation.cancelSendWallMs === null && matchedShares < Number(intent.shares)) ||
       (matchedShares > 0 && (!tradeIdSourceAgreement || !matchedSizeSourceAgreement));
@@ -1194,6 +1232,8 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       public_market_channel_duplicates: marketChannel.duplicateCount(),
       authenticated_user_channel_unparsed: userChannel.unparsedCount(),
       public_market_channel_unparsed: marketChannel.unparsedCount(),
+      authenticated_user_channel_history_evictions: userChannelHistory?.evicted_count || 0,
+      public_market_channel_history_evictions: marketChannelHistory?.evicted_count || 0,
       reconciliation_complete: reconciliationComplete,
       zero_open_orders_confirmed: reconciliation.zeroOpenOrders,
       data_gap_detected: dataGapDetected,
@@ -1378,6 +1418,16 @@ export function streamBookEvidence(messages, tokenId) {
     }
   }
   return null;
+}
+
+export function assertPersistentIntentRemainingTtl(intent, minimumMs, nowMs = Date.now()) {
+  const minimum = Number(minimumMs);
+  const remaining = Date.parse(intent?.valid_until) - nowMs;
+  if (!Number.isFinite(minimum) || minimum < 1_000 ||
+      !Number.isFinite(remaining) || remaining < minimum) {
+    throw new Error(`fail closed: persistent executor has less than ${minimum}ms of intent TTL before signing`);
+  }
+  return remaining;
 }
 
 async function uploadFailedPostAckEvidence({ intent, runtime, reservation, orderId, acknowledgedAt, sentAt, acknowledgementLatencyMs, preSendContext, emergency, originalError }) {

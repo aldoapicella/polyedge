@@ -56,8 +56,8 @@ function env(overrides = {}) {
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
     FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/session.json",
     FUNDED_DIRECT_SESSION_MANIFEST_SHA256: sha256(Buffer.from(JSON.stringify(value, null, 2))),
-    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "25000",
-    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "15000",
+    FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "7000",
+    FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS: "2000",
     STRATEGY_CANARY_CANDIDATE_NAME: "dynamic_quote_style",
     STRATEGY_CANARY_CANDIDATE_VERSION: "dynamic_quote_style@2026-06-14",
     STRATEGY_CANARY_CANDIDATE_CONFIG_HASH: `sha256:${"a".repeat(64)}`,
@@ -108,7 +108,7 @@ class Container {
 function intent(now, id = "c".repeat(64)) {
   const value = session();
   const decision = new Date(now.getTime() - 1_000);
-  const valid = new Date(decision.getTime() + 30_000);
+  const valid = new Date(decision.getTime() + 10_000);
   return {
     schema: "polyedge.execution_intent.v1",
     decision_id: id,
@@ -133,7 +133,7 @@ function intent(now, id = "c".repeat(64)) {
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 300_000).toISOString(),
-    ttl_ms: 30_000
+    ttl_ms: 10_000
   };
 }
 
@@ -157,8 +157,8 @@ test("operator-funded config requires the profitable 6-15 minute window", () => 
 
 test("worker TTL gates reserve time for the authenticated child preflight", () => {
   const config = loadFundedDirectConfig(env());
-  assert.equal(config.minRemainingTtlMs, 25_000);
-  assert.equal(config.childMinRemainingTtlMs, 15_000);
+  assert.equal(config.minRemainingTtlMs, 7_000);
+  assert.equal(config.childMinRemainingTtlMs, 2_000);
   assert.throws(
     () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MIN_REMAINING_TTL_MS: "4000" })),
     /must be in \[5000, 30000\]/
@@ -218,7 +218,7 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
       calls += 1;
       assert.equal(childEnv.EXECUTION_MODE, "funded_direct");
       assert.equal(childEnv.STRATEGY_CANARY_MAX_ORDER_NOTIONAL, "10.5");
-      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "15000");
+      assert.equal(childEnv.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, "2000");
       assert.equal(childEnv.VENUE_PROBE_CAMPAIGN_CASH_FLOWS, "[]");
       return { exitCode: 0, error: "" };
     }
@@ -257,7 +257,7 @@ test("stale handoff is rejected before authorization and creates no reservation"
       control,
       intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
     },
-    clock: () => clockCalls++ === 0 ? now : new Date(now.getTime() + 15_000),
+    clock: () => clockCalls++ === 0 ? now : new Date(now.getTime() + 3_000),
     sleep: async () => {},
     invokeChild: async () => assert.fail("stale handoff must not launch a child")
   });
@@ -270,7 +270,7 @@ test("authorization that loses launch TTL is terminally sealed with no reservati
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "2".repeat(64));
   const control = new Container();
-  const times = [now, now, new Date(now.getTime() + 25_000)];
+  const times = [now, now, new Date(now.getTime() + 8_000)];
   const output = await runFundedDirectWorker({
     env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
     containers: {
@@ -344,7 +344,7 @@ test("worker downloads only blob bodies that can still contain a fresh intent", 
   assert.equal(downloads, 1);
 });
 
-test("worker reports an account-risk pause without retrying a funded child", async () => {
+test("worker reports projected account-risk blockers as a pause without retrying", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "d".repeat(64));
   const output = await runFundedDirectWorker({
@@ -357,7 +357,7 @@ test("worker reports an account-risk pause without retrying a funded child", asy
     sleep: async () => {},
     invokeChild: async () => ({
       exitCode: 1,
-      error: "campaign equity/risk gate failed (existing_unresolved_position_blocks_submission)"
+      error: "campaign equity/risk gate failed (projected_equity_floor_breach, projected_campaign_drawdown_breach)"
     })
   });
   assert.equal(output.status, "paused_by_account_risk_state");
@@ -583,7 +583,7 @@ test("persistent handoff rejects expired, tampered, and authorization-leak deliv
     createFundedDirectProcessor({
       env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
       containers: { control: new Container(), intents },
-      clock: () => new Date(now.getTime() + 31_000),
+      clock: () => new Date(now.getTime() + 10_000),
       executeCanary: async () => { executions += 1; }
     }).then((expired) => expired.process(handoff)),
     /binding or TTL is invalid/

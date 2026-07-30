@@ -55,7 +55,7 @@ jobs:
           const assert = require("node:assert/strict");
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-29_v6.json"));
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-28_v4.json"));
           const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
           const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
           assert.deepEqual(embedded, session);
@@ -68,10 +68,19 @@ jobs:
           assert.equal(session.allow_automatic_replenishment, false);
           assert.equal(session.allow_compounding, false);
           assert.deepEqual(session.external_cash_flows, []);
-          assert.equal(session.profit_quarantine.enabled, true);
-          assert.equal(session.profit_quarantine.risk_headroom, "starting_collateral_only");
-          assert.equal(session.verified_internal_settlements.length, 1);
-          assert.equal(session.verified_internal_settlements[0].realized_pnl, 6.806);
+          assert.equal(session.session_id, "dynamic-quote-funded-2026-07-28-v4");
+          assert.equal(session.starting_collateral, 11.09862);
+          assert.equal(session.max_account_loss, 11.09862);
+          assert.equal(session.target_order_notional, 10.5);
+          assert.equal(session.max_order_notional, 10.5);
+          assert.equal(
+            parameters.fundedDirectSessionManifestBlobName.value,
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-28-v4/session.json"
+          );
+          assert.equal(
+            parameters.fundedDirectSessionManifestSha256.value,
+            "sha256:4833c6f23c1762e2328a1cef40e24a749d94e0152b4a8e6fe25b9e1b7853a6c7"
+          );
           NODE
 
       - uses: actions/setup-node@v4
@@ -116,7 +125,7 @@ jobs:
             and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/queues")][0]
               | .properties.requiresDuplicateDetection == true
               and .properties.duplicateDetectionHistoryTimeWindow == "PT10M"
-              and .properties.defaultMessageTimeToLive == "PT30S"
+              and .properties.defaultMessageTimeToLive == "PT10S"
               and .properties.lockDuration == "PT30S"
             and .properties.deadLetteringOnMessageExpiration == true
             and .properties.maxDeliveryCount == 3)
@@ -145,6 +154,9 @@ jobs:
           assert.equal(env.FUNDED_DIRECT_ENGINE, "persistent_v1");
           assert.equal(env.FUNDED_DIRECT_SERVICE_BUS_ENABLED, "true");
           assert.equal(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, "2000");
+          assert.equal(env.FUNDED_DIRECT_POLL_INTERVAL_MS, "1000");
+          assert.equal(env.FUNDED_DIRECT_MIN_REMAINING_TTL_MS, "7000");
+          assert.equal(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS, "2000");
           assert.equal(app.properties.template.scale.maxReplicas, 1);
           assert.match(JSON.stringify(app.properties.template.scale.minReplicas), /fundedDirectEnabled/);
           const producer = JSON.parse(fs.readFileSync("venue-probe.json")).resources.find((resource) =>
@@ -183,6 +195,7 @@ jobs:
       SERVICE_BUS_NAMESPACE: sb-polyedge-funded-cl-6urdjr5nmwx7w
       SERVICE_BUS_QUEUE: funded-dynamic-quote-intents
       FUNDED_WARMUP_JOB: polyedge-funded-warmup-cl
+      LEGACY_NEU_FUNDED_JOB: polyedge-funded-ladder-neu-job
     steps:
       - uses: actions/checkout@v4
 
@@ -270,6 +283,45 @@ jobs:
             --only-show-errors \
             -o json > funded-deployment.json
           test "$(jq -r '.properties.provisioningState' funded-deployment.json)" = "Succeeded"
+
+      - name: Keep the obsolete North Europe funded job fail-closed
+        run: |
+          set -euo pipefail
+          az containerapp job update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$LEGACY_NEU_FUNDED_JOB" \
+            --set-env-vars \
+              FUNDED_DIRECT_WORKER_ENABLED=false \
+              ALLOW_FUNDED_DIRECT=false \
+              FUNDED_DIRECT_DRY_RUN=true \
+              FUNDED_LADDER_CONTROLLER_ENABLED=false \
+              ALLOW_FUNDED_LADDER=false \
+              FUNDED_LADDER_DRY_RUN=true \
+              ALLOW_LIVE=false \
+            --only-show-errors \
+            -o none
+          az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$LEGACY_NEU_FUNDED_JOB" \
+            -o json > legacy-neu-funded-job.json
+          test "$(jq -r '.properties.configuration.triggerType' legacy-neu-funded-job.json)" = "Manual"
+          legacy_env() {
+            jq -r --arg name "$1" \
+              '.properties.template.containers[0].env[] | select(.name == $name) | .value' \
+              legacy-neu-funded-job.json
+          }
+          test "$(legacy_env FUNDED_DIRECT_WORKER_ENABLED)" = "false"
+          test "$(legacy_env ALLOW_FUNDED_DIRECT)" = "false"
+          test "$(legacy_env FUNDED_DIRECT_DRY_RUN)" = "true"
+          test "$(legacy_env FUNDED_LADDER_CONTROLLER_ENABLED)" = "false"
+          test "$(legacy_env ALLOW_FUNDED_LADDER)" = "false"
+          test "$(legacy_env FUNDED_LADDER_DRY_RUN)" = "true"
+          test "$(legacy_env ALLOW_LIVE)" = "false"
+          running=$(az containerapp job execution list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$LEGACY_NEU_FUNDED_JOB" \
+            --query "[?properties.status=='Running'] | length(@)" -o tsv)
+          test "${running:-0}" = "0"
 
       - name: Run real cloud queue, REST, storage, and WebSocket no-sign rehearsal
         run: |
@@ -411,8 +463,20 @@ jobs:
           test "$(env_value ENABLE_TAKER_ORDERS)" = "false"
           test "$(env_value VENUE_PROBE_CAMPAIGN_CASH_FLOWS)" = "[]"
           test "$(env_value FUNDED_DIRECT_POLL_INTERVAL_MS)" = "1000"
-          test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "25000"
-          test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "15000"
+          test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
+          test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "2000"
+          test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME)" = \
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-28-v4/session.json"
+          test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = \
+            "sha256:4833c6f23c1762e2328a1cef40e24a749d94e0152b4a8e6fe25b9e1b7853a6c7"
+          test "$(env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = \
+            "dynamic-quote-funded-2026-07-28-v4"
+          session_json=$(env_value FUNDED_DIRECT_SESSION_MANIFEST_JSON)
+          test "$(jq -r '.session_id' <<<"$session_json")" = "dynamic-quote-funded-2026-07-28-v4"
+          test "$(jq -r '.no_deposits' <<<"$session_json")" = "true"
+          test "$(jq -r '.allow_automatic_replenishment' <<<"$session_json")" = "false"
+          test "$(jq -r '.allow_compounding' <<<"$session_json")" = "false"
+          test "$(jq -c '.external_cash_flows' <<<"$session_json")" = "[]"
           producer_image=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
@@ -446,7 +510,7 @@ jobs:
             -o json > service-bus-queue.json
           test "$(jq -r '.requiresDuplicateDetection' service-bus-queue.json)" = "true"
           test "$(jq -r '.duplicateDetectionHistoryTimeWindow' service-bus-queue.json)" = "PT10M"
-          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT30S"
+          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT10S"
           test "$(jq -r '.deadLetteringOnMessageExpiration' service-bus-queue.json)" = "true"
           test "$(jq -r '.maxDeliveryCount' service-bus-queue.json)" = "3"
           az servicebus namespace network-rule-set show \

@@ -76,8 +76,8 @@ export function loadFundedDirectConfig(env = process.env) {
     errors.push("FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS must be in [1000, FUNDED_DIRECT_MIN_REMAINING_TTL_MS]");
   }
   if (String(env.FUNDED_DIRECT_ENGINE || "") === "persistent_v1" &&
-      (config.minRemainingTtlMs < 15_000 || config.childMinRemainingTtlMs < 15_000)) {
-    errors.push("persistent_v1 requires at least 15000ms before authorization and child execution");
+      (config.minRemainingTtlMs !== 7_000 || config.childMinRemainingTtlMs !== 2_000)) {
+    errors.push("persistent_v1 requires the reviewed 7000ms authorization and 2000ms child TTL gates");
   }
   if (errors.length) throw new Error(`funded_direct_worker blocked: ${errors.join("; ")}`);
   validateSession(config);
@@ -348,7 +348,7 @@ async function executeSelectedIntent({
         })
       };
     }
-    if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
+    if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|projected_equity_floor_breach|projected_campaign_drawdown_breach|authorized_starting_collateral|external_cash_flow_record/.test(child.error || "")) {
       await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
         status: "child_failed_closed_pre_submission",
         order_submission_attempted: false,

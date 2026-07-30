@@ -15,7 +15,9 @@ import {
 import {
   putOperatorSessionManifest,
   requireExecutionModelArtifact,
+  assertPersistentIntentRemainingTtl,
   selectFreshCachedSafetySnapshot,
+  startSafetySnapshotCache,
   streamBookEvidence
 } from "../src/canary.mjs";
 
@@ -29,6 +31,10 @@ const book = {
 const intentHash = `sha256:${"1".repeat(64)}`;
 const manifestHash = `sha256:${"2".repeat(64)}`;
 const executionModelHash = `sha256:${"7".repeat(64)}`;
+
+async function flushMicrotasks(rounds = 12) {
+  for (let index = 0; index < rounds; index += 1) await Promise.resolve();
+}
 
 test("execution model URI resolves its exact cross-container artifact", () => {
   assert.deepEqual(
@@ -108,6 +114,91 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
     selectFreshCachedSafetySnapshot(resources, { ...intent, token_id: "token-down" }, 10_600),
     null
   );
+});
+
+test("persistent executor honors the configured child TTL gate", () => {
+  const nowMs = Date.parse("2026-07-30T12:00:00.000Z");
+  assert.equal(
+    assertPersistentIntentRemainingTtl(
+      { valid_until: new Date(nowMs + 2_000).toISOString() },
+      2_000,
+      nowMs
+    ),
+    2_000
+  );
+  assert.throws(
+    () => assertPersistentIntentRemainingTtl(
+      { valid_until: new Date(nowMs + 1_999).toISOString() },
+      2_000,
+      nowMs
+    ),
+    /less than 2000ms/
+  );
+});
+
+test("safety cache keeps pending preflights globally bounded across warmup generations", async () => {
+  const cache = {
+    generation: 0,
+    timer: null,
+    inFlight: 0,
+    latest: null,
+    lastError: null,
+    market_id: null,
+    condition_id: null,
+    token_id: null
+  };
+  const resources = {
+    busy: false,
+    client: {},
+    manifestDocument: { value: {} },
+    profitQuarantineSnapshot: null,
+    safetyCache: cache
+  };
+  const captures = [];
+  const timers = [];
+  const capture = (_client, intent) => new Promise((resolve) => {
+    captures.push({ market_id: intent.market_id, resolve });
+  });
+  const setIntervalFn = (callback) => {
+    const timer = { callback, cleared: false, unref() {} };
+    timers.push(timer);
+    return timer;
+  };
+  const clearIntervalFn = (timer) => { timer.cleared = true; };
+  const options = {
+    capture,
+    createIntent: (market) => ({ market_id: market.market_id }),
+    setIntervalFn,
+    clearIntervalFn
+  };
+  const marketA = { market_id: "market-a", condition_id: "condition-a", token_id: "token-a" };
+  const marketB = { market_id: "market-b", condition_id: "condition-b", token_id: "token-b" };
+
+  startSafetySnapshotCache(resources, marketA, options);
+  timers[0].callback();
+  timers[0].callback();
+  await flushMicrotasks();
+  assert.equal(captures.length, 3);
+  assert.equal(cache.inFlight, 3);
+
+  startSafetySnapshotCache(resources, marketB, options);
+  await flushMicrotasks();
+  assert.equal(timers[0].cleared, true);
+  assert.equal(captures.length, 3, "a market change must not reset the global in-flight budget");
+  assert.equal(cache.inFlight, 3);
+
+  captures[0].resolve({ capturedCompletedWallMs: 1 });
+  await flushMicrotasks();
+  assert.equal(cache.inFlight, 2);
+  timers[1].callback();
+  await flushMicrotasks();
+  assert.equal(captures.length, 4);
+  assert.equal(captures.at(-1).market_id, "market-b");
+  assert.equal(cache.inFlight, 3);
+
+  for (const captureEntry of captures) captureEntry.resolve({ capturedCompletedWallMs: 2 });
+  await flushMicrotasks();
+  assert.equal(cache.inFlight, 0);
 });
 
 test("final stream evidence follows the newest token-specific top-of-book update", () => {

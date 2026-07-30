@@ -16,11 +16,9 @@ use std::env;
 use std::time::Instant;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
-// The frozen strategy's quote TTL controls how long a maker order may rest.
-// Funded execution also needs a bounded handoff envelope for blob discovery,
-// authorization, process launch, and the full authenticated preflight. Keep
-// those semantics separate and use the existing schema maximum for handoff.
-const EXECUTION_HANDOFF_TTL_MS: i64 = MAX_INTENT_TTL_MS;
+// Preserve the frozen producer contract: every funded handoff remains valid
+// for exactly the strategy's immutable ten-second quote lifecycle.
+const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
 // Keep the signed venue expiry well beyond the documented minimum. Live V2
 // rejected a correctly serialized order 107 seconds before its expiry, so the
 // immutable intent carries a five-minute fail-safe while the lifecycle still

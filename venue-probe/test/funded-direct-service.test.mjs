@@ -22,6 +22,14 @@ test("continuous funded service is disabled by default", () => {
   assert.throws(() => loadFundedDirectServiceConfig({}), /FUNDED_DIRECT_SERVICE_ENABLED/);
 });
 
+test("funded service validates the one-second Service Bus receive interval", () => {
+  assert.equal(loadFundedDirectServiceConfig(env({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" })).pollIntervalMs, 1_000);
+  assert.throws(
+    () => loadFundedDirectServiceConfig(env({ FUNDED_DIRECT_POLL_INTERVAL_MS: "999" })),
+    /FUNDED_DIRECT_POLL_INTERVAL_MS must be in \[1000, 60000\]/
+  );
+});
+
 test("continuous funded service immediately restarts bounded worker cycles", async () => {
   const sleeps = [];
   const logs = [];
@@ -68,8 +76,10 @@ function persistentEnv(overrides = {}) {
 function fakeBus(messages) {
   const completed = [];
   const deadLettered = [];
+  const receiveCalls = [];
   const receiver = {
-    async receiveMessages() {
+    async receiveMessages(maxMessages, options) {
+      receiveCalls.push({ maxMessages, options });
       const message = messages.shift();
       return message ? [message] : [];
     },
@@ -82,6 +92,7 @@ function fakeBus(messages) {
   return {
     completed,
     deadLettered,
+    receiveCalls,
     client: {
       createReceiver: () => receiver,
       async close() {}
@@ -118,7 +129,7 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   let warmups = 0;
   let executions = 0;
   const result = await runPersistentFundedDirectService({
-    env: persistentEnv(),
+    env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
     createBusClient: () => bus.client,
     createExecutor: async () => {
       executorCreations += 1;
@@ -148,6 +159,52 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.equal(executions, 1);
   assert.deepEqual(bus.completed, ["warmup", "decision"]);
   assert.deepEqual(bus.deadLettered, []);
+  assert.equal(bus.receiveCalls.length, 2);
+  assert.ok(bus.receiveCalls.every(({ maxMessages, options }) =>
+    maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
+  ));
+});
+
+test("persistent service preserves attempted-order observability for an idempotent completion", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const bus = fakeBus([{
+    messageId: "duplicate-post-submit",
+    deliveryCount: 2,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: "b".repeat(64),
+      decision_ts: decisionTs
+    }
+  }]);
+  const logs = [];
+  await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => ({
+        status: "already_completed_idempotent",
+        completion: {
+          status: "child_failed_closed_post_submission_unresolved",
+          order_submission_attempted: true
+        }
+      })
+    }),
+    logger: (value) => logs.push(value)
+  });
+
+  const completion = logs.find((value) =>
+    value.schema === "polyedge.funded_direct_latency.v1" &&
+    value.decision_id === "b".repeat(64)
+  );
+  assert.equal(completion.order_submission_attempted, true);
+  assert.equal(completion.worker_status, "already_completed_idempotent");
+  assert.deepEqual(bus.completed, ["duplicate-post-submit"]);
 });
 
 test("persistent service pauses after three consecutive transitions above three seconds", async () => {

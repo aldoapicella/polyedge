@@ -15,6 +15,7 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     riskPauseMs: integer(env.FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS, 60_000),
     heartbeatMs: integer(env.FUNDED_DIRECT_SERVICE_HEARTBEAT_MS, 60_000),
     maxCycles: integer(env.FUNDED_DIRECT_SERVICE_MAX_CYCLES, 0),
+    pollIntervalMs: integer(env.FUNDED_DIRECT_POLL_INTERVAL_MS, 1_000),
     engine: String(env.FUNDED_DIRECT_ENGINE || "legacy_spawn").trim(),
     serviceBusNamespace: String(env.FUNDED_DIRECT_SERVICE_BUS_NAMESPACE || "").trim(),
     serviceBusQueue: String(env.FUNDED_DIRECT_SERVICE_BUS_QUEUE || "").trim(),
@@ -34,6 +35,9 @@ export function loadFundedDirectServiceConfig(env = process.env) {
   }
   if (!(config.maxCycles >= 0 && config.maxCycles <= 10_000)) {
     errors.push("FUNDED_DIRECT_SERVICE_MAX_CYCLES must be in [0, 10000]");
+  }
+  if (!(config.pollIntervalMs >= 1_000 && config.pollIntervalMs <= 60_000)) {
+    errors.push("FUNDED_DIRECT_POLL_INTERVAL_MS must be in [1000, 60000]");
   }
   if (!["legacy_spawn", "persistent_v1"].includes(config.engine)) {
     errors.push("FUNDED_DIRECT_ENGINE must equal legacy_spawn or persistent_v1");
@@ -66,7 +70,7 @@ export async function runFundedDirectService({
   logger({
     schema: "polyedge.funded_direct_service.v1",
     status: "continuous_service_started",
-    poll_interval_ms: Number(env.FUNDED_DIRECT_POLL_INTERVAL_MS),
+    poll_interval_ms: config.pollIntervalMs,
     cloud_only: true
   });
 
@@ -146,6 +150,7 @@ export async function runPersistentFundedDirectService({
     engine: config.engine,
     handoff: "azure_service_bus_peek_lock",
     queue: config.serviceBusQueue,
+    poll_interval_ms: config.pollIntervalMs,
     signal_to_send_slo_ms: config.signalToSendSloMs,
     cloud_only: true,
     executor: executor.status()
@@ -174,7 +179,7 @@ export async function runPersistentFundedDirectService({
   heartbeat.unref?.();
   try {
     while (!stopping) {
-      const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: 10_000 });
+      const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs });
       if (!messages.length) continue;
       const message = messages[0];
       const queueReceiveMonotonicMs = performance.now();
@@ -236,7 +241,9 @@ export async function runPersistentFundedDirectService({
             rolling_p95_signal_to_send_ms: rollingP95Ms,
             rolling_p95_slo_breached: rollingP95Ms !== null && rollingP95Ms > config.signalToSendSloMs,
             consecutive_latency_breaches: consecutiveLatencyBreaches,
-            order_submission_attempted: result?.execution?.order_submission_attempted === true,
+            order_submission_attempted:
+              result?.execution?.order_submission_attempted === true ||
+              result?.completion?.order_submission_attempted === true,
             worker_status: result?.status || null,
             worker_error: result?.error || null,
             execution_timing: result?.execution_timing || null
@@ -329,7 +336,7 @@ function persistentCanaryBootstrapEnv(env) {
     STRATEGY_CANARY_EXECUTION_MODEL_SHA256: session.execution_model?.sha256,
     STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION: session.execution_model?.model_version,
     STRATEGY_CANARY_MAX_ORDER_NOTIONAL: String(session.max_order_notional),
-    STRATEGY_CANARY_MIN_REMAINING_TTL_MS: String(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS || "15000"),
+    STRATEGY_CANARY_MIN_REMAINING_TTL_MS: String(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS || "2000"),
     VENUE_PROBE_CAMPAIGN_CASH_FLOWS: "[]"
   };
 }

@@ -970,10 +970,10 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   name: fundedLadderJobName
   location: location
   tags: union(tags, {
-    trigger: fundedDirectReleaseReady ? 'schedule-every-5-minutes' : 'manual-only'
+    trigger: 'manual-only'
     operation: 'funded-dynamic-quote-operator-direct'
-    fundedExecution: fundedDirectReleaseReady ? 'enabled' : 'disabled'
-    dryRun: fundedDirectReleaseReady ? 'false' : 'true'
+    fundedExecution: 'disabled'
+    dryRun: 'true'
   })
   identity: {
     type: 'UserAssigned'
@@ -981,8 +981,8 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   }
   properties: {
     environmentId: managedEnvironment.id
-    configuration: union({
-      triggerType: fundedDirectReleaseReady ? 'Schedule' : 'Manual'
+    configuration: {
+      triggerType: 'Manual'
       replicaRetryLimit: 0
       replicaTimeout: 290
       registries: [{ server: registry.properties.loginServer, identity: identity.id }]
@@ -992,27 +992,20 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
         { name: 'polymarket-api-secret', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret', identity: identity.id }
         { name: 'polymarket-api-passphrase', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase', identity: identity.id }
       ]
-    }, fundedDirectReleaseReady ? {
-      scheduleTriggerConfig: {
-        cronExpression: '*/5 * * * *'
-        parallelism: 1
-        replicaCompletionCount: 1
-      }
-    } : {
       manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1
       }
-    })
+    }
     template: {
       containers: [{
         name: 'funded-ladder'
         image: venueProbeImage
         command: ['node', 'src/funded-direct-worker.mjs']
         env: [
-          { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectReleaseReady ? 'true' : 'false' }
-          { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
-          { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectReleaseReady ? 'false' : 'true' }
+          { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: 'false' }
+          { name: 'ALLOW_FUNDED_DIRECT', value: 'false' }
+          { name: 'FUNDED_DIRECT_DRY_RUN', value: 'true' }
           { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
           { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '1000' }
           { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
@@ -1023,8 +1016,8 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
           { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
-          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '25000' }
-          { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '15000' }
+          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
+          { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
