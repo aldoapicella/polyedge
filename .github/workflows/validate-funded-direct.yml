@@ -284,6 +284,7 @@ jobs:
               && timeout 20s az containerapp logs show \
                 --resource-group "$AZURE_RESOURCE_GROUP" \
                 --name "$FUNDED_APP" \
+                --follow false \
                 --tail 100 > funded-before-rehearsal.log 2>/dev/null \
               && grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log; then
               break
@@ -315,6 +316,7 @@ jobs:
             if timeout 20s az containerapp logs show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
+              --follow false \
               --tail 100 > funded-rehearsal.log 2>/dev/null \
               && grep -q '"status":"market_warmed"' funded-rehearsal.log; then
               break
@@ -445,6 +447,7 @@ jobs:
             if timeout 20s az containerapp logs show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
+              --follow false \
               --tail 100 > funded-service.log 2>/dev/null \
               && grep -q 'persistent_service_started' funded-service.log; then
               break
