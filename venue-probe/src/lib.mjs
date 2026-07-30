@@ -897,6 +897,50 @@ export function storageContainer(config) {
   return service.getContainerClient(config.storageContainer);
 }
 
+export function createCampaignLeaseRenewalGuard({
+  now = monotonicMs,
+  freshnessLimitMs = 45_000
+} = {}) {
+  if (typeof now !== "function" || !(Number(freshnessLimitMs) > 0)) {
+    throw new Error("campaign lease renewal guard configuration is invalid");
+  }
+  let lastConfirmedRenewalMs = now();
+  let renewalError = null;
+  let fatalRenewalError = false;
+  return {
+    canRenew: () => !fatalRenewalError,
+    recordSuccess() {
+      lastConfirmedRenewalMs = now();
+      renewalError = null;
+      fatalRenewalError = false;
+    },
+    recordFailure(error) {
+      renewalError = error;
+      fatalRenewalError = !isRetryableCampaignLeaseRenewalError(error);
+    },
+    hasError: () => renewalError !== null,
+    assertHealthy() {
+      if (fatalRenewalError) {
+        throw new Error(`fail closed: campaign lease renewal failed (${renewalError?.message || "unknown error"})`);
+      }
+      const ageMs = now() - lastConfirmedRenewalMs;
+      if (ageMs > freshnessLimitMs) {
+        if (renewalError) {
+          throw new Error(`fail closed: campaign lease renewal failed (${renewalError.message || "unknown error"})`);
+        }
+        throw new Error(`fail closed: campaign lease freshness exceeded ${freshnessLimitMs / 1_000} seconds (${ageMs.toFixed(0)}ms)`);
+      }
+    }
+  };
+}
+
+function isRetryableCampaignLeaseRenewalError(error) {
+  const statusCode = Number(error?.statusCode ?? error?.status);
+  if ([408, 429].includes(statusCode) || statusCode >= 500) return true;
+  const value = `${error?.name || ""} ${error?.code || ""} ${error?.message || ""}`;
+  return /(abort|timed?\s*out|timeout|econnreset|etimedout|socket hang up)/i.test(value);
+}
+
 export async function acquireCampaignLease(config, runId) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable storage is required for the campaign lease");
@@ -916,17 +960,16 @@ export async function acquireCampaignLease(config, runId) {
   } catch (error) {
     throw new Error(`fail closed: another venue probe owns the campaign lease (${error.statusCode || "lease unavailable"})`);
   }
-  let renewalError = null;
   let renewing = false;
-  let lastConfirmedRenewalMs = monotonicMs();
+  const renewalGuard = createCampaignLeaseRenewalGuard();
   const timer = setInterval(async () => {
-    if (renewing || renewalError) return;
+    if (renewing || !renewalGuard.canRenew()) return;
     renewing = true;
     try {
       await leaseClient.renewLease({ abortSignal: AbortSignal.timeout(10_000) });
-      lastConfirmedRenewalMs = monotonicMs();
+      renewalGuard.recordSuccess();
     } catch (error) {
-      renewalError = error;
+      renewalGuard.recordFailure(error);
     } finally {
       renewing = false;
     }
@@ -935,16 +978,14 @@ export async function acquireCampaignLease(config, runId) {
   return {
     run_id: runId,
     assertHealthy() {
-      if (renewalError) throw new Error(`fail closed: campaign lease renewal failed (${renewalError.message})`);
-      const ageMs = monotonicMs() - lastConfirmedRenewalMs;
-      if (ageMs > 45_000) throw new Error(`fail closed: campaign lease freshness exceeded 45 seconds (${ageMs.toFixed(0)}ms)`);
+      renewalGuard.assertHealthy();
     },
     async release() {
       clearInterval(timer);
       try {
         await leaseClient.releaseLease({ abortSignal: AbortSignal.timeout(10_000) });
       } catch (error) {
-        if (!renewalError) throw error;
+        if (!renewalGuard.hasError()) throw error;
       }
     }
   };

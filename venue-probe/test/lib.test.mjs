@@ -4,6 +4,7 @@ import {
   assertEligibleOrigin,
   buildQueueCalibrationArtifact,
   campaignRestSchedule,
+  createCampaignLeaseRenewalGuard,
   evaluateCampaignRiskGate,
   evaluateDailyRiskGate,
   fitEffectiveQueueModel,
@@ -41,6 +42,33 @@ const safeEnv = {
   POLYMARKET_FUNDER_ADDRESS: "0x123",
   AZURE_STORAGE_ACCOUNT_NAME: "storage"
 };
+
+test("transient campaign lease renewal errors retry within the freshness window", () => {
+  let now = 0;
+  const guard = createCampaignLeaseRenewalGuard({ now: () => now });
+
+  now = 20_000;
+  guard.recordFailure(new Error("The operation was aborted while making request"));
+  assert.equal(guard.canRenew(), true);
+  assert.doesNotThrow(() => guard.assertHealthy());
+
+  now = 40_000;
+  guard.recordSuccess();
+  assert.equal(guard.hasError(), false);
+
+  now = 86_000;
+  assert.throws(() => guard.assertHealthy(), /campaign lease freshness exceeded 45 seconds/);
+});
+
+test("non-transient campaign lease loss fails immediately and stops renewal", () => {
+  const guard = createCampaignLeaseRenewalGuard({ now: () => 0 });
+  const error = new Error("lease id no longer owns the blob");
+  error.statusCode = 409;
+  guard.recordFailure(error);
+
+  assert.equal(guard.canRenew(), false);
+  assert.throws(() => guard.assertHealthy(), /campaign lease renewal failed/);
+});
 
 test("safe venue probe gates load", () => {
   const config = loadProbeConfig(safeEnv);
