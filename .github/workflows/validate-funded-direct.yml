@@ -274,29 +274,47 @@ jobs:
       - name: Run real cloud queue, REST, storage, and WebSocket no-sign rehearsal
         run: |
           set -euo pipefail
+          environment_id=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.environmentId -o tsv)
+          workspace_customer_id=$(az containerapp env show \
+            --ids "$environment_id" \
+            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+          test -n "$workspace_customer_id"
           for attempt in $(seq 1 36); do
             active_replicas=$(az containerapp revision list \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               --query '[?properties.active].properties.replicas | sum(@)' \
               -o tsv)
-            if [ "${active_replicas:-0}" = "1" ] \
-              && timeout 20s az containerapp logs show \
+            if [ "${active_replicas:-0}" = "1" ]; then
+              active_revision=$(az containerapp revision list \
                 --resource-group "$AZURE_RESOURCE_GROUP" \
                 --name "$FUNDED_APP" \
-                --follow false \
-                --tail 100 > funded-before-rehearsal.log 2>/dev/null \
-              && grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log; then
-              break
+                --query '[?properties.active].name | [0]' -o tsv)
+              startup_count=$(az monitor log-analytics query \
+                --workspace "$workspace_customer_id" \
+                --analytics-query "ContainerAppConsoleLogs_CL
+                  | where ContainerAppName_s == '$FUNDED_APP'
+                  | where RevisionName_s == '$active_revision'
+                  | where TimeGenerated > ago(30m)
+                  | where Log_s contains '\"status\":\"persistent_service_started\"'
+                  | count" \
+                --query '[0].Count' -o tsv)
+              if [ "${startup_count:-0}" -ge 1 ]; then
+                break
+              fi
             fi
             sleep 10
           done
           test "${active_replicas:-0}" = "1"
-          grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log
+          test "${startup_count:-0}" -ge 1
           previous_executions=$(az containerapp job execution list \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_WARMUP_JOB" \
             --query '[].name' -o tsv)
+          rehearsal_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_WARMUP_JOB" \
@@ -325,17 +343,21 @@ jobs:
           done
           test "$status" = "Succeeded"
           for attempt in $(seq 1 18); do
-            if timeout 20s az containerapp logs show \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$FUNDED_APP" \
-              --follow false \
-              --tail 100 > funded-rehearsal.log 2>/dev/null \
-              && grep -q '"status":"market_warmed"' funded-rehearsal.log; then
+            warmup_count=$(az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$active_revision'
+                | where TimeGenerated >= datetime($rehearsal_started_at)
+                | where Log_s contains '\"status\":\"market_warmed\"'
+                | count" \
+              --query '[0].Count' -o tsv)
+            if [ "${warmup_count:-0}" -ge 1 ]; then
               break
             fi
             sleep 10
           done
-          grep -q '"status":"market_warmed"' funded-rehearsal.log
+          test "${warmup_count:-0}" -ge 1
 
       - name: Deploy compatible Dynamic Quote intent producer
         run: |
@@ -455,18 +477,33 @@ jobs:
       - name: Verify service startup and qset isolation
         run: |
           set -euo pipefail
+          environment_id=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.environmentId -o tsv)
+          workspace_customer_id=$(az containerapp env show \
+            --ids "$environment_id" \
+            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+          active_revision=$(az containerapp revision list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query '[?properties.active].name | [0]' -o tsv)
           for attempt in $(seq 1 18); do
-            if timeout 20s az containerapp logs show \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$FUNDED_APP" \
-              --follow false \
-              --tail 100 > funded-service.log 2>/dev/null \
-              && grep -q 'persistent_service_started' funded-service.log; then
+            startup_count=$(az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$active_revision'
+                | where TimeGenerated > ago(30m)
+                | where Log_s contains '\"status\":\"persistent_service_started\"'
+                | count" \
+              --query '[0].Count' -o tsv)
+            if [ "${startup_count:-0}" -ge 1 ]; then
               break
             fi
             sleep 10
           done
-          grep -q 'persistent_service_started' funded-service.log
+          test "${startup_count:-0}" -ge 1
           qset_after=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$PROTECTED_QSET_APP" \
