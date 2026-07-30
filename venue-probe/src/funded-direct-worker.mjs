@@ -336,7 +336,24 @@ async function executeSelectedIntent({
         })
       };
     }
-    throw new Error(`fail closed: funded Dynamic Quote child exited ${child.exitCode} (${child.error || "unknown"})`);
+    await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
+      status: "child_failed_closed_pre_submission",
+      order_submission_attempted: false,
+      authorization_consumed: false,
+      risk_reservation_created: false,
+      error: child.error || "unknown pre-submission failure"
+    });
+    executionTiming.completion_persisted_wall_ms = Date.now();
+    executionTiming.completion_persisted_monotonic_ms = performance.now();
+    return {
+      childInvocations,
+      result: result("child_failed_closed_pre_submission", config, {
+        iteration,
+        childInvocations,
+        decisionId: selected.value.decision_id,
+        error: child.error || "unknown pre-submission failure"
+      })
+    };
   }
   await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
     status: "child_completed",

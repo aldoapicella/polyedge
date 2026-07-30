@@ -364,6 +364,45 @@ test("worker reports an account-risk pause without retrying a funded child", asy
   assert.equal(output.childInvocations, 1);
 });
 
+test("persistent pre-submission failure is terminally sealed without authorization leakage", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "6".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: {
+      control,
+      intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+    },
+    clock: () => now,
+    executeCanary: async () => {
+      throw new Error("fail closed: exact resolution source is not confirmed");
+    }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
+  };
+
+  const first = await processor.process(handoff);
+  const duplicate = await processor.process(handoff);
+
+  assert.equal(first.status, "child_failed_closed_pre_submission");
+  assert.equal(first.childInvocations, 1);
+  assert.equal(duplicate.status, "already_completed_idempotent");
+  assert.equal(duplicate.completion.authorization_consumed, false);
+  assert.equal(duplicate.completion.risk_reservation_created, false);
+  assert.equal(duplicate.completion.order_submission_attempted, false);
+});
+
 test("persistent handoff verifies the immutable hash and executes exactly once across duplicate delivery", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "8".repeat(64));

@@ -852,7 +852,15 @@ export function selectFreshCachedSafetySnapshot(resources, intent, nowMs = Date.
       nowMs - completedWallMs > SAFETY_CACHE_MAX_SELECTION_AGE_MS) {
     return null;
   }
-  return cached.runtime;
+  // The warm snapshot is captured with a deliberately non-executable
+  // synthetic intent. Rebind only the immutable resolution provenance from
+  // the verified executable intent; all volatile venue/account evidence
+  // remains the independently captured warm snapshot.
+  return {
+    ...cached.runtime,
+    exactResolutionSource: intent.exact_resolution_source === true,
+    resolutionSource: intent.resolution_source
+  };
 }
 
 async function executeLifecycle(client, { intent, documents, runtime, reservation }) {

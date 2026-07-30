@@ -75,7 +75,12 @@ test("persistent executor rejects missing execution-model provenance before exec
 });
 
 test("persistent executor selects only a fresh exact-market safety snapshot", () => {
-  const runtime = { capturedCompletedWallMs: 10_000, risk: { passed: true } };
+  const runtime = {
+    capturedCompletedWallMs: 10_000,
+    risk: { passed: true },
+    exactResolutionSource: false,
+    resolutionSource: null
+  };
   const resources = {
     safetyCache: {
       latest: {
@@ -89,9 +94,15 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
   const intent = {
     market_id: "market-1",
     condition_id: "condition-1",
-    token_id: "token-up"
+    token_id: "token-up",
+    exact_resolution_source: true,
+    resolution_source: "chainlink_reference"
   };
-  assert.equal(selectFreshCachedSafetySnapshot(resources, intent, 10_600), runtime);
+  assert.deepEqual(selectFreshCachedSafetySnapshot(resources, intent, 10_600), {
+    ...runtime,
+    exactResolutionSource: true,
+    resolutionSource: "chainlink_reference"
+  });
   assert.equal(selectFreshCachedSafetySnapshot(resources, intent, 10_651), null);
   assert.equal(
     selectFreshCachedSafetySnapshot(resources, { ...intent, token_id: "token-down" }, 10_600),
