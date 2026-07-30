@@ -293,13 +293,25 @@ jobs:
           done
           test "${active_replicas:-0}" = "1"
           grep -q '"status":"persistent_service_started"' funded-before-rehearsal.log
-          execution=$(timeout 180s az containerapp job start \
+          previous_executions=$(az containerapp job execution list \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_WARMUP_JOB" \
-            --query name -o tsv)
-          test -n "$execution"
+            --query '[].name' -o tsv)
+          az containerapp job start \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_WARMUP_JOB" \
+            --no-wait >/dev/null
+          execution=""
           status=""
-          for attempt in $(seq 1 18); do
+          for attempt in $(seq 1 24); do
+            execution=$(az containerapp job execution list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_WARMUP_JOB" \
+              --query 'sort_by([], &properties.startTime)[-1].name' -o tsv)
+            if [ -z "$execution" ] || grep -Fqx "$execution" <<<"$previous_executions"; then
+              sleep 10
+              continue
+            fi
             status=$(az containerapp job execution show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_WARMUP_JOB" \
