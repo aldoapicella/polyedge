@@ -494,6 +494,13 @@ jobs:
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
 
+      - name: Refresh Azure login for post-deployment verification
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Verify Service Bus security and delivery contract
         run: |
           set -euo pipefail
