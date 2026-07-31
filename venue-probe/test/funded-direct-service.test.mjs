@@ -97,17 +97,41 @@ function automaticRedemptionEnv(overrides = {}) {
 
 test("automatic redemption remains strictly inside the final no-trade window", () => {
   const config = loadFundedDirectServiceConfig(automaticRedemptionEnv());
-  const now = Date.parse("2026-07-30T12:00:00Z");
-  const status = (seconds) => ({
+  const status = (marketEndTs = "2026-07-30T12:15:00Z") => ({
     warmed_market: {
       market_id: "btc-market",
-      market_end_ts: new Date(now + seconds * 1_000).toISOString()
+      market_end_ts: marketEndTs
     }
   });
-  assert.equal(fundedRedemptionMaintenanceWindow(status(360), now, config).eligible, false);
-  assert.equal(fundedRedemptionMaintenanceWindow(status(350), now, config).eligible, true);
-  assert.equal(fundedRedemptionMaintenanceWindow(status(30), now, config).eligible, true);
-  assert.equal(fundedRedemptionMaintenanceWindow(status(29), now, config).eligible, false);
+  assert.equal(fundedRedemptionMaintenanceWindow(
+    status(),
+    Date.parse("2026-07-30T12:09:00Z"),
+    config
+  ).eligible, false);
+  assert.equal(fundedRedemptionMaintenanceWindow(
+    status(),
+    Date.parse("2026-07-30T12:09:10Z"),
+    config
+  ).eligible, true);
+  assert.equal(fundedRedemptionMaintenanceWindow(
+    status(),
+    Date.parse("2026-07-30T12:14:30Z"),
+    config
+  ).eligible, true);
+  assert.equal(fundedRedemptionMaintenanceWindow(
+    status(),
+    Date.parse("2026-07-30T12:14:31Z"),
+    config
+  ).eligible, false);
+  const futureWarmup = fundedRedemptionMaintenanceWindow(
+    status("2026-07-30T12:30:00Z"),
+    Date.parse("2026-07-30T12:10:00Z"),
+    config
+  );
+  assert.equal(futureWarmup.eligible, true);
+  assert.equal(futureWarmup.market_id, null);
+  assert.equal(futureWarmup.market_end_ts, "2026-07-30T12:15:00.000Z");
+  assert.equal(futureWarmup.clock_source, "btc_15m_utc_boundary");
   assert.throws(
     () => loadFundedDirectServiceConfig(automaticRedemptionEnv({
       FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "360"
@@ -209,9 +233,9 @@ test("persistent service reuses one warm executor and processes warmup plus inte
 });
 
 test("persistent service runs redemption under the inherited lease after entering the no-trade window", async () => {
-  const now = Date.parse("2026-07-30T12:00:00Z");
+  const now = Date.parse("2026-07-30T12:10:00Z");
   const bus = fakeBus([{
-    messageId: "warmup-final-window",
+    messageId: "warmup-next-market",
     deliveryCount: 1,
     body: {
       schema: "polyedge.funded_market_warmup.v1",
@@ -219,7 +243,7 @@ test("persistent service runs redemption under the inherited lease after enterin
       condition_id: "condition",
       token_id: "token-up",
       token_ids: ["token-up", "token-down"],
-      market_end_ts: new Date(now + 300_000).toISOString()
+      market_end_ts: "2026-07-30T12:30:00Z"
     }
   }]);
   const lease = { assertHealthy() {} };
@@ -255,7 +279,9 @@ test("persistent service runs redemption under the inherited lease after enterin
   assert.equal(result.redemption_results, 1);
   assert.equal(maintenanceRuns, 1);
   assert.equal(redemptionRuns, 1);
-  assert.ok(logs.some((value) => value.status === "automatic_redemption_cycle_completed"));
+  const completion = logs.find((value) => value.status === "automatic_redemption_cycle_completed");
+  assert.equal(completion?.market_end_ts, "2026-07-30T12:15:00.000Z");
+  assert.equal(completion?.clock_source, "btc_15m_utc_boundary");
 });
 
 test("persistent service preserves attempted-order observability for an idempotent completion", async () => {

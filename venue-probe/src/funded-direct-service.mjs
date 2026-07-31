@@ -9,6 +9,8 @@ import {
 } from "./funded-direct-worker.mjs";
 import { sanitize } from "./lib.mjs";
 
+const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
+
 export function loadFundedDirectServiceConfig(env = process.env) {
   const config = {
     enabled: env.FUNDED_DIRECT_SERVICE_ENABLED === "true",
@@ -230,6 +232,8 @@ export async function runPersistentFundedDirectService({
         schema: "polyedge.funded_redemption_service.v1",
         status: "automatic_redemption_cycle_completed",
         market_id: window.market_id,
+        market_end_ts: window.market_end_ts,
+        clock_source: window.clock_source,
         remaining_seconds: window.remaining_seconds,
         redemption_status: lastRedemptionStatus,
         redemption_submitted: result?.redemption_submitted === true
@@ -241,6 +245,8 @@ export async function runPersistentFundedDirectService({
         schema: "polyedge.funded_direct_alert.v1",
         status: "automatic_redemption_failed_closed",
         market_id: window.market_id,
+        market_end_ts: window.market_end_ts,
+        clock_source: window.clock_source,
         remaining_seconds: window.remaining_seconds,
         account_risk_pause: true,
         error: error.message
@@ -419,15 +425,23 @@ export async function runPersistentFundedDirectService({
 
 export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config) {
   const market = executorStatus?.warmed_market;
-  const endMs = Date.parse(String(market?.market_end_ts || ""));
-  const remainingSeconds = (endMs - Number(nowMs)) / 1_000;
-  const eligible = Number.isFinite(endMs) &&
+  const checkedAtMs = Number(nowMs);
+  const endMs = Number.isFinite(checkedAtMs)
+    ? (Math.floor(checkedAtMs / FUNDED_BTC_MARKET_INTERVAL_MS) + 1) *
+      FUNDED_BTC_MARKET_INTERVAL_MS
+    : Number.NaN;
+  const warmedEndMs = Date.parse(String(market?.market_end_ts || ""));
+  const remainingSeconds = (endMs - checkedAtMs) / 1_000;
+  const eligible = Number.isFinite(checkedAtMs) &&
+    Number.isFinite(endMs) &&
     Number.isFinite(remainingSeconds) &&
     remainingSeconds >= config.autoRedemptionMinSecondsToExpiry &&
     remainingSeconds <= config.autoRedemptionMaxSecondsToExpiry;
   return {
     eligible,
-    market_id: market?.market_id || null,
+    market_id: warmedEndMs === endMs ? market?.market_id || null : null,
+    market_end_ts: Number.isFinite(endMs) ? new Date(endMs).toISOString() : null,
+    clock_source: "btc_15m_utc_boundary",
     remaining_seconds: Number.isFinite(remainingSeconds)
       ? Math.round(remainingSeconds * 1_000) / 1_000
       : null
