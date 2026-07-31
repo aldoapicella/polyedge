@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
+  RELAYER_DEADLINE_BUFFER_SECONDS,
   rejectedRelayerSubmissionMatches,
   safeRelayerErrorDetail
 } from "../src/redeem.mjs";
@@ -27,6 +28,10 @@ const conditionB = `0x${"22".repeat(32)}`;
 test("redemption uses the current Polymarket collateral adapters", () => {
   assert.equal(CTF_COLLATERAL_ADAPTER, "0xAdA100Db00Ca00073811820692005400218FcE1f");
   assert.equal(NEG_RISK_CTF_COLLATERAL_ADAPTER, "0xadA2005600Dec949baf300f4C6120000bDB6eAab");
+});
+
+test("redemption uses the documented ten-minute relayer deadline buffer", () => {
+  assert.equal(RELAYER_DEADLINE_BUFFER_SECONDS, 600);
 });
 
 const safeEnv = {

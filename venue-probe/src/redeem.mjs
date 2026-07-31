@@ -47,6 +47,7 @@ let runId;
 let ledger;
 let lease;
 let redemptionRunning = false;
+export const RELAYER_DEADLINE_BUFFER_SECONDS = 600;
 
 export async function runVenueRedemption({
   env = process.env,
@@ -233,7 +234,7 @@ async function run() {
   let sent = false;
   try {
     const nonce = await relayerJson(`/nonce?address=${encodeURIComponent(account.address)}&type=WALLET`);
-    const deadline = Math.floor(Date.now() / 1000) + 240;
+    const deadline = Math.floor(Date.now() / 1000) + RELAYER_DEADLINE_BUFFER_SECONDS;
     const typedData = depositWalletTypedData(config.funderAddress, nonce.nonce, deadline, calls);
     const signature = await account.signTypedData(typedData);
     const request = depositWalletRequest(account.address, config.funderAddress, nonce.nonce, deadline, calls, signature);
