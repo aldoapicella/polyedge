@@ -11,10 +11,12 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
+import { pathToFileURL } from "node:url";
 import {
   EventLedger,
   acquireCampaignLease,
   assertEligibleOrigin,
+  loadCampaignRiskReservationRecords,
   sanitize,
   settleProbeRiskReservations,
   storageContainer,
@@ -33,55 +35,82 @@ import {
   selectRedeemableConditions,
   summarizeRecentRedemptions
 } from "./redemption.mjs";
+import {
+  discoverVerifiedAutomaticInternalSettlements,
+  loadDurableInternalSettlements,
+  putVerifiedInternalSettlement
+} from "./compounding-risk.mjs";
+import { tradeFillsFromRest } from "./canary-lifecycle-lib.mjs";
 
-const config = loadRedemptionConfig();
-const runId = `venue-redemption-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
-const ledger = new EventLedger(runId);
+let config;
+let runId;
+let ledger;
 let lease;
-let summary;
+let redemptionRunning = false;
 
-try {
-  summary = await run();
-} catch (error) {
-  ledger.record("venue_redemption_failed", { message: error.message });
-  summary = {
-    schema_version: 1,
-    run_id: runId,
-    status: "failed_closed",
-    finished_ts: new Date().toISOString(),
-    error: error.message,
-    redemption_submitted: ledger.events.some((event) => event.type === "venue_redemption_send"),
-    research_only: true,
-    live_strategy_enabled: false
-  };
-  process.exitCode = 1;
-}
-
-try {
-  await uploadRedemptionEvidence(summary);
-  console.log(JSON.stringify(sanitize(summary)));
-} catch (error) {
-  process.exitCode = 1;
-  console.error(JSON.stringify({ status: "failed_closed", error: `redemption evidence upload failed: ${error.message}` }));
-}
-
-if (lease) {
+export async function runVenueRedemption({
+  env = process.env,
+  inheritedLease = null,
+  logger = (value) => console.log(JSON.stringify(sanitize(value)))
+} = {}) {
+  if (redemptionRunning) throw new Error("fail closed: a venue redemption is already running");
+  redemptionRunning = true;
   try {
-    await lease.release();
-  } catch (error) {
-    process.exitCode = 1;
-    console.error(JSON.stringify({ status: "failed_closed", error: `redemption lease release failed: ${error.message}` }));
+    config = loadRedemptionConfig(env);
+    runId = `venue-redemption-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
+    ledger = new EventLedger(runId);
+    lease = inheritedLease;
+    let summary;
+    let failure = null;
+    try {
+      summary = await run();
+    } catch (error) {
+      failure = error;
+      ledger.record("venue_redemption_failed", { message: error.message });
+      summary = {
+        schema_version: 1,
+        run_id: runId,
+        status: "failed_closed",
+        finished_ts: new Date().toISOString(),
+        error: error.message,
+        redemption_submitted: ledger.events.some((event) => event.type === "venue_redemption_send"),
+        research_only: !config.fundedServiceManaged,
+        live_strategy_enabled: config.fundedServiceManaged
+      };
+    }
+
+    try {
+      await uploadRedemptionEvidence(summary);
+    } catch (error) {
+      failure ||= new Error(`redemption evidence upload failed: ${error.message}`);
+    }
+
+    try {
+      if (lease && !inheritedLease) await lease.release();
+    } catch (error) {
+      failure ||= new Error(`redemption lease release failed: ${error.message}`);
+    }
+    logger(sanitize(summary));
+    if (failure) throw failure;
+    return summary;
+  } finally {
+    lease = null;
+    ledger = null;
+    config = null;
+    runId = null;
+    redemptionRunning = false;
   }
 }
 
 async function run() {
-  lease = await acquireCampaignLease(config, runId);
+  lease ||= await acquireCampaignLease(config, runId);
   ledger.record("venue_redemption_started", {
     dry_run: config.dryRun,
     enabled: config.enabled,
     max_payout: config.maxPayout,
     max_conditions: config.maxConditions,
-    execution_origin: "azure_north_europe_static_egress"
+    execution_origin: config.executionOrigin,
+    funded_service_managed: config.fundedServiceManaged
   });
 
   const geoblock = await checkOrigin("startup");
@@ -245,9 +274,31 @@ async function run() {
     await clob.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType });
 
     const verified = await waitForSettlementVerification(clob, publicClient, selection, approvals, liquidBefore);
+    const reservationRecords = await loadCampaignRiskReservationRecords(config);
+    const settlementValues = await waitForAutomaticSettlementEvidence({
+      clob,
+      transactionHash: transaction.transactionHash,
+      receipt,
+      reservationRecords
+    });
+    if (settlementValues.length !== selection.selected.length ||
+        settlementValues.some((settlement) =>
+          !selection.selected.some((row) =>
+            row.condition_id.toLowerCase() === settlement.condition_id.toLowerCase()
+          ))) {
+      throw new Error("fail closed: automatic settlement does not match the exact redeemed condition set");
+    }
+    const settlements = [];
+    for (const settlement of settlementValues) {
+      settlements.push(await putVerifiedInternalSettlement(
+        storageContainer(config),
+        settlement
+      ));
+    }
     control.state = "confirmed_and_verified";
     control.liquid_collateral_after = verified.liquid_collateral_after;
     control.realized_payout = verified.realized_payout;
+    control.internal_settlement_blobs = settlements.map((row) => row.blob_name);
     control.updated_ts = new Date().toISOString();
     await writeRedemptionControl(control);
     await settleProbeRiskReservations(config, {
@@ -266,6 +317,8 @@ async function run() {
       terminal_portfolio: verified.portfolio,
       zero_open_orders_confirmed: verified.zero_open_orders_confirmed,
       evidence_source: "polymarket_data_api_plus_onchain_redemption"
+    }, {
+      reservationRecords
     });
     ledger.record("venue_redemption_verified", verified);
     return {
@@ -275,7 +328,8 @@ async function run() {
       transaction_hash: transaction.transactionHash || null,
       liquid_collateral_after: verified.liquid_collateral_after,
       realized_payout: verified.realized_payout,
-      zero_open_orders_confirmed: verified.zero_open_orders_confirmed
+      zero_open_orders_confirmed: verified.zero_open_orders_confirmed,
+      internal_settlement_blobs: settlements.map((row) => row.blob_name)
     };
   } catch (error) {
     if (!sent) {
@@ -293,7 +347,7 @@ function baseSummary(status, geoblock, owner, liquidBefore, selection, approvals
     run_id: runId,
     status,
     finished_ts: new Date().toISOString(),
-    execution_origin: "azure_north_europe_static_egress",
+    execution_origin: config.executionOrigin,
     execution_country: geoblock.country,
     static_egress_verified: geoblock.ip === config.expectedEgressIp,
     dry_run: config.dryRun,
@@ -315,8 +369,8 @@ function baseSummary(status, geoblock, owner, liquidBefore, selection, approvals
     })),
     zero_open_orders_confirmed: true,
     redemption_submitted: false,
-    research_only: true,
-    live_strategy_enabled: false
+    research_only: !config.fundedServiceManaged,
+    live_strategy_enabled: config.fundedServiceManaged
   };
 }
 
@@ -578,6 +632,56 @@ async function waitForSettlementVerification(clob, publicClient, selection, init
   throw new Error("fail closed: confirmed relayer redemption did not reconcile in Data API/CLOB before timeout");
 }
 
+async function waitForAutomaticSettlementEvidence({
+  clob,
+  transactionHash,
+  receipt,
+  reservationRecords
+}) {
+  const container = storageContainer(config);
+  const manifest = JSON.parse(config.fundedSessionManifestJson);
+  const deadline = Date.now() + 120_000;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const durableSettlements = await loadDurableInternalSettlements(
+        container,
+        config.campaignId
+      );
+      const settlements = await discoverVerifiedAutomaticInternalSettlements({
+        manifest,
+        reservations: reservationRecords.map((record) => record.reservation),
+        activity: await fetchActivity(),
+        durableSettlements,
+        getOrderFills: async (reservation) => {
+          const trades = await clob.getTrades({ market: reservation.condition_id });
+          if (!Array.isArray(trades)) {
+            throw new Error("fail closed: authenticated CLOB trade history is invalid");
+          }
+          return tradeFillsFromRest(trades, reservation.order_id);
+        },
+        getTransactionReceipt: async (hash) => {
+          if (String(hash).toLowerCase() !== String(transactionHash).toLowerCase()) {
+            throw new Error("fail closed: automatic settlement receipt hash is not the submitted redemption");
+          }
+          return {
+            status: receipt.status,
+            chain_id: polygon.id,
+            block_number: receipt.blockNumber.toString(),
+            confirmations: 2
+          };
+        }
+      });
+      if (settlements.length) return settlements;
+      lastError = new Error("automatic settlement activity is not visible yet");
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(2_000);
+  }
+  throw new Error(`fail closed: automatic settlement evidence did not reconcile (${lastError?.message || "unknown"})`);
+}
+
 async function readPusdBalance(publicClient) {
   const value = await publicClient.readContract({
     address: PUSD,
@@ -626,7 +730,7 @@ async function readAdapterApproval(publicClient, adapter) {
 
 async function readRedemptionControl() {
   const container = storageContainer(config);
-  const blob = container.getBlobClient("reports/research/venue-probe/control/redemption-state.json");
+  const blob = container.getBlobClient(redemptionControlBlobName());
   try {
     const response = await blob.download();
     return JSON.parse(await streamToString(response.readableStreamBody));
@@ -638,7 +742,7 @@ async function readRedemptionControl() {
 
 async function writeRedemptionControl(value) {
   const container = storageContainer(config);
-  await container.getBlockBlobClient("reports/research/venue-probe/control/redemption-state.json").uploadData(
+  await container.getBlockBlobClient(redemptionControlBlobName()).uploadData(
     Buffer.from(JSON.stringify(sanitize(value), null, 2)),
     { blobHTTPHeaders: { blobContentType: "application/json" } }
   );
@@ -649,11 +753,12 @@ async function uploadRedemptionEvidence(value) {
   await container.createIfNotExists();
   const payload = Buffer.from(JSON.stringify(sanitize(value), null, 2));
   const date = new Date().toISOString().slice(0, 10);
-  await container.getBlockBlobClient(`reports/research/venue-probe/redemptions/${date}/${runId}.json`).uploadData(payload, {
+  const prefix = redemptionEvidencePrefix();
+  await container.getBlockBlobClient(`${prefix}/redemptions/${date}/${runId}.json`).uploadData(payload, {
     conditions: { ifNoneMatch: "*" },
     blobHTTPHeaders: { blobContentType: "application/json" }
   });
-  await container.getBlockBlobClient("reports/research/venue-probe/latest_redemption.json").uploadData(payload, {
+  await container.getBlockBlobClient(`${prefix}/latest-redemption.json`).uploadData(payload, {
     blobHTTPHeaders: { blobContentType: "application/json" }
   });
 }
@@ -661,6 +766,16 @@ async function uploadRedemptionEvidence(value) {
 function normalizePrivateKey(value) {
   const trimmed = String(value || "").trim();
   return trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`;
+}
+
+function redemptionEvidencePrefix() {
+  return config.fundedServiceManaged
+    ? `reports/funded/dynamic-quote/sessions/${config.campaignId}`
+    : "reports/research/venue-probe";
+}
+
+function redemptionControlBlobName() {
+  return `${redemptionEvidencePrefix()}/control/redemption-state.json`;
 }
 
 async function streamToString(stream) {
@@ -671,4 +786,15 @@ async function streamToString(stream) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  runVenueRedemption().catch((error) => {
+    process.exitCode = 1;
+    console.error(JSON.stringify(sanitize({
+      status: "failed_closed",
+      error: error.message
+    })));
+  });
 }

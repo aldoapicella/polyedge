@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  fundedRedemptionMaintenanceWindow,
   loadFundedDirectServiceConfig,
   runFundedDirectService,
   runPersistentFundedDirectService
@@ -72,6 +73,48 @@ function persistentEnv(overrides = {}) {
     ...overrides
   });
 }
+
+function automaticRedemptionEnv(overrides = {}) {
+  const session = {
+    session_id: "dynamic-quote-funded-2026-07-29-v5",
+    starting_collateral: 11.09862,
+    allow_compounding: true,
+    no_deposits: true,
+    allow_automatic_replenishment: false
+  };
+  return persistentEnv({
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS: "60000",
+    FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY: "30",
+    FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "350",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
+    POLYMARKET_RELAYER_API_KEY: "relayer-key",
+    POLYMARKET_RELAYER_API_KEY_ADDRESS: "0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921",
+    ...overrides
+  });
+}
+
+test("automatic redemption remains strictly inside the final no-trade window", () => {
+  const config = loadFundedDirectServiceConfig(automaticRedemptionEnv());
+  const now = Date.parse("2026-07-30T12:00:00Z");
+  const status = (seconds) => ({
+    warmed_market: {
+      market_id: "btc-market",
+      market_end_ts: new Date(now + seconds * 1_000).toISOString()
+    }
+  });
+  assert.equal(fundedRedemptionMaintenanceWindow(status(360), now, config).eligible, false);
+  assert.equal(fundedRedemptionMaintenanceWindow(status(350), now, config).eligible, true);
+  assert.equal(fundedRedemptionMaintenanceWindow(status(30), now, config).eligible, true);
+  assert.equal(fundedRedemptionMaintenanceWindow(status(29), now, config).eligible, false);
+  assert.throws(
+    () => loadFundedDirectServiceConfig(automaticRedemptionEnv({
+      FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "360"
+    })),
+    /strictly inside the final 360 seconds/
+  );
+});
 
 function fakeBus(messages) {
   const completed = [];
@@ -163,6 +206,56 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.ok(bus.receiveCalls.every(({ maxMessages, options }) =>
     maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
   ));
+});
+
+test("persistent service runs redemption under the inherited lease after entering the no-trade window", async () => {
+  const now = Date.parse("2026-07-30T12:00:00Z");
+  const bus = fakeBus([{
+    messageId: "warmup-final-window",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      condition_id: "condition",
+      token_id: "token-up",
+      token_ids: ["token-up", "token-down"],
+      market_end_ts: new Date(now + 300_000).toISOString()
+    }
+  }]);
+  const lease = { assertHealthy() {} };
+  let warmedMarket = null;
+  let maintenanceRuns = 0;
+  let redemptionRuns = 0;
+  const logs = [];
+  const result = await runPersistentFundedDirectService({
+    env: automaticRedemptionEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    now: () => now,
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async (value) => { warmedMarket = value; },
+      execute: async () => {},
+      runMaintenance: async (task) => {
+        maintenanceRuns += 1;
+        return task({ lease });
+      },
+      status: () => ({ warmed_market: warmedMarket }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    runRedemption: async ({ env: redemptionEnv, inheritedLease }) => {
+      redemptionRuns += 1;
+      assert.equal(redemptionEnv.EXECUTION_MODE, "venue_redemption");
+      assert.equal(redemptionEnv.VENUE_REDEMPTION_DRY_RUN, "false");
+      assert.equal(redemptionEnv.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY, "true");
+      assert.equal(inheritedLease, lease);
+      return { status: "nothing_to_redeem", redemption_submitted: false };
+    },
+    logger: (value) => logs.push(value)
+  });
+  assert.equal(result.redemption_results, 1);
+  assert.equal(maintenanceRuns, 1);
+  assert.equal(redemptionRuns, 1);
+  assert.ok(logs.some((value) => value.status === "automatic_redemption_cycle_completed"));
 });
 
 test("persistent service preserves attempted-order observability for an idempotent completion", async () => {

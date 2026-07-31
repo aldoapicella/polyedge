@@ -10,8 +10,9 @@ import {
   acquireCampaignLease,
   assertEligibleOrigin,
   finalizeProbeRisk,
+  isRiskReservationResolved,
   loadCampaignRiskControl,
-  loadUnresolvedRiskReservations,
+  loadCampaignRiskReservationRecords,
   marketContext,
   modelObservations,
   publishTerminalRiskPortfolioEvidence,
@@ -55,6 +56,7 @@ import {
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
 import {
+  discoverVerifiedAutomaticInternalSettlements,
   loadDurableInternalSettlements,
   putVerifiedInternalSettlement,
   reconcileProtectedCompoundingState,
@@ -211,8 +213,82 @@ async function initializeProtectedCompounding({ container, manifest }) {
   }
   return {
     state: null,
-    verifiedConfiguredSettlements
+    verifiedConfiguredSettlements,
+    automaticSettlementPromise: null
   };
+}
+
+async function reconcileProtectedCompoundingWithAutomaticSettlement({
+  client,
+  container,
+  manifest,
+  accountEquity,
+  fullyReconciled,
+  context,
+  reservationRecords,
+  allowAutomaticDiscovery
+}) {
+  const reconcile = () => reconcileProtectedCompoundingState({
+    container,
+    manifest,
+    accountEquity,
+    fullyReconciled,
+    verifiedConfiguredSettlements: context.verifiedConfiguredSettlements
+  });
+  try {
+    return await reconcile();
+  } catch (error) {
+    if (!fullyReconciled ||
+        !String(error?.message || "").includes("unauthorized external deposit detected")) {
+      throw error;
+    }
+    if (!allowAutomaticDiscovery) {
+      throw new Error(
+        "fail closed: authenticated automatic settlement reconciliation is pending the background safety cache"
+      );
+    }
+    if (!context.automaticSettlementPromise) {
+      const work = (async () => {
+        const durableSettlements = await loadDurableInternalSettlements(
+          container,
+          manifest.session_id
+        );
+        const activity = await fetchJson(
+          `https://data-api.polymarket.com/activity?user=${encodeURIComponent(config.funderAddress)}&limit=500`
+        );
+        const settlements = await discoverVerifiedAutomaticInternalSettlements({
+          manifest,
+          reservations: reservationRecords.map((record) => record.reservation),
+          activity,
+          durableSettlements,
+          getOrderFills: async (reservation) => {
+            const trades = await client.getTrades({ market: reservation.condition_id });
+            if (!Array.isArray(trades)) {
+              throw new Error("fail closed: authenticated CLOB trade history is invalid");
+            }
+            return tradeFillsFromRest(trades, reservation.order_id);
+          },
+          getTransactionReceipt: confirmedPolygonReceipt
+        });
+        if (!settlements.length) {
+          throw new Error(
+            "fail closed: excess equity has no new exact reservation-bound authenticated redemption"
+          );
+        }
+        for (const settlement of settlements) {
+          await putVerifiedInternalSettlement(container, settlement);
+        }
+        return reconcile();
+      })();
+      const shared = work.finally(() => {
+        if (context.automaticSettlementPromise === shared) {
+          context.automaticSettlementPromise = null;
+        }
+      });
+      context.automaticSettlementPromise = shared;
+    }
+    return context.automaticSettlementPromise;
+  }
 }
 
 export function requireExecutionModelArtifact(value) {
@@ -357,6 +433,16 @@ async function reconcilePersistentChannels(resources, market) {
   resources.marketChannel.markReconciled();
 }
 
+async function waitForSafetySnapshotIdle(resources, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (resources.safetyCache?.inFlight > 0 && Date.now() < deadline) {
+    await sleep(25);
+  }
+  if (resources.safetyCache?.inFlight > 0) {
+    throw new Error("fail closed: safety snapshot requests did not quiesce for funded maintenance");
+  }
+}
+
 export async function createPersistentCanaryExecutor({ env = process.env } = {}) {
   setExecutionContext(env);
   const resources = await initializeResources({ persistent: true });
@@ -426,6 +512,34 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
         resources.userChannel?.beginEvidenceWindow?.();
         resources.marketChannel?.beginEvidenceWindow?.();
         activeResources = null;
+        resources.busy = false;
+      }
+    },
+    async runMaintenance(task) {
+      if (resources.busy) throw new Error("fail closed: persistent executor is already processing an intent");
+      if (typeof task !== "function") throw new Error("fail closed: funded maintenance callback is required");
+      resources.busy = true;
+      try {
+        validatePersistentBinding(resources);
+        resources.lease?.assertHealthy();
+        await waitForSafetySnapshotIdle(resources);
+        if (resources.userChannel?.requiresReconciliation() === true ||
+            resources.marketChannel?.requiresReconciliation() === true) {
+          if (!resources.warmedMarket) {
+            throw new Error("fail closed: funded maintenance cannot reconcile websocket state without a warmed market");
+          }
+          await reconcilePersistentChannels(resources, resources.warmedMarket);
+        }
+        const openOrders = await getOpenOrdersStrict(resources.client);
+        if (openOrders.length !== 0) {
+          throw new Error("fail closed: funded maintenance found an open order");
+        }
+        const result = await task({ lease: resources.lease });
+        resources.lease?.assertHealthy();
+        return result;
+      } finally {
+        resources.userChannel?.beginEvidenceWindow?.();
+        resources.marketChannel?.beginEvidenceWindow?.();
         resources.busy = false;
       }
     },
@@ -733,7 +847,7 @@ async function capturePreflight(
     balance,
     positionsResponse,
     valueResponse,
-    unresolvedReservations
+    campaignReservationRecords
   ] = await Promise.all([
     fetchJson("https://polymarket.com/api/geoblock"),
     clock(),
@@ -745,7 +859,7 @@ async function capturePreflight(
     client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
     fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) }),
-    loadUnresolvedRiskReservations(config)
+    loadCampaignRiskReservationRecords(config)
   ]);
   assertEligibleOrigin(geoblock, config);
   const {
@@ -772,7 +886,10 @@ async function capturePreflight(
   const terminalConditionIds = [...new Set(positions
     .filter((row) => row.redeemable === true && row.conditionId)
     .map((row) => String(row.conditionId)))];
-  let reservations = unresolvedReservations;
+  const campaignReservations = campaignReservationRecords.map((record) => record.reservation);
+  let reservations = campaignReservations.filter(
+    (reservation) => !isRiskReservationResolved(reservation)
+  );
   const terminalConditions = new Set(terminalConditionIds.map((value) => value.toLowerCase()));
   const terminalRiskNeedsSettlement = reservations.some((reservation) =>
     Number(reservation?.matched_notional) > 0
@@ -784,8 +901,13 @@ async function capturePreflight(
       terminal_settlement_verified: true,
       evidence_source: "polymarket_data_api_redeemable",
       run_id: runId
+    }, {
+      reservationRecords: campaignReservationRecords
     });
-    reservations = await loadUnresolvedRiskReservations(config);
+    reservations = reservations.filter((reservation) =>
+      !(Number(reservation?.matched_notional) > 0
+        && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase()))
+    );
   }
   const liquidCollateral = Number(balance.balance) / 1_000_000;
   const summedPositionValue = positions.reduce(
@@ -819,14 +941,17 @@ async function capturePreflight(
     const stateMatchesEquity = cachedState
       && Math.abs(Number(cachedState.last_reconciled_equity) - accountEquity) <= 0.0000011;
     if ((fullyReconciled && !stateMatchesEquity) || !cachedState) {
-      protectedCompoundingContext.state = await reconcileProtectedCompoundingState({
-        container: storageContainer(config),
-        manifest,
-        accountEquity,
-        fullyReconciled,
-        verifiedConfiguredSettlements:
-          protectedCompoundingContext.verifiedConfiguredSettlements
-      });
+      protectedCompoundingContext.state =
+        await reconcileProtectedCompoundingWithAutomaticSettlement({
+          client,
+          container: storageContainer(config),
+          manifest,
+          accountEquity,
+          fullyReconciled,
+          context: protectedCompoundingContext,
+          reservationRecords: campaignReservationRecords,
+          allowAutomaticDiscovery: recordLedger === false
+        });
     }
     protectedCompoundingState = protectedCompoundingContext.state;
   }

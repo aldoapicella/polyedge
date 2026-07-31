@@ -156,13 +156,29 @@ jobs:
           const app = template.resources.find((resource) =>
             resource.type === "Microsoft.App/containerApps" &&
             resource.properties.template.containers[0].name === "funded-direct");
-          const env = Object.fromEntries(app.properties.template.containers[0].env.map((entry) => [entry.name, entry.value]));
+          const envEntries = app.properties.template.containers[0].env;
+          const env = Object.fromEntries(envEntries.map((entry) => [entry.name, entry.value]));
           assert.equal(env.FUNDED_DIRECT_ENGINE, "persistent_v1");
           assert.equal(env.FUNDED_DIRECT_SERVICE_BUS_ENABLED, "true");
           assert.equal(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, "2000");
           assert.equal(env.FUNDED_DIRECT_POLL_INTERVAL_MS, "1000");
           assert.equal(env.FUNDED_DIRECT_MIN_REMAINING_TTL_MS, "7000");
           assert.equal(env.FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS, "2000");
+          assert.match(JSON.stringify(env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED), /fundedDirectEnabled/);
+          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, "60000");
+          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, "30");
+          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, "350");
+          assert.equal(env.VENUE_REDEMPTION_MAX_PAYOUT, "25");
+          assert.equal(env.VENUE_REDEMPTION_MAX_CONDITIONS, "1");
+          assert.equal(
+            envEntries.find((entry) => entry.name === "POLYMARKET_RELAYER_API_KEY")?.secretRef,
+            "polymarket-relayer-api-key"
+          );
+          assert.equal(
+            app.properties.configuration.secrets.find((entry) => entry.name === "polymarket-relayer-api-key")
+              ?.keyVaultUrl.includes("/secrets/polymarket-relayer-api-key"),
+            true
+          );
           assert.equal(app.properties.template.scale.maxReplicas, 1);
           assert.match(JSON.stringify(app.properties.template.scale.minReplicas), /fundedDirectEnabled/);
           const producer = JSON.parse(fs.readFileSync("venue-probe.json")).resources.find((resource) =>
@@ -457,6 +473,9 @@ jobs:
           env_value() {
             jq -r --arg name "$1" '.properties.template.containers[0].env[] | select(.name == $name) | .value' funded-app.json
           }
+          env_secret_ref() {
+            jq -r --arg name "$1" '.properties.template.containers[0].env[] | select(.name == $name) | .secretRef' funded-app.json
+          }
           test "$(env_value FUNDED_DIRECT_SERVICE_ENABLED)" = "true"
           test "$(env_value FUNDED_DIRECT_ENGINE)" = "persistent_v1"
           test "$(env_value FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
@@ -471,6 +490,13 @@ jobs:
           test "$(env_value FUNDED_DIRECT_POLL_INTERVAL_MS)" = "1000"
           test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
           test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "2000"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "true"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS)" = "60000"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY)" = "30"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY)" = "350"
+          test "$(env_value VENUE_REDEMPTION_MAX_PAYOUT)" = "25"
+          test "$(env_value VENUE_REDEMPTION_MAX_CONDITIONS)" = "1"
+          test "$(env_secret_ref POLYMARKET_RELAYER_API_KEY)" = "polymarket-relayer-api-key"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME)" = \
             "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/session.json"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = \

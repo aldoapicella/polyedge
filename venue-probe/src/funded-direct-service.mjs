@@ -2,6 +2,7 @@ import { DefaultAzureCredential } from "@azure/identity";
 import { ServiceBusClient } from "@azure/service-bus";
 import { pathToFileURL } from "node:url";
 import { createPersistentCanaryExecutor } from "./canary.mjs";
+import { runVenueRedemption } from "./redeem.mjs";
 import {
   createFundedDirectProcessor,
   runFundedDirectWorker
@@ -20,7 +21,11 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     serviceBusNamespace: String(env.FUNDED_DIRECT_SERVICE_BUS_NAMESPACE || "").trim(),
     serviceBusQueue: String(env.FUNDED_DIRECT_SERVICE_BUS_QUEUE || "").trim(),
     signalToSendSloMs: integer(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, 2_000),
-    maxMessages: integer(env.FUNDED_DIRECT_SERVICE_MAX_MESSAGES, 0)
+    maxMessages: integer(env.FUNDED_DIRECT_SERVICE_MAX_MESSAGES, 0),
+    autoRedemptionEnabled: env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true",
+    autoRedemptionIntervalMs: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, 60_000),
+    autoRedemptionMinSecondsToExpiry: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, 30),
+    autoRedemptionMaxSecondsToExpiry: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, 350)
   };
   const errors = [];
   if (!config.enabled) errors.push("FUNDED_DIRECT_SERVICE_ENABLED must be true");
@@ -50,6 +55,36 @@ export function loadFundedDirectServiceConfig(env = process.env) {
   }
   if (!(config.maxMessages >= 0 && config.maxMessages <= 10_000)) {
     errors.push("FUNDED_DIRECT_SERVICE_MAX_MESSAGES must be in [0, 10000]");
+  }
+  if (config.autoRedemptionEnabled) {
+    let session = null;
+    try {
+      session = JSON.parse(String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || ""));
+    } catch {}
+    if (config.engine !== "persistent_v1") {
+      errors.push("automatic redemption requires FUNDED_DIRECT_ENGINE=persistent_v1");
+    }
+    if (!(config.autoRedemptionIntervalMs >= 30_000 && config.autoRedemptionIntervalMs <= 600_000)) {
+      errors.push("FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS must be in [30000, 600000]");
+    }
+    if (!(config.autoRedemptionMinSecondsToExpiry >= 10 &&
+        config.autoRedemptionMaxSecondsToExpiry <= 359 &&
+        config.autoRedemptionMinSecondsToExpiry < config.autoRedemptionMaxSecondsToExpiry)) {
+      errors.push("automatic redemption window must remain strictly inside the final 360 seconds");
+    }
+    if (!env.POLYMARKET_RELAYER_API_KEY) {
+      errors.push("POLYMARKET_RELAYER_API_KEY is required for automatic redemption");
+    }
+    if (!/^0x[0-9a-fA-F]{40}$/.test(String(env.POLYMARKET_RELAYER_API_KEY_ADDRESS || ""))) {
+      errors.push("POLYMARKET_RELAYER_API_KEY_ADDRESS must be a valid address");
+    }
+    if (!session || typeof session !== "object" ||
+        session.session_id !== env.VENUE_PROBE_FUNDED_CAMPAIGN_ID ||
+        session.allow_compounding !== true ||
+        session.no_deposits !== true ||
+        session.allow_automatic_replenishment !== false) {
+      errors.push("automatic redemption requires the matching protected-compounding operator session");
+    }
   }
   if (errors.length) throw new Error(`funded_direct_service blocked: ${errors.join("; ")}`);
   return config;
@@ -123,6 +158,8 @@ export async function runPersistentFundedDirectService({
   logger = (value) => console.log(JSON.stringify(sanitize(value))),
   createExecutor = createPersistentCanaryExecutor,
   createProcessor = createFundedDirectProcessor,
+  runRedemption = runVenueRedemption,
+  now = Date.now,
   createBusClient = ({ namespace, credential }) =>
     new ServiceBusClient(`${namespace}.servicebus.windows.net`, credential)
 } = {}) {
@@ -139,6 +176,11 @@ export async function runPersistentFundedDirectService({
   let processedMessages = 0;
   let failedMessages = 0;
   let consecutiveLatencyBreaches = 0;
+  let redemptionChecks = 0;
+  let redemptionResults = 0;
+  let redemptionFailures = 0;
+  let lastRedemptionStatus = null;
+  let lastRedemptionCheckMs = 0;
   const signalToSendSamples = [];
   let stopping = false;
   const stop = () => { stopping = true; };
@@ -152,9 +194,59 @@ export async function runPersistentFundedDirectService({
     queue: config.serviceBusQueue,
     poll_interval_ms: config.pollIntervalMs,
     signal_to_send_slo_ms: config.signalToSendSloMs,
+    automatic_redemption_enabled: config.autoRedemptionEnabled,
+    automatic_redemption_window_seconds_to_expiry: config.autoRedemptionEnabled
+      ? {
+          minimum: config.autoRedemptionMinSecondsToExpiry,
+          maximum: config.autoRedemptionMaxSecondsToExpiry
+        }
+      : null,
     cloud_only: true,
     executor: executor.status()
   });
+  const maybeRunAutomaticRedemption = async () => {
+    if (!config.autoRedemptionEnabled) return;
+    const checkedAt = now();
+    if (checkedAt - lastRedemptionCheckMs < config.autoRedemptionIntervalMs) return;
+    lastRedemptionCheckMs = checkedAt;
+    redemptionChecks += 1;
+    const window = fundedRedemptionMaintenanceWindow(executor.status(), checkedAt, config);
+    if (!window.eligible) return;
+    try {
+      const result = await executor.runMaintenance(({ lease: inheritedLease }) =>
+        runRedemption({
+          env: fundedRedemptionEnv(env),
+          inheritedLease,
+          logger: (value) => logger({
+            schema: "polyedge.funded_redemption_service.v1",
+            status: "redemption_worker_summary",
+            redemption: value
+          })
+        })
+      );
+      redemptionResults += 1;
+      lastRedemptionStatus = result?.status || "unknown";
+      logger({
+        schema: "polyedge.funded_redemption_service.v1",
+        status: "automatic_redemption_cycle_completed",
+        market_id: window.market_id,
+        remaining_seconds: window.remaining_seconds,
+        redemption_status: lastRedemptionStatus,
+        redemption_submitted: result?.redemption_submitted === true
+      });
+    } catch (error) {
+      redemptionFailures += 1;
+      lastRedemptionStatus = "failed_closed";
+      logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "automatic_redemption_failed_closed",
+        market_id: window.market_id,
+        remaining_seconds: window.remaining_seconds,
+        account_risk_pause: true,
+        error: error.message
+      });
+    }
+  };
   const heartbeat = setInterval(() => {
     const executorStatus = executor.status();
     logger({
@@ -163,6 +255,10 @@ export async function runPersistentFundedDirectService({
       processed_messages: processedMessages,
       failed_messages: failedMessages,
       consecutive_latency_breaches: consecutiveLatencyBreaches,
+      redemption_checks: redemptionChecks,
+      redemption_results: redemptionResults,
+      redemption_failures: redemptionFailures,
+      last_redemption_status: lastRedemptionStatus,
       executor: executorStatus
     });
     if (executorStatus.reconnect_reconciliation_required ||
@@ -180,7 +276,10 @@ export async function runPersistentFundedDirectService({
   try {
     while (!stopping) {
       const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs });
-      if (!messages.length) continue;
+      if (!messages.length) {
+        await maybeRunAutomaticRedemption();
+        continue;
+      }
       const message = messages[0];
       const queueReceiveMonotonicMs = performance.now();
       let renewalError = null;
@@ -295,13 +394,18 @@ export async function runPersistentFundedDirectService({
       } finally {
         clearInterval(renewal);
       }
+      await maybeRunAutomaticRedemption();
       if (config.maxMessages > 0 && processedMessages + failedMessages >= config.maxMessages) break;
     }
     return {
       schema: "polyedge.funded_direct_service.v2",
       status: "persistent_service_stopped",
       processed_messages: processedMessages,
-      failed_messages: failedMessages
+      failed_messages: failedMessages,
+      redemption_checks: redemptionChecks,
+      redemption_results: redemptionResults,
+      redemption_failures: redemptionFailures,
+      last_redemption_status: lastRedemptionStatus
     };
   } finally {
     clearInterval(heartbeat);
@@ -311,6 +415,39 @@ export async function runPersistentFundedDirectService({
     await receiver.close().catch(() => null);
     await bus.close().catch(() => null);
   }
+}
+
+export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config) {
+  const market = executorStatus?.warmed_market;
+  const endMs = Date.parse(String(market?.market_end_ts || ""));
+  const remainingSeconds = (endMs - Number(nowMs)) / 1_000;
+  const eligible = Number.isFinite(endMs) &&
+    Number.isFinite(remainingSeconds) &&
+    remainingSeconds >= config.autoRedemptionMinSecondsToExpiry &&
+    remainingSeconds <= config.autoRedemptionMaxSecondsToExpiry;
+  return {
+    eligible,
+    market_id: market?.market_id || null,
+    remaining_seconds: Number.isFinite(remainingSeconds)
+      ? Math.round(remainingSeconds * 1_000) / 1_000
+      : null
+  };
+}
+
+function fundedRedemptionEnv(env) {
+  const session = JSON.parse(String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON));
+  return {
+    ...env,
+    EXECUTION_MODE: "venue_redemption",
+    VENUE_REDEMPTION_ENABLED: "true",
+    VENUE_REDEMPTION_DRY_RUN: "false",
+    VENUE_REDEMPTION_MAX_PAYOUT: String(env.VENUE_REDEMPTION_MAX_PAYOUT || "25"),
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1",
+    VENUE_PROBE_STARTING_CAPITAL: String(session.starting_collateral),
+    FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
+    ALLOW_LIVE: "false",
+    ENABLE_TAKER_ORDERS: "false"
+  };
 }
 
 function persistentCanaryBootstrapEnv(env) {

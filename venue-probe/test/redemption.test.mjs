@@ -66,16 +66,52 @@ test("redemption defaults to disabled dry-run and requires separate relayer auth
   assert.equal(live.dryRun, false);
 });
 
+test("funded-service redemption is bound to the Chile protected-compounding session", () => {
+  const session = {
+    session_id: "dynamic-quote-funded-2026-07-29-v5",
+    allow_compounding: true,
+    no_deposits: true,
+    allow_automatic_replenishment: false
+  };
+  const funded = loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
+    VENUE_PROBE_EXECUTION_ORIGIN: "azure_chile_central_static_egress",
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1"
+  });
+  assert.equal(funded.fundedServiceManaged, true);
+  assert.equal(funded.executionOrigin, "azure_chile_central_static_egress");
+  assert.throws(() => loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: "other-session",
+    VENUE_PROBE_EXECUTION_ORIGIN: "azure_chile_central_static_egress",
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1"
+  }), /must match the funded operator session/);
+  assert.throws(() => loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
+    VENUE_PROBE_EXECUTION_ORIGIN: "azure_north_europe_static_egress",
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1"
+  }), /Azure Chile Central/);
+});
+
 test("only positive redeemable condition payouts are selected once and within the cap", () => {
   const selection = selectRedeemableConditions([
-    { conditionId: conditionA, redeemable: true, currentValue: 5, negativeRisk: false, title: "A", asset: "101", oppositeAsset: "102", outcomeIndex: 0 },
-    { conditionId: conditionA, redeemable: true, currentValue: 0, negativeRisk: false, title: "A", asset: "102", oppositeAsset: "101", outcomeIndex: 1 },
+    { conditionId: conditionA, redeemable: true, currentValue: 5, initialValue: 3, negativeRisk: false, title: "A", asset: "101", oppositeAsset: "102", outcomeIndex: 0 },
+    { conditionId: conditionA, redeemable: true, currentValue: 0, initialValue: 1, negativeRisk: false, title: "A", asset: "102", oppositeAsset: "101", outcomeIndex: 1 },
     { conditionId: conditionB, redeemable: true, currentValue: 30, negativeRisk: true, title: "B" },
     { conditionId: `0x${"33".repeat(32)}`, redeemable: false, currentValue: 4, negativeRisk: false }
   ], 25, 5);
   assert.equal(selection.selected.length, 1);
   assert.equal(selection.selected[0].condition_id, conditionA);
   assert.equal(selection.selected_gross_payout, 5);
+  assert.equal(selection.selected[0].principal, 4);
   assert.equal(selection.skipped_winner_conditions, 1);
   assert.deepEqual(selection.selected[0].assets, [
     { asset: "101", outcome_index: 0 },

@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 
 const STATE_SCHEMA = "polyedge.protected_compounding_state.v1";
 const MANUAL_SETTLEMENT_TYPE = "internal_manual_settlement";
+const AUTOMATIC_SETTLEMENT_TYPE = "internal_automatic_settlement";
 const RESOLVED_LOSS_TYPE = "internal_resolved_loss";
 const ZERO_TRANSACTION_HASH = `0x${"0".repeat(64)}`;
 const MONEY_SCALE = 1_000_000;
 const SIZE_SCALE = 100;
+const ACTIVITY_MATCH_TOLERANCE_MS = 120_000;
 
 export function validateProtectedCompoundingManifest(manifest) {
   const policy = manifest?.capital_policy;
@@ -108,6 +110,199 @@ export async function verifyConfiguredInternalSettlements({
     });
   }
   return verified;
+}
+
+export async function discoverVerifiedAutomaticInternalSettlements({
+  manifest,
+  reservations,
+  activity,
+  durableSettlements = [],
+  getOrderFills,
+  getTransactionReceipt
+}) {
+  validateProtectedCompoundingManifest(manifest);
+  if (typeof getOrderFills !== "function" || typeof getTransactionReceipt !== "function") {
+    throw new Error("fail closed: automatic settlement authenticated evidence readers are unavailable");
+  }
+  const sessionId = String(manifest.session_id || "");
+  const sessionStartedMs = activityTimestampMs(manifest.created_at);
+  if (!sessionId || !Number.isFinite(sessionStartedMs)) {
+    throw new Error("fail closed: automatic settlement session time binding is invalid");
+  }
+  const rows = Array.isArray(activity) ? activity : [];
+  const durable = Array.isArray(durableSettlements) ? durableSettlements : [];
+  if (durable.some((row) => !validDurableInternalSettlement(row) || row.session_id !== sessionId)) {
+    throw new Error("fail closed: automatic settlement durable ledger binding is invalid");
+  }
+  const redemptions = rows.filter((row) =>
+    String(row?.type || "").toUpperCase() === "REDEEM"
+      && normalizedHash(row?.transactionHash)
+      && normalizedHash(row?.conditionId)
+      && Number(row?.usdcSize) > 0
+      && activityTimestampMs(row?.timestamp) >= sessionStartedMs
+  );
+  const identities = new Set();
+  for (const redemption of redemptions) {
+    const identity = `${normalizedHash(redemption.transactionHash)}:${normalizedHash(redemption.conditionId)}`;
+    if (identities.has(identity)) {
+      throw new Error("fail closed: automatic settlement Data API redemption evidence is duplicated");
+    }
+    identities.add(identity);
+  }
+  const pending = redemptions.filter((redemption) => !durable.some((settlement) =>
+    normalizedHash(settlement.transaction_hash) === normalizedHash(redemption.transactionHash)
+      && normalizedHash(settlement.condition_id) === normalizedHash(redemption.conditionId)
+  ));
+  const values = await Promise.all(pending.map(async (redemption) => {
+    const conditionId = normalizedHash(redemption.conditionId);
+    const matchingReservations = (Array.isArray(reservations) ? reservations : []).filter((reservation) =>
+      reservation?.campaign_id === sessionId
+        && normalizedHash(reservation?.condition_id) === conditionId
+        && reservation?.order_submission_intended === true
+        && reservation?.order_submitted === true
+        && typeof reservation?.order_id === "string"
+        && reservation.order_id.length > 0
+        && typeof reservation?.probe_id === "string"
+        && reservation.probe_id.length > 0
+        && typeof reservation?.run_id === "string"
+        && reservation.run_id.length > 0
+        && Number(reservation?.matched_notional) > 0
+    );
+    if (matchingReservations.length !== 1) {
+      throw new Error("fail closed: automatic settlement redemption does not bind one exact funded reservation");
+    }
+    const reservation = matchingReservations[0];
+    const [orderFills, receipt] = await Promise.all([
+      getOrderFills(reservation),
+      getTransactionReceipt(normalizedHash(redemption.transactionHash))
+    ]);
+    return verifyAutomaticSettlementEvidence({
+      manifest,
+      reservation,
+      redemption,
+      activity: rows,
+      orderFills,
+      receipt
+    });
+  }));
+  return values;
+}
+
+export function verifyAutomaticSettlementEvidence({
+  manifest,
+  reservation,
+  redemption,
+  activity,
+  orderFills,
+  receipt
+}) {
+  validateProtectedCompoundingManifest(manifest);
+  const sessionId = String(manifest.session_id || "");
+  const conditionId = normalizedHash(redemption?.conditionId);
+  const transactionHash = normalizedHash(redemption?.transactionHash);
+  const reservationConditionId = normalizedHash(reservation?.condition_id);
+  if (!sessionId
+      || reservation?.campaign_id !== sessionId
+      || reservationConditionId !== conditionId
+      || !transactionHash
+      || reservation?.order_submission_intended !== true
+      || reservation?.order_submitted !== true
+      || !(Number(reservation?.matched_notional) > 0)
+      || !reservation?.run_id
+      || !reservation?.probe_id
+      || !reservation?.order_id) {
+    throw new Error("fail closed: automatic settlement reservation/session/order binding is invalid");
+  }
+  const fills = Array.isArray(orderFills) ? orderFills : [];
+  if (!fills.length || fills.some((fill) =>
+    typeof fill?.id !== "string"
+      || !fill.id
+      || !(Number(fill?.size) > 0)
+      || !(Number(fill?.price) > 0 && Number(fill.price) < 1)
+      || !Number.isFinite(Number(fill?.timestampMs))
+      || fill?.orderRole !== "MAKER"
+  ) || new Set(fills.map((fill) => fill.id)).size !== fills.length) {
+    throw new Error("fail closed: automatic settlement exact authenticated maker fills are invalid");
+  }
+  const activityTrades = (Array.isArray(activity) ? activity : []).filter((row) =>
+    String(row?.type || "").toUpperCase() === "TRADE"
+      && normalizedHash(row?.conditionId) === conditionId
+      && normalizedHash(row?.transactionHash)
+      && String(row?.side || "BUY").toUpperCase() === "BUY"
+  );
+  const matchedTrades = [];
+  const usedTransactionHashes = new Set();
+  for (const fill of fills) {
+    const candidates = activityTrades.filter((row) => {
+      const hash = normalizedHash(row.transactionHash);
+      const rowSize = Number(row.size);
+      const rowPrincipal = Number(row.usdcSize);
+      const rowTimestampMs = activityTimestampMs(row.timestamp);
+      return !usedTransactionHashes.has(hash)
+        && moneyEqual(rowSize, fill.size)
+        && moneyEqual(rowPrincipal, Number(fill.size) * Number(fill.price))
+        && Number.isFinite(rowTimestampMs)
+        && Math.abs(rowTimestampMs - Number(fill.timestampMs)) <= ACTIVITY_MATCH_TOLERANCE_MS;
+    });
+    if (candidates.length !== 1) {
+      throw new Error("fail closed: automatic settlement Data API fill binding is missing or ambiguous");
+    }
+    const trade = candidates[0];
+    usedTransactionHashes.add(normalizedHash(trade.transactionHash));
+    matchedTrades.push(trade);
+  }
+  const principal = money(sum(matchedTrades, "usdcSize"));
+  const authenticatedPrincipal = money(fills.reduce(
+    (total, fill) => total + Number(fill.size) * Number(fill.price),
+    0
+  ));
+  const matchedRisk = money(reservation.matched_notional);
+  const feeRiskUpperBound = money(Math.max(0, Number(reservation.fee_risk_upper_bound) || 0));
+  if (!moneyEqual(principal, authenticatedPrincipal)
+      || matchedRisk + 1 / MONEY_SCALE < principal
+      || matchedRisk > principal + feeRiskUpperBound + 1 / MONEY_SCALE) {
+    throw new Error("fail closed: automatic settlement principal does not reconcile to reservation risk");
+  }
+  const payout = money(redemption.usdcSize);
+  const redemptionTimestampMs = activityTimestampMs(redemption.timestamp);
+  const latestFillTimestampMs = Math.max(...fills.map((fill) => Number(fill.timestampMs)));
+  const reservationCreatedMs = activityTimestampMs(reservation.created_ts);
+  if (!(payout > 0)
+      || !Number.isFinite(redemptionTimestampMs)
+      || redemptionTimestampMs < latestFillTimestampMs
+      || !Number.isFinite(reservationCreatedMs)
+      || latestFillTimestampMs + ACTIVITY_MATCH_TOLERANCE_MS < reservationCreatedMs
+      || receipt?.status !== "success"
+      || Number(receipt?.chain_id) !== 137
+      || !/^\d+$/.test(String(receipt?.block_number || ""))
+      || BigInt(receipt.block_number) <= 0n
+      || !Number.isInteger(Number(receipt?.confirmations))
+      || Number(receipt.confirmations) < 2) {
+    throw new Error("fail closed: automatic settlement redemption timing or Polygon receipt is invalid");
+  }
+  return {
+    id: `automatic-redeem-${transactionHash.slice(2, 18)}`,
+    type: AUTOMATIC_SETTLEMENT_TYPE,
+    session_id: sessionId,
+    campaign_id: reservation.campaign_id,
+    run_id: reservation.run_id,
+    probe_id: reservation.probe_id,
+    order_id: reservation.order_id,
+    transaction_hash: transactionHash,
+    condition_id: conditionId,
+    payout,
+    principal,
+    realized_pnl: money(payout - principal),
+    fill_transaction_hashes: matchedTrades.map((row) =>
+      normalizedHash(row.transactionHash)).sort(),
+    authenticated_clob_fill_ids: fills.map((fill) => fill.id).sort(),
+    reservation_matched_notional: matchedRisk,
+    reservation_fee_risk_upper_bound: feeRiskUpperBound,
+    evidence_source: "polymarket_data_api_plus_onchain_redemption",
+    receipt_block_number: String(receipt.block_number),
+    receipt_confirmations: Number(receipt.confirmations),
+    settled_at: new Date(redemptionTimestampMs).toISOString()
+  };
 }
 
 export async function reconcileProtectedCompoundingState({
@@ -416,7 +611,7 @@ function validInternalSettlement(value) {
   return value
     && typeof value.id === "string"
     && value.id.length > 0
-    && [MANUAL_SETTLEMENT_TYPE, "internal_automatic_settlement", RESOLVED_LOSS_TYPE].includes(value.type)
+    && [MANUAL_SETTLEMENT_TYPE, AUTOMATIC_SETTLEMENT_TYPE, RESOLVED_LOSS_TYPE].includes(value.type)
     && /^0x[0-9a-fA-F]{64}$/.test(String(value.transaction_hash || ""))
     && /^0x[0-9a-fA-F]{64}$/.test(String(value.condition_id || ""))
     && Number(value.payout) >= 0
@@ -438,6 +633,35 @@ function validDurableInternalSettlement(value) {
       && Number(value.realized_pnl) <= 0
       && value.evidence_source === "polymarket_data_api_resolved_zero_payout"
       && value.resolution_verified === true;
+  }
+  if (value.type === AUTOMATIC_SETTLEMENT_TYPE
+      && (value.evidence_source !== "polymarket_data_api_plus_onchain_redemption"
+        || value.campaign_id !== value.session_id
+        || typeof value.run_id !== "string"
+        || !value.run_id
+        || typeof value.probe_id !== "string"
+        || !value.probe_id
+        || typeof value.order_id !== "string"
+        || !value.order_id
+        || !Array.isArray(value.fill_transaction_hashes)
+        || value.fill_transaction_hashes.length === 0
+        || value.fill_transaction_hashes.some((hash) => !normalizedHash(hash))
+        || new Set(value.fill_transaction_hashes.map(normalizedHash)).size !==
+          value.fill_transaction_hashes.length
+        || !Array.isArray(value.authenticated_clob_fill_ids)
+        || value.authenticated_clob_fill_ids.length === 0
+        || value.authenticated_clob_fill_ids.some((id) => typeof id !== "string" || !id)
+        || new Set(value.authenticated_clob_fill_ids).size !==
+          value.authenticated_clob_fill_ids.length
+        || !Number.isFinite(Number(value.reservation_matched_notional))
+        || !Number.isFinite(Number(value.reservation_fee_risk_upper_bound))
+        || Number(value.reservation_fee_risk_upper_bound) < 0
+        || Number(value.reservation_matched_notional) + 1 / MONEY_SCALE <
+          Number(value.principal)
+        || Number(value.reservation_matched_notional) >
+          Number(value.principal) + Number(value.reservation_fee_risk_upper_bound) +
+            1 / MONEY_SCALE)) {
+    return false;
   }
   return [
       "polymarket_data_api_fills_plus_polygon_receipt",
@@ -462,6 +686,13 @@ function settlementAccountingEqual(left, right) {
 function normalizedHash(value) {
   const text = String(value || "").toLowerCase();
   return /^0x[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function activityTimestampMs(value) {
+  if (typeof value === "string" && /[T:-]/.test(value)) return Date.parse(value);
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return NaN;
+  return parsed < 1e12 ? parsed * 1_000 : parsed;
 }
 
 function safeBlobName(value) {

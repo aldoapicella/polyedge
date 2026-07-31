@@ -18,6 +18,7 @@ param producerIdentityName string = 'polyedge-shadow-neu-id'
 param producerPublicIpName string = 'pip-polyedge-venue-neu-egress-2'
 param alertActionGroupName string = 'polyedge-dev-research-alerts'
 param funderAddress string = '0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8'
+param relayerApiKeyAddress string = '0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921'
 param fundedDirectEnabled bool = false
 @secure()
 param fundedDirectSessionManifestJson string
@@ -102,6 +103,11 @@ resource polymarketApiSecretSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01
 resource polymarketApiPassphraseSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
   parent: keyVault
   name: 'polymarket-api-passphrase'
+}
+
+resource polymarketRelayerApiKeySecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+  parent: keyVault
+  name: 'polymarket-relayer-api-key'
 }
 
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
@@ -321,6 +327,16 @@ resource apiSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 resource apiPassphraseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(polymarketApiPassphraseSecret.id, identity.id, 'key-vault-secrets-user')
   scope: polymarketApiPassphraseSecret
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource relayerApiKeySecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(polymarketRelayerApiKeySecret.id, identity.id, 'key-vault-secrets-user')
+  scope: polymarketRelayerApiKeySecret
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
     principalId: identity.properties.principalId
@@ -594,6 +610,7 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
     apiKeySecretReader
     apiSecretReader
     apiPassphraseSecretReader
+    relayerApiKeySecretReader
     fundedEvidenceContributor
     shadowEventsReader
     researchReader
@@ -631,6 +648,11 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
           keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase'
           identity: identity.id
         }
+        {
+          name: 'polymarket-relayer-api-key'
+          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-relayer-api-key'
+          identity: identity.id
+        }
       ]
     }
     template: {
@@ -653,6 +675,10 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_HEARTBEAT_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_MAX_CYCLES', value: '0' }
+            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS', value: '60000' }
+            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY', value: '30' }
+            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY', value: '350' }
             { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }
@@ -702,6 +728,10 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'POLYMARKET_API_KEY', secretRef: 'polymarket-api-key' }
             { name: 'POLYMARKET_API_SECRET', secretRef: 'polymarket-api-secret' }
             { name: 'POLYMARKET_API_PASSPHRASE', secretRef: 'polymarket-api-passphrase' }
+            { name: 'POLYMARKET_RELAYER_API_KEY', secretRef: 'polymarket-relayer-api-key' }
+            { name: 'POLYMARKET_RELAYER_API_KEY_ADDRESS', value: relayerApiKeyAddress }
+            { name: 'VENUE_REDEMPTION_MAX_PAYOUT', value: '25' }
+            { name: 'VENUE_REDEMPTION_MAX_CONDITIONS', value: '1' }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storage.name }
             { name: 'AZURE_STORAGE_CONTAINER_NAME', value: fundedEvidenceContainer.name }
