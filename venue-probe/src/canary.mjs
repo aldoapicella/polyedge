@@ -521,7 +521,12 @@ async function reconcilePersistentChannels(resources, market) {
   resources.marketChannel.markReconciled();
 }
 
-async function waitForSafetySnapshotIdle(resources, timeoutMs = 10_000) {
+export const SAFETY_CACHE_MAINTENANCE_QUIESCE_MS = 30_000;
+
+export async function waitForSafetySnapshotIdle(
+  resources,
+  timeoutMs = SAFETY_CACHE_MAINTENANCE_QUIESCE_MS
+) {
   const deadline = Date.now() + timeoutMs;
   while (resources.safetyCache?.inFlight > 0 && Date.now() < deadline) {
     await sleep(25);

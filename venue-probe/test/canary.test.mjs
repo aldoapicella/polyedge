@@ -21,9 +21,11 @@ import {
   decodeSettlementReceiptEvidence,
   initializeProtectedCompounding,
   loadSettlementActivity,
+  SAFETY_CACHE_MAINTENANCE_QUIESCE_MS,
   selectFreshCachedSafetySnapshot,
   startSafetySnapshotCache,
-  streamBookEvidence
+  streamBookEvidence,
+  waitForSafetySnapshotIdle
 } from "../src/canary.mjs";
 import { automaticSettlementReceiptEvidence } from "../src/redeem.mjs";
 
@@ -525,6 +527,20 @@ test("safety cache keeps pending preflights globally bounded across warmup gener
   for (const captureEntry of captures) captureEntry.resolve({ capturedCompletedWallMs: 2 });
   await flushMicrotasks();
   assert.equal(cache.inFlight, 0);
+});
+
+test("funded maintenance gives bounded preflights room to quiesce", async () => {
+  assert.equal(SAFETY_CACHE_MAINTENANCE_QUIESCE_MS, 30_000);
+  const resources = { safetyCache: { inFlight: 1 } };
+  const completion = setTimeout(() => {
+    resources.safetyCache.inFlight = 0;
+  }, 40);
+  try {
+    await waitForSafetySnapshotIdle(resources, 250);
+  } finally {
+    clearTimeout(completion);
+  }
+  assert.equal(resources.safetyCache.inFlight, 0);
 });
 
 test("final stream evidence follows the newest token-specific top-of-book update", () => {
