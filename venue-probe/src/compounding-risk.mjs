@@ -5,6 +5,13 @@ const MANUAL_SETTLEMENT_TYPE = "internal_manual_settlement";
 const AUTOMATIC_SETTLEMENT_TYPE = "internal_automatic_settlement";
 const RESOLVED_LOSS_TYPE = "internal_resolved_loss";
 const ZERO_TRANSACTION_HASH = `0x${"0".repeat(64)}`;
+const ZERO_ADDRESS = `0x${"0".repeat(40)}`;
+const CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+const USDCE_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
+const PUSD_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+const PUSD_CTF_COLLATERAL_ADAPTER_ADDRESS =
+  "0xada100db00ca00073811820692005400218fce1f";
+const CONFIRMED_CLOB_STATUSES = new Set(["CONFIRMED", "TRADE_STATUS_CONFIRMED"]);
 const MONEY_SCALE = 1_000_000;
 const SIZE_SCALE = 100;
 const ACTIVITY_MATCH_TOLERANCE_MS = 120_000;
@@ -117,11 +124,15 @@ export async function discoverVerifiedAutomaticInternalSettlements({
   reservations,
   activity,
   durableSettlements = [],
+  expectedWallet,
   getOrderFills,
   getTransactionReceipt
 }) {
   validateProtectedCompoundingManifest(manifest);
-  if (typeof getOrderFills !== "function" || typeof getTransactionReceipt !== "function") {
+  const wallet = normalizedAddress(expectedWallet);
+  if (!wallet
+      || typeof getOrderFills !== "function"
+      || typeof getTransactionReceipt !== "function") {
     throw new Error("fail closed: automatic settlement authenticated evidence readers are unavailable");
   }
   const sessionId = String(manifest.session_id || "");
@@ -136,6 +147,7 @@ export async function discoverVerifiedAutomaticInternalSettlements({
   }
   const redemptions = rows.filter((row) =>
     String(row?.type || "").toUpperCase() === "REDEEM"
+      && normalizedAddress(row?.proxyWallet) === wallet
       && normalizedHash(row?.transactionHash)
       && normalizedHash(row?.conditionId)
       && Number(row?.usdcSize) > 0
@@ -143,9 +155,11 @@ export async function discoverVerifiedAutomaticInternalSettlements({
   );
   const identities = new Set();
   for (const redemption of redemptions) {
-    const identity = `${normalizedHash(redemption.transactionHash)}:${normalizedHash(redemption.conditionId)}`;
+    const transactionHash = normalizedHash(redemption?.transactionHash);
+    const conditionId = normalizedHash(redemption?.conditionId);
+    const identity = `${transactionHash}:${conditionId}`;
     if (identities.has(identity)) {
-      throw new Error("fail closed: automatic settlement Data API redemption evidence is duplicated");
+      throw new Error("fail closed: Data API redemption evidence is duplicated");
     }
     identities.add(identity);
   }
@@ -153,11 +167,14 @@ export async function discoverVerifiedAutomaticInternalSettlements({
     normalizedHash(settlement.transaction_hash) === normalizedHash(redemption.transactionHash)
       && normalizedHash(settlement.condition_id) === normalizedHash(redemption.conditionId)
   ));
+  const receiptPromises = new Map();
   const values = await Promise.all(pending.map(async (redemption) => {
     const conditionId = normalizedHash(redemption.conditionId);
+    const transactionHash = normalizedHash(redemption.transactionHash);
     const matchingReservations = (Array.isArray(reservations) ? reservations : []).filter((reservation) =>
       reservation?.campaign_id === sessionId
         && normalizedHash(reservation?.condition_id) === conditionId
+        && normalizedAsset(reservation?.token_id)
         && reservation?.order_submission_intended === true
         && reservation?.order_submitted === true
         && typeof reservation?.order_id === "string"
@@ -168,21 +185,31 @@ export async function discoverVerifiedAutomaticInternalSettlements({
         && reservation.run_id.length > 0
         && Number(reservation?.matched_notional) > 0
     );
-    if (matchingReservations.length !== 1) {
-      throw new Error("fail closed: automatic settlement redemption does not bind one exact funded reservation");
+    if (!matchingReservations.length) {
+      throw new Error("fail closed: automatic settlement redemption does not bind funded reservations");
     }
-    const reservation = matchingReservations[0];
-    const [orderFills, receipt] = await Promise.all([
-      getOrderFills(reservation),
-      getTransactionReceipt(normalizedHash(redemption.transactionHash))
-    ]);
+    const tokenIds = [...new Set(matchingReservations.map((row) =>
+      normalizedAsset(row.token_id)))];
+    if (tokenIds.length !== 1) {
+      throw new Error("fail closed: automatic settlement reservations do not bind one exact asset");
+    }
+    if (!redemptionAssetMatches(redemption?.asset, tokenIds[0])) {
+      throw new Error("fail closed: Data API redemption asset does not bind the reservation token");
+    }
+    const fillGroups = await Promise.all(matchingReservations.map((reservation) =>
+      getOrderFills(reservation)));
+    if (!receiptPromises.has(transactionHash)) {
+      receiptPromises.set(transactionHash, getTransactionReceipt(transactionHash));
+    }
+    const receipt = await receiptPromises.get(transactionHash);
     return verifyAutomaticSettlementEvidence({
       manifest,
-      reservation,
+      reservations: matchingReservations,
       redemption,
       activity: rows,
-      orderFills,
-      receipt
+      orderFills: fillGroups.flat(),
+      receipt,
+      expectedWallet: wallet
     });
   }));
   return values;
@@ -190,115 +217,264 @@ export async function discoverVerifiedAutomaticInternalSettlements({
 
 export function verifyAutomaticSettlementEvidence({
   manifest,
-  reservation,
+  reservations,
   redemption,
   activity,
   orderFills,
-  receipt
+  receipt,
+  expectedWallet
 }) {
   validateProtectedCompoundingManifest(manifest);
   const sessionId = String(manifest.session_id || "");
   const conditionId = normalizedHash(redemption?.conditionId);
   const transactionHash = normalizedHash(redemption?.transactionHash);
-  const reservationConditionId = normalizedHash(reservation?.condition_id);
+  const wallet = normalizedAddress(expectedWallet);
+  const boundReservations = Array.isArray(reservations) ? reservations : [];
   if (!sessionId
-      || reservation?.campaign_id !== sessionId
-      || reservationConditionId !== conditionId
       || !transactionHash
-      || reservation?.order_submission_intended !== true
-      || reservation?.order_submitted !== true
-      || !(Number(reservation?.matched_notional) > 0)
-      || !reservation?.run_id
-      || !reservation?.probe_id
-      || !reservation?.order_id) {
-    throw new Error("fail closed: automatic settlement reservation/session/order binding is invalid");
+      || !conditionId
+      || !wallet
+      || normalizedAddress(redemption?.proxyWallet) !== wallet
+      || String(redemption?.type || "").toUpperCase() !== "REDEEM"
+      || !(Number(redemption?.usdcSize) > 0)
+      || !boundReservations.length
+      || boundReservations.some((reservation) =>
+        reservation?.campaign_id !== sessionId
+          || normalizedHash(reservation?.condition_id) !== conditionId
+          || !normalizedAsset(reservation?.token_id)
+          || reservation?.order_submission_intended !== true
+          || reservation?.order_submitted !== true
+          || !(Number(reservation?.matched_notional) > 0)
+          || !reservation?.run_id
+          || !reservation?.probe_id
+          || !reservation?.order_id
+          || !Number.isFinite(activityTimestampMs(reservation?.created_ts)))
+      || new Set(boundReservations.map((row) => row.order_id)).size !==
+        boundReservations.length) {
+    throw new Error("fail closed: automatic settlement reservation/session/order/redemption binding is invalid");
   }
-  const fills = Array.isArray(orderFills) ? orderFills : [];
-  if (!fills.length || fills.some((fill) =>
-    typeof fill?.id !== "string"
-      || !fill.id
-      || !(Number(fill?.size) > 0)
-      || !(Number(fill?.price) > 0 && Number(fill.price) < 1)
-      || !Number.isFinite(Number(fill?.timestampMs))
-      || fill?.orderRole !== "MAKER"
-  ) || new Set(fills.map((fill) => fill.id)).size !== fills.length) {
-    throw new Error("fail closed: automatic settlement exact authenticated maker fills are invalid");
+  const tokenIds = [...new Set(boundReservations.map((row) =>
+    normalizedAsset(row.token_id)))];
+  if (tokenIds.length !== 1) {
+    throw new Error("fail closed: automatic settlement reservations do not bind one exact asset");
   }
-  const activityTrades = (Array.isArray(activity) ? activity : []).filter((row) =>
-    String(row?.type || "").toUpperCase() === "TRADE"
-      && normalizedHash(row?.conditionId) === conditionId
-      && normalizedHash(row?.transactionHash)
-      && String(row?.side || "BUY").toUpperCase() === "BUY"
-  );
-  const matchedTrades = [];
-  const usedTransactionHashes = new Set();
-  for (const fill of fills) {
-    const candidates = activityTrades.filter((row) => {
-      const hash = normalizedHash(row.transactionHash);
-      const rowSize = Number(row.size);
-      const rowPrincipal = Number(row.usdcSize);
-      const rowTimestampMs = activityTimestampMs(row.timestamp);
-      return !usedTransactionHashes.has(hash)
-        && moneyEqual(rowSize, fill.size)
-        && moneyEqual(rowPrincipal, Number(fill.size) * Number(fill.price))
-        && Number.isFinite(rowTimestampMs)
-        && Math.abs(rowTimestampMs - Number(fill.timestampMs)) <= ACTIVITY_MATCH_TOLERANCE_MS;
-    });
-    if (candidates.length !== 1) {
-      throw new Error("fail closed: automatic settlement Data API fill binding is missing or ambiguous");
+  const tokenId = tokenIds[0];
+  if (!redemptionAssetMatches(redemption?.asset, tokenId)) {
+    throw new Error("fail closed: Data API redemption asset does not bind the reservation token");
+  }
+  const reservationByOrder = new Map(boundReservations.map((row) => [row.order_id, row]));
+  const fills = (Array.isArray(orderFills) ? orderFills : []).map((fill) => ({
+    ...fill,
+    trade_id: String(fill?.id || ""),
+    id: `${String(fill?.id || "")}:${String(fill?.orderId || "")}`,
+    transaction_hash: normalizedHash(fill?.transactionHash),
+    asset_id: normalizedAsset(fill?.assetId),
+    condition_id: normalizedHash(fill?.market),
+    order_id: String(fill?.orderId || ""),
+    maker_order_id: String(fill?.makerOrderId || ""),
+    size: Number(fill?.size),
+    price: Number(fill?.price),
+    timestamp_ms: Number(fill?.timestampMs)
+  }));
+  if (fills.some((fill) =>
+    !fill.trade_id
+      || !fill.transaction_hash
+      || fill.asset_id !== tokenId
+      || normalizedAsset(fill?.tradeAssetId) !== tokenId
+      || normalizedAsset(fill?.makerAssetId) !== tokenId
+      || fill.condition_id !== conditionId
+      || !CONFIRMED_CLOB_STATUSES.has(String(fill?.status || "").toUpperCase())
+      || fill.orderRole !== "MAKER"
+      || fill.order_id !== fill.maker_order_id
+      || !reservationByOrder.has(fill.order_id)
+      || String(fill?.orderSide || "").toUpperCase() !== "BUY"
+      || !normalizedAddress(fill?.makerAddress)
+      || normalizedAddress(fill.makerAddress) !== wallet
+      || typeof fill?.owner !== "string"
+      || !fill.owner
+      || !(fill.size > 0)
+      || !(fill.price > 0 && fill.price < 1)
+      || !Number.isFinite(fill.timestamp_ms)
+  )) {
+    throw new Error("fail closed: authenticated CLOB trade hash/asset/market/maker/status binding is invalid");
+  }
+  if (!fills.length
+      || new Set(fills.map((fill) => fill.id)).size !== fills.length
+      || [...reservationByOrder.keys()].some((orderId) =>
+        !fills.some((fill) => fill.order_id === orderId))) {
+    throw new Error("fail closed: authenticated CLOB maker fills do not cover every reservation order");
+  }
+  const clobGroups = groupClobFills(fills);
+  const matchedActivity = [];
+  for (const group of clobGroups) {
+    const candidates = (Array.isArray(activity) ? activity : []).filter((row) =>
+      String(row?.type || "").toUpperCase() === "TRADE"
+        && String(row?.side || "").toUpperCase() === "BUY"
+        && normalizedAddress(row?.proxyWallet) === wallet
+        && normalizedAsset(row?.asset) === tokenId
+        && normalizedHash(row?.transactionHash) === group.transaction_hash
+        && normalizedHash(row?.conditionId) === conditionId
+        && Number.isFinite(activityTimestampMs(row?.timestamp))
+        && Math.abs(activityTimestampMs(row.timestamp) - group.timestamp_ms) <=
+          ACTIVITY_MATCH_TOLERANCE_MS
+    );
+    if (!candidates.length
+        || !moneyEqual(sum(candidates, "size"), group.size)
+        || !moneyEqual(sum(candidates, "usdcSize"), group.principal)) {
+      throw new Error("fail closed: exact Data API proxy wallet/asset/transaction/fill binding is missing or ambiguous");
     }
-    const trade = candidates[0];
-    usedTransactionHashes.add(normalizedHash(trade.transactionHash));
-    matchedTrades.push(trade);
+    matchedActivity.push(...candidates);
   }
-  const principal = money(sum(matchedTrades, "usdcSize"));
+  const principal = money(sum(matchedActivity, "usdcSize"));
   const authenticatedPrincipal = money(fills.reduce(
     (total, fill) => total + Number(fill.size) * Number(fill.price),
     0
   ));
-  const matchedRisk = money(reservation.matched_notional);
-  const feeRiskUpperBound = money(Math.max(0, Number(reservation.fee_risk_upper_bound) || 0));
+  const matchedRisk = money(boundReservations.reduce(
+    (total, row) => total + Number(row.matched_notional),
+    0
+  ));
+  const feeRiskUpperBound = money(boundReservations.reduce(
+    (total, row) => total + Math.max(0, Number(row.fee_risk_upper_bound) || 0),
+    0
+  ));
   if (!moneyEqual(principal, authenticatedPrincipal)
       || matchedRisk + 1 / MONEY_SCALE < principal
       || matchedRisk > principal + feeRiskUpperBound + 1 / MONEY_SCALE) {
     throw new Error("fail closed: automatic settlement principal does not reconcile to reservation risk");
   }
   const payout = money(redemption.usdcSize);
-  const redemptionTimestampMs = activityTimestampMs(redemption.timestamp);
-  const latestFillTimestampMs = Math.max(...fills.map((fill) => Number(fill.timestampMs)));
-  const reservationCreatedMs = activityTimestampMs(reservation.created_ts);
-  if (!(payout > 0)
-      || !Number.isFinite(redemptionTimestampMs)
-      || redemptionTimestampMs < latestFillTimestampMs
-      || !Number.isFinite(reservationCreatedMs)
-      || latestFillTimestampMs + ACTIVITY_MATCH_TOLERANCE_MS < reservationCreatedMs
-      || receipt?.status !== "success"
+  const payoutBaseUnits = String(Math.round(payout * MONEY_SCALE));
+  const decodedRedemptions = Array.isArray(receipt?.redemptions)
+    ? receipt.redemptions
+    : [];
+  const decodedMatches = decodedRedemptions.filter((row) =>
+    normalizedAddress(row?.contract_address) === CONDITIONAL_TOKENS_ADDRESS
+      && normalizedHash(row?.transaction_hash) === transactionHash
+      && normalizedAddress(row?.redeemer) === PUSD_CTF_COLLATERAL_ADAPTER_ADDRESS
+      && normalizedAddress(row?.collateral_token) === USDCE_ADDRESS
+      && normalizedHash(row?.parent_collection_id) === ZERO_TRANSACTION_HASH
+      && normalizedHash(row?.condition_id) === conditionId
+      && moneyEqual(row?.payout, payout)
+      && /^\d+$/.test(String(row?.payout_base_units || ""))
+      && String(row.payout_base_units) === payoutBaseUnits
+      && Array.isArray(row?.index_sets)
+      && row.index_sets.length > 0
+      && row.index_sets.every((index) => normalizedIndexSet(index))
+  );
+  if (receipt?.status !== "success"
       || Number(receipt?.chain_id) !== 137
+      || normalizedHash(receipt?.transaction_hash) !== transactionHash
       || !/^\d+$/.test(String(receipt?.block_number || ""))
       || BigInt(receipt.block_number) <= 0n
       || !Number.isInteger(Number(receipt?.confirmations))
-      || Number(receipt.confirmations) < 2) {
-    throw new Error("fail closed: automatic settlement redemption timing or Polygon receipt is invalid");
+      || Number(receipt.confirmations) < 2
+      || decodedMatches.length !== 1) {
+    throw new Error("fail closed: decoded confirmed redemption wallet/condition/payout/transaction evidence is invalid");
+  }
+  const decodedRedemption = decodedMatches[0];
+  const adapter = normalizedAddress(decodedRedemption.redeemer);
+  const ctfTransfers = Array.isArray(receipt?.ctf_transfers) ? receipt.ctf_transfers : [];
+  const erc20Transfers = Array.isArray(receipt?.erc20_transfers) ? receipt.erc20_transfers : [];
+  const collateralWraps = Array.isArray(receipt?.collateral_wraps)
+    ? receipt.collateral_wraps
+    : [];
+  const walletToAdapter = ctfTransfers.filter((row) =>
+    row?.event === "TransferBatch"
+      && normalizedAddress(row?.contract_address) === CONDITIONAL_TOKENS_ADDRESS
+      && normalizedAddress(row?.operator) === adapter
+      && normalizedAddress(row?.from) === wallet
+      && normalizedAddress(row?.to) === adapter
+      && transferContainsExact(row, tokenId, payoutBaseUnits)
+  );
+  const adapterBurn = ctfTransfers.filter((row) =>
+    row?.event === "TransferSingle"
+      && normalizedAddress(row?.contract_address) === CONDITIONAL_TOKENS_ADDRESS
+      && normalizedAddress(row?.operator) === adapter
+      && normalizedAddress(row?.from) === adapter
+      && normalizedAddress(row?.to) === ZERO_ADDRESS
+      && transferContainsOnly(row, tokenId, payoutBaseUnits)
+  );
+  const usdceCtfToAdapter = erc20Transfers.filter((row) =>
+    normalizedAddress(row?.token) === USDCE_ADDRESS
+      && normalizedAddress(row?.from) === CONDITIONAL_TOKENS_ADDRESS
+      && normalizedAddress(row?.to) === adapter
+      && canonicalBaseUnits(row?.value_base_units) === payoutBaseUnits
+  );
+  const usdceAdapterToPusd = erc20Transfers.filter((row) =>
+    normalizedAddress(row?.token) === USDCE_ADDRESS
+      && normalizedAddress(row?.from) === adapter
+      && normalizedAddress(row?.to) === PUSD_ADDRESS
+      && canonicalBaseUnits(row?.value_base_units) === payoutBaseUnits
+  );
+  const pusdMintToWallet = erc20Transfers.filter((row) =>
+    normalizedAddress(row?.token) === PUSD_ADDRESS
+      && normalizedAddress(row?.from) === ZERO_ADDRESS
+      && normalizedAddress(row?.to) === wallet
+      && canonicalBaseUnits(row?.value_base_units) === payoutBaseUnits
+  );
+  const pusdWrapToWallet = collateralWraps.filter((row) =>
+    normalizedAddress(row?.contract_address) === PUSD_ADDRESS
+      && normalizedAddress(row?.caller) === adapter
+      && normalizedAddress(row?.asset) === USDCE_ADDRESS
+      && normalizedAddress(row?.to) === wallet
+      && canonicalBaseUnits(row?.amount_base_units) === payoutBaseUnits
+  );
+  if (walletToAdapter.length !== 1
+      || adapterBurn.length !== 1
+      || usdceCtfToAdapter.length !== 1
+      || usdceAdapterToPusd.length !== 1
+      || pusdMintToWallet.length !== 1
+      || pusdWrapToWallet.length !== 1) {
+    throw new Error("fail closed: decoded redemption adapter/CTF/USDC.e/pUSD transfer chain is invalid");
+  }
+  const filledShares = money(fills.reduce(
+    (total, fill) => total + Number(fill.size),
+    0
+  ));
+  const redemptionTimestampMs = activityTimestampMs(redemption.timestamp);
+  const latestFillTimestampMs = Math.max(...fills.map((fill) => fill.timestamp_ms));
+  const earliestReservationMs = Math.min(...boundReservations.map((row) =>
+    activityTimestampMs(row.created_ts)));
+  if (!(payout > 0) || !moneyEqual(payout, filledShares)) {
+    throw new Error("fail closed: automatic settlement payout does not reconcile to exact filled shares");
+  }
+  if (!Number.isFinite(redemptionTimestampMs)
+      || redemptionTimestampMs < latestFillTimestampMs
+      || !Number.isFinite(earliestReservationMs)
+      || latestFillTimestampMs + ACTIVITY_MATCH_TOLERANCE_MS < earliestReservationMs) {
+    throw new Error("fail closed: automatic settlement redemption timing is invalid");
   }
   return {
-    id: `automatic-redeem-${transactionHash.slice(2, 18)}`,
+    id: automaticSettlementId(transactionHash, conditionId),
     type: AUTOMATIC_SETTLEMENT_TYPE,
     session_id: sessionId,
-    campaign_id: reservation.campaign_id,
-    run_id: reservation.run_id,
-    probe_id: reservation.probe_id,
-    order_id: reservation.order_id,
+    campaign_id: sessionId,
+    run_ids: boundReservations.map((row) => row.run_id).sort(),
+    probe_ids: boundReservations.map((row) => row.probe_id).sort(),
+    order_ids: boundReservations.map((row) => row.order_id).sort(),
+    token_ids: [tokenId],
+    proxy_wallet: wallet,
     transaction_hash: transactionHash,
     condition_id: conditionId,
     payout,
     principal,
     realized_pnl: money(payout - principal),
-    fill_transaction_hashes: matchedTrades.map((row) =>
-      normalizedHash(row.transactionHash)).sort(),
+    fill_transaction_hashes: [...new Set(fills.map((fill) =>
+      fill.transaction_hash))].sort(),
     authenticated_clob_fill_ids: fills.map((fill) => fill.id).sort(),
     reservation_matched_notional: matchedRisk,
     reservation_fee_risk_upper_bound: feeRiskUpperBound,
     evidence_source: "polymarket_data_api_plus_onchain_redemption",
+    redemption_evidence_decoded: true,
+    redemption_adapter_address: adapter,
+    redemption_contract_address: normalizedAddress(decodedRedemption.contract_address),
+    redemption_collateral_token: normalizedAddress(decodedRedemption.collateral_token),
+    redemption_parent_collection_id: normalizedHash(decodedRedemption.parent_collection_id),
+    redemption_index_sets: decodedRedemption.index_sets.map(normalizedIndexSet),
+    redemption_payout_base_units: payoutBaseUnits,
+    redemption_transfer_chain_verified: true,
+    redemption_token_id: tokenId,
     receipt_block_number: String(receipt.block_number),
     receipt_confirmations: Number(receipt.confirmations),
     settled_at: new Date(redemptionTimestampMs).toISOString()
@@ -637,12 +813,15 @@ function validDurableInternalSettlement(value) {
   if (value.type === AUTOMATIC_SETTLEMENT_TYPE
       && (value.evidence_source !== "polymarket_data_api_plus_onchain_redemption"
         || value.campaign_id !== value.session_id
-        || typeof value.run_id !== "string"
-        || !value.run_id
-        || typeof value.probe_id !== "string"
-        || !value.probe_id
-        || typeof value.order_id !== "string"
-        || !value.order_id
+        || value.id !== automaticSettlementId(value.transaction_hash, value.condition_id)
+        || !validUniqueStrings(value.run_ids)
+        || !validUniqueStrings(value.probe_ids)
+        || !validUniqueStrings(value.order_ids)
+        || !validUniqueStrings(value.token_ids)
+        || value.run_ids.length !== value.order_ids.length
+        || value.probe_ids.length !== value.order_ids.length
+        || value.token_ids.length !== 1
+        || !normalizedAddress(value.proxy_wallet)
         || !Array.isArray(value.fill_transaction_hashes)
         || value.fill_transaction_hashes.length === 0
         || value.fill_transaction_hashes.some((hash) => !normalizedHash(hash))
@@ -653,6 +832,21 @@ function validDurableInternalSettlement(value) {
         || value.authenticated_clob_fill_ids.some((id) => typeof id !== "string" || !id)
         || new Set(value.authenticated_clob_fill_ids).size !==
           value.authenticated_clob_fill_ids.length
+        || value.redemption_evidence_decoded !== true
+        || normalizedAddress(value.redemption_adapter_address) !==
+          PUSD_CTF_COLLATERAL_ADAPTER_ADDRESS
+        || normalizedAddress(value.redemption_contract_address) !==
+          CONDITIONAL_TOKENS_ADDRESS
+        || normalizedAddress(value.redemption_collateral_token) !== USDCE_ADDRESS
+        || normalizedHash(value.redemption_parent_collection_id) !== ZERO_TRANSACTION_HASH
+        || !Array.isArray(value.redemption_index_sets)
+        || value.redemption_index_sets.length === 0
+        || value.redemption_index_sets.some((index) =>
+          typeof index !== "string" || !normalizedIndexSet(index))
+        || canonicalBaseUnits(value.redemption_payout_base_units) !==
+          String(Math.round(Number(value.payout) * MONEY_SCALE))
+        || value.redemption_transfer_chain_verified !== true
+        || normalizedAsset(value.redemption_token_id) !== value.token_ids[0]
         || !Number.isFinite(Number(value.reservation_matched_notional))
         || !Number.isFinite(Number(value.reservation_fee_risk_upper_bound))
         || Number(value.reservation_fee_risk_upper_bound) < 0
@@ -686,6 +880,89 @@ function settlementAccountingEqual(left, right) {
 function normalizedHash(value) {
   const text = String(value || "").toLowerCase();
   return /^0x[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function normalizedAddress(value) {
+  const text = String(value || "").toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(text) ? text : "";
+}
+
+function normalizedAsset(value) {
+  const text = String(value || "");
+  return /^\d+$/.test(text) ? text : "";
+}
+
+function redemptionAssetMatches(value, tokenId) {
+  const text = String(value ?? "").trim();
+  return text === "" || normalizedAsset(text) === tokenId;
+}
+
+function normalizedIndexSet(value) {
+  const text = String(value || "");
+  if (!/^[1-9]\d*$/.test(text)) return "";
+  return BigInt(text) < (1n << 256n) ? text : "";
+}
+
+function canonicalBaseUnits(value) {
+  const text = String(value || "");
+  return /^(0|[1-9]\d*)$/.test(text) ? text : "";
+}
+
+function transferContainsExact(transfer, tokenId, valueBaseUnits) {
+  const ids = Array.isArray(transfer?.ids) ? transfer.ids.map(normalizedAsset) : [];
+  const values = Array.isArray(transfer?.values)
+    ? transfer.values.map(canonicalBaseUnits)
+    : [];
+  return ids.length === values.length
+    && ids.filter((id) => id === tokenId).length === 1
+    && values[ids.indexOf(tokenId)] === valueBaseUnits;
+}
+
+function transferContainsOnly(transfer, tokenId, valueBaseUnits) {
+  return Array.isArray(transfer?.ids)
+    && Array.isArray(transfer?.values)
+    && transfer.ids.length === 1
+    && transfer.values.length === 1
+    && normalizedAsset(transfer.ids[0]) === tokenId
+    && canonicalBaseUnits(transfer.values[0]) === valueBaseUnits;
+}
+
+function automaticSettlementId(transactionHash, conditionId) {
+  const identity = createHash("sha256")
+    .update(`${normalizedHash(transactionHash)}\u0000${normalizedHash(conditionId)}`)
+    .digest("hex");
+  return `automatic-redeem-${identity}`;
+}
+
+function groupClobFills(fills) {
+  const groups = new Map();
+  for (const fill of fills) {
+    const key = `${fill.transaction_hash}:${fill.asset_id}:${fill.condition_id}`;
+    const current = groups.get(key) || {
+      transaction_hash: fill.transaction_hash,
+      asset_id: fill.asset_id,
+      condition_id: fill.condition_id,
+      size: 0,
+      principal: 0,
+      timestamp_ms: fill.timestamp_ms
+    };
+    current.size += Number(fill.size);
+    current.principal += Number(fill.size) * Number(fill.price);
+    current.timestamp_ms = Math.max(current.timestamp_ms, fill.timestamp_ms);
+    groups.set(key, current);
+  }
+  return [...groups.values()].map((group) => ({
+    ...group,
+    size: money(group.size),
+    principal: money(group.principal)
+  }));
+}
+
+function validUniqueStrings(values) {
+  return Array.isArray(values)
+    && values.length > 0
+    && values.every((value) => typeof value === "string" && value.length > 0)
+    && new Set(values).size === values.length;
 }
 
 function activityTimestampMs(value) {

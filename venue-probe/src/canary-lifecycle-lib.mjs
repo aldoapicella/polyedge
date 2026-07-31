@@ -1,10 +1,33 @@
 import WebSocket from "ws";
+import { createHash } from "node:crypto";
 
 const TERMINAL_ORDER_STATES = ["CANCELED", "CANCELLED", "MATCHED", "FILLED", "EXPIRED"];
 const DEFAULT_MAX_MESSAGE_HISTORY = 32_768;
 const DEFAULT_MAX_MESSAGE_HISTORY_BYTES = 64 * 1024 * 1024;
 const DEFAULT_EVIDENCE_BASELINE_MESSAGES = 4_096;
 const DEFAULT_EVIDENCE_BASELINE_BYTES = 8 * 1024 * 1024;
+
+function unparsedFrameMetadata(frame, isBinary, receivedWallMs) {
+  const hash = createHash("sha256");
+  let byteLength = 0;
+  for (const chunk of Array.isArray(frame) ? frame : [frame]) {
+    const bytes = Buffer.isBuffer(chunk)
+      ? chunk
+      : chunk instanceof ArrayBuffer
+        ? Buffer.from(chunk)
+        : ArrayBuffer.isView(chunk)
+          ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          : Buffer.from(String(chunk), "utf8");
+    byteLength += bytes.byteLength;
+    hash.update(bytes);
+  }
+  return {
+    received_wall_ms: receivedWallMs,
+    byte_length: byteLength,
+    sha256: `sha256:${hash.digest("hex")}`,
+    classification: isBinary === true ? "binary" : "text"
+  };
+}
 
 export async function connectLifecycleChannel({
   url,
@@ -55,6 +78,7 @@ export async function connectLifecycleChannel({
   let reconnects = 0;
   let duplicates = 0;
   let unparsed = 0;
+  let latestUnparsedFrameMetadata = null;
   let reconnectPromise = null;
   let requiresReconciliation = false;
   let currentSubscription = structuredClone(subscription);
@@ -230,7 +254,7 @@ export async function connectLifecycleChannel({
     }
     socketState = state;
     socket = ws;
-    ws.on("message", (buffer) => {
+    ws.on("message", (buffer, isBinary) => {
       if (state.closeHandled) return;
       const text = buffer.toString();
       if (text === "PONG") {
@@ -260,6 +284,7 @@ export async function connectLifecycleChannel({
         }
       } catch {
         unparsed += 1;
+        latestUnparsedFrameMetadata = unparsedFrameMetadata(buffer, isBinary, nowMs());
         requiresReconciliation = true;
         if (recordMessages) ledger?.record(`${eventType}_unparsed`, { unparsed_count: unparsed });
       }
@@ -363,6 +388,9 @@ export async function connectLifecycleChannel({
     reconnectCount: () => reconnects,
     duplicateCount: () => duplicates,
     unparsedCount: () => unparsed,
+    latestUnparsedFrameMetadata: () => latestUnparsedFrameMetadata
+      ? { ...latestUnparsedFrameMetadata }
+      : null,
     requiresReconciliation: () => requiresReconciliation,
     markReconciled: () => {
       if (!open || socket?.readyState !== WebSocketImpl.OPEN) {
@@ -605,7 +633,7 @@ export function tradeFillsFromUserEvents(events, orderId) {
 }
 
 export function tradeFillsFromRest(trades, orderId) {
-  return normalizeTradeFills(trades || [], orderId);
+  return normalizeTradeFills(trades || [], orderId, { includeSettlementEvidence: true });
 }
 
 export function mergeTradeFills(...groups) {
@@ -693,7 +721,7 @@ export function cancellationEventReceivedAt(events) {
   return Number.isFinite(Number(event?._received_wall_ms)) ? Number(event._received_wall_ms) : null;
 }
 
-function normalizeTradeFills(trades, orderId) {
+function normalizeTradeFills(trades, orderId, { includeSettlementEvidence = false } = {}) {
   const fills = [];
   for (const trade of uniqueTrades(trades)) {
     const id = String(trade.id || trade.trade_id || trade.transaction_hash || "");
@@ -721,7 +749,7 @@ function normalizeTradeFills(trades, orderId) {
     const authenticatedFeeAmount = optionalNumber(
       trade.fee_amount_usdc_decimal ?? trade.feeAmountUsdcDecimal ?? trade.fee_amount ?? trade.feeAmount
     );
-    fills.push({
+    const fill = {
       id, size, price, timestampMs, traderSide, orderRole,
       authenticatedFeeRateBps,
       authenticatedFeeAmount,
@@ -736,7 +764,24 @@ function normalizeTradeFills(trades, orderId) {
         fee_usdc: trade.fee_usdc ?? trade.feeUsdc ?? null,
         builder_fee: maker?.builder_fee ?? trade.builder_fee ?? trade.builderFee ?? null
       }
-    });
+    };
+    if (includeSettlementEvidence) {
+      Object.assign(fill, {
+        transactionHash: firstNonBlank(trade.transaction_hash, trade.transactionHash),
+        market: firstNonBlank(trade.market, trade.condition_id, trade.conditionId),
+        assetId: firstNonBlank(maker?.asset_id, trade.asset_id, trade.assetId),
+        tradeAssetId: firstNonBlank(trade.asset_id, trade.assetId),
+        makerAssetId: firstNonBlank(maker?.asset_id),
+        status: String(trade.status || "").trim().toUpperCase() || null,
+        orderId: String(orderId),
+        makerOrderId: firstNonBlank(maker?.order_id, trade.maker_order_id),
+        takerOrderId: firstNonBlank(trade.taker_order_id),
+        owner: firstNonBlank(maker?.owner, trade.owner),
+        makerAddress: firstNonBlank(maker?.maker_address, trade.maker_address),
+        orderSide: String(maker?.side || trade.side || "").trim().toUpperCase() || null
+      });
+    }
+    fills.push(fill);
   }
   return fills;
 }

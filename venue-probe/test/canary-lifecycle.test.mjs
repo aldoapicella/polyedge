@@ -8,6 +8,7 @@ import {
   marketMessagesThrough,
   maximumMatchedSize,
   postCancelFillStats,
+  tradeFillsFromRest,
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
 } from "../src/canary-lifecycle-lib.mjs";
@@ -101,6 +102,64 @@ test("empty maker fee field falls back to the authenticated trade fee", () => {
   assert.equal(fills[0].authenticatedFeeRaw.fee_rate_bps, "0");
   assert.equal(fills[0].traderSide, "MAKER");
   assert.equal(fills[0].orderRole, "MAKER");
+});
+
+test("authenticated REST fills retain exact settlement binding fields", () => {
+  const transactionHash = `0x${"a".repeat(64)}`;
+  const conditionId = `0x${"b".repeat(64)}`;
+  const fills = tradeFillsFromRest([{
+    id: "trade-rest-1",
+    taker_order_id: "taker-order-1",
+    market: conditionId,
+    asset_id: "trade-asset",
+    side: "SELL",
+    size: "2.5",
+    price: "0.40",
+    status: "CONFIRMED",
+    match_time: "2026-07-13T12:00:01.000Z",
+    owner: "trade-owner",
+    maker_address: "0x1111111111111111111111111111111111111111",
+    transaction_hash: transactionHash,
+    trader_side: "MAKER",
+    maker_orders: [{
+      order_id: "maker-order-1",
+      owner: "maker-owner",
+      maker_address: "0x2222222222222222222222222222222222222222",
+      matched_amount: "2.5",
+      price: "0.40",
+      asset_id: "maker-asset",
+      side: "BUY"
+    }]
+  }], "maker-order-1");
+
+  assert.equal(fills.length, 1);
+  assert.deepEqual({
+    transactionHash: fills[0].transactionHash,
+    market: fills[0].market,
+    assetId: fills[0].assetId,
+    tradeAssetId: fills[0].tradeAssetId,
+    makerAssetId: fills[0].makerAssetId,
+    status: fills[0].status,
+    orderId: fills[0].orderId,
+    makerOrderId: fills[0].makerOrderId,
+    takerOrderId: fills[0].takerOrderId,
+    owner: fills[0].owner,
+    makerAddress: fills[0].makerAddress,
+    orderSide: fills[0].orderSide
+  }, {
+    transactionHash,
+    market: conditionId,
+    assetId: "maker-asset",
+    tradeAssetId: "trade-asset",
+    makerAssetId: "maker-asset",
+    status: "CONFIRMED",
+    orderId: "maker-order-1",
+    makerOrderId: "maker-order-1",
+    takerOrderId: "taker-order-1",
+    owner: "maker-owner",
+    makerAddress: "0x2222222222222222222222222222222222222222",
+    orderSide: "BUY"
+  });
 });
 
 test("a later partial fill after cancel is classified as a cancellation race", () => {
@@ -207,10 +266,14 @@ test("channel disconnect is counted as a gap and reconnects before reuse", async
   assert.equal(channel.gapCount(), 1);
   assert.equal(channel.reconnectCount(), 1);
   assert.equal(channel.isOpen(), true);
+  assert.equal(channel.requiresReconciliation(), true);
+  channel.markReconciled();
+  assert.equal(channel.gapCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
   channel.close();
 });
 
-test("an unparsed websocket frame requires REST reconciliation before reuse", async () => {
+test("unparsed frame metadata survives reconciliation without retaining payloads", async () => {
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;
     static instances = [];
@@ -235,6 +298,7 @@ test("an unparsed websocket frame requires REST reconciliation before reuse", as
     }
   }
 
+  let wallMs = 1_722_470_400_000;
   const channel = await connectLifecycleChannel({
     url: "wss://example.invalid",
     subscription: { type: "user" },
@@ -243,18 +307,39 @@ test("an unparsed websocket frame requires REST reconciliation before reuse", as
     settleMs: 0,
     openTimeoutMs: 100,
     heartbeatTimeoutMs: 100,
-    sleep: async () => {}
+    sleep: async () => {},
+    nowMs: () => wallMs
   });
 
-  FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"));
+  assert.equal(channel.latestUnparsedFrameMetadata(), null);
+  wallMs += 100;
+  FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"), false);
 
   assert.equal(channel.gapCount(), 0);
   assert.equal(channel.unparsedCount(), 1);
   assert.equal(channel.requiresReconciliation(), true);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), {
+    received_wall_ms: 1_722_470_400_100,
+    byte_length: 8,
+    sha256: "sha256:0c21a879c732a67910d80988df4919d794f6a070aab610ef865032a28046b021",
+    classification: "text"
+  });
+
+  wallMs += 100;
+  FakeWebSocket.instances[0].emit("message", Buffer.from([0xff, 0x00]), true);
+  const latestMetadata = {
+    received_wall_ms: 1_722_470_400_200,
+    byte_length: 2,
+    sha256: "sha256:ea5dbf9596d187e9500f23e9a680109475341cf4e81f7e043f7d97152c10772f",
+    classification: "binary"
+  };
+  assert.equal(channel.unparsedCount(), 2);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), latestMetadata);
 
   channel.markReconciled();
   assert.equal(channel.unparsedCount(), 0);
   assert.equal(channel.requiresReconciliation(), false);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), latestMetadata);
   channel.close();
 });
 

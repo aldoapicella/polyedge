@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
+import { encodeAbiParameters, encodeEventTopics } from "viem";
 import {
   beginFillMarkoutCapture,
   artifactLocationFromUri,
@@ -16,6 +17,10 @@ import {
   putOperatorSessionManifest,
   requireExecutionModelArtifact,
   assertPersistentIntentRemainingTtl,
+  decodePayoutRedemptions,
+  decodeSettlementReceiptEvidence,
+  initializeProtectedCompounding,
+  loadSettlementActivity,
   selectFreshCachedSafetySnapshot,
   startSafetySnapshotCache,
   streamBookEvidence
@@ -31,6 +36,64 @@ const book = {
 const intentHash = `sha256:${"1".repeat(64)}`;
 const manifestHash = `sha256:${"2".repeat(64)}`;
 const executionModelHash = `sha256:${"7".repeat(64)}`;
+const payoutRedemptionEvent = [{
+  type: "event",
+  name: "PayoutRedemption",
+  anonymous: false,
+  inputs: [
+    { name: "redeemer", type: "address", indexed: true },
+    { name: "collateralToken", type: "address", indexed: true },
+    { name: "parentCollectionId", type: "bytes32", indexed: true },
+    { name: "conditionId", type: "bytes32", indexed: false },
+    { name: "indexSets", type: "uint256[]", indexed: false },
+    { name: "payout", type: "uint256", indexed: false }
+  ]
+}];
+const erc20TransferEvent = [{
+  type: "event",
+  name: "Transfer",
+  anonymous: false,
+  inputs: [
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "value", type: "uint256", indexed: false }
+  ]
+}];
+const erc1155TransferSingleEvent = [{
+  type: "event",
+  name: "TransferSingle",
+  anonymous: false,
+  inputs: [
+    { name: "operator", type: "address", indexed: true },
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "id", type: "uint256", indexed: false },
+    { name: "value", type: "uint256", indexed: false }
+  ]
+}];
+const erc1155TransferBatchEvent = [{
+  type: "event",
+  name: "TransferBatch",
+  anonymous: false,
+  inputs: [
+    { name: "operator", type: "address", indexed: true },
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "ids", type: "uint256[]", indexed: false },
+    { name: "values", type: "uint256[]", indexed: false }
+  ]
+}];
+const collateralWrappedEvent = [{
+  type: "event",
+  name: "Wrapped",
+  anonymous: false,
+  inputs: [
+    { name: "caller", type: "address", indexed: true },
+    { name: "asset", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "amount", type: "uint256", indexed: false }
+  ]
+}];
 
 async function flushMicrotasks(rounds = 12) {
   for (let index = 0; index < rounds; index += 1) await Promise.resolve();
@@ -78,6 +141,258 @@ test("persistent executor rejects missing execution-model provenance before exec
       /execution-model artifact provenance is unavailable/
     );
   }
+});
+
+test("settlement activity is condition-scoped, session-bounded, and fully paginated", async () => {
+  const wallet = "0x1111111111111111111111111111111111111111";
+  const firstCondition = `0x${"a".repeat(64)}`;
+  const secondCondition = `0x${"b".repeat(64)}`;
+  const startedAt = "2026-07-30T00:00:00.000Z";
+  const calls = [];
+  const row = (conditionId, transaction, timestamp, type = "TRADE") => ({
+    type,
+    conditionId,
+    transactionHash: `0x${transaction.repeat(64)}`,
+    proxyWallet: wallet,
+    asset: "123",
+    size: 1,
+    usdcSize: 0.5,
+    timestamp
+  });
+  const fetcher = async (rawUrl) => {
+    const url = new URL(rawUrl);
+    calls.push(url);
+    assert.equal(url.searchParams.get("user"), wallet);
+    assert.equal(url.searchParams.get("start"), String(Date.parse(startedAt) / 1_000));
+    assert.equal(url.searchParams.get("sortBy"), "TIMESTAMP");
+    assert.equal(url.searchParams.get("sortDirection"), "ASC");
+    assert.equal(url.searchParams.get("type"), "TRADE,REDEEM");
+    assert.equal(url.searchParams.get("market"), `${firstCondition},${secondCondition}`);
+    const offset = Number(url.searchParams.get("offset"));
+    if (offset === 0) {
+      return [
+        row(firstCondition, "1", Date.parse("2026-07-30T00:01:00.000Z") / 1_000),
+        row(firstCondition, "2", Date.parse("2026-07-30T00:02:00.000Z") / 1_000, "REDEEM")
+      ];
+    }
+    if (offset === 2) {
+      return [
+        row(firstCondition, "3", Date.parse("2026-07-30T00:03:00.000Z") / 1_000),
+        row(secondCondition, "4", Date.parse("2026-07-30T00:04:00.000Z") / 1_000)
+      ];
+    }
+    return [];
+  };
+
+  const activity = await loadSettlementActivity({
+    user: wallet,
+    conditionIds: [secondCondition, firstCondition, firstCondition],
+    sessionStartedAt: startedAt,
+    fetcher,
+    pageSize: 2
+  });
+
+  assert.equal(calls.length, 3);
+  assert.deepEqual(activity.map((value) => value.transactionHash), [
+    `0x${"1".repeat(64)}`,
+    `0x${"2".repeat(64)}`,
+    `0x${"3".repeat(64)}`,
+    `0x${"4".repeat(64)}`
+  ]);
+});
+
+test("settlement activity fails closed instead of truncating a full final page", async () => {
+  await assert.rejects(
+    loadSettlementActivity({
+      user: "0x1111111111111111111111111111111111111111",
+      conditionIds: [`0x${"a".repeat(64)}`],
+      sessionStartedAt: "2026-07-30T00:00:00.000Z",
+      pageSize: 1,
+      maxPagesPerBatch: 2,
+      fetcher: async () => [{
+        type: "TRADE",
+        conditionId: `0x${"a".repeat(64)}`,
+        transactionHash: `0x${crypto.randomUUID().replaceAll("-", "").padEnd(64, "0")}`,
+        proxyWallet: "0x1111111111111111111111111111111111111111",
+        asset: "123",
+        size: 1,
+        usdcSize: 0.5,
+        timestamp: Date.parse("2026-07-30T00:01:00.000Z") / 1_000
+      }]
+    }),
+    /exceeds pagination bound/
+  );
+});
+
+test("protected-compounding startup skips settlement activity for an empty manifest ledger", async () => {
+  let activityCalls = 0;
+  const manifest = {
+    allow_compounding: true,
+    session_id: "dynamic-quote-funded-empty-settlements",
+    internal_settlements: [],
+    capital_policy: {
+      reserve_monotonic: true,
+      high_water_update: "full_reconciliation_only",
+      reserve_ratio: 0.3,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      state_blob_name:
+        "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-empty-settlements/capital-reserve-state.json"
+    }
+  };
+  const container = {
+    async *listBlobsFlat() {}
+  };
+  const result = await initializeProtectedCompounding({
+    container,
+    manifest,
+    loadActivity: async () => {
+      activityCalls += 1;
+      throw new Error("network must not be queried");
+    }
+  });
+  assert.equal(activityCalls, 0);
+  assert.deepEqual(result.verifiedConfiguredSettlements, []);
+});
+
+test("Polygon receipt decoder preserves the exact CTF-to-pUSD adapter chain", () => {
+  const transactionHash = `0x${"c".repeat(64)}`;
+  const wallet = "0x1111111111111111111111111111111111111111";
+  const adapter = "0x2222222222222222222222222222222222222222";
+  const conditionalTokens = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+  const usdce = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+  const pusd = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+  const zero = "0x0000000000000000000000000000000000000000";
+  const parentCollectionId = `0x${"0".repeat(64)}`;
+  const conditionId = `0x${"d".repeat(64)}`;
+  const tokenId = 123456789n;
+  const amount = 22_180_000n;
+  const log = (address, abi, eventName, indexedArgs, dataParameters, dataValues) => ({
+    address,
+    topics: encodeEventTopics({ abi, eventName, args: indexedArgs }),
+    data: encodeAbiParameters(dataParameters, dataValues)
+  });
+  const receipt = {
+    transactionHash,
+    logs: [{
+      ...log(
+        conditionalTokens,
+        erc1155TransferBatchEvent,
+        "TransferBatch",
+        { operator: adapter, from: wallet, to: adapter },
+        [{ type: "uint256[]" }, { type: "uint256[]" }],
+        [[999n, tokenId], [0n, amount]]
+      )
+    }, {
+      ...log(
+        conditionalTokens,
+        erc1155TransferSingleEvent,
+        "TransferSingle",
+        { operator: adapter, from: adapter, to: zero },
+        [{ type: "uint256" }, { type: "uint256" }],
+        [tokenId, amount]
+      )
+    }, {
+      ...log(
+        usdce,
+        erc20TransferEvent,
+        "Transfer",
+        { from: conditionalTokens, to: adapter },
+        [{ type: "uint256" }],
+        [amount]
+      )
+    }, {
+      ...log(
+        conditionalTokens,
+        payoutRedemptionEvent,
+        "PayoutRedemption",
+        { redeemer: adapter, collateralToken: usdce, parentCollectionId },
+        [{ type: "bytes32" }, { type: "uint256[]" }, { type: "uint256" }],
+        [conditionId, [1n, 2n], amount]
+      )
+    }, {
+      ...log(
+        usdce,
+        erc20TransferEvent,
+        "Transfer",
+        { from: adapter, to: pusd },
+        [{ type: "uint256" }],
+        [amount]
+      )
+    }, {
+      ...log(
+        pusd,
+        erc20TransferEvent,
+        "Transfer",
+        { from: zero, to: wallet },
+        [{ type: "uint256" }],
+        [amount]
+      )
+    }, {
+      ...log(
+        pusd,
+        collateralWrappedEvent,
+        "Wrapped",
+        { caller: adapter, asset: usdce, to: wallet },
+        [{ type: "uint256" }],
+        [amount]
+      )
+    }]
+  };
+
+  const decoded = decodeSettlementReceiptEvidence(receipt, transactionHash);
+  assert.deepEqual(decoded.redemptions, [{
+    contract_address: conditionalTokens.toLowerCase(),
+    transaction_hash: transactionHash,
+    redeemer: adapter,
+    collateral_token: usdce.toLowerCase(),
+    parent_collection_id: parentCollectionId,
+    condition_id: conditionId,
+    index_sets: ["1", "2"],
+    payout_base_units: String(amount),
+    payout: 22.18
+  }]);
+  assert.deepEqual(decoded.ctf_transfers, [{
+    event: "TransferBatch",
+    contract_address: conditionalTokens.toLowerCase(),
+    operator: adapter,
+    from: wallet,
+    to: adapter,
+    ids: ["999", String(tokenId)],
+    values: ["0", String(amount)]
+  }, {
+    event: "TransferSingle",
+    contract_address: conditionalTokens.toLowerCase(),
+    operator: adapter,
+    from: adapter,
+    to: zero,
+    ids: [String(tokenId)],
+    values: [String(amount)]
+  }]);
+  assert.deepEqual(decoded.erc20_transfers, [{
+    token: usdce.toLowerCase(),
+    from: conditionalTokens.toLowerCase(),
+    to: adapter,
+    value_base_units: String(amount)
+  }, {
+    token: usdce.toLowerCase(),
+    from: adapter,
+    to: pusd.toLowerCase(),
+    value_base_units: String(amount)
+  }, {
+    token: pusd.toLowerCase(),
+    from: zero,
+    to: wallet,
+    value_base_units: String(amount)
+  }]);
+  assert.deepEqual(decoded.collateral_wraps, [{
+    contract_address: pusd.toLowerCase(),
+    caller: adapter,
+    asset: usdce.toLowerCase(),
+    to: wallet,
+    amount_base_units: String(amount)
+  }]);
+  assert.deepEqual(decodePayoutRedemptions(receipt, transactionHash), decoded.redemptions);
 });
 
 test("persistent executor selects only a fresh exact-market safety snapshot", () => {

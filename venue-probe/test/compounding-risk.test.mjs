@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   discoverVerifiedAutomaticInternalSettlements,
   loadDurableInternalSettlements,
@@ -170,9 +171,27 @@ test("venue or policy minimums produce a no-trade instead of reserve leakage", (
 });
 
 const automaticCondition = `0x${"d".repeat(64)}`;
+const secondCondition = `0x${"c".repeat(64)}`;
 const automaticRedemption = `0x${"e".repeat(64)}`;
 const automaticFillTransaction = `0x${"f".repeat(64)}`;
+const secondFillTransaction = `0x${"b".repeat(64)}`;
+const expectedWallet = `0x${"a".repeat(40)}`;
+const adapter = "0xada100db00ca00073811820692005400218fce1f";
+const conditionalTokens = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+const collateralToken = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
+const pusdToken = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+const zeroAddress = `0x${"0".repeat(40)}`;
+const parentCollection = `0x${"0".repeat(64)}`;
+const automaticToken = "111111111111111111111111111111111111111";
+const secondToken = "222222222222222222222222222222222222222";
 const fillTimestampMs = Date.parse("2026-07-30T00:01:00.000Z");
+const redemptionTimestamp = Date.parse("2026-07-30T00:10:00.000Z") / 1_000;
+
+function settlementId(transactionHash, conditionId) {
+  return `automatic-redeem-${createHash("sha256")
+    .update(`${transactionHash}\u0000${conditionId}`)
+    .digest("hex")}`;
+}
 
 function automaticReservation(overrides = {}) {
   return {
@@ -181,6 +200,7 @@ function automaticReservation(overrides = {}) {
     probe_id: "probe-funded-1",
     order_id: "order-funded-1",
     condition_id: automaticCondition,
+    token_id: automaticToken,
     order_submission_intended: true,
     order_submitted: true,
     matched_notional: 2,
@@ -190,55 +210,183 @@ function automaticReservation(overrides = {}) {
   };
 }
 
-function automaticActivity(overrides = {}) {
-  return [
+function tradeActivity({
+  conditionId = automaticCondition,
+  asset = automaticToken,
+  transactionHash = automaticFillTransaction,
+  size = 10,
+  usdcSize = 2,
+  ...overrides
+} = {}) {
+  return {
+    type: "TRADE",
+    side: "BUY",
+    proxyWallet: expectedWallet,
+    asset,
+    transactionHash,
+    conditionId,
+    size,
+    usdcSize,
+    timestamp: fillTimestampMs / 1_000,
+    ...overrides
+  };
+}
+
+function redeemActivity({
+  conditionId = automaticCondition,
+  asset = "",
+  payout = 10,
+  ...overrides
+} = {}) {
+  return {
+    type: "REDEEM",
+    proxyWallet: expectedWallet,
+    transactionHash: automaticRedemption,
+    conditionId,
+    asset,
+    usdcSize: payout,
+    timestamp: redemptionTimestamp,
+    ...overrides
+  };
+}
+
+function automaticFill({
+  id = "authenticated-clob-fill-1",
+  orderId = "order-funded-1",
+  conditionId = automaticCondition,
+  assetId = automaticToken,
+  transactionHash = automaticFillTransaction,
+  size = 10,
+  price = 0.2,
+  ...overrides
+} = {}) {
+  return {
+    id,
+    size,
+    price,
+    timestampMs: fillTimestampMs,
+    orderRole: "MAKER",
+    transactionHash,
+    market: conditionId,
+    assetId,
+    tradeAssetId: assetId,
+    makerAssetId: assetId,
+    status: "TRADE_STATUS_CONFIRMED",
+    orderId,
+    makerOrderId: orderId,
+    takerOrderId: "taker-order-1",
+    owner: "authenticated-owner-1",
+    makerAddress: expectedWallet,
+    orderSide: "BUY",
+    ...overrides
+  };
+}
+
+function decodedRedemption({
+  conditionId = automaticCondition,
+  payout = 10,
+  ...overrides
+} = {}) {
+  return {
+    contract_address: conditionalTokens,
+    transaction_hash: automaticRedemption,
+    redeemer: adapter,
+    collateral_token: collateralToken,
+    parent_collection_id: parentCollection,
+    condition_id: conditionId,
+    index_sets: [1],
+    payout_base_units: String(Math.round(payout * 1_000_000)),
+    payout,
+    ...overrides
+  };
+}
+
+function confirmedReceipt(redemptions = [decodedRedemption()], overrides = {}) {
+  const ctfTransfers = redemptions.flatMap((redemption) => [
     {
-      type: "TRADE",
-      side: "BUY",
-      transactionHash: automaticFillTransaction,
-      conditionId: automaticCondition,
-      size: 10,
-      usdcSize: 2,
-      timestamp: fillTimestampMs / 1_000,
-      ...overrides
+      event: "TransferBatch",
+      contract_address: conditionalTokens,
+      operator: adapter,
+      from: expectedWallet,
+      to: adapter,
+      ids: [redemption.condition_id === automaticCondition ? automaticToken : secondToken],
+      values: [redemption.payout_base_units]
     },
     {
-      type: "REDEEM",
-      transactionHash: automaticRedemption,
-      conditionId: automaticCondition,
-      usdcSize: 10,
-      timestamp: Date.parse("2026-07-30T00:10:00.000Z") / 1_000
+      event: "TransferSingle",
+      contract_address: conditionalTokens,
+      operator: adapter,
+      from: adapter,
+      to: zeroAddress,
+      ids: [redemption.condition_id === automaticCondition ? automaticToken : secondToken],
+      values: [redemption.payout_base_units]
     }
-  ];
-}
-
-function automaticFills() {
-  return [{
-    id: "authenticated-clob-fill-1",
-    size: 10,
-    price: 0.2,
-    timestampMs: fillTimestampMs,
-    orderRole: "MAKER"
-  }];
-}
-
-function confirmedReceipt() {
+  ]);
+  const erc20Transfers = redemptions.flatMap((redemption) => [
+    {
+      token: collateralToken,
+      from: conditionalTokens,
+      to: adapter,
+      value_base_units: redemption.payout_base_units
+    },
+    {
+      token: collateralToken,
+      from: adapter,
+      to: pusdToken,
+      value_base_units: redemption.payout_base_units
+    },
+    {
+      token: pusdToken,
+      from: zeroAddress,
+      to: expectedWallet,
+      value_base_units: redemption.payout_base_units
+    }
+  ]);
+  const collateralWraps = redemptions.map((redemption) => ({
+    contract_address: pusdToken,
+    caller: adapter,
+    asset: collateralToken,
+    to: expectedWallet,
+    amount_base_units: redemption.payout_base_units
+  }));
   return {
     status: "success",
     chain_id: 137,
     block_number: "12345678",
-    confirmations: 3
+    confirmations: 3,
+    transaction_hash: automaticRedemption,
+    redemptions,
+    ctf_transfers: ctfTransfers,
+    erc20_transfers: erc20Transfers,
+    collateral_wraps: collateralWraps,
+    ...overrides
   };
 }
 
-test("automatic settlement binds exact reservation, maker fill, Data API evidence, and receipt", async () => {
+function verifyFixture(overrides = {}) {
+  const reservation = automaticReservation();
+  const activity = [tradeActivity(), redeemActivity()];
+  return {
+    manifest: manifest(),
+    reservations: [reservation],
+    redemption: activity[1],
+    activity,
+    orderFills: [automaticFill()],
+    receipt: confirmedReceipt(),
+    expectedWallet,
+    ...overrides
+  };
+}
+
+test("automatic settlement binds exact reservation, CLOB, Data API, wallet, and decoded receipt", async () => {
   const settlements = await discoverVerifiedAutomaticInternalSettlements({
     manifest: manifest(),
     reservations: [automaticReservation()],
-    activity: automaticActivity(),
+    activity: [tradeActivity(), redeemActivity()],
+    expectedWallet,
     getOrderFills: async (reservation) => {
       assert.equal(reservation.order_id, "order-funded-1");
-      return automaticFills();
+      return [automaticFill()];
     },
     getTransactionReceipt: async (transactionHash) => {
       assert.equal(transactionHash, automaticRedemption);
@@ -247,23 +395,34 @@ test("automatic settlement binds exact reservation, maker fill, Data API evidenc
   });
   assert.equal(settlements.length, 1);
   assert.deepEqual(settlements[0], {
-    id: `automatic-redeem-${"e".repeat(16)}`,
+    id: settlementId(automaticRedemption, automaticCondition),
     type: "internal_automatic_settlement",
     session_id: "dynamic-quote-funded-test-v5",
     campaign_id: "dynamic-quote-funded-test-v5",
-    run_id: "run-funded-1",
-    probe_id: "probe-funded-1",
-    order_id: "order-funded-1",
+    run_ids: ["run-funded-1"],
+    probe_ids: ["probe-funded-1"],
+    order_ids: ["order-funded-1"],
+    token_ids: [automaticToken],
+    proxy_wallet: expectedWallet,
     transaction_hash: automaticRedemption,
     condition_id: automaticCondition,
     payout: 10,
     principal: 2,
     realized_pnl: 8,
     fill_transaction_hashes: [automaticFillTransaction],
-    authenticated_clob_fill_ids: ["authenticated-clob-fill-1"],
+    authenticated_clob_fill_ids: ["authenticated-clob-fill-1:order-funded-1"],
     reservation_matched_notional: 2,
     reservation_fee_risk_upper_bound: 0.1,
     evidence_source: "polymarket_data_api_plus_onchain_redemption",
+    redemption_evidence_decoded: true,
+    redemption_adapter_address: adapter,
+    redemption_contract_address: conditionalTokens,
+    redemption_collateral_token: collateralToken,
+    redemption_parent_collection_id: parentCollection,
+    redemption_index_sets: ["1"],
+    redemption_payout_base_units: "10000000",
+    redemption_transfer_chain_verified: true,
+    redemption_token_id: automaticToken,
     receipt_block_number: "12345678",
     receipt_confirmations: 3,
     settled_at: "2026-07-30T00:10:00.000Z"
@@ -293,12 +452,29 @@ test("automatic settlement binds exact reservation, maker fill, Data API evidenc
   assert.equal(state.protected_reserve, 5.729586);
 });
 
-test("an existing manual redemption identity is idempotently excluded", async () => {
+test("automatic settlement accepts only explicit confirmed CLOB response enums", () => {
+  for (const status of ["CONFIRMED", "TRADE_STATUS_CONFIRMED"]) {
+    const settlement = verifyAutomaticSettlementEvidence(verifyFixture({
+      orderFills: [automaticFill({ status })]
+    }));
+    assert.equal(settlement.condition_id, automaticCondition, status);
+  }
+});
+
+test("automatic settlement accepts an exact optional Data API REDEEM asset", () => {
+  const fixture = verifyFixture();
+  fixture.redemption.asset = automaticToken;
+  const settlement = verifyAutomaticSettlementEvidence(fixture);
+  assert.equal(settlement.token_ids[0], automaticToken);
+});
+
+test("an existing manual redemption identity remains backward-compatible and idempotent", async () => {
   const calls = [];
   const settlements = await discoverVerifiedAutomaticInternalSettlements({
     manifest: manifest(),
     reservations: [automaticReservation()],
-    activity: automaticActivity(),
+    activity: [tradeActivity(), redeemActivity()],
+    expectedWallet,
     durableSettlements: [{
       schema: "polyedge.verified_internal_settlement.v1",
       id: "manual-redeem-2026-07-31-0109z",
@@ -314,47 +490,291 @@ test("an existing manual redemption identity is idempotently excluded", async ()
       receipt_block_number: "12345678",
       receipt_confirmations: 3
     }],
-    getOrderFills: async () => { calls.push("fills"); return automaticFills(); },
+    getOrderFills: async () => { calls.push("fills"); return [automaticFill()]; },
     getTransactionReceipt: async () => { calls.push("receipt"); return confirmedReceipt(); }
   });
   assert.deepEqual(settlements, []);
   assert.deepEqual(calls, []);
 });
 
-test("automatic settlement fails closed on ambiguous reservations or mismatched evidence", async () => {
-  await assert.rejects(
-    discoverVerifiedAutomaticInternalSettlements({
-      manifest: manifest(),
-      reservations: [
-        automaticReservation(),
-        automaticReservation({ probe_id: "probe-funded-2", order_id: "order-funded-2" })
-      ],
-      activity: automaticActivity(),
-      getOrderFills: async () => automaticFills(),
-      getTransactionReceipt: async () => confirmedReceipt()
+test("multiple exact reservations and maker orders aggregate for one condition", async () => {
+  const reservations = [
+    automaticReservation({
+      order_id: "order-funded-1",
+      probe_id: "probe-funded-1",
+      run_id: "run-funded-1",
+      matched_notional: 0.8
     }),
-    /does not bind one exact funded reservation/
-  );
-  assert.throws(
-    () => verifyAutomaticSettlementEvidence({
-      manifest: manifest(),
-      reservation: automaticReservation(),
-      redemption: automaticActivity()[1],
-      activity: automaticActivity({ size: 9 }),
-      orderFills: automaticFills(),
-      receipt: confirmedReceipt()
+    automaticReservation({
+      order_id: "order-funded-2",
+      probe_id: "probe-funded-2",
+      run_id: "run-funded-2",
+      matched_notional: 1.2
+    })
+  ];
+  const fills = {
+    "order-funded-1": automaticFill({
+      id: "trade-shared",
+      orderId: "order-funded-1",
+      size: 4,
+      price: 0.2
     }),
-    /Data API fill binding is missing or ambiguous/
-  );
-  assert.throws(
-    () => verifyAutomaticSettlementEvidence({
-      manifest: manifest(),
-      reservation: automaticReservation(),
-      redemption: automaticActivity()[1],
-      activity: automaticActivity(),
-      orderFills: automaticFills(),
-      receipt: { ...confirmedReceipt(), confirmations: 1 }
+    "order-funded-2": automaticFill({
+      id: "trade-shared",
+      orderId: "order-funded-2",
+      size: 6,
+      price: 0.2
+    })
+  };
+  const [settlement] = await discoverVerifiedAutomaticInternalSettlements({
+    manifest: manifest(),
+    reservations,
+    activity: [
+      tradeActivity({ size: 4, usdcSize: 0.8 }),
+      tradeActivity({ size: 6, usdcSize: 1.2 }),
+      redeemActivity()
+    ],
+    expectedWallet,
+    getOrderFills: async (reservation) => [fills[reservation.order_id]],
+    getTransactionReceipt: async () => confirmedReceipt()
+  });
+  assert.deepEqual(settlement.order_ids, ["order-funded-1", "order-funded-2"]);
+  assert.deepEqual(settlement.authenticated_clob_fill_ids, [
+    "trade-shared:order-funded-1",
+    "trade-shared:order-funded-2"
+  ]);
+  assert.equal(settlement.principal, 2);
+  assert.equal(settlement.payout, 10);
+  assert.equal(settlement.reservation_matched_notional, 2);
+});
+
+test("one confirmed transaction redeeming multiple conditions creates separate records", async () => {
+  const reservations = [
+    automaticReservation(),
+    automaticReservation({
+      condition_id: secondCondition,
+      token_id: secondToken,
+      order_id: "order-funded-2",
+      probe_id: "probe-funded-2",
+      run_id: "run-funded-2",
+      matched_notional: 2
+    })
+  ];
+  const activity = [
+    tradeActivity(),
+    tradeActivity({
+      conditionId: secondCondition,
+      asset: secondToken,
+      transactionHash: secondFillTransaction,
+      size: 5,
+      usdcSize: 2
     }),
-    /Polygon receipt is invalid/
-  );
+    redeemActivity(),
+    redeemActivity({ conditionId: secondCondition, payout: 5 })
+  ];
+  const receipt = confirmedReceipt([
+    decodedRedemption(),
+    decodedRedemption({ conditionId: secondCondition, payout: 5, index_sets: [2] })
+  ]);
+  let receiptCalls = 0;
+  const settlements = await discoverVerifiedAutomaticInternalSettlements({
+    manifest: manifest(),
+    reservations,
+    activity,
+    expectedWallet,
+    getOrderFills: async (reservation) => [reservation.condition_id === automaticCondition
+      ? automaticFill()
+      : automaticFill({
+          id: "authenticated-clob-fill-2",
+          orderId: "order-funded-2",
+          conditionId: secondCondition,
+          assetId: secondToken,
+          transactionHash: secondFillTransaction,
+          size: 5,
+          price: 0.4
+        })],
+    getTransactionReceipt: async () => { receiptCalls += 1; return receipt; }
+  });
+  assert.equal(receiptCalls, 1);
+  assert.equal(settlements.length, 2);
+  assert.deepEqual(settlements.map((row) => row.condition_id).sort(), [
+    secondCondition,
+    automaticCondition
+  ].sort());
+  assert.equal(new Set(settlements.map((row) => row.id)).size, 2);
+  assert.ok(settlements.every((row) => row.transaction_hash === automaticRedemption));
+});
+
+test("automatic settlement fails closed on CLOB hash, asset, wallet, status, or receipt mismatch", () => {
+  const cases = [
+    {
+      name: "transaction hash",
+      mutate: (fixture) => {
+        fixture.orderFills[0].transactionHash = secondFillTransaction;
+      },
+      error: /Data API proxy wallet\/asset\/transaction/
+    },
+    {
+      name: "asset",
+      mutate: (fixture) => {
+        fixture.orderFills[0].assetId = secondToken;
+      },
+      error: /CLOB trade hash\/asset\/market/
+    },
+    {
+      name: "wallet",
+      mutate: (fixture) => {
+        fixture.activity[0].proxyWallet = `0x${"9".repeat(40)}`;
+      },
+      error: /Data API proxy wallet\/asset\/transaction/
+    },
+    {
+      name: "redemption asset",
+      mutate: (fixture) => {
+        fixture.redemption.asset = secondToken;
+      },
+      error: /Data API redemption asset/
+    },
+    {
+      name: "status",
+      mutate: (fixture) => {
+        fixture.orderFills[0].status = "MATCHED";
+      },
+      error: /CLOB trade hash\/asset\/market/
+    },
+    {
+      name: "decoded redemption transaction",
+      mutate: (fixture) => {
+        fixture.receipt.transaction_hash = secondFillTransaction;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "decoded redemption adapter",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].redeemer = `0x${"9".repeat(40)}`;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "decoded redemption payout",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].payout = 9;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "wrong but self-consistent adapter",
+      mutate: (fixture) => {
+        const wrongAdapter = `0x${"9".repeat(40)}`;
+        fixture.receipt.redemptions[0].redeemer = wrongAdapter;
+        for (const row of fixture.receipt.ctf_transfers) {
+          for (const field of ["operator", "from", "to"]) {
+            if (row[field] === adapter) row[field] = wrongAdapter;
+          }
+        }
+        for (const row of fixture.receipt.erc20_transfers) {
+          for (const field of ["from", "to"]) {
+            if (row[field] === adapter) row[field] = wrongAdapter;
+          }
+        }
+        fixture.receipt.collateral_wraps[0].caller = wrongAdapter;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "decoded redemption transaction hash",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].transaction_hash = secondFillTransaction;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "decoded redemption contract",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].contract_address = `0x${"9".repeat(40)}`;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "decoded redemption collateral",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].collateral_token = pusdToken;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "decoded redemption parent",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].parent_collection_id = automaticCondition;
+      },
+      error: /decoded confirmed redemption/
+    },
+    {
+      name: "wallet to adapter CTF transfer",
+      mutate: (fixture) => {
+        fixture.receipt.ctf_transfers[0].from = adapter;
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "ambiguous duplicate token in wallet to adapter CTF transfer",
+      mutate: (fixture) => {
+        fixture.receipt.ctf_transfers[0].ids.push(automaticToken);
+        fixture.receipt.ctf_transfers[0].values.push("1");
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "adapter CTF burn",
+      mutate: (fixture) => {
+        fixture.receipt.ctf_transfers[1].to = expectedWallet;
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "USDC.e CTF to adapter",
+      mutate: (fixture) => {
+        fixture.receipt.erc20_transfers[0].from = expectedWallet;
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "USDC.e adapter to pUSD",
+      mutate: (fixture) => {
+        fixture.receipt.erc20_transfers[1].to = expectedWallet;
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "pUSD mint to wallet",
+      mutate: (fixture) => {
+        fixture.receipt.erc20_transfers[2].from = adapter;
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "pUSD wrapped to wallet",
+      mutate: (fixture) => {
+        fixture.receipt.collateral_wraps[0].caller = expectedWallet;
+      },
+      error: /adapter\/CTF\/USDC.e\/pUSD/
+    },
+    {
+      name: "decoded redemption overflowing index set",
+      mutate: (fixture) => {
+        fixture.receipt.redemptions[0].index_sets = [(1n << 256n).toString()];
+      },
+      error: /decoded confirmed redemption/
+    }
+  ];
+  for (const { name, mutate, error } of cases) {
+    const fixture = verifyFixture();
+    mutate(fixture);
+    assert.throws(
+      () => verifyAutomaticSettlementEvidence(fixture),
+      error,
+      name
+    );
+  }
 });
