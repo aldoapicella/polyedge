@@ -176,7 +176,7 @@ jobs:
           );
           assert.equal(
             app.properties.configuration.secrets.find((entry) => entry.name === "polymarket-relayer-api-key")
-              ?.keyVaultUrl.includes("/secrets/polymarket-relayer-api-key"),
+              ?.keyVaultUrl.includes("secrets/polymarket-relayer-api-key"),
             true
           );
           assert.equal(app.properties.template.scale.maxReplicas, 1);
