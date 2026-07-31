@@ -609,6 +609,10 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
         market_channel_gaps: resources.marketChannel?.gapCount() || 0,
         user_channel_unparsed: resources.userChannel?.unparsedCount() || 0,
         market_channel_unparsed: resources.marketChannel?.unparsedCount() || 0,
+        user_channel_latest_unparsed_frame_metadata:
+          resources.userChannel?.latestUnparsedFrameMetadata?.() || null,
+        market_channel_latest_unparsed_frame_metadata:
+          resources.marketChannel?.latestUnparsedFrameMetadata?.() || null,
         user_channel_reconnects: resources.userChannel?.reconnectCount() || 0,
         market_channel_reconnects: resources.marketChannel?.reconnectCount() || 0,
         reconnect_reconciliation_required:

@@ -266,10 +266,14 @@ test("channel disconnect is counted as a gap and reconnects before reuse", async
   assert.equal(channel.gapCount(), 1);
   assert.equal(channel.reconnectCount(), 1);
   assert.equal(channel.isOpen(), true);
+  assert.equal(channel.requiresReconciliation(), true);
+  channel.markReconciled();
+  assert.equal(channel.gapCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
   channel.close();
 });
 
-test("an unparsed websocket frame requires REST reconciliation before reuse", async () => {
+test("unparsed frame metadata survives reconciliation without retaining payloads", async () => {
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;
     static instances = [];
@@ -294,6 +298,7 @@ test("an unparsed websocket frame requires REST reconciliation before reuse", as
     }
   }
 
+  let wallMs = 1_722_470_400_000;
   const channel = await connectLifecycleChannel({
     url: "wss://example.invalid",
     subscription: { type: "user" },
@@ -302,18 +307,39 @@ test("an unparsed websocket frame requires REST reconciliation before reuse", as
     settleMs: 0,
     openTimeoutMs: 100,
     heartbeatTimeoutMs: 100,
-    sleep: async () => {}
+    sleep: async () => {},
+    nowMs: () => wallMs
   });
 
-  FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"));
+  assert.equal(channel.latestUnparsedFrameMetadata(), null);
+  wallMs += 100;
+  FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"), false);
 
   assert.equal(channel.gapCount(), 0);
   assert.equal(channel.unparsedCount(), 1);
   assert.equal(channel.requiresReconciliation(), true);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), {
+    received_wall_ms: 1_722_470_400_100,
+    byte_length: 8,
+    sha256: "sha256:0c21a879c732a67910d80988df4919d794f6a070aab610ef865032a28046b021",
+    classification: "text"
+  });
+
+  wallMs += 100;
+  FakeWebSocket.instances[0].emit("message", Buffer.from([0xff, 0x00]), true);
+  const latestMetadata = {
+    received_wall_ms: 1_722_470_400_200,
+    byte_length: 2,
+    sha256: "sha256:ea5dbf9596d187e9500f23e9a680109475341cf4e81f7e043f7d97152c10772f",
+    classification: "binary"
+  };
+  assert.equal(channel.unparsedCount(), 2);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), latestMetadata);
 
   channel.markReconciled();
   assert.equal(channel.unparsedCount(), 0);
   assert.equal(channel.requiresReconciliation(), false);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), latestMetadata);
   channel.close();
 });
 
