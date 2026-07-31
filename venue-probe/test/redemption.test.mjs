@@ -24,6 +24,11 @@ const funder = "0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8";
 const conditionA = `0x${"11".repeat(32)}`;
 const conditionB = `0x${"22".repeat(32)}`;
 
+test("redemption uses the current Polymarket collateral adapters", () => {
+  assert.equal(CTF_COLLATERAL_ADAPTER, "0xAdA100Db00Ca00073811820692005400218FcE1f");
+  assert.equal(NEG_RISK_CTF_COLLATERAL_ADAPTER, "0xadA2005600Dec949baf300f4C6120000bDB6eAab");
+});
+
 const safeEnv = {
   EXECUTION_MODE: "venue_redemption",
   ALLOW_LIVE: "false",
