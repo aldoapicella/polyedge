@@ -6,6 +6,7 @@ import {
 import {
   createPublicClient,
   createWalletClient,
+  decodeEventLog,
   formatUnits,
   http
 } from "viem";
@@ -49,6 +50,18 @@ let ledger;
 let lease;
 let redemptionRunning = false;
 export const RELAYER_DEADLINE_BUFFER_SECONDS = 600;
+const APPROVAL_FOR_ALL_TOPIC =
+  "0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31";
+const APPROVAL_FOR_ALL_EVENT = [{
+  type: "event",
+  name: "ApprovalForAll",
+  anonymous: false,
+  inputs: [
+    { name: "account", type: "address", indexed: true },
+    { name: "operator", type: "address", indexed: true },
+    { name: "approved", type: "bool", indexed: false }
+  ]
+}];
 
 export async function runVenueRedemption({
   env = process.env,
@@ -455,7 +468,13 @@ async function recoverConfirmedRedemption({
     clob,
     publicClient,
     conditionIds,
-    settlementValues
+    settlementValues,
+    expectedApprovals: expectedRecoveredAdapterApprovals(
+      receipt,
+      config.funderAddress,
+      settlementValues.map((settlement) =>
+        settlement.redemption_adapter_address)
+    )
   });
   await settleProbeRiskReservations(config, {
     condition_ids: conditionIds,
@@ -601,7 +620,8 @@ async function waitForRecoveredSettlementState({
   clob,
   publicClient,
   conditionIds,
-  settlementValues
+  settlementValues,
+  expectedApprovals
 }) {
   const selected = new Set(conditionIds.map((value) => String(value).toLowerCase()));
   const tokenIds = [...new Set(settlementValues.flatMap((settlement) =>
@@ -612,6 +632,10 @@ async function waitForRecoveredSettlementState({
   ))];
   if (!tokenIds.length || !adapters.length) {
     throw new Error("fail closed: recovered settlement token or adapter binding is unavailable");
+  }
+  if (adapters.some((adapter) =>
+    typeof expectedApprovals?.[adapter.toLowerCase()] !== "boolean")) {
+    throw new Error("fail closed: recovered settlement approval history is unavailable");
   }
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
@@ -641,7 +665,8 @@ async function waitForRecoveredSettlementState({
     if (!remaining.length &&
         Math.abs(liquidAfter - onchainLiquid) <= 0.000001 &&
         tokenBalances.every((value) => value === 0n) &&
-        approvals.every((value) => value === false) &&
+        approvals.every((value, index) =>
+          value === expectedApprovals[adapters[index].toLowerCase()]) &&
         openOrders.length === 0) {
       return {
         liquid_collateral_after: onchainLiquid,
@@ -664,6 +689,50 @@ async function waitForRecoveredSettlementState({
     await sleep(2_000);
   }
   throw new Error("fail closed: confirmed redemption recovery did not reconcile account state");
+}
+
+export function expectedRecoveredAdapterApprovals(receipt, wallet, adapters) {
+  const expectedWallet = String(wallet || "").toLowerCase();
+  const expectedAdapters = [...new Set((adapters || []).map((adapter) =>
+    String(adapter || "").toLowerCase()
+  ))];
+  if (!Array.isArray(receipt?.logs) ||
+      !/^0x[0-9a-f]{40}$/.test(expectedWallet) ||
+      !expectedAdapters.length ||
+      expectedAdapters.some((adapter) => !/^0x[0-9a-f]{40}$/.test(adapter))) {
+    throw new Error("fail closed: recovered adapter approval binding is invalid");
+  }
+  const changes = new Map(expectedAdapters.map((adapter) => [adapter, []]));
+  for (const log of receipt.logs) {
+    if (String(log?.address || "").toLowerCase() !== CONDITIONAL_TOKENS.toLowerCase() ||
+        String(log?.topics?.[0] || "").toLowerCase() !== APPROVAL_FOR_ALL_TOPIC) {
+      continue;
+    }
+    const args = decodeEventLog({
+      abi: APPROVAL_FOR_ALL_EVENT,
+      data: log.data,
+      topics: log.topics,
+      strict: true
+    }).args || {};
+    if (String(args.account || "").toLowerCase() !== expectedWallet) continue;
+    const operator = String(args.operator || "").toLowerCase();
+    if (!changes.has(operator)) {
+      throw new Error("fail closed: redemption changed an unexpected adapter approval");
+    }
+    changes.get(operator).push(args.approved === true);
+  }
+  return Object.fromEntries(expectedAdapters.map((adapter) => {
+    const values = changes.get(adapter);
+    if (!values.length) {
+      // A successful adapter redemption with no ApprovalForAll event means
+      // the wallet was already approved and the batch left it unchanged.
+      return [adapter, true];
+    }
+    if (values.length === 2 && values[0] === true && values[1] === false) {
+      return [adapter, false];
+    }
+    throw new Error("fail closed: redemption adapter approval sequence is invalid");
+  }));
 }
 
 function baseSummary(status, geoblock, owner, liquidBefore, selection, approvals, calls, recentRedemptions = [], portfolio = null) {

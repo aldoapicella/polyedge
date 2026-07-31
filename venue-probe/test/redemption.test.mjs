@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { verifyTypedData } from "viem";
+import {
+  encodeAbiParameters,
+  encodeEventTopics,
+  verifyTypedData
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   RELAYER_DEADLINE_BUFFER_SECONDS,
   confirmedRedemptionControlMatches,
+  expectedRecoveredAdapterApprovals,
   rejectedRelayerSubmissionMatches,
   safeRelayerErrorDetail
 } from "../src/redeem.mjs";
@@ -153,6 +158,51 @@ test("only an exact confirmed redemption control can enter no-resubmit recovery"
     ...control,
     funder: owner
   }, binding), false);
+});
+
+test("confirmed recovery preserves preapproval or proves temporary grant and revoke", () => {
+  const approvalEvent = [{
+    type: "event",
+    name: "ApprovalForAll",
+    anonymous: false,
+    inputs: [
+      { name: "account", type: "address", indexed: true },
+      { name: "operator", type: "address", indexed: true },
+      { name: "approved", type: "bool", indexed: false }
+    ]
+  }];
+  const log = (operator, approved) => ({
+    address: CONDITIONAL_TOKENS,
+    topics: encodeEventTopics({
+      abi: approvalEvent,
+      eventName: "ApprovalForAll",
+      args: { account: funder, operator }
+    }),
+    data: encodeAbiParameters([{ type: "bool" }], [approved])
+  });
+  assert.deepEqual(
+    expectedRecoveredAdapterApprovals(
+      { logs: [] },
+      funder,
+      [CTF_COLLATERAL_ADAPTER]
+    ),
+    { [CTF_COLLATERAL_ADAPTER.toLowerCase()]: true }
+  );
+  assert.deepEqual(
+    expectedRecoveredAdapterApprovals({
+      logs: [
+        log(CTF_COLLATERAL_ADAPTER, true),
+        log(CTF_COLLATERAL_ADAPTER, false)
+      ]
+    }, funder, [CTF_COLLATERAL_ADAPTER]),
+    { [CTF_COLLATERAL_ADAPTER.toLowerCase()]: false }
+  );
+  assert.throws(() => expectedRecoveredAdapterApprovals({
+    logs: [log(CTF_COLLATERAL_ADAPTER, true)]
+  }, funder, [CTF_COLLATERAL_ADAPTER]), /approval sequence is invalid/);
+  assert.throws(() => expectedRecoveredAdapterApprovals({
+    logs: [log(NEG_RISK_CTF_COLLATERAL_ADAPTER, true)]
+  }, funder, [CTF_COLLATERAL_ADAPTER]), /unexpected adapter approval/);
 });
 
 test("relayer error details retain bounded diagnostics without secrets or signed payloads", () => {
