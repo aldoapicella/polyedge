@@ -10,8 +10,7 @@ use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
 use execution_intent::{
-    build_execution_intent_with_model, resolve_execution_model, IntentPublisher,
-    IntentPublisherConfig,
+    build_execution_intent_with_model, resolve_execution_model, IntentPublisherConfig,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
@@ -71,7 +70,6 @@ struct RuntimeInner {
     recorder_tx: std_mpsc::Sender<RecorderRequest>,
     recorder_metrics: Arc<RecorderMetrics>,
     persistence_filter: StdMutex<PersistenceFilter>,
-    intent_publisher: Option<StdMutex<IntentPublisher>>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
 }
@@ -340,7 +338,6 @@ struct RuntimeData {
     execution_reports: VecDeque<ExecutionReport>,
     recent_events: VecDeque<RuntimeEvent>,
     settled_markets: Vec<MarketId>,
-    funded_warmup_market_id: Option<MarketId>,
     feed_status: BTreeMap<String, Value>,
     feed_events: usize,
     runtime_events: usize,
@@ -362,17 +359,6 @@ struct RuntimeEngine {
     pending_decision_application: Option<PendingDecisionApplication>,
 }
 
-fn select_funded_warmup_market<'a>(
-    markets: impl Iterator<Item = &'a MarketSpec>,
-    now: DateTime<Utc>,
-    minimum_seconds_to_expiry: i64,
-) -> Option<&'a MarketSpec> {
-    let minimum_seconds_to_expiry = minimum_seconds_to_expiry.max(0);
-    markets
-        .filter(|market| (market.end_ts - now).num_seconds() >= minimum_seconds_to_expiry)
-        .min_by_key(|market| market.end_ts)
-}
-
 impl RuntimeController {
     pub fn new(settings: RuntimeSettings) -> Self {
         let recorder = RuntimeRecorder::new(&settings);
@@ -381,10 +367,6 @@ impl RuntimeController {
 
     fn new_with_recorder(settings: RuntimeSettings, recorder: RuntimeRecorder) -> Self {
         let (broadcaster, _) = broadcast::channel(1_000);
-        let intent_publisher = IntentPublisherConfig::from_settings(&settings)
-            .and_then(IntentPublisherConfig::connect)
-            .ok()
-            .map(StdMutex::new);
         let data = RuntimeData {
             decision_generation: 0,
             started_at: Utc::now(),
@@ -406,7 +388,6 @@ impl RuntimeController {
             execution_reports: VecDeque::new(),
             recent_events: VecDeque::new(),
             settled_markets: Vec::new(),
-            funded_warmup_market_id: None,
             feed_status: BTreeMap::new(),
             feed_events: 0,
             runtime_events: 0,
@@ -444,7 +425,6 @@ impl RuntimeController {
                 recorder_tx,
                 recorder_metrics,
                 persistence_filter: StdMutex::new(PersistenceFilter::default()),
-                intent_publisher,
                 broadcaster,
                 started: AtomicBool::new(false),
             }),
@@ -732,21 +712,6 @@ impl RuntimeController {
                         "feeds": status["task_health"]["feeds"]
                     })
                 );
-                if runtime.inner.settings.azure.strategy_intent_operator_direct {
-                    let warmup_market = {
-                        let data = runtime.inner.data.read().await;
-                        data.funded_warmup_market_id
-                            .as_ref()
-                            .and_then(|market_id| data.markets.get(market_id))
-                            .cloned()
-                    };
-                    if let Some(market) = warmup_market {
-                        // The stable duplicate-detected message and immutable
-                        // non-executable marker keep producer Blob/Service Bus
-                        // transports warm without creating another intent.
-                        runtime.maybe_publish_market_warmup(market).await;
-                    }
-                }
             }
         })
     }
@@ -1032,87 +997,10 @@ impl RuntimeController {
             }
             data = self.inner.data.write().await;
         }
-        let warmup_market = select_funded_warmup_market(
-            data.markets.values(),
-            now,
-            self.inner
-                .settings
-                .azure
-                .strategy_intent_min_seconds_to_expiry,
-        )
-        .filter(|market| data.funded_warmup_market_id.as_ref() != Some(&market.market_id))
-        .cloned();
         data.decision_generation = data.decision_generation.wrapping_add(1);
         drop(data);
         drop(_decision_guard);
         self.retry_pending_market_start_events().await;
-        if let Some(market) = warmup_market {
-            if self.maybe_publish_market_warmup(market.clone()).await {
-                self.inner.data.write().await.funded_warmup_market_id = Some(market.market_id);
-            }
-        }
-    }
-
-    async fn maybe_publish_market_warmup(&self, market: MarketSpec) -> bool {
-        if !self.inner.settings.azure.strategy_intent_operator_direct {
-            return false;
-        }
-        let publisher_runtime = self.clone();
-        let publish_market = market.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let publisher = publisher_runtime
-                .inner
-                .intent_publisher
-                .as_ref()
-                .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
-            publisher
-                .lock()
-                .map_err(|_| "persistent intent publisher lock is poisoned".to_owned())?
-                .warm_market(&publish_market)
-        })
-        .await
-        .map_err(|error| format!("market warmup task failed: {error}"))
-        .and_then(|result| result);
-        match result {
-            Ok(true) => {
-                self.record_event(
-                    "funded_market_warmup_sent",
-                    json!({
-                        "market_id": market.market_id,
-                        "condition_id": market.condition_id,
-                        "token_ids": [market.up_token_id, market.down_token_id],
-                        "market_end_ts": market.end_ts,
-                        "executable": false
-                    }),
-                    None,
-                    None,
-                )
-                .await;
-                true
-            }
-            Ok(false) => false,
-            Err(reason) => {
-                warn!(
-                    market_id = %market.market_id,
-                    reason = %reason,
-                    "funded market warmup not sent"
-                );
-                self.record_event(
-                    "funded_market_warmup_not_sent",
-                    json!({
-                        "market_id": market.market_id,
-                        "condition_id": market.condition_id,
-                        "reason": reason,
-                        "fail_closed": true,
-                        "executable": false
-                    }),
-                    None,
-                    None,
-                )
-                .await;
-                false
-            }
-        }
     }
 
     async fn handle_reference(&self, reference: ReferencePrice) {
@@ -1354,15 +1242,13 @@ impl RuntimeController {
                     .token_id
                     .as_ref()
                     .and_then(|token_id| books.get(token_id));
-                if let Some(registration) = engine.execution_quality.register_order(
+                if let Some(snapshot) = engine.execution_quality.register_order(
                     decision,
                     report,
                     book,
                     self.inner.settings.paper.order_live_after_ms,
                 ) {
-                    report
-                        .raw
-                        .insert("execution_quality".to_owned(), registration);
+                    report.raw.insert("execution_quality".to_owned(), snapshot);
                 }
             }
             engine.order_manager.on_execution_report(decision, report);
@@ -1763,10 +1649,10 @@ impl RuntimeController {
                         "execution_report".to_owned(),
                         serde_json::to_value(report).unwrap_or(Value::Null),
                     ));
-                    if let Some(registration) = report.raw.get("execution_quality") {
+                    if let Some(snapshot) = report.raw.get("execution_quality") {
                         applied_events.push((
                             "paper_order_queue_registration".to_owned(),
-                            registration.clone(),
+                            snapshot.clone(),
                         ));
                     }
                 }
@@ -1899,12 +1785,6 @@ impl RuntimeController {
         {
             Ok(model) => model,
             Err(reason) => {
-                warn!(
-                    market_id = %market.market_id,
-                    candidate_version = %metadata.candidate.version,
-                    reason = %reason,
-                    "execution intent not published"
-                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1935,12 +1815,6 @@ impl RuntimeController {
         ) {
             Ok(intent) => intent,
             Err(reason) => {
-                warn!(
-                    market_id = %market.market_id,
-                    candidate_version = %metadata.candidate.version,
-                    reason = %reason,
-                    "execution intent not published"
-                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1958,34 +1832,31 @@ impl RuntimeController {
                 return;
             }
         };
+        let publisher = match IntentPublisherConfig::from_settings(&self.inner.settings) {
+            Ok(publisher) => publisher,
+            Err(reason) => {
+                self.record_event(
+                    "execution_intent_not_published",
+                    json!({
+                        "decision_id": intent.decision_id,
+                        "market_id": intent.market_id,
+                        "reason": reason,
+                        "fail_closed": true
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
         let runtime = self.clone();
         tokio::spawn(async move {
             let publish_intent = intent.clone();
-            let publisher_runtime = runtime.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let publisher = publisher_runtime
-                    .inner
-                    .intent_publisher
-                    .as_ref()
-                    .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
-                publisher
-                    .lock()
-                    .map_err(|_| "persistent intent publisher lock is poisoned".to_owned())?
-                    .publish(&publish_intent)
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || publisher.publish(&publish_intent)).await;
             match result {
                 Ok(Ok(published)) => {
-                    info!(
-                        decision_id = %intent.decision_id,
-                        market_id = %intent.market_id,
-                        market_end_ts = ?intent.market_end_ts,
-                        notional = %intent.notional,
-                        blob_name = %published.blob_name,
-                        blob_commit_elapsed_ms = published.blob_commit_elapsed_ms,
-                        queue_send_elapsed_ms = ?published.queue_send_elapsed_ms,
-                        "execution intent published"
-                    );
                     runtime
                         .record_event(
                             "execution_intent_published",
@@ -1997,12 +1868,6 @@ impl RuntimeController {
                                 "candidate_version": intent.candidate_version,
                                 "blob_name": published.blob_name,
                                 "artifact_sha256": published.artifact_sha256,
-                                "queue_handoff_sent": published.queue_handoff_sent,
-                                "intent_created_wall_ts": intent.decision_ts,
-                                "blob_commit_wall_ts": published.blob_commit_wall_ts,
-                                "blob_commit_elapsed_ms": published.blob_commit_elapsed_ms,
-                                "queue_send_wall_ts": published.queue_send_wall_ts,
-                                "queue_send_elapsed_ms": published.queue_send_elapsed_ms,
                                 "valid_until": intent.valid_until,
                                 "order_submission_attempted": false,
                                 "credential_free": true
@@ -2013,12 +1878,6 @@ impl RuntimeController {
                         .await;
                 }
                 Ok(Err(reason)) => {
-                    warn!(
-                        decision_id = %intent.decision_id,
-                        market_id = %intent.market_id,
-                        reason = %reason,
-                        "execution intent not published"
-                    );
                     runtime
                         .record_event(
                             "execution_intent_not_published",
@@ -2035,12 +1894,6 @@ impl RuntimeController {
                         .await;
                 }
                 Err(error) => {
-                    warn!(
-                        decision_id = %intent.decision_id,
-                        market_id = %intent.market_id,
-                        error = %error,
-                        "execution intent not published"
-                    );
                     runtime
                         .record_event(
                             "execution_intent_not_published",
@@ -2106,8 +1959,8 @@ impl RuntimeController {
         }
         self.record_event("execution_report", &report, None, None)
             .await;
-        if let Some(registration) = report.raw.get("execution_quality") {
-            self.record_event("paper_order_queue_registration", registration, None, None)
+        if let Some(snapshot) = report.raw.get("execution_quality") {
+            self.record_event("paper_order_queue_registration", snapshot, None, None)
                 .await;
         }
         for event in quality_events {
@@ -3938,58 +3791,6 @@ mod tests {
             vec!["a-down-token".to_owned(), "z-up-token".to_owned()]
         );
         assert!(!scoped.contains_key(&TokenId::new("unrelated-token")));
-    }
-
-    #[test]
-    fn funded_warmup_tracks_the_nearest_market_outside_the_final_six_minutes() {
-        let now = Utc::now();
-        let market = |id: &str, seconds_to_expiry: i64| MarketSpec {
-            asset: "BTC".to_owned(),
-            horizon: "15m".to_owned(),
-            event_id: None,
-            event_slug: None,
-            market_id: MarketId::new(id),
-            market_slug: None,
-            condition_id: ConditionId::new(format!("{id}-condition")),
-            question: "BTC up?".to_owned(),
-            description: None,
-            up_token_id: TokenId::new(format!("{id}-up")),
-            down_token_id: TokenId::new(format!("{id}-down")),
-            start_ts: now,
-            end_ts: now + chrono::Duration::seconds(seconds_to_expiry),
-            start_price: Some(Decimal::from(100)),
-            resolution_source: "chainlink_reference".to_owned(),
-            tick_size: Decimal::new(1, 2),
-            minimum_order_size: Decimal::from(5),
-            neg_risk: false,
-            fees_enabled: true,
-            accepting_orders: true,
-            status: MarketStatus::Tradeable,
-            raw: BTreeMap::new(),
-        };
-        let markets = [
-            market("final-six", 300),
-            market("active-window", 840),
-            market("future", 1_740),
-        ]
-        .into_iter()
-        .map(|market| (market.market_id.clone(), market))
-        .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(
-            select_funded_warmup_market(markets.values(), now, 360)
-                .map(|market| market.market_id.to_string()),
-            Some("active-window".to_owned())
-        );
-        assert_eq!(
-            select_funded_warmup_market(
-                markets.values(),
-                now + chrono::Duration::seconds(500),
-                360,
-            )
-            .map(|market| market.market_id.to_string()),
-            Some("future".to_owned())
-        );
     }
 
     #[tokio::test]

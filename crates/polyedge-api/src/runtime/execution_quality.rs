@@ -5,26 +5,11 @@ use polyedge_domain::{
 };
 use polyedge_feeds::MarketChannelEvent;
 use rust_decimal::Decimal;
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
 const MARKOUT_HORIZONS_SECONDS: [i64; 3] = [1, 5, 30];
-const REGISTRATION_QUEUE_POSITION_SCHEMA: &str = "polyedge.paper_registration_queue_position.v1";
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RegistrationQueuePositionStatus {
-    Available,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RegistrationQueuePositionUnavailableReason {
-    PublicL2BookUnavailableAtRegistration,
-}
 
 #[derive(Clone, Debug)]
 pub(super) struct QualityEvent {
@@ -90,23 +75,9 @@ impl ExecutionQualityTracker {
         let side = decision.side.clone()?;
         let quote_price = decision.price?;
         let original_size = decision.size?;
-        let submitted_ts = report.local_ts;
-        let earlier_shadow_order_size_ahead = self
-            .orders
-            .values()
-            .filter(|earlier| {
-                earlier.order_id != order_id
-                    && earlier.token_id == token_id
-                    && earlier.side == side
-                    && earlier.quote_price == quote_price
-                    && earlier.submitted_ts < submitted_ts
-            })
-            .map(|earlier| earlier.shadow_remaining_size)
-            .sum::<Decimal>();
         let (
-            registration_same_level_size,
-            registration_better_level_size,
-            registration_inferred_size_ahead,
+            submit_same_level_size,
+            submit_better_level_size,
             best_bid,
             best_ask,
             book_hash,
@@ -115,26 +86,16 @@ impl ExecutionQualityTracker {
             .map(|book| {
                 let (same, better) = visible_depth(book, &side, quote_price);
                 (
-                    Some(same),
-                    Some(better),
-                    Some(same + better + earlier_shadow_order_size_ahead),
+                    same,
+                    better,
                     book.best_bid().map(|level| level.price),
                     book.best_ask().map(|level| level.price),
                     book.book_hash.clone(),
                     Some(book.local_ts),
                 )
             })
-            .unwrap_or((None, None, None, None, None, None, None));
-        let registration_queue_position_status = if book.is_some() {
-            RegistrationQueuePositionStatus::Available
-        } else {
-            RegistrationQueuePositionStatus::Unavailable
-        };
-        let registration_queue_position_unavailable_reason = book.is_none().then_some(
-            RegistrationQueuePositionUnavailableReason::PublicL2BookUnavailableAtRegistration,
-        );
-        let submit_same_level_size = registration_same_level_size.unwrap_or(Decimal::ZERO);
-        let submit_better_level_size = registration_better_level_size.unwrap_or(Decimal::ZERO);
+            .unwrap_or((Decimal::ZERO, Decimal::ZERO, None, None, None, None));
+        let submitted_ts = report.local_ts;
         let live_ts = submitted_ts + Duration::milliseconds(order_live_after_ms.max(0));
         self.orders.insert(
             order_id.clone(),
@@ -169,18 +130,6 @@ impl ExecutionQualityTracker {
             "queue_position_source": "public_l2_shadow",
             "queue_position_method": "first_l2_snapshot_at_or_after_order_live_ts",
             "queue_snapshot_finalized": false,
-            "registration_queue_position_schema": REGISTRATION_QUEUE_POSITION_SCHEMA,
-            "registration_queue_position_status": registration_queue_position_status,
-            "registration_queue_position_source": "public_l2_shadow",
-            "registration_queue_position_metric": "inferred_size_ahead",
-            "registration_queue_position_method": "public_l2_at_registration_plus_earlier_shadow_orders",
-            "registration_inferred_size_ahead": registration_inferred_size_ahead.map(|value| value.to_string()),
-            "registration_inferred_size_ahead_unavailable_reason": registration_queue_position_unavailable_reason,
-            "registration_same_price_public_size_ahead": registration_same_level_size.map(|value| value.to_string()),
-            "registration_better_price_public_size_ahead": registration_better_level_size.map(|value| value.to_string()),
-            "registration_earlier_shadow_order_size_ahead": earlier_shadow_order_size_ahead.to_string(),
-            "registration_queue_position_capture_ts": submitted_ts,
-            "literal_fifo_rank_available": false,
             "submit_visible_same_price_size": submit_same_level_size.to_string(),
             "submit_visible_better_price_size": submit_better_level_size.to_string(),
             "best_bid": best_bid.map(|value| value.to_string()),
@@ -993,33 +942,6 @@ mod tests {
             .register_order(&decision, &report, Some(&initial_book), 250)
             .unwrap();
         assert_eq!(registration["queue_snapshot_finalized"], false);
-        assert_eq!(
-            registration["registration_queue_position_schema"],
-            REGISTRATION_QUEUE_POSITION_SCHEMA
-        );
-        assert_eq!(
-            registration["registration_queue_position_status"],
-            "available"
-        );
-        assert_eq!(
-            registration["registration_queue_position_metric"],
-            "inferred_size_ahead"
-        );
-        assert_eq!(registration["registration_inferred_size_ahead"], "14");
-        assert_eq!(
-            registration["registration_same_price_public_size_ahead"],
-            "4"
-        );
-        assert_eq!(
-            registration["registration_better_price_public_size_ahead"],
-            "10"
-        );
-        assert_eq!(
-            registration["registration_earlier_shadow_order_size_ahead"],
-            "0"
-        );
-        assert!(registration["registration_inferred_size_ahead_unavailable_reason"].is_null());
-        assert_eq!(registration["literal_fifo_rank_available"], false);
         let snapshot = tracker.observe_book(&book("0.51", "10", "0.52", "4", ts(1)));
         assert_eq!(snapshot[0].payload["visible_size_ahead_estimate"], "14");
 
@@ -1047,100 +969,6 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert!(fill_ids.contains("paper-quality-paper-1-1"));
         assert!(fill_ids.contains("paper-quality-paper-1-2"));
-    }
-
-    #[test]
-    fn registration_without_public_book_records_typed_unavailable_reason() {
-        let mut tracker = ExecutionQualityTracker::default();
-        let registration = tracker
-            .register_order(
-                &decision(),
-                &report("paper_resting", Decimal::ZERO, None, ts(0)),
-                None,
-                250,
-            )
-            .unwrap();
-
-        assert_eq!(
-            registration["registration_queue_position_status"],
-            "unavailable"
-        );
-        assert!(registration["registration_inferred_size_ahead"].is_null());
-        assert_eq!(
-            registration["registration_inferred_size_ahead_unavailable_reason"],
-            "public_l2_book_unavailable_at_registration"
-        );
-        assert!(registration["registration_same_price_public_size_ahead"].is_null());
-        assert!(registration["registration_better_price_public_size_ahead"].is_null());
-        assert_eq!(
-            registration["registration_earlier_shadow_order_size_ahead"],
-            "0"
-        );
-        assert_eq!(registration["literal_fifo_rank_available"], false);
-    }
-
-    #[test]
-    fn registration_capture_does_not_activate_queue_before_post_live_snapshot() {
-        let mut tracker = ExecutionQualityTracker::default();
-        let decision = decision();
-        let order_id = OrderId::new("paper-1");
-        tracker
-            .register_order(
-                &decision,
-                &report("paper_resting", Decimal::ZERO, None, ts(0)),
-                Some(&book("0.51", "10", "0.52", "4", ts(0))),
-                250,
-            )
-            .unwrap();
-
-        let tracked = &tracker.orders[&order_id];
-        assert!(!tracked.snapshot_finalized);
-        assert_eq!(tracked.size_ahead, Decimal::ZERO);
-        assert_eq!(tracked.initial_size_ahead, Decimal::ZERO);
-        assert!(tracker
-            .observe_market_event(&trade("0.49", "20", ts(1)))
-            .is_empty());
-
-        let snapshots = tracker.observe_book(&book("0.51", "10", "0.52", "4", ts(2)));
-        assert_eq!(snapshots.len(), 1);
-        let tracked = &tracker.orders[&order_id];
-        assert!(tracked.snapshot_finalized);
-        assert_eq!(tracked.size_ahead, dec("14"));
-        assert_eq!(tracked.initial_size_ahead, dec("14"));
-    }
-
-    #[test]
-    fn registration_capture_includes_earlier_same_price_shadow_size() {
-        let mut tracker = ExecutionQualityTracker::default();
-        let decision = decision();
-        tracker
-            .register_order(
-                &decision,
-                &report("paper_resting", Decimal::ZERO, None, ts(0)),
-                Some(&book("0.51", "10", "0.52", "4", ts(0))),
-                250,
-            )
-            .unwrap();
-        let mut later_report = report("paper_resting", Decimal::ZERO, None, ts(1));
-        later_report.order_id = Some(OrderId::new("paper-2"));
-
-        let registration = tracker
-            .register_order(
-                &decision,
-                &later_report,
-                Some(&book("0.51", "10", "0.52", "4", ts(1))),
-                250,
-            )
-            .unwrap();
-
-        assert_eq!(
-            registration["registration_earlier_shadow_order_size_ahead"],
-            "5"
-        );
-        assert_eq!(registration["registration_inferred_size_ahead"], "19");
-        let tracked = &tracker.orders[&OrderId::new("paper-2")];
-        assert!(!tracked.snapshot_finalized);
-        assert_eq!(tracked.size_ahead, Decimal::ZERO);
     }
 
     #[test]

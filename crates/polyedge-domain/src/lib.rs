@@ -423,8 +423,6 @@ pub struct ExecutionIntentV1 {
     pub order_kind: OrderKind,
     pub ttl_ms: i64,
     pub decision_ts: DateTime<Utc>,
-    #[serde(default)]
-    pub market_end_ts: Option<DateTime<Utc>>,
     pub valid_until: DateTime<Utc>,
     #[serde(default)]
     pub gtd_expiry_ts: Option<DateTime<Utc>>,
@@ -519,6 +517,7 @@ impl ExecutionIntentV1 {
             || self.price >= Decimal::ONE
             || self.shares <= Decimal::ZERO
             || self.notional != self.price * self.shares
+            || self.notional > Decimal::ONE
             || self.minimum_order_size <= Decimal::ZERO
             || self.shares < self.minimum_order_size
         {
@@ -533,20 +532,11 @@ impl ExecutionIntentV1 {
         if self.valid_until != self.decision_ts + chrono::Duration::milliseconds(self.ttl_ms) {
             return Err("valid_until must equal decision_ts plus ttl_ms".to_owned());
         }
-        if self.market_end_ts.is_some_and(|market_end_ts| {
-            market_end_ts <= self.decision_ts
-                || self.valid_until >= market_end_ts
-                || self
-                    .gtd_expiry_ts
-                    .is_some_and(|expiry| expiry >= market_end_ts)
-        }) {
-            return Err("execution intent validity must end before market expiry".to_owned());
-        }
         if self.order_kind == OrderKind::PostOnlyGtd
-            && self.gtd_expiry_ts != Some(self.valid_until + chrono::Duration::seconds(300))
+            && self.gtd_expiry_ts != Some(self.valid_until + chrono::Duration::seconds(60))
         {
             return Err(
-                "post-only GTD venue expiry must equal active valid_until plus 300 seconds"
+                "post-only GTD venue expiry must equal active valid_until plus 60 seconds"
                     .to_owned(),
             );
         }
@@ -804,9 +794,8 @@ mod tests {
             order_kind: OrderKind::PostOnlyGtd,
             ttl_ms: 5_000,
             decision_ts,
-            market_end_ts: Some(decision_ts + Duration::minutes(10)),
             valid_until: decision_ts + Duration::seconds(5),
-            gtd_expiry_ts: Some(decision_ts + Duration::seconds(305)),
+            gtd_expiry_ts: Some(decision_ts + Duration::seconds(65)),
             book_hash: "sha256:book".to_owned(),
             q: Decimal::new(46, 2),
             gross_edge: Decimal::new(6, 2),
@@ -837,7 +826,7 @@ mod tests {
         invalid.exact_resolution_source = true;
         invalid.notional = Decimal::new(101, 2);
         invalid.shares = invalid.notional / invalid.price;
-        assert!(invalid.validate().is_ok());
+        assert!(invalid.validate().is_err());
         invalid.notional = Decimal::new(80, 2);
         invalid.shares = Decimal::from(2);
         invalid.net_edge_lower_bound = Decimal::ZERO;

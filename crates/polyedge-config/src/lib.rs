@@ -285,14 +285,6 @@ pub struct AzureConfig {
     pub shadow_book_sample_ms: usize,
     pub publish_strategy_canary_intents: bool,
     pub strategy_canary_intent_prefix: String,
-    pub funded_direct_service_bus_enabled: bool,
-    pub funded_direct_service_bus_namespace: String,
-    pub funded_direct_service_bus_queue: String,
-    pub strategy_intent_operator_direct: bool,
-    pub strategy_intent_target_order_notional: Decimal,
-    pub strategy_intent_max_order_notional: Decimal,
-    pub strategy_intent_min_seconds_to_expiry: i64,
-    pub strategy_intent_max_seconds_to_expiry: i64,
     pub strategy_canary_fill_model_version: String,
     pub strategy_canary_execution_model_blob_uri: String,
     pub strategy_canary_execution_model_sha256: String,
@@ -314,14 +306,6 @@ impl Default for AzureConfig {
             publish_strategy_canary_intents: false,
             strategy_canary_intent_prefix:
                 "reports/research/venue-probe/control/strategy-canary/intents".to_owned(),
-            funded_direct_service_bus_enabled: false,
-            funded_direct_service_bus_namespace: String::new(),
-            funded_direct_service_bus_queue: String::new(),
-            strategy_intent_operator_direct: false,
-            strategy_intent_target_order_notional: Decimal::ZERO,
-            strategy_intent_max_order_notional: Decimal::ONE,
-            strategy_intent_min_seconds_to_expiry: 0,
-            strategy_intent_max_seconds_to_expiry: 86_400,
             strategy_canary_fill_model_version: "conservative-execution-prior-v1".to_owned(),
             strategy_canary_execution_model_blob_uri: String::new(),
             strategy_canary_execution_model_sha256: String::new(),
@@ -522,38 +506,6 @@ impl RuntimeSettings {
             "STRATEGY_CANARY_INTENT_PREFIX",
             settings.azure.strategy_canary_intent_prefix,
         );
-        settings.azure.funded_direct_service_bus_enabled = env_bool(
-            "FUNDED_DIRECT_SERVICE_BUS_ENABLED",
-            settings.azure.funded_direct_service_bus_enabled,
-        );
-        settings.azure.funded_direct_service_bus_namespace = env_string(
-            "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE",
-            settings.azure.funded_direct_service_bus_namespace,
-        );
-        settings.azure.funded_direct_service_bus_queue = env_string(
-            "FUNDED_DIRECT_SERVICE_BUS_QUEUE",
-            settings.azure.funded_direct_service_bus_queue,
-        );
-        settings.azure.strategy_intent_operator_direct = env_bool(
-            "STRATEGY_INTENT_OPERATOR_DIRECT",
-            settings.azure.strategy_intent_operator_direct,
-        );
-        settings.azure.strategy_intent_target_order_notional = env_decimal(
-            "STRATEGY_INTENT_TARGET_ORDER_NOTIONAL",
-            settings.azure.strategy_intent_target_order_notional,
-        )?;
-        settings.azure.strategy_intent_max_order_notional = env_decimal(
-            "STRATEGY_INTENT_MAX_ORDER_NOTIONAL",
-            settings.azure.strategy_intent_max_order_notional,
-        )?;
-        settings.azure.strategy_intent_min_seconds_to_expiry = env_i64(
-            "STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY",
-            settings.azure.strategy_intent_min_seconds_to_expiry,
-        );
-        settings.azure.strategy_intent_max_seconds_to_expiry = env_i64(
-            "STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY",
-            settings.azure.strategy_intent_max_seconds_to_expiry,
-        );
         settings.azure.strategy_canary_fill_model_version = env_string(
             "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION",
             settings.azure.strategy_canary_fill_model_version,
@@ -687,25 +639,8 @@ impl RuntimeSettings {
         if !self.azure.publish_strategy_canary_intents {
             reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
         }
-        if self.azure.strategy_intent_operator_direct
-            && (!self.azure.funded_direct_service_bus_enabled
-                || self
-                    .azure
-                    .funded_direct_service_bus_namespace
-                    .trim()
-                    .is_empty()
-                || self.azure.funded_direct_service_bus_queue.trim().is_empty())
-        {
-            reasons.push(
-                "operator-direct intent publication requires the managed-identity Service Bus handoff",
-            );
-        }
-        if !matches!(
-            self.azure.storage_container_name.as_str(),
-            "polyedge-shadow-events" | "polyedge-shadow-qset-events"
-        ) {
-            reasons
-                .push("AZURE_STORAGE_CONTAINER_NAME must be an approved shadow evidence container");
+        if self.azure.storage_container_name != "polyedge-shadow-events" {
+            reasons.push("AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events");
         }
         if !self.azure.event_blob_prefix.starts_with("shadow-events/") {
             reasons.push("AZURE_EVENT_BLOB_PREFIX must start with shadow-events/");
@@ -815,14 +750,6 @@ impl RuntimeSettings {
                 "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
                 "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
                 "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
-                "funded_direct_service_bus_enabled": self.azure.funded_direct_service_bus_enabled,
-                "funded_direct_service_bus_namespace": self.azure.funded_direct_service_bus_namespace,
-                "funded_direct_service_bus_queue": self.azure.funded_direct_service_bus_queue,
-                "strategy_intent_operator_direct": self.azure.strategy_intent_operator_direct,
-                "strategy_intent_target_order_notional": self.azure.strategy_intent_target_order_notional.to_string(),
-                "strategy_intent_max_order_notional": self.azure.strategy_intent_max_order_notional.to_string(),
-                "strategy_intent_min_seconds_to_expiry": self.azure.strategy_intent_min_seconds_to_expiry,
-                "strategy_intent_max_seconds_to_expiry": self.azure.strategy_intent_max_seconds_to_expiry,
                 "strategy_canary_fill_model_version": self.azure.strategy_canary_fill_model_version
                 ,"strategy_canary_execution_model_blob_uri_configured": !self.azure.strategy_canary_execution_model_blob_uri.is_empty()
                 ,"strategy_canary_execution_model_sha256_configured": !self.azure.strategy_canary_execution_model_sha256.is_empty()
@@ -953,13 +880,6 @@ mod tests {
     }
 
     #[test]
-    fn profitability_shadow_accepts_isolated_qset_evidence_container() {
-        let mut settings = safe_shadow_settings();
-        settings.azure.storage_container_name = "polyedge-shadow-qset-events".to_owned();
-        assert!(settings.validate_runtime_role().is_ok());
-    }
-
-    #[test]
     fn event_blob_prefix_cutover_is_paired_and_uses_event_time_boundary() {
         let mut settings = safe_shadow_settings();
         settings.azure.event_blob_prefix = "shadow-events/old".to_owned();
@@ -1021,7 +941,7 @@ mod tests {
             "ADAPTIVE_REGIME_ENABLED must be true",
             "ADAPTIVE_REGIME_MODE must be dynamic_quote_style",
             "PUBLISH_STRATEGY_CANARY_INTENTS must be true",
-            "AZURE_STORAGE_CONTAINER_NAME must be an approved shadow evidence container",
+            "AZURE_STORAGE_CONTAINER_NAME must be polyedge-shadow-events",
             "AZURE_EVENT_BLOB_PREFIX must start with shadow-events/",
         ] {
             assert!(message.contains(expected), "missing {expected}: {message}");
