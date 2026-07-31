@@ -13,9 +13,11 @@ import {
   isRiskReservationResolved,
   loadCampaignRiskControl,
   loadCampaignRiskReservationRecords,
+  loadCampaignUnresolvedRiskReservationRecords,
   marketContext,
   modelObservations,
   publishTerminalRiskPortfolioEvidence,
+  rebuildCampaignRiskReservationIndex,
   reserveProbeRisk,
   settleProbeRiskReservations,
   sanitize,
@@ -200,6 +202,17 @@ async function initializeResources({ persistent = false } = {}) {
       })
     : null;
   const resourceLease = !config.dryRun ? await acquireCampaignLease(config, persistent ? `funded-direct-service-${crypto.randomUUID()}` : runId) : null;
+  let riskReservationIndex = null;
+  try {
+    if (config.operatorDirect && !config.dryRun) {
+      resourceLease?.assertHealthy();
+      riskReservationIndex = await rebuildCampaignRiskReservationIndex(config, { container });
+      resourceLease?.assertHealthy();
+    }
+  } catch (error) {
+    await resourceLease?.release().catch(() => null);
+    throw error;
+  }
   const ledgerMultiplexer = {
     current: persistent ? null : ledger,
     record(event, payload) {
@@ -227,6 +240,7 @@ async function initializeResources({ persistent = false } = {}) {
     executionModelDocument,
     profitQuarantineSnapshot,
     protectedCompoundingContext,
+    riskReservationIndex,
     client,
     lease: resourceLease,
     ledgerMultiplexer,
@@ -302,7 +316,7 @@ async function reconcileProtectedCompoundingWithAutomaticSettlement({
   accountEquity,
   fullyReconciled,
   context,
-  reservationRecords,
+  loadReservationRecords,
   allowAutomaticDiscovery
 }) {
   const reconcile = () => reconcileProtectedCompoundingState({
@@ -334,6 +348,10 @@ async function reconcileProtectedCompoundingWithAutomaticSettlement({
       }
       context.automaticSettlementLastAttemptMs = Date.now();
       const work = (async () => {
+        if (typeof loadReservationRecords !== "function") {
+          throw new Error("fail closed: funded reservation history loader is unavailable");
+        }
+        const reservationRecords = await loadReservationRecords();
         const durableSettlements = await loadDurableInternalSettlements(
           container,
           manifest.session_id
@@ -666,8 +684,17 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
         safety_snapshot_cache_age_ms: Number.isFinite(safetySnapshotCompletedWallMs)
           ? Math.max(0, Date.now() - safetySnapshotCompletedWallMs)
           : null,
+        safety_snapshot_component_durations_ms:
+          resources.safetyCache?.latest?.runtime?.preflightComponentDurationsMs || null,
         safety_snapshot_cache_in_flight: resources.safetyCache?.inFlight || 0,
         safety_snapshot_cache_error: resources.safetyCache?.lastError || null,
+        risk_reservation_index_ready: resources.riskReservationIndex !== null,
+        risk_reservation_index_startup_generation:
+          resources.riskReservationIndex?.generation || null,
+        risk_reservation_index_startup_unresolved_count:
+          resources.riskReservationIndex?.unresolved_count ?? null,
+        risk_reservation_index_rebuilt_ts:
+          resources.riskReservationIndex?.rebuilt_ts || null,
         user_channel_history_entries: userChannelHistory?.message_count || 0,
         user_channel_history_bytes: userChannelHistory?.approximate_bytes || 0,
         user_channel_history_evictions: userChannelHistory?.evicted_count || 0,
@@ -726,7 +753,8 @@ async function main(resources) {
     monotonic_ms: performance.now(),
     decision_id: intentDocument.value.decision_id,
     snapshot_completed_wall_ms: runtime.capturedCompletedWallMs,
-    snapshot_age_ms: Date.now() - Number(runtime.capturedCompletedWallMs)
+    snapshot_age_ms: Date.now() - Number(runtime.capturedCompletedWallMs),
+    component_durations_ms: runtime.preflightComponentDurationsMs || null
   });
   const documents = {
     intent: intentDocument.value,
@@ -915,6 +943,15 @@ async function capturePreflight(
 ) {
   const capturedStartedWallMs = Date.now();
   const capturedStartedMonotonicMs = performance.now();
+  const preflightComponentDurationsMs = {};
+  const timed = async (name, operation) => {
+    const started = performance.now();
+    try {
+      return await operation();
+    } finally {
+      preflightComponentDurationsMs[name] = Math.max(0, performance.now() - started);
+    }
+  };
   const clock = async () => {
     const requestStarted = Date.now();
     const serverTimeResponse = await client.getServerTime();
@@ -946,17 +983,28 @@ async function capturePreflight(
     valueResponse,
     campaignReservationRecords
   ] = await Promise.all([
-    fetchJson("https://polymarket.com/api/geoblock"),
-    clock(),
-    loadExactMarket(intent),
-    client.getOrderBook(String(intent.token_id)),
-    client.getClobMarketInfo(String(intent.condition_id)),
-    getOpenOrdersStrict(client),
-    loadCampaignRiskControl(config),
-    client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
-    fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
-    fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) }),
-    loadCampaignRiskReservationRecords(config)
+    timed("geoblock", () => fetchJson("https://polymarket.com/api/geoblock")),
+    timed("venue_clock", clock),
+    timed("exact_market", () => loadExactMarket(intent)),
+    timed("order_book", () => client.getOrderBook(String(intent.token_id))),
+    timed("clob_market_info", () => client.getClobMarketInfo(String(intent.condition_id))),
+    timed("open_orders", () => getOpenOrdersStrict(client)),
+    timed("campaign_risk_control", () => loadCampaignRiskControl(config)),
+    timed("collateral_balance", () => client.getBalanceAllowance({
+      asset_type: AssetType.COLLATERAL,
+      signature_type: config.signatureType
+    })),
+    timed("account_positions", () => fetch(
+      `https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`,
+      { signal: AbortSignal.timeout(10_000) }
+    )),
+    timed("account_value", () => fetch(
+      `https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`,
+      { signal: AbortSignal.timeout(10_000) }
+    )),
+    timed("unresolved_risk_reservations", () =>
+      loadCampaignUnresolvedRiskReservationRecords(config)
+    )
   ]);
   assertEligibleOrigin(geoblock, config);
   const {
@@ -1046,7 +1094,7 @@ async function capturePreflight(
           accountEquity,
           fullyReconciled,
           context: protectedCompoundingContext,
-          reservationRecords: campaignReservationRecords,
+          loadReservationRecords: () => loadCampaignRiskReservationRecords(config),
           allowAutomaticDiscovery: recordLedger === false
         });
     }
@@ -1074,6 +1122,7 @@ async function capturePreflight(
     capturedStartedWallMs,
     capturedCompletedWallMs,
     captureDurationMs,
+    preflightComponentDurationsMs,
     riskBasis: {
       control: riskControl,
       liquidCollateral,
@@ -1092,6 +1141,7 @@ async function capturePreflight(
       wall_ms: capturedCompletedWallMs,
       monotonic_ms: performance.now(),
       duration_ms: captureDurationMs,
+      component_durations_ms: preflightComponentDurationsMs,
       decision_id: intent.decision_id,
       open_order_count: openOrders.length,
       risk_passed: boundRuntime.risk.passed === true,

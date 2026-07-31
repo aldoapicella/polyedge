@@ -1059,11 +1059,236 @@ export async function loadCampaignRiskControl(config) {
   };
 }
 
-export async function reserveProbeRisk(config, reservation) {
-  const container = storageContainer(config);
+const RISK_RESERVATION_PREFIX = "reports/research/venue-probe/risk-reservations/";
+const UNRESOLVED_RISK_INDEX_SCHEMA = "polyedge.funded_unresolved_risk_reservation_index.v1";
+
+function unresolvedRiskIndexBlobName(config) {
+  return `reports/research/venue-probe/control/campaign-risk/${config.campaignId}/unresolved-reservations-index.json`;
+}
+
+function riskReservationBytes(reservation) {
+  return Buffer.from(JSON.stringify(reservation, null, 2));
+}
+
+function riskReservationIndexEntry(blobName, reservation, bytes = riskReservationBytes(reservation)) {
+  return {
+    blob_name: blobName,
+    probe_id: String(reservation?.probe_id || ""),
+    reservation_sha256: digest(bytes)
+  };
+}
+
+function sortedRiskReservationIndexEntries(entries) {
+  return [...entries].sort((left, right) =>
+    String(left.blob_name).localeCompare(String(right.blob_name))
+  );
+}
+
+function buildUnresolvedRiskIndex(config, entries, {
+  generation,
+  rebuiltTs,
+  rebuildScannedRecordCount
+}) {
+  const normalized = sortedRiskReservationIndexEntries(entries);
+  return {
+    schema: UNRESOLVED_RISK_INDEX_SCHEMA,
+    schema_version: 1,
+    campaign_id: config.campaignId,
+    generation,
+    unresolved_count: normalized.length,
+    entries_sha256: digest(Buffer.from(JSON.stringify(normalized))),
+    entries: normalized,
+    rebuilt_ts: rebuiltTs,
+    rebuild_scanned_record_count: rebuildScannedRecordCount,
+    updated_ts: new Date().toISOString()
+  };
+}
+
+export function validateUnresolvedRiskReservationIndex(index, config) {
+  if (index?.schema !== UNRESOLVED_RISK_INDEX_SCHEMA ||
+      index?.schema_version !== 1 ||
+      index?.campaign_id !== config.campaignId ||
+      !Number.isInteger(index?.generation) || index.generation < 1 ||
+      !Number.isInteger(index?.unresolved_count) || index.unresolved_count < 0 ||
+      !Array.isArray(index?.entries)) {
+    throw new Error("fail closed: funded unresolved risk reservation index binding is invalid");
+  }
+  const normalized = sortedRiskReservationIndexEntries(index.entries);
+  const names = new Set();
+  for (const entry of normalized) {
+    if (!String(entry?.blob_name || "").startsWith(RISK_RESERVATION_PREFIX) ||
+        !String(entry.blob_name).endsWith(".json") ||
+        !String(entry?.probe_id || "") ||
+        !/^sha256:[0-9a-f]{64}$/.test(String(entry?.reservation_sha256 || "")) ||
+        names.has(entry.blob_name)) {
+      throw new Error("fail closed: funded unresolved risk reservation index entry is invalid or duplicated");
+    }
+    names.add(entry.blob_name);
+  }
+  if (index.unresolved_count !== normalized.length ||
+      JSON.stringify(index.entries) !== JSON.stringify(normalized) ||
+      index.entries_sha256 !== digest(Buffer.from(JSON.stringify(normalized)))) {
+    throw new Error("fail closed: funded unresolved risk reservation index hash or count disagrees");
+  }
+  return index;
+}
+
+async function downloadBlobDocument(blob, { allowInvalidJson = false } = {}) {
+  const response = await blob.download();
+  const bytes = await streamToBuffer(response.readableStreamBody);
+  let value = null;
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    if (allowInvalidJson) return { value, bytes, etag: response.etag || null };
+    throw new Error("fail closed: durable funded risk control blob is not valid JSON");
+  }
+  return { value, bytes, etag: response.etag || null };
+}
+
+async function downloadUnresolvedRiskIndex(container, config, { allowMissing = false, validate = true } = {}) {
+  const blob = container.getBlockBlobClient(unresolvedRiskIndexBlobName(config));
+  let document;
+  try {
+    document = await downloadBlobDocument(blob, { allowInvalidJson: !validate });
+  } catch (error) {
+    if (allowMissing && Number(error?.statusCode) === 404) return null;
+    throw error;
+  }
+  if (validate) validateUnresolvedRiskReservationIndex(document.value, config);
+  return { ...document, blob };
+}
+
+async function uploadUnresolvedRiskIndex(container, config, index, currentDocument) {
+  const conditions = currentDocument
+    ? { ifMatch: currentDocument.etag }
+    : { ifNoneMatch: "*" };
+  if (currentDocument && !currentDocument.etag) {
+    throw new Error("fail closed: funded unresolved risk reservation index ETag is unavailable");
+  }
+  await container
+    .getBlockBlobClient(unresolvedRiskIndexBlobName(config))
+    .uploadData(riskReservationBytes(index), {
+      conditions,
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+}
+
+export async function rebuildCampaignRiskReservationIndex(config, {
+  container = storageContainer(config)
+} = {}) {
+  if (!container) throw new Error("fail closed: durable storage is required to rebuild funded risk reservation index");
+  const current = await downloadUnresolvedRiskIndex(container, config, {
+    allowMissing: true,
+    validate: false
+  });
+  const entries = [];
+  let scannedRecordCount = 0;
+  for await (const item of container.listBlobsFlat({ prefix: RISK_RESERVATION_PREFIX })) {
+    if (!item.name.endsWith(".json")) continue;
+    const blob = typeof container.getBlobClient === "function"
+      ? container.getBlobClient(item.name)
+      : container.getBlockBlobClient(item.name);
+    const document = await downloadBlobDocument(blob);
+    const reservation = document.value;
+    if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
+    scannedRecordCount += 1;
+    if (!isRiskReservationResolved(reservation)) {
+      entries.push(riskReservationIndexEntry(item.name, reservation, document.bytes));
+    }
+  }
+  const priorGeneration = Number.isInteger(current?.value?.generation)
+    ? current.value.generation
+    : 0;
+  const rebuiltTs = new Date().toISOString();
+  const index = buildUnresolvedRiskIndex(config, entries, {
+    generation: priorGeneration + 1,
+    rebuiltTs,
+    rebuildScannedRecordCount: scannedRecordCount
+  });
+  await uploadUnresolvedRiskIndex(container, config, index, current);
+  const verified = await downloadUnresolvedRiskIndex(container, config);
+  if (verified.value.entries_sha256 !== index.entries_sha256 ||
+      verified.value.unresolved_count !== index.unresolved_count ||
+      verified.value.generation !== index.generation) {
+    throw new Error("fail closed: rebuilt funded unresolved risk reservation index did not verify");
+  }
+  return verified.value;
+}
+
+async function updateCampaignRiskReservationIndex(container, config, transitions) {
+  if (config.operatorDirect !== true || config.dryRun === true) return null;
+  const current = await downloadUnresolvedRiskIndex(container, config);
+  const entries = new Map(current.value.entries.map((entry) => [entry.blob_name, entry]));
+  for (const transition of transitions) {
+    const existing = entries.get(transition.blobName);
+    const unresolved = !isRiskReservationResolved(transition.reservation);
+    if (transition.requireAbsent && existing) {
+      throw new Error("fail closed: funded risk reservation index already contains the new reservation");
+    }
+    if (unresolved) {
+      if (transition.requirePresent && !existing) {
+        throw new Error("fail closed: funded risk reservation index lost an unresolved reservation");
+      }
+      entries.set(
+        transition.blobName,
+        riskReservationIndexEntry(transition.blobName, transition.reservation, transition.bytes)
+      );
+    } else {
+      entries.delete(transition.blobName);
+    }
+  }
+  const normalized = sortedRiskReservationIndexEntries(entries.values());
+  if (JSON.stringify(normalized) === JSON.stringify(current.value.entries)) return current.value;
+  const index = buildUnresolvedRiskIndex(config, normalized, {
+    generation: current.value.generation + 1,
+    rebuiltTs: current.value.rebuilt_ts,
+    rebuildScannedRecordCount: current.value.rebuild_scanned_record_count
+  });
+  await uploadUnresolvedRiskIndex(container, config, index, current);
+  return index;
+}
+
+export async function loadCampaignUnresolvedRiskReservationRecords(config, {
+  container = storageContainer(config)
+} = {}) {
+  if (!container) return [];
+  if (config.operatorDirect !== true || config.dryRun === true) {
+    return (await loadCampaignRiskReservationRecordsFromContainer(config, container))
+      .filter((record) => !isRiskReservationResolved(record.reservation));
+  }
+  const index = (await downloadUnresolvedRiskIndex(container, config)).value;
+  return Promise.all(index.entries.map(async (entry) => {
+    const blob = typeof container.getBlobClient === "function"
+      ? container.getBlobClient(entry.blob_name)
+      : container.getBlockBlobClient(entry.blob_name);
+    let document;
+    try {
+      document = await downloadBlobDocument(blob);
+    } catch (error) {
+      throw new Error(`fail closed: funded unresolved risk reservation index points to an unavailable blob (${error.message})`);
+    }
+    if (digest(document.bytes) !== entry.reservation_sha256 ||
+        document.value?.campaign_id !== config.campaignId ||
+        String(document.value?.probe_id || "") !== entry.probe_id ||
+        isRiskReservationResolved(document.value)) {
+      throw new Error("fail closed: funded unresolved risk reservation index disagrees with durable reservation state");
+    }
+    return {
+      blob_name: entry.blob_name,
+      etag: document.etag,
+      reservation: document.value
+    };
+  }));
+}
+
+export async function reserveProbeRisk(config, reservation, {
+  container = storageContainer(config)
+} = {}) {
   if (!container) throw new Error("fail closed: durable storage is required before order submission");
   const date = reservation.date || new Date().toISOString().slice(0, 10);
-  const blob = container.getBlockBlobClient(`reports/research/venue-probe/risk-reservations/${date}/${reservation.probe_id}.json`);
+  const blobName = `${RISK_RESERVATION_PREFIX}${date}/${reservation.probe_id}.json`;
+  const blob = container.getBlockBlobClient(blobName);
   const payload = {
     schema_version: 1,
     evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
@@ -1085,17 +1310,28 @@ export async function reserveProbeRisk(config, reservation) {
     created_ts: new Date().toISOString(),
     updated_ts: new Date().toISOString()
   };
-  await blob.uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
+  const bytes = riskReservationBytes(payload);
+  // Index first: a crash can leave a visible missing-blob blocker, but can
+  // never create an unresolved reservation that the funded preflight hides.
+  await updateCampaignRiskReservationIndex(container, config, [{
+    blobName,
+    reservation: payload,
+    bytes,
+    requireAbsent: true
+  }]);
+  await blob.uploadData(bytes, {
     conditions: { ifNoneMatch: "*" },
     blobHTTPHeaders: { blobContentType: "application/json" }
   });
   return payload;
 }
 
-export async function finalizeProbeRisk(config, reservation, result) {
-  const container = storageContainer(config);
+export async function finalizeProbeRisk(config, reservation, result, {
+  container = storageContainer(config)
+} = {}) {
   if (!container) throw new Error("fail closed: durable storage is required to finalize order risk");
   const date = reservation.date || new Date().toISOString().slice(0, 10);
+  const blobName = `${RISK_RESERVATION_PREFIX}${date}/${reservation.probe_id}.json`;
   const payload = {
     ...reservation,
     state: result.state || "finalized",
@@ -1108,16 +1344,26 @@ export async function finalizeProbeRisk(config, reservation, result) {
     reconciliation_evidence: result.reconciliation_evidence || reservation.reconciliation_evidence || null,
     updated_ts: new Date().toISOString()
   };
+  const bytes = riskReservationBytes(payload);
   await container
-    .getBlockBlobClient(`reports/research/venue-probe/risk-reservations/${date}/${reservation.probe_id}.json`)
-    .uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
+    .getBlockBlobClient(blobName)
+    .uploadData(bytes, {
       blobHTTPHeaders: { blobContentType: "application/json" }
     });
+  // Blob first: a crash can leave a conservative stale index entry, never a
+  // missing unresolved entry. Startup rebuild repairs that fail-closed state.
+  await updateCampaignRiskReservationIndex(container, config, [{
+    blobName,
+    reservation: payload,
+    bytes,
+    requirePresent: !isRiskReservationResolved(payload)
+  }]);
   return payload;
 }
 
 export async function settleProbeRiskReservations(config, settlement, {
-  reservationRecords = null
+  reservationRecords = null,
+  container = storageContainer(config)
 } = {}) {
   const conditionIds = new Set((settlement?.condition_ids || []).map((value) => String(value).toLowerCase()));
   const redemptionVerified = settlement?.settlement_verified === true && Boolean(settlement?.transaction_hash);
@@ -1126,11 +1372,11 @@ export async function settleProbeRiskReservations(config, settlement, {
   if (!conditionIds.size || (!redemptionVerified && !terminalVerified)) {
     throw new Error("fail closed: verified settlement evidence is required to release filled risk reservations");
   }
-  const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable storage is required to settle order risk");
   const campaign = settlement?.terminal_portfolio ? await loadCampaignRiskControl(config) : null;
   let settled = 0;
   const terminalReservations = [];
+  const indexTransitions = [];
   const records = reservationRecords ||
     await loadCampaignRiskReservationRecordsFromContainer(config, container);
   for (const record of records) {
@@ -1154,12 +1400,21 @@ export async function settleProbeRiskReservations(config, settlement, {
       updated_ts: new Date().toISOString()
     };
     const blob = container.getBlockBlobClient(record.blob_name);
-    await blob.uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
+    const bytes = riskReservationBytes(payload);
+    await blob.uploadData(bytes, {
       conditions: record.etag ? { ifMatch: record.etag } : undefined,
       blobHTTPHeaders: { blobContentType: "application/json" }
     });
+    indexTransitions.push({
+      blobName: record.blob_name,
+      reservation: payload,
+      bytes
+    });
     if (settlement?.terminal_portfolio) terminalReservations.push(payload);
     settled += 1;
+  }
+  if (indexTransitions.length) {
+    await updateCampaignRiskReservationIndex(container, config, indexTransitions);
   }
   // Publish terminal artifacts only after every reservation covered by this
   // verified atomic settlement has been durably updated. Otherwise the first
@@ -1452,8 +1707,8 @@ export async function loadDailyCampaignRisk(config, date = new Date().toISOStrin
 }
 
 export async function loadUnresolvedRiskReservations(config) {
-  return (await loadCampaignRiskReservations(config))
-    .filter((reservation) => !isRiskReservationResolved(reservation));
+  return (await loadCampaignUnresolvedRiskReservationRecords(config))
+    .map((record) => record.reservation);
 }
 
 export async function loadCampaignRiskReservations(config) {
@@ -1470,7 +1725,7 @@ export async function loadCampaignRiskReservationRecords(config) {
 async function loadCampaignRiskReservationRecordsFromContainer(config, container) {
   const records = [];
   for await (const item of container.listBlobsFlat({
-    prefix: "reports/research/venue-probe/risk-reservations/"
+    prefix: RISK_RESERVATION_PREFIX
   })) {
     if (!item.name.endsWith(".json")) continue;
     const response = await container.getBlobClient(item.name).download();
