@@ -1116,7 +1116,9 @@ export async function finalizeProbeRisk(config, reservation, result) {
   return payload;
 }
 
-export async function settleProbeRiskReservations(config, settlement) {
+export async function settleProbeRiskReservations(config, settlement, {
+  reservationRecords = null
+} = {}) {
   const conditionIds = new Set((settlement?.condition_ids || []).map((value) => String(value).toLowerCase()));
   const redemptionVerified = settlement?.settlement_verified === true && Boolean(settlement?.transaction_hash);
   const terminalVerified = settlement?.terminal_settlement_verified === true &&
@@ -1129,11 +1131,10 @@ export async function settleProbeRiskReservations(config, settlement) {
   const campaign = settlement?.terminal_portfolio ? await loadCampaignRiskControl(config) : null;
   let settled = 0;
   const terminalReservations = [];
-  for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
-    if (!item.name.endsWith(".json")) continue;
-    const blob = container.getBlockBlobClient(item.name);
-    const response = await blob.download();
-    const reservation = JSON.parse(await streamToString(response.readableStreamBody));
+  const records = reservationRecords ||
+    await loadCampaignRiskReservationRecordsFromContainer(config, container);
+  for (const record of records) {
+    const reservation = record?.reservation;
     if ((config.operatorDirect === true && reservation?.campaign_id !== config.campaignId)
         || number(reservation?.matched_notional, 0) <= 0
         || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
@@ -1152,8 +1153,9 @@ export async function settleProbeRiskReservations(config, settlement) {
       settled_ts: settlement.settled_ts || new Date().toISOString(),
       updated_ts: new Date().toISOString()
     };
+    const blob = container.getBlockBlobClient(record.blob_name);
     await blob.uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
-      conditions: response.etag ? { ifMatch: response.etag } : undefined,
+      conditions: record.etag ? { ifMatch: record.etag } : undefined,
       blobHTTPHeaders: { blobContentType: "application/json" }
     });
     if (settlement?.terminal_portfolio) terminalReservations.push(payload);
@@ -1450,17 +1452,37 @@ export async function loadDailyCampaignRisk(config, date = new Date().toISOStrin
 }
 
 export async function loadUnresolvedRiskReservations(config) {
+  return (await loadCampaignRiskReservations(config))
+    .filter((reservation) => !isRiskReservationResolved(reservation));
+}
+
+export async function loadCampaignRiskReservations(config) {
+  return (await loadCampaignRiskReservationRecords(config))
+    .map((record) => record.reservation);
+}
+
+export async function loadCampaignRiskReservationRecords(config) {
   const container = storageContainer(config);
   if (!container) return [];
-  const unresolved = [];
-  for await (const blob of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
-    if (!blob.name.endsWith(".json")) continue;
-    const response = await container.getBlobClient(blob.name).download();
+  return loadCampaignRiskReservationRecordsFromContainer(config, container);
+}
+
+async function loadCampaignRiskReservationRecordsFromContainer(config, container) {
+  const records = [];
+  for await (const item of container.listBlobsFlat({
+    prefix: "reports/research/venue-probe/risk-reservations/"
+  })) {
+    if (!item.name.endsWith(".json")) continue;
+    const response = await container.getBlobClient(item.name).download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
     if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
-    if (!isRiskReservationResolved(reservation)) unresolved.push(reservation);
+    records.push({
+      blob_name: item.name,
+      etag: response.etag || null,
+      reservation
+    });
   }
-  return unresolved;
+  return records;
 }
 
 export function summarizeDailyRiskRecords(date, reservations, summaries) {

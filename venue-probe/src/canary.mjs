@@ -1,6 +1,6 @@
 import { AssetType, Chain, ClobClient, OrderType, Side } from "@polymarket/clob-client-v2";
 import { pathToFileURL } from "node:url";
-import { createWalletClient, http } from "viem";
+import { createWalletClient, decodeEventLog, formatUnits, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import {
@@ -10,8 +10,9 @@ import {
   acquireCampaignLease,
   assertEligibleOrigin,
   finalizeProbeRisk,
+  isRiskReservationResolved,
   loadCampaignRiskControl,
-  loadUnresolvedRiskReservations,
+  loadCampaignRiskReservationRecords,
   marketContext,
   modelObservations,
   publishTerminalRiskPortfolioEvidence,
@@ -55,6 +56,7 @@ import {
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
 import {
+  discoverVerifiedAutomaticInternalSettlements,
   loadDurableInternalSettlements,
   putVerifiedInternalSettlement,
   reconcileProtectedCompoundingState,
@@ -72,6 +74,73 @@ let userChannel;
 let marketChannel;
 let orderSubmissionAttempted = false;
 let activeResources = null;
+const AUTOMATIC_SETTLEMENT_RETRY_MS = 10_000;
+const CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+const PUSD_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+const USDCE_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
+const PAYOUT_REDEMPTION_TOPIC = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d";
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC1155_TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
+const ERC1155_TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb";
+const COLLATERAL_WRAPPED_TOPIC = "0xc00a5c84859ae82a7f5e6a2773283fb525335d5b3195f61174aa1ecc7e15dd84";
+const PAYOUT_REDEMPTION_EVENT = [{
+  type: "event",
+  name: "PayoutRedemption",
+  anonymous: false,
+  inputs: [
+    { name: "redeemer", type: "address", indexed: true },
+    { name: "collateralToken", type: "address", indexed: true },
+    { name: "parentCollectionId", type: "bytes32", indexed: true },
+    { name: "conditionId", type: "bytes32", indexed: false },
+    { name: "indexSets", type: "uint256[]", indexed: false },
+    { name: "payout", type: "uint256", indexed: false }
+  ]
+}];
+const ERC20_TRANSFER_EVENT = [{
+  type: "event",
+  name: "Transfer",
+  anonymous: false,
+  inputs: [
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "value", type: "uint256", indexed: false }
+  ]
+}];
+const ERC1155_TRANSFER_SINGLE_EVENT = [{
+  type: "event",
+  name: "TransferSingle",
+  anonymous: false,
+  inputs: [
+    { name: "operator", type: "address", indexed: true },
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "id", type: "uint256", indexed: false },
+    { name: "value", type: "uint256", indexed: false }
+  ]
+}];
+const ERC1155_TRANSFER_BATCH_EVENT = [{
+  type: "event",
+  name: "TransferBatch",
+  anonymous: false,
+  inputs: [
+    { name: "operator", type: "address", indexed: true },
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "ids", type: "uint256[]", indexed: false },
+    { name: "values", type: "uint256[]", indexed: false }
+  ]
+}];
+const COLLATERAL_WRAPPED_EVENT = [{
+  type: "event",
+  name: "Wrapped",
+  anonymous: false,
+  inputs: [
+    { name: "caller", type: "address", indexed: true },
+    { name: "asset", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "amount", type: "uint256", indexed: false }
+  ]
+}];
 
 function setExecutionContext(env) {
   config = loadCanaryConfig(env);
@@ -187,14 +256,23 @@ async function initializeResources({ persistent = false } = {}) {
   };
 }
 
-async function initializeProtectedCompounding({ container, manifest }) {
+export async function initializeProtectedCompounding({
+  container,
+  manifest,
+  loadActivity = loadSettlementActivity
+}) {
   const durableSettlements = await loadDurableInternalSettlements(
     container,
     manifest.session_id
   );
-  const activity = await fetchJson(
-    `https://data-api.polymarket.com/activity?user=${encodeURIComponent(config.funderAddress)}&limit=500`
-  );
+  const configuredSettlements = manifest.internal_settlements || [];
+  const activity = configuredSettlements.length
+    ? await loadActivity({
+        user: config.funderAddress,
+        conditionIds: configuredSettlements.map((row) => row.condition_id),
+        sessionStartedAt: manifest.created_at
+      })
+    : [];
   const verifiedConfiguredSettlements = await verifyConfiguredInternalSettlements({
     manifest,
     activity,
@@ -211,8 +289,94 @@ async function initializeProtectedCompounding({ container, manifest }) {
   }
   return {
     state: null,
-    verifiedConfiguredSettlements
+    verifiedConfiguredSettlements,
+    automaticSettlementPromise: null,
+    automaticSettlementLastAttemptMs: 0
   };
+}
+
+async function reconcileProtectedCompoundingWithAutomaticSettlement({
+  client,
+  container,
+  manifest,
+  accountEquity,
+  fullyReconciled,
+  context,
+  reservationRecords,
+  allowAutomaticDiscovery
+}) {
+  const reconcile = () => reconcileProtectedCompoundingState({
+    container,
+    manifest,
+    accountEquity,
+    fullyReconciled,
+    verifiedConfiguredSettlements: context.verifiedConfiguredSettlements
+  });
+  try {
+    return await reconcile();
+  } catch (error) {
+    if (!fullyReconciled ||
+        !String(error?.message || "").includes("unauthorized external deposit detected")) {
+      throw error;
+    }
+    if (!allowAutomaticDiscovery) {
+      throw new Error(
+        "fail closed: authenticated automatic settlement reconciliation is pending the background safety cache"
+      );
+    }
+    if (!context.automaticSettlementPromise) {
+      const elapsedSinceAttempt = Date.now() -
+        Number(context.automaticSettlementLastAttemptMs || 0);
+      if (elapsedSinceAttempt < AUTOMATIC_SETTLEMENT_RETRY_MS) {
+        throw new Error(
+          "fail closed: authenticated automatic settlement reconciliation retry is cooling down"
+        );
+      }
+      context.automaticSettlementLastAttemptMs = Date.now();
+      const work = (async () => {
+        const durableSettlements = await loadDurableInternalSettlements(
+          container,
+          manifest.session_id
+        );
+        const activity = await loadSettlementActivity({
+          user: config.funderAddress,
+          conditionIds: reservationRecords.map((record) => record.reservation?.condition_id),
+          sessionStartedAt: manifest.created_at
+        });
+        const settlements = await discoverVerifiedAutomaticInternalSettlements({
+          manifest,
+          reservations: reservationRecords.map((record) => record.reservation),
+          activity,
+          durableSettlements,
+          expectedWallet: config.funderAddress,
+          getOrderFills: async (reservation) => {
+            const trades = await client.getTrades({ market: reservation.condition_id });
+            if (!Array.isArray(trades)) {
+              throw new Error("fail closed: authenticated CLOB trade history is invalid");
+            }
+            return tradeFillsFromRest(trades, reservation.order_id);
+          },
+          getTransactionReceipt: confirmedPolygonReceipt
+        });
+        if (!settlements.length) {
+          throw new Error(
+            "fail closed: excess equity has no new exact reservation-bound authenticated redemption"
+          );
+        }
+        for (const settlement of settlements) {
+          await putVerifiedInternalSettlement(container, settlement);
+        }
+        return reconcile();
+      })();
+      const shared = work.finally(() => {
+        if (context.automaticSettlementPromise === shared) {
+          context.automaticSettlementPromise = null;
+        }
+      });
+      context.automaticSettlementPromise = shared;
+    }
+    return context.automaticSettlementPromise;
+  }
 }
 
 export function requireExecutionModelArtifact(value) {
@@ -733,7 +897,7 @@ async function capturePreflight(
     balance,
     positionsResponse,
     valueResponse,
-    unresolvedReservations
+    campaignReservationRecords
   ] = await Promise.all([
     fetchJson("https://polymarket.com/api/geoblock"),
     clock(),
@@ -745,7 +909,7 @@ async function capturePreflight(
     client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
     fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) }),
-    loadUnresolvedRiskReservations(config)
+    loadCampaignRiskReservationRecords(config)
   ]);
   assertEligibleOrigin(geoblock, config);
   const {
@@ -772,7 +936,10 @@ async function capturePreflight(
   const terminalConditionIds = [...new Set(positions
     .filter((row) => row.redeemable === true && row.conditionId)
     .map((row) => String(row.conditionId)))];
-  let reservations = unresolvedReservations;
+  const campaignReservations = campaignReservationRecords.map((record) => record.reservation);
+  let reservations = campaignReservations.filter(
+    (reservation) => !isRiskReservationResolved(reservation)
+  );
   const terminalConditions = new Set(terminalConditionIds.map((value) => value.toLowerCase()));
   const terminalRiskNeedsSettlement = reservations.some((reservation) =>
     Number(reservation?.matched_notional) > 0
@@ -784,8 +951,13 @@ async function capturePreflight(
       terminal_settlement_verified: true,
       evidence_source: "polymarket_data_api_redeemable",
       run_id: runId
+    }, {
+      reservationRecords: campaignReservationRecords
     });
-    reservations = await loadUnresolvedRiskReservations(config);
+    reservations = reservations.filter((reservation) =>
+      !(Number(reservation?.matched_notional) > 0
+        && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase()))
+    );
   }
   const liquidCollateral = Number(balance.balance) / 1_000_000;
   const summedPositionValue = positions.reduce(
@@ -819,14 +991,17 @@ async function capturePreflight(
     const stateMatchesEquity = cachedState
       && Math.abs(Number(cachedState.last_reconciled_equity) - accountEquity) <= 0.0000011;
     if ((fullyReconciled && !stateMatchesEquity) || !cachedState) {
-      protectedCompoundingContext.state = await reconcileProtectedCompoundingState({
-        container: storageContainer(config),
-        manifest,
-        accountEquity,
-        fullyReconciled,
-        verifiedConfiguredSettlements:
-          protectedCompoundingContext.verifiedConfiguredSettlements
-      });
+      protectedCompoundingContext.state =
+        await reconcileProtectedCompoundingWithAutomaticSettlement({
+          client,
+          container: storageContainer(config),
+          manifest,
+          accountEquity,
+          fullyReconciled,
+          context: protectedCompoundingContext,
+          reservationRecords: campaignReservationRecords,
+          allowAutomaticDiscovery: recordLedger === false
+        });
     }
     protectedCompoundingState = protectedCompoundingContext.state;
   }
@@ -1819,23 +1994,223 @@ function normalizeFillClock(fills, serverMinusLocalMs) {
 function normalizePrivateKey(value) { const clean = String(value || "").trim(); return clean.startsWith("0x") ? clean : `0x${clean}`; }
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }
+
+export async function loadSettlementActivity({
+  user,
+  conditionIds,
+  sessionStartedAt,
+  fetcher = fetchJson,
+  pageSize = 500,
+  conditionBatchSize = 25,
+  maxPagesPerBatch = null
+}) {
+  const wallet = normalizedAddress(user);
+  const startedMs = activityTimestampMs(sessionStartedAt);
+  const conditions = [...new Set((conditionIds || []).map(normalizedBytes32).filter(Boolean))].sort();
+  const apiMaxOffset = 5_000;
+  const apiPageBound = Math.floor(apiMaxOffset / pageSize) + 1;
+  const pageBound = maxPagesPerBatch === null ? apiPageBound : maxPagesPerBatch;
+  if (!wallet || !Number.isFinite(startedMs) || startedMs <= 0 || !conditions.length) {
+    throw new Error("fail closed: settlement activity query binding is invalid");
+  }
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 500
+      || !Number.isInteger(conditionBatchSize) || conditionBatchSize < 1 || conditionBatchSize > 50
+      || !Number.isInteger(pageBound) || pageBound < 1 || pageBound > apiPageBound) {
+    throw new Error("fail closed: settlement activity pagination bounds are invalid");
+  }
+  const values = [];
+  const identities = new Set();
+  const batches = [];
+  for (let index = 0; index < conditions.length; index += conditionBatchSize) {
+    batches.push(conditions.slice(index, index + conditionBatchSize));
+  }
+  await Promise.all(batches.map(async (batch) => {
+    const batchConditions = new Set(batch);
+    let offset = 0;
+    let complete = false;
+    for (let page = 0; page < pageBound; page += 1) {
+      const url = new URL("https://data-api.polymarket.com/activity");
+      url.searchParams.set("user", wallet);
+      url.searchParams.set("market", batch.join(","));
+      url.searchParams.set("type", "TRADE,REDEEM");
+      url.searchParams.set("start", String(Math.floor(startedMs / 1_000)));
+      url.searchParams.set("sortBy", "TIMESTAMP");
+      url.searchParams.set("sortDirection", "ASC");
+      url.searchParams.set("limit", String(pageSize));
+      url.searchParams.set("offset", String(offset));
+      const rows = await fetcher(url.toString());
+      if (!Array.isArray(rows)) {
+        throw new Error("fail closed: settlement activity page is invalid");
+      }
+      for (const row of rows) {
+        const conditionId = normalizedBytes32(row?.conditionId);
+        if (!batchConditions.has(conditionId)
+            || activityTimestampMs(row?.timestamp) < startedMs
+            || !["TRADE", "REDEEM"].includes(String(row?.type || "").toUpperCase())) {
+          continue;
+        }
+        const identity = [
+          String(row.type || "").toUpperCase(),
+          normalizedBytes32(row.conditionId),
+          normalizedBytes32(row.transactionHash),
+          String(row.asset || ""),
+          normalizedAddress(row.proxyWallet),
+          String(row.timestamp ?? ""),
+          String(row.size ?? ""),
+          String(row.usdcSize ?? "")
+        ].join("\u0000");
+        if (identities.has(identity)) {
+          throw new Error("fail closed: settlement activity pagination returned duplicate evidence");
+        }
+        identities.add(identity);
+        values.push(row);
+      }
+      if (rows.length < pageSize) {
+        complete = true;
+        break;
+      }
+      offset += pageSize;
+    }
+    if (!complete) {
+      throw new Error("fail closed: settlement activity history exceeds pagination bound");
+    }
+  }));
+  return values.sort((left, right) =>
+    activityTimestampMs(left?.timestamp) - activityTimestampMs(right?.timestamp)
+      || String(left?.transactionHash || "").localeCompare(String(right?.transactionHash || ""))
+      || String(left?.type || "").localeCompare(String(right?.type || ""))
+  );
+}
+
 async function confirmedPolygonReceipt(transactionHash) {
+  const expectedHash = normalizedBytes32(transactionHash);
+  if (!expectedHash) {
+    throw new Error("fail closed: Polygon profit-settlement transaction hash is invalid");
+  }
   const [receipt, latestBlock] = await Promise.all([
-    polygonRpc("eth_getTransactionReceipt", [transactionHash]),
+    polygonRpc("eth_getTransactionReceipt", [expectedHash]),
     polygonRpc("eth_blockNumber", [])
   ]);
-  if (!receipt?.blockNumber || !latestBlock) {
+  if (!receipt?.blockNumber || !latestBlock
+      || normalizedBytes32(receipt.transactionHash) !== expectedHash) {
     throw new Error("fail closed: Polygon profit-settlement receipt is unavailable");
   }
   const receiptBlock = BigInt(receipt.blockNumber);
   const head = BigInt(latestBlock);
+  const settlementEvidence = decodeSettlementReceiptEvidence(receipt, expectedHash);
   return {
     status: receipt.status === "0x1" ? "success" : "failed",
     chain_id: 137,
+    transaction_hash: expectedHash,
     block_number: receiptBlock.toString(),
-    confirmations: Number(head >= receiptBlock ? head - receiptBlock + 1n : 0n)
+    confirmations: Number(head >= receiptBlock ? head - receiptBlock + 1n : 0n),
+    ...settlementEvidence
   };
 }
+
+export function decodeSettlementReceiptEvidence(
+  receipt,
+  transactionHash = receipt?.transactionHash
+) {
+  const hash = normalizedBytes32(transactionHash);
+  if (!hash || normalizedBytes32(receipt?.transactionHash) !== hash
+      || !Array.isArray(receipt?.logs)) {
+    throw new Error("fail closed: Polygon redemption receipt evidence is invalid");
+  }
+  const redemptions = [];
+  const ctfTransfers = [];
+  const erc20Transfers = [];
+  const collateralWraps = [];
+  for (const log of receipt.logs) {
+    const contractAddress = normalizedAddress(log?.address);
+    const topic = String(log?.topics?.[0] || "").toLowerCase();
+    if (contractAddress === CONDITIONAL_TOKENS_ADDRESS
+        && topic === PAYOUT_REDEMPTION_TOPIC) {
+      const args = decodeReceiptEvent(log, PAYOUT_REDEMPTION_EVENT).args || {};
+      redemptions.push({
+        contract_address: CONDITIONAL_TOKENS_ADDRESS,
+        transaction_hash: hash,
+        redeemer: normalizedAddress(args.redeemer),
+        collateral_token: normalizedAddress(args.collateralToken),
+        parent_collection_id: normalizedBytes32(args.parentCollectionId),
+        condition_id: normalizedBytes32(args.conditionId),
+        index_sets: (args.indexSets || []).map((value) => String(value)),
+        payout_base_units: String(args.payout),
+        payout: Number(formatUnits(args.payout, 6))
+      });
+      continue;
+    }
+    if (contractAddress === CONDITIONAL_TOKENS_ADDRESS
+        && topic === ERC1155_TRANSFER_BATCH_TOPIC) {
+      const args = decodeReceiptEvent(log, ERC1155_TRANSFER_BATCH_EVENT).args || {};
+      ctfTransfers.push({
+        event: "TransferBatch",
+        contract_address: CONDITIONAL_TOKENS_ADDRESS,
+        operator: normalizedAddress(args.operator),
+        from: normalizedAddress(args.from),
+        to: normalizedAddress(args.to),
+        ids: (args.ids || []).map((value) => String(value)),
+        values: (args.values || []).map((value) => String(value))
+      });
+      continue;
+    }
+    if (contractAddress === CONDITIONAL_TOKENS_ADDRESS
+        && topic === ERC1155_TRANSFER_SINGLE_TOPIC) {
+      const args = decodeReceiptEvent(log, ERC1155_TRANSFER_SINGLE_EVENT).args || {};
+      ctfTransfers.push({
+        event: "TransferSingle",
+        contract_address: CONDITIONAL_TOKENS_ADDRESS,
+        operator: normalizedAddress(args.operator),
+        from: normalizedAddress(args.from),
+        to: normalizedAddress(args.to),
+        ids: [String(args.id)],
+        values: [String(args.value)]
+      });
+      continue;
+    }
+    if ([USDCE_ADDRESS, PUSD_ADDRESS].includes(contractAddress)
+        && topic === ERC20_TRANSFER_TOPIC) {
+      const args = decodeReceiptEvent(log, ERC20_TRANSFER_EVENT).args || {};
+      erc20Transfers.push({
+        token: contractAddress,
+        from: normalizedAddress(args.from),
+        to: normalizedAddress(args.to),
+        value_base_units: String(args.value)
+      });
+      continue;
+    }
+    if (contractAddress === PUSD_ADDRESS && topic === COLLATERAL_WRAPPED_TOPIC) {
+      const args = decodeReceiptEvent(log, COLLATERAL_WRAPPED_EVENT).args || {};
+      collateralWraps.push({
+        contract_address: PUSD_ADDRESS,
+        caller: normalizedAddress(args.caller),
+        asset: normalizedAddress(args.asset),
+        to: normalizedAddress(args.to),
+        amount_base_units: String(args.amount)
+      });
+    }
+  }
+  return {
+    redemptions,
+    ctf_transfers: ctfTransfers,
+    erc20_transfers: erc20Transfers,
+    collateral_wraps: collateralWraps
+  };
+}
+
+export function decodePayoutRedemptions(receipt, transactionHash = receipt?.transactionHash) {
+  return decodeSettlementReceiptEvidence(receipt, transactionHash).redemptions;
+}
+
+function decodeReceiptEvent(log, abi) {
+  return decodeEventLog({
+    abi,
+    data: log.data,
+    topics: log.topics,
+    strict: true
+  });
+}
+
 async function polygonRpc(method, params) {
   for (const url of [
     "https://polygon.drpc.org",
@@ -1861,6 +2236,23 @@ async function polygonRpc(method, params) {
   throw new Error(`fail closed: Polygon RPC ${method} failed`);
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function normalizedAddress(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(text) ? text : "";
+}
+
+function normalizedBytes32(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^0x[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function activityTimestampMs(value) {
+  if (typeof value === "string" && /[T:-]/.test(value)) return Date.parse(value);
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return NaN;
+  return parsed < 1e12 ? parsed * 1_000 : parsed;
+}
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {

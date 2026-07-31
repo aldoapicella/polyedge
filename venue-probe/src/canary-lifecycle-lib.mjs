@@ -605,7 +605,7 @@ export function tradeFillsFromUserEvents(events, orderId) {
 }
 
 export function tradeFillsFromRest(trades, orderId) {
-  return normalizeTradeFills(trades || [], orderId);
+  return normalizeTradeFills(trades || [], orderId, { includeSettlementEvidence: true });
 }
 
 export function mergeTradeFills(...groups) {
@@ -693,7 +693,7 @@ export function cancellationEventReceivedAt(events) {
   return Number.isFinite(Number(event?._received_wall_ms)) ? Number(event._received_wall_ms) : null;
 }
 
-function normalizeTradeFills(trades, orderId) {
+function normalizeTradeFills(trades, orderId, { includeSettlementEvidence = false } = {}) {
   const fills = [];
   for (const trade of uniqueTrades(trades)) {
     const id = String(trade.id || trade.trade_id || trade.transaction_hash || "");
@@ -721,7 +721,7 @@ function normalizeTradeFills(trades, orderId) {
     const authenticatedFeeAmount = optionalNumber(
       trade.fee_amount_usdc_decimal ?? trade.feeAmountUsdcDecimal ?? trade.fee_amount ?? trade.feeAmount
     );
-    fills.push({
+    const fill = {
       id, size, price, timestampMs, traderSide, orderRole,
       authenticatedFeeRateBps,
       authenticatedFeeAmount,
@@ -736,7 +736,24 @@ function normalizeTradeFills(trades, orderId) {
         fee_usdc: trade.fee_usdc ?? trade.feeUsdc ?? null,
         builder_fee: maker?.builder_fee ?? trade.builder_fee ?? trade.builderFee ?? null
       }
-    });
+    };
+    if (includeSettlementEvidence) {
+      Object.assign(fill, {
+        transactionHash: firstNonBlank(trade.transaction_hash, trade.transactionHash),
+        market: firstNonBlank(trade.market, trade.condition_id, trade.conditionId),
+        assetId: firstNonBlank(maker?.asset_id, trade.asset_id, trade.assetId),
+        tradeAssetId: firstNonBlank(trade.asset_id, trade.assetId),
+        makerAssetId: firstNonBlank(maker?.asset_id),
+        status: String(trade.status || "").trim().toUpperCase() || null,
+        orderId: String(orderId),
+        makerOrderId: firstNonBlank(maker?.order_id, trade.maker_order_id),
+        takerOrderId: firstNonBlank(trade.taker_order_id),
+        owner: firstNonBlank(maker?.owner, trade.owner),
+        makerAddress: firstNonBlank(maker?.maker_address, trade.maker_address),
+        orderSide: String(maker?.side || trade.side || "").trim().toUpperCase() || null
+      });
+    }
+    fills.push(fill);
   }
   return fills;
 }
