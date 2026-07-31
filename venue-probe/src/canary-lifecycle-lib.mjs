@@ -726,7 +726,10 @@ function normalizeTradeFills(trades, orderId, { includeSettlementEvidence = fals
   for (const trade of uniqueTrades(trades)) {
     const id = String(trade.id || trade.trade_id || trade.transaction_hash || "");
     if (!id) continue;
-    const maker = (trade.maker_orders || []).find((row) => String(row.order_id) === String(orderId));
+    const makerMatches = (trade.maker_orders || []).filter((row) =>
+      String(row.order_id) === String(orderId)
+    );
+    const maker = makerMatches[0];
     const directMaker = String(trade.maker_order_id || "") === String(orderId);
     const isTaker = String(trade.taker_order_id || "") === String(orderId);
     const directOrder = String(trade.order_id || "") === String(orderId);
@@ -775,6 +778,8 @@ function normalizeTradeFills(trades, orderId, { includeSettlementEvidence = fals
         status: String(trade.status || "").trim().toUpperCase() || null,
         orderId: String(orderId),
         makerOrderId: firstNonBlank(maker?.order_id, trade.maker_order_id),
+        nestedMakerOrderMatchCount: makerMatches.length,
+        directMakerOrder: directMaker,
         takerOrderId: firstNonBlank(trade.taker_order_id),
         owner: firstNonBlank(maker?.owner, trade.owner),
         makerAddress: firstNonBlank(maker?.maker_address, trade.maker_address),

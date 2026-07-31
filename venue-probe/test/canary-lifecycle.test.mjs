@@ -142,6 +142,8 @@ test("authenticated REST fills retain exact settlement binding fields", () => {
     status: fills[0].status,
     orderId: fills[0].orderId,
     makerOrderId: fills[0].makerOrderId,
+    nestedMakerOrderMatchCount: fills[0].nestedMakerOrderMatchCount,
+    directMakerOrder: fills[0].directMakerOrder,
     takerOrderId: fills[0].takerOrderId,
     owner: fills[0].owner,
     makerAddress: fills[0].makerAddress,
@@ -155,11 +157,39 @@ test("authenticated REST fills retain exact settlement binding fields", () => {
     status: "CONFIRMED",
     orderId: "maker-order-1",
     makerOrderId: "maker-order-1",
+    nestedMakerOrderMatchCount: 1,
+    directMakerOrder: false,
     takerOrderId: "taker-order-1",
     owner: "maker-owner",
     makerAddress: "0x2222222222222222222222222222222222222222",
     orderSide: "BUY"
   });
+});
+
+test("authenticated REST fills expose duplicate nested maker-order matches", () => {
+  const makerOrder = {
+    order_id: "maker-order-duplicate",
+    owner: "maker-owner",
+    maker_address: "0x2222222222222222222222222222222222222222",
+    matched_amount: "2.5",
+    price: "0.40",
+    asset_id: "maker-asset",
+    side: "BUY"
+  };
+  const fills = tradeFillsFromRest([{
+    id: "trade-rest-duplicate",
+    market: `0x${"b".repeat(64)}`,
+    asset_id: "trade-asset",
+    status: "CONFIRMED",
+    match_time: "2026-07-13T12:00:01.000Z",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    trader_side: "MAKER",
+    maker_orders: [makerOrder, { ...makerOrder }]
+  }], makerOrder.order_id);
+
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].nestedMakerOrderMatchCount, 2);
+  assert.equal(fills[0].directMakerOrder, false);
 });
 
 test("a later partial fill after cancel is classified as a cancellation race", () => {

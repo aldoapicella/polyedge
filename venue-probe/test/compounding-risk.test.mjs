@@ -256,6 +256,8 @@ function automaticFill({
   conditionId = automaticCondition,
   assetId = automaticToken,
   tradeAssetId = secondToken,
+  nestedMakerOrderMatchCount = 1,
+  directMakerOrder = false,
   transactionHash = automaticFillTransaction,
   size = 10,
   price = 0.2,
@@ -272,6 +274,8 @@ function automaticFill({
     assetId,
     tradeAssetId,
     makerAssetId: assetId,
+    nestedMakerOrderMatchCount,
+    directMakerOrder,
     status: "TRADE_STATUS_CONFIRMED",
     orderId,
     makerOrderId: orderId,
@@ -453,6 +457,19 @@ test("automatic settlement binds exact reservation, CLOB, Data API, wallet, and 
   assert.equal(state.protected_reserve, 5.729586);
 });
 
+test("automatic settlement accepts a flat maker row only with the exact reservation asset", () => {
+  const fixture = verifyFixture();
+  Object.assign(fixture.orderFills[0], {
+    tradeAssetId: automaticToken,
+    makerAssetId: null,
+    nestedMakerOrderMatchCount: 0,
+    directMakerOrder: true
+  });
+  const settlement = verifyAutomaticSettlementEvidence(fixture);
+  assert.equal(settlement.condition_id, automaticCondition);
+  assert.equal(settlement.token_ids[0], automaticToken);
+});
+
 test("automatic settlement accepts only explicit confirmed CLOB response enums", () => {
   for (const status of ["CONFIRMED", "TRADE_STATUS_CONFIRMED"]) {
     const settlement = verifyAutomaticSettlementEvidence(verifyFixture({
@@ -626,6 +643,22 @@ test("automatic settlement fails closed on CLOB hash, asset, wallet, status, or 
       name: "maker asset",
       mutate: (fixture) => {
         fixture.orderFills[0].makerAssetId = secondToken;
+      },
+      error: /CLOB trade hash\/asset\/market/
+    },
+    {
+      name: "duplicate nested maker order",
+      mutate: (fixture) => {
+        fixture.orderFills[0].nestedMakerOrderMatchCount = 2;
+      },
+      error: /CLOB trade hash\/asset\/market/
+    },
+    {
+      name: "flat direct maker with complementary top-level asset",
+      mutate: (fixture) => {
+        fixture.orderFills[0].makerAssetId = null;
+        fixture.orderFills[0].nestedMakerOrderMatchCount = 0;
+        fixture.orderFills[0].directMakerOrder = true;
       },
       error: /CLOB trade hash\/asset\/market/
     },

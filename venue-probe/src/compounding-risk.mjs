@@ -276,28 +276,33 @@ export function verifyAutomaticSettlementEvidence({
     price: Number(fill?.price),
     timestamp_ms: Number(fill?.timestampMs)
   }));
-  if (fills.some((fill) =>
-    !fill.trade_id
-      || !fill.transaction_hash
-      || fill.asset_id !== tokenId
-      || normalizedAsset(fill?.makerAssetId) !== tokenId
-      // CLOB's top-level asset belongs to the aggregate/taker side and can be
-      // the complementary outcome; the nested maker asset is the exact order binding.
-      || !normalizedAsset(fill?.tradeAssetId)
-      || fill.condition_id !== conditionId
-      || !CONFIRMED_CLOB_STATUSES.has(String(fill?.status || "").toUpperCase())
-      || fill.orderRole !== "MAKER"
-      || fill.order_id !== fill.maker_order_id
-      || !reservationByOrder.has(fill.order_id)
-      || String(fill?.orderSide || "").toUpperCase() !== "BUY"
-      || !normalizedAddress(fill?.makerAddress)
-      || normalizedAddress(fill.makerAddress) !== wallet
-      || typeof fill?.owner !== "string"
-      || !fill.owner
-      || !(fill.size > 0)
-      || !(fill.price > 0 && fill.price < 1)
-      || !Number.isFinite(fill.timestamp_ms)
-  )) {
+  if (fills.some((fill) => {
+    const nestedMakerBound = fill.nestedMakerOrderMatchCount === 1 &&
+      normalizedAsset(fill?.makerAssetId) === tokenId;
+    const directMakerBound = fill.nestedMakerOrderMatchCount === 0 &&
+      fill.directMakerOrder === true &&
+      normalizedAsset(fill?.tradeAssetId) === tokenId;
+    return !fill.trade_id
+        || !fill.transaction_hash
+        || fill.asset_id !== tokenId
+        || !normalizedAsset(fill?.tradeAssetId)
+        // For nested maker evidence, CLOB's top-level aggregate/taker asset can
+        // be the complementary outcome. Flat maker evidence stays exact-token bound.
+        || (!nestedMakerBound && !directMakerBound)
+        || fill.condition_id !== conditionId
+        || !CONFIRMED_CLOB_STATUSES.has(String(fill?.status || "").toUpperCase())
+        || fill.orderRole !== "MAKER"
+        || fill.order_id !== fill.maker_order_id
+        || !reservationByOrder.has(fill.order_id)
+        || String(fill?.orderSide || "").toUpperCase() !== "BUY"
+        || !normalizedAddress(fill?.makerAddress)
+        || normalizedAddress(fill.makerAddress) !== wallet
+        || typeof fill?.owner !== "string"
+        || !fill.owner
+        || !(fill.size > 0)
+        || !(fill.price > 0 && fill.price < 1)
+        || !Number.isFinite(fill.timestamp_ms);
+  })) {
     throw new Error("fail closed: authenticated CLOB trade hash/asset/market/maker/status binding is invalid");
   }
   if (!fills.length
