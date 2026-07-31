@@ -6,24 +6,26 @@ use polyedge_config::{embedded_git_sha, RuntimeRole, RuntimeSettings};
 use polyedge_reporting::research::{
     advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
     initialize_funded_manifest_after_canary, load_default_exclusions, publish_daily_directory,
-    run_audit, run_azure_freshness, run_backfill, run_baseline, run_begin_shadow_correction,
-    run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
-    run_calibration, run_chart_backfill, run_complete_shadow_correction,
-    run_evaluate_profitability, run_execution_quality, run_final_report, run_loss_diagnostics,
-    run_loss_regime_oos, run_materialize_projected_campaign, run_ml_calibrate, run_normalize,
-    run_publish_projected_day, run_queue_audit, run_regimes, run_replay, run_sample_size,
-    run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
-    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
-    BackfillOptions, BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions,
-    CalibrationOptions, ChartBackfillOptions, CompleteShadowCorrectionOptions,
-    CumulativeWalletSnapshotOptions, ExcludedTimeWindow, ExecutionQualityOptions,
-    ExpireFundedManifestOptions, FillModel, FinalReportOptions, InitializeFundedManifestOptions,
-    LossDiagnosticsOptions, LossRegimeOosOptions, MaterializeProjectedCampaignOptions,
-    MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
-    ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
-    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, SettlementCarryOptions,
-    StopFundedManifestFromStageBlockOptions, SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
+    publish_normalized_snapshot, restore_normalized_snapshot, run_audit, run_azure_freshness,
+    run_backfill, run_baseline, run_begin_shadow_correction, run_build_cumulative_wallet_snapshot,
+    run_build_markets, run_build_replay_index, run_calibration, run_chart_backfill,
+    run_complete_shadow_correction, run_evaluate_profitability, run_execution_quality,
+    run_final_report, run_loss_diagnostics, run_loss_regime_oos,
+    run_materialize_projected_campaign, run_ml_calibrate, run_normalize, run_publish_projected_day,
+    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
+    stop_funded_manifest_from_stage_block, AdvanceFundedLadderOptions,
+    AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions, BackfillOptions,
+    BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions, CalibrationOptions,
+    ChartBackfillOptions, CompleteShadowCorrectionOptions, CumulativeWalletSnapshotOptions,
+    ExcludedTimeWindow, ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel,
+    FinalReportOptions, InitializeFundedManifestOptions, LossDiagnosticsOptions,
+    LossRegimeOosOptions, MaterializeProjectedCampaignOptions, MlCalibrateOptions,
+    NormalizeOptions, ProfitabilityEvaluationOptions, ProspectiveValidationOptions,
+    PublishNormalizedSnapshotOptions, PublishProjectedDayOptions, QueueAuditOptions,
+    RegimesOptions, ReplayIndexOptions, ReplayOptions, RestoreNormalizedSnapshotOptions,
+    SampleSizeOptions, SettlementCarryOptions, StopFundedManifestFromStageBlockOptions,
+    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -445,6 +447,44 @@ enum ResearchCommand {
         out: PathBuf,
         #[arg(long = "sas-env")]
         sas_env: Option<String>,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Publish a content-addressed immutable normalized day for reuse by later jobs.
+    PublishNormalizedSnapshot {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        date: String,
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
+        #[arg(long, default_value = "data/research/normalized/v1")]
+        prefix: String,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Restore and hash-verify the normalized day selected by its manifest-last pointer.
+    RestoreNormalizedSnapshot {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        date: String,
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
+        #[arg(long, default_value = "data/research/normalized/v1")]
+        prefix: String,
         #[arg(long, env = "AZURE_CLIENT_ID")]
         client_id: Option<String>,
     },
@@ -1036,6 +1076,36 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             sas_env,
             client_id,
             generated_at: None,
+        })?,
+        ResearchCommand::PublishNormalizedSnapshot {
+            input,
+            date,
+            account,
+            container,
+            prefix,
+            client_id,
+        } => publish_normalized_snapshot(PublishNormalizedSnapshotOptions {
+            input,
+            date: parse_date_arg(&date)?,
+            account,
+            container,
+            prefix,
+            client_id,
+        })?,
+        ResearchCommand::RestoreNormalizedSnapshot {
+            out,
+            date,
+            account,
+            container,
+            prefix,
+            client_id,
+        } => restore_normalized_snapshot(RestoreNormalizedSnapshotOptions {
+            out,
+            date: parse_date_arg(&date)?,
+            account,
+            container,
+            prefix,
+            client_id,
         })?,
         ResearchCommand::ValidateProspective {
             since,
@@ -2001,6 +2071,71 @@ mod tests {
                 "--test-child-argument"
             ]
         );
+    }
+
+    #[test]
+    fn normalized_snapshot_cli_requires_explicit_date_and_path() {
+        let publish = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "publish-normalized-snapshot",
+            "--input",
+            "normalized",
+            "--date",
+            "2026-07-30",
+            "--account",
+            "storage",
+            "--container",
+            "events",
+        ])
+        .expect("parse normalized snapshot publisher");
+        let Command::Research {
+            command:
+                ResearchCommand::PublishNormalizedSnapshot {
+                    input,
+                    date,
+                    prefix,
+                    ..
+                },
+        } = publish.command
+        else {
+            panic!("unexpected publisher command");
+        };
+        assert_eq!(input, PathBuf::from("normalized"));
+        assert_eq!(date, "2026-07-30");
+        assert_eq!(prefix, "data/research/normalized/v1");
+
+        let restore = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "restore-normalized-snapshot",
+            "--out",
+            "restored",
+            "--date",
+            "2026-07-30",
+            "--account",
+            "storage",
+            "--container",
+            "events",
+        ])
+        .expect("parse normalized snapshot restore");
+        let Command::Research {
+            command: ResearchCommand::RestoreNormalizedSnapshot { out, date, .. },
+        } = restore.command
+        else {
+            panic!("unexpected restore command");
+        };
+        assert_eq!(out, PathBuf::from("restored"));
+        assert_eq!(date, "2026-07-30");
+
+        assert!(Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "publish-normalized-snapshot",
+            "--account",
+            "storage",
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]

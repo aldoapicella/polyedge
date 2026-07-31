@@ -10,6 +10,7 @@ on:
       - "crates/polyedge-storage/**"
       - "infra/funded-direct-chile.bicep"
       - "infra/funded-direct-chile.parameters.json"
+      - "infra/storage-service-endpoints.bicep"
       - "infra/venue-probe.bicep"
       - "research/configs/funded_direct_dynamic_quote_*.json"
       - "venue-probe/**"
@@ -118,6 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           az bicep build --file infra/funded-direct-chile.bicep --stdout > funded-direct-chile.json
+          az bicep build --file infra/storage-service-endpoints.bicep --stdout > storage-service-endpoints.json
           az bicep build --file infra/venue-probe.bicep --stdout > venue-probe.json
           jq -e '
             ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces")] | length) == 1
@@ -152,6 +154,15 @@ jobs:
           const assert = require("node:assert/strict");
           const fs = require("node:fs");
           const template = JSON.parse(fs.readFileSync("funded-direct-chile.json"));
+          const isolatedEndpoints = JSON.parse(fs.readFileSync("storage-service-endpoints.json"));
+          const endpointSubnets = isolatedEndpoints.resources.filter((resource) =>
+            resource.type === "Microsoft.Network/virtualNetworks/subnets");
+          assert.equal(endpointSubnets.length, 2);
+          assert.equal(endpointSubnets.every((resource) =>
+            resource.properties.serviceEndpoints.some((endpoint) => endpoint.service === "Microsoft.Storage.Global")), true);
+          const chileVnet = template.resources.find((resource) =>
+            resource.type === "Microsoft.Network/virtualNetworks");
+          assert.equal(chileVnet.properties.subnets[0].properties.serviceEndpoints[0].service, "Microsoft.Storage.Global");
           assert.equal(template.parameters.producerPublicIpName.defaultValue, "pip-polyedge-venue-neu-egress-2");
           const app = template.resources.find((resource) =>
             resource.type === "Microsoft.App/containerApps" &&
@@ -192,6 +203,9 @@ jobs:
             JSON.parse(fs.readFileSync("venue-probe.json")).parameters.publicIpName.defaultValue,
             "pip-polyedge-venue-neu-egress-2"
           );
+          const producerVnet = JSON.parse(fs.readFileSync("venue-probe.json")).resources.find((resource) =>
+            resource.type === "Microsoft.Network/virtualNetworks");
+          assert.equal(producerVnet.properties.subnets[0].properties.serviceEndpoints[0].service, "Microsoft.Storage.Global");
           const warmup = template.resources.find((resource) =>
             resource.type === "Microsoft.App/jobs" &&
             resource.properties.template.containers[0].name === "funded-warmup");

@@ -36,6 +36,7 @@ use thiserror::Error;
 mod labs;
 mod loss_diagnostics;
 mod loss_regime_oos;
+mod normalized_snapshot;
 mod projected_cache;
 mod run_bundle;
 pub use labs::{
@@ -52,6 +53,11 @@ pub use labs::{
 };
 pub use loss_diagnostics::{run_loss_diagnostics, LossDiagnosticsOptions};
 pub use loss_regime_oos::{run_loss_regime_oos, LossRegimeOosOptions};
+pub use normalized_snapshot::{
+    publish_normalized_snapshot, restore_normalized_snapshot, NormalizedSnapshotFileV1,
+    NormalizedSnapshotManifestV1, NormalizedSnapshotPointerV1, PublishNormalizedSnapshotOptions,
+    RestoreNormalizedSnapshotOptions,
+};
 pub use projected_cache::{
     read_shadow_correction_state, read_verified_campaign_index, run_begin_shadow_correction,
     run_complete_shadow_correction, run_materialize_projected_campaign, run_publish_projected_day,

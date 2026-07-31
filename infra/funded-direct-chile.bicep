@@ -255,6 +255,11 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' = {
           natGateway: {
             id: natGateway.id
           }
+          serviceEndpoints: [
+            {
+              service: 'Microsoft.Storage.Global'
+            }
+          ]
           delegations: [
             {
               name: 'Microsoft.App.environments'

@@ -10,7 +10,10 @@ on:
         type: choice
         options:
           - build-only
+          - polyedge-data-freshness-job
+          - polyedge-hourly-quality-job
           - polyedge-daily-research-job
+          - polyedge-replay-index-job
           - polyedge-shadow-daily-neu-job
           - polyedge-backfill-job
           - polyedge-prospective-job
@@ -53,7 +56,7 @@ jobs:
           git merge-base --is-ancestor "$CAMPAIGN_RUNTIME_SHA" HEAD
           while IFS= read -r path; do
             case "$path" in
-              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/configs/experiments/loss-regime-oos-v*.yaml|research/run_shadow_daily.sh|research/test_run_shadow_daily.sh) ;;
+              Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/configs/experiments/loss-regime-oos-v*.yaml|research/run_compact_report_job.sh|research/run_primary_daily.sh|research/run_replay_index.sh|research/run_shadow_daily.sh|research/test_compact_report_job.sh|research/test_primary_daily_jobs.sh|research/test_run_shadow_daily.sh) ;;
               Cargo.toml|Dockerfile.rust|crates/*|data_quality/*|research/*|tests/fixtures/*)
                 echo "Research image contains an out-of-scope change: $path" >&2
                 exit 1
@@ -78,6 +81,8 @@ jobs:
           # report roots, so the complete workspace suite must be serialized.
           cargo test --workspace --all-features -- --test-threads=1
           cargo build --release -p polyedge-cli
+          sh research/test_primary_daily_jobs.sh
+          sh research/test_compact_report_job.sh
           sh research/test_run_shadow_daily.sh
 
       - name: Azure login
@@ -94,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$TARGET_JOB" in
-            build-only|polyedge-daily-research-job|polyedge-shadow-daily-neu-job|polyedge-backfill-job|polyedge-prospective-job|polyedge-chart-backfill-job) ;;
+            build-only|polyedge-data-freshness-job|polyedge-hourly-quality-job|polyedge-daily-research-job|polyedge-replay-index-job|polyedge-shadow-daily-neu-job|polyedge-backfill-job|polyedge-prospective-job|polyedge-chart-backfill-job) ;;
             *) echo "Unsupported research job: $TARGET_JOB" >&2; exit 1 ;;
           esac
 
@@ -130,12 +135,31 @@ jobs:
             expected_trigger="Schedule"
             expected_location="northeurope"
             expected_command="polyedge-rs research with-azure-lease --account stpolyedge6urdjr5nmwx7w --container polyedge-research --blob data/research/shadow/campaign-2026-07-23/control/replay.lock -- /bin/sh /app/research/run_shadow_daily.sh"
-          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+          elif [ "$TARGET_JOB" = "polyedge-data-freshness-job" ] || [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
             expected_identity_name="polyedge-dev-id"
             expected_container="research-job"
             expected_trigger="Schedule"
             expected_location="eastus"
-            expected_command_fragment="publish-daily-bundle"
+            expected_command_fragment="/app/research/run_compact_report_job.sh"
+            if [ "$TARGET_JOB" = "polyedge-data-freshness-job" ]; then
+              legacy_command_fragment="research azure-freshness"
+              expected_cron="*/5 * * * *"
+            else
+              legacy_command_fragment="research audit"
+              expected_cron="10 * * * *"
+            fi
+          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ] || [ "$TARGET_JOB" = "polyedge-replay-index-job" ]; then
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Schedule"
+            expected_location="eastus"
+            if [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+              expected_command_fragment="/app/research/run_primary_daily.sh"
+              expected_cron="30 0 * * *"
+            else
+              expected_command_fragment="/app/research/run_replay_index.sh"
+              expected_cron="0 3 * * *"
+            fi
           else
             expected_identity_name="polyedge-dev-id"
             expected_container="research-job"
@@ -168,12 +192,35 @@ jobs:
           if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
             test "$command_line" = "$expected_command"
             test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "15 2 * * *"
-          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+          elif [ "$TARGET_JOB" = "polyedge-data-freshness-job" ] || [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+            case "$command_line" in
+              *"$expected_command_fragment"*|*"$legacy_command_fragment"*) ;;
+              *) echo "Unexpected scheduled compact-report command" >&2; exit 1 ;;
+            esac
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "$expected_cron"
+          elif [ "$TARGET_JOB" = "polyedge-daily-research-job" ] || [ "$TARGET_JOB" = "polyedge-replay-index-job" ]; then
             case "$command_line" in
               *"$expected_command_fragment"*) ;;
-              *) echo "Unexpected primary daily research command" >&2; exit 1 ;;
+              *)
+                if [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+                  [[ "$command_line" == *"research audit"* \
+                    && "$command_line" == *"research normalize"* \
+                    && "$command_line" == *"research publish-daily-bundle"* \
+                    && "$command_line" == *"research validate-prospective"* ]] || {
+                    echo "Unexpected primary daily research command" >&2
+                    exit 1
+                  }
+                else
+                  [[ "$command_line" == *"research normalize"* \
+                    && "$command_line" == *"research build-replay-index"* \
+                    && "$command_line" == *'data/research/replay-index/$DATE'* ]] || {
+                    echo "Unexpected replay index command" >&2
+                    exit 1
+                  }
+                fi
+                ;;
             esac
-            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "30 0 * * *"
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "$expected_cron"
           else
             case "$command_line" in
               *"$expected_command_fragment"*) ;;
@@ -242,13 +289,49 @@ jobs:
               echo "Refusing to update the primary reporter near its 00:30 UTC execution" >&2
               exit 1
             fi
+          elif [ "$TARGET_JOB" = "polyedge-replay-index-job" ]; then
+            utc_hhmm=$(date -u +%H%M)
+            if (( 10#$utc_hhmm >= 245 && 10#$utc_hhmm <= 315 )); then
+              echo "Refusing to update the replay indexer near its 03:00 UTC execution" >&2
+              exit 1
+            fi
+          elif [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+            utc_minute=$(date -u +%M)
+            if (( 10#$utc_minute >= 5 && 10#$utc_minute <= 15 )); then
+              echo "Refusing to update hourly quality near its minute-10 execution" >&2
+              exit 1
+            fi
           fi
-          az containerapp job update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$TARGET_JOB" \
-            --container-name "$CONTAINER_NAME" \
-            --image "$RESEARCH_IMAGE" \
+          update_args=(
+            az containerapp job update
+            --resource-group "$AZURE_RESOURCE_GROUP"
+            --name "$TARGET_JOB"
+            --container-name "$CONTAINER_NAME"
+            --image "$RESEARCH_IMAGE"
             --output none
+          )
+          if [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
+            update_args+=(
+              --command /bin/sh -lc
+              --args 'polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_primary_daily.sh'
+            )
+          elif [ "$TARGET_JOB" = "polyedge-replay-index-job" ]; then
+            update_args+=(
+              --command /bin/sh -lc
+              --args 'polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
+            )
+          elif [ "$TARGET_JOB" = "polyedge-data-freshness-job" ]; then
+            update_args+=(
+              --command /bin/sh -lc
+              --args '/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
+            )
+          elif [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+            update_args+=(
+              --command /bin/sh -lc
+              --args 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+            )
+          fi
+          "${update_args[@]}"
 
           job_json=$(az containerapp job show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -264,7 +347,22 @@ jobs:
             expected_identity_name="polyedge-dev-id"
             expected_container="research-job"
             expected_trigger="Schedule"
-            expected_command_fragment="publish-daily-bundle"
+            expected_command_fragment="/app/research/run_primary_daily.sh"
+          elif [ "$TARGET_JOB" = "polyedge-replay-index-job" ]; then
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Schedule"
+            expected_command_fragment="/app/research/run_replay_index.sh"
+          elif [ "$TARGET_JOB" = "polyedge-data-freshness-job" ]; then
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Schedule"
+            expected_command_fragment="/app/research/run_compact_report_job.sh polyedge_data_freshness"
+          elif [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+            expected_identity_name="polyedge-dev-id"
+            expected_container="research-job"
+            expected_trigger="Schedule"
+            expected_command_fragment="/app/research/run_compact_report_job.sh polyedge_hourly_quality"
           else
             expected_identity_name="polyedge-dev-id"
             expected_container="research-job"
@@ -284,6 +382,11 @@ jobs:
             *"$expected_command_fragment"*) ;;
             *) echo "Research command drifted during update" >&2; exit 1 ;;
           esac
+          if [ "$TARGET_JOB" = "polyedge-data-freshness-job" ]; then
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "*/5 * * * *"
+          elif [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+            test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "10 * * * *"
+          fi
           test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ALLOW_LIVE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "false"
           test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "EXECUTION_MODE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "paper"
           test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "RUN_BOT_ON_STARTUP") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "false"

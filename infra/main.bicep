@@ -51,13 +51,19 @@ param frontendCpu string = '0.5'
 @description('Frontend container memory allocation.')
 param frontendMemory string = '1Gi'
 
-@description('Backend API base URL used by the frontend server proxy.')
-param frontendBackendApiBaseUrl string = 'http://127.0.0.1:8081/api/v1'
+@description('Minimum public frontend replicas. Keep zero so the dashboard scales down while the backend remains continuous.')
+param frontendMinReplicas int = 0
 
-@description('Backend WebSocket URL used by the frontend realtime proxy when BACKEND_SSE_URL is not set.')
-param frontendBackendWsUrl string = 'ws://127.0.0.1:8081/api/v1/ws/live'
+@description('Maximum public frontend replicas.')
+param frontendMaxReplicas int = 1
 
-@description('Optional upstream Server-Sent Events URL for frontend proxy overrides. Leave empty for the active Rust sidecar.')
+@description('Backend API base URL used by the frontend server proxy. Leave empty to use the internal API Container App.')
+param frontendBackendApiBaseUrl string = ''
+
+@description('Backend WebSocket URL used by the frontend realtime proxy. Leave empty to use the internal API Container App.')
+param frontendBackendWsUrl string = ''
+
+@description('Optional upstream Server-Sent Events URL for frontend proxy overrides. Leave empty to use the internal API WebSocket route.')
 param frontendBackendSseUrl string = ''
 
 @description('Deployment environment tag.')
@@ -78,6 +84,7 @@ var keyVaultName = take('kv${safeAppName}${suffix}', 24)
 var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix}', 63)
 var managedEnvironmentName = '${appName}-${environmentName}-env'
 var containerAppName = '${appName}-${environmentName}'
+var apiContainerAppName = '${containerAppName}-api'
 var shadowContainerAppName = 'polyedge-shadow-neu'
 var storageContainerName = 'bot-events'
 var researchStorageContainerName = 'polyedge-research'
@@ -179,7 +186,7 @@ var researchJobDefinitions = [
     replicaTimeout: 300
     cpu: cpu
     memory: memory
-    command: 'polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
+    command: '/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
   }
   {
     id: 'hourly-quality-audit'
@@ -189,7 +196,7 @@ var researchJobDefinitions = [
     replicaTimeout: 1800
     cpu: cpu
     memory: memory
-    command: 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=\${TARGET%/*}; HOUR=\${TARGET##*/}; polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "reports/research/hourly/$DAY/$HOUR/audit.json" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+    command: 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=\${TARGET%/*}; HOUR=\${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
   }
   {
     id: 'daily-research-report'
@@ -199,7 +206,7 @@ var researchJobDefinitions = [
     replicaTimeout: 46800
     cpu: '2'
     memory: '4Gi'
-    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); RUN_ID="daily-$DATE-$(date -u +%Y%m%dT%H%M%SZ)"; INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/daily/$DATE/normalized"; STAGING="reports/research/staging/$RUN_ID"; MARKETS="$STAGING/markets_summary.json"; mkdir -p "$STAGING" "data/research/daily/$DATE"; polyedge-rs research audit --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/raw_data_audit.json" --markdown "$STAGING/raw_data_audit.md"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research audit --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/data_audit.json" --markdown "$STAGING/data_audit.md"; polyedge-rs research execution-quality --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/execution_quality.json" --markdown "$STAGING/execution_quality.md"; polyedge-rs research build-markets --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "$MARKETS" --markdown "$STAGING/markets_summary.md"; polyedge-rs research baseline --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/baseline.json" --markdown "$STAGING/baseline.md"; polyedge-rs research regimes --input "$NORMALIZED" --markets "$MARKETS" --fill-model queue_proxy_conservative --profile-config "research/configs/frozen_candidates.yaml" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/regimes.json" --markdown "$STAGING/regimes.md"; polyedge-rs research calibration --input "$NORMALIZED" --markets "$MARKETS" --exclude-file "data_quality/exclusion_windows.yaml" --out "$STAGING/calibration.json" --markdown "$STAGING/calibration.md"; polyedge-rs research sample-size --results "$STAGING/baseline.json" --out "$STAGING/sample_size.json" --markdown "$STAGING/sample_size.md"; polyedge-rs research report --reports-dir "$STAGING" --out "$STAGING/final_report.json" --markdown "$STAGING/final_report.md"; INPUT_SHA="sha256:$(sha256sum "$NORMALIZED/events_manifest.json" | cut -d" " -f1)"; polyedge-rs research publish-daily-bundle --date "$DATE" --run-id "$RUN_ID" --input-sha256 "$INPUT_SHA" --expected-runtime-role primary --source-dir "$STAGING" --output-root "reports/research/daily" --data-audit "$STAGING/data_audit.json"; polyedge-rs research report --reports-dir "$STAGING" --out "reports/research/latest_daily_report.json" --markdown "reports/research/latest_daily_report.md"; polyedge-rs research validate-prospective --since "2026-07-13T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --expected-daily-date "$DATE" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
+    command: 'polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_primary_daily.sh'
   }
   {
     id: 'prospective-validation'
@@ -219,7 +226,7 @@ var researchJobDefinitions = [
     replicaTimeout: 43200
     cpu: '2'
     memory: '4Gi'
-    command: 'set -eu; DATE=$(date -u -d "yesterday" +%Y-%m-%d); DAY=$(date -u -d "$DATE" +%Y/%m/%d); INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=16"; NORMALIZED="data/research/replay-index/$DATE/normalized"; mkdir -p "data/research/replay-index/$DATE"; polyedge-rs research normalize --input "$INPUT" --out "$NORMALIZED" --format jsonl-indexed-gzip-sharded --overwrite true; polyedge-rs research build-replay-index --input "$NORMALIZED" --exclude-file "data_quality/exclusion_windows.yaml" --out "data/research/replay-index/$DATE"'
+    command: 'polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
   }
   {
     id: 'chart-backfill'
@@ -282,43 +289,43 @@ var logAlerts = [
     name: 'no-new-blob-for-3-minutes'
     displayName: 'PolyEdge no new blob for 3 minutes'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-data-freshness-job" | where (Log_s has "status" and Log_s has "critical") or Log_s has "no new blob"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s == "polyedge-data-freshness-job" | where (Log_s has "status" and Log_s has "critical") or Log_s has "no new blob"'
   }
   {
     name: 'tiny-blob-anomaly'
     displayName: 'PolyEdge tiny blob anomaly'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-data-freshness-job" | where Log_s has "tiny blob ratio" or (Log_s has "tiny_blob_ratio" and Log_s has "warning")'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s == "polyedge-data-freshness-job" | where Log_s has "tiny blob ratio" or (Log_s has "tiny_blob_ratio" and Log_s has "warning")'
   }
   {
     name: 'hour-missing-minute-blobs'
     displayName: 'PolyEdge hour missing minute blobs'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-hourly-quality-job" | where Log_s has "missing minute" or Log_s has "hour_missing_minute_blobs"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s == "polyedge-hourly-quality-job" | where Log_s has "missing minute" or Log_s has "hour_missing_minute_blobs"'
   }
   {
     name: 'recorder-failed-total-gt-0'
     displayName: 'PolyEdge recorder has unrecovered durable evidence'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
   }
   {
     name: 'recorder-dropped-count-gt-0'
     displayName: 'PolyEdge recorder dropped count > 0'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
   }
   {
     name: 'recorder-queue-over-1000'
     displayName: 'PolyEdge recorder queue over 1000 events'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
   }
   {
     name: 'runtime-container-restarted'
     displayName: 'PolyEdge runtime container restarted or backed off'
     severity: 0
-    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
+    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
   }
   {
     name: 'shadow-runtime-health-missing'
@@ -330,19 +337,19 @@ var logAlerts = [
     name: 'job-failed'
     displayName: 'PolyEdge job failed'
     severity: 0
-    query: 'union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL | where (ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job") or (JobName_s has "polyedge-" and JobName_s has "-job") | where Reason_s in ("Error", "BackoffLimitExceeded", "DeadlineExceeded", "Failed", "FailedMount", "ErrImagePull", "ImagePullBackOff", "ContainerCrashing") or Log_s has_any ("panicked", "exited with status Failed", "exit code: 1", "exit code 1", "has failed", "failed to", "runtime recorder flush failed")'
+    query: 'union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL | where (ContainerJobName_s has "polyedge-" and ContainerJobName_s has "-job") or (JobName_s has "polyedge-" and JobName_s has "-job") | where Reason_s in ("Error", "BackoffLimitExceeded", "DeadlineExceeded", "Failed", "FailedMount", "ErrImagePull", "ImagePullBackOff", "ContainerCrashing") or Log_s has_any ("panicked", "exited with status Failed", "child command failed with status exit status:", "exit code: 1", "exit code 1", "has failed", "failed to", "runtime recorder flush failed") or Log_s has \'"status":"failed"\''
   }
   {
     name: 'job-duration-too-long'
     displayName: 'PolyEdge job duration too long'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s has "polyedge-" and ContainerAppName_s has "-job" | where Log_s has "duration_seconds" and Log_s has "too_long"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s has "polyedge-" and ContainerJobName_s has "-job" | where Log_s has "duration_seconds" and Log_s has "too_long"'
   }
   {
     name: 'adx-ingestion-failed'
     displayName: 'PolyEdge ADX ingestion failed'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "polyedge-adx-ingestion-job" | where Log_s has "error" or Log_s has "failed"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s == "polyedge-adx-ingestion-job" | where Log_s has "error" or Log_s has "failed"'
   }
 ]
 
@@ -379,6 +386,39 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
     containerDeleteRetentionPolicy: {
       enabled: true
       days: 14
+    }
+  }
+}
+
+resource storageLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@2023-05-01' = {
+  parent: storage
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          enabled: true
+          name: 'delete-normalized-research-snapshots-after-7-days'
+          type: 'Lifecycle'
+          definition: {
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: 7
+                }
+              }
+            }
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                '${storageContainerName}/data/research/normalized/v1/'
+              ]
+            }
+          }
+        }
+      ]
     }
   }
 }
@@ -541,8 +581,8 @@ resource venueModelIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@20
   tags: tags
 }
 
-resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
-  name: containerAppName
+resource apiContainerApp 'Microsoft.App/containerApps@2024-03-01' = {
+  name: apiContainerAppName
   location: location
   tags: tags
   identity: {
@@ -556,8 +596,8 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
     configuration: {
       activeRevisionsMode: 'Single'
       ingress: {
-        external: true
-        targetPort: frontendEnabled ? 3000 : 8081
+        external: false
+        targetPort: 8081
         transport: 'http'
         allowInsecure: false
       }
@@ -565,14 +605,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'api-bearer-token'
           value: apiBearerToken
-        }
-        {
-          name: 'dashboard-auth-password'
-          value: dashboardAuthPassword
-        }
-        {
-          name: 'dashboard-session-secret'
-          value: dashboardSessionSecret
         }
       ]
       registries: [
@@ -583,7 +615,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       ]
     }
     template: {
-      containers: concat([
+      containers: [
         {
           name: 'bot'
           image: image
@@ -738,7 +770,58 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             memory: memory
           }
         }
-      ], frontendEnabled ? [
+      ]
+      scale: {
+        minReplicas: minReplicas
+        maxReplicas: maxReplicas
+      }
+    }
+  }
+}
+
+resource containerApp 'Microsoft.App/containerApps@2024-03-01' = if (frontendEnabled) {
+  name: containerAppName
+  location: location
+  tags: tags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${containerAppIdentity.id}': {}
+    }
+  }
+  properties: {
+    managedEnvironmentId: managedEnvironment.id
+    configuration: {
+      activeRevisionsMode: 'Single'
+      ingress: {
+        external: true
+        targetPort: 3000
+        transport: 'http'
+        allowInsecure: false
+      }
+      secrets: [
+        {
+          name: 'api-bearer-token'
+          value: apiBearerToken
+        }
+        {
+          name: 'dashboard-auth-password'
+          value: dashboardAuthPassword
+        }
+        {
+          name: 'dashboard-session-secret'
+          value: dashboardSessionSecret
+        }
+      ]
+      registries: [
+        {
+          server: acr.properties.loginServer
+          identity: containerAppIdentity.id
+        }
+      ]
+    }
+    template: {
+      containers: [
         {
           name: 'frontend'
           image: frontendImage
@@ -749,11 +832,11 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'BACKEND_API_BASE_URL'
-              value: frontendBackendApiBaseUrl
+              value: empty(frontendBackendApiBaseUrl) ? 'https://${apiContainerApp.properties.configuration.ingress.fqdn}/api/v1' : frontendBackendApiBaseUrl
             }
             {
               name: 'BACKEND_WS_URL'
-              value: frontendBackendWsUrl
+              value: empty(frontendBackendWsUrl) ? 'wss://${apiContainerApp.properties.configuration.ingress.fqdn}/api/v1/ws/live' : frontendBackendWsUrl
             }
             {
               name: 'BACKEND_API_BEARER_TOKEN'
@@ -782,10 +865,20 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             memory: frontendMemory
           }
         }
-      ] : [])
+      ]
       scale: {
-        minReplicas: minReplicas
-        maxReplicas: maxReplicas
+        minReplicas: frontendMinReplicas
+        maxReplicas: frontendMaxReplicas
+        rules: [
+          {
+            name: 'frontend-http'
+            http: {
+              metadata: {
+                concurrentRequests: '20'
+              }
+            }
+          }
+        ]
       }
     }
   }
@@ -1176,7 +1269,7 @@ resource runtimeMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = 
     severity: 1
     enabled: true
     scopes: [
-      containerApp.id
+      apiContainerApp.id
     ]
     evaluationFrequency: 'PT1M'
     windowSize: 'PT5M'
@@ -1202,7 +1295,7 @@ resource runtimeMetricAlertRules 'Microsoft.Insights/metricAlerts@2018-03-01' = 
         actionGroupId: actionGroup.id
         webHookProperties: {
           environment: environmentName
-          container_app: containerApp.name
+          container_app: apiContainerApp.name
           recommended_action: 'Inspect replica memory, recorder queue, and recent book event volume.'
         }
       }
@@ -1261,8 +1354,10 @@ resource logAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' = [fo
 output acrName string = acr.name
 output acrLoginServer string = acr.properties.loginServer
 output keyVaultName string = keyVault.name
-output containerAppName string = containerApp.name
-output containerAppFqdn string = containerApp.properties.configuration.ingress.fqdn
+output containerAppName string = frontendEnabled ? containerApp!.name : ''
+output containerAppFqdn string = frontendEnabled ? containerApp!.properties.configuration.ingress.fqdn : ''
+output apiContainerAppName string = apiContainerApp.name
+output apiContainerAppFqdn string = apiContainerApp.properties.configuration.ingress.fqdn
 output containerAppIdentityName string = containerAppIdentity.name
 output logAnalyticsWorkspaceName string = logAnalyticsWorkspace.name
 output storageAccountName string = storage.name

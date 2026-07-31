@@ -14,6 +14,7 @@ param shadowContainerAppName string = 'polyedge-shadow-neu'
 
 var suffix = uniqueString(subscription().id, resourceGroup().id, appName)
 var containerAppName = '${appName}-${environmentName}'
+var apiContainerAppName = '${containerAppName}-api'
 var logAnalyticsWorkspaceName = take('log-${appName}-${environmentName}-${suffix}', 63)
 var actionGroupName = '${containerAppName}-research-alerts'
 var tags = {
@@ -26,31 +27,37 @@ var recorderAlerts = [
     name: 'recorder-failed-total-gt-0'
     displayName: 'PolyEdge recorder has unrecovered durable evidence'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | extend durable = tolong(extract(@\'"recorder_unrecovered_durable_events":([0-9]+)\', 1, Log_s)), flush = extract(@\'"recorder_flush_unrecovered":(true|false)\', 1, Log_s) | where durable > 0 or flush == "true" or Log_s has "worker_alive=false"'
   }
   {
     name: 'recorder-dropped-count-gt-0'
     displayName: 'PolyEdge recorder dropped count > 0'
     severity: 0
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_dropped_count":([0-9]+)\', 1, Log_s)) | where value > 0'
   }
   {
     name: 'recorder-queue-over-1000'
     displayName: 'PolyEdge recorder queue over 1000 events'
     severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
+    query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | extend value = tolong(extract(@\'"recorder_queued":([0-9]+)\', 1, Log_s)) | where value > 1000'
   }
   {
     name: 'runtime-container-restarted'
     displayName: 'PolyEdge runtime container restarted or backed off'
     severity: 0
-    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${shadowContainerAppName}") | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
+    query: 'ContainerAppSystemLogs_CL | where ContainerAppName_s in ("${containerAppName}", "${apiContainerAppName}", "${shadowContainerAppName}") | where Reason_s in ("ContainerBackOff", "ContainerCrashing", "Unhealthy", "OOMKilled") or Log_s has_any ("Back-off restarting failed container", "OOMKilled")'
   }
   {
     name: 'shadow-runtime-health-missing'
     displayName: 'PolyEdge shadow runtime health heartbeat missing'
     severity: 0
     query: 'ContainerAppConsoleLogs_CL | where ContainerAppName_s == "${shadowContainerAppName}" | where Log_s has "runtime_health" | summarize heartbeat_count = count() | where heartbeat_count == 0'
+  }
+  {
+    name: 'job-failed'
+    displayName: 'PolyEdge job failed'
+    severity: 0
+    query: 'union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppSystemLogs_CL | where (ContainerJobName_s has "polyedge-" and ContainerJobName_s has "-job") or (JobName_s has "polyedge-" and JobName_s has "-job") | where Reason_s in ("Error", "BackoffLimitExceeded", "DeadlineExceeded", "Failed", "FailedMount", "ErrImagePull", "ImagePullBackOff", "ContainerCrashing") or Log_s has_any ("panicked", "exited with status Failed", "child command failed with status exit status:", "exit code: 1", "exit code 1", "has failed", "failed to", "runtime recorder flush failed") or Log_s has \'"status":"failed"\''
   }
 ]
 
@@ -98,7 +105,7 @@ resource recorderAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' 
       ]
       customProperties: {
         environment: environmentName
-        monitored_apps: '${containerAppName},${shadowContainerAppName}'
+        monitored_apps: '${containerAppName},${apiContainerAppName},${shadowContainerAppName}'
         recommended_action: 'Inspect recorder durability, queue health, and Container App restart state before trusting campaign evidence.'
       }
     }
@@ -107,6 +114,7 @@ resource recorderAlertRules 'Microsoft.Insights/scheduledQueryRules@2022-06-15' 
 
 output monitoredContainerApps array = [
   containerAppName
+  apiContainerAppName
   shadowContainerAppName
 ]
 
