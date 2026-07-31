@@ -124,9 +124,11 @@ test("a rejected relayer submission is retryable only from exact immutable and o
 
 test("only an exact confirmed redemption control can enter no-resubmit recovery", () => {
   const control = {
+    schema_version: 1,
     state: "confirmed_pending_verification",
     run_id: "venue-redemption-20260731072438297-c7ba96ce",
     owner,
+    signer_address: owner,
     funder,
     condition_ids: [conditionA],
     expected_gross_payout: 11.12,
@@ -157,6 +159,23 @@ test("only an exact confirmed redemption control can enter no-resubmit recovery"
   assert.equal(confirmedRedemptionControlMatches({
     ...control,
     funder: owner
+  }, binding), false);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    signer_address: funder
+  }, binding), false);
+  const legacySanitized = {
+    ...control,
+    owner: "[REDACTED]"
+  };
+  delete legacySanitized.signer_address;
+  assert.equal(
+    confirmedRedemptionControlMatches(legacySanitized, binding),
+    true
+  );
+  assert.equal(confirmedRedemptionControlMatches({
+    ...legacySanitized,
+    schema_version: 2
   }, binding), false);
 });
 

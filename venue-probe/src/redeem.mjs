@@ -244,6 +244,7 @@ async function run() {
     state: "prepared",
     run_id: runId,
     owner: account.address,
+    signer_address: account.address,
     funder: config.funderAddress,
     condition_ids: selection.selected.map((row) => row.condition_id),
     expected_gross_payout: selection.selected_gross_payout,
@@ -562,6 +563,12 @@ export function confirmedRedemptionControlMatches(control, {
   const conditions = Array.isArray(control?.condition_ids)
     ? control.condition_ids.map((value) => String(value).toLowerCase())
     : [];
+  const expectedOwner = String(owner || "").toLowerCase();
+  const storedOwner = String(control?.owner || "").toLowerCase();
+  const storedSigner = String(control?.signer_address || "").toLowerCase();
+  const signerBound = storedSigner
+    ? storedSigner === expectedOwner && /^0x[0-9a-f]{40}$/.test(storedSigner)
+    : control?.schema_version === 1 && control?.owner === "[REDACTED]";
   return control?.state === "confirmed_pending_verification" &&
     control?.submission_attempted === true &&
     typeof control?.run_id === "string" &&
@@ -569,9 +576,9 @@ export function confirmedRedemptionControlMatches(control, {
     typeof control?.transaction_id === "string" &&
     control.transaction_id.length > 0 &&
     /^0x[0-9a-f]{64}$/.test(String(control?.transaction_hash || "").toLowerCase()) &&
-    String(control?.owner || "").toLowerCase() === String(owner || "").toLowerCase() &&
+    signerBound &&
+    (storedOwner === expectedOwner || control?.owner === "[REDACTED]") &&
     String(control?.funder || "").toLowerCase() === String(funder || "").toLowerCase() &&
-    /^0x[0-9a-f]{40}$/.test(String(control?.owner || "").toLowerCase()) &&
     /^0x[0-9a-f]{40}$/.test(String(control?.funder || "").toLowerCase()) &&
     conditions.length > 0 &&
     conditions.length <= Number(maxConditions) &&
