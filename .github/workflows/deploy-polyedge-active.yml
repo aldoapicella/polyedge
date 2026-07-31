@@ -129,7 +129,7 @@ jobs:
               "ME_polyedge-execution-cl-env_rg-polyedge-dev_chilecentral"
             ] | sort)
           ' polyedge-monthly-budget.json
-          jq -e '.properties.amount == 350 and .properties.filter == null' polyedge-subscription-monthly-budget.json
+          jq -e '.properties.amount == 350 and (.properties.filter == null or .properties.filter == {})' polyedge-subscription-monthly-budget.json
 
   monitoring-only-deploy:
     if: inputs.research_job_target == 'monitoring-only'

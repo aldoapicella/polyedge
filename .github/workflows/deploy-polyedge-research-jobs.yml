@@ -177,6 +177,7 @@ jobs:
           trigger=$(jq -r '.properties.configuration.triggerType' <<<"$job_json")
           location=$(jq -r '.location | ascii_downcase | gsub(" "; "")' <<<"$job_json")
           command_line=$(jq -r '([.properties.template.containers[0].command[]?] + [.properties.template.containers[0].args[]?]) | join(" ")' <<<"$job_json")
+          shell_command=$(jq -c '.properties.template.containers[0].command' <<<"$job_json")
           allow_live=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ALLOW_LIVE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
           execution_mode=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "EXECUTION_MODE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
           run_bot=$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "RUN_BOT_ON_STARTUP") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")
@@ -189,6 +190,7 @@ jobs:
           test "$actual_identity" = "$expected_identity"
           test "$trigger" = "$expected_trigger"
           test "$location" = "$expected_location"
+          test "$shell_command" = '["/bin/sh","-lc"]'
           if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
             test "$command_line" = "$expected_command"
             test "$(jq -r '.properties.configuration.scheduleTriggerConfig.cronExpression' <<<"$job_json")" = "15 2 * * *"
@@ -310,24 +312,25 @@ jobs:
             --image "$RESEARCH_IMAGE"
             --output none
           )
+          if [ "$TARGET_JOB" != "polyedge-shadow-daily-neu-job" ]; then
+            update_args+=(
+              --set-env-vars API_BEARER_TOKEN=secretref:api-bearer-token
+            )
+          fi
           if [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
             update_args+=(
-              --command /bin/sh -lc
               --args 'polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_primary_daily.sh'
             )
           elif [ "$TARGET_JOB" = "polyedge-replay-index-job" ]; then
             update_args+=(
-              --command /bin/sh -lc
               --args 'polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
             )
           elif [ "$TARGET_JOB" = "polyedge-data-freshness-job" ]; then
             update_args+=(
-              --command /bin/sh -lc
               --args '/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
             )
           elif [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
             update_args+=(
-              --command /bin/sh -lc
               --args 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
             )
           fi
@@ -377,6 +380,7 @@ jobs:
           test "$(jq -r '.properties.template.containers | if length == 1 then .[0].name else empty end' <<<"$job_json")" = "$expected_container"
           test "$(jq -r '.identity.userAssignedIdentities | keys | if length == 1 then .[0] else empty end' <<<"$job_json")" = "$expected_identity"
           test "$(jq -r '.properties.configuration.triggerType' <<<"$job_json")" = "$expected_trigger"
+          test "$(jq -c '.properties.template.containers[0].command' <<<"$job_json")" = '["/bin/sh","-lc"]'
           command_line=$(jq -r '([.properties.template.containers[0].command[]?] + [.properties.template.containers[0].args[]?]) | join(" ")' <<<"$job_json")
           case "$command_line" in
             *"$expected_command_fragment"*) ;;

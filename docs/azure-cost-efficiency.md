@@ -68,13 +68,26 @@ No source change in this update should be treated as permission to deploy it.
 Use this sequence and keep the full runtime topology change behind the active
 qset campaign gate.
 
-1. Deploy budgets. This has no runtime effect.
+1. Deploy budgets. This has no runtime effect. The GitHub deployment identity is
+   resource-group scoped, so a subscription operator must run this isolated
+   subscription-scope deployment unless that identity is deliberately granted
+   separate subscription-level budget and deployment permissions.
 
    ```bash
-   gh workflow run deploy-polyedge-active.yml \
-     --ref <reviewed-sha> \
-     -f research_job_target=cost-governance-only \
-     -f authorize_shadow_runtime_change=false
+   expected_subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+   test "$(az account show --query id -o tsv)" = "$expected_subscription"
+   budget_start=$(date -u +%Y-%m-01T00:00:00Z)
+   az deployment sub what-if \
+     --name polyedge-cost-governance \
+     --location eastus \
+     --template-file infra/cost-governance.bicep \
+     --parameters budgetStartDate="$budget_start" \
+     --result-format ResourceIdOnly
+   az deployment sub create \
+     --name polyedge-cost-governance \
+     --location eastus \
+     --template-file infra/cost-governance.bicep \
+     --parameters budgetStartDate="$budget_start"
    ```
 
 2. Deploy the isolated monitoring template. It may safely mention
@@ -157,6 +170,36 @@ qset campaign gate.
   `Microsoft.App/environments` delegation; `Microsoft.Storage.Global` exists;
   protected North Europe/qset/funded runtime definitions compare byte-for-byte;
   storage upload/download and recorder heartbeat checks pass.
+
+## Applied state on 2026-07-31
+
+- Subscription deployment `polyedge-cost-governance-3814514` created and
+  verified the $275 PolyEdge and $350 subscription budgets.
+- GitHub Actions run `30659858265` deployed the six retained monitoring rules
+  and proved protected runtime definitions unchanged. The guarded cleanup then
+  removed only `polyedge-dev-missing-latest-blob`,
+  `polyedge-dev-research-job-failure`, and the unattached
+  `pip-polyedge-venue-neu-egress` public IP.
+- Research snapshot `e7ca3ecb46c52230f007c302a7e4aac671f9d9ca` passed the
+  source-freeze guard and complete CI validation step. OIDC then rejected the
+  temporary branch before any Azure mutation, so the authenticated subscription
+  operator ran ACR build `ca22`, which published
+  `polyedge-rust-research@sha256:c77f000689d7733b692be714b8b18ba019a5fdf98943c5aff724fa14a34f4b96`,
+  which is deployed to freshness, hourly quality, daily research, and replay
+  index. Freshness executions at 20:05 and 20:10 UTC succeeded with compact
+  two-line output.
+- Resource-group deployment `polyedge-storage-service-endpoints-3814514`
+  enabled `Microsoft.Storage.Global` on the two exact subnets. The qset
+  recorder saw one connection reset during route propagation and recovered all
+  three queued events on retry 2; later health rows showed zero unrecovered
+  durable events. Protected shadow, qset, and funded definitions were unchanged
+  and funded heartbeats continued.
+- The `polyedge-dev` frontend/API split is not deployed. The qset disposition
+  still marks `campaign-2026-07-28-qset-v1` active through 2026-09-25, so the
+  broad topology cutover remains blocked. Live `polyedge-dev--0000123` retains
+  its existing bot and frontend containers at one replica until that gate is
+  formally closed or a separately reviewed exactly-one-writer cutover is
+  approved.
 
 ## Rollback
 
