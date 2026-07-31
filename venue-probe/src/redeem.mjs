@@ -40,6 +40,7 @@ import {
   loadDurableInternalSettlements,
   putVerifiedInternalSettlement
 } from "./compounding-risk.mjs";
+import { decodeSettlementReceiptEvidence } from "./canary.mjs";
 import { tradeFillsFromRest } from "./canary-lifecycle-lib.mjs";
 
 let config;
@@ -150,6 +151,16 @@ async function run() {
   const onchainLiquidBefore = await readPusdBalance(publicClient);
   if (Math.abs(onchainLiquidBefore - liquidBefore) > 0.000001) {
     throw new Error("fail closed: CLOB and onchain liquid collateral disagree before redemption");
+  }
+  if (initialRedemptionControl?.state === "confirmed_pending_verification") {
+    return recoverConfirmedRedemption({
+      account,
+      clob,
+      publicClient,
+      geoblock,
+      control: initialRedemptionControl,
+      liquidCollateral: liquidBefore
+    });
   }
   const selection = await validateOnchainSelection(
     publicClient,
@@ -301,7 +312,8 @@ async function run() {
       clob,
       transactionHash: transaction.transactionHash,
       receipt,
-      reservationRecords
+      reservationRecords,
+      conditionIds: selection.selected.map((row) => row.condition_id)
     });
     if (settlementValues.length !== selection.selected.length ||
         settlementValues.some((settlement) =>
@@ -322,7 +334,6 @@ async function run() {
     control.realized_payout = verified.realized_payout;
     control.internal_settlement_blobs = settlements.map((row) => row.blob_name);
     control.updated_ts = new Date().toISOString();
-    await writeRedemptionControl(control);
     await settleProbeRiskReservations(config, {
       condition_ids: selection.selected.map((row) => row.condition_id),
       settlement_verified: true,
@@ -342,6 +353,7 @@ async function run() {
     }, {
       reservationRecords
     });
+    await writeRedemptionControl(control);
     ledger.record("venue_redemption_verified", verified);
     return {
       ...baseSummary("redeemed_and_verified", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, verified.portfolio),
@@ -361,6 +373,297 @@ async function run() {
     }
     throw error;
   }
+}
+
+async function recoverConfirmedRedemption({
+  account,
+  clob,
+  publicClient,
+  geoblock,
+  control,
+  liquidCollateral
+}) {
+  if (!confirmedRedemptionControlMatches(control, {
+    owner: account.address,
+    funder: config.funderAddress,
+    maxPayout: config.maxPayout,
+    maxConditions: config.maxConditions
+  })) {
+    throw new Error("fail closed: confirmed redemption control binding is invalid");
+  }
+  const transactionHash = String(control.transaction_hash).toLowerCase();
+  const conditionIds = control.condition_ids.map((value) => String(value).toLowerCase());
+  ledger.record("venue_redemption_recovery_started", {
+    prior_run_id: control.run_id,
+    transaction_id: control.transaction_id,
+    transaction_hash: transactionHash,
+    condition_ids: conditionIds
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({
+    hash: transactionHash,
+    confirmations: 2,
+    timeout: 60_000
+  });
+  if (receipt.status !== "success") {
+    throw new Error("fail closed: confirmed redemption recovery receipt was not successful");
+  }
+  await clob.updateBalanceAllowance({
+    asset_type: AssetType.COLLATERAL,
+    signature_type: config.signatureType
+  });
+
+  const container = storageContainer(config);
+  const manifest = JSON.parse(config.fundedSessionManifestJson);
+  const reservationRecords = await loadCampaignRiskReservationRecords(config);
+  const durableSettlements = await loadDurableInternalSettlements(
+    container,
+    config.campaignId
+  );
+  const exactDurable = exactControlledSettlements(
+    durableSettlements,
+    transactionHash,
+    conditionIds
+  );
+  let settlementValues = exactDurable;
+  if (settlementValues.length !== conditionIds.length) {
+    const discovered = await waitForAutomaticSettlementEvidence({
+      clob,
+      transactionHash,
+      receipt,
+      reservationRecords,
+      conditionIds
+    });
+    settlementValues = exactControlledSettlements(
+      [...exactDurable, ...discovered],
+      transactionHash,
+      conditionIds
+    );
+  }
+  assertExactControlledSettlements(
+    settlementValues,
+    transactionHash,
+    conditionIds,
+    control.expected_gross_payout
+  );
+
+  const settlements = [];
+  for (const settlement of settlementValues) {
+    settlements.push(await putVerifiedInternalSettlement(container, settlement));
+  }
+  const verified = await waitForRecoveredSettlementState({
+    clob,
+    publicClient,
+    conditionIds,
+    settlementValues
+  });
+  await settleProbeRiskReservations(config, {
+    condition_ids: conditionIds,
+    settlement_verified: true,
+    trust_boundary_ready: config.trustBoundaryReady,
+    transaction_hash: transactionHash,
+    polygon_chain_id: polygon.id,
+    transaction_receipt_status: receipt.status,
+    transaction_block_number: receipt.blockNumber.toString(),
+    transaction_receipt_confirmations: 2,
+    settlement_wallet: config.funderAddress,
+    settlement_signer: account.address,
+    run_id: runId,
+    settled_ts: new Date().toISOString(),
+    zero_open_orders_confirmed: true,
+    evidence_source: "polymarket_data_api_plus_onchain_redemption"
+  }, {
+    reservationRecords
+  });
+
+  const finalized = {
+    ...control,
+    state: "confirmed_and_verified",
+    recovery_run_id: runId,
+    liquid_collateral_after: verified.liquid_collateral_after,
+    realized_payout: verified.realized_payout,
+    internal_settlement_blobs: settlements.map((row) => row.blob_name),
+    updated_ts: new Date().toISOString()
+  };
+  await writeRedemptionControl(finalized);
+  ledger.record("venue_redemption_recovery_verified", {
+    prior_run_id: control.run_id,
+    transaction_hash: transactionHash,
+    condition_ids: conditionIds,
+    realized_payout: verified.realized_payout,
+    zero_open_orders_confirmed: true
+  });
+  return {
+    schema_version: 1,
+    run_id: runId,
+    status: "recovered_confirmed_and_verified",
+    finished_ts: new Date().toISOString(),
+    execution_origin: config.executionOrigin,
+    execution_country: geoblock.country,
+    static_egress_verified: geoblock.ip === config.expectedEgressIp,
+    dry_run: false,
+    redemption_enabled: true,
+    owner: account.address,
+    funder: config.funderAddress,
+    wallet_type: "legacy_uups_deposit_wallet",
+    derived_wallet_match: true,
+    liquid_collateral_before: liquidCollateral,
+    liquid_collateral_after: verified.liquid_collateral_after,
+    realized_payout: verified.realized_payout,
+    selection: {
+      selected: settlementValues.map((settlement) => ({
+        condition_id: settlement.condition_id,
+        gross_payout: settlement.payout
+      })),
+      selected_gross_payout: verified.realized_payout,
+      payout_source: "decoded_confirmed_recovery_receipt"
+    },
+    recent_redemptions: [],
+    portfolio: verified.portfolio,
+    approvals: verified.approvals,
+    planned_calls: [],
+    zero_open_orders_confirmed: true,
+    redemption_submitted: true,
+    new_submission_attempted: false,
+    confirmed_transaction_reused: true,
+    transaction_id: control.transaction_id,
+    transaction_hash: transactionHash,
+    internal_settlement_blobs: settlements.map((row) => row.blob_name),
+    research_only: false,
+    live_strategy_enabled: true
+  };
+}
+
+export function confirmedRedemptionControlMatches(control, {
+  owner,
+  funder,
+  maxPayout,
+  maxConditions = 5
+}) {
+  const conditions = Array.isArray(control?.condition_ids)
+    ? control.condition_ids.map((value) => String(value).toLowerCase())
+    : [];
+  return control?.state === "confirmed_pending_verification" &&
+    control?.submission_attempted === true &&
+    typeof control?.run_id === "string" &&
+    control.run_id.startsWith("venue-redemption-") &&
+    typeof control?.transaction_id === "string" &&
+    control.transaction_id.length > 0 &&
+    /^0x[0-9a-f]{64}$/.test(String(control?.transaction_hash || "").toLowerCase()) &&
+    String(control?.owner || "").toLowerCase() === String(owner || "").toLowerCase() &&
+    String(control?.funder || "").toLowerCase() === String(funder || "").toLowerCase() &&
+    /^0x[0-9a-f]{40}$/.test(String(control?.owner || "").toLowerCase()) &&
+    /^0x[0-9a-f]{40}$/.test(String(control?.funder || "").toLowerCase()) &&
+    conditions.length > 0 &&
+    conditions.length <= Number(maxConditions) &&
+    new Set(conditions).size === conditions.length &&
+    conditions.every((value) => /^0x[0-9a-f]{64}$/.test(value)) &&
+    Number(control?.expected_gross_payout) > 0 &&
+    Number(control.expected_gross_payout) <= Number(maxPayout) + 1e-9 &&
+    Number.isFinite(Date.parse(String(control?.created_ts || ""))) &&
+    Number.isFinite(Date.parse(String(control?.updated_ts || "")));
+}
+
+function exactControlledSettlements(settlements, transactionHash, conditionIds) {
+  const expectedConditions = new Set(conditionIds.map((value) => String(value).toLowerCase()));
+  return (Array.isArray(settlements) ? settlements : []).filter((settlement) =>
+    String(settlement?.transaction_hash || "").toLowerCase() === transactionHash &&
+    expectedConditions.has(String(settlement?.condition_id || "").toLowerCase())
+  );
+}
+
+function assertExactControlledSettlements(
+  settlements,
+  transactionHash,
+  conditionIds,
+  expectedPayout
+) {
+  const identities = settlements.map((settlement) =>
+    `${String(settlement?.transaction_hash || "").toLowerCase()}:` +
+    String(settlement?.condition_id || "").toLowerCase()
+  );
+  const conditions = settlements.map((settlement) =>
+    String(settlement?.condition_id || "").toLowerCase()
+  ).sort();
+  const expectedConditions = conditionIds.map((value) => String(value).toLowerCase()).sort();
+  const payout = settlements.reduce((total, settlement) =>
+    total + Number(settlement?.payout || 0), 0);
+  if (settlements.length !== expectedConditions.length ||
+      new Set(identities).size !== identities.length ||
+      identities.some((identity) => !identity.startsWith(`${transactionHash}:`)) ||
+      JSON.stringify(conditions) !== JSON.stringify(expectedConditions) ||
+      Math.abs(payout - Number(expectedPayout)) > 0.01) {
+    throw new Error("fail closed: recovered settlement does not match the exact durable control");
+  }
+}
+
+async function waitForRecoveredSettlementState({
+  clob,
+  publicClient,
+  conditionIds,
+  settlementValues
+}) {
+  const selected = new Set(conditionIds.map((value) => String(value).toLowerCase()));
+  const tokenIds = [...new Set(settlementValues.flatMap((settlement) =>
+    settlement.token_ids || []
+  ))].map(BigInt);
+  const adapters = [...new Set(settlementValues.map((settlement) =>
+    String(settlement.redemption_adapter_address || "")
+  ))];
+  if (!tokenIds.length || !adapters.length) {
+    throw new Error("fail closed: recovered settlement token or adapter binding is unavailable");
+  }
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    const [positions, balance, openOrders, onchainLiquid, tokenBalances, approvals] =
+      await Promise.all([
+        fetchPositions(),
+        clob.getBalanceAllowance({
+          asset_type: AssetType.COLLATERAL,
+          signature_type: config.signatureType
+        }),
+        clob.getOpenOrders(undefined, true),
+        readPusdBalance(publicClient),
+        Promise.all(tokenIds.map((assetId) =>
+          readConditionalBalance(publicClient, assetId))),
+        Promise.all(adapters.map((adapter) =>
+          readAdapterApproval(publicClient, adapter)))
+      ]);
+    if (!Array.isArray(openOrders)) {
+      throw new Error("fail closed: recovered redemption open-order response is not an array");
+    }
+    const remaining = positions.filter((row) =>
+      row.redeemable === true &&
+      Number(row.currentValue || 0) > 0 &&
+      selected.has(String(row.conditionId || "").toLowerCase())
+    );
+    const liquidAfter = Number(formatUnits(BigInt(balance.balance || "0"), 6));
+    if (!remaining.length &&
+        Math.abs(liquidAfter - onchainLiquid) <= 0.000001 &&
+        tokenBalances.every((value) => value === 0n) &&
+        approvals.every((value) => value === false) &&
+        openOrders.length === 0) {
+      return {
+        liquid_collateral_after: onchainLiquid,
+        realized_payout: Math.round(settlementValues.reduce(
+          (total, settlement) => total + Number(settlement.payout),
+          0
+        ) * 1_000_000) / 1_000_000,
+        zero_open_orders_confirmed: true,
+        conditional_token_balances_zero: true,
+        approvals: Object.fromEntries(adapters.map((adapter, index) => [
+          adapter.toLowerCase(),
+          approvals[index]
+        ])),
+        portfolio: {
+          ...summarizePortfolio(positions, onchainLiquid, config.startingCapital),
+          captured_ts: new Date().toISOString()
+        }
+      };
+    }
+    await sleep(2_000);
+  }
+  throw new Error("fail closed: confirmed redemption recovery did not reconcile account state");
 }
 
 function baseSummary(status, geoblock, owner, liquidBefore, selection, approvals, calls, recentRedemptions = [], portfolio = null) {
@@ -696,10 +999,20 @@ async function waitForAutomaticSettlementEvidence({
   clob,
   transactionHash,
   receipt,
-  reservationRecords
+  reservationRecords,
+  conditionIds
 }) {
   const container = storageContainer(config);
   const manifest = JSON.parse(config.fundedSessionManifestJson);
+  const expectedTransactionHash = String(transactionHash).toLowerCase();
+  const expectedConditions = new Set((conditionIds || []).map((value) =>
+    String(value).toLowerCase()
+  ));
+  if (!/^0x[0-9a-f]{64}$/.test(expectedTransactionHash) ||
+      !expectedConditions.size ||
+      [...expectedConditions].some((value) => !/^0x[0-9a-f]{64}$/.test(value))) {
+    throw new Error("fail closed: automatic settlement control binding is invalid");
+  }
   const deadline = Date.now() + 120_000;
   let lastError = null;
   while (Date.now() < deadline) {
@@ -711,8 +1024,15 @@ async function waitForAutomaticSettlementEvidence({
       const settlements = await discoverVerifiedAutomaticInternalSettlements({
         manifest,
         reservations: reservationRecords.map((record) => record.reservation),
-        activity: await fetchActivity(),
+        activity: (await fetchActivity()).filter((row) =>
+          String(row?.type || "").toUpperCase() !== "REDEEM" ||
+          (
+            String(row?.transactionHash || "").toLowerCase() === expectedTransactionHash &&
+            expectedConditions.has(String(row?.conditionId || "").toLowerCase())
+          )
+        ),
         durableSettlements,
+        expectedWallet: config.funderAddress,
         getOrderFills: async (reservation) => {
           const trades = await clob.getTrades({ market: reservation.condition_id });
           if (!Array.isArray(trades)) {
@@ -721,15 +1041,10 @@ async function waitForAutomaticSettlementEvidence({
           return tradeFillsFromRest(trades, reservation.order_id);
         },
         getTransactionReceipt: async (hash) => {
-          if (String(hash).toLowerCase() !== String(transactionHash).toLowerCase()) {
+          if (String(hash).toLowerCase() !== expectedTransactionHash) {
             throw new Error("fail closed: automatic settlement receipt hash is not the submitted redemption");
           }
-          return {
-            status: receipt.status,
-            chain_id: polygon.id,
-            block_number: receipt.blockNumber.toString(),
-            confirmations: 2
-          };
+          return automaticSettlementReceiptEvidence(receipt, transactionHash);
         }
       });
       if (settlements.length) return settlements;
@@ -740,6 +1055,31 @@ async function waitForAutomaticSettlementEvidence({
     await sleep(2_000);
   }
   throw new Error(`fail closed: automatic settlement evidence did not reconcile (${lastError?.message || "unknown"})`);
+}
+
+export function automaticSettlementReceiptEvidence(
+  receipt,
+  transactionHash,
+  confirmations = 2
+) {
+  const decoded = decodeSettlementReceiptEvidence(receipt, transactionHash);
+  const blockNumber = BigInt(receipt?.blockNumber ?? 0);
+  const normalizedHash = String(transactionHash || "").toLowerCase();
+  if (receipt?.status !== "success" ||
+      !/^0x[0-9a-f]{64}$/.test(normalizedHash) ||
+      blockNumber <= 0n ||
+      !Number.isInteger(Number(confirmations)) ||
+      Number(confirmations) < 2) {
+    throw new Error("fail closed: automatic settlement receipt confirmation is invalid");
+  }
+  return {
+    status: "success",
+    chain_id: polygon.id,
+    transaction_hash: normalizedHash,
+    block_number: blockNumber.toString(),
+    confirmations: Number(confirmations),
+    ...decoded
+  };
 }
 
 async function readPusdBalance(publicClient) {

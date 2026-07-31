@@ -4,6 +4,7 @@ import { verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   RELAYER_DEADLINE_BUFFER_SECONDS,
+  confirmedRedemptionControlMatches,
   rejectedRelayerSubmissionMatches,
   safeRelayerErrorDetail
 } from "../src/redeem.mjs";
@@ -114,6 +115,44 @@ test("a rejected relayer submission is retryable only from exact immutable and o
     evidence,
     { ...selection, selected_gross_payout: 11.11 }
   ), false);
+});
+
+test("only an exact confirmed redemption control can enter no-resubmit recovery", () => {
+  const control = {
+    state: "confirmed_pending_verification",
+    run_id: "venue-redemption-20260731072438297-c7ba96ce",
+    owner,
+    funder,
+    condition_ids: [conditionA],
+    expected_gross_payout: 11.12,
+    submission_attempted: true,
+    transaction_id: "relayer-transaction-1",
+    transaction_hash: `0x${"ab".repeat(32)}`,
+    created_ts: "2026-07-31T07:24:38.297Z",
+    updated_ts: "2026-07-31T07:26:59.000Z"
+  };
+  const binding = { owner, funder, maxPayout: 25, maxConditions: 1 };
+  assert.equal(confirmedRedemptionControlMatches(control, binding), true);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    transaction_hash: null
+  }, binding), false);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    condition_ids: [conditionA, conditionA]
+  }, binding), false);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    condition_ids: [conditionA, conditionB]
+  }, binding), false);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    expected_gross_payout: 25.01
+  }, binding), false);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    funder: owner
+  }, binding), false);
 });
 
 test("relayer error details retain bounded diagnostics without secrets or signed payloads", () => {

@@ -25,6 +25,7 @@ import {
   startSafetySnapshotCache,
   streamBookEvidence
 } from "../src/canary.mjs";
+import { automaticSettlementReceiptEvidence } from "../src/redeem.mjs";
 
 const now = new Date("2026-07-12T12:00:20.000Z");
 const book = {
@@ -274,6 +275,8 @@ test("Polygon receipt decoder preserves the exact CTF-to-pUSD adapter chain", ()
   });
   const receipt = {
     transactionHash,
+    status: "success",
+    blockNumber: 77n,
     logs: [{
       ...log(
         conditionalTokens,
@@ -393,6 +396,14 @@ test("Polygon receipt decoder preserves the exact CTF-to-pUSD adapter chain", ()
     amount_base_units: String(amount)
   }]);
   assert.deepEqual(decodePayoutRedemptions(receipt, transactionHash), decoded.redemptions);
+  assert.deepEqual(automaticSettlementReceiptEvidence(receipt, transactionHash), {
+    status: "success",
+    chain_id: 137,
+    transaction_hash: transactionHash,
+    block_number: "77",
+    confirmations: 2,
+    ...decoded
+  });
 });
 
 test("persistent executor selects only a fresh exact-market safety snapshot", () => {
