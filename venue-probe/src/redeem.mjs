@@ -799,9 +799,14 @@ async function readRedemptionControl() {
   }
 }
 
-async function readLatestRedemptionEvidence() {
+async function readRedemptionEvidenceForControl(control) {
+  const createdMs = Date.parse(String(control?.created_ts || ""));
+  if (!control?.run_id || !Number.isFinite(createdMs)) return null;
+  const date = new Date(createdMs).toISOString().slice(0, 10);
   const container = storageContainer(config);
-  const blob = container.getBlobClient(`${redemptionEvidencePrefix()}/latest-redemption.json`);
+  const blob = container.getBlobClient(
+    `${redemptionEvidencePrefix()}/redemptions/${date}/${control.run_id}.json`
+  );
   try {
     const response = await blob.download();
     return JSON.parse(await streamToString(response.readableStreamBody));
@@ -815,7 +820,7 @@ async function reconcilePriorRejectedSubmission(control, selection) {
   if (!control || control.state !== "submission_attempted" || control.transaction_id) {
     return control;
   }
-  const evidence = await readLatestRedemptionEvidence();
+  const evidence = await readRedemptionEvidenceForControl(control);
   if (!rejectedRelayerSubmissionMatches(control, evidence, selection)) {
     return control;
   }
