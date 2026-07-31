@@ -139,7 +139,7 @@ async function run() {
   if (!Array.isArray(openOrders)) throw new Error("fail closed: CLOB open-order response is not an array");
   if (openOrders.length) throw new Error(`fail closed: account has ${openOrders.length} open order(s)`);
 
-  const [positions, balance, activity, redemptionControl] = await Promise.all([
+  const [positions, balance, activity, initialRedemptionControl] = await Promise.all([
     fetchPositions(),
     clob.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetchActivity(),
@@ -153,6 +153,10 @@ async function run() {
   const selection = await validateOnchainSelection(
     publicClient,
     selectRedeemableConditions(positions, config.maxPayout, config.maxConditions)
+  );
+  const redemptionControl = await reconcilePriorRejectedSubmission(
+    initialRedemptionControl,
+    selection
   );
   const approvals = await adapterApprovals(publicClient, selection);
   const calls = buildRedemptionCalls(selection, approvals);
@@ -189,7 +193,12 @@ async function run() {
   await validateRelayerCredential();
 
   const pending = redemptionControl;
-  if (pending && !["confirmed_and_verified", "failed_before_submission", "relayer_failed"].includes(pending.state)) {
+  if (pending && ![
+    "confirmed_and_verified",
+    "failed_before_submission",
+    "relayer_failed",
+    "relayer_rejected"
+  ].includes(pending.state)) {
     throw new Error(`fail closed: prior redemption control record is unresolved (${pending.state || "unknown"})`);
   }
 
@@ -244,7 +253,19 @@ async function run() {
       call_count: calls.length
     });
     sent = true;
-    const accepted = await relayerJson("/submit", { method: "POST", body: JSON.stringify(request) });
+    let accepted;
+    try {
+      accepted = await relayerJson("/submit", { method: "POST", body: JSON.stringify(request) });
+    } catch (error) {
+      if (Number(error.relayerHttpStatus) >= 400 && Number(error.relayerHttpStatus) < 500) {
+        control.state = "relayer_rejected";
+        control.relayer_http_status = Number(error.relayerHttpStatus);
+        control.relayer_error_detail = error.relayerSafeDetail || null;
+        control.updated_ts = new Date().toISOString();
+        await writeRedemptionControl(control);
+      }
+      throw error;
+    }
     if (!accepted?.transactionID) throw new Error("relayer accepted response did not contain transactionID");
     control.state = "relayer_accepted";
     control.transaction_id = accepted.transactionID;
@@ -555,8 +576,46 @@ async function relayerJson(path, options = {}) {
   const body = await response.text();
   let value;
   try { value = body ? JSON.parse(body) : null; } catch { value = null; }
-  if (!response.ok) throw new Error(`relayer ${path.split("?")[0]} returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const detail = safeRelayerErrorDetail(value ?? body, [
+      config.relayerApiKey,
+      config.apiSecret,
+      config.apiPassphrase,
+      config.privateKey
+    ]);
+    const error = new Error(
+      `relayer ${path.split("?")[0]} returned HTTP ${response.status}` +
+      (detail ? ` (${detail})` : "")
+    );
+    error.relayerHttpStatus = response.status;
+    error.relayerSafeDetail = detail;
+    throw error;
+  }
   return value;
+}
+
+export function safeRelayerErrorDetail(value, secrets = []) {
+  let detail = "";
+  if (typeof value === "string") {
+    detail = value;
+  } else if (value && typeof value === "object") {
+    for (const key of ["code", "error", "message", "reason", "detail"]) {
+      if (typeof value[key] === "string" && value[key].trim()) {
+        detail = `${key}=${value[key]}`;
+        break;
+      }
+    }
+  }
+  detail = detail.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret.length >= 8) {
+      detail = detail.split(secret).join("[redacted]");
+    }
+  }
+  return detail
+    .replace(/0x[0-9a-fA-F]{64,}/g, "[hex-redacted]")
+    .replace(/[A-Za-z0-9+/=_-]{48,}/g, "[token-redacted]")
+    .slice(0, 500);
 }
 
 async function validateRelayerCredential() {
@@ -738,6 +797,67 @@ async function readRedemptionControl() {
     if (Number(error.statusCode) === 404) return null;
     throw error;
   }
+}
+
+async function readLatestRedemptionEvidence() {
+  const container = storageContainer(config);
+  const blob = container.getBlobClient(`${redemptionEvidencePrefix()}/latest-redemption.json`);
+  try {
+    const response = await blob.download();
+    return JSON.parse(await streamToString(response.readableStreamBody));
+  } catch (error) {
+    if (Number(error.statusCode) === 404) return null;
+    throw error;
+  }
+}
+
+async function reconcilePriorRejectedSubmission(control, selection) {
+  if (!control || control.state !== "submission_attempted" || control.transaction_id) {
+    return control;
+  }
+  const evidence = await readLatestRedemptionEvidence();
+  if (!rejectedRelayerSubmissionMatches(control, evidence, selection)) {
+    return control;
+  }
+  const reconciled = {
+    ...control,
+    state: "relayer_rejected",
+    relayer_http_status: Number(
+      String(evidence.error).match(/HTTP (4\d\d)/)?.[1]
+    ),
+    relayer_error_detail: "reconciled_from_immutable_failed_submission_evidence",
+    updated_ts: new Date().toISOString()
+  };
+  await writeRedemptionControl(reconciled);
+  ledger.record("venue_redemption_prior_rejection_reconciled", {
+    run_id: control.run_id,
+    condition_ids: control.condition_ids,
+    relayer_http_status: reconciled.relayer_http_status
+  });
+  return reconciled;
+}
+
+export function rejectedRelayerSubmissionMatches(control, evidence, selection) {
+  if (control?.state !== "submission_attempted" ||
+      control?.transaction_id ||
+      evidence?.run_id !== control.run_id ||
+      evidence?.status !== "failed_closed" ||
+      evidence?.redemption_submitted !== true ||
+      !/^relayer \/submit returned HTTP 4\d\d(?:\s|\(|$)/.test(String(evidence?.error || ""))) {
+    return false;
+  }
+  const expectedConditions = [...new Set(
+    (control.condition_ids || []).map((value) => String(value).toLowerCase())
+  )].sort();
+  const currentConditions = [...new Set(
+    (selection?.selected || []).map((value) => String(value.condition_id).toLowerCase())
+  )].sort();
+  return expectedConditions.length > 0 &&
+    JSON.stringify(expectedConditions) === JSON.stringify(currentConditions) &&
+    Math.abs(
+      Number(control.expected_gross_payout) -
+      Number(selection?.selected_gross_payout)
+    ) <= 0.000001;
 }
 
 async function writeRedemptionControl(value) {

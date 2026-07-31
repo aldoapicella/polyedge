@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { verifyTypedData } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
+  rejectedRelayerSubmissionMatches,
+  safeRelayerErrorDetail
+} from "../src/redeem.mjs";
+import {
   CONDITIONAL_TOKENS,
   CTF_COLLATERAL_ADAPTER,
   NEG_RISK_CTF_COLLATERAL_ADAPTER,
@@ -64,6 +68,52 @@ test("redemption defaults to disabled dry-run and requires separate relayer auth
   });
   assert.equal(live.enabled, true);
   assert.equal(live.dryRun, false);
+});
+
+test("a rejected relayer submission is retryable only from exact immutable and onchain evidence", () => {
+  const control = {
+    state: "submission_attempted",
+    run_id: "venue-redemption-rejected",
+    transaction_id: null,
+    condition_ids: [conditionA],
+    expected_gross_payout: 11.12
+  };
+  const evidence = {
+    run_id: control.run_id,
+    status: "failed_closed",
+    error: "relayer /submit returned HTTP 400",
+    redemption_submitted: true
+  };
+  const selection = {
+    selected: [{ condition_id: conditionA }],
+    selected_gross_payout: 11.12
+  };
+  assert.equal(rejectedRelayerSubmissionMatches(control, evidence, selection), true);
+  assert.equal(rejectedRelayerSubmissionMatches(
+    control,
+    { ...evidence, error: "relayer confirmation timed out" },
+    selection
+  ), false);
+  assert.equal(rejectedRelayerSubmissionMatches(
+    control,
+    evidence,
+    { ...selection, selected: [{ condition_id: conditionB }] }
+  ), false);
+  assert.equal(rejectedRelayerSubmissionMatches(
+    control,
+    evidence,
+    { ...selection, selected_gross_payout: 11.11 }
+  ), false);
+});
+
+test("relayer error details retain bounded diagnostics without secrets or signed payloads", () => {
+  const secret = "relayer-secret-value";
+  const detail = safeRelayerErrorDetail({
+    message: `invalid batch ${secret} 0x${"ab".repeat(65)}`
+  }, [secret]);
+  assert.equal(detail, "message=invalid batch [redacted] [hex-redacted]");
+  assert.equal(safeRelayerErrorDetail({ request: "must not be retained" }), "");
+  assert.equal(safeRelayerErrorDetail("x".repeat(700)), "[token-redacted]");
 });
 
 test("funded-service redemption is bound to the Chile protected-compounding session", () => {
