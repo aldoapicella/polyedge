@@ -296,14 +296,26 @@ jobs:
       - name: Deploy continuous funded Dynamic Quote service
         run: |
           set -euo pipefail
-          az deployment group create \
-            --name "polyedge-funded-direct-cl-${GITHUB_RUN_ID}" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --template-file infra/funded-direct-chile.bicep \
-            --parameters @infra/funded-direct-chile.parameters.json \
-            --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
-            --only-show-errors \
-            -o json > funded-deployment.json
+          deployed=false
+          for attempt in 1 2 3; do
+            if az deployment group create \
+              --name "polyedge-funded-direct-cl-${GITHUB_RUN_ID}" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --template-file infra/funded-direct-chile.bicep \
+              --parameters @infra/funded-direct-chile.parameters.json \
+              --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
+              --only-show-errors \
+              -o json > funded-deployment.json 2> funded-deployment.stderr; then
+              deployed=true
+              break
+            fi
+            if ! grep -Fq 'unable to pull image using Managed identity' funded-deployment.stderr || [ "$attempt" -eq 3 ]; then
+              cat funded-deployment.stderr >&2
+              exit 1
+            fi
+            sleep "$((attempt * 30))"
+          done
+          test "$deployed" = true
           test "$(jq -r '.properties.provisioningState' funded-deployment.json)" = "Succeeded"
 
       - name: Keep the obsolete North Europe funded job fail-closed

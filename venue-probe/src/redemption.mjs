@@ -57,6 +57,14 @@ export const DEPOSIT_WALLET_BATCH_TYPES = {
 };
 
 export function loadRedemptionConfig(env = process.env) {
+  const fundedServiceManaged = env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true";
+  const fundedSessionManifestJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "");
+  let fundedSession = null;
+  if (fundedServiceManaged) {
+    try {
+      fundedSession = JSON.parse(fundedSessionManifestJson);
+    } catch {}
+  }
   const config = {
     executionMode: env.EXECUTION_MODE,
     enabled: env.VENUE_REDEMPTION_ENABLED === "true",
@@ -71,13 +79,15 @@ export function loadRedemptionConfig(env = process.env) {
     startingCapital: finiteNumber(env.VENUE_PROBE_STARTING_CAPITAL, null),
     campaignId: String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "funded-campaign-2026-07-12"),
     executionOrigin: String(env.VENUE_PROBE_EXECUTION_ORIGIN || "azure_north_europe_static_egress"),
-    fundedServiceManaged: env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true",
-    operatorDirect: env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true",
-    fundedSessionManifestJson: String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || ""),
+    fundedServiceManaged,
+    operatorDirect: fundedServiceManaged,
+    fundedSessionManifestJson,
     campaignBaselineEquity: finiteNumber(env.VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY, 5.030521),
     campaignEquityFloor: finiteNumber(env.VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR, 4.03),
     maxCampaignDrawdown: finiteNumber(env.VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN, 1),
-    maxOrderNotional: 1,
+    maxOrderNotional: fundedServiceManaged
+      ? finiteNumber(fundedSession?.max_order_notional, null)
+      : 1,
     maxReconciliationDiscrepancy: finiteNumber(env.VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY, 0.01),
     campaignCashFlows: JSON.parse(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]"),
     privateKey: env.POLYMARKET_PRIVATE_KEY,
@@ -125,6 +135,10 @@ export function validateRedemptionConfig(config) {
       }
       if (session.no_deposits !== true || session.allow_automatic_replenishment !== false) {
         errors.push("funded operator session must preserve no-deposit/no-replenishment controls");
+      }
+      if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= 25) ||
+          Number(session.target_order_notional) !== config.maxOrderNotional) {
+        errors.push("funded operator session must bind matching positive target/max order notional");
       }
     }
     if (config.executionOrigin !== "azure_chile_central_static_egress") {

@@ -239,7 +239,9 @@ test("funded-service redemption is bound to the Chile protected-compounding sess
     session_id: "dynamic-quote-funded-2026-07-29-v5",
     allow_compounding: true,
     no_deposits: true,
-    allow_automatic_replenishment: false
+    allow_automatic_replenishment: false,
+    target_order_notional: 10.5,
+    max_order_notional: 10.5
   };
   const funded = loadRedemptionConfig({
     ...safeEnv,
@@ -251,6 +253,7 @@ test("funded-service redemption is bound to the Chile protected-compounding sess
   });
   assert.equal(funded.fundedServiceManaged, true);
   assert.equal(funded.executionOrigin, "azure_chile_central_static_egress");
+  assert.equal(funded.maxOrderNotional, 10.5);
   assert.throws(() => loadRedemptionConfig({
     ...safeEnv,
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
@@ -267,6 +270,17 @@ test("funded-service redemption is bound to the Chile protected-compounding sess
     VENUE_PROBE_EXECUTION_ORIGIN: "azure_north_europe_static_egress",
     VENUE_REDEMPTION_MAX_CONDITIONS: "1"
   }), /Azure Chile Central/);
+  assert.throws(() => loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify({
+      ...session,
+      target_order_notional: 1
+    }),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
+    VENUE_PROBE_EXECUTION_ORIGIN: "azure_chile_central_static_egress",
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1"
+  }), /target\/max order notional/);
 });
 
 test("only positive redeemable condition payouts are selected once and within the cap", () => {
