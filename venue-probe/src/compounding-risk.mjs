@@ -280,8 +280,10 @@ export function verifyAutomaticSettlementEvidence({
     !fill.trade_id
       || !fill.transaction_hash
       || fill.asset_id !== tokenId
-      || normalizedAsset(fill?.tradeAssetId) !== tokenId
       || normalizedAsset(fill?.makerAssetId) !== tokenId
+      // CLOB's top-level asset belongs to the aggregate/taker side and can be
+      // the complementary outcome; the nested maker asset is the exact order binding.
+      || !normalizedAsset(fill?.tradeAssetId)
       || fill.condition_id !== conditionId
       || !CONFIRMED_CLOB_STATUSES.has(String(fill?.status || "").toUpperCase())
       || fill.orderRole !== "MAKER"

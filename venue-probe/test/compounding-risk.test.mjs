@@ -255,6 +255,7 @@ function automaticFill({
   orderId = "order-funded-1",
   conditionId = automaticCondition,
   assetId = automaticToken,
+  tradeAssetId = secondToken,
   transactionHash = automaticFillTransaction,
   size = 10,
   price = 0.2,
@@ -269,7 +270,7 @@ function automaticFill({
     transactionHash,
     market: conditionId,
     assetId,
-    tradeAssetId: assetId,
+    tradeAssetId,
     makerAssetId: assetId,
     status: "TRADE_STATUS_CONFIRMED",
     orderId,
@@ -618,6 +619,20 @@ test("automatic settlement fails closed on CLOB hash, asset, wallet, status, or 
       name: "asset",
       mutate: (fixture) => {
         fixture.orderFills[0].assetId = secondToken;
+      },
+      error: /CLOB trade hash\/asset\/market/
+    },
+    {
+      name: "maker asset",
+      mutate: (fixture) => {
+        fixture.orderFills[0].makerAssetId = secondToken;
+      },
+      error: /CLOB trade hash\/asset\/market/
+    },
+    {
+      name: "missing top-level trade asset",
+      mutate: (fixture) => {
+        fixture.orderFills[0].tradeAssetId = "";
       },
       error: /CLOB trade hash\/asset\/market/
     },
