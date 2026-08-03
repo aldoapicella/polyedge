@@ -16,11 +16,17 @@ pub(super) struct RuntimeRecorder {
 impl RuntimeRecorder {
     pub(super) fn new(settings: &RuntimeSettings) -> Self {
         let mut recorders: Vec<Box<dyn EventRecorder + Send>> = Vec::new();
-        let path = env::var("RECORDER_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("data/events.jsonl"));
-        recorders.push(Box::new(JsonlRecorder::new(path)));
         let authoritative_remote = settings.azure.storage_account_name.is_some();
+        let local_jsonl_enabled = local_jsonl_recorder_enabled(
+            authoritative_remote,
+            env::var("LOCAL_JSONL_RECORDER_ENABLED").ok().as_deref(),
+        );
+        if local_jsonl_enabled {
+            let path = env::var("RECORDER_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("data/events.jsonl"));
+            recorders.push(Box::new(JsonlRecorder::new(path)));
+        }
         if let Some(account) = settings.azure.storage_account_name.as_deref() {
             let client_id = env::var("AZURE_CLIENT_ID").ok();
             recorders.push(Box::new(AzureAppendBlobRecorder::new_with_prefix_cutover(
@@ -134,5 +140,32 @@ impl RuntimeRecorder {
             "last_error": Value::Null,
             "busy": true
         })
+    }
+}
+
+fn local_jsonl_recorder_enabled(authoritative_remote: bool, configured: Option<&str>) -> bool {
+    if !authoritative_remote {
+        return true;
+    }
+    !matches!(
+        configured
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("false" | "0" | "no")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_jsonl_recorder_enabled;
+
+    #[test]
+    fn local_jsonl_can_only_be_disabled_when_remote_storage_is_authoritative() {
+        assert!(!local_jsonl_recorder_enabled(true, Some("false")));
+        assert!(!local_jsonl_recorder_enabled(true, Some(" 0 ")));
+        assert!(local_jsonl_recorder_enabled(true, None));
+        assert!(local_jsonl_recorder_enabled(true, Some("true")));
+        assert!(local_jsonl_recorder_enabled(false, Some("false")));
     }
 }

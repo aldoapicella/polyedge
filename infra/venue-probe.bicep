@@ -628,6 +628,7 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_EVENT_BLOB_PREFIX', value: 'shadow-events/campaign-2026-07-22' }
             { name: 'AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER', value: shadowCampaignEventPrefix }
             { name: 'AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC', value: '${shadowCampaignStart}T00:00:00Z' }
+            { name: 'LOCAL_JSONL_RECORDER_ENABLED', value: 'false' }
             { name: 'COMPACT_SHADOW_RECORDING', value: 'true' }
             { name: 'SHADOW_BOOK_SAMPLE_MS', value: '1000' }
             { name: 'PUBLISH_STRATEGY_CANARY_INTENTS', value: 'true' }
