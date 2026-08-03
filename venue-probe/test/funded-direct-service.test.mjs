@@ -232,6 +232,53 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   ));
 });
 
+test("persistent service waits for the prior revision lease before receiving messages", async () => {
+  const bus = fakeBus([{
+    messageId: "warmup-after-handoff",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      condition_id: "condition",
+      token_id: "token-up",
+      token_ids: ["token-up", "token-down"],
+      market_end_ts: new Date(Date.now() + 600_000).toISOString()
+    }
+  }]);
+  let executorCreations = 0;
+  let sleeps = 0;
+  const logs = [];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => {
+      executorCreations += 1;
+      if (executorCreations < 3) {
+        throw new Error("fail closed: another venue probe owns the campaign lease (409)");
+      }
+      return {
+        warmMarket: async () => {},
+        execute: async () => {},
+        status: () => ({ ready: true }),
+        close: async () => {}
+      };
+    },
+    createProcessor: async () => ({ process: async () => ({}) }),
+    sleep: async () => { sleeps += 1; },
+    logger: (value) => logs.push(value)
+  });
+
+  assert.equal(result.processed_messages, 1);
+  assert.equal(executorCreations, 3);
+  assert.equal(sleeps, 2);
+  assert.deepEqual(bus.completed, ["warmup-after-handoff"]);
+  assert.deepEqual(
+    logs.filter((value) => value.status === "awaiting_campaign_lease_handoff")
+      .map((value) => value.attempt),
+    [1, 2]
+  );
+});
+
 test("persistent service runs redemption under the inherited lease after entering the no-trade window", async () => {
   const now = Date.parse("2026-07-30T12:10:00Z");
   const bus = fakeBus([{

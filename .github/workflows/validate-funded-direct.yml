@@ -388,22 +388,31 @@ jobs:
             --ids "$environment_id" \
             --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
           test -n "$workspace_customer_id"
+          target_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test -n "$target_revision"
           for attempt in $(seq 1 36); do
-            active_replicas=$(az containerapp revision list \
+            az containerapp revision list \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
-              --query '[?properties.active].properties.replicas | sum(@)' \
-              -o tsv)
-            if [ "${active_replicas:-0}" = "1" ]; then
-              active_revision=$(az containerapp revision list \
-                --resource-group "$AZURE_RESOURCE_GROUP" \
-                --name "$FUNDED_APP" \
-                --query '[?properties.active].name | [0]' -o tsv)
+              -o json > funded-revisions.json
+            active_revision_count=$(jq '[.[] | select(.properties.active == true)] | length' funded-revisions.json)
+            active_revision=$(jq -r '[.[] | select(.properties.active == true)][0].name // ""' funded-revisions.json)
+            target_health=$(jq -r --arg revision "$target_revision" \
+              '.[] | select(.name == $revision) | .properties.healthState // ""' funded-revisions.json)
+            target_replicas=$(jq -r --arg revision "$target_revision" \
+              '.[] | select(.name == $revision) | .properties.replicas // 0' funded-revisions.json)
+            if [ "$active_revision_count" = "1" ] && \
+                [ "$active_revision" = "$target_revision" ] && \
+                [ "$target_health" = "Healthy" ] && \
+                [ "$target_replicas" = "1" ]; then
               startup_count=$(az monitor log-analytics query \
                 --workspace "$workspace_customer_id" \
                 --analytics-query "ContainerAppConsoleLogs_CL
                   | where ContainerAppName_s == '$FUNDED_APP'
-                  | where RevisionName_s == '$active_revision'
+                  | where RevisionName_s == '$target_revision'
                   | where TimeGenerated > ago(30m)
                   | where Log_s contains '\"status\":\"persistent_service_started\"'
                   | count" \
@@ -414,7 +423,10 @@ jobs:
             fi
             sleep 10
           done
-          test "${active_replicas:-0}" = "1"
+          test "$active_revision_count" = "1"
+          test "$active_revision" = "$target_revision"
+          test "$target_health" = "Healthy"
+          test "$target_replicas" = "1"
           test "${startup_count:-0}" -ge 1
           previous_executions=$(az containerapp job execution list \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -488,17 +500,29 @@ jobs:
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               -o json > funded-app.json
-            active_replicas=$(az containerapp revision list \
+            target_revision=$(jq -r '.properties.latestRevisionName' funded-app.json)
+            az containerapp revision list \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
-              --query '[?properties.active].properties.replicas | sum(@)' \
-              -o tsv)
-            if [ "${active_replicas:-0}" = "1" ]; then
+              -o json > funded-revisions.json
+            active_revision_count=$(jq '[.[] | select(.properties.active == true)] | length' funded-revisions.json)
+            active_revision=$(jq -r '[.[] | select(.properties.active == true)][0].name // ""' funded-revisions.json)
+            target_health=$(jq -r --arg revision "$target_revision" \
+              '.[] | select(.name == $revision) | .properties.healthState // ""' funded-revisions.json)
+            target_replicas=$(jq -r --arg revision "$target_revision" \
+              '.[] | select(.name == $revision) | .properties.replicas // 0' funded-revisions.json)
+            if [ "$active_revision_count" = "1" ] && \
+                [ "$active_revision" = "$target_revision" ] && \
+                [ "$target_health" = "Healthy" ] && \
+                [ "$target_replicas" = "1" ]; then
               break
             fi
             sleep 10
           done
-          test "${active_replicas:-0}" = "1"
+          test "$active_revision_count" = "1"
+          test "$active_revision" = "$target_revision"
+          test "$target_health" = "Healthy"
+          test "$target_replicas" = "1"
           test "$(jq -r '.properties.template.scale.minReplicas' funded-app.json)" = "1"
           test "$(jq -r '.properties.template.scale.maxReplicas' funded-app.json)" = "1"
           test "$(jq -r '.properties.template.containers[0].image' funded-app.json)" = "${{ steps.images.outputs.funded_reference }}"
@@ -628,10 +652,16 @@ jobs:
           workspace_customer_id=$(az containerapp env show \
             --ids "$environment_id" \
             --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
-          active_revision=$(az containerapp revision list \
+          active_revision=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
-            --query '[?properties.active].name | [0]' -o tsv)
+            --query properties.latestRevisionName -o tsv)
+          az containerapp revision list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            -o json > funded-revisions-final.json
+          test "$(jq '[.[] | select(.properties.active == true)] | length' funded-revisions-final.json)" = "1"
+          test "$(jq -r '[.[] | select(.properties.active == true)][0].name' funded-revisions-final.json)" = "$active_revision"
           for attempt in $(seq 1 18); do
             startup_count=$(az monitor log-analytics query \
               --workspace "$workspace_customer_id" \

@@ -162,6 +162,7 @@ export async function runPersistentFundedDirectService({
   createProcessor = createFundedDirectProcessor,
   runRedemption = runVenueRedemption,
   now = Date.now,
+  sleep = delay,
   createBusClient = ({ namespace, credential }) =>
     new ServiceBusClient(`${namespace}.servicebus.windows.net`, credential)
 } = {}) {
@@ -170,7 +171,23 @@ export async function runPersistentFundedDirectService({
   const credential = new DefaultAzureCredential({ managedIdentityClientId: env.AZURE_CLIENT_ID });
   const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
   const receiver = bus.createReceiver(config.serviceBusQueue, { receiveMode: "peekLock" });
-  const executor = await createExecutor({ env: persistentCanaryBootstrapEnv(env) });
+  let executor = null;
+  let leaseHandoffAttempts = 0;
+  while (!executor) {
+    try {
+      executor = await createExecutor({ env: persistentCanaryBootstrapEnv(env) });
+    } catch (error) {
+      if (!isCampaignLeaseHandoffConflict(error)) throw error;
+      leaseHandoffAttempts += 1;
+      logger({
+        schema: "polyedge.funded_direct_service.v2",
+        status: "awaiting_campaign_lease_handoff",
+        attempt: leaseHandoffAttempts,
+        retry_delay_ms: config.restartDelayMs
+      });
+      await sleep(config.restartDelayMs);
+    }
+  }
   const processor = await createProcessor({
     env,
     executeCanary: (childEnv) => executor.execute(childEnv)
@@ -421,6 +438,12 @@ export async function runPersistentFundedDirectService({
     await receiver.close().catch(() => null);
     await bus.close().catch(() => null);
   }
+}
+
+function isCampaignLeaseHandoffConflict(error) {
+  return /^fail closed: another venue probe owns the campaign lease \((409|412)\)$/.test(
+    String(error?.message || "")
+  );
 }
 
 export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config) {
