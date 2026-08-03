@@ -258,6 +258,95 @@ test("protected-compounding startup skips settlement activity for an empty manif
   assert.deepEqual(result.verifiedConfiguredSettlements, []);
 });
 
+test("protected-compounding successor imports exact durable predecessor settlement without historical API scan", async () => {
+  const predecessorSessionId = "dynamic-quote-funded-test-v5";
+  const sessionId = "dynamic-quote-funded-test-v7";
+  const settlement = {
+    schema: "polyedge.verified_internal_settlement.v1",
+    session_id: predecessorSessionId,
+    id: "manual-redeem-1",
+    type: "internal_manual_settlement",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    condition_id: `0x${"b".repeat(64)}`,
+    payout: 17.015,
+    principal: 10.209,
+    realized_pnl: 6.806,
+    fill_transaction_hashes: [`0x${"c".repeat(64)}`],
+    evidence_source: "polymarket_data_api_fills_plus_polygon_receipt",
+    receipt_block_number: "123",
+    receipt_confirmations: 2
+  };
+  const predecessorBlob =
+    `reports/funded/dynamic-quote/sessions/${predecessorSessionId}/internal-settlements/manual.json`;
+  const values = new Map([[predecessorBlob, Buffer.from(JSON.stringify(settlement))]]);
+  const container = {
+    async *listBlobsFlat({ prefix }) {
+      for (const name of values.keys()) {
+        if (name.startsWith(prefix)) yield { name };
+      }
+    },
+    getBlobClient: (name) => ({
+      download: async () => {
+        if (!values.has(name)) throw Object.assign(new Error("missing"), { statusCode: 404 });
+        return { readableStreamBody: Readable.from([values.get(name)]) };
+      }
+    }),
+    getBlockBlobClient: (name) => ({
+      uploadData: async (bytes, options) => {
+        assert.equal(options.conditions.ifNoneMatch, "*");
+        if (values.has(name)) throw Object.assign(new Error("exists"), { statusCode: 412 });
+        values.set(name, Buffer.from(bytes));
+      }
+    })
+  };
+  const manifest = {
+    schema_version: "polyedge.operator_funded_session.v3",
+    session_id: sessionId,
+    starting_collateral: 11.09862,
+    allow_compounding: true,
+    continue_after_loss: true,
+    internal_settlements: [{
+      id: settlement.id,
+      type: settlement.type,
+      transaction_hash: settlement.transaction_hash,
+      condition_id: settlement.condition_id,
+      payout: settlement.payout,
+      principal: settlement.principal,
+      realized_pnl: settlement.realized_pnl,
+      fill_transaction_hashes: settlement.fill_transaction_hashes
+    }],
+    capital_policy: {
+      reserve_ratio: 0.3,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      reserve_basis: "fully_reconciled_current_equity",
+      loss_response: "resize_from_fully_reconciled_current_equity",
+      prior_state_session_id: predecessorSessionId,
+      prior_state_blob_name:
+        `reports/funded/dynamic-quote/sessions/${predecessorSessionId}/capital-reserve-state.json`,
+      minimum_historical_high_water_equity: 41.34362,
+      high_water_update: "full_reconciliation_only",
+      reserve_monotonic: false,
+      state_blob_name:
+        `reports/funded/dynamic-quote/sessions/${sessionId}/capital-reserve-state.json`
+    }
+  };
+  let activityCalls = 0;
+  const result = await initializeProtectedCompounding({
+    container,
+    manifest,
+    loadActivity: async () => {
+      activityCalls += 1;
+      return [];
+    }
+  });
+  assert.equal(activityCalls, 0);
+  assert.equal(result.verifiedConfiguredSettlements.length, 1);
+  assert.equal(result.verifiedConfiguredSettlements[0].session_id, sessionId);
+  assert.equal([...values.keys()].filter((name) =>
+    name.includes(`/sessions/${sessionId}/internal-settlements/`)).length, 1);
+});
+
 test("Polygon receipt decoder preserves the exact CTF-to-pUSD adapter chain", () => {
   const transactionHash = `0x${"c".repeat(64)}`;
   const wallet = "0x1111111111111111111111111111111111111111";

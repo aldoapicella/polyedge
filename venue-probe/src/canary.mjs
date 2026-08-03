@@ -275,15 +275,28 @@ export async function initializeProtectedCompounding({
   manifest,
   loadActivity = loadSettlementActivity
 }) {
-  const durableSettlements = await loadDurableInternalSettlements(
-    container,
-    manifest.session_id
-  );
+  const predecessorSessionId = manifest?.schema_version ===
+      "polyedge.operator_funded_session.v3"
+    ? manifest?.capital_policy?.prior_state_session_id
+    : null;
+  const [durableSettlements, predecessorSettlements] = await Promise.all([
+    loadDurableInternalSettlements(container, manifest.session_id),
+    predecessorSessionId
+      ? loadDurableInternalSettlements(container, predecessorSessionId)
+      : Promise.resolve([])
+  ]);
+  const durableVerificationEvidence = [
+    ...durableSettlements,
+    ...predecessorSettlements.filter((row) =>
+      !durableSettlements.some((current) => current.id === row.id))
+  ];
   const configuredSettlements = manifest.internal_settlements || [];
-  const activity = configuredSettlements.length
+  const configuredSettlementsNeedingActivity = configuredSettlements.filter((configured) =>
+    !durableVerificationEvidence.some((durable) => durable.id === configured.id));
+  const activity = configuredSettlementsNeedingActivity.length
     ? await loadActivity({
         user: config.funderAddress,
-        conditionIds: configuredSettlements.map((row) => row.condition_id),
+        conditionIds: configuredSettlementsNeedingActivity.map((row) => row.condition_id),
         sessionStartedAt: manifest.created_at
       })
     : [];
@@ -291,8 +304,11 @@ export async function initializeProtectedCompounding({
     manifest,
     activity,
     getTransactionReceipt: confirmedPolygonReceipt,
-    durableSettlements
-  });
+    durableSettlements: durableVerificationEvidence
+  }).then((rows) => rows.map((row) => ({
+    ...row,
+    session_id: manifest.session_id
+  })));
   for (const settlement of verifiedConfiguredSettlements) {
     if (!durableSettlements.some((row) => row.id === settlement.id)) {
       await putVerifiedInternalSettlement(container, {
