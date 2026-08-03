@@ -239,6 +239,50 @@ test("operator-funded config accepts the reviewed monotonic 30% reserve contract
   );
 });
 
+test("operator-funded config accepts current-equity resizing after losses", () => {
+  const value = session();
+  value.schema_version = "polyedge.operator_funded_session.v3";
+  value.session_id = "dynamic-quote-funded-test-v7";
+  value.authorized_by_user_reference = "Codex task continue after losses";
+  value.allow_compounding = true;
+  value.continue_after_loss = true;
+  value.capital_policy = {
+    reserve_ratio: 0.3,
+    operating_buffer_ratio: 0.01,
+    minimum_order_notional: 1,
+    reserve_basis: "fully_reconciled_current_equity",
+    loss_response: "resize_from_fully_reconciled_current_equity",
+    prior_state_session_id: "dynamic-quote-funded-test-v5",
+    prior_state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
+    minimum_historical_high_water_equity: 17.90462,
+    high_water_update: "full_reconciliation_only",
+    reserve_monotonic: false,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v7/capital-reserve-state.json"
+  };
+  value.internal_settlements = [];
+  const fundedEnv = env({
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+    FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+      sha256(Buffer.from(JSON.stringify(value, null, 2)))
+  });
+  const config = loadFundedDirectConfig(fundedEnv);
+  assert.equal(config.session.continue_after_loss, true);
+  assert.equal(config.session.capital_policy.reserve_monotonic, false);
+
+  value.capital_policy.reserve_basis = "fully_reconciled_high_water_equity";
+  assert.throws(
+    () => loadFundedDirectConfig({
+      ...fundedEnv,
+      FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+      FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+        sha256(Buffer.from(JSON.stringify(value, null, 2)))
+    }),
+    /operator-funded session contract/
+  );
+});
+
 test("worker executes a fresh Dynamic Quote intent under the operator session", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now);

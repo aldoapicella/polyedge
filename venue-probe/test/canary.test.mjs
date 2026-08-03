@@ -915,7 +915,7 @@ test("operator-funded child executes above the old one-dollar cap without claimi
   assert.deepEqual(quarantineControls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
 });
 
-test("protected compounding submits only the current-funds size bound to the source intent", async () => {
+test("loss-resizing protected capital submits only the current-equity size bound to the source intent", async () => {
   const input = fixture(false);
   input.config.operatorDirect = true;
   input.config.trustBoundaryReady = false;
@@ -925,8 +925,8 @@ test("protected compounding submits only the current-funds size bound to the sou
   input.documents.intent.shares = "20";
   input.documents.intent.notional = "4";
   input.documents.manifest = {
-    schema_version: "polyedge.operator_funded_session.v2",
-    session_id: "dynamic-quote-funded-test-v5",
+    schema_version: "polyedge.operator_funded_session.v3",
+    session_id: "dynamic-quote-funded-test-v7",
     authorization_mode: "operator_direct",
     authorized_by_user_reference: "Codex task protected compounding",
     research_promotion_bypassed: true,
@@ -935,6 +935,7 @@ test("protected compounding submits only the current-funds size bound to the sou
     no_deposits: true,
     allow_automatic_replenishment: false,
     allow_compounding: true,
+    continue_after_loss: true,
     external_cash_flows: [],
     max_open_orders: 1,
     target_order_notional: 10.5,
@@ -946,10 +947,16 @@ test("protected compounding submits only the current-funds size bound to the sou
       reserve_ratio: 0.3,
       operating_buffer_ratio: 0.01,
       minimum_order_notional: 1,
+      reserve_basis: "fully_reconciled_current_equity",
+      loss_response: "resize_from_fully_reconciled_current_equity",
+      prior_state_session_id: "dynamic-quote-funded-test-v5",
+      prior_state_blob_name:
+        "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
+      minimum_historical_high_water_equity: 17.90462,
       high_water_update: "full_reconciliation_only",
-      reserve_monotonic: true,
+      reserve_monotonic: false,
       state_blob_name:
-        "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json"
+        "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v7/capital-reserve-state.json"
     },
     internal_settlements: [],
     candidate: {
@@ -994,13 +1001,21 @@ test("protected compounding submits only the current-funds size bound to the sou
     cash_flow_count: 0,
     cash_flow_ids: [],
     maximum_reconciliation_discrepancy: 0.01,
-    account_equity: 7.57122,
+    account_equity: 5,
     high_water_equity: 17.90462,
-    protected_reserve: 5.371386,
-    operating_buffer: 0.075712,
-    operable_capital: 2.124122,
-    order_notional: 2.124,
-    proposed_notional: 2.124
+    historical_high_water_equity: 17.90462,
+    prior_state_session_id: "dynamic-quote-funded-test-v5",
+    prior_state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
+    protected_reserve: 1.5,
+    reserve_basis: "fully_reconciled_current_equity",
+    reserve_monotonic: false,
+    continue_after_loss: true,
+    last_reconciled_equity: 5,
+    operating_buffer: 0.05,
+    operable_capital: 3.45,
+    order_notional: 3.45,
+    proposed_notional: 3.45
   };
   input.runtime.executionSizing = {
     schema: "polyedge.protected_order_sizing.v1",
@@ -1008,10 +1023,10 @@ test("protected compounding submits only the current-funds size bound to the sou
     source_shares: 20,
     source_notional: 4,
     price: 0.2,
-    shares: 10.62,
-    notional: 2.124,
+    shares: 17.25,
+    notional: 3.45,
     fee_risk_upper_bound: 0,
-    reserved_notional: 2.124,
+    reserved_notional: 3.45,
     blockers: []
   };
   let submittedIntent;
@@ -1030,11 +1045,11 @@ test("protected compounding submits only the current-funds size bound to the sou
   const result = await executeStrategyCanary({ ...input, ...controls });
   assert.equal(result.status, "funded_direct_executed");
   assert.equal(result.execution_sizing.scaled_to_current_funds, true);
-  assert.equal(submittedIntent.shares, "10.62");
-  assert.equal(submittedIntent.notional, "2.124");
+  assert.equal(submittedIntent.shares, "17.25");
+  assert.equal(submittedIntent.notional, "3.45");
   assert.equal(submittedIntent.source_requested_notional, "4");
-  assert.equal(reservation.principal_notional, 2.124);
-  assert.equal(reservation.reserved_notional, 2.124);
+  assert.equal(reservation.principal_notional, 3.45);
+  assert.equal(reservation.reserved_notional, 3.45);
   assert.deepEqual(controls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
 });
 

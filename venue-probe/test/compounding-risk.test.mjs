@@ -83,10 +83,183 @@ test("protected compounding contract fixes the reserve at 30% with a 1% buffer",
     reserveRatio: 0.3,
     operatingBufferRatio: 0.01,
     minimumOrderNotional: 1,
+    reserveBasis: "fully_reconciled_high_water_equity",
+    reserveMonotonic: true,
+    lossResponse: null,
+    stateSchema: "polyedge.protected_compounding_state.v1",
+    priorStateBlobName: null,
+    priorStateSessionId: null,
+    minimumHistoricalHighWaterEquity: null,
     stateBlobName:
       "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
     internalSettlements: []
   });
+});
+
+function lossResizingManifest() {
+  const value = manifest();
+  value.schema_version = "polyedge.operator_funded_session.v3";
+  value.session_id = "dynamic-quote-funded-test-v7";
+  value.continue_after_loss = true;
+  value.capital_policy = {
+    ...value.capital_policy,
+    reserve_basis: "fully_reconciled_current_equity",
+    loss_response: "resize_from_fully_reconciled_current_equity",
+    prior_state_session_id: "dynamic-quote-funded-test-v5",
+    prior_state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
+    minimum_historical_high_water_equity: 17.90462,
+    reserve_monotonic: false,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v7/capital-reserve-state.json"
+  };
+  return value;
+}
+
+function seedPriorState(container) {
+  const name =
+    "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json";
+  container.values.set(name, Buffer.from(JSON.stringify({
+    schema: "polyedge.protected_compounding_state.v1",
+    session_id: "dynamic-quote-funded-test-v5",
+    high_water_equity: 17.90462,
+    protected_reserve: 5.371386,
+    reconciliation_complete: true,
+    reserve_monotonic: true
+  })));
+  container.etags.set(name, '"1"');
+}
+
+test("loss-resizing contract binds the reserve to fully reconciled current equity", () => {
+  assert.deepEqual(validateProtectedCompoundingManifest(lossResizingManifest()), {
+    reserveRatio: 0.3,
+    operatingBufferRatio: 0.01,
+    minimumOrderNotional: 1,
+    reserveBasis: "fully_reconciled_current_equity",
+    reserveMonotonic: false,
+    lossResponse: "resize_from_fully_reconciled_current_equity",
+    stateSchema: "polyedge.protected_compounding_state.v2",
+    priorStateBlobName:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
+    priorStateSessionId: "dynamic-quote-funded-test-v5",
+    minimumHistoricalHighWaterEquity: 17.90462,
+    stateBlobName:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v7/capital-reserve-state.json",
+    internalSettlements: []
+  });
+});
+
+test("successive losses resize orders instead of freezing the historical high water", async () => {
+  const container = new Container();
+  seedPriorState(container);
+  const fundedManifest = lossResizingManifest();
+  const verifiedConfiguredSettlements = [{
+    id: "manual-redeem-1",
+    type: "internal_manual_settlement",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    condition_id: `0x${"b".repeat(64)}`,
+    payout: 17.015,
+    principal: 10.209,
+    realized_pnl: 6.806,
+    fill_transaction_hashes: [`0x${"c".repeat(64)}`]
+  }];
+  fundedManifest.internal_settlements = verifiedConfiguredSettlements;
+  const first = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 13.323639,
+    fullyReconciled: true,
+    verifiedConfiguredSettlements
+  });
+  const afterLoss = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 5,
+    fullyReconciled: true,
+    verifiedConfiguredSettlements
+  });
+  assert.equal(first.high_water_equity, 17.90462);
+  assert.equal(afterLoss.high_water_equity, 17.90462);
+  assert.equal(first.protected_reserve, 3.997092);
+  assert.equal(first.operable_capital, 9.193311);
+  assert.equal(afterLoss.protected_reserve, 1.5);
+  assert.equal(afterLoss.operable_capital, 3.45);
+  assert.equal(afterLoss.continue_after_loss, true);
+  assert.equal(afterLoss.reserve_monotonic, false);
+
+  const sizing = sizeProtectedOrder({
+    state: afterLoss,
+    accountEquity: 5,
+    price: 0.2,
+    requestedShares: 52.5,
+    requestedNotional: 10.5,
+    minimumOrderSize: 5,
+    maximumOrderNotional: 10.5,
+    feePerShare: 0.001
+  });
+  assert.equal(sizing.executable, true);
+  assert.ok(sizing.reserved_notional <= 3.45);
+  assert.ok(sizing.notional >= 1);
+});
+
+test("loss resizing still fails closed below the venue and policy minimum", async () => {
+  const container = new Container();
+  seedPriorState(container);
+  const state = await reconcileProtectedCompoundingState({
+    container,
+    manifest: lossResizingManifest(),
+    accountEquity: 1.4,
+    fullyReconciled: true
+  });
+  const sizing = sizeProtectedOrder({
+    state,
+    accountEquity: 1.4,
+    price: 0.2,
+    requestedShares: 52.5,
+    requestedNotional: 10.5,
+    minimumOrderSize: 5,
+    maximumOrderNotional: 10.5,
+    feePerShare: 0
+  });
+  assert.equal(sizing.executable, false);
+  assert.ok(sizing.blockers.includes("protected_order_below_policy_minimum"));
+});
+
+test("loss resizing refuses a missing predecessor or incompatible cached state", async () => {
+  const missing = new Container();
+  await assert.rejects(
+    reconcileProtectedCompoundingState({
+      container: missing,
+      manifest: lossResizingManifest(),
+      accountEquity: 5,
+      fullyReconciled: true
+    }),
+    /prior funded high-water state/
+  );
+
+  const container = new Container();
+  seedPriorState(container);
+  const fundedManifest = lossResizingManifest();
+  const state = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 5,
+    fullyReconciled: true
+  });
+  const name = fundedManifest.capital_policy.state_blob_name;
+  container.values.set(name, Buffer.from(JSON.stringify({
+    ...state,
+    reserve_basis: "fully_reconciled_high_water_equity"
+  })));
+  await assert.rejects(
+    reconcileProtectedCompoundingState({
+      container,
+      manifest: fundedManifest,
+      accountEquity: 4,
+      fullyReconciled: false
+    }),
+    /persisted protected compounding state is incompatible/
+  );
 });
 
 test("a loss cannot lower the reconciled high-water reserve", async () => {

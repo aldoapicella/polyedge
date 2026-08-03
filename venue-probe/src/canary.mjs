@@ -1137,6 +1137,26 @@ async function capturePreflight(
     client
   }, intent, manifest);
   if (recordLedger) {
+    console.log(JSON.stringify(sanitize({
+      schema: "polyedge.funded_capital_snapshot.v1",
+      session_id: manifest?.session_id || null,
+      decision_id: intent.decision_id,
+      account_equity: boundRuntime.risk.account_equity,
+      historical_high_water_equity: boundRuntime.risk.historical_high_water_equity,
+      protected_reserve: boundRuntime.risk.protected_reserve,
+      operating_buffer: boundRuntime.risk.operating_buffer,
+      operable_capital: boundRuntime.risk.operable_capital,
+      reserve_basis: boundRuntime.risk.reserve_basis,
+      continue_after_loss: boundRuntime.risk.continue_after_loss,
+      proposed_notional: boundRuntime.risk.proposed_notional,
+      order_notional: boundRuntime.risk.order_notional,
+      risk_passed: boundRuntime.risk.passed === true,
+      blockers: boundRuntime.risk.blockers,
+      open_order_count: boundRuntime.risk.open_order_count,
+      unresolved_position_count: boundRuntime.risk.unresolved_position_count,
+      unresolved_risk_reservation_count:
+        boundRuntime.risk.unresolved_risk_reservation_count
+    })));
     ledger?.record("funded_safety_snapshot_completed", {
       wall_ms: capturedCompletedWallMs,
       monotonic_ms: performance.now(),

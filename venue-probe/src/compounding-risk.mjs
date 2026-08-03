@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 
-const STATE_SCHEMA = "polyedge.protected_compounding_state.v1";
+const STATE_SCHEMA_V1 = "polyedge.protected_compounding_state.v1";
+const STATE_SCHEMA_V2 = "polyedge.protected_compounding_state.v2";
+const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
+const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
+const MONOTONIC_RESERVE_BASIS = "fully_reconciled_high_water_equity";
+const CURRENT_EQUITY_RESERVE_BASIS = "fully_reconciled_current_equity";
+const LOSS_RESIZE_POLICY = "resize_from_fully_reconciled_current_equity";
 const MANUAL_SETTLEMENT_TYPE = "internal_manual_settlement";
 const AUTOMATIC_SETTLEMENT_TYPE = "internal_automatic_settlement";
 const RESOLVED_LOSS_TYPE = "internal_resolved_loss";
@@ -22,8 +28,39 @@ export function validateProtectedCompoundingManifest(manifest) {
     ? manifest.internal_settlements
     : [];
   const errors = [];
+  const currentEquityPolicy = manifest?.schema_version === SESSION_SCHEMA_V3;
+  if (manifest?.schema_version !== undefined
+      && ![SESSION_SCHEMA_V2, SESSION_SCHEMA_V3].includes(manifest?.schema_version)) {
+    errors.push("schema_version must be a protected capital session schema");
+  }
   if (manifest?.allow_compounding !== true) errors.push("allow_compounding must be true");
-  if (policy?.reserve_monotonic !== true) errors.push("capital_policy.reserve_monotonic must be true");
+  if (currentEquityPolicy) {
+    if (manifest?.continue_after_loss !== true) {
+      errors.push("continue_after_loss must be true");
+    }
+    if (policy?.reserve_basis !== CURRENT_EQUITY_RESERVE_BASIS) {
+      errors.push(`capital_policy.reserve_basis must equal ${CURRENT_EQUITY_RESERVE_BASIS}`);
+    }
+    if (policy?.loss_response !== LOSS_RESIZE_POLICY) {
+      errors.push(`capital_policy.loss_response must equal ${LOSS_RESIZE_POLICY}`);
+    }
+    if (policy?.reserve_monotonic !== false) {
+      errors.push("capital_policy.reserve_monotonic must be false for current-equity loss resizing");
+    }
+    if (!safeBlobName(policy?.prior_state_blob_name)
+        || !safeSessionId(policy?.prior_state_session_id)
+        || policy?.prior_state_session_id === manifest?.session_id
+        || policy?.prior_state_blob_name !==
+          `reports/funded/dynamic-quote/sessions/${policy?.prior_state_session_id}/capital-reserve-state.json`) {
+      errors.push("capital_policy prior state must bind a different exact funded session");
+    }
+    if (!(Number(policy?.minimum_historical_high_water_equity) >=
+        Number(manifest?.starting_collateral))) {
+      errors.push("capital_policy.minimum_historical_high_water_equity must preserve prior funded high water");
+    }
+  } else if (policy?.reserve_monotonic !== true) {
+    errors.push("capital_policy.reserve_monotonic must be true");
+  }
   if (policy?.high_water_update !== "full_reconciliation_only") {
     errors.push("capital_policy.high_water_update must equal full_reconciliation_only");
   }
@@ -49,6 +86,17 @@ export function validateProtectedCompoundingManifest(manifest) {
     reserveRatio: Number(policy.reserve_ratio),
     operatingBufferRatio: Number(policy.operating_buffer_ratio),
     minimumOrderNotional: Number(policy.minimum_order_notional),
+    reserveBasis: currentEquityPolicy
+      ? CURRENT_EQUITY_RESERVE_BASIS
+      : MONOTONIC_RESERVE_BASIS,
+    reserveMonotonic: !currentEquityPolicy,
+    lossResponse: currentEquityPolicy ? LOSS_RESIZE_POLICY : null,
+    stateSchema: currentEquityPolicy ? STATE_SCHEMA_V2 : STATE_SCHEMA_V1,
+    priorStateBlobName: currentEquityPolicy ? String(policy.prior_state_blob_name) : null,
+    priorStateSessionId: currentEquityPolicy ? String(policy.prior_state_session_id) : null,
+    minimumHistoricalHighWaterEquity: currentEquityPolicy
+      ? Number(policy.minimum_historical_high_water_equity)
+      : null,
     stateBlobName: String(policy.state_blob_name),
     internalSettlements: settlements
   };
@@ -501,9 +549,16 @@ export async function reconcileProtectedCompoundingState({
   if (!fullyReconciled) {
     const current = await readState(container, policy.stateBlobName);
     if (!current) throw new Error("fail closed: protected compounding state is unavailable before full reconciliation");
+    assertCompatibleState(current.value, manifest, policy);
     return current.value;
   }
-  const ledgerSettlements = await loadDurableInternalSettlements(container, manifest.session_id);
+  const [ledgerSettlements, priorHistoricalDocument, initialCurrent] = await Promise.all([
+    loadDurableInternalSettlements(container, manifest.session_id),
+    policy.reserveMonotonic
+      ? Promise.resolve(null)
+      : readState(container, policy.priorStateBlobName),
+    readState(container, policy.stateBlobName)
+  ]);
   if (verifiedConfiguredSettlements.some((row) =>
     !policy.internalSettlements.some((configured) =>
       settlementAccountingEqual(configured, row)))) {
@@ -517,28 +572,44 @@ export async function reconcileProtectedCompoundingState({
   if (equity > authorizedEquityCeiling + tolerance + 1e-9) {
     throw new Error("fail closed: unauthorized external deposit detected above verified trading PnL");
   }
+  let priorHistoricalState = null;
+  if (!policy.reserveMonotonic) {
+    priorHistoricalState = priorHistoricalDocument?.value;
+    if (priorHistoricalState?.schema !== STATE_SCHEMA_V1
+        || priorHistoricalState?.session_id !== policy.priorStateSessionId
+        || priorHistoricalState?.reconciliation_complete !== true
+        || priorHistoricalState?.reserve_monotonic !== true
+        || Number(priorHistoricalState?.high_water_equity) + 1e-9 <
+          policy.minimumHistoricalHighWaterEquity
+        || Number(priorHistoricalState?.protected_reserve) + 0.0000011 <
+          Number(priorHistoricalState?.high_water_equity) * policy.reserveRatio) {
+      throw new Error("fail closed: prior funded high-water state is unavailable or incompatible");
+    }
+  }
 
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const current = await readState(container, policy.stateBlobName);
+    const current = attempt === 0
+      ? initialCurrent
+      : await readState(container, policy.stateBlobName);
     const prior = current?.value;
     assertCompatibleState(prior, manifest, policy);
-    // The verified internal-profit ceiling is itself a fully reconciled
-    // historical equity observation. Including it here prevents a fresh
-    // process or session repair after a loss from lowering the 30% reserve.
+    // High water remains monotonic audit evidence in both policy versions.
+    // The v3 reserve deliberately follows fully reconciled current equity so
+    // a loss resizes the next order instead of permanently stopping trading.
     const highWater = money(Math.max(
       Number(manifest.starting_collateral),
       authorizedEquityCeiling,
+      Number(priorHistoricalState?.high_water_equity || 0),
       Number(prior?.high_water_equity || 0),
       equity
     ));
-    const protectedReserve = money(Math.max(
-      Number(prior?.protected_reserve || 0),
-      highWater * policy.reserveRatio
-    ));
+    const protectedReserve = policy.reserveMonotonic
+      ? money(Math.max(Number(prior?.protected_reserve || 0), highWater * policy.reserveRatio))
+      : money(equity * policy.reserveRatio);
     const operatingBuffer = money(equity * policy.operatingBufferRatio);
     const operableCapital = money(Math.max(0, equity - protectedReserve - operatingBuffer));
     const value = {
-      schema: STATE_SCHEMA,
+      schema: policy.stateSchema,
       session_id: manifest.session_id,
       reserve_ratio: policy.reserveRatio,
       operating_buffer_ratio: policy.operatingBufferRatio,
@@ -552,7 +623,13 @@ export async function reconcileProtectedCompoundingState({
       verified_realized_pnl: verifiedRealizedPnl,
       verified_settlement_ids: settlements.map((row) => row.id).sort(),
       reconciliation_complete: true,
-      reserve_monotonic: true,
+      historical_high_water_equity: highWater,
+      prior_state_session_id: policy.priorStateSessionId,
+      prior_state_blob_name: policy.priorStateBlobName,
+      reserve_basis: policy.reserveBasis,
+      loss_response: policy.lossResponse,
+      continue_after_loss: !policy.reserveMonotonic,
+      reserve_monotonic: policy.reserveMonotonic,
       created_at: prior?.created_at || now().toISOString(),
       updated_at: now().toISOString()
     };
@@ -603,6 +680,17 @@ export function protectedCapitalSnapshot({ state, accountEquity, proposedNotiona
     operable_capital: operableCapital,
     minimum_order_notional: minimumOrderNotional,
     authorized_equity_ceiling: money(state?.authorized_equity_ceiling),
+    historical_high_water_equity: state?.historical_high_water_equity === undefined
+      ? highWater
+      : money(state.historical_high_water_equity),
+    prior_state_session_id: state?.prior_state_session_id || null,
+    prior_state_blob_name: state?.prior_state_blob_name || null,
+    last_reconciled_equity: state?.last_reconciled_equity === undefined
+      ? null
+      : money(state.last_reconciled_equity),
+    reserve_basis: state?.reserve_basis || MONOTONIC_RESERVE_BASIS,
+    continue_after_loss: state?.continue_after_loss === true,
+    reserve_monotonic: state?.reserve_monotonic !== false,
     blockers
   };
 }
@@ -748,12 +836,20 @@ async function readBlob(container, name) {
 
 function assertCompatibleState(state, manifest, policy) {
   if (!state) return;
-  if (state.schema !== STATE_SCHEMA
+  if (state.schema !== policy.stateSchema
       || state.session_id !== manifest.session_id
       || Number(state.reserve_ratio) !== policy.reserveRatio
       || Number(state.operating_buffer_ratio) !== policy.operatingBufferRatio
       || Number(state.minimum_order_notional) !== policy.minimumOrderNotional
-      || state.reserve_monotonic !== true) {
+      || state.reserve_basis !== policy.reserveBasis
+      || state.reserve_monotonic !== policy.reserveMonotonic
+      || state.continue_after_loss !== !policy.reserveMonotonic
+      || (!policy.reserveMonotonic
+        && (state.prior_state_session_id !== policy.priorStateSessionId
+          || state.prior_state_blob_name !== policy.priorStateBlobName
+          || Number(state.historical_high_water_equity) + 1e-9 <
+            policy.minimumHistoricalHighWaterEquity))
+      || (policy.lossResponse && state.loss_response !== policy.lossResponse)) {
     throw new Error("fail closed: persisted protected compounding state is incompatible");
   }
 }
@@ -772,6 +868,12 @@ function sameCapitalState(left, right) {
     "authorized_equity_ceiling",
     "verified_realized_pnl",
     "reconciliation_complete",
+    "historical_high_water_equity",
+    "prior_state_session_id",
+    "prior_state_blob_name",
+    "reserve_basis",
+    "loss_response",
+    "continue_after_loss",
     "reserve_monotonic"
   ].every((field) => JSON.stringify(left?.[field]) === JSON.stringify(right?.[field]))
     && JSON.stringify(left?.verified_settlement_ids) === JSON.stringify(right?.verified_settlement_ids);
@@ -982,6 +1084,10 @@ function activityTimestampMs(value) {
 function safeBlobName(value) {
   const text = String(value || "");
   return text.length > 0 && text.length <= 512 && !text.startsWith("/") && !text.includes("..");
+}
+
+function safeSessionId(value) {
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(String(value || ""));
 }
 
 function sum(rows, field) {

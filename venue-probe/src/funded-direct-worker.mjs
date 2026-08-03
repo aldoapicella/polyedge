@@ -14,6 +14,7 @@ const EXPECTED_CANDIDATE = "dynamic_quote_style";
 const EXPECTED_VERSION = "dynamic_quote_style@2026-06-14";
 const SESSION_SCHEMA_V1 = "polyedge.operator_funded_session.v1";
 const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
+const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const MAX_INTENT_TTL_MS = 30_000;
 
@@ -528,7 +529,7 @@ function validateSession(config) {
   const expires = Date.parse(value?.expires_at);
   const expectedHash = sha256(Buffer.from(JSON.stringify(value, null, 2)));
   let capitalModeValid = false;
-  if (value?.schema_version === SESSION_SCHEMA_V2) {
+  if ([SESSION_SCHEMA_V2, SESSION_SCHEMA_V3].includes(value?.schema_version)) {
     try {
       validateProtectedCompoundingManifest(value);
       capitalModeValid = value.allow_compounding === true;
@@ -548,7 +549,8 @@ function validateSession(config) {
     }
     capitalModeValid = value.allow_compounding === false && profitQuarantineValid;
   }
-  const valid = [SESSION_SCHEMA_V1, SESSION_SCHEMA_V2].includes(value?.schema_version)
+  const valid = [SESSION_SCHEMA_V1, SESSION_SCHEMA_V2, SESSION_SCHEMA_V3]
+    .includes(value?.schema_version)
     && clean(value.session_id)
     && value.authorization_mode === "operator_direct"
     && clean(value.authorized_by_user_reference)

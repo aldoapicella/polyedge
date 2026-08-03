@@ -9,6 +9,11 @@ const OPERATOR_DIRECT_AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_au
 const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
 const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
 const OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v2";
+const OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v3";
+const OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS = new Set([
+  OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA,
+  OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA
+]);
 export const VENUE_GTD_SECURITY_BUFFER_MS = 300_000;
 const VENUE_GTD_MINIMUM_LIFETIME_MS = 60_000;
 const VENUE_GTD_SEND_MARGIN_MS = 5_000;
@@ -269,7 +274,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
     const startingCollateral = Number(manifest?.starting_collateral);
     const reconciliationTolerance = Number(manifest?.max_reconciliation_discrepancy);
     const protectedCompoundingEnabled =
-      manifest?.schema_version === OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA;
+      OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS.has(manifest?.schema_version);
     const profitQuarantineEnabled = !protectedCompoundingEnabled
       && manifest?.profit_quarantine?.enabled === true;
     let capitalModeValid = false;
@@ -293,7 +298,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       capitalModeValid = manifest?.schema_version === OPERATOR_DIRECT_MANIFEST_SCHEMA
         && manifest.allow_compounding === false;
     }
-    if (![OPERATOR_DIRECT_MANIFEST_SCHEMA, OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA]
+    if (![OPERATOR_DIRECT_MANIFEST_SCHEMA, ...OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS]
           .includes(manifest?.schema_version)
         || manifest.authorization_mode !== "operator_direct"
         || manifest.research_promotion_bypassed !== true
@@ -369,7 +374,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
     const startingCollateral = Number(manifest.starting_collateral);
     const reconciliationTolerance = Number(manifest.max_reconciliation_discrepancy);
     const protectedCompoundingEnabled =
-      manifest?.schema_version === OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA;
+      OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS.has(manifest?.schema_version);
     if (Number(runtime.risk?.baseline_equity) !== startingCollateral
         || Number(runtime.risk?.cash_flow_adjusted_baseline) !== startingCollateral
         || Number(runtime.risk?.authorized_starting_collateral) !== startingCollateral
@@ -392,10 +397,26 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       const riskEquity = Number(runtime.risk?.account_equity);
       const highWater = Number(runtime.risk?.high_water_equity);
       const protectedReserve = Number(runtime.risk?.protected_reserve);
+      const lastReconciledEquity = Number(runtime.risk?.last_reconciled_equity);
       const operatingBuffer = Number(runtime.risk?.operating_buffer);
       const operableCapital = Number(runtime.risk?.operable_capital);
       const reserveRatio = Number(manifest.capital_policy?.reserve_ratio);
       const operatingBufferRatio = Number(manifest.capital_policy?.operating_buffer_ratio);
+      const lossResizingEnabled =
+        manifest.schema_version === OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA;
+      const reserveReconciled = lossResizingEnabled
+        ? runtime.risk?.reserve_basis === "fully_reconciled_current_equity"
+          && runtime.risk?.reserve_monotonic === false
+          && runtime.risk?.continue_after_loss === true
+          && runtime.risk?.prior_state_session_id ===
+            manifest.capital_policy?.prior_state_session_id
+          && runtime.risk?.prior_state_blob_name ===
+            manifest.capital_policy?.prior_state_blob_name
+          && Number(runtime.risk?.historical_high_water_equity) + 1e-9 >=
+            Number(manifest.capital_policy?.minimum_historical_high_water_equity)
+          && Math.abs(lastReconciledEquity - riskEquity) <= 0.0000011
+          && Math.abs(protectedReserve - lastReconciledEquity * reserveRatio) <= 0.0000011
+        : protectedReserve + 0.0000011 >= highWater * reserveRatio;
       const expectedFeeRisk = actualShares * polymarketV2FeePerShare(
         price,
         runtime.feeRate,
@@ -420,7 +441,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
           || Number(runtime.risk?.order_notional) !== actualNotional
           || Number(runtime.risk?.proposed_notional) !== actualReserved
           || highWater + 1e-9 < Math.max(startingCollateral, riskEquity)
-          || protectedReserve + 0.0000011 < highWater * reserveRatio
+          || !reserveReconciled
           || Math.abs(operatingBuffer - riskEquity * operatingBufferRatio) > 0.0000011
           || Math.abs(operableCapital - Math.max(0, riskEquity - protectedReserve - operatingBuffer)) > 0.0000011
           || actualReserved > operableCapital + 1e-9
@@ -479,7 +500,7 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
     fail("exact Polymarket V2 fee rate/exponent/taker-only parameters are required");
   }
   const executionSizing = operatorDirect
-    && manifest?.schema_version === OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA
+    && OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS.has(manifest?.schema_version)
     ? runtime.executionSizing
     : null;
   const executionShares = executionSizing ? Number(executionSizing.shares) : shares;
