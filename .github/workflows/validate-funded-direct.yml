@@ -199,6 +199,7 @@ jobs:
           assert.ok("FUNDED_DIRECT_SERVICE_BUS_ENABLED" in producerEnv);
           assert.ok("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE" in producerEnv);
           assert.ok("FUNDED_DIRECT_SERVICE_BUS_QUEUE" in producerEnv);
+          assert.equal(producerEnv.LOCAL_JSONL_RECORDER_ENABLED, "false");
           assert.equal(
             JSON.parse(fs.readFileSync("venue-probe.json")).parameters.publicIpName.defaultValue,
             "pip-polyedge-venue-neu-egress-2"
@@ -470,6 +471,7 @@ jobs:
               FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
               FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
               FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
+              LOCAL_JSONL_RECORDER_ENABLED=false \
             --only-show-errors \
             -o none
 
@@ -553,6 +555,7 @@ jobs:
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
+          test "$(producer_env_value LOCAL_JSONL_RECORDER_ENABLED)" = "false"
 
       - name: Refresh Azure login for post-deployment verification
         uses: azure/login@v2

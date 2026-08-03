@@ -71,7 +71,7 @@ struct RuntimeInner {
     recorder_tx: std_mpsc::Sender<RecorderRequest>,
     recorder_metrics: Arc<RecorderMetrics>,
     persistence_filter: StdMutex<PersistenceFilter>,
-    intent_publisher: Option<StdMutex<IntentPublisher>>,
+    intent_publisher: Option<IntentPublisher>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
 }
@@ -383,8 +383,7 @@ impl RuntimeController {
         let (broadcaster, _) = broadcast::channel(1_000);
         let intent_publisher = IntentPublisherConfig::from_settings(&settings)
             .and_then(IntentPublisherConfig::connect)
-            .ok()
-            .map(StdMutex::new);
+            .ok();
         let data = RuntimeData {
             decision_generation: 0,
             started_at: Utc::now(),
@@ -1065,10 +1064,7 @@ impl RuntimeController {
                 .intent_publisher
                 .as_ref()
                 .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
-            publisher
-                .lock()
-                .map_err(|_| "persistent intent publisher lock is poisoned".to_owned())?
-                .warm_market(&publish_market)
+            publisher.warm_market(&publish_market)
         })
         .await
         .map_err(|error| format!("market warmup task failed: {error}"))
@@ -1968,10 +1964,7 @@ impl RuntimeController {
                     .intent_publisher
                     .as_ref()
                     .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
-                publisher
-                    .lock()
-                    .map_err(|_| "persistent intent publisher lock is poisoned".to_owned())?
-                    .publish(&publish_intent)
+                publisher.publish(&publish_intent)
             })
             .await;
             match result {

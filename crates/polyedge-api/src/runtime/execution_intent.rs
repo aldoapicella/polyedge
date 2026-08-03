@@ -13,12 +13,19 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Instant;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
 // Preserve the frozen producer contract: every funded handoff remains valid
 // for exactly the strategy's immutable ten-second quote lifecycle.
 const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
+// A decision cycle can emit several independently authenticated PLACE intents.
+// Keep their immutable blob commits and Service Bus handoffs bounded but
+// concurrent so one slow Azure request cannot consume another intent's frozen
+// ten-second lifetime. Warmups use a separate lane below.
+const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
 // Keep the signed venue expiry well beyond the documented minimum. Live V2
 // rejected a correctly serialized order 107 seconds before its expiry, so the
 // immutable intent carries a five-minute fail-safe while the lifecycle still
@@ -41,9 +48,15 @@ pub(super) struct IntentPublisherConfig {
 }
 
 pub(super) struct IntentPublisher {
+    intent_lanes: Vec<StdMutex<IntentPublisherLane>>,
+    warmup_lane: StdMutex<IntentPublisherLane>,
+    next_intent_lane: AtomicUsize,
+    prefix: String,
+}
+
+struct IntentPublisherLane {
     blob_client: AzureBlobClient,
     service_bus_sender: Option<AzureServiceBusSender>,
-    prefix: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,7 +132,7 @@ impl IntentPublisherConfig {
         })
     }
 
-    pub(super) fn connect(self) -> Result<IntentPublisher, String> {
+    fn connect_lane(&self) -> Result<IntentPublisherLane, String> {
         let service_bus_sender = if self.operator_direct {
             if self.service_bus_namespace.is_empty() || self.service_bus_queue.is_empty() {
                 return Err(
@@ -128,43 +141,66 @@ impl IntentPublisherConfig {
                 );
             }
             Some(AzureServiceBusSender::with_managed_identity(
-                self.service_bus_namespace,
-                self.service_bus_queue,
+                self.service_bus_namespace.clone(),
+                self.service_bus_queue.clone(),
                 self.client_id.clone(),
             ))
         } else {
             None
         };
-        Ok(IntentPublisher {
+        Ok(IntentPublisherLane {
             blob_client: AzureBlobClient::with_managed_identity(
-                self.account,
-                self.container,
-                self.client_id,
+                self.account.clone(),
+                self.container.clone(),
+                self.client_id.clone(),
             ),
             service_bus_sender,
+        })
+    }
+
+    pub(super) fn connect(self) -> Result<IntentPublisher, String> {
+        let lane_count = if self.operator_direct {
+            OPERATOR_DIRECT_INTENT_PUBLISH_LANES
+        } else {
+            1
+        };
+        let intent_lanes = (0..lane_count)
+            .map(|_| self.connect_lane().map(StdMutex::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        let warmup_lane = StdMutex::new(self.connect_lane()?);
+        Ok(IntentPublisher {
+            intent_lanes,
+            warmup_lane,
+            next_intent_lane: AtomicUsize::new(0),
             prefix: self.prefix,
         })
     }
 }
 
 impl IntentPublisher {
-    pub(super) fn publish(
-        &mut self,
-        intent: &ExecutionIntentV1,
-    ) -> Result<PublishedIntent, String> {
+    fn intent_lane(&self) -> Result<StdMutexGuard<'_, IntentPublisherLane>, String> {
+        let lane_index =
+            self.next_intent_lane.fetch_add(1, Ordering::Relaxed) % self.intent_lanes.len();
+        self.intent_lanes[lane_index]
+            .lock()
+            .map_err(|_| "persistent intent publisher lane lock is poisoned".to_owned())
+    }
+
+    pub(super) fn publish(&self, intent: &ExecutionIntentV1) -> Result<PublishedIntent, String> {
         let publish_started = Instant::now();
         intent.validate()?;
         let bytes = serde_json::to_vec_pretty(intent).map_err(|error| error.to_string())?;
         let artifact_sha256 = sha256_bytes(&bytes);
         let blob_name = intent_blob_name(&self.prefix, &intent.decision_id)?;
-        match self
+        let mut lane = self.intent_lane()?;
+        match lane
             .blob_client
             .upload_block_blob_bytes_if_absent(&blob_name, &bytes, "application/json")
             .map_err(|error| error.to_string())?
         {
             ImmutableBlobWrite::Created => {}
             ImmutableBlobWrite::AlreadyExists => {
-                let existing = self
+                let existing = lane
                     .blob_client
                     .download_blob_bytes(&blob_name)
                     .map_err(|error| error.to_string())?;
@@ -179,7 +215,7 @@ impl IntentPublisher {
         let blob_commit_elapsed_ms = publish_started.elapsed().as_millis() as u64;
         let mut queue_send_wall_ts = None;
         let mut queue_send_elapsed_ms = None;
-        let queue_handoff_sent = if let Some(sender) = &mut self.service_bus_sender {
+        let queue_handoff_sent = if let Some(sender) = &mut lane.service_bus_sender {
             let remaining_ms = (intent.valid_until - Utc::now()).num_milliseconds();
             if remaining_ms < 1_000 {
                 return Err(
@@ -211,21 +247,25 @@ impl IntentPublisher {
         })
     }
 
-    pub(super) fn warm_market(&mut self, market: &MarketSpec) -> Result<bool, String> {
-        let Some(sender) = &mut self.service_bus_sender else {
+    pub(super) fn warm_market(&self, market: &MarketSpec) -> Result<bool, String> {
+        let mut lane = self
+            .warmup_lane
+            .lock()
+            .map_err(|_| "persistent warmup publisher lane lock is poisoned".to_owned())?;
+        if lane.service_bus_sender.is_none() {
             return Ok(false);
-        };
+        }
         let marker = funded_market_warmup_marker(market);
         let marker_bytes = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
         let marker_name = funded_market_warmup_blob_name(&self.prefix, market)?;
-        match self
+        match lane
             .blob_client
             .upload_block_blob_bytes_if_absent(&marker_name, &marker_bytes, "application/json")
             .map_err(|error| error.to_string())?
         {
             ImmutableBlobWrite::Created => {}
             ImmutableBlobWrite::AlreadyExists => {
-                let existing = self
+                let existing = lane
                     .blob_client
                     .download_blob_bytes(&marker_name)
                     .map_err(|error| error.to_string())?;
@@ -239,10 +279,17 @@ impl IntentPublisher {
         let producer_ts = Utc::now();
         let message = funded_market_warmup(market, producer_ts);
         let message_id = funded_market_warmup_message_id(market, producer_ts);
-        sender
+        lane.service_bus_sender
+            .as_mut()
+            .expect("warmup sender was checked above")
             .send_json(&message_id, 30, &message)
             .map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    #[cfg(test)]
+    fn intent_lane_count(&self) -> usize {
+        self.intent_lanes.len()
     }
 }
 
@@ -1382,6 +1429,28 @@ mod tests {
             .err()
             .expect("missing Service Bus binding must fail");
         assert!(error.contains("exact Service Bus binding"));
+    }
+
+    #[test]
+    fn operator_direct_publisher_isolates_warmup_and_bounded_intent_lanes() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_account_name = Some("storage".to_owned());
+        settings.azure.storage_container_name = "shadow".to_owned();
+        settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
+        settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
+
+        let publisher = IntentPublisherConfig::from_settings(&settings)
+            .unwrap()
+            .connect()
+            .unwrap();
+
+        assert_eq!(
+            publisher.intent_lane_count(),
+            OPERATOR_DIRECT_INTENT_PUBLISH_LANES
+        );
     }
 
     #[test]
