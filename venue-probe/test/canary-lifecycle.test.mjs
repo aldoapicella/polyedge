@@ -342,6 +342,9 @@ test("unparsed frame metadata survives reconciliation without retaining payloads
   });
 
   assert.equal(channel.latestUnparsedFrameMetadata(), null);
+  FakeWebSocket.instances[0].emit("message", Buffer.from("NO NEW ASSETS"), false);
+  assert.equal(channel.unparsedCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
   wallMs += 100;
   FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"), false);
 

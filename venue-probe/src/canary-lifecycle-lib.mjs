@@ -269,6 +269,10 @@ export async function connectLifecycleChannel({
         }
         return;
       }
+      if (text === "NO NEW ASSETS") {
+        if (recordMessages) ledger?.record(`${eventType}_subscription_noop`);
+        return;
+      }
       try {
         const parsed = JSON.parse(text);
         for (const value of Array.isArray(parsed) ? parsed : [parsed]) {

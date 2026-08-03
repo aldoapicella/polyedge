@@ -527,7 +527,18 @@ async function ensurePersistentMarket(resources, { market_id, condition_id, toke
     );
     if (!latest) {
       needsFreshBook = true;
-      await resources.marketChannel.updateSubscription({ operation: "subscribe", assets_ids: [next.token_id] });
+      const retainedTokens = resources.marketChannel.subscription().assets_ids || [];
+      resources.marketChannel.close();
+      resources.marketChannel = await connectLifecycleChannel({
+        url: config.marketWsUrl,
+        subscription: {
+          assets_ids: [...new Set([...retainedTokens, ...next.token_ids])],
+          type: "market",
+          custom_feature_enabled: true
+        },
+        ledger: resources.ledgerMultiplexer,
+        eventType: "venue_market_channel"
+      });
     }
   }
   if (needsFreshBook) {
@@ -599,6 +610,7 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
       resources.userChannel?.beginEvidenceWindow?.();
       resources.marketChannel?.beginEvidenceWindow?.();
       const warmed = await ensurePersistentMarket(resources, value);
+      await reconcilePersistentChannels(resources, warmed);
       const warmupStartedMonotonicMs = performance.now();
       const [geoblock, serverTime, book] = await Promise.all([
         fetchJson("https://polymarket.com/api/geoblock"),
