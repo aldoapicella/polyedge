@@ -556,6 +556,27 @@ async function reconcilePersistentChannels(resources, market) {
 }
 
 export const SAFETY_CACHE_MAINTENANCE_QUIESCE_MS = 30_000;
+export const PREFLIGHT_COMPONENT_TIMEOUT_MS = 2_000;
+
+export async function runBoundedPreflightComponent(
+  name,
+  operation,
+  timeoutMs = PREFLIGHT_COMPONENT_TIMEOUT_MS
+) {
+  let timeout;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(
+          `fail closed: ${name} preflight timed out after ${timeoutMs}ms`
+        )), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 export async function waitForSafetySnapshotIdle(
   resources,
@@ -963,7 +984,7 @@ async function capturePreflight(
   const timed = async (name, operation) => {
     const started = performance.now();
     try {
-      return await operation();
+      return await runBoundedPreflightComponent(name, operation);
     } finally {
       preflightComponentDurationsMs[name] = Math.max(0, performance.now() - started);
     }
@@ -1242,7 +1263,7 @@ function bindIntentSizingAndRisk(runtime, intent, manifest) {
 }
 
 const SAFETY_CACHE_REFRESH_MS = 700;
-const SAFETY_CACHE_MAX_IN_FLIGHT = 3;
+const SAFETY_CACHE_MAX_IN_FLIGHT = 1;
 const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
 
 export function startSafetySnapshotCache(resources, market, {

@@ -21,6 +21,8 @@ import {
   decodeSettlementReceiptEvidence,
   initializeProtectedCompounding,
   loadSettlementActivity,
+  PREFLIGHT_COMPONENT_TIMEOUT_MS,
+  runBoundedPreflightComponent,
   SAFETY_CACHE_MAINTENANCE_QUIESCE_MS,
   selectFreshCachedSafetySnapshot,
   startSafetySnapshotCache,
@@ -553,7 +555,7 @@ test("persistent executor honors the configured child TTL gate", () => {
   );
 });
 
-test("safety cache keeps pending preflights globally bounded across warmup generations", async () => {
+test("safety cache permits only one pending preflight across warmup generations", async () => {
   const cache = {
     generation: 0,
     timer: null,
@@ -595,27 +597,39 @@ test("safety cache keeps pending preflights globally bounded across warmup gener
   timers[0].callback();
   timers[0].callback();
   await flushMicrotasks();
-  assert.equal(captures.length, 3);
-  assert.equal(cache.inFlight, 3);
+  assert.equal(captures.length, 1);
+  assert.equal(cache.inFlight, 1);
 
   startSafetySnapshotCache(resources, marketB, options);
   await flushMicrotasks();
   assert.equal(timers[0].cleared, true);
-  assert.equal(captures.length, 3, "a market change must not reset the global in-flight budget");
-  assert.equal(cache.inFlight, 3);
+  assert.equal(captures.length, 1, "a market change must not reset the global in-flight budget");
+  assert.equal(cache.inFlight, 1);
 
   captures[0].resolve({ capturedCompletedWallMs: 1 });
   await flushMicrotasks();
-  assert.equal(cache.inFlight, 2);
+  assert.equal(cache.inFlight, 0);
   timers[1].callback();
   await flushMicrotasks();
-  assert.equal(captures.length, 4);
+  assert.equal(captures.length, 2);
   assert.equal(captures.at(-1).market_id, "market-b");
-  assert.equal(cache.inFlight, 3);
+  assert.equal(cache.inFlight, 1);
 
   for (const captureEntry of captures) captureEntry.resolve({ capturedCompletedWallMs: 2 });
   await flushMicrotasks();
   assert.equal(cache.inFlight, 0);
+});
+
+test("every independent preflight component has a hard latency bound", async () => {
+  assert.equal(PREFLIGHT_COMPONENT_TIMEOUT_MS, 2_000);
+  await assert.rejects(
+    runBoundedPreflightComponent("open_orders", () => new Promise(() => {}), 20),
+    /open_orders preflight timed out after 20ms/
+  );
+  assert.equal(
+    await runBoundedPreflightComponent("open_orders", async () => "ok", 20),
+    "ok"
+  );
 });
 
 test("funded maintenance gives bounded preflights room to quiesce", async () => {
