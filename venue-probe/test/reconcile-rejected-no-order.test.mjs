@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateRejectedReservationRecovery } from "../src/reconcile-rejected-no-order.mjs";
+import {
+  runRejectedNoOrderReconciliation,
+  validateRejectedReservationRecovery
+} from "../src/reconcile-rejected-no-order.mjs";
 
 function fixture() {
   return {
@@ -44,4 +47,63 @@ test("rejected-order recovery preserves risk for every ambiguous or exposed stat
     mutate(value);
     assert.throws(() => validateRejectedReservationRecovery(value), /fail closed/);
   }
+});
+
+test("post-only rejection recovery updates the exact campaign-scoped reservation index", async () => {
+  const value = fixture();
+  let unresolved = [value.reservation];
+  const result = await runRejectedNoOrderReconciliation({
+    env: {
+      FUNDED_DIRECT_RECONCILIATION_ENABLED: "true",
+      FUNDED_DIRECT_RECONCILE_RUN_ID: value.expectedRunId,
+      FUNDED_DIRECT_RECONCILE_REJECTION_CODE: "post_only_crosses_book",
+      VENUE_PROBE_FUNDED_CAMPAIGN_ID: "dynamic-quote-funded-2026-08-03-v7",
+      AZURE_STORAGE_ACCOUNT_NAME: "storage",
+      AZURE_STORAGE_CONTAINER_NAME: "funded",
+      AZURE_CLIENT_ID: "client",
+      POLYMARKET_FUNDER_ADDRESS: "0xfunder"
+    },
+    createClient: async () => ({
+      getOpenOrders: async () => [],
+      getTrades: async () => value.authenticatedTrades,
+      getBalanceAllowance: async () => ({ balance: "10357051" })
+    }),
+    fetchImpl: async () => ({ ok: true, json: async () => value.positions }),
+    loadReservations: async (config) => {
+      assert.equal(config.campaignId, "dynamic-quote-funded-2026-08-03-v7");
+      assert.equal(config.operatorDirect, true);
+      assert.equal(config.dryRun, false);
+      return unresolved;
+    },
+    finalize: async (config, reservation, settlement) => {
+      assert.equal(config.campaignId, "dynamic-quote-funded-2026-08-03-v7");
+      assert.equal(reservation.run_id, value.expectedRunId);
+      assert.equal(settlement.state, "released_no_order");
+      assert.equal(settlement.reconciliation_reason, "post_only_crosses_book");
+      unresolved = [];
+      return reservation;
+    }
+  });
+  assert.equal(result.status, "released_no_order");
+  assert.equal(result.rejection_code, "post_only_crosses_book");
+  assert.equal(result.run_id, value.expectedRunId);
+});
+
+test("rejected-order recovery refuses unknown codes and missing campaign binding", async () => {
+  const base = {
+    FUNDED_DIRECT_RECONCILIATION_ENABLED: "true",
+    FUNDED_DIRECT_RECONCILE_RUN_ID: "funded-direct-run-1"
+  };
+  await assert.rejects(
+    runRejectedNoOrderReconciliation({
+      env: { ...base, FUNDED_DIRECT_RECONCILE_REJECTION_CODE: "gateway_timeout" }
+    }),
+    /not an exact deterministic no-order code/
+  );
+  await assert.rejects(
+    runRejectedNoOrderReconciliation({
+      env: { ...base, FUNDED_DIRECT_RECONCILE_REJECTION_CODE: "post_only_crosses_book" }
+    }),
+    /exact VENUE_PROBE_FUNDED_CAMPAIGN_ID/
+  );
 });

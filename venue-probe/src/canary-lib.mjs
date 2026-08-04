@@ -535,6 +535,9 @@ export function deterministicNoOrderRejection(error) {
   if (/invalid expiration value, must be in the future for GTD orders/i.test(message)) {
     return { code: "invalid_gtd_expiration", message };
   }
+  if (/^invalid post-only order: order crosses book$/i.test(message)) {
+    return { code: "post_only_crosses_book", message };
+  }
   return null;
 }
 

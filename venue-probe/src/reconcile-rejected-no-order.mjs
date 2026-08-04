@@ -9,7 +9,10 @@ import {
   sanitize
 } from "./lib.mjs";
 
-const EXPECTED_REJECTION_CODE = "invalid_gtd_expiration";
+const EXPECTED_REJECTION_CODES = new Set([
+  "invalid_gtd_expiration",
+  "post_only_crosses_book"
+]);
 
 export function validateRejectedReservationRecovery({
   reservation,
@@ -60,14 +63,20 @@ export async function runRejectedNoOrderReconciliation({
   }
   const expectedRunId = String(env.FUNDED_DIRECT_RECONCILE_RUN_ID || "").trim();
   if (!expectedRunId) throw new Error("fail closed: exact FUNDED_DIRECT_RECONCILE_RUN_ID is required");
-  if (env.FUNDED_DIRECT_RECONCILE_REJECTION_CODE !== EXPECTED_REJECTION_CODE) {
-    throw new Error(`fail closed: rejection code must equal ${EXPECTED_REJECTION_CODE}`);
+  const expectedRejectionCode = String(env.FUNDED_DIRECT_RECONCILE_REJECTION_CODE || "").trim();
+  if (!EXPECTED_REJECTION_CODES.has(expectedRejectionCode)) {
+    throw new Error("fail closed: rejection code is not an exact deterministic no-order code");
   }
+  const campaignId = String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "").trim();
+  if (!campaignId) throw new Error("fail closed: exact VENUE_PROBE_FUNDED_CAMPAIGN_ID is required");
   const config = {
     storageAccount: env.AZURE_STORAGE_ACCOUNT_NAME,
     storageContainer: env.AZURE_STORAGE_CONTAINER_NAME,
     storageAccountKey: env.AZURE_STORAGE_ACCOUNT_KEY,
-    azureClientId: env.AZURE_CLIENT_ID
+    azureClientId: env.AZURE_CLIENT_ID,
+    campaignId,
+    operatorDirect: true,
+    dryRun: false
   };
   const reservations = await loadReservations(config);
   const matches = reservations.filter((reservation) => reservation.run_id === expectedRunId);
@@ -103,7 +112,7 @@ export async function runRejectedNoOrderReconciliation({
     matched_notional: 0,
     reconciliation_complete: true,
     zero_open_orders_confirmed: true,
-    reconciliation_reason: EXPECTED_REJECTION_CODE,
+    reconciliation_reason: expectedRejectionCode,
     reconciliation_evidence: {
       ...evidence,
       source: "authenticated_clob_rest_and_polymarket_data_api",
@@ -119,7 +128,7 @@ export async function runRejectedNoOrderReconciliation({
     status: "released_no_order",
     run_id: expectedRunId,
     probe_id: finalized.probe_id,
-    rejection_code: EXPECTED_REJECTION_CODE,
+    rejection_code: expectedRejectionCode,
     evidence
   };
 }

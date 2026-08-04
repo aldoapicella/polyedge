@@ -1278,13 +1278,26 @@ test("stale, book-hash, geoblock, clock, equity, model, and authorization failur
   }
 });
 
-test("only the exact venue GTD rejection is classified as deterministic no-order", () => {
+test("only exact venue rejection messages are classified as deterministic no-order", () => {
   assert.deepEqual(
     deterministicNoOrderRejection(new Error("invalid expiration value, must be in the future for GTD orders")),
     {
       code: "invalid_gtd_expiration",
       message: "invalid expiration value, must be in the future for GTD orders"
     }
+  );
+  assert.deepEqual(
+    deterministicNoOrderRejection({
+      response: { data: { error: "invalid post-only order: order crosses book" } }
+    }),
+    {
+      code: "post_only_crosses_book",
+      message: "invalid post-only order: order crosses book"
+    }
+  );
+  assert.equal(
+    deterministicNoOrderRejection(new Error("invalid post-only order: order crosses book after submission")),
+    null
   );
   assert.equal(deterministicNoOrderRejection(new Error("request timed out after signing")), null);
   assert.equal(deterministicNoOrderRejection({ response: { data: { error: "gateway unavailable" } } }), null);
@@ -1300,6 +1313,13 @@ test("deterministic no-order release requires complete zero-order, zero-position
     postSendTradeCount: 0
   };
   assert.equal(validateDeterministicNoOrderReconciliation(proof).code, "invalid_gtd_expiration");
+  assert.equal(
+    validateDeterministicNoOrderReconciliation({
+      ...proof,
+      error: new Error("invalid post-only order: order crosses book")
+    }).code,
+    "post_only_crosses_book"
+  );
   for (const field of [
     "openOrderCount",
     "unresolvedPositionCount",
