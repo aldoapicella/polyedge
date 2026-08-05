@@ -73,6 +73,25 @@ The containers receive those files read-only at `/run/credentials`; secret
 values never belong in env files, Quadlets, Git, commands, or logs. Keep API
 table access separate from the blob-only research/ring identity.
 
+## Entra administrator handoff
+
+The operator does not need a permanent directory role. An Entra administrator
+can create the three applications and service principals, then add the operator
+as an application owner. This step creates no credential:
+
+```sh
+operator_object_id=REPLACE_OPERATOR_OBJECT_ID
+for name in polyedge-conduit-api polyedge-conduit-research polyedge-conduit-funded-signer; do
+  app_id=$(az ad app create --display-name "$name" --sign-in-audience AzureADMyOrg --query appId -o tsv)
+  az ad sp create --id "$app_id" --query id -o tsv
+  az ad app owner add --id "$app_id" --owner-object-id "$operator_object_id"
+done
+```
+
+After ownership propagates, the operator creates each credential directly into
+its root-only host file and assigns only the documented container, table, or
+queue scope. Do not send the credential through GitHub, chat, or shell history.
+
 The funded signer is a separate, no-ingress, read-only container. Only it gets
 the Podman wallet secrets and its dedicated Azure funded identity; the API and
 research jobs get neither. It has no install target and remains disabled until
