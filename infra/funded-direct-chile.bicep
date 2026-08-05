@@ -735,7 +735,6 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'POLYMARKET_API_PASSPHRASE', secretRef: 'polymarket-api-passphrase' }
             { name: 'POLYMARKET_RELAYER_API_KEY', secretRef: 'polymarket-relayer-api-key' }
             { name: 'POLYMARKET_RELAYER_API_KEY_ADDRESS', value: relayerApiKeyAddress }
-            { name: 'VENUE_REDEMPTION_MAX_PAYOUT', value: '25' }
             { name: 'VENUE_REDEMPTION_MAX_CONDITIONS', value: '1' }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'AZURE_STORAGE_ACCOUNT_NAME', value: storage.name }

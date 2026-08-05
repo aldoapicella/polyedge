@@ -33,6 +33,7 @@ import {
   depositWalletTypedData,
   deriveLegacyUupsDepositWallet,
   loadRedemptionConfig,
+  hasPayoutCap,
   selectRedeemableConditions,
   summarizeRecentRedemptions
 } from "./redemption.mjs";
@@ -569,6 +570,10 @@ export function confirmedRedemptionControlMatches(control, {
   const signerBound = storedSigner
     ? storedSigner === expectedOwner && /^0x[0-9a-f]{40}$/.test(storedSigner)
     : control?.schema_version === 1 && control?.owner === "[REDACTED]";
+  const expectedGrossPayout = Number(control?.expected_gross_payout);
+  const payoutWithinConfiguredLimit = Number.isFinite(expectedGrossPayout) &&
+    expectedGrossPayout > 0 &&
+    (!hasPayoutCap(maxPayout) || expectedGrossPayout <= Number(maxPayout) + 1e-9);
   return control?.state === "confirmed_pending_verification" &&
     control?.submission_attempted === true &&
     typeof control?.run_id === "string" &&
@@ -584,8 +589,7 @@ export function confirmedRedemptionControlMatches(control, {
     conditions.length <= Number(maxConditions) &&
     new Set(conditions).size === conditions.length &&
     conditions.every((value) => /^0x[0-9a-f]{64}$/.test(value)) &&
-    Number(control?.expected_gross_payout) > 0 &&
-    Number(control.expected_gross_payout) <= Number(maxPayout) + 1e-9 &&
+    payoutWithinConfiguredLimit &&
     Number.isFinite(Date.parse(String(control?.created_ts || ""))) &&
     Number.isFinite(Date.parse(String(control?.updated_ts || "")));
 }
@@ -892,7 +896,7 @@ async function validateOnchainSelection(publicClient, selection) {
       onchain_expected_payout: expectedPayout
     });
   }
-  if (totalPayout > config.maxPayout + 1e-9) {
+  if (hasPayoutCap(config.maxPayout) && totalPayout > Number(config.maxPayout) + 1e-9) {
     throw new Error(`fail closed: exact onchain payout ${totalPayout} exceeds the configured redemption cap`);
   }
   return {

@@ -158,6 +158,14 @@ test("only an exact confirmed redemption control can enter no-resubmit recovery"
   }, binding), false);
   assert.equal(confirmedRedemptionControlMatches({
     ...control,
+    expected_gross_payout: 28.69
+  }, { ...binding, maxPayout: null }), true);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
+    expected_gross_payout: "Infinity"
+  }, { ...binding, maxPayout: null }), false);
+  assert.equal(confirmedRedemptionControlMatches({
+    ...control,
     funder: owner
   }, binding), false);
   assert.equal(confirmedRedemptionControlMatches({
@@ -249,11 +257,13 @@ test("funded-service redemption is bound to the Chile protected-compounding sess
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
     VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
     VENUE_PROBE_EXECUTION_ORIGIN: "azure_chile_central_static_egress",
+    VENUE_REDEMPTION_MAX_PAYOUT: "25",
     VENUE_REDEMPTION_MAX_CONDITIONS: "1"
   });
   assert.equal(funded.fundedServiceManaged, true);
   assert.equal(funded.executionOrigin, "azure_chile_central_static_egress");
   assert.equal(funded.maxOrderNotional, 10.5);
+  assert.equal(funded.maxPayout, null);
   assert.throws(() => loadRedemptionConfig({
     ...safeEnv,
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
@@ -299,6 +309,17 @@ test("only positive redeemable condition payouts are selected once and within th
     { asset: "101", outcome_index: 0 },
     { asset: "102", outcome_index: 1 }
   ]);
+});
+
+test("funded redemption selects the full winning condition without a payout cap", () => {
+  const selection = selectRedeemableConditions([
+    { conditionId: conditionA, redeemable: true, currentValue: 28.69, initialValue: 10.0414, negativeRisk: false, title: "funded winner", asset: "101", oppositeAsset: "102", outcomeIndex: 0 },
+    { conditionId: conditionB, redeemable: true, currentValue: 5, initialValue: 4, negativeRisk: false, title: "other winner", asset: "201", oppositeAsset: "202", outcomeIndex: 0 }
+  ], null, 1);
+  assert.equal(selection.selected.length, 1);
+  assert.equal(selection.selected[0].condition_id, conditionA);
+  assert.equal(selection.selected_gross_payout, 28.69);
+  assert.equal(selection.skipped_winner_conditions, 1);
 });
 
 test("recent redemption activity is attributed only to a matching durable worker control record", () => {

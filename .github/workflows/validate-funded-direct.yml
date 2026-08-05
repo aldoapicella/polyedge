@@ -184,7 +184,7 @@ jobs:
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, "60000");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, "30");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, "350");
-          assert.equal(env.VENUE_REDEMPTION_MAX_PAYOUT, "25");
+          assert.equal("VENUE_REDEMPTION_MAX_PAYOUT" in env, false);
           assert.equal(env.VENUE_REDEMPTION_MAX_CONDITIONS, "1");
           assert.equal(
             envEntries.find((entry) => entry.name === "POLYMARKET_RELAYER_API_KEY")?.secretRef,
@@ -551,7 +551,7 @@ jobs:
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS)" = "60000"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY)" = "30"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY)" = "350"
-          test "$(env_value VENUE_REDEMPTION_MAX_PAYOUT)" = "25"
+          test -z "$(env_value VENUE_REDEMPTION_MAX_PAYOUT)"
           test "$(env_value VENUE_REDEMPTION_MAX_CONDITIONS)" = "1"
           test "$(env_secret_ref POLYMARKET_RELAYER_API_KEY)" = "polymarket-relayer-api-key"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME)" = \

@@ -299,7 +299,10 @@ test("persistent service runs redemption under the inherited lease after enterin
   let redemptionRuns = 0;
   const logs = [];
   const result = await runPersistentFundedDirectService({
-    env: automaticRedemptionEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    env: automaticRedemptionEnv({
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1",
+      VENUE_REDEMPTION_MAX_PAYOUT: "25"
+    }),
     now: () => now,
     createBusClient: () => bus.client,
     createExecutor: async () => ({
@@ -318,6 +321,7 @@ test("persistent service runs redemption under the inherited lease after enterin
       assert.equal(redemptionEnv.EXECUTION_MODE, "venue_redemption");
       assert.equal(redemptionEnv.VENUE_REDEMPTION_DRY_RUN, "false");
       assert.equal(redemptionEnv.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY, "true");
+      assert.equal("VENUE_REDEMPTION_MAX_PAYOUT" in redemptionEnv, false);
       assert.equal(inheritedLease, lease);
       return { status: "nothing_to_redeem", redemption_submitted: false };
     },

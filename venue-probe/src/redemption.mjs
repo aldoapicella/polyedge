@@ -74,7 +74,13 @@ export function loadRedemptionConfig(env = process.env) {
     enableTakerOrders: env.ENABLE_TAKER_ORDERS === "true",
     expectedCountry: String(env.VENUE_PROBE_EXPECTED_COUNTRY || "").trim().toUpperCase(),
     expectedEgressIp: String(env.VENUE_PROBE_EXPECTED_EGRESS_IP || "").trim(),
-    maxPayout: finiteNumber(env.VENUE_REDEMPTION_MAX_PAYOUT, 25),
+    // A funded redemption only releases already-won collateral from the exact
+    // authenticated position. Its safety boundary is one condition per cycle,
+    // not the payout size produced by an authorized order. Keep the legacy cap
+    // for standalone/manual redemption runs only.
+    maxPayout: fundedServiceManaged
+      ? null
+      : finiteNumber(env.VENUE_REDEMPTION_MAX_PAYOUT, 25),
     maxConditions: integer(env.VENUE_REDEMPTION_MAX_CONDITIONS, 5),
     startingCapital: finiteNumber(env.VENUE_PROBE_STARTING_CAPITAL, null),
     campaignId: String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "funded-campaign-2026-07-12"),
@@ -117,7 +123,10 @@ export function validateRedemptionConfig(config) {
   if (config.allowLive) errors.push("ALLOW_LIVE must remain false");
   if (config.enableTakerOrders) errors.push("ENABLE_TAKER_ORDERS must remain false");
   if (config.signatureType !== 3) errors.push("POLYMARKET_SIGNATURE_TYPE must equal 3 for the deposit wallet");
-  if (!(config.maxPayout > 0 && config.maxPayout <= 25)) errors.push("VENUE_REDEMPTION_MAX_PAYOUT must be in (0, 25]");
+  if (!config.fundedServiceManaged &&
+      !(config.maxPayout > 0 && config.maxPayout <= 25)) {
+    errors.push("VENUE_REDEMPTION_MAX_PAYOUT must be in (0, 25]");
+  }
   if (!(config.maxConditions >= 1 && config.maxConditions <= 5)) errors.push("VENUE_REDEMPTION_MAX_CONDITIONS must be in [1, 5]");
   if (config.fundedServiceManaged) {
     let session = null;
@@ -235,7 +244,7 @@ export function selectRedeemableConditions(positions, maxPayout = 25, maxConditi
   let payout = 0;
   for (const winner of winners) {
     if (selected.length >= maxConditions) break;
-    if (payout + winner.gross_payout > maxPayout + 1e-9) continue;
+    if (hasPayoutCap(maxPayout) && payout + winner.gross_payout > Number(maxPayout) + 1e-9) continue;
     selected.push({
       ...winner,
       gross_payout: roundMoney(winner.gross_payout),
@@ -253,6 +262,10 @@ export function selectRedeemableConditions(positions, maxPayout = 25, maxConditi
     available_winner_conditions: winners.length,
     skipped_winner_conditions: winners.length - selected.length
   };
+}
+
+export function hasPayoutCap(maxPayout) {
+  return Number.isFinite(Number(maxPayout)) && Number(maxPayout) > 0;
 }
 
 export function summarizeRecentRedemptions(activity, control = null, limit = 5) {

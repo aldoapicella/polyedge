@@ -473,12 +473,12 @@ export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config)
 
 function fundedRedemptionEnv(env) {
   const session = JSON.parse(String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON));
+  const { VENUE_REDEMPTION_MAX_PAYOUT: _obsoletePayoutCap, ...uncappedEnv } = env;
   return {
-    ...env,
+    ...uncappedEnv,
     EXECUTION_MODE: "venue_redemption",
     VENUE_REDEMPTION_ENABLED: "true",
     VENUE_REDEMPTION_DRY_RUN: "false",
-    VENUE_REDEMPTION_MAX_PAYOUT: String(env.VENUE_REDEMPTION_MAX_PAYOUT || "25"),
     VENUE_REDEMPTION_MAX_CONDITIONS: "1",
     VENUE_PROBE_STARTING_CAPITAL: String(session.starting_collateral),
     FUNDED_EVIDENCE_TRUST_BOUNDARY_READY: "true",
