@@ -303,6 +303,72 @@ test("channel disconnect is counted as a gap and reconnects before reuse", async
   channel.close();
 });
 
+test("subscription update retries after the automatic reconnect batch is exhausted", async () => {
+  const ledgerEvents = [];
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static accepting = true;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        if (!FakeWebSocket.accepting) {
+          this.emit("error", new Error("temporary outage"));
+          return;
+        }
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    forceClose() {
+      this.readyState = 3;
+      this.emit("close", 1006, Buffer.from("network gap"));
+    }
+
+    close() {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { assets_ids: ["old-token"], type: "market" },
+    eventType: "test_market_channel",
+    ledger: { record: (event, fields) => ledgerEvents.push({ event, fields }) },
+    WebSocketImpl: FakeWebSocket,
+    reconnectAttempts: 2,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 1)))
+  });
+
+  FakeWebSocket.accepting = false;
+  FakeWebSocket.instances[0].forceClose();
+  while (ledgerEvents.filter(({ event }) => event === "test_market_channel_reconnect_failed").length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  await flushMicrotasks();
+  FakeWebSocket.accepting = true;
+
+  await channel.updateSubscription({ operation: "subscribe", assets_ids: ["new-token"] });
+
+  assert.equal(FakeWebSocket.instances.length, 4);
+  assert.equal(channel.isOpen(), true);
+  assert.deepEqual(channel.subscription().assets_ids, ["old-token", "new-token"]);
+  channel.close();
+});
+
 test("unparsed frame metadata survives reconciliation without retaining payloads", async () => {
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;

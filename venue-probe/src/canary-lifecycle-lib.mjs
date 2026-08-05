@@ -166,7 +166,7 @@ export async function connectLifecycleChannel({
     if (!stopped && countGap) {
       gaps += 1;
       requiresReconciliation = true;
-      reconnectPromise ||= reconnect().finally(() => { reconnectPromise = null; });
+      void reconnectIfNeeded();
     }
   }
 
@@ -359,6 +359,26 @@ export async function connectLifecycleChannel({
     }
   }
 
+  function reconnectIfNeeded() {
+    if (!stopped && (!open || socket?.readyState !== WebSocketImpl.OPEN)) {
+      reconnectPromise ||= reconnect().finally(() => { reconnectPromise = null; });
+    }
+    return reconnectPromise;
+  }
+
+  async function ensureChannelOpen() {
+    if (open && socket?.readyState === WebSocketImpl.OPEN) return true;
+    const reconnecting = reconnectIfNeeded();
+    if (reconnecting) await reconnecting;
+    await waitUntil(
+      () => open && socket?.readyState === WebSocketImpl.OPEN,
+      openTimeoutMs,
+      "websocket reconnect timeout",
+      sleep
+    );
+    return true;
+  }
+
   try {
     await openSocket(false);
   } catch (error) {
@@ -377,17 +397,7 @@ export async function connectLifecycleChannel({
       evicted_count: historyEvictions
     }),
     isOpen: () => open && socket?.readyState === WebSocketImpl.OPEN,
-    ensureOpen: async () => {
-      if (open && socket?.readyState === WebSocketImpl.OPEN) return true;
-      if (reconnectPromise) await reconnectPromise;
-      await waitUntil(
-        () => open && socket?.readyState === WebSocketImpl.OPEN,
-        openTimeoutMs,
-        "websocket reconnect timeout",
-        sleep
-      );
-      return true;
-    },
+    ensureOpen: ensureChannelOpen,
     gapCount: () => gaps,
     reconnectCount: () => reconnects,
     duplicateCount: () => duplicates,
@@ -412,10 +422,7 @@ export async function connectLifecycleChannel({
       return values.length ? Math.max(...values) : null;
     },
     forceHeartbeat: async () => {
-      if (reconnectPromise) await reconnectPromise;
-      if (!open || socket?.readyState !== WebSocketImpl.OPEN) {
-        throw new Error("fail closed: websocket is unavailable for forced heartbeat");
-      }
+      await ensureChannelOpen();
       if (socketState.heartbeatTimer !== null) {
         clearTimer(socketState.heartbeatTimer);
         socketState.heartbeatTimer = null;
@@ -428,10 +435,7 @@ export async function connectLifecycleChannel({
       if (!["subscribe", "unsubscribe"].includes(operation)) {
         throw new Error("fail closed: websocket subscription operation is invalid");
       }
-      if (reconnectPromise) await reconnectPromise;
-      if (!open || socket?.readyState !== WebSocketImpl.OPEN) {
-        throw new Error("fail closed: websocket is unavailable for subscription update");
-      }
+      await ensureChannelOpen();
       const marketValues = [...new Set(markets.map(String).filter(Boolean))];
       const assetValues = [...new Set(assets_ids.map(String).filter(Boolean))];
       if (!marketValues.length && !assetValues.length) {
