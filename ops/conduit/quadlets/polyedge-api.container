@@ -1,0 +1,23 @@
+[Unit]
+Description=PolyEdge paper API and collector
+Wants=network-online.target
+After=network-online.target polyedge-network.service
+Requires=polyedge-network.service
+
+[Container]
+# Replace the all-zero digest with the reviewed ARM64 image digest.
+Image=registry.example.invalid/polyedge-rust-backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+ContainerName=polyedge-api
+Network=polyedge.network
+EnvironmentFile=/etc/polyedge/api.env
+Volume=/srv/polyedge-ring:/srv/polyedge-ring:Z
+Volume=/etc/polyedge/credentials/api:/run/credentials:ro,Z
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

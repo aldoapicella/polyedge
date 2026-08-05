@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+
+job=${1:?usage: polyedge-run-job JOB}
+case "$job" in
+  freshness)
+    cpus=0.5 memory=1g limit=300
+    command='/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "events/" --out "data_quality/freshness/latest.json"'
+    ;;
+  hourly)
+    cpus=0.5 memory=1g limit=1800
+    command='TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+    ;;
+  daily)
+    cpus=2 memory=4g limit=46800
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_primary_daily.sh'
+    ;;
+  replay)
+    cpus=2 memory=4g limit=43200
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
+    ;;
+  shadow-qset)
+    cpus=3 memory=8g limit=16800
+    test "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-07-28-qset-v1 || {
+      echo 'shadow-qset only permits campaign-2026-07-28-qset-v1' >&2
+      exit 64
+    }
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/shadow/campaign-2026-07-28-qset-v1/control/replay.lock" -- /bin/sh /app/research/run_shadow_daily.sh'
+    ;;
+  *)
+    echo "unknown PolyEdge job: $job" >&2
+    exit 64
+    ;;
+esac
+
+: "${POLYEDGE_RESEARCH_IMAGE:?set an immutable POLYEDGE_RESEARCH_IMAGE in /etc/polyedge/jobs/$job.env}"
+printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
+  echo 'POLYEDGE_RESEARCH_IMAGE must be an immutable sha256 digest' >&2
+  exit 64
+}
+
+ring=/srv/polyedge-ring
+mountpoint -q "$ring" || { echo "$ring is not a mount point" >&2; exit 1; }
+minimum_free=${POLYEDGE_JOB_MIN_FREE_BYTES:-42949672960}
+available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
+[ "$available" -ge "$minimum_free" ] || {
+  echo "insufficient free ring space: $available bytes available, $minimum_free required" >&2
+  exit 1
+}
+work=$ring/jobs/$job
+install -d -m 0750 "$work/data" "$work/reports" "$work/freshness"
+
+# One host-wide lock prevents every research writer from overlapping. The
+# per-job timeout below starts only after the lock has been acquired.
+exec /usr/bin/flock -w 36h /run/polyedge/research.lock \
+  /usr/bin/timeout --preserve-status "$limit" \
+  /usr/bin/podman run --rm --name "polyedge-job-$job" --network polyedge \
+    --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
+    --env-file "/etc/polyedge/jobs/$job.env" \
+    -v "/etc/polyedge/credentials/$job:/run/credentials:ro,Z" \
+    -v "$work/data:/app/data:Z" \
+    -v "$work/reports:/app/reports:Z" \
+    -v "$work/freshness:/app/data_quality/freshness:Z" \
+    "$POLYEDGE_RESEARCH_IMAGE" /bin/sh -lc "$command"

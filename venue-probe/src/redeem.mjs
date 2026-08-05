@@ -1296,7 +1296,6 @@ async function writeRedemptionControl(value) {
 
 async function uploadRedemptionEvidence(value) {
   const container = storageContainer(config);
-  await container.createIfNotExists();
   const payload = Buffer.from(JSON.stringify(sanitize(value), null, 2));
   const date = new Date().toISOString().slice(0, 10);
   const prefix = redemptionEvidencePrefix();

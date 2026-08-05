@@ -239,16 +239,6 @@ var researchJobDefinitions = [
     command: 'INPUT=$CHART_BACKFILL_INPUT; if [ -z "$INPUT" ]; then DATE=$(date -u -d "yesterday" +%Y-%m-%d); INPUT="data/research/daily/$DATE/normalized"; fi; polyedge-rs research chart-backfill --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/jobs/latest/chart-backfill.json" --markdown "reports/jobs/latest/chart-backfill.md"'
   }
   {
-    id: 'adx-ingestion'
-    name: 'polyedge-adx-ingestion-job'
-    triggerType: 'Schedule'
-    cron: '15 * * * *'
-    replicaTimeout: 1800
-    cpu: cpu
-    memory: memory
-    command: 'mkdir -p reports/jobs/latest; printf \'%s\' \'{"job_id":"adx-ingestion","job_type":"adx-ingestion","status":"defined_pending_pipeline","started_ts":null,"finished_ts":null,"artifacts":[],"warnings":["ADX ingestion is defined for Azure visibility but no ingestion endpoint is configured"],"errors":[],"data_quality":"unknown","research_only":true,"live_trading_enabled":false}\' > reports/jobs/latest/adx-ingestion.json'
-  }
-  {
     id: 'manual-backfill'
     name: 'polyedge-backfill-job'
     triggerType: 'Manual'
@@ -345,12 +335,6 @@ var logAlerts = [
     severity: 1
     query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s has "polyedge-" and ContainerJobName_s has "-job" | where Log_s has "duration_seconds" and Log_s has "too_long"'
   }
-  {
-    name: 'adx-ingestion-failed'
-    displayName: 'PolyEdge ADX ingestion failed'
-    severity: 1
-    query: 'ContainerAppConsoleLogs_CL | where ContainerJobName_s == "polyedge-adx-ingestion-job" | where Log_s has "error" or Log_s has "failed"'
-  }
 ]
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
@@ -376,8 +360,7 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01'
   name: 'default'
   properties: {
     changeFeed: {
-      enabled: true
-      retentionInDays: 30
+      enabled: false
     }
     deleteRetentionPolicy: {
       enabled: true

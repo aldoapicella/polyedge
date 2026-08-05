@@ -1,0 +1,91 @@
+#!/bin/sh
+set -eu
+
+env_file=${POLYEDGE_RING_ENV_FILE:-/etc/polyedge/ring.env}
+test -r "$env_file" || { echo "missing $env_file" >&2; exit 64; }
+set -a
+. "$env_file"
+set +a
+
+root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
+segments=$root/segments
+segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
+grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
+prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-dual}
+printf '%s' "$segment_seconds" | grep -Eq '^[0-9]+$'
+[ "$segment_seconds" -ge 300 ] && [ "$segment_seconds" -le 900 ] || {
+  echo 'RECORDER_SEGMENT_SECONDS must be from 300 through 900' >&2
+  exit 64
+}
+printf '%s' "$prefix" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$' || {
+  echo 'POLYEDGE_RING_BLOB_PREFIX is invalid' >&2
+  exit 64
+}
+mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
+install -d -m 0750 "$segments"
+
+now=$(date -u +%s)
+cutoff=$((now - grace_seconds))
+find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segment; do
+  name=${segment##*/}
+  start=${name%.jsonl}
+  printf '%s' "$start" | grep -Eq '^[0-9]+$' || { echo "invalid segment name: $segment" >&2; exit 1; }
+  end=$((start + segment_seconds))
+  [ "$end" -le "$cutoff" ] || continue
+  manifest=$segment.manifest.json
+  [ -e "$manifest" ] && continue
+  [ "$(tail -c 1 "$segment" | od -An -t u1 | tr -d ' ')" = 10 ] || {
+    echo "sealed segment lacks a final newline: $segment" >&2
+    exit 1
+  }
+  relative=${segment#"$root"/}
+  hour=$(date -u -d "@$start" +%Y/%m/%d/%H)
+  blob=$prefix/$hour/$start.jsonl
+  sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
+  bytes=$(wc -c < "$segment")
+  lines=$(wc -l < "$segment")
+  temporary=$(mktemp "$manifest.XXXXXX")
+  trap 'rm -f "$temporary"' EXIT HUP INT TERM
+  jq -n \
+    --arg segment_path "$relative" \
+    --arg blob_name "$blob" \
+    --arg sha256 "$sha" \
+    --argjson bytes "$bytes" \
+    --argjson lines "$lines" \
+    --argjson segment_start_epoch "$start" \
+    --argjson segment_end_epoch "$end" \
+    '{schema_version:1,segment_path:$segment_path,blob_name:$blob_name,sha256:$sha256,bytes:$bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch}' \
+    > "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$segment"
+  mv "$temporary" "$manifest"
+  trap - EXIT HUP INT TERM
+done
+
+if [ "${POLYEDGE_RING_SEAL_ONLY:-}" = 1 ]; then
+  exit 0
+fi
+
+: "${POLYEDGE_RING_IMAGE:?set an immutable POLYEDGE_RING_IMAGE}"
+: "${AZURE_STORAGE_ACCOUNT_NAME:?set AZURE_STORAGE_ACCOUNT_NAME}"
+: "${AZURE_STORAGE_CONTAINER_NAME:?set AZURE_STORAGE_CONTAINER_NAME}"
+: "${AZURE_TENANT_ID:?set AZURE_TENANT_ID}"
+: "${AZURE_CLIENT_ID:?set AZURE_CLIENT_ID}"
+printf '%s' "$POLYEDGE_RING_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' || {
+  echo 'POLYEDGE_RING_IMAGE must be an immutable GHCR digest' >&2
+  exit 64
+}
+
+exec /usr/bin/podman run --rm --name polyedge-ring-upload \
+  --network polyedge --cpus 0.5 --memory 1g --pids-limit 256 \
+  --env AZURE_STORAGE_ACCOUNT_NAME \
+  --env AZURE_STORAGE_CONTAINER_NAME \
+  --env AZURE_TENANT_ID \
+  --env AZURE_CLIENT_ID \
+  --env AZURE_CLIENT_SECRET_FILE=/run/credentials/azure-client-secret \
+  -v "$root:/srv/polyedge-ring:Z" \
+  -v /etc/polyedge/credentials/research:/run/credentials:ro,Z \
+  "$POLYEDGE_RING_IMAGE" polyedge-rs ring-upload \
+    --root /srv/polyedge-ring \
+    --blob-prefix "$prefix" \
+    --retention-hours "${POLYEDGE_RING_RETENTION_HOURS:-48}"

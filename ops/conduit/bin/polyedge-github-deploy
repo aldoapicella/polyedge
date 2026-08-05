@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+die() {
+  echo "polyedge-github-deploy: $*" >&2
+  exit 64
+}
+
+command=${SSH_ORIGINAL_COMMAND:-}
+single_line=$(printf '%s' "$command" | tr -d '\n\r\t')
+[ "$single_line" = "$command" ] || die 'invalid deployment command'
+printf '%s' "$command" | grep -Eq '^sudo -n /usr/local/sbin/polyedge-quadlet-deploy (polyedge-api|polyedge-frontend|polyedge-funded-signer) ghcr\.io/[a-z0-9][a-z0-9._-]*/(polyedge-rust-backend|polyedge-frontend|polyedge-venue-probe)@sha256:[0-9a-f]{64}$' || die 'invalid deployment command'
+
+set -f
+old_ifs=$IFS
+IFS=' '
+set -- $command
+IFS=$old_ifs
+[ "$#" -eq 5 ] || die 'invalid deployment command'
+
+if [ "${POLYEDGE_GITHUB_DEPLOY_TEST:-}" = 1 ]; then
+  printf '%s\n' "$4 $5"
+  exit 0
+fi
+exec /usr/bin/sudo -n /usr/local/sbin/polyedge-quadlet-deploy "$4" "$5"

@@ -1,0 +1,3 @@
+# Operator-created files only. Keep the checked-in *.example files secret-free.
+*.env
+!*.env.example

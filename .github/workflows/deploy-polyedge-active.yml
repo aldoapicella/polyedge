@@ -599,7 +599,7 @@ jobs:
           test "$(echo "$event_index_types" | grep -c 'runtime_provenance')" = "1"
           test "$(jq -s '[.[].properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length' frontend-containerapp.json api-containerapp.json)" = "0"
           test "$(jq -s '[.[].properties.configuration.secrets[]? | select(.name == "storage-account-key")] | length' frontend-containerapp.json api-containerapp.json)" = "0"
-          for research_job_name in polyedge-data-freshness-job polyedge-hourly-quality-job polyedge-daily-research-job polyedge-prospective-job polyedge-replay-index-job polyedge-chart-backfill-job polyedge-adx-ingestion-job polyedge-backfill-job; do
+          for research_job_name in polyedge-data-freshness-job polyedge-hourly-quality-job polyedge-daily-research-job polyedge-prospective-job polyedge-replay-index-job polyedge-chart-backfill-job polyedge-backfill-job; do
             research_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$research_job_name" -o json)
             test "$(echo "$research_job" | jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length')" = "0"
             test "$(echo "$research_job" | jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length')" = "0"

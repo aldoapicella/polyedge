@@ -1,0 +1,10 @@
+[Unit]
+Description=Run current PolyEdge qset shadow daily job (UTC)
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=true
+Unit=polyedge-job@shadow-qset.service
+
+[Install]
+WantedBy=timers.target

@@ -25,7 +25,20 @@ impl RuntimeRecorder {
             let path = env::var("RECORDER_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("data/events.jsonl"));
-            recorders.push(Box::new(JsonlRecorder::new(path)));
+            let recorder = match env::var("RECORDER_SEGMENT_SECONDS") {
+                Ok(value) => {
+                    let seconds = value.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("RECORDER_SEGMENT_SECONDS must be an integer from 300 through 900")
+                    });
+                    assert!(
+                        (300..=900).contains(&seconds),
+                        "RECORDER_SEGMENT_SECONDS must be from 300 through 900"
+                    );
+                    JsonlRecorder::segmented(path, seconds)
+                }
+                Err(_) => JsonlRecorder::new(path),
+            };
+            recorders.push(Box::new(recorder));
         }
         if let Some(account) = settings.azure.storage_account_name.as_deref() {
             let client_id = env::var("AZURE_CLIENT_ID").ok();

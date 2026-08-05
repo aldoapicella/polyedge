@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+env_file=${POLYEDGE_RING_ENV_FILE:-/etc/polyedge/ring.env}
+test -r "$env_file" || { echo "missing $env_file" >&2; exit 64; }
+set -a
+. "$env_file"
+set +a
+
+root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
+segments=$root/segments
+status=$root/status.json
+segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
+grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
+retention_hours=${POLYEDGE_RING_RETENTION_HOURS:-48}
+minimum_free=${POLYEDGE_RING_MIN_FREE_BYTES:-34359738368}
+maximum_unuploaded_age=${POLYEDGE_RING_MAX_UNUPLOADED_SECONDS:-1200}
+
+mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
+test -d "$segments" || { echo "$segments does not exist" >&2; exit 1; }
+now=$(date -u +%s)
+size=$(df -P -B1 "$root" | awk 'NR == 2 {print $2}')
+available=$(df -P -B1 "$root" | awk 'NR == 2 {print $4}')
+segment_count=0
+sealed_count=0
+unsealed_closed_count=0
+unuploaded_count=0
+oldest_unuploaded_age=0
+maximum_segment_bytes=0
+
+for segment in $(find "$segments" -type f -name '*.jsonl' -print); do
+  segment_count=$((segment_count + 1))
+  bytes=$(wc -c < "$segment")
+  [ "$bytes" -le "$maximum_segment_bytes" ] || maximum_segment_bytes=$bytes
+  start=${segment##*/}
+  start=${start%.jsonl}
+  manifest=$segment.manifest.json
+  if [ -e "$manifest" ]; then
+    sealed_count=$((sealed_count + 1))
+    receipt=$manifest.uploaded.json
+    if [ ! -e "$receipt" ]; then
+      unuploaded_count=$((unuploaded_count + 1))
+      age=$((now - $(stat -c %Y "$manifest")))
+      [ "$age" -le "$oldest_unuploaded_age" ] || oldest_unuploaded_age=$age
+    fi
+  elif printf '%s' "$start" | grep -Eq '^[0-9]+$' && [ $((start + segment_seconds + grace_seconds)) -le "$now" ]; then
+    unsealed_closed_count=$((unsealed_closed_count + 1))
+  fi
+done
+
+retention_segments=$((retention_hours * 3600 / segment_seconds))
+projected_retention_bytes=$((maximum_segment_bytes * retention_segments))
+capacity_ok=true
+[ "$projected_retention_bytes" -le $((size - minimum_free)) ] || capacity_ok=false
+free_ok=true
+[ "$available" -ge "$minimum_free" ] || free_ok=false
+upload_fresh=true
+if [ "${POLYEDGE_RING_SEAL_ONLY:-}" != 1 ] && [ "$oldest_unuploaded_age" -gt "$maximum_unuploaded_age" ]; then
+  upload_fresh=false
+fi
+
+temporary=$(mktemp "$status.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+jq -n \
+  --arg generated_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --argjson size_bytes "$size" \
+  --argjson available_bytes "$available" \
+  --argjson minimum_free_bytes "$minimum_free" \
+  --argjson segment_count "$segment_count" \
+  --argjson sealed_count "$sealed_count" \
+  --argjson unsealed_closed_count "$unsealed_closed_count" \
+  --argjson unuploaded_count "$unuploaded_count" \
+  --argjson oldest_unuploaded_age_seconds "$oldest_unuploaded_age" \
+  --argjson projected_retention_bytes "$projected_retention_bytes" \
+  --argjson retention_hours "$retention_hours" \
+  --argjson seal_only "${POLYEDGE_RING_SEAL_ONLY:-0}" \
+  --argjson capacity_ok "$capacity_ok" \
+  --argjson free_ok "$free_ok" \
+  --argjson upload_fresh "$upload_fresh" \
+  '{schema_version:1,generated_ts:$generated_ts,size_bytes:$size_bytes,available_bytes:$available_bytes,minimum_free_bytes:$minimum_free_bytes,segment_count:$segment_count,sealed_count:$sealed_count,unsealed_closed_count:$unsealed_closed_count,unuploaded_count:$unuploaded_count,oldest_unuploaded_age_seconds:$oldest_unuploaded_age_seconds,projected_retention_bytes:$projected_retention_bytes,retention_hours:$retention_hours,seal_only:($seal_only == 1),capacity_ok:$capacity_ok,free_ok:$free_ok,upload_fresh:$upload_fresh}' \
+  > "$temporary"
+chmod 0640 "$temporary"
+mv "$temporary" "$status"
+trap - EXIT HUP INT TERM
+
+if [ "$free_ok" != true ]; then
+  logger -p daemon.crit -t polyedge-ring-health "ring has $available bytes free; stopping polyedge-api before the filesystem fills"
+  if [ "${POLYEDGE_RING_HEALTH_TEST:-}" != 1 ]; then
+    systemctl stop polyedge-api.service
+  fi
+  exit 1
+fi
+if [ "$capacity_ok" != true ] || [ "$upload_fresh" != true ] || [ "$unsealed_closed_count" -ne 0 ]; then
+  logger -p daemon.err -t polyedge-ring-health "ring capacity, sealing, or upload freshness requires attention; see $status"
+  exit 1
+fi

@@ -1,0 +1,7 @@
+[Unit]
+Description=Verify PolyEdge ring capacity, sealing, and upload freshness
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/polyedge-ring-health

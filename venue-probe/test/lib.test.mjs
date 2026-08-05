@@ -13,6 +13,7 @@ import {
   isRiskReservationResolved,
   isTransientUnsafeMarket,
   finalizeProbeRisk,
+  loadCampaignRiskControl,
   loadCampaignUnresolvedRiskReservationRecords,
   loadProbeConfig,
   modelObservations,
@@ -109,6 +110,46 @@ test("funded campaign risk does not reset at UTC midnight or process restart", (
   assert.match(beforeMidnight.blockers.join(","), /equity_floor_breached|campaign_drawdown_exhausted/);
   assert.throws(() => evaluateCampaignRiskGate(beforeMidnight, false), /funded campaign risk gate blocked/);
   assert.equal(evaluateCampaignRiskGate(beforeMidnight, true).diagnostics_only, true);
+});
+
+test("existing campaign baseline is read without a guaranteed-conflict write", async () => {
+  let downloads = 0;
+  let uploads = 0;
+  const baseline = {
+    schema_version: 1,
+    campaign_id: "campaign-1",
+    baseline_equity: 5,
+    equity_floor: 4,
+    max_campaign_drawdown: 1,
+    max_order_notional: 1,
+    max_open_orders: 1,
+    max_unresolved_positions: 1,
+    max_reconciliation_discrepancy: 0.01
+  };
+  const blob = {
+    async download() {
+      downloads += 1;
+      return { readableStreamBody: Readable.from([JSON.stringify(baseline)]) };
+    },
+    async uploadData() { uploads += 1; }
+  };
+  const control = await loadCampaignRiskControl({
+    campaignId: "campaign-1",
+    campaignBaselineEquity: 5,
+    campaignEquityFloor: 4,
+    maxCampaignDrawdown: 1,
+    maxOrderNotional: 1,
+    maxReconciliationDiscrepancy: 0.01,
+    campaignCashFlows: []
+  }, {
+    container: {
+      getBlockBlobClient: () => blob,
+      async *listBlobsFlat() {}
+    }
+  });
+  assert.equal(control.cash_flow_count, 0);
+  assert.equal(downloads, 1);
+  assert.equal(uploads, 0);
 });
 
 test("campaign risk is cash-flow aware and blocks discrepancies above one cent", () => {

@@ -1,0 +1,15 @@
+[Unit]
+Description=PolyEdge Azure-backed job (%i)
+Wants=network-online.target
+After=network-online.target polyedge-network.service polyedge-api.service
+Requires=polyedge-network.service
+# Jobs are intentionally inert until an operator creates this approval marker.
+ConditionPathExists=/etc/polyedge/ENABLE_AZURE_JOBS
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/polyedge/jobs/%i.env
+ExecStartPre=/usr/bin/install -d -m 0750 /var/lib/polyedge/jobs/%i
+ExecStart=/usr/local/libexec/polyedge-run-job %i
+# Includes the shared-lock wait plus the longest configured job runtime.
+TimeoutStartSec=48h

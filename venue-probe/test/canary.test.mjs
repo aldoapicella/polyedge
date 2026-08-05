@@ -22,6 +22,7 @@ import {
   initializeProtectedCompounding,
   loadSettlementActivity,
   PREFLIGHT_COMPONENT_TIMEOUT_MS,
+  refreshCampaignRiskSnapshot,
   runBoundedPreflightComponent,
   SAFETY_CACHE_MAINTENANCE_QUIESCE_MS,
   selectFreshCachedSafetySnapshot,
@@ -533,6 +534,44 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
     selectFreshCachedSafetySnapshot(resources, { ...intent, token_id: "token-down" }, 10_600),
     null
   );
+});
+
+test("campaign risk snapshot avoids duplicate list loaders and does not cross runs", async () => {
+  const calls = { control: 0, reservations: 0 };
+  const campaignConfig = { campaignId: "campaign-a" };
+  const container = {};
+  const loadControl = async (_config, options) => {
+    calls.control += 1;
+    assert.equal(options.container, container);
+    return { campaign_id: "campaign-a", revision: calls.control };
+  };
+  const loadUnresolved = async (_config, options) => {
+    calls.reservations += 1;
+    assert.equal(options.container, container);
+    return [{ reservation: { probe_id: `probe-${calls.reservations}` } }];
+  };
+  const firstRun = { container, lease: { assertHealthy() {} } };
+
+  const first = await refreshCampaignRiskSnapshot(firstRun, {
+    campaignConfig,
+    loadControl,
+    loadUnresolved
+  });
+  for (let preflight = 0; preflight < 3; preflight += 1) {
+    assert.equal(firstRun.campaignRiskSnapshot.control.revision, 1);
+    assert.equal(firstRun.campaignRiskSnapshot.reservationRecords[0].reservation.probe_id, "probe-1");
+  }
+  assert.deepEqual(calls, { control: 1, reservations: 1 });
+
+  const secondRun = { container, lease: { assertHealthy() {} } };
+  const second = await refreshCampaignRiskSnapshot(secondRun, {
+    campaignConfig,
+    loadControl,
+    loadUnresolved
+  });
+  assert.notStrictEqual(second, first);
+  assert.equal(second.control.revision, 2);
+  assert.deepEqual(calls, { control: 2, reservations: 2 });
 });
 
 test("persistent executor honors the configured child TTL gate", () => {

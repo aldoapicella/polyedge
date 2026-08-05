@@ -155,7 +155,6 @@ function setExecutionContext(env) {
 async function initializeResources({ persistent = false } = {}) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable Azure Blob storage is unavailable");
-  await container.createIfNotExists();
   const intentContainer = storageContainer({ ...config, storageContainer: config.intentContainerName });
   const manifestContainer = storageContainer({ ...config, storageContainer: config.manifestContainerName });
   if (!intentContainer || !manifestContainer) throw new Error("fail closed: intent or manifest source container is unavailable");
@@ -241,6 +240,7 @@ async function initializeResources({ persistent = false } = {}) {
     profitQuarantineSnapshot,
     protectedCompoundingContext,
     riskReservationIndex,
+    campaignRiskSnapshot: null,
     client,
     lease: resourceLease,
     ledgerMultiplexer,
@@ -441,6 +441,35 @@ async function closeResources(resources) {
   if (resources?.lease) await resources.lease.release();
 }
 
+export async function refreshCampaignRiskSnapshot(resources, {
+  campaignConfig = config,
+  loadControl = loadCampaignRiskControl,
+  loadUnresolved = loadCampaignUnresolvedRiskReservationRecords
+} = {}) {
+  if (!resources?.container) {
+    throw new Error("fail closed: durable storage is required for the campaign risk snapshot");
+  }
+  resources.lease?.assertHealthy();
+  const [control, reservationRecords] = await Promise.all([
+    loadControl(campaignConfig, { container: resources.container }),
+    loadUnresolved(campaignConfig, { container: resources.container })
+  ]);
+  if (control?.campaign_id !== campaignConfig.campaignId || !Array.isArray(reservationRecords)) {
+    throw new Error("fail closed: campaign risk snapshot is incomplete or belongs to another campaign");
+  }
+  const snapshot = { control, reservationRecords };
+  resources.campaignRiskSnapshot = snapshot;
+  return snapshot;
+}
+
+function requireCampaignRiskSnapshot() {
+  const snapshot = activeResources?.campaignRiskSnapshot;
+  if (snapshot?.control?.campaign_id !== config.campaignId || !Array.isArray(snapshot?.reservationRecords)) {
+    throw new Error("fail closed: current-run campaign risk snapshot is unavailable");
+  }
+  return snapshot;
+}
+
 export async function putOperatorSessionManifest(container, {
   blobName,
   expectedHash,
@@ -627,6 +656,7 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
           Math.abs(restBestAsk - streamEvidence.bestAsk) > 1e-9) {
         throw new Error("fail closed: persistent warmup REST, clock, and public stream evidence disagree");
       }
+      await refreshCampaignRiskSnapshot(resources);
       startSafetySnapshotCache(resources, warmed);
       resources.userChannel?.beginEvidenceWindow?.();
       resources.marketChannel?.beginEvidenceWindow?.();
@@ -780,6 +810,7 @@ async function main(resources) {
     executionModelDocument,
     client
   } = resources;
+  await refreshCampaignRiskSnapshot(resources);
   // Provenance is needed after venue reconciliation to publish the immutable
   // summary. Validate it before any reservation, authorization, or signing.
   const modelArtifact = requireExecutionModelArtifact(rawModelArtifact);
@@ -826,7 +857,8 @@ async function main(resources) {
         monotonic_ms: startedMonotonicMs,
         decision_id: documents.intent.decision_id
       });
-      const value = await reserveProbeRisk(config, reservation);
+      const value = await reserveProbeRisk(config, reservation, { container });
+      await refreshCampaignRiskSnapshot(resources);
       ledger.record("funded_risk_reservation_completed", {
         wall_ms: Date.now(),
         monotonic_ms: performance.now(),
@@ -835,13 +867,17 @@ async function main(resources) {
       });
       return value;
     },
-    finalizeNoOrder: (reservation) => finalizeProbeRisk(config, reservation, {
-      state: "released_no_order",
-      order_submitted: false,
-      matched_notional: 0,
-      reconciliation_complete: true,
-      zero_open_orders_confirmed: true
-    }),
+    finalizeNoOrder: async (reservation) => {
+      const finalized = await finalizeProbeRisk(config, reservation, {
+        state: "released_no_order",
+        order_submitted: false,
+        matched_notional: 0,
+        reconciliation_complete: true,
+        zero_open_orders_confirmed: true
+      }, { container });
+      await refreshCampaignRiskSnapshot(resources);
+      return finalized;
+    },
     consumeAuthorization: async (value) => {
       const startedMonotonicMs = performance.now();
       ledger.record("funded_authorization_consumption_started", {
@@ -864,8 +900,10 @@ async function main(resources) {
   if (!evidenceProbe) return result;
   let terminalEvidence = null;
   if (Number(evidenceProbe.lifecycle.actual_matched_size) === 0) {
+    await refreshCampaignRiskSnapshot(resources);
     const terminalRuntime = await capturePreflight(client, documents.intent, documents.manifest);
-    const campaign = await loadCampaignRiskControl(config);
+    const campaign = terminalRuntime.riskBasis?.control;
+    if (!campaign) throw new Error("fail closed: terminal campaign risk control is unavailable");
     terminalEvidence = await publishTerminalRiskPortfolioEvidence(container, {
       reservation: {
         run_id: runId,
@@ -1019,6 +1057,7 @@ async function capturePreflight(
       clockUncertaintyMs
     };
   };
+  let campaignRiskSnapshot = requireCampaignRiskSnapshot();
   const [
     geoblock,
     clockEvidence,
@@ -1038,7 +1077,7 @@ async function capturePreflight(
     timed("order_book", () => client.getOrderBook(String(intent.token_id))),
     timed("clob_market_info", () => client.getClobMarketInfo(String(intent.condition_id))),
     timed("open_orders", () => getOpenOrdersStrict(client)),
-    timed("campaign_risk_control", () => loadCampaignRiskControl(config)),
+    timed("campaign_risk_control", () => campaignRiskSnapshot.control),
     timed("collateral_balance", () => client.getBalanceAllowance({
       asset_type: AssetType.COLLATERAL,
       signature_type: config.signatureType
@@ -1051,9 +1090,7 @@ async function capturePreflight(
       `https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`,
       { signal: AbortSignal.timeout(10_000) }
     )),
-    timed("unresolved_risk_reservations", () =>
-      loadCampaignUnresolvedRiskReservationRecords(config)
-    )
+    timed("unresolved_risk_reservations", () => campaignRiskSnapshot.reservationRecords)
   ]);
   assertEligibleOrigin(geoblock, config);
   const {
@@ -1096,12 +1133,11 @@ async function capturePreflight(
       evidence_source: "polymarket_data_api_redeemable",
       run_id: runId
     }, {
+      container: activeResources.container,
       reservationRecords: campaignReservationRecords
     });
-    reservations = reservations.filter((reservation) =>
-      !(Number(reservation?.matched_notional) > 0
-        && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase()))
-    );
+    campaignRiskSnapshot = await refreshCampaignRiskSnapshot(activeResources);
+    reservations = campaignRiskSnapshot.reservationRecords.map((record) => record.reservation);
   }
   const liquidCollateral = Number(balance.balance) / 1_000_000;
   const summedPositionValue = positions.reduce(

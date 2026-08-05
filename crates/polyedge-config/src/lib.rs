@@ -278,6 +278,7 @@ pub struct AzureConfig {
     pub storage_table_name: String,
     pub chart_table_name: String,
     pub market_table_name: String,
+    pub chart_persist_interval_ms: usize,
     pub event_blob_prefix: String,
     pub event_blob_prefix_after_cutover: Option<String>,
     pub event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
@@ -306,6 +307,7 @@ impl Default for AzureConfig {
             storage_table_name: "BotEventIndex".to_owned(),
             chart_table_name: "BotChartSeries".to_owned(),
             market_table_name: "BotMarketCatalog".to_owned(),
+            chart_persist_interval_ms: 1_000,
             event_blob_prefix: "events".to_owned(),
             event_blob_prefix_after_cutover: None,
             event_blob_prefix_cutover_utc: None,
@@ -482,6 +484,11 @@ impl RuntimeSettings {
             env_string("AZURE_CHART_TABLE_NAME", settings.azure.chart_table_name);
         settings.azure.market_table_name =
             env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
+        settings.azure.chart_persist_interval_ms = env_usize(
+            "AZURE_CHART_PERSIST_INTERVAL_MS",
+            settings.azure.chart_persist_interval_ms,
+        )
+        .clamp(1_000, 60_000);
         settings.azure.event_blob_prefix =
             env_string("AZURE_EVENT_BLOB_PREFIX", settings.azure.event_blob_prefix);
         settings.azure.event_blob_prefix_after_cutover =
@@ -813,6 +820,7 @@ impl RuntimeSettings {
                 "event_blob_prefix_cutover_utc": self.azure.event_blob_prefix_cutover_utc,
                 "compact_shadow_recording": self.azure.compact_shadow_recording,
                 "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
+                "chart_persist_interval_ms": self.azure.chart_persist_interval_ms,
                 "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
                 "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
                 "funded_direct_service_bus_enabled": self.azure.funded_direct_service_bus_enabled,

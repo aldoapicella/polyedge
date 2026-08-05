@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,6 +28,8 @@ const AZURE_APPEND_RECONCILE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const AZURE_TABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const AZURE_TABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const AZURE_AUTHORITY_HOST: &str = "https://login.microsoftonline.com";
+const AZURE_CLIENT_SECRET_MAX_BYTES: u64 = 16 * 1024;
 type AzureTableContinuation = Option<(String, String)>;
 type AzureTablePage = (Vec<Value>, AzureTableContinuation);
 type HmacSha256 = Hmac<Sha256>;
@@ -119,15 +122,37 @@ pub fn wire_normalized_json<T: Serialize>(value: &T) -> Result<Value, serde_json
 #[derive(Clone, Debug)]
 pub struct JsonlRecorder {
     path: PathBuf,
+    segment_seconds: Option<i64>,
 }
 
 impl JsonlRecorder {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            segment_seconds: None,
+        }
+    }
+
+    pub fn segmented(path: impl Into<PathBuf>, segment_seconds: u64) -> Self {
+        assert!(segment_seconds > 0 && segment_seconds <= i64::MAX as u64);
+        Self {
+            path: path.into(),
+            segment_seconds: Some(segment_seconds as i64),
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn active_path(&self, now: DateTime<Utc>) -> PathBuf {
+        let Some(segment_seconds) = self.segment_seconds else {
+            return self.path.clone();
+        };
+        let start = now.timestamp().div_euclid(segment_seconds) * segment_seconds;
+        self.path
+            .join(now.format("%Y/%m/%d/%H").to_string())
+            .join(format!("{start}.jsonl"))
     }
 }
 
@@ -140,17 +165,16 @@ impl EventRecorder for JsonlRecorder {
         if events.is_empty() {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
+        let path = self.active_path(Utc::now());
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         for event in events {
             serde_json::to_writer(&mut file, &jsonl_event_envelope(event))?;
             file.write_all(b"\n")?;
         }
+        file.sync_all()?;
         Ok(())
     }
 }
@@ -806,6 +830,8 @@ pub enum AzureBlobError {
     HttpStatus(u16),
     #[error("managed identity token is unavailable: {0}")]
     ManagedIdentity(String),
+    #[error("external Azure identity token is unavailable: {0}")]
+    ExternalIdentity(String),
     #[error("Azure Blob HTTP transport error: {0}")]
     Transport(String),
     #[error("Azure append position error: {0}")]
@@ -862,6 +888,20 @@ struct ManagedIdentityToken {
     resource: String,
     access_token: Option<String>,
     expires_on_epoch: Option<i64>,
+    cached_auth: Option<AzureTokenAuth>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AzureTokenAuth {
+    ManagedIdentity,
+    ClientSecretFile(ExternalAzureAuth),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExternalAzureAuth {
+    tenant_id: String,
+    client_id: String,
+    secret_file: PathBuf,
 }
 
 impl ManagedIdentityToken {
@@ -875,30 +915,249 @@ impl ManagedIdentityToken {
             resource: resource.into(),
             access_token: None,
             expires_on_epoch: None,
+            cached_auth: None,
         }
     }
 
     fn access_token(&mut self, agent: &ureq::Agent) -> Result<String, AzureBlobError> {
+        let auth = token_auth_from_env(self.client_id.as_deref())?;
         let now = Utc::now().timestamp();
-        if let (Some(token), Some(expires_on)) = (&self.access_token, self.expires_on_epoch) {
-            if expires_on - now > 120 {
-                return Ok(token.clone());
+        if self.cached_auth.as_ref() == Some(&auth) {
+            if let (Some(token), Some(expires_on)) = (&self.access_token, self.expires_on_epoch) {
+                if expires_on - now > 120 {
+                    return Ok(token.clone());
+                }
             }
         }
-        let payload =
-            fetch_managed_identity_token(agent, self.client_id.as_deref(), &self.resource)?;
+        let payload = match &auth {
+            AzureTokenAuth::ManagedIdentity => {
+                fetch_managed_identity_token(agent, self.client_id.as_deref(), &self.resource)?
+            }
+            AzureTokenAuth::ClientSecretFile(config) => {
+                fetch_external_identity_token(agent, config, &self.resource)?
+            }
+        };
         let token = payload
             .get("access_token")
             .and_then(Value::as_str)
-            .ok_or_else(|| AzureBlobError::ManagedIdentity("missing access_token".to_owned()))?
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| match &auth {
+                AzureTokenAuth::ManagedIdentity => {
+                    AzureBlobError::ManagedIdentity("missing access_token".to_owned())
+                }
+                AzureTokenAuth::ClientSecretFile(_) => {
+                    AzureBlobError::ExternalIdentity("missing access_token".to_owned())
+                }
+            })?
             .to_owned();
-        let expires_on = payload
-            .get("expires_on")
-            .and_then(parse_expires_on)
-            .unwrap_or(now + 300);
+        let expires_on = match &auth {
+            AzureTokenAuth::ManagedIdentity => payload
+                .get("expires_on")
+                .and_then(parse_expires_on)
+                .unwrap_or(now + 300),
+            AzureTokenAuth::ClientSecretFile(_) => payload
+                .get("expires_in")
+                .and_then(parse_expires_on)
+                .filter(|seconds| *seconds > 0)
+                .map(|seconds| now.saturating_add(seconds))
+                .unwrap_or(now + 300),
+        };
         self.access_token = Some(token.clone());
         self.expires_on_epoch = Some(expires_on);
+        self.cached_auth = Some(auth);
         Ok(token)
+    }
+}
+
+fn token_auth_from_env(expected_client_id: Option<&str>) -> Result<AzureTokenAuth, AzureBlobError> {
+    select_token_auth(
+        env::var_os("AZURE_TENANT_ID"),
+        env::var_os("AZURE_CLIENT_ID"),
+        env::var_os("AZURE_CLIENT_SECRET_FILE"),
+        expected_client_id,
+    )
+}
+
+fn select_token_auth(
+    tenant_id: Option<OsString>,
+    client_id: Option<OsString>,
+    secret_file: Option<OsString>,
+    expected_client_id: Option<&str>,
+) -> Result<AzureTokenAuth, AzureBlobError> {
+    // AZURE_CLIENT_ID alone selects a user-assigned managed identity today.
+    if tenant_id.is_none() && secret_file.is_none() {
+        return Ok(AzureTokenAuth::ManagedIdentity);
+    }
+    if tenant_id.is_none() || client_id.is_none() || secret_file.is_none() {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET_FILE must be set together"
+                .to_owned(),
+        ));
+    }
+
+    let tenant_id = unicode_config("AZURE_TENANT_ID", tenant_id.unwrap())?;
+    let client_id = unicode_config("AZURE_CLIENT_ID", client_id.unwrap())?;
+    let secret_file = PathBuf::from(secret_file.unwrap());
+    if !is_guid(&tenant_id) || !is_guid(&client_id) {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_TENANT_ID and AZURE_CLIENT_ID must be GUIDs".to_owned(),
+        ));
+    }
+    if expected_client_id.is_some_and(|expected| expected != client_id.as_str()) {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_CLIENT_ID changed after the Azure client was initialized".to_owned(),
+        ));
+    }
+    if !secret_file.is_absolute() {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_CLIENT_SECRET_FILE must be an absolute path".to_owned(),
+        ));
+    }
+
+    Ok(AzureTokenAuth::ClientSecretFile(ExternalAzureAuth {
+        tenant_id,
+        client_id,
+        secret_file,
+    }))
+}
+
+fn unicode_config(name: &str, value: OsString) -> Result<String, AzureBlobError> {
+    value
+        .into_string()
+        .map_err(|_| AzureBlobError::ExternalIdentity(format!("{name} must contain valid Unicode")))
+}
+
+fn is_guid(value: &str) -> bool {
+    value.len() == 36
+        && value != "00000000-0000-0000-0000-000000000000"
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn fetch_external_identity_token(
+    agent: &ureq::Agent,
+    config: &ExternalAzureAuth,
+    resource: &str,
+) -> Result<Value, AzureBlobError> {
+    let secret = read_client_secret(&config.secret_file)?;
+    let (url, body) = external_token_request(config, resource, &secret);
+    let response = agent
+        .post(&url)
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .set("Accept", "application/json")
+        .send_string(&body)
+        .map_err(external_identity_error)?;
+    let text = response.into_string().map_err(|error| {
+        AzureBlobError::ExternalIdentity(format!("token response could not be read: {error}"))
+    })?;
+    serde_json::from_str(&text).map_err(|error| {
+        AzureBlobError::ExternalIdentity(format!("token response was not JSON: {error}"))
+    })
+}
+
+fn external_token_request(
+    config: &ExternalAzureAuth,
+    resource: &str,
+    secret: &str,
+) -> (String, String) {
+    let url = format!(
+        "{}/{}/oauth2/v2.0/token",
+        AZURE_AUTHORITY_HOST, config.tenant_id
+    );
+    let scope = format!("{}/.default", resource.trim_end_matches('/'));
+    let encode = |value: &str| utf8_percent_encode(value, NON_ALPHANUMERIC).to_string();
+    let body = format!(
+        "client_id={}&client_secret={}&scope={}&grant_type=client_credentials",
+        encode(&config.client_id),
+        encode(secret),
+        encode(&scope)
+    );
+    (url, body)
+}
+
+fn read_client_secret(path: &Path) -> Result<String, AzureBlobError> {
+    let path_metadata = fs::symlink_metadata(path).map_err(external_secret_file_error)?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_CLIENT_SECRET_FILE must be a regular file, not a symlink".to_owned(),
+        ));
+    }
+    validate_secret_file_metadata(&path_metadata)?;
+    let file = File::open(path).map_err(external_secret_file_error)?;
+    let opened_metadata = file.metadata().map_err(external_secret_file_error)?;
+    validate_secret_file_metadata(&opened_metadata)?;
+    validate_same_secret_file(&path_metadata, &opened_metadata)?;
+
+    let mut bytes = Vec::new();
+    file.take(AZURE_CLIENT_SECRET_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(external_secret_file_error)?;
+    if bytes.len() as u64 > AZURE_CLIENT_SECRET_MAX_BYTES {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_CLIENT_SECRET_FILE exceeds 16 KiB".to_owned(),
+        ));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| {
+        AzureBlobError::ExternalIdentity("AZURE_CLIENT_SECRET_FILE is not UTF-8".to_owned())
+    })?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_CLIENT_SECRET_FILE is empty or contains an invalid control character".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_secret_file_metadata(metadata: &fs::Metadata) -> Result<(), AzureBlobError> {
+    if metadata.len() == 0 || metadata.len() > AZURE_CLIENT_SECRET_MAX_BYTES {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_CLIENT_SECRET_FILE is empty or exceeds 16 KiB".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            return Err(AzureBlobError::ExternalIdentity(
+                "AZURE_CLIENT_SECRET_FILE must have no group/other permissions or hard links"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_same_secret_file(
+    path_metadata: &fs::Metadata,
+    opened_metadata: &fs::Metadata,
+) -> Result<(), AzureBlobError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != opened_metadata.dev()
+            || path_metadata.ino() != opened_metadata.ino()
+        {
+            return Err(AzureBlobError::ExternalIdentity(
+                "AZURE_CLIENT_SECRET_FILE changed while it was opened".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn external_secret_file_error(error: std::io::Error) -> AzureBlobError {
+    AzureBlobError::ExternalIdentity(format!("AZURE_CLIENT_SECRET_FILE cannot be read: {error}"))
+}
+
+fn external_identity_error(error: ureq::Error) -> AzureBlobError {
+    match error {
+        ureq::Error::Status(status, _) => {
+            AzureBlobError::ExternalIdentity(format!("HTTP {status}"))
+        }
+        ureq::Error::Transport(error) => AzureBlobError::ExternalIdentity(error.to_string()),
     }
 }
 
@@ -1317,7 +1576,23 @@ impl AzureBlobClient {
             self.container,
             encode_blob_path(name)
         );
-        self.put_block_blob_if_absent(&url, bytes, content_type)
+        self.put_block_blob_if_absent(&url, bytes, content_type, None)
+    }
+
+    /// Creates an immutable block blob directly in Azure's Cool tier.
+    pub fn upload_cool_block_blob_bytes_if_absent(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<ImmutableBlobWrite, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        self.put_block_blob_if_absent(&url, bytes, content_type, Some("Cool"))
     }
 
     /// Replaces a block blob only while it still has `expected_etag`.
@@ -1667,29 +1942,41 @@ impl AzureBlobClient {
         url: &str,
         bytes: &[u8],
         content_type: &str,
+        access_tier: Option<&str>,
     ) -> Result<ImmutableBlobWrite, AzureBlobError> {
         let date = rfc1123_now();
         let response = match &mut self.auth {
-            AzureBlobAuth::Sas(sas) => self
-                .agent
-                .put(&append_sas(url, sas))
-                .set("x-ms-version", AZURE_BLOB_API_VERSION)
-                .set("x-ms-date", &date)
-                .set("x-ms-blob-type", "BlockBlob")
-                .set("content-type", content_type)
-                .set("if-none-match", "*")
-                .send_bytes(bytes),
+            AzureBlobAuth::Sas(sas) => {
+                let request = self
+                    .agent
+                    .put(&append_sas(url, sas))
+                    .set("x-ms-version", AZURE_BLOB_API_VERSION)
+                    .set("x-ms-date", &date)
+                    .set("x-ms-blob-type", "BlockBlob")
+                    .set("content-type", content_type)
+                    .set("if-none-match", "*");
+                let request = match access_tier {
+                    Some(tier) => request.set("x-ms-access-tier", tier),
+                    None => request,
+                };
+                request.send_bytes(bytes)
+            }
             AzureBlobAuth::ManagedIdentity(token) => {
                 let access_token = token.access_token(&self.agent)?;
-                self.agent
+                let request = self
+                    .agent
                     .put(url)
                     .set("authorization", &format!("Bearer {access_token}"))
                     .set("x-ms-version", AZURE_BLOB_API_VERSION)
                     .set("x-ms-date", &date)
                     .set("x-ms-blob-type", "BlockBlob")
                     .set("content-type", content_type)
-                    .set("if-none-match", "*")
-                    .send_bytes(bytes)
+                    .set("if-none-match", "*");
+                let request = match access_tier {
+                    Some(tier) => request.set("x-ms-access-tier", tier),
+                    None => request,
+                };
+                request.send_bytes(bytes)
             }
         };
         match response {
@@ -1814,13 +2101,12 @@ impl AzureTableClient {
             .get("RowKey")
             .and_then(Value::as_str)
             .ok_or_else(|| AzureBlobError::Transport("missing Table RowKey".to_owned()))?;
-        match self.insert_entity(table, entity) {
-            Ok(()) => Ok(()),
-            Err(AzureBlobError::HttpStatus(409)) => {
-                self.merge_entity(table, partition_key, row_key, entity)
-            }
-            Err(error) => Err(error),
-        }
+        let resource_path = table_entity_path(table, partition_key, row_key);
+        let url = format!(
+            "https://{}.table.core.windows.net/{}",
+            self.account, resource_path
+        );
+        self.send_table_entity("MERGE", &url, &resource_path, entity)
     }
 
     fn query_page(
@@ -1891,26 +2177,6 @@ impl AzureTableClient {
         unreachable!("Azure Table retry loop always returns");
     }
 
-    fn insert_entity(&mut self, table: &str, entity: &Value) -> Result<(), AzureBlobError> {
-        let url = format!("https://{}.table.core.windows.net/{}", self.account, table);
-        self.send_table_entity("POST", &url, table, entity)
-    }
-
-    fn merge_entity(
-        &mut self,
-        table: &str,
-        partition_key: &str,
-        row_key: &str,
-        entity: &Value,
-    ) -> Result<(), AzureBlobError> {
-        let resource_path = table_entity_path(table, partition_key, row_key);
-        let url = format!(
-            "https://{}.table.core.windows.net/{}",
-            self.account, resource_path
-        );
-        self.send_table_entity("MERGE", &url, &resource_path, entity)
-    }
-
     fn send_table_entity(
         &mut self,
         method: &str,
@@ -1934,11 +2200,6 @@ impl AzureTableClient {
                 .set("DataServiceVersion", "3.0;NetFx")
                 .set("MaxDataServiceVersion", "3.0;NetFx")
                 .set("Prefer", "return-no-content");
-            let request = if method == "MERGE" {
-                request.set("If-Match", "*")
-            } else {
-                request
-            };
             match request.send_string(&body) {
                 Ok(_) => return Ok(()),
                 Err(ureq::Error::Status(status, _))
@@ -2289,6 +2550,139 @@ mod tests {
     use polyedge_domain::RuntimeEvent;
     use serde_json::json;
 
+    const TEST_TENANT_ID: &str = "11111111-2222-3333-4444-555555555555";
+    const TEST_CLIENT_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn external_auth_options(
+        tenant_id: Option<&str>,
+        client_id: Option<&str>,
+        secret_file: Option<&str>,
+    ) -> (Option<OsString>, Option<OsString>, Option<OsString>) {
+        (
+            tenant_id.map(OsString::from),
+            client_id.map(OsString::from),
+            secret_file.map(OsString::from),
+        )
+    }
+
+    #[test]
+    fn external_auth_selection_is_explicit_and_fail_closed() {
+        assert_eq!(
+            select_token_auth(None, None, None, Some(TEST_CLIENT_ID)).unwrap(),
+            AzureTokenAuth::ManagedIdentity
+        );
+        assert_eq!(
+            select_token_auth(
+                None,
+                Some(OsString::from(TEST_CLIENT_ID)),
+                None,
+                Some(TEST_CLIENT_ID),
+            )
+            .unwrap(),
+            AzureTokenAuth::ManagedIdentity
+        );
+
+        let (tenant, client, file) = external_auth_options(
+            Some(TEST_TENANT_ID),
+            Some(TEST_CLIENT_ID),
+            Some("/run/credentials/polyedge/azure-client-secret"),
+        );
+        assert!(matches!(
+            select_token_auth(tenant, client, file, Some(TEST_CLIENT_ID)).unwrap(),
+            AzureTokenAuth::ClientSecretFile(_)
+        ));
+
+        let (tenant, client, file) =
+            external_auth_options(Some(TEST_TENANT_ID), Some(TEST_CLIENT_ID), None);
+        assert!(select_token_auth(tenant, client, file, None).is_err());
+
+        let (tenant, client, file) = external_auth_options(
+            Some("not-a-guid"),
+            Some(TEST_CLIENT_ID),
+            Some("/run/credentials/polyedge/azure-client-secret"),
+        );
+        assert!(select_token_auth(tenant, client, file, None).is_err());
+
+        let (tenant, client, file) = external_auth_options(
+            Some(TEST_TENANT_ID),
+            Some(TEST_CLIENT_ID),
+            Some("relative-secret"),
+        );
+        assert!(select_token_auth(tenant, client, file, None).is_err());
+    }
+
+    #[test]
+    fn external_token_request_uses_v2_scope_and_form_encoding() {
+        let config = ExternalAzureAuth {
+            tenant_id: TEST_TENANT_ID.to_owned(),
+            client_id: TEST_CLIENT_ID.to_owned(),
+            secret_file: PathBuf::from("/unused"),
+        };
+        let (url, body) =
+            external_token_request(&config, "https://storage.azure.com/", "test@ secret");
+        assert_eq!(
+            url,
+            format!("{AZURE_AUTHORITY_HOST}/{TEST_TENANT_ID}/oauth2/v2.0/token")
+        );
+        assert!(body.contains("scope=https%3A%2F%2Fstorage%2Eazure%2Ecom%2F%2Edefault"));
+        assert!(body.contains("grant_type=client_credentials"));
+        assert!(!body.contains("test@ secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_secret_file_rejects_empty_large_linked_and_open_permissions() {
+        use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-external-auth-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let secure = dir.join("secure");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secure)
+            .unwrap();
+        file.write_all(b"test-only-value\n").unwrap();
+        drop(file);
+        assert_eq!(read_client_secret(&secure).unwrap(), "test-only-value");
+
+        let empty = dir.join("empty");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&empty)
+            .unwrap();
+        assert!(read_client_secret(&empty).is_err());
+
+        let large = dir.join("large");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&large)
+            .unwrap();
+        file.write_all(&vec![b'x'; AZURE_CLIENT_SECRET_MAX_BYTES as usize + 1])
+            .unwrap();
+        drop(file);
+        assert!(read_client_secret(&large).is_err());
+
+        let open = dir.join("open");
+        fs::write(&open, b"test-only-value").unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_client_secret(&open).is_err());
+
+        let linked = dir.join("linked");
+        symlink(&secure, &linked).unwrap();
+        assert!(read_client_secret(&linked).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn event_blob_prefix_is_configurable_and_defaults_to_events() {
         let event = RuntimeEvent {
@@ -2538,6 +2932,22 @@ mod tests {
         let recorded: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(canonical_json_sha256(&recorded["payload"]), expected_sha256);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn segmented_jsonl_recorder_uses_stable_ten_minute_paths() {
+        let recorder = JsonlRecorder::segmented("/srv/polyedge-ring/segments", 600);
+        let first = DateTime::parse_from_rfc3339("2026-08-05T22:34:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let last = DateTime::parse_from_rfc3339("2026-08-05T22:39:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(recorder.active_path(first), recorder.active_path(last));
+        assert_eq!(
+            recorder.active_path(first),
+            PathBuf::from("/srv/polyedge-ring/segments/2026/08/05/22/1785969000.jsonl")
+        );
     }
 
     #[test]

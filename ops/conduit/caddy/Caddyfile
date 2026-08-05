@@ -1,0 +1,4 @@
+# Replace this placeholder with the public DNS name before installing.
+polyedge.example.invalid {
+	reverse_proxy 127.0.0.1:3000
+}

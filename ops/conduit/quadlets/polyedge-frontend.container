@@ -1,0 +1,22 @@
+[Unit]
+Description=PolyEdge dashboard frontend
+Wants=network-online.target
+After=network-online.target polyedge-network.service polyedge-api.service
+Requires=polyedge-network.service
+
+[Container]
+# Replace the all-zero digest with the reviewed ARM64 image digest.
+Image=registry.example.invalid/polyedge-frontend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+ContainerName=polyedge-frontend
+Network=polyedge.network
+PublishPort=127.0.0.1:3000:3000
+EnvironmentFile=/etc/polyedge/frontend.env
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

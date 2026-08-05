@@ -951,7 +951,6 @@ function isRetryableCampaignLeaseRenewalError(error) {
 export async function acquireCampaignLease(config, runId) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable storage is required for the campaign lease");
-  await container.createIfNotExists();
   const blob = container.getBlockBlobClient("reports/research/venue-probe/control/campaign.lock");
   try {
     await blob.uploadData(Buffer.from("polyedge venue probe campaign lock\n"), {
@@ -998,10 +997,10 @@ export async function acquireCampaignLease(config, runId) {
   };
 }
 
-export async function loadCampaignRiskControl(config) {
-  const container = storageContainer(config);
+export async function loadCampaignRiskControl(config, {
+  container = storageContainer(config)
+} = {}) {
   if (!container) throw new Error("fail closed: durable storage is required for funded campaign risk control");
-  await container.createIfNotExists();
   const prefix = `reports/research/venue-probe/control/campaign-risk/${config.campaignId}`;
   const baselineBlob = container.getBlockBlobClient(`${prefix}/baseline.json`);
   const expectedBaseline = {
@@ -1015,15 +1014,10 @@ export async function loadCampaignRiskControl(config) {
     max_unresolved_positions: 1,
     max_reconciliation_discrepancy: roundMoney(config.maxReconciliationDiscrepancy)
   };
-  try {
-    await baselineBlob.uploadData(Buffer.from(JSON.stringify({ ...expectedBaseline, created_ts: new Date().toISOString() }, null, 2)), {
-      conditions: { ifNoneMatch: "*" },
-      blobHTTPHeaders: { blobContentType: "application/json" }
-    });
-  } catch (error) {
-    if (![409, 412].includes(Number(error.statusCode))) throw error;
-  }
-  const baseline = await downloadJson(baselineBlob);
+  const baseline = await readOrCreateImmutableJson(baselineBlob, {
+    ...expectedBaseline,
+    created_ts: new Date().toISOString()
+  });
   for (const [field, expected] of Object.entries(expectedBaseline)) {
     if (baseline?.[field] !== expected) {
       throw new Error(`fail closed: immutable campaign baseline mismatch for ${field}`);
@@ -1039,17 +1033,12 @@ export async function loadCampaignRiskControl(config) {
       amount: roundMoney(flow.amount),
       transaction_hash: flow.transaction_hash
     };
-    try {
-      await blob.uploadData(Buffer.from(JSON.stringify({ ...expected, recorded_ts: new Date().toISOString() }, null, 2)), {
-        conditions: { ifNoneMatch: "*" },
-        blobHTTPHeaders: { blobContentType: "application/json" }
-      });
-    } catch (error) {
-      if (![409, 412].includes(Number(error.statusCode))) throw error;
-      const existing = await downloadJson(blob);
-      for (const [field, value] of Object.entries(expected)) {
-        if (existing?.[field] !== value) throw new Error(`fail closed: immutable campaign cash-flow mismatch for ${flow.id}`);
-      }
+    const existing = await readOrCreateImmutableJson(blob, {
+      ...expected,
+      recorded_ts: new Date().toISOString()
+    });
+    for (const [field, value] of Object.entries(expected)) {
+      if (existing?.[field] !== value) throw new Error(`fail closed: immutable campaign cash-flow mismatch for ${flow.id}`);
     }
   }
 
@@ -1547,7 +1536,6 @@ export async function uploadEvidence(config, runId, summary, ledger) {
   }
   const container = storageContainer(config);
   if (!container) return { uploaded: false, prefix: null };
-  await container.createIfNotExists();
   await uploadImmutable(container, `${prefix}/events.jsonl`, safeEventsJsonl, "application/x-ndjson");
   await uploadImmutable(container, `${prefix}/summary.json`, JSON.stringify(safeSummary, null, 2), "application/json");
   const payload = Buffer.from(JSON.stringify(safeSummary, null, 2));
@@ -1934,6 +1922,24 @@ async function uploadImmutable(container, name, content, contentType) {
 async function downloadJson(blob) {
   const response = await blob.download();
   return JSON.parse(await streamToString(response.readableStreamBody));
+}
+
+async function readOrCreateImmutableJson(blob, value) {
+  try {
+    return await downloadJson(blob);
+  } catch (error) {
+    if (Number(error?.statusCode) !== 404) throw error;
+  }
+  try {
+    await blob.uploadData(Buffer.from(JSON.stringify(value, null, 2)), {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    return value;
+  } catch (error) {
+    if (![409, 412].includes(Number(error?.statusCode))) throw error;
+    return downloadJson(blob);
+  }
 }
 
 async function streamToString(stream) {

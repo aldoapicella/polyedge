@@ -2155,6 +2155,7 @@ impl RuntimeController {
                     if should_persist(
                         data.chart_last_persisted_ms.get(market_id).copied(),
                         bucket_ms,
+                        self.inner.settings.azure.chart_persist_interval_ms as i64,
                     ) =>
                 {
                     data.chart_last_persisted_ms
