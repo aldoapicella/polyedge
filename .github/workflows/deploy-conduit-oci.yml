@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: conduit
     steps:
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Validate immutable ARM64 image input
         env:
