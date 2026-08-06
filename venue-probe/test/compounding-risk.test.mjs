@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   discoverVerifiedAutomaticInternalSettlements,
+  internalSettlementBlobName,
   loadDurableInternalSettlements,
+  migrateProtectedReserveState,
   putVerifiedInternalSettlement,
   reconcileProtectedCompoundingState,
   sizeProtectedOrder,
@@ -129,6 +131,234 @@ function seedPriorState(container) {
   })));
   container.etags.set(name, '"1"');
 }
+
+function manualSettlement({ id, sessionId, transaction, condition, payout, principal }) {
+  return {
+    schema: "polyedge.verified_internal_settlement.v1",
+    id,
+    type: "internal_manual_settlement",
+    session_id: sessionId,
+    transaction_hash: `0x${transaction.repeat(64)}`,
+    condition_id: `0x${condition.repeat(64)}`,
+    payout,
+    principal,
+    realized_pnl: payout - principal,
+    fill_transaction_hashes: [`0x${transaction.toUpperCase().repeat(64)}`],
+    evidence_source: "polymarket_data_api_fills_plus_polygon_receipt",
+    receipt_block_number: "12345678",
+    receipt_confirmations: 3
+  };
+}
+
+function configuredSettlement(value) {
+  const {
+    schema: _schema,
+    session_id: _sessionId,
+    evidence_source: _evidenceSource,
+    receipt_block_number: _block,
+    receipt_confirmations: _confirmations,
+    ...configured
+  } = value;
+  return configured;
+}
+
+async function reserveMigrationFixture() {
+  const container = new Container();
+  const target = manifest();
+  const source = lossResizingManifest();
+  const existing = manualSettlement({
+    id: "manual-existing",
+    sessionId: target.session_id,
+    transaction: "a",
+    condition: "b",
+    payout: 17.015,
+    principal: 10.209
+  });
+  const sourceExisting = { ...existing, session_id: source.session_id };
+  const sourceNew = manualSettlement({
+    id: "manual-v7-profit",
+    sessionId: source.session_id,
+    transaction: "c",
+    condition: "d",
+    payout: 57.997,
+    principal: 0
+  });
+  target.internal_settlements = [configuredSettlement(existing)];
+  source.internal_settlements = [configuredSettlement(sourceExisting)];
+  await putVerifiedInternalSettlement(container, existing);
+  await putVerifiedInternalSettlement(container, sourceExisting);
+  await putVerifiedInternalSettlement(container, sourceNew);
+  seedPriorState(container);
+  const sourceSessionBlobName =
+    `reports/funded/dynamic-quote/sessions/${source.session_id}/session.json`;
+  const sourceStateBlobName = source.capital_policy.state_blob_name;
+  const sourceBytes = Buffer.from(JSON.stringify(source, null, 2));
+  container.values.set(sourceSessionBlobName, sourceBytes);
+  container.etags.set(sourceSessionBlobName, '"1"');
+  container.values.set(sourceStateBlobName, Buffer.from(JSON.stringify({
+    schema: "polyedge.protected_compounding_state.v2",
+    session_id: source.session_id,
+    reserve_ratio: 0.3,
+    operating_buffer_ratio: 0.01,
+    minimum_order_notional: 1,
+    high_water_equity: 75.90162,
+    historical_high_water_equity: 75.90162,
+    protected_reserve: 14.94963,
+    last_reconciled_equity: 49.832101,
+    operating_buffer: 0.498321,
+    operable_capital: 34.38415,
+    authorized_equity_ceiling: 75.90162,
+    verified_realized_pnl: 64.803,
+    verified_settlement_ids: [existing.id, sourceNew.id].sort(),
+    reconciliation_complete: true,
+    prior_state_session_id: target.session_id,
+    prior_state_blob_name: target.capital_policy.state_blob_name,
+    reserve_basis: "fully_reconciled_current_equity",
+    loss_response: "resize_from_fully_reconciled_current_equity",
+    continue_after_loss: true,
+    reserve_monotonic: false
+  }, null, 2)));
+  container.etags.set(sourceStateBlobName, '"7"');
+  return {
+    container,
+    target,
+    source: {
+      sessionId: source.session_id,
+      sessionBlobName: sourceSessionBlobName,
+      sessionHash: `sha256:${createHash("sha256").update(sourceBytes).digest("hex")}`,
+      stateBlobName: sourceStateBlobName,
+      minimumHistoricalHighWaterEquity: 75.90162
+    },
+    existing,
+    sourceNew
+  };
+}
+
+test("v7-to-v5 migration preserves the fully reconciled high water and is idempotent", async () => {
+  const fixture = await reserveMigrationFixture();
+  const first = await migrateProtectedReserveState({
+    container: fixture.container,
+    manifest: fixture.target,
+    source: fixture.source,
+    accountEquity: 49.832101,
+    fullyReconciled: true,
+    openOrderCount: 0,
+    positionCount: 0,
+    unresolvedReservationCount: 0,
+    now: () => new Date("2026-08-06T03:00:00.000Z")
+  });
+  assert.equal(first.state.high_water_equity, 75.90162);
+  assert.equal(first.state.protected_reserve, 22.770486);
+  assert.equal(first.state.authorized_equity_ceiling, 75.90162);
+  assert.equal(first.state.reserve_basis, "fully_reconciled_high_water_equity");
+  assert.equal(first.state.reserve_monotonic, true);
+  assert.equal(first.state.migration_source_state_etag, '"7"');
+  assert.equal(first.state.migration_minimum_historical_high_water_equity, 75.90162);
+  assert.deepEqual(first.state.migration_verified_settlement_ids, [
+    fixture.existing.id,
+    fixture.sourceNew.id
+  ].sort());
+  const migratedLedger = await loadDurableInternalSettlements(
+    fixture.container,
+    fixture.target.session_id
+  );
+  assert.equal(migratedLedger.length, 2);
+  assert.equal(
+    migratedLedger.find((row) => row.id === fixture.sourceNew.id)
+      .migration_source_session_id,
+    fixture.source.sessionId
+  );
+  const targetEtag = fixture.container.etags.get(
+    fixture.target.capital_policy.state_blob_name
+  );
+  const second = await migrateProtectedReserveState({
+    container: fixture.container,
+    manifest: fixture.target,
+    source: fixture.source,
+    accountEquity: 49.832101,
+    fullyReconciled: true,
+    openOrderCount: 0,
+    positionCount: 0,
+    unresolvedReservationCount: 0,
+    now: () => new Date("2026-08-06T04:00:00.000Z")
+  });
+  assert.equal(fixture.container.etags.get(
+    fixture.target.capital_policy.state_blob_name
+  ), targetEtag);
+  assert.equal(second.state.migration_completed_at, first.state.migration_completed_at);
+
+  const reconciled = await reconcileProtectedCompoundingState({
+    container: fixture.container,
+    manifest: fixture.target,
+    accountEquity: 48,
+    fullyReconciled: true,
+    now: () => new Date("2026-08-06T05:00:00.000Z")
+  });
+  assert.equal(reconciled.migration_source_state_etag, '"7"');
+  assert.deepEqual(
+    reconciled.migration_verified_settlement_ids,
+    first.state.migration_verified_settlement_ids
+  );
+
+  const stateBlobName = fixture.target.capital_policy.state_blob_name;
+  const stateEtag = fixture.container.etags.get(stateBlobName);
+  const migratedBlobName = internalSettlementBlobName(
+    fixture.target.session_id,
+    fixture.sourceNew.transaction_hash,
+    fixture.sourceNew.condition_id
+  );
+  fixture.container.values.delete(migratedBlobName);
+  fixture.container.etags.delete(migratedBlobName);
+  await assert.rejects(reconcileProtectedCompoundingState({
+    container: fixture.container,
+    manifest: fixture.target,
+    accountEquity: 10,
+    fullyReconciled: true
+  }), /migration checkpoint is invalid/);
+  assert.equal(fixture.container.etags.get(stateBlobName), stateEtag);
+});
+
+test("reserve migration makes no target writes when reconciliation or source floor fails", async () => {
+  for (const [name, mutate, expected] of [
+    ["open order", (input) => { input.openOrderCount = 1; }, /zero orders/],
+    ["unresolved position", (input) => { input.positionCount = 1; }, /zero orders/],
+    ["unresolved reservation", (input) => { input.unresolvedReservationCount = 1; }, /zero orders/],
+    ["excess equity", (input) => { input.accountEquity = 76; }, /verified ceiling/],
+    ["stale high water", (input) => {
+      const state = JSON.parse(input.container.values.get(input.source.stateBlobName));
+      state.high_water_equity = 75;
+      state.historical_high_water_equity = 75;
+      input.container.values.set(input.source.stateBlobName, Buffer.from(JSON.stringify(state)));
+    }, /fully reconciled/],
+    ["source ledger mismatch", (input) => {
+      const state = JSON.parse(input.container.values.get(input.source.stateBlobName));
+      state.verified_realized_pnl = 0;
+      input.container.values.set(input.source.stateBlobName, Buffer.from(JSON.stringify(state)));
+    }, /fully reconciled/]
+  ]) {
+    const fixture = await reserveMigrationFixture();
+    const targetLedgerBefore = (await loadDurableInternalSettlements(
+      fixture.container,
+      fixture.target.session_id
+    )).length;
+    const input = {
+      container: fixture.container,
+      manifest: fixture.target,
+      source: fixture.source,
+      accountEquity: 49.832101,
+      fullyReconciled: true,
+      openOrderCount: 0,
+      positionCount: 0,
+      unresolvedReservationCount: 0
+    };
+    mutate(input);
+    await assert.rejects(migrateProtectedReserveState(input), expected, name);
+    assert.equal((await loadDurableInternalSettlements(
+      fixture.container,
+      fixture.target.session_id
+    )).length, targetLedgerBefore, name);
+  }
+});
 
 test("loss-resizing contract binds the reserve to fully reconciled current equity", () => {
   assert.deepEqual(validateProtectedCompoundingManifest(lossResizingManifest()), {

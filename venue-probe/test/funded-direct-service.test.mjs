@@ -144,13 +144,16 @@ function fakeBus(messages) {
   const completed = [];
   const deadLettered = [];
   const receiveCalls = [];
+  const received = [];
+  const renewed = [];
   const receiver = {
     async receiveMessages(maxMessages, options) {
       receiveCalls.push({ maxMessages, options });
-      const message = messages.shift();
-      return message ? [message] : [];
+      const result = messages.splice(0, maxMessages);
+      received.push(...result.map((message) => message.messageId));
+      return result;
     },
-    async renewMessageLock() {},
+    async renewMessageLock(message) { renewed.push(message.messageId); },
     async completeMessage(message) { completed.push(message.messageId); },
     async deadLetterMessage(message) { deadLettered.push(message.messageId); },
     async abandonMessage() {},
@@ -160,6 +163,8 @@ function fakeBus(messages) {
     completed,
     deadLettered,
     receiveCalls,
+    received,
+    renewed,
     client: {
       createReceiver: () => receiver,
       async close() {}
@@ -230,6 +235,175 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.ok(bus.receiveCalls.every(({ maxMessages, options }) =>
     maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
   ));
+  assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
+});
+
+test("persistent service coalesces only duplicate market-token warmups", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const bus = fakeBus([
+    {
+      messageId: "warmup-first",
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_market_warmup.v1",
+        market_id: "btc-market",
+        token_id: "token-up"
+      }
+    },
+    {
+      messageId: "warmup-duplicate",
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_market_warmup.v1",
+        market_id: "btc-market",
+        token_id: "token-up"
+      }
+    },
+    {
+      messageId: "warmup-other-token",
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_market_warmup.v1",
+        market_id: "btc-market",
+        token_id: "token-down"
+      }
+    },
+    {
+      messageId: "intent-first",
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_intent_handoff.v1",
+        decision_id: "c".repeat(64),
+        decision_ts: decisionTs
+      }
+    }
+  ]);
+  const order = [];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "4" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => { order.push("warmup"); },
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => {
+        order.push("intent");
+        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+      }
+    }),
+    logger: () => {}
+  });
+  assert.equal(result.processed_messages, 4);
+  assert.deepEqual(order, ["warmup", "warmup", "intent"]);
+  assert.deepEqual(bus.completed.sort(), ["intent-first", "warmup-duplicate", "warmup-first", "warmup-other-token"]);
+  assert.deepEqual(bus.renewed.sort(), ["intent-first", "warmup-duplicate", "warmup-first", "warmup-other-token"]);
+});
+
+test("persistent service seals a fresh intent busy while the first child is delayed", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const bus = fakeBus(["first", "fresh"].map((messageId) => ({
+    messageId,
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: messageId.repeat(64),
+      decision_ts: decisionTs
+    }
+  })));
+  const processed = [];
+  const logs = [];
+  let releaseFirst;
+  let firstStarted;
+  const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
+  const resultPromise = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async (handoff) => {
+        processed.push(handoff.decision_id);
+        if (handoff.decision_id.startsWith("first")) {
+          firstStarted();
+          await new Promise((resolve) => { releaseFirst = resolve; });
+        }
+        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+      },
+      rejectBusy: async () => ({ status: "one_workflow_busy" })
+    }),
+    logger: (value) => logs.push(value)
+  });
+  await firstStartedPromise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(bus.received, ["first", "fresh"]);
+  assert.deepEqual(bus.renewed.sort(), ["first", "fresh"]);
+  releaseFirst();
+  const result = await resultPromise;
+  assert.equal(result.processed_messages, 2, JSON.stringify(logs));
+  assert.deepEqual(bus.received, ["first", "fresh"]);
+  assert.equal(processed.length, 1);
+});
+
+test("persistent service settles a twelve-intent burst with one actual workflow", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const messages = Array.from({ length: 12 }, (_, index) => {
+    const decisionId = index.toString(16).padStart(64, "0");
+    return {
+      messageId: `intent-${index}`,
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_intent_handoff.v1",
+        decision_id: decisionId,
+        decision_ts: decisionTs
+      }
+    };
+  });
+  const bus = fakeBus(messages);
+  let releaseFirst;
+  let firstStarted;
+  const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
+  let executions = 0;
+  let busyRejections = 0;
+  const resultPromise = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "12" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => {}, execute: async () => {}, status: () => ({ ready: true }), close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => {
+        executions += 1;
+        firstStarted();
+        await new Promise((resolve) => { releaseFirst = resolve; });
+        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+      },
+      rejectBusy: async () => {
+        busyRejections += 1;
+        return { status: "one_workflow_busy" };
+      }
+    }),
+    logger: () => {}
+  });
+  await firstStartedPromise;
+  for (let attempt = 0; attempt < 40 && busyRejections < 11; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(executions, 1);
+  assert.equal(busyRejections, 11);
+  assert.equal(bus.received.length, 12);
+  assert.equal(bus.completed.length, 11);
+  releaseFirst();
+  const result = await resultPromise;
+  assert.equal(result.processed_messages, 12);
+  assert.equal(result.failed_messages, 0);
+  assert.equal(bus.completed.length, 12);
 });
 
 test("persistent service waits for the prior revision lease before receiving messages", async () => {
@@ -378,7 +552,7 @@ test("persistent service preserves attempted-order observability for an idempote
 });
 
 test("persistent service pauses after three consecutive transitions above three seconds", async () => {
-  const messages = Array.from({ length: 3 }, (_, index) => {
+  const messages = Array.from({ length: 4 }, (_, index) => {
     const decisionTs = new Date(Date.now() - 500 - index).toISOString();
     return {
       messageId: `decision-${index}`,
@@ -408,11 +582,15 @@ test("persistent service pauses after three consecutive transitions above three 
           order_submission_attempted: true,
           lifecycle: { send_wall_ms: Date.parse(handoff.decision_ts) + 3_500 }
         }
-      })
+      }),
+      rejectBusy: async () => ({ status: "one_workflow_busy" })
     }),
     logger: (value) => logs.push(value)
   });
   assert.equal(result.processed_messages, 3);
+  assert.equal(result.failed_messages, 1);
   assert.ok(logs.some((value) => value.status === "engine_paused_by_consecutive_latency_breaches"));
   assert.deepEqual(bus.completed, ["decision-0", "decision-1", "decision-2"]);
+  assert.deepEqual(bus.received, ["decision-0", "decision-1", "decision-2", "decision-3"]);
+  assert.deepEqual(bus.deadLettered, ["decision-3"]);
 });

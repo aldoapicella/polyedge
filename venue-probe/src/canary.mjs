@@ -60,6 +60,7 @@ import {
 import {
   discoverVerifiedAutomaticInternalSettlements,
   loadDurableInternalSettlements,
+  migrateProtectedReserveState,
   putVerifiedInternalSettlement,
   reconcileProtectedCompoundingState,
   sizeProtectedOrder,
@@ -207,6 +208,31 @@ async function initializeResources({ persistent = false } = {}) {
       resourceLease?.assertHealthy();
       riskReservationIndex = await rebuildCampaignRiskReservationIndex(config, { container });
       resourceLease?.assertHealthy();
+      if (config.reserveMigrationSourceSessionId) {
+        if (!protectedCompoundingContext) {
+          throw new Error("fail closed: protected reserve migration requires protected compounding startup");
+        }
+        const migration = await migrateProtectedReserveAtStartup({
+          client,
+          container,
+          manifest: manifestDocument.value
+        });
+        protectedCompoundingContext.state = migration.state;
+        resourceLease?.assertHealthy();
+        console.log(JSON.stringify(sanitize({
+          schema: "polyedge.protected_reserve_migration.v1",
+          status: "protected_reserve_migration_completed",
+          target_session_id: manifestDocument.value.session_id,
+          source_session_id: config.reserveMigrationSourceSessionId,
+          source_state_etag: migration.source_state_etag,
+          source_session_sha256: migration.source_session_sha256,
+          account_equity: migration.state.last_reconciled_equity,
+          high_water_equity: migration.state.high_water_equity,
+          protected_reserve: migration.state.protected_reserve,
+          verified_equity_ceiling: migration.verified_equity_ceiling,
+          verified_settlement_ids: migration.verified_settlement_ids
+        })));
+      }
     }
   } catch (error) {
     await resourceLease?.release().catch(() => null);
@@ -323,6 +349,67 @@ export async function initializeProtectedCompounding({
     automaticSettlementPromise: null,
     automaticSettlementLastAttemptMs: 0
   };
+}
+
+async function migrateProtectedReserveAtStartup({ client, container, manifest }) {
+  const sourceConfig = {
+    ...config,
+    campaignId: config.reserveMigrationSourceSessionId
+  };
+  const [openOrders, balance, positions, reportedValues, targetReservations, sourceReservations] =
+    await Promise.all([
+      getOpenOrdersStrict(client),
+      client.getBalanceAllowance({
+        asset_type: AssetType.COLLATERAL,
+        signature_type: config.signatureType
+      }),
+      loadAccountPositions({ user: config.funderAddress }),
+      fetchJson(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`),
+      loadCampaignRiskReservationRecords(config),
+      loadCampaignRiskReservationRecords(sourceConfig)
+    ]);
+  if (!Array.isArray(positions)
+      || !Array.isArray(reportedValues)
+      || !Array.isArray(targetReservations)
+      || !Array.isArray(sourceReservations)) {
+    throw new Error("fail closed: protected reserve migration reconciliation payload is invalid");
+  }
+  const liquidCollateral = Number(balance?.balance) / 1_000_000;
+  const summedPositionValue = positions.reduce(
+    (total, row) => total + row.currentValue,
+    0
+  );
+  const reportedPositionValue = reportedValues.reduce(
+    (total, row) => total + Math.max(0, Number(row?.value) || 0),
+    0
+  );
+  if (!Number.isFinite(liquidCollateral) || liquidCollateral < 0) {
+    throw new Error("fail closed: protected reserve migration collateral is invalid");
+  }
+  const unresolvedReservations = new Map();
+  for (const record of [...targetReservations, ...sourceReservations]) {
+    if (!isRiskReservationResolved(record.reservation)) {
+      unresolvedReservations.set(record.blob_name, record);
+    }
+  }
+  return migrateProtectedReserveState({
+    container,
+    manifest,
+    source: {
+      sessionId: config.reserveMigrationSourceSessionId,
+      sessionBlobName: config.reserveMigrationSourceSessionBlobName,
+      sessionHash: config.reserveMigrationSourceSessionHash,
+      stateBlobName: config.reserveMigrationSourceStateBlobName,
+      minimumHistoricalHighWaterEquity:
+        config.reserveMigrationMinimumHistoricalHighWaterEquity
+    },
+    accountEquity: liquidCollateral + Math.min(summedPositionValue, reportedPositionValue),
+    fullyReconciled: Math.abs(summedPositionValue - reportedPositionValue) <=
+      Number(manifest.max_reconciliation_discrepancy) + 1e-9,
+    openOrderCount: openOrders.length,
+    positionCount: positions.filter((row) => row.size > 1e-9).length,
+    unresolvedReservationCount: unresolvedReservations.size
+  });
 }
 
 async function reconcileProtectedCompoundingWithAutomaticSettlement({
@@ -2196,6 +2283,51 @@ function normalizeFillClock(fills, serverMinusLocalMs) {
 function normalizePrivateKey(value) { const clean = String(value || "").trim(); return clean.startsWith("0x") ? clean : `0x${clean}`; }
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }
+
+export async function loadAccountPositions({
+  user,
+  fetcher = fetchJson,
+  pageSize = 500
+}) {
+  const wallet = normalizedAddress(user);
+  const apiMaxOffset = 10_000;
+  if (!wallet || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 500) {
+    throw new Error("fail closed: account positions pagination binding is invalid");
+  }
+  const values = [];
+  for (let offset = 0; offset <= apiMaxOffset; offset += pageSize) {
+    const url = new URL("https://data-api.polymarket.com/positions");
+    url.searchParams.set("user", wallet);
+    url.searchParams.set("sizeThreshold", "0");
+    url.searchParams.set("limit", String(pageSize));
+    url.searchParams.set("offset", String(offset));
+    const rows = await fetcher(url.toString());
+    if (!Array.isArray(rows) || rows.length > pageSize) {
+      throw new Error("fail closed: account positions page is invalid");
+    }
+    for (const row of rows) {
+      values.push({
+        ...row,
+        size: nonNegativePositionNumber(row?.size, "size"),
+        currentValue: nonNegativePositionNumber(row?.currentValue, "currentValue")
+      });
+    }
+    if (rows.length < pageSize) return values;
+  }
+  throw new Error("fail closed: account positions history exceeds API offset bound");
+}
+
+function nonNegativePositionNumber(value, field) {
+  if (!["number", "string"].includes(typeof value)
+      || (typeof value === "string" && value.trim() === "")) {
+    throw new Error(`fail closed: account position ${field} is invalid`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`fail closed: account position ${field} is invalid`);
+  }
+  return parsed;
+}
 
 export async function loadSettlementActivity({
   user,

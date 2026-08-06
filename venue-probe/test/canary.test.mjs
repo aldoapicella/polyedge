@@ -20,6 +20,7 @@ import {
   decodePayoutRedemptions,
   decodeSettlementReceiptEvidence,
   initializeProtectedCompounding,
+  loadAccountPositions,
   loadSettlementActivity,
   PREFLIGHT_COMPONENT_TIMEOUT_MS,
   refreshCampaignRiskSnapshot,
@@ -228,6 +229,64 @@ test("settlement activity fails closed instead of truncating a full final page",
     }),
     /exceeds pagination bound/
   );
+});
+
+test("protected-reserve startup paginates every account position beyond 500 rows", async () => {
+  const offsets = [];
+  const position = (asset) => ({ asset, size: "0", currentValue: "0" });
+  const positions = await loadAccountPositions({
+    user: "0x1111111111111111111111111111111111111111",
+    fetcher: async (value) => {
+      const offset = Number(new URL(value).searchParams.get("offset"));
+      offsets.push(offset);
+      if (offset === 0) {
+        return Array.from({ length: 500 }, (_, index) => position(String(index)));
+      }
+      return [position("500")];
+    }
+  });
+  assert.deepEqual(offsets, [0, 500]);
+  assert.equal(positions.length, 501);
+  assert.equal(positions.every((row) => row.size === 0 && row.currentValue === 0), true);
+});
+
+test("protected-reserve startup fails closed at the positions API offset ceiling", async () => {
+  const offsets = [];
+  await assert.rejects(loadAccountPositions({
+    user: "0x1111111111111111111111111111111111111111",
+    fetcher: async (value) => {
+      offsets.push(Number(new URL(value).searchParams.get("offset")));
+      return Array.from({ length: 500 }, (_, index) => ({
+        asset: String(index),
+        size: 0,
+        currentValue: 0
+      }));
+    }
+  }), /exceeds API offset bound/);
+  assert.equal(offsets.length, 21);
+  assert.equal(offsets.at(-1), 10_000);
+});
+
+test("protected-reserve startup rejects malformed or negative position amounts", async () => {
+  for (const [field, value] of [
+    ["size", undefined],
+    ["size", ""],
+    ["size", "not-a-number"],
+    ["size", -1],
+    ["currentValue", null],
+    ["currentValue", ""],
+    ["currentValue", "not-a-number"],
+    ["currentValue", -1]
+  ]) {
+    await assert.rejects(loadAccountPositions({
+      user: "0x1111111111111111111111111111111111111111",
+      fetcher: async () => [{
+        size: 0,
+        currentValue: 0,
+        [field]: value
+      }]
+    }), new RegExp(`account position ${field} is invalid`));
+  }
 });
 
 test("protected-compounding startup skips settlement activity for an empty manifest ledger", async () => {
