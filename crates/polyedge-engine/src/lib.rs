@@ -996,7 +996,7 @@ pub fn final_decision_evidence_v1(
                         })
                         .map(|(index, _)| index)
                         .collect::<Vec<_>>();
-                    (candidates.len() == 1).then_some(candidates[0])
+                    (candidates.len() == 1).then(|| candidates[0])
                 })
                 .flatten();
             let matched = exact.or(risk_adjusted);
