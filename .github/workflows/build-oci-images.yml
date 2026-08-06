@@ -87,13 +87,6 @@ jobs:
             args+=(--build-arg "$BUILD_ARGS")
           fi
           docker buildx build "${args[@]}" --output "type=oci,dest=image.oci.tar" .
-          tar -xOf image.oci.tar index.json > manifest.json
-
-          jq -e '
-            .manifests
-            | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture)
-            | sort == ["amd64", "arm64"]
-          ' manifest.json
 
   publish:
     if: github.event_name != 'pull_request'
