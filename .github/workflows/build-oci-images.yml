@@ -141,7 +141,7 @@ jobs:
           printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker buildx build "${args[@]}" --push .
           docker buildx imagetools inspect --raw "$reference" > manifest.json
-          digest=$(docker buildx imagetools inspect "$reference" | sed -n 's/^Digest: //p' | head -1)
+          digest=sha256:$(sha256sum manifest.json | awk '{print $1}')
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           jq -e '
             .manifests
@@ -182,7 +182,8 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          backend_digest=$(docker buildx imagetools inspect "$BACKEND" | sed -n 's/^Digest: //p' | head -1)
+          docker buildx imagetools inspect --raw "$BACKEND" > backend-manifest.json
+          backend_digest=sha256:$(sha256sum backend-manifest.json | awk '{print $1}')
           [[ "$backend_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx build \
             --file Dockerfile.research-validation \
@@ -193,7 +194,7 @@ jobs:
             --tag "$IMAGE" \
             --push .
           docker buildx imagetools inspect --raw "$IMAGE" > manifest.json
-          digest=$(docker buildx imagetools inspect "$IMAGE" | sed -n 's/^Digest: //p' | head -1)
+          digest=sha256:$(sha256sum manifest.json | awk '{print $1}')
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           jq -e '
             .manifests
