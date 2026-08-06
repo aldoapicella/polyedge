@@ -139,12 +139,13 @@ replay, prospective validation, and backfills reuse local artifacts. The qset
 workspace remains separate. The recorder writes one fsynced JSONL segment per
 ten-minute UTC bucket. The
 ring timer seals closed segments with SHA-256 manifests, creates immutable
-Azure Cool-tier blobs without any remote listing, verifies retry collisions byte for
-byte, and retains each local segment for 48 hours to leave job-workspace
+Azure Hot-tier blobs without any remote listing, verifies retry collisions byte
+for byte, and retains each local segment for 48 hours to leave job-workspace
 headroom on the 150-GB volume. It removes a local segment only after its
 immutable remote manifest is re-read successfully. A separate health timer
 checks upload age and projected capacity and stops the API before free space
-falls below 32 GiB.
+falls below 32 GiB. Azure tiers only the future `events-oci-hot7-v1/` prefix to
+Cool after seven days.
 
 After the approved authentication and separate-volume gates, create the marker
 and enable only the intended timers:
