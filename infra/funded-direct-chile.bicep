@@ -14,6 +14,11 @@ param keyVaultName string = 'kvpolyedge6urdjr5nmwx7w'
 param logAnalyticsWorkspaceName string = 'log-polyedge-dev-6urdjr5nmwx7w'
 param serviceBusNamespaceName string = 'sb-polyedge-funded-cl-6urdjr5nmwx7w'
 param serviceBusQueueName string = 'funded-dynamic-quote-intents'
+@allowed([
+  'Active'
+  'SendDisabled'
+])
+param fundedDirectQueueStatus string = 'Active'
 param producerIdentityName string = 'polyedge-shadow-neu-id'
 param producerPublicIpName string = 'pip-polyedge-venue-neu-egress-2'
 param alertActionGroupName string = 'polyedge-dev-research-alerts'
@@ -25,6 +30,11 @@ param fundedDirectSessionManifestJson string
 param fundedDirectSessionManifestBlobName string
 param fundedDirectSessionManifestSha256 string
 param fundedDirectCampaignId string
+param fundedDirectReserveMigrationSourceSessionId string
+param fundedDirectReserveMigrationSourceSessionManifestBlobName string
+param fundedDirectReserveMigrationSourceSessionManifestSha256 string
+param fundedDirectReserveMigrationSourceStateBlobName string
+param fundedDirectReserveMigrationMinimumHistoricalHighWaterEquity string
 param fundedDirectStartingCollateral string = '11.09862'
 param fundedDirectMaxAccountLoss string = '11.09862'
 param fundedDirectTargetOrderNotional string = '10.5'
@@ -172,7 +182,7 @@ resource serviceBusQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   parent: serviceBusNamespace
   name: serviceBusQueueName
   properties: {
-    status: 'Active'
+    status: fundedDirectQueueStatus
     lockDuration: 'PT30S'
     defaultMessageTimeToLive: 'PT10S'
     deadLetteringOnMessageExpiration: true
@@ -540,6 +550,11 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID', value: fundedDirectReserveMigrationSourceSessionId }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectReserveMigrationSourceSessionManifestBlobName }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256', value: fundedDirectReserveMigrationSourceSessionManifestSha256 }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME', value: fundedDirectReserveMigrationSourceStateBlobName }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY', value: fundedDirectReserveMigrationMinimumHistoricalHighWaterEquity }
             { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
             { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }
@@ -694,6 +709,11 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
             { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID', value: fundedDirectReserveMigrationSourceSessionId }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectReserveMigrationSourceSessionManifestBlobName }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256', value: fundedDirectReserveMigrationSourceSessionManifestSha256 }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME', value: fundedDirectReserveMigrationSourceStateBlobName }
+            { name: 'FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY', value: fundedDirectReserveMigrationMinimumHistoricalHighWaterEquity }
             { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
             { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
             { name: 'FUNDED_EVIDENCE_TRUST_BOUNDARY_READY', value: 'false' }

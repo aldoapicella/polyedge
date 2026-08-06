@@ -210,6 +210,24 @@ export async function createFundedDirectProcessor({
         execution: executed.execution || null,
         execution_timing: executionTiming
       });
+    },
+    async rejectBusy(handoff) {
+      const selected = await selectedFromHandoff(clients, config, sessionDocument.value, handoff, clock());
+      if (selected.duplicateCompletion) {
+        return result("already_completed_idempotent", config, {
+          iteration: 1,
+          childInvocations: 0,
+          decisionId: selected.value.decision_id,
+          completion: selected.duplicateCompletion
+        });
+      }
+      const completion = await writeBusyCompletion(clients.control, config, selected, clock());
+      return result("one_workflow_busy", config, {
+        iteration: 1,
+        childInvocations: 0,
+        decisionId: selected.value.decision_id,
+        completion: completion.value
+      });
     }
   };
 }
@@ -429,36 +447,53 @@ async function selectedFromHandoff(clients, config, session, handoff, now) {
     throw new Error("fail closed: funded intent handoff does not qualify for execution");
   }
   const authorizationName = authorizationBlobName(config, session, value);
-  if (await clients.control.getBlobClient(authorizationName).exists()) {
-    const completionName = completionBlobName(config, session, value);
-    if (await clients.control.getBlobClient(completionName).exists()) {
-      const completion = await readJsonBlob(clients.control, completionName);
-      if (completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
-          completion.session_id === session.session_id &&
-          completion.decision_id === value.decision_id &&
-          completion.authorization_blob_name === authorizationName &&
-          [
-            "child_completed",
-            "expired_before_child_launch",
-            "child_failed_closed_pre_submission",
-            "child_failed_closed_post_submission_unresolved"
-          ].includes(completion.status)) {
-        return {
-          value,
-          blobName,
-          hash: actualHash,
-          decisionMs: Date.parse(value.decision_ts),
-          duplicateCompletion: completion,
-          handoffTiming: {
-            hash_verification_started_wall_ms: verificationStartedWallMs,
-            hash_verification_started_monotonic_ms: verificationStartedMonotonicMs,
-            hash_verified_wall_ms: Date.now(),
-            hash_verified_monotonic_ms: performance.now()
-          }
-        };
-      }
-      throw new Error("fail closed: funded intent completion is not bound to its authorization");
+  const completionName = completionBlobName(config, session, value);
+  const [authorizationExists, completionExists] = await Promise.all([
+    clients.control.getBlobClient(authorizationName).exists(),
+    clients.control.getBlobClient(completionName).exists()
+  ]);
+  if (completionExists) {
+    const completion = await readJsonBlob(clients.control, completionName);
+    const busyCompletion = completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
+      completion.session_id === session.session_id &&
+      completion.decision_id === value.decision_id &&
+      completion.intent_blob_name === blobName &&
+      hash(completion.intent_sha256) === hash(actualHash) &&
+      completion.status === "one_workflow_busy" &&
+      completion.authorization_blob_name === null &&
+      completion.authorization_sha256 === null &&
+      completion.order_submission_attempted === false &&
+      completion.authorization_consumed === false &&
+      completion.risk_reservation_created === false;
+    const authorizedCompletion = authorizationExists &&
+      completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
+      completion.session_id === session.session_id &&
+      completion.decision_id === value.decision_id &&
+      completion.authorization_blob_name === authorizationName &&
+      [
+        "child_completed",
+        "expired_before_child_launch",
+        "child_failed_closed_pre_submission",
+        "child_failed_closed_post_submission_unresolved"
+      ].includes(completion.status);
+    if (busyCompletion || authorizedCompletion) {
+      return {
+        value,
+        blobName,
+        hash: actualHash,
+        decisionMs: Date.parse(value.decision_ts),
+        duplicateCompletion: completion,
+        handoffTiming: {
+          hash_verification_started_wall_ms: verificationStartedWallMs,
+          hash_verification_started_monotonic_ms: verificationStartedMonotonicMs,
+          hash_verified_wall_ms: Date.now(),
+          hash_verified_monotonic_ms: performance.now()
+        }
+      };
     }
+    throw new Error("fail closed: funded intent completion is not exactly bound");
+  }
+  if (authorizationExists) {
     const authorization = await readJsonBlobDocument(clients.control, authorizationName);
     assertExistingAuthorizationBinding(authorization, config, session, {
       value,
@@ -785,6 +820,27 @@ async function writeCompletion(container, config, selected, authorization, child
       child_run_id: childRunId,
       completed_at: now.toISOString(),
       ...details
+    }
+  });
+}
+
+async function writeBusyCompletion(container, config, selected, now) {
+  return putImmutableOrVerify(container, {
+    blobName: completionBlobName(config, config.session, selected.value),
+    value: {
+      schema: "polyedge.operator_funded_intent_completion.v1",
+      session_id: config.session.session_id,
+      decision_id: selected.value.decision_id,
+      intent_blob_name: selected.blobName,
+      intent_sha256: selected.hash,
+      authorization_blob_name: null,
+      authorization_sha256: null,
+      child_run_id: null,
+      completed_at: now.toISOString(),
+      status: "one_workflow_busy",
+      order_submission_attempted: false,
+      authorization_consumed: false,
+      risk_reservation_created: false
     }
   });
 }

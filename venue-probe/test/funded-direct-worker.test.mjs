@@ -483,6 +483,39 @@ test("persistent pre-submission failure is terminally sealed without authorizati
   assert.equal(duplicate.completion.order_submission_attempted, false);
 });
 
+test("persistent busy rejection is durable, idempotent, and creates no authorization", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "d".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  let executions = 0;
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: { control, intents: new Container({ [`intents/${value.decision_id}.json`]: bytes }) },
+    clock: () => now,
+    executeCanary: async () => { executions += 1; }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1", decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`, intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts, valid_until: value.valid_until
+  };
+  const first = await processor.rejectBusy(handoff);
+  const duplicate = await processor.rejectBusy(handoff);
+  const completionName = [...control.values.keys()].find((name) => name.includes("/completed/"));
+  const completion = JSON.parse(control.values.get(completionName).toString("utf8"));
+  assert.equal(first.status, "one_workflow_busy");
+  assert.equal(duplicate.status, "already_completed_idempotent");
+  assert.equal(completion.status, "one_workflow_busy");
+  assert.equal(completion.authorization_blob_name, null);
+  assert.equal(completion.authorization_consumed, false);
+  assert.equal([...control.values.keys()].some((name) => name.includes("/authorizations/")), false);
+  assert.equal(executions, 0);
+});
+
 test("persistent handoff verifies the immutable hash and executes exactly once across duplicate delivery", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "8".repeat(64));

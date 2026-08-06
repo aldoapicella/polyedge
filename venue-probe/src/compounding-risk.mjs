@@ -630,9 +630,11 @@ export async function reconcileProtectedCompoundingState({
       loss_response: policy.lossResponse,
       continue_after_loss: !policy.reserveMonotonic,
       reserve_monotonic: policy.reserveMonotonic,
+      ...migrationCheckpoint(prior),
       created_at: prior?.created_at || now().toISOString(),
       updated_at: now().toISOString()
     };
+    assertCompatibleState(value, manifest, policy);
     if (prior && sameCapitalState(prior, value)) return prior;
     try {
       await container.getBlockBlobClient(policy.stateBlobName).uploadData(
@@ -648,6 +650,263 @@ export async function reconcileProtectedCompoundingState({
     }
   }
   throw new Error("fail closed: protected compounding state CAS retries exhausted");
+}
+
+export async function migrateProtectedReserveState({
+  container,
+  manifest,
+  source,
+  accountEquity,
+  fullyReconciled,
+  openOrderCount,
+  positionCount,
+  unresolvedReservationCount,
+  now = () => new Date()
+}) {
+  const policy = validateProtectedCompoundingManifest(manifest);
+  const sourceHash = normalizedSha256(source?.sessionHash);
+  const minimumHistoricalHighWaterEquity = Number(
+    source?.minimumHistoricalHighWaterEquity
+  );
+  if (!container || manifest?.schema_version !== SESSION_SCHEMA_V2 || !policy.reserveMonotonic) {
+    throw new Error("fail closed: protected reserve migration requires the monotonic target session");
+  }
+  if (!safeSessionId(source?.sessionId)
+      || !safeBlobName(source?.sessionBlobName)
+      || !safeBlobName(source?.stateBlobName)
+      || !sourceHash
+      || !Number.isFinite(minimumHistoricalHighWaterEquity)
+      || minimumHistoricalHighWaterEquity < Number(manifest.starting_collateral)
+      || source.sessionId === manifest.session_id
+      || source.sessionBlobName !==
+        `reports/funded/dynamic-quote/sessions/${source.sessionId}/session.json`
+      || source.stateBlobName !==
+        `reports/funded/dynamic-quote/sessions/${source.sessionId}/capital-reserve-state.json`) {
+    throw new Error("fail closed: protected reserve migration source binding is invalid");
+  }
+  if (fullyReconciled !== true
+      || Number(openOrderCount) !== 0
+      || Number(positionCount) !== 0
+      || Number(unresolvedReservationCount) !== 0) {
+    throw new Error("fail closed: protected reserve migration requires zero orders, positions, and unresolved reservations");
+  }
+  const equity = money(accountEquity);
+  if (equity < 0) throw new Error("fail closed: protected reserve migration equity is invalid");
+
+  const sourceSessionDocument = await readBlob(container, source.sessionBlobName);
+  if (sourceSessionDocument.hash !== sourceHash) {
+    throw new Error("fail closed: protected reserve migration source session SHA-256 mismatch");
+  }
+  const sourceManifest = sourceSessionDocument.value;
+  const sourcePolicy = validateProtectedCompoundingManifest(sourceManifest);
+  if (sourceManifest?.schema_version !== SESSION_SCHEMA_V3
+      || sourceManifest?.session_id !== source.sessionId
+      || sourcePolicy.reserveMonotonic
+      || sourcePolicy.stateBlobName !== source.stateBlobName
+      || sourcePolicy.priorStateSessionId !== manifest.session_id
+      || sourcePolicy.priorStateBlobName !== policy.stateBlobName) {
+    throw new Error("fail closed: protected reserve migration source session is incompatible");
+  }
+
+  const [sourceStateDocument, initialTarget, sourceLedger, targetLedger] = await Promise.all([
+    readState(container, source.stateBlobName),
+    readState(container, policy.stateBlobName),
+    loadDurableInternalSettlements(container, source.sessionId),
+    loadDurableInternalSettlements(container, manifest.session_id)
+  ]);
+  if (!sourceStateDocument?.etag) {
+    throw new Error("fail closed: protected reserve migration source state or ETag is unavailable");
+  }
+  assertMigrationTargetState(initialTarget?.value, manifest, policy, source, sourceHash);
+  if (initialTarget && !initialTarget.etag) {
+    throw new Error("fail closed: protected reserve migration target ETag is unavailable");
+  }
+  const uniqueSourceLedger = uniqueSettlements(sourceLedger);
+  const uniqueTargetLedger = uniqueSettlements(targetLedger);
+  if (uniqueSourceLedger.length !== sourceLedger.length
+      || uniqueTargetLedger.length !== targetLedger.length) {
+    throw new Error("fail closed: protected reserve migration ledger identities are duplicated");
+  }
+  for (const configured of sourcePolicy.internalSettlements) {
+    if (!uniqueSourceLedger.some((row) => settlementAccountingEqual(row, configured))) {
+      throw new Error("fail closed: protected reserve migration source configured settlement is not durable");
+    }
+  }
+  for (const configured of policy.internalSettlements) {
+    if (!uniqueTargetLedger.some((row) => settlementAccountingEqual(row, configured))) {
+      throw new Error("fail closed: protected reserve migration target configured settlement is not durable");
+    }
+  }
+  const uniqueSource = uniqueSettlements([
+    ...sourcePolicy.internalSettlements,
+    ...uniqueSourceLedger
+  ]);
+  const uniqueTarget = uniqueSettlements([
+    ...policy.internalSettlements,
+    ...uniqueTargetLedger
+  ]);
+  const sourceSettlementIds = uniqueSource.map((row) => row.id).sort();
+  const sourceRealizedPnl = money(uniqueSource.reduce(
+    (total, row) => total + Number(row.realized_pnl),
+    0
+  ));
+  const sourceCeiling = money(Number(sourceManifest.starting_collateral) + sourceRealizedPnl);
+  assertMigrationSourceState(
+    sourceStateDocument.value,
+    sourceManifest,
+    sourcePolicy,
+    sourceSettlementIds,
+    sourceRealizedPnl,
+    sourceCeiling,
+    minimumHistoricalHighWaterEquity
+  );
+
+  const settlements = uniqueSettlements([...uniqueTarget, ...uniqueSource]);
+  const settlementIds = settlements.map((row) => row.id).sort();
+  const verifiedRealizedPnl = money(settlements.reduce(
+    (total, row) => total + Number(row.realized_pnl),
+    0
+  ));
+  const authorizedEquityCeiling = money(
+    Number(manifest.starting_collateral) + verifiedRealizedPnl
+  );
+  if (equity > authorizedEquityCeiling + Number(manifest.max_reconciliation_discrepancy) + 1e-9) {
+    throw new Error("fail closed: protected reserve migration equity exceeds the verified ceiling");
+  }
+  const stableSourceState = await readState(container, source.stateBlobName);
+  if (stableSourceState?.etag !== sourceStateDocument.etag
+      || stableSourceState?.hash !== sourceStateDocument.hash) {
+    throw new Error("fail closed: protected reserve migration source state changed during verification");
+  }
+
+  for (const settlement of uniqueSource) {
+    if (uniqueTarget.some((row) => row.id === settlement.id)) continue;
+    await putVerifiedInternalSettlement(container, {
+      ...settlement,
+      session_id: manifest.session_id,
+      ...(settlement.campaign_id ? { campaign_id: manifest.session_id } : {}),
+      migration_source_session_id: source.sessionId,
+      migration_source_session_blob_name: source.sessionBlobName,
+      migration_source_session_sha256: sourceHash,
+      migration_source_settlement_blob_name: internalSettlementBlobName(
+        source.sessionId,
+        settlement.transaction_hash,
+        settlement.condition_id
+      ),
+      migration_source_state_blob_name: source.stateBlobName,
+      migration_source_state_etag: sourceStateDocument.etag
+    });
+  }
+  const migratedLedger = await loadDurableInternalSettlements(container, manifest.session_id);
+  const migratedSettlements = uniqueSettlements(migratedLedger);
+  if (migratedSettlements.length !== migratedLedger.length
+      || JSON.stringify(migratedSettlements.map((row) => row.id).sort()) !==
+        JSON.stringify(settlementIds)
+      || settlements.some((row) => !migratedSettlements.some((migrated) =>
+        settlementAccountingEqual(row, migrated)))) {
+    throw new Error("fail closed: protected reserve migration ledger read-back mismatch");
+  }
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const current = attempt === 0 ? initialTarget : await readState(container, policy.stateBlobName);
+    const prior = current?.value;
+    assertMigrationTargetState(prior, manifest, policy, source, sourceHash);
+    if (prior && !current.etag) {
+      throw new Error("fail closed: protected reserve migration target ETag is unavailable");
+    }
+    const highWater = money(Math.max(
+      Number(manifest.starting_collateral),
+      authorizedEquityCeiling,
+      equity,
+      Number(sourceStateDocument.value.high_water_equity),
+      Number(sourceStateDocument.value.historical_high_water_equity || 0),
+      Number(prior?.high_water_equity || 0),
+      Number(prior?.historical_high_water_equity || 0)
+    ));
+    const protectedReserve = money(Math.max(
+      highWater * policy.reserveRatio,
+      Number(sourceStateDocument.value.protected_reserve),
+      Number(prior?.protected_reserve || 0)
+    ));
+    const operatingBuffer = money(equity * policy.operatingBufferRatio);
+    const checkpointMatches = prior
+      && prior.migration_source_session_id === source.sessionId
+      && prior.migration_source_session_blob_name === source.sessionBlobName
+      && prior.migration_source_session_sha256 === sourceHash
+      && prior.migration_source_state_blob_name === source.stateBlobName
+      && prior.migration_source_state_etag === sourceStateDocument.etag
+      && Number(prior.migration_minimum_historical_high_water_equity) ===
+        minimumHistoricalHighWaterEquity
+      && Number(prior.migration_verified_equity_ceiling) === authorizedEquityCeiling
+      && JSON.stringify(prior.migration_verified_settlement_ids) === JSON.stringify(settlementIds);
+    const value = {
+      schema: policy.stateSchema,
+      session_id: manifest.session_id,
+      reserve_ratio: policy.reserveRatio,
+      operating_buffer_ratio: policy.operatingBufferRatio,
+      minimum_order_notional: policy.minimumOrderNotional,
+      high_water_equity: highWater,
+      protected_reserve: protectedReserve,
+      last_reconciled_equity: equity,
+      operating_buffer: operatingBuffer,
+      operable_capital: money(Math.max(0, equity - protectedReserve - operatingBuffer)),
+      authorized_equity_ceiling: authorizedEquityCeiling,
+      verified_realized_pnl: verifiedRealizedPnl,
+      verified_settlement_ids: settlementIds,
+      reconciliation_complete: true,
+      historical_high_water_equity: highWater,
+      prior_state_session_id: null,
+      prior_state_blob_name: null,
+      reserve_basis: policy.reserveBasis,
+      loss_response: null,
+      continue_after_loss: false,
+      reserve_monotonic: true,
+      migration_source_session_id: source.sessionId,
+      migration_source_session_blob_name: source.sessionBlobName,
+      migration_source_session_sha256: sourceHash,
+      migration_source_state_blob_name: source.stateBlobName,
+      migration_source_state_etag: sourceStateDocument.etag,
+      migration_minimum_historical_high_water_equity:
+        minimumHistoricalHighWaterEquity,
+      migration_verified_equity_ceiling: authorizedEquityCeiling,
+      migration_verified_settlement_ids: settlementIds,
+      migration_completed_at: checkpointMatches
+        ? prior.migration_completed_at
+        : now().toISOString(),
+      created_at: prior?.created_at || now().toISOString(),
+      updated_at: now().toISOString()
+    };
+    if (prior && checkpointMatches && sameCapitalState(prior, value)) {
+      return migrationResult(prior, sourceStateDocument, sourceHash, authorizedEquityCeiling);
+    }
+    try {
+      await container.getBlockBlobClient(policy.stateBlobName).uploadData(
+        Buffer.from(JSON.stringify(value, null, 2)),
+        {
+          conditions: current ? { ifMatch: current.etag } : { ifNoneMatch: "*" },
+          blobHTTPHeaders: { blobContentType: "application/json" }
+        }
+      );
+      const verified = await readState(container, policy.stateBlobName);
+      assertCompatibleState(verified?.value, manifest, policy);
+      if (!verified?.etag
+          || !sameCapitalState(verified.value, value)
+          || verified.value.migration_source_state_etag !== sourceStateDocument.etag
+          || JSON.stringify(verified.value.migration_verified_settlement_ids) !==
+            JSON.stringify(settlementIds)) {
+        throw new Error("fail closed: protected reserve migration state read-back mismatch");
+      }
+      return migrationResult(
+        verified.value,
+        sourceStateDocument,
+        sourceHash,
+        authorizedEquityCeiling
+      );
+    } catch (error) {
+      if (![409, 412].includes(Number(error.statusCode))) throw error;
+    }
+  }
+  throw new Error("fail closed: protected reserve migration state CAS retries exhausted");
 }
 
 export function protectedCapitalSnapshot({ state, accountEquity, proposedNotional = 0 }) {
@@ -828,9 +1087,117 @@ async function readBlob(container, name) {
     ? container.getBlobClient(name)
     : container.getBlockBlobClient(name);
   const response = await client.download();
+  const bytes = Buffer.from(await streamToString(response.readableStreamBody));
   return {
-    value: JSON.parse(await streamToString(response.readableStreamBody)),
-    etag: response.etag || null
+    value: JSON.parse(bytes.toString("utf8")),
+    etag: response.etag || null,
+    hash: `sha256:${createHash("sha256").update(bytes).digest("hex")}`
+  };
+}
+
+function assertMigrationSourceState(
+  state,
+  manifest,
+  policy,
+  settlementIds,
+  verifiedRealizedPnl,
+  authorizedEquityCeiling,
+  minimumHistoricalHighWaterEquity
+) {
+  const highWater = Number(state?.high_water_equity);
+  const historicalHighWater = Number(state?.historical_high_water_equity);
+  const lastEquity = Number(state?.last_reconciled_equity);
+  const protectedReserve = Number(state?.protected_reserve);
+  const operatingBuffer = Number(state?.operating_buffer);
+  const operableCapital = Number(state?.operable_capital);
+  if (state?.schema !== STATE_SCHEMA_V2
+      || state?.session_id !== manifest.session_id
+      || state?.reconciliation_complete !== true
+      || Number(state?.reserve_ratio) !== policy.reserveRatio
+      || Number(state?.operating_buffer_ratio) !== policy.operatingBufferRatio
+      || Number(state?.minimum_order_notional) !== policy.minimumOrderNotional
+      || state?.reserve_basis !== CURRENT_EQUITY_RESERVE_BASIS
+      || state?.loss_response !== LOSS_RESIZE_POLICY
+      || state?.reserve_monotonic !== false
+      || state?.continue_after_loss !== true
+      || state?.prior_state_session_id !== policy.priorStateSessionId
+      || state?.prior_state_blob_name !== policy.priorStateBlobName
+      || ![
+        highWater,
+        historicalHighWater,
+        lastEquity,
+        protectedReserve,
+        operatingBuffer,
+        operableCapital
+      ]
+        .every((value) => Number.isFinite(value) && value >= 0)
+      || historicalHighWater + 1e-9 < highWater
+      || highWater + 1e-9 < minimumHistoricalHighWaterEquity
+      || historicalHighWater + 1e-9 < minimumHistoricalHighWaterEquity
+      || highWater + 1e-9 < Math.max(
+        Number(manifest.starting_collateral),
+        authorizedEquityCeiling,
+        lastEquity
+      )
+      || Math.abs(protectedReserve - lastEquity * policy.reserveRatio) > 0.0000011
+      || Math.abs(operatingBuffer - lastEquity * policy.operatingBufferRatio) > 0.0000011
+      || Math.abs(operableCapital - Math.max(
+        0,
+        lastEquity - protectedReserve - operatingBuffer
+      )) > 0.0000011
+      || !moneyEqual(state?.verified_realized_pnl, verifiedRealizedPnl)
+      || !moneyEqual(state?.authorized_equity_ceiling, authorizedEquityCeiling)
+      || JSON.stringify(state?.verified_settlement_ids) !== JSON.stringify(settlementIds)) {
+    throw new Error("fail closed: protected reserve migration source state is not fully reconciled to its ledger");
+  }
+}
+
+function assertMigrationTargetState(state, manifest, policy, source, sourceHash) {
+  if (!state) return;
+  const highWater = Number(state?.high_water_equity);
+  const protectedReserve = Number(state?.protected_reserve);
+  const checkpointSource = state?.migration_source_session_id;
+  if (state?.schema !== STATE_SCHEMA_V1
+      || state?.session_id !== manifest.session_id
+      || state?.reconciliation_complete !== true
+      || state?.reserve_monotonic !== true
+      || !Number.isFinite(highWater)
+      || highWater < 0
+      || !Number.isFinite(protectedReserve)
+      || protectedReserve < 0
+      || protectedReserve + 0.0000011 < highWater * policy.reserveRatio
+      || (state.reserve_ratio !== undefined
+        && Number(state.reserve_ratio) !== policy.reserveRatio)
+      || (state.operating_buffer_ratio !== undefined
+        && Number(state.operating_buffer_ratio) !== policy.operatingBufferRatio)
+      || (state.minimum_order_notional !== undefined
+        && Number(state.minimum_order_notional) !== policy.minimumOrderNotional)
+      || (state.reserve_basis !== undefined
+        && state.reserve_basis !== MONOTONIC_RESERVE_BASIS)
+      || (state.continue_after_loss !== undefined
+        && state.continue_after_loss !== false)
+      || (state.loss_response !== undefined && state.loss_response !== null)
+      || (state.prior_state_session_id !== undefined
+        && state.prior_state_session_id !== null)
+      || (state.prior_state_blob_name !== undefined
+        && state.prior_state_blob_name !== null)
+      || (checkpointSource !== undefined
+        && (checkpointSource !== source.sessionId
+          || state.migration_source_session_blob_name !== source.sessionBlobName
+          || state.migration_source_session_sha256 !== sourceHash
+          || state.migration_source_state_blob_name !== source.stateBlobName))) {
+    throw new Error("fail closed: protected reserve migration target state is incompatible");
+  }
+  assertMigrationCheckpoint(state);
+}
+
+function migrationResult(state, sourceStateDocument, sourceHash, authorizedEquityCeiling) {
+  return {
+    state,
+    source_state_etag: sourceStateDocument.etag,
+    source_session_sha256: sourceHash,
+    verified_equity_ceiling: authorizedEquityCeiling,
+    verified_settlement_ids: [...state.migration_verified_settlement_ids]
   };
 }
 
@@ -852,6 +1219,7 @@ function assertCompatibleState(state, manifest, policy) {
       || (policy.lossResponse && state.loss_response !== policy.lossResponse)) {
     throw new Error("fail closed: persisted protected compounding state is incompatible");
   }
+  assertMigrationCheckpoint(state);
 }
 
 function sameCapitalState(left, right) {
@@ -874,9 +1242,88 @@ function sameCapitalState(left, right) {
     "reserve_basis",
     "loss_response",
     "continue_after_loss",
-    "reserve_monotonic"
+    "reserve_monotonic",
+    "migration_source_session_id",
+    "migration_source_session_blob_name",
+    "migration_source_session_sha256",
+    "migration_source_state_blob_name",
+    "migration_source_state_etag",
+    "migration_minimum_historical_high_water_equity",
+    "migration_verified_equity_ceiling",
+    "migration_verified_settlement_ids",
+    "migration_completed_at"
   ].every((field) => JSON.stringify(left?.[field]) === JSON.stringify(right?.[field]))
     && JSON.stringify(left?.verified_settlement_ids) === JSON.stringify(right?.verified_settlement_ids);
+}
+
+function assertMigrationCheckpoint(state) {
+  const fields = [
+    state?.migration_source_session_id,
+    state?.migration_source_session_blob_name,
+    state?.migration_source_session_sha256,
+    state?.migration_source_state_blob_name,
+    state?.migration_source_state_etag,
+    state?.migration_minimum_historical_high_water_equity,
+    state?.migration_verified_equity_ceiling,
+    state?.migration_verified_settlement_ids,
+    state?.migration_completed_at
+  ];
+  if (fields.every((value) => value === undefined)) return;
+  const ids = state?.migration_verified_settlement_ids;
+  const minimumHighWater = Number(
+    state?.migration_minimum_historical_high_water_equity
+  );
+  const highWater = Number(state?.high_water_equity);
+  const historicalHighWater = Number(state?.historical_high_water_equity);
+  const protectedReserve = Number(state?.protected_reserve);
+  const reserveRatio = Number(state?.reserve_ratio);
+  const migrationCeiling = Number(state?.migration_verified_equity_ceiling);
+  const currentCeiling = Number(state?.authorized_equity_ceiling);
+  if (!safeSessionId(state?.migration_source_session_id)
+      || state.migration_source_session_id === state.session_id
+      || state?.migration_source_session_blob_name !==
+        `reports/funded/dynamic-quote/sessions/${state.migration_source_session_id}/session.json`
+      || !normalizedSha256(state?.migration_source_session_sha256)
+      || state?.migration_source_state_blob_name !==
+        `reports/funded/dynamic-quote/sessions/${state.migration_source_session_id}/capital-reserve-state.json`
+      || typeof state?.migration_source_state_etag !== "string"
+      || !state.migration_source_state_etag
+      || !Number.isFinite(minimumHighWater)
+      || minimumHighWater < 0
+      || !Number.isFinite(highWater)
+      || highWater + 1e-9 < minimumHighWater
+      || !Number.isFinite(historicalHighWater)
+      || historicalHighWater + 1e-9 < minimumHighWater
+      || !Number.isFinite(reserveRatio)
+      || !Number.isFinite(protectedReserve)
+      || protectedReserve + 0.0000011 < highWater * reserveRatio
+      || !Number.isFinite(migrationCeiling)
+      || !Number.isFinite(currentCeiling)
+      || migrationCeiling > currentCeiling + 1e-9
+      || !Array.isArray(ids)
+      || new Set(ids).size !== ids.length
+      || JSON.stringify(ids) !== JSON.stringify([...ids].sort())
+      || ids.some((id) => typeof id !== "string" || !id)
+      || ids.some((id) => !state?.verified_settlement_ids?.includes(id))
+      || !Number.isFinite(Date.parse(state?.migration_completed_at))) {
+    throw new Error("fail closed: persisted protected reserve migration checkpoint is invalid");
+  }
+}
+
+function migrationCheckpoint(state) {
+  if (state?.migration_source_session_id === undefined) return {};
+  return {
+    migration_source_session_id: state.migration_source_session_id,
+    migration_source_session_blob_name: state.migration_source_session_blob_name,
+    migration_source_session_sha256: state.migration_source_session_sha256,
+    migration_source_state_blob_name: state.migration_source_state_blob_name,
+    migration_source_state_etag: state.migration_source_state_etag,
+    migration_minimum_historical_high_water_equity:
+      state.migration_minimum_historical_high_water_equity,
+    migration_verified_equity_ceiling: state.migration_verified_equity_ceiling,
+    migration_verified_settlement_ids: state.migration_verified_settlement_ids,
+    migration_completed_at: state.migration_completed_at
+  };
 }
 
 function uniqueSettlements(rows) {
@@ -989,6 +1436,12 @@ function settlementAccountingEqual(left, right) {
 function normalizedHash(value) {
   const text = String(value || "").toLowerCase();
   return /^0x[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function normalizedSha256(value) {
+  const text = String(value || "").toLowerCase();
+  const prefixed = text.startsWith("sha256:") ? text : `sha256:${text}`;
+  return /^sha256:[0-9a-f]{64}$/.test(prefixed) ? prefixed : "";
 }
 
 function normalizedAddress(value) {
