@@ -19,6 +19,18 @@ case "$job" in
     cpus=2 memory=4g limit=43200
     command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
     ;;
+  prospective)
+    cpus=0.5 memory=1g limit=1800
+    command='polyedge-rs research validate-prospective --since "2026-07-13T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
+    ;;
+  chart-backfill)
+    cpus=0.5 memory=1g limit=7200
+    command='INPUT=${CHART_BACKFILL_INPUT:-}; if [ -z "$INPUT" ]; then DATE=$(date -u -d "yesterday" +%Y-%m-%d); INPUT="data/research/daily/$DATE/normalized"; fi; polyedge-rs research chart-backfill --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/jobs/latest/chart-backfill.json" --markdown "reports/jobs/latest/chart-backfill.md"'
+    ;;
+  backfill)
+    cpus=0.5 memory=1g limit=10800
+    command='START=${BACKFILL_START:-2026-06-14}; END=${BACKFILL_END:-$START}; TASK=${BACKFILL_TASK:-all}; polyedge-rs research backfill --start "$START" --end "$END" --task "$TASK" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/backfill/$START-$END-$TASK.json" --markdown "reports/research/backfill/$START-$END-$TASK.md"'
+    ;;
   shadow-qset)
     cpus=3 memory=8g limit=16800
     test "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-07-28-qset-v1 || {
@@ -47,7 +59,10 @@ available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
   echo "insufficient free ring space: $available bytes available, $minimum_free required" >&2
   exit 1
 }
-work=$ring/jobs/$job
+case "$job" in
+  shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;
+  *) work=$ring/jobs/research credential=research ;;
+esac
 install -d -m 0750 "$work/data" "$work/reports" "$work/freshness"
 
 # One host-wide lock prevents every research writer from overlapping. The
@@ -57,7 +72,7 @@ exec /usr/bin/flock -w 36h /run/polyedge/research.lock \
   /usr/bin/podman run --rm --name "polyedge-job-$job" --network polyedge \
     --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
     --env-file "/etc/polyedge/jobs/$job.env" \
-    -v "/etc/polyedge/credentials/$job:/run/credentials:ro,Z" \
+    -v "/etc/polyedge/credentials/$credential:/run/credentials:ro,Z" \
     -v "$work/data:/app/data:Z" \
     -v "$work/reports:/app/reports:Z" \
     -v "$work/freshness:/app/data_quality/freshness:Z" \

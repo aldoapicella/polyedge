@@ -34,7 +34,7 @@ minimal runtime:
 ```sh
 sudo apt-get install --no-install-recommends podman caddy curl
 sudo install -d -m 0750 /etc/polyedge/jobs /srv/polyedge-ring/jobs
-sudo install -d -m 0700 /etc/polyedge/credentials/{api,freshness,hourly,daily,replay,shadow-qset}
+sudo install -d -m 0700 /etc/polyedge/credentials/{api,research,shadow-qset}
 sudo install -m 0644 ops/conduit/quadlets/* /etc/containers/systemd/
 sudo install -m 0644 ops/conduit/systemd/* /etc/systemd/system/
 sudo install -m 0755 ops/conduit/bin/polyedge-run-job /usr/local/libexec/
@@ -86,7 +86,7 @@ endpoint and mounts only `/var/opt/azcmagent/tokens` read-only. Other containers
 remain on the private `polyedge` network.
 
 External Azure client secrets, when approved, live only at
-`/etc/polyedge/credentials/<service>/azure-client-secret` with mode `0600`.
+`/etc/polyedge/credentials/{api,research,shadow-qset}/azure-client-secret` with mode `0600`.
 The containers receive those files read-only at `/run/credentials`; secret
 values never belong in env files, Quadlets, Git, commands, or logs. Keep API
 table access separate from the blob-only research/ring identity.
@@ -120,7 +120,10 @@ the funded identity, exact non-secret environment, origin check, queue repair,
 and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review all pass. Root remains the
 single-host trust ceiling and can administer both containers.
 
-The recorder writes one fsynced JSONL segment per ten-minute UTC bucket. The
+Primary research jobs share one serialized workspace so daily normalization,
+replay, prospective validation, and backfills reuse local artifacts. The qset
+workspace remains separate. The recorder writes one fsynced JSONL segment per
+ten-minute UTC bucket. The
 ring timer seals closed segments with SHA-256 manifests, creates immutable
 Azure Cool-tier blobs without any remote listing, verifies retry collisions byte for
 byte, and retains each local segment for 48 hours to leave job-workspace

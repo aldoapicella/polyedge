@@ -80,6 +80,9 @@ the 72-hour clock starts.
 | `polyedge-shadow-qset.timer` | 02:15, disabled pending approval | `polyedge-shadow-qset-neu-job` |
 | `polyedge-ring-sync.timer` | every five minutes at `:02` | new local seal/upload plane |
 | `polyedge-ring-health.timer` | every five minutes at `:04` | capacity/backlog/upload guard |
+| `systemctl start polyedge-job@prospective` | manual | `polyedge-prospective-job` |
+| `systemctl start polyedge-job@chart-backfill` | manual | `polyedge-chart-backfill-job` |
+| `systemctl start polyedge-job@backfill` | manual | `polyedge-backfill-job` |
 
 The single `/run/polyedge/research.lock` serializes every research writer.
 Recurring daily/replay work is capped at 2 CPU / 4 GiB and qset at 3 CPU /
