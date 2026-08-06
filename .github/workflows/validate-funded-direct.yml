@@ -331,6 +331,13 @@ jobs:
             ] | length == 0
           ' funded-what-if.json
 
+      - name: Refresh Azure login before funded fence
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
       - name: Fence funded intake and prove the current reserve generation
         run: |
           set -euo pipefail
@@ -540,6 +547,13 @@ jobs:
             --name "$LEGACY_NEU_FUNDED_JOB" \
             --query "[?properties.status=='Running'] | length(@)" -o tsv)
           test "${running:-0}" = "0"
+
+      - name: Refresh Azure login before reserve migration proof
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Prove v7 reserve migration before v5 intake
         run: |
