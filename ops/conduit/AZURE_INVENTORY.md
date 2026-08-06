@@ -260,10 +260,10 @@ Blob and container soft delete remain enabled for 14 days. Change Feed is
 disabled. One lifecycle rule deletes only block blobs under
 `bot-events/data/research/normalized/v1/` seven days after modification. A
 second rule tiers only the new `bot-events/events-oci-hot7-v1/` block-blob
-prefix to Cool after seven days. That future-only prefix leaves the existing
-raw corpus and all evidence/control prefixes untouched. The exact two-rule
-policy was deployed and read back from Azure at `2026-08-06T04:33:15Z`; the new
-prefix was still producer-inactive at deployment time.
+prefix to Cool after seven days and Archive after 30 days. That future-only
+prefix leaves the existing raw corpus and all evidence/control prefixes
+untouched. The exact two-rule policy was updated and read back from Azure at
+`2026-08-06T06:17:06Z`.
 
 Key Vault `kvpolyedge6urdjr5nmwx7w` retains six named secrets: dashboard auth,
 four Polymarket API/wallet values, and the relayer API key.
