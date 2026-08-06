@@ -138,51 +138,36 @@ jobs:
           az bicep build --file infra/funded-direct-chile.bicep --stdout > funded-direct-chile.json
           az bicep build --file infra/storage-service-endpoints.bicep --stdout > storage-service-endpoints.json
           az bicep build --file infra/venue-probe.bicep --stdout > venue-probe.json
-          jq -c '{
-            queue_parameter: .parameters.fundedDirectQueueStatus,
-            namespaces: [.resources[] | select(.type == "Microsoft.ServiceBus/namespaces") | {sku, properties}],
-            network_rules: [.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/networkRuleSets") | .properties],
-            queues: [.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/queues") | .properties],
-            dead_letter_alerts: [.resources[] | select(.type == "Microsoft.Insights/metricAlerts" and .name == "polyedge-funded-direct-dead-letters") | .properties.criteria.allOf[0].timeAggregation],
-            service_bus_roles: [.resources[] | select(.type == "Microsoft.Authorization/roleAssignments") | .properties.roleDefinitionId | select(test("69a216fc-b8fb-44d8-bc22-1f3c2cd27a39|4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0"; "i"))]
-          }' funded-direct-chile.json
-          jq -e '
-            ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces")] | length) == 1
-            and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces")][0]
-              | .sku.name == "Standard"
-              and .properties.disableLocalAuth == true
-              and .properties.publicNetworkAccess == "Enabled")
-            and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/networkRuleSets")][0]
-              | .properties.defaultAction == "Deny"
-              and (.properties.ipRules | length) == 2)
-            and (.parameters.fundedDirectQueueStatus
-              | .defaultValue == "Active"
-              and .allowedValues == ["Active", "SendDisabled"])
-            and ([.resources[] | select(.type == "Microsoft.ServiceBus/namespaces/queues")][0]
-              | .properties.status == "[parameters('fundedDirectQueueStatus')]"
-              and .properties.requiresDuplicateDetection == true
-              and .properties.duplicateDetectionHistoryTimeWindow == "PT10M"
-              and .properties.defaultMessageTimeToLive == "PT10S"
-              and .properties.lockDuration == "PT30S"
-            and .properties.deadLetteringOnMessageExpiration == true
-            and .properties.maxDeliveryCount == 3)
-          and ([.resources[] | select(.type == "Microsoft.Insights/metricAlerts" and .name == "polyedge-funded-direct-dead-letters")][0]
-            | .properties.criteria.allOf[0].timeAggregation == "Maximum")
-          and ([.resources[]
-              | select(.type == "Microsoft.Authorization/roleAssignments")
-              | .properties.roleDefinitionId
-              | ascii_downcase
-              | select(contains("69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"))] | length) == 1
-            and ([.resources[]
-              | select(.type == "Microsoft.Authorization/roleAssignments")
-              | .properties.roleDefinitionId
-              | ascii_downcase
-              | select(contains("4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0"))] | length) == 1
-          ' funded-direct-chile.json
           node <<'NODE'
           const assert = require("node:assert/strict");
           const fs = require("node:fs");
           const template = JSON.parse(fs.readFileSync("funded-direct-chile.json"));
+          const resources = (type) => template.resources.filter((resource) => resource.type === type);
+          const [namespace] = resources("Microsoft.ServiceBus/namespaces");
+          assert.equal(resources("Microsoft.ServiceBus/namespaces").length, 1);
+          assert.equal(namespace.sku.name, "Standard");
+          assert.equal(namespace.properties.disableLocalAuth, true);
+          assert.equal(namespace.properties.publicNetworkAccess, "Enabled");
+          const [networkRules] = resources("Microsoft.ServiceBus/namespaces/networkRuleSets");
+          assert.equal(networkRules.properties.defaultAction, "Deny");
+          assert.equal(networkRules.properties.ipRules.length, 2);
+          assert.equal(template.parameters.fundedDirectQueueStatus.defaultValue, "Active");
+          assert.deepEqual(template.parameters.fundedDirectQueueStatus.allowedValues, ["Active", "SendDisabled"]);
+          const [queue] = resources("Microsoft.ServiceBus/namespaces/queues");
+          assert.equal(queue.properties.status, "[parameters('fundedDirectQueueStatus')]");
+          assert.equal(queue.properties.requiresDuplicateDetection, true);
+          assert.equal(queue.properties.duplicateDetectionHistoryTimeWindow, "PT10M");
+          assert.equal(queue.properties.defaultMessageTimeToLive, "PT10S");
+          assert.equal(queue.properties.lockDuration, "PT30S");
+          assert.equal(queue.properties.deadLetteringOnMessageExpiration, true);
+          assert.equal(queue.properties.maxDeliveryCount, 3);
+          const deadLetterAlert = resources("Microsoft.Insights/metricAlerts").find((resource) =>
+            resource.name === "polyedge-funded-direct-dead-letters");
+          assert.equal(deadLetterAlert.properties.criteria.allOf[0].timeAggregation, "Maximum");
+          const roleIds = resources("Microsoft.Authorization/roleAssignments")
+            .map((resource) => resource.properties.roleDefinitionId.toLowerCase());
+          assert.equal(roleIds.filter((value) => value.includes("69a216fc-b8fb-44d8-bc22-1f3c2cd27a39")).length, 1);
+          assert.equal(roleIds.filter((value) => value.includes("4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0")).length, 1);
           const isolatedEndpoints = JSON.parse(fs.readFileSync("storage-service-endpoints.json"));
           const endpointSubnets = isolatedEndpoints.resources.filter((resource) =>
             resource.type === "Microsoft.Network/virtualNetworks/subnets");
