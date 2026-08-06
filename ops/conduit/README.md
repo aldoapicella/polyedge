@@ -99,33 +99,122 @@ The uploader alone uses host networking to reach Arc's loopback identity
 endpoint and mounts only `/var/opt/azcmagent/tokens` read-only. Other containers
 remain on the private `polyedge` network.
 
-External Azure client secrets, when approved, live only at
-`/etc/polyedge/credentials/{api,research,shadow-qset}/azure-client-secret` with mode `0600`.
-The containers receive those files read-only at `/run/credentials`; secret
-values never belong in env files, Quadlets, Git, commands, or logs. Keep API
-table access separate from the blob-only research/ring identity.
+Federated JWT-SVIDs rotate into `/run/polyedge-federated-LANE/azure-federated-token`
+with mode `0600`; each container receives only its lane at `/run/credentials`.
+The Rust client still supports the reviewed client-secret-file rollback, but a
+lane must set exactly one credential-file variable. Never put a JWT, client
+secret, private key, or join token in Git, shell arguments, chat, or logs.
 
-## Separate Entra identities
+## Separate UAMI workload identities
 
-Arc unblocks the no-secret ring upload path. The API, primary research jobs,
-frozen qset job, and funded signer still use separate identities so neither the
-funded queue/wallet boundary nor qset storage is granted to the host-wide Arc
-identity. The operator does not need a permanent directory role. An Entra
-administrator can create the four applications and service principals, then
-add the operator as an application owner. This step creates no credential:
+Do not create Entra applications. The tenant disables application creation,
+but the subscription Owner can create four Azure user-assigned managed
+identities (UAMIs) and their federated identity credentials. The isolated
+`infra/conduit-federated-identity.bicep` template creates one lane per
+deployment and no role assignment. Its research-lane what-if produced exactly
+one UAMI and one FIC, with no deletes. Deploy lanes sequentially only after the
+issuer below is public and its observed JWT claims match the template.
+
+The issuer requires a reserved OCI public IP, a stable owned DNS name, valid
+TLS, and inbound TCP/80 and TCP/443 in OCI and UFW. Do not use an ephemeral
+platform hostname. Replace `oidc.example.invalid` consistently in the three
+SPIRE configs, `spire.env`, Caddy, and the Bicep `issuer` parameter.
+
+Use the verified SPIRE 1.15.2 ARM64 musl artifacts. Their SHA-256 values are
+`92e782b285c50c62cdf37fdfa8917ea68fa57685b3bf99d03db36da4095678fa`
+for SPIRE and
+`ec67c4d5e21b20a129d1f368f401e4fbb2bcd4fd5c13aa08a97778da94f52717`
+for SPIRE extras. Install only after both downloaded files pass `sha256sum -c`.
+The server is configured for a five-minute JWT-SVID, RSA-2048/RS256 signing,
+SQLite, disk keys, and the fixed `polyedge.local` trust domain. This remains a
+single-host root trust and availability ceiling.
+
+Create fixed service accounts once, then install the reviewed files:
 
 ```sh
-operator_object_id=REPLACE_OPERATOR_OBJECT_ID
-for name in polyedge-conduit-api polyedge-conduit-research polyedge-conduit-shadow-qset polyedge-conduit-funded-signer; do
-  app_id=$(az ad app create --display-name "$name" --sign-in-audience AzureADMyOrg --query appId -o tsv)
-  az ad sp create --id "$app_id" --query id -o tsv
-  az ad app owner add --id "$app_id" --owner-object-id "$operator_object_id"
+sudo groupadd --system spire-workload
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin spire-server
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin spire-oidc
+for lane in api research shadow-qset funded-signer; do
+  sudo useradd --system --no-create-home --shell /usr/sbin/nologin "polyedge-identity-$lane"
 done
+sudo install -d -m 0755 /opt/spire/bin /etc/spire
+sudo install -m 0755 spire-server spire-agent /opt/spire/bin/
+sudo install -m 0755 oidc-discovery-provider /opt/spire/bin/
+sudo install -m 0644 ops/conduit/spire/server.conf /etc/spire/server.conf
+sudo install -m 0644 ops/conduit/spire/agent.conf /etc/spire/agent.conf
+sudo install -m 0644 ops/conduit/spire/oidc-discovery-provider.conf /etc/spire/oidc-discovery-provider.conf
+sudo install -m 0600 ops/conduit/env/spire.env.example /etc/polyedge/spire.env
+sudo install -m 0755 ops/conduit/bin/polyedge-federated-token-refresh /usr/local/libexec/
+sudo install -m 0644 ops/conduit/systemd/spire-*.service /etc/systemd/system/
+sudo install -m 0644 ops/conduit/systemd/polyedge-federated-token@.* /etc/systemd/system/
 ```
 
-After ownership propagates, the operator creates each credential directly into
-its root-only host file and assigns only the documented container, table, or
-queue scope. Do not send the credential through GitHub, chat, or shell history.
+Bootstrap the one agent with a root-only join-token file, then remove that file
+after its first attestation and start the persistent unit without a token. Use
+the node ID `spiffe://polyedge.local/spire/agent/conduit-dev`. Register the OIDC
+provider and each fetcher with both its Unix user and the fixed official SPIRE
+Agent binary path. The four workload IDs are exactly:
+
+```text
+spiffe://polyedge.local/conduit/api
+spiffe://polyedge.local/conduit/research
+spiffe://polyedge.local/conduit/shadow-qset
+spiffe://polyedge.local/conduit/funded-signer
+```
+
+The bootstrap and registrations are credential-safe when the short-lived join
+token stays in a root-only file and never appears in a process argument:
+
+```sh
+server_socket=/run/spire-server/api.sock
+node_id=spiffe://polyedge.local/spire/agent/conduit-dev
+sudo systemctl enable --now spire-server.service
+sudo sh -c 'umask 077; /opt/spire/bin/spire-server bundle show -socketPath /run/spire-server/api.sock -format pem > /etc/spire/bootstrap.crt'
+sudo sh -c '/opt/spire/bin/spire-server token generate -socketPath /run/spire-server/api.sock -spiffeID spiffe://polyedge.local/spire/agent/conduit-dev -output json | jq -er .value > /etc/spire/join-token && chmod 0600 /etc/spire/join-token'
+sudo /opt/spire/bin/spire-agent run -config /etc/spire/agent.conf -joinTokenFile /etc/spire/join-token
+# After the first successful attestation, stop the foreground agent, unlink the
+# consumed join-token file, and start the persistent service.
+sudo unlink /etc/spire/join-token
+sudo systemctl enable --now spire-agent.service
+
+sudo /opt/spire/bin/spire-server entry create -socketPath "$server_socket" \
+  -parentID "$node_id" \
+  -spiffeID spiffe://polyedge.local/oidc-discovery-provider \
+  -selector unix:user:spire-oidc \
+  -selector unix:path:/opt/spire/bin/oidc-discovery-provider
+for lane in api research shadow-qset funded-signer; do
+  sudo /opt/spire/bin/spire-server entry create -socketPath "$server_socket" \
+    -parentID "$node_id" \
+    -spiffeID "spiffe://polyedge.local/conduit/$lane" \
+    -selector "unix:user:polyedge-identity-$lane" \
+    -selector unix:path:/opt/spire/bin/spire-agent \
+    -jwtSVIDTTL 300
+done
+sudo systemctl enable --now spire-oidc-discovery-provider.service
+sudo systemctl enable --now polyedge-federated-token@research.timer
+```
+
+The provider listens only on `/run/spire-oidc/provider.sock`; Caddy publishes
+only `/.well-known/openid-configuration` and `/keys`. The Workload API remains
+on `/run/spire/agent.sock`. Enable only the research token timer first. Before
+creating its FIC, decode claims locally without printing the token and verify
+`alg=RS256`, the exact HTTPS issuer and SPIFFE subject, the sole audience
+`api://AzureADTokenExchange`, and a lifetime no greater than six minutes.
+
+```sh
+az deployment group create --resource-group rg-polyedge-dev \
+  --template-file infra/conduit-federated-identity.bicep \
+  --parameters lane=research issuer=https://REPLACE_STABLE_OIDC_DOMAIN \
+  --parameters tags='{"owner":"polyedge","migration":"oci-compute-plane"}'
+```
+
+Assign the research UAMI only a temporary Blob Data Reader role on the
+`bot-events` container, run `npm run workload-identity-smoke`, and remove that
+role if the bounded `getProperties` proof fails. After success, apply only the
+positive scopes in `identity-rbac-plan.json`, read assignments back, and prove
+every cross-lane negative assertion before enabling workloads. Create the
+remaining FICs sequentially; concurrent UAMI FIC updates can return conflicts.
 
 The funded signer is a separate, no-ingress, read-only container. Only it gets
 the Podman wallet secrets and its dedicated Azure funded identity; the API and

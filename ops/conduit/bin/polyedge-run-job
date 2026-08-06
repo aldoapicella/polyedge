@@ -109,6 +109,12 @@ case "$job" in
 esac
 install -d -m 0750 "$work/data" "$work/reports" "$work/freshness"
 
+credential_dir=/run/polyedge-federated-$credential
+if [ ! -r "$credential_dir/azure-federated-token" ]; then
+  # Preserve the reviewed client-secret-file rollback path.
+  credential_dir=/etc/polyedge/credentials/$credential
+fi
+
 case "$job" in
   hourly|daily|replay)
     : "${POLYEDGE_LOCAL_RAW_ROOT:?set POLYEDGE_LOCAL_RAW_ROOT to /input/events}"
@@ -128,7 +134,7 @@ exec /usr/bin/flock -w 36h /run/polyedge/research.lock \
   /usr/bin/podman run --rm --name "polyedge-job-$job" --network polyedge \
     --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
     --env-file "/etc/polyedge/jobs/$job.env" \
-    -v "/etc/polyedge/credentials/$credential:/run/credentials:ro,Z" \
+    -v "$credential_dir:/run/credentials:ro,Z" \
     -v "$work/data:/app/data:Z" \
     -v "$work/reports:/app/reports:Z" \
     -v "$work/freshness:/app/data_quality/freshness:Z" \

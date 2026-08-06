@@ -14,6 +14,7 @@
     "funded-direct-worker": "node src/funded-direct-worker.mjs",
     "funded-direct-service": "node src/funded-direct-service.mjs",
     "validate-funded-direct-shadow": "node src/funded-direct-shadow-validation.mjs",
+    "workload-identity-smoke": "node src/workload-identity-smoke.mjs",
     "redeem": "node src/redeem.mjs",
     "train": "node src/train.mjs",
     "test": "node --test test/*.test.mjs"

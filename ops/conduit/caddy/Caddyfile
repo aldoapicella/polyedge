@@ -2,3 +2,17 @@
 polyedge.example.invalid {
 	reverse_proxy 127.0.0.1:3000
 }
+
+# Use a separate stable DNS name for OIDC discovery. The Workload API remains
+# local; every other path on this host returns 404.
+oidc.example.invalid {
+	@oidc path /.well-known/openid-configuration /keys
+	handle @oidc {
+		reverse_proxy unix//run/spire-oidc/provider.sock {
+			header_up Host {host}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

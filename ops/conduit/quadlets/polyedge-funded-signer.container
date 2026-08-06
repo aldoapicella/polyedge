@@ -10,7 +10,7 @@ Image=registry.example.invalid/polyedge-venue-probe@sha256:000000000000000000000
 ContainerName=polyedge-funded-signer
 Network=polyedge.network
 EnvironmentFile=/etc/polyedge/funded-signer.env
-Secret=polyedge-azure-funded-client-secret,type=env,target=AZURE_CLIENT_SECRET
+Volume=/run/polyedge-federated-funded-signer:/run/credentials:ro,Z
 Secret=polyedge-polymarket-private-key,type=env,target=POLYMARKET_PRIVATE_KEY
 Secret=polyedge-polymarket-api-key,type=env,target=POLYMARKET_API_KEY
 Secret=polyedge-polymarket-api-secret,type=env,target=POLYMARKET_API_SECRET

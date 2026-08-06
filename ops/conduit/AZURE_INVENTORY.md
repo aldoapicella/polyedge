@@ -78,12 +78,15 @@ Its local source and manifest hashes matched their receipts; an authenticated
 remote HEAD returned `200`, `BlockBlob`, `Hot`, and the exact 188,157,190-byte
 manifest length.
 
-The four dedicated Entra applications do not yet exist. The signed-in tenant's
-authorization policy reports `allowedToCreateApps=false`, so an Entra
-administrator must perform the credential-free application/service-principal
-handoff documented in `README.md`. Until that happens, the primary research
-job env files, approval marker, and timers remain absent. This blocks the two
-daily-cycle gate but does not affect the active ring uploader's narrow Arc role.
+The four dedicated UAMIs do not yet exist. The replacement architecture needs
+no Entra directory role: subscription Owner can create each UAMI and exact
+federated identity credential as Azure resources. An isolated research-lane
+ARM what-if passed with exactly two creates and no deletes or role assignments.
+Live creation remains blocked on a stable owned DNS name, reserved OCI public
+IP, valid TLS, and externally reachable SPIRE OIDC discovery/JWKS. The primary
+research job env files, approval marker, and timers remain absent. This blocks
+the two-daily-cycle gate but does not affect the active ring uploader's narrow
+Arc role.
 
 ## OCI schedule and coverage
 
@@ -160,6 +163,17 @@ $142.57/month and restores the later storage-optimized target to about
 $38-49/month: a projected $373-384/month (88-91%) reduction. Do not move funded
 credentials without explicit approval.
 
+Maintaining the full 48-hour local ring under the observed worst segment needs
+about 33.1 GB more than the current safe capacity. The least invasive
+same-retention fix is expanding the existing OCI block volume by 50 GB. The
+present 50-GB boot plus 150-GiB data layout already consumes essentially all of
+Oracle's combined 200-GB Always Free allowance. At the May 2026 public rate of
+$0.0255 per GB-month, 50 additional lower-cost block-volume GB add about
+$1.28/month (performance units can add cost if nonzero). That changes the
+defensible post-optimization range to roughly $39-50/month while retaining the
+48-hour peak guard. Reducing retention to stay at exactly $0 would change the
+requested functionality and is not the recommended cost cut.
+
 OCI metadata reports 4 A1 OCPUs and 24 GB. At 730 hours/month that consumes
 2,920 OCPU-hours and 17,520 GB-hours, within Oracle's current published free A1
 allowance of 3,000 OCPU-hours and 18,000 GB-hours. The cost model therefore
@@ -197,12 +211,20 @@ not a bill quote.
 The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
 24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks
 was 1.02 cores and 2.87 GB. `conduit-dev` has four ARM64 cores, 25.14 GB RAM,
-and 154.7 GB currently available on the dedicated ring volume. A closed
+and broad free space on the dedicated ring volume. A closed
 ten-minute local segment contained 340,675 events (about 568 events/second)
 while the local collector reported about 0.16 core and 131 MB. The 48-hour
 ring projection was 76.4 GB. This proves steady collector capacity with broad
 headroom; the two daily ARM64 cycles remain the required batch-efficiency gate.
-The free single VM does not provide Azure's failure-domain redundancy.
+The later live ring check found 125 segments with a combined raw-plus-gzip
+average of 287,727,134 bytes and a peak of 541,986,617 bytes. A 48-hour
+projection is 82.9 GB at the observed average but 156.1 GB at the peak, above
+the volume's roughly 123-GB budget after its 32-GiB safety reserve. Upload
+freshness is green and no sealed segment is waiting, but the conservative
+capacity guard is correctly failing. Do not call the host equivalent or start
+the formal parity clock until 48-hour peak retention fits without weakening
+that guard. The free single VM also does not provide Azure's failure-domain
+redundancy.
 
 ## Acceptance candidate
 

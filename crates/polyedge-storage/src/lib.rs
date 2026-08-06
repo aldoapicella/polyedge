@@ -30,6 +30,7 @@ const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const AZURE_TABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_AUTHORITY_HOST: &str = "https://login.microsoftonline.com";
 const AZURE_CLIENT_SECRET_MAX_BYTES: u64 = 16 * 1024;
+const AZURE_CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const AZURE_ARC_TOKEN_ROOT: &str = "/var/opt/azcmagent/tokens";
 const AZURE_ARC_CHALLENGE_MAX_BYTES: u64 = 4 * 1024;
 type AzureTableContinuation = Option<(String, String)>;
@@ -897,13 +898,14 @@ struct ManagedIdentityToken {
 enum AzureTokenAuth {
     ManagedIdentity,
     ClientSecretFile(ExternalAzureAuth),
+    FederatedTokenFile(ExternalAzureAuth),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalAzureAuth {
     tenant_id: String,
     client_id: String,
-    secret_file: PathBuf,
+    credential_file: PathBuf,
 }
 
 impl ManagedIdentityToken {
@@ -924,11 +926,9 @@ impl ManagedIdentityToken {
     fn access_token(&mut self, agent: &ureq::Agent) -> Result<String, AzureBlobError> {
         let auth = token_auth_from_env(self.client_id.as_deref())?;
         let now = Utc::now().timestamp();
-        if self.cached_auth.as_ref() == Some(&auth) {
-            if let (Some(token), Some(expires_on)) = (&self.access_token, self.expires_on_epoch) {
-                if expires_on - now > 120 {
-                    return Ok(token.clone());
-                }
+        if cache_is_valid(self.cached_auth.as_ref(), &auth, self.expires_on_epoch, now) {
+            if let Some(token) = &self.access_token {
+                return Ok(token.clone());
             }
         }
         let payload = match &auth {
@@ -936,7 +936,10 @@ impl ManagedIdentityToken {
                 fetch_managed_identity_token(agent, self.client_id.as_deref(), &self.resource)?
             }
             AzureTokenAuth::ClientSecretFile(config) => {
-                fetch_external_identity_token(agent, config, &self.resource)?
+                fetch_client_secret_token(agent, config, &self.resource)?
+            }
+            AzureTokenAuth::FederatedTokenFile(config) => {
+                fetch_federated_identity_token(agent, config, &self.resource)?
             }
         };
         let token = payload
@@ -950,6 +953,9 @@ impl ManagedIdentityToken {
                 AzureTokenAuth::ClientSecretFile(_) => {
                     AzureBlobError::ExternalIdentity("missing access_token".to_owned())
                 }
+                AzureTokenAuth::FederatedTokenFile(_) => {
+                    AzureBlobError::ExternalIdentity("missing access_token".to_owned())
+                }
             })?
             .to_owned();
         let expires_on = match &auth {
@@ -957,7 +963,7 @@ impl ManagedIdentityToken {
                 .get("expires_on")
                 .and_then(parse_expires_on)
                 .unwrap_or(now + 300),
-            AzureTokenAuth::ClientSecretFile(_) => payload
+            AzureTokenAuth::ClientSecretFile(_) | AzureTokenAuth::FederatedTokenFile(_) => payload
                 .get("expires_in")
                 .and_then(parse_expires_on)
                 .filter(|seconds| *seconds > 0)
@@ -971,11 +977,21 @@ impl ManagedIdentityToken {
     }
 }
 
+fn cache_is_valid(
+    cached_auth: Option<&AzureTokenAuth>,
+    auth: &AzureTokenAuth,
+    expires_on_epoch: Option<i64>,
+    now: i64,
+) -> bool {
+    cached_auth == Some(auth) && expires_on_epoch.is_some_and(|expires_on| expires_on - now > 120)
+}
+
 fn token_auth_from_env(expected_client_id: Option<&str>) -> Result<AzureTokenAuth, AzureBlobError> {
     select_token_auth(
         env::var_os("AZURE_TENANT_ID"),
         env::var_os("AZURE_CLIENT_ID"),
         env::var_os("AZURE_CLIENT_SECRET_FILE"),
+        env::var_os("AZURE_FEDERATED_TOKEN_FILE"),
         expected_client_id,
     )
 }
@@ -984,22 +1000,39 @@ fn select_token_auth(
     tenant_id: Option<OsString>,
     client_id: Option<OsString>,
     secret_file: Option<OsString>,
+    federated_token_file: Option<OsString>,
     expected_client_id: Option<&str>,
 ) -> Result<AzureTokenAuth, AzureBlobError> {
     // AZURE_CLIENT_ID alone selects a user-assigned managed identity today.
-    if tenant_id.is_none() && secret_file.is_none() {
+    if tenant_id.is_none() && secret_file.is_none() && federated_token_file.is_none() {
         return Ok(AzureTokenAuth::ManagedIdentity);
     }
-    if tenant_id.is_none() || client_id.is_none() || secret_file.is_none() {
+    if secret_file.is_some() && federated_token_file.is_some() {
         return Err(AzureBlobError::ExternalIdentity(
-            "AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET_FILE must be set together"
+            "AZURE_CLIENT_SECRET_FILE and AZURE_FEDERATED_TOKEN_FILE cannot both be set".to_owned(),
+        ));
+    }
+    let (credential_file, credential_name, federated) = match (secret_file, federated_token_file) {
+        (Some(file), None) => (file, "AZURE_CLIENT_SECRET_FILE", false),
+        (None, Some(file)) => (file, "AZURE_FEDERATED_TOKEN_FILE", true),
+        (None, None) => {
+            return Err(AzureBlobError::ExternalIdentity(
+                "AZURE_TENANT_ID, AZURE_CLIENT_ID, and exactly one credential file must be set"
+                    .to_owned(),
+            ));
+        }
+        (Some(_), Some(_)) => unreachable!("both credential files are rejected above"),
+    };
+    if tenant_id.is_none() || client_id.is_none() {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_TENANT_ID, AZURE_CLIENT_ID, and exactly one credential file must be set"
                 .to_owned(),
         ));
     }
 
     let tenant_id = unicode_config("AZURE_TENANT_ID", tenant_id.unwrap())?;
     let client_id = unicode_config("AZURE_CLIENT_ID", client_id.unwrap())?;
-    let secret_file = PathBuf::from(secret_file.unwrap());
+    let credential_file = PathBuf::from(credential_file);
     if !is_guid(&tenant_id) || !is_guid(&client_id) {
         return Err(AzureBlobError::ExternalIdentity(
             "AZURE_TENANT_ID and AZURE_CLIENT_ID must be GUIDs".to_owned(),
@@ -1010,17 +1043,22 @@ fn select_token_auth(
             "AZURE_CLIENT_ID changed after the Azure client was initialized".to_owned(),
         ));
     }
-    if !secret_file.is_absolute() {
-        return Err(AzureBlobError::ExternalIdentity(
-            "AZURE_CLIENT_SECRET_FILE must be an absolute path".to_owned(),
-        ));
+    if !credential_file.is_absolute() {
+        return Err(AzureBlobError::ExternalIdentity(format!(
+            "{credential_name} must be an absolute path"
+        )));
     }
 
-    Ok(AzureTokenAuth::ClientSecretFile(ExternalAzureAuth {
+    let config = ExternalAzureAuth {
         tenant_id,
         client_id,
-        secret_file,
-    }))
+        credential_file,
+    };
+    Ok(if federated {
+        AzureTokenAuth::FederatedTokenFile(config)
+    } else {
+        AzureTokenAuth::ClientSecretFile(config)
+    })
 }
 
 fn unicode_config(name: &str, value: OsString) -> Result<String, AzureBlobError> {
@@ -1038,15 +1076,33 @@ fn is_guid(value: &str) -> bool {
         })
 }
 
-fn fetch_external_identity_token(
+fn fetch_client_secret_token(
     agent: &ureq::Agent,
     config: &ExternalAzureAuth,
     resource: &str,
 ) -> Result<Value, AzureBlobError> {
-    let secret = read_client_secret(&config.secret_file)?;
+    let secret = read_credential_file(&config.credential_file, "AZURE_CLIENT_SECRET_FILE")?;
     let (url, body) = external_token_request(config, resource, &secret);
+    fetch_external_identity_token(agent, &url, &body)
+}
+
+fn fetch_federated_identity_token(
+    agent: &ureq::Agent,
+    config: &ExternalAzureAuth,
+    resource: &str,
+) -> Result<Value, AzureBlobError> {
+    let assertion = read_federated_token_file(&config.credential_file)?;
+    let (url, body) = federated_token_request(config, resource, &assertion);
+    fetch_external_identity_token(agent, &url, &body)
+}
+
+fn fetch_external_identity_token(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &str,
+) -> Result<Value, AzureBlobError> {
     let response = agent
-        .post(&url)
+        .post(url)
         .set("Content-Type", "application/x-www-form-urlencoded")
         .set("Accept", "application/json")
         .send_string(&body)
@@ -1079,62 +1135,130 @@ fn external_token_request(
     (url, body)
 }
 
-fn read_client_secret(path: &Path) -> Result<String, AzureBlobError> {
-    let path_metadata = fs::symlink_metadata(path).map_err(external_secret_file_error)?;
+fn federated_token_request(
+    config: &ExternalAzureAuth,
+    resource: &str,
+    assertion: &str,
+) -> (String, String) {
+    let url = format!(
+        "{}/{}/oauth2/v2.0/token",
+        AZURE_AUTHORITY_HOST, config.tenant_id
+    );
+    let scope = format!("{}/.default", resource.trim_end_matches('/'));
+    let encode = |value: &str| utf8_percent_encode(value, NON_ALPHANUMERIC).to_string();
+    let body = format!(
+        "client_id={}&scope={}&grant_type=client_credentials&client_assertion_type={}&client_assertion={}",
+        encode(&config.client_id),
+        encode(&scope),
+        encode(AZURE_CLIENT_ASSERTION_TYPE),
+        encode(assertion),
+    );
+    (url, body)
+}
+
+fn read_credential_file(path: &Path, name: &str) -> Result<String, AzureBlobError> {
+    validate_credential_file_path(path, name)?;
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|error| credential_file_error(name, error))?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-        return Err(AzureBlobError::ExternalIdentity(
-            "AZURE_CLIENT_SECRET_FILE must be a regular file, not a symlink".to_owned(),
-        ));
+        return Err(AzureBlobError::ExternalIdentity(format!(
+            "{name} must be a regular file, not a symlink"
+        )));
     }
-    validate_secret_file_metadata(&path_metadata)?;
-    let file = File::open(path).map_err(external_secret_file_error)?;
-    let opened_metadata = file.metadata().map_err(external_secret_file_error)?;
-    validate_secret_file_metadata(&opened_metadata)?;
-    validate_same_secret_file(&path_metadata, &opened_metadata)?;
+    validate_credential_file_metadata(&path_metadata, name)?;
+    let file = File::open(path).map_err(|error| credential_file_error(name, error))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| credential_file_error(name, error))?;
+    validate_credential_file_metadata(&opened_metadata, name)?;
+    validate_same_credential_file(&path_metadata, &opened_metadata, name)?;
 
     let mut bytes = Vec::new();
     file.take(AZURE_CLIENT_SECRET_MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(external_secret_file_error)?;
+        .map_err(|error| credential_file_error(name, error))?;
     if bytes.len() as u64 > AZURE_CLIENT_SECRET_MAX_BYTES {
-        return Err(AzureBlobError::ExternalIdentity(
-            "AZURE_CLIENT_SECRET_FILE exceeds 16 KiB".to_owned(),
-        ));
+        return Err(AzureBlobError::ExternalIdentity(format!(
+            "{name} exceeds 16 KiB"
+        )));
     }
-    let value = String::from_utf8(bytes).map_err(|_| {
-        AzureBlobError::ExternalIdentity("AZURE_CLIENT_SECRET_FILE is not UTF-8".to_owned())
-    })?;
+    let value = String::from_utf8(bytes)
+        .map_err(|_| AzureBlobError::ExternalIdentity(format!("{name} is not UTF-8")))?;
     let value = value.trim_end_matches(['\r', '\n']);
     if value.is_empty() || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
-        return Err(AzureBlobError::ExternalIdentity(
-            "AZURE_CLIENT_SECRET_FILE is empty or contains an invalid control character".to_owned(),
-        ));
+        return Err(AzureBlobError::ExternalIdentity(format!(
+            "{name} is empty or contains an invalid control character"
+        )));
     }
     Ok(value.to_owned())
 }
 
-fn validate_secret_file_metadata(metadata: &fs::Metadata) -> Result<(), AzureBlobError> {
-    if metadata.len() == 0 || metadata.len() > AZURE_CLIENT_SECRET_MAX_BYTES {
-        return Err(AzureBlobError::ExternalIdentity(
-            "AZURE_CLIENT_SECRET_FILE is empty or exceeds 16 KiB".to_owned(),
-        ));
-    }
-    #[cfg(unix)]
+fn validate_credential_file_path(path: &Path, name: &str) -> Result<(), AzureBlobError> {
+    if path
+        .as_os_str()
+        .to_string_lossy()
+        .split(['/', '\\'])
+        .any(|component| matches!(component, "." | ".."))
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
-            return Err(AzureBlobError::ExternalIdentity(
-                "AZURE_CLIENT_SECRET_FILE must have no group/other permissions or hard links"
-                    .to_owned(),
-            ));
+        return Err(AzureBlobError::ExternalIdentity(format!(
+            "{name} must not contain traversal components"
+        )));
+    }
+    for ancestor in path.ancestors().skip(1) {
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|error| credential_file_error(name, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AzureBlobError::ExternalIdentity(format!(
+                "{name} must not have a symlinked or non-directory ancestor"
+            )));
         }
     }
     Ok(())
 }
 
-fn validate_same_secret_file(
+fn read_federated_token_file(path: &Path) -> Result<String, AzureBlobError> {
+    let assertion = read_credential_file(path, "AZURE_FEDERATED_TOKEN_FILE")?;
+    if assertion.split('.').count() != 3
+        || assertion.split('.').any(|segment| {
+            segment.is_empty()
+                || segment.len() % 4 == 1
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err(AzureBlobError::ExternalIdentity(
+            "AZURE_FEDERATED_TOKEN_FILE must be an unpadded three-segment base64url JWT".to_owned(),
+        ));
+    }
+    Ok(assertion)
+}
+
+fn validate_credential_file_metadata(
+    metadata: &fs::Metadata,
+    name: &str,
+) -> Result<(), AzureBlobError> {
+    if metadata.len() == 0 || metadata.len() > AZURE_CLIENT_SECRET_MAX_BYTES {
+        return Err(AzureBlobError::ExternalIdentity(format!(
+            "{name} is empty or exceeds 16 KiB"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            return Err(AzureBlobError::ExternalIdentity(format!(
+                "{name} must have no group/other permissions or hard links"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_same_credential_file(
     path_metadata: &fs::Metadata,
     opened_metadata: &fs::Metadata,
+    name: &str,
 ) -> Result<(), AzureBlobError> {
     #[cfg(unix)]
     {
@@ -1142,16 +1266,16 @@ fn validate_same_secret_file(
         if path_metadata.dev() != opened_metadata.dev()
             || path_metadata.ino() != opened_metadata.ino()
         {
-            return Err(AzureBlobError::ExternalIdentity(
-                "AZURE_CLIENT_SECRET_FILE changed while it was opened".to_owned(),
-            ));
+            return Err(AzureBlobError::ExternalIdentity(format!(
+                "{name} changed while it was opened"
+            )));
         }
     }
     Ok(())
 }
 
-fn external_secret_file_error(error: std::io::Error) -> AzureBlobError {
-    AzureBlobError::ExternalIdentity(format!("AZURE_CLIENT_SECRET_FILE cannot be read: {error}"))
+fn credential_file_error(name: &str, error: std::io::Error) -> AzureBlobError {
+    AzureBlobError::ExternalIdentity(format!("{name} cannot be read: {error}"))
 }
 
 fn external_identity_error(error: ureq::Error) -> AzureBlobError {
@@ -2636,18 +2760,25 @@ mod tests {
         tenant_id: Option<&str>,
         client_id: Option<&str>,
         secret_file: Option<&str>,
-    ) -> (Option<OsString>, Option<OsString>, Option<OsString>) {
+        federated_token_file: Option<&str>,
+    ) -> (
+        Option<OsString>,
+        Option<OsString>,
+        Option<OsString>,
+        Option<OsString>,
+    ) {
         (
             tenant_id.map(OsString::from),
             client_id.map(OsString::from),
             secret_file.map(OsString::from),
+            federated_token_file.map(OsString::from),
         )
     }
 
     #[test]
     fn external_auth_selection_is_explicit_and_fail_closed() {
         assert_eq!(
-            select_token_auth(None, None, None, Some(TEST_CLIENT_ID)).unwrap(),
+            select_token_auth(None, None, None, None, Some(TEST_CLIENT_ID)).unwrap(),
             AzureTokenAuth::ManagedIdentity
         );
         assert_eq!(
@@ -2655,39 +2786,77 @@ mod tests {
                 None,
                 Some(OsString::from(TEST_CLIENT_ID)),
                 None,
+                None,
                 Some(TEST_CLIENT_ID),
             )
             .unwrap(),
             AzureTokenAuth::ManagedIdentity
         );
 
-        let (tenant, client, file) = external_auth_options(
+        let (tenant, client, secret_file, federated_token_file) = external_auth_options(
             Some(TEST_TENANT_ID),
             Some(TEST_CLIENT_ID),
             Some("/run/credentials/polyedge/azure-client-secret"),
+            None,
         );
         assert!(matches!(
-            select_token_auth(tenant, client, file, Some(TEST_CLIENT_ID)).unwrap(),
+            select_token_auth(
+                tenant,
+                client,
+                secret_file,
+                federated_token_file,
+                Some(TEST_CLIENT_ID)
+            )
+            .unwrap(),
             AzureTokenAuth::ClientSecretFile(_)
         ));
 
-        let (tenant, client, file) =
-            external_auth_options(Some(TEST_TENANT_ID), Some(TEST_CLIENT_ID), None);
-        assert!(select_token_auth(tenant, client, file, None).is_err());
+        let (tenant, client, secret_file, federated_token_file) = external_auth_options(
+            Some(TEST_TENANT_ID),
+            Some(TEST_CLIENT_ID),
+            None,
+            Some("/run/credentials/polyedge/federated-token"),
+        );
+        assert!(matches!(
+            select_token_auth(tenant, client, secret_file, federated_token_file, None).unwrap(),
+            AzureTokenAuth::FederatedTokenFile(_)
+        ));
 
-        let (tenant, client, file) = external_auth_options(
+        let (tenant, client, secret_file, federated_token_file) =
+            external_auth_options(Some(TEST_TENANT_ID), Some(TEST_CLIENT_ID), None, None);
+        assert!(
+            select_token_auth(tenant, client, secret_file, federated_token_file, None).is_err()
+        );
+
+        let (tenant, client, secret_file, federated_token_file) = external_auth_options(
+            Some(TEST_TENANT_ID),
+            Some(TEST_CLIENT_ID),
+            Some("/run/credentials/polyedge/azure-client-secret"),
+            Some("/run/credentials/polyedge/federated-token"),
+        );
+        assert!(
+            select_token_auth(tenant, client, secret_file, federated_token_file, None).is_err()
+        );
+
+        let (tenant, client, secret_file, federated_token_file) = external_auth_options(
             Some("not-a-guid"),
             Some(TEST_CLIENT_ID),
             Some("/run/credentials/polyedge/azure-client-secret"),
+            None,
         );
-        assert!(select_token_auth(tenant, client, file, None).is_err());
+        assert!(
+            select_token_auth(tenant, client, secret_file, federated_token_file, None).is_err()
+        );
 
-        let (tenant, client, file) = external_auth_options(
+        let (tenant, client, secret_file, federated_token_file) = external_auth_options(
             Some(TEST_TENANT_ID),
             Some(TEST_CLIENT_ID),
-            Some("relative-secret"),
+            None,
+            Some("relative-federated-token"),
         );
-        assert!(select_token_auth(tenant, client, file, None).is_err());
+        assert!(
+            select_token_auth(tenant, client, secret_file, federated_token_file, None).is_err()
+        );
     }
 
     #[test]
@@ -2695,7 +2864,7 @@ mod tests {
         let config = ExternalAzureAuth {
             tenant_id: TEST_TENANT_ID.to_owned(),
             client_id: TEST_CLIENT_ID.to_owned(),
-            secret_file: PathBuf::from("/unused"),
+            credential_file: PathBuf::from("/unused"),
         };
         let (url, body) =
             external_token_request(&config, "https://storage.azure.com/", "test@ secret");
@@ -2706,6 +2875,53 @@ mod tests {
         assert!(body.contains("scope=https%3A%2F%2Fstorage%2Eazure%2Ecom%2F%2Edefault"));
         assert!(body.contains("grant_type=client_credentials"));
         assert!(!body.contains("test@ secret"));
+    }
+
+    #[test]
+    fn federated_token_request_uses_exact_v2_assertion_form_without_secret() {
+        let config = ExternalAzureAuth {
+            tenant_id: TEST_TENANT_ID.to_owned(),
+            client_id: TEST_CLIENT_ID.to_owned(),
+            credential_file: PathBuf::from("/unused"),
+        };
+        let assertion = "header.payload.signature";
+        let (url, body) = federated_token_request(&config, "https://storage.azure.com/", assertion);
+        assert_eq!(
+            url,
+            format!("{AZURE_AUTHORITY_HOST}/{TEST_TENANT_ID}/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            body,
+            format!(
+                "client_id={}&scope=https%3A%2F%2Fstorage%2Eazure%2Ecom%2F%2Edefault&grant_type=client_credentials&client_assertion_type={}&client_assertion=header%2Epayload%2Esignature",
+                utf8_percent_encode(TEST_CLIENT_ID, NON_ALPHANUMERIC),
+                utf8_percent_encode(AZURE_CLIENT_ASSERTION_TYPE, NON_ALPHANUMERIC),
+            )
+        );
+        assert!(!body.contains("client_secret"));
+    }
+
+    #[test]
+    fn access_token_cache_requires_same_auth_and_more_than_120_seconds() {
+        let auth = AzureTokenAuth::FederatedTokenFile(ExternalAzureAuth {
+            tenant_id: TEST_TENANT_ID.to_owned(),
+            client_id: TEST_CLIENT_ID.to_owned(),
+            credential_file: PathBuf::from("/run/credentials/token-a"),
+        });
+        let different_path = AzureTokenAuth::FederatedTokenFile(ExternalAzureAuth {
+            tenant_id: TEST_TENANT_ID.to_owned(),
+            client_id: TEST_CLIENT_ID.to_owned(),
+            credential_file: PathBuf::from("/run/credentials/token-b"),
+        });
+        assert!(cache_is_valid(Some(&auth), &auth, Some(1_121), 1_000));
+        assert!(!cache_is_valid(Some(&auth), &auth, Some(1_120), 1_000));
+        assert!(!cache_is_valid(
+            Some(&auth),
+            &different_path,
+            Some(1_121),
+            1_000
+        ));
+        assert!(!cache_is_valid(None, &auth, Some(1_121), 1_000));
     }
 
     #[test]
@@ -2747,7 +2963,10 @@ mod tests {
             .unwrap();
         file.write_all(b"test-only-value\n").unwrap();
         drop(file);
-        assert_eq!(read_client_secret(&secure).unwrap(), "test-only-value");
+        assert_eq!(
+            read_credential_file(&secure, "AZURE_CLIENT_SECRET_FILE").unwrap(),
+            "test-only-value"
+        );
 
         let empty = dir.join("empty");
         OpenOptions::new()
@@ -2756,7 +2975,7 @@ mod tests {
             .mode(0o600)
             .open(&empty)
             .unwrap();
-        assert!(read_client_secret(&empty).is_err());
+        assert!(read_credential_file(&empty, "AZURE_CLIENT_SECRET_FILE").is_err());
 
         let large = dir.join("large");
         let mut file = OpenOptions::new()
@@ -2768,16 +2987,116 @@ mod tests {
         file.write_all(&vec![b'x'; AZURE_CLIENT_SECRET_MAX_BYTES as usize + 1])
             .unwrap();
         drop(file);
-        assert!(read_client_secret(&large).is_err());
+        assert!(read_credential_file(&large, "AZURE_CLIENT_SECRET_FILE").is_err());
 
         let open = dir.join("open");
         fs::write(&open, b"test-only-value").unwrap();
         fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_client_secret(&open).is_err());
+        assert!(read_credential_file(&open, "AZURE_CLIENT_SECRET_FILE").is_err());
 
         let linked = dir.join("linked");
         symlink(&secure, &linked).unwrap();
-        assert!(read_client_secret(&linked).is_err());
+        assert!(read_credential_file(&linked, "AZURE_CLIENT_SECRET_FILE").is_err());
+
+        let nested = dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        assert!(read_credential_file(
+            &nested.join("..").join("secure"),
+            "AZURE_CLIENT_SECRET_FILE"
+        )
+        .is_err());
+        assert!(
+            read_credential_file(&dir.join(".").join("secure"), "AZURE_CLIENT_SECRET_FILE")
+                .is_err()
+        );
+
+        let linked_parent = dir.join("linked-parent");
+        symlink(&dir, &linked_parent).unwrap();
+        assert!(
+            read_credential_file(&linked_parent.join("secure"), "AZURE_CLIENT_SECRET_FILE")
+                .is_err()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn federated_token_file_rejects_invalid_files_and_rereads_atomic_replacement() {
+        use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-federated-auth-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        let write_secure = |path: &Path, value: &[u8]| {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(value).unwrap();
+        };
+        write_secure(&token, b"b2xk.cGF5bG9hZA.c2lnbmF0dXJl\n");
+        assert_eq!(
+            read_federated_token_file(&token).unwrap(),
+            "b2xk.cGF5bG9hZA.c2lnbmF0dXJl"
+        );
+
+        let replacement = dir.join("token.next");
+        write_secure(&replacement, b"bmV3.cGF5bG9hZA.c2lnbmF0dXJl\n");
+        fs::rename(&replacement, &token).unwrap();
+        assert_eq!(
+            read_federated_token_file(&token).unwrap(),
+            "bmV3.cGF5bG9hZA.c2lnbmF0dXJl"
+        );
+
+        let empty = dir.join("empty");
+        write_secure(&empty, b"");
+        assert!(read_credential_file(&empty, "AZURE_FEDERATED_TOKEN_FILE").is_err());
+
+        for (name, malformed) in [
+            ("two-segments", b"aGVhZGVy.cGF5bG9hZA".as_slice()),
+            ("empty-segment", b"aGVhZGVy..c2lnbmF0dXJl".as_slice()),
+            ("padding", b"aGVhZGVy=.cGF5bG9hZA.c2lnbmF0dXJl".as_slice()),
+            (
+                "non-base64url",
+                b"aGVhZGVy+.cGF5bG9hZA.c2lnbmF0dXJl".as_slice(),
+            ),
+        ] {
+            let path = dir.join(name);
+            write_secure(&path, malformed);
+            let error = read_federated_token_file(&path).unwrap_err().to_string();
+            assert!(!error.contains(std::str::from_utf8(malformed).unwrap()));
+        }
+
+        let control = dir.join("control");
+        write_secure(&control, b"bad\nassertion");
+        let error = read_credential_file(&control, "AZURE_FEDERATED_TOKEN_FILE")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("bad\nassertion"));
+
+        let open = dir.join("open");
+        fs::write(&open, b"assertion").unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_credential_file(&open, "AZURE_FEDERATED_TOKEN_FILE").is_err());
+
+        let linked = dir.join("linked");
+        symlink(&token, &linked).unwrap();
+        assert!(read_credential_file(&linked, "AZURE_FEDERATED_TOKEN_FILE").is_err());
+
+        let nested = dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        assert!(read_federated_token_file(&nested.join("..").join("token")).is_err());
+        assert!(read_federated_token_file(&dir.join(".").join("token")).is_err());
+
+        let linked_parent = dir.join("linked-parent");
+        symlink(&dir, &linked_parent).unwrap();
+        assert!(read_federated_token_file(&linked_parent.join("token")).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

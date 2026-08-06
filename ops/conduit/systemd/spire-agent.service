@@ -1,0 +1,34 @@
+[Unit]
+Description=SPIRE Agent for PolyEdge workload identities
+After=spire-server.service
+Requires=spire-server.service
+
+[Service]
+User=root
+Group=spire-workload
+StateDirectory=spire-agent
+StateDirectoryMode=0700
+RuntimeDirectory=spire
+RuntimeDirectoryMode=0750
+UMask=0007
+ExecStart=/opt/spire/bin/spire-agent run -config /etc/spire/agent.conf
+ExecStartPost=/usr/bin/chmod 0660 /run/spire/agent.sock
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -19,3 +19,6 @@ grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z"' "$runner" >/dev/nu
 test "$(grep -c 'cpus=1.5 memory=' "$runner")" -eq 3
 grep -F '*) work=$ring/jobs/research credential=research ;;' "$runner" >/dev/null
 grep -F 'shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;' "$runner" >/dev/null
+grep -F 'credential_dir=/run/polyedge-federated-$credential' "$runner" >/dev/null
+grep -F 'credential_dir=/etc/polyedge/credentials/$credential' "$runner" >/dev/null
+grep -F -- '-v "$credential_dir:/run/credentials:ro,Z"' "$runner" >/dev/null
