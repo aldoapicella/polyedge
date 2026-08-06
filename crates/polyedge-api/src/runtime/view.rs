@@ -13,12 +13,14 @@ impl RuntimeController {
     pub async fn health(&self) -> Value {
         let data = self.inner.data.read().await;
         let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
+        let runtime_active = self.inner.started.load(Ordering::SeqCst);
+        let runtime_tasks_running = !runtime_active || self.runtime_tasks_running();
         json!({
-            "ok": true,
+            "ok": runtime_tasks_running,
             "backend_impl": "rust",
             "runtime_role": self.inner.settings.deploy.runtime_role.as_str(),
             "shadow_only": shadow_only,
-            "runtime_active": self.inner.started.load(Ordering::SeqCst),
+            "runtime_active": runtime_active,
             "execution_mode": execution_mode(&self.inner.settings),
             "kill_switch": data.kill_switch,
             "reports": report_status(shadow_only)
@@ -35,6 +37,8 @@ impl RuntimeController {
         let now = Utc::now();
         let recorder_status = self.recorder_status();
         let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
+        let runtime_active = self.inner.started.load(Ordering::SeqCst);
+        let runtime_tasks_running = !runtime_active || self.runtime_tasks_running();
         json!({
             "app": self.inner.settings.deploy.app_name,
             "backend_impl": "rust",
@@ -58,7 +62,7 @@ impl RuntimeController {
             "kill_switch": data.kill_switch,
             "task_health": {
                 "api": "ok",
-                "runtime_loop": if self.inner.started.load(Ordering::SeqCst) { "running" } else { "not_started" },
+                "runtime_loop": if !runtime_active { "not_started" } else if runtime_tasks_running { "running" } else { "failed" },
                 "feeds": feed_summary(&data)
             },
             "queue_depths": {

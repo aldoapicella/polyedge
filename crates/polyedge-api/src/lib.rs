@@ -176,8 +176,14 @@ async fn require_auth(
         .into_response()
 }
 
-async fn health(State(state): State<ApiState>) -> Json<Value> {
-    Json(state.runtime.health().await)
+async fn health(State(state): State<ApiState>) -> impl IntoResponse {
+    let payload = state.runtime.health().await;
+    let status = if payload["ok"] == true {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(payload))
 }
 
 async fn status(State(state): State<ApiState>) -> Json<Value> {

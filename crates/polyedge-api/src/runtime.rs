@@ -521,6 +521,18 @@ impl RuntimeController {
         info!("Rust PolyEdge runtime started in paper mode");
     }
 
+    fn runtime_tasks_running(&self) -> bool {
+        let Ok(feed_task) = self.inner.feed_task.lock() else {
+            return false;
+        };
+        let Ok(background_tasks) = self.inner.background_tasks.lock() else {
+            return false;
+        };
+        feed_task.as_ref().is_some_and(|task| !task.is_finished())
+            && !background_tasks.is_empty()
+            && background_tasks.iter().all(|task| !task.is_finished())
+    }
+
     pub async fn shutdown(&self) -> Result<(), String> {
         if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -3714,6 +3726,27 @@ mod tests {
     use std::fs;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    #[tokio::test]
+    async fn finished_runtime_task_marks_runtime_unhealthy() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        controller.inner.started.store(true, Ordering::SeqCst);
+        *controller.inner.feed_task.lock().unwrap() = Some(tokio::spawn(async {}));
+        controller
+            .inner
+            .background_tasks
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(std::future::pending()));
+        tokio::task::yield_now().await;
+
+        assert!(!controller.runtime_tasks_running());
+        assert_eq!(controller.health().await["ok"], false);
+        assert_eq!(
+            controller.status().await["task_health"]["runtime_loop"],
+            "failed"
+        );
+    }
 
     #[derive(Default)]
     struct BufferedRecorderTestState {
