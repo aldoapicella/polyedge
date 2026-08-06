@@ -269,10 +269,10 @@ test("funded-service redemption is bound to an approved static-egress protected-
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
     VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
-    VENUE_PROBE_EXECUTION_ORIGIN: "oci_bogota_nat_static_egress",
+    VENUE_PROBE_EXECUTION_ORIGIN: "oci_bogota_static_egress",
     VENUE_PROBE_EXPECTED_COUNTRY: "CO",
     VENUE_REDEMPTION_MAX_CONDITIONS: "1"
-  }).executionOrigin, "oci_bogota_nat_static_egress");
+  }).executionOrigin, "oci_bogota_static_egress");
   assert.throws(() => loadRedemptionConfig({
     ...safeEnv,
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",

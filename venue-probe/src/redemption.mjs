@@ -152,7 +152,7 @@ export function validateRedemptionConfig(config) {
     }
     const approvedCountry = {
       azure_chile_central_static_egress: "CL",
-      oci_bogota_nat_static_egress: "CO"
+      oci_bogota_static_egress: "CO"
     }[config.executionOrigin];
     if (!approvedCountry || (config.expectedCountry && config.expectedCountry !== approvedCountry)) {
       errors.push("funded-service redemption must use an approved static egress origin");

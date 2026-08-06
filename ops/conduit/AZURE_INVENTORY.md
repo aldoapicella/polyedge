@@ -115,13 +115,14 @@ current projected $279.39/month before the later ACR, compute-monitoring, and
 storage optimizations.
 
 The cheapest full-processing migration needs no paid relay. On 2026-08-06 the
-Polymarket geoblock endpoint observed `conduit-dev` through its existing OCI NAT
+Polymarket geoblock endpoint observed `conduit-dev` through its OCI public IP
 as `CO`, IP `149.130.178.214`, with `blocked=false`; Colombia is absent from the
 current official restricted-country list. OCI identifies the host as
-`sa-bogota-1` in a private subnet. Bind the signer to the exact NAT IP, country,
-and `oci_bogota_nat_static_egress`, then repeat origin and funded dry-run parity
-before moving credentials. The NAT address is stable only for the lifetime of
-that gateway unless OCI is explicitly configured with a reserved public IP.
+`sa-bogota-1`; its primary VNIC currently owns that same public IP. Bind the
+signer to the exact IP, country, and `oci_bogota_static_egress`, then repeat
+origin and funded dry-run parity before moving credentials. Confirm that the
+address is reserved in OCI before accepting a rebuild-safe cutover; an ephemeral
+address remains valid only while assigned and any change fails the signer closed.
 The previously budgeted $9-12/month Chile relay is now only a fallback if the
 OCI origin ceases to be eligible or the existing NAT IP cannot be retained.
 
