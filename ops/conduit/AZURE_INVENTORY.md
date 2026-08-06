@@ -59,6 +59,16 @@ Research jobs reference `api-bearer-token`. Venue/funded jobs reference the
 four Polymarket API/wallet secrets; the persistent funded app additionally
 references the relayer key. All nineteen jobs use user-assigned identities.
 
+Azure Arc machine `conduit-dev` is connected in East US with system identity
+`19d0cc08-c6be-4b5b-85a8-05211f19428a`. Arc extensions, guest configuration,
+and incoming connections are disabled locally. Its custom no-delete blob role
+is scoped only to `bot-events`; the funded evidence container and Service Bus
+queue are excluded. A host-side token challenge succeeded on 2026-08-06. The
+Rust uploader then created an immutable Cool-tier segment and manifest, re-read
+the manifest, and wrote its verified local receipt from both the host binary and
+the rootful ARM64 container. The published digest must repeat that proof before
+the 72-hour clock starts.
+
 ## OCI schedule and coverage
 
 | OCI unit | UTC schedule | Azure counterpart |

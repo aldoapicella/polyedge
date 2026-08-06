@@ -7,10 +7,11 @@ secrets, or automatic deployment.
 
 ## Hard gates
 
-Do **not** start this stack or enable any timer until an approved OCI-to-Azure
-authentication design exists. The active recorder and `with-azure-lease`
-commands use Azure managed identity; OCI does not provide the Container Apps
-identity endpoint. A read SAS is not sufficient for the writers or lease.
+Do **not** start this stack or enable any timer until its exact Azure identity
+and data scopes are assigned. The ring uploader supports the system-assigned
+identity of an Azure Arc-enabled host, with no client secret. API, research,
+and funded identities remain separate gates; a read SAS is not sufficient for
+the writers or leases.
 
 The API Quadlet persists its local recorder under `/srv/polyedge-ring`. Verify
 that path is the 150-GB block-volume mount (not a directory on `/`) before every
@@ -65,7 +66,22 @@ firewall. Never expose port 3000 or 8081.
 
 `ring.env.example` starts with `POLYEDGE_RING_SEAL_ONLY=1`, so it can hash local
 segments before Azure identity approval. Set it to `0` only after filling the
-digest, tenant, and blob-only client ID and installing the secret file.
+digest and either verifying the Arc identity's no-delete blob role or installing
+the client-secret-file fallback.
+
+For Arc, connect the host as `conduit-dev`, disable remote management features,
+and assign `PolyEdge OCI Blob Writer` only at the `bot-events` container scope:
+
+```sh
+sudo azcmagent config set incomingconnections.enabled false
+sudo azcmagent config set guestconfiguration.enabled false
+sudo azcmagent config set extensions.enabled false
+sudo azcmagent show
+```
+
+The uploader alone uses host networking to reach Arc's loopback identity
+endpoint and mounts only `/var/opt/azcmagent/tokens` read-only. Other containers
+remain on the private `polyedge` network.
 
 External Azure client secrets, when approved, live only at
 `/etc/polyedge/credentials/<service>/azure-client-secret` with mode `0600`.
@@ -73,11 +89,14 @@ The containers receive those files read-only at `/run/credentials`; secret
 values never belong in env files, Quadlets, Git, commands, or logs. Keep API
 table access separate from the blob-only research/ring identity.
 
-## Entra administrator handoff
+## Separate Entra identities
 
-The operator does not need a permanent directory role. An Entra administrator
-can create the three applications and service principals, then add the operator
-as an application owner. This step creates no credential:
+Arc unblocks the no-secret ring upload path. The API, research jobs, and funded
+signer still use separate identities so the funded queue and wallet boundary is
+never granted to the host-wide Arc identity. The operator does not need a
+permanent directory role. An Entra administrator can create the three
+applications and service principals, then add the operator as an application
+owner. This step creates no credential:
 
 ```sh
 operator_object_id=REPLACE_OPERATOR_OBJECT_ID

@@ -30,6 +30,8 @@ const AZURE_TABLE_READ_TIMEOUT: Duration = Duration::from_secs(8);
 const AZURE_TABLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const AZURE_AUTHORITY_HOST: &str = "https://login.microsoftonline.com";
 const AZURE_CLIENT_SECRET_MAX_BYTES: u64 = 16 * 1024;
+const AZURE_ARC_TOKEN_ROOT: &str = "/var/opt/azcmagent/tokens";
+const AZURE_ARC_CHALLENGE_MAX_BYTES: u64 = 4 * 1024;
 type AzureTableContinuation = Option<(String, String)>;
 type AzureTablePage = (Vec<Value>, AzureTableContinuation);
 type HmacSha256 = Hmac<Sha256>;
@@ -1167,20 +1169,37 @@ fn fetch_managed_identity_token(
     resource: &str,
 ) -> Result<Value, AzureBlobError> {
     let resource = utf8_percent_encode(resource, NON_ALPHANUMERIC).to_string();
-    if let (Ok(endpoint), Ok(header)) = (env::var("IDENTITY_ENDPOINT"), env::var("IDENTITY_HEADER"))
-    {
-        let mut url = format!("{endpoint}?api-version=2019-08-01&resource={resource}");
+    if let Ok(endpoint) = env::var("IDENTITY_ENDPOINT") {
+        let identity_header = env::var("IDENTITY_HEADER").ok();
+        let api_version = if identity_header.is_some() {
+            "2019-08-01"
+        } else {
+            "2019-11-01"
+        };
+        let mut url = format!("{endpoint}?api-version={api_version}&resource={resource}");
         if let Some(client_id) = client_id {
             url.push_str("&client_id=");
             url.push_str(&utf8_percent_encode(client_id, NON_ALPHANUMERIC).to_string());
         }
-        let response = agent
-            .get(&url)
-            .set("X-IDENTITY-HEADER", &header)
-            .set("Metadata", "true")
-            .call()
-            .map_err(identity_error)?;
-        return parse_json_response(response);
+        let mut request = agent.get(&url).set("Metadata", "true");
+        if let Some(header) = identity_header {
+            request = request.set("X-IDENTITY-HEADER", &header);
+            return parse_json_response(request.call().map_err(identity_error)?);
+        }
+        return match request.call() {
+            Ok(response) => parse_json_response(response),
+            Err(ureq::Error::Status(401, response)) => {
+                let challenge = read_arc_identity_challenge(&response)?;
+                let response = agent
+                    .get(&url)
+                    .set("Metadata", "true")
+                    .set("Authorization", &format!("Basic {challenge}"))
+                    .call()
+                    .map_err(identity_error)?;
+                parse_json_response(response)
+            }
+            Err(error) => Err(identity_error(error)),
+        };
     }
 
     let mut url = format!(
@@ -1196,6 +1215,66 @@ fn fetch_managed_identity_token(
         .call()
         .map_err(identity_error)?;
     parse_json_response(response)
+}
+
+fn read_arc_identity_challenge(response: &ureq::Response) -> Result<String, AzureBlobError> {
+    let header = response.header("WWW-Authenticate").ok_or_else(|| {
+        AzureBlobError::ManagedIdentity("Azure Arc challenge header is missing".to_owned())
+    })?;
+    let path = arc_identity_challenge_path(header)?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        AzureBlobError::ManagedIdentity(format!("Azure Arc challenge cannot be read: {error}"))
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > AZURE_ARC_CHALLENGE_MAX_BYTES
+    {
+        return Err(AzureBlobError::ManagedIdentity(
+            "Azure Arc challenge must be a small regular file".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| {
+            file.take(AZURE_ARC_CHALLENGE_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| {
+            AzureBlobError::ManagedIdentity(format!("Azure Arc challenge cannot be read: {error}"))
+        })?;
+    if bytes.len() as u64 > AZURE_ARC_CHALLENGE_MAX_BYTES {
+        return Err(AzureBlobError::ManagedIdentity(
+            "Azure Arc challenge is too large".to_owned(),
+        ));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| {
+        AzureBlobError::ManagedIdentity("Azure Arc challenge is not UTF-8".to_owned())
+    })?;
+    let value = value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err(AzureBlobError::ManagedIdentity(
+            "Azure Arc challenge is empty or invalid".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn arc_identity_challenge_path(header: &str) -> Result<PathBuf, AzureBlobError> {
+    let value = header
+        .strip_prefix("Basic realm=")
+        .map(str::trim)
+        .map(|value| value.trim_matches('"'))
+        .ok_or_else(|| {
+            AzureBlobError::ManagedIdentity("Azure Arc challenge header is invalid".to_owned())
+        })?;
+    let path = PathBuf::from(value);
+    if path.parent() != Some(Path::new(AZURE_ARC_TOKEN_ROOT)) || path.file_name().is_none() {
+        return Err(AzureBlobError::ManagedIdentity(
+            "Azure Arc challenge path is outside the agent token directory".to_owned(),
+        ));
+    }
+    Ok(path)
 }
 
 fn identity_error(error: ureq::Error) -> AzureBlobError {
@@ -2627,6 +2706,25 @@ mod tests {
         assert!(body.contains("scope=https%3A%2F%2Fstorage%2Eazure%2Ecom%2F%2Edefault"));
         assert!(body.contains("grant_type=client_credentials"));
         assert!(!body.contains("test@ secret"));
+    }
+
+    #[test]
+    fn arc_challenge_header_is_restricted_to_the_agent_token_directory() {
+        assert_eq!(
+            arc_identity_challenge_path("Basic realm=/var/opt/azcmagent/tokens/test-only.key")
+                .unwrap(),
+            PathBuf::from("/var/opt/azcmagent/tokens/test-only.key")
+        );
+        assert!(arc_identity_challenge_path(
+            "Basic realm=\"/var/opt/azcmagent/tokens/quoted.key\""
+        )
+        .is_ok());
+        assert!(arc_identity_challenge_path("Basic realm=/etc/shadow").is_err());
+        assert!(arc_identity_challenge_path(
+            "Basic realm=/var/opt/azcmagent/tokens/nested/challenge.key"
+        )
+        .is_err());
+        assert!(arc_identity_challenge_path("Bearer token").is_err());
     }
 
     #[cfg(unix)]
