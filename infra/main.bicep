@@ -401,6 +401,28 @@ resource storageLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@
             }
           }
         }
+        {
+          enabled: true
+          name: 'tier-future-oci-raw-to-cool-after-7-days'
+          type: 'Lifecycle'
+          definition: {
+            actions: {
+              baseBlob: {
+                tierToCool: {
+                  daysAfterModificationGreaterThan: 7
+                }
+              }
+            }
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                '${storageContainerName}/events-oci-hot7-v1/'
+              ]
+            }
+          }
+        }
       ]
     }
   }

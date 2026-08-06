@@ -1658,8 +1658,8 @@ impl AzureBlobClient {
         self.put_block_blob_if_absent(&url, bytes, content_type, None)
     }
 
-    /// Creates an immutable block blob directly in Azure's Cool tier.
-    pub fn upload_cool_block_blob_bytes_if_absent(
+    /// Creates an immutable block blob directly in Azure's Hot tier.
+    pub fn upload_hot_block_blob_bytes_if_absent(
         &mut self,
         name: &str,
         bytes: &[u8],
@@ -1671,7 +1671,7 @@ impl AzureBlobClient {
             self.container,
             encode_blob_path(name)
         );
-        self.put_block_blob_if_absent(&url, bytes, content_type, Some("Cool"))
+        self.put_block_blob_if_absent(&url, bytes, content_type, Some("Hot"))
     }
 
     /// Replaces a block blob only while it still has `expected_etag`.

@@ -11,7 +11,7 @@ root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 segments=$root/segments
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
-prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-dual}
+prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}
 printf '%s' "$segment_seconds" | grep -Eq '^[0-9]+$'
 [ "$segment_seconds" -ge 300 ] && [ "$segment_seconds" -le 900 ] || {
   echo 'RECORDER_SEGMENT_SECONDS must be from 300 through 900' >&2

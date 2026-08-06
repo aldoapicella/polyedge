@@ -102,7 +102,7 @@ enum Command {
         root: PathBuf,
         #[arg(
             long,
-            default_value = "events-oci-dual",
+            default_value = "events-oci-hot7-v1",
             env = "POLYEDGE_RING_BLOB_PREFIX"
         )]
         blob_prefix: String,
@@ -1876,7 +1876,7 @@ fn run_ring_upload(
                 bail!("sealed ring segment changed: {}", segment_path.display());
             }
             match client
-                .upload_cool_block_blob_bytes_if_absent(
+                .upload_hot_block_blob_bytes_if_absent(
                     &blob_name,
                     &segment_bytes,
                     "application/x-ndjson",
@@ -1944,7 +1944,7 @@ fn run_ring_upload(
         "newly_verified_segments": verified,
         "deleted_local_segments": deleted,
         "retention_hours": retention_hours,
-        "segment_access_tier": "Cool",
+        "segment_access_tier": "Hot",
     }))
 }
 

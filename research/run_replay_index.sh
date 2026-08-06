@@ -3,7 +3,8 @@ set -eu
 
 DATE=${POLYEDGE_RESEARCH_DATE:-$(date -u -d "yesterday" +%Y-%m-%d)}
 DAY=$(date -u -d "$DATE" +%Y/%m/%d)
-INPUT="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/?prefetch_blobs=${POLYEDGE_RESEARCH_PREFETCH_BLOBS:-16}"
+. "$(dirname "$0")/resolve_raw_input.sh"
+INPUT=$(polyedge_raw_input "$DAY")
 ROOT="data/research/replay-index/$DATE"
 NORMALIZED="$ROOT/normalized"
 mkdir -p "$ROOT"

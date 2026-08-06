@@ -66,7 +66,7 @@ jobs:
           set -euo pipefail
           [[ "$CONDUIT_SSH_TARGET" =~ ^[a-z_][a-z0-9_-]*@[a-zA-Z0-9.-]+$ ]]
           trap 'rm -f "$HOME/.ssh/id_ed25519"' EXIT
-          ssh \
+          receipt=$(ssh \
             -i "$HOME/.ssh/id_ed25519" \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
@@ -74,4 +74,8 @@ jobs:
             "$CONDUIT_SSH_TARGET" \
             sudo -n /usr/local/sbin/polyedge-quadlet-deploy \
               "$QUADLET_UNIT" \
-              "$IMAGE_DIGEST"
+              "$IMAGE_DIGEST")
+          printf '%s\n' "$receipt"
+          expected_digest="sha256:${IMAGE_DIGEST##*@sha256:}"
+          printf '%s\n' "$receipt" | grep -Ex \
+            "deployed $QUADLET_UNIT with $expected_digest; rollback copy: /etc/polyedge/rollback/[0-9]{8}T[0-9]{6}Z-$QUADLET_UNIT\.container"

@@ -96,12 +96,31 @@ daily-cycle gate but does not affect the active ring uploader's narrow Arc role.
 | `systemctl start polyedge-job@prospective` | manual | `polyedge-prospective-job` |
 | `systemctl start polyedge-job@chart-backfill` | manual | `polyedge-chart-backfill-job` |
 | `systemctl start polyedge-job@backfill` | manual | `polyedge-backfill-job` |
+| `systemctl start polyedge-job@origin-check` | manual, credential-free | `polyedge-origin-check-cl-job` |
 
 The single `/run/polyedge/research.lock` serializes every research writer.
-Recurring daily/replay work is capped at 2 CPU / 4 GiB and qset at 3 CPU /
-8 GiB, leaving capacity for the 0.5-CPU API and frontend. Manual Azure jobs not
-listed in this table still require an explicit local command mapping before
-their Azure definitions can be deleted.
+Daily, replay, and qset are each capped at 1.5 CPU. API/frontend, funded signer,
+ring upload, and the optional origin check consume at most the remaining 2.5
+CPU, so container quotas cannot exceed the 4-OCPU host. `origin-check` uses
+only the immutable venue image, no credentials or mounts, and exits non-zero
+unless Polymarket reports exactly `country=CO` and the configured exact OCI
+IPv4. Set that address from a trusted out-of-band host record in
+`/etc/polyedge/jobs/origin-check.env`; do not obtain it inside the job.
+
+### Remaining Azure job disposition
+
+The live inventory has 19 jobs (not the earlier 20-job planning estimate). The
+following definitions are **not** evidence that their capability has migrated:
+
+| Azure job(s) | Disposition before Azure deletion | Evidence |
+| --- | --- | --- |
+| `polyedge-venue-probe-neu-job`, `polyedge-redeem-neu-job` | Remain until the dedicated funded identity, wallet/API secrets, egress, and evidence-trust review exist locally. | Both jobs are disabled/dry-run/trust-false in the deployed templates. |
+| `polyedge-strategy-canary-neu-job`, `polyedge-funded-ladder-neu-job`, `polyedge-promotion-neu-job` | Remain gated; they need an explicit human grant/manifest or promotion bindings, not a generic local command. | All controller/promotion enable values and required bindings are false or blank. |
+| `polyedge-shadow-daily-neu-job`, `polyedge-shadow-val-neu-job` | Remain until their independent shadow/validation identities and existing correction are resolved. | The legacy shadow correction is `in_progress`; the validation job has its own identity and output container. |
+| `polyedge-shadow-qset-neu-job` | Existing `shadow-qset` mapping remains disabled pending the frozen campaign's controlled seal/approval. | Qset evidence and credentials are intentionally isolated. |
+| `polyedge-venue-model-job` | Remain until its model identity and explicit checkpoint/hash approval are supplied. | `QUEUE_MODEL_TRAINING_ENABLED=false`; checkpoint and hash are blank. |
+| `polyedge-funded-warmup-cl` | Remain until the producer Service Bus identity and Chile-egress replacement are proved. | It is a no-sign rehearsal but last succeeded on 2026-08-05. |
+| `polyedge-funded-direct-cl-job` | Explicitly retired as replaced by the continuous funded service; delete only with the Chile service after the funded cutover gates. | Template tag `retiredReason=replaced-by-continuous-service`. |
 
 The 2026-08-06 execution-history check found zero executions for backfill,
 chart-backfill, promotion, strategy-canary, and the frozen qset manual job.
@@ -230,9 +249,13 @@ Tables:
 `ShadowQsetEventIndex`, and `ShadowQsetMarketCatalog`.
 
 Blob and container soft delete remain enabled for 14 days. Change Feed is
-disabled. The active lifecycle rule deletes only block blobs under
-`bot-events/data/research/normalized/v1/` seven days after modification. It
-does not tier or move the existing raw corpus.
+disabled. One lifecycle rule deletes only block blobs under
+`bot-events/data/research/normalized/v1/` seven days after modification. A
+second rule tiers only the new `bot-events/events-oci-hot7-v1/` block-blob
+prefix to Cool after seven days. That future-only prefix leaves the existing
+raw corpus and all evidence/control prefixes untouched. The exact two-rule
+policy was deployed and read back from Azure at `2026-08-06T04:33:15Z`; the new
+prefix was still producer-inactive at deployment time.
 
 Key Vault `kvpolyedge6urdjr5nmwx7w` retains six named secrets: dashboard auth,
 four Polymarket API/wallet values, and the relayer API key.

@@ -87,6 +87,35 @@ jobs:
             args+=(--build-arg "$BUILD_ARGS")
           fi
           docker buildx build "${args[@]}" --output "type=oci,dest=image.oci.tar" .
+          python3 - image.oci.tar <<'PY'
+          import json
+          import tarfile
+          import sys
+
+          expected = {("linux", "amd64"), ("linux", "arm64")}
+          platforms = set()
+          with tarfile.open(sys.argv[1]) as archive:
+              index = json.load(archive.extractfile("index.json"))
+              for descriptor in index["manifests"]:
+                  if "image.manifest" not in descriptor.get("mediaType", ""):
+                      continue
+                  manifest = json.load(archive.extractfile(
+                      f"blobs/sha256/{descriptor['digest'].split(':', 1)[1]}"
+                  ))
+                  config = manifest.get("config", {})
+                  if "digest" not in config:
+                      continue
+                  image_config = json.load(archive.extractfile(
+                      f"blobs/sha256/{config['digest'].split(':', 1)[1]}"
+                  ))
+                  platform = (image_config.get("os"), image_config.get("architecture"))
+                  if platform in expected:
+                      platforms.add(platform)
+                  elif platform not in {(None, None), ("unknown", "unknown")}:
+                      raise SystemExit(f"unexpected OCI platform: {platform}")
+          if platforms != expected:
+              raise SystemExit(f"missing OCI platforms: expected {expected}, got {platforms}")
+          PY
 
   publish:
     if: github.event_name != 'pull_request'

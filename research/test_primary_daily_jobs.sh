@@ -45,6 +45,7 @@ EOF
 chmod +x "$TMP/bin/polyedge-rs"
 
 run_daily() {
+  local_root=${1:-}
   rm -rf "$TMP/work"
   mkdir -p "$TMP/work"
   : >"$TMP/args"
@@ -53,6 +54,7 @@ run_daily() {
     PATH="$TMP/bin:$PATH" \
       POLYEDGE_TEST_ARGS="$TMP/args" \
       POLYEDGE_RESEARCH_DATE=2026-07-30 \
+      POLYEDGE_LOCAL_RAW_ROOT="$local_root" \
       AZURE_STORAGE_ACCOUNT_NAME=st \
       AZURE_STORAGE_CONTAINER_NAME=events \
       sh "$ROOT/research/run_primary_daily.sh"
@@ -65,13 +67,31 @@ test "$(grep -c '^research publish-normalized-snapshot ' "$TMP/args")" -eq 1
 test "$(grep -c '^research build-replay-index ' "$TMP/args" || true)" -eq 0
 grep -F '"stage":"normalize"' "$TMP/daily-stdout" >/dev/null
 grep -F '"snapshot":"published"' "$TMP/daily-stdout" >/dev/null
+grep -F -- '--input azure://st/events/events/2026/07/30/?prefetch_blobs=16' "$TMP/args" >/dev/null
 if grep -F 'large_verbose_payload' "$TMP/daily-stdout" >/dev/null; then
   echo "successful command output leaked into daily logs" >&2
   exit 1
 fi
 
+run_daily /input/events
+grep -F -- '--input /input/events/2026/07/30' "$TMP/args" >/dev/null
+
+if (
+  cd "$TMP/work"
+  PATH="$TMP/bin:$PATH" \
+    POLYEDGE_TEST_ARGS="$TMP/args" \
+    POLYEDGE_RESEARCH_DATE=2026-07-30 \
+    POLYEDGE_LOCAL_RAW_ROOT=relative \
+    sh "$ROOT/research/run_primary_daily.sh"
+) >"$TMP/invalid-stdout" 2>"$TMP/invalid-stderr"; then
+  echo 'relative local raw root unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'POLYEDGE_LOCAL_RAW_ROOT must be absolute' "$TMP/invalid-stderr" >/dev/null
+
 run_replay() {
   restore_fail=$1
+  local_root=${2:-}
   rm -rf "$TMP/work"
   mkdir -p "$TMP/work"
   : >"$TMP/args"
@@ -80,6 +100,7 @@ run_replay() {
     PATH="$TMP/bin:$PATH" \
       POLYEDGE_TEST_ARGS="$TMP/args" \
       POLYEDGE_RESEARCH_DATE=2026-07-30 \
+      POLYEDGE_LOCAL_RAW_ROOT="$local_root" \
       AZURE_STORAGE_ACCOUNT_NAME=st \
       AZURE_STORAGE_CONTAINER_NAME=events \
       MOCK_RESTORE_FAIL="$restore_fail" \
@@ -97,7 +118,11 @@ test "$(grep -c '^research restore-normalized-snapshot ' "$TMP/args")" -eq 1
 test "$(grep -c '^research normalize ' "$TMP/args")" -eq 1
 test "$(grep -c '^research publish-normalized-snapshot ' "$TMP/args")" -eq 1
 grep -F '"normalized_source":"raw_fallback"' "$TMP/replay-stdout" >/dev/null
+grep -F -- '--input azure://st/events/events/2026/07/30/?prefetch_blobs=16' "$TMP/args" >/dev/null
 if grep -F 'large_verbose_payload' "$TMP/replay-stdout" "$TMP/replay-stderr" >/dev/null; then
   echo "handled snapshot fallback leaked verbose output into replay logs" >&2
   exit 1
 fi
+
+run_replay 1 /input/events
+grep -F -- '--input /input/events/2026/07/30' "$TMP/args" >/dev/null
