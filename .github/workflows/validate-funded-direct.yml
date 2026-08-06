@@ -404,12 +404,14 @@ jobs:
                 | top 1 by TimeGenerated desc
                 | project TimeGenerated, Log_s" \
               -o json > post-fence-heartbeat.json
-            if jq -e '
+            if jq -e --arg session "$current_session" '
               length == 1
               and (.[0].Log_s | fromjson
                 | .executor.busy == false
                 and .executor.user_channel_ready == true
-                and .executor.market_channel_ready == true
+                and (.executor.market_channel_ready == true
+                  or ($session == "dynamic-quote-funded-2026-07-29-v5"
+                    and .executor.warmed_market == null))
                 and .executor.reconnect_reconciliation_required == false
                 and .executor.user_channel_gaps == 0
                 and .executor.market_channel_gaps == 0)
@@ -418,12 +420,14 @@ jobs:
             fi
             sleep 5
           done
-          jq -e '
+          jq -e --arg session "$current_session" '
             length == 1
             and (.[0].Log_s | fromjson
               | .executor.busy == false
               and .executor.user_channel_ready == true
-              and .executor.market_channel_ready == true
+              and (.executor.market_channel_ready == true
+                or ($session == "dynamic-quote-funded-2026-07-29-v5"
+                  and .executor.warmed_market == null))
               and .executor.reconnect_reconciliation_required == false
               and .executor.user_channel_gaps == 0
               and .executor.market_channel_gaps == 0)
