@@ -12,7 +12,7 @@ Network=polyedge.network
 EnvironmentFile=/etc/polyedge/api.env
 Volume=/srv/polyedge-ring:/srv/polyedge-ring:Z
 Volume=/etc/polyedge/credentials/api:/run/credentials:ro,Z
-PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --health-on-failure=restart
 
 [Service]
 Restart=always

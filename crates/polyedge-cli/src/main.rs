@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
-use polyedge_api::{app, benchmark_snapshot};
+use polyedge_api::{app_with_shutdown, benchmark_snapshot};
 use polyedge_config::{embedded_git_sha, RuntimeRole, RuntimeSettings};
 use polyedge_reporting::research::{
     advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
@@ -1694,9 +1694,33 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
             "bind": bind
         })
     );
-    axum::serve(listener, app(settings))
+    let (app, shutdown) = app_with_shutdown(settings);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Err(error) = shutdown.drain().await {
+                eprintln!("Rust API shutdown did not fully drain: {error}");
+            }
+        })
         .await
         .context("serving Rust API")
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("installing Ctrl-C handler");
 }
 
 fn bench_ingest(events: usize) -> serde_json::Value {

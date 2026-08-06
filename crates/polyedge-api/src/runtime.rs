@@ -74,6 +74,9 @@ struct RuntimeInner {
     intent_publisher: Option<IntentPublisher>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
+    shutting_down: AtomicBool,
+    feed_task: StdMutex<Option<JoinHandle<()>>>,
+    background_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Default)]
@@ -446,6 +449,9 @@ impl RuntimeController {
                 intent_publisher,
                 broadcaster,
                 started: AtomicBool::new(false),
+                shutting_down: AtomicBool::new(false),
+                feed_task: StdMutex::new(None),
+                background_tasks: StdMutex::new(Vec::new()),
             }),
         }
     }
@@ -487,20 +493,82 @@ impl RuntimeController {
                 panic!("refusing runtime startup because provenance was not persisted: {error}")
             });
         let (sender, receiver) = mpsc::channel(10_000);
-        self.spawn_feed_event_loop(receiver);
-        self.spawn_discovery_loop();
-        self.spawn_strategy_loop();
-        self.spawn_runtime_telemetry_loop();
-        self.spawn_runtime_provenance_loop();
-        self.spawn_market_feed_loop(sender.clone());
-        self.spawn_rtds_loop(sender.clone());
-        self.spawn_chainlink_http_loop(sender.clone());
+        let feed_task = self.spawn_feed_event_loop(receiver);
+        let mut background_tasks = vec![
+            self.spawn_discovery_loop(),
+            self.spawn_strategy_loop(),
+            self.spawn_runtime_telemetry_loop(),
+            self.spawn_runtime_provenance_loop(),
+            self.spawn_market_feed_loop(sender.clone()),
+            self.spawn_rtds_loop(sender.clone()),
+            self.spawn_chainlink_http_loop(sender.clone()),
+        ];
         if self.inner.settings.target.enable_direct_binance_book_ticker {
-            self.spawn_binance_loop(sender);
+            background_tasks.push(self.spawn_binance_loop(sender));
         } else {
             info!("Direct Binance bookTicker feed disabled by configuration");
         }
+        *self
+            .inner
+            .feed_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(feed_task);
+        self.inner
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(background_tasks);
         info!("Rust PolyEdge runtime started in paper mode");
+    }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let background_tasks = self
+            .inner
+            .background_tasks
+            .lock()
+            .map_err(|error| format!("runtime background task lock poisoned: {error}"))?
+            .drain(..)
+            .collect::<Vec<_>>();
+        for task in &background_tasks {
+            task.abort();
+        }
+        for task in background_tasks {
+            let _ = task.await;
+        }
+
+        let feed_task = self
+            .inner
+            .feed_task
+            .lock()
+            .map_err(|error| format!("runtime feed task lock poisoned: {error}"))?
+            .take();
+        if let Some(mut feed_task) = feed_task {
+            match tokio::time::timeout(Duration::from_secs(10), &mut feed_task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(format!("runtime feed drain failed: {error}")),
+                Err(_) => {
+                    feed_task.abort();
+                    let _ = feed_task.await;
+                    return Err("runtime feed drain timed out".to_owned());
+                }
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.inner.recorder_metrics.queued.load(Ordering::Relaxed) != 0 {
+            if Instant::now() >= deadline {
+                return Err("runtime recorder drain timed out".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.inner
+            .recorder
+            .lock()
+            .map_err(|error| format!("runtime recorder lock poisoned: {error}"))?
+            .flush()
     }
 
     fn persist_startup_provenance(&self, payload: Value) -> Result<(), String> {
@@ -4302,6 +4370,31 @@ mod tests {
         assert_eq!(metrics.snapshot()["persisted_total"], 100);
         assert_eq!(metrics.snapshot()["failed_total"], 0);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_and_flushes_the_recorder_queue() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+
+        assert_eq!(controller.inner.recorder_metrics.snapshot()["queued"], 0);
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
+            vec![vec!["book"]]
+        );
     }
 
     #[test]

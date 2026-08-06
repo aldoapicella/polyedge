@@ -11,7 +11,7 @@ ContainerName=polyedge-frontend
 Network=polyedge.network
 PublishPort=127.0.0.1:3000:3000
 EnvironmentFile=/etc/polyedge/frontend.env
-PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --health-on-failure=restart
 
 [Service]
 Restart=always
