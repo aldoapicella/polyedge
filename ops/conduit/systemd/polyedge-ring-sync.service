@@ -7,6 +7,7 @@ Requires=polyedge-network.service
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/flock -n /run/polyedge-ring-sync.lock /usr/local/libexec/polyedge-ring-sync
+CPUQuota=50%
 TimeoutStartSec=30min
 
 [Install]

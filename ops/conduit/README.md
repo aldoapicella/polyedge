@@ -32,7 +32,7 @@ On Ubuntu/Debian, first verify the actual OS and packages, then install the
 minimal runtime:
 
 ```sh
-sudo apt-get install --no-install-recommends podman caddy curl
+sudo apt-get install --no-install-recommends podman caddy curl gzip jq
 sudo install -d -m 0750 /etc/polyedge/jobs /srv/polyedge-ring/jobs
 sudo install -d -m 0700 /etc/polyedge/credentials/{api,research,shadow-qset}
 sudo install -m 0644 ops/conduit/quadlets/* /etc/containers/systemd/
@@ -137,15 +137,17 @@ single-host trust ceiling and can administer both containers.
 Primary research jobs share one serialized workspace so daily normalization,
 replay, prospective validation, and backfills reuse local artifacts. The qset
 workspace remains separate. The recorder writes one fsynced JSONL segment per
-ten-minute UTC bucket. The
-ring timer seals closed segments with SHA-256 manifests, creates immutable
-Azure Hot-tier blobs without any remote listing, verifies retry collisions byte
-for byte, and retains each local segment for 48 hours to leave job-workspace
-headroom on the 150-GB volume. It removes a local segment only after its
-immutable remote manifest is re-read successfully. A separate health timer
-checks upload age and projected capacity and stops the API before free space
-falls below 32 GiB. Azure tiers only the future `events-oci-hot7-v1/` prefix to
-Cool after seven days.
+ten-minute UTC bucket. The ring timer leaves that local job input untouched,
+creates a deterministic gzip sidecar outside the job input tree, seals both
+hashes in a v2 manifest, uploads the compressed payload as an immutable Azure
+Hot-tier blob without any remote listing, and verifies retry collisions byte
+for byte. V1 uncompressed receipts remain valid. Local source, sidecar, and
+manifest files are retained for 48 hours to leave job-workspace headroom on the
+150-GB volume, then removed only after the immutable remote manifest is re-read
+successfully. A separate health timer checks upload age and projected capacity
+and stops the API before free space falls below 32 GiB. Azure tiers only the
+future `events-oci-hot7-v1/` prefix to Cool after seven days and Archive after
+30 days.
 
 After the approved authentication and separate-volume gates, create the marker
 and enable only the intended timers:

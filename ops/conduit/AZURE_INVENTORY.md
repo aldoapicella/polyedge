@@ -164,17 +164,25 @@ treats the host and its included public IP as $0 as requested. The instance
 identity is not authorized to read the tenancy usage API, so confirm the first
 OCI invoice before calling the saving durable.
 
-The storage bill is primarily transaction pressure, not retained bytes. The
-2026-07-25 through 2026-08-05 meter query returned $39.54: $14.93 Hot LRS write
-operations, $8.56 list/create-container operations, $12.84 Hot LRS stored data,
-$1.73 reads, and $1.48 other storage meters. Writes plus list/create are 59% of
-the storage cost. The no-list ring uploader, removal of repeated container
-creation calls, and run-scoped funded risk snapshot target that dominant cost
-without archiving evidence that active jobs still read. Measure the first two
-post-cutover days before adding lifecycle tiers. If those transaction meters
-fall by 85-95% and inactive older blobs can move to Cool/Cold, the stretch
-residual is about $30-36/month; keep $38-49 as the defensible target until the
-next bill proves the lower band.
+The storage bill has both a fixed retained-data floor and avoidable transaction
+pressure. The 2026-07-25 through 2026-08-05 meter query returned $39.54: $14.93
+Hot LRS write operations, $8.56 list/create-container operations, $12.84 Hot
+LRS stored data, $1.73 reads, and $1.48 other storage meters. Writes plus
+list/create are 59% of the storage cost. The retained 2,047,214,559,460 bytes
+alone project the stored-data meter near $32/month, so a $15 total is not
+compatible with the requirement to leave that corpus untouched.
+
+The no-list ring uploader, removal of repeated container creation calls, and
+run-scoped funded risk snapshot target the dominant transaction cost. A real
+302,050,848-byte closed segment compressed deterministically to 36,970,396
+bytes in 1.97 seconds, an 87.8% reduction. At the observed 44 GB/day raw rate,
+future archive growth falls to about 5.4 GB/day without changing the local job
+input. Only the future `events-oci-hot7-v1/` prefix moves from Hot to Cool after
+seven days and Archive after 30; the existing corpus and evidence/control
+prefixes do not move. Archive reads require rehydration. If transaction meters
+fall by 85-95%, gzip stays representative, and compute monitoring is removed,
+the upper edge of the $15-35 target becomes plausible; keep $38-49 as the
+defensible range until the first post-cutover bill proves otherwise.
 
 The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
 24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks

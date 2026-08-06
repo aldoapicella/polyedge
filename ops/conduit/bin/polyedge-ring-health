@@ -9,6 +9,7 @@ set +a
 
 root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 segments=$root/segments
+archive=$root/archive
 status=$root/status.json
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
@@ -30,12 +31,25 @@ maximum_segment_bytes=0
 
 for segment in $(find "$segments" -type f -name '*.jsonl' -print); do
   segment_count=$((segment_count + 1))
+  source_relative=${segment#"$segments"/}
   bytes=$(wc -c < "$segment")
+  archive_payload=$archive/$source_relative.gz
+  if [ -e "$archive_payload" ]; then
+    bytes=$((bytes + $(wc -c < "$archive_payload")))
+  fi
   [ "$bytes" -le "$maximum_segment_bytes" ] || maximum_segment_bytes=$bytes
   start=${segment##*/}
   start=${start%.jsonl}
-  manifest=$segment.manifest.json
-  if [ -e "$manifest" ]; then
+  legacy_manifest=$segment.manifest.json
+  compressed_manifest=$archive/$source_relative.gz.manifest.json
+  if [ -e "$legacy_manifest" ]; then
+    manifest=$legacy_manifest
+  elif [ -e "$compressed_manifest" ]; then
+    manifest=$compressed_manifest
+  else
+    manifest=
+  fi
+  if [ -n "$manifest" ]; then
     sealed_count=$((sealed_count + 1))
     receipt=$manifest.uploaded.json
     if [ ! -e "$receipt" ]; then

@@ -1824,18 +1824,35 @@ fn run_ring_upload(
             .with_context(|| format!("reading {}", manifest_path.display()))?;
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
             .with_context(|| format!("parsing {}", manifest_path.display()))?;
-        if manifest["schema_version"].as_u64() != Some(1) {
+        let schema_version = manifest["schema_version"]
+            .as_u64()
+            .context("ring manifest schema_version must be an unsigned integer")?;
+        if !matches!(schema_version, 1 | 2) {
             bail!(
                 "unsupported ring manifest schema: {}",
                 manifest_path.display()
             );
         }
-        let segment_relative = ring_relative_path(&manifest, "segment_path")?;
-        let segment_path = root.join(&segment_relative);
+        let source_relative = ring_relative_path(&manifest, "segment_path")?;
+        let payload_relative = if schema_version == 2 {
+            if manifest["compression"].as_str() != Some("gzip") {
+                bail!("ring manifest v2 compression must equal gzip");
+            }
+            ring_relative_path(&manifest, "archive_path")?
+        } else {
+            source_relative.clone()
+        };
+        let source_path = root.join(&source_relative);
+        let payload_path = root.join(&payload_relative);
         let receipt_path = PathBuf::from(format!("{}.uploaded.json", manifest_path.display()));
         let accepted_prefix =
             accepted_ring_blob_prefix(&manifest, blob_prefix, receipt_path.exists());
         let blob_name = ring_blob_name(&manifest, accepted_prefix)?;
+        if (schema_version == 1 && !blob_name.ends_with(".jsonl"))
+            || (schema_version == 2 && !blob_name.ends_with(".jsonl.gz"))
+        {
+            bail!("ring manifest schema and blob compression disagree");
+        }
         let expected_sha = ring_sha256(&manifest, "sha256")?;
         let expected_bytes = manifest["bytes"]
             .as_u64()
@@ -1847,7 +1864,8 @@ fn run_ring_upload(
             .as_i64()
             .context("ring manifest segment_start_epoch must be an integer")?;
         validate_ring_identity(
-            &segment_relative,
+            &source_relative,
+            &payload_relative,
             &blob_name,
             accepted_prefix,
             segment_start,
@@ -1872,18 +1890,35 @@ fn run_ring_upload(
                 bail!("ring receipt disagrees with {}", manifest_path.display());
             }
         } else {
-            let segment_bytes = fs::read(&segment_path)
-                .with_context(|| format!("reading {}", segment_path.display()))?;
-            if segment_bytes.len() as u64 != expected_bytes
-                || sha256_prefixed(&segment_bytes) != expected_sha
+            if schema_version == 2 {
+                let source_bytes = fs::read(&source_path)
+                    .with_context(|| format!("reading {}", source_path.display()))?;
+                let expected_source_bytes = manifest["source_bytes"]
+                    .as_u64()
+                    .context("ring manifest source_bytes must be an unsigned integer")?;
+                let expected_source_sha = ring_sha256(&manifest, "source_sha256")?;
+                if source_bytes.len() as u64 != expected_source_bytes
+                    || sha256_prefixed(&source_bytes) != expected_source_sha
+                {
+                    bail!("sealed ring source changed: {}", source_path.display());
+                }
+            }
+            let payload_bytes = fs::read(&payload_path)
+                .with_context(|| format!("reading {}", payload_path.display()))?;
+            if payload_bytes.len() as u64 != expected_bytes
+                || sha256_prefixed(&payload_bytes) != expected_sha
             {
-                bail!("sealed ring segment changed: {}", segment_path.display());
+                bail!("sealed ring payload changed: {}", payload_path.display());
             }
             match client
                 .upload_hot_block_blob_bytes_if_absent(
                     &blob_name,
-                    &segment_bytes,
-                    "application/x-ndjson",
+                    &payload_bytes,
+                    if schema_version == 2 {
+                        "application/gzip"
+                    } else {
+                        "application/x-ndjson"
+                    },
                 )
                 .with_context(|| format!("uploading {blob_name}"))?
             {
@@ -1929,9 +1964,13 @@ fn run_ring_upload(
             if client.download_blob_bytes(&manifest_blob)? != manifest_bytes {
                 bail!("remote manifest changed before local deletion: {manifest_blob}");
             }
-            if segment_path.exists() {
-                fs::remove_file(&segment_path)
-                    .with_context(|| format!("deleting verified {}", segment_path.display()))?;
+            if payload_path.exists() {
+                fs::remove_file(&payload_path)
+                    .with_context(|| format!("deleting verified {}", payload_path.display()))?;
+            }
+            if source_path != payload_path && source_path.exists() {
+                fs::remove_file(&source_path)
+                    .with_context(|| format!("deleting verified {}", source_path.display()))?;
             }
             if manifest_path.exists() {
                 fs::remove_file(&manifest_path)
@@ -1977,7 +2016,9 @@ fn collect_ring_manifests(path: &Path, output: &mut Vec<PathBuf>) -> Result<()> 
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".jsonl.manifest.json"))
+            .is_some_and(|name| {
+                name.ends_with(".jsonl.manifest.json") || name.ends_with(".jsonl.gz.manifest.json")
+            })
         {
             output.push(path);
         }
@@ -1991,12 +2032,15 @@ fn ring_relative_path(manifest: &serde_json::Value, field: &str) -> Result<PathB
         .with_context(|| format!("ring manifest {field} must be a string"))?;
     let path = PathBuf::from(value);
     if path.is_absolute()
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
-        || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        || !(value.ends_with(".jsonl") || value.ends_with(".jsonl.gz"))
     {
-        bail!("ring manifest {field} must be a relative JSONL path without traversal");
+        bail!("ring manifest {field} must be a relative JSONL or JSONL.gz path without traversal");
     }
     Ok(path)
 }
@@ -2007,7 +2051,7 @@ fn ring_blob_name(manifest: &serde_json::Value, blob_prefix: &str) -> Result<Str
         .context("ring manifest blob_name must be a string")?;
     if !value.starts_with(&format!("{blob_prefix}/"))
         || value.starts_with('/')
-        || !value.ends_with(".jsonl")
+        || !(value.ends_with(".jsonl") || value.ends_with(".jsonl.gz"))
         || value
             .split('/')
             .any(|part| part.is_empty() || matches!(part, "." | ".."))
@@ -2019,7 +2063,8 @@ fn ring_blob_name(manifest: &serde_json::Value, blob_prefix: &str) -> Result<Str
 }
 
 fn validate_ring_identity(
-    segment_path: &Path,
+    source_path: &Path,
+    payload_path: &Path,
     blob_name: &str,
     blob_prefix: &str,
     segment_start: i64,
@@ -2030,10 +2075,23 @@ fn validate_ring_identity(
         .context("segment_start_epoch is outside the UTC timestamp range")?
         .format("%Y/%m/%d/%H")
         .to_string();
+    let compressed = blob_name.ends_with(".jsonl.gz");
+    let expected_source = format!("segments/{hour}/{segment_start}.jsonl");
+    let expected_payload = if compressed {
+        format!("archive/{hour}/{segment_start}.jsonl.gz")
+    } else {
+        expected_source.clone()
+    };
+    let expected_blob = if compressed {
+        format!("{blob_prefix}/{hour}/{segment_start}.jsonl.gz")
+    } else {
+        format!("{blob_prefix}/{hour}/{segment_start}.jsonl")
+    };
     if !(300..=900).contains(&segment_end.saturating_sub(segment_start))
         || segment_end > now
-        || segment_path != Path::new(&format!("segments/{hour}/{segment_start}.jsonl"))
-        || blob_name != format!("{blob_prefix}/{hour}/{segment_start}.jsonl")
+        || source_path != Path::new(&expected_source)
+        || payload_path != Path::new(&expected_payload)
+        || blob_name != expected_blob
     {
         bail!("segment path, blob name, or UTC interval is not exactly bound");
     }
@@ -2320,6 +2378,7 @@ mod tests {
 
         assert!(validate_ring_identity(
             Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
             "events-oci-dual/2026/08/05/22/1785969000.jsonl",
             "events-oci-dual",
             1785969000,
@@ -2329,6 +2388,7 @@ mod tests {
         .is_ok());
         assert!(validate_ring_identity(
             Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
             "other-prefix/2026/08/05/22/1785969000.jsonl",
             "events-oci-dual",
             1785969000,
@@ -2336,6 +2396,24 @@ mod tests {
             1785969700,
         )
         .is_err());
+
+        let compressed = json!({
+            "segment_path": "segments/2026/08/05/22/1785969000.jsonl",
+            "archive_path": "archive/2026/08/05/22/1785969000.jsonl.gz",
+            "blob_name": "events-oci-hot7-v1/2026/08/05/22/1785969000.jsonl.gz",
+        });
+        assert!(ring_relative_path(&compressed, "archive_path").is_ok());
+        assert!(ring_blob_name(&compressed, "events-oci-hot7-v1").is_ok());
+        assert!(validate_ring_identity(
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            Path::new("archive/2026/08/05/22/1785969000.jsonl.gz"),
+            "events-oci-hot7-v1/2026/08/05/22/1785969000.jsonl.gz",
+            "events-oci-hot7-v1",
+            1785969000,
+            1785969600,
+            1785969700,
+        )
+        .is_ok());
 
         assert_eq!(
             accepted_ring_blob_prefix(&manifest, "events-oci-hot7-v1", true),

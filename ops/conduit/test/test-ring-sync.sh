@@ -3,13 +3,17 @@ set -eu
 
 fixture_dir=/srv/polyedge-ring/segments/ring-sync-selftest-$$
 fixture=$fixture_dir/1785960000.jsonl
-manifest=$fixture.manifest.json
+archive_dir=/srv/polyedge-ring/archive/ring-sync-selftest-$$
+archive_fixture=$archive_dir/1785960000.jsonl.gz
+manifest=$archive_fixture.manifest.json
 env_file=$(mktemp)
 cleanup() {
   [ ! -e "$fixture" ] || unlink "$fixture"
+  [ ! -e "$archive_fixture" ] || unlink "$archive_fixture"
   [ ! -e "$manifest" ] || unlink "$manifest"
   [ ! -e "$env_file" ] || unlink "$env_file"
   rmdir "$fixture_dir" 2>/dev/null || true
+  rmdir "$archive_dir" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -28,17 +32,26 @@ printf '%s\n' \
 POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_SEAL_ONLY=1 \
   ops/conduit/bin/polyedge-ring-sync
 jq -e '
-  .schema_version == 1 and
-  .bytes == 11 and
+  .schema_version == 2 and
+  .compression == "gzip" and
+  .source_bytes == 11 and
   .lines == 1 and
   (.sha256 | startswith("sha256:")) and
-  .blob_name == "events-oci-test/2026/08/05/20/1785960000.jsonl"
+  (.source_sha256 | startswith("sha256:")) and
+  .segment_path == "segments/ring-sync-selftest-'"$$"'/1785960000.jsonl" and
+  .archive_path == "archive/ring-sync-selftest-'"$$"'/1785960000.jsonl.gz" and
+  .blob_name == "events-oci-test/2026/08/05/20/1785960000.jsonl.gz"
 ' "$manifest" >/dev/null
 expected=$(jq -r '.sha256' "$manifest" | cut -d: -f2)
-actual=$(sha256sum "$fixture" | awk '{print $1}')
+actual=$(sha256sum "$archive_fixture" | awk '{print $1}')
 [ "$actual" = "$expected" ]
+expected_source=$(jq -r '.source_sha256' "$manifest" | cut -d: -f2)
+actual_source=$(sha256sum "$fixture" | awk '{print $1}')
+[ "$actual_source" = "$expected_source" ]
+[ "$(gzip -dc "$archive_fixture")" = '{"test":1}' ]
 grep -F -- '--cap-drop=all --cap-add=DAC_OVERRIDE' ops/conduit/bin/polyedge-ring-sync >/dev/null
 grep -F -- '-v "$segments:/srv/polyedge-ring/segments:Z"' ops/conduit/bin/polyedge-ring-sync >/dev/null
+grep -F -- '-v "$archive:/srv/polyedge-ring/archive:Z"' ops/conduit/bin/polyedge-ring-sync >/dev/null
 grep -F 'prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}' ops/conduit/bin/polyedge-ring-sync >/dev/null
 
 echo 'ring sealer self-test passed'

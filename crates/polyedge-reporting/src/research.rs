@@ -2097,15 +2097,14 @@ where
         ),
     };
     let mut blobs = client
-        .list_blobs_unfiltered(&source.prefix, source.max_blobs, source.max_bytes)
+        .list_blobs_by_suffixes(
+            &source.prefix,
+            &[".jsonl", ".jsonl.gz"],
+            source.max_blobs,
+            source.max_bytes,
+        )
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
     blobs.sort_by(|left, right| left.name.cmp(&right.name));
-    if let Some(unexpected) = blobs.iter().find(|blob| !blob.name.ends_with(".jsonl")) {
-        return Err(ResearchError::InvalidInput(format!(
-            "Azure raw-source day prefix contains unexpected non-JSONL blob {}",
-            unexpected.name
-        )));
-    }
     if blobs.windows(2).any(|pair| pair[0].name == pair[1].name) {
         return Err(ResearchError::InvalidInput(
             "Azure raw-source listing contains duplicate blob names".to_owned(),
@@ -2138,8 +2137,7 @@ where
             last_modified: prefetched.blob.last_modified.map(ts),
             sha256: sha256_prefixed(&prefetched.bytes),
         });
-        let reader =
-            BufReader::with_capacity(super::REPLAY_BUFFER_BYTES, prefetched.bytes.as_slice());
+        let reader = azure_event_reader(&prefetched.blob.name, prefetched.bytes.as_slice())?;
         let mut previous_ts = None;
         for line in reader.lines() {
             let line = line?;
@@ -2156,7 +2154,12 @@ where
         Ok(())
     })?;
     let mut final_blobs = client
-        .list_blobs_unfiltered(&source.prefix, source.max_blobs, source.max_bytes)
+        .list_blobs_by_suffixes(
+            &source.prefix,
+            &[".jsonl", ".jsonl.gz"],
+            source.max_blobs,
+            source.max_bytes,
+        )
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
     final_blobs.sort_by(|left, right| left.name.cmp(&right.name));
     if final_blobs != initial_blobs {
@@ -2176,6 +2179,27 @@ where
     )?);
     finalize_stream_stats(&mut stats);
     Ok(stats)
+}
+
+fn azure_event_reader<'a>(
+    blob_name: &str,
+    bytes: &'a [u8],
+) -> Result<Box<dyn BufRead + 'a>, ResearchError> {
+    if blob_name.ends_with(".jsonl.gz") {
+        Ok(Box::new(BufReader::with_capacity(
+            super::REPLAY_BUFFER_BYTES,
+            GzDecoder::new(bytes),
+        )))
+    } else if blob_name.ends_with(".jsonl") {
+        Ok(Box::new(BufReader::with_capacity(
+            super::REPLAY_BUFFER_BYTES,
+            bytes,
+        )))
+    } else {
+        Err(ResearchError::InvalidInput(format!(
+            "Azure raw-source blob is not JSONL or JSONL.gz: {blob_name}"
+        )))
+    }
 }
 
 struct PrefetchedAzureBlob {
@@ -11886,6 +11910,27 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn azure_event_reader_accepts_plain_and_gzip_jsonl_only() {
+        let raw = b"{\"event\":1}\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let plain = azure_event_reader("events/1.jsonl", raw)
+            .unwrap()
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let gzip = azure_event_reader("events/1.jsonl.gz", &compressed)
+            .unwrap()
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(plain, gzip);
+        assert!(azure_event_reader("events/1.manifest.json", raw).is_err());
+    }
 
     fn settlement_carry_fixture(
         name: &str,

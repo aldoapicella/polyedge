@@ -9,6 +9,7 @@ set +a
 
 root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 segments=$root/segments
+archive=$root/archive
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
 prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}
@@ -22,7 +23,8 @@ printf '%s' "$prefix" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$' || {
   exit 64
 }
 mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
-install -d -m 0750 "$segments"
+command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 1; }
+install -d -m 0750 "$segments" "$archive"
 
 now=$(date -u +%s)
 cutoff=$((now - grace_seconds))
@@ -32,29 +34,57 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
   printf '%s' "$start" | grep -Eq '^[0-9]+$' || { echo "invalid segment name: $segment" >&2; exit 1; }
   end=$((start + segment_seconds))
   [ "$end" -le "$cutoff" ] || continue
-  manifest=$segment.manifest.json
-  [ -e "$manifest" ] && continue
+  source_relative=${segment#"$root"/}
+  archive_relative=archive/${source_relative#segments/}.gz
+  archive_segment=$root/$archive_relative
+  manifest=$archive_segment.manifest.json
+  legacy_manifest=$segment.manifest.json
+  if [ -e "$legacy_manifest" ] || [ -e "$manifest" ]; then
+    continue
+  fi
   [ "$(tail -c 1 "$segment" | od -An -t u1 | tr -d ' ')" = 10 ] || {
     echo "sealed segment lacks a final newline: $segment" >&2
     exit 1
   }
-  relative=${segment#"$root"/}
   hour=$(date -u -d "@$start" +%Y/%m/%d/%H)
-  blob=$prefix/$hour/$start.jsonl
-  sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
-  bytes=$(wc -c < "$segment")
+  blob=$prefix/$hour/$start.jsonl.gz
+  source_sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
+  source_bytes=$(wc -c < "$segment")
   lines=$(wc -l < "$segment")
+  install -d -m 0750 "${archive_segment%/*}"
+  if [ -e "$archive_segment" ]; then
+    gzip -t "$archive_segment"
+    archived_source_sha=sha256:$(gzip -dc "$archive_segment" | sha256sum | awk '{print $1}')
+    [ "$archived_source_sha" = "$source_sha" ] || {
+      echo "existing gzip sidecar disagrees with $segment" >&2
+      exit 1
+    }
+  else
+    temporary=$(mktemp "$archive_segment.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    gzip -1 -n -c "$segment" > "$temporary"
+    chmod 0640 "$temporary"
+    gzip -t "$temporary"
+    sync -f "$temporary"
+    mv "$temporary" "$archive_segment"
+    trap - EXIT HUP INT TERM
+  fi
+  sha=sha256:$(sha256sum "$archive_segment" | awk '{print $1}')
+  bytes=$(wc -c < "$archive_segment")
   temporary=$(mktemp "$manifest.XXXXXX")
   trap 'rm -f "$temporary"' EXIT HUP INT TERM
   jq -n \
-    --arg segment_path "$relative" \
+    --arg segment_path "$source_relative" \
+    --arg archive_path "$archive_relative" \
     --arg blob_name "$blob" \
     --arg sha256 "$sha" \
+    --arg source_sha256 "$source_sha" \
     --argjson bytes "$bytes" \
+    --argjson source_bytes "$source_bytes" \
     --argjson lines "$lines" \
     --argjson segment_start_epoch "$start" \
     --argjson segment_end_epoch "$end" \
-    '{schema_version:1,segment_path:$segment_path,blob_name:$blob_name,sha256:$sha256,bytes:$bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch}' \
+    '{schema_version:2,segment_path:$segment_path,archive_path:$archive_path,blob_name:$blob_name,compression:"gzip",sha256:$sha256,source_sha256:$source_sha256,bytes:$bytes,source_bytes:$source_bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch}' \
     > "$temporary"
   chmod 0640 "$temporary"
   sync -f "$segment"
@@ -78,7 +108,8 @@ set -- /usr/bin/podman run --rm --name polyedge-ring-upload \
   --read-only --cap-drop=all --cap-add=DAC_OVERRIDE \
   --env AZURE_STORAGE_ACCOUNT_NAME \
   --env AZURE_STORAGE_CONTAINER_NAME \
-  -v "$segments:/srv/polyedge-ring/segments:Z"
+  -v "$segments:/srv/polyedge-ring/segments:Z" \
+  -v "$archive:/srv/polyedge-ring/archive:Z"
 
 case "${POLYEDGE_AZURE_ARC_IDENTITY:-0}" in
   1)
