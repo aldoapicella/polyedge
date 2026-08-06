@@ -70,10 +70,13 @@ Azure Arc machine `conduit-dev` is connected in East US with system identity
 and incoming connections are disabled locally. Its custom no-delete blob role
 is scoped only to `bot-events`; the funded evidence container and Service Bus
 queue are excluded. A host-side token challenge succeeded on 2026-08-06. The
-Rust uploader then created an immutable Cool-tier segment and manifest, re-read
-the manifest, and wrote its verified local receipt from both the host binary and
-the rootful ARM64 container. The published digest repeated that proof with all
-21 closed segments uploaded and locally receipted before the acceptance window.
+Rust uploader then created immutable Hot-tier segments and manifests, re-read
+each manifest, and wrote verified local receipts from the rootful ARM64
+container. Digest `d3a6ed43c8b7cb02c5cbe5e6d00bbbca60544ab034e7120cbf30dca67848ce1b`
+accepted all prior receipts and uploaded the clean 05:50-06:00 UTC interval.
+Its local source and manifest hashes matched their receipts; an authenticated
+remote HEAD returned `200`, `BlockBlob`, `Hot`, and the exact 188,157,190-byte
+manifest length.
 
 The four dedicated Entra applications do not yet exist. The signed-in tenant's
 authorization policy reports `allowedToCreateApps=false`, so an Entra
@@ -177,12 +180,19 @@ run-scoped funded risk snapshot target the dominant transaction cost. A real
 302,050,848-byte closed segment compressed deterministically to 36,970,396
 bytes in 1.97 seconds, an 87.8% reduction. At the observed 44 GB/day raw rate,
 future archive growth falls to about 5.4 GB/day without changing the local job
-input. Only the future `events-oci-hot7-v1/` prefix moves from Hot to Cool after
-seven days and Archive after 30; the existing corpus and evidence/control
-prefixes do not move. Archive reads require rehydration. If transaction meters
-fall by 85-95%, gzip stays representative, and compute monitoring is removed,
-the upper edge of the $15-35 target becomes plausible; keep $38-49 as the
-defensible range until the first post-cutover bill proves otherwise.
+input. At the 2026-08-06 East US public retail rates of $0.0208/GB-month Hot and
+$0.0152/GB-month Cool, the rolling 30-day raw window falls from about $21.79 to
+$2.67, roughly $19/month avoided before agreement discounts and transaction
+charges. Each older retained month then costs about $0.16 instead of $1.31 at
+the $0.00099/GB-month Archive rate. Only the future
+`events-oci-hot7-v1/` prefix moves from Hot to Cool after seven days and Archive
+after 30; the existing corpus and evidence/control prefixes do not move.
+Archive reads require rehydration. If transaction meters fall by 85-95%, gzip
+stays representative, and compute monitoring is removed, the upper edge of the
+$15-35 target becomes plausible; keep $38-49 as the defensible range until the
+first post-cutover bill proves otherwise. Prices are estimates from the
+[Azure Blob Storage pricing page](https://azure.microsoft.com/pricing/details/storage/blobs/),
+not a bill quote.
 
 The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
 24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks

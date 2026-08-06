@@ -105,8 +105,8 @@ qset campaign gate.
    second command.
 
    ```bash
-   scripts/azure-cost-cleanup.sh
-   scripts/azure-cost-cleanup.sh --apply
+   bash scripts/azure-cost-cleanup.sh
+   bash scripts/azure-cost-cleanup.sh --apply
    ```
 
 4. Deploy the compact freshness/hourly logs and the primary daily/replay jobs
