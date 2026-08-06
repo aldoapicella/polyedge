@@ -59,6 +59,12 @@ Research jobs reference `api-bearer-token`. Venue/funded jobs reference the
 four Polymarket API/wallet secrets; the persistent funded app additionally
 references the relayer key. All nineteen jobs use user-assigned identities.
 
+The Chile app is not idle. At `2026-08-06T02:27Z` it reported the funded
+worker and automatic redemption enabled, Chile static egress verified, zero
+open orders and unresolved reservations at that snapshot, and recent order
+submission attempts. Do not stop or delete it until a Chile-egress replacement
+passes the funded safety gates.
+
 Azure Arc machine `conduit-dev` is connected in East US with system identity
 `19d0cc08-c6be-4b5b-85a8-05211f19428a`. Arc extensions, guest configuration,
 and incoming connections are disabled locally. Its custom no-delete blob role
@@ -90,6 +96,12 @@ Recurring daily/replay work is capped at 2 CPU / 4 GiB and qset at 3 CPU /
 listed in this table still require an explicit local command mapping before
 their Azure definitions can be deleted.
 
+The 2026-08-06 execution-history check found zero executions for backfill,
+chart-backfill, promotion, strategy-canary, and the frozen qset manual job.
+The scheduled North Europe shadow daily failed at 02:15 because the prior
+`shadow-2026-07-23-through-2026-07-23` correction remains `in_progress`; this
+is an evidence blocker, not proof that the workload is unused.
+
 ## Capacity and cost evidence
 
 For 2026-07-25 through 2026-08-05, Cost Management reported $168.79 of
@@ -101,6 +113,16 @@ Container Instances. Deleting the accepted compute plane, environments, NATs,
 managed load balancers, and public IP/VNet resources therefore removes a
 current projected $279.39/month before the later ACR, compute-monitoring, and
 storage optimizations.
+
+The cheapest full-processing migration keeps only a network relay in Chile.
+Azure's 2026-08-06 Linux B1ls retail rate for Chile Central was $0.00728/hour,
+or about $5.31 per 730-hour month. With one Standard static IPv4 address and a
+small managed disk, budget about $9-12/month for a WireGuard egress relay. The
+funded signer and credentials remain on `conduit-dev`; only its venue-bound
+traffic uses the relay. This changes the later optimized target from $38-49 to
+about $47-61/month, still a projected $361-375/month (86-89%) reduction. Do
+not deploy the billable relay or move funded credentials without explicit
+approval.
 
 The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
 24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks
@@ -123,6 +145,9 @@ Both native health checks were healthy; the API reported eight books, one
 tradeable market, healthy discovery, and 29,841 persisted recorder events with
 zero failures or unrecovered durable events. The first rootful transition
 segment was hash-sealed and remotely verified at `2026-08-06T02:21:36Z`.
+The first full ten-minute rootful segment was 217,483,672 bytes, hash-sealed,
+uploaded, and receipted by `2026-08-06T02:32:26Z`; the API then reported
+487,932 persisted events with zero recorder failures.
 
 The older rootless image could not drain within 30 seconds. Its interrupted
 pre-acceptance segment was preserved, not deleted, under
