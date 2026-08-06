@@ -60,3 +60,7 @@ if POLYEDGE_TEST_ALLOW_UNPRIVILEGED=1 "$root/bin/polyedge-quadlet-deploy" nope "
   echo 'unknown service was accepted' >&2
   exit 1
 fi
+
+grep -F 'Authorization: Bearer %%s' "$root/quadlets/polyedge-api.container" >/dev/null
+grep -F '"$$API_BEARER_TOKEN"' "$root/quadlets/polyedge-api.container" >/dev/null
+grep -Fx 'HealthOnFailure=kill' "$root/quadlets/polyedge-api.container" >/dev/null

@@ -37,5 +37,7 @@ jq -e '
 expected=$(jq -r '.sha256' "$manifest" | cut -d: -f2)
 actual=$(sha256sum "$fixture" | awk '{print $1}')
 [ "$actual" = "$expected" ]
+grep -F -- '--cap-drop=all --cap-add=DAC_OVERRIDE' ops/conduit/bin/polyedge-ring-sync >/dev/null
+grep -F -- '-v "$segments:/srv/polyedge-ring/segments:Z"' ops/conduit/bin/polyedge-ring-sync >/dev/null
 
 echo 'ring sealer self-test passed'

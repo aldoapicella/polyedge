@@ -73,13 +73,12 @@ printf '%s' "$POLYEDGE_RING_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@s
   echo 'POLYEDGE_RING_IMAGE must be an immutable GHCR digest' >&2
   exit 64
 }
-
 set -- /usr/bin/podman run --rm --name polyedge-ring-upload \
   --cpus 0.5 --memory 1g --pids-limit 256 \
-  --read-only --cap-drop=all \
+  --read-only --cap-drop=all --cap-add=DAC_OVERRIDE \
   --env AZURE_STORAGE_ACCOUNT_NAME \
   --env AZURE_STORAGE_CONTAINER_NAME \
-  -v "$root:/srv/polyedge-ring:Z"
+  -v "$segments:/srv/polyedge-ring/segments:Z"
 
 case "${POLYEDGE_AZURE_ARC_IDENTITY:-0}" in
   1)

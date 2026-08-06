@@ -13,7 +13,13 @@ EnvironmentFile=/etc/polyedge/api.env
 Secret=polyedge-api-bearer-token,type=env,target=API_BEARER_TOKEN
 Volume=/srv/polyedge-ring:/srv/polyedge-ring:Z
 Volume=/etc/polyedge/credentials/api:/run/credentials:ro,Z
-PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --health-on-failure=restart
+HealthCmd=/usr/bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8081; printf "GET /api/v1/health HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer %%s\r\n\r\n" "$$API_BEARER_TOKEN" >&3; head -n 1 <&3 | grep -q " 200 "'
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=20s
+HealthOnFailure=kill
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30
 
 [Service]
 Restart=always

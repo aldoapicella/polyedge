@@ -66,8 +66,8 @@ is scoped only to `bot-events`; the funded evidence container and Service Bus
 queue are excluded. A host-side token challenge succeeded on 2026-08-06. The
 Rust uploader then created an immutable Cool-tier segment and manifest, re-read
 the manifest, and wrote its verified local receipt from both the host binary and
-the rootful ARM64 container. The published digest must repeat that proof before
-the 72-hour clock starts.
+the rootful ARM64 container. The published digest repeated that proof with all
+21 closed segments uploaded and locally receipted before the acceptance window.
 
 ## OCI schedule and coverage
 
@@ -111,6 +111,25 @@ while the local collector reported about 0.16 core and 131 MB. The 48-hour
 ring projection was 76.4 GB. This proves steady collector capacity with broad
 headroom; the two daily ARM64 cycles remain the required batch-efficiency gate.
 The free single VM does not provide Azure's failure-domain redundancy.
+
+## Acceptance candidate
+
+The candidate window started at the clean recorder boundary
+`2026-08-06T02:20:00Z`. The rootful API is running
+`sha256:08e0c7e4b563208d12fd507ea254ab6afdadba667b173bb428d046a532ce14ed`
+and the frontend is running
+`sha256:eeb2d570a8dfc9842e2725e823653ba3eb77f3060821e672adc0ca92a1b1d9f7`.
+Both native health checks were healthy; the API reported eight books, one
+tradeable market, healthy discovery, and 29,841 persisted recorder events with
+zero failures or unrecovered durable events. The first rootful transition
+segment was hash-sealed and remotely verified at `2026-08-06T02:21:36Z`.
+
+The older rootless image could not drain within 30 seconds. Its interrupted
+pre-acceptance segment was preserved, not deleted, under
+`/srv/polyedge-ring/quarantine`; it is excluded from the upload prefix. Azure
+remained authoritative through the handoff. Do not count time before the clean
+02:20 segment, and do not delete Azure compute until every deletion gate below
+passes.
 
 ## Azure data and evidence surfaces retained
 

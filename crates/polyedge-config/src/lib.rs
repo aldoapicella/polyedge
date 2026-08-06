@@ -471,7 +471,7 @@ impl RuntimeSettings {
             "RUST_PROXY_RUNTIME_API",
             settings.deploy.rust_upstream_api_base_url.is_some(),
         );
-        settings.azure.storage_account_name = env::var("AZURE_STORAGE_ACCOUNT_NAME").ok();
+        settings.azure.storage_account_name = env_non_empty("AZURE_STORAGE_ACCOUNT_NAME");
         settings.azure.storage_container_name = env_string(
             "AZURE_STORAGE_CONTAINER_NAME",
             settings.azure.storage_container_name,

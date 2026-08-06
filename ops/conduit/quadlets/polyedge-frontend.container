@@ -14,7 +14,13 @@ EnvironmentFile=/etc/polyedge/frontend.env
 Secret=polyedge-api-bearer-token,type=env,target=BACKEND_API_BEARER_TOKEN
 Secret=polyedge-dashboard-auth-password,type=env,target=DASHBOARD_AUTH_PASSWORD
 Secret=polyedge-dashboard-session-secret,type=env,target=DASHBOARD_SESSION_SECRET
-PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --health-on-failure=restart
+HealthCmd=node -e "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=30s
+HealthOnFailure=kill
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30
 
 [Service]
 Restart=always

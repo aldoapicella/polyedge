@@ -53,6 +53,20 @@ sudo systemctl daemon-reload
 sudo systemctl restart systemd-journald
 ```
 
+On a systemd-resolved host, point `/etc/resolv.conf` at its non-stub resolver
+file so Aardvark can forward external DNS. If UFW has a deny-input policy, allow
+DNS only from the inspected Podman subnet and interface to its gateway. The
+verified `conduit-dev` values are:
+
+```sh
+sudo ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
+sudo ufw allow in on podman1 from 10.89.0.0/24 to 10.89.0.1 port 53 proto udp
+sudo ufw allow in on podman1 from 10.89.0.0/24 to 10.89.0.1 port 53 proto tcp
+```
+
+Re-run `podman network inspect polyedge` after recreating the network; do not
+reuse these addresses if its interface, subnet, or gateway changed.
+
 The GitHub deploy key belongs to a locked `polyedge-deploy` account. Its only
 authorized-key command is `/usr/local/libexec/polyedge-github-deploy` with the
 `restrict` option. The wrapper and sudoers rule permit only digest-pinned API,
