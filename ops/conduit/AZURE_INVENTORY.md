@@ -87,6 +87,28 @@ Recurring daily/replay work is capped at 2 CPU / 4 GiB and qset at 3 CPU /
 listed in this table still require an explicit local command mapping before
 their Azure definitions can be deleted.
 
+## Capacity and cost evidence
+
+For 2026-07-25 through 2026-08-05, Cost Management reported $168.79 of
+PolyEdge spend. A straight 30-day projection is $421.96: Container Apps
+$125.45, NAT gateways $113.27, Storage $95.78, managed load balancers $28.41,
+Azure Monitor $18.68, Log Analytics $15.19, public IP/VNet meters $12.26, ACR
+$9.72, Service Bus $2.71, and $0.50 of bandwidth, Key Vault, and transient
+Container Instances. Deleting the accepted compute plane, environments, NATs,
+managed load balancers, and public IP/VNet resources therefore removes a
+current projected $279.39/month before the later ACR, compute-monitoring, and
+storage optimizations.
+
+The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
+24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks
+was 1.02 cores and 2.87 GB. `conduit-dev` has four ARM64 cores, 25.14 GB RAM,
+and 154.7 GB currently available on the dedicated ring volume. A closed
+ten-minute local segment contained 340,675 events (about 568 events/second)
+while the local collector reported about 0.16 core and 131 MB. The 48-hour
+ring projection was 76.4 GB. This proves steady collector capacity with broad
+headroom; the two daily ARM64 cycles remain the required batch-efficiency gate.
+The free single VM does not provide Azure's failure-domain redundancy.
+
 ## Azure data and evidence surfaces retained
 
 Storage account: `stpolyedge6urdjr5nmwx7w`, Standard LRS, StorageV2.
