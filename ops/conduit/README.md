@@ -107,16 +107,16 @@ table access separate from the blob-only research/ring identity.
 
 ## Separate Entra identities
 
-Arc unblocks the no-secret ring upload path. The API, research jobs, and funded
-signer still use separate identities so the funded queue and wallet boundary is
-never granted to the host-wide Arc identity. The operator does not need a
-permanent directory role. An Entra administrator can create the three
-applications and service principals, then add the operator as an application
-owner. This step creates no credential:
+Arc unblocks the no-secret ring upload path. The API, primary research jobs,
+frozen qset job, and funded signer still use separate identities so neither the
+funded queue/wallet boundary nor qset storage is granted to the host-wide Arc
+identity. The operator does not need a permanent directory role. An Entra
+administrator can create the four applications and service principals, then
+add the operator as an application owner. This step creates no credential:
 
 ```sh
 operator_object_id=REPLACE_OPERATOR_OBJECT_ID
-for name in polyedge-conduit-api polyedge-conduit-research polyedge-conduit-funded-signer; do
+for name in polyedge-conduit-api polyedge-conduit-research polyedge-conduit-shadow-qset polyedge-conduit-funded-signer; do
   app_id=$(az ad app create --display-name "$name" --sign-in-audience AzureADMyOrg --query appId -o tsv)
   az ad sp create --id "$app_id" --query id -o tsv
   az ad app owner add --id "$app_id" --owner-object-id "$operator_object_id"

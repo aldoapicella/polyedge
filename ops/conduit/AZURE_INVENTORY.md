@@ -75,6 +75,13 @@ the manifest, and wrote its verified local receipt from both the host binary and
 the rootful ARM64 container. The published digest repeated that proof with all
 21 closed segments uploaded and locally receipted before the acceptance window.
 
+The four dedicated Entra applications do not yet exist. The signed-in tenant's
+authorization policy reports `allowedToCreateApps=false`, so an Entra
+administrator must perform the credential-free application/service-principal
+handoff documented in `README.md`. Until that happens, the primary research
+job env files, approval marker, and timers remain absent. This blocks the two
+daily-cycle gate but does not affect the active ring uploader's narrow Arc role.
+
 ## OCI schedule and coverage
 
 | OCI unit | UTC schedule | Azure counterpart |
@@ -131,6 +138,25 @@ $142.57/month and restores the later storage-optimized target to about
 $38-49/month: a projected $373-384/month (88-91%) reduction. Do not move funded
 credentials without explicit approval.
 
+OCI metadata reports 4 A1 OCPUs and 24 GB. At 730 hours/month that consumes
+2,920 OCPU-hours and 17,520 GB-hours, within Oracle's current published free A1
+allowance of 3,000 OCPU-hours and 18,000 GB-hours. The cost model therefore
+treats the host and its included public IP as $0 as requested. The instance
+identity is not authorized to read the tenancy usage API, so confirm the first
+OCI invoice before calling the saving durable.
+
+The storage bill is primarily transaction pressure, not retained bytes. The
+2026-07-25 through 2026-08-05 meter query returned $39.54: $14.93 Hot LRS write
+operations, $8.56 list/create-container operations, $12.84 Hot LRS stored data,
+$1.73 reads, and $1.48 other storage meters. Writes plus list/create are 59% of
+the storage cost. The no-list ring uploader, removal of repeated container
+creation calls, and run-scoped funded risk snapshot target that dominant cost
+without archiving evidence that active jobs still read. Measure the first two
+post-cutover days before adding lifecycle tiers. If those transaction meters
+fall by 85-95% and inactive older blobs can move to Cool/Cold, the stretch
+residual is about $30-36/month; keep $38-49 as the defensible target until the
+next bill proves the lower band.
+
 The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
 24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks
 was 1.02 cores and 2.87 GB. `conduit-dev` has four ARM64 cores, 25.14 GB RAM,
@@ -168,6 +194,19 @@ panicked while building final-decision lineage. Raw recording continued, but
 strategy, fair-value, and decision processing stopped in the unsupervised Tokio
 task. The 72-hour clock is invalid and must restart from a clean segment after
 the corrected digest is deployed and its full processing path is verified.
+
+The corrected API candidate started at `2026-08-06T04:02:05Z` on source
+`af69993b24dea731322a068aaa9dfda5b59dbb50`, pinned to ARM64 digest
+`sha256:ead54f43b3dd25367f4b79a0e463d513ef332ea42986da440764ade6dea58e65`.
+At the `04:15` venue rollover it produced 12 fresh final decisions without a
+panic. At `04:15:14Z` the required feed and runtime tasks were still running,
+the service had zero restarts, and the recorder reported 504,431 persisted
+events with zero failures or unrecovered durable events. The `04:00` segment
+contains both API digests and is excluded; `04:10:00Z` is the first clean
+processing-observation boundary for the corrected digest. This is not the
+formal 72-hour acceptance start: the dedicated job identities and primary
+research timers must exist and run before that clock can start. Azure remains
+authoritative.
 
 ## Azure data and evidence surfaces retained
 
