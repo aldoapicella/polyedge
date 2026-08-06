@@ -96,23 +96,39 @@ jobs:
           platforms = set()
           with tarfile.open(sys.argv[1]) as archive:
               index = json.load(archive.extractfile("index.json"))
-              for descriptor in index["manifests"]:
-                  if "image.manifest" not in descriptor.get("mediaType", ""):
-                      continue
-                  manifest = json.load(archive.extractfile(
-                      f"blobs/sha256/{descriptor['digest'].split(':', 1)[1]}"
-                  ))
+              seen = set()
+
+              def blob(descriptor):
+                  digest = descriptor.get("digest", "")
+                  if not digest.startswith("sha256:") or len(digest) != 71:
+                      raise SystemExit(f"invalid OCI digest: {digest!r}")
+                  return json.load(archive.extractfile(f"blobs/sha256/{digest[7:]}"))
+
+              def inspect(descriptor):
+                  digest = descriptor.get("digest")
+                  if digest in seen:
+                      return
+                  seen.add(digest)
+                  media_type = descriptor.get("mediaType", "")
+                  if media_type.endswith("image.index.v1+json") or media_type.endswith("manifest.list.v2+json"):
+                      for child in blob(descriptor).get("manifests", []):
+                          inspect(child)
+                      return
+                  if not media_type.endswith("image.manifest.v1+json") and not media_type.endswith("manifest.v2+json"):
+                      return
+                  manifest = blob(descriptor)
                   config = manifest.get("config", {})
                   if "digest" not in config:
-                      continue
-                  image_config = json.load(archive.extractfile(
-                      f"blobs/sha256/{config['digest'].split(':', 1)[1]}"
-                  ))
+                      return
+                  image_config = blob(config)
                   platform = (image_config.get("os"), image_config.get("architecture"))
                   if platform in expected:
                       platforms.add(platform)
                   elif platform not in {(None, None), ("unknown", "unknown")}:
                       raise SystemExit(f"unexpected OCI platform: {platform}")
+
+              for descriptor in index["manifests"]:
+                  inspect(descriptor)
           if platforms != expected:
               raise SystemExit(f"missing OCI platforms: expected {expected}, got {platforms}")
           PY
