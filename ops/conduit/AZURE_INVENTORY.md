@@ -114,15 +114,21 @@ managed load balancers, and public IP/VNet resources therefore removes a
 current projected $279.39/month before the later ACR, compute-monitoring, and
 storage optimizations.
 
-The cheapest full-processing migration keeps only a network relay in Chile.
-Azure's 2026-08-06 Linux B1ls retail rate for Chile Central was $0.00728/hour,
-or about $5.31 per 730-hour month. With one Standard static IPv4 address and a
-small managed disk, budget about $9-12/month for a WireGuard egress relay. The
-funded signer and credentials remain on `conduit-dev`; only its venue-bound
-traffic uses the relay. This changes the later optimized target from $38-49 to
-about $47-61/month, still a projected $361-375/month (86-89%) reduction. Do
-not deploy the billable relay or move funded credentials without explicit
-approval.
+The cheapest full-processing migration needs no paid relay. On 2026-08-06 the
+Polymarket geoblock endpoint observed `conduit-dev` through its existing OCI NAT
+as `CO`, IP `149.130.178.214`, with `blocked=false`; Colombia is absent from the
+current official restricted-country list. OCI identifies the host as
+`sa-bogota-1` in a private subnet. Bind the signer to the exact NAT IP, country,
+and `oci_bogota_nat_static_egress`, then repeat origin and funded dry-run parity
+before moving credentials. The NAT address is stable only for the lifetime of
+that gateway unless OCI is explicitly configured with a reserved public IP.
+The previously budgeted $9-12/month Chile relay is now only a fallback if the
+OCI origin ceases to be eligible or the existing NAT IP cannot be retained.
+
+Direct OCI egress leaves the immediate post-compute Azure projection at
+$142.57/month and restores the later storage-optimized target to about
+$38-49/month: a projected $373-384/month (88-91%) reduction. Do not move funded
+credentials without explicit approval.
 
 The four Azure apps averaged 0.33 CPU cores and 2.40 GB of working set in the
 24 hours ending 2026-08-06T01:00Z. The sum of their individual observed peaks
@@ -155,6 +161,12 @@ pre-acceptance segment was preserved, not deleted, under
 remained authoritative through the handoff. Do not count time before the clean
 02:20 segment, and do not delete Azure compute until every deletion gate below
 passes.
+
+This candidate failed at `2026-08-06T02:30:36Z`: the non-adaptive primary path
+panicked while building final-decision lineage. Raw recording continued, but
+strategy, fair-value, and decision processing stopped in the unsupervised Tokio
+task. The 72-hour clock is invalid and must restart from a clean segment after
+the corrected digest is deployed and its full processing path is verified.
 
 ## Azure data and evidence surfaces retained
 

@@ -150,8 +150,12 @@ export function validateRedemptionConfig(config) {
         errors.push("funded operator session must bind matching positive target/max order notional");
       }
     }
-    if (config.executionOrigin !== "azure_chile_central_static_egress") {
-      errors.push("funded-service redemption must originate from Azure Chile Central");
+    const approvedCountry = {
+      azure_chile_central_static_egress: "CL",
+      oci_bogota_nat_static_egress: "CO"
+    }[config.executionOrigin];
+    if (!approvedCountry || (config.expectedCountry && config.expectedCountry !== approvedCountry)) {
+      errors.push("funded-service redemption must use an approved static egress origin");
     }
     if (config.maxConditions !== 1) {
       errors.push("funded-service redemption must cap each run at one condition");

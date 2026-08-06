@@ -242,7 +242,7 @@ test("relayer error details retain bounded diagnostics without secrets or signed
   assert.equal(safeRelayerErrorDetail("x".repeat(700)), "[token-redacted]");
 });
 
-test("funded-service redemption is bound to the Chile protected-compounding session", () => {
+test("funded-service redemption is bound to an approved static-egress protected-compounding session", () => {
   const session = {
     session_id: "dynamic-quote-funded-2026-07-29-v5",
     allow_compounding: true,
@@ -264,6 +264,15 @@ test("funded-service redemption is bound to the Chile protected-compounding sess
   assert.equal(funded.executionOrigin, "azure_chile_central_static_egress");
   assert.equal(funded.maxOrderNotional, 10.5);
   assert.equal(funded.maxPayout, null);
+  assert.equal(loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
+    VENUE_PROBE_EXECUTION_ORIGIN: "oci_bogota_nat_static_egress",
+    VENUE_PROBE_EXPECTED_COUNTRY: "CO",
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1"
+  }).executionOrigin, "oci_bogota_nat_static_egress");
   assert.throws(() => loadRedemptionConfig({
     ...safeEnv,
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
@@ -279,7 +288,7 @@ test("funded-service redemption is bound to the Chile protected-compounding sess
     VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
     VENUE_PROBE_EXECUTION_ORIGIN: "azure_north_europe_static_egress",
     VENUE_REDEMPTION_MAX_CONDITIONS: "1"
-  }), /Azure Chile Central/);
+  }), /approved static egress origin/);
   assert.throws(() => loadRedemptionConfig({
     ...safeEnv,
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
