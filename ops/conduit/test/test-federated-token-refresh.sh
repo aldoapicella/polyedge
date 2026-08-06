@@ -44,7 +44,10 @@ token = ".".join([
     encode({"iss": "https://oidc.example.invalid", "sub": "spiffe://polyedge.local/conduit/research", "aud": ["api://AzureADTokenExchange"], "iat": now, "exp": now + 300}),
     "c2lnbmF0dXJl",
 ])
-print(json.dumps({"svids": [{"spiffeId": "spiffe://polyedge.local/conduit/research", "svid": token}]}))
+print(json.dumps([
+    {"svids": [{"spiffeId": "spiffe://polyedge.local/conduit/research", "svid": token}]},
+    {"bundles": {}},
+]))
 PY
 SH
 chmod 0755 "$fake"

@@ -81,12 +81,24 @@ manifest length.
 The four dedicated UAMIs do not yet exist. The replacement architecture needs
 no Entra directory role: subscription Owner can create each UAMI and exact
 federated identity credential as Azure resources. An isolated research-lane
-ARM what-if passed with exactly two creates and no deletes or role assignments.
-Live creation remains blocked on a stable owned DNS name, reserved OCI public
-IP, valid TLS, and externally reachable SPIRE OIDC discovery/JWKS. The primary
-research job env files, approval marker, and timers remain absent. This blocks
-the two-daily-cycle gate but does not affect the active ring uploader's narrow
-Arc role.
+ARM what-if using `https://oidc.aldoapicella.com` passed with exactly two
+creates and no deletes or role assignments. SPIRE 1.15.2 Server, Agent, and
+OIDC Provider are installed and boot-enabled on `conduit-dev`; the provider and
+Workload API remain on protected Unix sockets. The live research JWT-SVID is
+RS256, has a 300-second lifetime, and exactly matches its issuer, subject, and
+`api://AzureADTokenExchange` audience. Its owner-only token file is refreshed
+by a two-minute systemd timer. Caddy is installed but disabled until public DNS
+and TLS can succeed.
+
+`aldoapicella.com` is user-owned and delegated through GoDaddy, but no DNS API
+credential is present on the host. The OCI instance principal is authorized to
+manage the ring volume but receives `NotAuthorizedOrNotFound` for public-IP,
+private-IP, DNS, and IAM policy operations. Public creation therefore remains
+blocked on assigning a reserved address to the VNIC and creating the
+`oidc.aldoapicella.com` A record. No FIC or Azure role assignment is created
+before externally reachable discovery/JWKS passes. This blocks the
+two-daily-cycle gate but does not affect the active ring uploader's narrow Arc
+role.
 
 ## OCI schedule and coverage
 
@@ -146,7 +158,10 @@ managed load balancers, and public IP/VNet resources therefore removes a
 current projected $279.39/month before the later ACR, compute-monitoring, and
 storage optimizations.
 
-The cheapest full-processing migration needs no paid relay. On 2026-08-06 the
+The approved ring block volume was expanded online from 150 GB to 200 GB at
+zero VPUs/GB. The ext4 filesystem now has about 172.7 GB available, and the
+production `polyedge-ring-health.service` capacity/upload check passes. The
+cheapest full-processing migration needs no paid relay. On 2026-08-06 the
 Polymarket geoblock endpoint observed `conduit-dev` through its OCI public IP
 as `CO`, IP `149.130.178.214`, with `blocked=false`; Colombia is absent from the
 current official restricted-country list. OCI identifies the host as

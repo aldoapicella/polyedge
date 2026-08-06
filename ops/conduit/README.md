@@ -14,7 +14,7 @@ and funded identities remain separate gates; a read SAS is not sufficient for
 the writers or leases.
 
 The API Quadlet persists its local recorder under `/srv/polyedge-ring`. Verify
-that path is the 150-GB block-volume mount (not a directory on `/`) before every
+that path is the 200-GB block-volume mount (not a directory on `/`) before every
 start: `findmnt -T /srv/polyedge-ring && df -h /srv/polyedge-ring`.
 
 Do **not** enable daily, replay, or qset shadow work on the boot disk. Their
@@ -115,10 +115,10 @@ deployment and no role assignment. Its research-lane what-if produced exactly
 one UAMI and one FIC, with no deletes. Deploy lanes sequentially only after the
 issuer below is public and its observed JWT claims match the template.
 
-The issuer requires a reserved OCI public IP, a stable owned DNS name, valid
+The issuer is `https://oidc.aldoapicella.com` and requires a reserved OCI public IP, valid
 TLS, and inbound TCP/80 and TCP/443 in OCI and UFW. Do not use an ephemeral
-platform hostname. Replace `oidc.example.invalid` consistently in the three
-SPIRE configs, `spire.env`, Caddy, and the Bicep `issuer` parameter.
+platform hostname. Keep the same exact issuer in the three SPIRE configs,
+`spire.env`, Caddy, and the Bicep `issuer` parameter.
 
 Use the verified SPIRE 1.15.2 ARM64 musl artifacts. Their SHA-256 values are
 `92e782b285c50c62cdf37fdfa8917ea68fa57685b3bf99d03db36da4095678fa`
@@ -133,10 +133,12 @@ Create fixed service accounts once, then install the reviewed files:
 
 ```sh
 sudo groupadd --system spire-workload
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin spire-server
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin spire-oidc
+sudo groupadd --system spire-server
+sudo useradd --system --no-create-home --gid spire-server --shell /usr/sbin/nologin spire-server
+sudo useradd --system --no-create-home --gid caddy --shell /usr/sbin/nologin spire-oidc
 for lane in api research shadow-qset funded-signer; do
-  sudo useradd --system --no-create-home --shell /usr/sbin/nologin "polyedge-identity-$lane"
+  sudo groupadd --system "polyedge-identity-$lane"
+  sudo useradd --system --no-create-home --gid "polyedge-identity-$lane" --shell /usr/sbin/nologin "polyedge-identity-$lane"
 done
 sudo install -d -m 0755 /opt/spire/bin /etc/spire
 sudo install -m 0755 spire-server spire-agent /opt/spire/bin/
@@ -152,7 +154,7 @@ sudo install -m 0644 ops/conduit/systemd/polyedge-federated-token@.* /etc/system
 
 Bootstrap the one agent with a root-only join-token file, then remove that file
 after its first attestation and start the persistent unit without a token. Use
-the node ID `spiffe://polyedge.local/spire/agent/conduit-dev`. Register the OIDC
+the node ID `spiffe://polyedge.local/conduit-dev`. Register the OIDC
 provider and each fetcher with both its Unix user and the fixed official SPIRE
 Agent binary path. The four workload IDs are exactly:
 
@@ -168,14 +170,14 @@ token stays in a root-only file and never appears in a process argument:
 
 ```sh
 server_socket=/run/spire-server/api.sock
-node_id=spiffe://polyedge.local/spire/agent/conduit-dev
+node_id=spiffe://polyedge.local/conduit-dev
 sudo systemctl enable --now spire-server.service
 sudo sh -c 'umask 077; /opt/spire/bin/spire-server bundle show -socketPath /run/spire-server/api.sock -format pem > /etc/spire/bootstrap.crt'
-sudo sh -c '/opt/spire/bin/spire-server token generate -socketPath /run/spire-server/api.sock -spiffeID spiffe://polyedge.local/spire/agent/conduit-dev -output json | jq -er .value > /etc/spire/join-token && chmod 0600 /etc/spire/join-token'
-sudo /opt/spire/bin/spire-agent run -config /etc/spire/agent.conf -joinTokenFile /etc/spire/join-token
-# After the first successful attestation, stop the foreground agent, unlink the
-# consumed join-token file, and start the persistent service.
+sudo sh -c '/opt/spire/bin/spire-server token generate -socketPath /run/spire-server/api.sock -spiffeID spiffe://polyedge.local/conduit-dev -output json | jq -er .value > /etc/spire/join-token && chmod 0600 /etc/spire/join-token'
+sudo sh -c 'timeout --signal=TERM 25 /opt/spire/bin/spire-agent run -config /etc/spire/agent.conf -joinTokenFile /etc/spire/join-token > /run/spire-agent-bootstrap.log 2>&1 || [ "$?" -eq 124 ]'
+sudo grep -q 'Node attestation was successful' /run/spire-agent-bootstrap.log
 sudo unlink /etc/spire/join-token
+sudo unlink /run/spire-agent-bootstrap.log
 sudo systemctl enable --now spire-agent.service
 
 sudo /opt/spire/bin/spire-server entry create -socketPath "$server_socket" \
@@ -205,7 +207,7 @@ creating its FIC, decode claims locally without printing the token and verify
 ```sh
 az deployment group create --resource-group rg-polyedge-dev \
   --template-file infra/conduit-federated-identity.bicep \
-  --parameters lane=research issuer=https://REPLACE_STABLE_OIDC_DOMAIN \
+  --parameters lane=research issuer=https://oidc.aldoapicella.com \
   --parameters tags='{"owner":"polyedge","migration":"oci-compute-plane"}'
 ```
 
@@ -232,7 +234,7 @@ hashes in a v2 manifest, uploads the compressed payload as an immutable Azure
 Hot-tier blob without any remote listing, and verifies retry collisions byte
 for byte. V1 uncompressed receipts remain valid. Local source, sidecar, and
 manifest files are retained for 48 hours to leave job-workspace headroom on the
-150-GB volume, then removed only after the immutable remote manifest is re-read
+200-GB volume, then removed only after the immutable remote manifest is re-read
 successfully. A separate health timer checks upload age and projected capacity
 and stops the API before free space falls below 32 GiB. Azure tiers only the
 future `events-oci-hot7-v1/` prefix to Cool after seven days and Archive after

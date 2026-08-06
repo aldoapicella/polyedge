@@ -1,11 +1,6 @@
-# Replace this placeholder with the public DNS name before installing.
-polyedge.example.invalid {
-	reverse_proxy 127.0.0.1:3000
-}
-
 # Use a separate stable DNS name for OIDC discovery. The Workload API remains
 # local; every other path on this host returns 404.
-oidc.example.invalid {
+oidc.aldoapicella.com {
 	@oidc path /.well-known/openid-configuration /keys
 	handle @oidc {
 		reverse_proxy unix//run/spire-oidc/provider.sock {

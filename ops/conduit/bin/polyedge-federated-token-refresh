@@ -34,7 +34,10 @@ trap 'unlink "$temporary" 2>/dev/null || true' EXIT HUP INT TERM
   -audience "$audience" \
   -output json \
   | jq -erj --arg subject "$subject" \
-      '[.svids[] | select((.spiffeId // .spiffe_id) == $subject) | .svid]
+      '[(if type == "array" then .[] else . end)
+        | .svids[]?
+        | select((.spiffeId // .spiffe_id) == $subject)
+        | .svid]
        | if length == 1 then .[0] else error("expected one JWT-SVID") end' \
       > "$temporary"
 chmod 0600 "$temporary"
