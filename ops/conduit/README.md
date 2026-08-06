@@ -58,11 +58,13 @@ authorized-key command is `/usr/local/libexec/polyedge-github-deploy` with the
 `restrict` option. The wrapper and sudoers rule permit only digest-pinned API,
 frontend, or funded-signer deployments through the validated Quadlet helper.
 
-Replace each zero digest and every `REPLACE_...` value in the installed files,
-not in this repository. Keep API/frontend image digests in their Quadlets; set
-the same reviewed backend digest in each enabled job env file. Configure Caddy
-with a real DNS name and allow only SSH, TCP/80, and TCP/443 in OCI and the host
-firewall. Never expose port 3000 or 8081.
+Replace each zero digest and every remaining `REPLACE_...` value in the
+installed files, not in this repository. Provision the three API/frontend
+Podman secrets named by their Quadlets before starting either service. Keep
+API/frontend image digests in their Quadlets; set the same reviewed backend
+digest in each enabled job env file. Configure Caddy with a real DNS name and
+allow only SSH, TCP/80, and TCP/443 in OCI and the host firewall. Never expose
+port 3000 or 8081.
 
 `ring.env.example` starts with `POLYEDGE_RING_SEAL_ONLY=1`, so it can hash local
 segments before Azure identity approval. Set it to `0` only after filling the

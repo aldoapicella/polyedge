@@ -10,6 +10,7 @@ Image=registry.example.invalid/polyedge-rust-backend@sha256:00000000000000000000
 ContainerName=polyedge-api
 Network=polyedge.network
 EnvironmentFile=/etc/polyedge/api.env
+Secret=polyedge-api-bearer-token,type=env,target=API_BEARER_TOKEN
 Volume=/srv/polyedge-ring:/srv/polyedge-ring:Z
 Volume=/etc/polyedge/credentials/api:/run/credentials:ro,Z
 PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --health-on-failure=restart
