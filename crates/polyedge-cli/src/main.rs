@@ -44,6 +44,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
+const LEGACY_RING_BLOB_PREFIX: &str = "events-oci-dual";
+
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
 #[command(about = "PolyEdge Rust backend CLI")]
@@ -1830,7 +1832,10 @@ fn run_ring_upload(
         }
         let segment_relative = ring_relative_path(&manifest, "segment_path")?;
         let segment_path = root.join(&segment_relative);
-        let blob_name = ring_blob_name(&manifest, blob_prefix)?;
+        let receipt_path = PathBuf::from(format!("{}.uploaded.json", manifest_path.display()));
+        let accepted_prefix =
+            accepted_ring_blob_prefix(&manifest, blob_prefix, receipt_path.exists());
+        let blob_name = ring_blob_name(&manifest, accepted_prefix)?;
         let expected_sha = ring_sha256(&manifest, "sha256")?;
         let expected_bytes = manifest["bytes"]
             .as_u64()
@@ -1844,7 +1849,7 @@ fn run_ring_upload(
         validate_ring_identity(
             &segment_relative,
             &blob_name,
-            blob_prefix,
+            accepted_prefix,
             segment_start,
             segment_end,
             now,
@@ -1857,7 +1862,6 @@ fn run_ring_upload(
         })?;
         let manifest_sha = sha256_prefixed(&manifest_bytes);
         let manifest_blob = format!("{blob_name}.manifest.json");
-        let receipt_path = PathBuf::from(format!("{}.uploaded.json", manifest_path.display()));
 
         if receipt_path.exists() {
             let receipt: serde_json::Value = serde_json::from_slice(
@@ -1946,6 +1950,22 @@ fn run_ring_upload(
         "retention_hours": retention_hours,
         "segment_access_tier": "Hot",
     }))
+}
+
+fn accepted_ring_blob_prefix<'a>(
+    manifest: &serde_json::Value,
+    current_prefix: &'a str,
+    receipt_exists: bool,
+) -> &'a str {
+    if receipt_exists
+        && manifest["blob_name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with(&format!("{LEGACY_RING_BLOB_PREFIX}/")))
+    {
+        LEGACY_RING_BLOB_PREFIX
+    } else {
+        current_prefix
+    }
 }
 
 fn collect_ring_manifests(path: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
@@ -2264,9 +2284,9 @@ fn profitability_authorization_flags(
 #[cfg(test)]
 mod tests {
     use super::{
-        profitability_authorization_flags, ring_blob_name, ring_relative_path, ring_sha256,
-        terminate_lease_child_tree, validate_ring_identity, Cli, Command, Path, PathBuf,
-        ResearchCommand,
+        accepted_ring_blob_prefix, profitability_authorization_flags, ring_blob_name,
+        ring_relative_path, ring_sha256, terminate_lease_child_tree, validate_ring_identity, Cli,
+        Command, Path, PathBuf, ResearchCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2294,7 +2314,7 @@ mod tests {
         invalid = manifest.clone();
         invalid["blob_name"] = json!("other-prefix/2026/08/05/22/1785969000.jsonl");
         assert!(ring_blob_name(&invalid, "events-oci-dual").is_err());
-        invalid = manifest;
+        invalid = manifest.clone();
         invalid["sha256"] = json!(format!("sha256:{}", "A".repeat(64)));
         assert!(ring_sha256(&invalid, "sha256").is_err());
 
@@ -2316,6 +2336,15 @@ mod tests {
             1785969700,
         )
         .is_err());
+
+        assert_eq!(
+            accepted_ring_blob_prefix(&manifest, "events-oci-hot7-v1", true),
+            "events-oci-dual"
+        );
+        assert_eq!(
+            accepted_ring_blob_prefix(&manifest, "events-oci-hot7-v1", false),
+            "events-oci-hot7-v1"
+        );
     }
 
     #[test]
