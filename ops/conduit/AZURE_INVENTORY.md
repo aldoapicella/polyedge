@@ -245,6 +245,21 @@ formal 72-hour acceptance start: the dedicated job identities and primary
 research timers must exist and run before that clock can start. Azure remains
 authoritative.
 
+The archive-capable API was deployed at `2026-08-06T07:27:55Z` from source
+`69402f0ddbbb8effedda30a5297e85b643134435`, pinned to ARM64 digest
+`sha256:4e2f32d34d3ac8768a656f6481728e643afaae588510763dddbdf739dfa7f02d`.
+The first production schema-v2 segment retained its 277,381,051-byte local
+JSONL source and uploaded a 34,635,062-byte deterministic gzip sidecar, an
+87.5% reduction. At `07:32:19Z` the runtime Arc identity created and receipted
+both immutable objects under `events-oci-hot7-v1/`; an independent Arc-authenticated
+download returned Hot `application/gzip` content whose 34,635,062-byte length
+and `sha256:4bffcd8e019ffb5487776c9c51b062f651912dafb995961397e35aef6a43ea9f`
+matched the sealed manifest exactly. Ring health then reported zero unuploaded
+or unsealed closed segments with the recurring timer enabled. A conflicting,
+unuploaded `events-oci-test` sidecar from preflight was moved intact to the
+rollback directory; its original source and already-verified production v1
+receipt were not changed.
+
 ## Azure data and evidence surfaces retained
 
 Storage account: `stpolyedge6urdjr5nmwx7w`, Standard LRS, StorageV2.
