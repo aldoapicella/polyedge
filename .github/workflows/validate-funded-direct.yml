@@ -431,8 +431,11 @@ jobs:
               -o json > stopped-funded-replicas.json
             jq -e '
               length == 1
-              and .[0].properties.runningState == "NotRunning"
-              and ([.[0].properties.containers[] | select(.ready == true)] | length) == 0
+              and ([.[0].properties.containers[]
+                | select(.name == "funded-direct"
+                  and .ready == false
+                  and (.restartCount // 0) >= 3)]
+                | length) == 1
             ' stopped-funded-replicas.json
             migration_failures=$(az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
