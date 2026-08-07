@@ -2204,6 +2204,10 @@ impl AzureBlobClient {
         match response {
             Ok(_) => Ok(ImmutableBlobWrite::Created),
             Err(ureq::Error::Status(409 | 412, _)) => Ok(ImmutableBlobWrite::AlreadyExists),
+            Err(ureq::Error::Status(403, _)) => match self.get_response(url) {
+                Ok(_) => Ok(ImmutableBlobWrite::AlreadyExists),
+                Err(error) => Err(error),
+            },
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
@@ -3346,6 +3350,57 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.to_ascii_lowercase().contains("if-none-match: *")));
+    }
+
+    #[test]
+    fn immutable_blob_put_accepts_forbidden_create_only_after_existing_blob_is_readable() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            ["403 Forbidden", "200 OK"]
+                .into_iter()
+                .map(|status| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        request.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    request
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut client = AzureBlobClient::new("unused", "unused", "test=sas");
+        let result = client
+            .put_block_blob_if_absent(
+                &format!("http://{address}/immutable"),
+                b"intent",
+                "application/json",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result, ImmutableBlobWrite::AlreadyExists);
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("PUT "));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-none-match: *"));
+        assert!(requests[1].starts_with("GET "));
     }
 
     #[test]
