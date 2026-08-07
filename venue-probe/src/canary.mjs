@@ -549,8 +549,8 @@ export async function refreshCampaignRiskSnapshot(resources, {
   return snapshot;
 }
 
-function requireCampaignRiskSnapshot() {
-  const snapshot = activeResources?.campaignRiskSnapshot;
+function requireCampaignRiskSnapshot(resources = activeResources) {
+  const snapshot = resources?.campaignRiskSnapshot;
   if (snapshot?.control?.campaign_id !== config.campaignId || !Array.isArray(snapshot?.reservationRecords)) {
     throw new Error("fail closed: current-run campaign risk snapshot is unavailable");
   }
@@ -1112,7 +1112,8 @@ async function capturePreflight(
     recordLedger = true,
     profitQuarantineSnapshot = activeResources?.profitQuarantineSnapshot || null,
     protectedCompoundingContext =
-      activeResources?.protectedCompoundingContext || null
+      activeResources?.protectedCompoundingContext || null,
+    preflightResources = activeResources
   } = {}
 ) {
   const capturedStartedWallMs = Date.now();
@@ -1144,7 +1145,7 @@ async function capturePreflight(
       clockUncertaintyMs
     };
   };
-  let campaignRiskSnapshot = requireCampaignRiskSnapshot();
+  let campaignRiskSnapshot = requireCampaignRiskSnapshot(preflightResources);
   const [
     geoblock,
     clockEvidence,
@@ -1220,10 +1221,10 @@ async function capturePreflight(
       evidence_source: "polymarket_data_api_redeemable",
       run_id: runId
     }, {
-      container: activeResources.container,
+      container: preflightResources.container,
       reservationRecords: campaignReservationRecords
     });
-    campaignRiskSnapshot = await refreshCampaignRiskSnapshot(activeResources);
+    campaignRiskSnapshot = await refreshCampaignRiskSnapshot(preflightResources);
     reservations = campaignRiskSnapshot.reservationRecords.map((record) => record.reservation);
   }
   const liquidCollateral = Number(balance.balance) / 1_000_000;
@@ -1437,7 +1438,8 @@ export function startSafetySnapshotCache(resources, market, {
         {
           recordLedger: false,
           profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
-          protectedCompoundingContext: resources.protectedCompoundingContext
+          protectedCompoundingContext: resources.protectedCompoundingContext,
+          preflightResources: resources
         }
       );
       if (cache.generation === generation) {

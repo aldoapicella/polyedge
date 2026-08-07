@@ -669,11 +669,16 @@ test("safety cache permits only one pending preflight across warmup generations"
     client: {},
     manifestDocument: { value: {} },
     profitQuarantineSnapshot: null,
+    campaignRiskSnapshot: {
+      control: { campaign_id: "campaign-a" },
+      reservationRecords: []
+    },
     safetyCache: cache
   };
   const captures = [];
   const timers = [];
-  const capture = (_client, intent) => new Promise((resolve) => {
+  const capture = (_client, intent, _manifest, _ignoredReservationId, options) => new Promise((resolve) => {
+    assert.strictEqual(options.preflightResources, resources);
     captures.push({ market_id: intent.market_id, resolve });
   });
   const setIntervalFn = (callback) => {
