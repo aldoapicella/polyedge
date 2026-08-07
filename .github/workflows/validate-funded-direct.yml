@@ -714,6 +714,7 @@ jobs:
             --name "$INTENT_PRODUCER_APP" \
             --query properties.template.containers[0].image -o tsv)
           test "$producer_image" = "${{ steps.images.outputs.producer_reference }}"
+          printf '%s\n' "$producer_revision" > intent-producer-revision-deployed.txt
 
       - name: Verify one active cloud replica and exact live controls
         run: |
@@ -987,7 +988,165 @@ jobs:
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query status -o tsv)" = "Active"
+
+      - name: Rewarm the producer after funded intake reopens
+        run: |
+          set -euo pipefail
+          cutover_complete=false
+          refence_incomplete_cutover() {
+            if [ "$cutover_complete" != true ]; then
+              az servicebus queue update \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --namespace-name "$SERVICE_BUS_NAMESPACE" \
+                --name "$SERVICE_BUS_QUEUE" \
+                --status SendDisabled \
+                --only-show-errors -o none || true
+            fi
+          }
+          trap refence_incomplete_cutover EXIT
+          test "$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --query status -o tsv)" = "Active"
+          producer_revision=$(cat intent-producer-revision-deployed.txt)
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer-after-reopen.json
+          test "$(jq -r '.properties.latestRevisionName' intent-producer-after-reopen.json)" = "$producer_revision"
+          test "$(jq -r '.properties.latestReadyRevisionName' intent-producer-after-reopen.json)" = "$producer_revision"
+          test "$(jq -r '.properties.template.containers[0].image' intent-producer-after-reopen.json)" = \
+            "${{ steps.images.outputs.producer_reference }}"
+          az containerapp replica list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --revision "$producer_revision" \
+            -o json > producer-replicas-before-reopen-restart.json
+          jq -e 'length == 1' producer-replicas-before-reopen-restart.json
+          jq '[.[].name]' producer-replicas-before-reopen-restart.json > \
+            producer-replica-names-before-reopen-restart.json
+          az containerapp revision restart \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --revision "$producer_revision" \
+            --only-show-errors -o none
+          producer_ready=false
+          for attempt in $(seq 1 36); do
+            az containerapp replica list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" \
+              --revision "$producer_revision" \
+              -o json > producer-replicas-after-reopen.json
+            if jq -e --slurpfile prior producer-replica-names-before-reopen-restart.json '
+              if length == 1 then
+                .[0] as $replica
+                | ($prior[0] | index($replica.name)) == null
+                  and $replica.properties.runningState == "Running"
+                  and ([$replica.properties.containers[]
+                    | select(.name == "shadow-runtime"
+                      and .ready == true
+                      and .runningState == "Running"
+                      and .restartCount == 0)] | length) == 1
+              else false end
+            ' producer-replicas-after-reopen.json >/dev/null; then
+              producer_ready=true
+              break
+            fi
+            sleep 5
+          done
+          test "$producer_ready" = true
+          producer_restarted_at=$(jq -r '.[0].properties.createdTime' producer-replicas-after-reopen.json)
+          environment_id=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.environmentId -o tsv)
+          workspace_customer_id=$(az containerapp env show \
+            --ids "$environment_id" \
+            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+          funded_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test "$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
+          warmup_ready=false
+          for attempt in $(seq 1 36); do
+            az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$funded_revision'
+                | where TimeGenerated >= datetime($producer_restarted_at)
+                | extend record = parse_json(Log_s)
+                | where tostring(record.status) == 'market_warmed'
+                | top 1 by TimeGenerated desc
+                | project TimeGenerated, Log_s" \
+              -o json > funded-warmup-after-reopen.json
+            warmup_market=$(jq -r '.[0].Log_s // "{}" | fromjson | .market_id // ""' \
+              funded-warmup-after-reopen.json)
+            warmup_time=$(jq -r '.[0].TimeGenerated // ""' funded-warmup-after-reopen.json)
+            if [[ "$warmup_market" =~ ^[0-9]+$ ]] && [ -n "$warmup_time" ]; then
+              az monitor log-analytics query \
+                --workspace "$workspace_customer_id" \
+                --analytics-query "ContainerAppConsoleLogs_CL
+                  | where ContainerAppName_s == '$FUNDED_APP'
+                  | where RevisionName_s == '$funded_revision'
+                  | where TimeGenerated >= datetime($warmup_time)
+                  | extend record = parse_json(Log_s)
+                  | where tostring(record.status) == 'persistent_service_heartbeat'
+                  | where tostring(record.executor.warmed_market.market_id) == '$warmup_market'
+                  | top 1 by TimeGenerated desc
+                  | project Log_s" \
+                -o json > funded-heartbeat-after-reopen.json
+              if jq -e '
+                length == 1
+                and (.[0].Log_s | fromjson
+                  | .executor.user_channel_ready == true
+                  and .executor.market_channel_ready == true
+                  and .executor.safety_snapshot_cache_ready == true
+                  and .executor.safety_snapshot_cache_error == null
+                  and .executor.reconnect_reconciliation_required == false
+                  and .executor.user_channel_gaps == 0
+                  and .executor.market_channel_gaps == 0)
+              ' funded-heartbeat-after-reopen.json >/dev/null; then
+                warmup_ready=true
+                break
+              fi
+            fi
+            sleep 5
+          done
+          test "$warmup_ready" = true
+          az containerapp revision list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > producer-revisions-after-reopen.json
+          jq -e --arg revision "$producer_revision" '
+            ([.[] | select(.properties.active == true)] | length) == 1
+            and ([.[] | select(.properties.active == true)][0].name == $revision)
+          ' producer-revisions-after-reopen.json
+          test "$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json | jq -e --arg revision "$producer_revision" \
+              --arg image "${{ steps.images.outputs.producer_reference }}" '
+              .properties.latestRevisionName == $revision
+              and .properties.latestReadyRevisionName == $revision
+              and .properties.template.containers[0].image == $image
+            ' >/dev/null
+          test "$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.latestRevisionName -o tsv)" = "$funded_revision"
+          test "$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           echo "FUNDED_CUTOVER_COMPLETE=true" >> "$GITHUB_ENV"
+          cutover_complete=true
+          trap - EXIT
 
       - name: Keep funded intake fenced after an incomplete cutover
         if: ${{ failure() && env.FUNDED_QUEUE_FENCED == 'true' && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
