@@ -271,29 +271,42 @@ test("v7-to-v5 migration preserves the fully reconciled high water and is idempo
   const targetEtag = fixture.container.etags.get(
     fixture.target.capital_policy.state_blob_name
   );
-  const second = await migrateProtectedReserveState({
-    container: fixture.container,
-    manifest: fixture.target,
-    source: fixture.source,
-    accountEquity: 49.832101,
-    fullyReconciled: true,
-    openOrderCount: 0,
-    positionCount: 0,
-    unresolvedReservationCount: 0,
-    now: () => new Date("2026-08-06T04:00:00.000Z")
+  const postMigration = manualSettlement({
+    id: "manual-v5-after-migration",
+    sessionId: fixture.target.session_id,
+    transaction: "e",
+    condition: "f",
+    payout: 2,
+    principal: 1
   });
-  assert.equal(fixture.container.etags.get(
-    fixture.target.capital_policy.state_blob_name
-  ), targetEtag);
-  assert.equal(second.state.migration_completed_at, first.state.migration_completed_at);
-
+  await putVerifiedInternalSettlement(fixture.container, postMigration);
   const reconciled = await reconcileProtectedCompoundingState({
     container: fixture.container,
     manifest: fixture.target,
     accountEquity: 48,
     fullyReconciled: true,
-    now: () => new Date("2026-08-06T05:00:00.000Z")
+    now: () => new Date("2026-08-06T03:30:00.000Z")
   });
+  assert.ok(reconciled.verified_settlement_ids.includes(postMigration.id));
+  const reconciledEtag = fixture.container.etags.get(
+    fixture.target.capital_policy.state_blob_name
+  );
+  const second = await migrateProtectedReserveState({
+    container: fixture.container,
+    manifest: fixture.target,
+    source: fixture.source,
+    accountEquity: 40,
+    fullyReconciled: false,
+    openOrderCount: 1,
+    positionCount: 1,
+    unresolvedReservationCount: 1,
+    now: () => new Date("2026-08-06T04:00:00.000Z")
+  });
+  assert.equal(fixture.container.etags.get(
+    fixture.target.capital_policy.state_blob_name
+  ), reconciledEtag);
+  assert.notEqual(reconciledEtag, targetEtag);
+  assert.equal(second.state.migration_completed_at, first.state.migration_completed_at);
   assert.equal(reconciled.migration_source_state_etag, '"7"');
   assert.deepEqual(
     reconciled.migration_verified_settlement_ids,
@@ -302,6 +315,21 @@ test("v7-to-v5 migration preserves the fully reconciled high water and is idempo
 
   const stateBlobName = fixture.target.capital_policy.state_blob_name;
   const stateEtag = fixture.container.etags.get(stateBlobName);
+  const validStateBytes = fixture.container.values.get(stateBlobName);
+  const tamperedState = JSON.parse(validStateBytes);
+  tamperedState.authorized_equity_ceiling += 1;
+  fixture.container.values.set(stateBlobName, Buffer.from(JSON.stringify(tamperedState)));
+  await assert.rejects(migrateProtectedReserveState({
+    container: fixture.container,
+    manifest: fixture.target,
+    source: fixture.source,
+    accountEquity: 40,
+    fullyReconciled: false,
+    openOrderCount: 1,
+    positionCount: 1,
+    unresolvedReservationCount: 1
+  }), /migration checkpoint is invalid/);
+  fixture.container.values.set(stateBlobName, validStateBytes);
   const migratedBlobName = internalSettlementBlobName(
     fixture.target.session_id,
     fixture.sourceNew.transaction_hash,
@@ -309,6 +337,16 @@ test("v7-to-v5 migration preserves the fully reconciled high water and is idempo
   );
   fixture.container.values.delete(migratedBlobName);
   fixture.container.etags.delete(migratedBlobName);
+  await assert.rejects(migrateProtectedReserveState({
+    container: fixture.container,
+    manifest: fixture.target,
+    source: fixture.source,
+    accountEquity: 40,
+    fullyReconciled: false,
+    openOrderCount: 1,
+    positionCount: 1,
+    unresolvedReservationCount: 1
+  }), /migration checkpoint is invalid/);
   await assert.rejects(reconcileProtectedCompoundingState({
     container: fixture.container,
     manifest: fixture.target,

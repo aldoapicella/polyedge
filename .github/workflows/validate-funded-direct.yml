@@ -392,6 +392,7 @@ jobs:
             sleep 5
           done
           test "${active_messages:-0}" = "0"
+          heartbeat_ok=false
           for attempt in $(seq 1 24); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
@@ -416,22 +417,34 @@ jobs:
                 and .executor.user_channel_gaps == 0
                 and .executor.market_channel_gaps == 0)
             ' post-fence-heartbeat.json >/dev/null; then
+              heartbeat_ok=true
               break
             fi
             sleep 5
           done
-          jq -e --arg session "$current_session" '
-            length == 1
-            and (.[0].Log_s | fromjson
-              | .executor.busy == false
-              and .executor.user_channel_ready == true
-              and (.executor.market_channel_ready == true
-                or ($session == "dynamic-quote-funded-2026-07-29-v5"
-                  and .executor.warmed_market == null))
-              and .executor.reconnect_reconciliation_required == false
-              and .executor.user_channel_gaps == 0
-              and .executor.market_channel_gaps == 0)
-          ' post-fence-heartbeat.json
+          if [ "$heartbeat_ok" != true ]; then
+            test "$current_session" = "dynamic-quote-funded-2026-07-29-v5"
+            az containerapp replica list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --revision "$current_revision" \
+              -o json > stopped-funded-replicas.json
+            jq -e '
+              length == 1
+              and .[0].properties.runningState == "NotRunning"
+              and ([.[0].properties.containers[] | select(.ready == true)] | length) == 0
+            ' stopped-funded-replicas.json
+            migration_failures=$(az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$current_revision'
+                | where TimeGenerated >= datetime($current_revision_created_at)
+                | where Log_s contains 'protected reserve migration requires zero orders, positions, and unresolved reservations'
+                | count" \
+              --query '[0].Count' -o tsv)
+            test "${migration_failures:-0}" -ge 3
+          fi
           case "$current_session" in
             dynamic-quote-funded-2026-08-03-v7)
               az monitor log-analytics query \
@@ -877,21 +890,78 @@ jobs:
           test "$(jq '[.[] | select(.properties.active == true)] | length' funded-revisions-final.json)" = "1"
           test "$(jq -r '[.[] | select(.properties.active == true)][0].name' funded-revisions-final.json)" = "$active_revision"
           for attempt in $(seq 1 18); do
+            az containerapp replica list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --revision "$active_revision" \
+              -o json > funded-replicas-final.json
+            replica_started_at=$(jq -r \
+              '.[0].properties.createdTime // "9999-12-31T23:59:59Z"' \
+              funded-replicas-final.json)
             startup_count=$(az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
                 | where ContainerAppName_s == '$FUNDED_APP'
                 | where RevisionName_s == '$active_revision'
-                | where TimeGenerated > ago(30m)
+                | where TimeGenerated >= datetime($replica_started_at)
                 | where Log_s contains '\"status\":\"persistent_service_started\"'
                 | count" \
               --query '[0].Count' -o tsv)
-            if [ "${startup_count:-0}" -ge 1 ]; then
+            az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$active_revision'
+                | where TimeGenerated >= datetime($replica_started_at)
+                | extend record = parse_json(Log_s)
+                | where tostring(record.status) == 'persistent_service_heartbeat'
+                | top 1 by TimeGenerated desc
+                | project Log_s" \
+              -o json > funded-heartbeat-final.json
+            if [ "${startup_count:-0}" -ge 1 ] && jq -e '
+                length == 1
+                and .[0].properties.runningState == "Running"
+                and ([.[0].properties.containers[]
+                  | select(.name == "funded-direct"
+                    and .ready == true
+                    and .runningState == "Running"
+                    and .restartCount == 0)] | length) == 1
+              ' funded-replicas-final.json >/dev/null && jq -e '
+                length == 1
+                and (.[0].Log_s | fromjson
+                  | .executor.busy == false
+                  and .executor.user_channel_ready == true
+                  and (.executor.market_channel_ready == true
+                    or .executor.warmed_market == null)
+                  and .executor.reconnect_reconciliation_required == false
+                  and .executor.user_channel_gaps == 0
+                  and .executor.market_channel_gaps == 0)
+              ' funded-heartbeat-final.json >/dev/null; then
               break
             fi
             sleep 10
           done
           test "${startup_count:-0}" -ge 1
+          jq -e '
+            length == 1
+            and .[0].properties.runningState == "Running"
+            and ([.[0].properties.containers[]
+              | select(.name == "funded-direct"
+                and .ready == true
+                and .runningState == "Running"
+                and .restartCount == 0)] | length) == 1
+          ' funded-replicas-final.json
+          jq -e '
+            length == 1
+            and (.[0].Log_s | fromjson
+              | .executor.busy == false
+              and .executor.user_channel_ready == true
+              and (.executor.market_channel_ready == true
+                or .executor.warmed_market == null)
+              and .executor.reconnect_reconciliation_required == false
+              and .executor.user_channel_gaps == 0
+              and .executor.market_channel_gaps == 0)
+          ' funded-heartbeat-final.json
           qset_after=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$PROTECTED_QSET_APP" \

@@ -684,15 +684,6 @@ export async function migrateProtectedReserveState({
         `reports/funded/dynamic-quote/sessions/${source.sessionId}/capital-reserve-state.json`) {
     throw new Error("fail closed: protected reserve migration source binding is invalid");
   }
-  if (fullyReconciled !== true
-      || Number(openOrderCount) !== 0
-      || Number(positionCount) !== 0
-      || Number(unresolvedReservationCount) !== 0) {
-    throw new Error("fail closed: protected reserve migration requires zero orders, positions, and unresolved reservations");
-  }
-  const equity = money(accountEquity);
-  if (equity < 0) throw new Error("fail closed: protected reserve migration equity is invalid");
-
   const sourceSessionDocument = await readBlob(container, source.sessionBlobName);
   if (sourceSessionDocument.hash !== sourceHash) {
     throw new Error("fail closed: protected reserve migration source session SHA-256 mismatch");
@@ -761,6 +752,87 @@ export async function migrateProtectedReserveState({
     minimumHistoricalHighWaterEquity
   );
 
+  const stableSourceState = await readState(container, source.stateBlobName);
+  if (stableSourceState?.etag !== sourceStateDocument.etag
+      || stableSourceState?.hash !== sourceStateDocument.hash) {
+    throw new Error("fail closed: protected reserve migration source state changed during verification");
+  }
+
+  const checkpoint = initialTarget?.value;
+  if (checkpoint?.migration_source_session_id !== undefined) {
+    const checkpointIds = checkpoint.migration_verified_settlement_ids;
+    const checkpointSettlements = checkpointIds.map((id) =>
+      uniqueTargetLedger.find((row) => row.id === id));
+    const targetSettlementIds = uniqueTargetLedger.map((row) => row.id).sort();
+    const targetRealizedPnl = money(uniqueTargetLedger.reduce(
+      (total, row) => total + Number(row.realized_pnl),
+      0
+    ));
+    const targetCeiling = money(
+      Number(manifest.starting_collateral) + targetRealizedPnl
+    );
+    const currentHighWater = Number(checkpoint.high_water_equity);
+    const historicalHighWater = Number(checkpoint.historical_high_water_equity);
+    const lastEquity = Number(checkpoint.last_reconciled_equity);
+    const protectedReserve = Number(checkpoint.protected_reserve);
+    const operatingBuffer = money(lastEquity * policy.operatingBufferRatio);
+    const requiredSettlements = uniqueSettlements([
+      ...policy.internalSettlements,
+      ...uniqueSource
+    ]);
+    if (checkpoint.migration_source_state_etag !== sourceStateDocument.etag
+        || Number(checkpoint.migration_minimum_historical_high_water_equity) !==
+          minimumHistoricalHighWaterEquity
+        || checkpointSettlements.some((row) => !row)
+        || requiredSettlements.some((required) =>
+          !checkpointIds.includes(required.id)
+          || !checkpointSettlements.some((row) =>
+            settlementAccountingEqual(row, required)))
+        || JSON.stringify(checkpoint.verified_settlement_ids) !==
+          JSON.stringify(targetSettlementIds)
+        || !moneyEqual(checkpoint.verified_realized_pnl, targetRealizedPnl)
+        || !moneyEqual(checkpoint.authorized_equity_ceiling, targetCeiling)
+        || !Number.isFinite(lastEquity)
+        || lastEquity < 0
+        || lastEquity > targetCeiling + Number(manifest.max_reconciliation_discrepancy) + 1e-9
+        || currentHighWater + 1e-9 < Math.max(
+          Number(manifest.starting_collateral),
+          targetCeiling,
+          Number(sourceStateDocument.value.high_water_equity),
+          Number(sourceStateDocument.value.historical_high_water_equity),
+          lastEquity
+        )
+        || historicalHighWater + 1e-9 < currentHighWater
+        || !moneyEqual(checkpoint.operating_buffer, operatingBuffer)
+        || !moneyEqual(
+          checkpoint.operable_capital,
+          Math.max(0, lastEquity - protectedReserve - operatingBuffer)
+        )) {
+      throw new Error("fail closed: persisted protected reserve migration checkpoint is invalid");
+    }
+    const checkpointCeiling = money(Number(manifest.starting_collateral) +
+      checkpointSettlements.reduce((total, row) =>
+        total + Number(row.realized_pnl), 0));
+    if (!moneyEqual(checkpoint.migration_verified_equity_ceiling, checkpointCeiling)) {
+      throw new Error("fail closed: persisted protected reserve migration checkpoint is invalid");
+    }
+    return migrationResult(
+      checkpoint,
+      sourceStateDocument,
+      sourceHash,
+      checkpointCeiling
+    );
+  }
+
+  if (fullyReconciled !== true
+      || Number(openOrderCount) !== 0
+      || Number(positionCount) !== 0
+      || Number(unresolvedReservationCount) !== 0) {
+    throw new Error("fail closed: protected reserve migration requires zero orders, positions, and unresolved reservations");
+  }
+  const equity = money(accountEquity);
+  if (equity < 0) throw new Error("fail closed: protected reserve migration equity is invalid");
+
   const settlements = uniqueSettlements([...uniqueTarget, ...uniqueSource]);
   const settlementIds = settlements.map((row) => row.id).sort();
   const verifiedRealizedPnl = money(settlements.reduce(
@@ -773,12 +845,6 @@ export async function migrateProtectedReserveState({
   if (equity > authorizedEquityCeiling + Number(manifest.max_reconciliation_discrepancy) + 1e-9) {
     throw new Error("fail closed: protected reserve migration equity exceeds the verified ceiling");
   }
-  const stableSourceState = await readState(container, source.stateBlobName);
-  if (stableSourceState?.etag !== sourceStateDocument.etag
-      || stableSourceState?.hash !== sourceStateDocument.hash) {
-    throw new Error("fail closed: protected reserve migration source state changed during verification");
-  }
-
   for (const settlement of uniqueSource) {
     if (uniqueTarget.some((row) => row.id === settlement.id)) continue;
     await putVerifiedInternalSettlement(container, {
