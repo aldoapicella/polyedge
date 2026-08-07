@@ -1,0 +1,249 @@
+name: Build OCI images
+
+on:
+  pull_request:
+    paths:
+      - '.dockerignore'
+      - 'Dockerfile.rust'
+      - 'Dockerfile.frontend'
+      - 'Dockerfile.venue-probe'
+      - 'Dockerfile.research-validation'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'data_quality/**'
+      - 'research/**'
+      - 'tests/fixtures/**'
+      - 'frontend/**'
+      - 'venue-probe/**'
+      - '.github/workflows/build-oci-images.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.dockerignore'
+      - 'Dockerfile.rust'
+      - 'Dockerfile.frontend'
+      - 'Dockerfile.venue-probe'
+      - 'Dockerfile.research-validation'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'data_quality/**'
+      - 'research/**'
+      - 'tests/fixtures/**'
+      - 'frontend/**'
+      - 'venue-probe/**'
+      - '.github/workflows/build-oci-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-oci-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    name: ${{ matrix.name }} (validate)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rust-backend
+            dockerfile: Dockerfile.rust
+            image: polyedge-rust-backend
+            build_args: GIT_SHA=${{ github.sha }}
+          - name: frontend
+            dockerfile: Dockerfile.frontend
+            image: polyedge-frontend
+            build_args: ''
+          - name: venue-probe
+            dockerfile: Dockerfile.venue-probe
+            image: polyedge-venue-probe
+            build_args: ''
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and validate multi-architecture image
+        env:
+          BUILD_ARGS: ${{ matrix.build_args }}
+        run: |
+          set -euo pipefail
+          args=(
+            --file "${{ matrix.dockerfile }}"
+            --platform linux/amd64,linux/arm64
+            --provenance=mode=max
+            --sbom=true
+          )
+          if [ -n "$BUILD_ARGS" ]; then
+            args+=(--build-arg "$BUILD_ARGS")
+          fi
+          docker buildx build "${args[@]}" --output "type=oci,dest=image.oci.tar" .
+          python3 - image.oci.tar <<'PY'
+          import json
+          import tarfile
+          import sys
+
+          expected = {("linux", "amd64"), ("linux", "arm64")}
+          platforms = set()
+          with tarfile.open(sys.argv[1]) as archive:
+              index = json.load(archive.extractfile("index.json"))
+              seen = set()
+
+              def blob(descriptor):
+                  digest = descriptor.get("digest", "")
+                  if not digest.startswith("sha256:") or len(digest) != 71:
+                      raise SystemExit(f"invalid OCI digest: {digest!r}")
+                  return json.load(archive.extractfile(f"blobs/sha256/{digest[7:]}"))
+
+              def inspect(descriptor):
+                  digest = descriptor.get("digest")
+                  if digest in seen:
+                      return
+                  seen.add(digest)
+                  media_type = descriptor.get("mediaType", "")
+                  if media_type.endswith("image.index.v1+json") or media_type.endswith("manifest.list.v2+json"):
+                      for child in blob(descriptor).get("manifests", []):
+                          inspect(child)
+                      return
+                  if not media_type.endswith("image.manifest.v1+json") and not media_type.endswith("manifest.v2+json"):
+                      return
+                  manifest = blob(descriptor)
+                  config = manifest.get("config", {})
+                  if "digest" not in config:
+                      return
+                  image_config = blob(config)
+                  platform = (image_config.get("os"), image_config.get("architecture"))
+                  if platform in expected:
+                      platforms.add(platform)
+                  elif platform not in {(None, None), ("unknown", "unknown")}:
+                      raise SystemExit(f"unexpected OCI platform: {platform}")
+
+              for descriptor in index["manifests"]:
+                  inspect(descriptor)
+          if platforms != expected:
+              raise SystemExit(f"missing OCI platforms: expected {expected}, got {platforms}")
+          PY
+
+  publish:
+    if: github.event_name != 'pull_request'
+    name: ${{ matrix.name }} (publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rust-backend
+            dockerfile: Dockerfile.rust
+            image: polyedge-rust-backend
+            build_args: GIT_SHA=${{ github.sha }}
+          - name: frontend
+            dockerfile: Dockerfile.frontend
+            image: polyedge-frontend
+            build_args: ''
+          - name: venue-probe
+            dockerfile: Dockerfile.venue-probe
+            image: polyedge-venue-probe
+            build_args: ''
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and publish immutable multi-architecture image
+        id: image
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          BUILD_ARGS: ${{ matrix.build_args }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          reference="$IMAGE:sha-$GITHUB_SHA"
+          args=(
+            --file "${{ matrix.dockerfile }}"
+            --platform linux/amd64,linux/arm64
+            --provenance=mode=max
+            --sbom=true
+            --tag "$reference"
+          )
+          if [ -n "$BUILD_ARGS" ]; then
+            args+=(--build-arg "$BUILD_ARGS")
+          fi
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx build "${args[@]}" --push .
+          docker buildx imagetools inspect --raw "$reference" > manifest.json
+          digest=sha256:$(sha256sum manifest.json | awk '{print $1}')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -e '
+            .manifests
+            | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture)
+            | sort == ["amd64", "arm64"]
+          ' manifest.json
+          printf '%s\n' "digest=$digest" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Record immutable image reference
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            echo "- \`${{ steps.image.outputs.reference }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-research-validation:
+    if: github.event_name != 'pull_request'
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build validation image from the published backend digest
+        env:
+          BACKEND: ghcr.io/${{ github.repository_owner }}/polyedge-rust-backend:sha-${{ github.sha }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/polyedge-research-validation:sha-${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools inspect --raw "$BACKEND" > backend-manifest.json
+          backend_digest=sha256:$(sha256sum backend-manifest.json | awk '{print $1}')
+          [[ "$backend_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx build \
+            --file Dockerfile.research-validation \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "BASE_IMAGE=${BACKEND%:*}@$backend_digest" \
+            --provenance=mode=max \
+            --sbom=true \
+            --tag "$IMAGE" \
+            --push .
+          docker buildx imagetools inspect --raw "$IMAGE" > manifest.json
+          digest=sha256:$(sha256sum manifest.json | awk '{print $1}')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          jq -e '
+            .manifests
+            | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture)
+            | sort == ["amd64", "arm64"]
+          ' manifest.json
+          printf '### research-validation\n\n- `%s@%s`\n' "${IMAGE%:*}" "$digest" >> "$GITHUB_STEP_SUMMARY"

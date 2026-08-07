@@ -1,0 +1,142 @@
+#!/bin/sh
+set -eu
+
+job=${1:?usage: polyedge-run-job JOB}
+
+# This is intentionally separate from Azure-backed research jobs: it receives no
+# credentials or mounts, and must prove this OCI host is the expected CO origin.
+if [ "$job" = origin-check ]; then
+  : "${POLYEDGE_VENUE_IMAGE:?set an immutable POLYEDGE_VENUE_IMAGE in /etc/polyedge/jobs/origin-check.env}"
+  : "${POLYEDGE_ORIGIN_EXPECTED_IP:?set POLYEDGE_ORIGIN_EXPECTED_IP in /etc/polyedge/jobs/origin-check.env}"
+  test "${POLYEDGE_ORIGIN_EXPECTED_COUNTRY:-}" = CO || {
+    echo 'POLYEDGE_ORIGIN_EXPECTED_COUNTRY must equal CO' >&2
+    exit 64
+  }
+  printf '%s' "$POLYEDGE_VENUE_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
+    echo 'POLYEDGE_VENUE_IMAGE must be an immutable sha256 digest' >&2
+    exit 64
+  }
+  printf '%s' "$POLYEDGE_ORIGIN_EXPECTED_IP" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || {
+    echo 'POLYEDGE_ORIGIN_EXPECTED_IP must be an IPv4 address' >&2
+    exit 64
+  }
+  endpoint_ip=$(getent ahostsv4 polymarket.com | awk 'NR == 1 {print $1}')
+  printf '%s' "$endpoint_ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || {
+    echo 'could not resolve polymarket.com to IPv4' >&2
+    exit 1
+  }
+  exec /usr/bin/timeout --preserve-status 60 \
+    /usr/bin/podman run --rm --name polyedge-job-origin-check --network polyedge \
+      --add-host "polymarket.com:$endpoint_ip" --read-only --cap-drop=all --pids-limit 128 \
+      --cpus 0.25 --memory 512m \
+      -e POLYEDGE_ORIGIN_EXPECTED_IP -e POLYEDGE_ORIGIN_EXPECTED_COUNTRY \
+      "$POLYEDGE_VENUE_IMAGE" node -e '
+        const expectedIp = process.env.POLYEDGE_ORIGIN_EXPECTED_IP;
+        fetch("https://polymarket.com/api/geoblock")
+          .then((response) => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
+          .then((origin) => {
+            if (origin.country !== "CO" || origin.ip !== expectedIp) throw new Error(`unexpected origin: ${JSON.stringify(origin)}`);
+            console.log(JSON.stringify(origin));
+          })
+          .catch((error) => { console.error(error.message); process.exit(1); });
+      '
+fi
+
+case "$job" in
+  freshness)
+    cpus=0.5 memory=1g limit=300
+    command='/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "${POLYEDGE_RAW_EVENT_PREFIX%/}/" --out "data_quality/freshness/latest.json"'
+    ;;
+  hourly)
+    cpus=0.5 memory=1g limit=1800
+    command='TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "${POLYEDGE_LOCAL_RAW_ROOT%/}/$DAY/$HOUR/" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+    ;;
+  daily)
+    cpus=1.5 memory=4g limit=46800
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_primary_daily.sh'
+    ;;
+  replay)
+    cpus=1.5 memory=4g limit=43200
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
+    ;;
+  prospective)
+    cpus=0.5 memory=1g limit=1800
+    command='polyedge-rs research validate-prospective --since "2026-07-13T00:00:00Z" --candidates "research/configs/frozen_candidates.yaml" --reports-dir "reports/research/daily" --out "reports/research/prospective/prospective_validation.json" --markdown "reports/research/prospective/prospective_validation.md"'
+    ;;
+  chart-backfill)
+    cpus=0.5 memory=1g limit=7200
+    command='INPUT=${CHART_BACKFILL_INPUT:-}; if [ -z "$INPUT" ]; then DATE=$(date -u -d "yesterday" +%Y-%m-%d); INPUT="data/research/daily/$DATE/normalized"; fi; polyedge-rs research chart-backfill --input "$INPUT" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/jobs/latest/chart-backfill.json" --markdown "reports/jobs/latest/chart-backfill.md"'
+    ;;
+  backfill)
+    cpus=0.5 memory=1g limit=10800
+    command='START=${BACKFILL_START:-2026-06-14}; END=${BACKFILL_END:-$START}; TASK=${BACKFILL_TASK:-all}; polyedge-rs research backfill --start "$START" --end "$END" --task "$TASK" --exclude-file "data_quality/exclusion_windows.yaml" --out "reports/research/backfill/$START-$END-$TASK.json" --markdown "reports/research/backfill/$START-$END-$TASK.md"'
+    ;;
+  shadow-qset)
+    cpus=1.5 memory=8g limit=16800
+    test "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-07-28-qset-v1 || {
+      echo 'shadow-qset only permits campaign-2026-07-28-qset-v1' >&2
+      exit 64
+    }
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/shadow/campaign-2026-07-28-qset-v1/control/replay.lock" -- /bin/sh /app/research/run_shadow_daily.sh'
+    ;;
+  *)
+    echo "unknown PolyEdge job: $job" >&2
+    exit 64
+    ;;
+esac
+
+: "${POLYEDGE_RESEARCH_IMAGE:?set an immutable POLYEDGE_RESEARCH_IMAGE in /etc/polyedge/jobs/$job.env}"
+printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
+  echo 'POLYEDGE_RESEARCH_IMAGE must be an immutable sha256 digest' >&2
+  exit 64
+}
+
+if [ "$job" = freshness ]; then
+  : "${POLYEDGE_RAW_EVENT_PREFIX:?set POLYEDGE_RAW_EVENT_PREFIX for Azure upload freshness}"
+fi
+
+ring=/srv/polyedge-ring
+mountpoint -q "$ring" || { echo "$ring is not a mount point" >&2; exit 1; }
+minimum_free=${POLYEDGE_JOB_MIN_FREE_BYTES:-42949672960}
+available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
+[ "$available" -ge "$minimum_free" ] || {
+  echo "insufficient free ring space: $available bytes available, $minimum_free required" >&2
+  exit 1
+}
+case "$job" in
+  shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;
+  *) work=$ring/jobs/research credential=research ;;
+esac
+install -d -m 0750 "$work/data" "$work/reports" "$work/freshness"
+
+credential_dir=/run/polyedge-federated-$credential
+if [ ! -r "$credential_dir/azure-federated-token" ]; then
+  # Preserve the reviewed client-secret-file rollback path.
+  credential_dir=/etc/polyedge/credentials/$credential
+fi
+
+case "$job" in
+  hourly|daily|replay)
+    : "${POLYEDGE_LOCAL_RAW_ROOT:?set POLYEDGE_LOCAL_RAW_ROOT to /input/events}"
+    test "$POLYEDGE_LOCAL_RAW_ROOT" = /input/events || {
+      echo 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' >&2
+      exit 64
+    }
+    set -- --volume "$ring/segments:/input/events:ro,Z"
+    ;;
+  *) set -- ;;
+esac
+
+# One host-wide lock prevents every research writer from overlapping. The
+# per-job timeout below starts only after the lock has been acquired.
+exec /usr/bin/flock -w 36h /run/polyedge/research.lock \
+  /usr/bin/timeout --preserve-status "$limit" \
+  /usr/bin/podman run --rm --name "polyedge-job-$job" --network polyedge \
+    --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
+    --env-file "/etc/polyedge/jobs/$job.env" \
+    -v "$credential_dir:/run/credentials:ro,Z" \
+    -v "$work/data:/app/data:Z" \
+    -v "$work/reports:/app/reports:Z" \
+    -v "$work/freshness:/app/data_quality/freshness:Z" \
+    "$@" \
+    "$POLYEDGE_RESEARCH_IMAGE" /bin/sh -lc "$command"

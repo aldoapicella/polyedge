@@ -1,0 +1,151 @@
+#!/bin/sh
+set -eu
+
+env_file=${POLYEDGE_RING_ENV_FILE:-/etc/polyedge/ring.env}
+test -r "$env_file" || { echo "missing $env_file" >&2; exit 64; }
+set -a
+. "$env_file"
+set +a
+
+root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
+segments=$root/segments
+archive=$root/archive
+segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
+grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
+prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}
+printf '%s' "$segment_seconds" | grep -Eq '^[0-9]+$'
+[ "$segment_seconds" -ge 300 ] && [ "$segment_seconds" -le 900 ] || {
+  echo 'RECORDER_SEGMENT_SECONDS must be from 300 through 900' >&2
+  exit 64
+}
+printf '%s' "$prefix" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$' || {
+  echo 'POLYEDGE_RING_BLOB_PREFIX is invalid' >&2
+  exit 64
+}
+mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
+command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 1; }
+install -d -m 0750 "$segments" "$archive"
+
+now=$(date -u +%s)
+cutoff=$((now - grace_seconds))
+find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segment; do
+  name=${segment##*/}
+  start=${name%.jsonl}
+  printf '%s' "$start" | grep -Eq '^[0-9]+$' || { echo "invalid segment name: $segment" >&2; exit 1; }
+  end=$((start + segment_seconds))
+  [ "$end" -le "$cutoff" ] || continue
+  source_relative=${segment#"$root"/}
+  archive_relative=archive/${source_relative#segments/}.gz
+  archive_segment=$root/$archive_relative
+  manifest=$archive_segment.manifest.json
+  legacy_manifest=$segment.manifest.json
+  if [ -e "$legacy_manifest" ] || [ -e "$manifest" ]; then
+    continue
+  fi
+  [ "$(tail -c 1 "$segment" | od -An -t u1 | tr -d ' ')" = 10 ] || {
+    echo "sealed segment lacks a final newline: $segment" >&2
+    exit 1
+  }
+  hour=$(date -u -d "@$start" +%Y/%m/%d/%H)
+  blob=$prefix/$hour/$start.jsonl.gz
+  source_sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
+  source_bytes=$(wc -c < "$segment")
+  lines=$(wc -l < "$segment")
+  install -d -m 0750 "${archive_segment%/*}"
+  if [ -e "$archive_segment" ]; then
+    gzip -t "$archive_segment"
+    archived_source_sha=sha256:$(gzip -dc "$archive_segment" | sha256sum | awk '{print $1}')
+    [ "$archived_source_sha" = "$source_sha" ] || {
+      echo "existing gzip sidecar disagrees with $segment" >&2
+      exit 1
+    }
+  else
+    temporary=$(mktemp "$archive_segment.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    gzip -1 -n -c "$segment" > "$temporary"
+    chmod 0640 "$temporary"
+    gzip -t "$temporary"
+    sync -f "$temporary"
+    mv "$temporary" "$archive_segment"
+    trap - EXIT HUP INT TERM
+  fi
+  sha=sha256:$(sha256sum "$archive_segment" | awk '{print $1}')
+  bytes=$(wc -c < "$archive_segment")
+  temporary=$(mktemp "$manifest.XXXXXX")
+  trap 'rm -f "$temporary"' EXIT HUP INT TERM
+  jq -n \
+    --arg segment_path "$source_relative" \
+    --arg archive_path "$archive_relative" \
+    --arg blob_name "$blob" \
+    --arg sha256 "$sha" \
+    --arg source_sha256 "$source_sha" \
+    --argjson bytes "$bytes" \
+    --argjson source_bytes "$source_bytes" \
+    --argjson lines "$lines" \
+    --argjson segment_start_epoch "$start" \
+    --argjson segment_end_epoch "$end" \
+    '{schema_version:2,segment_path:$segment_path,archive_path:$archive_path,blob_name:$blob_name,compression:"gzip",sha256:$sha256,source_sha256:$source_sha256,bytes:$bytes,source_bytes:$source_bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch}' \
+    > "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$segment"
+  mv "$temporary" "$manifest"
+  trap - EXIT HUP INT TERM
+done
+
+if [ "${POLYEDGE_RING_SEAL_ONLY:-}" = 1 ]; then
+  exit 0
+fi
+
+: "${POLYEDGE_RING_IMAGE:?set an immutable POLYEDGE_RING_IMAGE}"
+: "${AZURE_STORAGE_ACCOUNT_NAME:?set AZURE_STORAGE_ACCOUNT_NAME}"
+: "${AZURE_STORAGE_CONTAINER_NAME:?set AZURE_STORAGE_CONTAINER_NAME}"
+printf '%s' "$POLYEDGE_RING_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' || {
+  echo 'POLYEDGE_RING_IMAGE must be an immutable GHCR digest' >&2
+  exit 64
+}
+set -- /usr/bin/podman run --rm --name polyedge-ring-upload \
+  --cpus 0.5 --memory 1g --pids-limit 256 \
+  --read-only --cap-drop=all --cap-add=DAC_OVERRIDE \
+  --env AZURE_STORAGE_ACCOUNT_NAME \
+  --env AZURE_STORAGE_CONTAINER_NAME \
+  -v "$segments:/srv/polyedge-ring/segments:Z" \
+  -v "$archive:/srv/polyedge-ring/archive:Z"
+
+case "${POLYEDGE_AZURE_ARC_IDENTITY:-0}" in
+  1)
+    test -d /var/opt/azcmagent/tokens || {
+      echo 'Azure Arc identity token directory is unavailable' >&2
+      exit 1
+    }
+    himds_gid=$(getent group himds | cut -d: -f3)
+    printf '%s' "$himds_gid" | grep -Eq '^[0-9]+$' || {
+      echo 'Azure Arc himds group is unavailable' >&2
+      exit 1
+    }
+    set -- "$@" \
+      --network host \
+      --group-add "$himds_gid" \
+      --env IDENTITY_ENDPOINT=http://127.0.0.1:40342/metadata/identity/oauth2/token \
+      --env IMDS_ENDPOINT=http://127.0.0.1:40342 \
+      -v /var/opt/azcmagent/tokens:/var/opt/azcmagent/tokens:ro
+    ;;
+  0)
+    : "${AZURE_TENANT_ID:?set AZURE_TENANT_ID}"
+    : "${AZURE_CLIENT_ID:?set AZURE_CLIENT_ID}"
+    set -- "$@" \
+      --network polyedge \
+      --env AZURE_TENANT_ID \
+      --env AZURE_CLIENT_ID \
+      --env AZURE_CLIENT_SECRET_FILE=/run/credentials/azure-client-secret \
+      -v /etc/polyedge/credentials/research:/run/credentials:ro,Z
+    ;;
+  *)
+    echo 'POLYEDGE_AZURE_ARC_IDENTITY must equal 0 or 1' >&2
+    exit 64
+    ;;
+esac
+
+exec "$@" "$POLYEDGE_RING_IMAGE" polyedge-rs ring-upload \
+    --root /srv/polyedge-ring \
+    --blob-prefix "$prefix" \
+    --retention-hours "${POLYEDGE_RING_RETENTION_HOURS:-48}"

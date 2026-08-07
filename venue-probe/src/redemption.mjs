@@ -14,8 +14,8 @@ export const DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc0
 export const DEPOSIT_WALLET_IMPLEMENTATION = "0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB";
 export const CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 export const PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
-export const CTF_COLLATERAL_ADAPTER = "0xADa100874d00e3331D00F2007a9c336a65009718";
-export const NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xAdA200001000ef00D07553cEE7006808F895c6F1";
+export const CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f";
+export const NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab";
 
 const ERC1967_CONST1 = "0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3";
 const ERC1967_CONST2 = "0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076";
@@ -57,6 +57,14 @@ export const DEPOSIT_WALLET_BATCH_TYPES = {
 };
 
 export function loadRedemptionConfig(env = process.env) {
+  const fundedServiceManaged = env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true";
+  const fundedSessionManifestJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "");
+  let fundedSession = null;
+  if (fundedServiceManaged) {
+    try {
+      fundedSession = JSON.parse(fundedSessionManifestJson);
+    } catch {}
+  }
   const config = {
     executionMode: env.EXECUTION_MODE,
     enabled: env.VENUE_REDEMPTION_ENABLED === "true",
@@ -66,14 +74,26 @@ export function loadRedemptionConfig(env = process.env) {
     enableTakerOrders: env.ENABLE_TAKER_ORDERS === "true",
     expectedCountry: String(env.VENUE_PROBE_EXPECTED_COUNTRY || "").trim().toUpperCase(),
     expectedEgressIp: String(env.VENUE_PROBE_EXPECTED_EGRESS_IP || "").trim(),
-    maxPayout: finiteNumber(env.VENUE_REDEMPTION_MAX_PAYOUT, 25),
+    // A funded redemption only releases already-won collateral from the exact
+    // authenticated position. Its safety boundary is one condition per cycle,
+    // not the payout size produced by an authorized order. Keep the legacy cap
+    // for standalone/manual redemption runs only.
+    maxPayout: fundedServiceManaged
+      ? null
+      : finiteNumber(env.VENUE_REDEMPTION_MAX_PAYOUT, 25),
     maxConditions: integer(env.VENUE_REDEMPTION_MAX_CONDITIONS, 5),
     startingCapital: finiteNumber(env.VENUE_PROBE_STARTING_CAPITAL, null),
     campaignId: String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "funded-campaign-2026-07-12"),
+    executionOrigin: String(env.VENUE_PROBE_EXECUTION_ORIGIN || "azure_north_europe_static_egress"),
+    fundedServiceManaged,
+    operatorDirect: fundedServiceManaged,
+    fundedSessionManifestJson,
     campaignBaselineEquity: finiteNumber(env.VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY, 5.030521),
     campaignEquityFloor: finiteNumber(env.VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR, 4.03),
     maxCampaignDrawdown: finiteNumber(env.VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN, 1),
-    maxOrderNotional: 1,
+    maxOrderNotional: fundedServiceManaged
+      ? finiteNumber(fundedSession?.max_order_notional, null)
+      : 1,
     maxReconciliationDiscrepancy: finiteNumber(env.VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY, 0.01),
     campaignCashFlows: JSON.parse(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]"),
     privateKey: env.POLYMARKET_PRIVATE_KEY,
@@ -103,8 +123,44 @@ export function validateRedemptionConfig(config) {
   if (config.allowLive) errors.push("ALLOW_LIVE must remain false");
   if (config.enableTakerOrders) errors.push("ENABLE_TAKER_ORDERS must remain false");
   if (config.signatureType !== 3) errors.push("POLYMARKET_SIGNATURE_TYPE must equal 3 for the deposit wallet");
-  if (!(config.maxPayout > 0 && config.maxPayout <= 25)) errors.push("VENUE_REDEMPTION_MAX_PAYOUT must be in (0, 25]");
+  if (!config.fundedServiceManaged &&
+      !(config.maxPayout > 0 && config.maxPayout <= 25)) {
+    errors.push("VENUE_REDEMPTION_MAX_PAYOUT must be in (0, 25]");
+  }
   if (!(config.maxConditions >= 1 && config.maxConditions <= 5)) errors.push("VENUE_REDEMPTION_MAX_CONDITIONS must be in [1, 5]");
+  if (config.fundedServiceManaged) {
+    let session = null;
+    try {
+      session = JSON.parse(config.fundedSessionManifestJson);
+    } catch {}
+    if (!session || typeof session !== "object") {
+      errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be valid for funded-service redemption");
+    } else {
+      if (session.session_id !== config.campaignId) {
+        errors.push("VENUE_PROBE_FUNDED_CAMPAIGN_ID must match the funded operator session");
+      }
+      if (session.allow_compounding !== true) {
+        errors.push("funded operator session must explicitly allow compounding");
+      }
+      if (session.no_deposits !== true || session.allow_automatic_replenishment !== false) {
+        errors.push("funded operator session must preserve no-deposit/no-replenishment controls");
+      }
+      if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= 25) ||
+          Number(session.target_order_notional) !== config.maxOrderNotional) {
+        errors.push("funded operator session must bind matching positive target/max order notional");
+      }
+    }
+    const approvedCountry = {
+      azure_chile_central_static_egress: "CL",
+      oci_bogota_static_egress: "CO"
+    }[config.executionOrigin];
+    if (!approvedCountry || (config.expectedCountry && config.expectedCountry !== approvedCountry)) {
+      errors.push("funded-service redemption must use an approved static egress origin");
+    }
+    if (config.maxConditions !== 1) {
+      errors.push("funded-service redemption must cap each run at one condition");
+    }
+  }
   for (const [name, value] of [
     ["POLYMARKET_PRIVATE_KEY", config.privateKey],
     ["POLYMARKET_FUNDER_ADDRESS", config.funderAddress],
@@ -165,6 +221,7 @@ export function selectRedeemableConditions(positions, maxPayout = 25, maxConditi
         condition_id: conditionId,
         negative_risk: row.negativeRisk === true,
         gross_payout: 0,
+        principal: 0,
         titles: new Set(),
         assets: new Map()
       });
@@ -174,6 +231,7 @@ export function selectRedeemableConditions(positions, maxPayout = 25, maxConditi
       throw new Error(`fail closed: inconsistent negativeRisk metadata for ${conditionId}`);
     }
     group.gross_payout += Math.max(0, finiteNumber(row.currentValue, 0));
+    group.principal += Math.max(0, finiteNumber(row.initialValue, 0));
     if (row.title) group.titles.add(String(row.title));
     const outcomeIndex = Number(row.outcomeIndex);
     if (/^\d+$/.test(String(row.asset || "")) && [0, 1].includes(outcomeIndex)) {
@@ -190,10 +248,11 @@ export function selectRedeemableConditions(positions, maxPayout = 25, maxConditi
   let payout = 0;
   for (const winner of winners) {
     if (selected.length >= maxConditions) break;
-    if (payout + winner.gross_payout > maxPayout + 1e-9) continue;
+    if (hasPayoutCap(maxPayout) && payout + winner.gross_payout > Number(maxPayout) + 1e-9) continue;
     selected.push({
       ...winner,
       gross_payout: roundMoney(winner.gross_payout),
+      principal: roundMoney(winner.principal),
       titles: [...winner.titles],
       assets: [...winner.assets.entries()]
         .map(([asset, outcome_index]) => ({ asset, outcome_index }))
@@ -207,6 +266,10 @@ export function selectRedeemableConditions(positions, maxPayout = 25, maxConditi
     available_winner_conditions: winners.length,
     skipped_winner_conditions: winners.length - selected.length
   };
+}
+
+export function hasPayoutCap(maxPayout) {
+  return Number.isFinite(Number(maxPayout)) && Number(maxPayout) > 0;
 }
 
 export function summarizeRecentRedemptions(activity, control = null, limit = 5) {

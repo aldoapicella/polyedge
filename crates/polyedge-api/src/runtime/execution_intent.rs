@@ -6,14 +6,31 @@ use polyedge_domain::{
 };
 use polyedge_engine::{crypto_taker_fee_per_share, FrozenStrategyMode, StrategyDecisionMetadata};
 use polyedge_reporting::research::{parse_azure_artifact_uri, PromotionManifestV1, PromotionPhase};
-use polyedge_storage::{AzureBlobClient, AzureBlobError, ImmutableBlobWrite};
-use rust_decimal::Decimal;
+use polyedge_storage::{
+    AzureBlobClient, AzureBlobError, AzureServiceBusSender, ImmutableBlobWrite,
+};
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::time::Instant;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
-const VENUE_GTD_SECURITY_BUFFER_SECONDS: i64 = 60;
+// Preserve the frozen producer contract: every funded handoff remains valid
+// for exactly the strategy's immutable ten-second quote lifecycle.
+const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
+// A decision cycle can emit several independently authenticated PLACE intents.
+// Keep their immutable blob commits and Service Bus handoffs bounded but
+// concurrent so one slow Azure request cannot consume another intent's frozen
+// ten-second lifetime. Warmups use a separate lane below.
+const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
+// Keep the signed venue expiry well beyond the documented minimum. Live V2
+// rejected a correctly serialized order 107 seconds before its expiry, so the
+// immutable intent carries a five-minute fail-safe while the lifecycle still
+// cancels the maker quote after its configured rest period.
+const VENUE_GTD_SECURITY_BUFFER_SECONDS: i64 = 300;
 const FUNDED_CANONICAL_MANIFEST_BLOB: &str = "reports/research/profitability/latest.json";
 const CONSERVATIVE_PRIOR_VERSION: &str = "conservative-execution-prior-v1";
 const CONSERVATIVE_PRIOR_SHA256: &str =
@@ -25,12 +42,32 @@ pub(super) struct IntentPublisherConfig {
     container: String,
     client_id: Option<String>,
     prefix: String,
+    operator_direct: bool,
+    service_bus_namespace: String,
+    service_bus_queue: String,
+}
+
+pub(super) struct IntentPublisher {
+    intent_lanes: Vec<StdMutex<IntentPublisherLane>>,
+    warmup_lane: StdMutex<IntentPublisherLane>,
+    next_intent_lane: AtomicUsize,
+    prefix: String,
+}
+
+struct IntentPublisherLane {
+    blob_client: AzureBlobClient,
+    service_bus_sender: Option<AzureServiceBusSender>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PublishedIntent {
     pub blob_name: String,
     pub artifact_sha256: String,
+    pub queue_handoff_sent: bool,
+    pub blob_commit_wall_ts: DateTime<Utc>,
+    pub blob_commit_elapsed_ms: u64,
+    pub queue_send_wall_ts: Option<DateTime<Utc>>,
+    pub queue_send_elapsed_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,32 +118,249 @@ impl IntentPublisherConfig {
             container: settings.azure.storage_container_name.clone(),
             client_id: env::var("AZURE_CLIENT_ID").ok(),
             prefix,
+            operator_direct: settings.azure.strategy_intent_operator_direct,
+            service_bus_namespace: settings
+                .azure
+                .funded_direct_service_bus_namespace
+                .trim()
+                .to_owned(),
+            service_bus_queue: settings
+                .azure
+                .funded_direct_service_bus_queue
+                .trim()
+                .to_owned(),
         })
     }
 
+    fn connect_lane(&self) -> Result<IntentPublisherLane, String> {
+        let service_bus_sender = if self.operator_direct {
+            if self.service_bus_namespace.is_empty() || self.service_bus_queue.is_empty() {
+                return Err(
+                    "operator-direct intent publisher requires an exact Service Bus binding"
+                        .to_owned(),
+                );
+            }
+            Some(AzureServiceBusSender::with_managed_identity(
+                self.service_bus_namespace.clone(),
+                self.service_bus_queue.clone(),
+                self.client_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(IntentPublisherLane {
+            blob_client: AzureBlobClient::with_managed_identity(
+                self.account.clone(),
+                self.container.clone(),
+                self.client_id.clone(),
+            ),
+            service_bus_sender,
+        })
+    }
+
+    pub(super) fn connect(self) -> Result<IntentPublisher, String> {
+        let lane_count = if self.operator_direct {
+            OPERATOR_DIRECT_INTENT_PUBLISH_LANES
+        } else {
+            1
+        };
+        let intent_lanes = (0..lane_count)
+            .map(|_| self.connect_lane().map(StdMutex::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        let warmup_lane = StdMutex::new(self.connect_lane()?);
+        Ok(IntentPublisher {
+            intent_lanes,
+            warmup_lane,
+            next_intent_lane: AtomicUsize::new(0),
+            prefix: self.prefix,
+        })
+    }
+}
+
+impl IntentPublisher {
+    fn intent_lane(&self) -> Result<StdMutexGuard<'_, IntentPublisherLane>, String> {
+        let lane_index =
+            self.next_intent_lane.fetch_add(1, Ordering::Relaxed) % self.intent_lanes.len();
+        self.intent_lanes[lane_index]
+            .lock()
+            .map_err(|_| "persistent intent publisher lane lock is poisoned".to_owned())
+    }
+
     pub(super) fn publish(&self, intent: &ExecutionIntentV1) -> Result<PublishedIntent, String> {
+        let publish_started = Instant::now();
         intent.validate()?;
         let bytes = serde_json::to_vec_pretty(intent).map_err(|error| error.to_string())?;
         let artifact_sha256 = sha256_bytes(&bytes);
         let blob_name = intent_blob_name(&self.prefix, &intent.decision_id)?;
-        let mut client = AzureBlobClient::with_managed_identity(
-            self.account.clone(),
-            self.container.clone(),
-            self.client_id.clone(),
-        );
-        match client
+        let mut lane = self.intent_lane()?;
+        match lane
+            .blob_client
             .upload_block_blob_bytes_if_absent(&blob_name, &bytes, "application/json")
             .map_err(|error| error.to_string())?
         {
-            ImmutableBlobWrite::Created => Ok(PublishedIntent {
-                blob_name,
-                artifact_sha256,
-            }),
-            ImmutableBlobWrite::AlreadyExists => Err(format!(
-                "immutable strategy canary intent already exists: {blob_name}"
-            )),
+            ImmutableBlobWrite::Created => {}
+            ImmutableBlobWrite::AlreadyExists => {
+                let existing = lane
+                    .blob_client
+                    .download_blob_bytes(&blob_name)
+                    .map_err(|error| error.to_string())?;
+                if existing != bytes {
+                    return Err(format!(
+                        "immutable strategy canary intent collision: {blob_name}"
+                    ));
+                }
+            }
         }
+        let blob_commit_wall_ts = Utc::now();
+        let blob_commit_elapsed_ms = publish_started.elapsed().as_millis() as u64;
+        let mut queue_send_wall_ts = None;
+        let mut queue_send_elapsed_ms = None;
+        let queue_handoff_sent = if let Some(sender) = &mut lane.service_bus_sender {
+            let remaining_ms = (intent.valid_until - Utc::now()).num_milliseconds();
+            if remaining_ms < 1_000 {
+                return Err(
+                    "funded intent expired before the Service Bus handoff could be sent".to_owned(),
+                );
+            }
+            let queue_send_started = Instant::now();
+            sender
+                .send_json(
+                    &intent.decision_id,
+                    ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64,
+                    &funded_intent_handoff(intent, &blob_name, &artifact_sha256),
+                )
+                .map_err(|error| error.to_string())?;
+            queue_send_wall_ts = Some(Utc::now());
+            queue_send_elapsed_ms = Some(queue_send_started.elapsed().as_millis() as u64);
+            true
+        } else {
+            false
+        };
+        Ok(PublishedIntent {
+            blob_name,
+            artifact_sha256,
+            queue_handoff_sent,
+            blob_commit_wall_ts,
+            blob_commit_elapsed_ms,
+            queue_send_wall_ts,
+            queue_send_elapsed_ms,
+        })
     }
+
+    pub(super) fn warm_market(&self, market: &MarketSpec) -> Result<bool, String> {
+        let mut lane = self
+            .warmup_lane
+            .lock()
+            .map_err(|_| "persistent warmup publisher lane lock is poisoned".to_owned())?;
+        if lane.service_bus_sender.is_none() {
+            return Ok(false);
+        }
+        let marker = funded_market_warmup_marker(market);
+        let marker_bytes = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
+        let marker_name = funded_market_warmup_blob_name(&self.prefix, market)?;
+        match lane
+            .blob_client
+            .upload_block_blob_bytes_if_absent(&marker_name, &marker_bytes, "application/json")
+            .map_err(|error| error.to_string())?
+        {
+            ImmutableBlobWrite::Created => {}
+            ImmutableBlobWrite::AlreadyExists => {
+                let existing = lane
+                    .blob_client
+                    .download_blob_bytes(&marker_name)
+                    .map_err(|error| error.to_string())?;
+                if existing != marker_bytes {
+                    return Err(format!(
+                        "immutable funded market warmup collision: {marker_name}"
+                    ));
+                }
+            }
+        }
+        let producer_ts = Utc::now();
+        let message = funded_market_warmup(market, producer_ts);
+        let message_id = funded_market_warmup_message_id(market, producer_ts);
+        lane.service_bus_sender
+            .as_mut()
+            .expect("warmup sender was checked above")
+            .send_json(&message_id, 30, &message)
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn intent_lane_count(&self) -> usize {
+        self.intent_lanes.len()
+    }
+}
+
+fn funded_market_warmup_message_id(market: &MarketSpec, producer_ts: DateTime<Utc>) -> String {
+    format!(
+        "warmup-{}",
+        sha256_hex(
+            format!(
+                "{}:{}:{}",
+                market.condition_id,
+                market.end_ts.to_rfc3339(),
+                producer_ts.timestamp() / 60
+            )
+            .as_bytes()
+        )
+    )
+}
+
+fn funded_market_warmup_blob_name(
+    intent_prefix: &str,
+    market: &MarketSpec,
+) -> Result<String, String> {
+    let (parent, leaf) = intent_prefix
+        .trim_matches('/')
+        .rsplit_once('/')
+        .ok_or_else(|| "funded intent prefix has no isolated parent".to_owned())?;
+    if parent.is_empty() || leaf != "intents" {
+        return Err("funded intent prefix is not the exact isolated intents path".to_owned());
+    }
+    Ok(format!(
+        "{parent}/warmups/{}.json",
+        sha256_hex(format!("{}:{}", market.condition_id, market.end_ts.to_rfc3339()).as_bytes())
+    ))
+}
+
+fn funded_market_warmup_marker(market: &MarketSpec) -> Value {
+    json!({
+        "schema": "polyedge.funded_market_warmup_marker.v1",
+        "executable": false,
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "token_ids": [market.up_token_id, market.down_token_id],
+        "market_end_ts": market.end_ts
+    })
+}
+
+fn funded_intent_handoff(
+    intent: &ExecutionIntentV1,
+    blob_name: &str,
+    artifact_sha256: &str,
+) -> Value {
+    json!({
+        "schema": "polyedge.funded_intent_handoff.v1",
+        "decision_id": intent.decision_id,
+        "intent_blob_name": blob_name,
+        "intent_sha256": artifact_sha256,
+        "decision_ts": intent.decision_ts,
+        "valid_until": intent.valid_until
+    })
+}
+
+fn funded_market_warmup(market: &MarketSpec, producer_ts: DateTime<Utc>) -> Value {
+    json!({
+        "schema": "polyedge.funded_market_warmup.v1",
+        "market_id": market.market_id,
+        "condition_id": market.condition_id,
+        "token_id": market.up_token_id,
+        "token_ids": [market.up_token_id, market.down_token_id],
+        "market_end_ts": market.end_ts,
+        "producer_ts": producer_ts
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -210,21 +464,57 @@ pub(super) fn build_execution_intent_with_model(
     let price = decision
         .price
         .ok_or_else(|| "decision price is missing".to_owned())?;
+    if price <= Decimal::ZERO || price >= Decimal::ONE {
+        return Err("decision price must be strictly between zero and one".to_owned());
+    }
     let requested_shares = decision
         .size
         .ok_or_else(|| "decision share size is missing".to_owned())?;
+    let minimum_seconds_to_expiry = settings.azure.strategy_intent_min_seconds_to_expiry;
+    let maximum_seconds_to_expiry = settings.azure.strategy_intent_max_seconds_to_expiry;
+    if minimum_seconds_to_expiry < 0 || maximum_seconds_to_expiry <= minimum_seconds_to_expiry {
+        return Err("configured execution-intent expiry window is invalid".to_owned());
+    }
+    let time_to_expiry_ms = (market.end_ts - decision_ts).num_milliseconds();
+    if time_to_expiry_ms < minimum_seconds_to_expiry * 1_000
+        || time_to_expiry_ms > maximum_seconds_to_expiry * 1_000
+    {
+        return Err("decision is outside the configured execution-intent expiry window".to_owned());
+    }
     if market.minimum_order_size <= Decimal::ZERO {
         return Err("venue minimum_order_size must be positive".to_owned());
     }
-    let shares = requested_shares.max(market.minimum_order_size);
+    let target_intent_notional = settings.azure.strategy_intent_target_order_notional;
+    let max_intent_notional = settings.azure.strategy_intent_max_order_notional;
+    if target_intent_notional < Decimal::ZERO
+        || max_intent_notional <= Decimal::ZERO
+        || target_intent_notional > max_intent_notional
+    {
+        return Err("configured execution-intent target and cap are invalid".to_owned());
+    }
+    let fee_allowance = if market.fees_enabled {
+        crypto_taker_fee_per_share(price).map_err(|error| error.to_string())?
+    } else {
+        Decimal::ZERO
+    };
+    let shares = if target_intent_notional > Decimal::ZERO {
+        // Size the total risk reservation (principal plus venue fee), so low
+        // prices cannot exceed the operator-authorized account loss envelope.
+        (target_intent_notional / (price + fee_allowance))
+            .round_dp_with_strategy(2, RoundingStrategy::ToZero)
+            .max(market.minimum_order_size)
+    } else {
+        requested_shares.max(market.minimum_order_size)
+    };
     let notional = price * shares;
     if price <= Decimal::ZERO
         || price >= Decimal::ONE
         || shares <= Decimal::ZERO
-        || notional > Decimal::ONE
+        || notional > max_intent_notional
     {
         return Err(
-            "decision price, size, or notional violates the one-dollar canary cap".to_owned(),
+            "decision price, size, or notional violates the configured execution-intent cap"
+                .to_owned(),
         );
     }
     let best_ask = book
@@ -242,9 +532,13 @@ pub(super) fn build_execution_intent_with_model(
     if book_age_ms > settings.risk.max_book_age_ms {
         return Err("captured order book is stale".to_owned());
     }
-    if !reference.exact_resolution_source
-        || reference.source != market.resolution_source
-        || reference.source != settings.target.resolution_source
+    let canonical_resolution_source = settings.target.resolution_source.as_str();
+    let reference_is_exact_resolution_source = reference.exact_resolution_source
+        && (reference.source == canonical_resolution_source
+            || (settings.target.enable_polymarket_rtds_chainlink
+                && reference.source == settings.rtds_chainlink_source_name()));
+    if !reference_is_exact_resolution_source
+        || market.resolution_source != canonical_resolution_source
     {
         return Err("exact market resolution source is not confirmed".to_owned());
     }
@@ -252,21 +546,17 @@ pub(super) fn build_execution_intent_with_model(
         .q
         .ok_or_else(|| "strategy probability q is missing".to_owned())?;
     let gross_edge = q - price;
-    let fee_allowance = if market.fees_enabled {
-        crypto_taker_fee_per_share(price).map_err(|error| error.to_string())?
-    } else {
-        Decimal::ZERO
-    };
     let slippage_allowance = settings.strategy.slippage_buffer;
     let toxicity_allowance = settings.strategy.adverse_selection_buffer + fair_value.model_error;
     let net_edge_lower_bound = gross_edge - fee_allowance - slippage_allowance - toxicity_allowance;
     if net_edge_lower_bound <= Decimal::ZERO {
         return Err("conservative net-edge lower bound is not positive".to_owned());
     }
-    let ttl_ms = decision
+    let strategy_ttl_ms = decision
         .ttl_ms
         .unwrap_or(settings.strategy.order_ttl_seconds * 1_000)
         .clamp(1, MAX_INTENT_TTL_MS);
+    let ttl_ms = strategy_ttl_ms.max(EXECUTION_HANDOFF_TTL_MS);
     let valid_until = decision_ts + Duration::milliseconds(ttl_ms);
     let gtd_expiry_ts = valid_until + Duration::seconds(VENUE_GTD_SECURITY_BUFFER_SECONDS);
     let book_hash = canonical_book_hash(market, book);
@@ -284,6 +574,7 @@ pub(super) fn build_execution_intent_with_model(
         "side": "buy",
         "price": price.to_string(),
         "shares": shares.to_string(),
+        "market_end_ts": market.end_ts,
         "decision_ts": decision_ts,
         "valid_until": valid_until,
         "gtd_expiry_ts": gtd_expiry_ts,
@@ -291,6 +582,8 @@ pub(super) fn build_execution_intent_with_model(
         "book_hash": book_hash,
         "features_digest": features_digest,
         "reference_source_ts": reference.source_ts,
+        "reference_source": reference.source,
+        "resolution_source": canonical_resolution_source,
         "execution_model_blob_uri": execution_model.blob_uri,
         "execution_model_sha256": execution_model.sha256,
     });
@@ -315,6 +608,7 @@ pub(super) fn build_execution_intent_with_model(
         order_kind: OrderKind::PostOnlyGtd,
         ttl_ms,
         decision_ts,
+        market_end_ts: Some(market.end_ts),
         valid_until,
         gtd_expiry_ts: Some(gtd_expiry_ts),
         book_hash,
@@ -329,7 +623,7 @@ pub(super) fn build_execution_intent_with_model(
         reference_age_ms,
         book_age_ms,
         exact_resolution_source: true,
-        resolution_source: reference.source.clone(),
+        resolution_source: canonical_resolution_source.to_owned(),
         required_fill_model_version: execution_model.version.clone(),
         execution_model_blob_uri: execution_model.blob_uri.clone(),
         execution_model_sha256: execution_model.sha256.clone(),
@@ -341,6 +635,9 @@ pub(super) fn resolve_execution_model(
     settings: &RuntimeSettings,
     decision_ts: DateTime<Utc>,
 ) -> Result<IntentExecutionModel, String> {
+    if settings.azure.strategy_intent_operator_direct {
+        return validated_conservative_prior(settings);
+    }
     let account = settings
         .azure
         .storage_account_name
@@ -703,7 +1000,7 @@ mod tests {
         FundedLadderStateV1, ImmutableArtifactBindingV1, ProfitabilityMetrics, PromotionEvaluation,
         QueueModelTransitionV1,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn fixture() -> (
         RuntimeSettings,
@@ -1022,9 +1319,10 @@ mod tests {
         .unwrap();
         intent.validate().unwrap();
         assert_eq!(intent.order_kind, OrderKind::PostOnlyGtd);
+        assert_eq!(intent.ttl_ms, EXECUTION_HANDOFF_TTL_MS);
         assert_eq!(
             intent.gtd_expiry_ts,
-            Some(intent.valid_until + Duration::seconds(60))
+            Some(intent.valid_until + Duration::seconds(300))
         );
         assert_eq!(intent.notional, Decimal::new(90, 2));
         assert_eq!(intent.resolution_source, "chainlink_reference");
@@ -1037,6 +1335,121 @@ mod tests {
         assert_eq!(
             intent_blob_name("reports/intents", &intent.decision_id).unwrap(),
             format!("reports/intents/{}.json", intent.decision_id)
+        );
+    }
+
+    #[test]
+    fn funded_handoff_contains_only_immutable_binding_and_timing_fields() {
+        let (settings, market, fair, reference, book, decision, metadata, now) = fixture();
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        let blob_name = format!("reports/intents/{}.json", intent.decision_id);
+        let handoff =
+            funded_intent_handoff(&intent, &blob_name, &format!("sha256:{}", "f".repeat(64)));
+        let keys = handoff
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "schema",
+                "decision_id",
+                "intent_blob_name",
+                "intent_sha256",
+                "decision_ts",
+                "valid_until"
+            ])
+        );
+        assert_eq!(
+            handoff["schema"],
+            Value::String("polyedge.funded_intent_handoff.v1".to_owned())
+        );
+        assert!(handoff.get("price").is_none());
+        assert!(handoff.get("notional").is_none());
+    }
+
+    #[test]
+    fn market_warmup_is_non_executable_and_covers_both_tokens() {
+        let (_, market, _, _, _, _, _, now) = fixture();
+        let warmup = funded_market_warmup(&market, now);
+        assert_eq!(
+            warmup["schema"],
+            Value::String("polyedge.funded_market_warmup.v1".to_owned())
+        );
+        assert_eq!(
+            warmup["token_ids"],
+            json!([market.up_token_id, market.down_token_id])
+        );
+        assert!(warmup.get("decision_id").is_none());
+        assert!(warmup.get("price").is_none());
+        assert!(warmup.get("side").is_none());
+        let marker = funded_market_warmup_marker(&market);
+        assert_eq!(
+            marker["schema"],
+            Value::String("polyedge.funded_market_warmup_marker.v1".to_owned())
+        );
+        assert_eq!(marker["executable"], Value::Bool(false));
+        let marker_name = funded_market_warmup_blob_name(
+            "reports/research/venue-probe/control/strategy-canary/intents",
+            &market,
+        )
+        .unwrap();
+        assert!(marker_name
+            .starts_with("reports/research/venue-probe/control/strategy-canary/warmups/"));
+        assert!(marker_name.ends_with(".json"));
+        assert!(funded_market_warmup_blob_name("intents", &market).is_err());
+        let minute = DateTime::<Utc>::from_timestamp((now.timestamp() / 60) * 60, 0).unwrap();
+        let message_id = funded_market_warmup_message_id(&market, minute);
+        assert_eq!(
+            message_id,
+            funded_market_warmup_message_id(&market, minute + Duration::seconds(30))
+        );
+        assert_ne!(
+            message_id,
+            funded_market_warmup_message_id(&market, minute + Duration::seconds(60))
+        );
+    }
+
+    #[test]
+    fn operator_direct_publisher_requires_exact_service_bus_binding() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_account_name = Some("storage".to_owned());
+        settings.azure.storage_container_name = "shadow".to_owned();
+        settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
+        settings.azure.strategy_intent_operator_direct = true;
+        let error = IntentPublisherConfig::from_settings(&settings)
+            .unwrap()
+            .connect()
+            .err()
+            .expect("missing Service Bus binding must fail");
+        assert!(error.contains("exact Service Bus binding"));
+    }
+
+    #[test]
+    fn operator_direct_publisher_isolates_warmup_and_bounded_intent_lanes() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_account_name = Some("storage".to_owned());
+        settings.azure.storage_container_name = "shadow".to_owned();
+        settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
+        settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
+
+        let publisher = IntentPublisherConfig::from_settings(&settings)
+            .unwrap()
+            .connect()
+            .unwrap();
+
+        assert_eq!(
+            publisher.intent_lane_count(),
+            OPERATOR_DIRECT_INTENT_PUBLISH_LANES
         );
     }
 
@@ -1079,14 +1492,37 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_when_notional_exceeds_one_dollar_or_candidate_changes() {
+    fn canonicalizes_exact_polymarket_rtds_chainlink_source() {
+        let (settings, market, fair, mut reference, book, decision, metadata, now) = fixture();
+        reference.source = settings.rtds_chainlink_source_name();
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(intent.resolution_source, "chainlink_reference");
+        assert!(intent.exact_resolution_source);
+    }
+
+    #[test]
+    fn rejects_unrecognized_source_even_when_marked_exact() {
+        let (settings, market, fair, mut reference, book, decision, metadata, now) = fixture();
+        reference.source = "unrecognized_exact_source".to_owned();
+        assert!(build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now
+        )
+        .unwrap_err()
+        .contains("exact market resolution"));
+    }
+
+    #[test]
+    fn fails_closed_when_notional_exceeds_configured_cap_or_candidate_changes() {
         let (settings, market, fair, reference, book, mut decision, mut metadata, now) = fixture();
         decision.size = Some(Decimal::from(3));
         assert!(build_execution_intent(
             &settings, &market, &fair, &reference, &book, &decision, &metadata, now
         )
         .unwrap_err()
-        .contains("one-dollar"));
+        .contains("configured execution-intent cap"));
 
         decision.size = Some(Decimal::ONE);
         metadata.candidate = FrozenStrategyMode::DynamicSafetyOnly.candidate();
@@ -1098,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn derives_venue_feasible_minimum_shares_without_exceeding_one_dollar() {
+    fn derives_venue_feasible_minimum_shares_without_exceeding_configured_cap() {
         let (settings, mut market, fair, reference, book, mut decision, metadata, now) = fixture();
         market.minimum_order_size = Decimal::from(5);
         decision.price = Some(Decimal::new(20, 2));
@@ -1116,6 +1552,63 @@ mod tests {
             &settings, &market, &fair, &reference, &book, &decision, &metadata, now
         )
         .unwrap_err()
-        .contains("one-dollar"));
+        .contains("configured execution-intent cap"));
+    }
+
+    #[test]
+    fn funded_intent_cap_allows_the_frozen_strategy_to_publish_larger_maker_orders() {
+        let (mut settings, market, fair, reference, book, mut decision, metadata, now) = fixture();
+        settings.azure.strategy_intent_max_order_notional = Decimal::from(5);
+        decision.size = Some(Decimal::from(10));
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(intent.notional, Decimal::new(45, 1));
+    }
+
+    #[test]
+    fn operator_direct_scales_to_funded_notional_only_inside_six_to_fifteen_minutes() {
+        let (mut settings, mut market, fair, reference, book, decision, metadata, now) = fixture();
+        settings.azure.strategy_intent_target_order_notional = Decimal::new(105, 1);
+        settings.azure.strategy_intent_max_order_notional = Decimal::new(105, 1);
+        settings.azure.strategy_intent_min_seconds_to_expiry = 360;
+        settings.azure.strategy_intent_max_seconds_to_expiry = 900;
+        market.fees_enabled = true;
+
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        let reserved_notional = intent.notional + intent.shares * intent.fee_allowance;
+        assert!(reserved_notional <= Decimal::new(105, 1));
+        assert!(reserved_notional >= Decimal::new(1049, 2));
+        assert!(intent.notional < Decimal::new(105, 1));
+        assert_eq!(intent.market_end_ts, Some(market.end_ts));
+
+        market.end_ts = now + Duration::seconds(359);
+        assert!(build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now
+        )
+        .unwrap_err()
+        .contains("outside the configured execution-intent expiry window"));
+
+        market.end_ts = now + Duration::seconds(901);
+        assert!(build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now
+        )
+        .unwrap_err()
+        .contains("outside the configured execution-intent expiry window"));
+    }
+
+    #[test]
+    fn operator_direct_uses_the_exact_conservative_prior_without_promotion_control() {
+        let (mut settings, ..) = fixture();
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.strategy_canary_execution_model_sha256 =
+            CONSERVATIVE_PRIOR_SHA256.to_owned();
+        let model = resolve_execution_model(&settings, Utc::now()).unwrap();
+        assert_eq!(model.version, CONSERVATIVE_PRIOR_VERSION);
+        assert_eq!(model.sha256, CONSERVATIVE_PRIOR_SHA256);
     }
 }

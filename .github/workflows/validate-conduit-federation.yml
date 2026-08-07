@@ -1,0 +1,68 @@
+name: Validate conduit workload federation
+
+on:
+  pull_request:
+    paths:
+      - 'crates/polyedge-storage/**'
+      - 'infra/conduit-federated-identity.bicep'
+      - 'ops/conduit/**'
+      - '.github/workflows/validate-conduit-federation.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/polyedge-storage/**'
+      - 'infra/conduit-federated-identity.bicep'
+      - 'ops/conduit/**'
+      - '.github/workflows/validate-conduit-federation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-conduit-federation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test shared Azure token authentication
+        run: cargo test -p polyedge-storage
+
+      - name: Test token rotation and bounded Node smoke
+        run: |
+          ops/conduit/test/test-federated-token-refresh.sh
+          node --test venue-probe/test/workload-identity-smoke.test.mjs
+          jq -e '
+            .status == "planned-not-assigned"
+            and (.lanes | keys == ["api", "funded-signer", "research", "shadow-qset"])
+            and ([.lanes[].assignments[]] | length == 21)
+            and all(.lanes[]; (.negativeAssertions | length) > 0)
+            and .arc.unchanged
+          ' ops/conduit/identity-rbac-plan.json
+
+      - name: Validate isolated UAMI federation template
+        run: |
+          set -euo pipefail
+          az bicep build \
+            --file infra/conduit-federated-identity.bicep \
+            --stdout > conduit-federated-identity.json
+          jq -e '
+            ([.resources[] | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities")] | length) == 1
+            and ([.resources[] | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials")] | length) == 1
+            and ([.resources[] | select(.type == "Microsoft.Authorization/roleAssignments")] | length) == 0
+            and ([.resources[] | select(.type | test("KeyVault|ServiceBus|Storage"; "i"))] | length) == 0
+          ' conduit-federated-identity.json
+          jq -e '
+            .variables.audience == "api://AzureADTokenExchange"
+            and ([.resources[]
+              | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials")
+              | .properties.audiences
+              | length]
+            == [1])
+          ' conduit-federated-identity.json

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PolyEdge replay index (UTC)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+Unit=polyedge-job@replay.service
+
+[Install]
+WantedBy=timers.target

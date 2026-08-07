@@ -1,17 +1,32 @@
 import { createHash } from "node:crypto";
+import { validateProtectedCompoundingManifest } from "./compounding-risk.mjs";
+import { validateProfitQuarantineManifest } from "./profit-quarantine.mjs";
 
 const EXECUTION_INTENT_SCHEMA = "polyedge.execution_intent.v1";
 const AUTHORIZATION_SCHEMA = "polyedge.strategy_canary_authorization.v1";
 const FUNDED_AUTHORIZATION_SCHEMA = "polyedge.funded_stage_intent_authorization.v1";
+const OPERATOR_DIRECT_AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const PROMOTION_MANIFEST_SCHEMA = "promotion_manifest_v1";
-const VENUE_GTD_SECURITY_BUFFER_MS = 60_000;
+const OPERATOR_DIRECT_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v1";
+const OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v2";
+const OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v3";
+const OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS = new Set([
+  OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA,
+  OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA
+]);
+export const VENUE_GTD_SECURITY_BUFFER_MS = 300_000;
+const VENUE_GTD_MINIMUM_LIFETIME_MS = 60_000;
+const VENUE_GTD_SEND_MARGIN_MS = 5_000;
 const MAX_ACTIVE_INTENT_TTL_MS = 30_000;
+const OPERATOR_DIRECT_BOOK_DRIFT_MAX_MS = 20_000;
 
 export function loadCanaryConfig(env = process.env) {
   const config = {
     executionMode: env.EXECUTION_MODE || "strategy_canary",
+    operatorDirect: env.EXECUTION_MODE === "funded_direct",
     allowLive: boolean(env.ALLOW_LIVE),
     allowCanary: boolean(env.ALLOW_STRATEGY_CANARY),
+    allowFundedDirect: boolean(env.ALLOW_FUNDED_DIRECT),
     enableTakerOrders: boolean(env.ENABLE_TAKER_ORDERS),
     dryRun: env.STRATEGY_CANARY_DRY_RUN !== "false",
     trustBoundaryReady: boolean(env.FUNDED_EVIDENCE_TRUST_BOUNDARY_READY),
@@ -32,6 +47,7 @@ export function loadCanaryConfig(env = process.env) {
     executionModelBlobUri: clean(env.STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI),
     executionModelHash: normalizeHash(env.STRATEGY_CANARY_EXECUTION_MODEL_SHA256),
     requiredResolutionSource: clean(env.STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE || "chainlink_reference"),
+    executionOrigin: clean(env.VENUE_PROBE_EXECUTION_ORIGIN || "azure_north_europe_static_egress"),
     expectedCountry: clean(env.VENUE_PROBE_EXPECTED_COUNTRY).toUpperCase(),
     expectedEgressIp: clean(env.VENUE_PROBE_EXPECTED_EGRESS_IP),
     maxClockDriftMs: integer(env.VENUE_PROBE_MAX_CLOCK_DRIFT_MS, 5000),
@@ -61,7 +77,27 @@ export function loadCanaryConfig(env = process.env) {
     campaignEquityFloor: number(env.VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR, 4.03),
     maxCampaignDrawdown: number(env.VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN, 1),
     maxReconciliationDiscrepancy: number(env.VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY, 0.01),
-    campaignCashFlows: parseJson(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]")
+    campaignCashFlows: parseJson(env.VENUE_PROBE_CAMPAIGN_CASH_FLOWS || "[]"),
+    operatorSessionManifest: parseOptionalObject(
+      env.FUNDED_DIRECT_SESSION_MANIFEST_JSON
+    ),
+    reserveMigrationSourceSessionId: clean(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID
+    ),
+    reserveMigrationSourceSessionBlobName: clean(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME
+    ),
+    reserveMigrationSourceSessionHash: normalizeHash(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256
+    ),
+    reserveMigrationSourceStateBlobName: clean(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME
+    ),
+    reserveMigrationMinimumHistoricalHighWaterEquity: number(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY,
+      0
+    ),
+    minRemainingTtlMs: integer(env.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, 5_000)
   };
   validateCanaryConfig(config);
   return config;
@@ -69,12 +105,17 @@ export function loadCanaryConfig(env = process.env) {
 
 export function validateCanaryConfig(config) {
   const errors = [];
-  if (config.executionMode !== "strategy_canary") errors.push("EXECUTION_MODE must equal strategy_canary");
-  if (!config.dryRun && config.trustBoundaryReady !== true) errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control isolation");
+  if (!["strategy_canary", "funded_direct"].includes(config.executionMode)) errors.push("EXECUTION_MODE must equal strategy_canary or funded_direct");
+  if (!config.operatorDirect && !config.dryRun && config.trustBoundaryReady !== true) errors.push("FUNDED_EVIDENCE_TRUST_BOUNDARY_READY must be true only after signer/control isolation");
   if (config.allowLive) errors.push("ALLOW_LIVE must remain false");
-  if (!config.allowCanary) errors.push("ALLOW_STRATEGY_CANARY must be true");
+  if (config.operatorDirect ? !config.allowFundedDirect : !config.allowCanary) {
+    errors.push(config.operatorDirect ? "ALLOW_FUNDED_DIRECT must be true" : "ALLOW_STRATEGY_CANARY must be true");
+  }
   if (config.enableTakerOrders) errors.push("ENABLE_TAKER_ORDERS must remain false");
-  if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= 1)) errors.push("STRATEGY_CANARY_MAX_ORDER_NOTIONAL must be in (0, 1]");
+  const maxAllowedNotional = config.operatorDirect ? 100 : 1;
+  if (!(config.maxOrderNotional > 0 && config.maxOrderNotional <= maxAllowedNotional)) {
+    errors.push(`STRATEGY_CANARY_MAX_ORDER_NOTIONAL must be in (0, ${maxAllowedNotional}]`);
+  }
   if (!config.candidateConfigHash) errors.push("STRATEGY_CANARY_CANDIDATE_CONFIG_HASH is required");
   if (!config.requiredFillModelVersion) errors.push("STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION is required");
   if (!config.executionModelBlobUri) errors.push("STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI is required");
@@ -86,16 +127,58 @@ export function validateCanaryConfig(config) {
     ["STRATEGY_CANARY_PROMOTION_MANIFEST_SHA256", config.manifestBlobHash],
     ["STRATEGY_CANARY_AUTHORIZATION_BLOB_NAME", config.authorizationBlobName],
     ["STRATEGY_CANARY_AUTHORIZATION_SHA256", config.authorizationBlobHash],
-    ["STRATEGY_CANARY_HUMAN_GRANT_ID", config.humanGrantId],
-    ["STRATEGY_CANARY_HUMAN_GRANT_SHA256", config.humanGrantHash],
-    ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_BLOB_NAME", config.humanGrantConsumptionBlobName],
-    ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_SHA256", config.humanGrantConsumptionHash]
+    ...(!config.operatorDirect ? [
+      ["STRATEGY_CANARY_HUMAN_GRANT_ID", config.humanGrantId],
+      ["STRATEGY_CANARY_HUMAN_GRANT_SHA256", config.humanGrantHash],
+      ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_BLOB_NAME", config.humanGrantConsumptionBlobName],
+      ["STRATEGY_CANARY_HUMAN_GRANT_CONSUMPTION_SHA256", config.humanGrantConsumptionHash]
+    ] : [])
   ]) if (!value) errors.push(`${name} is required`);
   if (!config.expectedCountry) errors.push("VENUE_PROBE_EXPECTED_COUNTRY is required");
   if (!config.expectedEgressIp) errors.push("VENUE_PROBE_EXPECTED_EGRESS_IP is required");
   if (!config.storageAccount) errors.push("AZURE_STORAGE_ACCOUNT_NAME is required");
   if (!config.intentContainerName) errors.push("STRATEGY_CANARY_INTENT_CONTAINER_NAME is required");
   if (!config.manifestContainerName) errors.push("STRATEGY_CANARY_MANIFEST_CONTAINER_NAME is required");
+  if (config.operatorDirect && !config.operatorSessionManifest) {
+    errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be a valid object");
+  }
+  const migrationValues = [
+    config.reserveMigrationSourceSessionId,
+    config.reserveMigrationSourceSessionBlobName,
+    config.reserveMigrationSourceSessionHash,
+    config.reserveMigrationSourceStateBlobName,
+    config.reserveMigrationMinimumHistoricalHighWaterEquity
+  ];
+  const migrationConfigured = migrationValues.every(Boolean);
+  if (migrationValues.some(Boolean) && !migrationConfigured) {
+    errors.push("funded protected-reserve migration source binding must be complete");
+  }
+  if (config.operatorSessionManifest?.session_id === "dynamic-quote-funded-2026-07-29-v5"
+      && !migrationConfigured) {
+    errors.push("the production v5 session requires the authenticated v7 reserve migration source");
+  }
+  if (migrationConfigured
+      && (config.reserveMigrationSourceSessionId ===
+          config.operatorSessionManifest?.session_id
+        || config.reserveMigrationSourceSessionBlobName !==
+          `reports/funded/dynamic-quote/sessions/${config.reserveMigrationSourceSessionId}/session.json`
+        || config.reserveMigrationSourceStateBlobName !==
+          `reports/funded/dynamic-quote/sessions/${config.reserveMigrationSourceSessionId}/capital-reserve-state.json`
+        || !(config.reserveMigrationMinimumHistoricalHighWaterEquity >=
+          Number(config.operatorSessionManifest?.starting_collateral)))) {
+    errors.push("funded protected-reserve migration source paths must bind one different exact session");
+  }
+  if (!(config.maxReconciliationDiscrepancy >= 0 && config.maxReconciliationDiscrepancy <= 0.01)) {
+    errors.push("VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY must be in [0, 0.01]");
+  }
+  if (!Array.isArray(config.campaignCashFlows)) {
+    errors.push("VENUE_PROBE_CAMPAIGN_CASH_FLOWS must be a JSON array");
+  } else if (config.operatorDirect && config.campaignCashFlows.length !== 0) {
+    errors.push("operator-funded execution requires explicit zero external cash flows");
+  }
+  if (!(config.minRemainingTtlMs >= 1_000 && config.minRemainingTtlMs <= MAX_ACTIVE_INTENT_TTL_MS)) {
+    errors.push(`STRATEGY_CANARY_MIN_REMAINING_TTL_MS must be in [1000, ${MAX_ACTIVE_INTENT_TTL_MS}]`);
+  }
   for (const [name, value] of [
     ["POLYMARKET_PRIVATE_KEY", config.privateKey],
     ["POLYMARKET_API_KEY", config.apiKey],
@@ -187,15 +270,18 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   const intentMinimumOrderSize = finite(intent.minimum_order_size, "minimum_order_size");
   if (!(price > 0 && price < 1 && shares > 0 && notional > 0)) fail("execution intent price, shares, and notional must be positive");
   if (Math.abs(price * shares - notional) > 1e-9) fail("execution intent notional does not reconcile");
-  if (notional > config.maxOrderNotional + 1e-9 || notional > 1 + 1e-9) fail("execution intent exceeds the one-dollar notional cap");
+  if (notional > config.maxOrderNotional + 1e-9 || (!config.operatorDirect && notional > 1 + 1e-9)) {
+    fail(config.operatorDirect ? "execution intent exceeds the operator-funded order cap" : "execution intent exceeds the one-dollar notional cap");
+  }
   if (!(intentMinimumOrderSize > 0) || shares + 1e-9 < intentMinimumOrderSize) fail("execution intent is below its bound venue minimum_order_size");
   const decisionMs = Date.parse(intent.decision_ts);
   const validUntilMs = Date.parse(intent.valid_until);
   const expiryMs = Date.parse(intent.gtd_expiry_ts);
   if (![decisionMs, validUntilMs, expiryMs].every(Number.isFinite)) fail("execution intent timestamps are invalid");
   if (nowMs < decisionMs || nowMs >= validUntilMs) fail("execution intent is stale or not yet valid");
+  if (validUntilMs - nowMs < config.minRemainingTtlMs) fail("execution intent has insufficient remaining TTL");
   if (Number(intent.ttl_ms) !== validUntilMs - decisionMs || Number(intent.ttl_ms) > MAX_ACTIVE_INTENT_TTL_MS) fail("active intent TTL does not reconcile or exceeds the short-lifecycle limit");
-  if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 60-second security buffer");
+  if (expiryMs !== validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS) fail("venue GTD expiry must include the exact 300-second security buffer");
   const referenceAgeMs = Number(intent.reference_age_ms);
   const bookAgeMs = Number(intent.book_age_ms);
   if (!Number.isFinite(referenceAgeMs) || referenceAgeMs < 0 || referenceAgeMs > config.maxReferenceAgeMs) fail("reference source is stale");
@@ -224,25 +310,88 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
   if (intent.exact_resolution_source !== true || intent.resolution_source !== config.requiredResolutionSource || runtime.exactResolutionSource !== true || runtime.resolutionSource !== config.requiredResolutionSource) fail("exact resolution source is not confirmed");
 
   const fundedStage = authorization?.schema === FUNDED_AUTHORIZATION_SCHEMA;
-  const manifestPhaseValid = fundedStage
-    ? manifest?.phase === "limited_live" && manifest?.gate_metrics?.phase === "shadow_passed" && manifest?.funded_ladder?.phase === "limited_live" && manifest?.funded_ladder?.stage_authorized === true && manifest?.funded_ladder?.human_grant_required === false
-    : manifest?.phase === "canary_ready" && manifest?.gate_metrics?.phase === "canary_ready";
-  if (manifest?.schema_version !== PROMOTION_MANIFEST_SCHEMA || !manifestPhaseValid) fail("promotion manifest phase or funded-stage authorization state is invalid");
-  if (manifest.promotion_allowed !== false || manifest.gate_metrics?.promotion_allowed !== true || manifest.human_authorization_required !== true) fail("promotion manifest gates are not passing or the research manifest is directly executable");
+  const operatorDirect = authorization?.schema === OPERATOR_DIRECT_AUTHORIZATION_SCHEMA;
+  if (Boolean(config.operatorDirect) !== operatorDirect) fail("execution mode and authorization kind disagree");
+  if (operatorDirect) {
+    const startingCollateral = Number(manifest?.starting_collateral);
+    const reconciliationTolerance = Number(manifest?.max_reconciliation_discrepancy);
+    const protectedCompoundingEnabled =
+      OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS.has(manifest?.schema_version);
+    const profitQuarantineEnabled = !protectedCompoundingEnabled
+      && manifest?.profit_quarantine?.enabled === true;
+    let capitalModeValid = false;
+    if (protectedCompoundingEnabled) {
+      try {
+        validateProtectedCompoundingManifest(manifest);
+        capitalModeValid = manifest.allow_compounding === true;
+      } catch {
+        fail("operator-funded protected compounding contract is invalid");
+      }
+    } else {
+      if (profitQuarantineEnabled) {
+        try {
+          validateProfitQuarantineManifest(manifest);
+        } catch {
+          fail("operator-funded profit quarantine contract is invalid");
+        }
+      } else if (manifest?.verified_internal_settlements !== undefined) {
+        fail("operator-funded settlements require an explicit profit quarantine");
+      }
+      capitalModeValid = manifest?.schema_version === OPERATOR_DIRECT_MANIFEST_SCHEMA
+        && manifest.allow_compounding === false;
+    }
+    if (![OPERATOR_DIRECT_MANIFEST_SCHEMA, ...OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS]
+          .includes(manifest?.schema_version)
+        || manifest.authorization_mode !== "operator_direct"
+        || manifest.research_promotion_bypassed !== true
+        || manifest.research_lane_isolated !== true
+        || manifest.maker_only !== true
+        || manifest.no_deposits !== true
+        || manifest.allow_automatic_replenishment !== false
+        || !capitalModeValid
+        || !Array.isArray(manifest.external_cash_flows)
+        || manifest.external_cash_flows.length !== 0
+        || Number(manifest.max_open_orders) !== 1
+        || Number(manifest.max_order_notional) !== Number(config.maxOrderNotional)
+        || !(startingCollateral > 0)
+        || Number(manifest.max_account_loss) !== startingCollateral
+        || Number(config.campaignBaselineEquity) !== startingCollateral
+        || !(reconciliationTolerance >= 0 && reconciliationTolerance <= 0.01)
+        || Number(config.maxReconciliationDiscrepancy) !== reconciliationTolerance
+        || !clean(manifest.authorized_by_user_reference)
+        || !clean(manifest.session_id)) {
+      fail("operator-funded session contract is invalid");
+    }
+  } else {
+    const manifestPhaseValid = fundedStage
+      ? manifest?.phase === "limited_live" && manifest?.gate_metrics?.phase === "shadow_passed" && manifest?.funded_ladder?.phase === "limited_live" && manifest?.funded_ladder?.stage_authorized === true && manifest?.funded_ladder?.human_grant_required === false
+      : manifest?.phase === "canary_ready" && manifest?.gate_metrics?.phase === "canary_ready";
+    if (manifest?.schema_version !== PROMOTION_MANIFEST_SCHEMA || !manifestPhaseValid) fail("promotion manifest phase or funded-stage authorization state is invalid");
+    if (manifest.promotion_allowed !== false || manifest.gate_metrics?.promotion_allowed !== true || manifest.human_authorization_required !== true) fail("promotion manifest gates are not passing or the research manifest is directly executable");
+  }
   const manifestCreatedMs = Date.parse(manifest.created_at);
   const manifestExpiresMs = Date.parse(manifest.expires_at);
   if (!Number.isFinite(manifestCreatedMs) || !Number.isFinite(manifestExpiresMs) || manifestCreatedMs > nowMs || manifestExpiresMs <= nowMs || manifestExpiresMs <= manifestCreatedMs) fail("promotion manifest is expired or has an invalid validity window");
-  if (manifest.candidate?.name !== intent.candidate_name || manifest.candidate?.candidate_version !== intent.candidate_version || manifest.candidate?.config_hash !== intent.candidate_config_hash) fail("promotion manifest candidate mismatch");
-  if (manifest.execution_model?.blob_uri !== config.executionModelBlobUri || normalizeHash(manifest.execution_model?.sha256) !== config.executionModelHash || manifest.execution_model?.model_version !== config.requiredFillModelVersion) fail("promotion manifest exact model artifact binding mismatch");
+  if (manifest.candidate?.name !== intent.candidate_name || manifest.candidate?.candidate_version !== intent.candidate_version || manifest.candidate?.config_hash !== intent.candidate_config_hash) fail("execution manifest candidate mismatch");
+  if (manifest.execution_model?.blob_uri !== config.executionModelBlobUri || normalizeHash(manifest.execution_model?.sha256) !== config.executionModelHash || manifest.execution_model?.model_version !== config.requiredFillModelVersion) fail("execution manifest exact model artifact binding mismatch");
 
-  if (![AUTHORIZATION_SCHEMA, FUNDED_AUTHORIZATION_SCHEMA].includes(authorization?.schema) || authorization.single_use !== true) fail("invalid one-shot authorization");
+  if (![AUTHORIZATION_SCHEMA, FUNDED_AUTHORIZATION_SCHEMA, OPERATOR_DIRECT_AUTHORIZATION_SCHEMA].includes(authorization?.schema) || authorization.single_use !== true) fail("invalid one-shot authorization");
   for (const field of ["authorization_id", "human_authorization_reference", "authorized_at", "expires_at"]) if (!clean(authorization?.[field])) fail(`authorization ${field} is required`);
   if (authorization.decision_id !== intent.decision_id) fail("authorization decision mismatch");
   const authorizationStartedMs = Date.parse(authorization.authorized_at);
   const authorizationExpiresMs = Date.parse(authorization.expires_at);
   if (!Number.isFinite(authorizationStartedMs) || !Number.isFinite(authorizationExpiresMs) || authorizationStartedMs > nowMs || authorizationExpiresMs <= nowMs || authorizationExpiresMs <= authorizationStartedMs) fail("authorization is stale, not yet valid, or has an invalid validity window");
   if (authorization.intent_blob_name !== config.intentBlobName || normalizeHash(authorization.intent_sha256) !== config.intentBlobHash || authorization.promotion_manifest_blob_name !== config.manifestBlobName || normalizeHash(authorization.promotion_manifest_sha256) !== config.manifestBlobHash) fail("authorization artifact binding mismatch");
-  if (fundedStage) {
+  if (operatorDirect) {
+    if (authorization.session_id !== manifest.session_id
+        || authorization.authorization_mode !== "operator_direct"
+        || authorization.operator_session_manifest_blob_name !== config.manifestBlobName
+        || normalizeHash(authorization.operator_session_manifest_sha256) !== config.manifestBlobHash
+        || authorization.research_promotion_bypassed !== true
+        || Number(authorization.max_order_notional) !== Number(config.maxOrderNotional)) {
+      fail("operator-funded authorization session binding mismatch");
+    }
+  } else if (fundedStage) {
     if (authorization.funded_stage_consumption_blob_name !== config.humanGrantConsumptionBlobName || normalizeHash(authorization.funded_stage_consumption_sha256) !== config.humanGrantConsumptionHash || !normalizeHash(authorization.funded_stage_source_state_sha256) || Number(authorization.funded_stage_target_orders) !== Number(manifest.funded_ladder?.active_target_orders)) fail("funded-stage consumption, state, or target binding mismatch");
   } else if (authorization.human_grant_id !== config.humanGrantId || normalizeHash(authorization.human_grant_sha256) !== config.humanGrantHash || authorization.human_grant_consumption_blob_name !== config.humanGrantConsumptionBlobName || normalizeHash(authorization.human_grant_consumption_sha256) !== config.humanGrantConsumptionHash) fail("authorization human-grant consumption binding mismatch");
   if (authorization.candidate_name !== intent.candidate_name || authorization.candidate_version !== intent.candidate_version || authorization.candidate_config_hash !== intent.candidate_config_hash || authorization.required_fill_model_version !== intent.required_fill_model_version) fail("authorization candidate or fill-model binding mismatch");
@@ -258,12 +407,124 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       || runtime.clockUncertaintyMs < 0 || runtime.clockUncertaintyMs > config.maxClockUncertaintyMs) {
     fail("clock uncertainty exceeds limit");
   }
+  const venueNowMs = nowMs + Number(runtime.clockServerMinusLocalMs);
+  if (expiryMs - venueNowMs < VENUE_GTD_MINIMUM_LIFETIME_MS + VENUE_GTD_SEND_MARGIN_MS) {
+    fail("venue GTD expiry is inside the one-minute security threshold plus send margin");
+  }
   if (runtime.risk?.passed !== true) fail(`campaign equity/risk gate failed (${(runtime.risk?.blockers || ["unknown"]).join(", ")})`);
+  if (operatorDirect) {
+    const startingCollateral = Number(manifest.starting_collateral);
+    const reconciliationTolerance = Number(manifest.max_reconciliation_discrepancy);
+    const protectedCompoundingEnabled =
+      OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS.has(manifest?.schema_version);
+    if (Number(runtime.risk?.baseline_equity) !== startingCollateral
+        || Number(runtime.risk?.cash_flow_adjusted_baseline) !== startingCollateral
+        || Number(runtime.risk?.authorized_starting_collateral) !== startingCollateral
+        || runtime.risk?.no_replenishment !== true
+        || Number(runtime.risk?.net_external_cash_flow) !== 0
+        || Number(runtime.risk?.cash_flow_count) !== 0
+        || !Array.isArray(runtime.risk?.cash_flow_ids)
+        || runtime.risk.cash_flow_ids.length !== 0
+        || Number(runtime.risk?.maximum_reconciliation_discrepancy) !== reconciliationTolerance) {
+      fail(protectedCompoundingEnabled
+        ? "operator-funded protected compounding capital reconciliation failed"
+        : "operator-funded no-replenishment/no-compounding reconciliation failed");
+    }
+    if (protectedCompoundingEnabled) {
+      const sizing = runtime.executionSizing;
+      const actualShares = Number(sizing?.shares);
+      const actualNotional = Number(sizing?.notional);
+      const actualReserved = Number(sizing?.reserved_notional);
+      const actualFeeRisk = Number(sizing?.fee_risk_upper_bound);
+      const riskEquity = Number(runtime.risk?.account_equity);
+      const highWater = Number(runtime.risk?.high_water_equity);
+      const protectedReserve = Number(runtime.risk?.protected_reserve);
+      const lastReconciledEquity = Number(runtime.risk?.last_reconciled_equity);
+      const operatingBuffer = Number(runtime.risk?.operating_buffer);
+      const operableCapital = Number(runtime.risk?.operable_capital);
+      const reserveRatio = Number(manifest.capital_policy?.reserve_ratio);
+      const operatingBufferRatio = Number(manifest.capital_policy?.operating_buffer_ratio);
+      const lossResizingEnabled =
+        manifest.schema_version === OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA;
+      const reserveReconciled = lossResizingEnabled
+        ? runtime.risk?.reserve_basis === "fully_reconciled_current_equity"
+          && runtime.risk?.reserve_monotonic === false
+          && runtime.risk?.continue_after_loss === true
+          && runtime.risk?.prior_state_session_id ===
+            manifest.capital_policy?.prior_state_session_id
+          && runtime.risk?.prior_state_blob_name ===
+            manifest.capital_policy?.prior_state_blob_name
+          && Number(runtime.risk?.historical_high_water_equity) + 1e-9 >=
+            Number(manifest.capital_policy?.minimum_historical_high_water_equity)
+          && Math.abs(lastReconciledEquity - riskEquity) <= 0.0000011
+          && Math.abs(protectedReserve - lastReconciledEquity * reserveRatio) <= 0.0000011
+        : protectedReserve + 0.0000011 >= highWater * reserveRatio;
+      const expectedFeeRisk = actualShares * polymarketV2FeePerShare(
+        price,
+        runtime.feeRate,
+        runtime.feeExponent
+      );
+      if (runtime.risk?.allow_compounding !== true
+          || runtime.risk?.no_compounding !== false
+          || sizing?.schema !== "polyedge.protected_order_sizing.v1"
+          || sizing?.executable !== true
+          || sizing?.blockers?.length !== 0
+          || Number(sizing?.source_shares) !== shares
+          || Number(sizing?.source_notional) !== notional
+          || Number(sizing?.price) !== price
+          || !(actualShares > 0)
+          || Math.abs(actualShares * 100 - Math.round(actualShares * 100)) > 1e-7
+          || actualShares > shares + 1e-9
+          || actualNotional > notional + 1e-9
+          || Math.abs(actualNotional - price * actualShares) > 0.0000011
+          || actualNotional + 1e-9 < Number(manifest.capital_policy.minimum_order_notional)
+          || Math.abs(actualFeeRisk - expectedFeeRisk) > 0.0000011
+          || Math.abs(actualReserved - actualNotional - actualFeeRisk) > 0.0000011
+          || Number(runtime.risk?.order_notional) !== actualNotional
+          || Number(runtime.risk?.proposed_notional) !== actualReserved
+          || highWater + 1e-9 < Math.max(startingCollateral, riskEquity)
+          || !reserveReconciled
+          || Math.abs(operatingBuffer - riskEquity * operatingBufferRatio) > 0.0000011
+          || Math.abs(operableCapital - Math.max(0, riskEquity - protectedReserve - operatingBuffer)) > 0.0000011
+          || actualReserved > operableCapital + 1e-9
+          || Number(runtime.risk?.account_equity) >
+            Number(runtime.risk?.authorized_equity_ceiling) + reconciliationTolerance + 1e-9) {
+        fail("operator-funded protected compounding or current-funds sizing reconciliation failed");
+      }
+    } else {
+      const profitQuarantineEnabled = manifest?.profit_quarantine?.enabled === true;
+      const verifiedProfit = (manifest?.verified_internal_settlements || [])
+        .reduce((total, row) => total + Number(row?.realized_pnl || 0), 0);
+      const verifiedSettlementIds = (manifest?.verified_internal_settlements || [])
+        .map((row) => row.id)
+        .sort();
+      const expectedEquityCeiling = startingCollateral + verifiedProfit;
+      if (runtime.risk?.no_compounding !== true
+          || runtime.risk?.allow_compounding === true
+          || (profitQuarantineEnabled
+            ? runtime.risk?.profit_quarantine_enabled !== true
+              || runtime.risk?.risk_headroom !== "starting_collateral_only"
+              || Number(runtime.risk?.verified_internal_realized_pnl) !== verifiedProfit
+              || JSON.stringify(runtime.risk?.verified_internal_settlement_ids) !==
+                JSON.stringify(verifiedSettlementIds)
+              || Number(runtime.risk?.quarantined_internal_profit) !== verifiedProfit
+              || Number(runtime.risk?.authorized_equity_ceiling) !== expectedEquityCeiling
+              || Number(runtime.risk?.risk_eligible_equity) > startingCollateral + reconciliationTolerance + 1e-9
+              || Number(runtime.risk?.account_equity) > expectedEquityCeiling + reconciliationTolerance + 1e-9
+            : runtime.risk?.profit_quarantine_enabled === true
+              || Number(runtime.risk?.account_equity) > startingCollateral + reconciliationTolerance + 1e-9)) {
+        fail("operator-funded no-replenishment/no-compounding reconciliation failed");
+      }
+    }
+  }
   if (Number(runtime.openOrderCount) !== 0) fail("account has open orders");
   if (String(runtime.market?.marketId) !== String(intent.market_id) || String(runtime.market?.conditionId) !== String(intent.condition_id) || String(runtime.market?.tokenId) !== String(intent.token_id)) fail("market, condition, or token identity mismatch");
   if (runtime.market?.closed === true || runtime.market?.acceptingOrders !== true) fail("market is not accepting orders");
   const actualBookHash = canonicalBookHash(runtime.book, intent.token_id);
-  if (actualBookHash !== normalizeHash(intent.book_hash)) fail("current order book hash disagrees with the intent");
+  const bookHashMatched = actualBookHash === normalizeHash(intent.book_hash);
+  if (!bookHashMatched && (!operatorDirect || nowMs - decisionMs > OPERATOR_DIRECT_BOOK_DRIFT_MAX_MS)) {
+    fail("current order book hash disagrees with the intent");
+  }
   const bestAsk = Math.min(...(runtime.book?.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
   if (!Number.isFinite(bestAsk) || price >= bestAsk) fail("post-only BUY would cross the current ask");
   const tick = Number(runtime.book?.tick_size ?? runtime.book?.tickSize);
@@ -280,7 +541,66 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       (feeRate > 0 && runtime.feeTakerOnly !== true)) {
     fail("exact Polymarket V2 fee rate/exponent/taker-only parameters are required");
   }
-  return { price, shares, notional, validUntilMs, venueExpiryMs: expiryMs, actualBookHash };
+  const executionSizing = operatorDirect
+    && OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS.has(manifest?.schema_version)
+    ? runtime.executionSizing
+    : null;
+  const executionShares = executionSizing ? Number(executionSizing.shares) : shares;
+  const executionNotional = executionSizing ? Number(executionSizing.notional) : notional;
+  if (executionShares + 1e-9 < minimumOrderSize) {
+    fail("current-funds execution size is below the venue minimum_order_size");
+  }
+  return {
+    price,
+    shares: executionShares,
+    notional: executionNotional,
+    sourceShares: shares,
+    sourceNotional: notional,
+    scaledToCurrentFunds: Boolean(executionSizing)
+      && (executionShares < shares - 1e-9 || executionNotional < notional - 1e-9),
+    validUntilMs,
+    venueExpiryMs: expiryMs,
+    actualBookHash,
+    bookHashMatched
+  };
+}
+
+export function deterministicNoOrderRejection(error) {
+  const message = String(
+    error?.response?.data?.error ??
+    error?.response?.data?.message ??
+    error?.errorMsg ??
+    error?.message ??
+    error ??
+    ""
+  ).trim();
+  if (/invalid expiration value, must be in the future for GTD orders/i.test(message)) {
+    return { code: "invalid_gtd_expiration", message };
+  }
+  if (/^invalid post-only order: order crosses book$/i.test(message)) {
+    return { code: "post_only_crosses_book", message };
+  }
+  return null;
+}
+
+export function validateDeterministicNoOrderReconciliation({
+  error,
+  openOrderCount,
+  unresolvedPositionCount,
+  userChannelGapCount,
+  userChannelUnparsedCount,
+  postSendTradeCount
+}) {
+  const rejection = deterministicNoOrderRejection(error);
+  if (!rejection) return null;
+  if (Number(openOrderCount) !== 0 ||
+      Number(unresolvedPositionCount) !== 0 ||
+      Number(userChannelGapCount) !== 0 ||
+      Number(userChannelUnparsedCount) !== 0 ||
+      Number(postSendTradeCount) !== 0) {
+    throw new Error("fail closed: deterministic venue rejection did not prove zero orders, zero positions, and an authenticated zero-fill window");
+  }
+  return rejection;
 }
 
 export async function consumeOneShotAuthorization(container, { authorization, authorizationHash, decisionId, runId, now = new Date() }) {
@@ -319,7 +639,7 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
   );
   const reservation = await reserveRisk({
     run_id: runId,
-    probe_id: `strategy-canary-${documents.intent.decision_id}`,
+    probe_id: `${config.operatorDirect ? "funded-direct" : "strategy-canary"}-${documents.intent.decision_id}`,
     reserved_notional: validated.notional + feeRiskUpperBound,
     principal_notional: validated.notional,
     fee_model: "polymarket_clob_v2_curve",
@@ -345,8 +665,36 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
     if (finalizeNoOrder) await finalizeNoOrder(reservation);
     throw error;
   }
-  const lifecycle = await executeLifecycle({ intent: documents.intent, documents, runtime, reservation, consumption, validated });
-  return { status: "strategy_canary_executed", order_submission_attempted: true, authorization_consumed: true, decision_id: documents.intent.decision_id, lifecycle };
+  const executionIntent = {
+    ...documents.intent,
+    shares: String(validated.shares),
+    notional: String(validated.notional),
+    source_requested_shares: String(validated.sourceShares),
+    source_requested_notional: String(validated.sourceNotional),
+    current_funds_scaled: validated.scaledToCurrentFunds
+  };
+  const lifecycle = await executeLifecycle({
+    intent: executionIntent,
+    documents,
+    runtime,
+    reservation,
+    consumption,
+    validated
+  });
+  return {
+    status: config.operatorDirect ? "funded_direct_executed" : "strategy_canary_executed",
+    order_submission_attempted: true,
+    authorization_consumed: true,
+    decision_id: documents.intent.decision_id,
+    execution_sizing: {
+      source_shares: validated.sourceShares,
+      source_notional: validated.sourceNotional,
+      submitted_shares: validated.shares,
+      submitted_notional: validated.notional,
+      scaled_to_current_funds: validated.scaledToCurrentFunds
+    },
+    lifecycle
+  };
 }
 
 export function beginFillMarkoutCapture(client, tokenId, currentFills, options = {}) {
@@ -585,3 +933,12 @@ function boolean(value) { return String(value || "").toLowerCase() === "true"; }
 function integer(value, fallback) { const parsed = Number.parseInt(value, 10); return Number.isFinite(parsed) ? parsed : fallback; }
 function number(value, fallback) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback; }
 function parseJson(value) { try { return JSON.parse(value); } catch { throw new Error("strategy_canary blocked: campaign cash flows must be valid JSON"); } }
+function parseOptionalObject(value) {
+  if (!clean(value)) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}

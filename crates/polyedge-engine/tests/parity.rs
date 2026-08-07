@@ -1,14 +1,14 @@
 use chrono::{DateTime, Utc};
 use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
-    BookState, ExecutionReport, FairValue, MarketId, MarketSpec, OrderId, ReferencePrice, TokenId,
-    TradeDecision,
+    BookState, ExecutionReport, FairValue, MarketId, MarketSpec, OrderId, ReferencePrice,
+    RiskAssessment, TokenId, TradeDecision,
 };
 use polyedge_engine::{
-    evaluate_decision_pipeline_v3, DecisionPipelineInputV3, FrozenStrategyMode,
-    LogReturnFairValueModel, MakerFirstStrategy, MarketStartEvidenceV1, OrderManager,
-    PaperFillEngine, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
-    RegimeReferencePoint, RestingMakerOrder, RiskManager,
+    evaluate_decision_pipeline_v3, final_decision_evidence_v1, DecisionPipelineInputV3,
+    DecisionPipelineOutputV3, FrozenStrategyMode, LogReturnFairValueModel, MakerFirstStrategy,
+    MarketStartEvidenceV1, OrderManager, PaperFillEngine, RegimeBookSnapshot, RegimeClassifier,
+    RegimeFeatureInput, RegimeReferencePoint, RestingMakerOrder, RiskManager,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,6 +86,30 @@ fn order_manager_matches_fixture_golden_master() {
         );
         assert_eq!(serde_json::to_value(actual).unwrap(), case["expected"]);
     }
+}
+
+#[test]
+fn final_place_without_strategy_lineage_is_reconciliation_evidence() {
+    let decision = serde_json::from_value::<TradeDecision>(
+        fixture()["strategy_cases"][0]["expected"][0].clone(),
+    )
+    .unwrap();
+    let output = DecisionPipelineOutputV3 {
+        raw_decisions: vec![decision.clone()],
+        strategy_evaluations: Vec::new(),
+        strategy_decisions: vec![decision.clone()],
+        risk_assessment: RiskAssessment::allow(),
+        risk_decisions: vec![decision.clone()],
+        final_decisions: vec![decision],
+        classifier_after: None,
+    };
+
+    let evidence = final_decision_evidence_v1(&output).unwrap();
+    assert_eq!(
+        evidence[0].payload["final_decision_metadata"]["source"],
+        "risk_or_order_reconciliation"
+    );
+    assert_eq!(evidence[0].strategy_evaluation_index, None);
 }
 
 #[test]
