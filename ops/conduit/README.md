@@ -88,13 +88,18 @@ The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
 The current formal parity window starts at the clean recorder boundary
-`2026-08-09T14:10:00Z` and cannot complete before
-`2026-08-12T14:10:00Z` or before two successful OCI daily cycles. Its
+`2026-08-09T21:00:00Z` and cannot complete before
+`2026-08-12T21:00:00Z` or before two successful OCI daily cycles. Its
 root-owned ledger is
-`/srv/polyedge-ring/parity/20260809T141000Z.json`; it must retain
+`/srv/polyedge-ring/parity/20260809T210000Z.json`; it must retain
 `azureDeletionAllowed:false` until the remaining parity, reboot, qset, and
-funded gates pass. The earlier `20260809T103000Z.json` ledger is superseded but
-retained as pre-window evidence. The OCI API recorder remains pinned to
+funded gates pass. The preceding `20260809T141000Z.json` ledger retained five
+accepted hours, then rejected hour `2026-08-09T20:00:00Z` after Azure replaced
+the `polyedge-dev--parityfix1` replica at `20:57:24Z`. Azure produced 61 valid
+runtime-provenance observations with two in minute `20:57`; OCI produced the
+required 60. The rejection is retained at
+`/srv/polyedge-ring/parity/hourly/20260809T20/rejection.json`, and no continuity
+credit carried into the replacement window. The OCI API recorder remains pinned to
 `sha256:20b695cb710d3da0ad5125e809aa4e029b5aa4f2a75c36f40dd9d905e553d713`
 from source `f7ecc30b2aaaeec5ad50b84bf5f548e33cae8e22`; all seven primary research
 jobs are pinned to
