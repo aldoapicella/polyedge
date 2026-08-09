@@ -81,6 +81,22 @@ export function loadCanaryConfig(env = process.env) {
     operatorSessionManifest: parseOptionalObject(
       env.FUNDED_DIRECT_SESSION_MANIFEST_JSON
     ),
+    reserveMigrationSourceSessionId: clean(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID
+    ),
+    reserveMigrationSourceSessionBlobName: clean(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME
+    ),
+    reserveMigrationSourceSessionHash: normalizeHash(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256
+    ),
+    reserveMigrationSourceStateBlobName: clean(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME
+    ),
+    reserveMigrationMinimumHistoricalHighWaterEquity: number(
+      env.FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY,
+      0
+    ),
     minRemainingTtlMs: integer(env.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, 5_000)
   };
   validateCanaryConfig(config);
@@ -125,6 +141,32 @@ export function validateCanaryConfig(config) {
   if (!config.manifestContainerName) errors.push("STRATEGY_CANARY_MANIFEST_CONTAINER_NAME is required");
   if (config.operatorDirect && !config.operatorSessionManifest) {
     errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be a valid object");
+  }
+  const migrationValues = [
+    config.reserveMigrationSourceSessionId,
+    config.reserveMigrationSourceSessionBlobName,
+    config.reserveMigrationSourceSessionHash,
+    config.reserveMigrationSourceStateBlobName,
+    config.reserveMigrationMinimumHistoricalHighWaterEquity
+  ];
+  const migrationConfigured = migrationValues.every(Boolean);
+  if (migrationValues.some(Boolean) && !migrationConfigured) {
+    errors.push("funded protected-reserve migration source binding must be complete");
+  }
+  if (config.operatorSessionManifest?.session_id === "dynamic-quote-funded-2026-07-29-v5"
+      && !migrationConfigured) {
+    errors.push("the production v5 session requires the authenticated v7 reserve migration source");
+  }
+  if (migrationConfigured
+      && (config.reserveMigrationSourceSessionId ===
+          config.operatorSessionManifest?.session_id
+        || config.reserveMigrationSourceSessionBlobName !==
+          `reports/funded/dynamic-quote/sessions/${config.reserveMigrationSourceSessionId}/session.json`
+        || config.reserveMigrationSourceStateBlobName !==
+          `reports/funded/dynamic-quote/sessions/${config.reserveMigrationSourceSessionId}/capital-reserve-state.json`
+        || !(config.reserveMigrationMinimumHistoricalHighWaterEquity >=
+          Number(config.operatorSessionManifest?.starting_collateral)))) {
+    errors.push("funded protected-reserve migration source paths must bind one different exact session");
   }
   if (!(config.maxReconciliationDiscrepancy >= 0 && config.maxReconciliationDiscrepancy <= 0.01)) {
     errors.push("VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY must be in [0, 0.01]");

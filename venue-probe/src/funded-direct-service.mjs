@@ -10,6 +10,8 @@ import {
 import { sanitize } from "./lib.mjs";
 
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
+const FUNDED_LOCK_RENEWAL_MS = 10_000;
+const FUNDED_BUSY_VALIDATION_LIMIT = 4;
 
 export function loadFundedDirectServiceConfig(env = process.env) {
   const config = {
@@ -296,130 +298,202 @@ export async function runPersistentFundedDirectService({
     }
   }, config.heartbeatMs);
   heartbeat.unref?.();
+  const warmedMarketTokens = new Set();
+  const startLockRenewal = (message) => {
+    const entry = {
+      message,
+      body: null,
+      renewalError: null,
+      renewal: null,
+      queueReceiveMonotonicMs: performance.now()
+    };
+    const renew = async () => {
+      try {
+        await receiver.renewMessageLock(message);
+      } catch (error) {
+        entry.renewalError = error;
+      }
+    };
+    void renew();
+    entry.renewal = setInterval(renew, FUNDED_LOCK_RENEWAL_MS);
+    entry.renewal.unref?.();
+    return entry;
+  };
+  const settleStoppedMessage = async (entry) => {
+    clearInterval(entry.renewal);
+    failedMessages += 1;
+    await receiver.deadLetterMessage(entry.message, {
+      deadLetterReason: "FundedServiceStopping",
+      deadLetterErrorDescription: "Funded service stopped before this locked message could be processed."
+    }).catch(() => receiver.abandonMessage(entry.message).catch(() => null));
+    logger({
+      schema: "polyedge.funded_direct_service.v2",
+      status: "persistent_message_stopped_fail_closed",
+      message_id: entry.message.messageId || null,
+      delivery_count: entry.message.deliveryCount || 0
+    });
+  };
+  const failMessage = async (entry, error) => {
+    failedMessages += 1;
+    const deterministic = /unsupported|schema|binding|TTL|stale|SHA-256|does not qualify|already has an authorization|latency|risk|reservation|cash.flow|equity|position|open order/i.test(error.message);
+    if (deterministic || Number(entry.message.deliveryCount || 0) >= 2) {
+      await receiver.deadLetterMessage(entry.message, {
+        deadLetterReason: "FundedIntentFailedClosed",
+        deadLetterErrorDescription: String(error.message).slice(0, 4_000)
+      }).catch(() => null);
+    } else {
+      await receiver.abandonMessage(entry.message).catch(() => null);
+    }
+    logger({
+      schema: "polyedge.funded_direct_service.v2",
+      status: "persistent_message_failed_closed",
+      message_id: entry.message.messageId || null,
+      delivery_count: entry.message.deliveryCount || 0,
+      error: error.message
+    });
+  };
+  const processIntent = async (entry, busy) => {
+    const { message, body, queueReceiveMonotonicMs } = entry;
+    try {
+      if (entry.renewalError) throw entry.renewalError;
+      const receivedWallMs = Date.now();
+      const result = busy ? await processor.rejectBusy(body) : await processor.process(body);
+      if (entry.renewalError) throw entry.renewalError;
+      await receiver.completeMessage(message);
+      processedMessages += 1;
+      if (busy) {
+        logger({
+          schema: "polyedge.funded_direct_service.v2",
+          status: "one_workflow_busy",
+          message_id: message.messageId || null,
+          decision_id: body.decision_id,
+          order_submission_attempted: false,
+          worker_status: result?.status || null
+        });
+        return;
+      }
+      const sendWallMs = Number(result?.execution?.lifecycle?.send_wall_ms);
+      const decisionWallMs = Date.parse(body.decision_ts);
+      const signalToSendMs = Number.isFinite(sendWallMs) && Number.isFinite(decisionWallMs)
+        ? Math.max(0, sendWallMs - decisionWallMs) : null;
+      const queueToReceiveMs = Number.isFinite(decisionWallMs)
+        ? Math.max(0, receivedWallMs - decisionWallMs) : null;
+      const breached = signalToSendMs !== null && signalToSendMs > config.signalToSendSloMs;
+      const severeBreach = signalToSendMs !== null && signalToSendMs > 3_000;
+      consecutiveLatencyBreaches = severeBreach ? consecutiveLatencyBreaches + 1 : 0;
+      if (signalToSendMs !== null) {
+        signalToSendSamples.push(signalToSendMs);
+        if (signalToSendSamples.length > 100) signalToSendSamples.shift();
+      }
+      const rollingP95Ms = percentile(signalToSendSamples, 0.95);
+      logger({ schema: "polyedge.funded_direct_latency.v1", status: breached ? "signal_to_send_slo_breached" : "intent_completed",
+        message_id: message.messageId || null, decision_id: body.decision_id, queue_to_receive_ms: queueToReceiveMs,
+        queue_receive_wall_ms: receivedWallMs, queue_receive_monotonic_ms: queueReceiveMonotonicMs,
+        signal_to_send_ms: signalToSendMs, signal_to_send_slo_ms: config.signalToSendSloMs,
+        rolling_p95_signal_to_send_ms: rollingP95Ms,
+        rolling_p95_slo_breached: rollingP95Ms !== null && rollingP95Ms > config.signalToSendSloMs,
+        consecutive_latency_breaches: consecutiveLatencyBreaches,
+        order_submission_attempted: result?.execution?.order_submission_attempted === true || result?.completion?.order_submission_attempted === true,
+        worker_status: result?.status || null, worker_error: result?.error || null, execution_timing: result?.execution_timing || null });
+      if (result?.status === "paused_by_account_risk_state") logger({ schema: "polyedge.funded_direct_alert.v1", status: "paused_by_account_risk_state", decision_id: body.decision_id, account_risk_pause: true, error: result.error || null });
+      if (consecutiveLatencyBreaches >= 3) {
+        stopping = true;
+        logger({ schema: "polyedge.funded_direct_alert.v1", status: "engine_paused_by_consecutive_latency_breaches", decision_id: body.decision_id, consecutive_transitions_above_3000_ms: consecutiveLatencyBreaches, account_risk_pause: true });
+      }
+    } catch (error) {
+      await failMessage(entry, error);
+    } finally {
+      clearInterval(entry.renewal);
+    }
+  };
+  const processWarmup = async (entry) => {
+    const { message, body } = entry;
+    const key = body.market_id && body.token_id ? `${body.market_id}:${body.token_id}` : null;
+    try {
+      if (entry.renewalError) throw entry.renewalError;
+      if (key && warmedMarketTokens.has(key)) {
+        await receiver.completeMessage(message);
+        processedMessages += 1;
+        logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_coalesced", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+        return;
+      }
+      await executor.warmMarket(body);
+      if (entry.renewalError) throw entry.renewalError;
+      await receiver.completeMessage(message);
+      processedMessages += 1;
+      if (key) warmedMarketTokens.add(key);
+      logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmed", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+    } catch (error) {
+      await failMessage(entry, error);
+    } finally {
+      clearInterval(entry.renewal);
+    }
+  };
+  let activeWorkflow = null;
+  const busyValidations = new Set();
+  const trackBusyValidation = (entry) => {
+    const task = processIntent(entry, true).finally(() => busyValidations.delete(task));
+    busyValidations.add(task);
+  };
   try {
     while (!stopping) {
+      if (activeWorkflow) await new Promise((resolve) => setImmediate(resolve));
+      if (config.maxMessages > 0 && processedMessages + failedMessages >= config.maxMessages) {
+        stopping = true;
+        break;
+      }
+      if (busyValidations.size >= FUNDED_BUSY_VALIDATION_LIMIT ||
+          (config.maxMessages > 0 && processedMessages + failedMessages + busyValidations.size + (activeWorkflow ? 1 : 0) >= config.maxMessages)) {
+        await Promise.race([activeWorkflow, ...busyValidations].filter(Boolean));
+        continue;
+      }
       const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs });
       if (!messages.length) {
-        await maybeRunAutomaticRedemption();
+        if (!activeWorkflow) await maybeRunAutomaticRedemption();
+        await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
       const message = messages[0];
-      const queueReceiveMonotonicMs = performance.now();
-      let renewalError = null;
-      const renewal = setInterval(async () => {
-        try {
-          await receiver.renewMessageLock(message);
-        } catch (error) {
-          renewalError = error;
-        }
-      }, 20_000);
-      renewal.unref?.();
+      const entry = startLockRenewal(message);
       try {
-        const body = parseMessageBody(message.body);
-        if (body?.schema === "polyedge.funded_market_warmup.v1") {
-          await executor.warmMarket(body);
-          if (renewalError) throw renewalError;
-          await receiver.completeMessage(message);
-          processedMessages += 1;
-          logger({
-            schema: "polyedge.funded_direct_service.v2",
-            status: "market_warmed",
-            message_id: message.messageId || null,
-            market_id: body.market_id,
-            token_id: body.token_id
-          });
-        } else if (body?.schema === "polyedge.funded_intent_handoff.v1") {
-          const receivedWallMs = Date.now();
-          const result = await processor.process(body);
-          if (renewalError) throw renewalError;
-          await receiver.completeMessage(message);
-          processedMessages += 1;
-          const sendWallMs = Number(result?.execution?.lifecycle?.send_wall_ms);
-          const decisionWallMs = Date.parse(body.decision_ts);
-          const signalToSendMs = Number.isFinite(sendWallMs) && Number.isFinite(decisionWallMs)
-            ? Math.max(0, sendWallMs - decisionWallMs)
-            : null;
-          const queueToReceiveMs = Number.isFinite(decisionWallMs)
-            ? Math.max(0, receivedWallMs - decisionWallMs)
-            : null;
-          const breached = signalToSendMs !== null && signalToSendMs > config.signalToSendSloMs;
-          const severeBreach = signalToSendMs !== null && signalToSendMs > 3_000;
-          consecutiveLatencyBreaches = severeBreach ? consecutiveLatencyBreaches + 1 : 0;
-          if (signalToSendMs !== null) {
-            signalToSendSamples.push(signalToSendMs);
-            if (signalToSendSamples.length > 100) signalToSendSamples.shift();
-          }
-          const rollingP95Ms = percentile(signalToSendSamples, 0.95);
-          logger({
-            schema: "polyedge.funded_direct_latency.v1",
-            status: breached ? "signal_to_send_slo_breached" : "intent_completed",
-            message_id: message.messageId || null,
-            decision_id: body.decision_id,
-            queue_to_receive_ms: queueToReceiveMs,
-            queue_receive_wall_ms: receivedWallMs,
-            queue_receive_monotonic_ms: queueReceiveMonotonicMs,
-            signal_to_send_ms: signalToSendMs,
-            signal_to_send_slo_ms: config.signalToSendSloMs,
-            rolling_p95_signal_to_send_ms: rollingP95Ms,
-            rolling_p95_slo_breached: rollingP95Ms !== null && rollingP95Ms > config.signalToSendSloMs,
-            consecutive_latency_breaches: consecutiveLatencyBreaches,
-            order_submission_attempted:
-              result?.execution?.order_submission_attempted === true ||
-              result?.completion?.order_submission_attempted === true,
-            worker_status: result?.status || null,
-            worker_error: result?.error || null,
-            execution_timing: result?.execution_timing || null
-          });
-          if (result?.status === "paused_by_account_risk_state") {
-            logger({
-              schema: "polyedge.funded_direct_alert.v1",
-              status: "paused_by_account_risk_state",
-              decision_id: body.decision_id,
-              account_risk_pause: true,
-              error: result.error || null
-            });
-          }
-          if (consecutiveLatencyBreaches >= 3) {
-            stopping = true;
-            logger({
-              schema: "polyedge.funded_direct_alert.v1",
-              status: "engine_paused_by_consecutive_latency_breaches",
-              decision_id: body.decision_id,
-              consecutive_transitions_above_3000_ms: consecutiveLatencyBreaches,
-              account_risk_pause: true
-            });
-          }
-        } else {
-          await receiver.deadLetterMessage(message, {
-            deadLetterReason: "UnsupportedSchema",
-            deadLetterErrorDescription: "Message is not a funded warmup or exact intent handoff."
-          });
-          failedMessages += 1;
-        }
+        entry.body = parseMessageBody(message.body);
       } catch (error) {
-        failedMessages += 1;
-        const deterministic = /unsupported|schema|binding|TTL|stale|SHA-256|does not qualify|already has an authorization|latency|risk|reservation|cash.flow|equity|position|open order/i.test(error.message);
-        if (deterministic || Number(message.deliveryCount || 0) >= 2) {
-          await receiver.deadLetterMessage(message, {
-            deadLetterReason: "FundedIntentFailedClosed",
-            deadLetterErrorDescription: String(error.message).slice(0, 4_000)
-          }).catch(() => null);
-        } else {
-          await receiver.abandonMessage(message).catch(() => null);
-        }
-        logger({
-          schema: "polyedge.funded_direct_service.v2",
-          status: "persistent_message_failed_closed",
-          message_id: message.messageId || null,
-          delivery_count: message.deliveryCount || 0,
-          error: error.message
-        });
-      } finally {
-        clearInterval(renewal);
+        entry.renewalError = error;
       }
-      await maybeRunAutomaticRedemption();
-      if (config.maxMessages > 0 && processedMessages + failedMessages >= config.maxMessages) break;
+      const { body } = entry;
+      if (stopping) {
+        await settleStoppedMessage(entry);
+        continue;
+      }
+      if (body?.schema === "polyedge.funded_intent_handoff.v1") {
+        if (activeWorkflow) {
+          trackBusyValidation(entry);
+        } else {
+          const task = processIntent(entry, false);
+          activeWorkflow = task;
+          task.finally(() => {
+            if (activeWorkflow === task) activeWorkflow = null;
+          });
+        }
+        continue;
+      }
+      if (body?.schema === "polyedge.funded_market_warmup.v1") {
+        if (activeWorkflow) {
+          clearInterval(entry.renewal);
+          await receiver.completeMessage(message);
+          processedMessages += 1;
+          logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_deferred", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+        } else {
+          await processWarmup(entry);
+          await maybeRunAutomaticRedemption();
+        }
+        continue;
+      }
+      await failMessage(entry, entry.renewalError || new Error("fail closed: unsupported funded intent handoff schema"));
+      clearInterval(entry.renewal);
+      continue;
     }
+    await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
     return {
       schema: "polyedge.funded_direct_service.v2",
       status: "persistent_service_stopped",
@@ -431,6 +505,8 @@ export async function runPersistentFundedDirectService({
       last_redemption_status: lastRedemptionStatus
     };
   } finally {
+    stopping = true;
+    await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
     clearInterval(heartbeat);
     process.removeListener("SIGTERM", stop);
     process.removeListener("SIGINT", stop);

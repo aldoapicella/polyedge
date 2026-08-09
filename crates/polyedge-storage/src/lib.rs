@@ -2147,6 +2147,25 @@ impl AzureBlobClient {
         content_type: &str,
         access_tier: Option<&str>,
     ) -> Result<ImmutableBlobWrite, AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self.put_block_blob_if_absent_once(url, bytes, content_type, access_tier) {
+                Ok(result) => return Ok(result),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure Blob immutable upload retry loop always returns");
+    }
+
+    fn put_block_blob_if_absent_once(
+        &mut self,
+        url: &str,
+        bytes: &[u8],
+        content_type: &str,
+        access_tier: Option<&str>,
+    ) -> Result<ImmutableBlobWrite, AzureBlobError> {
         let date = rfc1123_now();
         let response = match &mut self.auth {
             AzureBlobAuth::Sas(sas) => {
@@ -2185,6 +2204,10 @@ impl AzureBlobClient {
         match response {
             Ok(_) => Ok(ImmutableBlobWrite::Created),
             Err(ureq::Error::Status(409 | 412, _)) => Ok(ImmutableBlobWrite::AlreadyExists),
+            Err(ureq::Error::Status(403, _)) => match self.get_response(url) {
+                Ok(_) => Ok(ImmutableBlobWrite::AlreadyExists),
+                Err(error) => Err(error),
+            },
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
@@ -3277,6 +3300,107 @@ mod tests {
         .unwrap();
         assert!(already_committed);
         assert!(!starts.contains_key("events/minute.jsonl"));
+    }
+
+    #[test]
+    fn immutable_blob_put_retries_with_the_create_only_precondition() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            ["500 Internal Server Error", "412 Precondition Failed"]
+                .into_iter()
+                .map(|status| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut headers = String::new();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        headers.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    headers
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut client = AzureBlobClient::new("unused", "unused", "test=sas");
+        let result = client
+            .put_block_blob_if_absent(
+                &format!("http://{address}/immutable"),
+                b"intent",
+                "application/json",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result, ImmutableBlobWrite::AlreadyExists);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.to_ascii_lowercase().contains("if-none-match: *")));
+    }
+
+    #[test]
+    fn immutable_blob_put_accepts_forbidden_create_only_after_existing_blob_is_readable() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            ["403 Forbidden", "200 OK"]
+                .into_iter()
+                .map(|status| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        request.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    request
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut client = AzureBlobClient::new("unused", "unused", "test=sas");
+        let result = client
+            .put_block_blob_if_absent(
+                &format!("http://{address}/immutable"),
+                b"intent",
+                "application/json",
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result, ImmutableBlobWrite::AlreadyExists);
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("PUT "));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-none-match: *"));
+        assert!(requests[1].starts_with("GET "));
     }
 
     #[test]

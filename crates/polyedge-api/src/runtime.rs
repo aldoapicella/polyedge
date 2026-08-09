@@ -811,21 +811,6 @@ impl RuntimeController {
                         "feeds": status["task_health"]["feeds"]
                     })
                 );
-                if runtime.inner.settings.azure.strategy_intent_operator_direct {
-                    let warmup_market = {
-                        let data = runtime.inner.data.read().await;
-                        data.funded_warmup_market_id
-                            .as_ref()
-                            .and_then(|market_id| data.markets.get(market_id))
-                            .cloned()
-                    };
-                    if let Some(market) = warmup_market {
-                        // The stable duplicate-detected message and immutable
-                        // non-executable marker keep producer Blob/Service Bus
-                        // transports warm without creating another intent.
-                        runtime.maybe_publish_market_warmup(market).await;
-                    }
-                }
             }
         })
     }
