@@ -22,4 +22,5 @@ grep -F 'shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;' "$r
 grep -F 'credential_dir=/run/polyedge-federated-$credential' "$runner" >/dev/null
 grep -F 'credential_dir=/etc/polyedge/credentials/$credential' "$runner" >/dev/null
 grep -F -- '-v "$credential_dir:/run/credentials:ro,Z"' "$runner" >/dev/null
+grep -F 'flock -w 129600 /run/polyedge/research.lock' "$runner" >/dev/null
 test "$(grep -c -- '--pull=never --log-driver=journald' "$runner")" -eq 2

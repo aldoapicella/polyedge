@@ -301,7 +301,7 @@ API, frontend, or funded signer.
 
 Schedules are UTC: freshness every five minutes; hourly quality at `:10`;
 primary daily at 00:30; replay at 03:00; qset shadow at 02:15. The runner uses
-one `flock -w 36h /run/polyedge/research.lock`, so writers serialize even when
+one `flock -w 129600 /run/polyedge/research.lock` (36 hours), so writers serialize even when
 timers collide. Daily, replay, and qset are each capped at 1.5 CPU. With the
 API/frontend (1 CPU), funded signer (0.75), ring uploader (0.5), and optional
 origin check (0.25), container CPU quotas cannot exceed the host's 4 OCPUs.

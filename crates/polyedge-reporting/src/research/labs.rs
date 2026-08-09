@@ -459,7 +459,7 @@ pub fn run_azure_freshness(options: AzureFreshnessOptions) -> Result<Value, Rese
     let mut blobs = Vec::new();
     for prefix in [&previous_prefix, &current_prefix] {
         let listed = client
-            .list_blobs(prefix, None, None)
+            .list_blobs_by_suffixes(prefix, &[".jsonl", ".jsonl.gz"], None, None)
             .map_err(|error| ResearchError::Azure(error.to_string()))?;
         blobs.extend(listed);
     }

@@ -129,7 +129,7 @@ esac
 
 # One host-wide lock prevents every research writer from overlapping. The
 # per-job timeout below starts only after the lock has been acquired.
-exec /usr/bin/flock -w 36h /run/polyedge/research.lock \
+exec /usr/bin/flock -w 129600 /run/polyedge/research.lock \
   /usr/bin/timeout --preserve-status "$limit" \
   /usr/bin/podman run --rm --pull=never --log-driver=journald --name "polyedge-job-$job" --network polyedge \
     --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
