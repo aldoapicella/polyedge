@@ -1,6 +1,6 @@
 # Use a separate stable DNS name for OIDC discovery. The Workload API remains
 # local; every other path on this host returns 404.
-oidc.aldoapicella.com {
+oidc.jupiterlabs.dev {
 	@oidc path /.well-known/openid-configuration /keys
 	handle @oidc {
 		reverse_proxy unix//run/spire-oidc/provider.sock {

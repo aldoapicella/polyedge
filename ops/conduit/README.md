@@ -107,15 +107,15 @@ secret, private key, or join token in Git, shell arguments, chat, or logs.
 
 ## Separate UAMI workload identities
 
-Do not create Entra applications. The tenant disables application creation,
-but the subscription Owner can create four Azure user-assigned managed
-identities (UAMIs) and their federated identity credentials. The isolated
-`infra/conduit-federated-identity.bicep` template creates one lane per
-deployment and no role assignment. Its research-lane what-if produced exactly
-one UAMI and one FIC, with no deletes. Deploy lanes sequentially only after the
-issuer below is public and its observed JWT claims match the template.
+Do not create Entra applications. The tenant disables application creation.
+Four Azure user-assigned managed identities (UAMIs) and their exact federated
+identity credentials now exist. The isolated
+`infra/conduit-federated-identity.bicep` template created one lane per
+deployment and no role assignment. Each lane what-if produced exactly one UAMI
+and one FIC, with no updates or deletes; the deployments ran sequentially only
+after the public issuer and observed JWT claims matched the template.
 
-The issuer is `https://oidc.aldoapicella.com` and requires a reserved OCI public IP, valid
+The issuer is `https://oidc.jupiterlabs.dev` and requires a reserved OCI public IP, valid
 TLS, and inbound TCP/80 and TCP/443 in OCI and UFW. Do not use an ephemeral
 platform hostname. Keep the same exact issuer in the three SPIRE configs,
 `spire.env`, Caddy, and the Bicep `issuer` parameter.
@@ -207,16 +207,17 @@ creating its FIC, decode claims locally without printing the token and verify
 ```sh
 az deployment group create --resource-group rg-polyedge-dev \
   --template-file infra/conduit-federated-identity.bicep \
-  --parameters lane=research issuer=https://oidc.aldoapicella.com \
+  --parameters lane=research issuer=https://oidc.jupiterlabs.dev \
   --parameters tags='{"owner":"polyedge","migration":"oci-compute-plane"}'
 ```
 
-Assign the research UAMI only a temporary Blob Data Reader role on the
-`bot-events` container, run `npm run workload-identity-smoke`, and remove that
-role if the bounded `getProperties` proof fails. After success, apply only the
-positive scopes in `identity-rbac-plan.json`, read assignments back, and prove
-every cross-lane negative assertion before enabling workloads. Create the
-remaining FICs sequentially; concurrent UAMI FIC updates can return conflicts.
+The research UAMI first received only a temporary Blob Data Reader role on the
+`bot-events` container. Its bounded workload-federation `getProperties` proof
+passed, after which the temporary role was replaced with the reviewed exact
+container Contributor role. The remaining FICs were created sequentially and
+only the positive scopes in `identity-rbac-plan.json` were assigned. Live IDs,
+role counts, positive reads, and cross-lane 403 checks are captured without
+credentials in `identity-rbac-proof.json`.
 
 The funded signer is a separate, no-ingress, read-only container. Only it gets
 the Podman wallet secrets and its dedicated Azure funded identity; the API and

@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
-  "status": "planned-not-assigned",
+  "status": "applied-live-verified",
+  "proof": "identity-rbac-proof.json",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
   "roles": {

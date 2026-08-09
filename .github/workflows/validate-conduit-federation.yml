@@ -39,12 +39,23 @@ jobs:
           ops/conduit/test/test-federated-token-refresh.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
-            .status == "planned-not-assigned"
+            .status == "applied-live-verified"
+            and .proof == "identity-rbac-proof.json"
             and (.lanes | keys == ["api", "funded-signer", "research", "shadow-qset"])
             and ([.lanes[].assignments[]] | length == 21)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
           ' ops/conduit/identity-rbac-plan.json
+          jq -e '
+            .status == "live-verified"
+            and .secretsOrTokensCaptured == false
+            and .issuer.validTls
+            and .jwtSvid.perLaneOwnerOnlyFiles
+            and ([.lanes[].assignmentCount] | add) == 21
+            and all(.lanes[]; .exactPlanMatch)
+            and all(.lanes[]; all(.negativeAssertions[]; .passed))
+            and .arc.unchanged
+          ' ops/conduit/identity-rbac-proof.json
 
       - name: Validate isolated UAMI federation template
         run: |

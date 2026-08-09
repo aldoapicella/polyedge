@@ -78,27 +78,28 @@ Its local source and manifest hashes matched their receipts; an authenticated
 remote HEAD returned `200`, `BlockBlob`, `Hot`, and the exact 188,157,190-byte
 manifest length.
 
-The four dedicated UAMIs do not yet exist. The replacement architecture needs
-no Entra directory role: subscription Owner can create each UAMI and exact
-federated identity credential as Azure resources. An isolated research-lane
-ARM what-if using `https://oidc.aldoapicella.com` passed with exactly two
-creates and no deletes or role assignments. SPIRE 1.15.2 Server, Agent, and
-OIDC Provider are installed and boot-enabled on `conduit-dev`; the provider and
-Workload API remain on protected Unix sockets. The live research JWT-SVID is
-RS256, has a 300-second lifetime, and exactly matches its issuer, subject, and
-`api://AzureADTokenExchange` audience. Its owner-only token file is refreshed
-by a two-minute systemd timer. Caddy is installed but disabled until public DNS
-and TLS can succeed.
+The four dedicated UAMIs and exact FICs now exist without any Entra directory
+role. Each isolated lane what-if using `https://oidc.jupiterlabs.dev` produced
+exactly two creates and no updates, deletes, or role assignments; deployments
+ran sequentially. SPIRE 1.15.2 Server, Agent, OIDC Provider, and Caddy are
+installed, active, and boot-enabled on `conduit-dev`; the provider and Workload
+API remain on protected Unix sockets. Every lane JWT-SVID is RS256, has a
+300-second lifetime, and exactly matches its issuer, subject, and sole
+`api://AzureADTokenExchange` audience. Token files are owner-only and isolated
+per lane; research refreshes on its two-minute timer and the other lanes remain
+disabled from workload execution.
 
-`aldoapicella.com` is user-owned and delegated through GoDaddy, but no DNS API
-credential is present on the host. The OCI instance principal is authorized to
-manage the ring volume but receives `NotAuthorizedOrNotFound` for public-IP,
-private-IP, DNS, and IAM policy operations. Public creation therefore remains
-blocked on assigning a reserved address to the VNIC and creating the
-`oidc.aldoapicella.com` A record. No FIC or Azure role assignment is created
-before externally reachable discovery/JWKS passes. This blocks the
-two-daily-cycle gate but does not affect the active ring uploader's narrow Arc
-role.
+`jupiterlabs.dev` is user-owned and delegated through GoDaddy; no DNS API
+credential is present on the host. `oidc.jupiterlabs.dev` resolves to reserved
+OCI public IP `149.130.186.60`, assigned to secondary private IP `10.0.0.81` on
+the existing VNIC. The primary ephemeral IP remains assigned and was not
+disrupted. OCI and UFW TCP/80 and TCP/443 ingress are live; Caddy obtained a
+valid public certificate after multi-network ACME validation. HTTPS discovery
+and JWKS return the exact issuer and public RS256 keys, while all other Caddy
+paths return 404. The four UAMIs have only the exact container, table, and queue
+roles in `identity-rbac-plan.json`; live positive and cross-lane negative proof
+is in `identity-rbac-proof.json`. This clears the identity gate but not the
+two-daily-cycle, qset, funded, reboot, rollback, or parity gates.
 
 ## OCI schedule and coverage
 
