@@ -78,6 +78,17 @@ struct SnapshotIdentity<'a> {
 pub fn publish_normalized_snapshot(
     options: PublishNormalizedSnapshotOptions,
 ) -> Result<Value, ResearchError> {
+    if super::research_artifact_publication_disabled() {
+        let (manifest, _) = build_manifest(&options.input, options.date)?;
+        return Ok(json!({
+            "status": "local_only",
+            "date": options.date,
+            "snapshot_sha256": manifest.snapshot_sha256,
+            "source_inventory_sha256": manifest.source_inventory_sha256,
+            "file_count": manifest.files.len(),
+            "content_length": manifest.files.iter().map(|file| file.content_length).sum::<u64>(),
+        }));
+    }
     validate_location(&options.account, &options.container, &options.prefix)?;
     let mut client = AzureBlobClient::with_managed_identity(
         &options.account,

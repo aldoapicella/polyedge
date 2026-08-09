@@ -91,6 +91,13 @@ printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
   exit 64
 }
 
+if [ "$job" != shadow-qset ]; then
+  test "${POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH:-}" = true || {
+    echo 'POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH must equal true for primary OCI jobs' >&2
+    exit 64
+  }
+fi
+
 if [ "$job" = freshness ]; then
   : "${POLYEDGE_RAW_EVENT_PREFIX:?set POLYEDGE_RAW_EVENT_PREFIX for Azure upload freshness}"
 fi

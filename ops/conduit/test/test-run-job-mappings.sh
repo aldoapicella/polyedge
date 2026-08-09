@@ -16,6 +16,7 @@ grep -F 'set POLYEDGE_RAW_EVENT_PREFIX for Azure upload freshness' "$runner" >/d
 grep -F -- '--max-age-seconds 900 --expected-interval-seconds 600' "$runner" >/dev/null
 grep -F 'POLYEDGE_LOCAL_RAW_ROOT%/}/$DAY/$HOUR/' "$runner" >/dev/null
 grep -F 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' "$runner" >/dev/null
+grep -F 'POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH must equal true for primary OCI jobs' "$runner" >/dev/null
 grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z"' "$runner" >/dev/null
 test "$(grep -c 'cpus=1.5 memory=' "$runner")" -eq 3
 grep -F '*) work=$ring/jobs/research credential=research ;;' "$runner" >/dev/null

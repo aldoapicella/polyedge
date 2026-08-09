@@ -308,8 +308,8 @@ unuploaded `events-oci-test` sidecar from preflight was moved intact to the
 rollback directory; its original source and already-verified production v1
 receipt were not changed.
 
-The formal Azure-authoritative parity window started at the first clean final
-digest segment boundary, `2026-08-09T07:50:00Z`, and cannot complete before
+The first provisional Azure-authoritative parity window started at the clean
+final digest segment boundary, `2026-08-09T07:50:00Z`, and cannot complete before
 `2026-08-12T07:50:00Z` or before two OCI daily cycles pass. The API is pinned to
 ARM64 digest
 `sha256:d6e9545f18d7d53da42880749b57beee6c9477d6f1e3621eead74b80f6192334`
@@ -329,6 +329,13 @@ false. The first clean in-window segment (`07:50-08:00Z`) contained 165,980
 records and 139,862,191 source bytes; its 20,588,439-byte gzip object and
 manifest were remotely verified at `08:02:21Z`. The immediately following
 `08:03:02Z` freshness run was healthy with zero warnings or critical findings.
+That window was invalidated at `08:15:39Z`: the shared report writer still
+auto-published OCI outputs to the same Azure comparison paths. All four OCI
+research timers were disabled immediately. Azure execution
+`polyedge-hourly-quality-job-0ly3tr8` then regenerated the affected hour and
+succeeded at `08:20:35Z`, restoring Azure as the last writer. No deletion gate
+was advanced; a new 72-hour window starts only after the local-only guard is
+published and proven.
 
 ## Azure data and evidence surfaces retained
 

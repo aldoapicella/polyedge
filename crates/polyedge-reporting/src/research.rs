@@ -11245,6 +11245,9 @@ fn write_text_file(path: &Path, text: &str) -> Result<(), ResearchError> {
 }
 
 fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
+    if research_artifact_publication_disabled() {
+        return Ok(());
+    }
     let Some(blob_name) = research_artifact_blob_name(path) else {
         return Ok(());
     };
@@ -11276,6 +11279,15 @@ fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
             ResearchError::Azure(format!("publishing research artifact {blob_name}: {error}"))
         })?;
     Ok(())
+}
+
+pub(super) fn research_artifact_publication_disabled() -> bool {
+    let value = std::env::var("POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH").ok();
+    explicit_true(value.as_deref())
+}
+
+fn explicit_true(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn publish_promotion_transition_compare_and_swap(
@@ -11910,6 +11922,14 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_publication_is_disabled_only_by_explicit_true() {
+        assert!(explicit_true(Some("true")));
+        assert!(explicit_true(Some("TRUE")));
+        assert!(!explicit_true(Some("false")));
+        assert!(!explicit_true(None));
+    }
 
     #[test]
     fn azure_event_reader_accepts_plain_and_gzip_jsonl_only() {

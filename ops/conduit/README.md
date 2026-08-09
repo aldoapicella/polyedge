@@ -79,6 +79,11 @@ the shared research lock serializes any local daily/replay overlap. Revisit the
 offsets only after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
+Primary OCI job environments must set
+`POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true`. This keeps reports local
+during parity while preserving Azure reads and the shared daily/replay lease;
+the runner fails closed if the flag is absent. Shadow-qset is excluded because
+its separately approved lane must publish only to its own evidence scope.
 
 On a systemd-resolved host, point `/etc/resolv.conf` at its non-stub resolver
 file so Aardvark can forward external DNS. If UFW has a deny-input policy, allow
