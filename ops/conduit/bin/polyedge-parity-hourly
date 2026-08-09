@@ -142,6 +142,13 @@ collect_refs() {
     secure_file "$file" 640
     jq -e '.schemaVersion == 1 and (.acceptedForParityWindow | type == "boolean")' "$file" >/dev/null || die "malformed evidence: $file"
     if [ "$(jq -r '.acceptedForParityWindow' "$file")" = true ]; then
+      evidence_window=$(jq -r '.windowStartUtc // ""' "$file")
+      evidence_ledger=$(jq -r '.ledgerPath // ""' "$file")
+      if [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] || [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ]; then
+        [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] && [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ] \
+          || die "accepted evidence has mixed parity provenance: $file"
+        continue
+      fi
       start=$(jq -r '.hourStartUtc' "$file")
       epoch=$(date -u -d "$start" +%s) || die "invalid accepted hour: $file"
       [ "$((epoch % 3600))" -eq 0 ] && [ "$(date -u -d "@$epoch" +%Y-%m-%dT%H:00:00Z)" = "$start" ] || die "non-canonical accepted hour: $file"

@@ -222,6 +222,21 @@ run_collector "$success" >/dev/null
 jq -e '(.acceptedHourlyEvidence | length) == 2 and .acceptedHourlyEvidence[1].hourStartUtc == "2026-08-09T16:00:00Z"' \
   "$success/ring/parity/ledger.json" >/dev/null
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+
+superseded=$root/superseded
+fixture "$superseded"
+historical=$superseded/ring/parity/hourly/20260809T14
+mkdir -p -m 0750 "$historical"
+jq -n --arg ledger "$superseded/ring/parity/old-ledger.json" '{
+  schemaVersion:1,status:"validated",acceptedForParityWindow:true,
+  windowStartUtc:"2026-08-09T14:00:00Z",hourStartUtc:"2026-08-09T14:00:00Z",hourEndUtc:"2026-08-09T15:00:00Z",
+  ledgerPath:$ledger,azureAuthoritative:true,azureDeletionAllowed:false,
+  sameInput:{deterministicResultExactMatch:true}
+}' >"$historical/evidence.json"
+chmod 0640 "$historical/evidence.json"
+run_collector "$superseded" >/dev/null
+[ "$(jq -r '.acceptedCleanLiveHours' "$superseded/ring/parity/ledger.json")" = 1 ]
+
 recovery=$root/recovery
 fixture "$recovery"
 seed_artifacts "$recovery" both
