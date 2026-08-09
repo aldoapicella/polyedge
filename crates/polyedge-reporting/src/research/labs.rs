@@ -40,6 +40,8 @@ pub struct AzureFreshnessOptions {
     pub sas_env: Option<String>,
     pub client_id: Option<String>,
     pub generated_at: Option<DateTime<Utc>>,
+    pub max_age_seconds: u64,
+    pub expected_interval_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -438,6 +440,17 @@ pub struct BackfillOptions {
 pub fn run_azure_freshness(options: AzureFreshnessOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
     let generated_at = options.generated_at.unwrap_or_else(Utc::now);
+    let max_age_seconds = i64::try_from(options.max_age_seconds)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ResearchError::InvalidInput("max age seconds must be positive".to_owned())
+        })?;
+    let expected_current_hour_blobs =
+        expected_current_hour_blob_count(generated_at, options.expected_interval_seconds)
+            .ok_or_else(|| {
+                ResearchError::InvalidInput("expected interval seconds must be positive".to_owned())
+            })?;
     let mut client = match options.sas_env.as_deref() {
         Some(sas_env) => {
             let sas = std::env::var(sas_env).map_err(|_| {
@@ -496,16 +509,20 @@ pub fn run_azure_freshness(options: AzureFreshnessOptions) -> Result<Value, Rese
             .map(|blob| blob.content_length)
             .collect(),
     );
-    let expected_current_hour_blobs = usize::try_from(generated_at.minute() + 1).unwrap_or(60);
     let mut warnings = Vec::new();
     let mut critical = Vec::new();
     if latest.is_none() {
         critical.push("no blobs found in current or previous UTC hour".to_owned());
     }
-    if latest_age_seconds.is_some_and(|age| age > 300) {
-        critical.push("no new blob for more than 5 minutes".to_owned());
-    } else if latest_age_seconds.is_some_and(|age| age > 180) {
-        warnings.push("no new blob for more than 3 minutes".to_owned());
+    if latest_age_seconds.is_some_and(|age| age > max_age_seconds) {
+        critical.push(format!(
+            "no new blob for more than {max_age_seconds} seconds"
+        ));
+    } else if latest_age_seconds.is_some_and(|age| age > max_age_seconds * 3 / 5) {
+        warnings.push(format!(
+            "no new blob for more than {} seconds",
+            max_age_seconds * 3 / 5
+        ));
     }
     if tiny_blob_ratio > 0.20 {
         warnings.push("tiny blob ratio above 20% in current hour".to_owned());
@@ -533,6 +550,8 @@ pub fn run_azure_freshness(options: AzureFreshnessOptions) -> Result<Value, Rese
         "current_hour_prefix": current_prefix,
         "current_hour_blob_count": current_hour_blobs.len(),
         "expected_current_hour_blob_count": expected_current_hour_blobs,
+        "expected_interval_seconds": options.expected_interval_seconds,
+        "max_age_seconds": options.max_age_seconds,
         "tiny_blob_count": tiny_blob_count,
         "very_tiny_blob_count": very_tiny_blob_count,
         "tiny_blob_ratio": tiny_blob_ratio,
@@ -1245,6 +1264,30 @@ fn hour_blob_prefix(base_prefix: &str, timestamp: DateTime<Utc>) -> String {
         timestamp.day(),
         timestamp.hour()
     )
+}
+
+fn expected_current_hour_blob_count(
+    timestamp: DateTime<Utc>,
+    interval_seconds: u64,
+) -> Option<usize> {
+    if interval_seconds == 0 {
+        return None;
+    }
+    let elapsed_seconds = u64::from(timestamp.minute()) * 60 + u64::from(timestamp.second());
+    usize::try_from(elapsed_seconds / interval_seconds + 1).ok()
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    #[test]
+    fn expected_blob_count_tracks_configured_cadence() {
+        let timestamp = "2026-08-09T06:29:11Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(expected_current_hour_blob_count(timestamp, 60), Some(30));
+        assert_eq!(expected_current_hour_blob_count(timestamp, 600), Some(3));
+        assert_eq!(expected_current_hour_blob_count(timestamp, 0), None);
+    }
 }
 
 fn median_u64(mut values: Vec<u64>) -> Option<u64> {

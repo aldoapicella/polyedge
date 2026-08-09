@@ -68,6 +68,9 @@ and rolls back if the post-deploy headroom check fails. Podman logs use journald
 whose persistent and runtime growth is capped by `journald/polyedge.conf`.
 Each five-minute check also records its usage and available bytes in journald,
 providing the minimum-free history required throughout the parity window.
+The OCI freshness mapping accepts raw or gzip JSONL and uses a 900-second age
+limit with a 600-second expected interval, matching the recorder segment cadence
+without multiplying Azure blob transactions.
 
 During dual-running, OCI schedules deliberately trail Azure: freshness by two
 minutes, hourly quality by two minutes, daily research at 02:20 UTC (after the

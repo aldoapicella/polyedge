@@ -45,7 +45,7 @@ fi
 case "$job" in
   freshness)
     cpus=0.5 memory=1g limit=300
-    command='/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "${POLYEDGE_RAW_EVENT_PREFIX%/}/" --out "data_quality/freshness/latest.json"'
+    command='/bin/sh /app/research/run_compact_report_job.sh polyedge_data_freshness data_quality/freshness/latest.json polyedge-rs research azure-freshness --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --prefix "${POLYEDGE_RAW_EVENT_PREFIX%/}/" --max-age-seconds 900 --expected-interval-seconds 600 --out "data_quality/freshness/latest.json"'
     ;;
   hourly)
     cpus=0.5 memory=1g limit=1800

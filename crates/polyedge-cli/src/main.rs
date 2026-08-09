@@ -472,6 +472,10 @@ enum ResearchCommand {
         container: String,
         #[arg(long, default_value = "events/")]
         prefix: String,
+        #[arg(long, default_value_t = 300)]
+        max_age_seconds: u64,
+        #[arg(long, default_value_t = 60)]
+        expected_interval_seconds: u64,
         #[arg(long, default_value = "data_quality/freshness/latest.json")]
         out: PathBuf,
         #[arg(long = "sas-env")]
@@ -1109,6 +1113,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             account,
             container,
             prefix,
+            max_age_seconds,
+            expected_interval_seconds,
             out,
             sas_env,
             client_id,
@@ -1120,6 +1126,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             sas_env,
             client_id,
             generated_at: None,
+            max_age_seconds,
+            expected_interval_seconds,
         })?,
         ResearchCommand::PublishNormalizedSnapshot {
             input,

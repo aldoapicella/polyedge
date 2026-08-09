@@ -13,6 +13,7 @@ grep -F -- '--network polyedge' "$runner" >/dev/null
 grep -F 'origin.country !== "CO" || origin.ip !== expectedIp' "$runner" >/dev/null
 grep -F 'POLYEDGE_RAW_EVENT_PREFIX%/}/' "$runner" >/dev/null
 grep -F 'set POLYEDGE_RAW_EVENT_PREFIX for Azure upload freshness' "$runner" >/dev/null
+grep -F -- '--max-age-seconds 900 --expected-interval-seconds 600' "$runner" >/dev/null
 grep -F 'POLYEDGE_LOCAL_RAW_ROOT%/}/$DAY/$HOUR/' "$runner" >/dev/null
 grep -F 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' "$runner" >/dev/null
 grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z"' "$runner" >/dev/null
