@@ -66,6 +66,14 @@ rollback Quadlets are not automatic cleanup targets. Approved host run paths
 use `--pull=never`; only the digest deploy helper pulls after passing the guard
 and rolls back if the post-deploy headroom check fails. Podman logs use journald,
 whose persistent and runtime growth is capped by `journald/polyedge.conf`.
+Each five-minute check also records its usage and available bytes in journald,
+providing the minimum-free history required throughout the parity window.
+
+During dual-running, OCI schedules deliberately trail Azure: freshness by two
+minutes, hourly quality by two minutes, daily research at 02:20 UTC (after the
+observed 00:30 Azure run), and replay at 03:05 UTC. Azure remains authoritative;
+the shared research lock serializes any local daily/replay overlap. Revisit the
+offsets only after Azure compute deletion, not during parity.
 
 On a systemd-resolved host, point `/etc/resolv.conf` at its non-stub resolver
 file so Aardvark can forward external DNS. If UFW has a deny-input policy, allow

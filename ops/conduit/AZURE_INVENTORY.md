@@ -86,8 +86,9 @@ installed, active, and boot-enabled on `conduit-dev`; the provider and Workload
 API remain on protected Unix sockets. Every lane JWT-SVID is RS256, has a
 300-second lifetime, and exactly matches its issuer, subject, and sole
 `api://AzureADTokenExchange` audience. Token files are owner-only and isolated
-per lane; research refreshes on its two-minute timer and the other lanes remain
-disabled from workload execution.
+per lane. All four two-minute refresh timers are enabled; enabling token
+rotation does not enable the shadow-qset or funded workloads, which remain
+disabled behind their independent gates.
 
 `jupiterlabs.dev` is user-owned and delegated through GoDaddy; no DNS API
 credential is present on the host. `oidc.jupiterlabs.dev` resolves to reserved
@@ -105,10 +106,10 @@ two-daily-cycle, qset, funded, reboot, rollback, or parity gates.
 
 | OCI unit | UTC schedule | Azure counterpart |
 | --- | --- | --- |
-| `polyedge-freshness.timer` | every five minutes | `polyedge-data-freshness-job` |
-| `polyedge-hourly.timer` | hourly at `:10` | `polyedge-hourly-quality-job` |
-| `polyedge-daily.timer` | 00:30 | `polyedge-daily-research-job` |
-| `polyedge-replay.timer` | 03:00 | `polyedge-replay-index-job` |
+| `polyedge-freshness.timer` | every five minutes at `:02/:07/...` | `polyedge-data-freshness-job` at `:00/:05/...` |
+| `polyedge-hourly.timer` | hourly at `:12` | `polyedge-hourly-quality-job` at `:10` |
+| `polyedge-daily.timer` | 02:20 | `polyedge-daily-research-job` at 00:30 |
+| `polyedge-replay.timer` | 03:05 | `polyedge-replay-index-job` at 03:00 |
 | `polyedge-shadow-qset.timer` | 02:15, disabled pending approval | `polyedge-shadow-qset-neu-job` |
 | `polyedge-ring-sync.timer` | every five minutes at `:02` | new local seal/upload plane |
 | `polyedge-ring-health.timer` | every five minutes at `:04` | capacity/backlog/upload guard |
@@ -118,6 +119,10 @@ two-daily-cycle, qset, funded, reboot, rollback, or parity gates.
 | `systemctl start polyedge-job@origin-check` | manual, credential-free | `polyedge-origin-check-cl-job` |
 
 The single `/run/polyedge/research.lock` serializes every research writer.
+The offsets keep Azure first during parity: the latest freshness, hourly, and
+replay executions finished in 32, 47-52, and 47-58 seconds respectively; the
+last five daily runs finished between 01:36 and 02:15 UTC. OCI daily therefore
+starts at 02:20, and replay waits on the same host lock if that run is active.
 Daily, replay, and qset are each capped at 1.5 CPU. API/frontend, funded signer,
 ring upload, and the optional origin check consume at most the remaining 2.5
 CPU, so container quotas cannot exceed the 4-OCPU host. `origin-check` uses
@@ -160,42 +165,43 @@ current projected $279.39/month before the later ACR, compute-monitoring, and
 storage optimizations.
 
 The approved ring block volume was expanded online from 150 GB to 200 GB at
-zero VPUs/GB. The ext4 filesystem now has about 172.7 GB available, and the
-production `polyedge-ring-health.service` capacity/upload check passes. The
+zero VPUs/GB. The ext4 filesystem has about 126 GiB available after live ring
+growth, and the production `polyedge-ring-health.service` capacity/upload check
+passes. The
 cheapest full-processing migration needs no paid relay. On 2026-08-06 the
-Polymarket geoblock endpoint observed `conduit-dev` through its OCI public IP
-as `CO`, IP `149.130.178.214`, with `blocked=false`; Colombia is absent from the
-current official restricted-country list. OCI identifies the host as
-`sa-bogota-1`; its primary VNIC currently owns that same public IP. Bind the
-signer to the exact IP, country, and `oci_bogota_static_egress`, then repeat
-origin and funded dry-run parity before moving credentials. Confirm that the
-address is reserved in OCI before accepting a rebuild-safe cutover; an ephemeral
-address remains valid only while assigned and any change fails the signer closed.
+Polymarket geoblock endpoint observed the default OCI egress as `CO`, ephemeral
+IP `157.137.237.247`, with `blocked=false`. Binding the host request to secondary
+private IP `10.0.0.81` instead produced reserved public IP `149.130.186.60`, also
+`CO` and `blocked=false`, without changing SSH. The signer must use that exact
+reserved route and `oci_bogota_static_egress`, then repeat origin and funded
+dry-run parity before moving credentials; it remains disabled today.
 The previously budgeted $9-12/month Chile relay is now only a fallback if the
 OCI origin ceases to be eligible or the existing NAT IP cannot be retained.
 
 Direct OCI egress leaves the immediate post-compute Azure projection at
-$142.57/month and restores the later storage-optimized target to about
-$38-49/month: a projected $373-384/month (88-91%) reduction. Do not move funded
+$142.57/month. Before the approved OCI storage excess, it restores the later
+storage-optimized Azure target to about $38-49/month. Do not move funded
 credentials without explicit approval.
 
-Maintaining the full 48-hour local ring under the observed worst segment needs
-about 33.1 GB more than the current safe capacity. The least invasive
-same-retention fix is expanding the existing OCI block volume by 50 GB. The
-present 50-GB boot plus 150-GiB data layout already consumes essentially all of
-Oracle's combined 200-GB Always Free allowance. At the May 2026 public rate of
-$0.0255 per GB-month, 50 additional lower-cost block-volume GB add about
-$1.28/month (performance units can add cost if nonzero). That changes the
-defensible post-optimization range to roughly $39-50/month while retaining the
-48-hour peak guard. Reducing retention to stay at exactly $0 would change the
-requested functionality and is not the recommended cost cut.
+Maintaining the full 48-hour local ring under the observed worst segment needed
+the completed 50-GB data-volume expansion. The boot volume was separately
+expanded online from 47 GB to 97 GB to enforce the 15-GiB deployment reserve.
+The resulting 297 GB of combined boot and block storage is 97 GB above Oracle's
+documented 200-GB Always Free allowance. At the May 2026 public storage rate of
+$0.0255 per GB-month, the paid excess is at least about $2.47/month. OCI requires
+boot volumes to stay at the 10-VPU/GB Balanced tier; if the paid allocation falls
+entirely on the boot volume, its performance units make about $4.12/month a
+conservative upper bound. This changes the defensible post-optimization range
+to roughly $41-54/month, a projected $368-381/month (87-90%) reduction from the
+current $421.96 projection. Reducing retention or boot headroom to save those
+few dollars would weaken explicit acceptance gates and is not recommended.
 
-OCI metadata reports 4 A1 OCPUs and 24 GB. At 730 hours/month that consumes
-2,920 OCPU-hours and 17,520 GB-hours, within Oracle's current published free A1
-allowance of 3,000 OCPU-hours and 18,000 GB-hours. The cost model therefore
-treats the host and its included public IP as $0 as requested. The instance
-identity is not authorized to read the tenancy usage API, so confirm the first
-OCI invoice before calling the saving durable.
+OCI metadata reports 4 A1 OCPUs and 24 GB. The user reports this existing VM is
+free, so the cost model treats its compute and included public IP as $0. Oracle's
+current public Free Tier pages are inconsistent about whether the A1 allowance
+is 2 OCPUs/12 GB or 4 OCPUs/24 GB. The instance identity is not authorized to
+read the tenancy usage API, so the first OCI invoice remains a mandatory cost
+acceptance check; do not present the saving as durable before that readback.
 
 The storage bill has both a fixed retained-data floor and avoidable transaction
 pressure. The 2026-07-25 through 2026-08-05 meter query returned $39.54: $14.93
@@ -239,12 +245,11 @@ logs are routed through the size-capped system journal.
 The later live ring check found 125 segments with a combined raw-plus-gzip
 average of 287,727,134 bytes and a peak of 541,986,617 bytes. A 48-hour
 projection is 82.9 GB at the observed average but 156.1 GB at the peak, above
-the volume's roughly 123-GB budget after its 32-GiB safety reserve. Upload
-freshness is green and no sealed segment is waiting, but the conservative
-capacity guard is correctly failing. Do not call the host equivalent or start
-the formal parity clock until 48-hour peak retention fits without weakening
-that guard. The free single VM also does not provide Azure's failure-domain
-redundancy.
+the old volume's roughly 123-GB budget after its 32-GiB safety reserve. The
+completed expansion raised the data volume to 200 GB; the same conservative
+projection now fits, `capacity_ok`, `free_ok`, and `upload_fresh` are green,
+and no sealed segment is waiting for upload. The free single VM still does not
+provide Azure's failure-domain redundancy.
 
 ## Acceptance candidate
 

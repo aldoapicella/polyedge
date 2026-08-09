@@ -97,6 +97,7 @@ printf '{"schemaVersion":1,"generatedAtUtc":"%s","initialUsagePercent":%s,"usage
 chmod 0644 "$temporary"
 mv "$temporary" "$status_file"
 trap - EXIT HUP INT TERM
+log daemon.info "boot disk check: usage=${usage}% available_bytes=$available cleanup_attempted=$cleanup_attempted image_pulls_paused=$paused"
 
 if [ "$paused" = true ]; then
   exit 75
