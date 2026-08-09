@@ -10,7 +10,7 @@ set +a
 root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 segments=$root/segments
 archive=$root/archive
-status=$root/status.json
+status=${POLYEDGE_RING_STATUS:-$root/status.json}
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
 retention_hours=${POLYEDGE_RING_RETENTION_HOURS:-48}
