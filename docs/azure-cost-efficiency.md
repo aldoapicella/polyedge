@@ -42,6 +42,11 @@ authorized, so this runbook does not claim the lower target. Revisit it only
 after the 72-hour cutover evidence quantifies the transaction collapse or a new
 explicit decision changes the existing-data constraint.
 
+The current control-plane policy readback and bounded data-plane inventory are
+captured in `ops/conduit/storage-lifecycle-proof.json`. The live rule matched
+996 future-prefix block blobs (18,205,708,074 bytes), while the legacy
+`events/` append-blob corpus matched neither the rule prefix nor its blob type.
+
 ### Live utilization evidence
 
 | Driver | 2026-07-31 observation | Decision |
