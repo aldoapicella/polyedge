@@ -29,6 +29,34 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Verify public OIDC discovery and JWKS
+        env:
+          OIDC_ISSUER: https://oidc.jupiterlabs.dev
+        run: |
+          set -euo pipefail
+          discovery=$(mktemp)
+          jwks=$(mktemp)
+          trap 'rm -f "$discovery" "$jwks"' EXIT
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 \
+            --retry 2 --retry-all-errors --retry-delay 2 \
+            "$OIDC_ISSUER/.well-known/openid-configuration" --output "$discovery"
+          jq -e --arg issuer "$OIDC_ISSUER" '
+            .issuer == $issuer
+            and .jwks_uri == ($issuer + "/keys")
+            and (.id_token_signing_alg_values_supported | index("RS256") != null)
+          ' "$discovery" >/dev/null
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 \
+            --retry 2 --retry-all-errors --retry-delay 2 \
+            "$OIDC_ISSUER/keys" --output "$jwks"
+          jq -e '
+            (.keys | type == "array" and length > 0)
+            and all(.keys[];
+              .kty == "RSA" and .alg == "RS256"
+              and (.kid | type == "string" and length > 0)
+              and (.n | type == "string" and length > 0)
+              and (.e | type == "string" and length > 0))
+          ' "$jwks" >/dev/null
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Test shared Azure token authentication
