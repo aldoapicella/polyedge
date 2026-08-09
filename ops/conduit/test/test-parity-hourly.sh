@@ -216,6 +216,18 @@ runs=$(wc -l <"$success/calls/podman")
 run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+second=$success/ring/parity/hourly/20260809T16
+mkdir -m 0750 "$second"
+jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z"' \
+  "$success/ring/parity/hourly/20260809T15/evidence.json" >"$second/evidence.json"
+chmod 0640 "$second/evidence.json"
+sed -i 's/POLYEDGE_PARITY_TARGET_HOUR_UTC=.*/POLYEDGE_PARITY_TARGET_HOUR_UTC=2026-08-09T16:00:00Z/' "$success/parity.env"
+sed -i "s/POLYEDGE_PARITY_NOW_EPOCH=.*/POLYEDGE_PARITY_NOW_EPOCH=$(date -u -d '2026-08-09T17:20:00Z' +%s)/" "$success/parity.env"
+run_collector "$success" >/dev/null
+[ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 2 ]
+jq -e '(.acceptedHourlyEvidence | length) == 2 and .acceptedHourlyEvidence[1].hourStartUtc == "2026-08-09T16:00:00Z"' \
+  "$success/ring/parity/ledger.json" >/dev/null
+[ "$(wc -l <"$success/calls/podman")" = "$runs" ]
 recovery=$root/recovery
 fixture "$recovery"
 seed_artifacts "$recovery" both

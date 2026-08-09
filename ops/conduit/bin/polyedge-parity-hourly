@@ -164,9 +164,29 @@ collect_refs() {
   count=$(printf '%s' "$refs" | jq 'length')
   [ "$count" -eq $(( (target_epoch - first_epoch) / 3600 + 1 )) ] || die 'accepted evidence has a gap'
   printf '%s' "$refs" | jq -e --argjson first "$first_epoch" '
-    to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600))) and
+    (to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600)))) and
     ([.[].hourStartEpoch] | length == (unique | length))
   ' >/dev/null || die 'accepted evidence is duplicate or non-sequential'
+}
+
+update_ledger() {
+  old_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+  [ "$old_count" -eq $((count - 1)) ] || die 'ledger was not at the strictly previous count'
+  old_refs=$(jq -c '.acceptedHourlyEvidence // []' "$POLYEDGE_PARITY_LEDGER")
+  expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
+  [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
+
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$POLYEDGE_PARITY_LEDGER")
+  ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
+  jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
+    "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+  chmod 0640 "$ledger_tmp"
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$ledger_tmp")" = "$protected_before" ] \
+    || die 'protected ledger fields changed'
+  sync -f "$ledger_tmp"
+  mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 }
 
 if [ -e "$evidence" ]; then
@@ -185,6 +205,9 @@ if [ -e "$evidence" ]; then
     exit 0
   fi
   [ "$ledger_count" -eq $((count - 1)) ] || die 'ledger count disagrees with accepted evidence'
+  update_ledger
+  echo "validated parity hour $target; acceptedCleanLiveHours=$count"
+  exit 0
 else
   evidence=
 fi
@@ -389,22 +412,6 @@ mv "$tmp" "$evidence"
 trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 
 collect_refs
-old_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
-[ "$old_count" -eq $((count - 1)) ] || die 'ledger was not at the strictly previous count'
-old_refs=$(jq -c '.acceptedHourlyEvidence // []' "$POLYEDGE_PARITY_LEDGER")
-expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
-[ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
-
-protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$POLYEDGE_PARITY_LEDGER")
-ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
-jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
-  "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
-chmod 0640 "$ledger_tmp"
-[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$ledger_tmp")" = "$protected_before" ] \
-  || die 'protected ledger fields changed'
-sync -f "$ledger_tmp"
-mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+update_ledger
 
 echo "validated parity hour $target; acceptedCleanLiveHours=$count"
