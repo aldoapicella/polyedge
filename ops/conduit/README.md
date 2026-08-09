@@ -35,11 +35,14 @@ minimal runtime:
 sudo apt-get install --no-install-recommends podman caddy curl gzip jq
 sudo install -d -m 0750 /etc/polyedge/jobs /srv/polyedge-ring/jobs
 sudo install -d -m 0700 /etc/polyedge/credentials/{api,research,shadow-qset}
+# Bootstrap only: on upgrades preserve the installed Image= digests and use
+# polyedge-quadlet-deploy; repository Quadlets intentionally contain placeholders.
 sudo install -m 0644 ops/conduit/quadlets/* /etc/containers/systemd/
 sudo install -m 0644 ops/conduit/systemd/* /etc/systemd/system/
 sudo install -m 0755 ops/conduit/bin/polyedge-run-job /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-sync /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-health /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-boot-disk-guard /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-github-deploy /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-quadlet-deploy /usr/local/sbin/
 sudo install -m 0440 ops/conduit/sudoers/polyedge-deploy /etc/sudoers.d/
@@ -52,6 +55,17 @@ sudo install -m 0600 ops/conduit/env/ring.env.example /etc/polyedge/ring.env
 sudo systemctl daemon-reload
 sudo systemctl restart systemd-journald
 ```
+
+The verified boot volume is 97 GB and the mounted root filesystem must retain
+at least 15 GiB free. `polyedge-boot-disk-guard.timer` warns at 75%, prunes only
+disposable package/Rust caches and dangling images older than seven days at
+80%, and creates `/run/polyedge/image-pulls-paused` at 85% or below the free
+space floor. It never uses `podman image prune --all` or `podman system prune`,
+so containers, volumes, databases, evidence, digest-pinned rollback images, and
+rollback Quadlets are not automatic cleanup targets. Approved host run paths
+use `--pull=never`; only the digest deploy helper pulls after passing the guard
+and rolls back if the post-deploy headroom check fails. Podman logs use journald,
+whose persistent and runtime growth is capped by `journald/polyedge.conf`.
 
 On a systemd-resolved host, point `/etc/resolv.conf` at its non-stub resolver
 file so Aardvark can forward external DNS. If UFW has a deny-input policy, allow
@@ -249,6 +263,7 @@ sudo touch /etc/polyedge/ENABLE_AZURE_JOBS
 sudo systemctl enable --now polyedge-api.service polyedge-frontend.service caddy.service
 sudo systemctl enable --now polyedge-ring-sync.timer
 sudo systemctl enable --now polyedge-ring-health.timer
+sudo systemctl enable --now polyedge-boot-disk-guard.timer
 sudo systemctl enable --now polyedge-freshness.timer polyedge-hourly.timer
 # Enable daily/replay/qset individually only after their validation.
 # sudo systemctl enable --now polyedge-daily.timer polyedge-replay.timer

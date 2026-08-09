@@ -26,11 +26,14 @@ quadlet_dir=${POLYEDGE_QUADLET_DIR:-/etc/containers/systemd}
 rollback_dir=${POLYEDGE_ROLLBACK_DIR:-/etc/polyedge/rollback}
 podman=${POLYEDGE_PODMAN:-/usr/bin/podman}
 systemctl=${POLYEDGE_SYSTEMCTL:-/usr/bin/systemctl}
+disk_guard=${POLYEDGE_DISK_GUARD:-/usr/local/libexec/polyedge-boot-disk-guard}
 quadlet=$quadlet_dir/$unit.container
 test -f "$quadlet" || die "missing installed Quadlet: $quadlet"
 test "$(grep -c '^Image=' "$quadlet")" -eq 1 || die "expected exactly one Image= line in $quadlet"
+test -x "$disk_guard" || die "missing boot-disk guard: $disk_guard"
 
 # Confirm the exact ARM64 manifest before changing the installed definition.
+"$disk_guard" --pull-gate || die 'boot-disk headroom blocks image pulls'
 "$podman" pull "$image"
 test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/arm64 || \
   die "image is not linux/arm64: $image"
@@ -68,6 +71,11 @@ running=$("$podman" inspect --type container --format '{{.State.Running}} {{.Ima
 if [ "$running" != "true $image_id $image" ]; then
   echo "running container did not resolve $digest; restoring previous Quadlet" >&2
   restore || die 'verification failed and rollback restart failed'
+  exit 1
+fi
+if ! "$disk_guard" --assert-headroom; then
+  echo 'deployment consumed reserved boot-disk headroom; restoring previous Quadlet' >&2
+  restore || die 'headroom check failed and rollback restart failed'
   exit 1
 fi
 

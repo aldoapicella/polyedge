@@ -17,7 +17,7 @@ Secret=polyedge-polymarket-api-secret,type=env,target=POLYMARKET_API_SECRET
 Secret=polyedge-polymarket-api-passphrase,type=env,target=POLYMARKET_API_PASSPHRASE
 Secret=polyedge-polymarket-relayer-api-key,type=env,target=POLYMARKET_RELAYER_API_KEY
 Exec=node src/funded-direct-service.mjs
-PodmanArgs=--cpus=0.75 --memory=2g --pids-limit=512 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges
+PodmanArgs=--cpus=0.75 --memory=2g --pids-limit=512 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges --pull=never --log-driver=journald
 
 [Service]
 Restart=on-failure

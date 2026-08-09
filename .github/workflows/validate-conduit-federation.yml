@@ -37,6 +37,9 @@ jobs:
       - name: Test token rotation and bounded Node smoke
         run: |
           ops/conduit/test/test-federated-token-refresh.sh
+          ops/conduit/test/test-boot-disk-guard.sh
+          ops/conduit/test/test-quadlet-deploy.sh
+          ops/conduit/test/test-run-job-mappings.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"

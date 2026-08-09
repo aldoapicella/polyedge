@@ -26,7 +26,7 @@ if [ "$job" = origin-check ]; then
     exit 1
   }
   exec /usr/bin/timeout --preserve-status 60 \
-    /usr/bin/podman run --rm --name polyedge-job-origin-check --network polyedge \
+    /usr/bin/podman run --rm --pull=never --log-driver=journald --name polyedge-job-origin-check --network polyedge \
       --add-host "polymarket.com:$endpoint_ip" --read-only --cap-drop=all --pids-limit 128 \
       --cpus 0.25 --memory 512m \
       -e POLYEDGE_ORIGIN_EXPECTED_IP -e POLYEDGE_ORIGIN_EXPECTED_COUNTRY \
@@ -131,7 +131,7 @@ esac
 # per-job timeout below starts only after the lock has been acquired.
 exec /usr/bin/flock -w 36h /run/polyedge/research.lock \
   /usr/bin/timeout --preserve-status "$limit" \
-  /usr/bin/podman run --rm --name "polyedge-job-$job" --network polyedge \
+  /usr/bin/podman run --rm --pull=never --log-driver=journald --name "polyedge-job-$job" --network polyedge \
     --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
     --env-file "/etc/polyedge/jobs/$job.env" \
     -v "$credential_dir:/run/credentials:ro,Z" \

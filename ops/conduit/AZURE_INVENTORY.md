@@ -232,6 +232,10 @@ ten-minute local segment contained 340,675 events (about 568 events/second)
 while the local collector reported about 0.16 core and 131 MB. The 48-hour
 ring projection was 76.4 GB. This proves steady collector capacity with broad
 headroom; the two daily ARM64 cycles remain the required batch-efficiency gate.
+The OCI boot volume is 97 GB with a 15-GiB minimum-free cutover gate. A
+five-minute guard warns at 75%, performs only safe cache/dangling-image cleanup
+at 80%, and blocks image pulls at 85% or below the minimum-free floor. Container
+logs are routed through the size-capped system journal.
 The later live ring check found 125 segments with a combined raw-plus-gzip
 average of 287,727,134 bytes and a peak of 541,986,617 bytes. A 48-hour
 projection is 82.9 GB at the observed average but 156.1 GB at the peak, above

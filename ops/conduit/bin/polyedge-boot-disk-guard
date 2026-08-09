@@ -1,0 +1,103 @@
+#!/bin/sh
+set -eu
+
+mode=${1:---check}
+case "$mode" in
+  --check|--pull-gate|--assert-headroom) ;;
+  *) echo 'usage: polyedge-boot-disk-guard [--check|--pull-gate|--assert-headroom]' >&2; exit 64 ;;
+esac
+
+root=${POLYEDGE_BOOT_DISK_ROOT:-/}
+state_dir=${POLYEDGE_BOOT_DISK_STATE_DIR:-/run/polyedge}
+pause_file=${POLYEDGE_IMAGE_PULL_PAUSE_FILE:-$state_dir/image-pulls-paused}
+status_file=${POLYEDGE_BOOT_DISK_STATUS_FILE:-$state_dir/boot-disk-status.json}
+minimum_free=${POLYEDGE_BOOT_DISK_MIN_FREE_BYTES:-16106127360}
+warning_percent=${POLYEDGE_BOOT_DISK_WARNING_PERCENT:-75}
+cleanup_percent=${POLYEDGE_BOOT_DISK_CLEANUP_PERCENT:-80}
+pause_percent=${POLYEDGE_BOOT_DISK_PAUSE_PERCENT:-85}
+logger=${POLYEDGE_LOGGER:-/usr/bin/logger}
+
+read_usage() {
+  if [ -n "${POLYEDGE_BOOT_DISK_TEST_USAGE_PERCENT:-}" ]; then
+    usage=$POLYEDGE_BOOT_DISK_TEST_USAGE_PERCENT
+    available=${POLYEDGE_BOOT_DISK_TEST_AVAILABLE_BYTES:?set test available bytes}
+  else
+    set -- $(df -P -B1 "$root" | awk 'NR == 2 {gsub(/%/, "", $5); print $5, $4}')
+    usage=$1
+    available=$2
+  fi
+  printf '%s %s\n' "$usage" "$available" | grep -Eq '^[0-9]+ [0-9]+$' || {
+    echo 'could not read boot-disk usage' >&2
+    exit 1
+  }
+}
+
+log() {
+  priority=$1
+  shift
+  "$logger" -p "$priority" -t polyedge-boot-disk-guard "$*" 2>/dev/null || true
+}
+
+cleanup() {
+  if [ "${POLYEDGE_BOOT_DISK_TEST:-}" = 1 ]; then
+    printf 'cleanup\n' >> "${POLYEDGE_BOOT_DISK_TEST_LOG:?set test log}"
+    return
+  fi
+
+  /usr/bin/apt-get clean || log daemon.err 'apt cache cleanup failed'
+  if [ -d /home/ubuntu/projects/polyedge/target ] \
+    && ! /usr/bin/pgrep -u ubuntu -x cargo >/dev/null 2>&1 \
+    && ! /usr/bin/pgrep -u ubuntu -x rustc >/dev/null 2>&1; then
+    /usr/sbin/runuser -u ubuntu -- /home/ubuntu/.cargo/bin/cargo clean \
+      --manifest-path /home/ubuntu/projects/polyedge/Cargo.toml \
+      || log daemon.err 'Rust build-cache cleanup failed'
+  fi
+
+  # Default prune removes only dangling images. Never use --all/system prune:
+  # digest-pinned rollback images, containers, volumes, and data must survive.
+  /usr/bin/podman image prune -f --filter until=168h \
+    || log daemon.err 'root Podman dangling-image cleanup failed'
+  ubuntu_uid=$(/usr/bin/id -u ubuntu)
+  if [ -d "/run/user/$ubuntu_uid" ]; then
+    /usr/sbin/runuser -u ubuntu -- /usr/bin/env "XDG_RUNTIME_DIR=/run/user/$ubuntu_uid" \
+      /usr/bin/podman image prune -f --filter until=168h \
+      || log daemon.err 'ubuntu Podman dangling-image cleanup failed'
+  fi
+}
+
+/usr/bin/install -d -m 0755 "$state_dir"
+read_usage
+initial_usage=$usage
+cleanup_attempted=false
+if [ "$usage" -ge "$warning_percent" ]; then
+  log daemon.warning "boot disk is ${usage}% used with $available bytes free"
+fi
+if [ "$usage" -ge "$cleanup_percent" ]; then
+  cleanup_attempted=true
+  cleanup
+  read_usage
+fi
+
+paused=false
+if [ "$usage" -ge "$pause_percent" ] || [ "$available" -lt "$minimum_free" ]; then
+  paused=true
+  : > "$pause_file"
+  chmod 0644 "$pause_file"
+  log daemon.crit "image pulls and host builds paused: boot disk is ${usage}% used with $available bytes free"
+else
+  rm -f "$pause_file"
+fi
+
+temporary=$(mktemp "$state_dir/.boot-disk-status.XXXXXX")
+trap 'rm -f "$temporary"' EXIT HUP INT TERM
+printf '{"schemaVersion":1,"generatedAtUtc":"%s","initialUsagePercent":%s,"usagePercent":%s,"availableBytes":%s,"minimumFreeBytes":%s,"warningPercent":%s,"cleanupPercent":%s,"pausePercent":%s,"cleanupAttempted":%s,"imagePullsPaused":%s}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$initial_usage" "$usage" "$available" \
+  "$minimum_free" "$warning_percent" "$cleanup_percent" "$pause_percent" \
+  "$cleanup_attempted" "$paused" > "$temporary"
+chmod 0644 "$temporary"
+mv "$temporary" "$status_file"
+trap - EXIT HUP INT TERM
+
+if [ "$paused" = true ]; then
+  exit 75
+fi

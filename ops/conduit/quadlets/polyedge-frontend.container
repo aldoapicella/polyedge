@@ -20,7 +20,7 @@ HealthTimeout=5s
 HealthRetries=3
 HealthStartPeriod=30s
 HealthOnFailure=kill
-PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --pull=never --log-driver=journald
 
 [Service]
 Restart=always
