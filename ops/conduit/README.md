@@ -81,15 +81,22 @@ The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
 The current formal parity window starts at the clean recorder boundary
-`2026-08-09T10:30:00Z` and cannot complete before
-`2026-08-12T10:30:00Z` or before two successful OCI daily cycles. Its
+`2026-08-09T14:10:00Z` and cannot complete before
+`2026-08-12T14:10:00Z` or before two successful OCI daily cycles. Its
 root-owned ledger is
-`/srv/polyedge-ring/parity/20260809T103000Z.json`; it must retain
+`/srv/polyedge-ring/parity/20260809T141000Z.json`; it must retain
 `azureDeletionAllowed:false` until the remaining parity, reboot, qset, and
-funded gates pass. The OCI API and all primary job environments are pinned to
+funded gates pass. The earlier `20260809T103000Z.json` ledger is superseded but
+retained as pre-window evidence. The OCI API recorder remains pinned to
 `sha256:20b695cb710d3da0ad5125e809aa4e029b5aa4f2a75c36f40dd9d905e553d713`
-from source `f7ecc30b2aaaeec5ad50b84bf5f548e33cae8e22`. Qset remains disabled and
-the funded signer remains masked.
+from source `f7ecc30b2aaaeec5ad50b84bf5f548e33cae8e22`; all seven primary research
+jobs are pinned to
+`sha256:5a41caacf389ba63c34c121d9afb633e675b4b68cd5100e1e5c9137ad46e0f58`
+from source `bd6fc4a22de7f3276b67e51db60a5df2d3ca3373`. The primary-job rollback
+snapshot is `/etc/polyedge/rollback/20260809T135058Z-primary-jobs`; a bounded
+freshness rollback to the previous digest and forward recovery to the final
+digest both passed before the window. Qset remains disabled and the funded
+signer remains masked.
 
 Primary OCI job environments must set
 `POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true`. This keeps reports local
@@ -321,8 +328,9 @@ Rollback copies live in `/etc/polyedge/rollback/`. The helper never accepts a
 tag, a non-GHCR registry, a mismatched image repository, or any unit other than
 API, frontend, or funded signer.
 
-Schedules are UTC: freshness every five minutes; hourly quality at `:10`;
-primary daily at 00:30; replay at 03:00; qset shadow at 02:15. The runner uses
+Schedules are UTC: freshness every five minutes; hourly quality at `:12`;
+primary daily at 02:20; replay at 03:05; the disabled qset shadow timer remains
+configured for 02:15. The runner uses
 one `flock -w 129600 /run/polyedge/research.lock` (36 hours), so writers serialize even when
 timers collide. Daily, replay, and qset are each capped at 1.5 CPU. With the
 API/frontend (1 CPU), funded signer (0.75), ring uploader (0.5), and optional
@@ -332,7 +340,7 @@ origin check (0.25), container CPU quotas cannot exceed the host's 4 OCPUs.
 
 ```sh
 sudo systemd-analyze verify /etc/systemd/system/polyedge-job@.service
-systemd-analyze calendar '*-*-* *:00/5:00 UTC' '*-*-* 00:30:00 UTC' '*-*-* 02:15:00 UTC'
+systemd-analyze calendar '*-*-* *:03/5:00 UTC' '*-*-* *:12:00 UTC' '*-*-* 02:20:00 UTC' '*-*-* 03:05:00 UTC'
 systemctl list-timers 'polyedge-*'
 podman ps --format '{{.Names}} {{.Status}}'
 curl -fsS https://YOUR_DOMAIN/api/backend/health | jq -e '.ok and .execution_mode == "paper" and .kill_switch == false'

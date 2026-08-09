@@ -22,6 +22,26 @@ job duration varies, and Azure meter prices apply at billing time. Budgets alert
 at $206.25, $247.50, and $275 of actual PolyEdge spend and at a forecast of
 $275.
 
+### OCI migration live cost floor
+
+A second live Cost Management query on 2026-08-09 covers August 1 through
+August 8. Storage cost $27.1352: $9.7256 of Hot LRS capacity, $9.6638 of Hot
+writes, and $6.1772 of list/create-class operations. Storage metrics at
+13:00 UTC reported 2,204,118,414,920 bytes in the retained Standard LRS Hot
+account. Daily metrics also showed hundreds of thousands of OAuth table writes
+and append operations while the Azure API remained authoritative. Those
+transaction meters should fall after the gated compute cutover, but that claim
+must be verified from the post-cutover bill rather than assumed.
+
+The retained capacity alone is currently about a $38-$41 monthly floor; the
+retained Service Bus, Key Vault, and storage monitoring keep the honest
+steady-state estimate above the requested $15-$35 range. The account already
+uses Standard LRS, and the deployed lifecycle rule tiers only future compressed
+OCI block blobs. Moving, deleting, or tiering the existing roughly 2 TB is not
+authorized, so this runbook does not claim the lower target. Revisit it only
+after the 72-hour cutover evidence quantifies the transaction collapse or a new
+explicit decision changes the existing-data constraint.
+
 ### Live utilization evidence
 
 | Driver | 2026-07-31 observation | Decision |
