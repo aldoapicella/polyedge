@@ -79,6 +79,18 @@ the shared research lock serializes any local daily/replay overlap. Revisit the
 offsets only after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
+
+The current formal parity window starts at the clean recorder boundary
+`2026-08-09T10:30:00Z` and cannot complete before
+`2026-08-12T10:30:00Z` or before two successful OCI daily cycles. Its
+root-owned ledger is
+`/srv/polyedge-ring/parity/20260809T103000Z.json`; it must retain
+`azureDeletionAllowed:false` until the remaining parity, reboot, qset, and
+funded gates pass. The OCI API and all primary job environments are pinned to
+`sha256:20b695cb710d3da0ad5125e809aa4e029b5aa4f2a75c36f40dd9d905e553d713`
+from source `f7ecc30b2aaaeec5ad50b84bf5f548e33cae8e22`. Qset remains disabled and
+the funded signer remains masked.
+
 Primary OCI job environments must set
 `POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true`. This keeps reports local
 during parity while preserving Azure reads and the shared daily/replay lease;

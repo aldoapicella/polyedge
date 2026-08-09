@@ -337,6 +337,37 @@ succeeded at `08:20:35Z`, restoring Azure as the last writer. No deletion gate
 was advanced; a new 72-hour window starts only after the local-only guard is
 published and proven.
 
+Azure's fixed authoritative control revision `polyedge-dev--parityfix1`
+started at `2026-08-09T09:42:54Z` on source
+`23d59dbd6d1aba42a9617b574c88b6528988f829` and digest
+`sha256:8bd859d4c85e3807a68968ce2cb986b8d517470d241bbb0ae48cf0aee6d02af2`.
+Clean post-roll evidence contained 112 strategy batches, fair values, and
+decisions with no panic. The previous revision is retained inactive for
+rollback but is excluded from parity because its decision task can panic.
+
+The final OCI candidate uses source
+`f7ecc30b2aaaeec5ad50b84bf5f548e33cae8e22` and multi-architecture digest
+`sha256:20b695cb710d3da0ad5125e809aa4e029b5aa4f2a75c36f40dd9d905e553d713`.
+Publication workflow `31305426718` and PR validation `31305416650` both
+passed. A real rollback to the prior OCI digest passed at `10:15:54Z`, and
+the final digest redeployed healthy at `10:16:16Z`. Consecutive raw
+provenance observations identify `local_jsonl` as the authoritative recorder
+with a null Azure storage account. Manual hourly and freshness jobs wrote local
+reports while the corresponding Azure blob timestamps, ETags, sizes, and
+SHA-256 hashes remained unchanged. The first timer-fired freshness run then
+passed at `10:28:02Z` with zero warnings or critical findings.
+
+The replacement formal window starts at the clean
+`2026-08-09T10:30:00Z` segment boundary and cannot complete before
+`2026-08-12T10:30:00Z` or before two successful OCI daily cycles. Its
+machine-readable ledger is
+`/srv/polyedge-ring/parity/20260809T103000Z.json`. At start the boot
+filesystem had 56,848,891,904 bytes free (44% used) against its 15-GiB floor;
+the ring had 137,225,486,336 bytes free with zero closed-unsealed or unuploaded
+segments. The four primary timers are boot-enabled. Shadow-qset remains
+disabled, funded signer remains masked, reboot recovery is still required, and
+Azure deletion remains forbidden.
+
 ## Azure data and evidence surfaces retained
 
 Storage account: `stpolyedge6urdjr5nmwx7w`, Standard LRS, StorageV2.
