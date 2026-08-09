@@ -106,7 +106,7 @@ two-daily-cycle, qset, funded, reboot, rollback, or parity gates.
 
 | OCI unit | UTC schedule | Azure counterpart |
 | --- | --- | --- |
-| `polyedge-freshness.timer` | every five minutes at `:02/:07/...` | `polyedge-data-freshness-job` at `:00/:05/...` |
+| `polyedge-freshness.timer` | every five minutes at `:03/:08/...` | `polyedge-data-freshness-job` at `:00/:05/...` |
 | `polyedge-hourly.timer` | hourly at `:12` | `polyedge-hourly-quality-job` at `:10` |
 | `polyedge-daily.timer` | 02:20 | `polyedge-daily-research-job` at 00:30 |
 | `polyedge-replay.timer` | 03:05 | `polyedge-replay-index-job` at 03:00 |
@@ -119,9 +119,10 @@ two-daily-cycle, qset, funded, reboot, rollback, or parity gates.
 | `systemctl start polyedge-job@origin-check` | manual, credential-free | `polyedge-origin-check-cl-job` |
 
 The single `/run/polyedge/research.lock` serializes every research writer.
-The offsets keep Azure first during parity: the latest freshness, hourly, and
-replay executions finished in 32, 47-52, and 47-58 seconds respectively; the
-last five daily runs finished between 01:36 and 02:15 UTC. OCI daily therefore
+The offsets keep Azure first during parity: freshness runs one minute after the
+local ring sync and three minutes after Azure. The latest observed Azure
+freshness, hourly, and replay runs finished in 32, 47-52, and 47-58 seconds;
+the last five daily runs finished between 01:36 and 02:15 UTC. OCI daily therefore
 starts at 02:20, and replay waits on the same host lock if that run is active.
 Daily, replay, and qset are each capped at 1.5 CPU. API/frontend, funded signer,
 ring upload, and the optional origin check consume at most the remaining 2.5
@@ -306,6 +307,28 @@ or unsealed closed segments with the recurring timer enabled. A conflicting,
 unuploaded `events-oci-test` sidecar from preflight was moved intact to the
 rollback directory; its original source and already-verified production v1
 receipt were not changed.
+
+The formal Azure-authoritative parity window started at the first clean final
+digest segment boundary, `2026-08-09T07:50:00Z`, and cannot complete before
+`2026-08-12T07:50:00Z` or before two OCI daily cycles pass. The API is pinned to
+ARM64 digest
+`sha256:d6e9545f18d7d53da42880749b57beee6c9477d6f1e3621eead74b80f6192334`
+from source `e451bf77317d55060ecbbd6aef6d6ea544c78fcf`; the frontend remains pinned to
+`sha256:dd59509d917855a345ab7b3eb9b33d44506fa75f9a6ba96b4d65100c39ca78c1`.
+An actual rollback to API digest
+`sha256:4e2f32d34d3ac8768a656f6481728e643afaae588510763dddbdf739dfa7f02d`
+passed at `07:41:17Z`, and the final UAMI configuration/digest redeployed and
+passed at `07:41:41Z`. The first timer-fired freshness run at `07:47:02Z` was
+healthy against the gzip ring prefix, with zero warnings or critical findings;
+the manual hourly smoke finished in 77 seconds with no critical finding. The
+four primary timers are boot-enabled; shadow-qset and funded remain disabled.
+At window start, root had about 56 GiB free and the ring about 127 GiB free.
+Machine-readable live state is preserved at
+`/srv/polyedge-ring/parity/20260809T075000Z.json`, with Azure deletion set to
+false. The first clean in-window segment (`07:50-08:00Z`) contained 165,980
+records and 139,862,191 source bytes; its 20,588,439-byte gzip object and
+manifest were remotely verified at `08:02:21Z`. The immediately following
+`08:03:02Z` freshness run was healthy with zero warnings or critical findings.
 
 ## Azure data and evidence surfaces retained
 

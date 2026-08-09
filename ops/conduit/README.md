@@ -72,11 +72,13 @@ The OCI freshness mapping accepts raw or gzip JSONL and uses a 900-second age
 limit with a 600-second expected interval, matching the recorder segment cadence
 without multiplying Azure blob transactions.
 
-During dual-running, OCI schedules deliberately trail Azure: freshness by two
+During dual-running, OCI schedules deliberately trail Azure: freshness by three
 minutes, hourly quality by two minutes, daily research at 02:20 UTC (after the
 observed 00:30 Azure run), and replay at 03:05 UTC. Azure remains authoritative;
 the shared research lock serializes any local daily/replay overlap. Revisit the
 offsets only after Azure compute deletion, not during parity.
+The extra freshness minute lets the local ring upload finish before the Azure
+blob-age query runs.
 
 On a systemd-resolved host, point `/etc/resolv.conf` at its non-stub resolver
 file so Aardvark can forward external DNS. If UFW has a deny-input policy, allow
