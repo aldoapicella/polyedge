@@ -60,11 +60,12 @@ sudo systemctl restart systemd-journald
 
 The verified boot volume is 97 GB and the mounted root filesystem must retain
 at least 15 GiB free. `polyedge-boot-disk-guard.timer` warns at 75%, prunes only
-disposable package/Rust caches and dangling images older than seven days at
-80%, and creates `/run/polyedge/image-pulls-paused` at 85% or below the free
-space floor. It never uses `podman image prune --all` or `podman system prune`,
-so containers, volumes, databases, evidence, digest-pinned rollback images, and
-rollback Quadlets are not automatic cleanup targets. Approved host run paths
+disposable package/Rust caches and images explicitly labeled
+`io.polyedge.disposable=true` after seven days at 80%, and creates
+`/run/polyedge/image-pulls-paused` at 85% or below the free-space floor.
+Unlabeled images are preserved, so containers, volumes, databases, evidence,
+digest-pinned rollback images, and rollback Quadlets are not automatic cleanup
+targets. Approved host run paths
 use `--pull=never`; only the digest deploy helper pulls after passing the guard
 and rolls back if the post-deploy headroom check fails. Podman logs use journald,
 whose persistent and runtime growth is capped by `journald/polyedge.conf`.

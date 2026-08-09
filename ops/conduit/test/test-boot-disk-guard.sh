@@ -34,3 +34,6 @@ test -e "$tmp/run/image-pulls-paused"
 run_guard 70 17179869184
 test ! -e "$tmp/run/image-pulls-paused"
 grep -F '"minimumFreeBytes":16106127360' "$tmp/run/boot-disk-status.json" >/dev/null
+test "$(grep -c '/usr/bin/podman image prune -f --filter label=io.polyedge.disposable=true --filter until=168h' "$guard")" -eq 2
+! grep -F 'podman image prune --all' "$guard" >/dev/null
+! grep -F 'podman system prune' "$guard" >/dev/null

@@ -53,15 +53,15 @@ cleanup() {
       || log daemon.err 'Rust build-cache cleanup failed'
   fi
 
-  # Default prune removes only dangling images. Never use --all/system prune:
-  # digest-pinned rollback images, containers, volumes, and data must survive.
-  /usr/bin/podman image prune -f --filter until=168h \
-    || log daemon.err 'root Podman dangling-image cleanup failed'
+  # Rollback Quadlets are not native Podman references. Only opt-in disposable
+  # images may be pruned; active and rollback images remain unlabeled.
+  /usr/bin/podman image prune -f --filter label=io.polyedge.disposable=true --filter until=168h \
+    || log daemon.err 'root Podman disposable-image cleanup failed'
   ubuntu_uid=$(/usr/bin/id -u ubuntu)
   if [ -d "/run/user/$ubuntu_uid" ]; then
     /usr/sbin/runuser -u ubuntu -- /usr/bin/env "XDG_RUNTIME_DIR=/run/user/$ubuntu_uid" \
-      /usr/bin/podman image prune -f --filter until=168h \
-      || log daemon.err 'ubuntu Podman dangling-image cleanup failed'
+      /usr/bin/podman image prune -f --filter label=io.polyedge.disposable=true --filter until=168h \
+      || log daemon.err 'ubuntu Podman disposable-image cleanup failed'
   fi
 }
 
