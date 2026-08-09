@@ -43,6 +43,7 @@ sudo install -m 0755 ops/conduit/bin/polyedge-run-job /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-sync /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-health /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-boot-disk-guard /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-parity-hourly /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-github-deploy /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-quadlet-deploy /usr/local/sbin/
 sudo install -m 0440 ops/conduit/sudoers/polyedge-deploy /etc/sudoers.d/
@@ -52,6 +53,7 @@ sudo install -m 0600 ops/conduit/env/api.env.example /etc/polyedge/api.env
 sudo install -m 0600 ops/conduit/env/frontend.env.example /etc/polyedge/frontend.env
 sudo install -m 0600 ops/conduit/env/funded-signer.env.example /etc/polyedge/funded-signer.env
 sudo install -m 0600 ops/conduit/env/ring.env.example /etc/polyedge/ring.env
+sudo install -m 0640 ops/conduit/env/parity-hourly.env.example /etc/polyedge/parity-hourly.env
 sudo systemctl daemon-reload
 sudo systemctl restart systemd-journald
 ```
@@ -97,6 +99,12 @@ snapshot is `/etc/polyedge/rollback/20260809T135058Z-primary-jobs`; a bounded
 freshness rollback to the previous digest and forward recovery to the final
 digest both passed before the window. Qset remains disabled and the funded
 signer remains masked.
+
+`polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
+`:12` audits. It hash-verifies the six local segments and upload receipts,
+compares the Azure scheduled result with a local same-input audit, and advances
+only the sequential clean-hour count. It never changes Azure authority,
+deletion, reboot, qset, or funded gates and fails closed on a gap or mismatch.
 
 Primary OCI job environments must set
 `POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true`. This keeps reports local
@@ -301,6 +309,7 @@ sudo systemctl enable --now polyedge-api.service polyedge-frontend.service caddy
 sudo systemctl enable --now polyedge-ring-sync.timer
 sudo systemctl enable --now polyedge-ring-health.timer
 sudo systemctl enable --now polyedge-boot-disk-guard.timer
+sudo systemctl enable --now polyedge-parity-hourly.timer
 sudo systemctl enable --now polyedge-freshness.timer polyedge-hourly.timer
 # Enable daily/replay/qset individually only after their validation.
 # sudo systemctl enable --now polyedge-daily.timer polyedge-replay.timer
