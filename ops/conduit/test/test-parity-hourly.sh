@@ -33,9 +33,10 @@ case "$1" in
   run)
     printf '%s\n' "$*" >>"$FAKE_CALLS/podman"
     host=
-    for arg do case "$arg" in *:/evidence:Z) host=${arg%:/evidence:Z} ;; esac; done
+    for arg do case "$arg" in *:/evidence:rw,Z) host=${arg%:/evidence:rw,Z} ;; esac; done
     [ -n "$host" ] || exit 2
-    cp "$FAKE_SAME_REPORT" "$host/.same-input-audit.tmp"
+    cp "$FAKE_SAME_REPORT" "$host/audit.json"
+    : >"$host/audit.md"
     ;;
   *) exit 2 ;;
 esac
@@ -207,6 +208,9 @@ run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
 jq -e '.acceptedForParityWindow == true and .sameInput.deterministicResultExactMatch == true and (.segments | length) == 6' \
   "$success/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
+grep -q -- "--user $uid:$gid" "$success/calls/podman"
+grep -q -- "$success/token/azure-federated-token:/run/credentials/azure-federated-token:ro,Z" "$success/calls/podman"
+! grep -q -- '--security-opt=no-new-privileges' "$success/calls/podman"
 [ "$(protected "$success/ring/parity/ledger.json")" = "$before" ]
 runs=$(wc -l <"$success/calls/podman")
 run_collector "$success" >/dev/null
