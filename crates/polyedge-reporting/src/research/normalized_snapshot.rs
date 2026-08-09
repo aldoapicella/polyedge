@@ -78,8 +78,9 @@ struct SnapshotIdentity<'a> {
 pub fn publish_normalized_snapshot(
     options: PublishNormalizedSnapshotOptions,
 ) -> Result<Value, ResearchError> {
-    if super::research_artifact_publication_disabled() {
-        let (manifest, _) = build_manifest(&options.input, options.date)?;
+    let local_only = super::research_artifact_publication_disabled();
+    let (manifest, local_files) = build_manifest(&options.input, options.date, !local_only)?;
+    if local_only {
         return Ok(json!({
             "status": "local_only",
             "date": options.date,
@@ -95,7 +96,6 @@ pub fn publish_normalized_snapshot(
         &options.container,
         options.client_id.clone(),
     );
-    let (manifest, local_files) = build_manifest(&options.input, options.date)?;
     let snapshot_segment = manifest.snapshot_sha256.trim_start_matches("sha256:");
     let snapshot_root = format!(
         "{}/{}/{snapshot_segment}",
@@ -217,6 +217,7 @@ pub fn restore_normalized_snapshot(
 fn build_manifest(
     input: &Path,
     date: NaiveDate,
+    require_azure_source: bool,
 ) -> Result<(NormalizedSnapshotManifestV1, Vec<PathBuf>), ResearchError> {
     if !input.is_dir() {
         return Err(ResearchError::InvalidInput(format!(
@@ -237,11 +238,14 @@ fn build_manifest(
             })?,
     )?;
     validate_raw_source_inventory(&raw_source_inventory)?;
-    if raw_source_inventory.canonical.source_kind != "azure_blob"
-        || !raw_source_inventory.canonical.exhaustive_listing
-    {
+    if !raw_source_inventory.canonical.exhaustive_listing {
         return Err(ResearchError::InvalidInput(
-            "normalized snapshot requires an exhaustive Azure raw-source inventory".to_owned(),
+            "normalized snapshot requires an exhaustive raw-source inventory".to_owned(),
+        ));
+    }
+    if require_azure_source && raw_source_inventory.canonical.source_kind != "azure_blob" {
+        return Err(ResearchError::InvalidInput(
+            "normalized snapshot publication requires an Azure raw-source inventory".to_owned(),
         ));
     }
     let format = events_manifest
@@ -715,16 +719,37 @@ mod tests {
             serde_json::to_vec(&json!({
                 "format": "jsonl-indexed-gzip",
                 "events": 1,
-                "raw_source_inventory": inventory,
+                "raw_source_inventory": inventory.clone(),
             }))
             .unwrap(),
         )
         .unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
-        let first = build_manifest(&root, date).unwrap().0;
-        let second = build_manifest(&root, date).unwrap().0;
+        let first = build_manifest(&root, date, true).unwrap().0;
+        let second = build_manifest(&root, date, true).unwrap().0;
         assert_eq!(first, second);
         assert!(is_sha256(&first.snapshot_sha256));
+
+        let mut local_inventory = inventory;
+        local_inventory.canonical.source_kind = "local_files".to_owned();
+        local_inventory.canonical.account = None;
+        local_inventory.canonical.container = None;
+        local_inventory.canonical.blobs[0].etag = None;
+        local_inventory.canonical.blobs[0].blob_type = Some("LocalFile".to_owned());
+        local_inventory.canonical_sha256 =
+            sha256_prefixed(&serde_json::to_vec(&local_inventory.canonical).unwrap());
+        fs::write(
+            root.join("events_manifest.json"),
+            serde_json::to_vec(&json!({
+                "format": "jsonl-indexed-gzip",
+                "events": 1,
+                "raw_source_inventory": local_inventory,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(build_manifest(&root, date, false).is_ok());
+        assert!(build_manifest(&root, date, true).is_err());
         let _ = fs::remove_dir_all(root);
     }
 }
