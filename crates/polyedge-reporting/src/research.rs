@@ -11932,6 +11932,43 @@ mod tests {
     }
 
     #[test]
+    fn local_runtime_provenance_requires_an_explicit_authoritative_recorder() {
+        let mut payload = json!({
+            "schema_version": 1,
+            "backend_impl": "rust",
+            "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+            "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+            "app_name": "polyedge",
+            "runtime_role": "primary",
+            "execution_mode": "paper",
+            "paper_maker_fill_policy": "touch_after_quote_was_live",
+            "storage_account": null,
+            "storage_container": "bot-events",
+            "event_blob_prefix": "events",
+            "shadow_only": false,
+            "allow_live": false,
+            "enable_taker_orders": false,
+            "allow_emergency_account_cancel": false,
+            "adaptive_regime_enabled": false,
+            "publish_strategy_canary_intents": false,
+            "research_only": true
+        });
+        assert_eq!(
+            run_bundle::runtime_provenance_common_errors(&payload),
+            ["/authoritative_recorder_backend must identify a local recorder when /storage_account is null"]
+        );
+        payload["authoritative_recorder_backend"] = json!("local_jsonl");
+        assert!(run_bundle::runtime_provenance_common_errors(&payload).is_empty());
+        payload["storage_account"] = json!("stpolyedgedev");
+        assert_eq!(
+            run_bundle::runtime_provenance_common_errors(&payload),
+            ["/storage_account must be null when /authoritative_recorder_backend is local_jsonl"]
+        );
+        payload["authoritative_recorder_backend"] = json!("azure_append_blob");
+        assert!(run_bundle::runtime_provenance_common_errors(&payload).is_empty());
+    }
+
+    #[test]
     fn azure_event_reader_accepts_plain_and_gzip_jsonl_only() {
         let raw = b"{\"event\":1}\n";
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());

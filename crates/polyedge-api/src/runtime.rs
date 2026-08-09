@@ -3369,6 +3369,11 @@ fn runtime_provenance_with_git_sha_at(
         "decision_config_schema": "polyedge.decision_config.v1",
         "decision_config_sha256": decision_config_sha256,
         "candidate": candidate,
+        "authoritative_recorder_backend": if settings.azure.storage_account_name.is_some() {
+            "azure_append_blob"
+        } else {
+            "local_jsonl"
+        },
         "storage_account": settings.azure.storage_account_name,
         "storage_container": settings.azure.storage_container_name,
         "event_blob_prefix": settings.azure.event_blob_prefix_at(event_ts),
@@ -3815,6 +3820,8 @@ mod tests {
         assert_eq!(payload["candidate"]["name"], "dynamic_quote_style");
         assert_eq!(payload["compact_shadow_recording"], true);
         assert_eq!(payload["shadow_book_sample_ms"], 1_000);
+        assert_eq!(payload["authoritative_recorder_backend"], "local_jsonl");
+        assert!(payload["storage_account"].is_null());
         assert_eq!(
             payload["decision_pipeline_schema"],
             "polyedge.strategy_decision_batch.v4"
