@@ -61,7 +61,6 @@ boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
 pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
 token_file=${POLYEDGE_PARITY_TOKEN_FILE:-/run/polyedge-federated-research/azure-federated-token}
 runtime_dir=${POLYEDGE_PARITY_RUNTIME_DIR:-/run/polyedge/parity-hourly}
-lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/research.lock}
 
 mountpoint -q "$ring" || die 'ring root is not a mount point'
 ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
@@ -130,12 +129,6 @@ install -d -m 0700 "$runtime_dir"
 [ ! -L "$runtime_dir" ] && [ -d "$runtime_dir" ] || die 'unsafe runtime directory'
 set -- $(stat -c '%u %g %a' "$runtime_dir")
 [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || die 'unsafe runtime directory ownership or mode'
-if [ -e "$lock_file" ]; then
-  [ ! -L "$lock_file" ] && [ -f "$lock_file" ] && [ "$(stat -c '%u:%g:%h' "$lock_file")" = "$expected_uid:$expected_gid:1" ] || die 'unsafe research lock file'
-fi
-exec 9>"$lock_file"
-flock -w 1800 9 || die 'research lock timed out'
-
 refs_tmp=$(mktemp "$runtime_dir/refs.XXXXXX")
 segments_tmp=$(mktemp "$runtime_dir/segments.XXXXXX")
 oauth_response=$(mktemp "$runtime_dir/oauth.XXXXXX")

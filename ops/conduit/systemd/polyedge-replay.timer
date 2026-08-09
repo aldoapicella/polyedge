@@ -2,7 +2,7 @@
 Description=Run PolyEdge replay index (UTC)
 
 [Timer]
-OnCalendar=*-*-* 03:05:00 UTC
+OnCalendar=*-*-* 03:15:00 UTC
 Persistent=true
 Unit=polyedge-job@replay.service
 

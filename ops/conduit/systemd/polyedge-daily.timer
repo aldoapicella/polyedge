@@ -2,7 +2,7 @@
 Description=Run PolyEdge primary daily research (UTC)
 
 [Timer]
-OnCalendar=*-*-* 02:20:00 UTC
+OnCalendar=*-*-* 03:10:00 UTC
 Persistent=true
 Unit=polyedge-job@daily.service
 

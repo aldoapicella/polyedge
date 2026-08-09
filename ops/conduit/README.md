@@ -75,10 +75,14 @@ limit with a 600-second expected interval, matching the recorder segment cadence
 without multiplying Azure blob transactions.
 
 During dual-running, OCI schedules deliberately trail Azure: freshness by three
-minutes, hourly quality by two minutes, daily research at 02:20 UTC (after the
-observed 00:30 Azure run), and replay at 03:05 UTC. Azure remains authoritative;
-the shared research lock serializes any local daily/replay overlap. Revisit the
-offsets only after Azure compute deletion, not during parity.
+minutes and hourly quality by two minutes. Azure daily and replay remain at
+00:30 and 03:00; OCI daily starts at 03:10 after both, and OCI replay at 03:15
+waits behind it on the host lock. Azure remains authoritative. Daily, replay,
+shadow, and manual data-producing jobs share the research lock; the bounded
+freshness, hourly, and parity audits stay independent so a long daily cycle
+cannot create a monitoring or parity gap. Their combined CPU caps remain within
+the four-core host. Revisit the offsets only after Azure compute deletion, not
+during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
@@ -338,18 +342,19 @@ tag, a non-GHCR registry, a mismatched image repository, or any unit other than
 API, frontend, or funded signer.
 
 Schedules are UTC: freshness every five minutes; hourly quality at `:12`;
-primary daily at 02:20; replay at 03:05; the disabled qset shadow timer remains
-configured for 02:15. The runner uses
-one `flock -w 129600 /run/polyedge/research.lock` (36 hours), so writers serialize even when
-timers collide. Daily, replay, and qset are each capped at 1.5 CPU. With the
-API/frontend (1 CPU), funded signer (0.75), ring uploader (0.5), and optional
-origin check (0.25), container CPU quotas cannot exceed the host's 4 OCPUs.
+primary daily at 03:10; replay at 03:15; the disabled qset shadow timer remains
+configured for 02:15. Data-producing jobs use one
+`flock -w 129600 /run/polyedge/research.lock` (36 hours); bounded audits bypass
+it. Daily, replay, and qset are each capped at 1.5 CPU. During parity, qset and
+funded are disabled, so API/frontend (1 CPU), one writer (1.5), freshness (0.5),
+ordered hourly or parity (0.5), and the ring uploader (0.5) total 4 OCPUs.
+Origin check is manual and unscheduled; re-budget before enabling funded.
 
 ## Verify, reboot, rollback
 
 ```sh
 sudo systemd-analyze verify /etc/systemd/system/polyedge-job@.service
-systemd-analyze calendar '*-*-* *:03/5:00 UTC' '*-*-* *:12:00 UTC' '*-*-* 02:20:00 UTC' '*-*-* 03:05:00 UTC'
+systemd-analyze calendar '*-*-* *:03/5:00 UTC' '*-*-* *:12:00 UTC' '*-*-* 03:10:00 UTC' '*-*-* 03:15:00 UTC'
 systemctl list-timers 'polyedge-*'
 podman ps --format '{{.Names}} {{.Status}}'
 curl -fsS https://YOUR_DOMAIN/api/backend/health | jq -e '.ok and .execution_mode == "paper" and .kill_switch == false'

@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-runner=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-run-job
+bundle=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+runner=$bundle/bin/polyedge-run-job
 sh -n "$runner"
 for job in prospective chart-backfill backfill; do
   grep -F "  $job)" "$runner" >/dev/null
@@ -24,5 +25,9 @@ grep -F 'shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;' "$r
 grep -F 'credential_dir=/run/polyedge-federated-$credential' "$runner" >/dev/null
 grep -F 'credential_dir=/etc/polyedge/credentials/$credential' "$runner" >/dev/null
 grep -F -- '-v "$credential_dir:/run/credentials:ro,Z"' "$runner" >/dev/null
-grep -F 'flock -w 129600 /run/polyedge/research.lock' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset)' "$runner" >/dev/null
+grep -F 'set -- /usr/bin/flock -w 129600 /run/polyedge/research.lock "$@"' "$runner" >/dev/null
+test "$(grep -c '/usr/bin/flock -w 129600 /run/polyedge/research.lock' "$runner")" -eq 1
 test "$(grep -c -- '--pull=never --log-driver=journald' "$runner")" -eq 2
+grep -F 'OnCalendar=*-*-* 03:10:00 UTC' "$bundle/systemd/polyedge-daily.timer" >/dev/null
+grep -F 'OnCalendar=*-*-* 03:15:00 UTC' "$bundle/systemd/polyedge-replay.timer" >/dev/null

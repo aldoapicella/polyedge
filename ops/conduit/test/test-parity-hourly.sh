@@ -66,11 +66,6 @@ printf '%s\n' 'Filesystem 1-blocks Used Available Capacity Mounted on'
 printf 'fixture 100000000000 1 %s 1%% /\n' "$FAKE_DF_AVAILABLE"
 EOF
 
-cat >"$fake/flock" <<'EOF'
-#!/bin/sh
-exit 0
-EOF
-
 cat >"$fake/timeout" <<'EOF'
 #!/bin/sh
 [ "$1" != --preserve-status ] || shift
@@ -135,7 +130,6 @@ POLYEDGE_PARITY_BOOT_ROOT=$case_root
 POLYEDGE_PARITY_PAUSE_FILE=$case_root/run/image-pulls-paused
 POLYEDGE_PARITY_TOKEN_FILE=$case_root/token/azure-federated-token
 POLYEDGE_PARITY_RUNTIME_DIR=$case_root/run
-POLYEDGE_PARITY_LOCK_FILE=$case_root/run/research.lock
 POLYEDGE_PARITY_TARGET_HOUR_UTC=$target
 POLYEDGE_PARITY_NOW_EPOCH=$fixture_now
 POLYEDGE_PARITY_TOKEN_UID=$uid
@@ -296,5 +290,6 @@ if grep -R -F 'fixture-access-token' "$root"/*/calls >/dev/null || grep -R -F 'f
   echo 'a token leaked into command arguments' >&2
   exit 1
 fi
+! grep -q 'flock\|POLYEDGE_PARITY_LOCK_FILE' "$collector"
 
 echo 'parity hourly collector self-test passed'

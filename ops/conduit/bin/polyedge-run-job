@@ -134,10 +134,9 @@ case "$job" in
   *) set -- ;;
 esac
 
-# One host-wide lock prevents every research writer from overlapping. The
-# per-job timeout below starts only after the lock has been acquired.
-exec /usr/bin/flock -w 129600 /run/polyedge/research.lock \
-  /usr/bin/timeout --preserve-status "$limit" \
+# Freshness and hourly audits write only their own disjoint report paths and
+# must stay live while the longer data-producing jobs serialize below.
+set -- /usr/bin/timeout --preserve-status "$limit" \
   /usr/bin/podman run --rm --pull=never --log-driver=journald --name "polyedge-job-$job" --network polyedge \
     --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
     --env-file "/etc/polyedge/jobs/$job.env" \
@@ -147,3 +146,10 @@ exec /usr/bin/flock -w 129600 /run/polyedge/research.lock \
     -v "$work/freshness:/app/data_quality/freshness:Z" \
     "$@" \
     "$POLYEDGE_RESEARCH_IMAGE" /bin/sh -lc "$command"
+
+case "$job" in
+  daily|replay|prospective|chart-backfill|backfill|shadow-qset)
+    set -- /usr/bin/flock -w 129600 /run/polyedge/research.lock "$@"
+    ;;
+esac
+exec "$@"
