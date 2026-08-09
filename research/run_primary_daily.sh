@@ -7,10 +7,12 @@ RUN_ID="daily-$DATE-$(date -u +%Y%m%dT%H%M%SZ)"
 . "$(dirname "$0")/resolve_raw_input.sh"
 INPUT=$(polyedge_raw_input "$DAY")
 NORMALIZED="data/research/daily/$DATE/normalized"
+NORMALIZED_COMPLETE="$NORMALIZED/.polyedge-daily-complete.json"
 STAGING="reports/research/staging/$RUN_ID"
 MARKETS="$STAGING/markets_summary.json"
 
 mkdir -p "$STAGING" "data/research/daily/$DATE"
+rm -f -- "$NORMALIZED_COMPLETE"
 
 run_stage() {
   label=$1
@@ -109,5 +111,19 @@ run_stage validate-prospective polyedge-rs research validate-prospective \
   --expected-daily-date "$DATE" \
   --out reports/research/prospective/prospective_validation.json \
   --markdown reports/research/prospective/prospective_validation.md
+
+if ! printf '%s\n' "${GIT_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo 'GIT_SHA must be the immutable 40-character source commit' >&2
+  exit 1
+fi
+marker_tmp=$(mktemp "$NORMALIZED_COMPLETE.tmp.XXXXXX")
+jq -n \
+  --arg date "$DATE" \
+  --arg git_sha "$GIT_SHA" \
+  --arg events_manifest_sha256 "$INPUT_SHA" \
+  '{schema_version: 1, date: $date, git_sha: $git_sha, events_manifest_sha256: $events_manifest_sha256}' \
+  >"$marker_tmp"
+chmod 600 "$marker_tmp"
+mv -f -- "$marker_tmp" "$NORMALIZED_COMPLETE"
 
 printf '{"event":"polyedge_primary_daily","date":"%s","status":"completed","snapshot":"published"}\n' "$DATE"

@@ -7,6 +7,8 @@ DAY=$(date -u -d "$DATE" +%Y/%m/%d)
 INPUT=$(polyedge_raw_input "$DAY")
 ROOT="data/research/replay-index/$DATE"
 NORMALIZED="$ROOT/normalized"
+DAILY_NORMALIZED="data/research/daily/$DATE/normalized"
+DAILY_COMPLETE="$DAILY_NORMALIZED/.polyedge-daily-complete.json"
 mkdir -p "$ROOT"
 
 run_stage() {
@@ -50,17 +52,36 @@ try_restore_snapshot() {
   return "$status"
 }
 
-source_kind=normalized_snapshot
-if ! try_restore_snapshot; then
-  source_kind=raw_fallback
-  run_stage normalize-fallback polyedge-rs research normalize \
-    --input "$INPUT" \
-    --out "$NORMALIZED" \
-    --format jsonl-indexed-gzip-sharded \
-    --overwrite true
-  run_stage publish-normalized-snapshot polyedge-rs research publish-normalized-snapshot \
-    --input "$NORMALIZED" \
-    --date "$DATE"
+try_local_daily() {
+  [ -d "$DAILY_NORMALIZED" ] && [ ! -L "$DAILY_NORMALIZED" ] || return 1
+  [ -f "$DAILY_NORMALIZED/events_manifest.json" ] && [ ! -L "$DAILY_NORMALIZED/events_manifest.json" ] || return 1
+  [ -f "$DAILY_COMPLETE" ] && [ ! -L "$DAILY_COMPLETE" ] || return 1
+  expected=$(jq -er \
+    --arg date "$DATE" \
+    --arg git_sha "${GIT_SHA:-}" \
+    'select(.schema_version == 1 and .date == $date and .git_sha == $git_sha) | .events_manifest_sha256 | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))' \
+    "$DAILY_COMPLETE" 2>/dev/null) || return 1
+  actual="sha256:$(sha256sum "$DAILY_NORMALIZED/events_manifest.json" | cut -d' ' -f1)"
+  [ "$expected" = "$actual" ] || return 1
+  NORMALIZED="$DAILY_NORMALIZED"
+}
+
+source_kind=local_daily
+if try_local_daily; then
+  printf '{"event":"polyedge_replay_index_stage","stage":"reuse-local-daily","date":"%s","status":"completed"}\n' "$DATE"
+else
+  source_kind=normalized_snapshot
+  if ! try_restore_snapshot; then
+    source_kind=raw_fallback
+    run_stage normalize-fallback polyedge-rs research normalize \
+      --input "$INPUT" \
+      --out "$NORMALIZED" \
+      --format jsonl-indexed-gzip-sharded \
+      --overwrite true
+    run_stage publish-normalized-snapshot polyedge-rs research publish-normalized-snapshot \
+      --input "$NORMALIZED" \
+      --date "$DATE"
+  fi
 fi
 
 run_stage build-replay-index polyedge-rs research build-replay-index \
