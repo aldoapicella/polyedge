@@ -251,10 +251,12 @@ test("persistent service recycles a receive link that outlives the one-second po
     }
   };
   const completed = [];
+  const abandoned = [];
   const closed = [];
   const logs = [];
   let receiverCreations = 0;
   let stalledReceiveOptions;
+  let stalledClosed = false;
   const receiverMethods = {
     async renewMessageLock() {},
     async deadLetterMessage() {},
@@ -264,16 +266,19 @@ test("persistent service recycles a receive link that outlives the one-second po
     ...receiverMethods,
     receiveMessages: async (_maxMessages, options) => {
       stalledReceiveOptions = options;
-      return new Promise((_, reject) => {
-        options.abortSignal.addEventListener(
-          "abort",
-          () => reject(options.abortSignal.reason),
-          { once: true }
-        );
+      return new Promise((resolve) => {
+        setTimeout(() => resolve([{ messageId: "late-locked-intent" }]), 1_520);
       });
     },
+    async abandonMessage(received) {
+      assert.equal(stalledClosed, false);
+      abandoned.push(received.messageId);
+    },
     async completeMessage() {},
-    async close() { closed.push("stalled"); }
+    async close() {
+      stalledClosed = true;
+      closed.push("stalled");
+    }
   };
   const healthyReceiver = {
     ...receiverMethods,
@@ -304,26 +309,88 @@ test("persistent service recycles a receive link that outlives the one-second po
   assert.equal(stalledReceiveOptions.maxWaitTimeInMs, 1_000);
   assert.equal(stalledReceiveOptions.abortSignal.aborted, true);
   assert.deepEqual(completed, ["warmup-after-recycle"]);
+  assert.deepEqual(abandoned, ["late-locked-intent"]);
   assert.deepEqual(closed.sort(), ["healthy", "stalled"]);
   assert.ok(logs.some((value) =>
     value.status === "service_bus_receive_watchdog_expired" &&
-    value.watchdog_ms === 2_000 &&
+    value.watchdog_ms === 1_500 &&
+    value.recovery_action === "new_client_receiver" &&
     value.missed_signal_risk === true
   ));
+  assert.ok(logs.some((value) =>
+    value.status === "service_bus_late_receive_abandoned" &&
+    value.message_count === 1
+  ));
+});
+
+test("persistent service alerts if a locked message surfaces only after stale link closure", async () => {
+  const warmup = {
+    messageId: "warmup-after-late-cleanup",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  };
+  let receiverCreations = 0;
+  let staleClosed = false;
+  let resolveLateAlert;
+  const lateAlert = new Promise((resolve) => { resolveLateAlert = resolve; });
+  const staleReceiver = {
+    receiveMessages: async () => new Promise((resolve) => {
+      setTimeout(() => resolve([{ messageId: "late-after-close" }]), 1_600);
+    }),
+    async abandonMessage() {
+      if (staleClosed) throw new Error("receiver is closed");
+    },
+    async close() { staleClosed = true; }
+  };
+  const healthyReceiver = {
+    async receiveMessages() { return [warmup]; },
+    async completeMessage() {},
+    async renewMessageLock() {},
+    async close() {}
+  };
+  await runPersistentFundedDirectService({
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
+    createBusClient: () => ({
+      createReceiver: () => receiverCreations++ === 0 ? staleReceiver : healthyReceiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => {
+      if (value.status === "service_bus_late_receive_cleanup_failed") resolveLateAlert(value);
+    }
+  });
+  assert.deepEqual(await lateAlert, {
+    schema: "polyedge.funded_direct_alert.v1",
+    status: "service_bus_late_receive_cleanup_failed",
+    missed_signal_risk: true,
+    error: "receiver is closed"
+  });
 });
 
 test("persistent service fails closed instead of recycling a second stalled receive link", async () => {
   const closed = [];
   let receiverCreations = 0;
+  let resolveTermination;
+  const termination = new Promise((resolve) => { resolveTermination = resolve; });
   const result = runPersistentFundedDirectService({
     env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
     createBusClient: () => ({
       createReceiver: () => {
         const id = ++receiverCreations;
         return {
-          receiveMessages: async (_maxMessages, options) => new Promise((_, reject) => {
-            options.abortSignal.addEventListener("abort", () => reject(options.abortSignal.reason), { once: true });
-          }),
+          receiveMessages: async () => new Promise(() => {}),
           async close() { closed.push(id); }
         };
       },
@@ -334,11 +401,42 @@ test("persistent service fails closed instead of recycling a second stalled rece
       close: async () => {}
     }),
     createProcessor: async () => ({ process: async () => ({}) }),
-    logger: () => {}
+    logger: () => {},
+    terminate: resolveTermination
   });
   await assert.rejects(result, /watchdog expired after receiver recycle/);
+  assert.equal(await termination, 1);
   assert.equal(receiverCreations, 2);
   assert.deepEqual(closed.sort(), [1, 2]);
+});
+
+test("persistent service hard-stops when a stalled receive link cannot close", async () => {
+  let receiverCreations = 0;
+  let resolveTermination;
+  const termination = new Promise((resolve) => { resolveTermination = resolve; });
+  const result = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
+    createBusClient: () => ({
+      createReceiver: () => {
+        receiverCreations += 1;
+        return {
+          receiveMessages: async () => new Promise(() => {}),
+          async close() { return new Promise(() => {}); }
+        };
+      },
+      async close() { return new Promise(() => {}); }
+    }),
+    createExecutor: async () => ({
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: () => {},
+    terminate: resolveTermination
+  });
+  await assert.rejects(result, /timed out closing stalled Service Bus receiver/);
+  assert.equal(await termination, 1);
+  assert.equal(receiverCreations, 1);
 });
 
 test("persistent service coalesces only duplicate market-token warmups", async () => {

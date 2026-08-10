@@ -196,7 +196,7 @@ jobs:
             "FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME",
             "FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY"
           ]) assert.ok(name in env, `${name} missing from funded executor`);
-          assert.match(JSON.stringify(env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED), /fundedDirectEnabled/);
+          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED, "false");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, "60000");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, "30");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, "350");
@@ -771,7 +771,7 @@ jobs:
           test "$(env_value FUNDED_DIRECT_POLL_INTERVAL_MS)" = "1000"
           test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
           test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "2000"
-          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "true"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "false"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS)" = "60000"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY)" = "30"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY)" = "350"
