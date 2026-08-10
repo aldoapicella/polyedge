@@ -1091,7 +1091,9 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           warmup_ready=false
-          for attempt in $(seq 1 36); do
+          # A fresh 15-minute market may be the first valid warmup after restart;
+          # include Log Analytics ingestion without weakening the live gates.
+          for attempt in $(seq 1 240); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
