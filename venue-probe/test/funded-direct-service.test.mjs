@@ -302,7 +302,7 @@ test("persistent service coalesces only duplicate market-token warmups", async (
   assert.deepEqual(bus.renewed.sort(), ["intent-first", "warmup-duplicate", "warmup-first", "warmup-other-token"]);
 });
 
-test("persistent service seals a fresh intent busy while the first child is delayed", async () => {
+test("persistent service leaves a fresh intent queued while the first child is active", async () => {
   const decisionTs = new Date(Date.now() - 500).toISOString();
   const bus = fakeBus(["first", "fresh"].map((messageId) => ({
     messageId,
@@ -315,6 +315,8 @@ test("persistent service seals a fresh intent busy while the first child is dela
   })));
   const processed = [];
   const logs = [];
+  let activeProcesses = 0;
+  let maxActiveProcesses = 0;
   let releaseFirst;
   let firstStarted;
   const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
@@ -330,80 +332,35 @@ test("persistent service seals a fresh intent busy while the first child is dela
     createProcessor: async () => ({
       process: async (handoff) => {
         processed.push(handoff.decision_id);
-        if (handoff.decision_id.startsWith("first")) {
-          firstStarted();
-          await new Promise((resolve) => { releaseFirst = resolve; });
+        activeProcesses += 1;
+        maxActiveProcesses = Math.max(maxActiveProcesses, activeProcesses);
+        try {
+          if (handoff.decision_id.startsWith("first")) {
+            firstStarted();
+            await new Promise((resolve) => { releaseFirst = resolve; });
+          }
+          return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+        } finally {
+          activeProcesses -= 1;
         }
-        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
       },
-      rejectBusy: async () => ({ status: "one_workflow_busy" })
+      rejectBusy: async () => assert.fail("fresh intents must remain in Service Bus while a workflow is active")
     }),
     logger: (value) => logs.push(value)
   });
   await firstStartedPromise;
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(bus.received, ["first", "fresh"]);
-  assert.deepEqual(bus.renewed.sort(), ["first", "fresh"]);
+  assert.deepEqual(bus.received, ["first"]);
+  assert.deepEqual(bus.completed, []);
+  assert.equal(maxActiveProcesses, 1);
   releaseFirst();
   const result = await resultPromise;
   assert.equal(result.processed_messages, 2, JSON.stringify(logs));
   assert.deepEqual(bus.received, ["first", "fresh"]);
-  assert.equal(processed.length, 1);
-});
-
-test("persistent service settles a twelve-intent burst with one actual workflow", async () => {
-  const decisionTs = new Date(Date.now() - 500).toISOString();
-  const messages = Array.from({ length: 12 }, (_, index) => {
-    const decisionId = index.toString(16).padStart(64, "0");
-    return {
-      messageId: `intent-${index}`,
-      deliveryCount: 1,
-      body: {
-        schema: "polyedge.funded_intent_handoff.v1",
-        decision_id: decisionId,
-        decision_ts: decisionTs
-      }
-    };
-  });
-  const bus = fakeBus(messages);
-  let releaseFirst;
-  let firstStarted;
-  const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
-  let executions = 0;
-  let busyRejections = 0;
-  const resultPromise = runPersistentFundedDirectService({
-    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "12" }),
-    createBusClient: () => bus.client,
-    createExecutor: async () => ({
-      warmMarket: async () => {}, execute: async () => {}, status: () => ({ ready: true }), close: async () => {}
-    }),
-    createProcessor: async () => ({
-      process: async () => {
-        executions += 1;
-        firstStarted();
-        await new Promise((resolve) => { releaseFirst = resolve; });
-        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
-      },
-      rejectBusy: async () => {
-        busyRejections += 1;
-        return { status: "one_workflow_busy" };
-      }
-    }),
-    logger: () => {}
-  });
-  await firstStartedPromise;
-  for (let attempt = 0; attempt < 40 && busyRejections < 11; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  assert.equal(executions, 1);
-  assert.equal(busyRejections, 11);
-  assert.equal(bus.received.length, 12);
-  assert.equal(bus.completed.length, 11);
-  releaseFirst();
-  const result = await resultPromise;
-  assert.equal(result.processed_messages, 12);
-  assert.equal(result.failed_messages, 0);
-  assert.equal(bus.completed.length, 12);
+  assert.deepEqual(bus.completed, ["first", "fresh"]);
+  assert.deepEqual(bus.renewed.sort(), ["first", "fresh"]);
+  assert.equal(processed.length, 2);
+  assert.equal(maxActiveProcesses, 1);
 });
 
 test("persistent service waits for the prior revision lease before receiving messages", async () => {
@@ -588,9 +545,9 @@ test("persistent service pauses after three consecutive transitions above three 
     logger: (value) => logs.push(value)
   });
   assert.equal(result.processed_messages, 3);
-  assert.equal(result.failed_messages, 1);
+  assert.equal(result.failed_messages, 0);
   assert.ok(logs.some((value) => value.status === "engine_paused_by_consecutive_latency_breaches"));
   assert.deepEqual(bus.completed, ["decision-0", "decision-1", "decision-2"]);
-  assert.deepEqual(bus.received, ["decision-0", "decision-1", "decision-2", "decision-3"]);
-  assert.deepEqual(bus.deadLettered, ["decision-3"]);
+  assert.deepEqual(bus.received, ["decision-0", "decision-1", "decision-2"]);
+  assert.deepEqual(bus.deadLettered, []);
 });
