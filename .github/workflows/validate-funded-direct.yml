@@ -870,8 +870,26 @@ jobs:
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query id -o tsv)
-          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Sender'] | length(@)" -o tsv)" = "1"
-          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Receiver'] | length(@)" -o tsv)" = "1"
+          expected_sender_principal=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query "identity.userAssignedIdentities.*.principalId | [0]" -o tsv)
+          expected_receiver_principal=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query "identity.userAssignedIdentities.*.principalId | [0]" -o tsv)
+          test -n "$expected_sender_principal"
+          test -n "$expected_receiver_principal"
+          az role assignment list --scope "$queue_id" \
+            --query "[?roleDefinitionName=='Azure Service Bus Data Sender'].principalId" \
+            -o json > service-bus-sender-principals.json
+          az role assignment list --scope "$queue_id" \
+            --query "[?roleDefinitionName=='Azure Service Bus Data Receiver'].principalId" \
+            -o json > service-bus-receiver-principals.json
+          jq -e --arg expected "$expected_sender_principal" \
+            'length == 1 and .[0] == $expected' service-bus-sender-principals.json
+          jq -e --arg expected "$expected_receiver_principal" \
+            'length == 1 and .[0] == $expected' service-bus-receiver-principals.json
 
       - name: Verify service startup and qset isolation
         run: |
