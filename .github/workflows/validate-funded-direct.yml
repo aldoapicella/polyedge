@@ -1145,7 +1145,7 @@ jobs:
             ([.[] | select(.properties.active == true)] | length) == 1
             and ([.[] | select(.properties.active == true)][0].name == $revision)
           ' producer-revisions-after-reopen.json
-          test "$(az containerapp show \
+          az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
             -o json | jq -e --arg revision "$producer_revision" \
