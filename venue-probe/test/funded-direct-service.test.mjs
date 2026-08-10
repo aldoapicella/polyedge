@@ -281,7 +281,8 @@ test("persistent service reconciles websocket risk before receiving another fund
         market_channel_ready: true,
         user_channel_gaps: 0,
         market_channel_gaps: reconciliationRequired ? 1 : 0,
-        reconnect_reconciliation_required: reconciliationRequired
+        reconnect_reconciliation_required: reconciliationRequired,
+        warmed_market: { condition_id: "condition" }
       }),
       close: async () => {}
     }),
@@ -298,6 +299,44 @@ test("persistent service reconciles websocket risk before receiving another fund
     value.account_risk_pause === true
   ));
   assert.ok(logs.some((value) => value.status === "websocket_reconciliation_completed"));
+});
+
+test("persistent service restarts before receiving if a channel gaps before first warmup", async () => {
+  const bus = fakeBus([{
+    messageId: "warmup-that-must-remain-queued",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  }]);
+  const logs = [];
+  await assert.rejects(runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      runMaintenance: async () => assert.fail("cold channel risk cannot be reconciled without a warmed market"),
+      status: () => ({
+        user_channel_ready: true,
+        market_channel_ready: false,
+        user_channel_gaps: 1,
+        market_channel_gaps: 0,
+        reconnect_reconciliation_required: true,
+        warmed_market: null
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  }), /websocket risk before first market warmup requires process restart/);
+
+  assert.equal(bus.receiveCalls.length, 0);
+  assert.ok(logs.some((value) =>
+    value.status === "websocket_reconciliation_restart_required" &&
+    value.account_risk_pause === true &&
+    value.missed_signal_risk === true
+  ));
 });
 
 test("persistent service recycles a receive link that outlives the one-second poll", async () => {
