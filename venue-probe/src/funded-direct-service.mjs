@@ -294,6 +294,16 @@ export async function runPersistentFundedDirectService({
     const before = executor.status();
     channelReconciliationPending ||= channelsRequireReconciliation(before);
     if (!channelReconciliationPending) return true;
+    if (!before.warmed_market) {
+      logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "websocket_reconciliation_restart_required",
+        account_risk_pause: true,
+        missed_signal_risk: true,
+        executor: before
+      });
+      throw new Error("fail closed: websocket risk before first market warmup requires process restart");
+    }
     try {
       await executor.runMaintenance(async () => null);
       const after = executor.status();
