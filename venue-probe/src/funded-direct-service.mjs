@@ -283,6 +283,41 @@ export async function runPersistentFundedDirectService({
       });
     }
   };
+  const channelsRequireReconciliation = (status) =>
+    status.reconnect_reconciliation_required === true ||
+    Number(status.user_channel_gaps || 0) > 0 ||
+    Number(status.market_channel_gaps || 0) > 0 ||
+    Number(status.user_channel_unparsed || 0) > 0 ||
+    Number(status.market_channel_unparsed || 0) > 0;
+  let channelReconciliationPending = false;
+  const reconcileChannelsIfRequired = async () => {
+    const before = executor.status();
+    channelReconciliationPending ||= channelsRequireReconciliation(before);
+    if (!channelReconciliationPending) return true;
+    try {
+      await executor.runMaintenance(async () => null);
+      const after = executor.status();
+      if (channelsRequireReconciliation(after)) {
+        throw new Error("fail closed: websocket reconciliation did not clear channel risk state");
+      }
+      channelReconciliationPending = false;
+      logger({
+        schema: "polyedge.funded_direct_service.v2",
+        status: "websocket_reconciliation_completed",
+        executor: after
+      });
+      return true;
+    } catch (error) {
+      logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "websocket_reconciliation_failed_closed",
+        account_risk_pause: true,
+        error: error.message,
+        executor: executor.status()
+      });
+      return false;
+    }
+  };
   const heartbeat = setInterval(() => {
     const executorStatus = executor.status();
     logger({
@@ -297,9 +332,7 @@ export async function runPersistentFundedDirectService({
       last_redemption_status: lastRedemptionStatus,
       executor: executorStatus
     });
-    if (executorStatus.reconnect_reconciliation_required ||
-        executorStatus.user_channel_gaps > 0 ||
-        executorStatus.market_channel_gaps > 0) {
+    if (channelsRequireReconciliation(executorStatus)) {
       logger({
         schema: "polyedge.funded_direct_alert.v1",
         status: "websocket_gap_or_reconciliation_required",
@@ -434,6 +467,10 @@ export async function runPersistentFundedDirectService({
       if (config.maxMessages > 0 && processedMessages + failedMessages >= config.maxMessages) {
         stopping = true;
         break;
+      }
+      if (!await reconcileChannelsIfRequired()) {
+        await sleep(config.riskPauseMs);
+        continue;
       }
       const receiveController = new AbortController();
       let receiveWatchdog;

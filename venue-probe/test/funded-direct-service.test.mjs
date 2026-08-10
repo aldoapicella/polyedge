@@ -240,6 +240,66 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
 });
 
+test("persistent service reconciles websocket risk before receiving another funded handoff", async () => {
+  const bus = fakeBus([{
+    messageId: "warmup-after-reconciliation",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  }]);
+  const order = [];
+  const sleeps = [];
+  const logs = [];
+  let reconciliationRequired = true;
+  let maintenanceAttempts = 0;
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({
+      createReceiver: () => ({
+        ...bus.client.createReceiver(),
+        async receiveMessages(...args) {
+          order.push("receive");
+          return bus.client.createReceiver().receiveMessages(...args);
+        }
+      }),
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => { order.push("warmup"); },
+      runMaintenance: async (task) => {
+        maintenanceAttempts += 1;
+        order.push(`reconcile-${maintenanceAttempts}`);
+        reconciliationRequired = false;
+        if (maintenanceAttempts === 1) throw new Error("transient post-reconciliation account snapshot failure");
+        return task({ lease: {} });
+      },
+      status: () => ({
+        user_channel_ready: true,
+        market_channel_ready: true,
+        user_channel_gaps: 0,
+        market_channel_gaps: reconciliationRequired ? 1 : 0,
+        reconnect_reconciliation_required: reconciliationRequired
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    sleep: async (ms) => { sleeps.push(ms); },
+    logger: (value) => logs.push(value)
+  });
+
+  assert.equal(result.processed_messages, 1);
+  assert.deepEqual(order, ["reconcile-1", "reconcile-2", "receive", "warmup"]);
+  assert.deepEqual(sleeps, [60_000]);
+  assert.ok(logs.some((value) =>
+    value.status === "websocket_reconciliation_failed_closed" &&
+    value.account_risk_pause === true
+  ));
+  assert.ok(logs.some((value) => value.status === "websocket_reconciliation_completed"));
+});
+
 test("persistent service recycles a receive link that outlives the one-second poll", async () => {
   const message = {
     messageId: "warmup-after-recycle",
