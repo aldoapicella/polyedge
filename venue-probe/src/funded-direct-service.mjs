@@ -11,7 +11,10 @@ import { sanitize } from "./lib.mjs";
 
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
 const FUNDED_LOCK_RENEWAL_MS = 10_000;
-const FUNDED_RECEIVE_WATCHDOG_GRACE_MS = 1_000;
+const FUNDED_RECEIVE_WATCHDOG_GRACE_MS = 500;
+const FUNDED_RECEIVE_LATE_SETTLEMENT_GRACE_MS = 50;
+const FUNDED_RECEIVE_CLOSE_GRACE_MS = 250;
+const FUNDED_RECEIVE_FORCE_EXIT_MS = 500;
 
 export function loadFundedDirectServiceConfig(env = process.env) {
   const config = {
@@ -165,15 +168,21 @@ export async function runPersistentFundedDirectService({
   runRedemption = runVenueRedemption,
   now = Date.now,
   sleep = delay,
+  terminate = (code) => process.exit(code),
   createBusClient = ({ namespace, credential }) =>
     new ServiceBusClient(`${namespace}.servicebus.windows.net`, credential)
 } = {}) {
   const config = loadFundedDirectServiceConfig(env);
   if (config.engine !== "persistent_v1") throw new Error("persistent funded service requires FUNDED_DIRECT_ENGINE=persistent_v1");
   const credential = new DefaultAzureCredential({ managedIdentityClientId: env.AZURE_CLIENT_ID });
-  const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
-  const createReceiver = () => bus.createReceiver(config.serviceBusQueue, { receiveMode: "peekLock" });
-  let receiver = createReceiver();
+  const createBusReceiver = () => {
+    const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
+    return {
+      bus,
+      receiver: bus.createReceiver(config.serviceBusQueue, { receiveMode: "peekLock" })
+    };
+  };
+  let { bus, receiver } = createBusReceiver();
   let receiverRecycled = false;
   let executor = null;
   let leaseHandoffAttempts = 0;
@@ -427,16 +436,24 @@ export async function runPersistentFundedDirectService({
         break;
       }
       const receiveController = new AbortController();
-      const receiveWatchdog = setTimeout(
-        () => receiveController.abort(),
-        config.pollIntervalMs + FUNDED_RECEIVE_WATCHDOG_GRACE_MS
-      );
+      let receiveWatchdog;
+      const receiveWatchdogExpired = new Promise((_, reject) => {
+        receiveWatchdog = setTimeout(() => {
+          receiveController.abort();
+          reject(new Error("fail closed: Service Bus receive watchdog expired"));
+        }, config.pollIntervalMs + FUNDED_RECEIVE_WATCHDOG_GRACE_MS);
+      });
       let messages;
+      let receivePromise;
       try {
-        messages = await receiver.receiveMessages(1, {
+        receivePromise = receiver.receiveMessages(1, {
           maxWaitTimeInMs: config.pollIntervalMs,
           abortSignal: receiveController.signal
         });
+        messages = await Promise.race([
+          receivePromise,
+          receiveWatchdogExpired
+        ]);
       } catch (error) {
         if (!receiveController.signal.aborted) throw error;
         logger({
@@ -445,16 +462,46 @@ export async function runPersistentFundedDirectService({
           queue: config.serviceBusQueue,
           watchdog_ms: config.pollIntervalMs + FUNDED_RECEIVE_WATCHDOG_GRACE_MS,
           missed_signal_risk: true,
-          process_restart_required: receiverRecycled,
+          recovery_action: receiverRecycled ? "process_restart" : "new_client_receiver",
           error: error.message
         });
         const staleReceiver = receiver;
+        const staleBus = bus;
         receiver = null;
-        void staleReceiver.close().catch(() => null);
-        if (receiverRecycled) {
-          throw new Error("fail closed: Service Bus receive watchdog expired after receiver recycle");
+        bus = null;
+        const lateReceiveCleanup = receivePromise.then(async (lateMessages) => {
+          try {
+            for (const message of lateMessages) await staleReceiver.abandonMessage(message);
+            if (lateMessages.length) logger({
+              schema: "polyedge.funded_direct_alert.v1",
+              status: "service_bus_late_receive_abandoned",
+              message_count: lateMessages.length
+            });
+          } catch (cleanupError) {
+            logger({
+              schema: "polyedge.funded_direct_alert.v1",
+              status: "service_bus_late_receive_cleanup_failed",
+              missed_signal_risk: true,
+              error: cleanupError.message
+            });
+          }
+        }, () => null);
+        await Promise.race([
+          lateReceiveCleanup,
+          delay(FUNDED_RECEIVE_LATE_SETTLEMENT_GRACE_MS)
+        ]);
+        const linkClosed = await Promise.race([
+          Promise.allSettled([staleReceiver.close(), staleBus.close()])
+            .then((results) => results.every(({ status }) => status === "fulfilled")),
+          delay(FUNDED_RECEIVE_CLOSE_GRACE_MS).then(() => false)
+        ]);
+        if (!linkClosed || receiverRecycled) {
+          setTimeout(() => terminate(1), FUNDED_RECEIVE_FORCE_EXIT_MS);
+          throw new Error(linkClosed
+            ? "fail closed: Service Bus receive watchdog expired after receiver recycle"
+            : "fail closed: timed out closing stalled Service Bus receiver");
         }
-        receiver = createReceiver();
+        ({ bus, receiver } = createBusReceiver());
         receiverRecycled = true;
         continue;
       } finally {
@@ -507,7 +554,7 @@ export async function runPersistentFundedDirectService({
     process.removeListener("SIGINT", stop);
     await executor.close().catch(() => null);
     await receiver?.close().catch(() => null);
-    await bus.close().catch(() => null);
+    await bus?.close().catch(() => null);
   }
 }
 
