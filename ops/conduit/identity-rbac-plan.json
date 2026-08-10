@@ -7,12 +7,10 @@
   "roles": {
     "blobContributor": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
     "blobReader": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
-    "tableContributor": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
-    "serviceBusReceiver": "4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0"
+    "tableContributor": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3"
   },
   "scopePrefixes": {
-    "storage": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/",
-    "serviceBus": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ServiceBus/namespaces/"
+    "storage": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/"
   },
   "lanes": {
     "api": {
@@ -67,11 +65,10 @@
         { "role": "blobContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence" },
         { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events" },
         { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models" },
-        { "role": "serviceBusReceiver", "scope": "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents" }
+        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models" }
       ],
       "negativeAssertions": [
-        "no Service Bus sender, qset, bot-events, table, storage-account, namespace, resource-group, or subscription role"
+        "no Service Bus sender or receiver, qset, bot-events, table, storage-account, namespace, resource-group, or subscription role"
       ]
     }
   },
