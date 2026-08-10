@@ -233,9 +233,112 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.deepEqual(bus.deadLettered, []);
   assert.equal(bus.receiveCalls.length, 2);
   assert.ok(bus.receiveCalls.every(({ maxMessages, options }) =>
-    maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
+    maxMessages === 1 &&
+    options?.maxWaitTimeInMs === 1_000 &&
+    options?.abortSignal instanceof AbortSignal
   ));
   assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
+});
+
+test("persistent service recycles a receive link that outlives the one-second poll", async () => {
+  const message = {
+    messageId: "warmup-after-recycle",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  };
+  const completed = [];
+  const closed = [];
+  const logs = [];
+  let receiverCreations = 0;
+  let stalledReceiveOptions;
+  const receiverMethods = {
+    async renewMessageLock() {},
+    async deadLetterMessage() {},
+    async abandonMessage() {}
+  };
+  const stalledReceiver = {
+    ...receiverMethods,
+    receiveMessages: async (_maxMessages, options) => {
+      stalledReceiveOptions = options;
+      return new Promise((_, reject) => {
+        options.abortSignal.addEventListener(
+          "abort",
+          () => reject(options.abortSignal.reason),
+          { once: true }
+        );
+      });
+    },
+    async completeMessage() {},
+    async close() { closed.push("stalled"); }
+  };
+  const healthyReceiver = {
+    ...receiverMethods,
+    async receiveMessages() { return [message]; },
+    async completeMessage(received) { completed.push(received.messageId); },
+    async close() { closed.push("healthy"); }
+  };
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
+    createBusClient: () => ({
+      createReceiver: () => receiverCreations++ === 0 ? stalledReceiver : healthyReceiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  });
+  assert.equal(result.processed_messages, 1);
+  assert.equal(receiverCreations, 2);
+  assert.equal(stalledReceiveOptions.maxWaitTimeInMs, 1_000);
+  assert.equal(stalledReceiveOptions.abortSignal.aborted, true);
+  assert.deepEqual(completed, ["warmup-after-recycle"]);
+  assert.deepEqual(closed.sort(), ["healthy", "stalled"]);
+  assert.ok(logs.some((value) =>
+    value.status === "service_bus_receive_watchdog_expired" &&
+    value.watchdog_ms === 2_000 &&
+    value.missed_signal_risk === true
+  ));
+});
+
+test("persistent service fails closed instead of recycling a second stalled receive link", async () => {
+  const closed = [];
+  let receiverCreations = 0;
+  const result = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
+    createBusClient: () => ({
+      createReceiver: () => {
+        const id = ++receiverCreations;
+        return {
+          receiveMessages: async (_maxMessages, options) => new Promise((_, reject) => {
+            options.abortSignal.addEventListener("abort", () => reject(options.abortSignal.reason), { once: true });
+          }),
+          async close() { closed.push(id); }
+        };
+      },
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: () => {}
+  });
+  await assert.rejects(result, /watchdog expired after receiver recycle/);
+  assert.equal(receiverCreations, 2);
+  assert.deepEqual(closed.sort(), [1, 2]);
 });
 
 test("persistent service coalesces only duplicate market-token warmups", async () => {
