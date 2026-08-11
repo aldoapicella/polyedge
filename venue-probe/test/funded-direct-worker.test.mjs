@@ -494,6 +494,27 @@ test("stale handoff is rejected before authorization and creates no reservation"
   assert.equal([...control.values.keys()].some((name) => name.includes("risk-reservations")), false);
 });
 
+test("worker reports when scan latency leaves less than the reviewed intent TTL", async () => {
+  const decisionClock = new Date("2026-07-27T12:00:00Z");
+  const observedClock = new Date(decisionClock.getTime() + 3_001);
+  const value = intent(decisionClock, "a".repeat(64));
+  const output = await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: {
+      control: new Container(),
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => observedClock,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("intent below the reviewed TTL must not execute")
+  });
+  assert.equal(output.status, "iteration_limit_reached");
+  assert.equal(output.intent_scan.rejections.remaining_ttl, 1);
+  assert.equal(output.intent_scan.last_rejection, "remaining_ttl");
+  assert.equal(output.intent_scan.last_remaining_ttl_ms, 5_999);
+  assert.equal(output.childInvocations, 0);
+});
+
 test("authorization that loses launch TTL is terminally sealed with no reservation", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "2".repeat(64));

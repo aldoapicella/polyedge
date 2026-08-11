@@ -117,12 +117,19 @@ export async function runFundedDirectWorker({
 
   let idleSince = null;
   let childInvocations = 0;
+  const intentScan = intentScanDiagnostics();
   for (let iteration = 1; iteration <= config.maxIterations; iteration += 1) {
-    const selected = await firstFreshIntent(clients, config, sessionDocument.value, clock());
+    const scan = await firstFreshIntent(clients, config, sessionDocument.value, clock());
+    mergeIntentScanDiagnostics(intentScan, scan.diagnostics);
+    const selected = scan.selected;
     if (!selected) {
       idleSince ??= clock().getTime();
       if (clock().getTime() - idleSince >= config.maxIdleMs) {
-        return result("idle_waiting_for_fresh_intent", config, { iteration, childInvocations });
+        return result("idle_waiting_for_fresh_intent", config, {
+          iteration,
+          childInvocations,
+          intent_scan: intentScan
+        });
       }
       await sleep(config.pollIntervalMs);
       continue;
@@ -148,7 +155,11 @@ export async function runFundedDirectWorker({
     childInvocations = executed.childInvocations;
     if (executed.result) return executed.result;
   }
-  return result("iteration_limit_reached", config, { iteration: config.maxIterations, childInvocations });
+  return result("iteration_limit_reached", config, {
+    iteration: config.maxIterations,
+    childInvocations,
+    intent_scan: intentScan
+  });
 }
 
 export async function createFundedDirectProcessor({
@@ -639,6 +650,8 @@ function validateSession(config) {
 
 async function firstFreshIntent(clients, config, session, now) {
   const candidates = [];
+  const diagnostics = intentScanDiagnostics();
+  diagnostics.scans = 1;
   let currentSessionCandidates = 0;
   const sessionStartMs = Date.parse(session.created_at);
   const freshBlobFloorMs = now.getTime() - MAX_INTENT_TTL_MS;
@@ -649,20 +662,32 @@ async function firstFreshIntent(clients, config, session, now) {
     if (Number.isFinite(createdMs) && createdMs < freshBlobFloorMs) continue;
     currentSessionCandidates += 1;
     if (currentSessionCandidates > 10_000) throw new Error("fail closed: operator-funded session exceeded the bounded intent scan");
+    diagnostics.candidate_blobs += 1;
     const response = await clients.intents.getBlobClient(blob.name).download();
     const bytes = await streamToBuffer(response.readableStreamBody);
     let value;
-    try { value = JSON.parse(bytes.toString("utf8")); } catch { continue; }
-    if (!qualifies(value, blob.name, sha256(bytes), config, session, now)) continue;
+    try { value = JSON.parse(bytes.toString("utf8")); }
+    catch {
+      recordIntentRejection(diagnostics, "invalid_json");
+      continue;
+    }
+    const rejection = qualificationRejection(value, blob.name, sha256(bytes), config, session, now);
+    if (rejection) {
+      recordIntentRejection(diagnostics, rejection, Date.parse(value.valid_until) - now.getTime());
+      continue;
+    }
     const authorizationName = authorizationBlobName(config, session, value);
-    if (await clients.control.getBlobClient(authorizationName).exists()) continue;
+    if (await clients.control.getBlobClient(authorizationName).exists()) {
+      recordIntentRejection(diagnostics, "existing_grant", Date.parse(value.valid_until) - now.getTime());
+      continue;
+    }
     candidates.push({ value, blobName: blob.name, hash: sha256(bytes), decisionMs: Date.parse(value.decision_ts) });
   }
   candidates.sort((left, right) => right.decisionMs - left.decisionMs || left.blobName.localeCompare(right.blobName));
-  return candidates[0] || null;
+  return { selected: candidates[0] || null, diagnostics };
 }
 
-function qualifies(intent, blobName, intentHash, config, session, now) {
+function qualificationRejection(intent, blobName, intentHash, config, session, now) {
   const decisionMs = Date.parse(intent?.decision_ts);
   const validUntilMs = Date.parse(intent?.valid_until);
   const venueExpiryMs = Date.parse(intent?.gtd_expiry_ts);
@@ -675,37 +700,34 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
   const notional = Number(intent?.notional);
   const feeAllowance = Number(intent?.fee_allowance);
   const reservedNotional = notional + shares * feeAllowance;
-  return intent?.schema === "polyedge.execution_intent.v1"
+  if (!(intent?.schema === "polyedge.execution_intent.v1"
     && /^[0-9a-f]{64}$/.test(String(intent?.decision_id || ""))
     && blobName === `${config.intentPrefix}/${intent.decision_id}.json`
-    && hash(intentHash)
-    && intent.candidate_name === config.candidate
+    && hash(intentHash))) return "schema_binding";
+  if (!(intent.candidate_name === config.candidate
     && intent.candidate_version === config.candidateVersion
-    && hash(intent.candidate_config_hash) === config.candidateConfigHash
-    && intent.required_fill_model_version === session.execution_model.model_version
+    && hash(intent.candidate_config_hash) === config.candidateConfigHash)) return "strategy_binding";
+  if (!(intent.required_fill_model_version === session.execution_model.model_version
     && intent.execution_model_blob_uri === session.execution_model.blob_uri
-    && hash(intent.execution_model_sha256) === hash(session.execution_model.sha256)
-    && intent.resolution_source === config.requiredResolutionSource
+    && hash(intent.execution_model_sha256) === hash(session.execution_model.sha256))) return "model_binding";
+  if (!(intent.resolution_source === config.requiredResolutionSource
     && intent.exact_resolution_source === true
     && String(intent.side).toUpperCase() === "BUY"
     && intent.post_only === true
-    && intent.order_kind === "post_only_gtd"
-    && Number.isFinite(decisionMs)
-    && decisionMs >= sessionStartMs
-    && decisionMs <= nowMs
-    && Number.isFinite(validUntilMs)
-    && validUntilMs - nowMs >= config.minRemainingTtlMs
-    && validUntilMs <= sessionExpiryMs
+    && intent.order_kind === "post_only_gtd")) return "execution_policy";
+  if (!(Number.isFinite(decisionMs) && decisionMs >= sessionStartMs && decisionMs <= nowMs)) return "decision_time";
+  if (!(Number.isFinite(validUntilMs) && validUntilMs - nowMs >= config.minRemainingTtlMs)) return "remaining_ttl";
+  if (!(validUntilMs <= sessionExpiryMs
     && Number.isFinite(venueExpiryMs)
     && venueExpiryMs === validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS
-    && Number.isFinite(marketEndMs)
-    && marketEndMs - decisionMs >= config.minimumSecondsToExpiry * 1_000
-    && marketEndMs - decisionMs <= config.maximumSecondsToExpiry * 1_000
-    && venueExpiryMs < marketEndMs
     && Number(intent.ttl_ms) > 0
     && Number(intent.ttl_ms) <= MAX_INTENT_TTL_MS
-    && validUntilMs === decisionMs + Number(intent.ttl_ms)
-    && Number.isFinite(price)
+    && validUntilMs === decisionMs + Number(intent.ttl_ms))) return "expiry_binding";
+  if (!(Number.isFinite(marketEndMs)
+    && marketEndMs - decisionMs >= config.minimumSecondsToExpiry * 1_000
+    && marketEndMs - decisionMs <= config.maximumSecondsToExpiry * 1_000
+    && venueExpiryMs < marketEndMs)) return "market_window";
+  if (!(Number.isFinite(price)
     && Number.isFinite(shares)
     && Number.isFinite(notional)
     && Number.isFinite(feeAllowance)
@@ -715,9 +737,56 @@ function qualifies(intent, blobName, intentHash, config, session, now) {
     && reservedNotional >= config.targetOrderNotional - 0.01 - 1e-9
     && reservedNotional <= config.targetOrderNotional + 1e-9
     && notional <= config.maxOrderNotional
-    && Math.abs(price * shares - notional) <= 1e-9
-    && shares >= Number(intent.minimum_order_size)
-    && Number(intent.net_edge_lower_bound) > 0;
+    && Math.abs(price * shares - notional) <= 1e-9)) return "reserved_notional";
+  if (!(shares >= Number(intent.minimum_order_size))) return "minimum_size";
+  if (!(Number(intent.net_edge_lower_bound) > 0)) return "net_edge";
+  return null;
+}
+
+function qualifies(intent, blobName, intentHash, config, session, now) {
+  return qualificationRejection(intent, blobName, intentHash, config, session, now) === null;
+}
+
+function intentScanDiagnostics() {
+  return {
+    scans: 0,
+    candidate_blobs: 0,
+    rejections: {
+      invalid_json: 0,
+      schema_binding: 0,
+      strategy_binding: 0,
+      model_binding: 0,
+      execution_policy: 0,
+      decision_time: 0,
+      remaining_ttl: 0,
+      expiry_binding: 0,
+      market_window: 0,
+      reserved_notional: 0,
+      minimum_size: 0,
+      net_edge: 0,
+      existing_grant: 0
+    },
+    last_rejection: null,
+    last_remaining_ttl_ms: null
+  };
+}
+
+function recordIntentRejection(diagnostics, code, remainingTtlMs = null) {
+  diagnostics.rejections[code] += 1;
+  diagnostics.last_rejection = code;
+  diagnostics.last_remaining_ttl_ms = Number.isFinite(remainingTtlMs)
+    ? Math.max(-MAX_INTENT_TTL_MS, Math.min(MAX_INTENT_TTL_MS, Math.trunc(remainingTtlMs)))
+    : null;
+}
+
+function mergeIntentScanDiagnostics(target, source) {
+  target.scans += source.scans;
+  target.candidate_blobs += source.candidate_blobs;
+  for (const [code, count] of Object.entries(source.rejections)) target.rejections[code] += count;
+  if (source.last_rejection) {
+    target.last_rejection = source.last_rejection;
+    target.last_remaining_ttl_ms = source.last_remaining_ttl_ms;
+  }
 }
 
 function buildAuthorization(config, sessionDocument, intent, childRunId, now) {
