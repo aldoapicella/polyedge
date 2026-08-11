@@ -88,27 +88,38 @@ The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
 The current formal parity window starts at the clean recorder boundary
-`2026-08-09T21:00:00Z` and cannot complete before
-`2026-08-12T21:00:00Z` or before two successful OCI daily cycles. Its
+`2026-08-11T06:00:00Z` and cannot complete before
+`2026-08-14T06:00:00Z` or before two successful OCI daily cycles. Its
 root-owned ledger is
-`/srv/polyedge-ring/parity/20260809T210000Z.json`; it must retain
+`/srv/polyedge-ring/parity/20260811T060000Z.json`; it must retain
 `azureDeletionAllowed:false` until the remaining parity, reboot, qset, and
-funded gates pass. The preceding `20260809T141000Z.json` ledger retained five
-accepted hours, then rejected hour `2026-08-09T20:00:00Z` after Azure replaced
-the `polyedge-dev--parityfix1` replica at `20:57:24Z`. Azure produced 61 valid
-runtime-provenance observations with two in minute `20:57`; OCI produced the
-required 60. The rejection is retained at
-`/srv/polyedge-ring/parity/hourly/20260809T20/rejection.json`, and no continuity
-credit carried into the replacement window. The OCI API recorder remains pinned to
-`sha256:20b695cb710d3da0ad5125e809aa4e029b5aa4f2a75c36f40dd9d905e553d713`
-from source `f7ecc30b2aaaeec5ad50b84bf5f548e33cae8e22`; all seven primary research
-jobs are pinned to
-`sha256:5a41caacf389ba63c34c121d9afb633e675b4b68cd5100e1e5c9137ad46e0f58`
-from source `bd6fc4a22de7f3276b67e51db60a5df2d3ca3373`. The primary-job rollback
-snapshot is `/etc/polyedge/rollback/20260809T135058Z-primary-jobs`; a bounded
-freshness rollback to the previous digest and forward recovery to the final
-digest both passed before the window. Qset remains disabled and the funded
-signer remains masked.
+funded gates pass. It supersedes the retained `20260810T220000Z.json` ledger
+with no continuity credit because the prior collector accepted primary batches
+through shadow-role semantics and did not require stable code/config identity
+or bounded observation gaps.
+
+The OCI API and all seven primary research jobs are pinned to multi-architecture
+digest
+`sha256:6edd4587144a1ad8e5758111187e8a5b59098babd69259fd6417c0231d17cd01`
+from source `802281cff4e24706dfc6bc029b9979387716a20e`. Publication run
+`31454857110` and PR validation run `31454151207` passed, including the ARM64
+child image. Rollback state is retained in
+`/etc/polyedge/rollback/20260811T044800Z-strict-primary` and
+`/etc/polyedge/rollback/20260811T044922Z-polyedge-api.container`.
+
+Before the window, scheduled freshness runs were healthy with no warnings or
+critical findings. The `05:12` scheduled hourly audit processed 1,609,080
+events for hour `04` with zero duplicates or malformed lines. The strict
+collector retained that evidence at
+`/srv/polyedge-ring/parity/hourly/20260811T04/evidence.json` as
+`excluded_pre_window`, advanced no continuity credit, and left the ledger at
+zero accepted hours. At `06:00`, the API and frontend were healthy with zero
+restarts, the ring had zero closed-unsealed or unuploaded segments and about
+115 GiB free, and the boot filesystem had about 47 GiB free against its
+15-GiB floor. Freshness, hourly, and parity timers are enabled. Daily and replay
+remain disabled until the authoritative Azure daily execution reaches a
+terminal success and releases the shared lease. Qset remains disabled and the
+local funded signer remains masked.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
