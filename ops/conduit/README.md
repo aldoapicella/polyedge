@@ -108,18 +108,23 @@ child image. Rollback state is retained in
 `/etc/polyedge/rollback/20260811T044922Z-polyedge-api.container`.
 
 Before the window, scheduled freshness runs were healthy with no warnings or
-critical findings. The `05:12` scheduled hourly audit processed 1,609,080
-events for hour `04` with zero duplicates or malformed lines. The strict
-collector retained that evidence at
+critical findings. The strict collector retained hour `04` at
 `/srv/polyedge-ring/parity/hourly/20260811T04/evidence.json` as
-`excluded_pre_window`, advanced no continuity credit, and left the ledger at
-zero accepted hours. At `06:00`, the API and frontend were healthy with zero
-restarts, the ring had zero closed-unsealed or unuploaded segments and about
-115 GiB free, and the boot filesystem had about 47 GiB free against its
-15-GiB floor. Freshness, hourly, and parity timers are enabled. Daily and replay
-remain disabled until the authoritative Azure daily execution reaches a
-terminal success and releases the shared lease. Qset remains disabled and the
-local funded signer remains masked.
+`excluded_pre_window` and advanced no continuity credit. The first formal hour,
+`06:00` through `07:00`, is accepted at
+`/srv/polyedge-ring/parity/hourly/20260811T06/evidence.json`: all six local
+source/archive/manifest/receipt chains verified, the same-input Azure and OCI
+result hashes matched exactly across 1,736,689 events, the ring had zero
+closed-unsealed or unuploaded segments, and the boot filesystem retained about
+49.5 GB free against its 15-GiB floor. The initial collector invocation exposed
+an Azure hourly-job image drift that falsely rejected primary-role strategy
+batches; only `polyedge-hourly-quality-job` was repinned to the proven digest
+above, its bounded rerun succeeded, and the unchanged fail-closed collector
+then accepted the hour. The ledger now has one accepted clean hour while Azure
+remains authoritative and deletion remains disabled. Daily and replay remain
+disabled until the authoritative Azure daily execution reaches terminal
+success and releases the shared lease. Qset remains disabled and the local
+funded signer remains masked.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
