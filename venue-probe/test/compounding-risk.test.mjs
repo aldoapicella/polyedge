@@ -118,14 +118,33 @@ function lossResizingManifest() {
   return value;
 }
 
-function seedPriorState(container) {
+function lossTolerantManifest() {
+  const value = lossResizingManifest();
+  value.session_id = "dynamic-quote-funded-test-v8";
+  value.starting_collateral = 31.655501;
+  value.capital_policy = {
+    ...value.capital_policy,
+    reserve_ratio: 0.1,
+    minimum_reserve: 2,
+    target_order_ratio: 0.05,
+    minimum_historical_high_water_equity: 31.655501,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v8/capital-reserve-state.json"
+  };
+  return value;
+}
+
+function seedPriorState(container, {
+  highWater = 17.90462,
+  protectedReserve = 5.371386
+} = {}) {
   const name =
     "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json";
   container.values.set(name, Buffer.from(JSON.stringify({
     schema: "polyedge.protected_compounding_state.v1",
     session_id: "dynamic-quote-funded-test-v5",
-    high_water_equity: 17.90462,
-    protected_reserve: 5.371386,
+    high_water_equity: highWater,
+    protected_reserve: protectedReserve,
     reconciliation_complete: true,
     reserve_monotonic: true
   })));
@@ -491,6 +510,81 @@ test("loss resizing still fails closed below the venue and policy minimum", asyn
   });
   assert.equal(sizing.executable, false);
   assert.ok(sizing.blockers.includes("protected_order_below_policy_minimum"));
+});
+
+test("loss-tolerant sizing uses a 10% current-equity reserve and minimum orders after losses", async () => {
+  const container = new Container();
+  seedPriorState(container, {
+    highWater: 31.655501,
+    protectedReserve: 9.49665
+  });
+  const fundedManifest = lossTolerantManifest();
+  const policy = validateProtectedCompoundingManifest(fundedManifest);
+  assert.equal(policy.reserveRatio, 0.1);
+  assert.equal(policy.minimumReserve, 2);
+  assert.equal(policy.targetOrderRatio, 0.05);
+
+  const initial = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 31.655501,
+    fullyReconciled: true
+  });
+  assert.equal(initial.protected_reserve, 3.16555);
+  assert.equal(initial.operating_buffer, 0.316555);
+  assert.equal(initial.operable_capital, 28.173396);
+
+  const input = {
+    price: 0.3224734,
+    requestedShares: 20,
+    requestedNotional: 6.449468,
+    minimumOrderSize: 5,
+    maximumOrderNotional: 10.5,
+    feePerShare: 0.017052
+  };
+  const initialSizing = sizeProtectedOrder({
+    state: initial,
+    accountEquity: 31.655501,
+    ...input
+  });
+  assert.equal(initialSizing.executable, true);
+  assert.equal(initialSizing.shares, 5);
+  assert.equal(initialSizing.notional, 1.612367);
+  assert.equal(initialSizing.fee_risk_upper_bound, 0.08526);
+  assert.equal(initialSizing.reserved_notional, 1.697627);
+  assert.equal(initialSizing.order_risk_budget, 1.697627);
+
+  const afterLoss = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 5,
+    fullyReconciled: true
+  });
+  const afterLossSizing = sizeProtectedOrder({
+    state: afterLoss,
+    accountEquity: 5,
+    ...input
+  });
+  assert.equal(afterLoss.high_water_equity, 31.655501);
+  assert.equal(afterLoss.protected_reserve, 2);
+  assert.equal(afterLoss.continue_after_loss, true);
+  assert.equal(afterLossSizing.executable, true);
+  assert.equal(afterLossSizing.shares, 5);
+  assert.equal(afterLossSizing.reserved_notional, 1.697627);
+
+  const insolvent = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 3.6,
+    fullyReconciled: true
+  });
+  const insolventSizing = sizeProtectedOrder({
+    state: insolvent,
+    accountEquity: 3.6,
+    ...input
+  });
+  assert.equal(insolventSizing.executable, false);
+  assert.ok(insolventSizing.blockers.includes("protected_order_below_venue_minimum"));
 });
 
 test("loss resizing refuses a missing predecessor or incompatible cached state", async () => {

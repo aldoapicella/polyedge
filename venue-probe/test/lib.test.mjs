@@ -271,6 +271,56 @@ test("protected compounding uses current equity only above the monotonic reserve
   assert.equal(risk.projected_equity, 5.44722);
 });
 
+test("loss-tolerant protected capital keeps trading through drawdown but preserves hard blockers", () => {
+  const input = {
+    control: {
+      campaign_id: "dynamic-quote-funded-loss-tolerant",
+      baseline_equity: 31.655501,
+      equity_floor: 30,
+      max_campaign_drawdown: 1,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 0,
+      cash_flow_ids: []
+    },
+    liquidCollateral: 5,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    proposedNotional: 1.697627,
+    orderNotional: 1.612367,
+    authorizedStartingCollateral: 31.655501,
+    requireZeroExternalCashFlows: true,
+    protectedCompoundingState: {
+      high_water_equity: 31.655501,
+      protected_reserve: 2,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      minimum_reserve: 2,
+      target_order_ratio: 0.05,
+      authorized_equity_ceiling: 31.655501,
+      continue_after_loss: true,
+      reserve_monotonic: false
+    }
+  };
+  const risk = summarizeCampaignRisk(input);
+  assert.equal(risk.passed, true);
+  assert.equal(risk.loss_tolerant, true);
+  assert.equal(risk.minimum_reserve, 2);
+  assert.equal(risk.target_order_ratio, 0.05);
+  assert.equal(risk.blockers.includes("equity_floor_breached"), false);
+  assert.equal(risk.blockers.includes("campaign_drawdown_exhausted"), false);
+  assert.equal(risk.blockers.includes("projected_equity_floor_breach"), false);
+  assert.equal(risk.blockers.includes("projected_campaign_drawdown_breach"), false);
+
+  const unresolved = summarizeCampaignRisk({
+    ...input,
+    unresolvedReservationCount: 1
+  });
+  assert.equal(unresolved.passed, false);
+  assert.ok(unresolved.blockers.includes("unresolved_risk_reservation"));
+});
+
 test("one unresolved position is tolerated for reconciliation but blocks another submission", () => {
   const control = {
     campaign_id: "funded-campaign-2026-07-12",

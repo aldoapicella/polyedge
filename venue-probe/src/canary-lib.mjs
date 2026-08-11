@@ -444,6 +444,9 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       const operableCapital = Number(runtime.risk?.operable_capital);
       const reserveRatio = Number(manifest.capital_policy?.reserve_ratio);
       const operatingBufferRatio = Number(manifest.capital_policy?.operating_buffer_ratio);
+      const minimumReserve = Number(manifest.capital_policy?.minimum_reserve || 0);
+      const targetOrderRatio = Number(manifest.capital_policy?.target_order_ratio || 0);
+      const lossTolerant = targetOrderRatio > 0;
       const lossResizingEnabled =
         manifest.schema_version === OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA;
       const reserveReconciled = lossResizingEnabled
@@ -457,13 +460,35 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
           && Number(runtime.risk?.historical_high_water_equity) + 1e-9 >=
             Number(manifest.capital_policy?.minimum_historical_high_water_equity)
           && Math.abs(lastReconciledEquity - riskEquity) <= 0.0000011
-          && Math.abs(protectedReserve - lastReconciledEquity * reserveRatio) <= 0.0000011
+          && Math.abs(
+            protectedReserve - Math.max(minimumReserve, lastReconciledEquity * reserveRatio)
+          ) <= 0.0000011
         : protectedReserve + 0.0000011 >= highWater * reserveRatio;
       const expectedFeeRisk = actualShares * polymarketV2FeePerShare(
         price,
         runtime.feeRate,
         runtime.feeExponent
       );
+      const minimumOrderSize = Number(
+        runtime.book?.min_order_size ?? runtime.book?.minOrderSize
+      );
+      const policyMinimumShares = Math.ceil(
+        ((Number(manifest.capital_policy.minimum_order_notional) / price) - 1e-12) * 100
+      ) / 100;
+      const minimumExecutableShares = Math.max(
+        Math.ceil((minimumOrderSize - 1e-12) * 100) / 100,
+        policyMinimumShares
+      );
+      const expectedOrderRiskBudget = lossTolerant
+        ? Math.max(
+            minimumExecutableShares * (price + polymarketV2FeePerShare(
+              price,
+              runtime.feeRate,
+              runtime.feeExponent
+            )),
+            riskEquity * targetOrderRatio
+          )
+        : null;
       if (runtime.risk?.allow_compounding !== true
           || runtime.risk?.no_compounding !== false
           || sizing?.schema !== "polyedge.protected_order_sizing.v1"
@@ -478,6 +503,16 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
           || actualNotional > notional + 1e-9
           || Math.abs(actualNotional - price * actualShares) > 0.0000011
           || actualNotional + 1e-9 < Number(manifest.capital_policy.minimum_order_notional)
+          || (lossTolerant
+            && (Number(runtime.risk?.minimum_reserve) !== minimumReserve
+              || Number(runtime.risk?.target_order_ratio) !== targetOrderRatio
+              || runtime.risk?.loss_tolerant !== true
+              || Number(sizing?.target_order_ratio) !== targetOrderRatio
+              || Math.abs(Number(sizing?.minimum_executable_shares) -
+                minimumExecutableShares) > 0.0000011
+              || Math.abs(Number(sizing?.order_risk_budget) -
+                expectedOrderRiskBudget) > 0.0000011
+              || actualReserved > expectedOrderRiskBudget + 0.0000011))
           || Math.abs(actualFeeRisk - expectedFeeRisk) > 0.0000011
           || Math.abs(actualReserved - actualNotional - actualFeeRisk) > 0.0000011
           || Number(runtime.risk?.order_notional) !== actualNotional

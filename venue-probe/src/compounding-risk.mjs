@@ -7,6 +7,9 @@ const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
 const MONOTONIC_RESERVE_BASIS = "fully_reconciled_high_water_equity";
 const CURRENT_EQUITY_RESERVE_BASIS = "fully_reconciled_current_equity";
 const LOSS_RESIZE_POLICY = "resize_from_fully_reconciled_current_equity";
+const LOSS_TOLERANT_RESERVE_RATIO = 0.1;
+const LOSS_TOLERANT_MINIMUM_RESERVE = 2;
+const LOSS_TOLERANT_TARGET_ORDER_RATIO = 0.05;
 const MANUAL_SETTLEMENT_TYPE = "internal_manual_settlement";
 const AUTOMATIC_SETTLEMENT_TYPE = "internal_automatic_settlement";
 const RESOLVED_LOSS_TYPE = "internal_resolved_loss";
@@ -29,6 +32,9 @@ export function validateProtectedCompoundingManifest(manifest) {
     : [];
   const errors = [];
   const currentEquityPolicy = manifest?.schema_version === SESSION_SCHEMA_V3;
+  const lossTolerantPolicy = currentEquityPolicy
+    && (policy?.minimum_reserve !== undefined
+      || policy?.target_order_ratio !== undefined);
   if (manifest?.schema_version !== undefined
       && ![SESSION_SCHEMA_V2, SESSION_SCHEMA_V3].includes(manifest?.schema_version)) {
     errors.push("schema_version must be a protected capital session schema");
@@ -64,7 +70,19 @@ export function validateProtectedCompoundingManifest(manifest) {
   if (policy?.high_water_update !== "full_reconciliation_only") {
     errors.push("capital_policy.high_water_update must equal full_reconciliation_only");
   }
-  if (Number(policy?.reserve_ratio) !== 0.3) errors.push("capital_policy.reserve_ratio must equal 0.3");
+  if (lossTolerantPolicy) {
+    if (Number(policy?.reserve_ratio) !== LOSS_TOLERANT_RESERVE_RATIO) {
+      errors.push(`capital_policy.reserve_ratio must equal ${LOSS_TOLERANT_RESERVE_RATIO}`);
+    }
+    if (Number(policy?.minimum_reserve) !== LOSS_TOLERANT_MINIMUM_RESERVE) {
+      errors.push(`capital_policy.minimum_reserve must equal ${LOSS_TOLERANT_MINIMUM_RESERVE}`);
+    }
+    if (Number(policy?.target_order_ratio) !== LOSS_TOLERANT_TARGET_ORDER_RATIO) {
+      errors.push(`capital_policy.target_order_ratio must equal ${LOSS_TOLERANT_TARGET_ORDER_RATIO}`);
+    }
+  } else if (Number(policy?.reserve_ratio) !== 0.3) {
+    errors.push("capital_policy.reserve_ratio must equal 0.3");
+  }
   if (Number(policy?.operating_buffer_ratio) !== 0.01) {
     errors.push("capital_policy.operating_buffer_ratio must equal 0.01");
   }
@@ -97,6 +115,10 @@ export function validateProtectedCompoundingManifest(manifest) {
     minimumHistoricalHighWaterEquity: currentEquityPolicy
       ? Number(policy.minimum_historical_high_water_equity)
       : null,
+    ...(lossTolerantPolicy ? {
+      minimumReserve: LOSS_TOLERANT_MINIMUM_RESERVE,
+      targetOrderRatio: LOSS_TOLERANT_TARGET_ORDER_RATIO
+    } : {}),
     stateBlobName: String(policy.state_blob_name),
     internalSettlements: settlements
   };
@@ -605,7 +627,7 @@ export async function reconcileProtectedCompoundingState({
     ));
     const protectedReserve = policy.reserveMonotonic
       ? money(Math.max(Number(prior?.protected_reserve || 0), highWater * policy.reserveRatio))
-      : money(equity * policy.reserveRatio);
+      : money(Math.max(Number(policy.minimumReserve || 0), equity * policy.reserveRatio));
     const operatingBuffer = money(equity * policy.operatingBufferRatio);
     const operableCapital = money(Math.max(0, equity - protectedReserve - operatingBuffer));
     const value = {
@@ -630,6 +652,10 @@ export async function reconcileProtectedCompoundingState({
       loss_response: policy.lossResponse,
       continue_after_loss: !policy.reserveMonotonic,
       reserve_monotonic: policy.reserveMonotonic,
+      ...(policy.targetOrderRatio === undefined ? {} : {
+        minimum_reserve: policy.minimumReserve,
+        target_order_ratio: policy.targetOrderRatio
+      }),
       ...migrationCheckpoint(prior),
       created_at: prior?.created_at || now().toISOString(),
       updated_at: now().toISOString()
@@ -981,10 +1007,16 @@ export function protectedCapitalSnapshot({ state, accountEquity, proposedNotiona
   const protectedReserve = money(state?.protected_reserve);
   const bufferRatio = Number(state?.operating_buffer_ratio);
   const minimumOrderNotional = Number(state?.minimum_order_notional);
+  const minimumReserve = Number(state?.minimum_reserve ?? 0);
+  const targetOrderRatio = state?.target_order_ratio === undefined
+    ? null
+    : Number(state.target_order_ratio);
   if (!(highWater >= 0)
       || !(protectedReserve >= 0)
       || !(bufferRatio >= 0 && bufferRatio < 1)
-      || !(minimumOrderNotional > 0)) {
+      || !(minimumOrderNotional > 0)
+      || !(minimumReserve >= 0)
+      || !(targetOrderRatio === null || (targetOrderRatio > 0 && targetOrderRatio < 1))) {
     throw new Error("fail closed: protected compounding state is invalid");
   }
   const operatingBuffer = money(equity * bufferRatio);
@@ -1004,6 +1036,8 @@ export function protectedCapitalSnapshot({ state, accountEquity, proposedNotiona
     operating_buffer: operatingBuffer,
     operable_capital: operableCapital,
     minimum_order_notional: minimumOrderNotional,
+    minimum_reserve: minimumReserve,
+    target_order_ratio: targetOrderRatio,
     authorized_equity_ceiling: money(state?.authorized_equity_ceiling),
     historical_high_water_equity: state?.historical_high_water_equity === undefined
       ? highWater
@@ -1046,10 +1080,24 @@ export function sizeProtectedOrder({
       || !(fee >= 0)) {
     throw new Error("fail closed: protected order sizing input is invalid");
   }
+  const policyMinimumShares = Math.ceil(
+    ((capital.minimum_order_notional / p) - 1e-12) * SIZE_SCALE
+  ) / SIZE_SCALE;
+  const minimumExecutableShares = Math.max(
+    Math.ceil((venueMinimum - 1e-12) * SIZE_SCALE) / SIZE_SCALE,
+    policyMinimumShares
+  );
+  const orderRiskBudget = capital.target_order_ratio === null
+    ? Number.POSITIVE_INFINITY
+    : money(Math.max(
+        minimumExecutableShares * (p + fee),
+        Number(accountEquity) * capital.target_order_ratio
+      ));
   const affordableShares = Math.min(
     sourceShares,
     maxPrincipal / p,
-    capital.operable_capital / (p + fee)
+    capital.operable_capital / (p + fee),
+    orderRiskBudget / (p + fee)
   );
   const shares = Math.floor((affordableShares + 1e-12) * SIZE_SCALE) / SIZE_SCALE;
   const notional = money(shares * p);
@@ -1078,6 +1126,9 @@ export function sizeProtectedOrder({
     reserved_notional: reservedNotional,
     venue_minimum_order_size: venueMinimum,
     policy_minimum_order_notional: capital.minimum_order_notional,
+    minimum_executable_shares: minimumExecutableShares,
+    target_order_ratio: capital.target_order_ratio,
+    order_risk_budget: Number.isFinite(orderRiskBudget) ? orderRiskBudget : null,
     operable_capital: capital.operable_capital,
     protected_reserve: capital.protected_reserve,
     blockers: [...new Set(blockers)]
@@ -1274,6 +1325,11 @@ function assertCompatibleState(state, manifest, policy) {
       || Number(state.reserve_ratio) !== policy.reserveRatio
       || Number(state.operating_buffer_ratio) !== policy.operatingBufferRatio
       || Number(state.minimum_order_notional) !== policy.minimumOrderNotional
+      || (policy.targetOrderRatio !== undefined
+        && (Number(state.minimum_reserve) !== policy.minimumReserve
+          || Number(state.target_order_ratio) !== policy.targetOrderRatio))
+      || (policy.targetOrderRatio === undefined
+        && (state.minimum_reserve !== undefined || state.target_order_ratio !== undefined))
       || state.reserve_basis !== policy.reserveBasis
       || state.reserve_monotonic !== policy.reserveMonotonic
       || state.continue_after_loss !== !policy.reserveMonotonic
@@ -1294,6 +1350,8 @@ function sameCapitalState(left, right) {
     "reserve_ratio",
     "operating_buffer_ratio",
     "minimum_order_notional",
+    "minimum_reserve",
+    "target_order_ratio",
     "high_water_equity",
     "protected_reserve",
     "last_reconciled_equity",

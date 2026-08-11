@@ -228,6 +228,7 @@ export function summarizeCampaignRisk({
         proposedNotional
       })
     : null;
+  const lossTolerant = Number(protectedCapital?.target_order_ratio) > 0;
   const quarantinedProfit = protectedCapital ? 0 : Math.max(
     0,
     number(profitQuarantineSnapshot?.quarantined_internal_profit, 0)
@@ -278,11 +279,19 @@ export function summarizeCampaignRisk({
   if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
   if (Number(unresolvedPositionCount) > 1) blockers.push("unresolved_position_limit_exceeded");
   if (reserved > 0 && Number(unresolvedPositionCount) > 0) blockers.push("existing_unresolved_position_blocks_submission");
-  if (riskEligibleEquity + 1e-9 < equityFloor) blockers.push("equity_floor_breached");
-  if (campaignDrawdown > maximumDrawdown + 1e-9) blockers.push("campaign_drawdown_exhausted");
+  if (!lossTolerant && riskEligibleEquity + 1e-9 < equityFloor) {
+    blockers.push("equity_floor_breached");
+  }
+  if (!lossTolerant && campaignDrawdown > maximumDrawdown + 1e-9) {
+    blockers.push("campaign_drawdown_exhausted");
+  }
   if (principal > number(control?.max_order_notional, 1) + 1e-9) blockers.push("order_notional_limit_exceeded");
-  if (projectedEquity + 1e-9 < equityFloor) blockers.push("projected_equity_floor_breach");
-  if (projectedDrawdown > maximumDrawdown + 1e-9) blockers.push("projected_campaign_drawdown_breach");
+  if (!lossTolerant && projectedEquity + 1e-9 < equityFloor) {
+    blockers.push("projected_equity_floor_breach");
+  }
+  if (!lossTolerant && projectedDrawdown > maximumDrawdown + 1e-9) {
+    blockers.push("projected_campaign_drawdown_breach");
+  }
   return {
     schema_version: 1,
     campaign_id: control?.campaign_id || null,
@@ -323,6 +332,9 @@ export function summarizeCampaignRisk({
     operating_buffer: protectedCapital?.operating_buffer ?? null,
     operable_capital: protectedCapital?.operable_capital ?? null,
     minimum_order_notional: protectedCapital?.minimum_order_notional ?? null,
+    minimum_reserve: protectedCapital?.minimum_reserve ?? null,
+    target_order_ratio: protectedCapital?.target_order_ratio ?? null,
+    loss_tolerant: lossTolerant,
     equity_floor: roundMoney(equityFloor),
     max_campaign_drawdown: roundMoney(maximumDrawdown),
     liquid_collateral: roundMoney(liquid),
