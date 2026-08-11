@@ -2144,10 +2144,20 @@ impl AzureBlobClient {
             };
             match response {
                 Ok(response) => return Ok(response),
-                Err(ureq::Error::Status(status, _)) => {
+                Err(ureq::Error::Status(status, response)) => {
                     if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
                         thread::sleep(retry_delay(attempt));
                         continue;
+                    }
+                    if status == 403 {
+                        return Err(AzureBlobError::HttpStatusDetail {
+                            status,
+                            detail: format!(
+                                "GET x-ms-error-code={} x-ms-request-id={}",
+                                safe_azure_response_header(&response, "x-ms-error-code"),
+                                safe_azure_response_header(&response, "x-ms-request-id")
+                            ),
+                        });
                     }
                     return Err(AzureBlobError::HttpStatus(status));
                 }
@@ -3548,14 +3558,14 @@ mod tests {
     }
 
     #[test]
-    fn immutable_blob_put_retains_safe_forbidden_headers_when_follow_up_read_fails() {
+    fn immutable_blob_existing_read_retains_safe_forbidden_headers() {
         use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for _ in 0..2 {
+            for status in ["412 Precondition Failed", "403 Forbidden"] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 loop {
@@ -3567,29 +3577,31 @@ mod tests {
                 }
                 write!(
                     stream,
-                    "HTTP/1.1 403 Forbidden\r\n\
-                     x-ms-error-code: AuthorizationPermissionMismatch\r\n\
-                     x-ms-request-id: 11111111-2222-3333-4444-555555555555\r\n\
-                     Content-Length: 11\r\nConnection: close\r\n\r\nsecret-body"
+                    "HTTP/1.1 {status}\r\n{}Content-Length: 11\r\n\
+                     Connection: close\r\n\r\nsecret-body",
+                    if status.starts_with("403") {
+                        "x-ms-error-code: AuthorizationPermissionMismatch\r\n\
+                         x-ms-request-id: 11111111-2222-3333-4444-555555555555\r\n"
+                    } else {
+                        ""
+                    }
                 )
                 .unwrap();
             }
         });
 
         let mut client = AzureBlobClient::new("unused", "unused", "test=sas");
-        let error = client
-            .put_block_blob_if_absent(
-                &format!("http://{address}/immutable"),
-                b"intent",
-                "application/json",
-                None,
-            )
-            .unwrap_err();
+        let url = format!("http://{address}/immutable");
+        let result = client
+            .put_block_blob_if_absent(&url, b"intent", "application/json", None)
+            .unwrap();
+        assert_eq!(result, ImmutableBlobWrite::AlreadyExists);
+        let error = client.get_bytes_with_retry(&url).unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains("x-ms-error-code=AuthorizationPermissionMismatch"));
         assert!(message.contains("x-ms-request-id=11111111-2222-3333-4444-555555555555"));
-        assert!(message.contains("follow-up GET HTTP 403"));
+        assert!(message.contains("GET x-ms-error-code"));
         assert!(!message.contains("secret-body"));
         server.join().unwrap();
     }
