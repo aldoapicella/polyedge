@@ -840,7 +840,7 @@ jobs:
                 and .preflight_only == true
                 and .writes_performed == false
                 and .order_submission_attempted == false
-                and .authorization_created == false
+                and .execution_grant_created == false
                 and .risk_reservation_created == false
                 and .completion_created == false
                 and .session_manifest_blob_name == ($session_blob + "session.json")

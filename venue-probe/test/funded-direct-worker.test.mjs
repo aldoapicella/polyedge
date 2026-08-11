@@ -403,7 +403,7 @@ test("pure preflight validates embedded session, predecessor, and fresh intent w
   assert.equal(output.preflight_only, true);
   assert.equal(output.writes_performed, false);
   assert.equal(output.order_submission_attempted, false);
-  assert.equal(output.authorization_created, false);
+  assert.equal(output.execution_grant_created, false);
   assert.equal(output.risk_reservation_created, false);
   assert.equal(output.completion_created, false);
   assert.equal(output.session_manifest_blob_name, targetSessionName);
