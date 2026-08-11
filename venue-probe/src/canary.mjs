@@ -915,12 +915,21 @@ async function main(resources) {
     intentDocument.value,
     manifestDocument.value
   );
+  const snapshotObservedAt = Date.now();
+  if (cachedRuntime) {
+    console.log(JSON.stringify(fundedCapitalSnapshotRecord(
+      runtime,
+      intentDocument.value,
+      manifestDocument.value,
+      { source: "persistent_safety_cache", nowMs: snapshotObservedAt }
+    )));
+  }
   ledger.record(cachedRuntime ? "funded_safety_snapshot_cache_hit" : "funded_safety_snapshot_cache_miss", {
-    wall_ms: Date.now(),
+    wall_ms: snapshotObservedAt,
     monotonic_ms: performance.now(),
     decision_id: intentDocument.value.decision_id,
     snapshot_completed_wall_ms: runtime.capturedCompletedWallMs,
-    snapshot_age_ms: Date.now() - Number(runtime.capturedCompletedWallMs),
+    snapshot_age_ms: snapshotObservedAt - Number(runtime.capturedCompletedWallMs),
     component_durations_ms: runtime.preflightComponentDurationsMs || null
   });
   const documents = {
@@ -1310,26 +1319,7 @@ async function capturePreflight(
     client
   }, intent, manifest);
   if (recordLedger) {
-    console.log(JSON.stringify(sanitize({
-      schema: "polyedge.funded_capital_snapshot.v1",
-      session_id: manifest?.session_id || null,
-      decision_id: intent.decision_id,
-      account_equity: boundRuntime.risk.account_equity,
-      historical_high_water_equity: boundRuntime.risk.historical_high_water_equity,
-      protected_reserve: boundRuntime.risk.protected_reserve,
-      operating_buffer: boundRuntime.risk.operating_buffer,
-      operable_capital: boundRuntime.risk.operable_capital,
-      reserve_basis: boundRuntime.risk.reserve_basis,
-      continue_after_loss: boundRuntime.risk.continue_after_loss,
-      proposed_notional: boundRuntime.risk.proposed_notional,
-      order_notional: boundRuntime.risk.order_notional,
-      risk_passed: boundRuntime.risk.passed === true,
-      blockers: boundRuntime.risk.blockers,
-      open_order_count: boundRuntime.risk.open_order_count,
-      unresolved_position_count: boundRuntime.risk.unresolved_position_count,
-      unresolved_risk_reservation_count:
-        boundRuntime.risk.unresolved_risk_reservation_count
-    })));
+    console.log(JSON.stringify(fundedCapitalSnapshotRecord(boundRuntime, intent, manifest)));
     ledger?.record("funded_safety_snapshot_completed", {
       wall_ms: capturedCompletedWallMs,
       monotonic_ms: performance.now(),
@@ -1345,6 +1335,36 @@ async function capturePreflight(
     });
   }
   return boundRuntime;
+}
+
+export function fundedCapitalSnapshotRecord(runtime, intent, manifest, {
+  source = "live_preflight",
+  nowMs = Date.now()
+} = {}) {
+  const completedWallMs = Number(runtime.capturedCompletedWallMs);
+  return sanitize({
+    schema: "polyedge.funded_capital_snapshot.v1",
+    session_id: manifest?.session_id || null,
+    decision_id: intent.decision_id,
+    snapshot_source: source,
+    snapshot_completed_wall_ms: completedWallMs,
+    snapshot_age_ms: Math.max(0, nowMs - completedWallMs),
+    account_equity: runtime.risk.account_equity,
+    historical_high_water_equity: runtime.risk.historical_high_water_equity,
+    protected_reserve: runtime.risk.protected_reserve,
+    operating_buffer: runtime.risk.operating_buffer,
+    operable_capital: runtime.risk.operable_capital,
+    reserve_basis: runtime.risk.reserve_basis,
+    continue_after_loss: runtime.risk.continue_after_loss,
+    proposed_notional: runtime.risk.proposed_notional,
+    order_notional: runtime.risk.order_notional,
+    risk_passed: runtime.risk.passed === true,
+    blockers: runtime.risk.blockers,
+    open_order_count: runtime.risk.open_order_count,
+    unresolved_position_count: runtime.risk.unresolved_position_count,
+    unresolved_risk_reservation_count:
+      runtime.risk.unresolved_risk_reservation_count
+  });
 }
 
 function bindIntentSizingAndRisk(runtime, intent, manifest) {

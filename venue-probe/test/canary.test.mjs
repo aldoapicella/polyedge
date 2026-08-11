@@ -19,6 +19,7 @@ import {
   assertPersistentIntentRemainingTtl,
   decodePayoutRedemptions,
   decodeSettlementReceiptEvidence,
+  fundedCapitalSnapshotRecord,
   initializeProtectedCompounding,
   loadAccountPositions,
   loadSettlementActivity,
@@ -562,7 +563,22 @@ test("Polygon receipt decoder preserves the exact CTF-to-pUSD adapter chain", ()
 test("persistent executor selects only a fresh exact-market safety snapshot", () => {
   const runtime = {
     capturedCompletedWallMs: 10_000,
-    risk: { passed: true },
+    risk: {
+      passed: true,
+      account_equity: 5,
+      historical_high_water_equity: 102.78112,
+      protected_reserve: 2,
+      operating_buffer: 0.05,
+      operable_capital: 2.95,
+      reserve_basis: "fully_reconciled_current_equity",
+      continue_after_loss: true,
+      proposed_notional: 1.7,
+      order_notional: 1.65,
+      blockers: [],
+      open_order_count: 0,
+      unresolved_position_count: 0,
+      unresolved_risk_reservation_count: 0
+    },
     exactResolutionSource: false,
     resolutionSource: null
   };
@@ -580,13 +596,42 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
     market_id: "market-1",
     condition_id: "condition-1",
     token_id: "token-up",
+    decision_id: "decision-1",
     exact_resolution_source: true,
     resolution_source: "chainlink_reference"
   };
-  assert.deepEqual(selectFreshCachedSafetySnapshot(resources, intent, 10_600), {
+  const selected = selectFreshCachedSafetySnapshot(resources, intent, 10_600);
+  assert.deepEqual(selected, {
     ...runtime,
     exactResolutionSource: true,
     resolutionSource: "chainlink_reference"
+  });
+  assert.deepEqual(fundedCapitalSnapshotRecord(
+    selected,
+    intent,
+    { session_id: "session-v8" },
+    { source: "persistent_safety_cache", nowMs: 10_600 }
+  ), {
+    schema: "polyedge.funded_capital_snapshot.v1",
+    session_id: "session-v8",
+    decision_id: "decision-1",
+    snapshot_source: "persistent_safety_cache",
+    snapshot_completed_wall_ms: 10_000,
+    snapshot_age_ms: 600,
+    account_equity: 5,
+    historical_high_water_equity: 102.78112,
+    protected_reserve: 2,
+    operating_buffer: 0.05,
+    operable_capital: 2.95,
+    reserve_basis: "fully_reconciled_current_equity",
+    continue_after_loss: true,
+    proposed_notional: 1.7,
+    order_notional: 1.65,
+    risk_passed: true,
+    blockers: [],
+    open_order_count: 0,
+    unresolved_position_count: 0,
+    unresolved_risk_reservation_count: 0
   });
   assert.equal(selectFreshCachedSafetySnapshot(resources, intent, 10_651), null);
   assert.equal(
