@@ -123,7 +123,29 @@ if [ ! -r "$credential_dir/azure-federated-token" ]; then
 fi
 
 case "$job" in
-  hourly|daily|replay)
+  daily)
+    : "${POLYEDGE_LOCAL_RAW_ROOT:?set POLYEDGE_LOCAL_RAW_ROOT to /input/events}"
+    test "$POLYEDGE_LOCAL_RAW_ROOT" = /input/events || {
+      echo 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' >&2
+      exit 64
+    }
+    POLYEDGE_RESEARCH_DATE=${POLYEDGE_RESEARCH_DATE:-$(date -u -d yesterday +%Y-%m-%d)}
+    printf '%s' "$POLYEDGE_RESEARCH_DATE" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || {
+      echo 'POLYEDGE_RESEARCH_DATE must be a canonical YYYY-MM-DD date' >&2
+      exit 64
+    }
+    research_date_epoch=$(date -u -d "$POLYEDGE_RESEARCH_DATE 00:00:00Z" +%s) || {
+      echo 'POLYEDGE_RESEARCH_DATE is invalid' >&2
+      exit 64
+    }
+    test "$(date -u -d "@$research_date_epoch" +%Y-%m-%d)" = "$POLYEDGE_RESEARCH_DATE" || {
+      echo 'POLYEDGE_RESEARCH_DATE must be a canonical YYYY-MM-DD date' >&2
+      exit 64
+    }
+    export POLYEDGE_RESEARCH_DATE
+    set -- --volume "$ring/segments:/input/events:ro,Z" --env POLYEDGE_RESEARCH_DATE
+    ;;
+  hourly|replay)
     : "${POLYEDGE_LOCAL_RAW_ROOT:?set POLYEDGE_LOCAL_RAW_ROOT to /input/events}"
     test "$POLYEDGE_LOCAL_RAW_ROOT" = /input/events || {
       echo 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' >&2
@@ -152,4 +174,8 @@ case "$job" in
     set -- /usr/bin/flock -w 129600 /run/polyedge/research.lock "$@"
     ;;
 esac
+if [ "$job" = daily ]; then
+  "$@"
+  exec /usr/local/libexec/polyedge-parity-record-daily "$POLYEDGE_RESEARCH_DATE"
+fi
 exec "$@"

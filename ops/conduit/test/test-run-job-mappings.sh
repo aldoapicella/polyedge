@@ -19,6 +19,12 @@ grep -F 'POLYEDGE_LOCAL_RAW_ROOT%/}/$DAY/$HOUR/' "$runner" >/dev/null
 grep -F 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' "$runner" >/dev/null
 grep -F 'POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH must equal true for primary OCI jobs' "$runner" >/dev/null
 grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z"' "$runner" >/dev/null
+grep -F 'POLYEDGE_RESEARCH_DATE=${POLYEDGE_RESEARCH_DATE:-$(date -u -d yesterday +%Y-%m-%d)}' "$runner" >/dev/null
+grep -F "grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'" "$runner" >/dev/null
+grep -F 'date -u -d "$POLYEDGE_RESEARCH_DATE 00:00:00Z" +%s' "$runner" >/dev/null
+grep -F 'date -u -d "@$research_date_epoch" +%Y-%m-%d' "$runner" >/dev/null
+grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z" --env POLYEDGE_RESEARCH_DATE' "$runner" >/dev/null
+grep -F 'exec /usr/local/libexec/polyedge-parity-record-daily "$POLYEDGE_RESEARCH_DATE"' "$runner" >/dev/null
 test "$(grep -c 'cpus=1.5 memory=' "$runner")" -eq 3
 grep -F '*) work=$ring/jobs/research credential=research ;;' "$runner" >/dev/null
 grep -F 'shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;' "$runner" >/dev/null

@@ -1,0 +1,283 @@
+#!/bin/sh
+set -eu
+
+die() { echo "polyedge-parity-record-daily: $*" >&2; exit 1; }
+sha_raw() { sha256sum "$1" | awk '{print $1}'; }
+sha() { printf 'sha256:%s\n' "$(sha_raw "$1")"; }
+
+expected_uid=${POLYEDGE_PARITY_EXPECTED_UID:-0}
+expected_gid=${POLYEDGE_PARITY_EXPECTED_GID:-0}
+secure_file() {
+  file=$1
+  [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c %h "$file")" = 1 ] || die "unsafe or missing file: $file"
+}
+secure_owned_file() {
+  file=$1 mode=$2
+  secure_file "$file"
+  set -- $(stat -c '%u %g %a' "$file")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] \
+    || die "wrong owner or mode: $file"
+}
+secure_dir() {
+  dir=$1
+  [ ! -L "$dir" ] && [ -d "$dir" ] || die "unsafe or missing directory: $dir"
+  set -- $(stat -c '%u %g %a' "$dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die "wrong directory owner: $dir"
+  case "$3" in 700|750|755) ;; *) die "unsafe directory mode: $dir" ;; esac
+}
+
+env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+secure_owned_file "$env_file" 640
+set -a
+. "$env_file"
+set +a
+
+lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
+lock_ledger() {
+  lock_dir=${lock_file%/*}
+  secure_dir "$lock_dir"
+  if [ ! -e "$lock_file" ]; then
+    (umask 027; : >"$lock_file")
+  fi
+  secure_owned_file "$lock_file" 640
+  exec 9<>"$lock_file"
+  /usr/bin/flock -w 300 9 || die 'timed out waiting for the parity ledger lock'
+}
+
+: "${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}"
+: "${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}"
+: "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}"
+: "${POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE:?set the approved formal-window image digest}"
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'expected source commit is malformed'
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+  || die 'expected research image is malformed'
+[ "${POLYEDGE_RESEARCH_IMAGE:-}" = "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" ] || die 'daily job image differs from the formal-window image'
+target=${1:?usage: polyedge-parity-record-daily YYYY-MM-DD}
+printf '%s' "$target" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die 'cycle date is malformed'
+target_epoch=$(date -u -d "$target 00:00:00Z" +%s) || die 'cycle date is invalid'
+[ "$(date -u -d "@$target_epoch" +%Y-%m-%d)" = "$target" ] || die 'cycle date is not canonical UTC'
+window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
+[ "$(date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$POLYEDGE_PARITY_WINDOW_START_UTC" ] \
+  || die 'formal window start is not canonical UTC'
+first_date=$(date -u -d "@$window_epoch" +%Y-%m-%d)
+first_epoch=$(date -u -d "$first_date 00:00:00Z" +%s)
+[ "$target_epoch" -ge "$first_epoch" ] || die 'cycle date predates the formal window'
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+daily_root=$parity_root/daily
+report_root=${POLYEDGE_PARITY_DAILY_REPORT_ROOT:-$ring/jobs/research/reports/research/daily}
+normalized_root=${POLYEDGE_PARITY_DAILY_DATA_ROOT:-$ring/jobs/research/data/research/daily}
+ring_status=${POLYEDGE_PARITY_RING_STATUS:-$ring/status.json}
+boot_root=${POLYEDGE_PARITY_BOOT_ROOT:-/}
+boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
+ring_floor=${POLYEDGE_JOB_MIN_FREE_BYTES:-42949672960}
+pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
+
+mountpoint -q "$ring" || die 'ring root is not a mount point'
+ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
+ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
+[ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
+  || die 'formal ledger must be a direct .json child of the parity root'
+secure_owned_file "$POLYEDGE_PARITY_LEDGER" 640
+validate_ledger() {
+  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+    .schemaVersion == 1 and .status == "in_progress" and .windowStartUtc == $start and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedHourlyEvidence? // []) | type == "array") and
+    ((.completedDailyCycles? // 0) | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedDailyEvidence? // []) | type == "array") and
+    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == false
+  ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+}
+validate_ledger
+
+[ ! -e "$pause_file" ] || die 'image pulls are paused'
+boot_available=$(df -P -B1 "$boot_root" | awk 'NR == 2 {print $4}')
+ring_available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
+[ "$boot_available" -ge "$boot_floor" ] || die 'boot disk is below the parity floor'
+[ "$ring_available" -ge "$ring_floor" ] || die 'ring is below the job floor'
+secure_owned_file "$ring_status" 640
+jq -e '.capacity_ok == true and .free_ok == true and .upload_fresh == true and .unsealed_closed_count == 0 and .unuploaded_count == 0' \
+  "$ring_status" >/dev/null || die 'ring is unhealthy'
+
+date_dir=$report_root/$target
+latest=$date_dir/latest.json
+secure_dir "$report_root"
+secure_dir "$date_dir"
+secure_file "$latest"
+run_id=$(jq -er '.run_id | select(type == "string")' "$latest") || die 'daily pointer has no run ID'
+printf '%s' "$run_id" | grep -Eq "^daily-$target-[0-9]{8}T[0-9]{6}Z$" || die 'daily run ID is malformed'
+manifest_rel="runs/$run_id/run_manifest.json"
+jq -e --arg date "$target" --arg run "$run_id" --arg path "$manifest_rel" '
+  .schema_version == 1 and .date == $date and .run_id == $run and .manifest_path == $path and
+  (.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+  (.promoted_at | type == "string" and length > 0)
+' "$latest" >/dev/null || die 'daily pointer is malformed'
+manifest=$date_dir/$manifest_rel
+bundle_dir=${manifest%/*}
+secure_dir "$date_dir/runs"
+secure_dir "$bundle_dir"
+secure_file "$manifest"
+[ "$(sha_raw "$manifest")" = "$(jq -r '.manifest_sha256' "$latest")" ] || die 'daily manifest hash mismatch'
+jq -e --arg date "$target" --arg run "$run_id" --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" '
+  def complete: ((type == "string" or type == "number") and (tonumber >= 0.95));
+  def decimal_or_null: (. == null or ((type == "string" or type == "number") and (try tonumber catch null) != null));
+  def complete_or_na($value; $applicable): if $applicable == false then $value == null else ($value | complete) end;
+  .schema_version == 2 and .runtime_role == "primary" and .date == $date and .run_id == $run and
+  .status == "COMPLETE" and .git_sha == $expected_git and
+  (.completed_at | type == "string" and length > 0) and
+  (.input_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+  (.artifacts | type == "object" and length > 0) and
+  (["baseline_json","calibration_json","data_audit_json","execution_quality_json","final_report_json","markets_summary_json","raw_data_audit_json","regimes_json","sample_size_json"] - (.artifacts | keys) | length == 0) and
+  ([.artifacts[].relative_path] | length == (unique | length)) and
+  all(.artifacts | to_entries[];
+    .key == .value.name and
+    (.value.name | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) and
+    (.value.relative_path | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+    (.value.sha256 | test("^[0-9a-f]{64}$")) and
+    (.value.bytes | type == "number" and . >= 0 and floor == .)) and
+  .data_quality.registry_version == "research-data-quality-v5" and
+  (.data_quality.total_events | type == "number" and . > 0 and floor == .) and
+  (.data_quality.decision_grade_coverage | complete) and
+  (.data_quality.coverage_breakdown.start_price_capture_rate | complete) and
+  (.data_quality.coverage_breakdown.settlement_rate | complete) and
+  (.data_quality.coverage_breakdown.exact_reference_hour_coverage | complete) and
+  (.data_quality.coverage_breakdown.decision_metadata_coverage | complete) and
+  (.data_quality.coverage_breakdown.decision_grade_coverage | complete) and
+  (.data_quality.coverage_breakdown.final_decision_grade_coverage | complete) and
+  (.data_quality.coverage_breakdown.execution_field_coverage | complete) and
+  (.data_quality.coverage_breakdown.decision_parity_rate | tonumber) == 1 and
+  (.data_quality.coverage_breakdown.queue_snapshot_coverage | decimal_or_null) and
+  (.data_quality.coverage_breakdown.queue_snapshot_applicable == null or (.data_quality.coverage_breakdown.queue_snapshot_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.queue_position_applicable == null or (.data_quality.coverage_breakdown.queue_position_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.markout_1s_applicable == null or (.data_quality.coverage_breakdown.markout_1s_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.markout_5s_applicable == null or (.data_quality.coverage_breakdown.markout_5s_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.markout_30s_applicable == null or (.data_quality.coverage_breakdown.markout_30s_applicable | type == "boolean")) and
+  complete_or_na(.data_quality.coverage_breakdown.queue_position_coverage; .data_quality.coverage_breakdown.queue_position_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.markout_1s_completion; .data_quality.coverage_breakdown.markout_1s_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.markout_5s_completion; .data_quality.coverage_breakdown.markout_5s_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.markout_30s_completion; .data_quality.coverage_breakdown.markout_30s_applicable) and
+  (.data_quality.fatal_issues | type == "array" and all(.[]; type == "string") and length == 0) and
+  .data_quality.event_time_ordering_restored == true and
+  (.data_quality.out_of_order_events | type == "number" and . >= 0 and floor == .) and
+  ((.data_quality.out_of_order_events / .data_quality.total_events) <= 0.0001) and
+  (.data_quality.warnings | type == "array" and all(.[];
+    (.message | type == "string") and (.rule_id | type == "string") and
+    .severity == "informational" and (.known | type == "boolean")))
+' "$manifest" >/dev/null || die 'daily manifest is incomplete or malformed'
+completed_at=$(jq -r '.completed_at' "$manifest")
+completed_epoch=$(date -u -d "$completed_at" +%s) || die 'daily completion timestamp is invalid'
+[ "$completed_epoch" -ge "$window_epoch" ] || die 'daily run completed before the formal window'
+git_sha=$(jq -r '.git_sha' "$manifest")
+input_sha=$(jq -r '.input_sha256' "$manifest")
+artifact_count=$(jq '.artifacts | length' "$manifest")
+jq -r '.artifacts | to_entries[] | [.value.relative_path,.value.sha256,(.value.bytes|tostring)] | @tsv' "$manifest" |
+while IFS="$(printf '\t')" read -r relative expected_sha expected_bytes; do
+  artifact=$bundle_dir/$relative
+  secure_file "$artifact"
+  [ "$(stat -c %s "$artifact")" = "$expected_bytes" ] || die "daily artifact size mismatch: $relative"
+  [ "$(sha_raw "$artifact")" = "$expected_sha" ] || die "daily artifact hash mismatch: $relative"
+done
+
+marker=$normalized_root/$target/normalized/.polyedge-daily-complete.json
+secure_dir "$normalized_root"
+secure_dir "$normalized_root/$target"
+secure_dir "$normalized_root/$target/normalized"
+secure_file "$marker"
+jq -e --arg date "$target" --arg git "$git_sha" --arg input "$input_sha" '
+  .schema_version == 1 and .date == $date and .git_sha == $git and .events_manifest_sha256 == $input
+' "$marker" >/dev/null || die 'normalized completion marker disagrees with the daily manifest'
+
+secure_dir "$parity_root"
+install -d -m 0750 "$daily_root" "$daily_root/$target"
+secure_dir "$daily_root"
+secure_dir "$daily_root/$target"
+evidence=$daily_root/$target/evidence.json
+lock_ledger
+validate_ledger
+if [ -e "$evidence" ]; then
+  secure_owned_file "$evidence" 640
+  jq -e --arg date "$target" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg latest "$latest" --arg latest_sha "$(sha "$latest")" --arg manifest "$manifest" --arg manifest_sha "$(sha "$manifest")" \
+    --arg marker "$marker" --arg marker_sha "$(sha "$marker")" \
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg expected_image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" '
+    .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
+    .cycleDate == $date and .windowStartUtc == $window and .ledgerPath == $ledger and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .gitSha == $expected_git and .researchImage == $expected_image and
+    .dailyBundle.latest.path == $latest and .dailyBundle.latest.sha256 == $latest_sha and
+    .dailyBundle.manifest.path == $manifest and .dailyBundle.manifest.sha256 == $manifest_sha and
+    .normalizedCompletion.path == $marker and .normalizedCompletion.sha256 == $marker_sha
+  ' "$evidence" >/dev/null \
+    || die 'existing daily evidence is invalid or changed'
+else
+  tmp=$(mktemp "$daily_root/$target/.evidence.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+    --arg date "$target" --arg completed "$completed_at" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg run "$run_id" --arg git "$git_sha" --arg image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" --arg input "$input_sha" \
+    --arg latest "$latest" --arg latest_sha "$(sha "$latest")" --arg manifest "$manifest" --arg manifest_sha "$(sha "$manifest")" \
+    --arg marker "$marker" --arg marker_sha "$(sha "$marker")" --argjson artifacts "$artifact_count" \
+    --argjson boot "$boot_available" --argjson boot_floor "$boot_floor" --argjson ring "$ring_available" --argjson ring_floor "$ring_floor" \
+    '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,cycleDate:$date,completedAtUtc:$completed,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,runId:$run,gitSha:$git,researchImage:$image,inputSha256:$input,artifactCount:$artifacts,dailyBundle:{latest:{path:$latest,sha256:$latest_sha},manifest:{path:$manifest,sha256:$manifest_sha}},normalizedCompletion:{path:$marker,sha256:$marker_sha},disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring,ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}}' >"$tmp"
+  chmod 0640 "$tmp"
+  sync -f "$tmp"
+  mv "$tmp" "$evidence"
+  trap - EXIT HUP INT TERM
+fi
+
+refs_tmp=$(mktemp "$daily_root/.refs.XXXXXX")
+trap 'rm -f "$refs_tmp"' EXIT HUP INT TERM
+: >"$refs_tmp"
+find "$daily_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | while IFS= read -r file; do
+  secure_owned_file "$file" 640
+  evidence_window=$(jq -r '.windowStartUtc // ""' "$file")
+  evidence_ledger=$(jq -r '.ledgerPath // ""' "$file")
+  if [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] || [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ]; then
+    [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] && [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ] \
+      || die "accepted daily evidence has mixed parity provenance: $file"
+    continue
+  fi
+  date_value=$(jq -r '.cycleDate' "$file")
+  epoch=$(date -u -d "$date_value 00:00:00Z" +%s) || die "invalid accepted daily date: $file"
+  [ "$(date -u -d "@$epoch" +%Y-%m-%d)" = "$date_value" ] || die "non-canonical accepted daily date: $file"
+  [ "$file" = "$daily_root/$date_value/evidence.json" ] || die "accepted daily evidence is stored under the wrong date: $file"
+  jq -e --arg git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" \
+    '.schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and .azureAuthoritative == true and .azureDeletionAllowed == false and .gitSha == $git and .researchImage == $image' "$file" >/dev/null \
+    || die "accepted daily evidence failed its invariant: $file"
+  [ "$epoch" -le "$target_epoch" ] || continue
+  jq -nc --argjson epoch "$epoch" --arg date "$date_value" --arg path "$file" --arg sha "$(sha "$file")" \
+    '{cycleDateEpoch:$epoch,cycleDate:$date,path:$path,sha256:$sha}' >>"$refs_tmp"
+done
+refs=$(jq -sc 'sort_by(.cycleDateEpoch)' "$refs_tmp")
+count=$(printf '%s' "$refs" | jq 'length')
+[ "$count" -eq $(( (target_epoch - first_epoch) / 86400 + 1 )) ] || die 'accepted daily evidence has a gap'
+printf '%s' "$refs" | jq -e --argjson first "$first_epoch" --arg target "$target" '
+  (to_entries | all(.value.cycleDateEpoch == ($first + (.key * 86400)))) and
+  ([.[].cycleDateEpoch] | length == (unique | length)) and .[-1].cycleDate == $target
+' >/dev/null || die 'accepted daily evidence is duplicate or non-sequential'
+
+ledger_count=$(jq -r '.completedDailyCycles // 0' "$POLYEDGE_PARITY_LEDGER")
+if [ "$ledger_count" -eq "$count" ]; then
+  jq -e --argjson refs "$refs" '(.acceptedDailyEvidence // []) == $refs' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+    || die 'ledger daily references disagree with accepted evidence'
+  exit 0
+fi
+[ "$ledger_count" -eq $((count - 1)) ] || die 'ledger daily count was not at the strictly previous count'
+jq -e --argjson refs "$refs" '(.acceptedDailyEvidence // []) == ($refs[0:-1])' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+  || die 'ledger daily references are incomplete or divergent'
+protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$POLYEDGE_PARITY_LEDGER")
+ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
+trap 'rm -f "$refs_tmp" "$ledger_tmp"' EXIT HUP INT TERM
+jq --argjson count "$count" --argjson refs "$refs" '.completedDailyCycles = $count | .acceptedDailyEvidence = $refs' \
+  "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+chmod 0640 "$ledger_tmp"
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$ledger_tmp")" = "$protected_before" ] \
+  || die 'protected ledger fields changed'
+sync -f "$ledger_tmp"
+mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
+trap 'rm -f "$refs_tmp"' EXIT HUP INT TERM
+
+echo "validated daily cycle $target; completedDailyCycles=$count"

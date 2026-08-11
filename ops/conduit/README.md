@@ -44,6 +44,7 @@ sudo install -m 0755 ops/conduit/bin/polyedge-ring-sync /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-health /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-boot-disk-guard /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-parity-hourly /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-parity-record-daily /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-github-deploy /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-quadlet-deploy /usr/local/sbin/
 sudo install -m 0440 ops/conduit/sudoers/polyedge-deploy /etc/sudoers.d/
@@ -135,6 +136,14 @@ masked.
 compares the Azure scheduled result with a local same-input audit, and advances
 only the sequential clean-hour count. It never changes Azure authority,
 deletion, reboot, qset, or funded gates and fails closed on a gap or mismatch.
+After a successful OCI daily container exits, `polyedge-parity-record-daily`
+verifies the immutable primary bundle, normalized completion marker, every
+artifact hash/size, approved source/image, promotion-quality predicate, ring
+health, and both disk floors before advancing the
+sequential daily-cycle count. The daily and hourly collectors share only the
+short parity-ledger lock. Daily-cycle evidence never changes Azure authority,
+deletion, reboot, qset, funded, or hourly-continuity fields and is not by itself
+output-parity or deletion proof.
 
 Primary OCI job environments must set
 `POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true`. This keeps reports local

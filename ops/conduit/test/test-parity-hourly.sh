@@ -124,7 +124,8 @@ fixture() {
   chmod 0600 "$case_root/token/azure-federated-token"
   jq -n --arg start "$window" '{
     schemaVersion:1,status:"in_progress",azureAuthoritative:true,azureDeletionAllowed:false,
-    windowStartUtc:$start,acceptedCleanLiveHours:0,rebootRecoveryPassed:false,
+    windowStartUtc:$start,acceptedCleanLiveHours:0,acceptedHourlyEvidence:[],
+    completedDailyCycles:0,acceptedDailyEvidence:[],rebootRecoveryPassed:false,
     shadowQsetEnabled:false,fundedSignerEnabled:false
   }' >"$case_root/ring/parity/ledger.json"
   chmod 0640 "$case_root/ring/parity/ledger.json"
@@ -156,6 +157,7 @@ POLYEDGE_PARITY_BOOT_ROOT=$case_root
 POLYEDGE_PARITY_PAUSE_FILE=$case_root/run/image-pulls-paused
 POLYEDGE_PARITY_TOKEN_FILE=$case_root/token/azure-federated-token
 POLYEDGE_PARITY_RUNTIME_DIR=$case_root/run
+POLYEDGE_PARITY_LOCK_FILE=$case_root/run/ledger.lock
 POLYEDGE_PARITY_TARGET_HOUR_UTC=$target
 POLYEDGE_PARITY_NOW_EPOCH=$fixture_now
 POLYEDGE_PARITY_TOKEN_UID=$uid
@@ -236,6 +238,15 @@ runs=$(wc -l <"$success/calls/podman")
 run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+
+legacy=$root/legacy
+fixture "$legacy"
+jq 'del(.completedDailyCycles,.acceptedDailyEvidence)' "$legacy/ring/parity/ledger.json" >"$legacy/ledger.tmp"
+chmod 0640 "$legacy/ledger.tmp"
+mv "$legacy/ledger.tmp" "$legacy/ring/parity/ledger.json"
+run_collector "$legacy" >/dev/null
+[ "$(jq -r '.acceptedCleanLiveHours' "$legacy/ring/parity/ledger.json")" = 1 ]
+jq -e 'has("completedDailyCycles") == false and has("acceptedDailyEvidence") == false' "$legacy/ring/parity/ledger.json" >/dev/null
 
 invalid_parity=$root/invalid-parity
 fixture "$invalid_parity"
@@ -359,6 +370,6 @@ if grep -R -F 'fixture-access-token' "$root"/*/calls >/dev/null || grep -R -F 'f
   echo 'a token leaked into command arguments' >&2
   exit 1
 fi
-! grep -q 'flock\|POLYEDGE_PARITY_LOCK_FILE' "$collector"
+grep -F '/usr/bin/flock -w 300 9' "$collector" >/dev/null
 
 echo 'parity hourly collector self-test passed'

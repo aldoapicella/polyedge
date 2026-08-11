@@ -27,6 +27,21 @@ set -a
 . "$env_file"
 set +a
 
+lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
+lock_ledger() {
+  lock_dir=${lock_file%/*}
+  [ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] || die 'unsafe parity lock directory'
+  set -- $(stat -c '%u %g %a' "$lock_dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die 'wrong parity lock directory owner'
+  case "$3" in 700|750|755) ;; *) die 'unsafe parity lock directory mode' ;; esac
+  if [ ! -e "$lock_file" ]; then
+    (umask 027; : >"$lock_file")
+  fi
+  secure_file "$lock_file" 640
+  exec 9<>"$lock_file"
+  /usr/bin/flock -w 300 9 || die 'timed out waiting for the parity ledger lock'
+}
+
 hourly_env=${POLYEDGE_PARITY_HOURLY_ENV:-/etc/polyedge/jobs/hourly.env}
 secure_file "$hourly_env" 600
 set -a
@@ -69,14 +84,19 @@ ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
   || die 'formal ledger must be a direct .json child of the parity root'
 
 secure_file "$POLYEDGE_PARITY_LEDGER" 640
-jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" '
-  .schemaVersion == 1 and .status == "in_progress" and
-  .azureAuthoritative == true and .azureDeletionAllowed == false and
-  .windowStartUtc == $start and
-  (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
-  (.acceptedHourlyEvidence? // [] | type == "array") and
-  (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == false
-' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+validate_ledger() {
+  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+    .schemaVersion == 1 and .status == "in_progress" and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .windowStartUtc == $start and
+    (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedHourlyEvidence? // []) | type == "array") and
+    ((.completedDailyCycles? // 0) | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedDailyEvidence? // []) | type == "array") and
+    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == false
+  ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+}
+validate_ledger
 
 if [ -n "${POLYEDGE_PARITY_TARGET_HOUR_UTC:-}" ]; then
   target=$POLYEDGE_PARITY_TARGET_HOUR_UTC
@@ -176,13 +196,13 @@ update_ledger() {
   expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
   [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
 
-  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$POLYEDGE_PARITY_LEDGER")
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
   ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
   trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
   jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
     "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
   chmod 0640 "$ledger_tmp"
-  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$ledger_tmp")" = "$protected_before" ] \
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
     || die 'protected ledger fields changed'
   sync -f "$ledger_tmp"
   mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
@@ -197,6 +217,8 @@ if [ -e "$evidence" ]; then
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     .sameInput.deterministicResultExactMatch == true
   ' "$evidence" >/dev/null || die 'existing accepted evidence is invalid'
+  lock_ledger
+  validate_ledger
   collect_refs
   ledger_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
   if [ "$ledger_count" -eq "$count" ]; then
@@ -456,6 +478,8 @@ sync -f "$tmp"
 mv "$tmp" "$evidence"
 trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 
+lock_ledger
+validate_ledger
 collect_refs
 update_ledger
 

@@ -77,6 +77,7 @@ jobs:
           ops/conduit/test/test-quadlet-deploy.sh
           ops/conduit/test/test-run-job-mappings.sh
           ops/conduit/test/test-parity-hourly.sh
+          ops/conduit/test/test-parity-daily.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"
