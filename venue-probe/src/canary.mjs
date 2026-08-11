@@ -905,17 +905,18 @@ async function main(resources) {
     loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
     loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash)
   ]);
+  const snapshotSelectionAt = Date.now();
   const cachedRuntime = selectFreshCachedSafetySnapshot(
     resources,
     intentDocument.value,
-    Date.now()
+    snapshotSelectionAt
   );
   const runtime = cachedRuntime || await capturePreflight(
     client,
     intentDocument.value,
     manifestDocument.value
   );
-  const snapshotObservedAt = Date.now();
+  const snapshotObservedAt = cachedRuntime ? snapshotSelectionAt : Date.now();
   if (cachedRuntime) {
     console.log(JSON.stringify(fundedCapitalSnapshotRecord(
       runtime,

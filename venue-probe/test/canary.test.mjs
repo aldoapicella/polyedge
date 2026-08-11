@@ -600,7 +600,7 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
     exact_resolution_source: true,
     resolution_source: "chainlink_reference"
   };
-  const selected = selectFreshCachedSafetySnapshot(resources, intent, 10_600);
+  const selected = selectFreshCachedSafetySnapshot(resources, intent, 10_650);
   assert.deepEqual(selected, {
     ...runtime,
     exactResolutionSource: true,
@@ -610,14 +610,14 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
     selected,
     intent,
     { session_id: "session-v8" },
-    { source: "persistent_safety_cache", nowMs: 10_600 }
+    { source: "persistent_safety_cache", nowMs: 10_650 }
   ), {
     schema: "polyedge.funded_capital_snapshot.v1",
     session_id: "session-v8",
     decision_id: "decision-1",
     snapshot_source: "persistent_safety_cache",
     snapshot_completed_wall_ms: 10_000,
-    snapshot_age_ms: 600,
+    snapshot_age_ms: 650,
     account_equity: 5,
     historical_high_water_equity: 102.78112,
     protected_reserve: 2,
