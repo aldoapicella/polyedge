@@ -120,8 +120,9 @@ closed-unsealed or unuploaded segments, and the boot filesystem retained about
 an Azure hourly-job image drift that falsely rejected primary-role strategy
 batches; only `polyedge-hourly-quality-job` was repinned to the proven digest
 above, its bounded rerun succeeded, and the unchanged fail-closed collector
-then accepted the hour. The ledger now has one accepted clean hour while Azure
-remains authoritative and deletion remains disabled. The authoritative Azure
+then accepted the hour. The first two formal hours are recorded as sequential
+accepted clean hours while Azure remains authoritative and deletion remains
+disabled. The authoritative Azure
 daily execution completed successfully and explicitly released the shared
 lease at `2026-08-11T08:09:08Z`; OCI daily and replay timers are enabled with
 their first future triggers at `2026-08-12T03:10:00Z` and `03:15:00Z`.
