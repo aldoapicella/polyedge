@@ -572,6 +572,21 @@ test("loss-tolerant sizing uses a 10% current-equity reserve and minimum orders 
   assert.equal(afterLossSizing.shares, 5);
   assert.equal(afterLossSizing.reserved_notional, 1.697627);
 
+  const boundarySizing = sizeProtectedOrder({
+    state: afterLoss,
+    accountEquity: 5,
+    price: 0.22,
+    requestedShares: 20,
+    requestedNotional: 4.4,
+    minimumOrderSize: 5,
+    maximumOrderNotional: 10.5,
+    feePerShare: 0.00736164
+  });
+  assert.equal(boundarySizing.executable, true);
+  assert.equal(boundarySizing.shares, 5);
+  assert.equal(boundarySizing.order_risk_budget, 1.136809);
+  assert.equal(boundarySizing.reserved_notional, 1.136808);
+
   const insolvent = await reconcileProtectedCompoundingState({
     container,
     manifest: fundedManifest,

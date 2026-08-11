@@ -1089,10 +1089,10 @@ export function sizeProtectedOrder({
   );
   const orderRiskBudget = capital.target_order_ratio === null
     ? Number.POSITIVE_INFINITY
-    : money(Math.max(
+    : Math.ceil((Math.max(
         minimumExecutableShares * (p + fee),
         Number(accountEquity) * capital.target_order_ratio
-      ));
+      ) - 1e-12) * MONEY_SCALE) / MONEY_SCALE;
   const affordableShares = Math.min(
     sourceShares,
     maxPrincipal / p,
