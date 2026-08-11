@@ -58,6 +58,8 @@ pub enum StorageError {
     AzureBlob(#[from] AzureBlobError),
     #[error("{0} is not implemented in the Rust backend yet")]
     Unsupported(&'static str),
+    #[error("invalid recorder binding: {0}")]
+    InvalidRecorderBinding(&'static str),
 }
 
 pub trait EventRecorder {
@@ -70,8 +72,52 @@ pub trait EventRecorder {
         Ok(())
     }
 
+    /// Records an event that crossed the runtime persistence boundary. The
+    /// default keeps existing recorders source-compatible; production JSONL
+    /// recorders override this to retain the binding in their envelope.
+    fn record_recorded_batch(
+        &mut self,
+        events: &[RecordedRuntimeEvent],
+    ) -> Result<(), StorageError> {
+        for event in events {
+            self.record(event.event())?;
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<(), StorageError> {
         Ok(())
+    }
+}
+
+/// Additive recorder-bound metadata. `RuntimeEvent` deliberately remains the
+/// event-bus and payload contract; this is only the persistence envelope.
+#[derive(Clone, Debug)]
+pub struct RecordedRuntimeEvent {
+    event: RuntimeEvent,
+    recorder_instance_id: String,
+    recorder_sequence: u64,
+}
+
+impl RecordedRuntimeEvent {
+    pub fn bound(
+        event: RuntimeEvent,
+        recorder_instance_id: impl Into<String>,
+        recorder_sequence: u64,
+    ) -> Self {
+        Self {
+            event,
+            recorder_instance_id: recorder_instance_id.into(),
+            recorder_sequence,
+        }
+    }
+
+    pub fn event(&self) -> &RuntimeEvent {
+        &self.event
+    }
+
+    pub fn recorder_sequence(&self) -> u64 {
+        self.recorder_sequence
     }
 }
 
@@ -175,6 +221,26 @@ impl EventRecorder for JsonlRecorder {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         for event in events {
             serde_json::to_writer(&mut file, &jsonl_event_envelope(event))?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn record_recorded_batch(
+        &mut self,
+        events: &[RecordedRuntimeEvent],
+    ) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let path = self.active_path(Utc::now());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        for event in events {
+            serde_json::to_writer(&mut file, &jsonl_recorded_event_envelope(event)?)?;
             file.write_all(b"\n")?;
         }
         file.sync_all()?;
@@ -658,6 +724,26 @@ impl EventRecorder for AzureAppendBlobRecorder {
         Ok(())
     }
 
+    fn record_recorded_batch(
+        &mut self,
+        events: &[RecordedRuntimeEvent],
+    ) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut ready_blocks = Vec::new();
+        for event in events {
+            ready_blocks.extend(self.pending_append_blocks.push_line(
+                &self.event_blob_name(event.event()),
+                jsonl_recorded_event_line(event)?,
+            ));
+        }
+        let mut blocks = self.pending_append_blocks.take_retry_blocks();
+        blocks.extend(ready_blocks);
+        self.append_ready_blocks(blocks)?;
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<(), StorageError> {
         let mut blocks = self.pending_append_blocks.take_retry_blocks();
         blocks.extend(self.pending_append_blocks.drain());
@@ -823,6 +909,12 @@ fn event_blob_name(prefix: &str, event: &RuntimeEvent) -> String {
 fn jsonl_event_line(event: &RuntimeEvent) -> Result<Vec<u8>, StorageError> {
     let envelope = jsonl_event_envelope(event);
     let mut line = serde_json::to_vec(&envelope)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn jsonl_recorded_event_line(event: &RecordedRuntimeEvent) -> Result<Vec<u8>, StorageError> {
+    let mut line = serde_json::to_vec(&jsonl_recorded_event_envelope(event)?)?;
     line.push(b'\n');
     Ok(line)
 }
@@ -1432,6 +1524,23 @@ fn jsonl_event_envelope(event: &RuntimeEvent) -> Value {
         "event_type": event.event_type,
         "payload": event.data
     })
+}
+
+fn jsonl_recorded_event_envelope(event: &RecordedRuntimeEvent) -> Result<Value, StorageError> {
+    if event.recorder_instance_id.is_empty() {
+        return Err(StorageError::InvalidRecorderBinding(
+            "recorder_instance_id is empty",
+        ));
+    }
+    if event.recorder_sequence == 0 {
+        return Err(StorageError::InvalidRecorderBinding(
+            "recorder_sequence is zero",
+        ));
+    }
+    let mut envelope = jsonl_event_envelope(event.event());
+    envelope["recorder_instance_id"] = json!(event.recorder_instance_id);
+    envelope["recorder_sequence"] = json!(event.recorder_sequence);
+    Ok(envelope)
 }
 
 #[derive(Clone)]
@@ -3443,6 +3552,28 @@ mod tests {
         remote.extend(&pending[0].1);
         assert_eq!(remote, b"B\nC\n");
         assert!(!starts.contains_key(blob));
+    }
+
+    #[test]
+    fn bound_jsonl_envelopes_match_for_local_and_azure_recorders() {
+        let event = RecordedRuntimeEvent::bound(
+            RuntimeEvent {
+                event_type: "book".to_owned(),
+                ts: Utc::now(),
+                data: json!({"token_id": "token"}),
+            },
+            "7c66d77b-a911-4f9b-95f2-98ca9395255e",
+            42,
+        );
+        let envelope = jsonl_recorded_event_envelope(&event).unwrap();
+        let azure_line: Value =
+            serde_json::from_slice(&jsonl_recorded_event_line(&event).unwrap()).unwrap();
+        assert_eq!(azure_line, envelope);
+        assert_eq!(
+            envelope["recorder_instance_id"],
+            "7c66d77b-a911-4f9b-95f2-98ca9395255e"
+        );
+        assert_eq!(envelope["recorder_sequence"], 42);
     }
 
     #[test]

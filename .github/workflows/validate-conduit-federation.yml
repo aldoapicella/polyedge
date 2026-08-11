@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'crates/polyedge-storage/**'
+      - 'crates/polyedge-api/**'
+      - 'crates/polyedge-cli/**'
       - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
       - 'infra/main.bicep'
@@ -13,6 +15,8 @@ on:
     branches: [main]
     paths:
       - 'crates/polyedge-storage/**'
+      - 'crates/polyedge-api/**'
+      - 'crates/polyedge-cli/**'
       - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
       - 'infra/main.bicep'
@@ -66,6 +70,8 @@ jobs:
       - name: Test shared Azure token authentication
         run: |
           cargo test -p polyedge-storage
+          cargo test -p polyedge-api recorder
+          cargo test -p polyedge-cli ring_manifest
           cargo test -p polyedge-reporting audit_recomputes_primary_paper_batch
           cargo test -p polyedge-reporting expected_daily_scan_is_inclusive_and_bounded
           cargo test -p polyedge-reporting local_daily_scan_stops_at_expected_date
@@ -76,6 +82,7 @@ jobs:
           ops/conduit/test/test-boot-disk-guard.sh
           ops/conduit/test/test-quadlet-deploy.sh
           ops/conduit/test/test-run-job-mappings.sh
+          ops/conduit/test/test-ring-sync.sh
           ops/conduit/test/test-parity-hourly.sh
           ops/conduit/test/test-parity-daily.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs

@@ -13,6 +13,13 @@ archive=$root/archive
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
 prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}
+legacy_cutoff=${POLYEDGE_RING_LEGACY_CUTOFF_EPOCH:-}
+if [ -n "$legacy_cutoff" ]; then
+  printf '%s' "$legacy_cutoff" | grep -Eq '^(0|[1-9][0-9]*)$' && [ "$((legacy_cutoff % 600))" -eq 0 ] || {
+    echo 'POLYEDGE_RING_LEGACY_CUTOFF_EPOCH must be a canonical 10-minute epoch' >&2
+    exit 64
+  }
+fi
 printf '%s' "$segment_seconds" | grep -Eq '^[0-9]+$'
 [ "$segment_seconds" -ge 300 ] && [ "$segment_seconds" -le 900 ] || {
   echo 'RECORDER_SEGMENT_SECONDS must be from 300 through 900' >&2
@@ -25,6 +32,44 @@ printf '%s' "$prefix" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$' || {
 mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
 command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 1; }
 install -d -m 0750 "$segments" "$archive"
+
+sequence_summary() {
+  segment=$1
+  sequence_tmp=$(mktemp "$segment.sequence.XXXXXX") || return 1
+  trap 'rm -f "$sequence_tmp"' EXIT HUP INT TERM
+  chmod 0600 "$sequence_tmp"
+  if ! jq -cer '
+    if type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_sequence | type == "number" and floor == . and . >= 1)
+    then "\(.recorder_instance_id)\t\(.recorder_sequence)"
+    else error("invalid recorder sequence fields")
+    end
+  ' "$segment" >"$sequence_tmp"; then
+    rm -f "$sequence_tmp"
+    sequence_tmp=
+    trap - EXIT HUP INT TERM
+    return 1
+  fi
+  if ! recorder=$(awk -F '\t' '
+    NR == 1 { instance=$1; first=$2; previous=$2; count=1; next }
+    $1 != instance || $2 != previous + 1 { exit 1 }
+    { previous=$2; count++ }
+    END {
+      if (NR == 0) exit 1
+      printf "{\"recorder_instance_id\":\"%s\",\"recorder_first_sequence\":%s,\"recorder_last_sequence\":%s,\"recorder_event_count\":%s}\n", instance, first, previous, count
+    }
+  ' "$sequence_tmp"); then
+    rm -f "$sequence_tmp"
+    sequence_tmp=
+    trap - EXIT HUP INT TERM
+    return 1
+  fi
+  rm -f "$sequence_tmp"
+  sequence_tmp=
+  trap - EXIT HUP INT TERM
+  printf '%s\n' "$recorder"
+}
 
 now=$(date -u +%s)
 cutoff=$((now - grace_seconds))
@@ -51,6 +96,16 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
   source_sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
   source_bytes=$(wc -c < "$segment")
   lines=$(wc -l < "$segment")
+  if [ -n "$legacy_cutoff" ] && [ "$start" -lt "$legacy_cutoff" ]; then
+    schema_version=2
+    recorder='{}'
+  else
+    schema_version=3
+    recorder=$(sequence_summary "$segment") || {
+      echo "invalid recorder sequence proof: $segment" >&2
+      exit 1
+    }
+  fi
   install -d -m 0750 "${archive_segment%/*}"
   if [ -e "$archive_segment" ]; then
     gzip -t "$archive_segment"
@@ -84,7 +139,9 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
     --argjson lines "$lines" \
     --argjson segment_start_epoch "$start" \
     --argjson segment_end_epoch "$end" \
-    '{schema_version:2,segment_path:$segment_path,archive_path:$archive_path,blob_name:$blob_name,compression:"gzip",sha256:$sha256,source_sha256:$source_sha256,bytes:$bytes,source_bytes:$source_bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch}' \
+    --argjson schema_version "$schema_version" \
+    --argjson recorder "$recorder" \
+    '{schema_version:$schema_version,segment_path:$segment_path,archive_path:$archive_path,blob_name:$blob_name,compression:"gzip",sha256:$sha256,source_sha256:$source_sha256,bytes:$bytes,source_bytes:$source_bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch} + $recorder' \
     > "$temporary"
   chmod 0640 "$temporary"
   sync -f "$segment"

@@ -1167,6 +1167,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

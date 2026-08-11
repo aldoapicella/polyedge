@@ -88,16 +88,15 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-The current formal parity window starts at the clean recorder boundary
-`2026-08-11T06:00:00Z` and cannot complete before
-`2026-08-14T06:00:00Z` or before two successful OCI daily cycles. Its
-root-owned ledger is
-`/srv/polyedge-ring/parity/20260811T060000Z.json`; it must retain
-`azureDeletionAllowed:false` until the remaining parity, reboot, qset, and
-funded gates pass. It supersedes the retained `20260810T220000Z.json` ledger
-with no continuity credit because the prior collector accepted primary batches
-through shadow-role semantics and did not require stable code/config identity
-or bounded observation gaps.
+Ledger `/srv/polyedge-ring/parity/20260811T060000Z.json` is superseded for
+deletion-continuity purposes. Its hours `06` through `09` remain useful
+service-health and same-input compute evidence, but contribute zero hours to
+the required 72-hour window. Azure remains authoritative and
+`azureDeletionAllowed:false`. A fresh formal window starts at the first full
+hour after the OCI runtime emits a UUID-v4 recorder instance and a contiguous
+monotonic sequence in every event and sealed segment. It cannot complete before
+72 consecutive accepted hours, two successful OCI daily cycles, and the
+remaining reboot, rollback, qset, funded, and deletion gates.
 
 The OCI API and all seven primary research jobs are pinned to multi-architecture
 digest
@@ -123,16 +122,22 @@ closed-unsealed or unuploaded segments, and the boot filesystem retained about
 an Azure hourly-job image drift that falsely rejected primary-role strategy
 batches; only `polyedge-hourly-quality-job` was repinned to the proven digest
 above, its bounded rerun succeeded, and the unchanged fail-closed collector
-then accepted the hour. Hours `06`, `07`, and `08` are recorded as three
-sequential accepted clean hours while Azure remains authoritative and deletion
-remains disabled. For hour `08`, the Azure scheduled audit and OCI same-input
+then accepted the hour. Hours `06` through `09` are retained only as compute
+and health evidence. For hour `08`, the Azure scheduled audit and OCI same-input
 audit again produced the exact result hash
 `sha256:afacecae7aa937b4c8eef1bcf3671520aa61f892280d489619ebb317b47883a4`.
 The independent Azure and local scheduled inputs contained 1,822,602 and
 1,815,359 events respectively, but came from different recorder Git/config
 provenance. That 7,243-event difference is retained as a source-equivalence
 gate; it is neither a compute mismatch nor proof of no missing or duplicate
-events. The authoritative Azure
+events. A constant-memory aggregate fingerprint audit reverified all 60 Azure
+minute blobs and all six sealed OCI segments. It found zero strict common
+fingerprints and only 566 timestamp-independent matches, ruling out ring
+corruption, prefix overlap, stale Azure mutation, and mirrored-stream exact
+duplication, but not proving upstream OCI capture completeness. Its
+aggregate-only output is retained at
+`/srv/polyedge-ring/parity-scratch/fingerprint-20260811T08-20260811T0935Z/aggregate.json`.
+The authoritative Azure
 daily execution completed successfully and explicitly released the shared
 lease at `2026-08-11T08:09:08Z`; OCI daily and replay timers are enabled with
 their first future triggers at `2026-08-12T03:10:00Z` and `03:15:00Z`.
@@ -142,9 +147,13 @@ masked.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
-compares the Azure scheduled result with a local same-input audit, and advances
-only the sequential clean-hour count. It never changes Azure authority,
-deletion, reboot, qset, or funded gates and fails closed on a gap or mismatch.
+requires one recorder instance with exact in-segment and cross-hour sequence
+continuity, requires zero recorder failures or backlog, compares the Azure
+scheduled result with a local same-input audit, and requires one identical
+`decision_config_sha256` across all three reports. It advances only the
+sequential clean-hour count. It never changes Azure authority, deletion,
+reboot, qset, or funded gates and fails closed on a gap, duplicate, instance
+change, unhealthy recorder, decision-config mismatch, or result mismatch.
 After a successful OCI daily container exits, `polyedge-parity-record-daily`
 verifies the immutable primary bundle, normalized completion marker, every
 artifact hash/size, approved source/image, promotion-quality predicate, ring
@@ -190,7 +199,11 @@ port 3000 or 8081.
 `ring.env.example` starts with `POLYEDGE_RING_SEAL_ONLY=1`, so it can hash local
 segments before Azure identity approval. Set it to `0` only after filling the
 digest and either verifying the Arc identity's no-delete blob role or installing
-the client-secret-file fallback.
+the client-secret-file fallback. For the one-time sequenced-recorder handoff,
+set `POLYEDGE_RING_LEGACY_CUTOFF_EPOCH` to the exact 10-minute epoch where the
+new API instance begins. The sealer emits schema 2 only before that boundary
+and requires source-verified schema 3 at or after it; schema 2 never receives
+new parity credit. Remove the cutoff after all earlier segments are sealed.
 
 For Arc, connect the host as `conduit-dev`, disable remote management features,
 and assign `PolyEdge OCI Blob Writer` only at the `bot-events` container scope:

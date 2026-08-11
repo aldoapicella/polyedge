@@ -1,6 +1,7 @@
 use polyedge_config::RuntimeSettings;
-use polyedge_domain::RuntimeEvent;
-use polyedge_storage::{AzureAppendBlobRecorder, EventRecorder, JsonlRecorder};
+use polyedge_storage::{
+    AzureAppendBlobRecorder, EventRecorder, JsonlRecorder, RecordedRuntimeEvent,
+};
 use serde_json::{json, Value};
 use std::env;
 use std::path::PathBuf;
@@ -89,10 +90,13 @@ impl RuntimeRecorder {
         self.authoritative_remote
     }
 
-    pub(super) fn record_batch(&mut self, events: &[RuntimeEvent]) -> Result<(), String> {
+    pub(super) fn record_recorded_batch(
+        &mut self,
+        events: &[RecordedRuntimeEvent],
+    ) -> Result<(), String> {
         let mut last_error = None;
         for recorder in &mut self.recorders {
-            if let Err(error) = recorder.record_batch(events) {
+            if let Err(error) = recorder.record_recorded_batch(events) {
                 self.error_count += 1;
                 last_error = Some(error.to_string());
             }

@@ -30,6 +30,7 @@ cat >"$fake/podman" <<'EOF'
 #!/bin/sh
 case "$1" in
   inspect) printf '%s\n' healthy ;;
+  exec) printf 'HTTP/1.0 200 OK\r\n\r\n'; cat "$FAKE_API_STATUS" ;;
   run)
     printf '%s\n' "$*" >>"$FAKE_CALLS/podman"
     host=
@@ -169,23 +170,25 @@ EOF
   jq '.input_path="/input/events/2026/08/09/15/"' "$case_root/reports/2026/08/09/15/audit.json" >"$case_root/oci.tmp"
   mv "$case_root/oci.tmp" "$case_root/reports/2026/08/09/15/audit.json"
   report azure "$case_root/same.json"
+  jq -n '{task_health:{api:"ok",runtime_loop:"running",feeds:"running"},drop_counts:{},recorder_status:{error_count:0,dropped_count:0},recorder_metrics:{recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",last_assigned_sequence:6,queued:0,enqueued_total:6,persisted_total:6,failed_total:0,unrecovered_durable_events:0,flush_unrecovered:false}}' >"$case_root/api-status.json"
 
   i=0
   start=$(date -u -d '2026-08-09T15:00:00Z' +%s)
   while [ "$i" -lt 6 ]; do
     epoch=$((start + i * 600))
+    seq=$((i + 1))
     source=$case_root/ring/segments/2026/08/09/15/$epoch.jsonl
     gzip_file=$case_root/ring/archive/2026/08/09/15/$epoch.jsonl.gz
     manifest=$gzip_file.manifest.json
     receipt=$manifest.uploaded.json
-    printf '{"fixture":%s}\n' "$i" >"$source"
+    printf '{"fixture":%s,"recorder_instance_id":"123e4567-e89b-42d3-a456-426614174000","recorder_sequence":%s}\n' "$i" "$seq" >"$source"
     gzip -1 -n -c "$source" >"$gzip_file"
     source_sha=sha256:$(sha256sum "$source" | awk '{print $1}')
     gzip_sha=sha256:$(sha256sum "$gzip_file" | awk '{print $1}')
     jq -n --arg segment "segments/2026/08/09/15/$epoch.jsonl" \
       --arg archive "archive/2026/08/09/15/$epoch.jsonl.gz" --arg blob "events-oci-hot7-v1/2026/08/09/15/$epoch.jsonl.gz" \
-      --arg source_sha "$source_sha" --arg gzip_sha "$gzip_sha" --argjson start "$epoch" \
-      '{schema_version:2,segment_path:$segment,archive_path:$archive,blob_name:$blob,compression:"gzip",sha256:$gzip_sha,source_sha256:$source_sha,segment_start_epoch:$start,segment_end_epoch:($start+600)}' >"$manifest"
+      --arg source_sha "$source_sha" --arg gzip_sha "$gzip_sha" --argjson start "$epoch" --argjson seq "$seq" \
+      '{schema_version:3,lines:1,recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:$seq,recorder_last_sequence:$seq,recorder_event_count:1,segment_path:$segment,archive_path:$archive,blob_name:$blob,compression:"gzip",sha256:$gzip_sha,source_sha256:$source_sha,segment_start_epoch:$start,segment_end_epoch:($start+600)}' >"$manifest"
     manifest_sha=sha256:$(sha256sum "$manifest" | awk '{print $1}')
     jq -n --arg blob "events-oci-hot7-v1/2026/08/09/15/$epoch.jsonl.gz" --arg sha "$manifest_sha" \
       '{schema_version:1,blob_name:$blob,manifest_blob_name:($blob+".manifest.json"),manifest_sha256:$sha,verified_ts:"2026-08-09T16:12:00Z"}' >"$receipt"
@@ -199,7 +202,7 @@ run_collector() {
     POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" \
     FAKE_CALLS="$case_root/calls" FAKE_DF_AVAILABLE="${FAKE_DF_AVAILABLE:-20000000000}" FAKE_MOUNTPOINT_OK="${FAKE_MOUNTPOINT_OK:-1}" \
-    FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_SAME_REPORT="$case_root/same.json" \
+    FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_SAME_REPORT="$case_root/same.json" FAKE_API_STATUS="$case_root/api-status.json" \
     "$collector"
 }
 
@@ -220,6 +223,35 @@ seed_artifacts() {
   esac
 }
 
+v2_manifest=$root/v2-manifest
+fixture "$v2_manifest"
+manifest=$(find "$v2_manifest/ring/archive" -name '*.manifest.json' | head -n 1)
+jq '.schema_version=2' "$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
+if run_collector "$v2_manifest" >/dev/null 2>&1; then echo 'v2 manifest unexpectedly passed' >&2; exit 1; fi
+
+gap=$root/sequence-gap
+fixture "$gap"
+manifest=$(find "$gap/ring/archive" -name '*.manifest.json' | sort | sed -n '2p')
+jq '.recorder_first_sequence=8 | .recorder_last_sequence=8' "$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
+if run_collector "$gap" >/dev/null 2>&1; then echo 'sequence gap unexpectedly passed' >&2; exit 1; fi
+
+duplicate=$root/sequence-duplicate
+fixture "$duplicate"
+manifest=$(find "$duplicate/ring/archive" -name '*.manifest.json' | sort | sed -n '2p')
+jq '.recorder_first_sequence=1 | .recorder_last_sequence=1' "$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
+if run_collector "$duplicate" >/dev/null 2>&1; then echo 'duplicate sequence unexpectedly passed' >&2; exit 1; fi
+
+instance_change=$root/instance-change
+fixture "$instance_change"
+manifest=$(find "$instance_change/ring/archive" -name '*.manifest.json' | sort | sed -n '2p')
+jq '.recorder_instance_id="223e4567-e89b-42d3-a456-426614174000"' "$manifest" >"$manifest.tmp" && mv "$manifest.tmp" "$manifest"
+if run_collector "$instance_change" >/dev/null 2>&1; then echo 'instance change unexpectedly passed' >&2; exit 1; fi
+
+metric_failure=$root/metric-failure
+fixture "$metric_failure"
+jq '.recorder_metrics.queued=1' "$metric_failure/api-status.json" >"$metric_failure/status.tmp" && mv "$metric_failure/status.tmp" "$metric_failure/api-status.json"
+if run_collector "$metric_failure" >/dev/null 2>&1; then echo 'recorder metric failure unexpectedly passed' >&2; exit 1; fi
+
 success=$root/success
 fixture "$success"
 jq '.rebootRecoveryPassed = true' "$success/ring/parity/ledger.json" >"$success/reboot.tmp"
@@ -228,6 +260,7 @@ mv "$success/reboot.tmp" "$success/ring/parity/ledger.json"
 before=$(protected "$success/ring/parity/ledger.json")
 run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
+[ "$(find "$success/ring/segments" -name '*.sequence.*' | wc -l)" -eq 0 ]
 jq -e '.acceptedForParityWindow == true and .sameInput.deterministicResultExactMatch == true and (.segments | length) == 6' \
   "$success/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
 grep -q -- "--user $uid:$gid" "$success/calls/podman"
@@ -237,6 +270,7 @@ grep -q -- "$success/token/azure-federated-token:/run/credentials/azure-federate
 runs=$(wc -l <"$success/calls/podman")
 run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
+[ "$(find "$success/ring/segments" -name '*.sequence.*' | wc -l)" -eq 0 ]
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
 
 legacy=$root/legacy
@@ -263,6 +297,16 @@ if run_collector "$invalid_parity" >/dev/null 2>&1; then
 fi
 [ "$(jq -r '.acceptedCleanLiveHours' "$invalid_parity/ring/parity/ledger.json")" = 0 ]
 
+decision_config_mismatch=$root/decision-config-mismatch
+fixture "$decision_config_mismatch"
+jq '.result.runtime_provenance.identities[0].decision_config_sha256="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"' \
+  "$decision_config_mismatch/reports/2026/08/09/15/audit.json" >"$decision_config_mismatch/oci.tmp"
+mv "$decision_config_mismatch/oci.tmp" "$decision_config_mismatch/reports/2026/08/09/15/audit.json"
+if run_collector "$decision_config_mismatch" >/dev/null 2>&1; then
+  echo 'cross-report decision config mismatch unexpectedly passed' >&2
+  exit 1
+fi
+
 gapped=$root/gapped
 fixture "$gapped"
 for file in "$gapped/azure.json" "$gapped/same.json" "$gapped/reports/2026/08/09/15/audit.json"; do
@@ -277,7 +321,7 @@ fi
 
 second=$success/ring/parity/hourly/20260809T16
 mkdir -m 0750 "$second"
-jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z"' \
+jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" | .recorderSequence.recorder_first_sequence=7 | .recorderSequence.recorder_last_sequence=12' \
   "$success/ring/parity/hourly/20260809T15/evidence.json" >"$second/evidence.json"
 chmod 0640 "$second/evidence.json"
 sed -i 's/POLYEDGE_PARITY_TARGET_HOUR_UTC=.*/POLYEDGE_PARITY_TARGET_HOUR_UTC=2026-08-09T16:00:00Z/' "$success/parity.env"
@@ -287,6 +331,17 @@ run_collector "$success" >/dev/null
 jq -e '(.acceptedHourlyEvidence | length) == 2 and .acceptedHourlyEvidence[1].hourStartUtc == "2026-08-09T16:00:00Z"' \
   "$success/ring/parity/ledger.json" >/dev/null
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+
+cross_hour_gap=$root/cross-hour-gap
+fixture "$cross_hour_gap"
+run_collector "$cross_hour_gap" >/dev/null
+mkdir -m 0750 "$cross_hour_gap/ring/parity/hourly/20260809T16"
+jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" | .recorderSequence.recorder_first_sequence=8 | .recorderSequence.recorder_last_sequence=13' \
+  "$cross_hour_gap/ring/parity/hourly/20260809T15/evidence.json" >"$cross_hour_gap/ring/parity/hourly/20260809T16/evidence.json"
+chmod 0640 "$cross_hour_gap/ring/parity/hourly/20260809T16/evidence.json"
+sed -i 's/POLYEDGE_PARITY_TARGET_HOUR_UTC=.*/POLYEDGE_PARITY_TARGET_HOUR_UTC=2026-08-09T16:00:00Z/' "$cross_hour_gap/parity.env"
+sed -i "s/POLYEDGE_PARITY_NOW_EPOCH=.*/POLYEDGE_PARITY_NOW_EPOCH=$(date -u -d '2026-08-09T17:20:00Z' +%s)/" "$cross_hour_gap/parity.env"
+if run_collector "$cross_hour_gap" >/dev/null 2>&1; then echo 'cross-hour sequence gap unexpectedly passed' >&2; exit 1; fi
 
 superseded=$root/superseded
 fixture "$superseded"
