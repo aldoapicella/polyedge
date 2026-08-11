@@ -400,86 +400,121 @@ jobs:
             sleep 5
           done
           test "${active_messages:-0}" = "0"
-          heartbeat_ok=false
-          for attempt in $(seq 1 24); do
-            az monitor log-analytics query \
-              --workspace "$workspace_customer_id" \
-              --analytics-query "ContainerAppConsoleLogs_CL
-                | where ContainerAppName_s == '$FUNDED_APP'
-                | where RevisionName_s == '$current_revision'
-                | where TimeGenerated >= datetime($fence_started_at)
-                | extend record = parse_json(Log_s)
-                | where tostring(record.status) == 'persistent_service_heartbeat'
-                | top 1 by TimeGenerated desc
-                | project TimeGenerated, Log_s" \
-              -o json > post-fence-heartbeat.json
-            if jq -e --arg session "$current_session" '
-              length == 1
-              and (.[0].Log_s | fromjson
-                | .executor.busy == false
-                and .executor.user_channel_ready == true
-                and (.executor.market_channel_ready == true
-                  or ($session == "dynamic-quote-funded-2026-07-29-v5"
-                    and .executor.warmed_market == null))
-                and .executor.reconnect_reconciliation_required == false
-                and .executor.user_channel_gaps == 0
-                and .executor.market_channel_gaps == 0)
-            ' post-fence-heartbeat.json >/dev/null; then
-              heartbeat_ok=true
-              break
-            fi
-            sleep 5
-          done
-          if [ "$heartbeat_ok" != true ]; then
-            test "$current_session" = "dynamic-quote-funded-2026-07-29-v5"
-            az containerapp replica list \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$FUNDED_APP" \
-              --revision "$current_revision" \
-              -o json > stopped-funded-replicas.json
-            jq -e '
-              length == 1
-              and ([.[0].properties.containers[]
-                | select(.name == "funded-direct"
-                  and .ready == false
-                  and (.restartCount // 0) >= 3)]
-                | length) == 1
-            ' stopped-funded-replicas.json
-            migration_failures=$(az monitor log-analytics query \
-              --workspace "$workspace_customer_id" \
-              --analytics-query "ContainerAppConsoleLogs_CL
-                | where ContainerAppName_s == '$FUNDED_APP'
-                | where RevisionName_s == '$current_revision'
-                | where TimeGenerated >= datetime($current_revision_created_at)
-                | where Log_s contains 'protected reserve migration requires zero orders, positions, and unresolved reservations'
-                | count" \
-              --query '[0].Count' -o tsv)
-            test "${migration_failures:-0}" -ge 3
-          fi
           case "$current_session" in
             dynamic-quote-funded-2026-07-29-v5)
-              az storage blob download \
+              heartbeat_ok=false
+              for attempt in $(seq 1 24); do
+                az monitor log-analytics query \
+                  --workspace "$workspace_customer_id" \
+                  --analytics-query "ContainerAppConsoleLogs_CL
+                    | where ContainerAppName_s == '$FUNDED_APP'
+                    | where RevisionName_s == '$current_revision'
+                    | where TimeGenerated >= datetime($fence_started_at)
+                    | extend record = parse_json(Log_s)
+                    | where tostring(record.status) == 'persistent_service_heartbeat'
+                    | top 1 by TimeGenerated desc
+                    | project TimeGenerated, Log_s" \
+                  -o json > post-fence-heartbeat.json
+                if jq -e '
+                  length == 1
+                  and (.[0].Log_s | fromjson
+                    | .executor.busy == false
+                    and .executor.user_channel_ready == true
+                    and (.executor.market_channel_ready == true
+                      or .executor.warmed_market == null)
+                    and .executor.reconnect_reconciliation_required == false
+                    and .executor.user_channel_gaps == 0
+                    and .executor.market_channel_gaps == 0)
+                ' post-fence-heartbeat.json >/dev/null; then
+                  heartbeat_ok=true
+                  break
+                fi
+                sleep 5
+              done
+              if [ "$heartbeat_ok" != true ]; then
+                az containerapp replica list \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --name "$FUNDED_APP" \
+                  --revision "$current_revision" \
+                  -o json > stopped-funded-replicas.json
+                jq -e '
+                  length == 1
+                  and ([.[0].properties.containers[]
+                    | select(.name == "funded-direct"
+                      and .ready == false
+                      and (.restartCount // 0) >= 3)]
+                    | length) == 1
+                ' stopped-funded-replicas.json
+                migration_failures=$(az monitor log-analytics query \
+                  --workspace "$workspace_customer_id" \
+                  --analytics-query "ContainerAppConsoleLogs_CL
+                    | where ContainerAppName_s == '$FUNDED_APP'
+                    | where RevisionName_s == '$current_revision'
+                    | where TimeGenerated >= datetime($current_revision_created_at)
+                    | where Log_s contains 'protected reserve migration requires zero orders, positions, and unresolved reservations'
+                    | count" \
+                  --query '[0].Count' -o tsv)
+                test "${migration_failures:-0}" -ge 3
+              fi
+              ;;
+            dynamic-quote-funded-2026-08-11-v8)
+              env_value() {
+                jq -r --arg name "$1" '
+                  [.properties.template.containers[0].env[]
+                    | select(.name == $name) | .value][0] // ""
+                ' current-funded-revision.json
+              }
+              test "$(jq -r '.properties.template.scale.minReplicas' current-funded-revision.json)" = "0"
+              test "$(env_value FUNDED_DIRECT_SERVICE_ENABLED)" = "false"
+              test "$(env_value FUNDED_DIRECT_DRY_RUN)" = "true"
+              test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME)" = \
+                "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/session.json"
+              test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = \
+                "sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
+              az storage blob list \
                 --account-name "$STORAGE_ACCOUNT" \
                 --container-name "$FUNDED_CONTAINER" \
-                --name "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json" \
-                --file current-v5-capital-reserve-state.json \
+                --prefix "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/" \
                 --auth-mode login \
-                --overwrite \
-                --only-show-errors -o none
+                --only-show-errors -o json > dormant-v8-prefix.json
               jq -e '
-                .schema == "polyedge.protected_compounding_state.v1"
-                and .session_id == "dynamic-quote-funded-2026-07-29-v5"
-                and .reconciliation_complete == true
-                and .high_water_equity >= 102.78112
-                and .historical_high_water_equity >= 102.78112
-                and (.last_reconciled_equity - 31.655501 | fabs) <= 0.01
-              ' current-v5-capital-reserve-state.json
+                length == 0 or (length == 1
+                  and .[0].name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/session.json")
+              ' dormant-v8-prefix.json >/dev/null
+              if [ "$(jq 'length' dormant-v8-prefix.json)" = "1" ]; then
+                az storage blob download \
+                  --account-name "$STORAGE_ACCOUNT" \
+                  --container-name "$FUNDED_CONTAINER" \
+                  --name "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/session.json" \
+                  --file dormant-v8-session.json \
+                  --auth-mode login \
+                  --overwrite \
+                  --only-show-errors -o none
+                test "sha256:$(sha256sum dormant-v8-session.json | cut -d' ' -f1)" = \
+                  "sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
+              fi
               ;;
             *)
               echo "Refusing cutover from unexpected funded session: ${current_session:-<unset>}" >&2
               exit 1
               ;;
           esac
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json" \
+            --file current-v5-capital-reserve-state.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          jq -e '
+            .schema == "polyedge.protected_compounding_state.v1"
+            and .session_id == "dynamic-quote-funded-2026-07-29-v5"
+            and .reconciliation_complete == true
+            and .high_water_equity >= 102.78112
+            and .historical_high_water_equity >= 102.78112
+            and (.last_reconciled_equity - 31.655501 | fabs) <= 0.01
+          ' current-v5-capital-reserve-state.json
       - name: Deploy continuous funded Dynamic Quote service
         run: |
           set -euo pipefail
