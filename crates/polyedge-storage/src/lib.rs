@@ -923,6 +923,8 @@ fn jsonl_recorded_event_line(event: &RecordedRuntimeEvent) -> Result<Vec<u8>, St
 pub enum AzureBlobError {
     #[error("Azure Blob HTTP status {0}")]
     HttpStatus(u16),
+    #[error("Azure Blob HTTP status {status}: {detail}")]
+    HttpStatusDetail { status: u16, detail: String },
     #[error("managed identity token is unavailable: {0}")]
     ManagedIdentity(String),
     #[error("external Azure identity token is unavailable: {0}")]
@@ -971,10 +973,24 @@ impl AzureBlobError {
     fn is_retryable(&self) -> bool {
         match self {
             AzureBlobError::HttpStatus(status) => is_retryable_azure_status(*status),
+            AzureBlobError::HttpStatusDetail { status, .. } => is_retryable_azure_status(*status),
             AzureBlobError::Transport(_) | AzureBlobError::Io(_) => true,
             _ => false,
         }
     }
+}
+
+fn safe_azure_response_header(response: &ureq::Response, name: &str) -> String {
+    response
+        .header(name)
+        .filter(|value| {
+            value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+        .unwrap_or("absent")
+        .to_owned()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2313,10 +2329,29 @@ impl AzureBlobClient {
         match response {
             Ok(_) => Ok(ImmutableBlobWrite::Created),
             Err(ureq::Error::Status(409 | 412, _)) => Ok(ImmutableBlobWrite::AlreadyExists),
-            Err(ureq::Error::Status(403, _)) => match self.get_response(url) {
-                Ok(_) => Ok(ImmutableBlobWrite::AlreadyExists),
-                Err(error) => Err(error),
-            },
+            Err(ureq::Error::Status(403, response)) => {
+                let error_code = safe_azure_response_header(&response, "x-ms-error-code");
+                let request_id = safe_azure_response_header(&response, "x-ms-request-id");
+                match self.get_response(url) {
+                    Ok(_) => Ok(ImmutableBlobWrite::AlreadyExists),
+                    Err(error) => {
+                        let follow_up = match error {
+                            AzureBlobError::HttpStatus(status) => format!("HTTP {status}"),
+                            AzureBlobError::HttpStatusDetail { status, .. } => {
+                                format!("HTTP {status}")
+                            }
+                            _ => "non-HTTP failure".to_owned(),
+                        };
+                        Err(AzureBlobError::HttpStatusDetail {
+                            status: 403,
+                            detail: format!(
+                                "immutable PUT x-ms-error-code={error_code} \
+                                 x-ms-request-id={request_id}; follow-up GET {follow_up}"
+                            ),
+                        })
+                    }
+                }
+            }
             Err(ureq::Error::Status(status, _)) => Err(AzureBlobError::HttpStatus(status)),
             Err(ureq::Error::Transport(error)) => Err(AzureBlobError::Transport(error.to_string())),
         }
@@ -3510,6 +3545,53 @@ mod tests {
             .to_ascii_lowercase()
             .contains("if-none-match: *"));
         assert!(requests[1].starts_with("GET "));
+    }
+
+    #[test]
+    fn immutable_blob_put_retains_safe_forbidden_headers_when_follow_up_read_fails() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 403 Forbidden\r\n\
+                     x-ms-error-code: AuthorizationPermissionMismatch\r\n\
+                     x-ms-request-id: 11111111-2222-3333-4444-555555555555\r\n\
+                     Content-Length: 11\r\nConnection: close\r\n\r\nsecret-body"
+                )
+                .unwrap();
+            }
+        });
+
+        let mut client = AzureBlobClient::new("unused", "unused", "test=sas");
+        let error = client
+            .put_block_blob_if_absent(
+                &format!("http://{address}/immutable"),
+                b"intent",
+                "application/json",
+                None,
+            )
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("x-ms-error-code=AuthorizationPermissionMismatch"));
+        assert!(message.contains("x-ms-request-id=11111111-2222-3333-4444-555555555555"));
+        assert!(message.contains("follow-up GET HTTP 403"));
+        assert!(!message.contains("secret-body"));
+        server.join().unwrap();
     }
 
     #[test]
