@@ -233,9 +233,309 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.deepEqual(bus.deadLettered, []);
   assert.equal(bus.receiveCalls.length, 2);
   assert.ok(bus.receiveCalls.every(({ maxMessages, options }) =>
-    maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
+    maxMessages === 1 &&
+    options?.maxWaitTimeInMs === 1_000 &&
+    options?.abortSignal instanceof AbortSignal
   ));
   assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
+});
+
+test("persistent service reconciles websocket risk before receiving another funded handoff", async () => {
+  const bus = fakeBus([{
+    messageId: "warmup-after-reconciliation",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  }]);
+  const order = [];
+  const sleeps = [];
+  const logs = [];
+  let reconciliationRequired = true;
+  let maintenanceAttempts = 0;
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({
+      createReceiver: () => ({
+        ...bus.client.createReceiver(),
+        async receiveMessages(...args) {
+          order.push("receive");
+          return bus.client.createReceiver().receiveMessages(...args);
+        }
+      }),
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => { order.push("warmup"); },
+      runMaintenance: async (task) => {
+        maintenanceAttempts += 1;
+        order.push(`reconcile-${maintenanceAttempts}`);
+        reconciliationRequired = false;
+        if (maintenanceAttempts === 1) throw new Error("transient post-reconciliation account snapshot failure");
+        return task({ lease: {} });
+      },
+      status: () => ({
+        user_channel_ready: true,
+        market_channel_ready: true,
+        user_channel_gaps: 0,
+        market_channel_gaps: reconciliationRequired ? 1 : 0,
+        reconnect_reconciliation_required: reconciliationRequired,
+        warmed_market: { condition_id: "condition" }
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    sleep: async (ms) => { sleeps.push(ms); },
+    logger: (value) => logs.push(value)
+  });
+
+  assert.equal(result.processed_messages, 1);
+  assert.deepEqual(order, ["reconcile-1", "reconcile-2", "receive", "warmup"]);
+  assert.deepEqual(sleeps, [60_000]);
+  assert.ok(logs.some((value) =>
+    value.status === "websocket_reconciliation_failed_closed" &&
+    value.account_risk_pause === true
+  ));
+  assert.ok(logs.some((value) => value.status === "websocket_reconciliation_completed"));
+});
+
+test("persistent service restarts before receiving if a channel gaps before first warmup", async () => {
+  const bus = fakeBus([{
+    messageId: "warmup-that-must-remain-queued",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  }]);
+  const logs = [];
+  await assert.rejects(runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      runMaintenance: async () => assert.fail("cold channel risk cannot be reconciled without a warmed market"),
+      status: () => ({
+        user_channel_ready: true,
+        market_channel_ready: false,
+        user_channel_gaps: 1,
+        market_channel_gaps: 0,
+        reconnect_reconciliation_required: true,
+        warmed_market: null
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  }), /websocket risk before first market warmup requires process restart/);
+
+  assert.equal(bus.receiveCalls.length, 0);
+  assert.ok(logs.some((value) =>
+    value.status === "websocket_reconciliation_restart_required" &&
+    value.account_risk_pause === true &&
+    value.missed_signal_risk === true
+  ));
+});
+
+test("persistent service recycles a receive link that outlives the one-second poll", async () => {
+  const message = {
+    messageId: "warmup-after-recycle",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  };
+  const completed = [];
+  const abandoned = [];
+  const closed = [];
+  const logs = [];
+  let receiverCreations = 0;
+  let stalledReceiveOptions;
+  let stalledClosed = false;
+  const receiverMethods = {
+    async renewMessageLock() {},
+    async deadLetterMessage() {},
+    async abandonMessage() {}
+  };
+  const stalledReceiver = {
+    ...receiverMethods,
+    receiveMessages: async (_maxMessages, options) => {
+      stalledReceiveOptions = options;
+      return new Promise((resolve) => {
+        setTimeout(() => resolve([{ messageId: "late-locked-intent" }]), 1_520);
+      });
+    },
+    async abandonMessage(received) {
+      assert.equal(stalledClosed, false);
+      abandoned.push(received.messageId);
+    },
+    async completeMessage() {},
+    async close() {
+      stalledClosed = true;
+      closed.push("stalled");
+    }
+  };
+  const healthyReceiver = {
+    ...receiverMethods,
+    async receiveMessages() { return [message]; },
+    async completeMessage(received) { completed.push(received.messageId); },
+    async close() { closed.push("healthy"); }
+  };
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
+    createBusClient: () => ({
+      createReceiver: () => receiverCreations++ === 0 ? stalledReceiver : healthyReceiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  });
+  assert.equal(result.processed_messages, 1);
+  assert.equal(receiverCreations, 2);
+  assert.equal(stalledReceiveOptions.maxWaitTimeInMs, 1_000);
+  assert.equal(stalledReceiveOptions.abortSignal.aborted, true);
+  assert.deepEqual(completed, ["warmup-after-recycle"]);
+  assert.deepEqual(abandoned, ["late-locked-intent"]);
+  assert.deepEqual(closed.sort(), ["healthy", "stalled"]);
+  assert.ok(logs.some((value) =>
+    value.status === "service_bus_receive_watchdog_expired" &&
+    value.watchdog_ms === 1_500 &&
+    value.recovery_action === "new_client_receiver" &&
+    value.missed_signal_risk === true
+  ));
+  assert.ok(logs.some((value) =>
+    value.status === "service_bus_late_receive_abandoned" &&
+    value.message_count === 1
+  ));
+});
+
+test("persistent service alerts if a locked message surfaces only after stale link closure", async () => {
+  const warmup = {
+    messageId: "warmup-after-late-cleanup",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  };
+  let receiverCreations = 0;
+  let staleClosed = false;
+  let resolveLateAlert;
+  const lateAlert = new Promise((resolve) => { resolveLateAlert = resolve; });
+  const staleReceiver = {
+    receiveMessages: async () => new Promise((resolve) => {
+      setTimeout(() => resolve([{ messageId: "late-after-close" }]), 1_600);
+    }),
+    async abandonMessage() {
+      if (staleClosed) throw new Error("receiver is closed");
+    },
+    async close() { staleClosed = true; }
+  };
+  const healthyReceiver = {
+    async receiveMessages() { return [warmup]; },
+    async completeMessage() {},
+    async renewMessageLock() {},
+    async close() {}
+  };
+  await runPersistentFundedDirectService({
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
+    createBusClient: () => ({
+      createReceiver: () => receiverCreations++ === 0 ? staleReceiver : healthyReceiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => {
+      if (value.status === "service_bus_late_receive_cleanup_failed") resolveLateAlert(value);
+    }
+  });
+  assert.deepEqual(await lateAlert, {
+    schema: "polyedge.funded_direct_alert.v1",
+    status: "service_bus_late_receive_cleanup_failed",
+    missed_signal_risk: true,
+    error: "receiver is closed"
+  });
+});
+
+test("persistent service fails closed instead of recycling a second stalled receive link", async () => {
+  const closed = [];
+  let receiverCreations = 0;
+  let resolveTermination;
+  const termination = new Promise((resolve) => { resolveTermination = resolve; });
+  const result = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
+    createBusClient: () => ({
+      createReceiver: () => {
+        const id = ++receiverCreations;
+        return {
+          receiveMessages: async () => new Promise(() => {}),
+          async close() { closed.push(id); }
+        };
+      },
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: () => {},
+    terminate: resolveTermination
+  });
+  await assert.rejects(result, /watchdog expired after receiver recycle/);
+  assert.equal(await termination, 1);
+  assert.equal(receiverCreations, 2);
+  assert.deepEqual(closed.sort(), [1, 2]);
+});
+
+test("persistent service hard-stops when a stalled receive link cannot close", async () => {
+  let receiverCreations = 0;
+  let resolveTermination;
+  const termination = new Promise((resolve) => { resolveTermination = resolve; });
+  const result = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
+    createBusClient: () => ({
+      createReceiver: () => {
+        receiverCreations += 1;
+        return {
+          receiveMessages: async () => new Promise(() => {}),
+          async close() { return new Promise(() => {}); }
+        };
+      },
+      async close() { return new Promise(() => {}); }
+    }),
+    createExecutor: async () => ({
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: () => {},
+    terminate: resolveTermination
+  });
+  await assert.rejects(result, /timed out closing stalled Service Bus receiver/);
+  assert.equal(await termination, 1);
+  assert.equal(receiverCreations, 1);
 });
 
 test("persistent service coalesces only duplicate market-token warmups", async () => {
@@ -302,7 +602,7 @@ test("persistent service coalesces only duplicate market-token warmups", async (
   assert.deepEqual(bus.renewed.sort(), ["intent-first", "warmup-duplicate", "warmup-first", "warmup-other-token"]);
 });
 
-test("persistent service seals a fresh intent busy while the first child is delayed", async () => {
+test("persistent service leaves a fresh intent queued while the first child is active", async () => {
   const decisionTs = new Date(Date.now() - 500).toISOString();
   const bus = fakeBus(["first", "fresh"].map((messageId) => ({
     messageId,
@@ -315,6 +615,8 @@ test("persistent service seals a fresh intent busy while the first child is dela
   })));
   const processed = [];
   const logs = [];
+  let activeProcesses = 0;
+  let maxActiveProcesses = 0;
   let releaseFirst;
   let firstStarted;
   const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
@@ -330,80 +632,35 @@ test("persistent service seals a fresh intent busy while the first child is dela
     createProcessor: async () => ({
       process: async (handoff) => {
         processed.push(handoff.decision_id);
-        if (handoff.decision_id.startsWith("first")) {
-          firstStarted();
-          await new Promise((resolve) => { releaseFirst = resolve; });
+        activeProcesses += 1;
+        maxActiveProcesses = Math.max(maxActiveProcesses, activeProcesses);
+        try {
+          if (handoff.decision_id.startsWith("first")) {
+            firstStarted();
+            await new Promise((resolve) => { releaseFirst = resolve; });
+          }
+          return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+        } finally {
+          activeProcesses -= 1;
         }
-        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
       },
-      rejectBusy: async () => ({ status: "one_workflow_busy" })
+      rejectBusy: async () => assert.fail("fresh intents must remain in Service Bus while a workflow is active")
     }),
     logger: (value) => logs.push(value)
   });
   await firstStartedPromise;
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(bus.received, ["first", "fresh"]);
-  assert.deepEqual(bus.renewed.sort(), ["first", "fresh"]);
+  assert.deepEqual(bus.received, ["first"]);
+  assert.deepEqual(bus.completed, []);
+  assert.equal(maxActiveProcesses, 1);
   releaseFirst();
   const result = await resultPromise;
   assert.equal(result.processed_messages, 2, JSON.stringify(logs));
   assert.deepEqual(bus.received, ["first", "fresh"]);
-  assert.equal(processed.length, 1);
-});
-
-test("persistent service settles a twelve-intent burst with one actual workflow", async () => {
-  const decisionTs = new Date(Date.now() - 500).toISOString();
-  const messages = Array.from({ length: 12 }, (_, index) => {
-    const decisionId = index.toString(16).padStart(64, "0");
-    return {
-      messageId: `intent-${index}`,
-      deliveryCount: 1,
-      body: {
-        schema: "polyedge.funded_intent_handoff.v1",
-        decision_id: decisionId,
-        decision_ts: decisionTs
-      }
-    };
-  });
-  const bus = fakeBus(messages);
-  let releaseFirst;
-  let firstStarted;
-  const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
-  let executions = 0;
-  let busyRejections = 0;
-  const resultPromise = runPersistentFundedDirectService({
-    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "12" }),
-    createBusClient: () => bus.client,
-    createExecutor: async () => ({
-      warmMarket: async () => {}, execute: async () => {}, status: () => ({ ready: true }), close: async () => {}
-    }),
-    createProcessor: async () => ({
-      process: async () => {
-        executions += 1;
-        firstStarted();
-        await new Promise((resolve) => { releaseFirst = resolve; });
-        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
-      },
-      rejectBusy: async () => {
-        busyRejections += 1;
-        return { status: "one_workflow_busy" };
-      }
-    }),
-    logger: () => {}
-  });
-  await firstStartedPromise;
-  for (let attempt = 0; attempt < 40 && busyRejections < 11; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  assert.equal(executions, 1);
-  assert.equal(busyRejections, 11);
-  assert.equal(bus.received.length, 12);
-  assert.equal(bus.completed.length, 11);
-  releaseFirst();
-  const result = await resultPromise;
-  assert.equal(result.processed_messages, 12);
-  assert.equal(result.failed_messages, 0);
-  assert.equal(bus.completed.length, 12);
+  assert.deepEqual(bus.completed, ["first", "fresh"]);
+  assert.deepEqual(bus.renewed.sort(), ["first", "fresh"]);
+  assert.equal(processed.length, 2);
+  assert.equal(maxActiveProcesses, 1);
 });
 
 test("persistent service waits for the prior revision lease before receiving messages", async () => {
@@ -588,9 +845,9 @@ test("persistent service pauses after three consecutive transitions above three 
     logger: (value) => logs.push(value)
   });
   assert.equal(result.processed_messages, 3);
-  assert.equal(result.failed_messages, 1);
+  assert.equal(result.failed_messages, 0);
   assert.ok(logs.some((value) => value.status === "engine_paused_by_consecutive_latency_breaches"));
   assert.deepEqual(bus.completed, ["decision-0", "decision-1", "decision-2"]);
-  assert.deepEqual(bus.received, ["decision-0", "decision-1", "decision-2", "decision-3"]);
-  assert.deepEqual(bus.deadLettered, ["decision-3"]);
+  assert.deepEqual(bus.received, ["decision-0", "decision-1", "decision-2"]);
+  assert.deepEqual(bus.deadLettered, []);
 });

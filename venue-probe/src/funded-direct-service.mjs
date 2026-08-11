@@ -11,7 +11,10 @@ import { sanitize } from "./lib.mjs";
 
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
 const FUNDED_LOCK_RENEWAL_MS = 10_000;
-const FUNDED_BUSY_VALIDATION_LIMIT = 4;
+const FUNDED_RECEIVE_WATCHDOG_GRACE_MS = 500;
+const FUNDED_RECEIVE_LATE_SETTLEMENT_GRACE_MS = 50;
+const FUNDED_RECEIVE_CLOSE_GRACE_MS = 250;
+const FUNDED_RECEIVE_FORCE_EXIT_MS = 500;
 
 export function loadFundedDirectServiceConfig(env = process.env) {
   const config = {
@@ -165,14 +168,22 @@ export async function runPersistentFundedDirectService({
   runRedemption = runVenueRedemption,
   now = Date.now,
   sleep = delay,
+  terminate = (code) => process.exit(code),
   createBusClient = ({ namespace, credential }) =>
     new ServiceBusClient(`${namespace}.servicebus.windows.net`, credential)
 } = {}) {
   const config = loadFundedDirectServiceConfig(env);
   if (config.engine !== "persistent_v1") throw new Error("persistent funded service requires FUNDED_DIRECT_ENGINE=persistent_v1");
   const credential = new DefaultAzureCredential({ managedIdentityClientId: env.AZURE_CLIENT_ID });
-  const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
-  const receiver = bus.createReceiver(config.serviceBusQueue, { receiveMode: "peekLock" });
+  const createBusReceiver = () => {
+    const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
+    return {
+      bus,
+      receiver: bus.createReceiver(config.serviceBusQueue, { receiveMode: "peekLock" })
+    };
+  };
+  let { bus, receiver } = createBusReceiver();
+  let receiverRecycled = false;
   let executor = null;
   let leaseHandoffAttempts = 0;
   while (!executor) {
@@ -272,6 +283,51 @@ export async function runPersistentFundedDirectService({
       });
     }
   };
+  const channelsRequireReconciliation = (status) =>
+    status.reconnect_reconciliation_required === true ||
+    Number(status.user_channel_gaps || 0) > 0 ||
+    Number(status.market_channel_gaps || 0) > 0 ||
+    Number(status.user_channel_unparsed || 0) > 0 ||
+    Number(status.market_channel_unparsed || 0) > 0;
+  let channelReconciliationPending = false;
+  const reconcileChannelsIfRequired = async () => {
+    const before = executor.status();
+    channelReconciliationPending ||= channelsRequireReconciliation(before);
+    if (!channelReconciliationPending) return true;
+    if (!before.warmed_market) {
+      logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "websocket_reconciliation_restart_required",
+        account_risk_pause: true,
+        missed_signal_risk: true,
+        executor: before
+      });
+      throw new Error("fail closed: websocket risk before first market warmup requires process restart");
+    }
+    try {
+      await executor.runMaintenance(async () => null);
+      const after = executor.status();
+      if (channelsRequireReconciliation(after)) {
+        throw new Error("fail closed: websocket reconciliation did not clear channel risk state");
+      }
+      channelReconciliationPending = false;
+      logger({
+        schema: "polyedge.funded_direct_service.v2",
+        status: "websocket_reconciliation_completed",
+        executor: after
+      });
+      return true;
+    } catch (error) {
+      logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "websocket_reconciliation_failed_closed",
+        account_risk_pause: true,
+        error: error.message,
+        executor: executor.status()
+      });
+      return false;
+    }
+  };
   const heartbeat = setInterval(() => {
     const executorStatus = executor.status();
     logger({
@@ -286,9 +342,7 @@ export async function runPersistentFundedDirectService({
       last_redemption_status: lastRedemptionStatus,
       executor: executorStatus
     });
-    if (executorStatus.reconnect_reconciliation_required ||
-        executorStatus.user_channel_gaps > 0 ||
-        executorStatus.market_channel_gaps > 0) {
+    if (channelsRequireReconciliation(executorStatus)) {
       logger({
         schema: "polyedge.funded_direct_alert.v1",
         status: "websocket_gap_or_reconciliation_required",
@@ -352,26 +406,15 @@ export async function runPersistentFundedDirectService({
       error: error.message
     });
   };
-  const processIntent = async (entry, busy) => {
+  const processIntent = async (entry) => {
     const { message, body, queueReceiveMonotonicMs } = entry;
     try {
       if (entry.renewalError) throw entry.renewalError;
       const receivedWallMs = Date.now();
-      const result = busy ? await processor.rejectBusy(body) : await processor.process(body);
+      const result = await processor.process(body);
       if (entry.renewalError) throw entry.renewalError;
       await receiver.completeMessage(message);
       processedMessages += 1;
-      if (busy) {
-        logger({
-          schema: "polyedge.funded_direct_service.v2",
-          status: "one_workflow_busy",
-          message_id: message.messageId || null,
-          decision_id: body.decision_id,
-          order_submission_attempted: false,
-          worker_status: result?.status || null
-        });
-        return;
-      }
       const sendWallMs = Number(result?.execution?.lifecycle?.send_wall_ms);
       const decisionWallMs = Date.parse(body.decision_ts);
       const signalToSendMs = Number.isFinite(sendWallMs) && Number.isFinite(decisionWallMs)
@@ -429,27 +472,90 @@ export async function runPersistentFundedDirectService({
       clearInterval(entry.renewal);
     }
   };
-  let activeWorkflow = null;
-  const busyValidations = new Set();
-  const trackBusyValidation = (entry) => {
-    const task = processIntent(entry, true).finally(() => busyValidations.delete(task));
-    busyValidations.add(task);
-  };
   try {
     while (!stopping) {
-      if (activeWorkflow) await new Promise((resolve) => setImmediate(resolve));
       if (config.maxMessages > 0 && processedMessages + failedMessages >= config.maxMessages) {
         stopping = true;
         break;
       }
-      if (busyValidations.size >= FUNDED_BUSY_VALIDATION_LIMIT ||
-          (config.maxMessages > 0 && processedMessages + failedMessages + busyValidations.size + (activeWorkflow ? 1 : 0) >= config.maxMessages)) {
-        await Promise.race([activeWorkflow, ...busyValidations].filter(Boolean));
+      if (!await reconcileChannelsIfRequired()) {
+        await sleep(config.riskPauseMs);
         continue;
       }
-      const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs });
+      const receiveController = new AbortController();
+      let receiveWatchdog;
+      const receiveWatchdogExpired = new Promise((_, reject) => {
+        receiveWatchdog = setTimeout(() => {
+          receiveController.abort();
+          reject(new Error("fail closed: Service Bus receive watchdog expired"));
+        }, config.pollIntervalMs + FUNDED_RECEIVE_WATCHDOG_GRACE_MS);
+      });
+      let messages;
+      let receivePromise;
+      try {
+        receivePromise = receiver.receiveMessages(1, {
+          maxWaitTimeInMs: config.pollIntervalMs,
+          abortSignal: receiveController.signal
+        });
+        messages = await Promise.race([
+          receivePromise,
+          receiveWatchdogExpired
+        ]);
+      } catch (error) {
+        if (!receiveController.signal.aborted) throw error;
+        logger({
+          schema: "polyedge.funded_direct_alert.v1",
+          status: "service_bus_receive_watchdog_expired",
+          queue: config.serviceBusQueue,
+          watchdog_ms: config.pollIntervalMs + FUNDED_RECEIVE_WATCHDOG_GRACE_MS,
+          missed_signal_risk: true,
+          recovery_action: receiverRecycled ? "process_restart" : "new_client_receiver",
+          error: error.message
+        });
+        const staleReceiver = receiver;
+        const staleBus = bus;
+        receiver = null;
+        bus = null;
+        const lateReceiveCleanup = receivePromise.then(async (lateMessages) => {
+          try {
+            for (const message of lateMessages) await staleReceiver.abandonMessage(message);
+            if (lateMessages.length) logger({
+              schema: "polyedge.funded_direct_alert.v1",
+              status: "service_bus_late_receive_abandoned",
+              message_count: lateMessages.length
+            });
+          } catch (cleanupError) {
+            logger({
+              schema: "polyedge.funded_direct_alert.v1",
+              status: "service_bus_late_receive_cleanup_failed",
+              missed_signal_risk: true,
+              error: cleanupError.message
+            });
+          }
+        }, () => null);
+        await Promise.race([
+          lateReceiveCleanup,
+          delay(FUNDED_RECEIVE_LATE_SETTLEMENT_GRACE_MS)
+        ]);
+        const linkClosed = await Promise.race([
+          Promise.allSettled([staleReceiver.close(), staleBus.close()])
+            .then((results) => results.every(({ status }) => status === "fulfilled")),
+          delay(FUNDED_RECEIVE_CLOSE_GRACE_MS).then(() => false)
+        ]);
+        if (!linkClosed || receiverRecycled) {
+          setTimeout(() => terminate(1), FUNDED_RECEIVE_FORCE_EXIT_MS);
+          throw new Error(linkClosed
+            ? "fail closed: Service Bus receive watchdog expired after receiver recycle"
+            : "fail closed: timed out closing stalled Service Bus receiver");
+        }
+        ({ bus, receiver } = createBusReceiver());
+        receiverRecycled = true;
+        continue;
+      } finally {
+        clearTimeout(receiveWatchdog);
+      }
       if (!messages.length) {
-        if (!activeWorkflow) await maybeRunAutomaticRedemption();
+        await maybeRunAutomaticRedemption();
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
@@ -466,34 +572,18 @@ export async function runPersistentFundedDirectService({
         continue;
       }
       if (body?.schema === "polyedge.funded_intent_handoff.v1") {
-        if (activeWorkflow) {
-          trackBusyValidation(entry);
-        } else {
-          const task = processIntent(entry, false);
-          activeWorkflow = task;
-          task.finally(() => {
-            if (activeWorkflow === task) activeWorkflow = null;
-          });
-        }
+        await processIntent(entry);
         continue;
       }
       if (body?.schema === "polyedge.funded_market_warmup.v1") {
-        if (activeWorkflow) {
-          clearInterval(entry.renewal);
-          await receiver.completeMessage(message);
-          processedMessages += 1;
-          logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_deferred", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
-        } else {
-          await processWarmup(entry);
-          await maybeRunAutomaticRedemption();
-        }
+        await processWarmup(entry);
+        await maybeRunAutomaticRedemption();
         continue;
       }
       await failMessage(entry, entry.renewalError || new Error("fail closed: unsupported funded intent handoff schema"));
       clearInterval(entry.renewal);
       continue;
     }
-    await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
     return {
       schema: "polyedge.funded_direct_service.v2",
       status: "persistent_service_stopped",
@@ -506,13 +596,12 @@ export async function runPersistentFundedDirectService({
     };
   } finally {
     stopping = true;
-    await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
     clearInterval(heartbeat);
     process.removeListener("SIGTERM", stop);
     process.removeListener("SIGINT", stop);
     await executor.close().catch(() => null);
-    await receiver.close().catch(() => null);
-    await bus.close().catch(() => null);
+    await receiver?.close().catch(() => null);
+    await bus?.close().catch(() => null);
   }
 }
 

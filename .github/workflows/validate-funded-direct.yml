@@ -196,7 +196,7 @@ jobs:
             "FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME",
             "FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY"
           ]) assert.ok(name in env, `${name} missing from funded executor`);
-          assert.match(JSON.stringify(env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED), /fundedDirectEnabled/);
+          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED, "false");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, "60000");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, "30");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, "350");
@@ -771,7 +771,7 @@ jobs:
           test "$(env_value FUNDED_DIRECT_POLL_INTERVAL_MS)" = "1000"
           test "$(env_value FUNDED_DIRECT_MIN_REMAINING_TTL_MS)" = "7000"
           test "$(env_value FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS)" = "2000"
-          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "true"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "false"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS)" = "60000"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY)" = "30"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY)" = "350"
@@ -870,8 +870,26 @@ jobs:
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query id -o tsv)
-          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Sender'] | length(@)" -o tsv)" = "1"
-          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Receiver'] | length(@)" -o tsv)" = "1"
+          expected_sender_principal=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query "identity.userAssignedIdentities.*.principalId | [0]" -o tsv)
+          expected_receiver_principal=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query "identity.userAssignedIdentities.*.principalId | [0]" -o tsv)
+          test -n "$expected_sender_principal"
+          test -n "$expected_receiver_principal"
+          az role assignment list --scope "$queue_id" \
+            --query "[?roleDefinitionName=='Azure Service Bus Data Sender'].principalId" \
+            -o json > service-bus-sender-principals.json
+          az role assignment list --scope "$queue_id" \
+            --query "[?roleDefinitionName=='Azure Service Bus Data Receiver'].principalId" \
+            -o json > service-bus-receiver-principals.json
+          jq -e --arg expected "$expected_sender_principal" \
+            'length == 1 and .[0] == $expected' service-bus-sender-principals.json
+          jq -e --arg expected "$expected_receiver_principal" \
+            'length == 1 and .[0] == $expected' service-bus-receiver-principals.json
 
       - name: Verify service startup and qset isolation
         run: |
@@ -1073,7 +1091,9 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           warmup_ready=false
-          for attempt in $(seq 1 36); do
+          # A fresh 15-minute market may be the first valid warmup after restart;
+          # include Log Analytics ingestion without weakening the live gates.
+          for attempt in $(seq 1 240); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
@@ -1127,7 +1147,7 @@ jobs:
             ([.[] | select(.properties.active == true)] | length) == 1
             and ([.[] | select(.properties.active == true)][0].name == $revision)
           ' producer-revisions-after-reopen.json
-          test "$(az containerapp show \
+          az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
             -o json | jq -e --arg revision "$producer_revision" \
