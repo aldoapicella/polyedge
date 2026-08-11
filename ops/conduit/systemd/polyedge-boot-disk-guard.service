@@ -1,0 +1,7 @@
+[Unit]
+Description=Guard PolyEdge boot-disk headroom and image pulls
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/polyedge-boot-disk-guard --check

@@ -1,12 +1,18 @@
 # Azure Deployment
 
-PolyEdge runs as a Rust backend container plus a Next.js frontend sidecar in Azure Container Apps.
+PolyEdge's cost-efficient target topology uses an internal Rust bot/API
+Container App plus a public Next.js frontend Container App. Until the frozen
+qset campaign permits the topology rollout, the live primary app may still use
+the legacy two-container sidecar revision. See
+[`azure-cost-efficiency.md`](azure-cost-efficiency.md) for sequencing and
+rollback.
 
 ```text
 subscription: Visual Studio Professional Subscription
 resource group: rg-polyedge-dev
 region: eastus
-Container App: polyedge-dev
+Public frontend Container App: polyedge-dev
+Internal bot/API Container App: polyedge-dev-api
 Container App identity: polyedge-dev-id
 FQDN: polyedge-dev.graypond-7f5d8417.eastus.azurecontainerapps.io
 Storage account: stpolyedge6urdjr5nmwx7w
@@ -56,11 +62,12 @@ Do not deploy by local `az acr build` or `az containerapp update`; use the workf
 
 During a frozen evidence campaign, Azure Monitor recorder and restart coverage
 can be updated with the `monitoring-only` target. This path compiles an isolated
-template containing only the five scheduled-query rules, snapshots both the
-primary and frozen shadow Container Apps, deploys the rules, and proves both
-protected runtime definitions and revisions are unchanged. Four rules watch
-both `polyedge-dev` and `polyedge-shadow-neu`; a fifth fails closed when the
-shadow runtime-health heartbeat is absent. They do not claim literal FIFO
+template containing only six scheduled-query rules, snapshots the existing
+primary/API and frozen shadow Container Apps, deploys the rules, and proves all
+protected runtime definitions and revisions are unchanged. Four runtime rules
+cover the primary API, public frontend where relevant, and shadow app; a fifth
+fails closed when the shadow runtime-health heartbeat is absent; the sixth
+covers Container Apps Job failures using job-specific log columns. They do not claim literal FIFO
 visibility and do not enable any funded job.
 
 ```bash
@@ -89,9 +96,9 @@ fail closed through the job memory limit and alerting.
 
 During a frozen shadow campaign, reporting changes must use
 `.github/workflows/deploy-polyedge-research-jobs.yml` instead of the active
-runtime workflow. The workflow accepts only the primary and shadow daily
-reporters plus the three existing manual research jobs; `build-only` validates
-and publishes an image without updating a job.
+runtime workflow. The workflow accepts only the primary daily reporter, compact
+replay indexer, shadow daily reporter, and three existing manual research jobs;
+`build-only` validates and publishes an image without updating a job.
 
 ```bash
 gh workflow run deploy-polyedge-research-jobs.yml \
@@ -100,7 +107,7 @@ gh workflow run deploy-polyedge-research-jobs.yml \
 ```
 
 The workflow limits source changes to reporting, the research CLI entry point,
-the two checked shadow-daily scripts, documentation, and the deployment
+the checked primary/replay/shadow scripts, documentation, and deployment
 workflows. It runs the full Rust validation suite, publishes a uniquely tagged
 image, resolves it to an immutable digest, and updates only the selected job.
 Before and after the update it verifies the job identity, trigger, command,
@@ -108,25 +115,22 @@ paper-only environment, and absence of funded credentials. It also proves that
 the frozen `polyedge-shadow-neu` revision and image did not change. Updating
 the shadow daily reporter is refused from 02:00 through 02:30 UTC so a
 deployment cannot overlap its 02:15 UTC schedule.
-The same guard rejects primary-daily updates from 00:15 through 00:45 UTC, and
-both scheduled targets must have zero running executions before any update.
+The same guard rejects primary-daily updates from 00:15 through 00:45 UTC and
+replay-index updates from 02:45 through 03:15 UTC. Every scheduled target must
+have zero running executions before any update.
 
 This workflow updates the selected job definition; it does not start a manual
 job or grant funded execution. The active deployment workflow separately
 requires an explicit campaign-runtime authorization before it may touch the
 shadow runtime during the frozen evidence window.
 
-Dashboard-only changes use the `frontend-only` target on the active workflow.
-That path changes only the `frontend` image, freezes the active backend image
-and the shadow revision before the update, and verifies both images are
-unchanged afterward. Azure Container Apps revisions are app-wide, so this does
-roll the primary paper bot sidecar process; the workflow therefore verifies
-recorder health, durable-event recovery, replica restart counts, and the Labs
-routes after rollout. The update is idempotent: if the immutable frontend
-digest is already active, it verifies the existing ready revision without
-rolling it again. It also refuses to deploy while a funded controller is
-running or enabled. A truly process-independent frontend deployment would
-require moving the frontend to a separate Container App.
+After the split topology is deployed, dashboard-only changes use the
+`frontend-only` target on the active workflow. That path changes only the
+public `frontend` image, freezes the internal API image and revision plus the
+shadow revision, and verifies them afterward. The update is idempotent: if the
+immutable frontend digest is already active, it verifies the existing ready
+revision without rolling it again. It also refuses to deploy while a funded
+controller is running or enabled.
 
 After deployment the workflow logs into the dashboard without exposing the
 password, verifies authenticated health/status/snapshot/market/order/fill/
@@ -141,11 +145,12 @@ instead of matching harmless fields whose value is zero.
 
 ## Frontend Wiring
 
-The frontend container proxies backend traffic to the Rust sidecar:
+In the split topology, the frontend proxies backend traffic through the
+internal Container Apps FQDN:
 
 ```text
-BACKEND_API_BASE_URL=http://127.0.0.1:8081/api/v1
-BACKEND_WS_URL=ws://127.0.0.1:8081/api/v1/ws/live
+BACKEND_API_BASE_URL=https://<polyedge-dev-api-internal-fqdn>/api/v1
+BACKEND_WS_URL=wss://<polyedge-dev-api-internal-fqdn>/api/v1/ws/live
 ```
 
 The public browser path remains stable:

@@ -1,5 +1,6 @@
 import { AssetType, Chain, ClobClient, OrderType, Side } from "@polymarket/clob-client-v2";
-import { createWalletClient, http } from "viem";
+import { pathToFileURL } from "node:url";
+import { createWalletClient, decodeEventLog, formatUnits, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import {
@@ -9,11 +10,14 @@ import {
   acquireCampaignLease,
   assertEligibleOrigin,
   finalizeProbeRisk,
+  isRiskReservationResolved,
   loadCampaignRiskControl,
-  loadUnresolvedRiskReservations,
+  loadCampaignRiskReservationRecords,
+  loadCampaignUnresolvedRiskReservationRecords,
   marketContext,
   modelObservations,
   publishTerminalRiskPortfolioEvidence,
+  rebuildCampaignRiskReservationIndex,
   reserveProbeRisk,
   settleProbeRiskReservations,
   sanitize,
@@ -26,10 +30,13 @@ import {
   consumeOneShotAuthorization,
   beginFillMarkoutCapture,
   artifactLocationFromUri,
+  deterministicNoOrderRejection,
   executeStrategyCanary,
   loadCanaryConfig,
   loadHashedJson,
   polymarketV2FeePerShare,
+  sha256,
+  validateDeterministicNoOrderReconciliation,
   validateCanaryPreflight
 } from "./canary-lib.mjs";
 import {
@@ -50,54 +57,122 @@ import {
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
 } from "./canary-lifecycle-lib.mjs";
+import {
+  discoverVerifiedAutomaticInternalSettlements,
+  loadDurableInternalSettlements,
+  migrateProtectedReserveState,
+  putVerifiedInternalSettlement,
+  reconcileProtectedCompoundingState,
+  sizeProtectedOrder,
+  verifyConfiguredInternalSettlements
+} from "./compounding-risk.mjs";
+import { initializeProfitQuarantine } from "./profit-quarantine.mjs";
 
-const config = loadCanaryConfig();
-const runId = process.env.STRATEGY_CANARY_RUN_ID || `strategy-canary-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
-const ledger = new EventLedger(runId);
+let config;
+let runKind;
+let runId;
+let ledger;
 let lease;
 let userChannel;
 let marketChannel;
 let orderSubmissionAttempted = false;
+let activeResources = null;
+const AUTOMATIC_SETTLEMENT_RETRY_MS = 10_000;
+const CONDITIONAL_TOKENS_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+const PUSD_ADDRESS = "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb";
+const USDCE_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
+const PAYOUT_REDEMPTION_TOPIC = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d";
+const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC1155_TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
+const ERC1155_TRANSFER_BATCH_TOPIC = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb";
+const COLLATERAL_WRAPPED_TOPIC = "0xc00a5c84859ae82a7f5e6a2773283fb525335d5b3195f61174aa1ecc7e15dd84";
+const PAYOUT_REDEMPTION_EVENT = [{
+  type: "event",
+  name: "PayoutRedemption",
+  anonymous: false,
+  inputs: [
+    { name: "redeemer", type: "address", indexed: true },
+    { name: "collateralToken", type: "address", indexed: true },
+    { name: "parentCollectionId", type: "bytes32", indexed: true },
+    { name: "conditionId", type: "bytes32", indexed: false },
+    { name: "indexSets", type: "uint256[]", indexed: false },
+    { name: "payout", type: "uint256", indexed: false }
+  ]
+}];
+const ERC20_TRANSFER_EVENT = [{
+  type: "event",
+  name: "Transfer",
+  anonymous: false,
+  inputs: [
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "value", type: "uint256", indexed: false }
+  ]
+}];
+const ERC1155_TRANSFER_SINGLE_EVENT = [{
+  type: "event",
+  name: "TransferSingle",
+  anonymous: false,
+  inputs: [
+    { name: "operator", type: "address", indexed: true },
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "id", type: "uint256", indexed: false },
+    { name: "value", type: "uint256", indexed: false }
+  ]
+}];
+const ERC1155_TRANSFER_BATCH_EVENT = [{
+  type: "event",
+  name: "TransferBatch",
+  anonymous: false,
+  inputs: [
+    { name: "operator", type: "address", indexed: true },
+    { name: "from", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "ids", type: "uint256[]", indexed: false },
+    { name: "values", type: "uint256[]", indexed: false }
+  ]
+}];
+const COLLATERAL_WRAPPED_EVENT = [{
+  type: "event",
+  name: "Wrapped",
+  anonymous: false,
+  inputs: [
+    { name: "caller", type: "address", indexed: true },
+    { name: "asset", type: "address", indexed: true },
+    { name: "to", type: "address", indexed: true },
+    { name: "amount", type: "uint256", indexed: false }
+  ]
+}];
 
-try {
-  const result = await main();
-  console.log(JSON.stringify(sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...result })));
-} catch (error) {
-  process.exitCode = 1;
-  console.error(JSON.stringify({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, status: "failed_closed", order_submission_attempted: orderSubmissionAttempted, error: error.message }));
-} finally {
-  userChannel?.close();
-  marketChannel?.close();
-  if (lease) await lease.release().catch((error) => {
-    process.exitCode = 1;
-    console.error(JSON.stringify({ status: "failed_closed", error: `campaign lease release failed: ${error.message}` }));
-  });
+function setExecutionContext(env) {
+  config = loadCanaryConfig(env);
+  runKind = config.operatorDirect ? "funded-direct" : "strategy-canary";
+  runId = env.STRATEGY_CANARY_RUN_ID || `${runKind}-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
+  ledger = new EventLedger(runId);
+  orderSubmissionAttempted = false;
 }
 
-async function main() {
+async function initializeResources({ persistent = false } = {}) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable Azure Blob storage is unavailable");
-  await container.createIfNotExists();
   const intentContainer = storageContainer({ ...config, storageContainer: config.intentContainerName });
   const manifestContainer = storageContainer({ ...config, storageContainer: config.manifestContainerName });
   if (!intentContainer || !manifestContainer) throw new Error("fail closed: intent or manifest source container is unavailable");
+  if (config.operatorDirect) {
+    await putOperatorSessionManifest(manifestContainer, {
+      blobName: config.manifestBlobName,
+      expectedHash: config.manifestBlobHash,
+      value: config.operatorSessionManifest
+    });
+  }
   const modelArtifact = artifactLocationFromUri(config.executionModelBlobUri, config.storageAccount);
   const modelContainer = storageContainer({ ...config, storageContainer: modelArtifact.container });
   if (!modelContainer) throw new Error("fail closed: execution model source container is unavailable");
-  const [intentDocument, manifestDocument, authorizationDocument, executionModelDocument] = await Promise.all([
-    loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
+  const [manifestDocument, executionModelDocument] = await Promise.all([
     loadHashedJson(manifestContainer, config.manifestBlobName, config.manifestBlobHash),
-    loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash),
     loadHashedJson(modelContainer, modelArtifact.blobName, config.executionModelHash)
   ]);
-  const documents = {
-    intent: intentDocument.value,
-    manifest: manifestDocument.value,
-    authorization: authorizationDocument.value,
-    authorizationHash: authorizationDocument.hash,
-    executionModel: executionModelDocument.value,
-    executionModelHash: executionModelDocument.hash
-  };
   const account = privateKeyToAccount(normalizePrivateKey(config.privateKey));
   const signer = createWalletClient({ account, chain: polygon, transport: http("https://polygon-bor-rpc.publicnode.com") });
   const client = new ClobClient({
@@ -110,30 +185,812 @@ async function main() {
     useServerTime: true,
     throwOnError: true
   });
-  if (!config.dryRun) lease = await acquireCampaignLease(config, runId);
-  const runtime = await capturePreflight(client, documents.intent);
+  const protectedCompoundingContext = manifestDocument.value?.allow_compounding === true
+    ? await initializeProtectedCompounding({
+        container,
+        manifest: manifestDocument.value
+      })
+    : null;
+  const profitQuarantineSnapshot = manifestDocument.value?.profit_quarantine?.enabled === true
+    ? await initializeProfitQuarantine({
+        container,
+        manifest: manifestDocument.value,
+        activity: await fetchJson(
+          `https://data-api.polymarket.com/activity?user=${encodeURIComponent(config.funderAddress)}&limit=500`
+        ),
+        getTransactionReceipt: confirmedPolygonReceipt
+      })
+    : null;
+  const resourceLease = !config.dryRun ? await acquireCampaignLease(config, persistent ? `funded-direct-service-${crypto.randomUUID()}` : runId) : null;
+  let riskReservationIndex = null;
+  try {
+    if (config.operatorDirect && !config.dryRun) {
+      resourceLease?.assertHealthy();
+      riskReservationIndex = await rebuildCampaignRiskReservationIndex(config, { container });
+      resourceLease?.assertHealthy();
+      if (config.reserveMigrationSourceSessionId) {
+        if (!protectedCompoundingContext) {
+          throw new Error("fail closed: protected reserve migration requires protected compounding startup");
+        }
+        const migration = await migrateProtectedReserveAtStartup({
+          client,
+          container,
+          manifest: manifestDocument.value
+        });
+        protectedCompoundingContext.state = migration.state;
+        resourceLease?.assertHealthy();
+        console.log(JSON.stringify(sanitize({
+          schema: "polyedge.protected_reserve_migration.v1",
+          status: "protected_reserve_migration_completed",
+          target_session_id: manifestDocument.value.session_id,
+          source_session_id: config.reserveMigrationSourceSessionId,
+          source_state_etag: migration.source_state_etag,
+          source_session_sha256: migration.source_session_sha256,
+          account_equity: migration.state.last_reconciled_equity,
+          high_water_equity: migration.state.high_water_equity,
+          protected_reserve: migration.state.protected_reserve,
+          verified_equity_ceiling: migration.verified_equity_ceiling,
+          verified_settlement_ids: migration.verified_settlement_ids
+        })));
+      }
+    }
+  } catch (error) {
+    await resourceLease?.release().catch(() => null);
+    throw error;
+  }
+  const ledgerMultiplexer = {
+    current: persistent ? null : ledger,
+    record(event, payload) {
+      this.current?.record(event, payload);
+    }
+  };
+  let persistentUserChannel = null;
+  if (persistent) {
+    persistentUserChannel = await connectLifecycleChannel({
+      url: config.userWsUrl,
+      subscription: {
+        auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
+        type: "user"
+      },
+      ledger: ledgerMultiplexer,
+      eventType: "venue_user_channel"
+    });
+  }
+  return {
+    persistent,
+    container,
+    intentContainer,
+    modelArtifact,
+    manifestDocument,
+    executionModelDocument,
+    profitQuarantineSnapshot,
+    protectedCompoundingContext,
+    riskReservationIndex,
+    campaignRiskSnapshot: null,
+    client,
+    lease: resourceLease,
+    ledgerMultiplexer,
+    userChannel: persistentUserChannel,
+    marketChannel: null,
+    warmedMarket: null,
+    safetyCache: {
+      generation: 0,
+      timer: null,
+      inFlight: 0,
+      latest: null,
+      lastError: null,
+      market_id: null,
+      condition_id: null,
+      token_id: null
+    },
+    busy: false,
+    baseBinding: {
+      manifestBlobName: config.manifestBlobName,
+      manifestBlobHash: config.manifestBlobHash,
+      executionModelBlobUri: config.executionModelBlobUri,
+      executionModelHash: config.executionModelHash,
+      candidateName: config.candidateName,
+      candidateVersion: config.candidateVersion,
+      candidateConfigHash: config.candidateConfigHash
+    }
+  };
+}
+
+export async function initializeProtectedCompounding({
+  container,
+  manifest,
+  loadActivity = loadSettlementActivity
+}) {
+  const predecessorSessionId = manifest?.schema_version ===
+      "polyedge.operator_funded_session.v3"
+    ? manifest?.capital_policy?.prior_state_session_id
+    : null;
+  const [durableSettlements, predecessorSettlements] = await Promise.all([
+    loadDurableInternalSettlements(container, manifest.session_id),
+    predecessorSessionId
+      ? loadDurableInternalSettlements(container, predecessorSessionId)
+      : Promise.resolve([])
+  ]);
+  const durableVerificationEvidence = [
+    ...durableSettlements,
+    ...predecessorSettlements.filter((row) =>
+      !durableSettlements.some((current) => current.id === row.id))
+  ];
+  const configuredSettlements = manifest.internal_settlements || [];
+  const configuredSettlementsNeedingActivity = configuredSettlements.filter((configured) =>
+    !durableVerificationEvidence.some((durable) => durable.id === configured.id));
+  const activity = configuredSettlementsNeedingActivity.length
+    ? await loadActivity({
+        user: config.funderAddress,
+        conditionIds: configuredSettlementsNeedingActivity.map((row) => row.condition_id),
+        sessionStartedAt: manifest.created_at
+      })
+    : [];
+  const verifiedConfiguredSettlements = await verifyConfiguredInternalSettlements({
+    manifest,
+    activity,
+    getTransactionReceipt: confirmedPolygonReceipt,
+    durableSettlements: durableVerificationEvidence
+  }).then((rows) => rows.map((row) => ({
+    ...row,
+    session_id: manifest.session_id
+  })));
+  for (const settlement of verifiedConfiguredSettlements) {
+    if (!durableSettlements.some((row) => row.id === settlement.id)) {
+      await putVerifiedInternalSettlement(container, {
+        ...settlement,
+        session_id: manifest.session_id
+      });
+    }
+  }
+  return {
+    state: null,
+    verifiedConfiguredSettlements,
+    automaticSettlementPromise: null,
+    automaticSettlementLastAttemptMs: 0
+  };
+}
+
+async function migrateProtectedReserveAtStartup({ client, container, manifest }) {
+  const sourceConfig = {
+    ...config,
+    campaignId: config.reserveMigrationSourceSessionId
+  };
+  const [openOrders, balance, positions, reportedValues, targetReservations, sourceReservations] =
+    await Promise.all([
+      getOpenOrdersStrict(client),
+      client.getBalanceAllowance({
+        asset_type: AssetType.COLLATERAL,
+        signature_type: config.signatureType
+      }),
+      loadAccountPositions({ user: config.funderAddress }),
+      fetchJson(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`),
+      loadCampaignRiskReservationRecords(config),
+      loadCampaignRiskReservationRecords(sourceConfig)
+    ]);
+  if (!Array.isArray(positions)
+      || !Array.isArray(reportedValues)
+      || !Array.isArray(targetReservations)
+      || !Array.isArray(sourceReservations)) {
+    throw new Error("fail closed: protected reserve migration reconciliation payload is invalid");
+  }
+  const liquidCollateral = Number(balance?.balance) / 1_000_000;
+  const summedPositionValue = positions.reduce(
+    (total, row) => total + row.currentValue,
+    0
+  );
+  const reportedPositionValue = reportedValues.reduce(
+    (total, row) => total + Math.max(0, Number(row?.value) || 0),
+    0
+  );
+  if (!Number.isFinite(liquidCollateral) || liquidCollateral < 0) {
+    throw new Error("fail closed: protected reserve migration collateral is invalid");
+  }
+  const unresolvedReservations = new Map();
+  for (const record of [...targetReservations, ...sourceReservations]) {
+    if (!isRiskReservationResolved(record.reservation)) {
+      unresolvedReservations.set(record.blob_name, record);
+    }
+  }
+  return migrateProtectedReserveState({
+    container,
+    manifest,
+    source: {
+      sessionId: config.reserveMigrationSourceSessionId,
+      sessionBlobName: config.reserveMigrationSourceSessionBlobName,
+      sessionHash: config.reserveMigrationSourceSessionHash,
+      stateBlobName: config.reserveMigrationSourceStateBlobName,
+      minimumHistoricalHighWaterEquity:
+        config.reserveMigrationMinimumHistoricalHighWaterEquity
+    },
+    accountEquity: liquidCollateral + Math.min(summedPositionValue, reportedPositionValue),
+    fullyReconciled: Math.abs(summedPositionValue - reportedPositionValue) <=
+      Number(manifest.max_reconciliation_discrepancy) + 1e-9,
+    openOrderCount: openOrders.length,
+    positionCount: positions.filter((row) => row.size > 1e-9).length,
+    unresolvedReservationCount: unresolvedReservations.size
+  });
+}
+
+async function reconcileProtectedCompoundingWithAutomaticSettlement({
+  client,
+  container,
+  manifest,
+  accountEquity,
+  fullyReconciled,
+  context,
+  loadReservationRecords,
+  allowAutomaticDiscovery
+}) {
+  const reconcile = () => reconcileProtectedCompoundingState({
+    container,
+    manifest,
+    accountEquity,
+    fullyReconciled,
+    verifiedConfiguredSettlements: context.verifiedConfiguredSettlements
+  });
+  try {
+    return await reconcile();
+  } catch (error) {
+    if (!fullyReconciled ||
+        !String(error?.message || "").includes("unauthorized external deposit detected")) {
+      throw error;
+    }
+    if (!allowAutomaticDiscovery) {
+      throw new Error(
+        "fail closed: authenticated automatic settlement reconciliation is pending the background safety cache"
+      );
+    }
+    if (!context.automaticSettlementPromise) {
+      const elapsedSinceAttempt = Date.now() -
+        Number(context.automaticSettlementLastAttemptMs || 0);
+      if (elapsedSinceAttempt < AUTOMATIC_SETTLEMENT_RETRY_MS) {
+        throw new Error(
+          "fail closed: authenticated automatic settlement reconciliation retry is cooling down"
+        );
+      }
+      context.automaticSettlementLastAttemptMs = Date.now();
+      const work = (async () => {
+        if (typeof loadReservationRecords !== "function") {
+          throw new Error("fail closed: funded reservation history loader is unavailable");
+        }
+        const reservationRecords = await loadReservationRecords();
+        const durableSettlements = await loadDurableInternalSettlements(
+          container,
+          manifest.session_id
+        );
+        const activity = await loadSettlementActivity({
+          user: config.funderAddress,
+          conditionIds: reservationRecords.map((record) => record.reservation?.condition_id),
+          sessionStartedAt: manifest.created_at
+        });
+        const settlements = await discoverVerifiedAutomaticInternalSettlements({
+          manifest,
+          reservations: reservationRecords.map((record) => record.reservation),
+          activity,
+          durableSettlements,
+          expectedWallet: config.funderAddress,
+          getOrderFills: async (reservation) => {
+            const trades = await client.getTrades({ market: reservation.condition_id });
+            if (!Array.isArray(trades)) {
+              throw new Error("fail closed: authenticated CLOB trade history is invalid");
+            }
+            return tradeFillsFromRest(trades, reservation.order_id);
+          },
+          getTransactionReceipt: confirmedPolygonReceipt
+        });
+        if (!settlements.length) {
+          throw new Error(
+            "fail closed: excess equity has no new exact reservation-bound authenticated redemption"
+          );
+        }
+        for (const settlement of settlements) {
+          await putVerifiedInternalSettlement(container, settlement);
+        }
+        return reconcile();
+      })();
+      const shared = work.finally(() => {
+        if (context.automaticSettlementPromise === shared) {
+          context.automaticSettlementPromise = null;
+        }
+      });
+      context.automaticSettlementPromise = shared;
+    }
+    return context.automaticSettlementPromise;
+  }
+}
+
+export function requireExecutionModelArtifact(value) {
+  const container = String(value?.container || "").trim();
+  const blobName = String(value?.blobName || "").trim();
+  if (!/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$/.test(container) ||
+      !blobName ||
+      blobName.startsWith("/") ||
+      blobName.includes("\\") ||
+      blobName.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new Error("fail closed: persistent execution-model artifact provenance is unavailable");
+  }
+  return { ...value, container, blobName };
+}
+
+async function closeResources(resources) {
+  if (resources?.safetyCache?.timer) clearInterval(resources.safetyCache.timer);
+  if (resources?.safetyCache) {
+    resources.safetyCache.timer = null;
+    resources.safetyCache.generation += 1;
+    resources.safetyCache.latest = null;
+  }
+  if (resources?.ledgerMultiplexer) resources.ledgerMultiplexer.current = null;
+  resources?.userChannel?.clearHistory?.();
+  resources?.marketChannel?.clearHistory?.();
+  resources?.userChannel?.close();
+  resources?.marketChannel?.close();
+  if (resources?.lease) await resources.lease.release();
+}
+
+export async function refreshCampaignRiskSnapshot(resources, {
+  campaignConfig = config,
+  loadControl = loadCampaignRiskControl,
+  loadUnresolved = loadCampaignUnresolvedRiskReservationRecords
+} = {}) {
+  if (!resources?.container) {
+    throw new Error("fail closed: durable storage is required for the campaign risk snapshot");
+  }
+  resources.lease?.assertHealthy();
+  const [control, reservationRecords] = await Promise.all([
+    loadControl(campaignConfig, { container: resources.container }),
+    loadUnresolved(campaignConfig, { container: resources.container })
+  ]);
+  if (control?.campaign_id !== campaignConfig.campaignId || !Array.isArray(reservationRecords)) {
+    throw new Error("fail closed: campaign risk snapshot is incomplete or belongs to another campaign");
+  }
+  const snapshot = { control, reservationRecords };
+  resources.campaignRiskSnapshot = snapshot;
+  return snapshot;
+}
+
+function requireCampaignRiskSnapshot(resources = activeResources) {
+  const snapshot = resources?.campaignRiskSnapshot;
+  if (snapshot?.control?.campaign_id !== config.campaignId || !Array.isArray(snapshot?.reservationRecords)) {
+    throw new Error("fail closed: current-run campaign risk snapshot is unavailable");
+  }
+  return snapshot;
+}
+
+export async function putOperatorSessionManifest(container, {
+  blobName,
+  expectedHash,
+  value
+}) {
+  if (!container || !blobName || !value) {
+    throw new Error("fail closed: operator session manifest bootstrap is incomplete");
+  }
+  const bytes = Buffer.from(JSON.stringify(value, null, 2));
+  if (sha256(bytes) !== expectedHash) {
+    throw new Error("fail closed: embedded operator session manifest SHA-256 mismatch");
+  }
+  try {
+    await container.getBlockBlobClient(blobName).uploadData(bytes, {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+  } catch (error) {
+    if (![409, 412].includes(Number(error?.statusCode))) throw error;
+  }
+  return loadHashedJson(container, blobName, expectedHash);
+}
+
+function validatePersistentBinding(resources) {
+  const expected = resources.baseBinding;
+  const actual = {
+    manifestBlobName: config.manifestBlobName,
+    manifestBlobHash: config.manifestBlobHash,
+    executionModelBlobUri: config.executionModelBlobUri,
+    executionModelHash: config.executionModelHash,
+    candidateName: config.candidateName,
+    candidateVersion: config.candidateVersion,
+    candidateConfigHash: config.candidateConfigHash
+  };
+  for (const [field, value] of Object.entries(expected)) {
+    if (actual[field] !== value) throw new Error(`fail closed: persistent executor binding drifted for ${field}`);
+  }
+}
+
+async function ensurePersistentMarket(resources, { market_id, condition_id, token_id, token_ids, market_end_ts }) {
+  const requestedTokens = [...new Set(
+    (Array.isArray(token_ids) ? token_ids : [token_id]).map(String).filter(Boolean)
+  )];
+  const next = {
+    market_id: String(market_id || ""),
+    condition_id: String(condition_id || ""),
+    token_id: String(token_id || requestedTokens[0] || ""),
+    token_ids: requestedTokens,
+    market_end_ts: String(market_end_ts || "")
+  };
+  if (!next.market_id || !next.condition_id || !next.token_id || !Number.isFinite(Date.parse(next.market_end_ts))) {
+    throw new Error("fail closed: persistent market warmup is incomplete");
+  }
+  const subscriptionStartedWallMs = Date.now();
+  let needsFreshBook = false;
+  if (!resources.marketChannel) {
+    needsFreshBook = true;
+    resources.marketChannel = await connectLifecycleChannel({
+      url: config.marketWsUrl,
+      subscription: {
+        assets_ids: next.token_ids,
+        type: "market",
+        custom_feature_enabled: true
+      },
+      ledger: resources.ledgerMultiplexer,
+      eventType: "venue_market_channel"
+    });
+  } else if (!resources.warmedMarket ||
+      resources.warmedMarket.condition_id !== next.condition_id ||
+      !next.token_ids.every((value) => resources.warmedMarket.token_ids.includes(value))) {
+    needsFreshBook = true;
+    await resources.marketChannel.updateSubscription({ operation: "subscribe", assets_ids: next.token_ids });
+    if (resources.warmedMarket?.token_ids?.length &&
+        resources.warmedMarket.condition_id !== next.condition_id) {
+      await resources.marketChannel.updateSubscription({
+        operation: "unsubscribe",
+        assets_ids: resources.warmedMarket.token_ids
+      });
+    }
+  } else {
+    const latest = [...resources.marketChannel.messages].reverse().find((message) =>
+      String(message?.event_type || message?.type || "").toLowerCase() === "book" &&
+      String(message?.asset_id || message?.token_id || message?.tokenId || "") === next.token_id
+    );
+    if (!latest) {
+      needsFreshBook = true;
+      const retainedTokens = resources.marketChannel.subscription().assets_ids || [];
+      resources.marketChannel.close();
+      resources.marketChannel = await connectLifecycleChannel({
+        url: config.marketWsUrl,
+        subscription: {
+          assets_ids: [...new Set([...retainedTokens, ...next.token_ids])],
+          type: "market",
+          custom_feature_enabled: true
+        },
+        ledger: resources.ledgerMultiplexer,
+        eventType: "venue_market_channel"
+      });
+    }
+  }
+  if (needsFreshBook) {
+    await resources.marketChannel.waitForMessage((message) =>
+      Number(message?._received_wall_ms) >= subscriptionStartedWallMs &&
+      String(message?.event_type || message?.type || "").toLowerCase() === "book" &&
+      String(message?.asset_id || message?.token_id || message?.tokenId || "") === next.token_id
+    , 2_000);
+  }
+  resources.warmedMarket = next;
+  return next;
+}
+
+async function reconcilePersistentChannels(resources, market) {
+  if (!resources.userChannel.requiresReconciliation() &&
+      !resources.marketChannel.requiresReconciliation()) return;
+  const [openOrders, trades] = await Promise.all([
+    getOpenOrdersStrict(resources.client),
+    resources.client.getTrades({ market: market.condition_id })
+  ]);
+  if (openOrders.length !== 0 || !Array.isArray(trades)) {
+    throw new Error("fail closed: websocket reconnect reconciliation did not prove a coherent account");
+  }
+  resources.userChannel.markReconciled();
+  resources.marketChannel.markReconciled();
+}
+
+export const SAFETY_CACHE_MAINTENANCE_QUIESCE_MS = 30_000;
+export const PREFLIGHT_COMPONENT_TIMEOUT_MS = 2_000;
+
+export async function runBoundedPreflightComponent(
+  name,
+  operation,
+  timeoutMs = PREFLIGHT_COMPONENT_TIMEOUT_MS
+) {
+  let timeout;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(
+          `fail closed: ${name} preflight timed out after ${timeoutMs}ms`
+        )), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function waitForSafetySnapshotIdle(
+  resources,
+  timeoutMs = SAFETY_CACHE_MAINTENANCE_QUIESCE_MS
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (resources.safetyCache?.inFlight > 0 && Date.now() < deadline) {
+    await sleep(25);
+  }
+  if (resources.safetyCache?.inFlight > 0) {
+    throw new Error("fail closed: safety snapshot requests did not quiesce for funded maintenance");
+  }
+}
+
+export async function createPersistentCanaryExecutor({ env = process.env } = {}) {
+  setExecutionContext(env);
+  const resources = await initializeResources({ persistent: true });
+  return {
+    async warmMarket(value) {
+      resources.userChannel?.beginEvidenceWindow?.();
+      resources.marketChannel?.beginEvidenceWindow?.();
+      const warmed = await ensurePersistentMarket(resources, value);
+      await reconcilePersistentChannels(resources, warmed);
+      const warmupStartedMonotonicMs = performance.now();
+      const [geoblock, serverTime, book] = await Promise.all([
+        fetchJson("https://polymarket.com/api/geoblock"),
+        resources.client.getServerTime(),
+        resources.client.getOrderBook(String(warmed.token_id))
+      ]);
+      assertEligibleOrigin(geoblock, config);
+      const venueClock = Number(serverTime?.server_time ?? serverTime?.time ?? serverTime);
+      const restBestAsk = Math.min(...(book?.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
+      const streamEvidence = streamBookEvidence(resources.marketChannel.messages, warmed.token_id);
+      if (!Number.isFinite(venueClock) ||
+          !Number.isFinite(restBestAsk) ||
+          !Number.isFinite(streamEvidence?.bestAsk) ||
+          Math.abs(restBestAsk - streamEvidence.bestAsk) > 1e-9) {
+        throw new Error("fail closed: persistent warmup REST, clock, and public stream evidence disagree");
+      }
+      await refreshCampaignRiskSnapshot(resources);
+      startSafetySnapshotCache(resources, warmed);
+      resources.userChannel?.beginEvidenceWindow?.();
+      resources.marketChannel?.beginEvidenceWindow?.();
+      return {
+        ...warmed,
+        no_sign: true,
+        rest_stream_book_agreement: true,
+        warmup_duration_ms: performance.now() - warmupStartedMonotonicMs
+      };
+    },
+    async execute(executionEnv) {
+      if (resources.busy) throw new Error("fail closed: persistent executor is already processing an intent");
+      resources.busy = true;
+      try {
+        setExecutionContext(executionEnv);
+        validatePersistentBinding(resources);
+        resources.ledgerMultiplexer.current = ledger;
+        resources.userChannel?.beginEvidenceWindow?.();
+        resources.marketChannel?.beginEvidenceWindow?.();
+        const warmedMarket = await ensurePersistentMarket(resources, {
+          market_id: executionEnv.STRATEGY_CANARY_MARKET_ID,
+          condition_id: executionEnv.STRATEGY_CANARY_CONDITION_ID,
+          token_id: executionEnv.STRATEGY_CANARY_TOKEN_ID,
+          market_end_ts: executionEnv.STRATEGY_CANARY_MARKET_END_TS
+        });
+        await reconcilePersistentChannels(resources, warmedMarket);
+        lease = resources.lease;
+        userChannel = resources.userChannel;
+        marketChannel = resources.marketChannel;
+        activeResources = resources;
+        try {
+          const result = await main(resources);
+          return sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...result });
+        } catch (error) {
+          // The persistent worker must distinguish a pre-submit failure from a
+          // post-submit evidence failure. It may only seal the latter after
+          // independently verifying the durable terminal risk reservation.
+          error.orderSubmissionAttempted = orderSubmissionAttempted;
+          throw error;
+        }
+      } finally {
+        resources.ledgerMultiplexer.current = null;
+        resources.userChannel?.beginEvidenceWindow?.();
+        resources.marketChannel?.beginEvidenceWindow?.();
+        activeResources = null;
+        resources.busy = false;
+      }
+    },
+    async runMaintenance(task) {
+      if (resources.busy) throw new Error("fail closed: persistent executor is already processing an intent");
+      if (typeof task !== "function") throw new Error("fail closed: funded maintenance callback is required");
+      resources.busy = true;
+      try {
+        validatePersistentBinding(resources);
+        resources.lease?.assertHealthy();
+        await waitForSafetySnapshotIdle(resources);
+        if (resources.userChannel?.requiresReconciliation() === true ||
+            resources.marketChannel?.requiresReconciliation() === true) {
+          if (!resources.warmedMarket) {
+            throw new Error("fail closed: funded maintenance cannot reconcile websocket state without a warmed market");
+          }
+          await reconcilePersistentChannels(resources, resources.warmedMarket);
+        }
+        const openOrders = await getOpenOrdersStrict(resources.client);
+        if (openOrders.length !== 0) {
+          throw new Error("fail closed: funded maintenance found an open order");
+        }
+        const result = await task({ lease: resources.lease });
+        resources.lease?.assertHealthy();
+        return result;
+      } finally {
+        resources.userChannel?.beginEvidenceWindow?.();
+        resources.marketChannel?.beginEvidenceWindow?.();
+        resources.busy = false;
+      }
+    },
+    async close() {
+      await closeResources(resources);
+    },
+    status() {
+      const safetySnapshotCompletedWallMs = Number(
+        resources.safetyCache?.latest?.runtime?.capturedCompletedWallMs
+      );
+      const userChannelHistory = resources.userChannel?.historyStats?.();
+      const marketChannelHistory = resources.marketChannel?.historyStats?.();
+      return {
+        user_channel_ready: resources.userChannel?.isOpen() === true,
+        market_channel_ready: resources.marketChannel?.isOpen() === true,
+        user_channel_gaps: resources.userChannel?.gapCount() || 0,
+        market_channel_gaps: resources.marketChannel?.gapCount() || 0,
+        user_channel_unparsed: resources.userChannel?.unparsedCount() || 0,
+        market_channel_unparsed: resources.marketChannel?.unparsedCount() || 0,
+        user_channel_latest_unparsed_frame_metadata:
+          resources.userChannel?.latestUnparsedFrameMetadata?.() || null,
+        market_channel_latest_unparsed_frame_metadata:
+          resources.marketChannel?.latestUnparsedFrameMetadata?.() || null,
+        user_channel_reconnects: resources.userChannel?.reconnectCount() || 0,
+        market_channel_reconnects: resources.marketChannel?.reconnectCount() || 0,
+        reconnect_reconciliation_required:
+          resources.userChannel?.requiresReconciliation() === true ||
+          resources.marketChannel?.requiresReconciliation() === true,
+        warmed_market: resources.warmedMarket,
+        safety_snapshot_cache_ready: Number.isFinite(safetySnapshotCompletedWallMs),
+        safety_snapshot_cache_age_ms: Number.isFinite(safetySnapshotCompletedWallMs)
+          ? Math.max(0, Date.now() - safetySnapshotCompletedWallMs)
+          : null,
+        safety_snapshot_component_durations_ms:
+          resources.safetyCache?.latest?.runtime?.preflightComponentDurationsMs || null,
+        safety_snapshot_cache_in_flight: resources.safetyCache?.inFlight || 0,
+        safety_snapshot_cache_error: resources.safetyCache?.lastError || null,
+        risk_reservation_index_ready: resources.riskReservationIndex !== null,
+        risk_reservation_index_startup_generation:
+          resources.riskReservationIndex?.generation || null,
+        risk_reservation_index_startup_unresolved_count:
+          resources.riskReservationIndex?.unresolved_count ?? null,
+        risk_reservation_index_rebuilt_ts:
+          resources.riskReservationIndex?.rebuilt_ts || null,
+        user_channel_history_entries: userChannelHistory?.message_count || 0,
+        user_channel_history_bytes: userChannelHistory?.approximate_bytes || 0,
+        user_channel_history_evictions: userChannelHistory?.evicted_count || 0,
+        market_channel_history_entries: marketChannelHistory?.message_count || 0,
+        market_channel_history_bytes: marketChannelHistory?.approximate_bytes || 0,
+        market_channel_history_evictions: marketChannelHistory?.evicted_count || 0,
+        busy: resources.busy
+      };
+    }
+  };
+}
+
+export async function runCanaryOnce({ env = process.env } = {}) {
+  setExecutionContext(env);
+  const resources = await initializeResources({ persistent: false });
+  lease = resources.lease;
+  activeResources = resources;
+  try {
+    return sanitize({ schema: "polyedge.strategy_canary_run.v1", run_id: runId, ...await main(resources) });
+  } finally {
+    activeResources = null;
+    userChannel?.close();
+    marketChannel?.close();
+    await closeResources(resources);
+  }
+}
+
+async function main(resources) {
+  const {
+    container,
+    intentContainer,
+    modelArtifact: rawModelArtifact,
+    manifestDocument,
+    executionModelDocument,
+    client
+  } = resources;
+  await refreshCampaignRiskSnapshot(resources);
+  // Provenance is needed after venue reconciliation to publish the immutable
+  // summary. Validate it before any reservation, authorization, or signing.
+  const modelArtifact = requireExecutionModelArtifact(rawModelArtifact);
+  const [intentDocument, authorizationDocument] = await Promise.all([
+    loadHashedJson(intentContainer, config.intentBlobName, config.intentBlobHash),
+    loadHashedJson(container, config.authorizationBlobName, config.authorizationBlobHash)
+  ]);
+  const cachedRuntime = selectFreshCachedSafetySnapshot(
+    resources,
+    intentDocument.value,
+    Date.now()
+  );
+  const runtime = cachedRuntime || await capturePreflight(
+    client,
+    intentDocument.value,
+    manifestDocument.value
+  );
+  ledger.record(cachedRuntime ? "funded_safety_snapshot_cache_hit" : "funded_safety_snapshot_cache_miss", {
+    wall_ms: Date.now(),
+    monotonic_ms: performance.now(),
+    decision_id: intentDocument.value.decision_id,
+    snapshot_completed_wall_ms: runtime.capturedCompletedWallMs,
+    snapshot_age_ms: Date.now() - Number(runtime.capturedCompletedWallMs),
+    component_durations_ms: runtime.preflightComponentDurationsMs || null
+  });
+  const documents = {
+    intent: intentDocument.value,
+    manifest: manifestDocument.value,
+    authorization: authorizationDocument.value,
+    authorizationHash: authorizationDocument.hash,
+    executionModel: executionModelDocument.value,
+    executionModelHash: executionModelDocument.hash
+  };
   const result = await executeStrategyCanary({
     config,
     documents,
     runtime,
     runId,
-    reserveRisk: (reservation) => reserveProbeRisk(config, reservation),
-    finalizeNoOrder: (reservation) => finalizeProbeRisk(config, reservation, {
-      state: "released_no_order",
-      order_submitted: false,
-      matched_notional: 0,
-      reconciliation_complete: true,
-      zero_open_orders_confirmed: true
-    }),
-    consumeAuthorization: (value) => consumeOneShotAuthorization(container, value),
+    reserveRisk: async (reservation) => {
+      const startedWallMs = Date.now();
+      const startedMonotonicMs = performance.now();
+      ledger.record("funded_risk_reservation_started", {
+        wall_ms: startedWallMs,
+        monotonic_ms: startedMonotonicMs,
+        decision_id: documents.intent.decision_id
+      });
+      const value = await reserveProbeRisk(config, reservation, { container });
+      await refreshCampaignRiskSnapshot(resources);
+      ledger.record("funded_risk_reservation_completed", {
+        wall_ms: Date.now(),
+        monotonic_ms: performance.now(),
+        duration_ms: performance.now() - startedMonotonicMs,
+        probe_id: value.probe_id
+      });
+      return value;
+    },
+    finalizeNoOrder: async (reservation) => {
+      const finalized = await finalizeProbeRisk(config, reservation, {
+        state: "released_no_order",
+        order_submitted: false,
+        matched_notional: 0,
+        reconciliation_complete: true,
+        zero_open_orders_confirmed: true
+      }, { container });
+      await refreshCampaignRiskSnapshot(resources);
+      return finalized;
+    },
+    consumeAuthorization: async (value) => {
+      const startedMonotonicMs = performance.now();
+      ledger.record("funded_authorization_consumption_started", {
+        wall_ms: Date.now(),
+        monotonic_ms: startedMonotonicMs,
+        decision_id: documents.intent.decision_id
+      });
+      const consumed = await consumeOneShotAuthorization(container, value);
+      ledger.record("funded_authorization_consumed", {
+        wall_ms: Date.now(),
+        monotonic_ms: performance.now(),
+        duration_ms: performance.now() - startedMonotonicMs,
+        decision_id: documents.intent.decision_id
+      });
+      return consumed;
+    },
     executeLifecycle: (value) => executeLifecycle(client, value)
   });
   const evidenceProbe = result.lifecycle?.evidence_probe;
   if (!evidenceProbe) return result;
   let terminalEvidence = null;
   if (Number(evidenceProbe.lifecycle.actual_matched_size) === 0) {
-    const terminalRuntime = await capturePreflight(client, documents.intent);
-    const campaign = await loadCampaignRiskControl(config);
+    await refreshCampaignRiskSnapshot(resources);
+    const terminalRuntime = await capturePreflight(client, documents.intent, documents.manifest);
+    const campaign = terminalRuntime.riskBasis?.control;
+    if (!campaign) throw new Error("fail closed: terminal campaign risk control is unavailable");
     terminalEvidence = await publishTerminalRiskPortfolioEvidence(container, {
       reservation: {
         run_id: runId,
@@ -186,7 +1043,13 @@ async function main() {
     },
     provenance: {
       decision_id: documents.intent.decision_id,
-      authorization_kind: documents.authorization.schema === "polyedge.funded_stage_intent_authorization.v1" ? "funded_stage" : "checkpoint_1_canary",
+      authorization_kind: documents.authorization.schema === "polyedge.operator_funded_intent_authorization.v1"
+        ? "operator_direct"
+        : documents.authorization.schema === "polyedge.funded_stage_intent_authorization.v1"
+          ? "funded_stage"
+          : "checkpoint_1_canary",
+      operator_session_id: documents.authorization.session_id || null,
+      research_promotion_bypassed: documents.authorization.research_promotion_bypassed === true,
       human_grant_id: documents.authorization.human_grant_id || null,
       human_grant_consumption_blob_name: documents.authorization.human_grant_consumption_blob_name || null,
       human_grant_consumption_sha256: documents.authorization.human_grant_consumption_sha256 || null,
@@ -211,7 +1074,7 @@ async function main() {
       terminal_evidence_blob_name: terminalEvidence?.blob_name || null,
       terminal_evidence_sha256: terminalEvidence?.sha256 || null
     },
-    execution_origin: "azure_north_europe_static_egress",
+    execution_origin: config.executionOrigin,
     execution_country: runtime.geoblock.country,
     funder_address: config.funderAddress,
     static_egress_verified: runtime.geoblock.ip === config.expectedEgressIp,
@@ -225,8 +1088,9 @@ async function main() {
     queue_position_source: "authenticated_lifecycle_plus_public_l2",
     queue_position_metric: "inferred_size_ahead",
     literal_fifo_rank_available: false,
-    research_only: true,
-    live_trading_enabled: false
+    research_only: !config.operatorDirect,
+    live_trading_enabled: config.operatorDirect,
+    evidence_trust_boundary_ready: config.trustBoundaryReady
   };
   ledger.record("strategy_canary_protocol_v3_completed", {
     probe_id: evidenceProbe.probe_id,
@@ -239,30 +1103,90 @@ async function main() {
   return { ...result, lifecycle: publicLifecycle, evidence_upload: evidenceUpload };
 }
 
-async function capturePreflight(client, intent, ignoredReservationId = null) {
-  const geoblock = await fetchJson("https://polymarket.com/api/geoblock");
-  assertEligibleOrigin(geoblock, config);
-  const requestStarted = Date.now();
-  const serverTimeResponse = await client.getServerTime();
-  const requestFinished = Date.now();
-  const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
-  const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
-  const clockRoundTripMs = requestFinished - requestStarted;
-  const localMidpointMs = (requestStarted + requestFinished) / 2;
-  const clockServerMinusLocalMs = serverMs - localMidpointMs;
-  const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
-  const clockUncertaintyMs = clockRoundTripMs / 2 + serverClockQuantizationMs;
-  const clockDriftMs = Math.abs(clockServerMinusLocalMs);
-  const market = await loadExactMarket(intent);
-  const [book, clobMarketInfo, openOrders, riskControl, balance, positionsResponse, valueResponse] = await Promise.all([
-    client.getOrderBook(String(intent.token_id)),
-    client.getClobMarketInfo(String(intent.condition_id)),
-    getOpenOrdersStrict(client),
-    loadCampaignRiskControl(config),
-    client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
-    fetch(`https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`, { signal: AbortSignal.timeout(10_000) }),
-    fetch(`https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`, { signal: AbortSignal.timeout(10_000) })
+async function capturePreflight(
+  client,
+  intent,
+  manifest,
+  ignoredReservationId = null,
+  {
+    recordLedger = true,
+    profitQuarantineSnapshot = activeResources?.profitQuarantineSnapshot || null,
+    protectedCompoundingContext =
+      activeResources?.protectedCompoundingContext || null,
+    preflightResources = activeResources
+  } = {}
+) {
+  const capturedStartedWallMs = Date.now();
+  const capturedStartedMonotonicMs = performance.now();
+  const preflightComponentDurationsMs = {};
+  const timed = async (name, operation) => {
+    const started = performance.now();
+    try {
+      return await runBoundedPreflightComponent(name, operation);
+    } finally {
+      preflightComponentDurationsMs[name] = Math.max(0, performance.now() - started);
+    }
+  };
+  const clock = async () => {
+    const requestStarted = Date.now();
+    const serverTimeResponse = await client.getServerTime();
+    const requestFinished = Date.now();
+    const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
+    const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
+    const clockRoundTripMs = requestFinished - requestStarted;
+    const localMidpointMs = (requestStarted + requestFinished) / 2;
+    const clockServerMinusLocalMs = serverMs - localMidpointMs;
+    const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
+    const clockUncertaintyMs = clockRoundTripMs / 2 + serverClockQuantizationMs;
+    return {
+      clockDriftMs: Math.abs(clockServerMinusLocalMs),
+      clockServerMinusLocalMs,
+      clockRoundTripMs,
+      clockUncertaintyMs
+    };
+  };
+  let campaignRiskSnapshot = requireCampaignRiskSnapshot(preflightResources);
+  const [
+    geoblock,
+    clockEvidence,
+    market,
+    book,
+    clobMarketInfo,
+    openOrders,
+    riskControl,
+    balance,
+    positionsResponse,
+    valueResponse,
+    campaignReservationRecords
+  ] = await Promise.all([
+    timed("geoblock", () => fetchJson("https://polymarket.com/api/geoblock")),
+    timed("venue_clock", clock),
+    timed("exact_market", () => loadExactMarket(intent)),
+    timed("order_book", () => client.getOrderBook(String(intent.token_id))),
+    timed("clob_market_info", () => client.getClobMarketInfo(String(intent.condition_id))),
+    timed("open_orders", () => getOpenOrdersStrict(client)),
+    timed("campaign_risk_control", () => campaignRiskSnapshot.control),
+    timed("collateral_balance", () => client.getBalanceAllowance({
+      asset_type: AssetType.COLLATERAL,
+      signature_type: config.signatureType
+    })),
+    timed("account_positions", () => fetch(
+      `https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`,
+      { signal: AbortSignal.timeout(10_000) }
+    )),
+    timed("account_value", () => fetch(
+      `https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`,
+      { signal: AbortSignal.timeout(10_000) }
+    )),
+    timed("unresolved_risk_reservations", () => campaignRiskSnapshot.reservationRecords)
   ]);
+  assertEligibleOrigin(geoblock, config);
+  const {
+    clockDriftMs,
+    clockServerMinusLocalMs,
+    clockRoundTripMs,
+    clockUncertaintyMs
+  } = clockEvidence;
   if (!Number.isFinite(clockDriftMs)) throw new Error("fail closed: venue clock is invalid");
   const feeRate = Number(clobMarketInfo?.fd?.r ?? 0);
   const feeExponent = Number(clobMarketInfo?.fd?.e ?? 0);
@@ -281,29 +1205,77 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
   const terminalConditionIds = [...new Set(positions
     .filter((row) => row.redeemable === true && row.conditionId)
     .map((row) => String(row.conditionId)))];
-  if (terminalConditionIds.length) {
+  const campaignReservations = campaignReservationRecords.map((record) => record.reservation);
+  let reservations = campaignReservations.filter(
+    (reservation) => !isRiskReservationResolved(reservation)
+  );
+  const terminalConditions = new Set(terminalConditionIds.map((value) => value.toLowerCase()));
+  const terminalRiskNeedsSettlement = reservations.some((reservation) =>
+    Number(reservation?.matched_notional) > 0
+      && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase())
+  );
+  if (terminalRiskNeedsSettlement) {
     await settleProbeRiskReservations(config, {
       condition_ids: terminalConditionIds,
       terminal_settlement_verified: true,
       evidence_source: "polymarket_data_api_redeemable",
       run_id: runId
+    }, {
+      container: preflightResources.container,
+      reservationRecords: campaignReservationRecords
     });
+    campaignRiskSnapshot = await refreshCampaignRiskSnapshot(preflightResources);
+    reservations = campaignRiskSnapshot.reservationRecords.map((record) => record.reservation);
   }
-  const reservations = await loadUnresolvedRiskReservations(config);
-  const principal = Number(intent.notional);
-  const feeRisk = Number(intent.shares) * polymarketV2FeePerShare(intent.price, feeRate, feeExponent);
-  const risk = summarizeCampaignRisk({
-    control: riskControl,
-    liquidCollateral: Number(balance.balance) / 1_000_000,
-    summedPositionValue: positions.reduce((sum, row) => sum + Math.max(0, Number(row.currentValue) || 0), 0),
-    reportedPositionValue: reportedValues.reduce((sum, row) => sum + Math.max(0, Number(row.value) || 0), 0),
-    openOrderCount: openOrders.length,
-    unresolvedPositionCount: positions.filter((row) => Number(row.size) > 1e-9 && row.redeemable !== true).length,
-    unresolvedReservationCount: reservations.filter((row) => String(row.probe_id) !== String(ignoredReservationId || "")).length,
-    proposedNotional: principal + feeRisk,
-    orderNotional: principal
-  });
-  return {
+  const liquidCollateral = Number(balance.balance) / 1_000_000;
+  const summedPositionValue = positions.reduce(
+    (sum, row) => sum + Math.max(0, Number(row.currentValue) || 0),
+    0
+  );
+  const reportedPositionValue = reportedValues.reduce(
+    (sum, row) => sum + Math.max(0, Number(row.value) || 0),
+    0
+  );
+  const unresolvedPositionCount = positions.filter(
+    (row) => Number(row.size) > 1e-9 && row.redeemable !== true
+  ).length;
+  const relevantReservations = reservations.filter(
+    (row) => String(row.probe_id) !== String(ignoredReservationId || "")
+  );
+  const accountEquity =
+    liquidCollateral + Math.min(summedPositionValue, reportedPositionValue);
+  let protectedCompoundingState = null;
+  if (config.operatorDirect && manifest?.allow_compounding === true) {
+    if (!protectedCompoundingContext) {
+      throw new Error("fail closed: protected compounding startup verification is unavailable");
+    }
+    const fullyReconciled =
+      Math.abs(summedPositionValue - reportedPositionValue) <=
+        Number(manifest.max_reconciliation_discrepancy) + 1e-9
+      && openOrders.length === 0
+      && unresolvedPositionCount === 0
+      && relevantReservations.length === 0;
+    const cachedState = protectedCompoundingContext.state;
+    const stateMatchesEquity = cachedState
+      && Math.abs(Number(cachedState.last_reconciled_equity) - accountEquity) <= 0.0000011;
+    if ((fullyReconciled && !stateMatchesEquity) || !cachedState) {
+      protectedCompoundingContext.state =
+        await reconcileProtectedCompoundingWithAutomaticSettlement({
+          client,
+          container: storageContainer(config),
+          manifest,
+          accountEquity,
+          fullyReconciled,
+          context: protectedCompoundingContext,
+          loadReservationRecords: () => loadCampaignRiskReservationRecords(config),
+          allowAutomaticDiscovery: recordLedger === false
+        });
+    }
+    protectedCompoundingState = protectedCompoundingContext.state;
+  }
+  const capturedCompletedWallMs = Date.now();
+  const captureDurationMs = Math.max(0, performance.now() - capturedStartedMonotonicMs);
+  const boundRuntime = bindIntentSizingAndRisk({
     geoblock,
     clockDriftMs,
     clockServerMinusLocalMs,
@@ -316,13 +1288,221 @@ async function capturePreflight(client, intent, ignoredReservationId = null) {
     feeRateBps,
     feeExponent,
     feeTakerOnly,
-    risk,
     openOrderCount: openOrders.length,
     fillModelVersion: config.requiredFillModelVersion,
     exactResolutionSource: intent.exact_resolution_source === true,
     resolutionSource: intent.resolution_source,
+    capturedStartedWallMs,
+    capturedCompletedWallMs,
+    captureDurationMs,
+    preflightComponentDurationsMs,
+    riskBasis: {
+      control: riskControl,
+      liquidCollateral,
+      summedPositionValue,
+      reportedPositionValue,
+      unresolvedPositionCount,
+      unresolvedReservationCount: relevantReservations.length,
+      accountEquity,
+      profitQuarantineSnapshot,
+      protectedCompoundingState
+    },
     client
+  }, intent, manifest);
+  if (recordLedger) {
+    console.log(JSON.stringify(sanitize({
+      schema: "polyedge.funded_capital_snapshot.v1",
+      session_id: manifest?.session_id || null,
+      decision_id: intent.decision_id,
+      account_equity: boundRuntime.risk.account_equity,
+      historical_high_water_equity: boundRuntime.risk.historical_high_water_equity,
+      protected_reserve: boundRuntime.risk.protected_reserve,
+      operating_buffer: boundRuntime.risk.operating_buffer,
+      operable_capital: boundRuntime.risk.operable_capital,
+      reserve_basis: boundRuntime.risk.reserve_basis,
+      continue_after_loss: boundRuntime.risk.continue_after_loss,
+      proposed_notional: boundRuntime.risk.proposed_notional,
+      order_notional: boundRuntime.risk.order_notional,
+      risk_passed: boundRuntime.risk.passed === true,
+      blockers: boundRuntime.risk.blockers,
+      open_order_count: boundRuntime.risk.open_order_count,
+      unresolved_position_count: boundRuntime.risk.unresolved_position_count,
+      unresolved_risk_reservation_count:
+        boundRuntime.risk.unresolved_risk_reservation_count
+    })));
+    ledger?.record("funded_safety_snapshot_completed", {
+      wall_ms: capturedCompletedWallMs,
+      monotonic_ms: performance.now(),
+      duration_ms: captureDurationMs,
+      component_durations_ms: preflightComponentDurationsMs,
+      decision_id: intent.decision_id,
+      open_order_count: openOrders.length,
+      risk_passed: boundRuntime.risk.passed === true,
+      submitted_notional: boundRuntime.executionSizing?.notional ??
+        Number(intent.notional),
+      current_funds_scaled:
+        Number(boundRuntime.executionSizing?.notional) < Number(intent.notional) - 1e-9
+    });
+  }
+  return boundRuntime;
+}
+
+function bindIntentSizingAndRisk(runtime, intent, manifest) {
+  const basis = runtime.riskBasis;
+  if (!basis) throw new Error("fail closed: account risk basis is unavailable");
+  const feePerShare = polymarketV2FeePerShare(
+    intent.price,
+    runtime.feeRate,
+    runtime.feeExponent
+  );
+  const executionSizing = basis.protectedCompoundingState
+    ? sizeProtectedOrder({
+        state: basis.protectedCompoundingState,
+        accountEquity: basis.accountEquity,
+        price: intent.price,
+        requestedShares: intent.shares,
+        requestedNotional: intent.notional,
+        minimumOrderSize:
+          runtime.book?.min_order_size ?? runtime.book?.minOrderSize,
+        maximumOrderNotional: config.maxOrderNotional,
+        feePerShare
+      })
+    : null;
+  const principal = executionSizing
+    ? executionSizing.notional
+    : Number(intent.notional);
+  const feeRisk = executionSizing
+    ? executionSizing.fee_risk_upper_bound
+    : Number(intent.shares) * feePerShare;
+  const risk = summarizeCampaignRisk({
+    control: basis.control,
+    liquidCollateral: basis.liquidCollateral,
+    summedPositionValue: basis.summedPositionValue,
+    reportedPositionValue: basis.reportedPositionValue,
+    openOrderCount: runtime.openOrderCount,
+    unresolvedPositionCount: basis.unresolvedPositionCount,
+    unresolvedReservationCount: basis.unresolvedReservationCount,
+    proposedNotional: principal + feeRisk,
+    orderNotional: principal,
+    authorizedStartingCollateral:
+      config.operatorDirect ? Number(manifest?.starting_collateral) : null,
+    requireZeroExternalCashFlows: config.operatorDirect,
+    profitQuarantineSnapshot: basis.profitQuarantineSnapshot,
+    protectedCompoundingState: basis.protectedCompoundingState,
+    additionalBlockers: executionSizing?.blockers || []
+  });
+  return {
+    ...runtime,
+    risk,
+    executionSizing
   };
+}
+
+const SAFETY_CACHE_REFRESH_MS = 700;
+const SAFETY_CACHE_MAX_IN_FLIGHT = 1;
+const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
+
+export function startSafetySnapshotCache(resources, market, {
+  capture = capturePreflight,
+  createIntent = conservativeWarmIntent,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval
+} = {}) {
+  const cache = resources.safetyCache;
+  if (cache.timer &&
+      cache.market_id === String(market.market_id) &&
+      cache.condition_id === String(market.condition_id) &&
+      cache.token_id === String(market.token_id)) {
+    return;
+  }
+  if (cache.timer) clearIntervalFn(cache.timer);
+  cache.timer = null;
+  cache.generation += 1;
+  cache.latest = null;
+  cache.lastError = null;
+  cache.market_id = String(market.market_id);
+  cache.condition_id = String(market.condition_id);
+  cache.token_id = String(market.token_id);
+  const generation = cache.generation;
+  const syntheticIntent = createIntent(market);
+  const refresh = async () => {
+    if (resources.busy || cache.generation !== generation ||
+        cache.inFlight >= SAFETY_CACHE_MAX_IN_FLIGHT) return;
+    cache.inFlight += 1;
+    try {
+      const runtime = await capture(
+        resources.client,
+        syntheticIntent,
+        resources.manifestDocument.value,
+        null,
+        {
+          recordLedger: false,
+          profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
+          protectedCompoundingContext: resources.protectedCompoundingContext,
+          preflightResources: resources
+        }
+      );
+      if (cache.generation === generation) {
+        cache.latest = {
+          market_id: String(market.market_id),
+          condition_id: String(market.condition_id),
+          token_id: String(market.token_id),
+          runtime
+        };
+        cache.lastError = null;
+      }
+    } catch (error) {
+      if (cache.generation === generation) cache.lastError = error.message;
+    } finally {
+      cache.inFlight = Math.max(0, cache.inFlight - 1);
+    }
+  };
+  void refresh();
+  cache.timer = setIntervalFn(() => { void refresh(); }, SAFETY_CACHE_REFRESH_MS);
+  cache.timer.unref?.();
+}
+
+function conservativeWarmIntent(market) {
+  const price = 0.5;
+  const notional = Number(config.maxOrderNotional);
+  return {
+    market_id: String(market.market_id),
+    condition_id: String(market.condition_id),
+    token_id: String(market.token_id),
+    price: String(price),
+    shares: String(notional / price),
+    notional: String(notional),
+    decision_id: `non-executable-warm-snapshot-${market.market_id}`
+  };
+}
+
+export function selectFreshCachedSafetySnapshot(resources, intent, nowMs = Date.now()) {
+  const cached = resources?.safetyCache?.latest;
+  const completedWallMs = Number(cached?.runtime?.capturedCompletedWallMs);
+  if (!cached ||
+      cached.market_id !== String(intent?.market_id || "") ||
+      cached.condition_id !== String(intent?.condition_id || "") ||
+      cached.token_id !== String(intent?.token_id || "") ||
+      !Number.isFinite(completedWallMs) ||
+      nowMs < completedWallMs ||
+      nowMs - completedWallMs > SAFETY_CACHE_MAX_SELECTION_AGE_MS) {
+    return null;
+  }
+  // The warm snapshot is captured with a deliberately non-executable
+  // synthetic intent. Rebind only the immutable resolution provenance from
+  // the verified executable intent; all volatile venue/account evidence
+  // remains the independently captured warm snapshot.
+  const rebound = {
+    ...cached.runtime,
+    exactResolutionSource: intent.exact_resolution_source === true,
+    resolutionSource: intent.resolution_source
+  };
+  if (!rebound.riskBasis || !resources?.manifestDocument?.value) return rebound;
+  return bindIntentSizingAndRisk(
+    rebound,
+    intent,
+    resources.manifestDocument.value
+  );
 }
 
 async function executeLifecycle(client, { intent, documents, runtime, reservation }) {
@@ -333,41 +1513,85 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     lease.assertHealthy();
     // Both channels are opened before signing so partial fills, cancellation races,
     // public trade-through, and markout evidence have no intentional blind window.
-    userChannel = await connectLifecycleChannel({
-      url: config.userWsUrl,
-      subscription: {
-        auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
-        markets: [intent.condition_id],
-        type: "user"
-      },
-      ledger,
-      eventType: "venue_user_channel"
-    });
-    marketChannel = await connectLifecycleChannel({
-      url: config.marketWsUrl,
-      subscription: {
-        assets_ids: [intent.token_id],
-        type: "market",
-        custom_feature_enabled: true
-      },
-      ledger,
-      eventType: "venue_market_channel"
-    });
-    refreshed = await capturePreflight(client, intent, reservation.probe_id);
+    const userChannelPromise = activeResources?.persistent
+      ? Promise.resolve(userChannel)
+      : connectLifecycleChannel({
+          url: config.userWsUrl,
+          subscription: {
+            auth: { apiKey: config.apiKey, secret: config.apiSecret, passphrase: config.apiPassphrase },
+            markets: [intent.condition_id],
+            type: "user"
+          },
+          ledger,
+          eventType: "venue_user_channel"
+        }).then((channel) => {
+          userChannel = channel;
+          return channel;
+        });
+    const marketChannelPromise = activeResources?.persistent
+      ? Promise.resolve(marketChannel)
+      : connectLifecycleChannel({
+          url: config.marketWsUrl,
+          subscription: {
+            assets_ids: [intent.token_id],
+            type: "market",
+            custom_feature_enabled: true
+          },
+          ledger,
+          eventType: "venue_market_channel"
+        }).then((channel) => {
+          marketChannel = channel;
+          return channel;
+        });
+    [, , refreshed] = await Promise.all([
+      userChannelPromise,
+      marketChannelPromise,
+      activeResources?.persistent
+        ? captureFinalGate(client, intent, runtime)
+        : capturePreflight(
+            client,
+            documents.intent,
+            documents.manifest,
+            reservation.probe_id
+          )
+    ]);
     // Repeat the full immutable-intent, book, risk, clock, geoblock, model, and
     // authorization contract immediately before the only signing call.
-    validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
+    const preSendValidation = validateCanaryPreflight({ config, ...documents, runtime: refreshed, now: new Date() });
+    if (Number(intent.shares) !== Number(preSendValidation.shares)
+        || Number(intent.notional) !== Number(preSendValidation.notional)) {
+      throw new Error("fail closed: current-funds execution sizing changed after reservation");
+    }
     lease.assertHealthy();
     await Promise.all([userChannel.ensureOpen(), marketChannel.ensureOpen()]);
     if (userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
         userChannel.unparsedCount() > 0 || marketChannel.unparsedCount() > 0) {
       throw new Error("fail closed: authenticated/public websocket completeness was lost before submission");
     }
+    if (activeResources?.persistent) {
+      const userChannelHistory = userChannel.historyStats?.();
+      const marketChannelHistory = marketChannel.historyStats?.();
+      if (userChannelHistory?.evicted_count > 0 || marketChannelHistory?.evicted_count > 0) {
+        throw new Error("fail closed: websocket evidence history was truncated before submission");
+      }
+      const snapshotAgeMs = Date.now() - Number(runtime.capturedCompletedWallMs);
+      const finalGateAgeMs = Date.now() - Number(refreshed.finalGateCompletedWallMs);
+      if (!Number.isFinite(snapshotAgeMs) || snapshotAgeMs > 1_500) {
+        throw new Error(`fail closed: full safety snapshot exceeded 1500ms at signing (${snapshotAgeMs}ms)`);
+      }
+      if (!Number.isFinite(finalGateAgeMs) || finalGateAgeMs > 500) {
+        throw new Error(`fail closed: final volatile gate exceeded 500ms at signing (${finalGateAgeMs}ms)`);
+      }
+      assertPersistentIntentRemainingTtl(intent, config.minRemainingTtlMs);
+    }
     preSendCapturedWallMs = Date.now();
     preSendContext = {
       ...marketContext(marketMessagesThrough(marketChannel.messages, preSendCapturedWallMs)),
       source: "public_market_channel_before_submission",
-      captured_wall_ms: preSendCapturedWallMs
+      captured_wall_ms: preSendCapturedWallMs,
+      intent_book_hash: intent.book_hash,
+      current_book_hash: preSendValidation.actualBookHash,
+      intent_book_hash_matched: preSendValidation.bookHashMatched
     };
   } catch (error) {
     try {
@@ -392,9 +1616,20 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     orderSubmissionAttempted = true;
     ledger.record("venue_order_send", {
       probe_id: reservation.probe_id,
+      wall_ms: Date.now(),
+      monotonic_ms: sentMonotonicMs,
       active_valid_until: intent.valid_until,
       venue_gtd_expiry_ts: intent.gtd_expiry_ts,
-      order: { token_id: intent.token_id, price: intent.price, shares: intent.shares, post_only: true }
+      order: {
+        token_id: intent.token_id,
+        price: intent.price,
+        shares: intent.shares,
+        notional: intent.notional,
+        source_requested_shares: intent.source_requested_shares,
+        source_requested_notional: intent.source_requested_notional,
+        current_funds_scaled: intent.current_funds_scaled === true,
+        post_only: true
+      }
     });
     response = await client.createAndPostOrder(
       { tokenID: intent.token_id, price: Number(intent.price), size: Number(intent.shares), side: Side.BUY, expiration },
@@ -403,6 +1638,17 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       true
     );
   } catch (error) {
+    const rejection = deterministicNoOrderRejection(error);
+    if (rejection) {
+      await releaseDeterministicRejectedOrder(client, {
+        intent,
+        manifest: documents.manifest,
+        reservation,
+        sentAt,
+        rejection
+      });
+      throw new Error(`fail closed: venue rejected the order without acknowledgement; no-order risk was reconciled and released (${rejection.code}: ${rejection.message})`);
+    }
     await cancelAllAndConfirm(client);
     throw new Error(`fail closed: ambiguous strategy-canary submission; authorization is consumed and risk remains reserved (${error.message})`);
   }
@@ -412,8 +1658,16 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
   }
   const acknowledgedAt = new Date();
   const acknowledgementLatencyMs = Math.max(0, performance.now() - sentMonotonicMs);
+  const acknowledgedMonotonicMs = performance.now();
   const orderId = String(response.orderID);
-  ledger.record("venue_order_http_ack", { probe_id: reservation.probe_id, order_id: orderId, response, client_to_http_ack_ms: acknowledgementLatencyMs });
+  ledger.record("venue_order_http_ack", {
+    probe_id: reservation.probe_id,
+    order_id: orderId,
+    response,
+    wall_ms: acknowledgedAt.getTime(),
+    monotonic_ms: acknowledgedMonotonicMs,
+    client_to_http_ack_ms: acknowledgementLatencyMs
+  });
   let markoutCapture;
   try {
     markoutCapture = beginFillMarkoutCapture(
@@ -461,6 +1715,12 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       response: cancellation.cancelResponse,
       client_cancel_round_trip_ms: cancellation.cancelRoundTripMs
     });
+    const reconciliationStartedMonotonicMs = performance.now();
+    ledger.record("funded_terminal_reconciliation_started", {
+      wall_ms: Date.now(),
+      monotonic_ms: reconciliationStartedMonotonicMs,
+      order_id: orderId
+    });
     const reconciliation = await waitForStablePostCancelReconciliation({
       client,
       conditionId: intent.condition_id,
@@ -491,6 +1751,14 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     const restOrderReturned = Boolean(reconciliation.finalOrder);
     const reconciliationComplete = reconciliation.zeroOpenOrders && reconciliation.stableFinality &&
       reconciliation.terminalConfirmed && restOrderReturned && matchedSizeSourceAgreement && tradeIdSourceAgreement;
+    ledger.record("funded_terminal_reconciliation_completed", {
+      wall_ms: Date.now(),
+      monotonic_ms: performance.now(),
+      duration_ms: performance.now() - reconciliationStartedMonotonicMs,
+      order_id: orderId,
+      reconciliation_complete: reconciliationComplete,
+      zero_open_orders_confirmed: reconciliation.zeroOpenOrders
+    });
     const matchedRisk = matchedShares * (Number(intent.price) +
       polymarketV2FeePerShare(intent.price, refreshed.feeRate, refreshed.feeExponent));
     await finalizeProbeRisk(config, reservation, {
@@ -518,9 +1786,14 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     );
     const cancelRace = postCancelFillStats(fills, cancellation.cancelSendWallMs);
     const fullContext = marketContext(marketChannel.messages);
+    const userChannelHistory = userChannel.historyStats?.();
+    const marketChannelHistory = marketChannel.historyStats?.();
+    const channelHistoryTruncated = userChannelHistory?.evicted_count > 0 ||
+      marketChannelHistory?.evicted_count > 0;
     const dataGapDetected = !reconciliation.stableFinality ||
       userChannel.gapCount() > 0 || marketChannel.gapCount() > 0 ||
       userChannel.unparsedCount() > 0 || marketChannel.unparsedCount() > 0 ||
+      channelHistoryTruncated ||
       (cancellation.cancelSendWallMs !== null && cancellationReceivedWallMs === null) ||
       (cancellation.cancelSendWallMs === null && matchedShares < Number(intent.shares)) ||
       (matchedShares > 0 && (!tradeIdSourceAgreement || !matchedSizeSourceAgreement));
@@ -589,6 +1862,8 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       public_market_channel_duplicates: marketChannel.duplicateCount(),
       authenticated_user_channel_unparsed: userChannel.unparsedCount(),
       public_market_channel_unparsed: marketChannel.unparsedCount(),
+      authenticated_user_channel_history_evictions: userChannelHistory?.evicted_count || 0,
+      public_market_channel_history_evictions: marketChannelHistory?.evicted_count || 0,
       reconciliation_complete: reconciliationComplete,
       zero_open_orders_confirmed: reconciliation.zeroOpenOrders,
       data_gap_detected: dataGapDetected,
@@ -668,14 +1943,121 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     }).catch((uploadError) => {
       ledger.record("strategy_canary_failed_evidence_upload", { error: uploadError.message });
     });
-    if (reservationPersistenceError) {
-      throw new Error(`fail closed: post-ack error and unresolved reservation persistence failed; prior durable reservation remains blocking (${error.message}; ${reservationPersistenceError.message})`);
-    }
-    if (!emergency.zeroOpenOrders) {
-      throw new Error(`fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved (${error.message})`);
-    }
-    throw new Error(`fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (${error.message})`);
+    const failure = reservationPersistenceError
+      ? new Error(`fail closed: post-ack error and unresolved reservation persistence failed; prior durable reservation remains blocking (${error.message}; ${reservationPersistenceError.message})`)
+      : !emergency.zeroOpenOrders
+        ? new Error(`fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved (${error.message})`)
+        : new Error(`fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (${error.message})`);
+    failure.executionEvidence = {
+      status: "post_submission_unresolved",
+      order_submission_attempted: true,
+      order_submitted: true,
+      lifecycle: {
+        order_id: orderId,
+        send_wall_ms: sentAt.getTime(),
+        ack_wall_ms: acknowledgedAt.getTime(),
+        client_to_http_ack_ms: acknowledgementLatencyMs,
+        matched_notional: matchedRisk,
+        reconciliation_complete: false,
+        zero_open_orders_confirmed: emergency.zeroOpenOrders
+      }
+    };
+    throw failure;
   }
+}
+
+async function captureFinalGate(client, intent, runtime) {
+  const gateStartedWallMs = Date.now();
+  const gateStartedMonotonicMs = performance.now();
+  const clock = async () => {
+    const requestStarted = Date.now();
+    const serverTimeResponse = await client.getServerTime();
+    const requestFinished = Date.now();
+    const serverValue = Number(serverTimeResponse?.server_time ?? serverTimeResponse?.time ?? serverTimeResponse);
+    const serverMs = serverValue < 1e12 ? serverValue * 1000 : serverValue;
+    const clockRoundTripMs = requestFinished - requestStarted;
+    const localMidpointMs = (requestStarted + requestFinished) / 2;
+    const clockServerMinusLocalMs = serverMs - localMidpointMs;
+    const serverClockQuantizationMs = serverValue < 1e12 && Number.isInteger(serverValue) ? 500 : 1;
+    return {
+      clockDriftMs: Math.abs(clockServerMinusLocalMs),
+      clockServerMinusLocalMs,
+      clockRoundTripMs,
+      clockUncertaintyMs: clockRoundTripMs / 2 + serverClockQuantizationMs
+    };
+  };
+  const [book, openOrders, clockEvidence] = await Promise.all([
+    client.getOrderBook(String(intent.token_id)),
+    getOpenOrdersStrict(client),
+    clock(),
+    userChannel.forceHeartbeat(),
+    marketChannel.forceHeartbeat()
+  ]);
+  if (openOrders.length !== 0) throw new Error("fail closed: final volatile gate found an open order");
+  const streamEvidence = streamBookEvidence(marketChannel.messages, intent.token_id);
+  if (!streamEvidence) throw new Error("fail closed: final volatile gate lacks public stream top-of-book evidence");
+  const restBestAsk = Math.min(...(book.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
+  const streamBestAsk = Number(streamEvidence.bestAsk);
+  const restTick = Number(book.tick_size ?? book.tickSize);
+  if (![restBestAsk, streamBestAsk, restTick].every(Number.isFinite) ||
+      Math.abs(restBestAsk - streamBestAsk) > 1e-9) {
+    throw new Error("fail closed: REST and public stream book disagree at the final volatile gate");
+  }
+  const finalGateCompletedWallMs = Date.now();
+  const finalGateDurationMs = Math.max(0, performance.now() - gateStartedMonotonicMs);
+  ledger?.record("funded_final_volatile_gate_completed", {
+    wall_ms: finalGateCompletedWallMs,
+    monotonic_ms: performance.now(),
+    duration_ms: finalGateDurationMs,
+    decision_id: intent.decision_id,
+    rest_best_ask: restBestAsk,
+    stream_best_ask: streamBestAsk,
+    open_order_count: 0
+  });
+  return {
+    ...runtime,
+    ...clockEvidence,
+    book,
+    openOrderCount: 0,
+    finalGateStartedWallMs: gateStartedWallMs,
+    finalGateCompletedWallMs,
+    finalGateDurationMs
+  };
+}
+
+export function streamBookEvidence(messages, tokenId) {
+  const expectedToken = String(tokenId);
+  for (const message of [...(messages || [])].reverse()) {
+    const type = String(message?.event_type || message?.type || "").toLowerCase();
+    if (type === "best_bid_ask" &&
+        String(message?.asset_id || message?.token_id || message?.tokenId || "") === expectedToken) {
+      const bestAsk = Number(message.best_ask ?? message.bestAsk);
+      if (Number.isFinite(bestAsk)) return { bestAsk, source: type, receivedWallMs: Number(message._received_wall_ms) };
+    }
+    if (type === "price_change") {
+      const change = [...(message.price_changes || [])].reverse().find((value) =>
+        String(value?.asset_id || value?.token_id || value?.tokenId || "") === expectedToken
+      );
+      const bestAsk = Number(change?.best_ask ?? change?.bestAsk);
+      if (Number.isFinite(bestAsk)) return { bestAsk, source: type, receivedWallMs: Number(message._received_wall_ms) };
+    }
+    if (type === "book" &&
+        String(message?.asset_id || message?.token_id || message?.tokenId || "") === expectedToken) {
+      const bestAsk = Math.min(...(message.asks || []).map((row) => Number(row.price)).filter(Number.isFinite));
+      if (Number.isFinite(bestAsk)) return { bestAsk, source: type, receivedWallMs: Number(message._received_wall_ms) };
+    }
+  }
+  return null;
+}
+
+export function assertPersistentIntentRemainingTtl(intent, minimumMs, nowMs = Date.now()) {
+  const minimum = Number(minimumMs);
+  const remaining = Date.parse(intent?.valid_until) - nowMs;
+  if (!Number.isFinite(minimum) || minimum < 1_000 ||
+      !Number.isFinite(remaining) || remaining < minimum) {
+    throw new Error(`fail closed: persistent executor has less than ${minimum}ms of intent TTL before signing`);
+  }
+  return remaining;
 }
 
 async function uploadFailedPostAckEvidence({ intent, runtime, reservation, orderId, acknowledgedAt, sentAt, acknowledgementLatencyMs, preSendContext, emergency, originalError }) {
@@ -755,8 +2137,9 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     queue_position_source: "authenticated_lifecycle_plus_public_l2",
     queue_position_metric: "inferred_size_ahead",
     literal_fifo_rank_available: false,
-    research_only: true,
-    live_trading_enabled: false
+    research_only: !config.operatorDirect,
+    live_trading_enabled: config.operatorDirect,
+    evidence_trust_boundary_ready: config.trustBoundaryReady
   };
   return uploadEvidence(config, runId, summary, ledger);
 }
@@ -774,6 +2157,9 @@ function evidenceOrder(intent, book) {
     price,
     size: Number(intent.shares),
     notional: Number(intent.notional),
+    source_requested_size: Number(intent.source_requested_shares ?? intent.shares),
+    source_requested_notional: Number(intent.source_requested_notional ?? intent.notional),
+    current_funds_scaled: intent.current_funds_scaled === true,
     post_only: true,
     spread: bestBid === null || bestAsk === null ? null : bestAsk - bestBid,
     samePricePublicSize: samePrice,
@@ -824,6 +2210,55 @@ async function cancelAllAndConfirm(client) {
   if ((await getOpenOrdersStrict(client)).length) throw new Error("fail closed: emergency cancellation did not produce zero open orders");
 }
 
+async function releaseDeterministicRejectedOrder(client, {
+  intent,
+  manifest,
+  reservation,
+  sentAt,
+  rejection
+}) {
+  await cancelAllAndConfirm(client);
+  await sleep(250);
+  await userChannel.ensureOpen();
+  const postSendTrades = userChannel.messages.filter((message) =>
+    Number(message?._received_wall_ms) >= sentAt.getTime() &&
+    String(message?.event_type || message?.type || "").toLowerCase().includes("trade")
+  );
+  if (userChannel.gapCount() > 0 || userChannel.unparsedCount() > 0 || postSendTrades.length > 0) {
+    throw new Error("fail closed: deterministic venue rejection could not prove an authenticated zero-fill window; risk remains reserved");
+  }
+  const reconciled = await capturePreflight(client, intent, manifest, reservation.probe_id);
+  validateDeterministicNoOrderReconciliation({
+    error: rejection.message,
+    openOrderCount: reconciled.openOrderCount,
+    unresolvedPositionCount: reconciled.risk?.unresolved_position_count,
+    userChannelGapCount: userChannel.gapCount(),
+    userChannelUnparsedCount: userChannel.unparsedCount(),
+    postSendTradeCount: postSendTrades.length
+  });
+  ledger.record("venue_order_rejected_no_order", {
+    probe_id: reservation.probe_id,
+    rejection_code: rejection.code,
+    venue_message: rejection.message,
+    zero_open_orders_confirmed: true,
+    zero_unresolved_positions_confirmed: true
+  });
+  await finalizeProbeRisk(config, reservation, {
+    state: "released_no_order",
+    order_submitted: false,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true,
+    reconciliation_reason: rejection.code,
+    reconciliation_evidence: {
+      source: "authenticated_clob_and_user_channel",
+      zero_open_orders: true,
+      zero_unresolved_positions: true,
+      post_send_authenticated_trade_count: 0
+    }
+  });
+}
+
 async function getOpenOrdersStrict(client) {
   const value = await client.getOpenOrders();
   if (!Array.isArray(value)) throw new Error("fail closed: venue open-order response is invalid");
@@ -850,4 +2285,323 @@ function normalizeFillClock(fills, serverMinusLocalMs) {
 function normalizePrivateKey(value) { const clean = String(value || "").trim(); return clean.startsWith("0x") ? clean : `0x${clean}`; }
 function parseArray(value) { if (Array.isArray(value)) return value; try { return JSON.parse(value || "[]"); } catch { return []; } }
 async function fetchJson(url) { const response = await fetch(url, { signal: AbortSignal.timeout(10_000) }); if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`); return response.json(); }
+
+export async function loadAccountPositions({
+  user,
+  fetcher = fetchJson,
+  pageSize = 500
+}) {
+  const wallet = normalizedAddress(user);
+  const apiMaxOffset = 10_000;
+  if (!wallet || !Number.isInteger(pageSize) || pageSize < 1 || pageSize > 500) {
+    throw new Error("fail closed: account positions pagination binding is invalid");
+  }
+  const values = [];
+  for (let offset = 0; offset <= apiMaxOffset; offset += pageSize) {
+    const url = new URL("https://data-api.polymarket.com/positions");
+    url.searchParams.set("user", wallet);
+    url.searchParams.set("sizeThreshold", "0");
+    url.searchParams.set("limit", String(pageSize));
+    url.searchParams.set("offset", String(offset));
+    const rows = await fetcher(url.toString());
+    if (!Array.isArray(rows) || rows.length > pageSize) {
+      throw new Error("fail closed: account positions page is invalid");
+    }
+    for (const row of rows) {
+      values.push({
+        ...row,
+        size: nonNegativePositionNumber(row?.size, "size"),
+        currentValue: nonNegativePositionNumber(row?.currentValue, "currentValue")
+      });
+    }
+    if (rows.length < pageSize) return values;
+  }
+  throw new Error("fail closed: account positions history exceeds API offset bound");
+}
+
+function nonNegativePositionNumber(value, field) {
+  if (!["number", "string"].includes(typeof value)
+      || (typeof value === "string" && value.trim() === "")) {
+    throw new Error(`fail closed: account position ${field} is invalid`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`fail closed: account position ${field} is invalid`);
+  }
+  return parsed;
+}
+
+export async function loadSettlementActivity({
+  user,
+  conditionIds,
+  sessionStartedAt,
+  fetcher = fetchJson,
+  pageSize = 500,
+  conditionBatchSize = 25,
+  maxPagesPerBatch = null
+}) {
+  const wallet = normalizedAddress(user);
+  const startedMs = activityTimestampMs(sessionStartedAt);
+  const conditions = [...new Set((conditionIds || []).map(normalizedBytes32).filter(Boolean))].sort();
+  const apiMaxOffset = 5_000;
+  const apiPageBound = Math.floor(apiMaxOffset / pageSize) + 1;
+  const pageBound = maxPagesPerBatch === null ? apiPageBound : maxPagesPerBatch;
+  if (!wallet || !Number.isFinite(startedMs) || startedMs <= 0 || !conditions.length) {
+    throw new Error("fail closed: settlement activity query binding is invalid");
+  }
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 500
+      || !Number.isInteger(conditionBatchSize) || conditionBatchSize < 1 || conditionBatchSize > 50
+      || !Number.isInteger(pageBound) || pageBound < 1 || pageBound > apiPageBound) {
+    throw new Error("fail closed: settlement activity pagination bounds are invalid");
+  }
+  const values = [];
+  const identities = new Set();
+  const batches = [];
+  for (let index = 0; index < conditions.length; index += conditionBatchSize) {
+    batches.push(conditions.slice(index, index + conditionBatchSize));
+  }
+  await Promise.all(batches.map(async (batch) => {
+    const batchConditions = new Set(batch);
+    let offset = 0;
+    let complete = false;
+    for (let page = 0; page < pageBound; page += 1) {
+      const url = new URL("https://data-api.polymarket.com/activity");
+      url.searchParams.set("user", wallet);
+      url.searchParams.set("market", batch.join(","));
+      url.searchParams.set("type", "TRADE,REDEEM");
+      url.searchParams.set("start", String(Math.floor(startedMs / 1_000)));
+      url.searchParams.set("sortBy", "TIMESTAMP");
+      url.searchParams.set("sortDirection", "ASC");
+      url.searchParams.set("limit", String(pageSize));
+      url.searchParams.set("offset", String(offset));
+      const rows = await fetcher(url.toString());
+      if (!Array.isArray(rows)) {
+        throw new Error("fail closed: settlement activity page is invalid");
+      }
+      for (const row of rows) {
+        const conditionId = normalizedBytes32(row?.conditionId);
+        if (!batchConditions.has(conditionId)
+            || activityTimestampMs(row?.timestamp) < startedMs
+            || !["TRADE", "REDEEM"].includes(String(row?.type || "").toUpperCase())) {
+          continue;
+        }
+        const identity = [
+          String(row.type || "").toUpperCase(),
+          normalizedBytes32(row.conditionId),
+          normalizedBytes32(row.transactionHash),
+          String(row.asset || ""),
+          normalizedAddress(row.proxyWallet),
+          String(row.timestamp ?? ""),
+          String(row.size ?? ""),
+          String(row.usdcSize ?? "")
+        ].join("\u0000");
+        if (identities.has(identity)) {
+          throw new Error("fail closed: settlement activity pagination returned duplicate evidence");
+        }
+        identities.add(identity);
+        values.push(row);
+      }
+      if (rows.length < pageSize) {
+        complete = true;
+        break;
+      }
+      offset += pageSize;
+    }
+    if (!complete) {
+      throw new Error("fail closed: settlement activity history exceeds pagination bound");
+    }
+  }));
+  return values.sort((left, right) =>
+    activityTimestampMs(left?.timestamp) - activityTimestampMs(right?.timestamp)
+      || String(left?.transactionHash || "").localeCompare(String(right?.transactionHash || ""))
+      || String(left?.type || "").localeCompare(String(right?.type || ""))
+  );
+}
+
+async function confirmedPolygonReceipt(transactionHash) {
+  const expectedHash = normalizedBytes32(transactionHash);
+  if (!expectedHash) {
+    throw new Error("fail closed: Polygon profit-settlement transaction hash is invalid");
+  }
+  const [receipt, latestBlock] = await Promise.all([
+    polygonRpc("eth_getTransactionReceipt", [expectedHash]),
+    polygonRpc("eth_blockNumber", [])
+  ]);
+  if (!receipt?.blockNumber || !latestBlock
+      || normalizedBytes32(receipt.transactionHash) !== expectedHash) {
+    throw new Error("fail closed: Polygon profit-settlement receipt is unavailable");
+  }
+  const receiptBlock = BigInt(receipt.blockNumber);
+  const head = BigInt(latestBlock);
+  const settlementEvidence = decodeSettlementReceiptEvidence(receipt, expectedHash);
+  return {
+    status: receipt.status === "0x1" ? "success" : "failed",
+    chain_id: 137,
+    transaction_hash: expectedHash,
+    block_number: receiptBlock.toString(),
+    confirmations: Number(head >= receiptBlock ? head - receiptBlock + 1n : 0n),
+    ...settlementEvidence
+  };
+}
+
+export function decodeSettlementReceiptEvidence(
+  receipt,
+  transactionHash = receipt?.transactionHash
+) {
+  const hash = normalizedBytes32(transactionHash);
+  if (!hash || normalizedBytes32(receipt?.transactionHash) !== hash
+      || !Array.isArray(receipt?.logs)) {
+    throw new Error("fail closed: Polygon redemption receipt evidence is invalid");
+  }
+  const redemptions = [];
+  const ctfTransfers = [];
+  const erc20Transfers = [];
+  const collateralWraps = [];
+  for (const log of receipt.logs) {
+    const contractAddress = normalizedAddress(log?.address);
+    const topic = String(log?.topics?.[0] || "").toLowerCase();
+    if (contractAddress === CONDITIONAL_TOKENS_ADDRESS
+        && topic === PAYOUT_REDEMPTION_TOPIC) {
+      const args = decodeReceiptEvent(log, PAYOUT_REDEMPTION_EVENT).args || {};
+      redemptions.push({
+        contract_address: CONDITIONAL_TOKENS_ADDRESS,
+        transaction_hash: hash,
+        redeemer: normalizedAddress(args.redeemer),
+        collateral_token: normalizedAddress(args.collateralToken),
+        parent_collection_id: normalizedBytes32(args.parentCollectionId),
+        condition_id: normalizedBytes32(args.conditionId),
+        index_sets: (args.indexSets || []).map((value) => String(value)),
+        payout_base_units: String(args.payout),
+        payout: Number(formatUnits(args.payout, 6))
+      });
+      continue;
+    }
+    if (contractAddress === CONDITIONAL_TOKENS_ADDRESS
+        && topic === ERC1155_TRANSFER_BATCH_TOPIC) {
+      const args = decodeReceiptEvent(log, ERC1155_TRANSFER_BATCH_EVENT).args || {};
+      ctfTransfers.push({
+        event: "TransferBatch",
+        contract_address: CONDITIONAL_TOKENS_ADDRESS,
+        operator: normalizedAddress(args.operator),
+        from: normalizedAddress(args.from),
+        to: normalizedAddress(args.to),
+        ids: (args.ids || []).map((value) => String(value)),
+        values: (args.values || []).map((value) => String(value))
+      });
+      continue;
+    }
+    if (contractAddress === CONDITIONAL_TOKENS_ADDRESS
+        && topic === ERC1155_TRANSFER_SINGLE_TOPIC) {
+      const args = decodeReceiptEvent(log, ERC1155_TRANSFER_SINGLE_EVENT).args || {};
+      ctfTransfers.push({
+        event: "TransferSingle",
+        contract_address: CONDITIONAL_TOKENS_ADDRESS,
+        operator: normalizedAddress(args.operator),
+        from: normalizedAddress(args.from),
+        to: normalizedAddress(args.to),
+        ids: [String(args.id)],
+        values: [String(args.value)]
+      });
+      continue;
+    }
+    if ([USDCE_ADDRESS, PUSD_ADDRESS].includes(contractAddress)
+        && topic === ERC20_TRANSFER_TOPIC) {
+      const args = decodeReceiptEvent(log, ERC20_TRANSFER_EVENT).args || {};
+      erc20Transfers.push({
+        token: contractAddress,
+        from: normalizedAddress(args.from),
+        to: normalizedAddress(args.to),
+        value_base_units: String(args.value)
+      });
+      continue;
+    }
+    if (contractAddress === PUSD_ADDRESS && topic === COLLATERAL_WRAPPED_TOPIC) {
+      const args = decodeReceiptEvent(log, COLLATERAL_WRAPPED_EVENT).args || {};
+      collateralWraps.push({
+        contract_address: PUSD_ADDRESS,
+        caller: normalizedAddress(args.caller),
+        asset: normalizedAddress(args.asset),
+        to: normalizedAddress(args.to),
+        amount_base_units: String(args.amount)
+      });
+    }
+  }
+  return {
+    redemptions,
+    ctf_transfers: ctfTransfers,
+    erc20_transfers: erc20Transfers,
+    collateral_wraps: collateralWraps
+  };
+}
+
+export function decodePayoutRedemptions(receipt, transactionHash = receipt?.transactionHash) {
+  return decodeSettlementReceiptEvidence(receipt, transactionHash).redemptions;
+}
+
+function decodeReceiptEvent(log, abi) {
+  return decodeEventLog({
+    abi,
+    data: log.data,
+    topics: log.topics,
+    strict: true
+  });
+}
+
+async function polygonRpc(method, params) {
+  for (const url of [
+    "https://polygon.drpc.org",
+    "https://tenderly.rpc.polygon.community",
+    "https://polygon.publicnode.com"
+  ]) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(10_000)
+      });
+      if (!response.ok) continue;
+      const payload = await response.json();
+      if (!payload?.error && payload?.result !== undefined && payload.result !== null) {
+        return payload.result;
+      }
+    } catch {
+      // Try the next independent endpoint. All failures remain fail-closed.
+    }
+  }
+  throw new Error(`fail closed: Polygon RPC ${method} failed`);
+}
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function normalizedAddress(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^0x[0-9a-f]{40}$/.test(text) ? text : "";
+}
+
+function normalizedBytes32(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return /^0x[0-9a-f]{64}$/.test(text) ? text : "";
+}
+
+function activityTimestampMs(value) {
+  if (typeof value === "string" && /[T:-]/.test(value)) return Date.parse(value);
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return NaN;
+  return parsed < 1e12 ? parsed * 1_000 : parsed;
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  runCanaryOnce().then((result) => {
+    console.log(JSON.stringify(result));
+  }).catch((error) => {
+    process.exitCode = 1;
+    console.error(JSON.stringify({
+      schema: "polyedge.strategy_canary_run.v1",
+      run_id: runId || null,
+      status: "failed_closed",
+      order_submission_attempted: orderSubmissionAttempted,
+      error: error.message
+    }));
+  });
+}

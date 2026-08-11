@@ -1,42 +1,50 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
-use polyedge_api::{app, benchmark_snapshot};
+use polyedge_api::{app_with_shutdown, benchmark_snapshot};
 use polyedge_config::{embedded_git_sha, RuntimeRole, RuntimeSettings};
 use polyedge_reporting::research::{
     advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
     initialize_funded_manifest_after_canary, load_default_exclusions, publish_daily_directory,
-    run_audit, run_azure_freshness, run_backfill, run_baseline, run_begin_shadow_correction,
-    run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
-    run_calibration, run_chart_backfill, run_complete_shadow_correction,
-    run_evaluate_profitability, run_execution_quality, run_final_report, run_loss_diagnostics,
-    run_loss_regime_oos, run_materialize_projected_campaign, run_ml_calibrate, run_normalize,
-    run_publish_projected_day, run_queue_audit, run_regimes, run_replay, run_sample_size,
-    run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
-    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
-    BackfillOptions, BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions,
-    CalibrationOptions, ChartBackfillOptions, CompleteShadowCorrectionOptions,
-    CumulativeWalletSnapshotOptions, ExcludedTimeWindow, ExecutionQualityOptions,
-    ExpireFundedManifestOptions, FillModel, FinalReportOptions, InitializeFundedManifestOptions,
-    LossDiagnosticsOptions, LossRegimeOosOptions, MaterializeProjectedCampaignOptions,
-    MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
-    ProspectiveValidationOptions, PublishProjectedDayOptions, QueueAuditOptions, RegimesOptions,
-    ReplayIndexOptions, ReplayOptions, SampleSizeOptions, SettlementCarryOptions,
-    StopFundedManifestFromStageBlockOptions, SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE,
-    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
+    publish_normalized_snapshot, restore_normalized_snapshot, run_audit, run_azure_freshness,
+    run_backfill, run_baseline, run_begin_shadow_correction, run_build_cumulative_wallet_snapshot,
+    run_build_markets, run_build_replay_index, run_calibration, run_chart_backfill,
+    run_complete_shadow_correction, run_evaluate_profitability, run_execution_quality,
+    run_final_report, run_loss_diagnostics, run_loss_regime_oos,
+    run_materialize_projected_campaign, run_ml_calibrate, run_normalize, run_publish_projected_day,
+    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
+    stop_funded_manifest_from_stage_block, AdvanceFundedLadderOptions,
+    AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions, BackfillOptions,
+    BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions, CalibrationOptions,
+    ChartBackfillOptions, CompleteShadowCorrectionOptions, CumulativeWalletSnapshotOptions,
+    ExcludedTimeWindow, ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel,
+    FinalReportOptions, InitializeFundedManifestOptions, LossDiagnosticsOptions,
+    LossRegimeOosOptions, MaterializeProjectedCampaignOptions, MlCalibrateOptions,
+    NormalizeOptions, ProfitabilityEvaluationOptions, ProspectiveValidationOptions,
+    PublishNormalizedSnapshotOptions, PublishProjectedDayOptions, QueueAuditOptions,
+    RegimesOptions, ReplayIndexOptions, ReplayOptions, RestoreNormalizedSnapshotOptions,
+    SampleSizeOptions, SettlementCarryOptions, StopFundedManifestFromStageBlockOptions,
+    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
+    DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
 };
-use polyedge_storage::{AzureBlobClient, AzureBlobItem, BlobLeaseAcquireResult};
+use polyedge_storage::{
+    AzureBlobClient, AzureBlobItem, BlobLeaseAcquireResult, ImmutableBlobWrite,
+};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{BufReader, Cursor};
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{BufReader, Cursor, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
+
+const LEGACY_RING_BLOB_PREFIX: &str = "events-oci-dual";
 
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
@@ -89,6 +97,29 @@ enum Command {
         max_bytes: Option<u64>,
         #[arg(long, default_value_t = 8)]
         prefetch_blobs: usize,
+    },
+    /// Upload locally sealed recorder segments without listing Azure blobs.
+    RingUpload {
+        #[arg(long, default_value = "/srv/polyedge-ring")]
+        root: PathBuf,
+        #[arg(
+            long,
+            default_value = "events-oci-hot7-v1",
+            env = "POLYEDGE_RING_BLOB_PREFIX"
+        )]
+        blob_prefix: String,
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
+        #[arg(long, default_value_t = 48)]
+        retention_hours: u64,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
     },
     BenchApiSnapshot {
         #[arg(long, default_value_t = 10_000)]
@@ -441,10 +472,52 @@ enum ResearchCommand {
         container: String,
         #[arg(long, default_value = "events/")]
         prefix: String,
+        #[arg(long, default_value_t = 300)]
+        max_age_seconds: u64,
+        #[arg(long, default_value_t = 60)]
+        expected_interval_seconds: u64,
         #[arg(long, default_value = "data_quality/freshness/latest.json")]
         out: PathBuf,
         #[arg(long = "sas-env")]
         sas_env: Option<String>,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Publish a content-addressed immutable normalized day for reuse by later jobs.
+    PublishNormalizedSnapshot {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        date: String,
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
+        #[arg(long, default_value = "data/research/normalized/v1")]
+        prefix: String,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Restore and hash-verify the normalized day selected by its manifest-last pointer.
+    RestoreNormalizedSnapshot {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        date: String,
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
+        #[arg(long, default_value = "data/research/normalized/v1")]
+        prefix: String,
         #[arg(long, env = "AZURE_CLIENT_ID")]
         client_id: Option<String>,
     },
@@ -702,6 +775,21 @@ async fn main() -> Result<()> {
             max_blobs,
             max_bytes,
             prefetch_blobs,
+        )?),
+        Command::RingUpload {
+            root,
+            blob_prefix,
+            account,
+            container,
+            retention_hours,
+            client_id,
+        } => print_json(run_ring_upload(
+            &root,
+            &blob_prefix,
+            account,
+            container,
+            retention_hours,
+            client_id,
         )?),
         Command::BenchApiSnapshot { iterations } => print_json(benchmark_snapshot(iterations)),
         Command::Research { command } => run_research_command(command),
@@ -1025,6 +1113,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             account,
             container,
             prefix,
+            max_age_seconds,
+            expected_interval_seconds,
             out,
             sas_env,
             client_id,
@@ -1036,6 +1126,38 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             sas_env,
             client_id,
             generated_at: None,
+            max_age_seconds,
+            expected_interval_seconds,
+        })?,
+        ResearchCommand::PublishNormalizedSnapshot {
+            input,
+            date,
+            account,
+            container,
+            prefix,
+            client_id,
+        } => publish_normalized_snapshot(PublishNormalizedSnapshotOptions {
+            input,
+            date: parse_date_arg(&date)?,
+            account,
+            container,
+            prefix,
+            client_id,
+        })?,
+        ResearchCommand::RestoreNormalizedSnapshot {
+            out,
+            date,
+            account,
+            container,
+            prefix,
+            client_id,
+        } => restore_normalized_snapshot(RestoreNormalizedSnapshotOptions {
+            out,
+            date: parse_date_arg(&date)?,
+            account,
+            container,
+            prefix,
+            client_id,
         })?,
         ResearchCommand::ValidateProspective {
             since,
@@ -1582,9 +1704,33 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
             "bind": bind
         })
     );
-    axum::serve(listener, app(settings))
+    let (app, shutdown) = app_with_shutdown(settings);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Err(error) = shutdown.drain().await {
+                eprintln!("Rust API shutdown did not fully drain: {error}");
+            }
+        })
         .await
         .context("serving Rust API")
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("installing Ctrl-C handler");
 }
 
 fn bench_ingest(events: usize) -> serde_json::Value {
@@ -1634,6 +1780,361 @@ fn bench_replay(path: PathBuf) -> Result<serde_json::Value> {
         "net_pnl": result.net_pnl,
         "memory_rss_mb": rss_mb()
     }))
+}
+
+fn run_ring_upload(
+    root: &Path,
+    blob_prefix: &str,
+    account: String,
+    container: String,
+    retention_hours: u64,
+    client_id: Option<String>,
+) -> Result<serde_json::Value> {
+    if blob_prefix.is_empty()
+        || blob_prefix.starts_with('/')
+        || blob_prefix.ends_with('/')
+        || blob_prefix
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || !blob_prefix.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-/".contains(&byte)
+        })
+    {
+        bail!("ring blob prefix is invalid");
+    }
+    if retention_hours < 48 {
+        bail!("ring retention must be at least 48 hours");
+    }
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolving ring root {}", root.display()))?;
+    if !root.is_dir() {
+        bail!("ring root is not a directory: {}", root.display());
+    }
+    let mut manifests = Vec::new();
+    collect_ring_manifests(&root, &mut manifests)?;
+    manifests.sort();
+
+    let mut client = AzureBlobClient::with_managed_identity(account, container, client_id);
+    let now = Utc::now().timestamp();
+    let retention_seconds = i64::try_from(retention_hours)
+        .ok()
+        .and_then(|hours| hours.checked_mul(3600))
+        .context("ring retention is too large")?;
+    let mut uploaded = 0_u64;
+    let mut verified = 0_u64;
+    let mut deleted = 0_u64;
+    let mut processed = 0_u64;
+
+    for manifest_path in manifests {
+        processed += 1;
+        let manifest_bytes = fs::read(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        let schema_version = manifest["schema_version"]
+            .as_u64()
+            .context("ring manifest schema_version must be an unsigned integer")?;
+        if !matches!(schema_version, 1 | 2) {
+            bail!(
+                "unsupported ring manifest schema: {}",
+                manifest_path.display()
+            );
+        }
+        let source_relative = ring_relative_path(&manifest, "segment_path")?;
+        let payload_relative = if schema_version == 2 {
+            if manifest["compression"].as_str() != Some("gzip") {
+                bail!("ring manifest v2 compression must equal gzip");
+            }
+            ring_relative_path(&manifest, "archive_path")?
+        } else {
+            source_relative.clone()
+        };
+        let source_path = root.join(&source_relative);
+        let payload_path = root.join(&payload_relative);
+        let receipt_path = PathBuf::from(format!("{}.uploaded.json", manifest_path.display()));
+        let accepted_prefix =
+            accepted_ring_blob_prefix(&manifest, blob_prefix, receipt_path.exists());
+        let blob_name = ring_blob_name(&manifest, accepted_prefix)?;
+        if (schema_version == 1 && !blob_name.ends_with(".jsonl"))
+            || (schema_version == 2 && !blob_name.ends_with(".jsonl.gz"))
+        {
+            bail!("ring manifest schema and blob compression disagree");
+        }
+        let expected_sha = ring_sha256(&manifest, "sha256")?;
+        let expected_bytes = manifest["bytes"]
+            .as_u64()
+            .context("ring manifest bytes must be an unsigned integer")?;
+        let segment_end = manifest["segment_end_epoch"]
+            .as_i64()
+            .context("ring manifest segment_end_epoch must be an integer")?;
+        let segment_start = manifest["segment_start_epoch"]
+            .as_i64()
+            .context("ring manifest segment_start_epoch must be an integer")?;
+        validate_ring_identity(
+            &source_relative,
+            &payload_relative,
+            &blob_name,
+            accepted_prefix,
+            segment_start,
+            segment_end,
+            now,
+        )
+        .with_context(|| {
+            format!(
+                "invalid ring manifest identity: {}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest_sha = sha256_prefixed(&manifest_bytes);
+        let manifest_blob = format!("{blob_name}.manifest.json");
+
+        if receipt_path.exists() {
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &fs::read(&receipt_path)
+                    .with_context(|| format!("reading {}", receipt_path.display()))?,
+            )?;
+            if receipt["manifest_sha256"].as_str() != Some(&manifest_sha) {
+                bail!("ring receipt disagrees with {}", manifest_path.display());
+            }
+        } else {
+            if schema_version == 2 {
+                let source_bytes = fs::read(&source_path)
+                    .with_context(|| format!("reading {}", source_path.display()))?;
+                let expected_source_bytes = manifest["source_bytes"]
+                    .as_u64()
+                    .context("ring manifest source_bytes must be an unsigned integer")?;
+                let expected_source_sha = ring_sha256(&manifest, "source_sha256")?;
+                if source_bytes.len() as u64 != expected_source_bytes
+                    || sha256_prefixed(&source_bytes) != expected_source_sha
+                {
+                    bail!("sealed ring source changed: {}", source_path.display());
+                }
+            }
+            let payload_bytes = fs::read(&payload_path)
+                .with_context(|| format!("reading {}", payload_path.display()))?;
+            if payload_bytes.len() as u64 != expected_bytes
+                || sha256_prefixed(&payload_bytes) != expected_sha
+            {
+                bail!("sealed ring payload changed: {}", payload_path.display());
+            }
+            match client
+                .upload_hot_block_blob_bytes_if_absent(
+                    &blob_name,
+                    &payload_bytes,
+                    if schema_version == 2 {
+                        "application/gzip"
+                    } else {
+                        "application/x-ndjson"
+                    },
+                )
+                .with_context(|| format!("uploading {blob_name}"))?
+            {
+                ImmutableBlobWrite::Created => uploaded += 1,
+                ImmutableBlobWrite::AlreadyExists => {
+                    let remote = client
+                        .download_blob_bytes(&blob_name)
+                        .with_context(|| format!("verifying existing {blob_name}"))?;
+                    if remote.len() as u64 != expected_bytes
+                        || sha256_prefixed(&remote) != expected_sha
+                    {
+                        bail!("existing Azure ring segment disagrees: {blob_name}");
+                    }
+                }
+            }
+            match client
+                .upload_block_blob_bytes_if_absent(
+                    &manifest_blob,
+                    &manifest_bytes,
+                    "application/json",
+                )
+                .with_context(|| format!("uploading {manifest_blob}"))?
+            {
+                ImmutableBlobWrite::Created => {}
+                ImmutableBlobWrite::AlreadyExists => {
+                    if client.download_blob_bytes(&manifest_blob)? != manifest_bytes {
+                        bail!("existing Azure ring manifest disagrees: {manifest_blob}");
+                    }
+                }
+            }
+            let receipt = serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "manifest_sha256": manifest_sha,
+                "blob_name": blob_name,
+                "manifest_blob_name": manifest_blob,
+                "verified_ts": Utc::now().to_rfc3339(),
+            }))?;
+            write_new_file(&receipt_path, &receipt)?;
+            verified += 1;
+        }
+
+        if now >= segment_end.saturating_add(retention_seconds) {
+            if client.download_blob_bytes(&manifest_blob)? != manifest_bytes {
+                bail!("remote manifest changed before local deletion: {manifest_blob}");
+            }
+            if payload_path.exists() {
+                fs::remove_file(&payload_path)
+                    .with_context(|| format!("deleting verified {}", payload_path.display()))?;
+            }
+            if source_path != payload_path && source_path.exists() {
+                fs::remove_file(&source_path)
+                    .with_context(|| format!("deleting verified {}", source_path.display()))?;
+            }
+            if manifest_path.exists() {
+                fs::remove_file(&manifest_path)
+                    .with_context(|| format!("deleting verified {}", manifest_path.display()))?;
+            }
+            deleted += 1;
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "manifest_count": processed,
+        "uploaded_segments": uploaded,
+        "newly_verified_segments": verified,
+        "deleted_local_segments": deleted,
+        "retention_hours": retention_hours,
+        "segment_access_tier": "Hot",
+    }))
+}
+
+fn accepted_ring_blob_prefix<'a>(
+    manifest: &serde_json::Value,
+    current_prefix: &'a str,
+    receipt_exists: bool,
+) -> &'a str {
+    if receipt_exists
+        && manifest["blob_name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with(&format!("{LEGACY_RING_BLOB_PREFIX}/")))
+    {
+        LEGACY_RING_BLOB_PREFIX
+    } else {
+        current_prefix
+    }
+}
+
+fn collect_ring_manifests(path: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("listing {}", path.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_ring_manifests(&path, output)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.ends_with(".jsonl.manifest.json") || name.ends_with(".jsonl.gz.manifest.json")
+            })
+        {
+            output.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn ring_relative_path(manifest: &serde_json::Value, field: &str) -> Result<PathBuf> {
+    let value = manifest[field]
+        .as_str()
+        .with_context(|| format!("ring manifest {field} must be a string"))?;
+    let path = PathBuf::from(value);
+    if path.is_absolute()
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || !(value.ends_with(".jsonl") || value.ends_with(".jsonl.gz"))
+    {
+        bail!("ring manifest {field} must be a relative JSONL or JSONL.gz path without traversal");
+    }
+    Ok(path)
+}
+
+fn ring_blob_name(manifest: &serde_json::Value, blob_prefix: &str) -> Result<String> {
+    let value = manifest["blob_name"]
+        .as_str()
+        .context("ring manifest blob_name must be a string")?;
+    if !value.starts_with(&format!("{blob_prefix}/"))
+        || value.starts_with('/')
+        || !(value.ends_with(".jsonl") || value.ends_with(".jsonl.gz"))
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        || value.chars().any(char::is_control)
+    {
+        bail!("ring manifest blob_name is invalid");
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_ring_identity(
+    source_path: &Path,
+    payload_path: &Path,
+    blob_name: &str,
+    blob_prefix: &str,
+    segment_start: i64,
+    segment_end: i64,
+    now: i64,
+) -> Result<()> {
+    let hour = DateTime::<Utc>::from_timestamp(segment_start, 0)
+        .context("segment_start_epoch is outside the UTC timestamp range")?
+        .format("%Y/%m/%d/%H")
+        .to_string();
+    let compressed = blob_name.ends_with(".jsonl.gz");
+    let expected_source = format!("segments/{hour}/{segment_start}.jsonl");
+    let expected_payload = if compressed {
+        format!("archive/{hour}/{segment_start}.jsonl.gz")
+    } else {
+        expected_source.clone()
+    };
+    let expected_blob = if compressed {
+        format!("{blob_prefix}/{hour}/{segment_start}.jsonl.gz")
+    } else {
+        format!("{blob_prefix}/{hour}/{segment_start}.jsonl")
+    };
+    if !(300..=900).contains(&segment_end.saturating_sub(segment_start))
+        || segment_end > now
+        || source_path != Path::new(&expected_source)
+        || payload_path != Path::new(&expected_payload)
+        || blob_name != expected_blob
+    {
+        bail!("segment path, blob name, or UTC interval is not exactly bound");
+    }
+    Ok(())
+}
+
+fn ring_sha256(manifest: &serde_json::Value, field: &str) -> Result<String> {
+    let value = manifest[field]
+        .as_str()
+        .with_context(|| format!("ring manifest {field} must be a string"))?;
+    if value.len() != 71
+        || !value.starts_with("sha256:")
+        || !value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("ring manifest {field} must be a lowercase sha256 digest");
+    }
+    Ok(value.to_owned())
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn bench_azure_replay(
@@ -1849,10 +2350,88 @@ fn profitability_authorization_flags(
 #[cfg(test)]
 mod tests {
     use super::{
-        profitability_authorization_flags, terminate_lease_child_tree, Cli, Command, PathBuf,
-        ResearchCommand,
+        accepted_ring_blob_prefix, profitability_authorization_flags, ring_blob_name,
+        ring_relative_path, ring_sha256, terminate_lease_child_tree, validate_ring_identity, Cli,
+        Command, Path, PathBuf, ResearchCommand,
     };
     use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn ring_manifest_paths_and_hashes_fail_closed() {
+        let manifest = json!({
+            "segment_path": "segments/2026/08/05/22/1785969000.jsonl",
+            "blob_name": "events-oci-dual/2026/08/05/22/1785969000.jsonl",
+            "sha256": format!("sha256:{}", "a".repeat(64)),
+        });
+        assert_eq!(
+            ring_relative_path(&manifest, "segment_path").unwrap(),
+            PathBuf::from("segments/2026/08/05/22/1785969000.jsonl")
+        );
+        assert!(ring_blob_name(&manifest, "events-oci-dual").is_ok());
+        assert!(ring_sha256(&manifest, "sha256").is_ok());
+
+        let mut invalid = manifest.clone();
+        invalid["segment_path"] = json!("../events.jsonl");
+        assert!(ring_relative_path(&invalid, "segment_path").is_err());
+        invalid = manifest.clone();
+        invalid["blob_name"] = json!("/events.jsonl");
+        assert!(ring_blob_name(&invalid, "events-oci-dual").is_err());
+        invalid = manifest.clone();
+        invalid["blob_name"] = json!("other-prefix/2026/08/05/22/1785969000.jsonl");
+        assert!(ring_blob_name(&invalid, "events-oci-dual").is_err());
+        invalid = manifest.clone();
+        invalid["sha256"] = json!(format!("sha256:{}", "A".repeat(64)));
+        assert!(ring_sha256(&invalid, "sha256").is_err());
+
+        assert!(validate_ring_identity(
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            "events-oci-dual/2026/08/05/22/1785969000.jsonl",
+            "events-oci-dual",
+            1785969000,
+            1785969600,
+            1785969700,
+        )
+        .is_ok());
+        assert!(validate_ring_identity(
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            "other-prefix/2026/08/05/22/1785969000.jsonl",
+            "events-oci-dual",
+            1785969000,
+            1785969600,
+            1785969700,
+        )
+        .is_err());
+
+        let compressed = json!({
+            "segment_path": "segments/2026/08/05/22/1785969000.jsonl",
+            "archive_path": "archive/2026/08/05/22/1785969000.jsonl.gz",
+            "blob_name": "events-oci-hot7-v1/2026/08/05/22/1785969000.jsonl.gz",
+        });
+        assert!(ring_relative_path(&compressed, "archive_path").is_ok());
+        assert!(ring_blob_name(&compressed, "events-oci-hot7-v1").is_ok());
+        assert!(validate_ring_identity(
+            Path::new("segments/2026/08/05/22/1785969000.jsonl"),
+            Path::new("archive/2026/08/05/22/1785969000.jsonl.gz"),
+            "events-oci-hot7-v1/2026/08/05/22/1785969000.jsonl.gz",
+            "events-oci-hot7-v1",
+            1785969000,
+            1785969600,
+            1785969700,
+        )
+        .is_ok());
+
+        assert_eq!(
+            accepted_ring_blob_prefix(&manifest, "events-oci-hot7-v1", true),
+            "events-oci-dual"
+        );
+        assert_eq!(
+            accepted_ring_blob_prefix(&manifest, "events-oci-hot7-v1", false),
+            "events-oci-hot7-v1"
+        );
+    }
 
     #[test]
     fn loss_diagnostics_cli_requires_explicit_snapshot_and_output_directory() {
@@ -2001,6 +2580,71 @@ mod tests {
                 "--test-child-argument"
             ]
         );
+    }
+
+    #[test]
+    fn normalized_snapshot_cli_requires_explicit_date_and_path() {
+        let publish = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "publish-normalized-snapshot",
+            "--input",
+            "normalized",
+            "--date",
+            "2026-07-30",
+            "--account",
+            "storage",
+            "--container",
+            "events",
+        ])
+        .expect("parse normalized snapshot publisher");
+        let Command::Research {
+            command:
+                ResearchCommand::PublishNormalizedSnapshot {
+                    input,
+                    date,
+                    prefix,
+                    ..
+                },
+        } = publish.command
+        else {
+            panic!("unexpected publisher command");
+        };
+        assert_eq!(input, PathBuf::from("normalized"));
+        assert_eq!(date, "2026-07-30");
+        assert_eq!(prefix, "data/research/normalized/v1");
+
+        let restore = Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "restore-normalized-snapshot",
+            "--out",
+            "restored",
+            "--date",
+            "2026-07-30",
+            "--account",
+            "storage",
+            "--container",
+            "events",
+        ])
+        .expect("parse normalized snapshot restore");
+        let Command::Research {
+            command: ResearchCommand::RestoreNormalizedSnapshot { out, date, .. },
+        } = restore.command
+        else {
+            panic!("unexpected restore command");
+        };
+        assert_eq!(out, PathBuf::from("restored"));
+        assert_eq!(date, "2026-07-30");
+
+        assert!(Cli::try_parse_from([
+            "polyedge-rs",
+            "research",
+            "publish-normalized-snapshot",
+            "--account",
+            "storage",
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]

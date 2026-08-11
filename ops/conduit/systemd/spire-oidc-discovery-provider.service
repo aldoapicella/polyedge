@@ -1,0 +1,32 @@
+[Unit]
+Description=SPIRE OIDC discovery and JWKS provider
+After=spire-agent.service
+Requires=spire-agent.service
+
+[Service]
+User=spire-oidc
+Group=caddy
+SupplementaryGroups=spire-workload
+RuntimeDirectory=spire-oidc
+RuntimeDirectoryMode=0750
+UMask=0007
+ExecStart=/opt/spire/bin/oidc-discovery-provider -config /etc/spire/oidc-discovery-provider.conf
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

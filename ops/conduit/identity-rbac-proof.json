@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-08-09T03:41:02Z",
+  "status": "live-verified",
+  "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
+  "resourceGroup": "rg-polyedge-dev",
+  "issuer": {
+    "url": "https://oidc.jupiterlabs.dev",
+    "reservedPublicIp": "149.130.186.60",
+    "secondaryPrivateIp": "10.0.0.81",
+    "dns": "passed",
+    "validTls": true,
+    "externalAcmeValidation": "passed",
+    "discovery": "passed",
+    "jwks": "passed"
+  },
+  "jwtSvid": {
+    "algorithm": "RS256",
+    "audience": "api://AzureADTokenExchange",
+    "lifetimeSeconds": 300,
+    "perLaneOwnerOnlyFiles": true,
+    "crossLaneResearchFileUnreadable": [
+      "api",
+      "shadow-qset",
+      "funded-signer"
+    ]
+  },
+  "rbacPlan": "identity-rbac-plan.json",
+  "lanes": {
+    "api": {
+      "identity": {
+        "resourceId": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-api",
+        "clientId": "d3e7f5e6-c8ed-4784-ad60-6d9fca6cd486",
+        "principalId": "f582805d-8d1b-49c4-85ca-66f7bb1a1b50"
+      },
+      "federatedCredential": {
+        "name": "fic-spire-conduit-api",
+        "issuer": "https://oidc.jupiterlabs.dev",
+        "subject": "spiffe://polyedge.local/conduit/api",
+        "audiences": ["api://AzureADTokenExchange"]
+      },
+      "assignmentCount": 13,
+      "exactPlanMatch": true,
+      "positiveChecks": [
+        { "operation": "blobContainer.getProperties", "target": "bot-events", "result": "success" }
+      ],
+      "negativeChecks": [
+        { "target": "polyedge-research-qset", "statusCode": 403, "result": "denied" }
+      ],
+      "negativeAssertions": [
+        { "assertion": "no subscription, resource-group, storage-account, Key Vault, or Service Bus role", "passed": true },
+        { "assertion": "no qset container or ShadowQset table role", "passed": true },
+        { "assertion": "no funded-evidence write role", "passed": true }
+      ]
+    },
+    "research": {
+      "identity": {
+        "resourceId": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-research",
+        "clientId": "567fd5e0-b89b-4742-b869-41903b0d5eb4",
+        "principalId": "e1ce4b8b-45a6-44f7-a07c-8d9b77de0bb5"
+      },
+      "federatedCredential": {
+        "name": "fic-spire-conduit-research",
+        "issuer": "https://oidc.jupiterlabs.dev",
+        "subject": "spiffe://polyedge.local/conduit/research",
+        "audiences": ["api://AzureADTokenExchange"]
+      },
+      "assignmentCount": 1,
+      "exactPlanMatch": true,
+      "positiveChecks": [
+        { "operation": "blobContainer.getProperties", "target": "bot-events", "result": "success" }
+      ],
+      "negativeChecks": [
+        { "target": "polyedge-funded-evidence", "statusCode": 403, "result": "denied" },
+        { "target": "polyedge-research-qset", "statusCode": 403, "result": "denied" }
+      ],
+      "negativeAssertions": [
+        { "assertion": "no table, Service Bus, qset, funded-evidence, storage-account, resource-group, or subscription role", "passed": true }
+      ]
+    },
+    "shadow-qset": {
+      "identity": {
+        "resourceId": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-shadow-qset",
+        "clientId": "bc1d5961-90c3-41e9-bdb0-8fbf210f5f0c",
+        "principalId": "29c06cc2-acac-4cfb-8dc1-b94fdf2beea7"
+      },
+      "federatedCredential": {
+        "name": "fic-spire-conduit-shadow-qset",
+        "issuer": "https://oidc.jupiterlabs.dev",
+        "subject": "spiffe://polyedge.local/conduit/shadow-qset",
+        "audiences": ["api://AzureADTokenExchange"]
+      },
+      "assignmentCount": 2,
+      "exactPlanMatch": true,
+      "workloadEnabled": false,
+      "positiveChecks": [
+        { "operation": "blobContainer.getProperties", "target": "polyedge-shadow-qset-events", "result": "success" }
+      ],
+      "negativeChecks": [
+        { "target": "bot-events", "statusCode": 403, "result": "denied" },
+        { "target": "polyedge-funded-evidence", "statusCode": 403, "result": "denied" }
+      ],
+      "negativeAssertions": [
+        { "assertion": "no primary, funded, control, table, Service Bus, storage-account, resource-group, or subscription role", "passed": true }
+      ]
+    },
+    "funded-signer": {
+      "identity": {
+        "resourceId": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-funded-signer",
+        "clientId": "d9ce9154-66a6-4bdb-839f-0da7b02b38da",
+        "principalId": "ab2527e7-06d0-4be4-af95-35b7fa353f62"
+      },
+      "federatedCredential": {
+        "name": "fic-spire-conduit-funded-signer",
+        "issuer": "https://oidc.jupiterlabs.dev",
+        "subject": "spiffe://polyedge.local/conduit/funded-signer",
+        "audiences": ["api://AzureADTokenExchange"]
+      },
+      "assignmentCount": 5,
+      "exactPlanMatch": true,
+      "workloadEnabled": false,
+      "positiveChecks": [
+        { "operation": "blobContainer.getProperties", "target": "polyedge-funded-evidence", "result": "success" }
+      ],
+      "negativeChecks": [
+        { "target": "bot-events", "statusCode": 403, "result": "denied" },
+        { "target": "polyedge-research-qset", "statusCode": 403, "result": "denied" }
+      ],
+      "negativeAssertions": [
+        { "assertion": "no Service Bus sender, qset, bot-events, table, storage-account, namespace, resource-group, or subscription role", "passed": true }
+      ]
+    }
+  },
+  "arc": {
+    "principalId": "19d0cc08-c6be-4b5b-85a8-05211f19428a",
+    "assignmentCount": 1,
+    "role": "PolyEdge OCI Blob Writer",
+    "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events",
+    "unchanged": true
+  },
+  "secretsOrTokensCaptured": false
+}

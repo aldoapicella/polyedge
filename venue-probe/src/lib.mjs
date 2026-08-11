@@ -4,6 +4,7 @@ import {
   BlobServiceClient,
   StorageSharedKeyCredential
 } from "@azure/storage-blob";
+import { protectedCapitalSnapshot } from "./compounding-risk.mjs";
 
 export const HORIZONS_SECONDS = [1, 5, 30, 60];
 export const MARKOUT_HORIZONS_SECONDS = [1, 5, 30];
@@ -192,7 +193,12 @@ export function summarizeCampaignRisk({
   unresolvedPositionCount = 0,
   unresolvedReservationCount = 0,
   proposedNotional = 0,
-  orderNotional = proposedNotional
+  orderNotional = proposedNotional,
+  authorizedStartingCollateral = null,
+  requireZeroExternalCashFlows = false,
+  profitQuarantineSnapshot = null,
+  protectedCompoundingState = null,
+  additionalBlockers = []
 }) {
   const liquid = Math.max(0, number(liquidCollateral, 0));
   const summed = Math.max(0, number(summedPositionValue, 0));
@@ -206,20 +212,73 @@ export function summarizeCampaignRisk({
   const equityFloor = number(control?.equity_floor, DEFAULT_CAMPAIGN_EQUITY_FLOOR) +
     number(control?.net_external_cash_flow, 0);
   const maximumDrawdown = number(control?.max_campaign_drawdown, DEFAULT_MAX_CAMPAIGN_DRAWDOWN);
+  const reconciliationTolerance = number(
+    control?.max_reconciliation_discrepancy,
+    DEFAULT_MAX_RECONCILIATION_DISCREPANCY
+  );
+  const cashFlowCount = Number(control?.cash_flow_count ?? (control?.cash_flow_ids || []).length);
+  const cashFlowIds = Array.isArray(control?.cash_flow_ids) ? [...control.cash_flow_ids].sort() : [];
+  const startingCollateral = authorizedStartingCollateral === null
+    ? null
+    : number(authorizedStartingCollateral, NaN);
+  const protectedCapital = protectedCompoundingState
+    ? protectedCapitalSnapshot({
+        state: protectedCompoundingState,
+        accountEquity,
+        proposedNotional
+      })
+    : null;
+  const quarantinedProfit = protectedCapital ? 0 : Math.max(
+    0,
+    number(profitQuarantineSnapshot?.quarantined_internal_profit, 0)
+  );
+  const profitQuarantineEnabled = !protectedCapital && profitQuarantineSnapshot !== null;
+  const authorizedEquityCeiling = protectedCapital
+    ? number(protectedCapital.authorized_equity_ceiling, NaN)
+    : profitQuarantineEnabled
+    ? number(profitQuarantineSnapshot?.authorized_equity_ceiling, NaN)
+    : startingCollateral;
+  // Legacy v1 sessions quarantine verified profit. A v2 session instead uses
+  // the fully reconciled account equity while preserving its monotonic reserve.
+  const riskEligibleEquity = protectedCapital
+    ? accountEquity
+    : Math.max(0, accountEquity - quarantinedProfit);
   const reserved = Math.max(0, number(proposedNotional, 0));
   const principal = Math.max(0, number(orderNotional, 0));
-  const campaignDrawdown = Math.max(0, adjustedBaseline - accountEquity);
-  const projectedEquity = accountEquity - reserved;
+  const campaignDrawdown = Math.max(0, adjustedBaseline - riskEligibleEquity);
+  const projectedEquity = riskEligibleEquity - reserved;
   const projectedDrawdown = Math.max(0, adjustedBaseline - projectedEquity);
   const blockers = [];
-  if (discrepancy > number(control?.max_reconciliation_discrepancy, DEFAULT_MAX_RECONCILIATION_DISCREPANCY) + 1e-9) {
+  if (discrepancy > reconciliationTolerance + 1e-9) {
     blockers.push("account_reconciliation_discrepancy");
   }
+  if (requireZeroExternalCashFlows &&
+      (number(control?.net_external_cash_flow, 0) !== 0 || cashFlowCount !== 0 || cashFlowIds.length !== 0)) {
+    blockers.push("external_cash_flow_record_present");
+  }
+  if (startingCollateral !== null) {
+    if (!(startingCollateral > 0) ||
+        Math.abs(number(control?.baseline_equity, NaN) - startingCollateral) > reconciliationTolerance + 1e-9 ||
+        Math.abs(adjustedBaseline - startingCollateral) > reconciliationTolerance + 1e-9) {
+      blockers.push("authorized_starting_collateral_mismatch");
+    }
+    if (!protectedCapital && profitQuarantineEnabled &&
+        (!(authorizedEquityCeiling >= startingCollateral) ||
+         profitQuarantineSnapshot?.allow_compounding !== false ||
+         profitQuarantineSnapshot?.risk_headroom !== "starting_collateral_only")) {
+      blockers.push("invalid_profit_quarantine");
+    }
+    if (accountEquity > authorizedEquityCeiling + reconciliationTolerance + 1e-9) {
+      blockers.push("authorized_starting_collateral_exceeded");
+    }
+  }
+  if (protectedCapital) blockers.push(...protectedCapital.blockers);
+  blockers.push(...additionalBlockers.map(String));
   if (Number(openOrderCount) > 0) blockers.push("open_orders_present");
   if (Number(unresolvedReservationCount) > 0) blockers.push("unresolved_risk_reservation");
   if (Number(unresolvedPositionCount) > 1) blockers.push("unresolved_position_limit_exceeded");
   if (reserved > 0 && Number(unresolvedPositionCount) > 0) blockers.push("existing_unresolved_position_blocks_submission");
-  if (accountEquity + 1e-9 < equityFloor) blockers.push("equity_floor_breached");
+  if (riskEligibleEquity + 1e-9 < equityFloor) blockers.push("equity_floor_breached");
   if (campaignDrawdown > maximumDrawdown + 1e-9) blockers.push("campaign_drawdown_exhausted");
   if (principal > number(control?.max_order_notional, 1) + 1e-9) blockers.push("order_notional_limit_exceeded");
   if (projectedEquity + 1e-9 < equityFloor) blockers.push("projected_equity_floor_breach");
@@ -229,7 +288,41 @@ export function summarizeCampaignRisk({
     campaign_id: control?.campaign_id || null,
     baseline_equity: roundMoney(number(control?.baseline_equity, DEFAULT_CAMPAIGN_BASELINE_EQUITY)),
     net_external_cash_flow: roundMoney(number(control?.net_external_cash_flow, 0)),
+    cash_flow_count: Number.isFinite(cashFlowCount) ? cashFlowCount : null,
+    cash_flow_ids: cashFlowIds,
     cash_flow_adjusted_baseline: roundMoney(adjustedBaseline),
+    authorized_starting_collateral: startingCollateral === null ? null : roundMoney(startingCollateral),
+    authorized_equity_ceiling: authorizedEquityCeiling === null
+      ? null
+      : roundMoney(authorizedEquityCeiling),
+    no_replenishment: startingCollateral !== null,
+    no_compounding: startingCollateral !== null && !protectedCapital,
+    allow_compounding: Boolean(protectedCapital),
+    profit_quarantine_enabled: profitQuarantineEnabled,
+    verified_internal_realized_pnl: roundMoney(
+      number(profitQuarantineSnapshot?.verified_internal_realized_pnl, 0)
+    ),
+    verified_internal_settlement_ids: Array.isArray(
+      profitQuarantineSnapshot?.verified_settlement_ids
+    ) ? [...profitQuarantineSnapshot.verified_settlement_ids].sort() : [],
+    quarantined_internal_profit: roundMoney(quarantinedProfit),
+    risk_eligible_equity: roundMoney(riskEligibleEquity),
+    risk_headroom: profitQuarantineEnabled
+      ? profitQuarantineSnapshot?.risk_headroom || null
+      : null,
+    high_water_equity: protectedCapital?.high_water_equity ?? null,
+    historical_high_water_equity: protectedCapital?.historical_high_water_equity ?? null,
+    prior_state_session_id: protectedCapital?.prior_state_session_id ?? null,
+    prior_state_blob_name: protectedCapital?.prior_state_blob_name ?? null,
+    protected_reserve: protectedCapital?.protected_reserve ?? null,
+    reserve_basis: protectedCapital?.reserve_basis ?? null,
+    reserve_monotonic: protectedCapital?.reserve_monotonic ?? null,
+    continue_after_loss: protectedCapital?.continue_after_loss ?? null,
+    last_reconciled_equity: protectedCapital?.last_reconciled_equity ?? null,
+    operating_buffer_ratio: protectedCapital?.operating_buffer_ratio ?? null,
+    operating_buffer: protectedCapital?.operating_buffer ?? null,
+    operable_capital: protectedCapital?.operable_capital ?? null,
+    minimum_order_notional: protectedCapital?.minimum_order_notional ?? null,
     equity_floor: roundMoney(equityFloor),
     max_campaign_drawdown: roundMoney(maximumDrawdown),
     liquid_collateral: roundMoney(liquid),
@@ -243,11 +336,11 @@ export function summarizeCampaignRisk({
     projected_equity: roundMoney(projectedEquity),
     projected_campaign_drawdown: roundMoney(projectedDrawdown),
     account_reconciliation_discrepancy: roundMoney(discrepancy),
-    maximum_reconciliation_discrepancy: roundMoney(number(control?.max_reconciliation_discrepancy, DEFAULT_MAX_RECONCILIATION_DISCREPANCY)),
+    maximum_reconciliation_discrepancy: roundMoney(reconciliationTolerance),
     open_order_count: Number(openOrderCount),
     unresolved_position_count: Number(unresolvedPositionCount),
     unresolved_risk_reservation_count: Number(unresolvedReservationCount),
-    blockers,
+    blockers: [...new Set(blockers)],
     passed: blockers.length === 0
   };
 }
@@ -811,10 +904,53 @@ export function storageContainer(config) {
   return service.getContainerClient(config.storageContainer);
 }
 
+export function createCampaignLeaseRenewalGuard({
+  now = monotonicMs,
+  freshnessLimitMs = 45_000
+} = {}) {
+  if (typeof now !== "function" || !(Number(freshnessLimitMs) > 0)) {
+    throw new Error("campaign lease renewal guard configuration is invalid");
+  }
+  let lastConfirmedRenewalMs = now();
+  let renewalError = null;
+  let fatalRenewalError = false;
+  return {
+    canRenew: () => !fatalRenewalError,
+    recordSuccess() {
+      lastConfirmedRenewalMs = now();
+      renewalError = null;
+      fatalRenewalError = false;
+    },
+    recordFailure(error) {
+      renewalError = error;
+      fatalRenewalError = !isRetryableCampaignLeaseRenewalError(error);
+    },
+    hasError: () => renewalError !== null,
+    assertHealthy() {
+      if (fatalRenewalError) {
+        throw new Error(`fail closed: campaign lease renewal failed (${renewalError?.message || "unknown error"})`);
+      }
+      const ageMs = now() - lastConfirmedRenewalMs;
+      if (ageMs > freshnessLimitMs) {
+        if (renewalError) {
+          throw new Error(`fail closed: campaign lease renewal failed (${renewalError.message || "unknown error"})`);
+        }
+        throw new Error(`fail closed: campaign lease freshness exceeded ${freshnessLimitMs / 1_000} seconds (${ageMs.toFixed(0)}ms)`);
+      }
+    }
+  };
+}
+
+function isRetryableCampaignLeaseRenewalError(error) {
+  const statusCode = Number(error?.statusCode ?? error?.status);
+  if ([408, 429].includes(statusCode) || statusCode >= 500) return true;
+  const value = `${error?.name || ""} ${error?.code || ""} ${error?.message || ""}`;
+  return /(abort|timed?\s*out|timeout|econnreset|etimedout|socket hang up)/i.test(value);
+}
+
 export async function acquireCampaignLease(config, runId) {
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable storage is required for the campaign lease");
-  await container.createIfNotExists();
   const blob = container.getBlockBlobClient("reports/research/venue-probe/control/campaign.lock");
   try {
     await blob.uploadData(Buffer.from("polyedge venue probe campaign lock\n"), {
@@ -830,17 +966,16 @@ export async function acquireCampaignLease(config, runId) {
   } catch (error) {
     throw new Error(`fail closed: another venue probe owns the campaign lease (${error.statusCode || "lease unavailable"})`);
   }
-  let renewalError = null;
   let renewing = false;
-  let lastConfirmedRenewalMs = monotonicMs();
+  const renewalGuard = createCampaignLeaseRenewalGuard();
   const timer = setInterval(async () => {
-    if (renewing || renewalError) return;
+    if (renewing || !renewalGuard.canRenew()) return;
     renewing = true;
     try {
       await leaseClient.renewLease({ abortSignal: AbortSignal.timeout(10_000) });
-      lastConfirmedRenewalMs = monotonicMs();
+      renewalGuard.recordSuccess();
     } catch (error) {
-      renewalError = error;
+      renewalGuard.recordFailure(error);
     } finally {
       renewing = false;
     }
@@ -849,25 +984,23 @@ export async function acquireCampaignLease(config, runId) {
   return {
     run_id: runId,
     assertHealthy() {
-      if (renewalError) throw new Error(`fail closed: campaign lease renewal failed (${renewalError.message})`);
-      const ageMs = monotonicMs() - lastConfirmedRenewalMs;
-      if (ageMs > 45_000) throw new Error(`fail closed: campaign lease freshness exceeded 45 seconds (${ageMs.toFixed(0)}ms)`);
+      renewalGuard.assertHealthy();
     },
     async release() {
       clearInterval(timer);
       try {
         await leaseClient.releaseLease({ abortSignal: AbortSignal.timeout(10_000) });
       } catch (error) {
-        if (!renewalError) throw error;
+        if (!renewalGuard.hasError()) throw error;
       }
     }
   };
 }
 
-export async function loadCampaignRiskControl(config) {
-  const container = storageContainer(config);
+export async function loadCampaignRiskControl(config, {
+  container = storageContainer(config)
+} = {}) {
   if (!container) throw new Error("fail closed: durable storage is required for funded campaign risk control");
-  await container.createIfNotExists();
   const prefix = `reports/research/venue-probe/control/campaign-risk/${config.campaignId}`;
   const baselineBlob = container.getBlockBlobClient(`${prefix}/baseline.json`);
   const expectedBaseline = {
@@ -881,15 +1014,10 @@ export async function loadCampaignRiskControl(config) {
     max_unresolved_positions: 1,
     max_reconciliation_discrepancy: roundMoney(config.maxReconciliationDiscrepancy)
   };
-  try {
-    await baselineBlob.uploadData(Buffer.from(JSON.stringify({ ...expectedBaseline, created_ts: new Date().toISOString() }, null, 2)), {
-      conditions: { ifNoneMatch: "*" },
-      blobHTTPHeaders: { blobContentType: "application/json" }
-    });
-  } catch (error) {
-    if (![409, 412].includes(Number(error.statusCode))) throw error;
-  }
-  const baseline = await downloadJson(baselineBlob);
+  const baseline = await readOrCreateImmutableJson(baselineBlob, {
+    ...expectedBaseline,
+    created_ts: new Date().toISOString()
+  });
   for (const [field, expected] of Object.entries(expectedBaseline)) {
     if (baseline?.[field] !== expected) {
       throw new Error(`fail closed: immutable campaign baseline mismatch for ${field}`);
@@ -905,17 +1033,12 @@ export async function loadCampaignRiskControl(config) {
       amount: roundMoney(flow.amount),
       transaction_hash: flow.transaction_hash
     };
-    try {
-      await blob.uploadData(Buffer.from(JSON.stringify({ ...expected, recorded_ts: new Date().toISOString() }, null, 2)), {
-        conditions: { ifNoneMatch: "*" },
-        blobHTTPHeaders: { blobContentType: "application/json" }
-      });
-    } catch (error) {
-      if (![409, 412].includes(Number(error.statusCode))) throw error;
-      const existing = await downloadJson(blob);
-      for (const [field, value] of Object.entries(expected)) {
-        if (existing?.[field] !== value) throw new Error(`fail closed: immutable campaign cash-flow mismatch for ${flow.id}`);
-      }
+    const existing = await readOrCreateImmutableJson(blob, {
+      ...expected,
+      recorded_ts: new Date().toISOString()
+    });
+    for (const [field, value] of Object.entries(expected)) {
+      if (existing?.[field] !== value) throw new Error(`fail closed: immutable campaign cash-flow mismatch for ${flow.id}`);
     }
   }
 
@@ -932,16 +1055,242 @@ export async function loadCampaignRiskControl(config) {
   };
 }
 
-export async function reserveProbeRisk(config, reservation) {
-  const container = storageContainer(config);
+const RISK_RESERVATION_PREFIX = "reports/research/venue-probe/risk-reservations/";
+const UNRESOLVED_RISK_INDEX_SCHEMA = "polyedge.funded_unresolved_risk_reservation_index.v1";
+
+function unresolvedRiskIndexBlobName(config) {
+  return `reports/research/venue-probe/control/campaign-risk/${config.campaignId}/unresolved-reservations-index.json`;
+}
+
+function riskReservationBytes(reservation) {
+  return Buffer.from(JSON.stringify(reservation, null, 2));
+}
+
+function riskReservationIndexEntry(blobName, reservation, bytes = riskReservationBytes(reservation)) {
+  return {
+    blob_name: blobName,
+    probe_id: String(reservation?.probe_id || ""),
+    reservation_sha256: digest(bytes)
+  };
+}
+
+function sortedRiskReservationIndexEntries(entries) {
+  return [...entries].sort((left, right) =>
+    String(left.blob_name).localeCompare(String(right.blob_name))
+  );
+}
+
+function buildUnresolvedRiskIndex(config, entries, {
+  generation,
+  rebuiltTs,
+  rebuildScannedRecordCount
+}) {
+  const normalized = sortedRiskReservationIndexEntries(entries);
+  return {
+    schema: UNRESOLVED_RISK_INDEX_SCHEMA,
+    schema_version: 1,
+    campaign_id: config.campaignId,
+    generation,
+    unresolved_count: normalized.length,
+    entries_sha256: digest(Buffer.from(JSON.stringify(normalized))),
+    entries: normalized,
+    rebuilt_ts: rebuiltTs,
+    rebuild_scanned_record_count: rebuildScannedRecordCount,
+    updated_ts: new Date().toISOString()
+  };
+}
+
+export function validateUnresolvedRiskReservationIndex(index, config) {
+  if (index?.schema !== UNRESOLVED_RISK_INDEX_SCHEMA ||
+      index?.schema_version !== 1 ||
+      index?.campaign_id !== config.campaignId ||
+      !Number.isInteger(index?.generation) || index.generation < 1 ||
+      !Number.isInteger(index?.unresolved_count) || index.unresolved_count < 0 ||
+      !Array.isArray(index?.entries)) {
+    throw new Error("fail closed: funded unresolved risk reservation index binding is invalid");
+  }
+  const normalized = sortedRiskReservationIndexEntries(index.entries);
+  const names = new Set();
+  for (const entry of normalized) {
+    if (!String(entry?.blob_name || "").startsWith(RISK_RESERVATION_PREFIX) ||
+        !String(entry.blob_name).endsWith(".json") ||
+        !String(entry?.probe_id || "") ||
+        !/^sha256:[0-9a-f]{64}$/.test(String(entry?.reservation_sha256 || "")) ||
+        names.has(entry.blob_name)) {
+      throw new Error("fail closed: funded unresolved risk reservation index entry is invalid or duplicated");
+    }
+    names.add(entry.blob_name);
+  }
+  if (index.unresolved_count !== normalized.length ||
+      JSON.stringify(index.entries) !== JSON.stringify(normalized) ||
+      index.entries_sha256 !== digest(Buffer.from(JSON.stringify(normalized)))) {
+    throw new Error("fail closed: funded unresolved risk reservation index hash or count disagrees");
+  }
+  return index;
+}
+
+async function downloadBlobDocument(blob, { allowInvalidJson = false } = {}) {
+  const response = await blob.download();
+  const bytes = await streamToBuffer(response.readableStreamBody);
+  let value = null;
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    if (allowInvalidJson) return { value, bytes, etag: response.etag || null };
+    throw new Error("fail closed: durable funded risk control blob is not valid JSON");
+  }
+  return { value, bytes, etag: response.etag || null };
+}
+
+async function downloadUnresolvedRiskIndex(container, config, { allowMissing = false, validate = true } = {}) {
+  const blob = container.getBlockBlobClient(unresolvedRiskIndexBlobName(config));
+  let document;
+  try {
+    document = await downloadBlobDocument(blob, { allowInvalidJson: !validate });
+  } catch (error) {
+    if (allowMissing && Number(error?.statusCode) === 404) return null;
+    throw error;
+  }
+  if (validate) validateUnresolvedRiskReservationIndex(document.value, config);
+  return { ...document, blob };
+}
+
+async function uploadUnresolvedRiskIndex(container, config, index, currentDocument) {
+  const conditions = currentDocument
+    ? { ifMatch: currentDocument.etag }
+    : { ifNoneMatch: "*" };
+  if (currentDocument && !currentDocument.etag) {
+    throw new Error("fail closed: funded unresolved risk reservation index ETag is unavailable");
+  }
+  await container
+    .getBlockBlobClient(unresolvedRiskIndexBlobName(config))
+    .uploadData(riskReservationBytes(index), {
+      conditions,
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+}
+
+export async function rebuildCampaignRiskReservationIndex(config, {
+  container = storageContainer(config)
+} = {}) {
+  if (!container) throw new Error("fail closed: durable storage is required to rebuild funded risk reservation index");
+  const current = await downloadUnresolvedRiskIndex(container, config, {
+    allowMissing: true,
+    validate: false
+  });
+  const entries = [];
+  let scannedRecordCount = 0;
+  for await (const item of container.listBlobsFlat({ prefix: RISK_RESERVATION_PREFIX })) {
+    if (!item.name.endsWith(".json")) continue;
+    const blob = typeof container.getBlobClient === "function"
+      ? container.getBlobClient(item.name)
+      : container.getBlockBlobClient(item.name);
+    const document = await downloadBlobDocument(blob);
+    const reservation = document.value;
+    if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
+    scannedRecordCount += 1;
+    if (!isRiskReservationResolved(reservation)) {
+      entries.push(riskReservationIndexEntry(item.name, reservation, document.bytes));
+    }
+  }
+  const priorGeneration = Number.isInteger(current?.value?.generation)
+    ? current.value.generation
+    : 0;
+  const rebuiltTs = new Date().toISOString();
+  const index = buildUnresolvedRiskIndex(config, entries, {
+    generation: priorGeneration + 1,
+    rebuiltTs,
+    rebuildScannedRecordCount: scannedRecordCount
+  });
+  await uploadUnresolvedRiskIndex(container, config, index, current);
+  const verified = await downloadUnresolvedRiskIndex(container, config);
+  if (verified.value.entries_sha256 !== index.entries_sha256 ||
+      verified.value.unresolved_count !== index.unresolved_count ||
+      verified.value.generation !== index.generation) {
+    throw new Error("fail closed: rebuilt funded unresolved risk reservation index did not verify");
+  }
+  return verified.value;
+}
+
+async function updateCampaignRiskReservationIndex(container, config, transitions) {
+  if (config.operatorDirect !== true || config.dryRun === true) return null;
+  const current = await downloadUnresolvedRiskIndex(container, config);
+  const entries = new Map(current.value.entries.map((entry) => [entry.blob_name, entry]));
+  for (const transition of transitions) {
+    const existing = entries.get(transition.blobName);
+    const unresolved = !isRiskReservationResolved(transition.reservation);
+    if (transition.requireAbsent && existing) {
+      throw new Error("fail closed: funded risk reservation index already contains the new reservation");
+    }
+    if (unresolved) {
+      if (transition.requirePresent && !existing) {
+        throw new Error("fail closed: funded risk reservation index lost an unresolved reservation");
+      }
+      entries.set(
+        transition.blobName,
+        riskReservationIndexEntry(transition.blobName, transition.reservation, transition.bytes)
+      );
+    } else {
+      entries.delete(transition.blobName);
+    }
+  }
+  const normalized = sortedRiskReservationIndexEntries(entries.values());
+  if (JSON.stringify(normalized) === JSON.stringify(current.value.entries)) return current.value;
+  const index = buildUnresolvedRiskIndex(config, normalized, {
+    generation: current.value.generation + 1,
+    rebuiltTs: current.value.rebuilt_ts,
+    rebuildScannedRecordCount: current.value.rebuild_scanned_record_count
+  });
+  await uploadUnresolvedRiskIndex(container, config, index, current);
+  return index;
+}
+
+export async function loadCampaignUnresolvedRiskReservationRecords(config, {
+  container = storageContainer(config)
+} = {}) {
+  if (!container) return [];
+  if (config.operatorDirect !== true || config.dryRun === true) {
+    return (await loadCampaignRiskReservationRecordsFromContainer(config, container))
+      .filter((record) => !isRiskReservationResolved(record.reservation));
+  }
+  const index = (await downloadUnresolvedRiskIndex(container, config)).value;
+  return Promise.all(index.entries.map(async (entry) => {
+    const blob = typeof container.getBlobClient === "function"
+      ? container.getBlobClient(entry.blob_name)
+      : container.getBlockBlobClient(entry.blob_name);
+    let document;
+    try {
+      document = await downloadBlobDocument(blob);
+    } catch (error) {
+      throw new Error(`fail closed: funded unresolved risk reservation index points to an unavailable blob (${error.message})`);
+    }
+    if (digest(document.bytes) !== entry.reservation_sha256 ||
+        document.value?.campaign_id !== config.campaignId ||
+        String(document.value?.probe_id || "") !== entry.probe_id ||
+        isRiskReservationResolved(document.value)) {
+      throw new Error("fail closed: funded unresolved risk reservation index disagrees with durable reservation state");
+    }
+    return {
+      blob_name: entry.blob_name,
+      etag: document.etag,
+      reservation: document.value
+    };
+  }));
+}
+
+export async function reserveProbeRisk(config, reservation, {
+  container = storageContainer(config)
+} = {}) {
   if (!container) throw new Error("fail closed: durable storage is required before order submission");
   const date = reservation.date || new Date().toISOString().slice(0, 10);
-  const blob = container.getBlockBlobClient(`reports/research/venue-probe/risk-reservations/${date}/${reservation.probe_id}.json`);
+  const blobName = `${RISK_RESERVATION_PREFIX}${date}/${reservation.probe_id}.json`;
+  const blob = container.getBlockBlobClient(blobName);
   const payload = {
     schema_version: 1,
     evidence_protocol_version: EVIDENCE_PROTOCOL_VERSION,
     state: "reserved",
     date,
+    campaign_id: config.campaignId,
     run_id: reservation.run_id,
     probe_id: reservation.probe_id,
     reserved_notional: number(reservation.reserved_notional, 0),
@@ -957,17 +1306,28 @@ export async function reserveProbeRisk(config, reservation) {
     created_ts: new Date().toISOString(),
     updated_ts: new Date().toISOString()
   };
-  await blob.uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
+  const bytes = riskReservationBytes(payload);
+  // Index first: a crash can leave a visible missing-blob blocker, but can
+  // never create an unresolved reservation that the funded preflight hides.
+  await updateCampaignRiskReservationIndex(container, config, [{
+    blobName,
+    reservation: payload,
+    bytes,
+    requireAbsent: true
+  }]);
+  await blob.uploadData(bytes, {
     conditions: { ifNoneMatch: "*" },
     blobHTTPHeaders: { blobContentType: "application/json" }
   });
   return payload;
 }
 
-export async function finalizeProbeRisk(config, reservation, result) {
-  const container = storageContainer(config);
+export async function finalizeProbeRisk(config, reservation, result, {
+  container = storageContainer(config)
+} = {}) {
   if (!container) throw new Error("fail closed: durable storage is required to finalize order risk");
   const date = reservation.date || new Date().toISOString().slice(0, 10);
+  const blobName = `${RISK_RESERVATION_PREFIX}${date}/${reservation.probe_id}.json`;
   const payload = {
     ...reservation,
     state: result.state || "finalized",
@@ -976,17 +1336,31 @@ export async function finalizeProbeRisk(config, reservation, result) {
     matched_notional: Math.max(0, number(result.matched_notional, 0)),
     reconciliation_complete: result.reconciliation_complete === true,
     zero_open_orders_confirmed: result.zero_open_orders_confirmed === true,
+    reconciliation_reason: result.reconciliation_reason || reservation.reconciliation_reason || null,
+    reconciliation_evidence: result.reconciliation_evidence || reservation.reconciliation_evidence || null,
     updated_ts: new Date().toISOString()
   };
+  const bytes = riskReservationBytes(payload);
   await container
-    .getBlockBlobClient(`reports/research/venue-probe/risk-reservations/${date}/${reservation.probe_id}.json`)
-    .uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
+    .getBlockBlobClient(blobName)
+    .uploadData(bytes, {
       blobHTTPHeaders: { blobContentType: "application/json" }
     });
+  // Blob first: a crash can leave a conservative stale index entry, never a
+  // missing unresolved entry. Startup rebuild repairs that fail-closed state.
+  await updateCampaignRiskReservationIndex(container, config, [{
+    blobName,
+    reservation: payload,
+    bytes,
+    requirePresent: !isRiskReservationResolved(payload)
+  }]);
   return payload;
 }
 
-export async function settleProbeRiskReservations(config, settlement) {
+export async function settleProbeRiskReservations(config, settlement, {
+  reservationRecords = null,
+  container = storageContainer(config)
+} = {}) {
   const conditionIds = new Set((settlement?.condition_ids || []).map((value) => String(value).toLowerCase()));
   const redemptionVerified = settlement?.settlement_verified === true && Boolean(settlement?.transaction_hash);
   const terminalVerified = settlement?.terminal_settlement_verified === true &&
@@ -994,17 +1368,18 @@ export async function settleProbeRiskReservations(config, settlement) {
   if (!conditionIds.size || (!redemptionVerified && !terminalVerified)) {
     throw new Error("fail closed: verified settlement evidence is required to release filled risk reservations");
   }
-  const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable storage is required to settle order risk");
   const campaign = settlement?.terminal_portfolio ? await loadCampaignRiskControl(config) : null;
   let settled = 0;
   const terminalReservations = [];
-  for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
-    if (!item.name.endsWith(".json")) continue;
-    const blob = container.getBlockBlobClient(item.name);
-    const response = await blob.download();
-    const reservation = JSON.parse(await streamToString(response.readableStreamBody));
-    if (number(reservation?.matched_notional, 0) <= 0 || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
+  const indexTransitions = [];
+  const records = reservationRecords ||
+    await loadCampaignRiskReservationRecordsFromContainer(config, container);
+  for (const record of records) {
+    const reservation = record?.reservation;
+    if ((config.operatorDirect === true && reservation?.campaign_id !== config.campaignId)
+        || number(reservation?.matched_notional, 0) <= 0
+        || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
     // A previous redemption pass may already have moved the reservation to
     // position_settled before terminal portfolio evidence was available.  Do
     // not skip that reservation: the trusted redemption path must still be
@@ -1020,12 +1395,22 @@ export async function settleProbeRiskReservations(config, settlement) {
       settled_ts: settlement.settled_ts || new Date().toISOString(),
       updated_ts: new Date().toISOString()
     };
-    await blob.uploadData(Buffer.from(JSON.stringify(payload, null, 2)), {
-      conditions: response.etag ? { ifMatch: response.etag } : undefined,
+    const blob = container.getBlockBlobClient(record.blob_name);
+    const bytes = riskReservationBytes(payload);
+    await blob.uploadData(bytes, {
+      conditions: record.etag ? { ifMatch: record.etag } : undefined,
       blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    indexTransitions.push({
+      blobName: record.blob_name,
+      reservation: payload,
+      bytes
     });
     if (settlement?.terminal_portfolio) terminalReservations.push(payload);
     settled += 1;
+  }
+  if (indexTransitions.length) {
+    await updateCampaignRiskReservationIndex(container, config, indexTransitions);
   }
   // Publish terminal artifacts only after every reservation covered by this
   // verified atomic settlement has been durably updated. Otherwise the first
@@ -1151,7 +1536,6 @@ export async function uploadEvidence(config, runId, summary, ledger) {
   }
   const container = storageContainer(config);
   if (!container) return { uploaded: false, prefix: null };
-  await container.createIfNotExists();
   await uploadImmutable(container, `${prefix}/events.jsonl`, safeEventsJsonl, "application/x-ndjson");
   await uploadImmutable(container, `${prefix}/summary.json`, JSON.stringify(safeSummary, null, 2), "application/json");
   const payload = Buffer.from(JSON.stringify(safeSummary, null, 2));
@@ -1318,16 +1702,37 @@ export async function loadDailyCampaignRisk(config, date = new Date().toISOStrin
 }
 
 export async function loadUnresolvedRiskReservations(config) {
+  return (await loadCampaignUnresolvedRiskReservationRecords(config))
+    .map((record) => record.reservation);
+}
+
+export async function loadCampaignRiskReservations(config) {
+  return (await loadCampaignRiskReservationRecords(config))
+    .map((record) => record.reservation);
+}
+
+export async function loadCampaignRiskReservationRecords(config) {
   const container = storageContainer(config);
   if (!container) return [];
-  const unresolved = [];
-  for await (const blob of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
-    if (!blob.name.endsWith(".json")) continue;
-    const response = await container.getBlobClient(blob.name).download();
+  return loadCampaignRiskReservationRecordsFromContainer(config, container);
+}
+
+async function loadCampaignRiskReservationRecordsFromContainer(config, container) {
+  const records = [];
+  for await (const item of container.listBlobsFlat({
+    prefix: RISK_RESERVATION_PREFIX
+  })) {
+    if (!item.name.endsWith(".json")) continue;
+    const response = await container.getBlobClient(item.name).download();
     const reservation = JSON.parse(await streamToString(response.readableStreamBody));
-    if (!isRiskReservationResolved(reservation)) unresolved.push(reservation);
+    if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
+    records.push({
+      blob_name: item.name,
+      etag: response.etag || null,
+      reservation
+    });
   }
-  return unresolved;
+  return records;
 }
 
 export function summarizeDailyRiskRecords(date, reservations, summaries) {
@@ -1517,6 +1922,24 @@ async function uploadImmutable(container, name, content, contentType) {
 async function downloadJson(blob) {
   const response = await blob.download();
   return JSON.parse(await streamToString(response.readableStreamBody));
+}
+
+async function readOrCreateImmutableJson(blob, value) {
+  try {
+    return await downloadJson(blob);
+  } catch (error) {
+    if (Number(error?.statusCode) !== 404) throw error;
+  }
+  try {
+    await blob.uploadData(Buffer.from(JSON.stringify(value, null, 2)), {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    return value;
+  } catch (error) {
+    if (![409, 412].includes(Number(error?.statusCode))) throw error;
+    return downloadJson(blob);
+  }
 }
 
 async function streamToString(stream) {

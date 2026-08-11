@@ -1,0 +1,462 @@
+#!/bin/sh
+set -eu
+
+die() { echo "polyedge-parity-hourly: $*" >&2; exit 1; }
+sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
+
+expected_uid=${POLYEDGE_PARITY_EXPECTED_UID:-0}
+expected_gid=${POLYEDGE_PARITY_EXPECTED_GID:-0}
+secure_file() {
+  file=$1 mode=$2
+  [ ! -L "$file" ] && [ -f "$file" ] || die "unsafe or missing file: $file"
+  set -- $(stat -c '%u %g %a %h' "$file")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] && [ "$4" = 1 ] \
+    || die "wrong owner, mode, or link count: $file"
+}
+secure_dir() {
+  dir=$1 mode=$2
+  [ ! -L "$dir" ] && [ -d "$dir" ] || die "unsafe or missing directory: $dir"
+  set -- $(stat -c '%u %g %a' "$dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] || die "wrong owner or mode: $dir"
+}
+
+
+env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+secure_file "$env_file" 640
+set -a
+. "$env_file"
+set +a
+
+hourly_env=${POLYEDGE_PARITY_HOURLY_ENV:-/etc/polyedge/jobs/hourly.env}
+secure_file "$hourly_env" 600
+set -a
+. "$hourly_env"
+set +a
+
+: "${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}"
+: "${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}"
+: "${POLYEDGE_RESEARCH_IMAGE:?missing pinned research image}"
+: "${AZURE_TENANT_ID:?missing research tenant ID}"
+: "${AZURE_CLIENT_ID:?missing research client ID}"
+[ "${AZURE_STORAGE_ACCOUNT_NAME:-}" = stpolyedge6urdjr5nmwx7w ] || die 'unexpected Azure storage account'
+[ "${AZURE_STORAGE_CONTAINER_NAME:-}" = bot-events ] || die 'unexpected Azure storage container'
+[ "${POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH:-}" = true ] || die 'artifact publication must remain disabled'
+printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+  || die 'research image is not an immutable GHCR digest'
+printf '%s' "$POLYEDGE_PARITY_WINDOW_START_UTC" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+  || die 'formal window start is malformed'
+window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
+[ "$(date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$POLYEDGE_PARITY_WINDOW_START_UTC" ] \
+  || die 'formal window start is not canonical UTC'
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+hourly_root=$parity_root/hourly
+segments_root=${POLYEDGE_PARITY_SEGMENTS_ROOT:-$ring/segments}
+archive_root=${POLYEDGE_PARITY_ARCHIVE_ROOT:-$ring/archive}
+report_root=${POLYEDGE_PARITY_REPORT_ROOT:-$ring/jobs/research/reports/research/hourly}
+ring_status=${POLYEDGE_PARITY_RING_STATUS:-$ring/status.json}
+boot_root=${POLYEDGE_PARITY_BOOT_ROOT:-/}
+boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
+pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
+token_file=${POLYEDGE_PARITY_TOKEN_FILE:-/run/polyedge-federated-research/azure-federated-token}
+runtime_dir=${POLYEDGE_PARITY_RUNTIME_DIR:-/run/polyedge/parity-hourly}
+
+mountpoint -q "$ring" || die 'ring root is not a mount point'
+ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
+ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
+[ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
+  || die 'formal ledger must be a direct .json child of the parity root'
+
+secure_file "$POLYEDGE_PARITY_LEDGER" 640
+jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+  .schemaVersion == 1 and .status == "in_progress" and
+  .azureAuthoritative == true and .azureDeletionAllowed == false and
+  .windowStartUtc == $start and
+  (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
+  (.acceptedHourlyEvidence? // [] | type == "array") and
+  (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == false
+' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+
+if [ -n "${POLYEDGE_PARITY_TARGET_HOUR_UTC:-}" ]; then
+  target=$POLYEDGE_PARITY_TARGET_HOUR_UTC
+else
+  target=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:00:00Z)
+fi
+printf '%s' "$target" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z$' || die 'target hour is malformed'
+target_epoch=$(date -u -d "$target" +%s) || die 'target hour is invalid'
+[ "$(date -u -d "@$target_epoch" +%Y-%m-%dT%H:00:00Z)" = "$target" ] || die 'target hour is not canonical UTC'
+end_epoch=$((target_epoch + 3600))
+now_epoch=${POLYEDGE_PARITY_NOW_EPOCH:-$(date -u +%s)}
+printf '%s' "$now_epoch" | grep -Eq '^[0-9]+$' || die 'current time is invalid'
+hour_end=$(date -u -d "@$end_epoch" +%Y-%m-%dT%H:%M:%SZ)
+[ "$end_epoch" -le "$now_epoch" ] || die 'target hour has not ended'
+stamp=$(date -u -d "@$target_epoch" +%Y%m%dT%H)
+day=$(date -u -d "@$target_epoch" +%Y/%m/%d)
+hour=$(date -u -d "@$target_epoch" +%H)
+hour_dir=$hourly_root/$stamp
+evidence=$hour_dir/evidence.json
+
+secure_dir "$parity_root" 750
+install -d -m 0750 "$hourly_root"
+secure_dir "$hourly_root" 750
+install -d -m 0750 "$hour_dir"
+secure_dir "$hour_dir" 750
+
+if [ "$target_epoch" -lt "$window_epoch" ]; then
+  if [ -e "$evidence" ]; then
+    secure_file "$evidence" 640
+    jq -e --arg hour "$target" '.schemaVersion == 1 and .hourStartUtc == $hour and .acceptedForParityWindow == false' "$evidence" >/dev/null \
+      || die 'existing excluded evidence is invalid'
+    exit 0
+  fi
+  tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+    --arg hour "$target" --arg end "$hour_end" \
+    '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$start,hourStartUtc:$hour,hourEndUtc:$end,status:"excluded_pre_window",acceptedForParityWindow:false,azureAuthoritative:true,azureDeletionAllowed:false}' >"$tmp"
+  chmod 0640 "$tmp"
+  sync -f "$tmp"
+  mv "$tmp" "$evidence"
+  trap - EXIT HUP INT TERM
+  exit 0
+fi
+
+first_epoch=$(( (window_epoch + 3599) / 3600 * 3600 ))
+[ "$target_epoch" -ge "$first_epoch" ] || die 'mixed window hour cannot be accepted'
+
+install -d -m 0700 "$runtime_dir"
+[ ! -L "$runtime_dir" ] && [ -d "$runtime_dir" ] || die 'unsafe runtime directory'
+set -- $(stat -c '%u %g %a' "$runtime_dir")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || die 'unsafe runtime directory ownership or mode'
+refs_tmp=$(mktemp "$runtime_dir/refs.XXXXXX")
+segments_tmp=$(mktemp "$runtime_dir/segments.XXXXXX")
+oauth_response=$(mktemp "$runtime_dir/oauth.XXXXXX")
+auth_header=$(mktemp "$runtime_dir/header.XXXXXX")
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+chmod 0600 "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"
+
+collect_refs() {
+  : >"$refs_tmp"
+  find "$hourly_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | while IFS= read -r file; do
+    secure_file "$file" 640
+    jq -e '.schemaVersion == 1 and (.acceptedForParityWindow | type == "boolean")' "$file" >/dev/null || die "malformed evidence: $file"
+    if [ "$(jq -r '.acceptedForParityWindow' "$file")" = true ]; then
+      evidence_window=$(jq -r '.windowStartUtc // ""' "$file")
+      evidence_ledger=$(jq -r '.ledgerPath // ""' "$file")
+      if [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] || [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ]; then
+        [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] && [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ] \
+          || die "accepted evidence has mixed parity provenance: $file"
+        continue
+      fi
+      start=$(jq -r '.hourStartUtc' "$file")
+      epoch=$(date -u -d "$start" +%s) || die "invalid accepted hour: $file"
+      [ "$((epoch % 3600))" -eq 0 ] && [ "$(date -u -d "@$epoch" +%Y-%m-%dT%H:00:00Z)" = "$start" ] || die "non-canonical accepted hour: $file"
+      expected_file="$hourly_root/$(date -u -d "@$epoch" +%Y%m%dT%H)/evidence.json"
+      [ "$file" = "$expected_file" ] || die "accepted evidence is stored under the wrong hour: $file"
+      jq -e '.status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true' "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
+      file_sha=$(sha "$file")
+      jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" \
+        '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha}' >>"$refs_tmp"
+    fi
+  done
+  refs=$(jq -sc 'sort_by(.hourStartEpoch)' "$refs_tmp")
+  count=$(printf '%s' "$refs" | jq 'length')
+  [ "$count" -eq $(( (target_epoch - first_epoch) / 3600 + 1 )) ] || die 'accepted evidence has a gap'
+  printf '%s' "$refs" | jq -e --argjson first "$first_epoch" '
+    (to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600)))) and
+    ([.[].hourStartEpoch] | length == (unique | length))
+  ' >/dev/null || die 'accepted evidence is duplicate or non-sequential'
+}
+
+update_ledger() {
+  old_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+  [ "$old_count" -eq $((count - 1)) ] || die 'ledger was not at the strictly previous count'
+  old_refs=$(jq -c '.acceptedHourlyEvidence // []' "$POLYEDGE_PARITY_LEDGER")
+  expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
+  [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
+
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$POLYEDGE_PARITY_LEDGER")
+  ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
+  jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
+    "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+  chmod 0640 "$ledger_tmp"
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$ledger_tmp")" = "$protected_before" ] \
+    || die 'protected ledger fields changed'
+  sync -f "$ledger_tmp"
+  mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+}
+
+if [ -e "$evidence" ]; then
+  secure_file "$evidence" 640
+  jq -e --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" '
+    .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
+    .hourStartUtc == $hour and .hourEndUtc == $end and .ledgerPath == $ledger and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .sameInput.deterministicResultExactMatch == true
+  ' "$evidence" >/dev/null || die 'existing accepted evidence is invalid'
+  collect_refs
+  ledger_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+  if [ "$ledger_count" -eq "$count" ]; then
+    jq -e --argjson refs "$refs" '(.acceptedHourlyEvidence // []) == $refs' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+      || die 'ledger references disagree with accepted evidence'
+    exit 0
+  fi
+  [ "$ledger_count" -eq $((count - 1)) ] || die 'ledger count disagrees with accepted evidence'
+  update_ledger
+  echo "validated parity hour $target; acceptedCleanLiveHours=$count"
+  exit 0
+else
+  evidence=
+fi
+
+[ ! -e "$pause_file" ] || die 'image pulls are paused'
+available=$(df -P -B1 "$boot_root" | awk 'NR == 2 {print $4}')
+printf '%s' "$available" | grep -Eq '^[0-9]+$' || die 'boot free space is unreadable'
+[ "$available" -ge "$boot_floor" ] || die 'boot disk is below the parity floor'
+secure_file "$ring_status" 640
+jq -e '
+  .capacity_ok == true and .free_ok == true and .upload_fresh == true and
+  .unsealed_closed_count == 0 and .unuploaded_count == 0
+' "$ring_status" >/dev/null || die 'ring is unhealthy'
+ring_age=$((now_epoch - $(stat -c %Y "$ring_status")))
+[ "$ring_age" -ge 0 ] && [ "$ring_age" -le 600 ] || die 'ring health status is stale'
+
+systemctl is-active --quiet polyedge-api.service || die 'API service is inactive'
+systemctl is-active --quiet polyedge-frontend.service || die 'frontend service is inactive'
+[ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-api)" = healthy ] || die 'API container is unhealthy'
+[ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-frontend)" = healthy ] || die 'frontend container is unhealthy'
+case "$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
+if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
+[ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
+if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
+
+source_dir=$segments_root/$day/$hour
+[ ! -L "$source_dir" ] && [ -d "$source_dir" ] || die 'hour segment directory is missing or unsafe'
+[ "$(find "$source_dir" -maxdepth 1 -name '*.jsonl' | wc -l)" -eq 6 ] || die 'target hour does not contain exactly six source segments'
+: >"$segments_tmp"
+i=0
+while [ "$i" -lt 6 ]; do
+  start=$((target_epoch + i * 600))
+  source=$source_dir/$start.jsonl
+  relative=$day/$hour/$start.jsonl
+  gzip_file=$archive_root/$relative.gz
+  manifest=$gzip_file.manifest.json
+  receipt=$manifest.uploaded.json
+  for file in "$source" "$gzip_file" "$manifest" "$receipt"; do
+    [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c %h "$file")" = 1 ] || die "unsafe segment evidence: $file"
+  done
+  gzip -t "$gzip_file" || die "invalid gzip: $gzip_file"
+  source_sha=$(sha "$source")
+  [ "sha256:$(gzip -dc "$gzip_file" | sha256sum | awk '{print $1}')" = "$source_sha" ] || die "gzip source mismatch: $gzip_file"
+  gzip_sha=$(sha "$gzip_file")
+  manifest_sha=$(sha "$manifest")
+  expected_blob="events-oci-hot7-v1/$day/$hour/$start.jsonl.gz"
+  [ "$(jq -r '.blob_name' "$manifest")" = "$expected_blob" ] || die "manifest blob mismatch: $manifest"
+  jq -e --arg segment "segments/$relative" --arg archive "archive/$relative.gz" --arg source_sha "$source_sha" \
+    --arg gzip_sha "$gzip_sha" --argjson start "$start" --argjson end "$((start + 600))" '
+    .schema_version == 2 and .segment_path == $segment and .archive_path == $archive and
+    .compression == "gzip" and .source_sha256 == $source_sha and .sha256 == $gzip_sha and
+    .segment_start_epoch == $start and .segment_end_epoch == $end
+  ' "$manifest" >/dev/null || die "manifest mismatch: $manifest"
+  jq -e --arg manifest_sha "$manifest_sha" --arg blob "$expected_blob" --arg manifest_blob "$expected_blob.manifest.json" '
+    .schema_version == 1 and .manifest_sha256 == $manifest_sha and .blob_name == $blob and
+    .manifest_blob_name == $manifest_blob and
+    (.verified_ts | type == "string" and length > 0)
+  ' "$receipt" >/dev/null || die "receipt mismatch: $receipt"
+  jq -nc --argjson start "$start" --arg source "$source" --arg source_sha "$source_sha" \
+    --arg gzip "$gzip_file" --arg gzip_sha "$gzip_sha" --arg manifest "$manifest" --arg manifest_sha "$manifest_sha" \
+    --arg receipt "$receipt" --arg receipt_sha "$(sha "$receipt")" \
+    '{segmentStartEpoch:$start,source:{path:$source,sha256:$source_sha},gzip:{path:$gzip,sha256:$gzip_sha},manifest:{path:$manifest,sha256:$manifest_sha},receipt:{path:$receipt,sha256:$receipt_sha}}' >>"$segments_tmp"
+  i=$((i + 1))
+done
+segments=$(jq -sc '.' "$segments_tmp")
+
+oci_scheduled=$report_root/$day/$hour/audit.json
+[ ! -L "$oci_scheduled" ] && [ -f "$oci_scheduled" ] && [ "$(stat -c %h "$oci_scheduled")" = 1 ] || die 'OCI scheduled audit is missing or unsafe'
+
+azure_report=$hour_dir/azure-scheduled-audit.json
+same_report=$hour_dir/same-input-audit.json
+azure_input="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$day/$hour/?prefetch_blobs=8"
+azure_tmp=
+same_tmp=
+same_markdown=
+same_work_dir=
+if [ -e "$azure_report" ]; then
+  secure_file "$azure_report" 640
+  azure_candidate=$azure_report
+else
+  azure_candidate=
+fi
+if [ -e "$same_report" ]; then
+  secure_file "$same_report" 640
+  same_candidate=$same_report
+else
+  same_candidate=
+fi
+
+if [ -z "$azure_candidate" ] || [ -z "$same_candidate" ]; then
+  [ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%a %h' "$token_file")" = '600 1' ] \
+    || die 'research workload token is missing or unsafe'
+  token_dir=${token_file%/*}
+  [ ! -L "$token_dir" ] && [ -d "$token_dir" ] && [ "$(stat -c %a "$token_dir")" = 700 ] \
+    || die 'research workload token directory is unsafe'
+  [ "$(stat -c '%u:%g' "$token_file")" = "$(stat -c '%u:%g' "$token_dir")" ] \
+    || die 'research workload token owner is unexpected'
+  token_uid=${POLYEDGE_PARITY_TOKEN_UID:-$(id -u polyedge-identity-research)}
+  token_gid=${POLYEDGE_PARITY_TOKEN_GID:-$(id -g polyedge-identity-research)}
+  [ "$(stat -c '%u:%g' "$token_file")" = "$token_uid:$token_gid" ] || die 'research workload token is not owned by the research identity'
+fi
+
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$azure_tmp" "$same_tmp" "$same_markdown"; [ -z "$same_work_dir" ] || rmdir "$same_work_dir" 2>/dev/null || true' EXIT HUP INT TERM
+if [ -z "$azure_candidate" ]; then
+  curl --silent --show-error --fail --output "$oauth_response" \
+    --request POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+    --data-urlencode grant_type=client_credentials \
+    --data-urlencode "client_id=$AZURE_CLIENT_ID" \
+    --data-urlencode scope=https://storage.azure.com/.default \
+    --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+    --data-urlencode "client_assertion@$token_file" || die 'research UAMI token exchange failed'
+  access_token=$(jq -er '.access_token | select(type == "string" and length > 0)' "$oauth_response") || die 'OAuth response is malformed'
+  printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header"
+  unset access_token
+  azure_tmp=$(mktemp "$hour_dir/.azure-scheduled-audit.XXXXXX")
+  curl --silent --show-error --fail --output "$azure_tmp" --header @"$auth_header" --header 'x-ms-version: 2023-11-03' \
+    "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/$AZURE_STORAGE_CONTAINER_NAME/reports/research/hourly/$day/$hour/audit.json" \
+    || die 'Azure scheduled audit download failed'
+  chmod 0640 "$azure_tmp"
+  azure_candidate=$azure_tmp
+fi
+
+if [ -z "$same_candidate" ]; then
+  same_work_dir=$(mktemp -d "$runtime_dir/same-input.XXXXXX")
+  chown "$token_uid:$token_gid" "$same_work_dir"
+  chmod 0700 "$same_work_dir"
+  same_tmp=$same_work_dir/audit.json
+  same_markdown=$same_work_dir/audit.md
+  # ponytail: Podman NNP breaks DNS on this host; the dedicated UID, read-only root, and zero capabilities contain this one-shot audit. Restore NNP after the runtime resolver is fixed.
+  timeout --preserve-status 1800 podman run --rm --pull=never --log-driver=journald --name "polyedge-parity-$stamp" --network polyedge \
+    --cpus 0.5 --memory 1g --pids-limit 1024 --read-only --cap-drop=all \
+    --user "$token_uid:$token_gid" --tmpfs /tmp:rw,noexec,nosuid,size=128m --env-file "$hourly_env" \
+    -v "$token_file:/run/credentials/azure-federated-token:ro,Z" -v "$same_work_dir:/evidence:rw,Z" \
+    "$POLYEDGE_RESEARCH_IMAGE" polyedge-rs research audit \
+    --input "$azure_input" \
+    --out /evidence/audit.json --markdown /evidence/audit.md --exclude-file /app/data_quality/exclusion_windows.yaml \
+    || die 'same-input OCI audit failed'
+  [ ! -L "$same_tmp" ] && [ -f "$same_tmp" ] && [ "$(stat -c %h "$same_tmp")" = 1 ] \
+    || die 'same-input OCI audit output is missing or unsafe'
+  chmod 0640 "$same_tmp"
+  same_candidate=$same_tmp
+fi
+
+validate_report() {
+  jq -e --arg start "$target" --arg end "$hour_end" '
+    type == "object" and (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.generated_at | type == "string") and (.result | type == "object") and
+    (.result.total_events | type == "number" and . >= 0) and
+    (.result.fatal_data_quality_issues | type == "array" and length == 0) and
+    .result.runtime_provenance.observations == 60 and
+    .result.runtime_provenance.valid_observations == 60 and
+    .result.runtime_provenance.invalid_observations == 0 and
+    (.result.runtime_provenance.distinct_identity_count |
+      type == "number" and . >= 1 and . <= 60 and floor == .) and
+    (.result.runtime_provenance.identities | type == "array") and
+    (.result.runtime_provenance.identities | length) ==
+      .result.runtime_provenance.distinct_identity_count and
+    (.result.runtime_provenance.identities | all(.[];
+      .app_name == "polyedge" and .runtime_role == "primary" and .execution_mode == "paper" and
+      .allow_live == false and .enable_taker_orders == false and
+      .allow_emergency_account_cancel == false and .research_only == true and
+      .shadow_only == false and .backend_impl == "rust" and
+      .storage_container == "bot-events" and .event_blob_prefix == "events" and
+      .adaptive_regime_enabled == false and .adaptive_regime_mode == "paper_only" and
+      .paper_maker_fill_policy == "touch_after_quote_was_live" and
+      .publish_strategy_canary_intents == false and .candidate == null and
+      .decision_config_schema == "polyedge.decision_config.v1" and
+      (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+      (.runtime_config_hash | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.decision_config_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      .decision_pipeline_schema == "polyedge.strategy_decision_batch.v4" and
+      .decision_pipeline_parity_scope == "full_decision_pipeline_recomputation"
+    )) and
+    ([.result.runtime_provenance.identities[].git_sha] | unique | length == 1) and
+    ([.result.runtime_provenance.identities[].runtime_config_hash] | unique | length == 1) and
+    ([.result.runtime_provenance.identities[].decision_config_sha256] | unique | length == 1) and
+    ((.result.runtime_provenance.first_timestamp | fromdateiso8601) <=
+      (($start | fromdateiso8601) + 300)) and
+    ((.result.runtime_provenance.last_timestamp | fromdateiso8601) >=
+      (($end | fromdateiso8601) - 300)) and
+    (.result.runtime_provenance.max_gap_ms | type == "number" and . >= 0 and . <= 300000) and
+    (.result.strategy_batches | type == "number" and . > 0 and floor == .) and
+    .result.strategy_batch_replayed == .result.strategy_batches and
+    .result.strategy_batch_matches == .result.strategy_batches and
+    .result.strategy_batch_invalid == 0 and
+    .result.strategy_batch_contract_invalid == 0 and
+    .result.strategy_batch_contract_invalid_reasons == {} and
+    .result.strategy_batch_missing_independent_start == 0 and
+    .result.strategy_batch_ineligible == 0 and
+    .result.strategy_batch_conflicts == 0 and
+    .result.strategy_binding_ineligible == 0 and
+    .result.strategy_binding_conflicts == 0 and
+    .result.unbound_strategy_decisions == 0 and
+    .result.decision_application_invalid == 0 and
+    .result.decision_application_conflicts == 0 and
+    .result.orphan_decision_applications == 0 and
+    .result.decision_pipeline_replay_rate == 1 and
+    .result.decision_output_binding_rate == 1 and
+    .result.decision_parity_rate == 1
+  ' "$1" >/dev/null || die "invalid or unhealthy audit report: $1"
+}
+validate_report "$azure_candidate"
+validate_report "$oci_scheduled"
+validate_report "$same_candidate"
+local_input="/input/events/$day/$hour/"
+for binding in "$azure_candidate:$azure_input" "$same_candidate:$azure_input" "$oci_scheduled:$local_input"; do
+  report_file=${binding%%:*}
+  expected_input=${binding#*:}
+  jq -e --arg input "$expected_input" '.input_path == $input' "$report_file" >/dev/null || die "audit input mismatch: $report_file"
+done
+azure_result=$(jq -cS '.result' "$azure_candidate" | sha256sum | awk '{print "sha256:"$1}')
+same_result=$(jq -cS '.result' "$same_candidate" | sha256sum | awk '{print "sha256:"$1}')
+[ "$azure_result" = "$same_result" ] || die 'same-input deterministic result mismatch'
+
+if [ -n "$azure_tmp" ]; then
+  sync -f "$azure_tmp"
+  mv "$azure_tmp" "$azure_report"
+  azure_tmp=
+fi
+if [ -n "$same_tmp" ]; then
+  sync -f "$same_tmp"
+  chown "$expected_uid:$expected_gid" "$same_tmp"
+  mv "$same_tmp" "$same_report"
+  same_tmp=
+  rm -f "$same_markdown"
+  same_markdown=
+  rmdir "$same_work_dir"
+  same_work_dir=
+fi
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+
+evidence=$hour_dir/evidence.json
+[ ! -e "$evidence" ] || die 'evidence appeared during collection'
+tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$tmp"' EXIT HUP INT TERM
+jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+  --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg image "$POLYEDGE_RESEARCH_IMAGE" \
+  --arg azure_path "$azure_report" --arg azure_sha "$(sha "$azure_report")" --arg oci_path "$oci_scheduled" --arg oci_sha "$(sha "$oci_scheduled")" \
+  --arg same_path "$same_report" --arg same_sha "$(sha "$same_report")" --arg result_sha "$azure_result" \
+  --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
+  --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
+  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,researchImage:$image,segments:$segments,scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null},oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null}},sameInput:{path:$same_path,sha256:$same_sha,azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} |
+  .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
+chmod 0640 "$tmp"
+sync -f "$tmp"
+mv "$tmp" "$evidence"
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+
+collect_refs
+update_ledger
+
+echo "validated parity hour $target; acceptedCleanLiveHours=$count"

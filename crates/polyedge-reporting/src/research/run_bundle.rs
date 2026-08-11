@@ -1420,12 +1420,35 @@ pub(super) fn runtime_provenance_common_errors(payload: &serde_json::Value) -> V
             errors.push(format!("{pointer} must be boolean"));
         }
     }
-    if payload
+    let storage_account = payload
         .get("storage_account")
+        .and_then(serde_json::Value::as_str);
+    match payload
+        .get("authoritative_recorder_backend")
         .and_then(serde_json::Value::as_str)
-        .is_none_or(str::is_empty)
     {
-        errors.push("/storage_account must be non-empty".to_owned());
+        Some("local_jsonl")
+            if payload
+                .get("storage_account")
+                .is_some_and(serde_json::Value::is_null) => {}
+        Some("local_jsonl") => errors.push(
+            "/storage_account must be null when /authoritative_recorder_backend is local_jsonl"
+                .to_owned(),
+        ),
+        Some("azure_append_blob") if storage_account.is_some_and(|value| !value.is_empty()) => {}
+        Some("azure_append_blob") => errors.push(
+            "/storage_account must be non-empty when /authoritative_recorder_backend is azure_append_blob"
+                .to_owned(),
+        ),
+        Some(_) => errors.push(
+            "/authoritative_recorder_backend must equal local_jsonl or azure_append_blob"
+                .to_owned(),
+        ),
+        None if storage_account.is_some_and(|value| !value.is_empty()) => {}
+        None => errors.push(
+            "/authoritative_recorder_backend must identify a local recorder when /storage_account is null"
+                .to_owned(),
+        ),
     }
     if payload
         .get("git_sha")

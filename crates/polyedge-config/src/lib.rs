@@ -278,6 +278,7 @@ pub struct AzureConfig {
     pub storage_table_name: String,
     pub chart_table_name: String,
     pub market_table_name: String,
+    pub chart_persist_interval_ms: usize,
     pub event_blob_prefix: String,
     pub event_blob_prefix_after_cutover: Option<String>,
     pub event_blob_prefix_cutover_utc: Option<DateTime<Utc>>,
@@ -285,6 +286,14 @@ pub struct AzureConfig {
     pub shadow_book_sample_ms: usize,
     pub publish_strategy_canary_intents: bool,
     pub strategy_canary_intent_prefix: String,
+    pub funded_direct_service_bus_enabled: bool,
+    pub funded_direct_service_bus_namespace: String,
+    pub funded_direct_service_bus_queue: String,
+    pub strategy_intent_operator_direct: bool,
+    pub strategy_intent_target_order_notional: Decimal,
+    pub strategy_intent_max_order_notional: Decimal,
+    pub strategy_intent_min_seconds_to_expiry: i64,
+    pub strategy_intent_max_seconds_to_expiry: i64,
     pub strategy_canary_fill_model_version: String,
     pub strategy_canary_execution_model_blob_uri: String,
     pub strategy_canary_execution_model_sha256: String,
@@ -298,6 +307,7 @@ impl Default for AzureConfig {
             storage_table_name: "BotEventIndex".to_owned(),
             chart_table_name: "BotChartSeries".to_owned(),
             market_table_name: "BotMarketCatalog".to_owned(),
+            chart_persist_interval_ms: 1_000,
             event_blob_prefix: "events".to_owned(),
             event_blob_prefix_after_cutover: None,
             event_blob_prefix_cutover_utc: None,
@@ -306,6 +316,14 @@ impl Default for AzureConfig {
             publish_strategy_canary_intents: false,
             strategy_canary_intent_prefix:
                 "reports/research/venue-probe/control/strategy-canary/intents".to_owned(),
+            funded_direct_service_bus_enabled: false,
+            funded_direct_service_bus_namespace: String::new(),
+            funded_direct_service_bus_queue: String::new(),
+            strategy_intent_operator_direct: false,
+            strategy_intent_target_order_notional: Decimal::ZERO,
+            strategy_intent_max_order_notional: Decimal::ONE,
+            strategy_intent_min_seconds_to_expiry: 0,
+            strategy_intent_max_seconds_to_expiry: 86_400,
             strategy_canary_fill_model_version: "conservative-execution-prior-v1".to_owned(),
             strategy_canary_execution_model_blob_uri: String::new(),
             strategy_canary_execution_model_sha256: String::new(),
@@ -453,7 +471,7 @@ impl RuntimeSettings {
             "RUST_PROXY_RUNTIME_API",
             settings.deploy.rust_upstream_api_base_url.is_some(),
         );
-        settings.azure.storage_account_name = env::var("AZURE_STORAGE_ACCOUNT_NAME").ok();
+        settings.azure.storage_account_name = env_non_empty("AZURE_STORAGE_ACCOUNT_NAME");
         settings.azure.storage_container_name = env_string(
             "AZURE_STORAGE_CONTAINER_NAME",
             settings.azure.storage_container_name,
@@ -466,6 +484,11 @@ impl RuntimeSettings {
             env_string("AZURE_CHART_TABLE_NAME", settings.azure.chart_table_name);
         settings.azure.market_table_name =
             env_string("AZURE_MARKET_TABLE_NAME", settings.azure.market_table_name);
+        settings.azure.chart_persist_interval_ms = env_usize(
+            "AZURE_CHART_PERSIST_INTERVAL_MS",
+            settings.azure.chart_persist_interval_ms,
+        )
+        .clamp(1_000, 60_000);
         settings.azure.event_blob_prefix =
             env_string("AZURE_EVENT_BLOB_PREFIX", settings.azure.event_blob_prefix);
         settings.azure.event_blob_prefix_after_cutover =
@@ -505,6 +528,38 @@ impl RuntimeSettings {
         settings.azure.strategy_canary_intent_prefix = env_string(
             "STRATEGY_CANARY_INTENT_PREFIX",
             settings.azure.strategy_canary_intent_prefix,
+        );
+        settings.azure.funded_direct_service_bus_enabled = env_bool(
+            "FUNDED_DIRECT_SERVICE_BUS_ENABLED",
+            settings.azure.funded_direct_service_bus_enabled,
+        );
+        settings.azure.funded_direct_service_bus_namespace = env_string(
+            "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE",
+            settings.azure.funded_direct_service_bus_namespace,
+        );
+        settings.azure.funded_direct_service_bus_queue = env_string(
+            "FUNDED_DIRECT_SERVICE_BUS_QUEUE",
+            settings.azure.funded_direct_service_bus_queue,
+        );
+        settings.azure.strategy_intent_operator_direct = env_bool(
+            "STRATEGY_INTENT_OPERATOR_DIRECT",
+            settings.azure.strategy_intent_operator_direct,
+        );
+        settings.azure.strategy_intent_target_order_notional = env_decimal(
+            "STRATEGY_INTENT_TARGET_ORDER_NOTIONAL",
+            settings.azure.strategy_intent_target_order_notional,
+        )?;
+        settings.azure.strategy_intent_max_order_notional = env_decimal(
+            "STRATEGY_INTENT_MAX_ORDER_NOTIONAL",
+            settings.azure.strategy_intent_max_order_notional,
+        )?;
+        settings.azure.strategy_intent_min_seconds_to_expiry = env_i64(
+            "STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY",
+            settings.azure.strategy_intent_min_seconds_to_expiry,
+        );
+        settings.azure.strategy_intent_max_seconds_to_expiry = env_i64(
+            "STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY",
+            settings.azure.strategy_intent_max_seconds_to_expiry,
         );
         settings.azure.strategy_canary_fill_model_version = env_string(
             "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION",
@@ -639,6 +694,19 @@ impl RuntimeSettings {
         if !self.azure.publish_strategy_canary_intents {
             reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
         }
+        if self.azure.strategy_intent_operator_direct
+            && (!self.azure.funded_direct_service_bus_enabled
+                || self
+                    .azure
+                    .funded_direct_service_bus_namespace
+                    .trim()
+                    .is_empty()
+                || self.azure.funded_direct_service_bus_queue.trim().is_empty())
+        {
+            reasons.push(
+                "operator-direct intent publication requires the managed-identity Service Bus handoff",
+            );
+        }
         if !matches!(
             self.azure.storage_container_name.as_str(),
             "polyedge-shadow-events" | "polyedge-shadow-qset-events"
@@ -752,8 +820,17 @@ impl RuntimeSettings {
                 "event_blob_prefix_cutover_utc": self.azure.event_blob_prefix_cutover_utc,
                 "compact_shadow_recording": self.azure.compact_shadow_recording,
                 "shadow_book_sample_ms": self.azure.shadow_book_sample_ms,
+                "chart_persist_interval_ms": self.azure.chart_persist_interval_ms,
                 "publish_strategy_canary_intents": self.azure.publish_strategy_canary_intents,
                 "strategy_canary_intent_prefix": self.azure.strategy_canary_intent_prefix,
+                "funded_direct_service_bus_enabled": self.azure.funded_direct_service_bus_enabled,
+                "funded_direct_service_bus_namespace": self.azure.funded_direct_service_bus_namespace,
+                "funded_direct_service_bus_queue": self.azure.funded_direct_service_bus_queue,
+                "strategy_intent_operator_direct": self.azure.strategy_intent_operator_direct,
+                "strategy_intent_target_order_notional": self.azure.strategy_intent_target_order_notional.to_string(),
+                "strategy_intent_max_order_notional": self.azure.strategy_intent_max_order_notional.to_string(),
+                "strategy_intent_min_seconds_to_expiry": self.azure.strategy_intent_min_seconds_to_expiry,
+                "strategy_intent_max_seconds_to_expiry": self.azure.strategy_intent_max_seconds_to_expiry,
                 "strategy_canary_fill_model_version": self.azure.strategy_canary_fill_model_version
                 ,"strategy_canary_execution_model_blob_uri_configured": !self.azure.strategy_canary_execution_model_blob_uri.is_empty()
                 ,"strategy_canary_execution_model_sha256_configured": !self.azure.strategy_canary_execution_model_sha256.is_empty()
