@@ -106,7 +106,9 @@ from source `802281cff4e24706dfc6bc029b9979387716a20e`. Publication run
 `31454857110` and PR validation run `31454151207` passed, including the ARM64
 child image. Rollback state is retained in
 `/etc/polyedge/rollback/20260811T044800Z-strict-primary` and
-`/etc/polyedge/rollback/20260811T044922Z-polyedge-api.container`.
+`/etc/polyedge/rollback/20260811T044922Z-polyedge-api.container`. The strict
+daily-cycle recorder deployment is separately recoverable from
+`/etc/polyedge/rollback/20260811T091000Z-daily-parity`.
 
 Before the window, scheduled freshness runs were healthy with no warnings or
 critical findings. The strict collector retained hour `04` at
@@ -121,9 +123,16 @@ closed-unsealed or unuploaded segments, and the boot filesystem retained about
 an Azure hourly-job image drift that falsely rejected primary-role strategy
 batches; only `polyedge-hourly-quality-job` was repinned to the proven digest
 above, its bounded rerun succeeded, and the unchanged fail-closed collector
-then accepted the hour. The first two formal hours are recorded as sequential
-accepted clean hours while Azure remains authoritative and deletion remains
-disabled. The authoritative Azure
+then accepted the hour. Hours `06`, `07`, and `08` are recorded as three
+sequential accepted clean hours while Azure remains authoritative and deletion
+remains disabled. For hour `08`, the Azure scheduled audit and OCI same-input
+audit again produced the exact result hash
+`sha256:afacecae7aa937b4c8eef1bcf3671520aa61f892280d489619ebb317b47883a4`.
+The independent Azure and local scheduled inputs contained 1,822,602 and
+1,815,359 events respectively, but came from different recorder Git/config
+provenance. That 7,243-event difference is retained as a source-equivalence
+gate; it is neither a compute mismatch nor proof of no missing or duplicate
+events. The authoritative Azure
 daily execution completed successfully and explicitly released the shared
 lease at `2026-08-11T08:09:08Z`; OCI daily and replay timers are enabled with
 their first future triggers at `2026-08-12T03:10:00Z` and `03:15:00Z`.
