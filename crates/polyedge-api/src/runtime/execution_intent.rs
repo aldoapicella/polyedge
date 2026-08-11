@@ -21,6 +21,9 @@ const MAX_INTENT_TTL_MS: i64 = 30_000;
 // Preserve the frozen producer contract: every funded handoff remains valid
 // for exactly the strategy's immutable ten-second quote lifecycle.
 const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
+// Match the worker's exact 7s admission floor. Equality is already stale once
+// the send begins, so only a strictly greater pre-send remainder is eligible.
+const FUNDED_HANDOFF_MIN_PRE_SEND_TTL_MS: i64 = 7_000;
 // A decision cycle can emit several independently authenticated PLACE intents.
 // Keep their immutable blob commits and Service Bus handoffs bounded but
 // concurrent so one slow Azure request cannot consume another intent's frozen
@@ -132,7 +135,21 @@ impl IntentPublisherConfig {
         })
     }
 
-    fn connect_lane(&self) -> Result<IntentPublisherLane, String> {
+    fn connect_lane(
+        &self,
+        service_bus_sender: Option<AzureServiceBusSender>,
+    ) -> IntentPublisherLane {
+        IntentPublisherLane {
+            blob_client: AzureBlobClient::with_managed_identity(
+                self.account.clone(),
+                self.container.clone(),
+                self.client_id.clone(),
+            ),
+            service_bus_sender,
+        }
+    }
+
+    pub(super) fn connect(self) -> Result<IntentPublisher, String> {
         let service_bus_sender = if self.operator_direct {
             if self.service_bus_namespace.is_empty() || self.service_bus_queue.is_empty() {
                 return Err(
@@ -148,26 +165,15 @@ impl IntentPublisherConfig {
         } else {
             None
         };
-        Ok(IntentPublisherLane {
-            blob_client: AzureBlobClient::with_managed_identity(
-                self.account.clone(),
-                self.container.clone(),
-                self.client_id.clone(),
-            ),
-            service_bus_sender,
-        })
-    }
-
-    pub(super) fn connect(self) -> Result<IntentPublisher, String> {
         let lane_count = if self.operator_direct {
             OPERATOR_DIRECT_INTENT_PUBLISH_LANES
         } else {
             1
         };
         let intent_lanes = (0..lane_count)
-            .map(|_| self.connect_lane().map(StdMutex::new))
-            .collect::<Result<Vec<_>, _>>()?;
-        let warmup_lane = StdMutex::new(self.connect_lane()?);
+            .map(|_| StdMutex::new(self.connect_lane(service_bus_sender.clone())))
+            .collect();
+        let warmup_lane = StdMutex::new(self.connect_lane(service_bus_sender));
         Ok(IntentPublisher {
             intent_lanes,
             warmup_lane,
@@ -217,16 +223,18 @@ impl IntentPublisher {
         let mut queue_send_elapsed_ms = None;
         let queue_handoff_sent = if let Some(sender) = &mut lane.service_bus_sender {
             let remaining_ms = (intent.valid_until - Utc::now()).num_milliseconds();
-            if remaining_ms < 1_000 {
-                return Err(
-                    "funded intent expired before the Service Bus handoff could be sent".to_owned(),
-                );
-            }
+            let message_ttl_seconds =
+                funded_handoff_ttl_seconds(remaining_ms).ok_or_else(|| {
+                    format!(
+                        "funded handoff not published after immutable intent audit commit: \
+                     {remaining_ms}ms remaining does not exceed the 7000ms worker gate"
+                    )
+                })?;
             let queue_send_started = Instant::now();
             sender
                 .send_json(
                     &intent.decision_id,
-                    ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64,
+                    message_ttl_seconds,
                     &funded_intent_handoff(intent, &blob_name, &artifact_sha256),
                 )
                 .map_err(|error| error.to_string())?;
@@ -291,6 +299,11 @@ impl IntentPublisher {
     fn intent_lane_count(&self) -> usize {
         self.intent_lanes.len()
     }
+}
+
+fn funded_handoff_ttl_seconds(remaining_ms: i64) -> Option<u64> {
+    (remaining_ms > FUNDED_HANDOFF_MIN_PRE_SEND_TTL_MS)
+        .then(|| ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64)
 }
 
 fn funded_market_warmup_message_id(market: &MarketSpec, producer_ts: DateTime<Utc>) -> String {
@@ -1374,6 +1387,18 @@ mod tests {
     }
 
     #[test]
+    fn funded_handoff_requires_more_than_the_worker_ttl_gate_at_send_time() {
+        assert_eq!(
+            funded_handoff_ttl_seconds(FUNDED_HANDOFF_MIN_PRE_SEND_TTL_MS),
+            None
+        );
+        assert_eq!(
+            funded_handoff_ttl_seconds(FUNDED_HANDOFF_MIN_PRE_SEND_TTL_MS + 1),
+            Some(8)
+        );
+    }
+
+    #[test]
     fn market_warmup_is_non_executable_and_covers_both_tokens() {
         let (_, market, _, _, _, _, _, now) = fixture();
         let warmup = funded_market_warmup(&market, now);
@@ -1451,6 +1476,17 @@ mod tests {
             publisher.intent_lane_count(),
             OPERATOR_DIRECT_INTENT_PUBLISH_LANES
         );
+        assert!(publisher.intent_lanes.iter().all(|lane| lane
+            .lock()
+            .unwrap()
+            .service_bus_sender
+            .is_some()));
+        assert!(publisher
+            .warmup_lane
+            .lock()
+            .unwrap()
+            .service_bus_sender
+            .is_some());
     }
 
     #[test]

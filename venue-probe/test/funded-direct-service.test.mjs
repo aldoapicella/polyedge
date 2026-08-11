@@ -240,14 +240,16 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
 });
 
-test("persistent service reconciles websocket risk before receiving another funded handoff", async () => {
+test("persistent service retries failed websocket reconciliation at poll cadence before processing a fresh handoff", async () => {
+  const decisionId = "d".repeat(64);
+  const decisionTs = new Date(Date.now() - 500).toISOString();
   const bus = fakeBus([{
-    messageId: "warmup-after-reconciliation",
+    messageId: "intent-after-reconciliation",
     deliveryCount: 1,
     body: {
-      schema: "polyedge.funded_market_warmup.v1",
-      market_id: "btc-market",
-      token_id: "token-up"
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: decisionId,
+      decision_ts: decisionTs
     }
   }]);
   const order = [];
@@ -256,7 +258,10 @@ test("persistent service reconciles websocket risk before receiving another fund
   let reconciliationRequired = true;
   let maintenanceAttempts = 0;
   const result = await runPersistentFundedDirectService({
-    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
     createBusClient: () => ({
       createReceiver: () => ({
         ...bus.client.createReceiver(),
@@ -268,7 +273,6 @@ test("persistent service reconciles websocket risk before receiving another fund
       async close() {}
     }),
     createExecutor: async () => ({
-      warmMarket: async () => { order.push("warmup"); },
       runMaintenance: async (task) => {
         maintenanceAttempts += 1;
         order.push(`reconcile-${maintenanceAttempts}`);
@@ -286,19 +290,61 @@ test("persistent service reconciles websocket risk before receiving another fund
       }),
       close: async () => {}
     }),
-    createProcessor: async () => ({ process: async () => ({}) }),
+    createProcessor: async () => ({
+      process: async (handoff) => {
+        order.push(`process-${handoff.decision_id}`);
+        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+      }
+    }),
     sleep: async (ms) => { sleeps.push(ms); },
     logger: (value) => logs.push(value)
   });
 
   assert.equal(result.processed_messages, 1);
-  assert.deepEqual(order, ["reconcile-1", "reconcile-2", "receive", "warmup"]);
-  assert.deepEqual(sleeps, [60_000]);
+  assert.deepEqual(order, ["reconcile-1", "reconcile-2", "receive", `process-${decisionId}`]);
+  assert.deepEqual(sleeps, [1_000]);
+  assert.deepEqual(bus.completed, ["intent-after-reconciliation"]);
   assert.ok(logs.some((value) =>
     value.status === "websocket_reconciliation_failed_closed" &&
     value.account_risk_pause === true
   ));
   assert.ok(logs.some((value) => value.status === "websocket_reconciliation_completed"));
+});
+
+test("persistent service failure telemetry binds deterministic TTL rejection to its decision", async () => {
+  const nowMs = Date.parse("2026-08-11T03:00:00Z");
+  const decisionId = "e".repeat(64);
+  const bus = fakeBus([{
+    messageId: "expired-intent",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: decisionId,
+      decision_ts: new Date(nowMs - 10_000).toISOString(),
+      valid_until: new Date(nowMs - 1).toISOString()
+    }
+  }]);
+  const logs = [];
+  await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    now: () => nowMs,
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => { throw new Error("fail closed: funded intent handoff binding or TTL is invalid"); }
+    }),
+    logger: (value) => logs.push(value)
+  });
+
+  const failure = logs.find((value) => value.status === "persistent_message_failed_closed");
+  assert.equal(failure.decision_id, decisionId);
+  assert.equal(failure.intent_valid_until, "2026-08-11T02:59:59.999Z");
+  assert.equal(failure.intent_remaining_ttl_ms, -1);
+  assert.equal("body" in failure, false);
+  assert.deepEqual(bus.deadLettered, ["expired-intent"]);
 });
 
 test("persistent service restarts before receiving if a channel gaps before first warmup", async () => {

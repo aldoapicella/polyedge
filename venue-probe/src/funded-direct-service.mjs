@@ -398,11 +398,21 @@ export async function runPersistentFundedDirectService({
     } else {
       await receiver.abandonMessage(entry.message).catch(() => null);
     }
+    const decisionId = String(entry.body?.decision_id || "").trim();
+    const validUntilMs = Date.parse(String(entry.body?.valid_until || ""));
+    const failureContext = {
+      ...(/^[0-9a-f]{64}$/.test(decisionId) ? { decision_id: decisionId } : {}),
+      ...(Number.isFinite(validUntilMs) ? {
+        intent_valid_until: new Date(validUntilMs).toISOString(),
+        intent_remaining_ttl_ms: validUntilMs - Number(now())
+      } : {})
+    };
     logger({
       schema: "polyedge.funded_direct_service.v2",
       status: "persistent_message_failed_closed",
       message_id: entry.message.messageId || null,
       delivery_count: entry.message.deliveryCount || 0,
+      ...failureContext,
       error: error.message
     });
   };
@@ -479,7 +489,7 @@ export async function runPersistentFundedDirectService({
         break;
       }
       if (!await reconcileChannelsIfRequired()) {
-        await sleep(config.riskPauseMs);
+        await sleep(config.pollIntervalMs);
         continue;
       }
       const receiveController = new AbortController();
