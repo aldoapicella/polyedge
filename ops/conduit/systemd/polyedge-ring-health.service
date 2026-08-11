@@ -1,6 +1,6 @@
 [Unit]
 Description=Verify PolyEdge ring capacity, sealing, and upload freshness
-After=local-fs.target
+After=local-fs.target polyedge-ring-sync.service
 
 [Service]
 Type=oneshot

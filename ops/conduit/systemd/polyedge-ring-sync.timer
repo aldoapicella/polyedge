@@ -1,10 +1,11 @@
 [Unit]
-Description=Upload sealed PolyEdge recorder segments every five minutes
+Description=Upload sealed PolyEdge recorder segments every ten minutes
 
 [Timer]
-OnCalendar=*-*-* *:02/5:00 UTC
+OnCalendar=*-*-* *:02/10:00 UTC
 Persistent=true
-RandomizedDelaySec=30
+AccuracySec=1s
+RandomizedDelaySec=0
 Unit=polyedge-ring-sync.service
 
 [Install]
