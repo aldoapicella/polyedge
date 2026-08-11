@@ -511,6 +511,7 @@ export async function runPersistentFundedDirectService({
           receivePromise,
           receiveWatchdogExpired
         ]);
+        receiverRecycled = false;
       } catch (error) {
         if (!receiveController.signal.aborted) throw error;
         logger({

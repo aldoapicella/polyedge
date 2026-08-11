@@ -468,6 +468,73 @@ test("persistent service recycles a receive link that outlives the one-second po
   ));
 });
 
+test("persistent service recycles non-consecutive stalled receive links", async () => {
+  const message = {
+    messageId: "warmup-after-two-recycles",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  };
+  const completed = [];
+  const closed = [];
+  const logs = [];
+  let secondReceiveCalls = 0;
+  let receiverCreations = 0;
+  let terminateCalls = 0;
+  const stalled = (id) => ({
+    async receiveMessages() { return new Promise(() => {}); },
+    async close() { closed.push(id); }
+  });
+  const receivers = [
+    stalled(1),
+    {
+      async receiveMessages() {
+        secondReceiveCalls += 1;
+        return secondReceiveCalls === 1 ? [] : new Promise(() => {});
+      },
+      async close() { closed.push(2); }
+    },
+    {
+      async receiveMessages() { return [message]; },
+      async renewMessageLock() {},
+      async completeMessage(received) { completed.push(received.messageId); },
+      async close() { closed.push(3); }
+    }
+  ];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
+    createBusClient: () => ({
+      createReceiver: () => receivers[receiverCreations++],
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value),
+    terminate: () => { terminateCalls += 1; }
+  });
+
+  assert.equal(result.processed_messages, 1);
+  assert.equal(receiverCreations, 3);
+  assert.equal(terminateCalls, 0);
+  assert.deepEqual(completed, ["warmup-after-two-recycles"]);
+  assert.deepEqual(closed, [1, 2, 3]);
+  assert.deepEqual(
+    logs.filter((value) => value.status === "service_bus_receive_watchdog_expired")
+      .map((value) => value.recovery_action),
+    ["new_client_receiver", "new_client_receiver"]
+  );
+});
+
 test("persistent service alerts if a locked message surfaces only after stale link closure", async () => {
   const warmup = {
     messageId: "warmup-after-late-cleanup",
