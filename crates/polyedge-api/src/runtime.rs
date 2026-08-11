@@ -4628,14 +4628,12 @@ mod tests {
         drop(sender);
 
         for _ in 0..100 {
-            let lines = fs::read_to_string(&path)
-                .map(|text| text.lines().count())
-                .unwrap_or_default();
-            if lines == 100 {
+            if metrics.queued.load(Ordering::Relaxed) == 0 {
                 break;
             }
             thread::sleep(StdDuration::from_millis(10));
         }
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
 
         let text = fs::read_to_string(&path).unwrap();
         let recorded = text
@@ -4654,7 +4652,6 @@ mod tests {
             (1..=100).collect::<Vec<_>>()
         );
         assert_eq!(recorder.lock().unwrap().status(false)["error_count"], 0);
-        assert_eq!(metrics.snapshot()["queued"], 0);
         assert_eq!(metrics.snapshot()["enqueued_total"], 100);
         assert_eq!(metrics.snapshot()["persisted_total"], 100);
         assert_eq!(metrics.snapshot()["failed_total"], 0);
