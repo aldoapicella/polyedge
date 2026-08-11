@@ -665,6 +665,7 @@ jobs:
           printf '%s\n' "$producer_revision" > intent-producer-revision-deployed.txt
 
       - name: Run the zero-write v8 preflight against a fresh producer intent
+        id: funded_preflight
         run: |
           set -euo pipefail
           v8_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/"
@@ -781,6 +782,37 @@ jobs:
             sleep 10
           done
           test "$status" = "Succeeded"
+          echo "execution=$preflight_execution" >> "$GITHUB_OUTPUT"
+          echo "v5_etag_before=$v5_etag_before" >> "$GITHUB_OUTPUT"
+          echo "intent_container=$intent_container" >> "$GITHUB_OUTPUT"
+          echo "intent_prefix=$intent_prefix" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh Azure login after zero-write preflight wait
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify the zero-write v8 preflight
+        env:
+          PREFLIGHT_EXECUTION: ${{ steps.funded_preflight.outputs.execution }}
+          PREFLIGHT_V5_ETAG_BEFORE: ${{ steps.funded_preflight.outputs.v5_etag_before }}
+          PREFLIGHT_INTENT_CONTAINER: ${{ steps.funded_preflight.outputs.intent_container }}
+          PREFLIGHT_INTENT_PREFIX: ${{ steps.funded_preflight.outputs.intent_prefix }}
+        run: |
+          set -euo pipefail
+          readonly v8_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/"
+          readonly v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
+          readonly v5_state_sha256="sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+          readonly preflight_execution="$PREFLIGHT_EXECUTION"
+          readonly v5_etag_before="$PREFLIGHT_V5_ETAG_BEFORE"
+          readonly intent_container="$PREFLIGHT_INTENT_CONTAINER"
+          readonly intent_prefix="$PREFLIGHT_INTENT_PREFIX"
+          test -n "$preflight_execution"
+          test -n "$v5_etag_before"
+          test -n "$intent_container"
+          test -n "$intent_prefix"
           environment_id=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
