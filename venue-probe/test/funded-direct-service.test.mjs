@@ -591,35 +591,57 @@ test("persistent service alerts if a locked message surfaces only after stale li
   });
 });
 
-test("persistent service fails closed instead of recycling a second stalled receive link", async () => {
+test("persistent service recycles consecutive stalled receive links", async () => {
+  const message = {
+    messageId: "warmup-after-consecutive-recycles",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up"
+    }
+  };
+  const completed = [];
   const closed = [];
+  const logs = [];
   let receiverCreations = 0;
-  let resolveTermination;
-  const termination = new Promise((resolve) => { resolveTermination = resolve; });
-  const result = runPersistentFundedDirectService({
-    env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
+  let terminateCalls = 0;
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1"
+    }),
     createBusClient: () => ({
       createReceiver: () => {
         const id = ++receiverCreations;
         return {
-          receiveMessages: async () => new Promise(() => {}),
+          receiveMessages: async () => id < 3 ? new Promise(() => {}) : [message],
+          async renewMessageLock() {},
+          async completeMessage(received) { completed.push(received.messageId); },
           async close() { closed.push(id); }
         };
       },
       async close() {}
     }),
     createExecutor: async () => ({
+      warmMarket: async () => {},
       status: () => ({ ready: true }),
       close: async () => {}
     }),
     createProcessor: async () => ({ process: async () => ({}) }),
-    logger: () => {},
-    terminate: resolveTermination
+    logger: (value) => logs.push(value),
+    terminate: () => { terminateCalls += 1; }
   });
-  await assert.rejects(result, /watchdog expired after receiver recycle/);
-  assert.equal(await termination, 1);
-  assert.equal(receiverCreations, 2);
-  assert.deepEqual(closed.sort(), [1, 2]);
+  assert.equal(result.processed_messages, 1);
+  assert.equal(receiverCreations, 3);
+  assert.equal(terminateCalls, 0);
+  assert.deepEqual(completed, ["warmup-after-consecutive-recycles"]);
+  assert.deepEqual(closed, [1, 2, 3]);
+  assert.deepEqual(
+    logs.filter((value) => value.status === "service_bus_receive_watchdog_expired")
+      .map((value) => value.recovery_action),
+    ["new_client_receiver", "new_client_receiver"]
+  );
 });
 
 test("persistent service hard-stops when a stalled receive link cannot close", async () => {

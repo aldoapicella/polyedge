@@ -183,7 +183,6 @@ export async function runPersistentFundedDirectService({
     };
   };
   let { bus, receiver } = createBusReceiver();
-  let receiverRecycled = false;
   let executor = null;
   let leaseHandoffAttempts = 0;
   while (!executor) {
@@ -511,7 +510,6 @@ export async function runPersistentFundedDirectService({
           receivePromise,
           receiveWatchdogExpired
         ]);
-        receiverRecycled = false;
       } catch (error) {
         if (!receiveController.signal.aborted) throw error;
         logger({
@@ -520,7 +518,7 @@ export async function runPersistentFundedDirectService({
           queue: config.serviceBusQueue,
           watchdog_ms: config.pollIntervalMs + FUNDED_RECEIVE_WATCHDOG_GRACE_MS,
           missed_signal_risk: true,
-          recovery_action: receiverRecycled ? "process_restart" : "new_client_receiver",
+          recovery_action: "new_client_receiver",
           error: error.message
         });
         const staleReceiver = receiver;
@@ -553,14 +551,11 @@ export async function runPersistentFundedDirectService({
             .then((results) => results.every(({ status }) => status === "fulfilled")),
           delay(FUNDED_RECEIVE_CLOSE_GRACE_MS).then(() => false)
         ]);
-        if (!linkClosed || receiverRecycled) {
+        if (!linkClosed) {
           setTimeout(() => terminate(1), FUNDED_RECEIVE_FORCE_EXIT_MS);
-          throw new Error(linkClosed
-            ? "fail closed: Service Bus receive watchdog expired after receiver recycle"
-            : "fail closed: timed out closing stalled Service Bus receiver");
+          throw new Error("fail closed: timed out closing stalled Service Bus receiver");
         }
         ({ bus, receiver } = createBusReceiver());
-        receiverRecycled = true;
         continue;
       } finally {
         clearTimeout(receiveWatchdog);
