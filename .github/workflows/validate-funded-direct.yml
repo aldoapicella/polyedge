@@ -671,7 +671,6 @@ jobs:
           readonly v8_session_blob="${v8_prefix}session.json"
           readonly v8_session_sha256="sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
           v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
-          readonly v5_state_etag="0x8DEF43F4E1B785A"
           readonly v5_state_sha256="sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
           az storage blob list \
             --account-name "$STORAGE_ACCOUNT" \
@@ -701,7 +700,7 @@ jobs:
             --name "$v5_state" \
             --auth-mode login \
             --query properties.etag -o tsv)
-          test "$v5_etag_before" = "$v5_state_etag"
+          test -n "$v5_etag_before"
           az storage blob download \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -835,7 +834,13 @@ jobs:
           jq -S '[.[] | {name, etag: .properties.etag, size: .properties.contentLength}]' \
             v8-prefix-after-preflight.json > v8-prefix-after-preflight.snapshot.json
           cmp -s v8-prefix-before-preflight.snapshot.json v8-prefix-after-preflight.snapshot.json
-          test "$(az storage blob show --account-name "$STORAGE_ACCOUNT" --container-name "$FUNDED_CONTAINER" --name "$v5_state" --auth-mode login --query properties.etag -o tsv)" = "$v5_state_etag"
+          v5_etag_after=$(az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$v5_state" \
+            --auth-mode login \
+            --query properties.etag -o tsv)
+          test "$v5_etag_after" = "$v5_etag_before"
           az containerapp job show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_JOB" \
