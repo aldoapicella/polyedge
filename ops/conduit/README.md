@@ -121,10 +121,13 @@ an Azure hourly-job image drift that falsely rejected primary-role strategy
 batches; only `polyedge-hourly-quality-job` was repinned to the proven digest
 above, its bounded rerun succeeded, and the unchanged fail-closed collector
 then accepted the hour. The ledger now has one accepted clean hour while Azure
-remains authoritative and deletion remains disabled. Daily and replay remain
-disabled until the authoritative Azure daily execution reaches terminal
-success and releases the shared lease. Qset remains disabled and the local
-funded signer remains masked.
+remains authoritative and deletion remains disabled. The authoritative Azure
+daily execution completed successfully and explicitly released the shared
+lease at `2026-08-11T08:09:08Z`; OCI daily and replay timers are enabled with
+their first future triggers at `2026-08-12T03:10:00Z` and `03:15:00Z`.
+Enabling them caused no catch-up execution: both service invocation IDs
+remained empty. Qset remains disabled and the local funded signer remains
+masked.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
