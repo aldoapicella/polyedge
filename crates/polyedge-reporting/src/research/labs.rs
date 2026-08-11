@@ -621,7 +621,11 @@ pub fn run_validate_prospective(
             ));
         }
     }
-    let rows = load_daily_prospective_rows(&options.reports_dir, options.since)?;
+    let rows = load_daily_prospective_rows(
+        &options.reports_dir,
+        options.since,
+        options.expected_daily_date,
+    )?;
     // Statistical evidence is drawn only from the current contiguous clean
     // suffix. Dirty bootstrap/restart days stay visible in `rows`, but cannot
     // contribute markets, PnL, parity, markouts, or confidence bounds toward
@@ -731,6 +735,7 @@ pub fn run_evaluate_profitability(
     let rows = load_daily_prospective_rows(
         &options.daily_root,
         DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is valid"),
+        None,
     )?;
     let (execution_model, execution_model_binding) =
         load_exact_execution_model(&options.execution_model)?;
@@ -1321,9 +1326,10 @@ fn write_freshness_snapshot_copy(
 fn load_daily_prospective_rows(
     reports_dir: &Path,
     since: DateTime<Utc>,
+    expected_date: Option<NaiveDate>,
 ) -> Result<Vec<Value>, ResearchError> {
-    let local = load_local_daily_prospective_rows(reports_dir, since)?;
-    let azure = load_azure_daily_prospective_rows(reports_dir, since)?;
+    let local = load_local_daily_prospective_rows(reports_dir, since, expected_date)?;
+    let azure = load_azure_daily_prospective_rows(reports_dir, since, expected_date)?;
     merge_daily_prospective_rows(local, azure)
 }
 
@@ -1353,6 +1359,7 @@ fn merge_daily_prospective_rows(
 fn load_local_daily_prospective_rows(
     reports_dir: &Path,
     since: DateTime<Utc>,
+    expected_date: Option<NaiveDate>,
 ) -> Result<Vec<Value>, ResearchError> {
     if !reports_dir.exists() {
         return Ok(Vec::new());
@@ -1368,7 +1375,7 @@ fn load_local_daily_prospective_rows(
         let Ok(report_date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") else {
             continue;
         };
-        if report_date < since_date {
+        if report_date < since_date || expected_date.is_some_and(|date| report_date > date) {
             continue;
         }
         let date_dir = entry.path();
@@ -1440,34 +1447,45 @@ fn daily_prospective_row(
     )
 }
 
+fn inclusive_daily_dates(since: NaiveDate, through: NaiveDate) -> Vec<String> {
+    std::iter::successors(Some(since), |date| date.succ_opt())
+        .take_while(|date| *date <= through)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .collect()
+}
+
 fn load_azure_daily_prospective_rows(
     reports_dir: &Path,
     since: DateTime<Utc>,
+    expected_date: Option<NaiveDate>,
 ) -> Result<Vec<Value>, ResearchError> {
     let Some(mut client) = research_blob_client() else {
         return Ok(Vec::new());
     };
     let prefix = report_blob_prefix(reports_dir);
-    let blobs = client
-        .list_blobs_by_suffixes(
-            &prefix,
-            &["latest.json", "run_manifest.json", "final_report.json"],
-            Some(3000),
-            None,
-        )
-        .map_err(|error| {
-            ResearchError::Azure(format!("listing prospective daily reports: {error}"))
-        })?;
     let since_date = since.date_naive();
-    let mut dates = blobs
-        .into_iter()
-        .filter_map(|blob| {
-            let relative = blob.name.strip_prefix(&prefix)?;
-            let date = relative.split('/').next()?.to_owned();
-            let report_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
-            (report_date >= since_date).then_some(date)
-        })
-        .collect::<Vec<_>>();
+    let mut dates = if let Some(expected_date) = expected_date {
+        inclusive_daily_dates(since_date, expected_date)
+    } else {
+        client
+            .list_blobs_by_suffixes(
+                &prefix,
+                &["latest.json", "run_manifest.json", "final_report.json"],
+                Some(3000),
+                None,
+            )
+            .map_err(|error| {
+                ResearchError::Azure(format!("listing prospective daily reports: {error}"))
+            })?
+            .into_iter()
+            .filter_map(|blob| {
+                let relative = blob.name.strip_prefix(&prefix)?;
+                let date = relative.split('/').next()?.to_owned();
+                let report_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
+                (report_date >= since_date).then_some(date)
+            })
+            .collect::<Vec<_>>()
+    };
     dates.sort();
     dates.dedup();
 
@@ -1539,6 +1557,11 @@ fn load_azure_daily_prospective_rows(
             AzureDailyBundleState::Absent => {
                 let report_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
                     .expect("date was validated while discovering daily blobs");
+                let final_report =
+                    read_blob_json(&mut client, &format!("{daily_prefix}final_report.json"))?;
+                if final_report.is_none() {
+                    continue;
+                }
                 if !legacy_daily_fallback_allowed(report_date, false) {
                     return Err(ResearchError::InvalidInput(format!(
                         "Azure atomic daily bundle is required on or after {ATOMIC_DAILY_PROTOCOL_CUTOFF}: {date}"
@@ -1547,10 +1570,7 @@ fn load_azure_daily_prospective_rows(
                 rows.push(daily_prospective_row_from_reports(
                     &date,
                     DailyReportDocuments {
-                        final_report: read_blob_json(
-                            &mut client,
-                            &format!("{daily_prefix}final_report.json"),
-                        )?,
+                        final_report,
                         regimes: read_blob_json(
                             &mut client,
                             &format!("{daily_prefix}regimes.json"),
@@ -3517,6 +3537,35 @@ mod wallet_metric_tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn expected_daily_scan_is_inclusive_and_bounded() {
+        let start = NaiveDate::from_ymd_opt(2026, 8, 9).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        assert_eq!(
+            inclusive_daily_dates(start, end),
+            ["2026-08-09", "2026-08-10", "2026-08-11"]
+        );
+        assert!(inclusive_daily_dates(end, start).is_empty());
+    }
+
+    #[test]
+    fn local_daily_scan_stops_at_expected_date() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-local-daily-bound-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(root.join("2026-08-12")).unwrap();
+        let rows = load_local_daily_prospective_rows(
+            &root,
+            Utc.with_ymd_and_hms(2026, 8, 9, 0, 0, 0).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 11),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(rows.is_empty());
+    }
+
     fn measured_quality(
         total_events: u64,
         coverage: Decimal,
@@ -4328,6 +4377,7 @@ mod wallet_metric_tests {
         let rows = load_local_daily_prospective_rows(
             &daily_root,
             Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap(),
+            None,
         )
         .unwrap();
         assert_eq!(rows.len(), 1);

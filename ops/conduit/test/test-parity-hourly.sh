@@ -80,7 +80,33 @@ report() {
     git_sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     generated_at:"2026-08-09T16:13:00Z",
     input_path:"azure://stpolyedge6urdjr5nmwx7w/bot-events/events/2026/08/09/15/?prefetch_blobs=8",
-    result:{total_events:123,fatal_data_quality_issues:[],runtime_provenance:{observations:60,valid_observations:60,invalid_observations:0,first_timestamp:"2026-08-09T15:00:01Z",last_timestamp:"2026-08-09T15:59:59Z"},fixture_marker:$marker},
+    result:{
+      total_events:123,fatal_data_quality_issues:[],fixture_marker:$marker,
+      runtime_provenance:{
+        observations:60,valid_observations:60,invalid_observations:0,distinct_identity_count:1,
+        first_timestamp:"2026-08-09T15:00:01Z",last_timestamp:"2026-08-09T15:59:59Z",max_gap_ms:60000,
+        identities:[{
+          app_name:"polyedge",runtime_role:"primary",execution_mode:"paper",allow_live:false,enable_taker_orders:false,
+          allow_emergency_account_cancel:false,research_only:true,shadow_only:false,backend_impl:"rust",
+          storage_container:"bot-events",event_blob_prefix:"events",adaptive_regime_enabled:false,
+          adaptive_regime_mode:"paper_only",paper_maker_fill_policy:"touch_after_quote_was_live",
+          publish_strategy_canary_intents:false,candidate:null,
+          git_sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          runtime_config_hash:"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          decision_config_schema:"polyedge.decision_config.v1",
+          decision_config_sha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          decision_pipeline_schema:"polyedge.strategy_decision_batch.v4",
+          decision_pipeline_parity_scope:"full_decision_pipeline_recomputation"
+        }]
+      },
+      strategy_batches:1,strategy_batch_replayed:1,strategy_batch_matches:1,
+      strategy_batch_invalid:0,strategy_batch_contract_invalid:0,
+      strategy_batch_contract_invalid_reasons:{},strategy_batch_missing_independent_start:0,
+      strategy_batch_ineligible:0,strategy_batch_conflicts:0,strategy_binding_ineligible:0,
+      strategy_binding_conflicts:0,unbound_strategy_decisions:0,decision_application_invalid:0,
+      decision_application_conflicts:0,orphan_decision_applications:0,
+      decision_pipeline_replay_rate:1,decision_output_binding_rate:1,decision_parity_rate:1
+    },
     warnings:[]
   }' >"$output"
 }
@@ -210,6 +236,34 @@ runs=$(wc -l <"$success/calls/podman")
 run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+
+invalid_parity=$root/invalid-parity
+fixture "$invalid_parity"
+for file in "$invalid_parity/azure.json" "$invalid_parity/same.json" \
+  "$invalid_parity/reports/2026/08/09/15/audit.json"; do
+  jq '.result.strategy_batch_replayed=0 | .result.strategy_batch_matches=0 |
+    .result.strategy_batch_invalid=1 | .result.decision_pipeline_replay_rate=0 |
+    .result.decision_output_binding_rate=null | .result.decision_parity_rate=0' "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+done
+if run_collector "$invalid_parity" >/dev/null 2>&1; then
+  echo 'invalid decision parity unexpectedly passed' >&2
+  exit 1
+fi
+[ "$(jq -r '.acceptedCleanLiveHours' "$invalid_parity/ring/parity/ledger.json")" = 0 ]
+
+gapped=$root/gapped
+fixture "$gapped"
+for file in "$gapped/azure.json" "$gapped/same.json" "$gapped/reports/2026/08/09/15/audit.json"; do
+  jq '.result.runtime_provenance.max_gap_ms=600000' "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+done
+if run_collector "$gapped" >/dev/null 2>&1; then
+  echo 'gapped runtime provenance unexpectedly passed' >&2
+  exit 1
+fi
+[ "$(jq -r '.acceptedCleanLiveHours' "$gapped/ring/parity/ledger.json")" = 0 ]
+
 second=$success/ring/parity/hourly/20260809T16
 mkdir -m 0750 "$second"
 jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z"' \

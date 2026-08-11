@@ -360,8 +360,53 @@ validate_report() {
     .result.runtime_provenance.observations == 60 and
     .result.runtime_provenance.valid_observations == 60 and
     .result.runtime_provenance.invalid_observations == 0 and
-    (.result.runtime_provenance.first_timestamp | type == "string" and . >= $start and . < $end) and
-    (.result.runtime_provenance.last_timestamp | type == "string" and . >= $start and . < $end)
+    (.result.runtime_provenance.distinct_identity_count |
+      type == "number" and . >= 1 and . <= 60 and floor == .) and
+    (.result.runtime_provenance.identities | type == "array") and
+    (.result.runtime_provenance.identities | length) ==
+      .result.runtime_provenance.distinct_identity_count and
+    (.result.runtime_provenance.identities | all(.[];
+      .app_name == "polyedge" and .runtime_role == "primary" and .execution_mode == "paper" and
+      .allow_live == false and .enable_taker_orders == false and
+      .allow_emergency_account_cancel == false and .research_only == true and
+      .shadow_only == false and .backend_impl == "rust" and
+      .storage_container == "bot-events" and .event_blob_prefix == "events" and
+      .adaptive_regime_enabled == false and .adaptive_regime_mode == "paper_only" and
+      .paper_maker_fill_policy == "touch_after_quote_was_live" and
+      .publish_strategy_canary_intents == false and .candidate == null and
+      .decision_config_schema == "polyedge.decision_config.v1" and
+      (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+      (.runtime_config_hash | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.decision_config_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      .decision_pipeline_schema == "polyedge.strategy_decision_batch.v4" and
+      .decision_pipeline_parity_scope == "full_decision_pipeline_recomputation"
+    )) and
+    ([.result.runtime_provenance.identities[].git_sha] | unique | length == 1) and
+    ([.result.runtime_provenance.identities[].runtime_config_hash] | unique | length == 1) and
+    ([.result.runtime_provenance.identities[].decision_config_sha256] | unique | length == 1) and
+    ((.result.runtime_provenance.first_timestamp | fromdateiso8601) <=
+      (($start | fromdateiso8601) + 300)) and
+    ((.result.runtime_provenance.last_timestamp | fromdateiso8601) >=
+      (($end | fromdateiso8601) - 300)) and
+    (.result.runtime_provenance.max_gap_ms | type == "number" and . >= 0 and . <= 300000) and
+    (.result.strategy_batches | type == "number" and . > 0 and floor == .) and
+    .result.strategy_batch_replayed == .result.strategy_batches and
+    .result.strategy_batch_matches == .result.strategy_batches and
+    .result.strategy_batch_invalid == 0 and
+    .result.strategy_batch_contract_invalid == 0 and
+    .result.strategy_batch_contract_invalid_reasons == {} and
+    .result.strategy_batch_missing_independent_start == 0 and
+    .result.strategy_batch_ineligible == 0 and
+    .result.strategy_batch_conflicts == 0 and
+    .result.strategy_binding_ineligible == 0 and
+    .result.strategy_binding_conflicts == 0 and
+    .result.unbound_strategy_decisions == 0 and
+    .result.decision_application_invalid == 0 and
+    .result.decision_application_conflicts == 0 and
+    .result.orphan_decision_applications == 0 and
+    .result.decision_pipeline_replay_rate == 1 and
+    .result.decision_output_binding_rate == 1 and
+    .result.decision_parity_rate == 1
   ' "$1" >/dev/null || die "invalid or unhealthy audit report: $1"
 }
 validate_report "$azure_candidate"

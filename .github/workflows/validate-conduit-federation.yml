@@ -4,14 +4,18 @@ on:
   pull_request:
     paths:
       - 'crates/polyedge-storage/**'
+      - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
+      - 'infra/main.bicep'
       - 'ops/conduit/**'
       - '.github/workflows/validate-conduit-federation.yml'
   push:
     branches: [main]
     paths:
       - 'crates/polyedge-storage/**'
+      - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
+      - 'infra/main.bicep'
       - 'ops/conduit/**'
       - '.github/workflows/validate-conduit-federation.yml'
   workflow_dispatch:
@@ -60,7 +64,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Test shared Azure token authentication
-        run: cargo test -p polyedge-storage
+        run: |
+          cargo test -p polyedge-storage
+          cargo test -p polyedge-reporting audit_recomputes_primary_paper_batch
+          cargo test -p polyedge-reporting expected_daily_scan_is_inclusive_and_bounded
+          cargo test -p polyedge-reporting local_daily_scan_stops_at_expected_date
 
       - name: Test token rotation and bounded Node smoke
         run: |
@@ -68,6 +76,7 @@ jobs:
           ops/conduit/test/test-boot-disk-guard.sh
           ops/conduit/test/test-quadlet-deploy.sh
           ops/conduit/test/test-run-job-mappings.sh
+          ops/conduit/test/test-parity-hourly.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"
@@ -108,3 +117,13 @@ jobs:
               | length]
             == [1])
           ' conduit-federated-identity.json
+          az bicep build --file infra/main.bicep --stdout > main.json
+          jq -e '
+            [.resources[]
+              | select(.type == "Microsoft.App/containerApps"
+                and .name == "[variables(\u0027apiContainerAppName\u0027)]")
+              | .properties.template.containers[]
+              | .env[]
+              | select(.name == "LOCAL_JSONL_RECORDER_ENABLED" and .value == "false")]
+            | length == 1
+          ' main.json

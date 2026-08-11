@@ -4372,9 +4372,6 @@ fn validate_strategy_batch(
     if input.schema_version != 3 {
         return Err("pipeline_input_schema_mismatch");
     }
-    if input.settings.deploy.runtime_role != polyedge_config::RuntimeRole::ProfitabilityShadow {
-        return Err("runtime_role_not_profitability_shadow");
-    }
     if input.settings.live.execution_mode != polyedge_config::ExecutionMode::Paper {
         return Err("execution_mode_not_paper");
     }
@@ -4385,8 +4382,22 @@ fn validate_strategy_batch(
     {
         return Err("unsafe_execution_settings");
     }
-    if input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle) {
-        return Err("adaptive_mode_mismatch");
+    match input.settings.deploy.runtime_role {
+        polyedge_config::RuntimeRole::ProfitabilityShadow => {
+            if input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle) {
+                return Err("adaptive_mode_mismatch");
+            }
+        }
+        polyedge_config::RuntimeRole::Primary => {
+            if input.adaptive_mode.is_some()
+                || input.classifier_before.is_some()
+                || input.settings.strategy.adaptive_regime_enabled
+                || input.settings.strategy.adaptive_regime_mode != "paper_only"
+                || input.settings.azure.publish_strategy_canary_intents
+            {
+                return Err("primary_runtime_settings_invalid");
+            }
+        }
     }
     if input.settings.validate_runtime_role().is_err() {
         return Err("runtime_settings_invalid");
@@ -4473,7 +4484,7 @@ fn validate_strategy_batch(
     {
         return Err("batch_id_hash_mismatch");
     }
-    let expected_candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+    let expected_candidate = input.adaptive_mode.map(FrozenStrategyMode::candidate);
     if payload.get("candidate")
         != Some(
             &serde_json::to_value(expected_candidate).map_err(|_| "candidate_roundtrip_failed")?,
@@ -14303,7 +14314,7 @@ mod tests {
         .into_iter()
         .map(|decision| polyedge_storage::wire_normalized_json(&decision).unwrap())
         .collect::<Vec<_>>();
-        if !input.kill_switch_enabled {
+        if !input.kill_switch_enabled && input.adaptive_mode.is_some() {
             assert!(decisions
                 .iter()
                 .any(|decision| decision.get("strategy_metadata").is_some()));
@@ -14326,7 +14337,7 @@ mod tests {
             "batch_id": batch_id,
             "market_id": input.market.market_id,
             "decision_ts": input.decision_ts,
-            "candidate": FrozenStrategyMode::DynamicQuoteStyle.candidate(),
+            "candidate": input.adaptive_mode.map(FrozenStrategyMode::candidate),
             "decision_config_schema": "polyedge.decision_config.v1",
             "decision_config_sha256": decision_config_sha256(input).unwrap(),
             "market_start_evidence_sha256": start_sha256,
@@ -14472,6 +14483,39 @@ mod tests {
         assert!(result["decision_config_sha256"]
             .as_str()
             .is_some_and(valid_prefixed_sha256));
+    }
+
+    #[test]
+    fn audit_recomputes_primary_paper_batch() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let mut input = decision_pipeline_v3_input(now);
+        input.settings.deploy.runtime_role = polyedge_config::RuntimeRole::Primary;
+        input.settings.paper.maker_fill_policy = "touch_after_quote_was_live".to_owned();
+        input.settings.strategy.adaptive_regime_enabled = false;
+        input.settings.strategy.adaptive_regime_mode = "paper_only".to_owned();
+        input.settings.azure.publish_strategy_canary_intents = false;
+        input.settings.azure.storage_container_name = "bot-events".to_owned();
+        input.settings.azure.event_blob_prefix = "events".to_owned();
+        input.adaptive_mode = None;
+        input.classifier_before = None;
+        assert!(input.settings.validate_runtime_role().is_ok());
+
+        let (batch, decisions) = decision_pipeline_v4_evidence(&input);
+        assert!(batch["candidate"].is_null());
+        let mut audit = AuditAccumulator::default();
+        observe_v3_evidence(&mut audit, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut audit, now, decision);
+        }
+        let result = audit.finish();
+        assert_eq!(result["strategy_batches"], 1);
+        assert_eq!(result["strategy_batch_replayed"], 1);
+        assert_eq!(result["strategy_batch_matches"], 1);
+        assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["strategy_batch_contract_invalid"], 0);
+        assert_eq!(result["decision_pipeline_replay_rate"], 1.0);
+        assert_eq!(result["decision_output_binding_rate"], 1.0);
+        assert_eq!(result["decision_parity_rate"], 1.0);
     }
 
     #[test]

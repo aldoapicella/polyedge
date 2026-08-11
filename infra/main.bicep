@@ -705,6 +705,10 @@ resource apiContainerApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: storageContainerName
             }
             {
+              name: 'LOCAL_JSONL_RECORDER_ENABLED'
+              value: 'false'
+            }
+            {
               name: 'AZURE_RESEARCH_STORAGE_CONTAINER_NAME'
               value: researchStorageContainerName
             }
