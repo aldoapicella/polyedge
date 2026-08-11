@@ -55,6 +55,7 @@ const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
 const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
+const ESSENTIAL_FEED_MAX_AGE_SECONDS: i64 = 5 * 60;
 
 #[derive(Clone)]
 pub struct RuntimeController {
@@ -909,9 +910,7 @@ impl RuntimeController {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
-                runtime
-                    .set_feed_status("PolymarketClobMarket", "connecting", None)
-                    .await;
+                runtime.mark_market_feed_connecting().await;
                 let subscribed_tokens = token_ids.clone();
                 let mut feed = tokio::spawn(polyedge_feeds::run_market_feed(
                     runtime.inner.settings.clone(),
@@ -949,13 +948,6 @@ impl RuntimeController {
                             if runtime.market_token_ids().await != subscribed_tokens {
                                 feed.abort();
                                 let _ = feed.await;
-                                runtime
-                                    .set_feed_status(
-                                        "PolymarketClobMarket",
-                                        "resubscribing_token_set_changed",
-                                        None,
-                                    )
-                                    .await;
                                 break;
                             }
                         }
@@ -2960,6 +2952,18 @@ impl RuntimeController {
         self.feed_error_at(source, message, Utc::now()).await;
     }
 
+    async fn mark_market_feed_connecting(&self) {
+        let now = Utc::now();
+        let fresh = {
+            let data = self.inner.data.read().await;
+            fresh_market_feed_ok(data.feed_status.get("PolymarketClobMarket"), now)
+        };
+        if !fresh {
+            self.set_feed_status_at("PolymarketClobMarket", "connecting", None, now)
+                .await;
+        }
+    }
+
     async fn feed_error_at(&self, source: FeedName, message: String, observed_at: DateTime<Utc>) {
         let source_text = format!("{source:?}");
         self.set_feed_status_at(&source_text, "error", Some(message.clone()), observed_at)
@@ -3445,7 +3449,7 @@ fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str 
             == Some("ok")
     };
     if healthy("Discovery")
-        && healthy("PolymarketClobMarket")
+        && fresh_market_feed_ok(data.feed_status.get("PolymarketClobMarket"), Utc::now())
         && (!settings.target.enable_polymarket_rtds_chainlink || healthy("PolymarketRtdsChainlink"))
         && (!settings.target.enable_polymarket_rtds_binance || healthy("PolymarketRtdsBinance"))
     {
@@ -3460,6 +3464,23 @@ fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str 
     } else {
         "starting"
     }
+}
+
+fn fresh_market_feed_ok(status: Option<&Value>, now: DateTime<Utc>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    let Some(updated_at) = status["updated_at"]
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return false;
+    };
+    status["status"] == "ok"
+        && updated_at <= now
+        && now.signed_duration_since(updated_at)
+            <= chrono::Duration::seconds(ESSENTIAL_FEED_MAX_AGE_SECONDS)
 }
 
 fn report_status(shadow_only: bool) -> Value {
@@ -3898,7 +3919,7 @@ mod tests {
     #[tokio::test]
     async fn feed_health_requires_every_enabled_source_and_market_data_clears_clob_error() {
         let controller = RuntimeController::new(RuntimeSettings::default());
-        let base = Utc::now();
+        let base = Utc::now() - chrono::Duration::seconds(20);
         controller.set_feed_status("Discovery", "ok", None).await;
         controller
             .set_feed_status("PolymarketRtdsChainlink", "ok", None)
@@ -3950,6 +3971,79 @@ mod tests {
         let data = controller.inner.data.read().await;
         assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
         assert_eq!(feed_summary(&data, &controller.inner.settings), "running");
+    }
+
+    #[tokio::test]
+    async fn planned_market_resubscription_preserves_only_fresh_ok_status() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        controller.mark_market_feed_connecting().await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"]["status"],
+            "connecting"
+        );
+
+        controller
+            .set_feed_status("PolymarketClobMarket", "ok", None)
+            .await;
+        let before = controller.inner.data.read().await.feed_status["PolymarketClobMarket"].clone();
+        controller.mark_market_feed_connecting().await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            before
+        );
+
+        let now = Utc::now();
+        for (name, status, expected) in [
+            (
+                "exact boundary",
+                json!({"status":"ok","updated_at":now - chrono::Duration::seconds(300)}),
+                true,
+            ),
+            (
+                "past boundary",
+                json!({"status":"ok","updated_at":now - chrono::Duration::seconds(301)}),
+                false,
+            ),
+            (
+                "future",
+                json!({"status":"ok","updated_at":now + chrono::Duration::seconds(1)}),
+                false,
+            ),
+            (
+                "malformed",
+                json!({"status":"ok","updated_at":"invalid"}),
+                false,
+            ),
+            (
+                "not ok",
+                json!({"status":"connecting","updated_at":now}),
+                false,
+            ),
+        ] {
+            assert_eq!(fresh_market_feed_ok(Some(&status), now), expected, "{name}");
+        }
+
+        let stale_controller = RuntimeController::new(RuntimeSettings::default());
+        for name in [
+            "Discovery",
+            "PolymarketRtdsChainlink",
+            "PolymarketRtdsBinance",
+        ] {
+            stale_controller.set_feed_status(name, "ok", None).await;
+        }
+        stale_controller
+            .set_feed_status_at(
+                "PolymarketClobMarket",
+                "ok",
+                None,
+                Utc::now() - chrono::Duration::minutes(6),
+            )
+            .await;
+        let data = stale_controller.inner.data.read().await;
+        assert_eq!(
+            feed_summary(&data, &stale_controller.inner.settings),
+            "starting"
+        );
     }
 
     #[tokio::test]
