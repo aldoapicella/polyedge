@@ -633,6 +633,8 @@ jobs:
         run: |
           set -euo pipefail
           v8_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/"
+          readonly v8_session_blob="${v8_prefix}session.json"
+          readonly v8_session_sha256="sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
           v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
           readonly v5_state_etag="0x8DEF43F4E1B785A"
           readonly v5_state_sha256="sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
@@ -642,7 +644,22 @@ jobs:
             --prefix "$v8_prefix" \
             --auth-mode login \
             --only-show-errors -o json > v8-prefix-before-preflight.json
-          test "$(jq 'length' v8-prefix-before-preflight.json)" = "0"
+          jq -e --arg session "$v8_session_blob" '
+            length == 0 or (length == 1 and .[0].name == $session)
+          ' v8-prefix-before-preflight.json >/dev/null
+          jq -S '[.[] | {name, etag: .properties.etag, size: .properties.contentLength}]' \
+            v8-prefix-before-preflight.json > v8-prefix-before-preflight.snapshot.json
+          if [ "$(jq 'length' v8-prefix-before-preflight.json)" = "1" ]; then
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$v8_session_blob" \
+              --file existing-v8-session.json \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none
+            test "$v8_session_sha256" = "sha256:$(sha256sum existing-v8-session.json | cut -d' ' -f1)"
+          fi
           v5_etag_before=$(az storage blob show \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -780,7 +797,9 @@ jobs:
             --prefix "$v8_prefix" \
             --auth-mode login \
             --only-show-errors -o json > v8-prefix-after-preflight.json
-          test "$(jq 'length' v8-prefix-after-preflight.json)" = "0"
+          jq -S '[.[] | {name, etag: .properties.etag, size: .properties.contentLength}]' \
+            v8-prefix-after-preflight.json > v8-prefix-after-preflight.snapshot.json
+          cmp -s v8-prefix-before-preflight.snapshot.json v8-prefix-after-preflight.snapshot.json
           test "$(az storage blob show --account-name "$STORAGE_ACCOUNT" --container-name "$FUNDED_CONTAINER" --name "$v5_state" --auth-mode login --query properties.etag -o tsv)" = "$v5_state_etag"
           az containerapp job show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
