@@ -10,6 +10,7 @@ import {
   reconcileProtectedCompoundingState,
   sizeProtectedOrder,
   validateProtectedCompoundingManifest,
+  validateProtectedCompoundingPredecessorState,
   verifyAutomaticSettlementEvidence
 } from "../src/compounding-risk.mjs";
 
@@ -91,6 +92,7 @@ test("protected compounding contract fixes the reserve at 30% with a 1% buffer",
     stateSchema: "polyedge.protected_compounding_state.v1",
     priorStateBlobName: null,
     priorStateSessionId: null,
+    priorStateSha256: null,
     minimumHistoricalHighWaterEquity: null,
     stateBlobName:
       "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
@@ -127,6 +129,10 @@ function lossTolerantManifest() {
     reserve_ratio: 0.1,
     minimum_reserve: 2,
     target_order_ratio: 0.05,
+    prior_state_sha256: documentHash(priorState({
+      highWater: 31.655501,
+      protectedReserve: 9.49665
+    })),
     minimum_historical_high_water_equity: 31.655501,
     state_blob_name:
       "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v8/capital-reserve-state.json"
@@ -134,20 +140,28 @@ function lossTolerantManifest() {
   return value;
 }
 
-function seedPriorState(container, {
+function priorState({
   highWater = 17.90462,
   protectedReserve = 5.371386
 } = {}) {
-  const name =
-    "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json";
-  container.values.set(name, Buffer.from(JSON.stringify({
+  return {
     schema: "polyedge.protected_compounding_state.v1",
     session_id: "dynamic-quote-funded-test-v5",
     high_water_equity: highWater,
     protected_reserve: protectedReserve,
     reconciliation_complete: true,
     reserve_monotonic: true
-  })));
+  };
+}
+
+function documentHash(value) {
+  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+function seedPriorState(container, options = {}) {
+  const name =
+    "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json";
+  container.values.set(name, Buffer.from(JSON.stringify(priorState(options))));
   container.etags.set(name, '"1"');
 }
 
@@ -429,11 +443,60 @@ test("loss-resizing contract binds the reserve to fully reconciled current equit
     priorStateBlobName:
       "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
     priorStateSessionId: "dynamic-quote-funded-test-v5",
+    priorStateSha256: null,
     minimumHistoricalHighWaterEquity: 17.90462,
     stateBlobName:
       "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v7/capital-reserve-state.json",
     internalSettlements: []
   });
+});
+
+test("predecessor validation reuses the exact loss-resizing invariant", () => {
+  const policy = validateProtectedCompoundingManifest(lossResizingManifest());
+  const state = {
+    schema: "polyedge.protected_compounding_state.v1",
+    session_id: policy.priorStateSessionId,
+    high_water_equity: 17.90462,
+    protected_reserve: 5.371386,
+    reconciliation_complete: true,
+    reserve_monotonic: true
+  };
+  assert.equal(validateProtectedCompoundingPredecessorState(state, policy), state);
+  assert.throws(
+    () => validateProtectedCompoundingPredecessorState({ ...state, reserve_monotonic: false }, policy),
+    /prior funded high-water state is unavailable or incompatible/
+  );
+});
+
+test("loss-tolerant predecessor validation requires exact durable bytes", () => {
+  const manifest = lossTolerantManifest();
+  const policy = validateProtectedCompoundingManifest(manifest);
+  const exact = priorState({
+    highWater: 31.655501,
+    protectedReserve: 9.49665
+  });
+  const exactHash = documentHash(exact);
+  assert.equal(policy.priorStateSha256, exactHash);
+  assert.equal(
+    validateProtectedCompoundingPredecessorState(exact, policy, exactHash),
+    exact
+  );
+
+  const modified = { ...exact, high_water_equity: 32 };
+  assert.throws(
+    () => validateProtectedCompoundingPredecessorState(
+      modified,
+      policy,
+      documentHash(modified)
+    ),
+    /prior funded high-water state is unavailable or incompatible/
+  );
+
+  delete manifest.capital_policy.prior_state_sha256;
+  assert.throws(
+    () => validateProtectedCompoundingManifest(manifest),
+    /prior_state_sha256 is required for loss-tolerant sizing/
+  );
 });
 
 test("successive losses resize orders instead of freezing the historical high water", async () => {
@@ -533,6 +596,7 @@ test("loss-tolerant sizing uses a 10% current-equity reserve and minimum orders 
   assert.equal(initial.protected_reserve, 3.16555);
   assert.equal(initial.operating_buffer, 0.316555);
   assert.equal(initial.operable_capital, 28.173396);
+  assert.equal(initial.prior_state_sha256, fundedManifest.capital_policy.prior_state_sha256);
 
   const input = {
     price: 0.3224734,

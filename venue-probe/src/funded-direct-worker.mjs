@@ -6,7 +6,10 @@ import {
   sha256,
   VENUE_GTD_SECURITY_BUFFER_MS
 } from "./canary-lib.mjs";
-import { validateProtectedCompoundingManifest } from "./compounding-risk.mjs";
+import {
+  validateProtectedCompoundingManifest,
+  validateProtectedCompoundingPredecessorState
+} from "./compounding-risk.mjs";
 import { sanitize, storageContainer } from "./lib.mjs";
 import { validateProfitQuarantineManifest } from "./profit-quarantine.mjs";
 
@@ -25,6 +28,7 @@ export function loadFundedDirectConfig(env = process.env) {
     enabled: env.FUNDED_DIRECT_WORKER_ENABLED === "true",
     allowed: env.ALLOW_FUNDED_DIRECT === "true",
     dryRun: env.FUNDED_DIRECT_DRY_RUN !== "false",
+    preflightOnly: env.FUNDED_DIRECT_PREFLIGHT_ONLY === "true",
     session,
     sessionBlobName: clean(env.FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME),
     sessionHash: hash(env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256),
@@ -54,6 +58,15 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!config.enabled) errors.push("FUNDED_DIRECT_WORKER_ENABLED must be true");
   if (!config.allowed) errors.push("ALLOW_FUNDED_DIRECT must be true");
   if (!config.session) errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be valid JSON");
+  if (config.preflightOnly && config.session?.schema_version !== SESSION_SCHEMA_V3) {
+    errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY requires an exact predecessor-bound v3 session");
+  }
+  if (config.preflightOnly && env.FUNDED_DIRECT_DRY_RUN !== "true") {
+    errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY requires FUNDED_DIRECT_DRY_RUN=true");
+  }
+  if (config.preflightOnly && String(env.FUNDED_DIRECT_ENGINE || "") === "persistent_v1") {
+    errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY is supported only by the one-shot worker");
+  }
   if (!config.sessionBlobName || !config.sessionHash) errors.push("exact operator session manifest blob and SHA-256 are required");
   if (config.candidate !== EXPECTED_CANDIDATE || config.candidateVersion !== EXPECTED_VERSION) {
     errors.push("worker must remain bound to the frozen Dynamic Quote candidate");
@@ -100,11 +113,7 @@ export async function runFundedDirectWorker({
     intents: storageContainer({ ...config, storageContainer: config.intentContainerName })
   };
   if (!clients.control || !clients.intents) throw new Error("fail closed: operator-funded storage clients are unavailable");
-  const sessionDocument = await putImmutableOrVerify(clients.control, {
-    blobName: config.sessionBlobName,
-    value: config.session
-  });
-  if (sessionDocument.hash !== config.sessionHash) throw new Error("fail closed: operator session manifest SHA-256 mismatch");
+  const { sessionDocument, predecessorDocument } = await loadWorkerBindings(clients.control, config);
 
   let idleSince = null;
   let childInvocations = 0;
@@ -119,6 +128,12 @@ export async function runFundedDirectWorker({
       continue;
     }
     idleSince = null;
+    if (config.preflightOnly) {
+      return preflightResult(config, sessionDocument, predecessorDocument, selected, {
+        iteration,
+        childInvocations
+      });
+    }
     const executed = await executeSelectedIntent({
       env,
       config,
@@ -913,6 +928,41 @@ async function readJsonBlobDocument(container, blobName) {
   catch { throw new Error(`fail closed: durable funded control blob is not valid JSON (${blobName})`); }
 }
 
+async function loadWorkerBindings(control, config) {
+  if (!config.preflightOnly) {
+    const sessionDocument = await putImmutableOrVerify(control, {
+      blobName: config.sessionBlobName,
+      value: config.session
+    });
+    if (sessionDocument.hash !== config.sessionHash) {
+      throw new Error("fail closed: operator session manifest SHA-256 mismatch");
+    }
+    return { sessionDocument, predecessorDocument: null };
+  }
+
+  const policy = validateProtectedCompoundingManifest(config.session);
+  let predecessorDocument;
+  try {
+    predecessorDocument = await readJsonBlobDocument(control, policy.priorStateBlobName);
+  } catch (error) {
+    if (Number(error.statusCode) !== 404) throw error;
+    validateProtectedCompoundingPredecessorState(null, policy);
+  }
+  validateProtectedCompoundingPredecessorState(
+    predecessorDocument?.value,
+    policy,
+    predecessorDocument?.hash
+  );
+  return {
+    sessionDocument: {
+      value: config.session,
+      blobName: config.sessionBlobName,
+      hash: config.sessionHash
+    },
+    predecessorDocument
+  };
+}
+
 async function putImmutableOrVerify(container, document) {
   const bytes = Buffer.from(JSON.stringify(document.value, null, 2));
   const expected = sha256(bytes);
@@ -953,6 +1003,26 @@ function result(status, config, details) {
     research_promotion_bypassed: true,
     ...details
   };
+}
+
+function preflightResult(config, sessionDocument, predecessorDocument, selected, details) {
+  return result("preflight_validated", config, {
+    ...details,
+    decisionId: selected.value.decision_id,
+    preflight_only: true,
+    writes_performed: false,
+    order_submission_attempted: false,
+    authorization_created: false,
+    risk_reservation_created: false,
+    completion_created: false,
+    session_manifest_blob_name: sessionDocument.blobName,
+    session_manifest_sha256: sessionDocument.hash,
+    predecessor_state_session_id: predecessorDocument.value.session_id,
+    predecessor_state_blob_name: predecessorDocument.blobName,
+    predecessor_state_sha256: predecessorDocument.hash,
+    intent_blob_name: selected.blobName,
+    intent_sha256: selected.hash
+  });
 }
 
 async function streamToBuffer(stream) {

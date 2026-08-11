@@ -78,9 +78,62 @@ function env(overrides = {}) {
   };
 }
 
+function preflightSession() {
+  const value = session();
+  value.schema_version = "polyedge.operator_funded_session.v3";
+  value.session_id = "dynamic-quote-funded-test-v7";
+  value.authorized_by_user_reference = "Codex task pure funded preflight";
+  value.allow_compounding = true;
+  value.continue_after_loss = true;
+  value.capital_policy = {
+    reserve_ratio: 0.1,
+    minimum_reserve: 2,
+    target_order_ratio: 0.05,
+    operating_buffer_ratio: 0.01,
+    minimum_order_notional: 1,
+    reserve_basis: "fully_reconciled_current_equity",
+    loss_response: "resize_from_fully_reconciled_current_equity",
+    prior_state_session_id: "dynamic-quote-funded-test-v5",
+    prior_state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/capital-reserve-state.json",
+    prior_state_sha256:
+      sha256(Buffer.from(JSON.stringify(predecessorState()))),
+    minimum_historical_high_water_equity: 17.90462,
+    high_water_update: "full_reconciliation_only",
+    reserve_monotonic: false,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v7/capital-reserve-state.json"
+  };
+  value.internal_settlements = [];
+  return value;
+}
+
+function preflightEnv(value = preflightSession(), overrides = {}) {
+  return env({
+    FUNDED_DIRECT_PREFLIGHT_ONLY: "true",
+    FUNDED_DIRECT_DRY_RUN: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(value),
+    FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+      sha256(Buffer.from(JSON.stringify(value, null, 2))),
+    ...overrides
+  });
+}
+
+function predecessorState() {
+  return {
+    schema: "polyedge.protected_compounding_state.v1",
+    session_id: "dynamic-quote-funded-test-v5",
+    high_water_equity: 17.90462,
+    protected_reserve: 5.371386,
+    reconciliation_complete: true,
+    reserve_monotonic: true
+  };
+}
+
 class Container {
   constructor(values = {}) {
     this.values = new Map(Object.entries(values));
+    this.uploadCalls = 0;
   }
   async *listBlobsFlat({ prefix }) {
     for (const name of [...this.values.keys()].filter((value) => value.startsWith(prefix))) yield { name };
@@ -94,6 +147,7 @@ class Container {
   getBlockBlobClient(name) {
     return {
       uploadData: async (bytes) => {
+        this.uploadCalls += 1;
         if (this.values.has(name)) {
           const error = new Error("exists");
           error.statusCode = 409;
@@ -103,6 +157,23 @@ class Container {
       }
     };
   }
+}
+
+function mutationKeysets(container, targetSessionBlobName) {
+  const names = [...container.values.keys()].sort();
+  return {
+    targetSession: names.filter((name) => name === targetSessionBlobName),
+    authorizations: names.filter((name) => name.includes("/authorizations/")),
+    reservations: names.filter((name) => name.includes("risk-reservations")),
+    completions: names.filter((name) => name.includes("/completed/")),
+    all: names
+  };
+}
+
+function containerSnapshot(container) {
+  return [...container.values.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, bytes]) => [name, Buffer.from(bytes).toString("hex")]);
 }
 
 function intent(now, id = "c".repeat(64)) {
@@ -280,6 +351,83 @@ test("operator-funded config accepts current-equity resizing after losses", () =
         sha256(Buffer.from(JSON.stringify(value, null, 2)))
     }),
     /operator-funded session contract/
+  );
+});
+
+test("pure preflight rejects a contradictory write-capable dry-run setting", () => {
+  assert.throws(
+    () => loadFundedDirectConfig(preflightEnv(preflightSession(), {
+      FUNDED_DIRECT_DRY_RUN: "false"
+    })),
+    /FUNDED_DIRECT_PREFLIGHT_ONLY requires FUNDED_DIRECT_DRY_RUN=true/
+  );
+});
+
+test("pure preflight validates embedded session, predecessor, and fresh intent without writes", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const fundedSession = preflightSession();
+  const value = intent(now, "4".repeat(64));
+  const predecessorName = fundedSession.capital_policy.prior_state_blob_name;
+  const predecessorBytes = Buffer.from(JSON.stringify(predecessorState()));
+  const targetSessionName = "reports/funded/session.json";
+  const control = new Container({
+    [predecessorName]: predecessorBytes,
+    [`reports/funded/dynamic-quote/sessions/existing/authorizations/${"a".repeat(64)}.json`]:
+      Buffer.from("{}"),
+    [`reports/research/venue-probe/risk-reservations/2026-07-27/existing.json`]:
+      Buffer.from("{}"),
+    [`reports/funded/dynamic-quote/sessions/existing/completed/${"b".repeat(64)}.json`]:
+      Buffer.from("{}")
+  });
+  const intents = new Container({
+    [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value))
+  });
+  const beforeControl = mutationKeysets(control, targetSessionName);
+  const beforeControlSnapshot = containerSnapshot(control);
+  const beforeIntents = [...intents.values.keys()].sort();
+  const beforeIntentSnapshot = containerSnapshot(intents);
+  let childCalls = 0;
+  const config = loadFundedDirectConfig(preflightEnv(fundedSession));
+  assert.equal(config.preflightOnly, true);
+  assert.equal(config.dryRun, true);
+
+  const output = await runFundedDirectWorker({
+    env: preflightEnv(fundedSession, { FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: { control, intents },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => { childCalls += 1; }
+  });
+
+  assert.equal(output.status, "preflight_validated");
+  assert.equal(output.preflight_only, true);
+  assert.equal(output.writes_performed, false);
+  assert.equal(output.order_submission_attempted, false);
+  assert.equal(output.authorization_created, false);
+  assert.equal(output.risk_reservation_created, false);
+  assert.equal(output.completion_created, false);
+  assert.equal(output.session_manifest_blob_name, targetSessionName);
+  assert.equal(output.session_manifest_sha256,
+    sha256(Buffer.from(JSON.stringify(fundedSession, null, 2))));
+  assert.equal(output.predecessor_state_blob_name, predecessorName);
+  assert.equal(output.predecessor_state_sha256, sha256(predecessorBytes));
+  assert.equal(output.intent_blob_name, `intents/${value.decision_id}.json`);
+  assert.equal(output.childInvocations, 0);
+  assert.equal(childCalls, 0);
+  assert.equal(control.uploadCalls, 0);
+  assert.equal(intents.uploadCalls, 0);
+  assert.deepEqual(mutationKeysets(control, targetSessionName), beforeControl);
+  assert.deepEqual(containerSnapshot(control), beforeControlSnapshot);
+  assert.deepEqual([...intents.values.keys()].sort(), beforeIntents);
+  assert.deepEqual(containerSnapshot(intents), beforeIntentSnapshot);
+});
+
+test("pure preflight rejects the persistent engine", () => {
+  assert.throws(
+    () => loadFundedDirectConfig(preflightEnv(preflightSession(), {
+      FUNDED_DIRECT_ENGINE: "persistent_v1"
+    })),
+    /FUNDED_DIRECT_PREFLIGHT_ONLY is supported only by the one-shot worker/
   );
 });
 

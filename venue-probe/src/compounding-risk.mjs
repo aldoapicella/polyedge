@@ -80,6 +80,9 @@ export function validateProtectedCompoundingManifest(manifest) {
     if (Number(policy?.target_order_ratio) !== LOSS_TOLERANT_TARGET_ORDER_RATIO) {
       errors.push(`capital_policy.target_order_ratio must equal ${LOSS_TOLERANT_TARGET_ORDER_RATIO}`);
     }
+    if (!normalizedSha256(policy?.prior_state_sha256)) {
+      errors.push("capital_policy.prior_state_sha256 is required for loss-tolerant sizing");
+    }
   } else if (Number(policy?.reserve_ratio) !== 0.3) {
     errors.push("capital_policy.reserve_ratio must equal 0.3");
   }
@@ -112,6 +115,9 @@ export function validateProtectedCompoundingManifest(manifest) {
     stateSchema: currentEquityPolicy ? STATE_SCHEMA_V2 : STATE_SCHEMA_V1,
     priorStateBlobName: currentEquityPolicy ? String(policy.prior_state_blob_name) : null,
     priorStateSessionId: currentEquityPolicy ? String(policy.prior_state_session_id) : null,
+    priorStateSha256: lossTolerantPolicy
+      ? normalizedSha256(policy.prior_state_sha256)
+      : null,
     minimumHistoricalHighWaterEquity: currentEquityPolicy
       ? Number(policy.minimum_historical_high_water_equity)
       : null,
@@ -122,6 +128,22 @@ export function validateProtectedCompoundingManifest(manifest) {
     stateBlobName: String(policy.state_blob_name),
     internalSettlements: settlements
   };
+}
+
+export function validateProtectedCompoundingPredecessorState(state, policy, actualHash = null) {
+  if (state?.schema !== STATE_SCHEMA_V1
+      || state?.session_id !== policy?.priorStateSessionId
+      || state?.reconciliation_complete !== true
+      || state?.reserve_monotonic !== true
+      || Number(state?.high_water_equity) + 1e-9 <
+        Number(policy?.minimumHistoricalHighWaterEquity)
+      || Number(state?.protected_reserve) + 0.0000011 <
+        Number(state?.high_water_equity) * Number(policy?.reserveRatio)
+      || (policy?.priorStateSha256
+        && normalizedSha256(actualHash) !== policy.priorStateSha256)) {
+    throw new Error("fail closed: prior funded high-water state is unavailable or incompatible");
+  }
+  return state;
 }
 
 export async function verifyConfiguredInternalSettlements({
@@ -597,16 +619,11 @@ export async function reconcileProtectedCompoundingState({
   let priorHistoricalState = null;
   if (!policy.reserveMonotonic) {
     priorHistoricalState = priorHistoricalDocument?.value;
-    if (priorHistoricalState?.schema !== STATE_SCHEMA_V1
-        || priorHistoricalState?.session_id !== policy.priorStateSessionId
-        || priorHistoricalState?.reconciliation_complete !== true
-        || priorHistoricalState?.reserve_monotonic !== true
-        || Number(priorHistoricalState?.high_water_equity) + 1e-9 <
-          policy.minimumHistoricalHighWaterEquity
-        || Number(priorHistoricalState?.protected_reserve) + 0.0000011 <
-          Number(priorHistoricalState?.high_water_equity) * policy.reserveRatio) {
-      throw new Error("fail closed: prior funded high-water state is unavailable or incompatible");
-    }
+    validateProtectedCompoundingPredecessorState(
+      priorHistoricalState,
+      policy,
+      priorHistoricalDocument?.hash
+    );
   }
 
   for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -648,6 +665,9 @@ export async function reconcileProtectedCompoundingState({
       historical_high_water_equity: highWater,
       prior_state_session_id: policy.priorStateSessionId,
       prior_state_blob_name: policy.priorStateBlobName,
+      ...(policy.priorStateSha256 ? {
+        prior_state_sha256: policy.priorStateSha256
+      } : {}),
       reserve_basis: policy.reserveBasis,
       loss_response: policy.lossResponse,
       continue_after_loss: !policy.reserveMonotonic,
@@ -1336,6 +1356,8 @@ function assertCompatibleState(state, manifest, policy) {
       || (!policy.reserveMonotonic
         && (state.prior_state_session_id !== policy.priorStateSessionId
           || state.prior_state_blob_name !== policy.priorStateBlobName
+          || (policy.priorStateSha256
+            && normalizedSha256(state.prior_state_sha256) !== policy.priorStateSha256)
           || Number(state.historical_high_water_equity) + 1e-9 <
             policy.minimumHistoricalHighWaterEquity))
       || (policy.lossResponse && state.loss_response !== policy.lossResponse)) {
@@ -1363,6 +1385,7 @@ function sameCapitalState(left, right) {
     "historical_high_water_equity",
     "prior_state_session_id",
     "prior_state_blob_name",
+    "prior_state_sha256",
     "reserve_basis",
     "loss_response",
     "continue_after_loss",

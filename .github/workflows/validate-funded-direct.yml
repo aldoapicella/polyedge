@@ -56,13 +56,12 @@ jobs:
           const assert = require("node:assert/strict");
           const crypto = require("node:crypto");
           const fs = require("node:fs");
-          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-29_v5.json"));
-          const source = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-08-03_v7.json"));
+          const session = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-08-11_v8.json"));
+          const predecessor = JSON.parse(fs.readFileSync("research/configs/funded_direct_dynamic_quote_2026-07-29_v5.json"));
           const parameters = JSON.parse(fs.readFileSync("infra/funded-direct-chile.parameters.json")).parameters;
           const embedded = JSON.parse(parameters.fundedDirectSessionManifestJson.value);
           assert.deepEqual(embedded, session);
           const digest = `sha256:${crypto.createHash("sha256").update(JSON.stringify(session, null, 2)).digest("hex")}`;
-          const sourceDigest = `sha256:${crypto.createHash("sha256").update(JSON.stringify(source, null, 2)).digest("hex")}`;
           assert.equal(parameters.fundedDirectSessionManifestSha256.value, digest);
           assert.equal(parameters.fundedDirectEnabled.value, true);
           assert.equal(session.research_promotion_bypassed, true);
@@ -70,41 +69,49 @@ jobs:
           assert.equal(session.no_deposits, true);
           assert.equal(session.allow_automatic_replenishment, false);
           assert.equal(session.allow_compounding, true);
-          assert.equal(session.capital_policy.reserve_ratio, 0.3);
+          assert.equal(session.schema_version, "polyedge.operator_funded_session.v3");
+          assert.equal(session.continue_after_loss, true);
+          assert.equal(session.capital_policy.reserve_ratio, 0.1);
+          assert.equal(session.capital_policy.minimum_reserve, 2);
+          assert.equal(session.capital_policy.target_order_ratio, 0.05);
           assert.equal(session.capital_policy.operating_buffer_ratio, 0.01);
           assert.equal(session.capital_policy.minimum_order_notional, 1);
+          assert.equal(session.capital_policy.reserve_basis, "fully_reconciled_current_equity");
+          assert.equal(session.capital_policy.loss_response, "resize_from_fully_reconciled_current_equity");
+          assert.equal(session.capital_policy.prior_state_session_id, predecessor.session_id);
+          assert.equal(session.capital_policy.prior_state_blob_name, predecessor.capital_policy.state_blob_name);
+          assert.equal(
+            session.capital_policy.prior_state_sha256,
+            "sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+          );
+          assert.equal(session.capital_policy.minimum_historical_high_water_equity, 102.78112);
           assert.equal(session.capital_policy.high_water_update, "full_reconciliation_only");
-          assert.equal(session.capital_policy.reserve_monotonic, true);
-          assert.equal(session.internal_settlements[0].type, "internal_manual_settlement");
+          assert.equal(session.capital_policy.reserve_monotonic, false);
           assert.deepEqual(session.external_cash_flows, []);
-          assert.equal(session.session_id, "dynamic-quote-funded-2026-07-29-v5");
-          assert.equal(session.starting_collateral, 11.09862);
-          assert.equal(session.max_account_loss, 11.09862);
+          assert.deepEqual(session.internal_settlements, []);
+          assert.equal(session.session_id, "dynamic-quote-funded-2026-08-11-v8");
+          assert.equal(session.starting_collateral, 31.655501);
+          assert.equal(session.max_account_loss, 31.655501);
           assert.equal(session.target_order_notional, 10.5);
           assert.equal(session.max_order_notional, 10.5);
           assert.equal(
             parameters.fundedDirectSessionManifestBlobName.value,
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/session.json"
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/session.json"
           );
           assert.equal(
             parameters.fundedDirectSessionManifestSha256.value,
-            "sha256:b8877f266f1e68d846ad2fd3ae8732c2d533cc7ccc14482ac5f76d0d1c1f58f9"
+            "sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
           );
           assert.equal(parameters.fundedDirectCampaignId.value, session.session_id);
-          assert.equal(parameters.fundedDirectReserveMigrationSourceSessionId.value, source.session_id);
-          assert.equal(
-            parameters.fundedDirectReserveMigrationSourceSessionManifestBlobName.value,
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-03-v7/session.json"
-          );
-          assert.equal(parameters.fundedDirectReserveMigrationSourceSessionManifestSha256.value, sourceDigest);
-          assert.equal(
-            parameters.fundedDirectReserveMigrationSourceStateBlobName.value,
-            source.capital_policy.state_blob_name
-          );
-          assert.equal(
-            parameters.fundedDirectReserveMigrationMinimumHistoricalHighWaterEquity.value,
-            "75.90162"
-          );
+          for (const name of [
+            "fundedDirectReserveMigrationSourceSessionId",
+            "fundedDirectReserveMigrationSourceSessionManifestBlobName",
+            "fundedDirectReserveMigrationSourceSessionManifestSha256",
+            "fundedDirectReserveMigrationSourceStateBlobName",
+            "fundedDirectReserveMigrationMinimumHistoricalHighWaterEquity"
+          ]) assert.equal(parameters[name].value, "");
+          assert.equal(parameters.fundedDirectStartingCollateral.value, "31.655501");
+          assert.equal(parameters.fundedDirectMaxAccountLoss.value, "31.655501");
           NODE
 
       - uses: actions/setup-node@v4
@@ -240,7 +247,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
     needs: funded-safety
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     concurrency:
       group: polyedge-funded-direct-cl
       cancel-in-progress: false
@@ -252,6 +259,7 @@ jobs:
       PROTECTED_QSET_APP: polyedge-shadow-qset-neu
       SERVICE_BUS_NAMESPACE: sb-polyedge-funded-cl-6urdjr5nmwx7w
       SERVICE_BUS_QUEUE: funded-dynamic-quote-intents
+      FUNDED_JOB: polyedge-funded-direct-cl-job
       LEGACY_NEU_FUNDED_JOB: polyedge-funded-ladder-neu-job
       STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
       FUNDED_CONTAINER: polyedge-funded-evidence
@@ -449,30 +457,6 @@ jobs:
             test "${migration_failures:-0}" -ge 3
           fi
           case "$current_session" in
-            dynamic-quote-funded-2026-08-03-v7)
-              az monitor log-analytics query \
-                --workspace "$workspace_customer_id" \
-                --analytics-query "ContainerAppConsoleLogs_CL
-                  | where ContainerAppName_s == '$FUNDED_APP'
-                  | where RevisionName_s == '$current_revision'
-                  | where TimeGenerated > ago(24h)
-                  | where TimeGenerated >= datetime($current_revision_created_at)
-                  | extend record = parse_json(Log_s)
-                  | where tostring(record.schema) == 'polyedge.funded_capital_snapshot.v1'
-                  | where tostring(record.session_id) == 'dynamic-quote-funded-2026-08-03-v7'
-                  | top 1 by TimeGenerated desc
-                  | project TimeGenerated, Log_s" \
-                -o json > v7-capital-snapshot.json
-              jq -e '
-                length == 1
-                and (.[0].Log_s | fromjson
-                  | .risk_passed == true
-                  and .open_order_count == 0
-                  and .unresolved_position_count == 0
-                  and .unresolved_risk_reservation_count == 0
-                  and .historical_high_water_equity >= 75.90162)
-              ' v7-capital-snapshot.json
-              ;;
             dynamic-quote-funded-2026-07-29-v5)
               az storage blob download \
                 --account-name "$STORAGE_ACCOUNT" \
@@ -486,15 +470,9 @@ jobs:
                 .schema == "polyedge.protected_compounding_state.v1"
                 and .session_id == "dynamic-quote-funded-2026-07-29-v5"
                 and .reconciliation_complete == true
-                and .reserve_basis == "fully_reconciled_high_water_equity"
-                and .reserve_monotonic == true
-                and .high_water_equity >= 75.90162
-                and .historical_high_water_equity >= 75.90162
-                and (.protected_reserve + 0.0000011) >= (.high_water_equity * .reserve_ratio)
-                and .migration_source_session_id == "dynamic-quote-funded-2026-08-03-v7"
-                and .migration_source_session_sha256 == "sha256:410abe9fc7f2f81359bbb4ef8304a153326d7be170a76dc64e84dd2bf1a4e709"
-                and .migration_minimum_historical_high_water_equity == 75.90162
-                and (.migration_verified_settlement_ids | type == "array")
+                and .high_water_equity >= 102.78112
+                and .historical_high_water_equity >= 102.78112
+                and (.last_reconciled_equity - 31.655501 | fabs) <= 0.01
               ' current-v5-capital-reserve-state.json
               ;;
             *)
@@ -502,6 +480,37 @@ jobs:
               exit 1
               ;;
           esac
+          capital_snapshot_ready=false
+          for attempt in $(seq 1 24); do
+            az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$current_revision'
+                | where TimeGenerated >= datetime($fence_started_at)
+                | extend record = parse_json(Log_s)
+                | where tostring(record.schema) == 'polyedge.funded_capital_snapshot.v1'
+                | where tostring(record.session_id) == 'dynamic-quote-funded-2026-07-29-v5'
+                | top 1 by TimeGenerated desc
+                | project TimeGenerated, Log_s" \
+              -o json > post-fence-v5-capital-snapshot.json
+            if jq -e '
+              length == 1
+              and (.[0].Log_s | fromjson
+                | .session_id == "dynamic-quote-funded-2026-07-29-v5"
+                and .risk_passed == true
+                and .open_order_count == 0
+                and .unresolved_position_count == 0
+                and .unresolved_risk_reservation_count == 0
+                and (.account_equity - 31.655501 | fabs) <= 0.01
+                and .historical_high_water_equity >= 102.78112)
+            ' post-fence-v5-capital-snapshot.json >/dev/null; then
+              capital_snapshot_ready=true
+              break
+            fi
+            sleep 5
+          done
+          test "$capital_snapshot_ready" = true
 
       - name: Deploy continuous funded Dynamic Quote service
         run: |
@@ -514,6 +523,7 @@ jobs:
               --template-file infra/funded-direct-chile.bicep \
               --parameters @infra/funded-direct-chile.parameters.json \
               --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
+              --parameters fundedDirectEnabled=false \
               --parameters fundedDirectQueueStatus=SendDisabled \
               --only-show-errors \
               -o json > funded-deployment.json 2> funded-deployment.stderr; then
@@ -575,64 +585,16 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Prove v7 reserve migration before v5 intake
+      - name: Prove the v5 predecessor while the v8 service remains disabled
         run: |
           set -euo pipefail
-          environment_id=$(az containerapp show \
+          az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
-            --query properties.environmentId -o tsv)
-          workspace_customer_id=$(az containerapp env show \
-            --ids "$environment_id" \
-            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
-          target_revision=$(az containerapp show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$FUNDED_APP" \
-            --query properties.latestRevisionName -o tsv)
-          for attempt in $(seq 1 36); do
-            az containerapp revision list \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$FUNDED_APP" \
-              -o json > funded-migration-revisions.json
-            active_revision_count=$(jq '[.[] | select(.properties.active == true)] | length' funded-migration-revisions.json)
-            active_revision=$(jq -r '[.[] | select(.properties.active == true)][0].name // ""' funded-migration-revisions.json)
-            target_health=$(jq -r --arg revision "$target_revision" \
-              '.[] | select(.name == $revision) | .properties.healthState // ""' funded-migration-revisions.json)
-            target_replicas=$(jq -r --arg revision "$target_revision" \
-              '.[] | select(.name == $revision) | .properties.replicas // 0' funded-migration-revisions.json)
-            az monitor log-analytics query \
-              --workspace "$workspace_customer_id" \
-              --analytics-query "ContainerAppConsoleLogs_CL
-                | where ContainerAppName_s == '$FUNDED_APP'
-                | where RevisionName_s == '$target_revision'
-                | where TimeGenerated > ago(30m)
-                | extend status = tostring(parse_json(Log_s).status)
-                | where status in ('protected_reserve_migration_completed', 'persistent_service_started')
-                | project timestamp = TimeGenerated, status
-                | order by timestamp asc" \
-              -o json > migration-startup-logs.json
-            if [ "$active_revision_count" = "1" ] && \
-                [ "$active_revision" = "$target_revision" ] && \
-                [ "$target_health" = "Healthy" ] && \
-                [ "$target_replicas" = "1" ] && \
-                jq -e '
-                  ([.[] | select(.status == "protected_reserve_migration_completed")] | length) >= 1
-                  and ([.[] | select(.status == "persistent_service_started")] | length) >= 1
-                  and ([.[] | select(.status == "protected_reserve_migration_completed")][0].timestamp
-                    <= [ .[] | select(.status == "persistent_service_started") ][0].timestamp)
-                ' migration-startup-logs.json >/dev/null; then
-              break
-            fi
-            sleep 10
-          done
-          test "$active_revision_count" = "1"
-          test "$active_revision" = "$target_revision"
-          test "$target_health" = "Healthy"
-          test "$target_replicas" = "1"
-          jq -e '
-            ([.[] | select(.status == "protected_reserve_migration_completed")] | length) >= 1
-            and ([.[] | select(.status == "persistent_service_started")] | length) >= 1
-          ' migration-startup-logs.json
+            -o json > disabled-v8-funded-app.json
+          test "$(jq -r '.properties.template.scale.minReplicas' disabled-v8-funded-app.json)" = "0"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_SERVICE_ENABLED") | .value' disabled-v8-funded-app.json)" = "false"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_DRY_RUN") | .value' disabled-v8-funded-app.json)" = "true"
           az storage blob download \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -645,26 +607,9 @@ jobs:
             .schema == "polyedge.protected_compounding_state.v1"
             and .session_id == "dynamic-quote-funded-2026-07-29-v5"
             and .reconciliation_complete == true
-            and .reserve_ratio == 0.3
-            and .operating_buffer_ratio == 0.01
-            and .reserve_basis == "fully_reconciled_high_water_equity"
-            and .reserve_monotonic == true
-            and .continue_after_loss == false
-            and .high_water_equity >= 75.90162
-            and .historical_high_water_equity >= 75.90162
-            and .protected_reserve >= 22.770486
-            and (.protected_reserve + 0.0000011) >= (.high_water_equity * .reserve_ratio)
-            and .last_reconciled_equity <= (.authorized_equity_ceiling + 0.01)
-            and .migration_source_session_id == "dynamic-quote-funded-2026-08-03-v7"
-            and .migration_source_session_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-03-v7/session.json"
-            and .migration_source_session_sha256 == "sha256:410abe9fc7f2f81359bbb4ef8304a153326d7be170a76dc64e84dd2bf1a4e709"
-            and .migration_source_state_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-03-v7/capital-reserve-state.json"
-            and (.migration_source_state_etag | type == "string" and length > 0)
-            and .migration_minimum_historical_high_water_equity == 75.90162
-            and .migration_verified_equity_ceiling <= .authorized_equity_ceiling
-            and (.migration_verified_settlement_ids | type == "array")
-            and ([.migration_verified_settlement_ids[] as $id
-              | .verified_settlement_ids | index($id) != null] | all)
+            and .historical_high_water_equity >= 102.78112
+            and .high_water_equity >= 102.78112
+            and (.last_reconciled_equity - 31.655501 | fabs) <= 0.01
           ' v5-capital-reserve-state.json
 
       - name: Deploy and verify the retry-capable Dynamic Quote intent producer
@@ -715,6 +660,200 @@ jobs:
             --query properties.template.containers[0].image -o tsv)
           test "$producer_image" = "${{ steps.images.outputs.producer_reference }}"
           printf '%s\n' "$producer_revision" > intent-producer-revision-deployed.txt
+
+      - name: Run the zero-write v8 preflight against a fresh producer intent
+        run: |
+          set -euo pipefail
+          v8_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/"
+          v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
+          readonly v5_state_etag="0x8DEF43F4E1B785A"
+          readonly v5_state_sha256="sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --prefix "$v8_prefix" \
+            --auth-mode login \
+            --only-show-errors -o json > v8-prefix-before-preflight.json
+          test "$(jq 'length' v8-prefix-before-preflight.json)" = "0"
+          v5_etag_before=$(az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$v5_state" \
+            --auth-mode login \
+            --query properties.etag -o tsv)
+          test "$v5_etag_before" = "$v5_state_etag"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$v5_state" \
+            --file v5-state-before-preflight.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          v5_sha_before="sha256:$(sha256sum v5-state-before-preflight.json | cut -d' ' -f1)"
+          test "$v5_sha_before" = "$v5_state_sha256"
+          az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_JOB" \
+            -o json > funded-preflight-job.json
+          intent_container=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_CONTAINER_NAME") | .value' funded-preflight-job.json)
+          intent_prefix=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_PREFIX") | .value' funded-preflight-job.json)
+          test -n "$intent_container"
+          test -n "$intent_prefix"
+          jq '
+            .properties.template
+            | .containers |= map(
+                if .name == "funded-direct" then
+                  .env = (
+                    [.env[] | select(.name != "FUNDED_DIRECT_WORKER_ENABLED"
+                      and .name != "ALLOW_FUNDED_DIRECT"
+                      and .name != "FUNDED_DIRECT_DRY_RUN"
+                      and .name != "FUNDED_DIRECT_PREFLIGHT_ONLY")]
+                    + [
+                      {name:"FUNDED_DIRECT_WORKER_ENABLED",value:"true"},
+                      {name:"ALLOW_FUNDED_DIRECT",value:"true"},
+                      {name:"FUNDED_DIRECT_DRY_RUN",value:"true"},
+                      {name:"FUNDED_DIRECT_PREFLIGHT_ONLY",value:"true"}
+                    ]
+                  )
+                else . end
+              )
+          ' funded-preflight-job.json > funded-preflight-execution.yaml
+          jq -e '
+            .containers | length == 1
+            and ([.[] | select(.name == "funded-direct") | .env[]
+              | select(.name == "FUNDED_DIRECT_WORKER_ENABLED" and .value == "true")] | length) == 1
+            and ([.[] | select(.name == "funded-direct") | .env[]
+              | select(.name == "ALLOW_FUNDED_DIRECT" and .value == "true")] | length) == 1
+            and ([.[] | select(.name == "funded-direct") | .env[]
+              | select(.name == "FUNDED_DIRECT_DRY_RUN" and .value == "true")] | length) == 1
+            and ([.[] | select(.name == "funded-direct") | .env[]
+              | select(.name == "FUNDED_DIRECT_PREFLIGHT_ONLY" and .value == "true")] | length) == 1
+          ' funded-preflight-execution.yaml
+          preflight_execution=$(az containerapp job start \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_JOB" \
+            --yaml funded-preflight-execution.yaml \
+            --query name -o tsv)
+          test -n "$preflight_execution"
+          status=Running
+          for attempt in $(seq 1 36); do
+            status=$(az containerapp job execution show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_JOB" \
+              --job-execution-name "$preflight_execution" \
+              --query properties.status -o tsv)
+            case "$status" in
+              Succeeded) break ;;
+              Failed|Stopped|Degraded) exit 1 ;;
+            esac
+            sleep 10
+          done
+          test "$status" = "Succeeded"
+          environment_id=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.environmentId -o tsv)
+          workspace_customer_id=$(az containerapp env show \
+            --ids "$environment_id" \
+            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+          preflight_ready=false
+          for attempt in $(seq 1 36); do
+            az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerJobName_s == '$FUNDED_JOB'
+                | where ContainerGroupName_s startswith '$preflight_execution'
+                | extend record = parse_json(Log_s)
+                | where tostring(record.schema) == 'polyedge.funded_direct_worker.v1'
+                | where tostring(record.status) == 'preflight_validated'
+                | project TimeGenerated, Log_s
+                | order by TimeGenerated asc" \
+              -o json > funded-preflight-logs.json
+            if jq -e --arg session_blob "$v8_prefix" --arg session_sha "sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf" --arg v5_state "$v5_state" --arg v5_sha "$v5_state_sha256" --arg intent_prefix "$intent_prefix" '
+              length == 1
+              and (.[0].Log_s | fromjson
+                | .session_id == "dynamic-quote-funded-2026-08-11-v8"
+                and .preflight_only == true
+                and .writes_performed == false
+                and .order_submission_attempted == false
+                and .authorization_created == false
+                and .risk_reservation_created == false
+                and .completion_created == false
+                and .session_manifest_blob_name == ($session_blob + "session.json")
+                and .session_manifest_sha256 == $session_sha
+                and .predecessor_state_session_id == "dynamic-quote-funded-2026-07-29-v5"
+                and .predecessor_state_blob_name == $v5_state
+                and .predecessor_state_sha256 == $v5_sha
+                and (.intent_blob_name | startswith($intent_prefix + "/") and test("/[0-9a-f]{64}\\.json$"))
+                and (.intent_sha256 | test("^sha256:[0-9a-f]{64}$")))
+            ' funded-preflight-logs.json >/dev/null; then
+              preflight_ready=true
+              break
+            fi
+            sleep 10
+          done
+          test "$preflight_ready" = true
+          preflight_intent_blob=$(jq -r '.[0].Log_s | fromjson | .intent_blob_name' funded-preflight-logs.json)
+          preflight_intent_sha=$(jq -r '.[0].Log_s | fromjson | .intent_sha256' funded-preflight-logs.json)
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$intent_container" \
+            --name "$preflight_intent_blob" \
+            --file fresh-preflight-intent.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          test "$preflight_intent_sha" = "sha256:$(sha256sum fresh-preflight-intent.json | cut -d' ' -f1)"
+          test "$(date -u -d "$(az storage blob show --account-name "$STORAGE_ACCOUNT" --container-name "$intent_container" --name "$preflight_intent_blob" --auth-mode login --query properties.creationTime -o tsv)" +%s)" -ge "$(date -u -d '2026-08-11T16:00:00Z' +%s)"
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --prefix "$v8_prefix" \
+            --auth-mode login \
+            --only-show-errors -o json > v8-prefix-after-preflight.json
+          test "$(jq 'length' v8-prefix-after-preflight.json)" = "0"
+          test "$(az storage blob show --account-name "$STORAGE_ACCOUNT" --container-name "$FUNDED_CONTAINER" --name "$v5_state" --auth-mode login --query properties.etag -o tsv)" = "$v5_state_etag"
+          az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_JOB" \
+            -o json > funded-preflight-job-after.json
+          job_env() {
+            jq -r --arg name "$1" \
+              '.properties.template.containers[0].env[] | select(.name == $name) | .value' \
+              funded-preflight-job-after.json
+          }
+          test "$(job_env FUNDED_DIRECT_WORKER_ENABLED)" = "false"
+          test "$(job_env ALLOW_FUNDED_DIRECT)" = "false"
+          test "$(job_env FUNDED_DIRECT_DRY_RUN)" = "true"
+          test -z "$(job_env FUNDED_DIRECT_PREFLIGHT_ONLY)"
+
+      - name: Enable v8 only after the zero-write preflight passes
+        run: |
+          set -euo pipefail
+          deployed=false
+          for attempt in 1 2 3; do
+            if az deployment group create \
+              --name "polyedge-funded-direct-cl-enabled-${GITHUB_RUN_ID}" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --template-file infra/funded-direct-chile.bicep \
+              --parameters @infra/funded-direct-chile.parameters.json \
+              --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
+              --parameters fundedDirectEnabled=true \
+              --parameters fundedDirectQueueStatus=SendDisabled \
+              --only-show-errors \
+              -o json > funded-enabled-deployment.json 2> funded-enabled-deployment.stderr; then
+              deployed=true
+              break
+            fi
+            if ! grep -Fq 'unable to pull image using Managed identity' funded-enabled-deployment.stderr || [ "$attempt" -eq 3 ]; then
+              cat funded-enabled-deployment.stderr >&2
+              exit 1
+            fi
+            sleep "$((attempt * 30))"
+          done
+          test "$deployed" = true
+          test "$(jq -r '.properties.provisioningState' funded-enabled-deployment.json)" = "Succeeded"
 
       - name: Verify one active cloud replica and exact live controls
         run: |
@@ -779,30 +918,39 @@ jobs:
           test "$(env_value VENUE_REDEMPTION_MAX_CONDITIONS)" = "1"
           test "$(env_secret_ref POLYMARKET_RELAYER_API_KEY)" = "polymarket-relayer-api-key"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME)" = \
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/session.json"
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/session.json"
           test "$(env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = \
-            "sha256:b8877f266f1e68d846ad2fd3ae8732c2d533cc7ccc14482ac5f76d0d1c1f58f9"
+            "sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
           test "$(env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = \
-            "dynamic-quote-funded-2026-07-29-v5"
-          test "$(env_value FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID)" = \
-            "dynamic-quote-funded-2026-08-03-v7"
-          test "$(env_value FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME)" = \
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-03-v7/session.json"
-          test "$(env_value FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256)" = \
-            "sha256:410abe9fc7f2f81359bbb4ef8304a153326d7be170a76dc64e84dd2bf1a4e709"
-          test "$(env_value FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME)" = \
-            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-03-v7/capital-reserve-state.json"
-          test "$(env_value FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY)" = \
-            "75.90162"
+            "dynamic-quote-funded-2026-08-11-v8"
+          for name in \
+            FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID \
+            FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME \
+            FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256 \
+            FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME \
+            FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY; do
+            test -z "$(env_value "$name")"
+          done
           session_json=$(env_value FUNDED_DIRECT_SESSION_MANIFEST_JSON)
-          test "$(jq -r '.session_id' <<<"$session_json")" = "dynamic-quote-funded-2026-07-29-v5"
+          test "$(jq -r '.session_id' <<<"$session_json")" = "dynamic-quote-funded-2026-08-11-v8"
           test "$(jq -r '.no_deposits' <<<"$session_json")" = "true"
           test "$(jq -r '.allow_automatic_replenishment' <<<"$session_json")" = "false"
           test "$(jq -r '.allow_compounding' <<<"$session_json")" = "true"
-          test "$(jq -r '.capital_policy.reserve_ratio' <<<"$session_json")" = "0.3"
+          test "$(jq -r '.continue_after_loss' <<<"$session_json")" = "true"
+          test "$(jq -r '.capital_policy.reserve_ratio' <<<"$session_json")" = "0.1"
+          test "$(jq -r '.capital_policy.minimum_reserve' <<<"$session_json")" = "2"
+          test "$(jq -r '.capital_policy.target_order_ratio' <<<"$session_json")" = "0.05"
           test "$(jq -r '.capital_policy.operating_buffer_ratio' <<<"$session_json")" = "0.01"
-          test "$(jq -r '.capital_policy.reserve_monotonic' <<<"$session_json")" = "true"
+          test "$(jq -r '.capital_policy.reserve_basis' <<<"$session_json")" = "fully_reconciled_current_equity"
+          test "$(jq -r '.capital_policy.loss_response' <<<"$session_json")" = "resize_from_fully_reconciled_current_equity"
+          test "$(jq -r '.capital_policy.prior_state_session_id' <<<"$session_json")" = "dynamic-quote-funded-2026-07-29-v5"
+          test "$(jq -r '.capital_policy.prior_state_blob_name' <<<"$session_json")" = \
+            "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
+          test "$(jq -r '.capital_policy.prior_state_sha256' <<<"$session_json")" = \
+            "sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+          test "$(jq -r '.capital_policy.reserve_monotonic' <<<"$session_json")" = "false"
           test "$(jq -c '.external_cash_flows' <<<"$session_json")" = "[]"
+          test "$(jq -c '.internal_settlements' <<<"$session_json")" = "[]"
           producer_image=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
@@ -827,6 +975,50 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prove the v8 current-equity reserve state before intake reopens
+        run: |
+          set -euo pipefail
+          v8_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/capital-reserve-state.json"
+          state_ready=false
+          for attempt in $(seq 1 36); do
+            if az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$v8_state" \
+              --file v8-capital-reserve-state.json \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none && jq -e '
+                .schema == "polyedge.protected_compounding_state.v2"
+                and .session_id == "dynamic-quote-funded-2026-08-11-v8"
+                and .reconciliation_complete == true
+                and .reserve_ratio == 0.1
+                and .minimum_reserve == 2
+                and .target_order_ratio == 0.05
+                and .operating_buffer_ratio == 0.01
+                and .minimum_order_notional == 1
+                and .reserve_basis == "fully_reconciled_current_equity"
+                and .loss_response == "resize_from_fully_reconciled_current_equity"
+                and .prior_state_session_id == "dynamic-quote-funded-2026-07-29-v5"
+                and .prior_state_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
+                and .prior_state_sha256 == "sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+                and .reserve_monotonic == false
+                and .continue_after_loss == true
+                and .high_water_equity >= 102.78112
+                and .historical_high_water_equity >= 102.78112
+                and (.last_reconciled_equity - 31.655501 | fabs) <= 0.01
+                and (.protected_reserve - ([2, (.last_reconciled_equity * .reserve_ratio)] | max) | fabs) <= 0.0000011
+                and (.operating_buffer - (.last_reconciled_equity * .operating_buffer_ratio) | fabs) <= 0.0000011
+                and (.operable_capital - ([0, (.last_reconciled_equity - .protected_reserve - .operating_buffer)] | max) | fabs) <= 0.0000011
+                and ([keys[] | startswith("migration_")] | length) == 0
+              ' v8-capital-reserve-state.json >/dev/null; then
+              state_ready=true
+              break
+            fi
+            sleep 10
+          done
+          test "$state_ready" = true
 
       - name: Verify Service Bus security and delivery contract
         run: |
@@ -977,19 +1169,8 @@ jobs:
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query status -o tsv)" = "SendDisabled"
-          az servicebus queue update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --status Active \
-            --only-show-errors -o none
-          test "$(az servicebus queue show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --query status -o tsv)" = "Active"
 
-      - name: Rewarm the producer after funded intake reopens
+      - name: Rewarm the producer and prove one complete v8 lifecycle before cutover
         run: |
           set -euo pipefail
           cutover_complete=false
@@ -1004,6 +1185,21 @@ jobs:
             fi
           }
           trap refence_incomplete_cutover EXIT
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-before-activation.json
+          test "$(jq -r '.status' funded-queue-before-activation.json)" = "SendDisabled"
+          dlq_before=$(jq -r '.countDetails.deadLetterMessageCount' funded-queue-before-activation.json)
+          [[ "$dlq_before" =~ ^[0-9]+$ ]]
+          activation_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          az servicebus queue update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --status Active \
+            --only-show-errors -o none
           test "$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
@@ -1127,7 +1323,7 @@ jobs:
             ([.[] | select(.properties.active == true)] | length) == 1
             and ([.[] | select(.properties.active == true)][0].name == $revision)
           ' producer-revisions-after-reopen.json
-          test "$(az containerapp show \
+          az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
             -o json | jq -e --arg revision "$producer_revision" \
@@ -1144,12 +1340,226 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
+          lifecycle_ready=false
+          for attempt in $(seq 1 72); do
+            az monitor log-analytics query \
+              --workspace "$workspace_customer_id" \
+              --analytics-query "ContainerAppConsoleLogs_CL
+                | where ContainerAppName_s == '$FUNDED_APP'
+                | where RevisionName_s == '$funded_revision'
+                | where TimeGenerated >= datetime($activation_started_at)
+                | extend record = parse_json(Log_s)
+                | where tostring(record.schema) == 'polyedge.funded_direct_latency.v1'
+                | where tostring(record.status) == 'intent_completed'
+                | where tostring(record.worker_status) == 'persistent_intent_completed'
+                | where tobool(record.order_submission_attempted) == true
+                | top 1 by TimeGenerated asc
+                | project TimeGenerated, Log_s" \
+              -o json > funded-v8-lifecycle-latency.json
+            if jq -e '
+              length == 1
+              and (.[0].Log_s | fromjson
+                | (.decision_id | test("^[0-9a-f]{64}$"))
+                and .order_submission_attempted == true
+                and .worker_status == "persistent_intent_completed")
+            ' funded-v8-lifecycle-latency.json >/dev/null; then
+              lifecycle_ready=true
+              break
+            fi
+            sleep 10
+          done
+          test "$lifecycle_ready" = true
+          decision_id=$(jq -r '.[0].Log_s | fromjson | .decision_id' funded-v8-lifecycle-latency.json)
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            -o json > funded-v8-live-app.json
+          funded_env() {
+            jq -r --arg name "$1" \
+              '.properties.template.containers[0].env[] | select(.name == $name) | .value' \
+              funded-v8-live-app.json
+          }
+          control_prefix=$(funded_env FUNDED_DIRECT_CONTROL_PREFIX)
+          intent_container=$(funded_env STRATEGY_CANARY_INTENT_CONTAINER_NAME)
+          intent_prefix=$(funded_env STRATEGY_CANARY_INTENT_PREFIX)
+          test "$control_prefix" = "reports/funded/dynamic-quote"
+          test -n "$intent_container"
+          test "$intent_prefix" = "reports/research/venue-probe/control/strategy-canary/intents"
+          authorization_blob="$control_prefix/sessions/dynamic-quote-funded-2026-08-11-v8/authorizations/$decision_id.json"
+          completion_blob="$control_prefix/sessions/dynamic-quote-funded-2026-08-11-v8/completed/$decision_id.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$authorization_blob" \
+            --file funded-v8-authorization.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          authorization_sha256="sha256:$(sha256sum funded-v8-authorization.json | cut -d' ' -f1)"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$completion_blob" \
+            --file funded-v8-completion.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          jq -e --arg decision "$decision_id" --arg authorization_blob "$authorization_blob" --arg authorization_sha "$authorization_sha256" '
+            .schema == "polyedge.operator_funded_intent_completion.v1"
+            and .session_id == "dynamic-quote-funded-2026-08-11-v8"
+            and .decision_id == $decision
+            and .authorization_blob_name == $authorization_blob
+            and .authorization_sha256 == $authorization_sha
+            and .status == "child_completed"
+            and .order_submission_attempted == true
+            and .authorization_consumed == true
+            and .risk_reservation_created == true
+            and (.child_run_id | type == "string" and length > 0)
+          ' funded-v8-completion.json
+          child_run_id=$(jq -r '.child_run_id' funded-v8-completion.json)
+          jq -e --arg decision "$decision_id" --arg run "$child_run_id" --arg authorization_blob "$authorization_blob" --arg authorization_sha "$authorization_sha256" '
+            .schema == "polyedge.operator_funded_intent_authorization.v1"
+            and .authorization_mode == "operator_direct"
+            and .session_id == "dynamic-quote-funded-2026-08-11-v8"
+            and .decision_id == $decision
+            and .child_run_id == $run
+            and .promotion_manifest_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/session.json"
+            and .promotion_manifest_sha256 == "sha256:04c4b7e9816b71b12e1f7ecd14c34be6bc368ab4db581ee34c62fb1c69e5d4bf"
+            and .operator_session_manifest_blob_name == .promotion_manifest_blob_name
+            and .operator_session_manifest_sha256 == .promotion_manifest_sha256
+            and .research_promotion_bypassed == true
+            and .max_order_notional == 10.5
+            and (.authorization_id | type == "string" and length > 0)
+            and (.intent_blob_name | type == "string")
+            and (.intent_sha256 | test("^sha256:[0-9a-f]{64}$"))
+          ' funded-v8-authorization.json
+          intent_blob=$(jq -r '.intent_blob_name' funded-v8-authorization.json)
+          intent_sha256=$(jq -r '.intent_sha256' funded-v8-authorization.json)
+          authorization_id=$(jq -r '.authorization_id' funded-v8-authorization.json)
+          test "$intent_blob" = "$intent_prefix/$decision_id.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$intent_container" \
+            --name "$intent_blob" \
+            --file funded-v8-intent.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          test "$intent_sha256" = "sha256:$(sha256sum funded-v8-intent.json | cut -d' ' -f1)"
+          jq -e --arg decision "$decision_id" '
+            .decision_id == $decision
+            and .notional == "10.5"
+          ' funded-v8-intent.json
+          consumption_blob="reports/research/venue-probe/control/strategy-canary/consumed/$authorization_id.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$consumption_blob" \
+            --file funded-v8-authorization-consumption.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          jq -e --arg authorization_id "$authorization_id" --arg authorization_sha "$authorization_sha256" --arg decision "$decision_id" --arg run "$child_run_id" '
+            .schema == "polyedge.strategy_canary_authorization_consumption.v1"
+            and .authorization_id == $authorization_id
+            and .authorization_sha256 == $authorization_sha
+            and .decision_id == $decision
+            and .run_id == $run
+          ' funded-v8-authorization-consumption.json
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --prefix "reports/research/venue-probe/risk-reservations/" \
+            --auth-mode login \
+            --only-show-errors -o json > funded-v8-risk-reservations.json
+          reservation_blob=$(jq -r --arg decision "$decision_id" '
+            [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))]
+            | if length == 1 then .[0].name else empty end
+          ' funded-v8-risk-reservations.json)
+          test -n "$reservation_blob"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$reservation_blob" \
+            --file funded-v8-risk-reservation.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --prefix "reports/research/venue-probe/runs/" \
+            --auth-mode login \
+            --only-show-errors -o json > funded-v8-run-summaries.json
+          summary_blob=$(jq -r --arg run "$child_run_id" '
+            [.[] | select(.name | endswith("/" + $run + "/summary.json"))]
+            | if length == 1 then .[0].name else empty end
+          ' funded-v8-run-summaries.json)
+          test -n "$summary_blob"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$summary_blob" \
+            --file funded-v8-run-summary.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          order_id=$(jq -r '.lifecycle.order_id // ""' funded-v8-run-summary.json)
+          [[ "$order_id" =~ ^0x[0-9a-fA-F]{64}$ ]]
+          jq -e --arg decision "$decision_id" --arg run "$child_run_id" --arg authorization_blob "$authorization_blob" --arg authorization_sha "$authorization_sha256" --arg intent_blob "$intent_blob" --arg intent_sha "$intent_sha256" --arg order_id "$order_id" '
+            .schema_version == 3
+            and .status == "completed"
+            and .run_id == $run
+            and .order_submission_attempted == true
+            and .order_submitted == true
+            and .provenance.decision_id == $decision
+            and .provenance.authorization_kind == "operator_direct"
+            and .provenance.operator_session_id == "dynamic-quote-funded-2026-08-11-v8"
+            and .provenance.research_promotion_bypassed == true
+            and .provenance.authorization_blob_name == $authorization_blob
+            and .provenance.authorization_sha256 == $authorization_sha
+            and .provenance.intent_blob_name == $intent_blob
+            and .provenance.intent_sha256 == $intent_sha
+            and .order.current_funds_scaled == true
+            and .order.source_requested_notional == 10.5
+            and .order.notional < 10.5
+            and .lifecycle.order_id == $order_id
+          ' funded-v8-run-summary.json
+          jq -e --arg decision "$decision_id" --arg run "$child_run_id" --arg order_id "$order_id" '
+            .schema_version == 1
+            and .campaign_id == "dynamic-quote-funded-2026-08-11-v8"
+            and .run_id == $run
+            and .probe_id == ("funded-direct-" + $decision)
+            and .order_submitted == true
+            and .order_id == $order_id
+            and (
+              (.state == "finalized_no_fill"
+                and .matched_notional == 0
+                and .reconciliation_complete == true
+                and .zero_open_orders_confirmed == true)
+              or
+              (.state == "position_settled"
+                and .matched_notional > 0
+                and .settlement_verified == true
+                and (.settlement_evidence_source == "verified_onchain_redemption"
+                  or .settlement_evidence_source == "polymarket_data_api_redeemable"))
+            )
+          ' funded-v8-risk-reservation.json
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-after-lifecycle.json
+          test "$(jq -r '.status' funded-queue-after-lifecycle.json)" = "Active"
+          test "$(jq -r '.countDetails.activeMessageCount' funded-queue-after-lifecycle.json)" = "0"
+          test "$(jq -r '.countDetails.scheduledMessageCount' funded-queue-after-lifecycle.json)" = "0"
+          test "$(jq -r '.countDetails.deadLetterMessageCount' funded-queue-after-lifecycle.json)" = "$dlq_before"
           echo "FUNDED_CUTOVER_COMPLETE=true" >> "$GITHUB_ENV"
           cutover_complete=true
           trap - EXIT
 
       - name: Keep funded intake fenced after an incomplete cutover
-        if: ${{ failure() && env.FUNDED_QUEUE_FENCED == 'true' && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
+        if: ${{ always() && env.FUNDED_QUEUE_FENCED == 'true' && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
         run: |
           set -euo pipefail
           az servicebus queue update \
