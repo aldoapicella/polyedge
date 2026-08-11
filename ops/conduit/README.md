@@ -88,12 +88,13 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260811T150000Z.json` is the current formal
-window. It supersedes the `13:00` and `06:00` ledgers with zero inherited credit,
-keeps Azure authoritative and `azureDeletionAllowed:false`, and cannot finish
-before `2026-08-14T15:00:00Z`. Completion still requires 72 consecutive accepted
-hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
-qset, funded, and deletion gates.
+Ledger `/srv/polyedge-ring/parity/20260811T160000Z.json` is the current formal
+window. It supersedes the zero-credit `15:00` ledger, which already superseded
+the `13:00` and `06:00` ledgers, keeps Azure authoritative and
+`azureDeletionAllowed:false`, and cannot finish before
+`2026-08-14T16:00:00Z`. Completion still requires 72 consecutive accepted hours,
+two successful OCI daily cycles, reboot and rollback proof, and explicit qset,
+funded, and deletion gates.
 
 The OCI API, ring uploader, and all seven primary research jobs are pinned to
 multi-architecture digest
@@ -115,7 +116,10 @@ minute-level provenance observations from `15:00:20Z` through `15:04:20Z` had
 all four essential feeds healthy and zero essential-feed errors. The first
 new-digest freshness cycle also completed successfully. Qset remains disabled,
 the local funded signer remains masked, and no Azure compute or network resource
-is deletion-eligible yet.
+is deletion-eligible yet. The `15:00` hour receives zero credit because an exact
+`PolymarketClobMarket` WebSocket reset produced an essential-feed error at
+`2026-08-11T15:15:59.981557808Z`; recorder sequence durability and both strict
+schema-3 segment uploads remained intact.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
