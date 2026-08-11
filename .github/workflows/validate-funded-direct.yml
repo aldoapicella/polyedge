@@ -393,7 +393,8 @@ jobs:
           done
           test "${active_messages:-0}" = "0"
           heartbeat_ok=false
-          for attempt in $(seq 1 24); do
+          # Allow the fenced receiver to recycle and its healthy heartbeat to reach Log Analytics.
+          for attempt in $(seq 1 36); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
