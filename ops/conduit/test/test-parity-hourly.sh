@@ -161,6 +161,7 @@ POLYEDGE_PARITY_RUNTIME_DIR=$case_root/run
 POLYEDGE_PARITY_LOCK_FILE=$case_root/run/ledger.lock
 POLYEDGE_PARITY_TARGET_HOUR_UTC=$target
 POLYEDGE_PARITY_NOW_EPOCH=$fixture_now
+POLYEDGE_PARITY_STATUS_NOW_EPOCH=$fixture_now
 POLYEDGE_PARITY_TOKEN_UID=$uid
 POLYEDGE_PARITY_TOKEN_GID=$gid
 EOF
@@ -170,30 +171,77 @@ EOF
   jq '.input_path="/input/events/2026/08/09/15/"' "$case_root/reports/2026/08/09/15/audit.json" >"$case_root/oci.tmp"
   mv "$case_root/oci.tmp" "$case_root/reports/2026/08/09/15/audit.json"
   report azure "$case_root/same.json"
-  jq -n '{task_health:{api:"ok",runtime_loop:"running",feeds:"running"},drop_counts:{},recorder_status:{error_count:0,dropped_count:0},recorder_metrics:{recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",last_assigned_sequence:6,queued:0,enqueued_total:6,persisted_total:6,failed_total:0,unrecovered_durable_events:0,flush_unrecovered:false}}' >"$case_root/api-status.json"
+  jq -n '{
+    task_health:{api:"ok",runtime_loop:"running",feeds:"running"},
+    feed_status:{
+      Discovery:{status:"ok",updated_at:"2026-08-09T16:19:59Z"},
+      PolymarketClobMarket:{status:"ok",updated_at:"2026-08-09T16:19:59.123456789Z"},
+      PolymarketRtdsChainlink:{status:"ok",updated_at:"2026-08-09T16:19:59Z"},
+      PolymarketRtdsBinance:{status:"ok",updated_at:"2026-08-09T16:19:59Z"}
+    },
+    drop_counts:{},recorder_status:{error_count:0,dropped_count:0},
+    recorder_metrics:{recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",last_assigned_sequence:60,queued:0,enqueued_total:60,persisted_total:60,failed_total:0,unrecovered_durable_events:0,flush_unrecovered:false}
+  }' >"$case_root/api-status.json"
 
   i=0
   start=$(date -u -d '2026-08-09T15:00:00Z' +%s)
   while [ "$i" -lt 6 ]; do
     epoch=$((start + i * 600))
-    seq=$((i + 1))
+    first=$((i * 10 + 1))
+    last=$((first + 9))
     source=$case_root/ring/segments/2026/08/09/15/$epoch.jsonl
     gzip_file=$case_root/ring/archive/2026/08/09/15/$epoch.jsonl.gz
     manifest=$gzip_file.manifest.json
     receipt=$manifest.uploaded.json
-    printf '{"fixture":%s,"recorder_instance_id":"123e4567-e89b-42d3-a456-426614174000","recorder_sequence":%s}\n' "$i" "$seq" >"$source"
+    minute=0
+    while [ "$minute" -lt 10 ]; do
+      seq=$((first + minute))
+      observed=$(date -u -d "@$((epoch + minute * 60 + 1))" +%Y-%m-%dT%H:%M:%SZ)
+      jq -nc --arg observed "$observed" --argjson seq "$seq" '{
+        event_type:"runtime_provenance",recorded_ts:$observed,
+        payload:{essential_feed_health:{summary:"running",feed_status:{
+          Discovery:{status:"ok",updated_at:$observed},
+          PolymarketClobMarket:{status:"ok",updated_at:$observed},
+          PolymarketRtdsChainlink:{status:"ok",updated_at:$observed},
+          PolymarketRtdsBinance:{status:"ok",updated_at:$observed}
+        }}},recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_sequence:$seq
+      }' >>"$source"
+      minute=$((minute + 1))
+    done
     gzip -1 -n -c "$source" >"$gzip_file"
     source_sha=sha256:$(sha256sum "$source" | awk '{print $1}')
     gzip_sha=sha256:$(sha256sum "$gzip_file" | awk '{print $1}')
     jq -n --arg segment "segments/2026/08/09/15/$epoch.jsonl" \
       --arg archive "archive/2026/08/09/15/$epoch.jsonl.gz" --arg blob "events-oci-hot7-v1/2026/08/09/15/$epoch.jsonl.gz" \
-      --arg source_sha "$source_sha" --arg gzip_sha "$gzip_sha" --argjson start "$epoch" --argjson seq "$seq" \
-      '{schema_version:3,lines:1,recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:$seq,recorder_last_sequence:$seq,recorder_event_count:1,segment_path:$segment,archive_path:$archive,blob_name:$blob,compression:"gzip",sha256:$gzip_sha,source_sha256:$source_sha,segment_start_epoch:$start,segment_end_epoch:($start+600)}' >"$manifest"
+      --arg source_sha "$source_sha" --arg gzip_sha "$gzip_sha" --argjson start "$epoch" --argjson first "$first" --argjson last "$last" \
+      '{schema_version:3,lines:10,recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:$first,recorder_last_sequence:$last,recorder_event_count:10,segment_path:$segment,archive_path:$archive,blob_name:$blob,compression:"gzip",sha256:$gzip_sha,source_sha256:$source_sha,segment_start_epoch:$start,segment_end_epoch:($start+600)}' >"$manifest"
     manifest_sha=sha256:$(sha256sum "$manifest" | awk '{print $1}')
     jq -n --arg blob "events-oci-hot7-v1/2026/08/09/15/$epoch.jsonl.gz" --arg sha "$manifest_sha" \
       '{schema_version:1,blob_name:$blob,manifest_blob_name:($blob+".manifest.json"),manifest_sha256:$sha,verified_ts:"2026-08-09T16:12:00Z"}' >"$receipt"
     i=$((i + 1))
   done
+}
+
+refresh_segment() {
+  source=$1
+  gzip_file=$(printf '%s\n' "$source" | sed 's#/segments/#/archive/#').gz
+  manifest=$gzip_file.manifest.json
+  receipt=$manifest.uploaded.json
+  gzip -1 -n -c "$source" >"$gzip_file"
+  source_sha=sha256:$(sha256sum "$source" | awk '{print $1}')
+  gzip_sha=sha256:$(sha256sum "$gzip_file" | awk '{print $1}')
+  lines=$(wc -l <"$source")
+  first=$(jq -r -s '.[0].recorder_sequence' "$source")
+  last=$(jq -r -s '.[-1].recorder_sequence' "$source")
+  jq --arg source_sha "$source_sha" --arg gzip_sha "$gzip_sha" --argjson lines "$lines" \
+    --argjson first "$first" --argjson last "$last" \
+    '.source_sha256=$source_sha | .sha256=$gzip_sha | .lines=$lines |
+     .recorder_first_sequence=$first | .recorder_last_sequence=$last | .recorder_event_count=$lines' \
+    "$manifest" >"$manifest.tmp"
+  mv "$manifest.tmp" "$manifest"
+  manifest_sha=sha256:$(sha256sum "$manifest" | awk '{print $1}')
+  jq --arg sha "$manifest_sha" '.manifest_sha256=$sha' "$receipt" >"$receipt.tmp"
+  mv "$receipt.tmp" "$receipt"
 }
 
 run_collector() {
@@ -252,6 +300,43 @@ fixture "$metric_failure"
 jq '.recorder_metrics.queued=1' "$metric_failure/api-status.json" >"$metric_failure/status.tmp" && mv "$metric_failure/status.tmp" "$metric_failure/api-status.json"
 if run_collector "$metric_failure" >/dev/null 2>&1; then echo 'recorder metric failure unexpectedly passed' >&2; exit 1; fi
 
+feed_failure=$root/feed-failure
+fixture "$feed_failure"
+jq '.feed_status.PolymarketClobMarket.status="error"' "$feed_failure/api-status.json" >"$feed_failure/status.tmp" && mv "$feed_failure/status.tmp" "$feed_failure/api-status.json"
+if run_collector "$feed_failure" >/dev/null 2>&1; then echo 'essential feed failure unexpectedly passed' >&2; exit 1; fi
+
+stale_feed=$root/stale-feed
+fixture "$stale_feed"
+jq '.feed_status.PolymarketRtdsChainlink.updated_at="2026-08-09T16:14:59Z"' "$stale_feed/api-status.json" >"$stale_feed/status.tmp" && mv "$stale_feed/status.tmp" "$stale_feed/api-status.json"
+if run_collector "$stale_feed" >/dev/null 2>&1; then echo 'stale essential feed unexpectedly passed' >&2; exit 1; fi
+
+hour_feed_failure=$root/hour-feed-failure
+fixture "$hour_feed_failure"
+source=$(find "$hour_feed_failure/ring/segments" -name '*.jsonl' | sort | tail -n 1)
+jq -nc '{event_type:"feed_error",recorded_ts:"2026-08-09T15:59:30Z",
+  payload:{feed:"PolymarketClobMarket",error:"fixture disconnect"},
+  recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_sequence:61}' >>"$source"
+refresh_segment "$source"
+jq '.recorder_metrics.last_assigned_sequence=61 | .recorder_metrics.enqueued_total=61 | .recorder_metrics.persisted_total=61' \
+  "$hour_feed_failure/api-status.json" >"$hour_feed_failure/status.tmp" && mv "$hour_feed_failure/status.tmp" "$hour_feed_failure/api-status.json"
+if run_collector "$hour_feed_failure" >/dev/null 2>&1; then echo 'target-hour feed error unexpectedly passed' >&2; exit 1; fi
+
+hour_health_gap=$root/hour-health-gap
+fixture "$hour_health_gap"
+source=$(find "$hour_health_gap/ring/segments" -name '*.jsonl' | sort | sed -n '3p')
+jq -c 'if .recorder_sequence == 21 then .payload.essential_feed_health.summary="degraded" else . end' \
+  "$source" >"$source.tmp" && mv "$source.tmp" "$source"
+refresh_segment "$source"
+if run_collector "$hour_health_gap" >/dev/null 2>&1; then echo 'unhealthy feed observation unexpectedly passed' >&2; exit 1; fi
+
+late_status_sample=$root/late-status-sample
+fixture "$late_status_sample"
+early=$(date -u -d '2026-08-09T16:15:00Z' +%s)
+sed -i "s/POLYEDGE_PARITY_NOW_EPOCH=.*/POLYEDGE_PARITY_NOW_EPOCH=$early/" "$late_status_sample/parity.env"
+touch -d "@$early" "$late_status_sample/ring/status.json"
+run_collector "$late_status_sample" >/dev/null
+[ "$(jq -r '.acceptedCleanLiveHours' "$late_status_sample/ring/parity/ledger.json")" = 1 ]
+
 success=$root/success
 fixture "$success"
 jq '.rebootRecoveryPassed = true' "$success/ring/parity/ledger.json" >"$success/reboot.tmp"
@@ -272,6 +357,17 @@ run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(find "$success/ring/segments" -name '*.sequence.*' | wc -l)" -eq 0 ]
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+
+legacy_feed_evidence=$root/legacy-feed-evidence
+fixture "$legacy_feed_evidence"
+run_collector "$legacy_feed_evidence" >/dev/null
+evidence=$legacy_feed_evidence/ring/parity/hourly/20260809T15/evidence.json
+jq 'del(.continuousFeedHealth)' "$evidence" >"$evidence.tmp" && mv "$evidence.tmp" "$evidence"
+chmod 0640 "$evidence"
+jq '.acceptedCleanLiveHours=0 | .acceptedHourlyEvidence=[]' "$legacy_feed_evidence/ring/parity/ledger.json" >"$legacy_feed_evidence/ledger.tmp"
+chmod 0640 "$legacy_feed_evidence/ledger.tmp"
+mv "$legacy_feed_evidence/ledger.tmp" "$legacy_feed_evidence/ring/parity/ledger.json"
+if run_collector "$legacy_feed_evidence" >/dev/null 2>&1; then echo 'legacy feed evidence unexpectedly passed' >&2; exit 1; fi
 
 legacy=$root/legacy
 fixture "$legacy"
@@ -321,7 +417,12 @@ fi
 
 second=$success/ring/parity/hourly/20260809T16
 mkdir -m 0750 "$second"
-jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" | .recorderSequence.recorder_first_sequence=7 | .recorderSequence.recorder_last_sequence=12' \
+jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" |
+  .recorderSequence.recorder_first_sequence=61 | .recorderSequence.recorder_last_sequence=120 |
+  .recorderStatus.sampledAtUtc="2026-08-09T17:20:00Z" |
+  (.recorderStatus.feedStatus[]).updated_at="2026-08-09T17:19:59Z" |
+  .continuousFeedHealth.firstObservationUtc="2026-08-09T16:00:01Z" |
+  .continuousFeedHealth.lastObservationUtc="2026-08-09T16:59:01Z"' \
   "$success/ring/parity/hourly/20260809T15/evidence.json" >"$second/evidence.json"
 chmod 0640 "$second/evidence.json"
 sed -i 's/POLYEDGE_PARITY_TARGET_HOUR_UTC=.*/POLYEDGE_PARITY_TARGET_HOUR_UTC=2026-08-09T16:00:00Z/' "$success/parity.env"
@@ -336,7 +437,12 @@ cross_hour_gap=$root/cross-hour-gap
 fixture "$cross_hour_gap"
 run_collector "$cross_hour_gap" >/dev/null
 mkdir -m 0750 "$cross_hour_gap/ring/parity/hourly/20260809T16"
-jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" | .recorderSequence.recorder_first_sequence=8 | .recorderSequence.recorder_last_sequence=13' \
+jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" |
+  .recorderSequence.recorder_first_sequence=62 | .recorderSequence.recorder_last_sequence=121 |
+  .recorderStatus.sampledAtUtc="2026-08-09T17:20:00Z" |
+  (.recorderStatus.feedStatus[]).updated_at="2026-08-09T17:19:59Z" |
+  .continuousFeedHealth.firstObservationUtc="2026-08-09T16:00:01Z" |
+  .continuousFeedHealth.lastObservationUtc="2026-08-09T16:59:01Z"' \
   "$cross_hour_gap/ring/parity/hourly/20260809T15/evidence.json" >"$cross_hour_gap/ring/parity/hourly/20260809T16/evidence.json"
 chmod 0640 "$cross_hour_gap/ring/parity/hourly/20260809T16/evidence.json"
 sed -i 's/POLYEDGE_PARITY_TARGET_HOUR_UTC=.*/POLYEDGE_PARITY_TARGET_HOUR_UTC=2026-08-09T16:00:00Z/' "$cross_hour_gap/parity.env"

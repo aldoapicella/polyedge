@@ -35,6 +35,35 @@ sequence_evidence() {
   ' "$1"
 }
 
+feed_evidence() {
+  jq -e '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def current_feed_ok($name; $sampled):
+      .recorderStatus.feedStatus[$name] as $feed |
+      (($feed | type) == "object") and $feed.status == "ok" and
+      (($feed.updated_at | type) == "string") and
+      (($feed.updated_at | epoch) as $updated |
+        $updated <= $sampled and $updated >= ($sampled - 300));
+    (.recorderStatus.sampledAtUtc | epoch) as $sampled |
+    (.hourStartUtc | epoch) as $start |
+    (.hourEndUtc | epoch) as $end |
+    current_feed_ok("Discovery"; $sampled) and
+    current_feed_ok("PolymarketClobMarket"; $sampled) and
+    current_feed_ok("PolymarketRtdsChainlink"; $sampled) and
+    current_feed_ok("PolymarketRtdsBinance"; $sampled) and
+    ((.continuousFeedHealth.observations | type) == "number") and
+    (.continuousFeedHealth.observations | floor == . and . >= 60) and
+    .continuousFeedHealth.unhealthyObservations == 0 and
+    .continuousFeedHealth.essentialFeedErrors == 0 and
+    ((.continuousFeedHealth.maxGapSeconds | type) == "number") and
+    (.continuousFeedHealth.maxGapSeconds >= 0 and .continuousFeedHealth.maxGapSeconds <= 75) and
+    ((.continuousFeedHealth.firstObservationUtc | epoch) as $first |
+      $first >= $start and $first <= ($start + 60)) and
+    ((.continuousFeedHealth.lastObservationUtc | epoch) as $last |
+      $last >= ($end - 60) and $last < $end)
+  ' "$1" >/dev/null
+}
+
 
 env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
 secure_file "$env_file" 640
@@ -166,12 +195,13 @@ set -- $(stat -c '%u %g %a' "$runtime_dir")
 [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || die 'unsafe runtime directory ownership or mode'
 refs_tmp=$(mktemp "$runtime_dir/refs.XXXXXX")
 segments_tmp=$(mktemp "$runtime_dir/segments.XXXXXX")
+feed_tmp=$(mktemp "$runtime_dir/feeds.XXXXXX")
 oauth_response=$(mktemp "$runtime_dir/oauth.XXXXXX")
 auth_header=$(mktemp "$runtime_dir/header.XXXXXX")
 sequence_tmp=
 api_status=
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$sequence_tmp" "$api_status"' EXIT HUP INT TERM
-chmod 0600 "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$sequence_tmp" "$api_status"' EXIT HUP INT TERM
+chmod 0600 "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"
 
 collect_refs() {
   : >"$refs_tmp"
@@ -193,6 +223,7 @@ collect_refs() {
       [ "$file" = "$expected_file" ] || die "accepted evidence is stored under the wrong hour: $file"
       jq -e '.status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true' "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
       sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
+      feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
       file_sha=$(sha "$file")
       jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" --argjson sequence "$sequence" \
         '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha,recorderSequence:$sequence}' >>"$refs_tmp"
@@ -220,7 +251,7 @@ update_ledger() {
 
   protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
   ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
-  trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
   jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
     "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
   chmod 0640 "$ledger_tmp"
@@ -228,7 +259,7 @@ update_ledger() {
     || die 'protected ledger fields changed'
   sync -f "$ledger_tmp"
   mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
-  trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 }
 
 if [ -e "$evidence" ]; then
@@ -240,6 +271,7 @@ if [ -e "$evidence" ]; then
     .sameInput.deterministicResultExactMatch == true
   ' "$evidence" >/dev/null || die 'existing accepted evidence is invalid'
   sequence_evidence "$evidence" >/dev/null || die 'existing accepted evidence lacks recorder sequence proof'
+  feed_evidence "$evidence" || die 'existing accepted evidence lacks continuous essential feed proof'
   lock_ledger
   validate_ledger
   collect_refs
@@ -279,6 +311,7 @@ if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset 
 if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
 
 source_dir=$segments_root/$day/$hour
+: >"$feed_tmp"
 sequence_summary() {
   segment=$1
   sequence_tmp=$(mktemp "$segment.sequence.XXXXXX") || return 1
@@ -351,9 +384,47 @@ while [ "$i" -lt 6 ]; do
     --arg gzip "$gzip_file" --arg gzip_sha "$gzip_sha" --arg manifest "$manifest" --arg manifest_sha "$manifest_sha" \
     --arg receipt "$receipt" --arg receipt_sha "$(sha "$receipt")" --argjson recorder "$recorder" \
     '{segmentStartEpoch:$start,source:{path:$source,sha256:$source_sha},gzip:{path:$gzip,sha256:$gzip_sha},manifest:{path:$manifest,sha256:$manifest_sha},receipt:{path:$receipt,sha256:$receipt_sha},recorderSequence:$recorder}' >>"$segments_tmp"
+  jq -cr --argjson hour_start "$target_epoch" --argjson hour_end "$end_epoch" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def essential($name):
+      $name == "Discovery" or $name == "PolymarketClobMarket" or
+      $name == "PolymarketRtdsChainlink" or $name == "PolymarketRtdsBinance";
+    def feed_ok($name; $recorded):
+      .payload.essential_feed_health.feed_status[$name] as $feed |
+      (($feed | type) == "object") and $feed.status == "ok" and
+      (($feed.updated_at | type) == "string") and
+      (($feed.updated_at | epoch) as $updated |
+        $updated <= $recorded and $updated >= ($recorded - 300));
+    if .event_type == "feed_error" and essential(.payload.feed) then
+      {kind:"error"}
+    elif .event_type == "runtime_provenance" and (.recorded_ts | type) == "string" then
+      . as $event | ($event.recorded_ts | epoch) as $recorded |
+      if $recorded >= $hour_start and $recorded < $hour_end then
+        {kind:"health",epoch:$recorded,recordedAt:$event.recorded_ts,
+         healthy:(.payload.essential_feed_health.summary == "running" and
+           feed_ok("Discovery"; $recorded) and feed_ok("PolymarketClobMarket"; $recorded) and
+           feed_ok("PolymarketRtdsChainlink"; $recorded) and feed_ok("PolymarketRtdsBinance"; $recorded))}
+      else empty end
+    else empty end
+  ' "$source" >>"$feed_tmp" || die "invalid continuous feed proof: $source"
   i=$((i + 1))
 done
 segments=$(jq -sc '.' "$segments_tmp")
+continuous_feed=$(jq -sce --argjson start "$target_epoch" --argjson end "$end_epoch" '
+  . as $events |
+  ([$events[] | select(.kind == "health")] | sort_by(.epoch)) as $health |
+  ([$events[] | select(.kind == "error")] | length) as $errors |
+  if ($health | length) >= 60 then
+    ([$health[].epoch]) as $epochs |
+    ([range(1; $epochs | length) as $index | $epochs[$index] - $epochs[$index - 1]] | max // 0) as $gap |
+    ([$health[] | select(.healthy != true)] | length) as $unhealthy |
+    if $errors == 0 and $unhealthy == 0 and $epochs[0] >= $start and $epochs[0] <= ($start + 60) and
+      $epochs[-1] >= ($end - 60) and $epochs[-1] < $end and $gap <= 75
+    then {observations:($health | length),unhealthyObservations:$unhealthy,essentialFeedErrors:$errors,
+      firstObservationUtc:$health[0].recordedAt,lastObservationUtc:$health[-1].recordedAt,maxGapSeconds:$gap}
+    else error("essential feed health was not continuous") end
+  else error("essential feed health observations are incomplete") end
+' "$feed_tmp") || die 'target hour lacks continuous essential feed health proof'
 hour_sequence=$(printf '%s' "$segments" | jq -ce '
   . as $segments |
   if length == 6 and
@@ -383,6 +454,7 @@ if [ "$target_epoch" -gt "$first_epoch" ]; then
     .sameInput.deterministicResultExactMatch == true
   ' "$prior" >/dev/null || die 'prior accepted evidence is invalid'
   prior_sequence=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
+  feed_evidence "$prior" || die 'prior accepted evidence lacks continuous essential feed proof'
   [ "$(printf '%s' "$prior_sequence" | jq -r '.recorder_instance_id')" = "$(printf '%s' "$hour_sequence" | jq -r '.recorder_instance_id')" ] || die 'prior recorder instance changed'
   [ "$(printf '%s' "$hour_sequence" | jq -r '.recorder_first_sequence')" -eq "$(( $(printf '%s' "$prior_sequence" | jq -r '.recorder_last_sequence') + 1 ))" ] || die 'prior recorder sequence is not adjacent'
 fi
@@ -391,12 +463,23 @@ api_status=$(mktemp "$runtime_dir/api-status.XXXXXX")
 chmod 0600 "$api_status"
 attempt=0
 while :; do
+  status_now_epoch=${POLYEDGE_PARITY_STATUS_NOW_EPOCH:-$(date -u +%s)}
+  printf '%s' "$status_now_epoch" | grep -Eq '^[0-9]+$' || die 'API status sample time is invalid'
   if podman exec polyedge-api /usr/bin/bash -ec '
     exec 3<>/dev/tcp/127.0.0.1/8081
     printf "GET /api/v1/status HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer %s\r\n\r\n" "$API_BEARER_TOKEN" >&3
     cat <&3
-  ' >"$api_status" && api_summary=$(tr -d '\r' <"$api_status" | sed '1,/^$/d' | jq -ce '
+  ' >"$api_status" && api_summary=$(tr -d '\r' <"$api_status" | sed '1,/^$/d' | jq -ce --argjson now "$status_now_epoch" '
+    def canonical_epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def essential_feed_ok($name):
+      .feed_status[$name] as $feed |
+      (($feed | type) == "object") and $feed.status == "ok" and
+      (($feed.updated_at | type) == "string") and
+      (($feed.updated_at | canonical_epoch) as $updated |
+        $updated <= $now and $updated >= ($now - 300));
     if .task_health.api == "ok" and .task_health.runtime_loop == "running" and .task_health.feeds == "running" and
+      essential_feed_ok("Discovery") and essential_feed_ok("PolymarketClobMarket") and
+      essential_feed_ok("PolymarketRtdsChainlink") and essential_feed_ok("PolymarketRtdsBinance") and
       (.drop_counts | type == "object" and length == 0) and
       .recorder_status.error_count == 0 and .recorder_status.dropped_count == 0 and
       .recorder_metrics.queued == 0 and .recorder_metrics.failed_total == 0 and
@@ -405,7 +488,14 @@ while :; do
       (.recorder_metrics.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
       (.recorder_metrics.last_assigned_sequence | type == "number" and floor == . and . >= 1)
     then {
-      taskHealth:{api:.task_health.api,runtime_loop:.task_health.runtime_loop,feeds:.task_health.feeds},dropCounts:.drop_counts,
+      sampledAtUtc:($now | todateiso8601),
+      taskHealth:{api:.task_health.api,runtime_loop:.task_health.runtime_loop,feeds:.task_health.feeds},
+      feedStatus:{
+        Discovery:(.feed_status.Discovery | {status,updated_at}),
+        PolymarketClobMarket:(.feed_status.PolymarketClobMarket | {status,updated_at}),
+        PolymarketRtdsChainlink:(.feed_status.PolymarketRtdsChainlink | {status,updated_at}),
+        PolymarketRtdsBinance:(.feed_status.PolymarketRtdsBinance | {status,updated_at})
+      },dropCounts:.drop_counts,
       recorder:{recorder_instance_id:.recorder_metrics.recorder_instance_id,last_assigned_sequence:.recorder_metrics.last_assigned_sequence,
         queued:.recorder_metrics.queued,enqueued_total:.recorder_metrics.enqueued_total,persisted_total:.recorder_metrics.persisted_total,
         failed_total:.recorder_metrics.failed_total,unrecovered_durable_events:.recorder_metrics.unrecovered_durable_events,
@@ -417,7 +507,7 @@ while :; do
     break
   fi
   attempt=$((attempt + 1))
-  [ "$attempt" -lt 3 ] || { rm -f "$api_status"; api_status=; die 'protected API recorder status is unhealthy'; }
+  [ "$attempt" -lt 3 ] || { rm -f "$api_status"; api_status=; die 'protected API recorder or essential feed status is unhealthy'; }
   sleep 2
 done
 rm -f "$api_status"
@@ -461,7 +551,7 @@ if [ -z "$azure_candidate" ] || [ -z "$same_candidate" ]; then
   [ "$(stat -c '%u:%g' "$token_file")" = "$token_uid:$token_gid" ] || die 'research workload token is not owned by the research identity'
 fi
 
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$azure_tmp" "$same_tmp" "$same_markdown"; [ -z "$same_work_dir" ] || rmdir "$same_work_dir" 2>/dev/null || true' EXIT HUP INT TERM
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$azure_tmp" "$same_tmp" "$same_markdown"; [ -z "$same_work_dir" ] || rmdir "$same_work_dir" 2>/dev/null || true' EXIT HUP INT TERM
 if [ -z "$azure_candidate" ]; then
   curl --silent --show-error --fail --output "$oauth_response" \
     --request POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
@@ -592,25 +682,25 @@ if [ -n "$same_tmp" ]; then
   rmdir "$same_work_dir"
   same_work_dir=
 fi
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 
 evidence=$hour_dir/evidence.json
 [ ! -e "$evidence" ] || die 'evidence appeared during collection'
 tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header" "$tmp"' EXIT HUP INT TERM
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$tmp"' EXIT HUP INT TERM
 jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
   --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg image "$POLYEDGE_RESEARCH_IMAGE" \
   --arg azure_path "$azure_report" --arg azure_sha "$(sha "$azure_report")" --arg oci_path "$oci_scheduled" --arg oci_sha "$(sha "$oci_scheduled")" \
   --arg same_path "$same_report" --arg same_sha "$(sha "$same_report")" --arg result_sha "$azure_result" --arg decision_config_sha256 "$azure_decision_config" \
   --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
   --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
-  --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" \
-  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,researchImage:$image,segments:$segments,recorderSequence:$recorder_sequence,recorderStatus:$recorder_status,decisionConfigSha256:$decision_config_sha256,scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null},oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null}},sameInput:{path:$same_path,sha256:$same_sha,azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} |
+  --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
+  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,researchImage:$image,segments:$segments,recorderSequence:$recorder_sequence,recorderStatus:$recorder_status,continuousFeedHealth:$continuous_feed,decisionConfigSha256:$decision_config_sha256,scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null},oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null}},sameInput:{path:$same_path,sha256:$same_sha,azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} |
   .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
 chmod 0640 "$tmp"
 sync -f "$tmp"
 mv "$tmp" "$evidence"
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 
 lock_ledger
 validate_ledger

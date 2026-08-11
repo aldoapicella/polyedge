@@ -791,8 +791,8 @@ impl RuntimeController {
     fn spawn_discovery_loop(&self) -> JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
+            runtime.set_feed_status("Discovery", "starting", None).await;
             loop {
-                runtime.set_feed_status("discovery", "running", None).await;
                 let settings = runtime.inner.settings.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     polyedge_feeds::discover_markets(&settings)
@@ -801,7 +801,7 @@ impl RuntimeController {
                 match result {
                     Ok(Ok(markets)) => {
                         runtime.replace_markets(markets).await;
-                        runtime.set_feed_status("discovery", "ok", None).await;
+                        runtime.set_feed_status("Discovery", "ok", None).await;
                     }
                     Ok(Err(error)) => {
                         runtime
@@ -877,8 +877,19 @@ impl RuntimeController {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let provenance = runtime_provenance(&runtime.inner.settings)
+                let mut provenance = runtime_provenance(&runtime.inner.settings)
                     .expect("startup already validated exact runtime provenance");
+                let data = runtime.inner.data.read().await;
+                provenance["essential_feed_health"] = json!({
+                    "summary": feed_summary(&data, &runtime.inner.settings),
+                    "feed_status": {
+                        "Discovery": data.feed_status.get("Discovery").cloned().unwrap_or(Value::Null),
+                        "PolymarketClobMarket": data.feed_status.get("PolymarketClobMarket").cloned().unwrap_or(Value::Null),
+                        "PolymarketRtdsChainlink": data.feed_status.get("PolymarketRtdsChainlink").cloned().unwrap_or(Value::Null),
+                        "PolymarketRtdsBinance": data.feed_status.get("PolymarketRtdsBinance").cloned().unwrap_or(Value::Null)
+                    }
+                });
+                drop(data);
                 runtime
                     .record_event("runtime_provenance", provenance, None, None)
                     .await;
@@ -893,13 +904,13 @@ impl RuntimeController {
                 let token_ids = runtime.market_token_ids().await;
                 if token_ids.is_empty() {
                     runtime
-                        .set_feed_status("polymarket_clob_market", "waiting_for_markets", None)
+                        .set_feed_status("PolymarketClobMarket", "waiting_for_markets", None)
                         .await;
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
                 runtime
-                    .set_feed_status("polymarket_clob_market", "connecting", None)
+                    .set_feed_status("PolymarketClobMarket", "connecting", None)
                     .await;
                 let subscribed_tokens = token_ids.clone();
                 let mut feed = tokio::spawn(polyedge_feeds::run_market_feed(
@@ -914,7 +925,10 @@ impl RuntimeController {
                             match result {
                                 Ok(Ok(())) => {
                                     runtime
-                                        .set_feed_status("polymarket_clob_market", "disconnected", None)
+                                        .record_feed_disconnect(
+                                            &[FeedName::PolymarketClobMarket],
+                                            "market feed ended without a close error",
+                                        )
                                         .await;
                                 }
                                 Ok(Err(error)) => {
@@ -937,7 +951,7 @@ impl RuntimeController {
                                 let _ = feed.await;
                                 runtime
                                     .set_feed_status(
-                                        "polymarket_clob_market",
+                                        "PolymarketClobMarket",
                                         "resubscribing_token_set_changed",
                                         None,
                                     )
@@ -964,7 +978,13 @@ impl RuntimeController {
                 {
                     Ok(()) => {
                         runtime
-                            .set_feed_status("polymarket_rtds", "disconnected", None)
+                            .record_feed_disconnect(
+                                &[
+                                    FeedName::PolymarketRtdsChainlink,
+                                    FeedName::PolymarketRtdsBinance,
+                                ],
+                                "RTDS feed ended without a close error",
+                            )
                             .await;
                     }
                     Err(error) => {
@@ -1056,13 +1076,23 @@ impl RuntimeController {
         }
         match event {
             FeedEvent::Reference(reference) => self.handle_reference(reference).await,
-            FeedEvent::RawMarketEvent(event) => self.handle_raw_market_event(event).await,
-            FeedEvent::Book(book) => self.handle_book(book).await,
+            FeedEvent::RawMarketEvent(event) => {
+                self.set_feed_status_at("PolymarketClobMarket", "ok", None, event.recorded_ts)
+                    .await;
+                self.handle_raw_market_event(event).await;
+            }
+            FeedEvent::Book(book) => {
+                self.set_feed_status_at("PolymarketClobMarket", "ok", None, book.local_ts)
+                    .await;
+                self.handle_book(book).await;
+            }
             FeedEvent::Error {
-                source, message, ..
-            } => self.feed_error(source, message).await,
-            FeedEvent::Heartbeat { source, .. } => {
-                self.set_feed_status(&format!("{source:?}"), "ok", None)
+                source,
+                message,
+                ts,
+            } => self.feed_error_at(source, message, ts).await,
+            FeedEvent::Heartbeat { source, ts } => {
+                self.set_feed_status_at(&format!("{source:?}"), "ok", None, ts)
                     .await;
             }
         }
@@ -2895,20 +2925,44 @@ impl RuntimeController {
     }
 
     async fn set_feed_status(&self, name: &str, status: &str, message: Option<String>) {
+        self.set_feed_status_at(name, status, message, Utc::now())
+            .await;
+    }
+
+    async fn set_feed_status_at(
+        &self,
+        name: &str,
+        status: &str,
+        message: Option<String>,
+        observed_at: DateTime<Utc>,
+    ) {
         let mut data = self.inner.data.write().await;
+        if data.feed_status.get(name).and_then(|value| {
+            value["updated_at"]
+                .as_str()
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc) > observed_at)
+        }) == Some(true)
+        {
+            return;
+        }
         data.feed_status.insert(
             name.to_owned(),
             json!({
                 "status": status,
                 "message": message,
-                "updated_at": Utc::now()
+                "updated_at": observed_at
             }),
         );
     }
 
     async fn feed_error(&self, source: FeedName, message: String) {
+        self.feed_error_at(source, message, Utc::now()).await;
+    }
+
+    async fn feed_error_at(&self, source: FeedName, message: String, observed_at: DateTime<Utc>) {
         let source_text = format!("{source:?}");
-        self.set_feed_status(&source_text, "error", Some(message.clone()))
+        self.set_feed_status_at(&source_text, "error", Some(message.clone()), observed_at)
             .await;
         self.record_event(
             "feed_error",
@@ -2920,6 +2974,12 @@ impl RuntimeController {
             None,
         )
         .await;
+    }
+
+    async fn record_feed_disconnect(&self, sources: &[FeedName], message: &str) {
+        for source in sources {
+            self.feed_error(source.clone(), message.to_owned()).await;
+        }
     }
 
     async fn market_token_ids(&self) -> Vec<TokenId> {
@@ -3376,14 +3436,27 @@ fn compact_recorded_book(book: &BookState) -> BookState {
     }
 }
 
-fn feed_summary(data: &RuntimeData) -> &'static str {
-    if data.feed_status.values().any(|status| {
+fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str {
+    let healthy = |name: &str| {
+        data.feed_status
+            .get(name)
+            .and_then(|status| status.get("status"))
+            .and_then(Value::as_str)
+            == Some("ok")
+    };
+    if healthy("Discovery")
+        && healthy("PolymarketClobMarket")
+        && (!settings.target.enable_polymarket_rtds_chainlink || healthy("PolymarketRtdsChainlink"))
+        && (!settings.target.enable_polymarket_rtds_binance || healthy("PolymarketRtdsBinance"))
+    {
+        "running"
+    } else if data.feed_status.values().any(|status| {
         status
             .get("status")
             .and_then(Value::as_str)
-            .is_some_and(|status| status == "ok" || status == "running" || status == "connecting")
+            .is_some_and(|status| status == "error" || status == "disconnected")
     }) {
-        "running"
+        "degraded"
     } else {
         "starting"
     }
@@ -3819,6 +3892,95 @@ mod tests {
         assert_eq!(
             controller.status().await["task_health"]["runtime_loop"],
             "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_health_requires_every_enabled_source_and_market_data_clears_clob_error() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let base = Utc::now();
+        controller.set_feed_status("Discovery", "ok", None).await;
+        controller
+            .set_feed_status("PolymarketRtdsChainlink", "ok", None)
+            .await;
+        controller
+            .set_feed_status("PolymarketRtdsBinance", "ok", None)
+            .await;
+        controller
+            .feed_error_at(
+                FeedName::PolymarketClobMarket,
+                "injected disconnect".to_owned(),
+                base + chrono::Duration::seconds(10),
+            )
+            .await;
+        {
+            let data = controller.inner.data.read().await;
+            assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        }
+
+        controller
+            .handle_feed_event(FeedEvent::Book(BookState {
+                token_id: TokenId::new("recovered-token"),
+                bids: Vec::new(),
+                asks: Vec::new(),
+                last_trade_price: None,
+                exchange_ts: None,
+                local_ts: base,
+                book_hash: None,
+            }))
+            .await;
+        {
+            let data = controller.inner.data.read().await;
+            assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "error");
+            assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        }
+
+        controller
+            .handle_feed_event(FeedEvent::Book(BookState {
+                token_id: TokenId::new("recovered-token"),
+                bids: Vec::new(),
+                asks: Vec::new(),
+                last_trade_price: None,
+                exchange_ts: None,
+                local_ts: base + chrono::Duration::seconds(11),
+                book_hash: None,
+            }))
+            .await;
+
+        let data = controller.inner.data.read().await;
+        assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
+        assert_eq!(feed_summary(&data, &controller.inner.settings), "running");
+    }
+
+    #[tokio::test]
+    async fn clean_disconnects_are_durable_canonical_feed_errors() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        controller
+            .record_feed_disconnect(
+                &[
+                    FeedName::PolymarketClobMarket,
+                    FeedName::PolymarketRtdsChainlink,
+                    FeedName::PolymarketRtdsBinance,
+                ],
+                "injected clean disconnect",
+            )
+            .await;
+
+        let data = controller.inner.data.read().await;
+        for source in [
+            "PolymarketClobMarket",
+            "PolymarketRtdsChainlink",
+            "PolymarketRtdsBinance",
+        ] {
+            assert_eq!(data.feed_status[source]["status"], "error");
+        }
+        assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "feed_error")
+                .count(),
+            3
         );
     }
 

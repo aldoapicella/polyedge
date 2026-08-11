@@ -63,7 +63,7 @@ impl RuntimeController {
             "task_health": {
                 "api": "ok",
                 "runtime_loop": if !runtime_active { "not_started" } else if runtime_tasks_running { "running" } else { "failed" },
-                "feeds": feed_summary(&data)
+                "feeds": feed_summary(&data, &self.inner.settings)
             },
             "queue_depths": {
                 "feed_events": 0,

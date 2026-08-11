@@ -148,12 +148,17 @@ masked.
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
 requires one recorder instance with exact in-segment and cross-hour sequence
-continuity, requires zero recorder failures or backlog, compares the Azure
-scheduled result with a local same-input audit, and requires one identical
-`decision_config_sha256` across all three reports. It advances only the
-sequential clean-hour count. It never changes Azure authority, deletion,
-reboot, qset, or funded gates and fails closed on a gap, duplicate, instance
-change, unhealthy recorder, decision-config mismatch, or result mismatch.
+continuity, requires zero recorder failures or backlog, and requires canonical
+`Discovery`, `PolymarketClobMarket`, `PolymarketRtdsChainlink`, and
+`PolymarketRtdsBinance` status to be `ok` and no older than five minutes. The
+same conditions must appear in at least 60 minute-level runtime provenance
+observations spanning the hour, with at most 75 seconds between observations
+and no essential-feed error event. It compares the Azure scheduled result with
+a local same-input audit and requires one identical `decision_config_sha256`
+across all three reports. It advances only the sequential clean-hour count. It
+never changes Azure authority, deletion, reboot, qset, or funded gates and
+fails closed on a gap, duplicate, instance change, unhealthy recorder,
+degraded or stale essential feed, decision-config mismatch, or result mismatch.
 After a successful OCI daily container exits, `polyedge-parity-record-daily`
 verifies the immutable primary bundle, normalized completion marker, every
 artifact hash/size, approved source/image, promotion-quality predicate, ring
