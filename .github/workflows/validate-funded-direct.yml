@@ -845,6 +845,7 @@ jobs:
                 and .predecessor_state_session_id == "dynamic-quote-funded-2026-07-29-v5"
                 and .predecessor_state_blob_name == $v5_state
                 and .predecessor_state_sha256 == $v5_sha
+                and .intent_handoff_blob_name == ($intent_prefix | sub("/intents$"; "/current-funded-intent.json"))
                 and (.intent_blob_name | startswith($intent_prefix + "/") and test("/[0-9a-f]{64}\\.json$"))
                 and (.intent_sha256 | test("^sha256:[0-9a-f]{64}$")))
             ' funded-preflight-logs.json >/dev/null; then

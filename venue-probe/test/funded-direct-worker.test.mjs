@@ -134,14 +134,20 @@ class Container {
   constructor(values = {}) {
     this.values = new Map(Object.entries(values));
     this.uploadCalls = 0;
+    this.listCalls = 0;
   }
   async *listBlobsFlat({ prefix }) {
+    this.listCalls += 1;
     for (const name of [...this.values.keys()].filter((value) => value.startsWith(prefix))) yield { name };
   }
   getBlobClient(name) {
     return {
       exists: async () => this.values.has(name),
-      download: async () => ({ readableStreamBody: stream(this.values.get(name)) })
+      download: async () => {
+        let value = this.values.get(name);
+        if (Array.isArray(value)) value = value.length > 1 ? value.shift() : value[0];
+        return { readableStreamBody: stream(value) };
+      }
     };
   }
   getBlockBlobClient(name) {
@@ -205,6 +211,18 @@ function intent(now, id = "c".repeat(64)) {
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 300_000).toISOString(),
     ttl_ms: 10_000
+  };
+}
+
+function handoff(value) {
+  const bytes = Buffer.from(JSON.stringify(value));
+  return {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
   };
 }
 
@@ -380,7 +398,8 @@ test("pure preflight validates embedded session, predecessor, and fresh intent w
       Buffer.from("{}")
   });
   const intents = new Container({
-    [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value))
+    [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)),
+    "current-funded-intent.json": Buffer.from(JSON.stringify(handoff(value)))
   });
   const beforeControl = mutationKeysets(control, targetSessionName);
   const beforeControlSnapshot = containerSnapshot(control);
@@ -411,15 +430,232 @@ test("pure preflight validates embedded session, predecessor, and fresh intent w
     sha256(Buffer.from(JSON.stringify(fundedSession, null, 2))));
   assert.equal(output.predecessor_state_blob_name, predecessorName);
   assert.equal(output.predecessor_state_sha256, sha256(predecessorBytes));
+  assert.equal(output.intent_handoff_blob_name, "current-funded-intent.json");
   assert.equal(output.intent_blob_name, `intents/${value.decision_id}.json`);
   assert.equal(output.childInvocations, 0);
   assert.equal(childCalls, 0);
   assert.equal(control.uploadCalls, 0);
   assert.equal(intents.uploadCalls, 0);
+  assert.equal(intents.listCalls, 0);
   assert.deepEqual(mutationKeysets(control, targetSessionName), beforeControl);
   assert.deepEqual(containerSnapshot(control), beforeControlSnapshot);
   assert.deepEqual([...intents.values.keys()].sort(), beforeIntents);
   assert.deepEqual(containerSnapshot(intents), beforeIntentSnapshot);
+});
+
+test("pure preflight rejects a handoff that loses TTL during download then accepts the next pointer", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const afterDownload = new Date(now.getTime() + 3_000);
+  const fundedSession = preflightSession();
+  const first = intent(now, "4".repeat(64));
+  const second = intent(afterDownload, "5".repeat(64));
+  const control = new Container({
+    [fundedSession.capital_policy.prior_state_blob_name]:
+      Buffer.from(JSON.stringify(predecessorState()))
+  });
+  const intents = new Container({
+    [`intents/${first.decision_id}.json`]: Buffer.from(JSON.stringify(first)),
+    [`intents/${second.decision_id}.json`]: Buffer.from(JSON.stringify(second)),
+    "current-funded-intent.json": [
+      Buffer.from(JSON.stringify(handoff(first))),
+      Buffer.from(JSON.stringify(handoff(second)))
+    ]
+  });
+  const times = [
+    now,
+    afterDownload,
+    afterDownload,
+    afterDownload,
+    afterDownload,
+    afterDownload,
+    afterDownload
+  ];
+  const clock = () => new Date((times.shift() || afterDownload).getTime());
+
+  const output = await runFundedDirectWorker({
+    env: preflightEnv(fundedSession, { FUNDED_DIRECT_MAX_ITERATIONS: "2" }),
+    containers: { control, intents },
+    clock,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("preflight must not invoke a child")
+  });
+
+  assert.equal(output.status, "preflight_validated");
+  assert.equal(output.iteration, 2);
+  assert.equal(output.decisionId, second.decision_id);
+  assert.equal(control.uploadCalls, 0);
+  assert.equal(intents.uploadCalls, 0);
+  assert.equal(intents.listCalls, 0);
+});
+
+test("pure preflight fails closed for tampered current intent pointer bindings", async (t) => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const fundedSession = preflightSession();
+  const value = intent(now, "6".repeat(64));
+  const cases = [
+    {
+      name: "hash",
+      mutate: (pointer) => ({ ...pointer, intent_sha256: `sha256:${"f".repeat(64)}` }),
+      error: /SHA-256 mismatch/
+    },
+    {
+      name: "blob name",
+      mutate: (pointer) => ({ ...pointer, intent_blob_name: `intents/${"7".repeat(64)}.json` }),
+      error: /pointer binding is invalid/
+    },
+    {
+      name: "decision id",
+      mutate: (pointer) => ({ ...pointer, decision_id: "7".repeat(64) }),
+      error: /pointer binding is invalid/
+    },
+    {
+      name: "decision time",
+      mutate: (pointer) => ({ ...pointer, decision_ts: new Date(now.getTime() + 1_000).toISOString() }),
+      error: /pointer decision time is invalid/
+    },
+    {
+      name: "expiry",
+      mutate: (pointer) => ({ ...pointer, valid_until: "not-a-time" }),
+      error: /pointer expiry is invalid/
+    },
+    {
+      name: "extra field",
+      mutate: (pointer) => ({ ...pointer, executable: true }),
+      error: /pointer binding is invalid/
+    }
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const control = new Container({
+        [fundedSession.capital_policy.prior_state_blob_name]:
+          Buffer.from(JSON.stringify(predecessorState()))
+      });
+      const intents = new Container({
+        [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)),
+        "current-funded-intent.json": Buffer.from(JSON.stringify(entry.mutate(handoff(value))))
+      });
+      const beforeControl = containerSnapshot(control);
+      const beforeIntents = containerSnapshot(intents);
+
+      await assert.rejects(
+        runFundedDirectWorker({
+          env: preflightEnv(fundedSession, { FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+          containers: { control, intents },
+          clock: () => now,
+          sleep: async () => {},
+          invokeChild: async () => assert.fail("preflight must not invoke a child")
+        }),
+        entry.error
+      );
+      assert.equal(control.uploadCalls, 0);
+      assert.equal(intents.uploadCalls, 0);
+      assert.equal(intents.listCalls, 0);
+      assert.deepEqual(containerSnapshot(control), beforeControl);
+      assert.deepEqual(containerSnapshot(intents), beforeIntents);
+    });
+  }
+});
+
+test("pure preflight fails closed without writes when authorization or completion already exists", async (t) => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const fundedSession = preflightSession();
+  const value = intent(now, "8".repeat(64));
+
+  for (const kind of ["authorizations", "completed"]) {
+    await t.test(kind, async () => {
+      const stateName =
+        `reports/funded/dynamic-quote/sessions/${fundedSession.session_id}/${kind}/${value.decision_id}.json`;
+      const control = new Container({
+        [fundedSession.capital_policy.prior_state_blob_name]:
+          Buffer.from(JSON.stringify(predecessorState())),
+        [stateName]: Buffer.from("{}")
+      });
+      const intents = new Container({
+        [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)),
+        "current-funded-intent.json": Buffer.from(JSON.stringify(handoff(value)))
+      });
+      const beforeControl = containerSnapshot(control);
+      const beforeIntents = containerSnapshot(intents);
+
+      await assert.rejects(
+        runFundedDirectWorker({
+          env: preflightEnv(fundedSession, { FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+          containers: { control, intents },
+          clock: () => now,
+          sleep: async () => {},
+          invokeChild: async () => assert.fail("preflight must not invoke a child")
+        }),
+        /preflight handoff already has durable execution state/
+      );
+      assert.equal(control.uploadCalls, 0);
+      assert.equal(intents.uploadCalls, 0);
+      assert.equal(intents.listCalls, 0);
+      assert.deepEqual(containerSnapshot(control), beforeControl);
+      assert.deepEqual(containerSnapshot(intents), beforeIntents);
+    });
+  }
+});
+
+test("pure preflight rejects iteration exhaustion instead of returning successful idle status", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const fundedSession = preflightSession();
+  const stale = intent(new Date(now.getTime() - 20_000), "9".repeat(64));
+  const control = new Container({
+    [fundedSession.capital_policy.prior_state_blob_name]:
+      Buffer.from(JSON.stringify(predecessorState()))
+  });
+  const intents = new Container({
+    [`intents/${stale.decision_id}.json`]: Buffer.from(JSON.stringify(stale)),
+    "current-funded-intent.json": Buffer.from(JSON.stringify(handoff(stale)))
+  });
+
+  await assert.rejects(
+    runFundedDirectWorker({
+      env: preflightEnv(fundedSession, { FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+      containers: { control, intents },
+      clock: () => now,
+      sleep: async () => {},
+      invokeChild: async () => assert.fail("preflight must not invoke a child")
+    }),
+    /preflight exhausted its iteration limit/
+  );
+  assert.equal(control.uploadCalls, 0);
+  assert.equal(intents.uploadCalls, 0);
+  assert.equal(intents.listCalls, 0);
+});
+
+test("pure preflight rejects idle timeout instead of returning successful idle status", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const fundedSession = preflightSession();
+  const stale = intent(new Date(now.getTime() - 20_000), "a".repeat(64));
+  const control = new Container({
+    [fundedSession.capital_policy.prior_state_blob_name]:
+      Buffer.from(JSON.stringify(predecessorState()))
+  });
+  const intents = new Container({
+    [`intents/${stale.decision_id}.json`]: Buffer.from(JSON.stringify(stale)),
+    "current-funded-intent.json": Buffer.from(JSON.stringify(handoff(stale)))
+  });
+  const times = [now, now, new Date(now.getTime() + 1_000)];
+  const clock = () => new Date((times.shift() || times.at(-1) || now).getTime());
+
+  await assert.rejects(
+    runFundedDirectWorker({
+      env: preflightEnv(fundedSession, {
+        FUNDED_DIRECT_MAX_ITERATIONS: "2",
+        FUNDED_DIRECT_MAX_IDLE_MS: "1000"
+      }),
+      containers: { control, intents },
+      clock,
+      sleep: async () => {},
+      invokeChild: async () => assert.fail("preflight must not invoke a child")
+    }),
+    /preflight timed out waiting for a fresh current intent/
+  );
+  assert.equal(control.uploadCalls, 0);
+  assert.equal(intents.uploadCalls, 0);
+  assert.equal(intents.listCalls, 0);
 });
 
 test("pure preflight rejects the persistent engine", () => {
@@ -868,7 +1104,7 @@ test("persistent handoff rejects expired, tampered, and authorization-leak deliv
       clock: () => new Date(now.getTime() + 10_000),
       executeCanary: async () => { executions += 1; }
     }).then((expired) => expired.process(handoff)),
-    /binding or TTL is invalid/
+    /insufficient remaining TTL/
   );
   const authorizationName = `reports/funded/dynamic-quote/sessions/${session().session_id}/authorizations/${value.decision_id}.json`;
   control.values.set(authorizationName, Buffer.from("{}"));

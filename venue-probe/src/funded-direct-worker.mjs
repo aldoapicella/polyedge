@@ -24,6 +24,7 @@ const MAX_INTENT_TTL_MS = 30_000;
 export function loadFundedDirectConfig(env = process.env) {
   const sessionJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "").trim();
   const session = parseJson(sessionJson);
+  const intentPrefix = clean(env.STRATEGY_CANARY_INTENT_PREFIX).replace(/^\/+|\/+$/g, "");
   const config = {
     enabled: env.FUNDED_DIRECT_WORKER_ENABLED === "true",
     allowed: env.ALLOW_FUNDED_DIRECT === "true",
@@ -41,7 +42,8 @@ export function loadFundedDirectConfig(env = process.env) {
     maxOrderNotional: number(env.STRATEGY_CANARY_MAX_ORDER_NOTIONAL),
     minimumSecondsToExpiry: integer(env.STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY, 360),
     maximumSecondsToExpiry: integer(env.STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY, 900),
-    intentPrefix: clean(env.STRATEGY_CANARY_INTENT_PREFIX).replace(/^\/+|\/+$/g, ""),
+    intentPrefix,
+    currentIntentBlobName: currentIntentHandoffBlobName(intentPrefix),
     controlPrefix: clean(env.FUNDED_DIRECT_CONTROL_PREFIX || "reports/funded/dynamic-quote").replace(/^\/+|\/+$/g, ""),
     intentContainerName: clean(env.STRATEGY_CANARY_INTENT_CONTAINER_NAME),
     controlContainerName: clean(env.AZURE_STORAGE_CONTAINER_NAME),
@@ -119,12 +121,15 @@ export async function runFundedDirectWorker({
   let childInvocations = 0;
   const intentScan = intentScanDiagnostics();
   for (let iteration = 1; iteration <= config.maxIterations; iteration += 1) {
-    const scan = await firstFreshIntent(clients, config, sessionDocument.value, clock());
+    const scan = await firstFreshIntent(clients, config, sessionDocument.value, clock(), clock);
     mergeIntentScanDiagnostics(intentScan, scan.diagnostics);
     const selected = scan.selected;
     if (!selected) {
       idleSince ??= clock().getTime();
       if (clock().getTime() - idleSince >= config.maxIdleMs) {
+        if (config.preflightOnly) {
+          throw new Error("funded_direct_worker blocked: preflight timed out waiting for a fresh current intent");
+        }
         return result("idle_waiting_for_fresh_intent", config, {
           iteration,
           childInvocations,
@@ -155,6 +160,9 @@ export async function runFundedDirectWorker({
     childInvocations = executed.childInvocations;
     if (executed.result) return executed.result;
   }
+  if (config.preflightOnly) {
+    throw new Error("funded_direct_worker blocked: preflight exhausted its iteration limit waiting for a fresh current intent");
+  }
   return result("iteration_limit_reached", config, {
     iteration: config.maxIterations,
     childInvocations,
@@ -184,7 +192,14 @@ export async function createFundedDirectProcessor({
     async process(handoff) {
       const processorStartedWallMs = Date.now();
       const processorStartedMonotonicMs = performance.now();
-      const selected = await selectedFromHandoff(clients, config, sessionDocument.value, handoff, clock());
+      const selected = await selectedFromHandoff(
+        clients,
+        config,
+        sessionDocument.value,
+        handoff,
+        clock(),
+        { clock }
+      );
       const executionTiming = {
         processor_started_wall_ms: processorStartedWallMs,
         processor_started_monotonic_ms: processorStartedMonotonicMs,
@@ -238,7 +253,14 @@ export async function createFundedDirectProcessor({
       });
     },
     async rejectBusy(handoff) {
-      const selected = await selectedFromHandoff(clients, config, sessionDocument.value, handoff, clock());
+      const selected = await selectedFromHandoff(
+        clients,
+        config,
+        sessionDocument.value,
+        handoff,
+        clock(),
+        { clock }
+      );
       if (selected.duplicateCompletion) {
         return result("already_completed_idempotent", config, {
           iteration: 1,
@@ -443,7 +465,14 @@ async function executeSelectedIntent({
   return { childInvocations, result: null, execution: child.value || null };
 }
 
-async function selectedFromHandoff(clients, config, session, handoff, now) {
+async function selectedFromHandoff(
+  clients,
+  config,
+  session,
+  handoff,
+  now,
+  { readOnly = false, clock = () => now } = {}
+) {
   const verificationStartedWallMs = Date.now();
   const verificationStartedMonotonicMs = performance.now();
   if (handoff?.schema !== "polyedge.funded_intent_handoff.v1") {
@@ -454,13 +483,32 @@ async function selectedFromHandoff(clients, config, session, handoff, now) {
   const expectedHash = hash(handoff.intent_sha256);
   if (!/^[0-9a-f]{64}$/.test(decisionId) ||
       blobName !== `${config.intentPrefix}/${decisionId}.json` ||
-      !expectedHash ||
-      Date.parse(handoff.decision_ts) > now.getTime() ||
-      Date.parse(handoff.valid_until) - now.getTime() < config.minRemainingTtlMs) {
-    throw new Error("fail closed: funded intent handoff binding or TTL is invalid");
+      !expectedHash) {
+    throw new Error("fail closed: funded intent handoff binding is invalid");
+  }
+  if (!Number.isFinite(Date.parse(handoff.decision_ts)) ||
+      Date.parse(handoff.decision_ts) > now.getTime()) {
+    throw new Error("fail closed: funded intent handoff decision time is invalid");
+  }
+  const initialRemainingTtlMs = Date.parse(handoff.valid_until) - now.getTime();
+  if (!Number.isFinite(initialRemainingTtlMs) || initialRemainingTtlMs < config.minRemainingTtlMs) {
+    throw fundedHandoffRejection(
+      "remaining_ttl",
+      "fail closed: funded intent handoff has insufficient remaining TTL",
+      initialRemainingTtlMs
+    );
   }
   const response = await clients.intents.getBlobClient(blobName).download();
   const bytes = await streamToBuffer(response.readableStreamBody);
+  const downloadedAt = clock();
+  const remainingTtlMs = Date.parse(handoff.valid_until) - downloadedAt.getTime();
+  if (!Number.isFinite(remainingTtlMs) || remainingTtlMs < config.minRemainingTtlMs) {
+    throw fundedHandoffRejection(
+      "remaining_ttl",
+      "fail closed: funded intent handoff expired during immutable intent download",
+      remainingTtlMs
+    );
+  }
   const actualHash = sha256(bytes);
   if (actualHash !== expectedHash) throw new Error("fail closed: funded intent handoff SHA-256 mismatch");
   let value;
@@ -469,7 +517,7 @@ async function selectedFromHandoff(clients, config, session, handoff, now) {
   if (value.decision_id !== decisionId ||
       value.decision_ts !== handoff.decision_ts ||
       value.valid_until !== handoff.valid_until ||
-      !qualifies(value, blobName, actualHash, config, session, now)) {
+      !qualifies(value, blobName, actualHash, config, session, downloadedAt)) {
     throw new Error("fail closed: funded intent handoff does not qualify for execution");
   }
   const authorizationName = authorizationBlobName(config, session, value);
@@ -478,6 +526,17 @@ async function selectedFromHandoff(clients, config, session, handoff, now) {
     clients.control.getBlobClient(authorizationName).exists(),
     clients.control.getBlobClient(completionName).exists()
   ]);
+  if (readOnly) {
+    if (authorizationExists || completionExists) {
+      throw new Error("fail closed: preflight handoff already has durable execution state");
+    }
+    return {
+      value,
+      blobName,
+      hash: actualHash,
+      decisionMs: Date.parse(value.decision_ts)
+    };
+  }
   if (completionExists) {
     const completion = await readJsonBlob(clients.control, completionName);
     const busyCompletion = completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
@@ -648,7 +707,8 @@ function validateSession(config) {
   if (!valid) throw new Error("funded_direct_worker blocked: operator-funded session contract is invalid or hash-mismatched");
 }
 
-async function firstFreshIntent(clients, config, session, now) {
+async function firstFreshIntent(clients, config, session, now, clock = () => now) {
+  if (config.preflightOnly) return currentPreflightIntent(clients, config, session, now, clock);
   const candidates = [];
   const diagnostics = intentScanDiagnostics();
   diagnostics.scans = 1;
@@ -685,6 +745,96 @@ async function firstFreshIntent(clients, config, session, now) {
   }
   candidates.sort((left, right) => right.decisionMs - left.decisionMs || left.blobName.localeCompare(right.blobName));
   return { selected: candidates[0] || null, diagnostics };
+}
+
+async function currentPreflightIntent(clients, config, session, now, clock) {
+  const diagnostics = intentScanDiagnostics();
+  diagnostics.scans = 1;
+  let response;
+  try {
+    response = await clients.intents.getBlobClient(config.currentIntentBlobName).download();
+  } catch (error) {
+    if (Number(error.statusCode) === 404) return { selected: null, diagnostics };
+    throw error;
+  }
+  diagnostics.candidate_blobs = 1;
+  const bytes = await streamToBuffer(response.readableStreamBody);
+  let handoff;
+  try { handoff = JSON.parse(bytes.toString("utf8")); }
+  catch { throw new Error("fail closed: funded current intent handoff is not valid JSON"); }
+
+  const decisionId = clean(handoff?.decision_id);
+  const decisionMs = Date.parse(handoff?.decision_ts);
+  const validUntilMs = Date.parse(handoff?.valid_until);
+  const remainingTtlMs = validUntilMs - now.getTime();
+  const exactKeys = [
+    "schema",
+    "decision_id",
+    "intent_blob_name",
+    "intent_sha256",
+    "decision_ts",
+    "valid_until"
+  ];
+  if (handoff?.schema !== "polyedge.funded_intent_handoff.v1" ||
+      !handoff || typeof handoff !== "object" || Array.isArray(handoff) ||
+      Object.keys(handoff).length !== exactKeys.length ||
+      exactKeys.some((key) => !Object.prototype.hasOwnProperty.call(handoff, key)) ||
+      !/^[0-9a-f]{64}$/.test(decisionId) ||
+      clean(handoff?.intent_blob_name) !== `${config.intentPrefix}/${decisionId}.json` ||
+      !hash(handoff?.intent_sha256)) {
+    throw new Error("fail closed: funded current intent pointer binding is invalid");
+  }
+  if (!Number.isFinite(decisionMs) ||
+      decisionMs < Date.parse(session.created_at) ||
+      decisionMs > now.getTime()) {
+    throw new Error("fail closed: funded current intent pointer decision time is invalid");
+  }
+  if (!Number.isFinite(validUntilMs) || validUntilMs <= decisionMs) {
+    throw new Error("fail closed: funded current intent pointer expiry is invalid");
+  }
+  if (remainingTtlMs < config.minRemainingTtlMs) {
+    recordIntentRejection(diagnostics, "remaining_ttl", remainingTtlMs);
+    return { selected: null, diagnostics };
+  }
+
+  let selected;
+  try {
+    selected = await selectedFromHandoff(
+      clients,
+      config,
+      session,
+      handoff,
+      now,
+      { readOnly: true, clock }
+    );
+  } catch (error) {
+    if (error?.code !== "remaining_ttl") throw error;
+    recordIntentRejection(
+      diagnostics,
+      "remaining_ttl",
+      error.remainingTtlMs
+    );
+    return { selected: null, diagnostics };
+  }
+  return {
+    selected: { ...selected, handoffBlobName: config.currentIntentBlobName },
+    diagnostics
+  };
+}
+
+function currentIntentHandoffBlobName(intentPrefix) {
+  const parts = String(intentPrefix || "").split("/");
+  if (parts.pop() !== "intents") {
+    throw new Error("funded_direct_worker blocked: intent prefix must end with the exact intents segment");
+  }
+  return [...parts, "current-funded-intent.json"].filter(Boolean).join("/");
+}
+
+function fundedHandoffRejection(code, message, remainingTtlMs = null) {
+  const error = new Error(message);
+  error.code = code;
+  error.remainingTtlMs = remainingTtlMs;
+  return error;
 }
 
 function qualificationRejection(intent, blobName, intentHash, config, session, now) {
@@ -1089,6 +1239,7 @@ function preflightResult(config, sessionDocument, predecessorDocument, selected,
     predecessor_state_session_id: predecessorDocument.value.session_id,
     predecessor_state_blob_name: predecessorDocument.blobName,
     predecessor_state_sha256: predecessorDocument.hash,
+    intent_handoff_blob_name: selected.handoffBlobName,
     intent_blob_name: selected.blobName,
     intent_sha256: selected.hash
   });

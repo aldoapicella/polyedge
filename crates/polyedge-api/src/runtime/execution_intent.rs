@@ -26,6 +26,7 @@ const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
 // concurrent so one slow Azure request cannot consume another intent's frozen
 // ten-second lifetime. Warmups use a separate lane below.
 const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
+const CURRENT_FUNDED_INTENT_CAS_ATTEMPTS: usize = 4;
 // Keep the signed venue expiry well beyond the documented minimum. Live V2
 // rejected a correctly serialized order 107 seconds before its expiry, so the
 // immutable intent carries a five-minute fail-safe while the lifecycle still
@@ -50,6 +51,7 @@ pub(super) struct IntentPublisherConfig {
 pub(super) struct IntentPublisher {
     intent_lanes: Vec<StdMutex<IntentPublisherLane>>,
     warmup_lane: StdMutex<IntentPublisherLane>,
+    current_intent_lane: Option<StdMutex<AzureBlobClient>>,
     next_intent_lane: AtomicUsize,
     prefix: String,
 }
@@ -57,6 +59,45 @@ pub(super) struct IntentPublisher {
 struct IntentPublisherLane {
     blob_client: AzureBlobClient,
     service_bus_sender: Option<AzureServiceBusSender>,
+}
+
+trait CurrentFundedIntentStore {
+    fn read_versioned(&mut self, name: &str) -> Result<Option<(Vec<u8>, String)>, String>;
+    fn put_if_absent(&mut self, name: &str, bytes: &[u8]) -> Result<ImmutableBlobWrite, String>;
+    fn compare_and_swap(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        expected_etag: &str,
+    ) -> Result<bool, String>;
+}
+
+impl CurrentFundedIntentStore for AzureBlobClient {
+    fn read_versioned(&mut self, name: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+        match self.download_blob_bytes_with_etag(name) {
+            Ok(blob) => Ok(Some((blob.bytes, blob.etag))),
+            Err(AzureBlobError::HttpStatus(404))
+            | Err(AzureBlobError::HttpStatusDetail { status: 404, .. }) => Ok(None),
+            Err(error) => Err(format!(
+                "current funded intent pointer is unreadable: {error}"
+            )),
+        }
+    }
+
+    fn put_if_absent(&mut self, name: &str, bytes: &[u8]) -> Result<ImmutableBlobWrite, String> {
+        self.upload_block_blob_bytes_if_absent(name, bytes, "application/json")
+            .map_err(|error| format!("current funded intent pointer create failed: {error}"))
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        expected_etag: &str,
+    ) -> Result<bool, String> {
+        self.upload_block_blob_bytes_if_match(name, bytes, "application/json", expected_etag)
+            .map_err(|error| format!("current funded intent pointer update failed: {error}"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,9 +209,17 @@ impl IntentPublisherConfig {
             .map(|_| self.connect_lane().map(StdMutex::new))
             .collect::<Result<Vec<_>, _>>()?;
         let warmup_lane = StdMutex::new(self.connect_lane()?);
+        let current_intent_lane = self.operator_direct.then(|| {
+            StdMutex::new(AzureBlobClient::with_managed_identity(
+                self.account.clone(),
+                self.container.clone(),
+                self.client_id.clone(),
+            ))
+        });
         Ok(IntentPublisher {
             intent_lanes,
             warmup_lane,
+            current_intent_lane,
             next_intent_lane: AtomicUsize::new(0),
             prefix: self.prefix,
         })
@@ -222,16 +271,23 @@ impl IntentPublisher {
                     "funded intent expired before the Service Bus handoff could be sent".to_owned(),
                 );
             }
-            let queue_send_started = Instant::now();
-            sender
-                .send_json(
-                    &intent.decision_id,
-                    ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64,
-                    &funded_intent_handoff(intent, &blob_name, &artifact_sha256),
-                )
-                .map_err(|error| error.to_string())?;
-            queue_send_wall_ts = Some(Utc::now());
-            queue_send_elapsed_ms = Some(queue_send_started.elapsed().as_millis() as u64);
+            let handoff = funded_intent_handoff(intent, &blob_name, &artifact_sha256);
+            let (sent_at, elapsed_ms) = publish_operator_direct_after_immutable(
+                || self.publish_current_intent_handoff(intent, &blob_name, &artifact_sha256),
+                || {
+                    let queue_send_started = Instant::now();
+                    sender
+                        .send_json(
+                            &intent.decision_id,
+                            ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64,
+                            &handoff,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    Ok((Utc::now(), queue_send_started.elapsed().as_millis() as u64))
+                },
+            )?;
+            queue_send_wall_ts = Some(sent_at);
+            queue_send_elapsed_ms = Some(elapsed_ms);
             true
         } else {
             false
@@ -245,6 +301,23 @@ impl IntentPublisher {
             queue_send_wall_ts,
             queue_send_elapsed_ms,
         })
+    }
+
+    fn publish_current_intent_handoff(
+        &self,
+        intent: &ExecutionIntentV1,
+        blob_name: &str,
+        artifact_sha256: &str,
+    ) -> Result<(), String> {
+        let pointer_name = current_funded_intent_blob_name(&self.prefix)?;
+        let handoff = funded_intent_handoff(intent, blob_name, artifact_sha256);
+        let mut client = self
+            .current_intent_lane
+            .as_ref()
+            .ok_or_else(|| "operator-direct current intent lane is unavailable".to_owned())?
+            .lock()
+            .map_err(|_| "current funded intent pointer lock is poisoned".to_owned())?;
+        publish_current_funded_intent_compare_and_swap(&mut *client, &pointer_name, &handoff)
     }
 
     pub(super) fn warm_market(&self, market: &MarketSpec) -> Result<bool, String> {
@@ -291,6 +364,14 @@ impl IntentPublisher {
     fn intent_lane_count(&self) -> usize {
         self.intent_lanes.len()
     }
+}
+
+fn publish_operator_direct_after_immutable<T>(
+    publish_pointer: impl FnOnce() -> Result<(), String>,
+    send_queue: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    publish_pointer()?;
+    send_queue()
 }
 
 fn funded_market_warmup_message_id(market: &MarketSpec, producer_ts: DateTime<Utc>) -> String {
@@ -349,6 +430,151 @@ fn funded_intent_handoff(
         "decision_ts": intent.decision_ts,
         "valid_until": intent.valid_until
     })
+}
+
+fn current_funded_intent_blob_name(intent_prefix: &str) -> Result<String, String> {
+    let trimmed = intent_prefix.trim_matches('/');
+    let (parent, leaf) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    if leaf != "intents" {
+        return Err("funded intent prefix is not the exact isolated intents path".to_owned());
+    }
+    Ok(if parent.is_empty() {
+        "current-funded-intent.json".to_owned()
+    } else {
+        format!("{parent}/current-funded-intent.json")
+    })
+}
+
+fn publish_current_funded_intent_compare_and_swap<S: CurrentFundedIntentStore>(
+    store: &mut S,
+    pointer_name: &str,
+    incoming: &Value,
+) -> Result<(), String> {
+    current_funded_intent_advances(None, incoming)?;
+    let bytes = serde_json::to_vec_pretty(incoming).map_err(|error| error.to_string())?;
+    for _ in 0..CURRENT_FUNDED_INTENT_CAS_ATTEMPTS {
+        match store.read_versioned(pointer_name)? {
+            Some((existing_bytes, etag)) => {
+                let existing =
+                    serde_json::from_slice::<Value>(&existing_bytes).map_err(|error| {
+                        format!("current funded intent pointer is invalid JSON: {error}")
+                    })?;
+                if !current_funded_intent_advances(Some(&existing), incoming)? {
+                    return Ok(());
+                }
+                if store.compare_and_swap(pointer_name, &bytes, &etag)? {
+                    return Ok(());
+                }
+            }
+            None => {
+                if store.put_if_absent(pointer_name, &bytes)? == ImmutableBlobWrite::Created {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let Some((winner_bytes, _)) = store.read_versioned(pointer_name)? else {
+        return Err("current funded intent pointer CAS exhausted without a winner".to_owned());
+    };
+    let winner = serde_json::from_slice::<Value>(&winner_bytes).map_err(|error| {
+        format!("current funded intent pointer winner is invalid JSON: {error}")
+    })?;
+    if current_funded_intent_advances(Some(&winner), incoming)? {
+        return Err(
+            "current funded intent pointer CAS remained behind after bounded retries".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn current_funded_intent_advances(
+    existing: Option<&Value>,
+    incoming: &Value,
+) -> Result<bool, String> {
+    let incoming_key = funded_intent_handoff_key(incoming)?;
+    let Some(existing) = existing else {
+        return Ok(true);
+    };
+    let existing_key = funded_intent_handoff_key(existing)?;
+    if existing_key.2 != incoming_key.2 {
+        return Err("current funded intent pointer escaped its exact intent prefix".to_owned());
+    }
+    if (existing_key.0, &existing_key.1) == (incoming_key.0, &incoming_key.1)
+        && existing != incoming
+    {
+        return Err(
+            "current funded intent pointer has conflicting bytes for one decision".to_owned(),
+        );
+    }
+    Ok((existing_key.0, existing_key.1) < (incoming_key.0, incoming_key.1))
+}
+
+fn funded_intent_handoff_key(handoff: &Value) -> Result<(DateTime<Utc>, String, String), String> {
+    let object = handoff
+        .as_object()
+        .ok_or_else(|| "current funded intent pointer is not an object".to_owned())?;
+    const KEYS: [&str; 6] = [
+        "schema",
+        "decision_id",
+        "intent_blob_name",
+        "intent_sha256",
+        "decision_ts",
+        "valid_until",
+    ];
+    if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
+        return Err("current funded intent pointer has an inexact schema".to_owned());
+    }
+    if handoff.get("schema").and_then(Value::as_str) != Some("polyedge.funded_intent_handoff.v1") {
+        return Err("current funded intent pointer has an unsupported schema".to_owned());
+    }
+    let decision_id = handoff
+        .get("decision_id")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| "current funded intent pointer has an invalid decision_id".to_owned())?;
+    let blob_name = handoff
+        .get("intent_blob_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "current funded intent pointer has an invalid blob name".to_owned())?;
+    let (prefix, _) = blob_name
+        .rsplit_once('/')
+        .ok_or_else(|| "current funded intent pointer has an invalid blob name".to_owned())?;
+    if intent_blob_name(prefix, decision_id)? != blob_name {
+        return Err("current funded intent pointer blob binding is invalid".to_owned());
+    }
+    let hash = handoff
+        .get("intent_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if hash.len() != 71
+        || !hash.starts_with("sha256:")
+        || !hash[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("current funded intent pointer hash binding is invalid".to_owned());
+    }
+    let decision_ts = handoff
+        .get("decision_ts")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "current funded intent pointer decision time is missing".to_owned())?;
+    let decision_ts = DateTime::parse_from_rfc3339(decision_ts)
+        .map_err(|_| "current funded intent pointer decision time is invalid".to_owned())?
+        .with_timezone(&Utc);
+    let valid_until = handoff
+        .get("valid_until")
+        .and_then(Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .ok_or_else(|| "current funded intent pointer expiry is invalid".to_owned())?;
+    if valid_until <= decision_ts {
+        return Err("current funded intent pointer expiry is not after its decision".to_owned());
+    }
+    Ok((decision_ts, decision_id.to_owned(), prefix.to_owned()))
 }
 
 fn funded_market_warmup(market: &MarketSpec, producer_ts: DateTime<Utc>) -> Value {
@@ -1000,7 +1226,56 @@ mod tests {
         FundedLadderStateV1, ImmutableArtifactBindingV1, ProfitabilityMetrics, PromotionEvaluation,
         QueueModelTransitionV1,
     };
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct TestCurrentFundedIntentStore {
+        current: Option<(Vec<u8>, String)>,
+        compare_conflicts: usize,
+        fail_update: bool,
+        compare_calls: usize,
+    }
+
+    impl CurrentFundedIntentStore for TestCurrentFundedIntentStore {
+        fn read_versioned(&mut self, _name: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+            Ok(self.current.clone())
+        }
+
+        fn put_if_absent(
+            &mut self,
+            _name: &str,
+            bytes: &[u8],
+        ) -> Result<ImmutableBlobWrite, String> {
+            if self.current.is_some() {
+                Ok(ImmutableBlobWrite::AlreadyExists)
+            } else {
+                self.current = Some((bytes.to_vec(), "etag-created".to_owned()));
+                Ok(ImmutableBlobWrite::Created)
+            }
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            _name: &str,
+            bytes: &[u8],
+            expected_etag: &str,
+        ) -> Result<bool, String> {
+            self.compare_calls += 1;
+            if self.fail_update {
+                return Err("injected pointer update failure".to_owned());
+            }
+            if self.compare_conflicts > 0 {
+                self.compare_conflicts -= 1;
+                return Ok(false);
+            }
+            if self.current.as_ref().map(|(_, etag)| etag.as_str()) != Some(expected_etag) {
+                return Ok(false);
+            }
+            self.current = Some((bytes.to_vec(), format!("etag-{}", self.compare_calls)));
+            Ok(true)
+        }
+    }
 
     fn fixture() -> (
         RuntimeSettings,
@@ -1371,6 +1646,190 @@ mod tests {
         );
         assert!(handoff.get("price").is_none());
         assert!(handoff.get("notional").is_none());
+    }
+
+    #[test]
+    fn current_funded_intent_pointer_uses_exact_sibling_and_never_regresses() {
+        fn handoff(decision_ts: DateTime<Utc>, decision_id: &str, prefix: &str) -> Value {
+            json!({
+                "schema": "polyedge.funded_intent_handoff.v1",
+                "decision_id": decision_id,
+                "intent_blob_name": format!("{prefix}/{decision_id}.json"),
+                "intent_sha256": format!("sha256:{}", "f".repeat(64)),
+                "decision_ts": decision_ts,
+                "valid_until": decision_ts + Duration::seconds(10)
+            })
+        }
+
+        assert_eq!(
+            current_funded_intent_blob_name("reports/funded/intents").unwrap(),
+            "reports/funded/current-funded-intent.json"
+        );
+        assert_eq!(
+            current_funded_intent_blob_name("intents").unwrap(),
+            "current-funded-intent.json"
+        );
+        assert!(current_funded_intent_blob_name("reports/funded/warmups").is_err());
+
+        let now = DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let earlier = handoff(now, &"a".repeat(64), "reports/funded/intents");
+        let later = handoff(
+            now + Duration::milliseconds(1),
+            &"b".repeat(64),
+            "reports/funded/intents",
+        );
+        let same_time_later_id = handoff(now, &"b".repeat(64), "reports/funded/intents");
+        assert!(current_funded_intent_advances(None, &earlier).unwrap());
+        assert!(current_funded_intent_advances(Some(&earlier), &later).unwrap());
+        assert!(current_funded_intent_advances(Some(&earlier), &same_time_later_id).unwrap());
+        assert!(!current_funded_intent_advances(Some(&same_time_later_id), &earlier).unwrap());
+        assert!(!current_funded_intent_advances(Some(&later), &earlier).unwrap());
+        assert!(!current_funded_intent_advances(Some(&later), &later).unwrap());
+
+        let escaped = handoff(now, &"c".repeat(64), "other/intents");
+        assert!(current_funded_intent_advances(Some(&later), &escaped).is_err());
+        let mut malformed = earlier.clone();
+        malformed["intent_sha256"] = Value::String("sha256:bad".to_owned());
+        assert!(current_funded_intent_advances(Some(&malformed), &later).is_err());
+        let mut conflicting = later.clone();
+        conflicting["intent_sha256"] = Value::String(format!("sha256:{}", "e".repeat(64)));
+        assert!(current_funded_intent_advances(Some(&conflicting), &later).is_err());
+    }
+
+    #[test]
+    fn current_funded_intent_cas_retries_conflicts_and_accepts_newer_winners() {
+        fn handoff(decision_ts: DateTime<Utc>, decision_id: &str) -> Value {
+            json!({
+                "schema": "polyedge.funded_intent_handoff.v1",
+                "decision_id": decision_id,
+                "intent_blob_name": format!("reports/funded/intents/{decision_id}.json"),
+                "intent_sha256": format!("sha256:{}", "f".repeat(64)),
+                "decision_ts": decision_ts,
+                "valid_until": decision_ts + Duration::seconds(10)
+            })
+        }
+
+        let now = DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let earlier = handoff(now, &"a".repeat(64));
+        let incoming = handoff(now + Duration::milliseconds(1), &"b".repeat(64));
+        let newer = handoff(now + Duration::milliseconds(2), &"c".repeat(64));
+        let mut store = TestCurrentFundedIntentStore {
+            current: Some((
+                serde_json::to_vec_pretty(&earlier).unwrap(),
+                "etag-0".to_owned(),
+            )),
+            compare_conflicts: 1,
+            ..Default::default()
+        };
+
+        publish_current_funded_intent_compare_and_swap(
+            &mut store,
+            "reports/funded/current-funded-intent.json",
+            &incoming,
+        )
+        .unwrap();
+        assert_eq!(store.compare_calls, 2);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.current.as_ref().unwrap().0).unwrap(),
+            incoming
+        );
+
+        store.current = Some((
+            serde_json::to_vec_pretty(&newer).unwrap(),
+            "etag-new".to_owned(),
+        ));
+        let comparisons_before = store.compare_calls;
+        publish_current_funded_intent_compare_and_swap(
+            &mut store,
+            "reports/funded/current-funded-intent.json",
+            &incoming,
+        )
+        .unwrap();
+        assert_eq!(store.compare_calls, comparisons_before);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&store.current.as_ref().unwrap().0).unwrap(),
+            newer
+        );
+
+        store.current = Some((b"{}".to_vec(), "etag-malformed".to_owned()));
+        assert!(publish_current_funded_intent_compare_and_swap(
+            &mut store,
+            "reports/funded/current-funded-intent.json",
+            &incoming,
+        )
+        .unwrap_err()
+        .contains("inexact schema"));
+    }
+
+    #[test]
+    fn operator_direct_sequence_is_immutable_then_pointer_then_queue_and_pointer_failure_stops_queue(
+    ) {
+        let events = RefCell::new(vec!["immutable"]);
+        publish_operator_direct_after_immutable(
+            || {
+                events.borrow_mut().push("pointer");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("service_bus");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events.into_inner(),
+            vec!["immutable", "pointer", "service_bus"]
+        );
+
+        let now = DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let existing = json!({
+            "schema": "polyedge.funded_intent_handoff.v1",
+            "decision_id": "a".repeat(64),
+            "intent_blob_name": format!("reports/funded/intents/{}.json", "a".repeat(64)),
+            "intent_sha256": format!("sha256:{}", "f".repeat(64)),
+            "decision_ts": now,
+            "valid_until": now + Duration::seconds(10)
+        });
+        let incoming = json!({
+            "schema": "polyedge.funded_intent_handoff.v1",
+            "decision_id": "b".repeat(64),
+            "intent_blob_name": format!("reports/funded/intents/{}.json", "b".repeat(64)),
+            "intent_sha256": format!("sha256:{}", "f".repeat(64)),
+            "decision_ts": now + Duration::milliseconds(1),
+            "valid_until": now + Duration::seconds(10) + Duration::milliseconds(1)
+        });
+        let mut store = TestCurrentFundedIntentStore {
+            current: Some((
+                serde_json::to_vec_pretty(&existing).unwrap(),
+                "etag-0".to_owned(),
+            )),
+            fail_update: true,
+            ..Default::default()
+        };
+        let events = RefCell::new(vec!["immutable"]);
+        let error = publish_operator_direct_after_immutable(
+            || {
+                events.borrow_mut().push("pointer");
+                publish_current_funded_intent_compare_and_swap(
+                    &mut store,
+                    "reports/funded/current-funded-intent.json",
+                    &incoming,
+                )
+            },
+            || {
+                events.borrow_mut().push("service_bus");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("injected pointer update failure"));
+        assert_eq!(events.into_inner(), vec!["immutable", "pointer"]);
     }
 
     #[test]
