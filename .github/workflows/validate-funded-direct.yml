@@ -928,6 +928,8 @@ jobs:
           v9_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-12-v9/"
           readonly v9_session_blob="${v9_prefix}session.json"
           readonly v9_session_sha256="sha256:15f7b4e2c749d401e9dbab01a6a9dca8ce81166948a5621a8b4c6dff536f4d22"
+          readonly v9_latest_redemption="${v9_prefix}latest-redemption.json"
+          readonly v9_redemption_prefix="${v9_prefix}redemptions/"
           v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
           readonly v5_state_sha256="sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
           az storage blob list \
@@ -937,12 +939,22 @@ jobs:
             --num-results '*' \
             --auth-mode login \
             --only-show-errors -o json > v9-prefix-before-preflight.json
-          jq -e --arg session "$v9_session_blob" '
-            length == 0 or (length == 1 and .[0].name == $session)
+          jq -e \
+            --arg session "$v9_session_blob" \
+            --arg latest "$v9_latest_redemption" \
+            --arg archive "$v9_redemption_prefix" '
+            ([.[].name] | length == (unique | length))
+            and all(.[].properties.contentLength; . > 0 and . <= 16384)
+            and all(.[].name;
+              . == $session
+              or . == $latest
+              or test("^" + $archive + "[0-9]{4}-[0-9]{2}-[0-9]{2}/venue-redemption-[0-9]{17}-[0-9a-f]{8}\\.json$"))
           ' v9-prefix-before-preflight.json >/dev/null
           jq -S '[.[] | {name, etag: .properties.etag, size: .properties.contentLength}]' \
             v9-prefix-before-preflight.json > v9-prefix-before-preflight.snapshot.json
-          if [ "$(jq 'length' v9-prefix-before-preflight.json)" = "1" ]; then
+          if jq -e --arg session "$v9_session_blob" \
+              '[.[].name] | index($session) != null' \
+              v9-prefix-before-preflight.json >/dev/null; then
             az storage blob download \
               --account-name "$STORAGE_ACCOUNT" \
               --container-name "$FUNDED_CONTAINER" \
@@ -952,6 +964,65 @@ jobs:
               --overwrite \
               --only-show-errors -o none
             test "$v9_session_sha256" = "sha256:$(sha256sum existing-v9-session.json | cut -d' ' -f1)"
+          fi
+          archive_count=$(jq --arg archive "$v9_redemption_prefix" \
+            '[.[].name | select(startswith($archive))] | length' \
+            v9-prefix-before-preflight.json)
+          latest_count=$(jq --arg latest "$v9_latest_redemption" \
+            '[.[].name | select(. == $latest)] | length' \
+            v9-prefix-before-preflight.json)
+          if [ "$archive_count" = "0" ]; then
+            test "$latest_count" = "0"
+          else
+            test "$latest_count" = "1"
+          fi
+          : > existing-v9-redemption-sha256.txt
+          while IFS= read -r blob_name; do
+            redemption_file=$(mktemp)
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$blob_name" \
+              --file "$redemption_file" \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none
+            jq -e '
+              .schema_version == 1
+              and .status == "nothing_to_redeem"
+              and (.finished_ts | type == "string")
+              and (.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
+              and .execution_origin == "azure_chile_central_static_egress"
+              and .execution_country == "CL"
+              and .static_egress_verified == true
+              and .dry_run == false
+              and .redemption_enabled == true
+              and .redemption_submitted == false
+              and .zero_open_orders_confirmed == true
+              and .selection.selected == []
+              and .selection.selected_gross_payout == 0
+              and .planned_calls == []
+              and .derived_wallet_match == true
+              and .wallet_type == "legacy_uups_deposit_wallet"
+              and .research_only == false
+              and .live_strategy_enabled == true
+              and (.liquid_collateral_before - 31.655501 | fabs) <= 0.0000011
+            ' "$redemption_file" >/dev/null
+            redemption_sha="sha256:$(sha256sum "$redemption_file" | cut -d' ' -f1)"
+            if [ "$blob_name" = "$v9_latest_redemption" ]; then
+              latest_redemption_sha="$redemption_sha"
+            else
+              redemption_date=$(jq -r '.finished_ts[0:10]' "$redemption_file")
+              redemption_run=$(jq -r '.run_id' "$redemption_file")
+              test "$blob_name" = \
+                "${v9_redemption_prefix}${redemption_date}/${redemption_run}.json"
+              printf '%s\n' "$redemption_sha" >> existing-v9-redemption-sha256.txt
+            fi
+          done < <(jq -r --arg latest "$v9_latest_redemption" --arg archive "$v9_redemption_prefix" '
+            .[].name | select(. == $latest or startswith($archive))
+          ' v9-prefix-before-preflight.json)
+          if [ "$archive_count" != "0" ]; then
+            grep -Fqx "$latest_redemption_sha" existing-v9-redemption-sha256.txt
           fi
           v5_etag_before=$(az storage blob show \
             --account-name "$STORAGE_ACCOUNT" \
