@@ -245,6 +245,22 @@ jobs:
             resource.properties.template.containers[0].name === "funded-direct");
           assert.equal(fundedJob.properties.configuration.replicaTimeout, 11400);
           assert.equal(fundedJob.properties.configuration.replicaRetryLimit, 0);
+          const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
+          assert.equal(workflow.includes(
+            ["FUNDED_DIRECT_SERVICE_BUS_ENABLED", "false"].join("=")), false);
+          const activation = workflow.slice(
+            workflow.lastIndexOf("- name: Rewarm the producer"),
+            workflow.lastIndexOf("- name: Restore the dormant funded service"));
+          const pause = activation.indexOf("RUN_BOT_ON_STARTUP=false");
+          const active = activation.indexOf("--status Active", pause);
+          const warmupStep = activation.indexOf('--name "$FUNDED_WARMUP_JOB"', active);
+          const ready = activation.indexOf('test "$warmup_ready" = true', warmupStep);
+          const enable = activation.indexOf("RUN_BOT_ON_STARTUP=true", ready);
+          const first = activation.indexOf("top 1 by TimeGenerated asc", enable);
+          assert.ok(pause < active && active < warmupStep && warmupStep < ready &&
+            ready < enable && enable < first);
+          assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
+          assert.match(activation, /\(\.market_id \| tostring\) == \$warmup_market/);
           NODE
           git diff --check
 
@@ -265,6 +281,7 @@ jobs:
       SERVICE_BUS_NAMESPACE: sb-polyedge-funded-cl-6urdjr5nmwx7w
       SERVICE_BUS_QUEUE: funded-dynamic-quote-intents
       FUNDED_JOB: polyedge-funded-direct-cl-job
+      FUNDED_WARMUP_JOB: polyedge-funded-warmup-cl
       LEGACY_NEU_FUNDED_JOB: polyedge-funded-ladder-neu-job
       STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
       FUNDED_CONTAINER: polyedge-funded-evidence
@@ -411,7 +428,9 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" -o json)
           test "$(jq -r '.countDetails.activeMessageCount' <<<"$queue_snapshot")" = "0"
           test "$(jq -r '.countDetails.scheduledMessageCount' <<<"$queue_snapshot")" = "0"
-          test "$(jq -r '.countDetails.deadLetterMessageCount' <<<"$queue_snapshot")" = "854"
+          fenced_dlq=$(jq -r '.countDetails.deadLetterMessageCount' <<<"$queue_snapshot")
+          [[ "$fenced_dlq" =~ ^[0-9]+$ ]]
+          printf '%s\n' "$fenced_dlq" > funded-fenced-dlq-before.txt
           env_value() {
             jq -er --arg name "$1" '
               [.properties.template.containers[0].env[]
@@ -924,7 +943,6 @@ jobs:
             --name "$INTENT_PRODUCER_APP" \
             --query properties.template.containers[0].image -o tsv)
           test "$producer_image" = "${{ steps.images.outputs.producer_reference }}"
-          printf '%s\n' "$producer_revision" > intent-producer-revision-deployed.txt
 
       - name: Run the zero-write v9 preflight against a fresh producer intent
         id: funded_preflight
@@ -1541,6 +1559,13 @@ jobs:
                 --name "$SERVICE_BUS_QUEUE" \
                 --status SendDisabled \
                 --only-show-errors -o none || true
+              az containerapp update \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$INTENT_PRODUCER_APP" \
+                --set-env-vars \
+                  RUN_BOT_ON_STARTUP=true \
+                  FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+                --only-show-errors -o none || true
             fi
           }
           trap refence_incomplete_cutover EXIT
@@ -1552,7 +1577,55 @@ jobs:
           test "$(jq -r '.status' funded-queue-before-activation.json)" = "SendDisabled"
           dlq_before=$(jq -r '.countDetails.deadLetterMessageCount' funded-queue-before-activation.json)
           [[ "$dlq_before" =~ ^[0-9]+$ ]]
-          activation_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          test "$dlq_before" = "$(cat funded-fenced-dlq-before.txt)"
+          az containerapp update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --set-env-vars \
+              RUN_BOT_ON_STARTUP=false \
+              FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+            --only-show-errors \
+            -o none
+          producer_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test -n "$producer_revision"
+          producer_paused=false
+          for attempt in $(seq 1 36); do
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" \
+              -o json > producer-revisions-paused.json
+            if jq -e --arg revision "$producer_revision" '
+              ([.[] | select(.properties.active == true)] | length) == 1
+              and ([.[] | select(.properties.active == true)][0].name == $revision)
+              and ([.[] | select(.name == $revision)] | length) == 1
+              and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
+              and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
+            ' producer-revisions-paused.json >/dev/null; then
+              producer_paused=true
+              break
+            fi
+            sleep 5
+          done
+          test "$producer_paused" = true
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer-paused.json
+          producer_paused_env() {
+            jq -er --arg name "$1" '
+              [.properties.template.containers[0].env[]
+                | select(.name == $name) | .value]
+              | if length == 1 then .[0]
+                else error("expected one producer environment value for " + $name)
+                end
+            ' intent-producer-paused.json
+          }
+          test "$(producer_paused_env RUN_BOT_ON_STARTUP)" = "false"
+          test "$(producer_paused_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
+          test "$(producer_paused_env FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
           az servicebus queue update \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
@@ -1564,54 +1637,34 @@ jobs:
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query status -o tsv)" = "Active"
-          producer_revision=$(cat intent-producer-revision-deployed.txt)
-          az containerapp show \
+          # Preserve one 360-second producer eligibility window for warmup and revision rollout.
+          while :; do
+            epoch=$(date -u +%s)
+            remaining_seconds=$((900 - epoch % 900))
+            if [ "$remaining_seconds" -ge 720 ]; then break; fi
+            sleep 10
+          done
+          warmup_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          warmup_execution=$(az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$INTENT_PRODUCER_APP" \
-            -o json > intent-producer-after-reopen.json
-          test "$(jq -r '.properties.latestRevisionName' intent-producer-after-reopen.json)" = "$producer_revision"
-          test "$(jq -r '.properties.latestReadyRevisionName' intent-producer-after-reopen.json)" = "$producer_revision"
-          test "$(jq -r '.properties.template.containers[0].image' intent-producer-after-reopen.json)" = \
-            "${{ steps.images.outputs.producer_reference }}"
-          az containerapp replica list \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$INTENT_PRODUCER_APP" \
-            --revision "$producer_revision" \
-            -o json > producer-replicas-before-reopen-restart.json
-          jq -e 'length == 1' producer-replicas-before-reopen-restart.json
-          jq '[.[].name]' producer-replicas-before-reopen-restart.json > \
-            producer-replica-names-before-reopen-restart.json
-          az containerapp revision restart \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$INTENT_PRODUCER_APP" \
-            --revision "$producer_revision" \
-            --only-show-errors -o none
-          producer_ready=false
-          for attempt in $(seq 1 36); do
-            az containerapp replica list \
+            --name "$FUNDED_WARMUP_JOB" \
+            --query name -o tsv)
+          test -n "$warmup_execution"
+          warmup_status=Running
+          for attempt in $(seq 1 24); do
+            warmup_status=$(az containerapp job execution show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$INTENT_PRODUCER_APP" \
-              --revision "$producer_revision" \
-              -o json > producer-replicas-after-reopen.json
-            if jq -e --slurpfile prior producer-replica-names-before-reopen-restart.json '
-              if length == 1 then
-                .[0] as $replica
-                | ($prior[0] | index($replica.name)) == null
-                  and $replica.properties.runningState == "Running"
-                  and ([$replica.properties.containers[]
-                    | select(.name == "shadow-runtime"
-                      and .ready == true
-                      and .runningState == "Running"
-                      and .restartCount == 0)] | length) == 1
-              else false end
-            ' producer-replicas-after-reopen.json >/dev/null; then
-              producer_ready=true
-              break
-            fi
+              --name "$FUNDED_WARMUP_JOB" \
+              --job-execution-name "$warmup_execution" \
+              --query properties.status -o tsv)
+            case "$warmup_status" in
+              Succeeded) break ;;
+              Failed|Stopped|Degraded) exit 1 ;;
+            esac
             sleep 5
           done
-          test "$producer_ready" = true
-          producer_restarted_at=$(jq -r '.[0].properties.createdTime' producer-replicas-after-reopen.json)
+          test "$warmup_status" = "Succeeded"
+          producer_restarted_at=$warmup_started_at
           environment_id=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
@@ -1674,6 +1727,59 @@ jobs:
             sleep 5
           done
           test "$warmup_ready" = true
+          warmup_market_end_ts=$(jq -r '.[0].Log_s | fromjson | .executor.warmed_market.market_end_ts' \
+            funded-heartbeat-after-reopen.json)
+          test -n "$warmup_market_end_ts"
+          producer_enabled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          test "$(( $(date -u -d "$warmup_market_end_ts" +%s) - $(date -u -d "$producer_enabled_at" +%s) ))" -ge 360
+          az containerapp update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --set-env-vars \
+              RUN_BOT_ON_STARTUP=true \
+              FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+            --only-show-errors \
+            -o none
+          producer_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test -n "$producer_revision"
+          producer_enabled=false
+          for attempt in $(seq 1 36); do
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" \
+              -o json > producer-revisions-enabled.json
+            if jq -e --arg revision "$producer_revision" '
+              ([.[] | select(.properties.active == true)] | length) == 1
+              and ([.[] | select(.properties.active == true)][0].name == $revision)
+              and ([.[] | select(.name == $revision)] | length) == 1
+              and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
+              and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
+            ' producer-revisions-enabled.json >/dev/null; then
+              producer_enabled=true
+              break
+            fi
+            sleep 5
+          done
+          test "$producer_enabled" = true
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer-enabled.json
+          producer_enabled_env() {
+            jq -er --arg name "$1" '
+              [.properties.template.containers[0].env[]
+                | select(.name == $name) | .value]
+              | if length == 1 then .[0]
+                else error("expected one producer environment value for " + $name)
+                end
+            ' intent-producer-enabled.json
+          }
+          test "$(producer_enabled_env RUN_BOT_ON_STARTUP)" = "true"
+          test "$(producer_enabled_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
+          test "$(producer_enabled_env FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
           az containerapp revision list \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
@@ -1708,12 +1814,9 @@ jobs:
               --analytics-query "ContainerAppConsoleLogs_CL
                 | where ContainerAppName_s == '$FUNDED_APP'
                 | where RevisionName_s == '$funded_revision'
-                | where TimeGenerated >= datetime($activation_started_at)
+                | where TimeGenerated >= datetime($producer_enabled_at)
                 | extend record = parse_json(Log_s)
                 | where tostring(record.schema) == 'polyedge.funded_direct_latency.v1'
-                | where tostring(record.status) == 'intent_completed'
-                | where tostring(record.worker_status) == 'persistent_intent_completed'
-                | where tobool(record.order_submission_attempted) == true
                 | top 1 by TimeGenerated asc
                 | project TimeGenerated, Log_s" \
               -o json > funded-v9-lifecycle-latency.json
@@ -1721,8 +1824,12 @@ jobs:
               length == 1
               and (.[0].Log_s | fromjson
                 | (.decision_id | test("^[0-9a-f]{64}$"))
+                and .status == "intent_completed"
                 and .order_submission_attempted == true
-                and .worker_status == "persistent_intent_completed")
+                and .worker_status == "persistent_intent_completed"
+                and (.signal_to_send_ms | type == "number")
+                and .signal_to_send_ms <= .signal_to_send_slo_ms
+                and .signal_to_send_slo_ms == 2000)
             ' funded-v9-lifecycle-latency.json >/dev/null; then
               lifecycle_ready=true
               break
@@ -1808,8 +1915,9 @@ jobs:
             --overwrite \
             --only-show-errors -o none
           test "$intent_sha256" = "sha256:$(sha256sum funded-v9-intent.json | cut -d' ' -f1)"
-          jq -e --arg decision "$decision_id" '
+          jq -e --arg decision "$decision_id" --arg warmup_market "$warmup_market" '
             .decision_id == $decision
+            and (.market_id | tostring) == $warmup_market
             and .notional == "10.5"
           ' funded-v9-intent.json
           consumption_blob="reports/research/venue-probe/control/strategy-canary/consumed/$authorization_id.json"
@@ -1932,6 +2040,53 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" \
             --status SendDisabled \
             --only-show-errors -o none
+          az containerapp update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --set-env-vars \
+              RUN_BOT_ON_STARTUP=true \
+              FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+            --only-show-errors -o none
+          restored_producer_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test -n "$restored_producer_revision"
+          producer_restored=false
+          for attempt in $(seq 1 36); do
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" \
+              -o json > producer-revisions-restored.json
+            if jq -e --arg revision "$restored_producer_revision" '
+              ([.[] | select(.properties.active == true)] | length) == 1
+              and ([.[] | select(.properties.active == true)][0].name == $revision)
+              and ([.[] | select(.name == $revision)] | length) == 1
+              and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
+              and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
+            ' producer-revisions-restored.json >/dev/null; then
+              producer_restored=true
+              break
+            fi
+            sleep 5
+          done
+          test "$producer_restored" = true
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer-restored.json
+          restored_producer_env() {
+            jq -er --arg name "$1" '
+              [.properties.template.containers[0].env[]
+                | select(.name == $name) | .value]
+              | if length == 1 then .[0]
+                else error("expected one restored producer environment value for " + $name)
+                end
+            ' intent-producer-restored.json
+          }
+          test "$(restored_producer_env RUN_BOT_ON_STARTUP)" = "true"
+          test "$(restored_producer_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
+          test "$(restored_producer_env FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
           if [ -n "${FUNDED_ROLLBACK_REVISION:-}" ]; then
             test -s funded-rollback-template.json
             az containerapp revision copy \
