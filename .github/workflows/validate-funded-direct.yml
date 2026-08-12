@@ -431,7 +431,18 @@ jobs:
                 fi
                 sleep 5
               done
-              if [ "$heartbeat_ok" != true ]; then
+              if [ "$heartbeat_ok" != true ] && ! jq -e '
+                def env_values($name):
+                  [.properties.template.containers[0].env[]
+                    | select(.name == $name) | .value];
+                .properties.template.scale.minReplicas == 0
+                and .properties.template.scale.maxReplicas == 1
+                and env_values("FUNDED_DIRECT_SERVICE_ENABLED") == ["false"]
+                and env_values("FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED") == ["false"]
+                and env_values("FUNDED_DIRECT_WORKER_ENABLED") == ["false"]
+                and env_values("ALLOW_FUNDED_DIRECT") == ["false"]
+                and env_values("FUNDED_DIRECT_DRY_RUN") == ["true"]
+              ' current-funded-revision.json >/dev/null; then
                 az containerapp replica list \
                   --resource-group "$AZURE_RESOURCE_GROUP" \
                   --name "$FUNDED_APP" \
@@ -1354,7 +1365,7 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           lifecycle_ready=false
-          # Cover two complete BTC 15-minute market cycles; warmup is readiness,
+          # Cover at least two BTC 15-minute market boundaries; warmup is readiness,
           # not proof that the strategy has emitted a qualifying Place intent.
           for attempt in $(seq 1 180); do
             az monitor log-analytics query \
@@ -1574,7 +1585,7 @@ jobs:
           cutover_complete=true
           trap - EXIT
 
-      - name: Keep funded intake fenced after an incomplete cutover
+      - name: Restore the dormant funded service after an incomplete cutover
         if: ${{ always() && env.FUNDED_QUEUE_FENCED == 'true' && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
         run: |
           set -euo pipefail
@@ -1584,8 +1595,31 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" \
             --status SendDisabled \
             --only-show-errors -o none
+          az containerapp update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --min-replicas 0 \
+            --max-replicas 1 \
+            --set-env-vars \
+              FUNDED_DIRECT_SERVICE_ENABLED=false \
+              FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED=false \
+              FUNDED_DIRECT_WORKER_ENABLED=false \
+              ALLOW_FUNDED_DIRECT=false \
+              FUNDED_DIRECT_DRY_RUN=true \
+            --only-show-errors -o none
           test "$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query status -o tsv)" = "SendDisabled"
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            -o json > restored-funded-app.json
+          test "$(jq -r '.properties.template.scale.minReplicas' restored-funded-app.json)" = "0"
+          test "$(jq -r '.properties.template.scale.maxReplicas' restored-funded-app.json)" = "1"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_SERVICE_ENABLED") | .value' restored-funded-app.json)" = "false"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED") | .value' restored-funded-app.json)" = "false"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_WORKER_ENABLED") | .value' restored-funded-app.json)" = "false"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_FUNDED_DIRECT") | .value' restored-funded-app.json)" = "false"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_DRY_RUN") | .value' restored-funded-app.json)" = "true"
