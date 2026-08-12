@@ -20,6 +20,40 @@ secure_dir() {
   [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] || die "wrong owner or mode: $dir"
 }
 
+validate_attestation() (
+  report=$1 attestation=$2 platform=$3 image=$4 job_name=${5:-}
+  [ ! -L "$report" ] && [ -f "$report" ] && [ "$(stat -c %h "$report")" = 1 ] || die "unsafe or missing report: $report"
+  secure_file "$attestation" 640
+  report_sha=$(sha "$report")
+  case "$platform" in
+    azure_container_apps_job)
+      jq -e --arg sha "$report_sha" --arg image "$image" --arg job "$job_name" '
+        .schema_version == 1 and .report_sha256 == $sha and
+        .platform == "azure_container_apps_job" and .image == $image and .job_name == $job and
+        (.execution_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
+      ' "$attestation" >/dev/null || die "invalid Azure execution attestation: $attestation"
+      jq -e --arg image "$image" --arg job "$job_name" --arg execution "$(jq -r '.execution_id' "$attestation")" '
+        .generator_provenance == {schema_version:1,platform:"azure_container_apps_job",
+          image:$image,execution_id:$execution,job_name:$job}
+      ' "$report" >/dev/null || die "Azure report provenance does not match its attestation: $report"
+      ;;
+    oci_podman)
+      jq -e --arg sha "$report_sha" --arg image "$image" '
+        .schema_version == 1 and .report_sha256 == $sha and .platform == "oci_podman" and
+        .image == $image and
+        (.execution_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
+        (.image_digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+        (.container_id | type == "string" and test("^[0-9a-f]{64}$"))
+      ' "$attestation" >/dev/null || die "invalid OCI execution attestation: $attestation"
+      jq -e --arg image "$image" --arg execution "$(jq -r '.execution_id' "$attestation")" '
+        .generator_provenance == {schema_version:1,platform:"oci_podman",
+          image:$image,execution_id:$execution,job_name:null}
+      ' "$report" >/dev/null || die "OCI report provenance does not match its attestation: $report"
+      ;;
+    *) die "unsupported attestation platform: $platform" ;;
+  esac
+)
+
 sequence_evidence() {
   jq -ce '
     def valid_run:
@@ -78,11 +112,73 @@ feed_evidence() {
 }
 
 
+validate_evidence_artifacts() {
+  file=$1
+  start=$(jq -er '.hourStartUtc | select(type == "string")' "$file") || die "evidence hour is missing: $file"
+  epoch=$(date -u -d "$start" +%s) || die "invalid evidence hour: $file"
+  stamp=$(date -u -d "@$epoch" +%Y%m%dT%H)
+  day=$(date -u -d "@$epoch" +%Y/%m/%d)
+  hour=$(date -u -d "@$epoch" +%H)
+  check_artifact() {
+    path=$1
+    declared_sha=$2
+    case "$path" in */../*|*/..|../*|..) die "unsafe evidence artifact path: $path" ;; esac
+    [ ! -L "$path" ] && [ -f "$path" ] && [ "$(stat -c %h "$path")" = 1 ] || die "unsafe evidence artifact: $path"
+    [ "$declared_sha" = "$(sha "$path")" ] || die "evidence artifact hash mismatch: $path"
+  }
+  azure_path=$(jq -er '.scheduledAudits.azure.path' "$file") || die "Azure artifact reference is missing: $file"
+  oci_path=$(jq -er '.scheduledAudits.oci.path' "$file") || die "OCI artifact reference is missing: $file"
+  same_path=$(jq -er '.sameInput.path' "$file") || die "same-input artifact reference is missing: $file"
+  azure_attestation=$(jq -er '.scheduledAudits.azure.attestation.path' "$file") || die "Azure attestation reference is missing: $file"
+  oci_attestation=$(jq -er '.scheduledAudits.oci.attestation.path' "$file") || die "OCI attestation reference is missing: $file"
+  same_attestation=$(jq -er '.sameInput.attestation.path' "$file") || die "same-input attestation reference is missing: $file"
+  [ "$azure_path" = "$hourly_root/$stamp/azure-scheduled-audit.json" ] || die "Azure artifact path is not bound to its hour: $file"
+  [ "$oci_path" = "$report_root/$day/$hour/audit.json" ] || die "OCI artifact path is not bound to its hour: $file"
+  [ "$same_path" = "$hourly_root/$stamp/same-input-audit.json" ] || die "same-input artifact path is not bound to its hour: $file"
+  [ "$azure_attestation" = "$azure_path.attestation.json" ] || die "Azure attestation path is not bound to its report: $file"
+  [ "$oci_attestation" = "$oci_path.attestation.json" ] || die "OCI attestation path is not bound to its report: $file"
+  [ "$same_attestation" = "$same_path.attestation.json" ] || die "same-input attestation path is not bound to its report: $file"
+  check_artifact "$azure_path" "$(jq -er '.scheduledAudits.azure.sha256' "$file")"
+  check_artifact "$oci_path" "$(jq -er '.scheduledAudits.oci.sha256' "$file")"
+  check_artifact "$same_path" "$(jq -er '.sameInput.sha256' "$file")"
+  check_artifact "$azure_attestation" "$(jq -er '.scheduledAudits.azure.attestation.sha256' "$file")"
+  check_artifact "$oci_attestation" "$(jq -er '.scheduledAudits.oci.attestation.sha256' "$file")"
+  check_artifact "$same_attestation" "$(jq -er '.sameInput.attestation.sha256' "$file")"
+  validate_attestation "$azure_path" "$azure_attestation" azure_container_apps_job "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_AZURE_JOB_NAME"
+  validate_attestation "$oci_path" "$oci_attestation" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+  validate_attestation "$same_path" "$same_attestation" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+  segment_count=$(jq -er '.segments | type == "array" and length == 6' "$file") || die "evidence segments are incomplete: $file"
+  i=0
+  while [ "$i" -lt 6 ]; do
+    source_path=$(jq -er ".segments[$i].source.path" "$file")
+    gzip_path=$(jq -er ".segments[$i].gzip.path" "$file")
+    manifest_path=$(jq -er ".segments[$i].manifest.path" "$file")
+    receipt_path=$(jq -er ".segments[$i].receipt.path" "$file")
+    case "$source_path" in "$segments_root/$day/$hour/"*) ;; *) die "segment source path is not bound to its hour: $file" ;; esac
+    case "$gzip_path" in "$archive_root/$day/$hour/"*) ;; *) die "segment archive path is not bound to its hour: $file" ;; esac
+    case "$manifest_path" in "$archive_root/$day/$hour/"*) ;; *) die "segment manifest path is not bound to its hour: $file" ;; esac
+    case "$receipt_path" in "$archive_root/$day/$hour/"*) ;; *) die "segment receipt path is not bound to its hour: $file" ;; esac
+    check_artifact "$source_path" "$(jq -er ".segments[$i].source.sha256" "$file")"
+    check_artifact "$gzip_path" "$(jq -er ".segments[$i].gzip.sha256" "$file")"
+    check_artifact "$manifest_path" "$(jq -er ".segments[$i].manifest.sha256" "$file")"
+    check_artifact "$receipt_path" "$(jq -er ".segments[$i].receipt.sha256" "$file")"
+    i=$((i + 1))
+  done
+}
+
 env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
 secure_file "$env_file" 640
 set -a
 . "$env_file"
 set +a
+formal_expected_git_sha=${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}
+formal_expected_azure_image=${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?set the approved Azure image digest}
+formal_expected_oci_image=${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?set the approved OCI multiarch image digest}
+formal_window_start=${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}
+formal_ledger=${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}
+formal_subscription=${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}
+formal_azure_resource_group=${POLYEDGE_PARITY_AZURE_RESOURCE_GROUP:?missing Azure resource group}
+formal_azure_job_name=${POLYEDGE_PARITY_AZURE_JOB_NAME:?missing Azure hourly job name}
 
 lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
 lock_ledger() {
@@ -104,17 +200,45 @@ secure_file "$hourly_env" 600
 set -a
 . "$hourly_env"
 set +a
+[ "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:-}" = "$formal_expected_git_sha" ] || die 'hourly environment overrides the formal source commit'
+[ "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:-}" = "$formal_expected_azure_image" ] || die 'hourly environment overrides the formal Azure image'
+[ "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:-}" = "$formal_expected_oci_image" ] || die 'hourly environment overrides the formal OCI image'
+[ "${POLYEDGE_PARITY_WINDOW_START_UTC:-}" = "$formal_window_start" ] || die 'hourly environment overrides the formal window start'
+[ "${POLYEDGE_PARITY_LEDGER:-}" = "$formal_ledger" ] || die 'hourly environment overrides the formal ledger path'
+[ "${AZURE_SUBSCRIPTION_ID:-}" = "$formal_subscription" ] || die 'hourly environment overrides the Azure subscription'
+[ "${POLYEDGE_PARITY_AZURE_RESOURCE_GROUP:-}" = "$formal_azure_resource_group" ] || die 'hourly environment overrides the Azure resource group'
+[ "${POLYEDGE_PARITY_AZURE_JOB_NAME:-}" = "$formal_azure_job_name" ] || die 'hourly environment overrides the Azure job name'
+POLYEDGE_PARITY_EXPECTED_GIT_SHA=$formal_expected_git_sha
+POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE=$formal_expected_azure_image
+POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=$formal_expected_oci_image
+POLYEDGE_PARITY_WINDOW_START_UTC=$formal_window_start
+POLYEDGE_PARITY_LEDGER=$formal_ledger
+AZURE_SUBSCRIPTION_ID=$formal_subscription
+POLYEDGE_PARITY_AZURE_RESOURCE_GROUP=$formal_azure_resource_group
+POLYEDGE_PARITY_AZURE_JOB_NAME=$formal_azure_job_name
 
 : "${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}"
 : "${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}"
+: "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}"
+: "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?set the approved Azure image digest}"
+: "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?set the approved OCI multiarch image digest}"
 : "${POLYEDGE_RESEARCH_IMAGE:?missing pinned research image}"
 : "${AZURE_TENANT_ID:?missing research tenant ID}"
 : "${AZURE_CLIENT_ID:?missing research client ID}"
+: "${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}"
+: "${POLYEDGE_PARITY_AZURE_RESOURCE_GROUP:?missing Azure resource group}"
+: "${POLYEDGE_PARITY_AZURE_JOB_NAME:?missing Azure hourly job name}"
 [ "${AZURE_STORAGE_ACCOUNT_NAME:-}" = stpolyedge6urdjr5nmwx7w ] || die 'unexpected Azure storage account'
 [ "${AZURE_STORAGE_CONTAINER_NAME:-}" = bot-events ] || die 'unexpected Azure storage container'
 [ "${POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH:-}" = true ] || die 'artifact publication must remain disabled'
-printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
-  || die 'research image is not an immutable GHCR digest'
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'expected source commit is malformed'
+for image in "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"; do
+  printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+    || die 'expected research image is not an immutable registry digest'
+done
+[ "$POLYEDGE_RESEARCH_IMAGE" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] || die 'hourly OCI job image differs from the formal multiarch image'
+printf '%s' "$AZURE_SUBSCRIPTION_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || die 'Azure subscription ID is malformed'
+printf '%s/%s' "$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP" "$POLYEDGE_PARITY_AZURE_JOB_NAME" | grep -Eq '^[A-Za-z0-9._()-]+/[A-Za-z0-9._()-]+$' || die 'Azure job resource identity is malformed'
 printf '%s' "$POLYEDGE_PARITY_WINDOW_START_UTC" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
   || die 'formal window start is malformed'
 window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
@@ -234,7 +358,10 @@ collect_refs() {
       [ "$((epoch % 3600))" -eq 0 ] && [ "$(date -u -d "@$epoch" +%Y-%m-%dT%H:00:00Z)" = "$start" ] || die "non-canonical accepted hour: $file"
       expected_file="$hourly_root/$(date -u -d "@$epoch" +%Y%m%dT%H)/evidence.json"
       [ "$file" = "$expected_file" ] || die "accepted evidence is stored under the wrong hour: $file"
-      jq -e '.status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true' "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
+      jq -e --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+        '.status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true and
+         .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image' "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
+      validate_evidence_artifacts "$file"
       sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
       feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
       file_sha=$(sha "$file")
@@ -284,12 +411,15 @@ update_ledger() {
 
 if [ -e "$evidence" ]; then
   secure_file "$evidence" 640
-  jq -e --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" '
+  jq -e --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .hourStartUtc == $hour and .hourEndUtc == $end and .ledgerPath == $ledger and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
-    .sameInput.deterministicResultExactMatch == true
+    .sameInput.deterministicResultExactMatch == true and
+    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image
   ' "$evidence" >/dev/null || die 'existing accepted evidence is invalid'
+  validate_evidence_artifacts "$evidence"
   sequence_evidence "$evidence" >/dev/null || die 'existing accepted evidence lacks recorder sequence proof'
   feed_evidence "$evidence" || die 'existing accepted evidence lacks continuous essential feed proof'
   lock_ledger
@@ -503,13 +633,16 @@ if [ "$target_epoch" -gt "$first_epoch" ]; then
   prior_epoch=$((target_epoch - 3600))
   prior=$hourly_root/$(date -u -d "@$prior_epoch" +%Y%m%dT%H)/evidence.json
   secure_file "$prior" 640
-  jq -e --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" --argjson epoch "$prior_epoch" '
+  jq -e --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" --argjson epoch "$prior_epoch" \
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .windowStartUtc == $window and .ledgerPath == $ledger and
     .hourStartUtc == ($epoch | strftime("%Y-%m-%dT%H:00:00Z")) and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
-    .sameInput.deterministicResultExactMatch == true
+    .sameInput.deterministicResultExactMatch == true and
+    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image
   ' "$prior" >/dev/null || die 'prior accepted evidence is invalid'
+  validate_evidence_artifacts "$prior"
   prior_runs=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
   feed_evidence "$prior" || die 'prior accepted evidence lacks continuous essential feed proof'
   printf '%s\n%s\n' "$prior_runs" "$hour_runs" | jq -se '
@@ -583,28 +716,42 @@ last_run=$(printf '%s' "$hour_runs" | jq -ce 'last')
 
 oci_scheduled=$report_root/$day/$hour/audit.json
 [ ! -L "$oci_scheduled" ] && [ -f "$oci_scheduled" ] && [ "$(stat -c %h "$oci_scheduled")" = 1 ] || die 'OCI scheduled audit is missing or unsafe'
+oci_attestation=$oci_scheduled.attestation.json
+validate_attestation "$oci_scheduled" "$oci_attestation" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
 
 azure_report=$hour_dir/azure-scheduled-audit.json
+azure_attestation=$azure_report.attestation.json
 same_report=$hour_dir/same-input-audit.json
+same_attestation=$same_report.attestation.json
 azure_input="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$day/$hour/?prefetch_blobs=8"
 azure_tmp=
+azure_attestation_tmp=
+azure_execution_tmp=
 same_tmp=
+same_attestation_tmp=
 same_markdown=
 same_work_dir=
-if [ -e "$azure_report" ]; then
+same_container=
+if [ -e "$azure_report" ] || [ -e "$azure_attestation" ]; then
   secure_file "$azure_report" 640
+  secure_file "$azure_attestation" 640
   azure_candidate=$azure_report
+  azure_attestation_candidate=$azure_attestation
 else
   azure_candidate=
+  azure_attestation_candidate=
 fi
-if [ -e "$same_report" ]; then
+if [ -e "$same_report" ] || [ -e "$same_attestation" ]; then
   secure_file "$same_report" 640
+  secure_file "$same_attestation" 640
   same_candidate=$same_report
+  same_attestation_candidate=$same_attestation
 else
   same_candidate=
+  same_attestation_candidate=
 fi
 
-if [ -z "$azure_candidate" ] || [ -z "$same_candidate" ]; then
+# The exact Azure execution is checked even when both local artifacts were recovered.
   [ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%a %h' "$token_file")" = '600 1' ] \
     || die 'research workload token is missing or unsafe'
   token_dir=${token_file%/*}
@@ -615,9 +762,8 @@ if [ -z "$azure_candidate" ] || [ -z "$same_candidate" ]; then
   token_uid=${POLYEDGE_PARITY_TOKEN_UID:-$(id -u polyedge-identity-research)}
   token_gid=${POLYEDGE_PARITY_TOKEN_GID:-$(id -g polyedge-identity-research)}
   [ "$(stat -c '%u:%g' "$token_file")" = "$token_uid:$token_gid" ] || die 'research workload token is not owned by the research identity'
-fi
 
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$azure_tmp" "$same_tmp" "$same_markdown"; [ -z "$same_work_dir" ] || rmdir "$same_work_dir" 2>/dev/null || true' EXIT HUP INT TERM
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$azure_tmp" "$azure_attestation_tmp" "$azure_execution_tmp" "$same_tmp" "$same_attestation_tmp" "$same_markdown"; [ -z "$same_container" ] || podman rm -f "$same_container" >/dev/null 2>&1 || true; [ -z "$same_work_dir" ] || rmdir "$same_work_dir" 2>/dev/null || true' EXIT HUP INT TERM
 if [ -z "$azure_candidate" ]; then
   curl --silent --show-error --fail --output "$oauth_response" \
     --request POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
@@ -633,34 +779,75 @@ if [ -z "$azure_candidate" ]; then
   curl --silent --show-error --fail --output "$azure_tmp" --header @"$auth_header" --header 'x-ms-version: 2023-11-03' \
     "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/$AZURE_STORAGE_CONTAINER_NAME/reports/research/hourly/$day/$hour/audit.json" \
     || die 'Azure scheduled audit download failed'
+  azure_attestation_tmp=$(mktemp "$hour_dir/.azure-scheduled-attestation.XXXXXX")
+  curl --silent --show-error --fail --output "$azure_attestation_tmp" --header @"$auth_header" --header 'x-ms-version: 2023-11-03' \
+    "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/$AZURE_STORAGE_CONTAINER_NAME/reports/research/hourly/$day/$hour/audit.json.attestation.json" \
+    || die 'Azure scheduled audit attestation download failed'
   chmod 0640 "$azure_tmp"
+  chmod 0640 "$azure_attestation_tmp"
   azure_candidate=$azure_tmp
+  azure_attestation_candidate=$azure_attestation_tmp
 fi
 
 if [ -z "$same_candidate" ]; then
   same_work_dir=$(mktemp -d "$runtime_dir/same-input.XXXXXX")
-  chown "$token_uid:$token_gid" "$same_work_dir"
+  chown "$expected_uid:$expected_gid" "$same_work_dir"
   chmod 0700 "$same_work_dir"
+  secure_dir "$same_work_dir" 700
   same_tmp=$same_work_dir/audit.json
   same_markdown=$same_work_dir/audit.md
+  same_attestation_tmp=$same_work_dir/audit.json.attestation.json
+  POLYEDGE_GENERATOR_EXECUTION_ID=$(cat /proc/sys/kernel/random/uuid)
+  POLYEDGE_GENERATOR_PLATFORM=oci_podman
+  POLYEDGE_GENERATOR_IMAGE=$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE
+  export POLYEDGE_GENERATOR_EXECUTION_ID POLYEDGE_GENERATOR_PLATFORM POLYEDGE_GENERATOR_IMAGE
+  same_container="polyedge-parity-$stamp-$POLYEDGE_GENERATOR_EXECUTION_ID"
   # ponytail: Podman NNP breaks DNS on this host; the dedicated UID, read-only root, and zero capabilities contain this one-shot audit. Restore NNP after the runtime resolver is fixed.
-  timeout --preserve-status 1800 podman run --rm --pull=never --log-driver=journald --name "polyedge-parity-$stamp" --network polyedge \
+  timeout --preserve-status 1800 podman run --pull=never --log-driver=journald --name "$same_container" --network polyedge \
     --cpus 0.5 --memory 1g --pids-limit 1024 --read-only --cap-drop=all \
-    --user "$token_uid:$token_gid" --tmpfs /tmp:rw,noexec,nosuid,size=128m --env-file "$hourly_env" \
-    -v "$token_file:/run/credentials/azure-federated-token:ro,Z" -v "$same_work_dir:/evidence:rw,Z" \
+    --user "$token_uid:$token_gid" --tmpfs /tmp:rw,noexec,nosuid,size=128m \
+    --tmpfs "/evidence:rw,noexec,nosuid,size=64m,mode=0700,uid=$token_uid,gid=$token_gid" --env-file "$hourly_env" \
+    -v "$token_file:/run/credentials/azure-federated-token:ro,Z" \
+    --env POLYEDGE_GENERATOR_EXECUTION_ID --env POLYEDGE_GENERATOR_PLATFORM --env POLYEDGE_GENERATOR_IMAGE \
     "$POLYEDGE_RESEARCH_IMAGE" polyedge-rs research audit \
     --input "$azure_input" \
     --out /evidence/audit.json --markdown /evidence/audit.md --exclude-file /app/data_quality/exclusion_windows.yaml \
     || die 'same-input OCI audit failed'
-  [ ! -L "$same_tmp" ] && [ -f "$same_tmp" ] && [ "$(stat -c %h "$same_tmp")" = 1 ] \
-    || die 'same-input OCI audit output is missing or unsafe'
-  chmod 0640 "$same_tmp"
+  same_configured_image=$(podman inspect --format '{{.Config.Image}}' "$same_container")
+  same_image_digest=$(podman inspect --format '{{.ImageDigest}}' "$same_container")
+  same_container_id=$(podman inspect --format '{{.Id}}' "$same_container")
+  [ "$same_configured_image" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] || die 'same-input container image differs from the approved OCI image'
+  printf '%s' "$same_image_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'same-input container image digest is invalid'
+  printf '%s' "$same_container_id" | grep -Eq '^[0-9a-f]{64}$' || die 'same-input container ID is invalid'
+  podman cp --archive=false "$same_container:/evidence/audit.json" "$same_tmp" \
+    || die 'same-input report extraction failed'
+  podman cp --archive=false "$same_container:/evidence/audit.md" "$same_markdown" \
+    || die 'same-input markdown extraction failed'
+  chmod 0640 "$same_tmp" "$same_markdown"
+  chown "$expected_uid:$expected_gid" "$same_tmp" "$same_markdown"
+  secure_file "$same_tmp" 640
+  secure_file "$same_markdown" 640
+  jq -e --arg image "$same_configured_image" --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" '
+    .generator_provenance == {schema_version:1,platform:"oci_podman",
+      image:$image,execution_id:$execution,job_name:null}
+  ' "$same_tmp" >/dev/null || die 'same-input report generator provenance is invalid'
+  jq -n --arg report_sha256 "$(sha "$same_tmp")" --arg image "$same_configured_image" \
+    --arg image_digest "$same_image_digest" --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" \
+    --arg container_id "$same_container_id" \
+    '{schema_version:1,report_sha256:$report_sha256,platform:"oci_podman",image:$image,
+      image_digest:$image_digest,execution_id:$execution,container_id:$container_id}' >"$same_attestation_tmp"
+  chmod 0640 "$same_attestation_tmp"
+  chown "$expected_uid:$expected_gid" "$same_attestation_tmp"
+  sync -f "$same_attestation_tmp"
+  podman rm "$same_container" >/dev/null || die 'same-input container removal failed'
+  same_container=
   same_candidate=$same_tmp
+  same_attestation_candidate=$same_attestation_tmp
 fi
 
 validate_report() {
-  jq -e --arg start "$target" --arg end "$hour_end" '
-    type == "object" and (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+  jq -e --arg start "$target" --arg end "$hour_end" --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" '
+    type == "object" and (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and .git_sha == $expected_git and
     (.generated_at | type == "string") and (.result | type == "object") and
     (.result.total_events | type == "number" and . >= 0) and
     (.result.fatal_data_quality_issues | type == "array" and length == 0) and
@@ -682,7 +869,7 @@ validate_report() {
       .paper_maker_fill_policy == "touch_after_quote_was_live" and
       .publish_strategy_canary_intents == false and .candidate == null and
       .decision_config_schema == "polyedge.decision_config.v1" and
-      (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+      (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and .git_sha == $expected_git and
       (.runtime_config_hash | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
       (.decision_config_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
       .decision_pipeline_schema == "polyedge.strategy_decision_batch.v4" and
@@ -691,10 +878,14 @@ validate_report() {
     ([.result.runtime_provenance.identities[].git_sha] | unique | length == 1) and
     ([.result.runtime_provenance.identities[].runtime_config_hash] | unique | length == 1) and
     ([.result.runtime_provenance.identities[].decision_config_sha256] | unique | length == 1) and
+    ((.result.runtime_provenance.first_timestamp | fromdateiso8601) >=
+      ($start | fromdateiso8601)) and
     ((.result.runtime_provenance.first_timestamp | fromdateiso8601) <=
       (($start | fromdateiso8601) + 300)) and
     ((.result.runtime_provenance.last_timestamp | fromdateiso8601) >=
       (($end | fromdateiso8601) - 300)) and
+    ((.result.runtime_provenance.last_timestamp | fromdateiso8601) <
+      ($end | fromdateiso8601)) and
     (.result.runtime_provenance.max_gap_ms | type == "number" and . >= 0 and . <= 300000) and
     (.result.strategy_batches | type == "number" and . > 0 and floor == .) and
     .result.strategy_batch_replayed == .result.strategy_batches and
@@ -719,6 +910,62 @@ validate_report() {
 validate_report "$azure_candidate"
 validate_report "$oci_scheduled"
 validate_report "$same_candidate"
+validate_attestation "$azure_candidate" "$azure_attestation_candidate" azure_container_apps_job "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_AZURE_JOB_NAME"
+validate_attestation "$same_candidate" "$same_attestation_candidate" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+azure_execution_id=$(jq -r '.execution_id' "$azure_attestation_candidate")
+curl --silent --show-error --fail --output "$oauth_response" \
+  --request POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode "client_id=$AZURE_CLIENT_ID" \
+  --data-urlencode scope=https://management.azure.com/.default \
+  --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  --data-urlencode "client_assertion@$token_file" || die 'research UAMI ARM token exchange failed'
+access_token=$(jq -er '.access_token | select(type == "string" and length > 0)' "$oauth_response") || die 'ARM OAuth response is malformed'
+printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header"
+unset access_token
+azure_execution_tmp=$(mktemp "$runtime_dir/azure-execution.XXXXXX")
+chmod 0600 "$azure_execution_tmp"
+# The exact execution GET requires Microsoft.App/jobs/execution/read on this job.
+curl --silent --show-error --fail --output "$azure_execution_tmp" --header @"$auth_header" \
+  "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP/providers/Microsoft.App/jobs/$POLYEDGE_PARITY_AZURE_JOB_NAME/executions/$azure_execution_id?api-version=2025-07-01" \
+  || die 'exact Azure job execution read failed'
+expected_azure_args='TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+azure_generated_at=$(jq -er '.generated_at | select(type == "string")' "$azure_candidate") || die 'Azure report generation time is missing'
+azure_execution_start=$(jq -er '.properties.startTime | select(type == "string")' "$azure_execution_tmp") || die 'Azure execution start time is missing'
+azure_execution_end=$(jq -er '.properties.endTime | select(type == "string")' "$azure_execution_tmp") || die 'Azure execution end time is missing'
+azure_start_epoch=$(date -u -d "$azure_execution_start" +%s) || die 'Azure execution start time is invalid RFC3339'
+azure_end_epoch=$(date -u -d "$azure_execution_end" +%s) || die 'Azure execution end time is invalid RFC3339'
+azure_generated_epoch=$(date -u -d "$azure_generated_at" +%s) || die 'Azure report generation time is invalid RFC3339'
+jq -e --arg execution "$azure_execution_id" --arg image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" \
+  --argjson hour_end_epoch "$end_epoch" --argjson started "$azure_start_epoch" \
+  --argjson ended "$azure_end_epoch" --argjson produced "$azure_generated_epoch" \
+  --arg expected_args "$expected_azure_args" '
+  def one_value($name; $value):
+    ([.properties.template.containers[0].env[]? | select(.name == $name)] | length == 1 and .[0].value == $value);
+  def one_safe_bearer_secret:
+    ([.properties.template.containers[0].env[]? | select(.name == "API_BEARER_TOKEN")] |
+      length == 1 and (.[0].secretRef == "api-bearer-token" or
+        .[0].secretRef == "cappjob-polyedge-hourly-quality-job") and
+      (.[0] | has("value") | not));
+  .name == $execution and .properties.status == "Succeeded" and
+  (.properties.startTime | type == "string") and (.properties.endTime | type == "string") and
+  $started >= $hour_end_epoch and $started <= ($hour_end_epoch + 1200) and
+  $ended >= $started and $ended <= ($hour_end_epoch + 1800) and
+  $produced >= $started and $produced <= $ended and
+  (.properties.template.containers | type == "array" and length == 1) and
+  .properties.template.containers[0].name == "research-job" and
+  .properties.template.containers[0].image == $image and
+  .properties.template.containers[0].command == ["/bin/sh", "-lc"] and
+  .properties.template.containers[0].args == [$expected_args] and
+  one_value("ALLOW_LIVE"; "false") and one_value("EXECUTION_MODE"; "paper") and
+  one_value("RUN_BOT_ON_STARTUP"; "false") and one_value("ENABLE_TAKER_ORDERS"; "false") and
+  one_value("ALLOW_EMERGENCY_ACCOUNT_CANCEL"; "false") and one_value("REQUIRE_API_AUTH"; "true") and
+  one_safe_bearer_secret and
+  one_value("POLYEDGE_GENERATOR_PLATFORM"; "azure_container_apps_job") and
+  one_value("POLYEDGE_GENERATOR_IMAGE"; $image) and
+  ([.properties.template.containers[0].env[]?.name |
+    select(. == "CONTAINER_APP_JOB_NAME" or . == "CONTAINER_APP_JOB_EXECUTION_NAME")] | length == 0)
+' "$azure_execution_tmp" >/dev/null || die 'Azure execution identity, time, command, environment, or immutable image does not match the report attestation'
 local_input="/input/events/$day/$hour/"
 for binding in "$azure_candidate:$azure_input" "$same_candidate:$azure_input" "$oci_scheduled:$local_input"; do
   report_file=${binding%%:*}
@@ -735,19 +982,27 @@ same_decision_config=$(jq -er '[.result.runtime_provenance.identities[].decision
 
 if [ -n "$azure_tmp" ]; then
   sync -f "$azure_tmp"
+  sync -f "$azure_attestation_tmp"
   mv "$azure_tmp" "$azure_report"
+  mv "$azure_attestation_tmp" "$azure_attestation"
   azure_tmp=
+  azure_attestation_tmp=
 fi
 if [ -n "$same_tmp" ]; then
   sync -f "$same_tmp"
+  sync -f "$same_attestation_tmp"
   chown "$expected_uid:$expected_gid" "$same_tmp"
   mv "$same_tmp" "$same_report"
+  mv "$same_attestation_tmp" "$same_attestation"
   same_tmp=
+  same_attestation_tmp=
   rm -f "$same_markdown"
   same_markdown=
   rmdir "$same_work_dir"
   same_work_dir=
 fi
+rm -f "$azure_execution_tmp"
+azure_execution_tmp=
 trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 
 evidence=$hour_dir/evidence.json
@@ -755,13 +1010,25 @@ evidence=$hour_dir/evidence.json
 tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
 trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$tmp"' EXIT HUP INT TERM
 jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
-  --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg image "$POLYEDGE_RESEARCH_IMAGE" \
+  --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" \
   --arg azure_path "$azure_report" --arg azure_sha "$(sha "$azure_report")" --arg oci_path "$oci_scheduled" --arg oci_sha "$(sha "$oci_scheduled")" \
+  --arg azure_attestation "$azure_attestation" --arg azure_attestation_sha "$(sha "$azure_attestation")" \
+  --arg oci_attestation "$oci_attestation" --arg oci_attestation_sha "$(sha "$oci_attestation")" \
   --arg same_path "$same_report" --arg same_sha "$(sha "$same_report")" --arg result_sha "$azure_result" --arg decision_config_sha256 "$azure_decision_config" \
+  --arg same_attestation "$same_attestation" --arg same_attestation_sha "$(sha "$same_attestation")" \
   --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
   --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
   --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
-  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,researchImage:$image,segments:$segments,recorderStatus:$recorder_status,continuousFeedHealth:$continuous_feed,decisionConfigSha256:$decision_config_sha256,scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null},oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null}},sameInput:{path:$same_path,sha256:$same_sha,azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
+  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,
+    status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,
+    ledgerPath:$ledger,gitSha:$expected_git,azureResearchImage:$azure_image,ociResearchImage:$oci_image,
+    segments:$segments,recorderStatus:$recorder_status,continuousFeedHealth:$continuous_feed,
+    decisionConfigSha256:$decision_config_sha256,
+    scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null,attestation:{path:$azure_attestation,sha256:$azure_attestation_sha}},
+      oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null,attestation:{path:$oci_attestation,sha256:$oci_attestation_sha}}},
+    sameInput:{path:$same_path,sha256:$same_sha,attestation:{path:$same_attestation,sha256:$same_attestation_sha},azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},
+    disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},
+    services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
   .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
 chmod 0640 "$tmp"
 sync -f "$tmp"

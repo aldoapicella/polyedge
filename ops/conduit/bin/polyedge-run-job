@@ -49,7 +49,10 @@ case "$job" in
     ;;
   hourly)
     cpus=0.5 memory=1g limit=1800
-    command='TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "${POLYEDGE_LOCAL_RAW_ROOT%/}/$DAY/$HOUR/" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+    audit_target=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)
+    audit_day=${audit_target%/*}
+    audit_hour=${audit_target##*/}
+    command='OUT="reports/research/hourly/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "${POLYEDGE_LOCAL_RAW_ROOT%/}/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/" --out "$OUT" --markdown "reports/research/hourly/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
     ;;
   daily)
     cpus=1.5 memory=4g limit=46800
@@ -145,7 +148,23 @@ case "$job" in
     export POLYEDGE_RESEARCH_DATE
     set -- --volume "$ring/segments:/input/events:ro,Z" --env POLYEDGE_RESEARCH_DATE
     ;;
-  hourly|replay)
+  hourly)
+    : "${POLYEDGE_LOCAL_RAW_ROOT:?set POLYEDGE_LOCAL_RAW_ROOT to /input/events}"
+    test "$POLYEDGE_LOCAL_RAW_ROOT" = /input/events || {
+      echo 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' >&2
+      exit 64
+    }
+    POLYEDGE_GENERATOR_EXECUTION_ID=$(cat /proc/sys/kernel/random/uuid)
+    POLYEDGE_GENERATOR_PLATFORM=oci_podman
+    POLYEDGE_GENERATOR_IMAGE=$POLYEDGE_RESEARCH_IMAGE
+    POLYEDGE_AUDIT_DAY=$audit_day
+    POLYEDGE_AUDIT_HOUR=$audit_hour
+    export POLYEDGE_GENERATOR_EXECUTION_ID POLYEDGE_GENERATOR_PLATFORM POLYEDGE_GENERATOR_IMAGE POLYEDGE_AUDIT_DAY POLYEDGE_AUDIT_HOUR
+    set -- --volume "$ring/segments:/input/events:ro,Z" \
+      --env POLYEDGE_GENERATOR_EXECUTION_ID --env POLYEDGE_GENERATOR_PLATFORM --env POLYEDGE_GENERATOR_IMAGE \
+      --env POLYEDGE_AUDIT_DAY --env POLYEDGE_AUDIT_HOUR
+    ;;
+  replay)
     : "${POLYEDGE_LOCAL_RAW_ROOT:?set POLYEDGE_LOCAL_RAW_ROOT to /input/events}"
     test "$POLYEDGE_LOCAL_RAW_ROOT" = /input/events || {
       echo 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' >&2
@@ -158,8 +177,14 @@ esac
 
 # Freshness and hourly audits write only their own disjoint report paths and
 # must stay live while the longer data-producing jobs serialize below.
+container_name=polyedge-job-$job
+remove_after=--rm
+if [ "$job" = hourly ]; then
+  container_name="polyedge-job-hourly-$POLYEDGE_GENERATOR_EXECUTION_ID"
+  remove_after=
+fi
 set -- /usr/bin/timeout --preserve-status "$limit" \
-  /usr/bin/podman run --rm --pull=never --log-driver=journald --name "polyedge-job-$job" --network polyedge \
+  /usr/bin/podman run $remove_after --pull=never --log-driver=journald --name "$container_name" --network polyedge \
     --cpus "$cpus" --memory "$memory" --pids-limit 1024 \
     --env-file "/etc/polyedge/jobs/$job.env" \
     -v "$credential_dir:/run/credentials:ro,Z" \
@@ -168,6 +193,65 @@ set -- /usr/bin/timeout --preserve-status "$limit" \
     -v "$work/freshness:/app/data_quality/freshness:Z" \
     "$@" \
     "$POLYEDGE_RESEARCH_IMAGE" /bin/sh -lc "$command"
+
+if [ "$job" = hourly ]; then
+  attestation_tmp=
+  published_attestation=
+  trap 'rm -f "${attestation_tmp:-}" "${published_attestation:-}"; /usr/bin/podman rm -f "$container_name" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+  set +e
+  "$@"
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || exit "$status"
+
+  report=$work/reports/research/hourly/$audit_day/$audit_hour/audit.json
+  attestation=$report.attestation.json
+  [ ! -L "$report" ] && [ -f "$report" ] && [ "$(stat -c %h "$report")" = 1 ] || {
+    echo "hourly audit report is missing or unsafe: $report" >&2
+    exit 1
+  }
+  configured_image=$(/usr/bin/podman inspect --format '{{.Config.Image}}' "$container_name")
+  image_digest=$(/usr/bin/podman inspect --format '{{.ImageDigest}}' "$container_name")
+  container_id=$(/usr/bin/podman inspect --format '{{.Id}}' "$container_name")
+  [ "$configured_image" = "$POLYEDGE_RESEARCH_IMAGE" ] || { echo 'hourly container image differs from configured immutable image' >&2; exit 1; }
+  printf '%s' "$image_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo 'hourly container image digest is invalid' >&2; exit 1; }
+  printf '%s' "$container_id" | grep -Eq '^[0-9a-f]{64}$' || { echo 'hourly container ID is invalid' >&2; exit 1; }
+  jq -e --arg image "$configured_image" --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" '
+    .generator_provenance == {
+      schema_version:1,platform:"oci_podman",image:$image,execution_id:$execution,job_name:null
+    }
+  ' "$report" >/dev/null || { echo 'hourly report generator provenance is invalid' >&2; exit 1; }
+
+  attestation_tmp=$(mktemp "$attestation.XXXXXX")
+  jq -n --arg report_sha256 "sha256:$(sha256sum "$report" | awk '{print $1}')" \
+    --arg image "$configured_image" --arg image_digest "$image_digest" \
+    --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" --arg container_id "$container_id" \
+    '{schema_version:1,report_sha256:$report_sha256,platform:"oci_podman",image:$image,
+      image_digest:$image_digest,execution_id:$execution,container_id:$container_id}' >"$attestation_tmp"
+  chmod 0640 "$attestation_tmp"
+  chown 0:0 "$attestation_tmp"
+  sync -f "$attestation_tmp"
+  mv "$attestation_tmp" "$attestation"
+  attestation_tmp=
+  published_attestation=$attestation
+  [ ! -L "$attestation" ] && [ -f "$attestation" ] && [ "$(stat -c '%u:%g:%a:%h' "$attestation")" = '0:0:640:1' ] || {
+    echo 'hourly audit attestation is unsafe' >&2
+    exit 1
+  }
+  jq -e --arg report_sha256 "sha256:$(sha256sum "$report" | awk '{print $1}')" \
+    --arg image "$configured_image" --arg image_digest "$image_digest" \
+    --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" --arg container_id "$container_id" '
+    . == {schema_version:1,report_sha256:$report_sha256,platform:"oci_podman",image:$image,
+      image_digest:$image_digest,execution_id:$execution,container_id:$container_id}
+  ' "$attestation" >/dev/null || {
+    echo 'hourly audit attestation failed post-write validation' >&2
+    exit 1
+  }
+  /usr/bin/podman rm "$container_name" >/dev/null
+  published_attestation=
+  trap - EXIT HUP INT TERM
+  exit 0
+fi
 
 case "$job" in
   daily|replay|prospective|chart-backfill|backfill|shadow-qset)

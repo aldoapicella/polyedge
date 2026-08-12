@@ -11137,6 +11137,7 @@ fn envelope(
         "generated_at": now_ts(),
         "git_sha": git_sha(),
         "backend": "rust",
+        "generator_provenance": generator_provenance(),
         "data_window": data_window(&result),
         "config": {
             "adaptive_regime_enabled": false,
@@ -11236,9 +11237,35 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), ResearchError> {
         fs::create_dir_all(parent)?;
     }
     let file = File::create(path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), value)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    drop(writer);
+    if let Some(attestation) = generator_attestation(value, &fs::read(path)?) {
+        let attestation_path = PathBuf::from(format!("{}.attestation.json", path.display()));
+        let file = File::create(&attestation_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &attestation)?;
+        writer.flush()?;
+        maybe_publish_research_artifact(&attestation_path)?;
+    }
     maybe_publish_research_artifact(path)?;
     Ok(())
+}
+
+fn generator_attestation(report: &Value, bytes: &[u8]) -> Option<Value> {
+    let provenance = report.get("generator_provenance")?;
+    if provenance.get("platform")?.as_str()? != "azure_container_apps_job" {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "report_sha256": sha256_prefixed(bytes),
+        "platform": provenance["platform"],
+        "image": provenance["image"],
+        "execution_id": provenance["execution_id"],
+        "job_name": provenance["job_name"]
+    }))
 }
 
 fn write_text_file(path: &Path, text: &str) -> Result<(), ResearchError> {
@@ -15415,4 +15442,113 @@ mod tests {
         assert_eq!(state.version, 1);
         assert_eq!(state.immutable.len(), 1);
     }
+    #[test]
+    fn generator_provenance_requires_exact_platform_image_and_execution() {
+        let image = format!(
+            "registry.example.invalid/research@sha256:{}",
+            "a".repeat(64)
+        );
+        let azure = strict_generator_provenance(
+            "azure_container_apps_job",
+            &image,
+            "polyedge-hourly-quality-job-fixture",
+            Some("polyedge-hourly-quality-job"),
+        )
+        .unwrap();
+        assert_eq!(azure["image"], image);
+        assert!(strict_generator_provenance(
+            "azure_container_apps_job",
+            "research:latest",
+            "exec",
+            Some("job")
+        )
+        .is_none());
+        assert!(strict_generator_provenance("oci_podman", &image, "../copied", None).is_none());
+        assert!(strict_generator_provenance("oci_podman", &image, "exec", Some("job")).is_none());
+    }
+
+    #[test]
+    fn azure_generator_attestation_binds_exact_report_bytes() {
+        let provenance = strict_generator_provenance(
+            "azure_container_apps_job",
+            &format!(
+                "registry.example.invalid/research@sha256:{}",
+                "b".repeat(64)
+            ),
+            "polyedge-hourly-quality-job-fixture",
+            Some("polyedge-hourly-quality-job"),
+        )
+        .unwrap();
+        let report = json!({"generator_provenance": provenance});
+        let attestation = generator_attestation(&report, b"exact report").unwrap();
+        assert_eq!(
+            attestation["report_sha256"],
+            sha256_prefixed(b"exact report")
+        );
+        assert_eq!(
+            attestation["execution_id"],
+            "polyedge-hourly-quality-job-fixture"
+        );
+    }
+}
+fn generator_provenance() -> Value {
+    let platform = std::env::var("POLYEDGE_GENERATOR_PLATFORM").unwrap_or_default();
+    let image = std::env::var("POLYEDGE_GENERATOR_IMAGE").unwrap_or_default();
+    let (execution_id, job_name) = if platform == "azure_container_apps_job" {
+        (
+            std::env::var("CONTAINER_APP_JOB_EXECUTION_NAME").unwrap_or_default(),
+            std::env::var("CONTAINER_APP_JOB_NAME").ok(),
+        )
+    } else {
+        (
+            std::env::var("POLYEDGE_GENERATOR_EXECUTION_ID").unwrap_or_default(),
+            None,
+        )
+    };
+    strict_generator_provenance(&platform, &image, &execution_id, job_name.as_deref())
+        .unwrap_or(Value::Null)
+}
+
+fn strict_generator_provenance(
+    platform: &str,
+    image: &str,
+    execution_id: &str,
+    job_name: Option<&str>,
+) -> Option<Value> {
+    if !matches!(platform, "azure_container_apps_job" | "oci_podman")
+        || !valid_immutable_image(image)
+        || !valid_execution_name(execution_id)
+        || (platform == "azure_container_apps_job" && !job_name.is_some_and(valid_execution_name))
+        || (platform == "oci_podman" && job_name.is_some())
+    {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "platform": platform,
+        "image": image,
+        "execution_id": execution_id,
+        "job_name": job_name
+    }))
+}
+
+fn valid_immutable_image(value: &str) -> bool {
+    let Some((name, digest)) = value.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty()
+        && name.contains('/')
+        && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_execution_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }

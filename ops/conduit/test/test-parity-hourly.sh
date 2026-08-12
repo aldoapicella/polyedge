@@ -22,6 +22,8 @@ done
 [ -n "$out" ] || exit 2
 case "$*" in
   *oauth2/v2.0/token*) printf '%s\n' '{"access_token":"fixture-access-token"}' >"$out" ;;
+  *management.azure.com*) cp "$FAKE_AZURE_EXECUTION" "$out" ;;
+  *audit.json.attestation.json*) cp "$FAKE_AZURE_ATTESTATION" "$out" ;;
   *) cp "$FAKE_AZURE_REPORT" "$out" ;;
 esac
 EOF
@@ -29,16 +31,35 @@ EOF
 cat >"$fake/podman" <<'EOF'
 #!/bin/sh
 case "$1" in
-  inspect) printf '%s\n' healthy ;;
+  inspect)
+    case "$*" in
+      *State.Health.Status*) printf '%s\n' healthy ;;
+      *Config.Image*) printf '%s\n' "$FAKE_OCI_IMAGE" ;;
+      *ImageDigest*) printf '%s\n' "$FAKE_OCI_IMAGE_DIGEST" ;;
+      *Id*) printf '%s\n' eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee ;;
+      *) exit 2 ;;
+    esac
+    ;;
   exec) printf 'HTTP/1.0 200 OK\r\n\r\n'; cat "$FAKE_API_STATUS" ;;
   run)
     printf '%s\n' "$*" >>"$FAKE_CALLS/podman"
-    host=
-    for arg do case "$arg" in *:/evidence:rw,Z) host=${arg%:/evidence:rw,Z} ;; esac; done
-    [ -n "$host" ] || exit 2
-    cp "$FAKE_SAME_REPORT" "$host/audit.json"
-    : >"$host/audit.md"
+    execution=${POLYEDGE_GENERATOR_EXECUTION_ID:-}
+    [ -n "$execution" ] || exit 2
+    jq --arg execution "$execution" '.generator_provenance.execution_id=$execution' \
+      "$FAKE_SAME_REPORT" >"$FAKE_CALLS/container-audit.json"
+    : >"$FAKE_CALLS/container-audit.md"
     ;;
+  cp)
+    shift
+    [ "${1:-}" != --archive=false ] || shift
+    source=$1 destination=$2
+    case "$source" in
+      *:/evidence/audit.json) cp "$FAKE_CALLS/container-audit.json" "$destination" ;;
+      *:/evidence/audit.md) cp "$FAKE_CALLS/container-audit.md" "$destination" ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  rm) printf '%s\n' "$*" >>"$FAKE_CALLS/podman-rm" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -75,12 +96,33 @@ exec "$@"
 EOF
 chmod 0755 "$fake"/*
 
+azure_image=crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-research@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+oci_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+oci_image_digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+azure_execution=polyedge-hourly-quality-job-fixture
+azure_args='TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+
 report() {
-  marker=$1 output=$2
-  jq -n --arg marker "$marker" '{
+  kind=$1 output=$2
+  marker=azure
+  platform=oci_podman
+  image=$oci_image
+  execution=$kind-fixture
+  job=null
+  if [ "$kind" = azure ]; then
+    platform=azure_container_apps_job
+    image=$azure_image
+    execution=$azure_execution
+    job=polyedge-hourly-quality-job
+  elif [ "$kind" = mismatch ]; then
+    marker=mismatch
+  fi
+  jq -n --arg marker "$marker" --arg platform "$platform" --arg image "$image" \
+    --arg execution "$execution" --argjson job "$(printf '%s' "$job" | jq -R 'if . == "null" then null else . end')" '{
     git_sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     generated_at:"2026-08-09T16:13:00Z",
     input_path:"azure://stpolyedge6urdjr5nmwx7w/bot-events/events/2026/08/09/15/?prefetch_blobs=8",
+    generator_provenance:{schema_version:1,platform:$platform,image:$image,execution_id:$execution,job_name:$job},
     result:{
       total_events:123,fatal_data_quality_issues:[],fixture_marker:$marker,
       runtime_provenance:{
@@ -110,6 +152,17 @@ report() {
     },
     warnings:[]
   }' >"$output"
+}
+
+attest() {
+  report_file=$1 output=$2
+  jq --arg report_sha256 "sha256:$(sha256sum "$report_file" | awk '{print $1}')" \
+    --arg image_digest "$oci_image_digest" \
+    '.generator_provenance + {report_sha256:$report_sha256} +
+      (if .generator_provenance.platform == "oci_podman" then
+        {image_digest:$image_digest,container_id:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
+       else {} end)' "$report_file" >"$output"
+  chmod 0640 "$output"
 }
 
 fixture() {
@@ -165,13 +218,32 @@ POLYEDGE_PARITY_NOW_EPOCH=$fixture_now
 POLYEDGE_PARITY_STATUS_NOW_EPOCH=$fixture_now
 POLYEDGE_PARITY_TOKEN_UID=$uid
 POLYEDGE_PARITY_TOKEN_GID=$gid
+POLYEDGE_PARITY_EXPECTED_GIT_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE=$azure_image
+POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=$oci_image
+AZURE_SUBSCRIPTION_ID=11111111-1111-1111-1111-111111111111
+POLYEDGE_PARITY_AZURE_RESOURCE_GROUP=rg-polyedge-dev
+POLYEDGE_PARITY_AZURE_JOB_NAME=polyedge-hourly-quality-job
 EOF
   chmod 0640 "$case_root/parity.env"
   report azure "$case_root/azure.json"
-  report azure "$case_root/reports/2026/08/09/15/audit.json"
+  attest "$case_root/azure.json" "$case_root/azure.json.attestation.json"
+  report oci "$case_root/reports/2026/08/09/15/audit.json"
   jq '.input_path="/input/events/2026/08/09/15/"' "$case_root/reports/2026/08/09/15/audit.json" >"$case_root/oci.tmp"
   mv "$case_root/oci.tmp" "$case_root/reports/2026/08/09/15/audit.json"
-  report azure "$case_root/same.json"
+  attest "$case_root/reports/2026/08/09/15/audit.json" "$case_root/reports/2026/08/09/15/audit.json.attestation.json"
+  report same "$case_root/same.json"
+  jq -n --arg execution "$azure_execution" --arg image "$azure_image" --arg args "$azure_args" '{
+    name:$execution,properties:{status:"Succeeded",startTime:"2026-08-09T16:10:00+00:00",endTime:"2026-08-09T16:14:00+00:00",
+      template:{containers:[{name:"research-job",image:$image,command:["/bin/sh","-lc"],args:[$args],env:[
+        {name:"ALLOW_LIVE",value:"false"},{name:"EXECUTION_MODE",value:"paper"},
+        {name:"RUN_BOT_ON_STARTUP",value:"false"},{name:"ENABLE_TAKER_ORDERS",value:"false"},
+        {name:"ALLOW_EMERGENCY_ACCOUNT_CANCEL",value:"false"},{name:"REQUIRE_API_AUTH",value:"true"},
+        {name:"API_BEARER_TOKEN",secretRef:"cappjob-polyedge-hourly-quality-job"},
+        {name:"POLYEDGE_GENERATOR_PLATFORM",value:"azure_container_apps_job"},
+        {name:"POLYEDGE_GENERATOR_IMAGE",value:$image}
+      ]}]}}
+  }' >"$case_root/azure-execution.json"
   jq -n '{
     task_health:{api:"ok",runtime_loop:"running",feeds:"running"},
     feed_status:{
@@ -254,7 +326,9 @@ run_collector() {
     POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" \
     FAKE_CALLS="$case_root/calls" FAKE_DF_AVAILABLE="${FAKE_DF_AVAILABLE:-20000000000}" FAKE_MOUNTPOINT_OK="${FAKE_MOUNTPOINT_OK:-1}" \
-    FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_SAME_REPORT="$case_root/same.json" FAKE_API_STATUS="$case_root/api-status.json" \
+    FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_AZURE_ATTESTATION="$case_root/azure.json.attestation.json" \
+    FAKE_AZURE_EXECUTION="$case_root/azure-execution.json" FAKE_SAME_REPORT="$case_root/same.json" \
+    FAKE_OCI_IMAGE="$oci_image" FAKE_OCI_IMAGE_DIGEST="$oci_image_digest" FAKE_API_STATUS="$case_root/api-status.json" \
     "$collector"
 }
 
@@ -268,12 +342,188 @@ seed_artifacts() {
   mkdir -p "$artifact_dir"
   chmod 0750 "$case_root/ring/parity/hourly" "$artifact_dir"
   case "$which" in
-    azure|both) cp "$case_root/azure.json" "$artifact_dir/azure-scheduled-audit.json"; chmod 0640 "$artifact_dir/azure-scheduled-audit.json" ;;
+    azure|both)
+      cp "$case_root/azure.json" "$artifact_dir/azure-scheduled-audit.json"
+      cp "$case_root/azure.json.attestation.json" "$artifact_dir/azure-scheduled-audit.json.attestation.json"
+      chmod 0640 "$artifact_dir/azure-scheduled-audit.json" "$artifact_dir/azure-scheduled-audit.json.attestation.json"
+      ;;
   esac
   case "$which" in
-    same|both) cp "$case_root/same.json" "$artifact_dir/same-input-audit.json"; chmod 0640 "$artifact_dir/same-input-audit.json" ;;
+    same|both)
+      cp "$case_root/same.json" "$artifact_dir/same-input-audit.json"
+      attest "$artifact_dir/same-input-audit.json" "$artifact_dir/same-input-audit.json.attestation.json"
+      chmod 0640 "$artifact_dir/same-input-audit.json" "$artifact_dir/same-input-audit.json.attestation.json"
+      ;;
   esac
 }
+
+image_mismatch=$root/image-mismatch
+fixture "$image_mismatch"
+jq --arg image "$oci_image" '.properties.template.containers[0].image=$image' \
+  "$image_mismatch/azure-execution.json" >"$image_mismatch/execution.tmp"
+mv "$image_mismatch/execution.tmp" "$image_mismatch/azure-execution.json"
+if run_collector "$image_mismatch" >/dev/null 2>&1; then
+  echo 'image mismatch unexpectedly passed' >&2
+  exit 1
+fi
+
+wrong_execution_time=$root/wrong-execution-time
+fixture "$wrong_execution_time"
+seed_artifacts "$wrong_execution_time" both
+jq '.properties.startTime="2026-08-09T15:59:59Z"' "$wrong_execution_time/azure-execution.json" >"$wrong_execution_time/execution.tmp"
+mv "$wrong_execution_time/execution.tmp" "$wrong_execution_time/azure-execution.json"
+if run_collector "$wrong_execution_time" >/dev/null 2>&1; then
+  echo 'wrong Azure execution time unexpectedly passed' >&2
+  exit 1
+fi
+
+wrong_execution_command=$root/wrong-execution-command
+fixture "$wrong_execution_command"
+seed_artifacts "$wrong_execution_command" both
+jq '.properties.template.containers[0].args=["polyedge-rs research audit --wrong-input"]' \
+  "$wrong_execution_command/azure-execution.json" >"$wrong_execution_command/execution.tmp"
+mv "$wrong_execution_command/execution.tmp" "$wrong_execution_command/azure-execution.json"
+if run_collector "$wrong_execution_command" >/dev/null 2>&1; then
+  echo 'wrong Azure execution command unexpectedly passed' >&2
+  exit 1
+fi
+
+wrong_execution_env=$root/wrong-execution-env
+fixture "$wrong_execution_env"
+seed_artifacts "$wrong_execution_env" both
+jq '(.properties.template.containers[0].env[] | select(.name=="ALLOW_LIVE").value)="true"' \
+  "$wrong_execution_env/azure-execution.json" >"$wrong_execution_env/execution.tmp"
+mv "$wrong_execution_env/execution.tmp" "$wrong_execution_env/azure-execution.json"
+if run_collector "$wrong_execution_env" >/dev/null 2>&1; then
+  echo 'wrong Azure execution safety environment unexpectedly passed' >&2
+  exit 1
+fi
+
+unknown_secret_ref=$root/unknown-secret-ref
+fixture "$unknown_secret_ref"
+seed_artifacts "$unknown_secret_ref" both
+jq '(.properties.template.containers[0].env[] | select(.name=="API_BEARER_TOKEN").secretRef)="untrusted-secret"' \
+  "$unknown_secret_ref/azure-execution.json" >"$unknown_secret_ref/execution.tmp"
+mv "$unknown_secret_ref/execution.tmp" "$unknown_secret_ref/azure-execution.json"
+if run_collector "$unknown_secret_ref" >/dev/null 2>&1; then
+  echo 'unknown Azure execution bearer secret reference unexpectedly passed' >&2
+  exit 1
+fi
+
+builtin_execution_override=$root/builtin-execution-override
+fixture "$builtin_execution_override"
+seed_artifacts "$builtin_execution_override" both
+jq '.properties.template.containers[0].env += [{name:"CONTAINER_APP_JOB_EXECUTION_NAME",value:"forged"}]' \
+  "$builtin_execution_override/azure-execution.json" >"$builtin_execution_override/execution.tmp"
+mv "$builtin_execution_override/execution.tmp" "$builtin_execution_override/azure-execution.json"
+if run_collector "$builtin_execution_override" >/dev/null 2>&1; then
+  echo 'explicit Container Apps execution override unexpectedly passed' >&2
+  exit 1
+fi
+
+wrong_execution=$root/wrong-execution
+fixture "$wrong_execution"
+jq '.generator_provenance.execution_id="polyedge-hourly-quality-job-wrong"' \
+  "$wrong_execution/azure.json" >"$wrong_execution/azure.tmp"
+mv "$wrong_execution/azure.tmp" "$wrong_execution/azure.json"
+attest "$wrong_execution/azure.json" "$wrong_execution/azure.json.attestation.json"
+if run_collector "$wrong_execution" >/dev/null 2>&1; then
+  echo 'wrong Azure execution unexpectedly passed' >&2
+  exit 1
+fi
+
+report_hash_mismatch=$root/report-hash-mismatch
+fixture "$report_hash_mismatch"
+jq '.report_sha256="sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"' \
+  "$report_hash_mismatch/reports/2026/08/09/15/audit.json.attestation.json" >"$report_hash_mismatch/attestation.tmp"
+mv "$report_hash_mismatch/attestation.tmp" "$report_hash_mismatch/reports/2026/08/09/15/audit.json.attestation.json"
+chmod 0640 "$report_hash_mismatch/reports/2026/08/09/15/audit.json.attestation.json"
+if run_collector "$report_hash_mismatch" >/dev/null 2>&1; then
+  echo 'report hash mismatch unexpectedly passed' >&2
+  exit 1
+fi
+
+missing_attestation=$root/missing-attestation
+fixture "$missing_attestation"
+rm "$missing_attestation/reports/2026/08/09/15/audit.json.attestation.json"
+if run_collector "$missing_attestation" >/dev/null 2>&1; then
+  echo 'missing attestation unexpectedly passed' >&2
+  exit 1
+fi
+
+stale_attestation=$root/stale-attestation
+fixture "$stale_attestation"
+seed_artifacts "$stale_attestation" same
+cp "$stale_attestation/reports/2026/08/09/15/audit.json.attestation.json" \
+  "$stale_attestation/ring/parity/hourly/20260809T15/same-input-audit.json.attestation.json"
+if run_collector "$stale_attestation" >/dev/null 2>&1; then
+  echo 'stale copied attestation unexpectedly passed' >&2
+  exit 1
+fi
+
+git_mismatch=$root/git-mismatch
+fixture "$git_mismatch"
+sed -i 's/^POLYEDGE_PARITY_EXPECTED_GIT_SHA=.*/POLYEDGE_PARITY_EXPECTED_GIT_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/' "$git_mismatch/parity.env"
+if run_collector "$git_mismatch" >/dev/null 2>&1; then
+  echo 'git mismatch unexpectedly passed' >&2
+  exit 1
+fi
+
+early_runtime=$root/early-runtime
+fixture "$early_runtime"
+for file in "$early_runtime/azure.json" "$early_runtime/same.json" \
+  "$early_runtime/reports/2026/08/09/15/audit.json"; do
+  jq '.result.runtime_provenance.first_timestamp="2026-08-09T14:59:59Z"' "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+done
+if run_collector "$early_runtime" >/dev/null 2>&1; then
+  echo 'early runtime provenance unexpectedly passed' >&2
+  exit 1
+fi
+
+late_runtime=$root/late-runtime
+fixture "$late_runtime"
+for file in "$late_runtime/azure.json" "$late_runtime/same.json" \
+  "$late_runtime/reports/2026/08/09/15/audit.json"; do
+  jq '.result.runtime_provenance.last_timestamp="2026-08-09T16:00:00Z"' "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+done
+if run_collector "$late_runtime" >/dev/null 2>&1; then
+  echo 'late runtime provenance unexpectedly passed' >&2
+  exit 1
+fi
+
+copied_source=$root/copied-source
+fixture "$copied_source"
+run_collector "$copied_source" >/dev/null
+copied_evidence=$root/copied-evidence
+fixture "$copied_evidence"
+mkdir -p -m 0750 "$copied_evidence/ring/parity/hourly/20260809T15"
+cp "$copied_source/ring/parity/hourly/20260809T15/evidence.json" "$copied_evidence/ring/parity/hourly/20260809T15/evidence.json"
+jq --arg ledger "$copied_evidence/ring/parity/ledger.json" '.ledgerPath=$ledger' \
+  "$copied_evidence/ring/parity/hourly/20260809T15/evidence.json" >"$copied_evidence/evidence.tmp"
+mv "$copied_evidence/evidence.tmp" "$copied_evidence/ring/parity/hourly/20260809T15/evidence.json"
+chmod 0640 "$copied_evidence/ring/parity/hourly/20260809T15/evidence.json"
+if run_collector "$copied_evidence" >/dev/null 2>&1; then
+  echo 'copied evidence unexpectedly credited' >&2
+  exit 1
+fi
+
+hourly_pin_override=$root/hourly-pin-override
+fixture "$hourly_pin_override"
+printf '%s\n' 'POLYEDGE_PARITY_EXPECTED_GIT_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' >>"$hourly_pin_override/hourly.env"
+if run_collector "$hourly_pin_override" >/dev/null 2>&1; then
+  echo 'hourly pin override unexpectedly passed' >&2
+  exit 1
+fi
+
+formal_identity_override=$root/formal-identity-override
+fixture "$formal_identity_override"
+printf '%s\n' 'AZURE_SUBSCRIPTION_ID=22222222-2222-2222-2222-222222222222' >>"$formal_identity_override/hourly.env"
+if run_collector "$formal_identity_override" >/dev/null 2>&1; then
+  echo 'hourly formal identity override unexpectedly passed' >&2
+  exit 1
+fi
 
 v2_manifest=$root/v2-manifest
 fixture "$v2_manifest"
@@ -426,8 +676,29 @@ fi
 [ "$(jq -r '.acceptedCleanLiveHours' "$gapped/ring/parity/ledger.json")" = 0 ]
 
 second=$success/ring/parity/hourly/20260809T16
-mkdir -m 0750 "$second"
+mkdir -p -m 0750 "$second" "$success/ring/segments/2026/08/09/16" "$success/ring/archive/2026/08/09/16" "$success/reports/2026/08/09/16"
+for file in "$success"/ring/segments/2026/08/09/15/*.jsonl; do cp "$file" "$success/ring/segments/2026/08/09/16/"; done
+for file in "$success"/ring/archive/2026/08/09/15/*; do cp "$file" "$success/ring/archive/2026/08/09/16/"; done
+cp "$success/reports/2026/08/09/15/audit.json" "$success/reports/2026/08/09/16/audit.json"
+cp "$success/reports/2026/08/09/15/audit.json.attestation.json" "$success/reports/2026/08/09/16/audit.json.attestation.json"
+cp "$success/ring/parity/hourly/20260809T15/azure-scheduled-audit.json" "$second/azure-scheduled-audit.json"
+cp "$success/ring/parity/hourly/20260809T15/azure-scheduled-audit.json.attestation.json" "$second/azure-scheduled-audit.json.attestation.json"
+cp "$success/ring/parity/hourly/20260809T15/same-input-audit.json" "$second/same-input-audit.json"
+cp "$success/ring/parity/hourly/20260809T15/same-input-audit.json.attestation.json" "$second/same-input-audit.json.attestation.json"
+chmod 0640 "$success/reports/2026/08/09/16/audit.json" "$success/reports/2026/08/09/16/audit.json.attestation.json" \
+  "$second/azure-scheduled-audit.json" "$second/azure-scheduled-audit.json.attestation.json" \
+  "$second/same-input-audit.json" "$second/same-input-audit.json.attestation.json"
 jq '.generatedAtUtc="2026-08-09T17:19:45Z" | .hourStartUtc="2026-08-09T16:00:00Z" | .hourEndUtc="2026-08-09T17:00:00Z" |
+  (.scheduledAudits.azure.path |= sub("20260809T15"; "20260809T16")) |
+  (.scheduledAudits.azure.attestation.path |= sub("20260809T15"; "20260809T16")) |
+  (.scheduledAudits.oci.path |= sub("/15/"; "/16/")) |
+  (.scheduledAudits.oci.attestation.path |= sub("/15/"; "/16/")) |
+  (.sameInput.path |= sub("20260809T15"; "20260809T16")) |
+  (.sameInput.attestation.path |= sub("20260809T15"; "20260809T16")) |
+  (.segments[].source.path |= sub("/15/"; "/16/")) |
+  (.segments[].gzip.path |= sub("/15/"; "/16/")) |
+  (.segments[].manifest.path |= sub("/15/"; "/16/")) |
+  (.segments[].receipt.path |= sub("/15/"; "/16/")) |
   .recorderSequence.recorder_first_sequence=61 | .recorderSequence.recorder_last_sequence=120 |
   .recorderStatus.sampledAtUtc="2026-08-09T17:20:00Z" |
   (.recorderStatus.feedStatus[]).updated_at="2026-08-09T17:19:59Z" |
@@ -478,21 +749,21 @@ fixture "$recovery"
 seed_artifacts "$recovery" both
 run_collector "$recovery" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$recovery/ring/parity/ledger.json")" = 1 ]
-[ ! -e "$recovery/calls/curl" ] && [ ! -e "$recovery/calls/podman" ]
+[ "$(wc -l <"$recovery/calls/curl")" = 2 ] && [ ! -e "$recovery/calls/podman" ]
 
 azure_only=$root/azure-only
 fixture "$azure_only"
 seed_artifacts "$azure_only" azure
 run_collector "$azure_only" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$azure_only/ring/parity/ledger.json")" = 1 ]
-[ ! -e "$azure_only/calls/curl" ] && [ "$(wc -l <"$azure_only/calls/podman")" = 1 ]
+[ "$(wc -l <"$azure_only/calls/curl")" = 2 ] && [ "$(wc -l <"$azure_only/calls/podman")" = 1 ]
 
 same_only=$root/same-only
 fixture "$same_only"
 seed_artifacts "$same_only" same
 run_collector "$same_only" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$same_only/ring/parity/ledger.json")" = 1 ]
-[ "$(wc -l <"$same_only/calls/curl")" = 2 ] && [ ! -e "$same_only/calls/podman" ]
+[ "$(wc -l <"$same_only/calls/curl")" = 5 ] && [ ! -e "$same_only/calls/podman" ]
 
 mismatch=$root/mismatch
 fixture "$mismatch"
@@ -536,6 +807,99 @@ run_collector "$excluded" >/dev/null
 jq -e '.status == "excluded_pre_window" and .acceptedForParityWindow == false' \
   "$excluded/ring/parity/hourly/20260809T14/evidence.json" >/dev/null
 [ "$(protected "$excluded/ring/parity/ledger.json")" = "$before" ]
+
+launcher_root=$root/run-job
+mkdir -p "$launcher_root/bin" "$launcher_root/etc/jobs" "$launcher_root/run/polyedge-federated-research" "$launcher_root/ring"
+: >"$launcher_root/etc/jobs/hourly.env"
+: >"$launcher_root/run/polyedge-federated-research/azure-federated-token"
+sed -e "s#/etc/polyedge/jobs/#$launcher_root/etc/jobs/#g" \
+  -e "s#/srv/polyedge-ring#$launcher_root/ring#g" \
+  -e "s#/run/polyedge-federated-#$launcher_root/run/polyedge-federated-#g" \
+  -e "s#/etc/polyedge/credentials/#$launcher_root/etc/credentials/#g" \
+  -e "s#/usr/bin/timeout#$launcher_root/bin/timeout#g" \
+  -e "s#/usr/bin/podman#$launcher_root/bin/podman#g" \
+  -e "s/chown 0:0/chown $uid:$gid/" \
+  -e "s/'0:0:640:1'/'$uid:$gid:640:1'/" \
+  "$(dirname "$collector")/polyedge-run-job" >"$launcher_root/run-job"
+chmod 0755 "$launcher_root/run-job"
+cat >"$launcher_root/bin/timeout" <<'EOF'
+#!/bin/sh
+[ "$1" != --preserve-status ] || shift
+shift
+exec "$@"
+EOF
+cat >"$launcher_root/bin/podman" <<'EOF'
+#!/bin/sh
+case "$1" in
+  run)
+    printf '%s\n' "$*" >>"$LAUNCH_CALLS/run"
+    report="$LAUNCH_RING/jobs/research/reports/research/hourly/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/audit.json"
+    mkdir -p "${report%/*}"
+    execution=$POLYEDGE_GENERATOR_EXECUTION_ID
+    [ "${LAUNCH_MODE:-}" != provenance ] || execution=forged-execution
+    jq -n --arg image "$POLYEDGE_GENERATOR_IMAGE" --arg execution "$execution" '{
+      generator_provenance:{schema_version:1,platform:"oci_podman",image:$image,execution_id:$execution,job_name:null}
+    }' >"$report"
+    ;;
+  inspect)
+    case "$*" in
+      *Config.Image*) printf '%s\n' "$POLYEDGE_RESEARCH_IMAGE" ;;
+      *ImageDigest*)
+        if [ "${LAUNCH_MODE:-}" = inspect ]; then printf '%s\n' invalid; else printf '%s\n' "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"; fi
+        ;;
+      *Id*) printf '%s\n' eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  rm) printf '%s\n' "$*" >>"$LAUNCH_CALLS/rm" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat >"$launcher_root/bin/sha256sum" <<'EOF'
+#!/bin/sh
+if [ "${LAUNCH_MODE:-}" = hash ] && [ "${1##*/}" = audit.json ]; then
+  count=0
+  [ ! -f "$LAUNCH_CALLS/hash-count" ] || count=$(cat "$LAUNCH_CALLS/hash-count")
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$LAUNCH_CALLS/hash-count"
+  if [ "$count" = 1 ]; then
+    printf '%064d  %s\n' 0 "$1"
+    exit 0
+  fi
+fi
+exec /usr/bin/sha256sum "$@"
+EOF
+chmod 0755 "$launcher_root/bin"/*
+
+run_launcher() {
+  mode=$1
+  rm -rf "$launcher_root/ring/jobs" "$launcher_root/calls"
+  mkdir -p "$launcher_root/calls"
+  env PATH="$launcher_root/bin:$fake:$PATH" FAKE_MOUNTPOINT_OK=1 FAKE_DF_AVAILABLE=100000000000 \
+    LAUNCH_MODE="$mode" LAUNCH_CALLS="$launcher_root/calls" LAUNCH_RING="$launcher_root/ring" \
+    POLYEDGE_RESEARCH_IMAGE="$oci_image" POLYEDGE_LOCAL_RAW_ROOT=/input/events \
+    POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true POLYEDGE_JOB_MIN_FREE_BYTES=1 \
+    "$launcher_root/run-job" hourly
+}
+
+run_launcher success
+launcher_report=$(find "$launcher_root/ring/jobs/research/reports/research/hourly" -name audit.json -print)
+launcher_attestation=$launcher_report.attestation.json
+jq -e --arg sha "sha256:$(/usr/bin/sha256sum "$launcher_report" | awk '{print $1}')" --arg image "$oci_image" '
+  .schema_version == 1 and .report_sha256 == $sha and .platform == "oci_podman" and .image == $image and
+  (.image_digest | test("^sha256:[0-9a-f]{64}$")) and (.container_id | test("^[0-9a-f]{64}$"))
+' "$launcher_attestation" >/dev/null
+! grep -q -- '--rm' "$launcher_root/calls/run"
+grep -q '^rm polyedge-job-hourly-' "$launcher_root/calls/rm"
+
+for launcher_failure in provenance hash inspect; do
+  if run_launcher "$launcher_failure" >/dev/null 2>&1; then
+    echo "launcher $launcher_failure failure unexpectedly passed" >&2
+    exit 1
+  fi
+  [ -s "$launcher_root/calls/rm" ] || { echo "launcher $launcher_failure failure skipped container cleanup" >&2; exit 1; }
+  ! find "$launcher_root/ring/jobs/research/reports" -name '*.attestation.json' -print -quit | grep -q .
+done
 
 if grep -R -F 'fixture-access-token' "$root"/*/calls >/dev/null || grep -R -F 'fixture-jwt' "$root"/*/calls >/dev/null; then
   echo 'a token leaked into command arguments' >&2

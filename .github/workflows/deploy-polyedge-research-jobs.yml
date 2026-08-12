@@ -313,9 +313,14 @@ jobs:
             --output none
           )
           if [ "$TARGET_JOB" != "polyedge-shadow-daily-neu-job" ]; then
-            update_args+=(
-              --set-env-vars API_BEARER_TOKEN=secretref:api-bearer-token
-            )
+            if [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+              update_args+=(--set-env-vars
+                API_BEARER_TOKEN=secretref:api-bearer-token
+                POLYEDGE_GENERATOR_PLATFORM=azure_container_apps_job
+                POLYEDGE_GENERATOR_IMAGE="$RESEARCH_IMAGE")
+            else
+              update_args+=(--set-env-vars API_BEARER_TOKEN=secretref:api-bearer-token)
+            fi
           fi
           if [ "$TARGET_JOB" = "polyedge-daily-research-job" ]; then
             update_args+=(
@@ -397,6 +402,13 @@ jobs:
           test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "ENABLE_TAKER_ORDERS") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "false"
           test "$(jq -r '[.properties.template.containers[0].env[]?.name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length' <<<"$job_json")" = "0"
           test "$(jq -r '[(.properties.configuration.secrets // [])[] | select(.keyVaultUrl != null or .identity != null)] | length' <<<"$job_json")" = "0"
+          if [ "$TARGET_JOB" = "polyedge-hourly-quality-job" ]; then
+            test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "POLYEDGE_GENERATOR_PLATFORM") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "azure_container_apps_job"
+            test "$(jq -r '[.properties.template.containers[0].env[]? | select(.name == "POLYEDGE_GENERATOR_IMAGE") | .value] | if length == 1 then .[0] else empty end' <<<"$job_json")" = "$RESEARCH_IMAGE"
+            test "$(jq -r '[.properties.template.containers[0].env[]?.name | select(. == "CONTAINER_APP_JOB_NAME" or . == "CONTAINER_APP_JOB_EXECUTION_NAME")] | length' <<<"$job_json")" = "0"
+          else
+            test "$(jq -r '[.properties.template.containers[0].env[]?.name | select(startswith("POLYEDGE_GENERATOR_"))] | length' <<<"$job_json")" = "0"
+          fi
           secret_names=$(jq -c '[(.properties.configuration.secrets // [])[].name] | sort' <<<"$job_json")
           secret_refs=$(jq -c '[.properties.template.containers[0].env[]? | select(.secretRef != null) | {name, secretRef}] | sort_by(.name)' <<<"$job_json")
           if [ "$TARGET_JOB" = "polyedge-shadow-daily-neu-job" ]; then
