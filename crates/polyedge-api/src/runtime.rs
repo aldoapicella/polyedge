@@ -11,7 +11,7 @@ use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersist
 use chrono::{DateTime, Utc};
 use execution_intent::{
     build_execution_intent_with_model, resolve_execution_model, IntentPublisher,
-    IntentPublisherConfig,
+    IntentPublisherConfig, IntentPublisherPreparation,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
@@ -432,9 +432,12 @@ impl RuntimeController {
 
     fn new_with_recorder(settings: RuntimeSettings, recorder: RuntimeRecorder) -> Self {
         let (broadcaster, _) = broadcast::channel(1_000);
-        let intent_publisher = IntentPublisherConfig::from_settings(&settings)
-            .and_then(IntentPublisherConfig::connect)
-            .ok();
+        let intent_publisher =
+            IntentPublisherConfig::optional_connect(&settings).unwrap_or_else(|error| {
+                panic!(
+                    "refusing runtime startup with invalid pointer-only intent preflight: {error}"
+                )
+            });
         let data = RuntimeData {
             decision_generation: 0,
             started_at: Utc::now(),
@@ -1198,6 +1201,11 @@ impl RuntimeController {
         if !self.inner.settings.azure.strategy_intent_operator_direct {
             return false;
         }
+        let pointer_only_preflight = self
+            .inner
+            .intent_publisher
+            .as_ref()
+            .is_some_and(IntentPublisher::is_pointer_only_preflight);
         let publisher_runtime = self.clone();
         let publish_market = market.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1212,7 +1220,8 @@ impl RuntimeController {
         .map_err(|error| format!("market warmup task failed: {error}"))
         .and_then(|result| result);
         match result {
-            Ok(true) => {
+            Ok(IntentPublisherPreparation::PointerOnly) if pointer_only_preflight => true,
+            Ok(IntentPublisherPreparation::WarmupSent) => {
                 self.record_event(
                     "funded_market_warmup_sent",
                     json!({
@@ -1228,7 +1237,8 @@ impl RuntimeController {
                 .await;
                 true
             }
-            Ok(false) => false,
+            Ok(IntentPublisherPreparation::NotRequired) => false,
+            Ok(IntentPublisherPreparation::PointerOnly) => false,
             Err(reason) => {
                 warn!(
                     market_id = %market.market_id,
@@ -2119,6 +2129,7 @@ impl RuntimeController {
                         blob_name = %published.blob_name,
                         blob_commit_elapsed_ms = published.blob_commit_elapsed_ms,
                         queue_send_elapsed_ms = ?published.queue_send_elapsed_ms,
+                        pointer_only_preflight = published.pointer_only_preflight,
                         "execution intent published"
                     );
                     runtime
@@ -2133,6 +2144,7 @@ impl RuntimeController {
                                 "blob_name": published.blob_name,
                                 "artifact_sha256": published.artifact_sha256,
                                 "queue_handoff_sent": published.queue_handoff_sent,
+                                "pointer_only_preflight": published.pointer_only_preflight,
                                 "intent_created_wall_ts": intent.decision_ts,
                                 "blob_commit_wall_ts": published.blob_commit_wall_ts,
                                 "blob_commit_elapsed_ms": published.blob_commit_elapsed_ms,

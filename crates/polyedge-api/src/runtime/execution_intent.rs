@@ -30,6 +30,7 @@ const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
 // ten-second lifetime. Warmups prepare these same executable lanes below.
 const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
 const CURRENT_FUNDED_INTENT_CAS_ATTEMPTS: usize = 4;
+const POINTER_ONLY_PREFLIGHT_ENV: &str = "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT";
 // Keep the signed venue expiry well beyond the documented minimum. Live V2
 // rejected a correctly serialized order 107 seconds before its expiry, so the
 // immutable intent carries a five-minute fail-safe while the lifecycle still
@@ -47,25 +48,27 @@ pub(super) struct IntentPublisherConfig {
     client_id: Option<String>,
     prefix: String,
     operator_direct: bool,
+    pointer_only_preflight: bool,
     service_bus_namespace: String,
     service_bus_queue: String,
 }
 
 pub(super) struct IntentPublisher {
     intent_lanes: Vec<StdMutex<IntentPublisherLane>>,
-    current_intent_lane: Option<StdMutex<AzureBlobClient>>,
+    current_intent_lane: Option<StdMutex<Box<dyn CurrentFundedIntentStore>>>,
     intent_preparation_gate: StdRwLock<()>,
     intent_lanes_prepared: AtomicBool,
     next_intent_lane: AtomicUsize,
     prefix: String,
+    pointer_only_preflight: bool,
 }
 
 struct IntentPublisherLane {
-    blob_client: AzureBlobClient,
+    blob_client: Box<dyn IntentBlobStore>,
     service_bus_sender: Option<AzureServiceBusSender>,
 }
 
-trait CurrentFundedIntentStore {
+trait CurrentFundedIntentStore: Send {
     fn read_versioned(&mut self, name: &str) -> Result<Option<(Vec<u8>, String)>, String>;
     fn put_if_absent(&mut self, name: &str, bytes: &[u8]) -> Result<ImmutableBlobWrite, String>;
     fn compare_and_swap(
@@ -74,6 +77,30 @@ trait CurrentFundedIntentStore {
         bytes: &[u8],
         expected_etag: &str,
     ) -> Result<bool, String>;
+}
+
+impl<T: CurrentFundedIntentStore + ?Sized> CurrentFundedIntentStore for Box<T> {
+    fn read_versioned(&mut self, name: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+        (**self).read_versioned(name)
+    }
+
+    fn put_if_absent(&mut self, name: &str, bytes: &[u8]) -> Result<ImmutableBlobWrite, String> {
+        (**self).put_if_absent(name, bytes)
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        expected_etag: &str,
+    ) -> Result<bool, String> {
+        (**self).compare_and_swap(name, bytes, expected_etag)
+    }
+}
+
+trait IntentBlobStore: CurrentFundedIntentStore {
+    fn put_immutable(&mut self, name: &str, bytes: &[u8]) -> Result<ImmutableBlobWrite, String>;
+    fn read(&mut self, name: &str) -> Result<Vec<u8>, String>;
 }
 
 impl CurrentFundedIntentStore for AzureBlobClient {
@@ -104,11 +131,31 @@ impl CurrentFundedIntentStore for AzureBlobClient {
     }
 }
 
+impl IntentBlobStore for AzureBlobClient {
+    fn put_immutable(&mut self, name: &str, bytes: &[u8]) -> Result<ImmutableBlobWrite, String> {
+        self.upload_block_blob_bytes_if_absent(name, bytes, "application/json")
+            .map_err(|error| error.to_string())
+    }
+
+    fn read(&mut self, name: &str) -> Result<Vec<u8>, String> {
+        self.download_blob_bytes(name)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IntentPublisherPreparation {
+    NotRequired,
+    PointerOnly,
+    WarmupSent,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct PublishedIntent {
     pub blob_name: String,
     pub artifact_sha256: String,
     pub queue_handoff_sent: bool,
+    pub pointer_only_preflight: bool,
     pub blob_commit_wall_ts: DateTime<Utc>,
     pub blob_commit_elapsed_ms: u64,
     pub queue_send_wall_ts: Option<DateTime<Utc>>,
@@ -139,9 +186,46 @@ impl IntentExecutionModel {
 }
 
 impl IntentPublisherConfig {
-    pub(super) fn from_settings(settings: &RuntimeSettings) -> Result<Self, String> {
+    pub(super) fn optional_connect(
+        settings: &RuntimeSettings,
+    ) -> Result<Option<IntentPublisher>, String> {
+        Self::optional_connect_with_pointer_only_preflight(
+            settings,
+            pointer_only_preflight_from_env()?,
+        )
+    }
+
+    fn optional_connect_with_pointer_only_preflight(
+        settings: &RuntimeSettings,
+        pointer_only_preflight: bool,
+    ) -> Result<Option<IntentPublisher>, String> {
+        let publisher =
+            Self::from_settings_with_pointer_only_preflight(settings, pointer_only_preflight)
+                .and_then(Self::connect);
+        if pointer_only_preflight {
+            publisher.map(Some)
+        } else {
+            Ok(publisher.ok())
+        }
+    }
+
+    fn from_settings_with_pointer_only_preflight(
+        settings: &RuntimeSettings,
+        pointer_only_preflight: bool,
+    ) -> Result<Self, String> {
         if !settings.azure.publish_strategy_canary_intents {
             return Err("strategy canary intent publication is disabled".to_owned());
+        }
+        if pointer_only_preflight
+            && (!settings.azure.strategy_intent_operator_direct
+                || settings.live.execution_mode != ExecutionMode::Paper
+                || settings.live.allow_live
+                || settings.live.polymarket_private_key.is_some())
+        {
+            return Err(
+                "pointer-only intent preflight requires an operator-direct, credential-free paper runtime"
+                    .to_owned(),
+            );
         }
         let account = settings
             .azure
@@ -164,6 +248,7 @@ impl IntentPublisherConfig {
             client_id: env::var("AZURE_CLIENT_ID").ok(),
             prefix,
             operator_direct: settings.azure.strategy_intent_operator_direct,
+            pointer_only_preflight,
             service_bus_namespace: settings
                 .azure
                 .funded_direct_service_bus_namespace
@@ -178,7 +263,7 @@ impl IntentPublisherConfig {
     }
 
     fn connect_lane(&self) -> Result<IntentPublisherLane, String> {
-        let service_bus_sender = if self.operator_direct {
+        let service_bus_sender = if self.operator_direct && !self.pointer_only_preflight {
             if self.service_bus_namespace.is_empty() || self.service_bus_queue.is_empty() {
                 return Err(
                     "operator-direct intent publisher requires an exact Service Bus binding"
@@ -194,11 +279,11 @@ impl IntentPublisherConfig {
             None
         };
         Ok(IntentPublisherLane {
-            blob_client: AzureBlobClient::with_managed_identity(
+            blob_client: Box::new(AzureBlobClient::with_managed_identity(
                 self.account.clone(),
                 self.container.clone(),
                 self.client_id.clone(),
-            ),
+            )),
             service_bus_sender,
         })
     }
@@ -212,13 +297,14 @@ impl IntentPublisherConfig {
         let intent_lanes = (0..lane_count)
             .map(|_| self.connect_lane().map(StdMutex::new))
             .collect::<Result<Vec<_>, _>>()?;
-        let current_intent_lane = self.operator_direct.then(|| {
-            StdMutex::new(AzureBlobClient::with_managed_identity(
-                self.account.clone(),
-                self.container.clone(),
-                self.client_id.clone(),
-            ))
-        });
+        let current_intent_lane: Option<StdMutex<Box<dyn CurrentFundedIntentStore>>> =
+            self.operator_direct.then(|| {
+                StdMutex::new(Box::new(AzureBlobClient::with_managed_identity(
+                    self.account.clone(),
+                    self.container.clone(),
+                    self.client_id.clone(),
+                )) as Box<dyn CurrentFundedIntentStore>)
+            });
         Ok(IntentPublisher {
             intent_lanes,
             current_intent_lane,
@@ -226,6 +312,7 @@ impl IntentPublisherConfig {
             intent_lanes_prepared: AtomicBool::new(!self.operator_direct),
             next_intent_lane: AtomicUsize::new(0),
             prefix: self.prefix,
+            pointer_only_preflight: self.pointer_only_preflight,
         })
     }
 }
@@ -248,17 +335,10 @@ impl IntentPublisher {
         let artifact_sha256 = sha256_bytes(&bytes);
         let blob_name = intent_blob_name(&self.prefix, &intent.decision_id)?;
         let mut lane = self.intent_lane()?;
-        match lane
-            .blob_client
-            .upload_block_blob_bytes_if_absent(&blob_name, &bytes, "application/json")
-            .map_err(|error| error.to_string())?
-        {
+        match lane.blob_client.put_immutable(&blob_name, &bytes)? {
             ImmutableBlobWrite::Created => {}
             ImmutableBlobWrite::AlreadyExists => {
-                let existing = lane
-                    .blob_client
-                    .download_blob_bytes(&blob_name)
-                    .map_err(|error| error.to_string())?;
+                let existing = lane.blob_client.read(&blob_name)?;
                 if existing != bytes {
                     return Err(format!(
                         "immutable strategy canary intent collision: {blob_name}"
@@ -270,7 +350,20 @@ impl IntentPublisher {
         let blob_commit_elapsed_ms = publish_started.elapsed().as_millis() as u64;
         let mut queue_send_wall_ts = None;
         let mut queue_send_elapsed_ms = None;
-        let queue_handoff_sent = if let Some(sender) = &mut lane.service_bus_sender {
+        let queue_handoff_sent = if self.pointer_only_preflight {
+            if (intent.valid_until - Utc::now()).num_milliseconds() < 1_000 {
+                return Err(
+                    "funded intent expired before its current pointer could be published"
+                        .to_owned(),
+                );
+            }
+            let queue_result = publish_operator_direct_after_immutable(
+                || self.publish_current_intent_handoff(intent, &blob_name, &artifact_sha256),
+                None::<fn() -> Result<(), String>>,
+            )?;
+            debug_assert!(queue_result.is_none());
+            false
+        } else if let Some(sender) = &mut lane.service_bus_sender {
             let remaining_ms = (intent.valid_until - Utc::now()).num_milliseconds();
             if remaining_ms < 1_000 {
                 return Err(
@@ -280,7 +373,7 @@ impl IntentPublisher {
             let handoff = funded_intent_handoff(intent, &blob_name, &artifact_sha256);
             let (sent_at, elapsed_ms) = publish_operator_direct_after_immutable(
                 || self.publish_current_intent_handoff(intent, &blob_name, &artifact_sha256),
-                || {
+                Some(|| {
                     let queue_send_started = Instant::now();
                     sender
                         .send_json(
@@ -290,8 +383,9 @@ impl IntentPublisher {
                         )
                         .map_err(|error| error.to_string())?;
                     Ok((Utc::now(), queue_send_started.elapsed().as_millis() as u64))
-                },
-            )?;
+                }),
+            )?
+            .ok_or_else(|| "operator-direct queue sender was not invoked".to_owned())?;
             queue_send_wall_ts = Some(sent_at);
             queue_send_elapsed_ms = Some(elapsed_ms);
             true
@@ -302,6 +396,7 @@ impl IntentPublisher {
             blob_name,
             artifact_sha256,
             queue_handoff_sent,
+            pointer_only_preflight: self.pointer_only_preflight,
             blob_commit_wall_ts,
             blob_commit_elapsed_ms,
             queue_send_wall_ts,
@@ -323,12 +418,15 @@ impl IntentPublisher {
             .ok_or_else(|| "operator-direct current intent lane is unavailable".to_owned())?
             .lock()
             .map_err(|_| "current funded intent pointer lock is poisoned".to_owned())?;
-        publish_current_funded_intent_compare_and_swap(&mut *client, &pointer_name, &handoff)
+        publish_current_funded_intent_compare_and_swap(&mut **client, &pointer_name, &handoff)
     }
 
-    pub(super) fn warm_market(&self, market: &MarketSpec) -> Result<bool, String> {
+    pub(super) fn warm_market(
+        &self,
+        market: &MarketSpec,
+    ) -> Result<IntentPublisherPreparation, String> {
         let Some(current_intent_lane) = self.current_intent_lane.as_ref() else {
-            return Ok(false);
+            return Ok(IntentPublisherPreparation::NotRequired);
         };
         let _preparation = self
             .intent_preparation_gate
@@ -337,6 +435,12 @@ impl IntentPublisher {
         self.intent_lanes_prepared.store(false, Ordering::Release);
         let pointer_name = current_funded_intent_blob_name(&self.prefix)?;
         prepare_current_intent_lane(current_intent_lane, &pointer_name)?;
+        if self.pointer_only_preflight {
+            prepare_all_lanes(&self.intent_lanes, &self.intent_lanes_prepared, |lane| {
+                prepare_current_intent_store(&mut *lane.blob_client, &pointer_name)
+            })?;
+            return Ok(IntentPublisherPreparation::PointerOnly);
+        }
         let marker = funded_market_warmup_marker(market);
         let marker_bytes = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
         let marker_name = funded_market_warmup_blob_name(&self.prefix, market)?;
@@ -346,15 +450,11 @@ impl IntentPublisher {
         prepare_all_lanes(&self.intent_lanes, &self.intent_lanes_prepared, |lane| {
             match lane
                 .blob_client
-                .upload_block_blob_bytes_if_absent(&marker_name, &marker_bytes, "application/json")
-                .map_err(|error| error.to_string())?
+                .put_immutable(&marker_name, &marker_bytes)?
             {
                 ImmutableBlobWrite::Created => {}
                 ImmutableBlobWrite::AlreadyExists => {
-                    let existing = lane
-                        .blob_client
-                        .download_blob_bytes(&marker_name)
-                        .map_err(|error| error.to_string())?;
+                    let existing = lane.blob_client.read(&marker_name)?;
                     if existing != marker_bytes {
                         return Err(format!(
                             "immutable funded market warmup collision: {marker_name}"
@@ -368,13 +468,39 @@ impl IntentPublisher {
                 .send_json(&message_id, 30, &message)
                 .map_err(|error| error.to_string())
         })?;
-        Ok(true)
+        Ok(IntentPublisherPreparation::WarmupSent)
+    }
+
+    pub(super) fn is_pointer_only_preflight(&self) -> bool {
+        self.pointer_only_preflight
     }
 
     #[cfg(test)]
     fn intent_lane_count(&self) -> usize {
         self.intent_lanes.len()
     }
+}
+
+fn pointer_only_preflight_from_env() -> Result<bool, String> {
+    match env::var(POINTER_ONLY_PREFLIGHT_ENV) {
+        Ok(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Ok(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Ok(_) => Err(format!(
+            "{POINTER_ONLY_PREFLIGHT_ENV} must be exactly true or false"
+        )),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{POINTER_ONLY_PREFLIGHT_ENV} must be valid UTF-8"))
+        }
+    }
+}
+
+fn prepare_current_intent_store<S: CurrentFundedIntentStore + ?Sized>(
+    store: &mut S,
+    pointer_name: &str,
+) -> Result<(), String> {
+    let _ = store.read_versioned(pointer_name)?;
+    Ok(())
 }
 
 fn prepare_current_intent_lane<S: CurrentFundedIntentStore>(
@@ -384,8 +510,7 @@ fn prepare_current_intent_lane<S: CurrentFundedIntentStore>(
     let mut store = lane
         .lock()
         .map_err(|_| "current funded intent pointer lock is poisoned".to_owned())?;
-    let _ = store.read_versioned(pointer_name)?;
-    Ok(())
+    prepare_current_intent_store(&mut *store, pointer_name)
 }
 
 fn prepare_all_lanes<T>(
@@ -419,10 +544,10 @@ fn prepared_publish_guard<'a>(
 
 fn publish_operator_direct_after_immutable<T>(
     publish_pointer: impl FnOnce() -> Result<(), String>,
-    send_queue: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    send_queue: Option<impl FnOnce() -> Result<T, String>>,
+) -> Result<Option<T>, String> {
     publish_pointer()?;
-    send_queue()
+    send_queue.map(|send| send()).transpose()
 }
 
 fn funded_market_warmup_message_id(market: &MarketSpec, producer_ts: DateTime<Utc>) -> String {
@@ -496,7 +621,7 @@ fn current_funded_intent_blob_name(intent_prefix: &str) -> Result<String, String
     })
 }
 
-fn publish_current_funded_intent_compare_and_swap<S: CurrentFundedIntentStore>(
+fn publish_current_funded_intent_compare_and_swap<S: CurrentFundedIntentStore + ?Sized>(
     store: &mut S,
     pointer_name: &str,
     incoming: &Value,
@@ -1279,6 +1404,7 @@ mod tests {
     };
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct TestCurrentFundedIntentStore {
@@ -1327,6 +1453,110 @@ mod tests {
             }
             self.current = Some((bytes.to_vec(), format!("etag-{}", self.compare_calls)));
             Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct TestPointerOnlyState {
+        blobs: BTreeMap<String, Vec<u8>>,
+        pointer: Option<(Vec<u8>, String)>,
+        events: Vec<String>,
+    }
+
+    struct TestPointerOnlyStore {
+        state: Arc<Mutex<TestPointerOnlyState>>,
+    }
+
+    impl CurrentFundedIntentStore for TestPointerOnlyStore {
+        fn read_versioned(&mut self, _name: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+            self.state
+                .lock()
+                .unwrap()
+                .events
+                .push("prepare_pointer".to_owned());
+            Ok(self.state.lock().unwrap().pointer.clone())
+        }
+
+        fn put_if_absent(
+            &mut self,
+            _name: &str,
+            bytes: &[u8],
+        ) -> Result<ImmutableBlobWrite, String> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("cas_pointer".to_owned());
+            if state.pointer.is_some() {
+                Ok(ImmutableBlobWrite::AlreadyExists)
+            } else {
+                state.pointer = Some((bytes.to_vec(), "etag-created".to_owned()));
+                Ok(ImmutableBlobWrite::Created)
+            }
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            _name: &str,
+            bytes: &[u8],
+            _expected_etag: &str,
+        ) -> Result<bool, String> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("cas_pointer".to_owned());
+            state.pointer = Some((bytes.to_vec(), "etag-updated".to_owned()));
+            Ok(true)
+        }
+    }
+
+    impl IntentBlobStore for TestPointerOnlyStore {
+        fn put_immutable(
+            &mut self,
+            name: &str,
+            bytes: &[u8],
+        ) -> Result<ImmutableBlobWrite, String> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push(if name.ends_with(".json") {
+                "immutable".to_owned()
+            } else {
+                "warmup_marker".to_owned()
+            });
+            if state.blobs.contains_key(name) {
+                Ok(ImmutableBlobWrite::AlreadyExists)
+            } else {
+                state.blobs.insert(name.to_owned(), bytes.to_vec());
+                Ok(ImmutableBlobWrite::Created)
+            }
+        }
+
+        fn read(&mut self, name: &str) -> Result<Vec<u8>, String> {
+            self.state
+                .lock()
+                .unwrap()
+                .blobs
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "missing test blob".to_owned())
+        }
+    }
+
+    fn pointer_only_publisher(state: Arc<Mutex<TestPointerOnlyState>>) -> IntentPublisher {
+        let lanes = (0..OPERATOR_DIRECT_INTENT_PUBLISH_LANES)
+            .map(|_| {
+                StdMutex::new(IntentPublisherLane {
+                    blob_client: Box::new(TestPointerOnlyStore {
+                        state: Arc::clone(&state),
+                    }),
+                    service_bus_sender: None,
+                })
+            })
+            .collect();
+        IntentPublisher {
+            intent_lanes: lanes,
+            current_intent_lane: Some(StdMutex::new(
+                Box::new(TestPointerOnlyStore { state }) as Box<dyn CurrentFundedIntentStore>
+            )),
+            intent_preparation_gate: StdRwLock::new(()),
+            intent_lanes_prepared: AtomicBool::new(false),
+            next_intent_lane: AtomicUsize::new(0),
+            prefix: "reports/funded/intents".to_owned(),
+            pointer_only_preflight: true,
         }
     }
 
@@ -1822,15 +2052,27 @@ mod tests {
     fn operator_direct_sequence_is_immutable_then_pointer_then_queue_and_pointer_failure_stops_queue(
     ) {
         let events = RefCell::new(vec!["immutable"]);
+        let queue_result = publish_operator_direct_after_immutable(
+            || {
+                events.borrow_mut().push("pointer");
+                Ok(())
+            },
+            None::<fn() -> Result<(), String>>,
+        )
+        .unwrap();
+        assert!(queue_result.is_none());
+        assert_eq!(events.into_inner(), vec!["immutable", "pointer"]);
+
+        let events = RefCell::new(vec!["immutable"]);
         publish_operator_direct_after_immutable(
             || {
                 events.borrow_mut().push("pointer");
                 Ok(())
             },
-            || {
+            Some(|| {
                 events.borrow_mut().push("service_bus");
                 Ok(())
-            },
+            }),
         )
         .unwrap();
         assert_eq!(
@@ -1875,10 +2117,10 @@ mod tests {
                     &incoming,
                 )
             },
-            || {
+            Some(|| {
                 events.borrow_mut().push("service_bus");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
         assert!(error.contains("injected pointer update failure"));
@@ -1935,11 +2177,12 @@ mod tests {
         settings.azure.storage_container_name = "shadow".to_owned();
         settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
         settings.azure.strategy_intent_operator_direct = true;
-        let error = IntentPublisherConfig::from_settings(&settings)
-            .unwrap()
-            .connect()
-            .err()
-            .expect("missing Service Bus binding must fail");
+        let error =
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, false)
+                .unwrap()
+                .connect()
+                .err()
+                .expect("missing Service Bus binding must fail");
         assert!(error.contains("exact Service Bus binding"));
     }
 
@@ -1954,21 +2197,127 @@ mod tests {
         settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
         settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
 
-        let publisher = IntentPublisherConfig::from_settings(&settings)
-            .unwrap()
-            .connect()
-            .unwrap();
+        let publisher =
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, false)
+                .unwrap()
+                .connect()
+                .unwrap();
 
         assert_eq!(
             publisher.intent_lane_count(),
             OPERATOR_DIRECT_INTENT_PUBLISH_LANES
         );
         assert!(!publisher.intent_lanes_prepared.load(Ordering::Acquire));
+        assert!(prepared_publish_guard(
+            &publisher.intent_preparation_gate,
+            &publisher.intent_lanes_prepared,
+        )
+        .unwrap_err()
+        .contains("not prepared"));
         assert!(publisher.intent_lanes.iter().all(|lane| lane
             .lock()
             .unwrap()
             .service_bus_sender
             .is_some()));
+    }
+
+    #[test]
+    fn pointer_only_real_methods_prepare_storage_then_publish_immutable_pointer_without_queue() {
+        let (settings, market, fair, reference, book, decision, metadata, now) = fixture();
+        let state = Arc::new(Mutex::new(TestPointerOnlyState::default()));
+        let publisher = pointer_only_publisher(Arc::clone(&state));
+
+        assert_eq!(
+            publisher.warm_market(&market).unwrap(),
+            IntentPublisherPreparation::PointerOnly
+        );
+        assert!(publisher.intent_lanes_prepared.load(Ordering::Acquire));
+        assert!(publisher.intent_lanes.iter().all(|lane| lane
+            .lock()
+            .unwrap()
+            .service_bus_sender
+            .is_none()));
+        {
+            let mut state = state.lock().unwrap();
+            assert!(
+                state.blobs.is_empty(),
+                "pointer preparation wrote a warmup marker"
+            );
+            assert_eq!(
+                state.events,
+                vec!["prepare_pointer"; OPERATOR_DIRECT_INTENT_PUBLISH_LANES + 1]
+            );
+            state.events.clear();
+        }
+
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        let published = publisher.publish(&intent).unwrap();
+        assert!(published.pointer_only_preflight);
+        assert!(!published.queue_handoff_sent);
+        assert!(published.queue_send_wall_ts.is_none());
+        assert!(published.queue_send_elapsed_ms.is_none());
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            ["immutable", "prepare_pointer", "cas_pointer"]
+        );
+        assert_eq!(state.blobs.len(), 1);
+        assert!(state.blobs.contains_key(&published.blob_name));
+        let pointer: Value = serde_json::from_slice(&state.pointer.as_ref().unwrap().0).unwrap();
+        assert_eq!(pointer["intent_blob_name"], published.blob_name);
+    }
+
+    #[test]
+    fn pointer_only_publish_checks_freshness_after_immutable_and_before_pointer() {
+        let (settings, market, fair, reference, book, decision, metadata, now) = fixture();
+        let state = Arc::new(Mutex::new(TestPointerOnlyState::default()));
+        let publisher = pointer_only_publisher(Arc::clone(&state));
+        publisher.warm_market(&market).unwrap();
+        state.lock().unwrap().events.clear();
+
+        let mut expired = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        expired.decision_ts -= Duration::seconds(20);
+        expired.valid_until -= Duration::seconds(20);
+        expired.gtd_expiry_ts = expired.gtd_expiry_ts.map(|ts| ts - Duration::seconds(20));
+        assert!(expired.validate().is_ok());
+        assert!(publisher.publish(&expired).unwrap_err().contains("expired"));
+        let state = state.lock().unwrap();
+        assert_eq!(state.events, ["immutable"]);
+        assert!(
+            state.pointer.is_none(),
+            "freshness failure reached pointer CAS"
+        );
+    }
+
+    #[test]
+    fn pointer_only_invalid_request_surfaces_while_default_failure_stays_optional() {
+        let mut settings = RuntimeSettings::default();
+        assert!(
+            IntentPublisherConfig::optional_connect_with_pointer_only_preflight(&settings, false,)
+                .unwrap()
+                .is_none()
+        );
+        settings.azure.publish_strategy_canary_intents = true;
+        let error =
+            IntentPublisherConfig::optional_connect_with_pointer_only_preflight(&settings, true)
+                .err()
+                .expect("invalid pointer-only request must fail");
+        assert!(error.contains("operator-direct"));
+
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.live.execution_mode = ExecutionMode::Live;
+        assert!(
+            IntentPublisherConfig::optional_connect_with_pointer_only_preflight(&settings, true,)
+                .err()
+                .expect("live pointer-only request must fail")
+                .contains("credential-free paper")
+        );
     }
 
     #[test]

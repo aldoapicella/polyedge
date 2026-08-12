@@ -248,6 +248,27 @@ jobs:
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
           assert.equal(workflow.includes(
             ["FUNDED_DIRECT_SERVICE_BUS_ENABLED", "false"].join("=")), false);
+          const pointerPreflightMarker = workflow.indexOf("FUNDED_POINTER_PREFLIGHT_REQUESTED=true");
+          const pointerPreflight = workflow.indexOf("STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true");
+          const pointerPreflightRestore = workflow.indexOf(
+            "--remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT", pointerPreflight);
+          const enableService = workflow.indexOf("- name: Enable v9 only after the zero-write preflight passes");
+          assert.ok(pointerPreflightMarker >= 0 && pointerPreflightMarker < pointerPreflight);
+          assert.ok(pointerPreflight < pointerPreflightRestore && pointerPreflightRestore < enableService);
+          const producerConsoleQuery = "ContainerAppName_s == '$" + "INTENT_PRODUCER_APP'";
+          assert.equal(workflow.includes(producerConsoleQuery), false);
+          const workerPreflightLog = workflow.indexOf("funded-preflight-logs.json");
+          const exactIntentProof = workflow.indexOf("pointer-preflight-exact-intent.json");
+          const queueInvariance = workflow.indexOf("funded-queue-after-pointer-preflight.snapshot.json");
+          assert.ok(workerPreflightLog >= 0 && workerPreflightLog < exactIntentProof);
+          assert.ok(exactIntentProof < queueInvariance);
+          const cutoff = workflow.indexOf("pointer_preflight_cutoff_epoch=$(date -u +%s)");
+          const pointerSnapshot = workflow.indexOf("pointer-before-preflight.json", cutoff);
+          const workerStart = workflow.indexOf("- name: Run the zero-write v9 preflight", pointerSnapshot);
+          const pointerAfter = workflow.indexOf("pointer-after-preflight.json", workerStart);
+          assert.ok(pointerPreflight < cutoff && cutoff < pointerSnapshot && pointerSnapshot < workerStart);
+          assert.ok(workerStart < pointerAfter && pointerAfter < queueInvariance);
+          assert.match(workflow, /pointer_after_etag[\s\S]*pointer_before_etag/);
           const activation = workflow.slice(
             workflow.lastIndexOf("- name: Rewarm the producer"),
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
@@ -948,9 +969,11 @@ jobs:
             and (.last_reconciled_equity - 31.655501 | fabs) <= 0.01
           ' v5-capital-reserve-state.json
 
-      - name: Deploy and verify the retry-capable Dynamic Quote intent producer
+      - name: Deploy and verify the pointer-only preflight Dynamic Quote intent producer
+        id: pointer_preflight_producer
         run: |
           set -euo pipefail
+          echo "FUNDED_POINTER_PREFLIGHT_REQUESTED=true" >> "$GITHUB_ENV"
           az containerapp update \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
@@ -959,6 +982,7 @@ jobs:
               FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
               FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
               FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
+              STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true \
               LOCAL_JSONL_RECORDER_ENABLED=false \
             --only-show-errors \
             -o none
@@ -995,6 +1019,63 @@ jobs:
             --name "$INTENT_PRODUCER_APP" \
             --query properties.template.containers[0].image -o tsv)
           test "$producer_image" = "${{ steps.images.outputs.producer_reference }}"
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer-pointer-preflight.json
+          producer_pointer_env() {
+            jq -er --arg name "$1" '
+              [.properties.template.containers[0].env[]
+                | select(.name == $name) | .value]
+              | if length == 1 then .[0]
+                else error("expected one pointer-only producer environment value for " + $name)
+                end
+            ' intent-producer-pointer-preflight.json
+          }
+          test "$(producer_pointer_env EXECUTION_MODE)" = "paper"
+          test "$(producer_pointer_env ALLOW_LIVE)" = "false"
+          test "$(producer_pointer_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
+          test "$(producer_pointer_env STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT)" = "true"
+          test "$(producer_pointer_env FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
+          test "$(producer_pointer_env FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
+          test "$(producer_pointer_env FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
+          jq -e '
+            ([.properties.template.containers[0].env[]
+              | select(.name == "POLYMARKET_PRIVATE_KEY")]
+             | length) == 0
+          ' intent-producer-pointer-preflight.json >/dev/null
+          pointer_preflight_intent_prefix=$(producer_pointer_env STRATEGY_CANARY_INTENT_PREFIX)
+          pointer_preflight_intent_container=$(producer_pointer_env AZURE_STORAGE_CONTAINER_NAME)
+          [[ "$pointer_preflight_intent_prefix" =~ /intents$ ]]
+          test -n "$pointer_preflight_intent_container"
+          pointer_preflight_current_blob="${pointer_preflight_intent_prefix%/intents}/current-funded-intent.json"
+          pointer_preflight_cutoff_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          pointer_preflight_cutoff_epoch=$(date -u +%s)
+          pointer_before_exists=false
+          pointer_before_etag=""
+          pointer_show_stderr=$(mktemp)
+          if az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$pointer_preflight_intent_container" \
+            --name "$pointer_preflight_current_blob" \
+            --auth-mode login --only-show-errors -o json > pointer-before-preflight.json \
+            2>"$pointer_show_stderr"; then
+            pointer_before_exists=true
+            pointer_before_etag=$(jq -er '.properties.etag' pointer-before-preflight.json)
+            test -n "$pointer_before_etag"
+          elif grep -Eq 'BlobNotFound|404' "$pointer_show_stderr"; then
+            rm -f "$pointer_show_stderr"
+          else
+            cat "$pointer_show_stderr" >&2
+            exit 1
+          fi
+          echo "cutoff_at=$pointer_preflight_cutoff_at" >> "$GITHUB_OUTPUT"
+          echo "cutoff_epoch=$pointer_preflight_cutoff_epoch" >> "$GITHUB_OUTPUT"
+          echo "intent_prefix=$pointer_preflight_intent_prefix" >> "$GITHUB_OUTPUT"
+          echo "intent_container=$pointer_preflight_intent_container" >> "$GITHUB_OUTPUT"
+          echo "current_blob=$pointer_preflight_current_blob" >> "$GITHUB_OUTPUT"
+          echo "pointer_before_exists=$pointer_before_exists" >> "$GITHUB_OUTPUT"
+          echo "pointer_before_etag=$pointer_before_etag" >> "$GITHUB_OUTPUT"
 
       - name: Run the zero-write v9 preflight against a fresh producer intent
         id: funded_preflight
@@ -1010,6 +1091,25 @@ jobs:
           readonly v9_completion_prefix="${v9_prefix}completed/"
           v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
           readonly v5_state_sha256="sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-before-pointer-preflight.json
+          jq -e '
+            .status == "SendDisabled"
+            and (.countDetails.activeMessageCount | tonumber) == 0
+            and (.countDetails.scheduledMessageCount | tonumber) == 0
+            and (.countDetails.deadLetterMessageCount | tonumber) >= 0
+          ' funded-queue-before-pointer-preflight.json >/dev/null
+          test "$(jq -r '.countDetails.deadLetterMessageCount' \
+            funded-queue-before-pointer-preflight.json)" = "$(cat funded-fenced-dlq-before.txt)"
+          jq -S '{
+            status,
+            active: .countDetails.activeMessageCount,
+            scheduled: .countDetails.scheduledMessageCount,
+            dead_letter: .countDetails.deadLetterMessageCount
+          }' funded-queue-before-pointer-preflight.json > funded-queue-before-pointer-preflight.snapshot.json
           az storage blob list \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -1383,6 +1483,14 @@ jobs:
           PREFLIGHT_EXECUTION: ${{ steps.funded_preflight.outputs.execution }}
           PREFLIGHT_V5_ETAG_BEFORE: ${{ steps.funded_preflight.outputs.v5_etag_before }}
           PREFLIGHT_INTENT_PREFIX: ${{ steps.funded_preflight.outputs.intent_prefix }}
+          PREFLIGHT_INTENT_CONTAINER: ${{ steps.funded_preflight.outputs.intent_container }}
+          POINTER_PREFLIGHT_CUTOFF_AT: ${{ steps.pointer_preflight_producer.outputs.cutoff_at }}
+          POINTER_PREFLIGHT_CUTOFF_EPOCH: ${{ steps.pointer_preflight_producer.outputs.cutoff_epoch }}
+          POINTER_PREFLIGHT_INTENT_PREFIX: ${{ steps.pointer_preflight_producer.outputs.intent_prefix }}
+          POINTER_PREFLIGHT_INTENT_CONTAINER: ${{ steps.pointer_preflight_producer.outputs.intent_container }}
+          POINTER_PREFLIGHT_CURRENT_BLOB: ${{ steps.pointer_preflight_producer.outputs.current_blob }}
+          POINTER_PREFLIGHT_POINTER_BEFORE_EXISTS: ${{ steps.pointer_preflight_producer.outputs.pointer_before_exists }}
+          POINTER_PREFLIGHT_POINTER_BEFORE_ETAG: ${{ steps.pointer_preflight_producer.outputs.pointer_before_etag }}
         run: |
           set -euo pipefail
           readonly v9_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-12-v9/"
@@ -1391,9 +1499,29 @@ jobs:
           readonly preflight_execution="$PREFLIGHT_EXECUTION"
           readonly v5_etag_before="$PREFLIGHT_V5_ETAG_BEFORE"
           readonly intent_prefix="$PREFLIGHT_INTENT_PREFIX"
+          readonly intent_container="$PREFLIGHT_INTENT_CONTAINER"
+          readonly pointer_preflight_cutoff_at="$POINTER_PREFLIGHT_CUTOFF_AT"
+          readonly pointer_preflight_cutoff_epoch="$POINTER_PREFLIGHT_CUTOFF_EPOCH"
+          readonly pointer_preflight_intent_prefix="$POINTER_PREFLIGHT_INTENT_PREFIX"
+          readonly pointer_preflight_intent_container="$POINTER_PREFLIGHT_INTENT_CONTAINER"
+          readonly pointer_preflight_current_blob="$POINTER_PREFLIGHT_CURRENT_BLOB"
+          readonly pointer_preflight_pointer_before_exists="$POINTER_PREFLIGHT_POINTER_BEFORE_EXISTS"
+          readonly pointer_preflight_pointer_before_etag="$POINTER_PREFLIGHT_POINTER_BEFORE_ETAG"
           test -n "$preflight_execution"
           test -n "$v5_etag_before"
           test -n "$intent_prefix"
+          test -n "$intent_container"
+          test "$intent_prefix" = "$pointer_preflight_intent_prefix"
+          test "$intent_container" = "$pointer_preflight_intent_container"
+          test "$pointer_preflight_current_blob" = "${intent_prefix%/intents}/current-funded-intent.json"
+          test -n "$pointer_preflight_cutoff_at"
+          [[ "$pointer_preflight_cutoff_epoch" =~ ^[0-9]+$ ]]
+          [[ "$pointer_preflight_pointer_before_exists" =~ ^(true|false)$ ]]
+          if [ "$pointer_preflight_pointer_before_exists" = true ]; then
+            test -n "$pointer_preflight_pointer_before_etag"
+          else
+            test -z "$pointer_preflight_pointer_before_etag"
+          fi
           environment_id=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
@@ -1439,6 +1567,103 @@ jobs:
             sleep 10
           done
           test "$preflight_ready" = true
+          preflight_decision_id=$(jq -er '.[0].Log_s | fromjson | .decisionId' funded-preflight-logs.json)
+          preflight_handoff_blob=$(jq -er '.[0].Log_s | fromjson | .intent_handoff_blob_name' funded-preflight-logs.json)
+          preflight_intent_blob=$(jq -er '.[0].Log_s | fromjson | .intent_blob_name' funded-preflight-logs.json)
+          preflight_intent_sha256=$(jq -er '.[0].Log_s | fromjson | .intent_sha256' funded-preflight-logs.json)
+          [[ "$preflight_decision_id" =~ ^[0-9a-f]{64}$ ]]
+          test "$preflight_handoff_blob" = "${intent_prefix%/intents}/current-funded-intent.json"
+          test "$preflight_intent_blob" = "$intent_prefix/$preflight_decision_id.json"
+          [[ "$preflight_intent_sha256" =~ ^sha256:[0-9a-f]{64}$ ]]
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$intent_container" \
+            --name "$preflight_intent_blob" \
+            --file pointer-preflight-exact-intent.json \
+            --auth-mode login --overwrite --only-show-errors -o none
+          test "sha256:$(sha256sum pointer-preflight-exact-intent.json | cut -d' ' -f1)" = \
+            "$preflight_intent_sha256"
+          az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$intent_container" \
+            --name "$preflight_intent_blob" \
+            --auth-mode login --only-show-errors -o json > pointer-preflight-exact-intent-properties.json
+          pointer_preflight_last_modified=$(jq -er '.properties.lastModified' \
+            pointer-preflight-exact-intent-properties.json)
+          node - \
+            pointer-preflight-exact-intent.json \
+            "$preflight_decision_id" \
+            "$preflight_intent_blob" \
+            "$intent_prefix" \
+            "$pointer_preflight_cutoff_epoch" \
+            "$pointer_preflight_last_modified" <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const [file, decisionId, blobName, prefix, startedEpoch, lastModified] = process.argv.slice(2);
+          const intent = JSON.parse(fs.readFileSync(file, "utf8"));
+          const parsedStarted = Number(startedEpoch) * 1_000;
+          const decisionAt = Date.parse(intent.decision_ts);
+          const validUntil = Date.parse(intent.valid_until);
+          const gtdExpiry = Date.parse(intent.gtd_expiry_ts);
+          const modifiedAt = Date.parse(lastModified);
+          assert.equal(intent.schema, "polyedge.execution_intent.v1");
+          assert.equal(intent.decision_id, decisionId);
+          assert.match(decisionId, /^[0-9a-f]{64}$/);
+          assert.equal(blobName, `${prefix}/${decisionId}.json`);
+          assert.ok(Number.isFinite(parsedStarted) && Number.isFinite(decisionAt) &&
+            Number.isFinite(validUntil) && Number.isFinite(gtdExpiry) && Number.isFinite(modifiedAt));
+          assert.ok(decisionAt >= parsedStarted, "intent decision predates pointer-only cutoff");
+          assert.ok(modifiedAt >= parsedStarted, "intent blob predates pointer-only cutoff");
+          assert.ok(Number.isInteger(intent.ttl_ms) && intent.ttl_ms >= 1_000 && intent.ttl_ms <= 30_000);
+          assert.equal(validUntil, decisionAt + intent.ttl_ms);
+          assert.equal(gtdExpiry, validUntil + 300_000);
+          assert.ok(intent.market_end_ts && Date.parse(intent.market_end_ts) > validUntil);
+          NODE
+          az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$intent_container" \
+            --name "$pointer_preflight_current_blob" \
+            --auth-mode login --only-show-errors -o json > pointer-after-preflight.json
+          pointer_after_etag=$(jq -er '.properties.etag' pointer-after-preflight.json)
+          test -n "$pointer_after_etag"
+          if [ "$pointer_preflight_pointer_before_exists" = true ]; then
+            test "$pointer_after_etag" != "$pointer_preflight_pointer_before_etag"
+          fi
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$intent_container" \
+            --name "$pointer_preflight_current_blob" \
+            --file pointer-after-preflight.json \
+            --auth-mode login --overwrite --only-show-errors -o none
+          node - \
+            pointer-after-preflight.json \
+            pointer-preflight-exact-intent.json \
+            "$preflight_decision_id" \
+            "$preflight_intent_blob" \
+            "$preflight_intent_sha256" \
+            "$intent_prefix" <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const [pointerFile, intentFile, decisionId, blobName, sha256, prefix] = process.argv.slice(2);
+          const pointer = JSON.parse(fs.readFileSync(pointerFile, "utf8"));
+          const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+          assert.equal(pointer.schema, "polyedge.funded_intent_handoff.v1");
+          assert.match(pointer.decision_id, /^[0-9a-f]{64}$/);
+          assert.match(pointer.intent_blob_name, new RegExp(`^${prefix}/[0-9a-f]{64}\\.json$`));
+          assert.match(pointer.intent_sha256, /^sha256:[0-9a-f]{64}$/);
+          const isWorkerPointer = pointer.decision_id === decisionId &&
+            pointer.intent_blob_name === blobName && pointer.intent_sha256 === sha256;
+          if (isWorkerPointer) {
+            assert.equal(pointer.decision_ts, intent.decision_ts);
+          } else {
+            const pointerAt = Date.parse(pointer.decision_ts);
+            const workerAt = Date.parse(intent.decision_ts);
+            assert.ok(Number.isFinite(pointerAt) && Number.isFinite(workerAt));
+            assert.ok(pointerAt > workerAt ||
+              (pointerAt === workerAt && pointer.decision_id > decisionId),
+              "current pointer is neither the worker handoff nor strictly newer");
+          }
+          NODE
           az storage blob list \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -1449,6 +1674,20 @@ jobs:
           jq -S '[.[] | {name, etag: .properties.etag, size: .properties.contentLength}]' \
             v9-prefix-after-preflight.json > v9-prefix-after-preflight.snapshot.json
           cmp -s v9-prefix-before-preflight.snapshot.json v9-prefix-after-preflight.snapshot.json
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-after-pointer-preflight.json
+          jq -S '{
+            status,
+            active: .countDetails.activeMessageCount,
+            scheduled: .countDetails.scheduledMessageCount,
+            dead_letter: .countDetails.deadLetterMessageCount
+          }' funded-queue-after-pointer-preflight.json > funded-queue-after-pointer-preflight.snapshot.json
+          cmp -s \
+            funded-queue-before-pointer-preflight.snapshot.json \
+            funded-queue-after-pointer-preflight.snapshot.json
           v5_etag_after=$(az storage blob show \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -1479,6 +1718,70 @@ jobs:
           test "$(job_env ALLOW_FUNDED_DIRECT)" = "false"
           test "$(job_env FUNDED_DIRECT_DRY_RUN)" = "true"
           test -z "$(job_env FUNDED_DIRECT_PREFLIGHT_ONLY)"
+
+      - name: Restore normal producer handoff before service activation
+        run: |
+          set -euo pipefail
+          restored=false
+          for attempt in 1 2 3; do
+            if az containerapp update \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" \
+              --remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT \
+              --set-env-vars \
+                RUN_BOT_ON_STARTUP=true \
+                STRATEGY_INTENT_OPERATOR_DIRECT=true \
+                FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+                FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
+                FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
+              --only-show-errors -o none; then
+              restored=true
+              break
+            fi
+            sleep "$((attempt * 10))"
+          done
+          test "$restored" = true
+          producer_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$INTENT_PRODUCER_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test -n "$producer_revision"
+          for attempt in $(seq 1 36); do
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" -o json > producer-revisions-normal-restored.json
+            if jq -e --arg revision "$producer_revision" '
+              ([.[] | select(.properties.active == true)] | length) == 1
+              and ([.[] | select(.properties.active == true)][0].name == $revision)
+              and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
+              and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
+            ' producer-revisions-normal-restored.json >/dev/null; then break; fi
+            sleep 5
+          done
+          jq -e --arg revision "$producer_revision" '
+            ([.[] | select(.properties.active == true)] | length) == 1
+            and ([.[] | select(.properties.active == true)][0].name == $revision)
+            and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
+            and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
+          ' producer-revisions-normal-restored.json >/dev/null
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" --name "$INTENT_PRODUCER_APP" \
+            -o json > intent-producer-normal-restored.json
+          jq -e --arg namespace "$SERVICE_BUS_NAMESPACE" --arg queue "$SERVICE_BUS_QUEUE" '
+            ([.properties.template.containers[0].env[] | select(.name == "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT")] | length) == 0
+            and ([.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_ENABLED" and .value == "true")] | length) == 1
+            and ([.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE" and .value == $namespace)] | length) == 1
+            and ([.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_QUEUE" and .value == $queue)] | length) == 1
+          ' intent-producer-normal-restored.json >/dev/null
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" --name "$FUNDED_APP" -o json > funded-app-before-enable.json
+          test "$(jq -r '.properties.template.scale.minReplicas' funded-app-before-enable.json)" = "0"
+          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_SERVICE_ENABLED") | .value' funded-app-before-enable.json)" = "false"
+          test "$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" --query status -o tsv)" = "SendDisabled"
+          echo "FUNDED_NORMAL_PRODUCER_RESTORED=true" >> "$GITHUB_ENV"
 
       - name: Enable v9 only after the zero-write preflight passes
         run: |
@@ -1790,13 +2093,19 @@ jobs:
                 --name "$SERVICE_BUS_QUEUE" \
                 --status SendDisabled \
                 --only-show-errors -o none || true
-              az containerapp update \
-                --resource-group "$AZURE_RESOURCE_GROUP" \
-                --name "$INTENT_PRODUCER_APP" \
-                --set-env-vars \
-                  RUN_BOT_ON_STARTUP=true \
-                  FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
-                --only-show-errors -o none || true
+              for attempt in 1 2 3; do
+                if az containerapp update \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --name "$INTENT_PRODUCER_APP" \
+                  --remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT \
+                  --set-env-vars \
+                    RUN_BOT_ON_STARTUP=true \
+                    FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+                  --only-show-errors -o none; then
+                  break
+                fi
+                sleep "$((attempt * 5))"
+              done
             fi
           }
           trap refence_incomplete_cutover EXIT
@@ -2267,22 +2576,45 @@ jobs:
           trap - EXIT
 
       - name: Restore the dormant funded service after an incomplete cutover
-        if: ${{ always() && env.FUNDED_QUEUE_FENCED == 'true' && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
+        if: ${{ always() && (env.FUNDED_QUEUE_FENCED == 'true' || env.FUNDED_POINTER_PREFLIGHT_REQUESTED == 'true') && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
         run: |
           set -euo pipefail
-          az servicebus queue update \
+          queue_fenced=false
+          for attempt in 1 2 3; do
+            if az servicebus queue update \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --namespace-name "$SERVICE_BUS_NAMESPACE" \
+              --name "$SERVICE_BUS_QUEUE" \
+              --status SendDisabled \
+              --only-show-errors -o none; then
+              queue_fenced=true
+              break
+            fi
+            sleep "$((attempt * 10))"
+          done
+          test "$queue_fenced" = true
+          test "$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --status SendDisabled \
-            --only-show-errors -o none
-          az containerapp update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$INTENT_PRODUCER_APP" \
-            --set-env-vars \
-              RUN_BOT_ON_STARTUP=true \
-              FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
-            --only-show-errors -o none
+            --name "$SERVICE_BUS_QUEUE" --query status -o tsv)" = "SendDisabled"
+          producer_cleanup_updated=false
+          for attempt in 1 2 3; do
+            if az containerapp update \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$INTENT_PRODUCER_APP" \
+              --remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT \
+              --set-env-vars \
+                RUN_BOT_ON_STARTUP=true \
+                FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+                FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
+                FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
+              --only-show-errors -o none; then
+              producer_cleanup_updated=true
+              break
+            fi
+            sleep "$((attempt * 10))"
+          done
+          test "$producer_cleanup_updated" = true
           restored_producer_revision=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
@@ -2323,6 +2655,11 @@ jobs:
           test "$(restored_producer_env RUN_BOT_ON_STARTUP)" = "true"
           test "$(restored_producer_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
           test "$(restored_producer_env FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
+          test "$(restored_producer_env FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
+          test "$(restored_producer_env FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
+          test "$(jq '[.properties.template.containers[0].env[]
+            | select(.name == "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT")] | length' \
+            intent-producer-restored.json)" = "0"
           if [ -n "${FUNDED_ROLLBACK_REVISION:-}" ]; then
             test -s funded-rollback-template.json
             az containerapp revision copy \
