@@ -247,7 +247,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
     needs: funded-safety
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     concurrency:
       group: polyedge-funded-direct-cl
       cancel-in-progress: false
