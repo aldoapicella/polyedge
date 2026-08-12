@@ -2048,6 +2048,11 @@ jobs:
                 | where TimeGenerated >= datetime($producer_enabled_at)
                 | extend record = parse_json(Log_s)
                 | where tostring(record.schema) == 'polyedge.funded_direct_latency.v1'
+                | where tostring(record.status) == 'intent_completed'
+                | where tobool(record.order_submission_attempted) == true
+                | where tostring(record.worker_status) == 'persistent_intent_completed'
+                | where todouble(record.signal_to_send_ms) <= todouble(record.signal_to_send_slo_ms)
+                | where tolong(record.signal_to_send_slo_ms) == 2000
                 | top 1 by TimeGenerated asc
                 | project TimeGenerated, Log_s" \
               -o json > funded-v9-lifecycle-latency.json
