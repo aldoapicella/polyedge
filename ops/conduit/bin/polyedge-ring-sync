@@ -7,6 +7,10 @@ set -a
 . "$env_file"
 set +a
 
+if [ "${POLYEDGE_RING_POST_UPLOAD_SEAL:-0}" = 1 ]; then
+  POLYEDGE_RING_SEAL_ONLY=1
+fi
+
 root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 segments=$root/segments
 archive=$root/archive
@@ -199,7 +203,9 @@ case "${POLYEDGE_AZURE_ARC_IDENTITY:-0}" in
     ;;
 esac
 
-exec "$@" "$POLYEDGE_RING_IMAGE" polyedge-rs ring-upload \
+"$@" "$POLYEDGE_RING_IMAGE" polyedge-rs ring-upload \
     --root /srv/polyedge-ring \
     --blob-prefix "$prefix" \
     --retention-hours "${POLYEDGE_RING_RETENTION_HOURS:-48}"
+
+POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$0"
