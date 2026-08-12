@@ -248,8 +248,14 @@ jobs:
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
           assert.equal(workflow.includes(
             ["FUNDED_DIRECT_SERVICE_BUS_ENABLED", "false"].join("=")), false);
-          const pointerPreflightMarker = workflow.indexOf("FUNDED_POINTER_PREFLIGHT_REQUESTED=true");
-          const pointerPreflight = workflow.indexOf("STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true");
+          const pointerPreflightDeployment = workflow.indexOf(
+            "\n      - name: Deploy and verify the pointer-only preflight Dynamic Quote intent producer"
+          );
+          assert.ok(pointerPreflightDeployment >= 0);
+          const pointerPreflightMarker = workflow.indexOf(
+            "FUNDED_POINTER_PREFLIGHT_REQUESTED=true", pointerPreflightDeployment);
+          const pointerPreflight = workflow.indexOf(
+            "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true", pointerPreflightDeployment);
           const pointerPreflightRestore = workflow.indexOf(
             "--remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT", pointerPreflight);
           const enableService = workflow.indexOf("- name: Enable v9 only after the zero-write preflight passes");
@@ -257,15 +263,19 @@ jobs:
           assert.ok(pointerPreflight < pointerPreflightRestore && pointerPreflightRestore < enableService);
           const producerConsoleQuery = "ContainerAppName_s == '$" + "INTENT_PRODUCER_APP'";
           assert.equal(workflow.includes(producerConsoleQuery), false);
-          const workerPreflightLog = workflow.indexOf("funded-preflight-logs.json");
-          const exactIntentProof = workflow.indexOf("pointer-preflight-exact-intent.json");
-          const queueInvariance = workflow.indexOf("funded-queue-after-pointer-preflight.snapshot.json");
+          const workerPreflightLog = workflow.indexOf(
+            "funded-preflight-logs.json", pointerPreflightDeployment);
+          const exactIntentProof = workflow.indexOf(
+            "pointer-preflight-exact-intent.json", pointerPreflightDeployment);
           assert.ok(workerPreflightLog >= 0 && workerPreflightLog < exactIntentProof);
-          assert.ok(exactIntentProof < queueInvariance);
-          const cutoff = workflow.indexOf("pointer_preflight_cutoff_epoch=$(date -u +%s)");
+          const cutoff = workflow.indexOf(
+            "pointer_preflight_cutoff_epoch=$(date -u +%s)", pointerPreflightDeployment);
           const pointerSnapshot = workflow.indexOf("pointer-before-preflight.json", cutoff);
           const workerStart = workflow.indexOf("- name: Run the zero-write v9 preflight", pointerSnapshot);
           const pointerAfter = workflow.indexOf("pointer-after-preflight.json", workerStart);
+          const queueInvariance = workflow.indexOf(
+            "funded-queue-after-pointer-preflight.snapshot.json", pointerAfter);
+          assert.ok(exactIntentProof < queueInvariance);
           assert.ok(pointerPreflight < cutoff && cutoff < pointerSnapshot && pointerSnapshot < workerStart);
           assert.ok(workerStart < pointerAfter && pointerAfter < queueInvariance);
           assert.match(workflow, /pointer_after_etag[\s\S]*pointer_before_etag/);
