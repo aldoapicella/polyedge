@@ -60,6 +60,10 @@ pub enum StorageError {
     Unsupported(&'static str),
     #[error("invalid recorder binding: {0}")]
     InvalidRecorderBinding(&'static str),
+    #[error("local JSONL recorder has an unterminated tail")]
+    UnterminatedJsonlTail,
+    #[error("local JSONL recorder append was short: wrote {actual} of {expected} bytes")]
+    ShortJsonlWrite { expected: usize, actual: usize },
 }
 
 pub trait EventRecorder {
@@ -203,6 +207,47 @@ impl JsonlRecorder {
             .join(now.format("%Y/%m/%d/%H").to_string())
             .join(format!("{start}.jsonl"))
     }
+
+    fn append_lines(&self, lines: &[Vec<u8>]) -> Result<(), StorageError> {
+        let path = self.active_path(Utc::now());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        let length = file.metadata()?.len();
+        if length > 0 {
+            let mut tail = [0_u8; 1];
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                file.read_exact_at(&mut tail, length - 1)?;
+            }
+            #[cfg(not(unix))]
+            {
+                use std::io::{Seek, SeekFrom};
+                file.seek(SeekFrom::Start(length - 1))?;
+                file.read_exact(&mut tail)?;
+            }
+            if tail[0] != b'\n' {
+                return Err(StorageError::UnterminatedJsonlTail);
+            }
+        }
+        for line in lines {
+            let actual = file.write(line)?;
+            if actual != line.len() {
+                return Err(StorageError::ShortJsonlWrite {
+                    expected: line.len(),
+                    actual,
+                });
+            }
+        }
+        file.sync_all()?;
+        Ok(())
+    }
 }
 
 impl EventRecorder for JsonlRecorder {
@@ -214,17 +259,11 @@ impl EventRecorder for JsonlRecorder {
         if events.is_empty() {
             return Ok(());
         }
-        let path = self.active_path(Utc::now());
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        for event in events {
-            serde_json::to_writer(&mut file, &jsonl_event_envelope(event))?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_all()?;
-        Ok(())
+        let lines = events
+            .iter()
+            .map(jsonl_event_line)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.append_lines(&lines)
     }
 
     fn record_recorded_batch(
@@ -234,17 +273,11 @@ impl EventRecorder for JsonlRecorder {
         if events.is_empty() {
             return Ok(());
         }
-        let path = self.active_path(Utc::now());
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        for event in events {
-            serde_json::to_writer(&mut file, &jsonl_recorded_event_envelope(event)?)?;
-            file.write_all(b"\n")?;
-        }
-        file.sync_all()?;
-        Ok(())
+        let lines = events
+            .iter()
+            .map(jsonl_recorded_event_line)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.append_lines(&lines)
     }
 }
 
@@ -3697,6 +3730,36 @@ mod tests {
         let line = fs::read_to_string(&path).unwrap();
         let recorded: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(canonical_json_sha256(&recorded["payload"]), expected_sha256);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn jsonl_recorder_rejects_unterminated_tail_without_changing_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-jsonl-tail-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let partial = br#"{"partial":"#;
+        fs::write(&path, partial).unwrap();
+        let event = RecordedRuntimeEvent::bound(
+            RuntimeEvent {
+                event_type: "runtime_provenance".to_owned(),
+                ts: Utc::now(),
+                data: json!({"git_sha": "test"}),
+            },
+            "7c66d77b-a911-4f9b-95f2-98ca9395255e",
+            1,
+        );
+
+        let error = JsonlRecorder::new(&path)
+            .record_recorded_batch(&[event])
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::UnterminatedJsonlTail));
+        assert_eq!(fs::read(&path).unwrap(), partial);
         let _ = fs::remove_dir_all(dir);
     }
 
