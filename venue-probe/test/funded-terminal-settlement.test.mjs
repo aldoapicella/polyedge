@@ -20,7 +20,7 @@ const env = {
   AZURE_TENANT_ID: "9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
   AZURE_STORAGE_ACCOUNT_NAME: "stpolyedge6urdjr5nmwx7w",
   AZURE_STORAGE_CONTAINER_NAME: "polyedge-funded-evidence",
-  AZURE_CLIENT_ID: "e98d6475-681c-4f75-81f1-0eff9ea5e332",
+  AZURE_CLIENT_ID: "d9ce9154-66a6-4bdb-839f-0da7b02b38da",
   AZURE_TOKEN_CREDENTIALS: "WorkloadIdentityCredential"
 };
 const record = {
