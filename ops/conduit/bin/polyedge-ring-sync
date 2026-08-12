@@ -46,28 +46,25 @@ sequence_summary() {
     else error("invalid recorder sequence fields")
     end
   ' "$segment" >"$sequence_tmp"; then
-    rm -f "$sequence_tmp"
-    sequence_tmp=
-    trap - EXIT HUP INT TERM
-    return 1
+    rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
   fi
   if ! recorder=$(awk -F '\t' '
-    NR == 1 { instance=$1; first=$2; previous=$2; count=1; next }
-    $1 != instance || $2 != previous + 1 { exit 1 }
-    { previous=$2; count++ }
-    END {
-      if (NR == 0) exit 1
-      printf "{\"recorder_instance_id\":\"%s\",\"recorder_first_sequence\":%s,\"recorder_last_sequence\":%s,\"recorder_event_count\":%s}\n", instance, first, previous, count
+    function emit() {
+      out = out comma "{\"recorder_instance_id\":\"" instance "\",\"recorder_first_sequence\":" first ",\"recorder_last_sequence\":" previous ",\"recorder_event_count\":" count "}"
+      comma=","
     }
+    NR == 1 { instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next }
+    $1 != instance {
+      if ($2 != 1 || seen[$1]) exit 1
+      emit(); instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next
+    }
+    $2 != previous + 1 { exit 1 }
+    { previous=$2; count++ }
+    END { if (NR == 0) exit 1; emit(); print "{\"recorder_runs\":[" out "]}" }
   ' "$sequence_tmp"); then
-    rm -f "$sequence_tmp"
-    sequence_tmp=
-    trap - EXIT HUP INT TERM
-    return 1
+    rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
   fi
-  rm -f "$sequence_tmp"
-  sequence_tmp=
-  trap - EXIT HUP INT TERM
+  rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM
   printf '%s\n' "$recorder"
 }
 
@@ -100,7 +97,7 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
     schema_version=2
     recorder='{}'
   else
-    schema_version=3
+    schema_version=4
     recorder=$(sequence_summary "$segment") || {
       echo "invalid recorder sequence proof: $segment" >&2
       exit 1

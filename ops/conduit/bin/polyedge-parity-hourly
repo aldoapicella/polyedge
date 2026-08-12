@@ -22,16 +22,29 @@ secure_dir() {
 
 sequence_evidence() {
   jq -ce '
-    .recorderSequence as $sequence |
-    if ($sequence | type == "object") and
-      ($sequence.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
-      ($sequence.recorder_first_sequence | type == "number" and floor == . and . >= 1) and
-      ($sequence.recorder_last_sequence | type == "number" and floor == . and . >= $sequence.recorder_first_sequence) and
-      ($sequence.recorder_event_count | type == "number" and floor == . and . >= 1) and
-      ($sequence.recorder_last_sequence - $sequence.recorder_first_sequence + 1 == $sequence.recorder_event_count)
-    then $sequence
+    def valid_run:
+      type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_first_sequence | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence | type == "number" and floor == .) and
+      (.recorder_last_sequence >= .recorder_first_sequence) and
+      (.recorder_event_count | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence - .recorder_first_sequence + 1 == .recorder_event_count);
+    def valid_runs:
+      . as $runs |
+      ($runs | length) >= 1 and all($runs[]; valid_run) and
+      all(range(1; ($runs | length)); . as $index |
+        if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+          $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+        else
+          $runs[$index].recorder_first_sequence == 1 and
+          ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+        end);
+    if .recorderSequence? != null then
+      if .recorderRuns? == null and (.recorderSequence | valid_run) then [.recorderSequence] else error("invalid recorder sequence evidence") end
+    elif (.recorderRuns | type) == "array" then .recorderRuns
     else error("invalid recorder sequence evidence")
-    end
+    end | if valid_runs then . else error("invalid recorder sequence evidence") end
   ' "$1"
 }
 
@@ -225,20 +238,27 @@ collect_refs() {
       sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
       feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
       file_sha=$(sha "$file")
-      jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" --argjson sequence "$sequence" \
-        '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha,recorderSequence:$sequence}' >>"$refs_tmp"
+      jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" --argjson runs "$sequence" \
+        '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha} +
+         (if ($runs | length) == 1 then {recorderSequence:$runs[0]} else {recorderRuns:$runs} end)' >>"$refs_tmp"
     fi
   done
   refs=$(jq -sc 'sort_by(.hourStartEpoch)' "$refs_tmp")
   count=$(printf '%s' "$refs" | jq 'length')
   [ "$count" -eq $(( (target_epoch - first_epoch) / 3600 + 1 )) ] || die 'accepted evidence has a gap'
   printf '%s' "$refs" | jq -e --argjson first "$first_epoch" '
+    def runs: if .recorderSequence? != null then [.recorderSequence] else .recorderRuns end;
     . as $refs |
+    ([$refs[] | runs[]]) as $runs |
     ($refs | to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600)))) and
     ([$refs[].hourStartEpoch] | length == (unique | length)) and
-    all(range(1; ($refs | length)); . as $index |
-      $refs[$index].recorderSequence.recorder_instance_id == $refs[$index - 1].recorderSequence.recorder_instance_id and
-      $refs[$index].recorderSequence.recorder_first_sequence == ($refs[$index - 1].recorderSequence.recorder_last_sequence + 1))
+    all(range(1; ($runs | length)); . as $index |
+      if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+        $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+      else
+        $runs[$index].recorder_first_sequence == 1 and
+        ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+      end)
   ' >/dev/null || die 'accepted evidence is duplicate or non-sequential'
 }
 
@@ -328,10 +348,18 @@ sequence_summary() {
     rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
   fi
   if ! recorder=$(awk -F '\t' '
-    NR == 1 { instance=$1; first=$2; previous=$2; count=1; next }
-    $1 != instance || $2 != previous + 1 { exit 1 }
+    function emit() {
+      out = out comma "{\"recorder_instance_id\":\"" instance "\",\"recorder_first_sequence\":" first ",\"recorder_last_sequence\":" previous ",\"recorder_event_count\":" count "}"
+      comma=","
+    }
+    NR == 1 { instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next }
+    $1 != instance {
+      if ($2 != 1 || seen[$1]) exit 1
+      emit(); instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next
+    }
+    $2 != previous + 1 { exit 1 }
     { previous=$2; count++ }
-    END { if (NR == 0) exit 1; printf "{\"recorder_instance_id\":\"%s\",\"recorder_first_sequence\":%s,\"recorder_last_sequence\":%s,\"recorder_event_count\":%s}\n", instance, first, previous, count }
+    END { if (NR == 0) exit 1; emit(); print "{\"recorder_runs\":[" out "]}" }
   ' "$sequence_tmp"); then
     rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
   fi
@@ -353,6 +381,7 @@ while [ "$i" -lt 6 ]; do
     [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c %h "$file")" = 1 ] || die "unsafe segment evidence: $file"
   done
   source_recorder=$(sequence_summary "$source") || die "invalid recorder sequence proof: $source"
+  source_runs=$(printf '%s' "$source_recorder" | jq -ce '.recorder_runs')
   gzip -t "$gzip_file" || die "invalid gzip: $gzip_file"
   source_sha=$(sha "$source")
   [ "sha256:$(gzip -dc "$gzip_file" | sha256sum | awk '{print $1}')" = "$source_sha" ] || die "gzip source mismatch: $gzip_file"
@@ -361,20 +390,43 @@ while [ "$i" -lt 6 ]; do
   expected_blob="events-oci-hot7-v1/$day/$hour/$start.jsonl.gz"
   [ "$(jq -r '.blob_name' "$manifest")" = "$expected_blob" ] || die "manifest blob mismatch: $manifest"
   source_lines=$(wc -l < "$source")
-  jq -e --arg segment "segments/$relative" --arg archive "archive/$relative.gz" --arg source_sha "$source_sha" \
+  manifest_runs=$(jq -ce --arg segment "segments/$relative" --arg archive "archive/$relative.gz" --arg source_sha "$source_sha" \
     --arg gzip_sha "$gzip_sha" --argjson start "$start" --argjson end "$((start + 600))" --argjson source_lines "$source_lines" '
+    def valid_run:
+      type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_first_sequence | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence | type == "number" and floor == .) and
+      (.recorder_last_sequence >= .recorder_first_sequence) and
+      (.recorder_event_count | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence - .recorder_first_sequence + 1 == .recorder_event_count);
+    def valid_runs:
+      . as $runs |
+      ($runs | length) >= 1 and all($runs[]; valid_run) and
+      all(range(1; ($runs | length)); . as $index |
+        if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+          $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+        else
+          $runs[$index].recorder_first_sequence == 1 and
+          ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+        end);
     . as $manifest |
-    .schema_version == 3 and .segment_path == $segment and .archive_path == $archive and
-    .compression == "gzip" and .source_sha256 == $source_sha and .sha256 == $gzip_sha and
-    .segment_start_epoch == $start and .segment_end_epoch == $end and .lines == $source_lines and
-    (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
-    (.recorder_first_sequence | type == "number" and floor == . and . >= 1) and
-    (.recorder_last_sequence | type == "number" and floor == . and . >= $manifest.recorder_first_sequence) and
-    (.recorder_event_count | type == "number" and floor == . and . == $source_lines) and
-    (.recorder_last_sequence - .recorder_first_sequence + 1 == .recorder_event_count)
-  ' "$manifest" >/dev/null || die "manifest mismatch: $manifest"
-  recorder=$(jq -c '{recorder_instance_id,recorder_first_sequence,recorder_last_sequence,recorder_event_count}' "$manifest")
-  jq -e --argjson source_recorder "$source_recorder" '{recorder_instance_id,recorder_first_sequence,recorder_last_sequence,recorder_event_count} == $source_recorder' "$manifest" >/dev/null || die "manifest recorder sequence differs from source: $manifest"
+    if (.segment_path == $segment and .archive_path == $archive and .compression == "gzip" and
+        .source_sha256 == $source_sha and .sha256 == $gzip_sha and .segment_start_epoch == $start and
+        .segment_end_epoch == $end and .lines == $source_lines) then
+      (if .schema_version == 3 and (has("recorder_runs") | not) then
+         [{recorder_instance_id,recorder_first_sequence,recorder_last_sequence,recorder_event_count}]
+       elif .schema_version == 4 and
+         (["recorder_instance_id","recorder_first_sequence","recorder_last_sequence","recorder_event_count"] | all(.[]; $manifest[.] == null)) then
+         .recorder_runs
+       else error("unsupported recorder manifest") end) as $runs |
+      if ($runs | type) == "array" and ($runs | valid_runs) and
+         ([$runs[].recorder_event_count] | add) == $source_lines
+      then $runs else error("manifest recorder runs are invalid") end
+    else error("manifest identity is invalid") end
+  ' "$manifest") || die "manifest mismatch: $manifest"
+  printf '%s' "$manifest_runs" | jq -e --argjson source_runs "$source_runs" '. == $source_runs' >/dev/null \
+    || die "manifest recorder sequence differs from source: $manifest"
   jq -e --arg manifest_sha "$manifest_sha" --arg blob "$expected_blob" --arg manifest_blob "$expected_blob.manifest.json" '
     .schema_version == 1 and .manifest_sha256 == $manifest_sha and .blob_name == $blob and
     .manifest_blob_name == $manifest_blob and
@@ -382,8 +434,8 @@ while [ "$i" -lt 6 ]; do
   ' "$receipt" >/dev/null || die "receipt mismatch: $receipt"
   jq -nc --argjson start "$start" --arg source "$source" --arg source_sha "$source_sha" \
     --arg gzip "$gzip_file" --arg gzip_sha "$gzip_sha" --arg manifest "$manifest" --arg manifest_sha "$manifest_sha" \
-    --arg receipt "$receipt" --arg receipt_sha "$(sha "$receipt")" --argjson recorder "$recorder" \
-    '{segmentStartEpoch:$start,source:{path:$source,sha256:$source_sha},gzip:{path:$gzip,sha256:$gzip_sha},manifest:{path:$manifest,sha256:$manifest_sha},receipt:{path:$receipt,sha256:$receipt_sha},recorderSequence:$recorder}' >>"$segments_tmp"
+    --arg receipt "$receipt" --arg receipt_sha "$(sha "$receipt")" --argjson runs "$manifest_runs" \
+    '{segmentStartEpoch:$start,source:{path:$source,sha256:$source_sha},gzip:{path:$gzip,sha256:$gzip_sha},manifest:{path:$manifest,sha256:$manifest_sha},receipt:{path:$receipt,sha256:$receipt_sha},recorderRuns:$runs}' >>"$segments_tmp"
   jq -cr --argjson hour_start "$target_epoch" --argjson hour_end "$end_epoch" '
     def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
     def essential($name):
@@ -425,22 +477,27 @@ continuous_feed=$(jq -sce --argjson start "$target_epoch" --argjson end "$end_ep
     else error("essential feed health was not continuous") end
   else error("essential feed health observations are incomplete") end
 ' "$feed_tmp") || die 'target hour lacks continuous essential feed health proof'
-hour_sequence=$(printf '%s' "$segments" | jq -ce '
+hour_runs=$(printf '%s' "$segments" | jq -ce '
   . as $segments |
-  if length == 6 and
-    ([$segments[].recorderSequence.recorder_instance_id] | unique | length == 1) and
-    all(range(1; ($segments | length)); . as $index |
-      $segments[$index].recorderSequence.recorder_first_sequence ==
-        ($segments[$index - 1].recorderSequence.recorder_last_sequence + 1))
-  then {
-    recorder_instance_id:$segments[0].recorderSequence.recorder_instance_id,
-    recorder_first_sequence:$segments[0].recorderSequence.recorder_first_sequence,
-    recorder_last_sequence:$segments[-1].recorderSequence.recorder_last_sequence,
-    recorder_event_count:([$segments[].recorderSequence.recorder_event_count] | add)
-  }
-  else error("invalid hourly recorder sequence proof")
-  end
+  ([$segments[].recorderRuns[]]) as $runs |
+  if length == 6 and ($runs | length) >= 1 and
+    all(range(1; ($runs | length)); . as $index |
+      if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+        $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+      else
+        $runs[$index].recorder_first_sequence == 1 and
+        ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+      end)
+  then reduce $runs[] as $run
+    ([]; if length > 0 and .[-1].recorder_instance_id == $run.recorder_instance_id then
+      .[-1].recorder_last_sequence = $run.recorder_last_sequence |
+      .[-1].recorder_event_count += $run.recorder_event_count
+    else . + [$run] end)
+  else error("invalid hourly recorder runs") end
 ') || die 'hourly recorder sequence proof is not contiguous'
+hour_sequence=$(printf '%s' "$hour_runs" | jq -ce '
+  if length == 1 then {recorderSequence:.[0]} else {recorderRuns:.} end
+')
 
 if [ "$target_epoch" -gt "$first_epoch" ]; then
   prior_epoch=$((target_epoch - 3600))
@@ -453,10 +510,18 @@ if [ "$target_epoch" -gt "$first_epoch" ]; then
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     .sameInput.deterministicResultExactMatch == true
   ' "$prior" >/dev/null || die 'prior accepted evidence is invalid'
-  prior_sequence=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
+  prior_runs=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
   feed_evidence "$prior" || die 'prior accepted evidence lacks continuous essential feed proof'
-  [ "$(printf '%s' "$prior_sequence" | jq -r '.recorder_instance_id')" = "$(printf '%s' "$hour_sequence" | jq -r '.recorder_instance_id')" ] || die 'prior recorder instance changed'
-  [ "$(printf '%s' "$hour_sequence" | jq -r '.recorder_first_sequence')" -eq "$(( $(printf '%s' "$prior_sequence" | jq -r '.recorder_last_sequence') + 1 ))" ] || die 'prior recorder sequence is not adjacent'
+  printf '%s\n%s\n' "$prior_runs" "$hour_runs" | jq -se '
+    .[0] + .[1] as $runs |
+    all(range(1; ($runs | length)); . as $index |
+      if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+        $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+      else
+        $runs[$index].recorder_first_sequence == 1 and
+        ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+      end)
+  ' >/dev/null || die 'prior recorder runs are not adjacent'
 fi
 
 api_status=$(mktemp "$runtime_dir/api-status.XXXXXX")
@@ -512,8 +577,9 @@ while :; do
 done
 rm -f "$api_status"
 api_status=
-[ "$(printf '%s' "$api_summary" | jq -r '.recorder.recorder_instance_id')" = "$(printf '%s' "$hour_sequence" | jq -r '.recorder_instance_id')" ] || die 'API recorder instance does not match the hour'
-[ "$(printf '%s' "$api_summary" | jq -r '.recorder.last_assigned_sequence')" -ge "$(printf '%s' "$hour_sequence" | jq -r '.recorder_last_sequence')" ] || die 'API recorder sequence is behind the hour'
+last_run=$(printf '%s' "$hour_runs" | jq -ce 'last')
+[ "$(printf '%s' "$api_summary" | jq -r '.recorder.recorder_instance_id')" = "$(printf '%s' "$last_run" | jq -r '.recorder_instance_id')" ] || die 'API recorder instance does not match the final hour run'
+[ "$(printf '%s' "$api_summary" | jq -r '.recorder.last_assigned_sequence')" -ge "$(printf '%s' "$last_run" | jq -r '.recorder_last_sequence')" ] || die 'API recorder sequence is behind the final hour run'
 
 oci_scheduled=$report_root/$day/$hour/audit.json
 [ ! -L "$oci_scheduled" ] && [ -f "$oci_scheduled" ] && [ "$(stat -c %h "$oci_scheduled")" = 1 ] || die 'OCI scheduled audit is missing or unsafe'
@@ -695,7 +761,7 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
   --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
   --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
   --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
-  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,researchImage:$image,segments:$segments,recorderSequence:$recorder_sequence,recorderStatus:$recorder_status,continuousFeedHealth:$continuous_feed,decisionConfigSha256:$decision_config_sha256,scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null},oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null}},sameInput:{path:$same_path,sha256:$same_sha,azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} |
+  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,researchImage:$image,segments:$segments,recorderStatus:$recorder_status,continuousFeedHealth:$continuous_feed,decisionConfigSha256:$decision_config_sha256,scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null},oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null}},sameInput:{path:$same_path,sha256:$same_sha,azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
   .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
 chmod 0640 "$tmp"
 sync -f "$tmp"

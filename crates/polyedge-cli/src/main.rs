@@ -35,7 +35,7 @@ use polyedge_storage::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1835,7 +1835,7 @@ fn run_ring_upload(
         let schema_version = manifest["schema_version"]
             .as_u64()
             .context("ring manifest schema_version must be an unsigned integer")?;
-        if !matches!(schema_version, 1 | 2 | 3) {
+        if !matches!(schema_version, 1 | 2 | 3 | 4) {
             bail!(
                 "unsupported ring manifest schema: {}",
                 manifest_path.display()
@@ -1846,8 +1846,10 @@ fn run_ring_upload(
             if manifest["compression"].as_str() != Some("gzip") {
                 bail!("ring manifest v2/v3 compression must equal gzip");
             }
-            if schema_version == 3 {
-                validate_ring_manifest_v3_sequence(&manifest)?;
+            match schema_version {
+                3 => validate_ring_manifest_v3_sequence(&manifest)?,
+                4 => validate_ring_manifest_v4_runs(&manifest)?,
+                _ => {}
             }
             ring_relative_path(&manifest, "archive_path")?
         } else {
@@ -1889,8 +1891,10 @@ fn run_ring_upload(
                 manifest_path.display()
             )
         })?;
-        if schema_version == 3 {
-            validate_ring_source_v3(&source_path, &manifest)?;
+        match schema_version {
+            3 => validate_ring_source_v3(&source_path, &manifest)?,
+            4 => validate_ring_source_v4(&source_path, &manifest)?,
+            _ => {}
         }
         let manifest_sha = sha256_prefixed(&manifest_bytes);
         let manifest_blob = format!("{blob_name}.manifest.json");
@@ -2142,6 +2146,86 @@ fn validate_ring_manifest_v3_sequence(manifest: &serde_json::Value) -> Result<()
     Ok(())
 }
 
+#[derive(Debug)]
+struct RingRecorderRun {
+    instance_id: String,
+    first: u64,
+    last: u64,
+    count: u64,
+}
+
+fn ring_manifest_v4_runs(manifest: &serde_json::Value) -> Result<Vec<RingRecorderRun>> {
+    if [
+        "recorder_instance_id",
+        "recorder_first_sequence",
+        "recorder_last_sequence",
+        "recorder_event_count",
+    ]
+    .iter()
+    .any(|field| manifest.get(*field).is_some())
+    {
+        bail!("ring manifest v4 must use recorder_runs instead of v3 recorder fields");
+    }
+    let lines = manifest["lines"]
+        .as_u64()
+        .context("ring manifest v4 lines must be an unsigned integer")?;
+    let values = manifest["recorder_runs"]
+        .as_array()
+        .filter(|runs| !runs.is_empty())
+        .context("ring manifest v4 recorder_runs must be a nonempty array")?;
+    let mut runs = Vec::with_capacity(values.len());
+    let mut seen_instances = HashSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let instance_id = value["recorder_instance_id"]
+            .as_str()
+            .filter(|value| is_canonical_uuid_v4(value))
+            .context("ring manifest v4 recorder run instance ID must be a lowercase UUID v4")?
+            .to_owned();
+        let first = value["recorder_first_sequence"]
+            .as_u64()
+            .filter(|sequence| *sequence >= 1)
+            .context(
+                "ring manifest v4 recorder run first sequence must be an unsigned integer >= 1",
+            )?;
+        let last = value["recorder_last_sequence"]
+            .as_u64()
+            .context("ring manifest v4 recorder run last sequence must be an unsigned integer")?;
+        let count = value["recorder_event_count"]
+            .as_u64()
+            .filter(|count| *count >= 1)
+            .context(
+                "ring manifest v4 recorder run event count must be an unsigned integer >= 1",
+            )?;
+        if last < first
+            || last.checked_sub(first).and_then(|span| span.checked_add(1)) != Some(count)
+            || (index > 0 && (first != 1 || !seen_instances.insert(instance_id.clone())))
+        {
+            bail!("ring manifest v4 recorder run evidence is inconsistent");
+        }
+        if index == 0 {
+            seen_instances.insert(instance_id.clone());
+        }
+        runs.push(RingRecorderRun {
+            instance_id,
+            first,
+            last,
+            count,
+        });
+    }
+    if runs
+        .iter()
+        .try_fold(0_u64, |total, run| total.checked_add(run.count))
+        != Some(lines)
+    {
+        bail!("ring manifest v4 recorder run counts must exactly cover lines");
+    }
+    Ok(runs)
+}
+
+fn validate_ring_manifest_v4_runs(manifest: &serde_json::Value) -> Result<()> {
+    ring_manifest_v4_runs(manifest).map(|_| ())
+}
+
 fn validate_ring_source_v3(source_path: &Path, manifest: &serde_json::Value) -> Result<()> {
     let instance_id = manifest["recorder_instance_id"]
         .as_str()
@@ -2198,6 +2282,45 @@ fn validate_ring_source_v3(source_path: &Path, manifest: &serde_json::Value) -> 
     }
     if seen != count || first.checked_add(seen - 1) != Some(last) {
         bail!("sealed ring source sequence proof disagrees with its manifest");
+    }
+    Ok(())
+}
+
+fn validate_ring_source_v4(source_path: &Path, manifest: &serde_json::Value) -> Result<()> {
+    let runs = ring_manifest_v4_runs(manifest)?;
+    let file = fs::File::open(source_path)
+        .with_context(|| format!("opening sealed ring source {}", source_path.display()))?;
+    let mut run_index = 0_usize;
+    let mut seen_in_run = 0_u64;
+    for line in BufReader::new(file).lines() {
+        let line =
+            line.with_context(|| format!("reading sealed ring source {}", source_path.display()))?;
+        if line.trim().is_empty() || run_index == runs.len() {
+            bail!("sealed ring source contains a blank or excess event");
+        }
+        let event: serde_json::Value =
+            serde_json::from_str(&line).context("sealed ring source contains invalid JSON")?;
+        let run = &runs[run_index];
+        let expected_sequence = run
+            .first
+            .checked_add(seen_in_run)
+            .context("sealed ring source sequence overflows")?;
+        if event["recorder_instance_id"].as_str() != Some(&run.instance_id)
+            || event["recorder_sequence"].as_u64() != Some(expected_sequence)
+        {
+            bail!("sealed ring source does not exactly match its recorder runs");
+        }
+        seen_in_run += 1;
+        if seen_in_run == run.count {
+            if expected_sequence != run.last {
+                bail!("sealed ring source recorder run disagrees with its manifest");
+            }
+            run_index += 1;
+            seen_in_run = 0;
+        }
+    }
+    if run_index != runs.len() || seen_in_run != 0 {
+        bail!("sealed ring source recorder runs do not exactly cover its manifest");
     }
     Ok(())
 }
@@ -2463,7 +2586,8 @@ mod tests {
     use super::{
         accepted_ring_blob_prefix, profitability_authorization_flags, ring_blob_name,
         ring_relative_path, ring_sha256, terminate_lease_child_tree, validate_ring_identity,
-        validate_ring_manifest_v3_sequence, validate_ring_source_v3, Cli, Command, Path, PathBuf,
+        validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
+        validate_ring_source_v3, validate_ring_source_v4, Cli, Command, Path, PathBuf,
         ResearchCommand,
     };
     use clap::Parser;
@@ -2486,6 +2610,56 @@ mod tests {
         invalid = manifest.clone();
         invalid["recorder_last_sequence"] = json!(43);
         assert!(validate_ring_manifest_v3_sequence(&invalid).is_err());
+    }
+
+    #[test]
+    fn ring_manifest_v4_exactly_covers_restart_runs() {
+        let first = "7c66d77b-a911-4f9b-95f2-98ca9395255e";
+        let second = "8c66d77b-a911-4f9b-95f2-98ca9395255e";
+        let manifest = json!({
+            "lines": 4,
+            "recorder_runs": [
+                {"recorder_instance_id": first, "recorder_first_sequence": 41, "recorder_last_sequence": 42, "recorder_event_count": 2},
+                {"recorder_instance_id": second, "recorder_first_sequence": 1, "recorder_last_sequence": 2, "recorder_event_count": 2}
+            ]
+        });
+        assert!(validate_ring_manifest_v4_runs(&manifest).is_ok());
+        let mut invalid = manifest.clone();
+        invalid["recorder_runs"][1]["recorder_first_sequence"] = json!(2);
+        assert!(validate_ring_manifest_v4_runs(&invalid).is_err());
+        invalid = manifest.clone();
+        invalid["recorder_runs"][1]["recorder_instance_id"] = json!(first);
+        assert!(validate_ring_manifest_v4_runs(&invalid).is_err());
+    }
+
+    #[test]
+    fn ring_manifest_v4_source_envelopes_exactly_match_runs() {
+        let path = std::env::temp_dir().join(format!(
+            "polyedge-ring-v4-source-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = "7c66d77b-a911-4f9b-95f2-98ca9395255e";
+        let second = "8c66d77b-a911-4f9b-95f2-98ca9395255e";
+        let manifest = json!({
+            "lines": 3,
+            "recorder_runs": [
+                {"recorder_instance_id": first, "recorder_first_sequence": 41, "recorder_last_sequence": 42, "recorder_event_count": 2},
+                {"recorder_instance_id": second, "recorder_first_sequence": 1, "recorder_last_sequence": 1, "recorder_event_count": 1}
+            ]
+        });
+        fs::write(&path, format!(
+            "{{\"recorder_instance_id\":\"{first}\",\"recorder_sequence\":41}}\n{{\"recorder_instance_id\":\"{first}\",\"recorder_sequence\":42}}\n{{\"recorder_instance_id\":\"{second}\",\"recorder_sequence\":1}}\n"
+        )).unwrap();
+        assert!(validate_ring_source_v4(&path, &manifest).is_ok());
+        fs::write(&path, format!(
+            "{{\"recorder_instance_id\":\"{first}\",\"recorder_sequence\":41}}\n{{\"recorder_instance_id\":\"{second}\",\"recorder_sequence\":1}}\n{{\"recorder_instance_id\":\"{first}\",\"recorder_sequence\":42}}\n"
+        )).unwrap();
+        assert!(validate_ring_source_v4(&path, &manifest).is_err());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

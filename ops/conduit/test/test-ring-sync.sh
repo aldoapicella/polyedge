@@ -21,7 +21,9 @@ printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake/mountpoint"
 chmod 0755 "$fake/mountpoint"
 printf '{"test":"legacy"}
 ' > "$legacy"
-printf '{"test":1,"recorder_instance_id":"123e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}\n' > "$fixture"
+printf '%s\n' \
+  '{"test":1,"recorder_instance_id":"123e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}' \
+  '{"test":2,"recorder_instance_id":"223e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}' > "$fixture"
 printf 'POLYEDGE_RING_ROOT=%s\n' "$root" > "$env_file"
 printf '%s\n' \
   'POLYEDGE_RING_IMAGE=ghcr.io/test/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
@@ -36,12 +38,14 @@ printf '%s\n' \
 PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_SEAL_ONLY=1 \
   ops/conduit/bin/polyedge-ring-sync
 jq -e '
-  .schema_version == 3 and
-  .recorder_instance_id == "123e4567-e89b-42d3-a456-426614174000" and
-  .recorder_first_sequence == 1 and .recorder_last_sequence == 1 and .recorder_event_count == 1 and
+  .schema_version == 4 and
+  .recorder_runs == [
+    {recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:1,recorder_last_sequence:1,recorder_event_count:1},
+    {recorder_instance_id:"223e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:1,recorder_last_sequence:1,recorder_event_count:1}
+  ] and
   .compression == "gzip" and
   .source_bytes > 11 and
-  .lines == 1 and
+  .lines == 2 and
   (.sha256 | startswith("sha256:")) and
   (.source_sha256 | startswith("sha256:")) and
   .segment_path == "segments/ring-sync-selftest-'"$$"'/1785960600.jsonl" and
@@ -55,7 +59,7 @@ actual=$(sha256sum "$archive_fixture" | awk '{print $1}')
 expected_source=$(jq -r '.source_sha256' "$manifest" | cut -d: -f2)
 actual_source=$(sha256sum "$fixture" | awk '{print $1}')
 [ "$actual_source" = "$expected_source" ]
-gzip -dc "$archive_fixture" | jq -e '.test == 1 and .recorder_sequence == 1' >/dev/null
+[ "$(gzip -dc "$archive_fixture" | jq -s 'length')" = 2 ]
 printf '{"test":"bad"}
 ' > "$bad"
 if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_SEAL_ONLY=1 ops/conduit/bin/polyedge-ring-sync >/dev/null 2>&1; then echo 'unsequenced post-cutoff segment unexpectedly passed' >&2; exit 1; fi

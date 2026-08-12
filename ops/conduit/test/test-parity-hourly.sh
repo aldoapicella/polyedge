@@ -116,6 +116,7 @@ fixture() {
   case_root=$1
   target=${2:-2026-08-09T15:00:00Z}
   window=${3:-2026-08-09T14:10:00Z}
+  manifest_schema=${4:-3}
   mkdir -p "$case_root/calls" "$case_root/run" "$case_root/token" "$case_root/ring/parity" \
     "$case_root/ring/segments/2026/08/09/15" "$case_root/ring/archive/2026/08/09/15" \
     "$case_root/reports/2026/08/09/15"
@@ -214,7 +215,10 @@ EOF
     jq -n --arg segment "segments/2026/08/09/15/$epoch.jsonl" \
       --arg archive "archive/2026/08/09/15/$epoch.jsonl.gz" --arg blob "events-oci-hot7-v1/2026/08/09/15/$epoch.jsonl.gz" \
       --arg source_sha "$source_sha" --arg gzip_sha "$gzip_sha" --argjson start "$epoch" --argjson first "$first" --argjson last "$last" \
-      '{schema_version:3,lines:10,recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:$first,recorder_last_sequence:$last,recorder_event_count:10,segment_path:$segment,archive_path:$archive,blob_name:$blob,compression:"gzip",sha256:$gzip_sha,source_sha256:$source_sha,segment_start_epoch:$start,segment_end_epoch:($start+600)}' >"$manifest"
+      --argjson schema "$manifest_schema" \
+      '{schema_version:$schema,lines:10,segment_path:$segment,archive_path:$archive,blob_name:$blob,compression:"gzip",sha256:$gzip_sha,source_sha256:$source_sha,segment_start_epoch:$start,segment_end_epoch:($start+600)} +
+       (if $schema == 4 then {recorder_runs:[{recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:$first,recorder_last_sequence:$last,recorder_event_count:10}]}
+        else {recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",recorder_first_sequence:$first,recorder_last_sequence:$last,recorder_event_count:10} end)' >"$manifest"
     manifest_sha=sha256:$(sha256sum "$manifest" | awk '{print $1}')
     jq -n --arg blob "events-oci-hot7-v1/2026/08/09/15/$epoch.jsonl.gz" --arg sha "$manifest_sha" \
       '{schema_version:1,blob_name:$blob,manifest_blob_name:($blob+".manifest.json"),manifest_sha256:$sha,verified_ts:"2026-08-09T16:12:00Z"}' >"$receipt"
@@ -357,6 +361,12 @@ run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(find "$success/ring/segments" -name '*.sequence.*' | wc -l)" -eq 0 ]
 [ "$(wc -l <"$success/calls/podman")" = "$runs" ]
+
+v4_success=$root/v4-success
+fixture "$v4_success" "2026-08-09T15:00:00Z" "2026-08-09T14:10:00Z" 4
+run_collector "$v4_success" >/dev/null
+jq -e '.acceptedCleanLiveHours == 1 and (.acceptedHourlyEvidence | length) == 1' \
+  "$v4_success/ring/parity/ledger.json" >/dev/null
 
 legacy_feed_evidence=$root/legacy-feed-evidence
 fixture "$legacy_feed_evidence"
