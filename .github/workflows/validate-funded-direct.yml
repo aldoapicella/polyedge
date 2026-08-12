@@ -697,6 +697,7 @@ jobs:
             '[.[].properties.createdTime] | min // ""' <<<"$v8_revisions_json")
           test -n "$v8_first_revision_created_at"
           retirement_audit_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          az extension add --name log-analytics --allow-preview true --only-show-errors
           sleep 60
           az monitor log-analytics query \
             --workspace "$workspace_customer_id" \
