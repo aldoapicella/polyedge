@@ -18,15 +18,15 @@ for attempt in $(seq 1 36); do
       | where TimeGenerated >= datetime($activation_started_at)
       | extend record = parse_json(Log_s)
       | where tostring(record.schema) == 'polyedge.funded_capital_snapshot.v1'
-      | where tostring(record.session_id) == 'dynamic-quote-funded-2026-08-11-v8'
+      | where tostring(record.session_id) == 'dynamic-quote-funded-2026-08-12-v9'
       | where tostring(record.decision_id) == '$decision_id'
       | top 1 by TimeGenerated asc
       | project TimeGenerated, Log_s" \
-    -o json > funded-v8-capital-snapshot.json
+    -o json > funded-v9-capital-snapshot.json
   if jq -e --arg decision "$decision_id" '
     length == 1
     and (.[0].Log_s | fromjson
-      | .session_id == "dynamic-quote-funded-2026-08-11-v8"
+      | .session_id == "dynamic-quote-funded-2026-08-12-v9"
       and .decision_id == $decision
       and (.snapshot_source == "persistent_safety_cache"
         or .snapshot_source == "live_preflight")
@@ -48,7 +48,7 @@ for attempt in $(seq 1 36); do
       and .order_notional > 0
       and .order_notional < 10.5
       and .proposed_notional >= .order_notional)
-  ' funded-v8-capital-snapshot.json >/dev/null; then
+  ' funded-v9-capital-snapshot.json >/dev/null; then
     capital_snapshot_ready=true
     break
   fi
@@ -56,27 +56,27 @@ for attempt in $(seq 1 36); do
 done
 test "$capital_snapshot_ready" = true
 
-snapshot_equity=$(jq -r '.[0].Log_s | fromjson | .account_equity' funded-v8-capital-snapshot.json)
-v8_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-11-v8/capital-reserve-state.json"
+snapshot_equity=$(jq -r '.[0].Log_s | fromjson | .account_equity' funded-v9-capital-snapshot.json)
+v9_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-12-v9/capital-reserve-state.json"
 az storage blob download \
   --account-name "$STORAGE_ACCOUNT" \
   --container-name "$FUNDED_CONTAINER" \
-  --name "$v8_state" \
-  --file v8-capital-reserve-state.json \
+  --name "$v9_state" \
+  --file v9-capital-reserve-state.json \
   --auth-mode login \
   --overwrite \
   --only-show-errors -o none
 state_last_modified=$(az storage blob show \
   --account-name "$STORAGE_ACCOUNT" \
   --container-name "$FUNDED_CONTAINER" \
-  --name "$v8_state" \
+  --name "$v9_state" \
   --auth-mode login \
   --query properties.lastModified -o tsv)
 test "$(date -u -d "$state_last_modified" +%s)" -ge \
   "$(date -u -d "$activation_started_at" +%s)"
 jq -e --argjson snapshot_equity "$snapshot_equity" '
   .schema == "polyedge.protected_compounding_state.v2"
-  and .session_id == "dynamic-quote-funded-2026-08-11-v8"
+  and .session_id == "dynamic-quote-funded-2026-08-12-v9"
   and .reconciliation_complete == true
   and .reserve_ratio == 0.1
   and .minimum_reserve == 2
@@ -97,4 +97,4 @@ jq -e --argjson snapshot_equity "$snapshot_equity" '
   and (.operating_buffer - (.last_reconciled_equity * .operating_buffer_ratio) | fabs) <= 0.0000011
   and (.operable_capital - ([0, (.last_reconciled_equity - .protected_reserve - .operating_buffer)] | max) | fabs) <= 0.0000011
   and ([keys[] | startswith("migration_")] | length) == 0
-' v8-capital-reserve-state.json
+' v9-capital-reserve-state.json >/dev/null
