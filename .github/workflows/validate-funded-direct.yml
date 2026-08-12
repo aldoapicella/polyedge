@@ -1067,8 +1067,8 @@ jobs:
                       {name:"FUNDED_DIRECT_DRY_RUN",value:"true"},
                       {name:"FUNDED_DIRECT_PREFLIGHT_ONLY",value:"true"},
                       {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"2000"},
-                      {name:"FUNDED_DIRECT_POLL_INTERVAL_MS",value:"1000"},
-                      {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"1800000"}
+                      {name:"FUNDED_DIRECT_POLL_INTERVAL_MS",value:"6000"},
+                      {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"10800000"}
                     ]
                   )
                 else . end
@@ -1087,9 +1087,9 @@ jobs:
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "2000")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_POLL_INTERVAL_MS" and .value == "1000")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_POLL_INTERVAL_MS" and .value == "6000")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "1800000")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "10800000")] | length) == 1
           ' funded-preflight-execution.yaml
           preflight_execution=$(az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -1098,7 +1098,7 @@ jobs:
             --query name -o tsv)
           test -n "$preflight_execution"
           status=Running
-          for attempt in $(seq 1 190); do
+          for attempt in $(seq 1 1100); do
             status=$(az containerapp job execution show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_JOB" \

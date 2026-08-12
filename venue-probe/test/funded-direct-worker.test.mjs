@@ -381,6 +381,16 @@ test("pure preflight rejects a contradictory write-capable dry-run setting", () 
   );
 });
 
+test("pure preflight alone permits a three-hour fresh-intent wait", () => {
+  assert.equal(loadFundedDirectConfig(preflightEnv(preflightSession(), {
+    FUNDED_DIRECT_MAX_IDLE_MS: "10800000"
+  })).maxIdleMs, 10_800_000);
+  assert.throws(
+    () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MAX_IDLE_MS: "10800000" })),
+    /FUNDED_DIRECT_MAX_IDLE_MS must be between the poll interval and 3600000/
+  );
+});
+
 test("pure preflight validates embedded session, predecessor, and fresh intent without writes", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const fundedSession = preflightSession();

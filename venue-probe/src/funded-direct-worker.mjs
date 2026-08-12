@@ -20,6 +20,7 @@ const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
 const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
 const MAX_INTENT_TTL_MS = 30_000;
+const MAX_PREFLIGHT_IDLE_MS = 10_800_000;
 
 export function loadFundedDirectConfig(env = process.env) {
   const sessionJson = String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "").trim();
@@ -86,7 +87,10 @@ export function loadFundedDirectConfig(env = process.env) {
   }
   if (!(config.maxIterations >= 1 && config.maxIterations <= 2_000)) errors.push("FUNDED_DIRECT_MAX_ITERATIONS must be in [1, 2000]");
   if (!(config.pollIntervalMs >= 1_000 && config.pollIntervalMs <= 60_000)) errors.push("FUNDED_DIRECT_POLL_INTERVAL_MS must be in [1000, 60000]");
-  if (!(config.maxIdleMs >= config.pollIntervalMs && config.maxIdleMs <= 3_600_000)) errors.push("FUNDED_DIRECT_MAX_IDLE_MS must be between the poll interval and 3600000");
+  const maxIdleMs = config.preflightOnly ? MAX_PREFLIGHT_IDLE_MS : 3_600_000;
+  if (!(config.maxIdleMs >= config.pollIntervalMs && config.maxIdleMs <= maxIdleMs)) {
+    errors.push(`FUNDED_DIRECT_MAX_IDLE_MS must be between the poll interval and ${maxIdleMs}`);
+  }
   if (!(config.minRemainingTtlMs >= 5_000 && config.minRemainingTtlMs <= MAX_INTENT_TTL_MS)) {
     errors.push("FUNDED_DIRECT_MIN_REMAINING_TTL_MS must be in [5000, 30000]");
   }
