@@ -270,7 +270,7 @@ jobs:
           assert.ok(workerStart < pointerAfter && pointerAfter < queueInvariance);
           assert.match(workflow, /pointer_after_etag[\s\S]*pointer_before_etag/);
           const activation = workflow.slice(
-            workflow.lastIndexOf("- name: Rewarm the producer"),
+            workflow.lastIndexOf("- name: Pause producer and warm funded intent"),
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
           const pause = activation.indexOf("RUN_BOT_ON_STARTUP=false");
           const active = activation.indexOf("--status Active", pause);
@@ -389,7 +389,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Retire exact dormant v8 before any v9 deployment
+      - name: Fence queue and verify predecessor before dormant v8 audit
         run: |
           set -euo pipefail
           az containerapp show \
@@ -636,6 +636,17 @@ jobs:
               ;;
           esac
           readonly v8_campaign_prefix="reports/research/venue-probe/control/campaign-risk/dynamic-quote-funded-2026-08-11-v8/"
+          echo "FUNDED_RETIRE_WORKSPACE_CUSTOMER_ID=$workspace_customer_id" >> "$GITHUB_ENV"
+          echo "FUNDED_RETIRE_CURRENT_REVISION=$current_revision" >> "$GITHUB_ENV"
+
+      - name: Retire exact dormant v8 before any v9 deployment
+        run: |
+          set -euo pipefail
+          readonly workspace_customer_id="$FUNDED_RETIRE_WORKSPACE_CUSTOMER_ID"
+          readonly current_revision="$FUNDED_RETIRE_CURRENT_REVISION"
+          test -n "$workspace_customer_id"
+          test -n "$current_revision"
+          readonly v8_campaign_prefix="reports/research/venue-probe/control/campaign-risk/dynamic-quote-funded-2026-08-11-v8/"
           readonly v8_baseline="${v8_campaign_prefix}baseline.json"
           readonly v8_index="${v8_campaign_prefix}unresolved-reservations-index.json"
           az storage blob list \
@@ -869,6 +880,7 @@ jobs:
           ' current-v5-capital-reserve-state.json >/dev/null
           jq -S '.properties.template' current-funded-revision.json > funded-rollback-template.json
           echo "FUNDED_ROLLBACK_REVISION=$current_revision" >> "$GITHUB_ENV"
+
       - name: Deploy continuous funded Dynamic Quote service
         run: |
           set -euo pipefail
@@ -1077,8 +1089,7 @@ jobs:
           echo "pointer_before_exists=$pointer_before_exists" >> "$GITHUB_OUTPUT"
           echo "pointer_before_etag=$pointer_before_etag" >> "$GITHUB_OUTPUT"
 
-      - name: Run the zero-write v9 preflight against a fresh producer intent
-        id: funded_preflight
+      - name: Prepare zero-write v9 preflight inputs
         run: |
           set -euo pipefail
           v9_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-12-v9/"
@@ -1429,6 +1440,15 @@ jobs:
                 else . end
               )
           ' funded-preflight-job.json > funded-preflight-execution.yaml
+          echo "PREFLIGHT_V5_ETAG_BEFORE=$v5_etag_before" >> "$GITHUB_ENV"
+          echo "PREFLIGHT_INTENT_CONTAINER=$intent_container" >> "$GITHUB_ENV"
+          echo "PREFLIGHT_INTENT_PREFIX=$intent_prefix" >> "$GITHUB_ENV"
+
+      - name: Run the zero-write v9 preflight against a fresh producer intent
+        id: funded_preflight
+        run: |
+          set -euo pipefail
+          test -s funded-preflight-execution.yaml
           jq -e '
             .containers | length == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
@@ -1481,9 +1501,6 @@ jobs:
       - name: Verify the zero-write v9 preflight
         env:
           PREFLIGHT_EXECUTION: ${{ steps.funded_preflight.outputs.execution }}
-          PREFLIGHT_V5_ETAG_BEFORE: ${{ steps.funded_preflight.outputs.v5_etag_before }}
-          PREFLIGHT_INTENT_PREFIX: ${{ steps.funded_preflight.outputs.intent_prefix }}
-          PREFLIGHT_INTENT_CONTAINER: ${{ steps.funded_preflight.outputs.intent_container }}
           POINTER_PREFLIGHT_CUTOFF_AT: ${{ steps.pointer_preflight_producer.outputs.cutoff_at }}
           POINTER_PREFLIGHT_CUTOFF_EPOCH: ${{ steps.pointer_preflight_producer.outputs.cutoff_epoch }}
           POINTER_PREFLIGHT_INTENT_PREFIX: ${{ steps.pointer_preflight_producer.outputs.intent_prefix }}
@@ -2081,7 +2098,7 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" \
             --query status -o tsv)" = "SendDisabled"
 
-      - name: Rewarm the producer and prove one complete v9 lifecycle before cutover
+      - name: Pause producer and warm funded intent before cutover
         run: |
           set -euo pipefail
           cutover_complete=false
@@ -2269,6 +2286,45 @@ jobs:
           test "$warmup_ready" = true
           warmup_market_end_ts=$(jq -r '.[0].Log_s | fromjson | .executor.warmed_market.market_end_ts' \
             funded-heartbeat-after-reopen.json)
+          test -n "$warmup_market_end_ts"
+          echo "FUNDED_CUTOVER_DLQ_BEFORE=$dlq_before" >> "$GITHUB_ENV"
+          echo "FUNDED_WARMUP_MARKET=$warmup_market" >> "$GITHUB_ENV"
+          echo "FUNDED_WARMUP_MARKET_END_TS=$warmup_market_end_ts" >> "$GITHUB_ENV"
+          trap - EXIT
+
+      - name: Rewarm the producer and prove one complete v9 lifecycle before cutover
+        run: |
+          set -euo pipefail
+          cutover_complete=false
+          refence_incomplete_cutover() {
+            if [ "$cutover_complete" != true ]; then
+              az servicebus queue update \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --namespace-name "$SERVICE_BUS_NAMESPACE" \
+                --name "$SERVICE_BUS_QUEUE" \
+                --status SendDisabled \
+                --only-show-errors -o none || true
+              for attempt in 1 2 3; do
+                if az containerapp update \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --name "$INTENT_PRODUCER_APP" \
+                  --remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT \
+                  --set-env-vars \
+                    RUN_BOT_ON_STARTUP=true \
+                    FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+                  --only-show-errors -o none; then
+                  break
+                fi
+                sleep "$((attempt * 5))"
+              done
+            fi
+          }
+          trap refence_incomplete_cutover EXIT
+          readonly dlq_before="$FUNDED_CUTOVER_DLQ_BEFORE"
+          readonly warmup_market="$FUNDED_WARMUP_MARKET"
+          readonly warmup_market_end_ts="$FUNDED_WARMUP_MARKET_END_TS"
+          [[ "$dlq_before" =~ ^[0-9]+$ ]]
+          test -n "$warmup_market"
           test -n "$warmup_market_end_ts"
           producer_enabled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           test "$(( $(date -u -d "$warmup_market_end_ts" +%s) - $(date -u -d "$producer_enabled_at" +%s) ))" -ge 360
