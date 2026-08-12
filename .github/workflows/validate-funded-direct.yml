@@ -747,7 +747,7 @@ jobs:
             length == 1
             and (.[0].SnapshotSource == "live_preflight"
               or .[0].SnapshotSource == "persistent_safety_cache")
-            and .[0].RiskPassed == true
+            and ((.[0].RiskPassed | tostring | ascii_downcase) == "true")
             and (.[0].BlockerCount | tonumber) == 0
             and (.[0].OpenOrderCount | tonumber) == 0
             and (.[0].UnresolvedPositionCount | tonumber) == 0
