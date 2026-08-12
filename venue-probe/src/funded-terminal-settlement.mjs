@@ -2,6 +2,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  EVIDENCE_PROTOCOL_VERSION,
   loadCampaignUnresolvedRiskReservationRecords,
   sanitize,
   settleProbeRiskReservations,
@@ -17,6 +18,12 @@ const CAMPAIGN_ID = "dynamic-quote-funded-2026-08-12-v9";
 const FUNDER_ADDRESS = "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8";
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
+function finiteNumber(value) {
+  if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return NaN;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
 export function validateTerminalSettlementFederatedTokenFile(
   tokenPath,
   { stat = lstatSync, read = readFileSync, uid = process.getuid?.() } = {}
@@ -25,17 +32,23 @@ export function validateTerminalSettlementFederatedTokenFile(
     throw new Error("fail closed: AZURE_FEDERATED_TOKEN_FILE must be an absolute path");
   }
   let tokenFile;
-  let assertion;
   try {
     tokenFile = stat(tokenPath);
-    assertion = read(tokenPath, "utf8");
   } catch {
     throw new Error("fail closed: AZURE_FEDERATED_TOKEN_FILE must be a readable regular file");
   }
   if (!tokenFile.isFile() || tokenFile.isSymbolicLink() || (tokenFile.mode & 0o077) !== 0 ||
       (tokenFile.mode & 0o400) === 0 || (typeof uid === "number" && tokenFile.uid !== uid) ||
-      typeof assertion !== "string" || assertion.length === 0 || assertion.length > 16_384 ||
-      !JWT_SHAPE.test(assertion)) {
+      !Number.isSafeInteger(tokenFile.size) || tokenFile.size < 1 || tokenFile.size > 16_384) {
+    throw new Error("fail closed: AZURE_FEDERATED_TOKEN_FILE must be an owner-only regular JWT file");
+  }
+  let assertion;
+  try {
+    assertion = read(tokenPath, "utf8");
+  } catch {
+    throw new Error("fail closed: AZURE_FEDERATED_TOKEN_FILE must be a readable regular file");
+  }
+  if (typeof assertion !== "string" || assertion.length !== tokenFile.size || !JWT_SHAPE.test(assertion)) {
     throw new Error("fail closed: AZURE_FEDERATED_TOKEN_FILE must be an owner-only regular JWT file");
   }
 }
@@ -45,9 +58,11 @@ export function terminalSettlementConfig(env = process.env, { requireFederatedTo
   const decisionId = String(env.FUNDED_TERMINAL_SETTLEMENT_DECISION_ID || "").trim();
   const blobName = String(env.FUNDED_TERMINAL_SETTLEMENT_RESERVATION_BLOB_NAME || "").trim();
   const funderAddress = String(env.POLYMARKET_FUNDER_ADDRESS || "").trim();
+  const outcome = String(env.FUNDED_TERMINAL_SETTLEMENT_OUTCOME || "").trim();
   if (env.FUNDED_TERMINAL_SETTLEMENT_ENABLED !== "true" ||
       campaignId !== CAMPAIGN_ID || !/^[0-9a-f]{64}$/.test(decisionId) ||
       funderAddress !== FUNDER_ADDRESS ||
+      !/^(Up|Down)$/.test(outcome) ||
       !new RegExp(`^${PREFIX}\\d{4}-\\d{2}-\\d{2}/funded-direct-${decisionId}\\.json$`).test(blobName) ||
       env.AZURE_TENANT_ID !== TENANT_ID ||
       env.AZURE_STORAGE_ACCOUNT_NAME !== STORAGE_ACCOUNT ||
@@ -63,6 +78,7 @@ export function terminalSettlementConfig(env = process.env, { requireFederatedTo
     decisionId,
     blobName,
     funderAddress,
+    outcome,
     operatorDirect: true,
     dryRun: false,
     storageAccount: STORAGE_ACCOUNT,
@@ -73,13 +89,20 @@ export function terminalSettlementConfig(env = process.env, { requireFederatedTo
 
 function exactReservation(record, config) {
   const reservation = record?.reservation;
-  if (record?.blob_name !== config.blobName || reservation?.campaign_id !== config.campaignId ||
+  const tokenId = String(reservation?.token_id || "");
+  const matchedNotional = finiteNumber(reservation?.matched_notional);
+  if (record?.blob_name !== config.blobName || typeof record?.etag !== "string" || !record.etag.trim() ||
+      reservation?.schema_version !== 1 || reservation?.evidence_protocol_version !== EVIDENCE_PROTOCOL_VERSION ||
+      reservation?.state !== "position_unresolved" || reservation?.campaign_id !== config.campaignId ||
       reservation?.probe_id !== `funded-direct-${config.decisionId}` ||
+      reservation?.order_submission_intended !== true ||
       reservation?.order_submitted !== true ||
       !/^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || "")) ||
-      !(Number(reservation?.matched_notional) > 0) ||
+      !(matchedNotional > 0) ||
+      reservation?.reconciliation_complete !== true ||
       reservation?.zero_open_orders_confirmed !== true ||
-      !/^0x[0-9a-f]{64}$/i.test(String(reservation?.condition_id || ""))) {
+      !/^0x[0-9a-f]{64}$/i.test(String(reservation?.condition_id || "")) ||
+      !/^[1-9]\d{0,77}$/.test(tokenId) || BigInt(tokenId) >= (1n << 256n)) {
     throw new Error("fail closed: terminal settlement reservation evidence is invalid");
   }
   return reservation;
@@ -88,6 +111,8 @@ function exactReservation(record, config) {
 async function terminalPosition(fetchImpl, config, reservation) {
   const url = new URL("https://data-api.polymarket.com/positions");
   url.searchParams.set("user", config.funderAddress);
+  url.searchParams.set("market", reservation.condition_id);
+  url.searchParams.set("redeemable", "true");
   url.searchParams.set("sizeThreshold", "0");
   url.searchParams.set("limit", "500");
   const response = await fetchImpl(url, { signal: AbortSignal.timeout(10_000) });
@@ -95,7 +120,10 @@ async function terminalPosition(fetchImpl, config, reservation) {
   const rows = await response.json();
   const matches = Array.isArray(rows) ? rows.filter((row) =>
     String(row?.conditionId || "").toLowerCase() === String(reservation.condition_id).toLowerCase() &&
-    row?.redeemable === true && Number(row?.size) > 0 && Number(row?.currentValue) === 0
+    String(row?.asset || "") === String(reservation.token_id) &&
+    String(row?.proxyWallet || "").toLowerCase() === config.funderAddress &&
+    String(row?.outcome || "").trim() === config.outcome &&
+    row?.redeemable === true && finiteNumber(row?.size) > 0 && finiteNumber(row?.currentValue) === 0
   ) : [];
   if (matches.length !== 1) {
     throw new Error("fail closed: Data API does not prove one redeemable terminal position");
