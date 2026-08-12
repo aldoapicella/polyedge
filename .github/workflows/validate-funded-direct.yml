@@ -1087,7 +1087,7 @@ jobs:
             and (.operating_buffer - (.last_reconciled_equity * .operating_buffer_ratio) | fabs) <= 0.0000011
             and (.operable_capital - ([0, (.last_reconciled_equity - .protected_reserve - .operating_buffer)] | max) | fabs) <= 0.0000011
             and .operable_capital >= .minimum_order_notional
-            and ([keys[] | startswith("migration_")] | length) == 0
+            and ([keys[] | select(startswith("migration_"))] | length) == 0
           ' existing-v9-capital-state.json >/dev/null
           authorized_ceiling=$(jq -r '.authorized_equity_ceiling' existing-v9-capital-state.json)
           jq -r --arg prefix "$v9_authorization_prefix" '

@@ -96,7 +96,7 @@ jq -e --argjson snapshot_equity "$snapshot_equity" '
   and (.operating_buffer - (.last_reconciled_equity * .operating_buffer_ratio) | fabs) <= 0.0000011
   and (.operable_capital - ([0, (.last_reconciled_equity - .protected_reserve - .operating_buffer)] | max) | fabs) <= 0.0000011
   and .operable_capital >= .minimum_order_notional
-  and ([keys[] | startswith("migration_")] | length) == 0
+  and ([keys[] | select(startswith("migration_"))] | length) == 0
 ' v9-capital-reserve-state.json >/dev/null
 
 jq -e --slurpfile state v9-capital-reserve-state.json '
