@@ -1354,7 +1354,9 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           lifecycle_ready=false
-          for attempt in $(seq 1 72); do
+          # Cover two complete BTC 15-minute market cycles; warmup is readiness,
+          # not proof that the strategy has emitted a qualifying Place intent.
+          for attempt in $(seq 1 180); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
