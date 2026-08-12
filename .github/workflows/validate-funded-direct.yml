@@ -258,7 +258,8 @@ jobs:
             "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true", pointerPreflightDeployment);
           const pointerPreflightRestore = workflow.indexOf(
             "--remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT", pointerPreflight);
-          const enableService = workflow.indexOf("- name: Enable v9 only after the zero-write preflight passes");
+          const enableService = workflow.indexOf(
+            "- name: Enable v9 only after the zero-write preflight passes", pointerPreflightRestore);
           assert.ok(pointerPreflightMarker >= 0 && pointerPreflightMarker < pointerPreflight);
           assert.ok(pointerPreflight < pointerPreflightRestore && pointerPreflightRestore < enableService);
           const producerConsoleQuery = "ContainerAppName_s == '$" + "INTENT_PRODUCER_APP'";
