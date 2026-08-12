@@ -563,7 +563,7 @@ function fundedRedemptionEnv(env) {
   };
 }
 
-function persistentCanaryBootstrapEnv(env) {
+export function persistentCanaryBootstrapEnv(env) {
   const session = JSON.parse(String(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON || "{}"));
   const placeholderHash = `sha256:${"0".repeat(64)}`;
   return {

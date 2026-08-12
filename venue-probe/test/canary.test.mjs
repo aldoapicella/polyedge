@@ -395,6 +395,18 @@ test("protected-compounding successor imports exact durable predecessor settleme
     }
   };
   let activityCalls = 0;
+  await assert.rejects(initializeProtectedCompounding({
+    container,
+    manifest,
+    readOnly: true,
+    loadActivity: async () => {
+      activityCalls += 1;
+      return [];
+    }
+  }), /read-only reconciliation cannot persist a verified settlement/);
+  assert.equal([...values.keys()].filter((name) =>
+    name.includes(`/sessions/${sessionId}/internal-settlements/`)).length, 0);
+
   const result = await initializeProtectedCompounding({
     container,
     manifest,
@@ -714,6 +726,7 @@ test("safety cache permits only one pending preflight across warmup generations"
     client: {},
     manifestDocument: { value: {} },
     profitQuarantineSnapshot: null,
+    readOnly: true,
     campaignRiskSnapshot: {
       control: { campaign_id: "campaign-a" },
       reservationRecords: []
@@ -724,6 +737,7 @@ test("safety cache permits only one pending preflight across warmup generations"
   const timers = [];
   const capture = (_client, intent, _manifest, _ignoredReservationId, options) => new Promise((resolve) => {
     assert.strictEqual(options.preflightResources, resources);
+    assert.equal(options.readOnly, true);
     captures.push({ market_id: intent.market_id, resolve });
   });
   const setIntervalFn = (callback) => {
@@ -1495,9 +1509,11 @@ test("blob content hash mismatch fails before JSON can reach execution", async (
 
 test("persistent startup atomically bootstraps or verifies the exact funded session manifest", async () => {
   const values = new Map();
+  let uploadCalls = 0;
   const container = {
     getBlockBlobClient: (name) => ({
       uploadData: async (bytes, options) => {
+        uploadCalls += 1;
         assert.equal(options.conditions.ifNoneMatch, "*");
         if (values.has(name)) {
           throw Object.assign(new Error("exists"), { statusCode: 412 });
@@ -1519,10 +1535,18 @@ test("persistent startup atomically bootstraps or verifies the exact funded sess
   const input = { blobName: "sessions/v6/session.json", expectedHash, value };
   assert.deepEqual((await putOperatorSessionManifest(container, input)).value, value);
   assert.deepEqual((await putOperatorSessionManifest(container, input)).value, value);
+  assert.equal(uploadCalls, 2);
+  assert.deepEqual((await putOperatorSessionManifest(container, { ...input, readOnly: true })).value, value);
+  assert.equal(uploadCalls, 2);
   await assert.rejects(
-    putOperatorSessionManifest(container, { ...input, value: { ...value, session_id: "tampered" } }),
+    putOperatorSessionManifest(container, {
+      ...input,
+      readOnly: true,
+      value: { ...value, session_id: "tampered" }
+    }),
     /SHA-256 mismatch/
   );
+  assert.equal(uploadCalls, 2);
 });
 
 test("shares below the venue minimum_order_size fail before risk reservation", async () => {

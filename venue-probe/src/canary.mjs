@@ -153,7 +153,10 @@ function setExecutionContext(env) {
   orderSubmissionAttempted = false;
 }
 
-async function initializeResources({ persistent = false } = {}) {
+async function initializeResources({ persistent = false, readOnly = false } = {}) {
+  if (readOnly && !config.dryRun) {
+    throw new Error("fail closed: read-only reconciliation requires dry-run mode");
+  }
   const container = storageContainer(config);
   if (!container) throw new Error("fail closed: durable Azure Blob storage is unavailable");
   const intentContainer = storageContainer({ ...config, storageContainer: config.intentContainerName });
@@ -163,7 +166,8 @@ async function initializeResources({ persistent = false } = {}) {
     await putOperatorSessionManifest(manifestContainer, {
       blobName: config.manifestBlobName,
       expectedHash: config.manifestBlobHash,
-      value: config.operatorSessionManifest
+      value: config.operatorSessionManifest,
+      readOnly
     });
   }
   const modelArtifact = artifactLocationFromUri(config.executionModelBlobUri, config.storageAccount);
@@ -188,9 +192,13 @@ async function initializeResources({ persistent = false } = {}) {
   const protectedCompoundingContext = manifestDocument.value?.allow_compounding === true
     ? await initializeProtectedCompounding({
         container,
-        manifest: manifestDocument.value
+        manifest: manifestDocument.value,
+        readOnly
       })
     : null;
+  if (readOnly && manifestDocument.value?.profit_quarantine?.enabled === true) {
+    throw new Error("fail closed: read-only reconciliation cannot bootstrap profit quarantine");
+  }
   const profitQuarantineSnapshot = manifestDocument.value?.profit_quarantine?.enabled === true
     ? await initializeProfitQuarantine({
         container,
@@ -258,6 +266,7 @@ async function initializeResources({ persistent = false } = {}) {
   }
   return {
     persistent,
+    readOnly,
     container,
     intentContainer,
     modelArtifact,
@@ -299,7 +308,8 @@ async function initializeResources({ persistent = false } = {}) {
 export async function initializeProtectedCompounding({
   container,
   manifest,
-  loadActivity = loadSettlementActivity
+  loadActivity = loadSettlementActivity,
+  readOnly = false
 }) {
   const predecessorSessionId = manifest?.schema_version ===
       "polyedge.operator_funded_session.v3"
@@ -337,6 +347,9 @@ export async function initializeProtectedCompounding({
   })));
   for (const settlement of verifiedConfiguredSettlements) {
     if (!durableSettlements.some((row) => row.id === settlement.id)) {
+      if (readOnly) {
+        throw new Error("fail closed: read-only reconciliation cannot persist a verified settlement");
+      }
       await putVerifiedInternalSettlement(container, {
         ...settlement,
         session_id: manifest.session_id
@@ -420,14 +433,16 @@ async function reconcileProtectedCompoundingWithAutomaticSettlement({
   fullyReconciled,
   context,
   loadReservationRecords,
-  allowAutomaticDiscovery
+  allowAutomaticDiscovery,
+  readOnly = false
 }) {
   const reconcile = () => reconcileProtectedCompoundingState({
     container,
     manifest,
     accountEquity,
     fullyReconciled,
-    verifiedConfiguredSettlements: context.verifiedConfiguredSettlements
+    verifiedConfiguredSettlements: context.verifiedConfiguredSettlements,
+    readOnly
   });
   try {
     return await reconcile();
@@ -560,7 +575,8 @@ function requireCampaignRiskSnapshot(resources = activeResources) {
 export async function putOperatorSessionManifest(container, {
   blobName,
   expectedHash,
-  value
+  value,
+  readOnly = false
 }) {
   if (!container || !blobName || !value) {
     throw new Error("fail closed: operator session manifest bootstrap is incomplete");
@@ -569,13 +585,15 @@ export async function putOperatorSessionManifest(container, {
   if (sha256(bytes) !== expectedHash) {
     throw new Error("fail closed: embedded operator session manifest SHA-256 mismatch");
   }
-  try {
-    await container.getBlockBlobClient(blobName).uploadData(bytes, {
-      conditions: { ifNoneMatch: "*" },
-      blobHTTPHeaders: { blobContentType: "application/json" }
-    });
-  } catch (error) {
-    if (![409, 412].includes(Number(error?.statusCode))) throw error;
+  if (!readOnly) {
+    try {
+      await container.getBlockBlobClient(blobName).uploadData(bytes, {
+        conditions: { ifNoneMatch: "*" },
+        blobHTTPHeaders: { blobContentType: "application/json" }
+      });
+    } catch (error) {
+      if (![409, 412].includes(Number(error?.statusCode))) throw error;
+    }
   }
   return loadHashedJson(container, blobName, expectedHash);
 }
@@ -718,9 +736,12 @@ export async function waitForSafetySnapshotIdle(
   }
 }
 
-export async function createPersistentCanaryExecutor({ env = process.env } = {}) {
+export async function createPersistentCanaryExecutor({
+  env = process.env,
+  readOnly = false
+} = {}) {
   setExecutionContext(env);
-  const resources = await initializeResources({ persistent: true });
+  const resources = await initializeResources({ persistent: true, readOnly });
   return {
     async warmMarket(value) {
       resources.userChannel?.beginEvidenceWindow?.();
@@ -755,6 +776,7 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
       };
     },
     async execute(executionEnv) {
+      if (resources.readOnly) throw new Error("fail closed: read-only executor cannot execute an intent");
       if (resources.busy) throw new Error("fail closed: persistent executor is already processing an intent");
       resources.busy = true;
       try {
@@ -793,6 +815,7 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
       }
     },
     async runMaintenance(task) {
+      if (resources.readOnly) throw new Error("fail closed: read-only executor cannot run maintenance");
       if (resources.busy) throw new Error("fail closed: persistent executor is already processing an intent");
       if (typeof task !== "function") throw new Error("fail closed: funded maintenance callback is required");
       resources.busy = true;
@@ -822,6 +845,24 @@ export async function createPersistentCanaryExecutor({ env = process.env } = {})
     },
     async close() {
       await closeResources(resources);
+    },
+    reconciliationSnapshot(nowMs = Date.now()) {
+      const intent = resources.warmedMarket
+        ? conservativeWarmIntent(resources.warmedMarket)
+        : null;
+      const runtime = intent
+        ? selectFreshCachedSafetySnapshot(resources, intent, nowMs)
+        : null;
+      if (resources.busy || resources.safetyCache?.inFlight > 0 ||
+          resources.safetyCache?.lastError || !runtime) {
+        throw new Error("fail closed: funded reconciliation snapshot is not ready");
+      }
+      return fundedCapitalSnapshotRecord(
+        runtime,
+        intent,
+        resources.manifestDocument.value,
+        { source: "persistent_safety_cache", nowMs }
+      );
     },
     status() {
       const safetySnapshotCompletedWallMs = Number(
@@ -1123,7 +1164,8 @@ async function capturePreflight(
     profitQuarantineSnapshot = activeResources?.profitQuarantineSnapshot || null,
     protectedCompoundingContext =
       activeResources?.protectedCompoundingContext || null,
-    preflightResources = activeResources
+    preflightResources = activeResources,
+    readOnly = false
   } = {}
 ) {
   const capturedStartedWallMs = Date.now();
@@ -1225,6 +1267,9 @@ async function capturePreflight(
       && terminalConditions.has(String(reservation?.condition_id || "").toLowerCase())
   );
   if (terminalRiskNeedsSettlement) {
+    if (readOnly) {
+      throw new Error("fail closed: read-only reconciliation cannot settle a risk reservation");
+    }
     await settleProbeRiskReservations(config, {
       condition_ids: terminalConditionIds,
       terminal_settlement_verified: true,
@@ -1278,7 +1323,8 @@ async function capturePreflight(
           fullyReconciled,
           context: protectedCompoundingContext,
           loadReservationRecords: () => loadCampaignRiskReservationRecords(config),
-          allowAutomaticDiscovery: recordLedger === false
+          allowAutomaticDiscovery: !readOnly && recordLedger === false,
+          readOnly
         });
     }
     protectedCompoundingState = protectedCompoundingContext.state;
@@ -1421,7 +1467,7 @@ function bindIntentSizingAndRisk(runtime, intent, manifest) {
 
 const SAFETY_CACHE_REFRESH_MS = 700;
 const SAFETY_CACHE_MAX_IN_FLIGHT = 1;
-const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
+export const SAFETY_CACHE_MAX_SELECTION_AGE_MS = 650;
 
 export function startSafetySnapshotCache(resources, market, {
   capture = capturePreflight,
@@ -1460,7 +1506,8 @@ export function startSafetySnapshotCache(resources, market, {
           recordLedger: false,
           profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
           protectedCompoundingContext: resources.protectedCompoundingContext,
-          preflightResources: resources
+          preflightResources: resources,
+          readOnly: resources.readOnly
         }
       );
       if (cache.generation === generation) {

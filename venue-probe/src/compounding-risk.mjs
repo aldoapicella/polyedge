@@ -586,7 +586,8 @@ export async function reconcileProtectedCompoundingState({
   accountEquity,
   fullyReconciled,
   verifiedConfiguredSettlements = [],
-  now = () => new Date()
+  now = () => new Date(),
+  readOnly = false
 }) {
   const policy = validateProtectedCompoundingManifest(manifest);
   if (!container) throw new Error("fail closed: durable storage is required for protected compounding");
@@ -682,6 +683,9 @@ export async function reconcileProtectedCompoundingState({
     };
     assertCompatibleState(value, manifest, policy);
     if (prior && sameCapitalState(prior, value)) return prior;
+    if (readOnly) {
+      throw new Error("fail closed: read-only reconciliation requires exact current protected capital state");
+    }
     try {
       await container.getBlockBlobClient(policy.stateBlobName).uploadData(
         Buffer.from(JSON.stringify(value, null, 2)),

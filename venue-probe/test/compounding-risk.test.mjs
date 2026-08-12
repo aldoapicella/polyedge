@@ -624,6 +624,25 @@ test("loss-tolerant sizing uses a 10% current-equity reserve and minimum orders 
     accountEquity: 5,
     fullyReconciled: true
   });
+  const stateBlobName = fundedManifest.capital_policy.state_blob_name;
+  const stateEtag = container.etags.get(stateBlobName);
+  const readOnlyState = await reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 5,
+    fullyReconciled: true,
+    readOnly: true
+  });
+  assert.deepEqual(readOnlyState, afterLoss);
+  assert.equal(container.etags.get(stateBlobName), stateEtag);
+  await assert.rejects(reconcileProtectedCompoundingState({
+    container,
+    manifest: fundedManifest,
+    accountEquity: 4,
+    fullyReconciled: true,
+    readOnly: true
+  }), /read-only reconciliation requires exact current protected capital state/);
+  assert.equal(container.etags.get(stateBlobName), stateEtag);
   const afterLossSizing = sizeProtectedOrder({
     state: afterLoss,
     accountEquity: 5,
