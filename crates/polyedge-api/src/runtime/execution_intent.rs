@@ -13,7 +13,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::time::Instant;
 
@@ -24,7 +24,7 @@ const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
 // A decision cycle can emit several independently authenticated PLACE intents.
 // Keep their immutable blob commits and Service Bus handoffs bounded but
 // concurrent so one slow Azure request cannot consume another intent's frozen
-// ten-second lifetime. Warmups use a separate lane below.
+// ten-second lifetime. Warmups prepare these same executable lanes below.
 const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
 const CURRENT_FUNDED_INTENT_CAS_ATTEMPTS: usize = 4;
 // Keep the signed venue expiry well beyond the documented minimum. Live V2
@@ -50,8 +50,8 @@ pub(super) struct IntentPublisherConfig {
 
 pub(super) struct IntentPublisher {
     intent_lanes: Vec<StdMutex<IntentPublisherLane>>,
-    warmup_lane: StdMutex<IntentPublisherLane>,
     current_intent_lane: Option<StdMutex<AzureBlobClient>>,
+    intent_lanes_prepared: AtomicBool,
     next_intent_lane: AtomicUsize,
     prefix: String,
 }
@@ -208,7 +208,6 @@ impl IntentPublisherConfig {
         let intent_lanes = (0..lane_count)
             .map(|_| self.connect_lane().map(StdMutex::new))
             .collect::<Result<Vec<_>, _>>()?;
-        let warmup_lane = StdMutex::new(self.connect_lane()?);
         let current_intent_lane = self.operator_direct.then(|| {
             StdMutex::new(AzureBlobClient::with_managed_identity(
                 self.account.clone(),
@@ -218,8 +217,8 @@ impl IntentPublisherConfig {
         });
         Ok(IntentPublisher {
             intent_lanes,
-            warmup_lane,
             current_intent_lane,
+            intent_lanes_prepared: AtomicBool::new(!self.operator_direct),
             next_intent_lane: AtomicUsize::new(0),
             prefix: self.prefix,
         })
@@ -236,6 +235,9 @@ impl IntentPublisher {
     }
 
     pub(super) fn publish(&self, intent: &ExecutionIntentV1) -> Result<PublishedIntent, String> {
+        if !self.intent_lanes_prepared.load(Ordering::Acquire) {
+            return Err("executable intent publisher lanes are not prepared".to_owned());
+        }
         let publish_started = Instant::now();
         intent.validate()?;
         let bytes = serde_json::to_vec_pretty(intent).map_err(|error| error.to_string())?;
@@ -321,42 +323,48 @@ impl IntentPublisher {
     }
 
     pub(super) fn warm_market(&self, market: &MarketSpec) -> Result<bool, String> {
-        let mut lane = self
-            .warmup_lane
+        let has_sender = self
+            .intent_lanes
+            .first()
+            .ok_or_else(|| "persistent intent publisher has no lanes".to_owned())?
             .lock()
-            .map_err(|_| "persistent warmup publisher lane lock is poisoned".to_owned())?;
-        if lane.service_bus_sender.is_none() {
+            .map_err(|_| "persistent intent publisher lane lock is poisoned".to_owned())?
+            .service_bus_sender
+            .is_some();
+        if !has_sender {
             return Ok(false);
         }
         let marker = funded_market_warmup_marker(market);
         let marker_bytes = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
         let marker_name = funded_market_warmup_blob_name(&self.prefix, market)?;
-        match lane
-            .blob_client
-            .upload_block_blob_bytes_if_absent(&marker_name, &marker_bytes, "application/json")
-            .map_err(|error| error.to_string())?
-        {
-            ImmutableBlobWrite::Created => {}
-            ImmutableBlobWrite::AlreadyExists => {
-                let existing = lane
-                    .blob_client
-                    .download_blob_bytes(&marker_name)
-                    .map_err(|error| error.to_string())?;
-                if existing != marker_bytes {
-                    return Err(format!(
-                        "immutable funded market warmup collision: {marker_name}"
-                    ));
-                }
-            }
-        }
         let producer_ts = Utc::now();
         let message = funded_market_warmup(market, producer_ts);
         let message_id = funded_market_warmup_message_id(market, producer_ts);
-        lane.service_bus_sender
-            .as_mut()
-            .expect("warmup sender was checked above")
-            .send_json(&message_id, 30, &message)
-            .map_err(|error| error.to_string())?;
+        prepare_all_lanes(&self.intent_lanes, &self.intent_lanes_prepared, |lane| {
+            match lane
+                .blob_client
+                .upload_block_blob_bytes_if_absent(&marker_name, &marker_bytes, "application/json")
+                .map_err(|error| error.to_string())?
+            {
+                ImmutableBlobWrite::Created => {}
+                ImmutableBlobWrite::AlreadyExists => {
+                    let existing = lane
+                        .blob_client
+                        .download_blob_bytes(&marker_name)
+                        .map_err(|error| error.to_string())?;
+                    if existing != marker_bytes {
+                        return Err(format!(
+                            "immutable funded market warmup collision: {marker_name}"
+                        ));
+                    }
+                }
+            }
+            lane.service_bus_sender
+                .as_mut()
+                .ok_or_else(|| "executable intent publisher lane has no sender".to_owned())?
+                .send_json(&message_id, 30, &message)
+                .map_err(|error| error.to_string())
+        })?;
         Ok(true)
     }
 
@@ -364,6 +372,21 @@ impl IntentPublisher {
     fn intent_lane_count(&self) -> usize {
         self.intent_lanes.len()
     }
+}
+
+fn prepare_all_lanes<T>(
+    lanes: &[StdMutex<T>],
+    prepared: &AtomicBool,
+    mut prepare: impl FnMut(&mut T) -> Result<(), String>,
+) -> Result<(), String> {
+    for lane in lanes {
+        let mut lane = lane
+            .lock()
+            .map_err(|_| "persistent intent publisher lane lock is poisoned".to_owned())?;
+        prepare(&mut lane)?;
+    }
+    prepared.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn publish_operator_direct_after_immutable<T>(
@@ -1891,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_direct_publisher_isolates_warmup_and_bounded_intent_lanes() {
+    fn operator_direct_publisher_uses_only_bounded_executable_lanes() {
         let mut settings = RuntimeSettings::default();
         settings.azure.publish_strategy_canary_intents = true;
         settings.azure.storage_account_name = Some("storage".to_owned());
@@ -1910,6 +1933,40 @@ mod tests {
             publisher.intent_lane_count(),
             OPERATOR_DIRECT_INTENT_PUBLISH_LANES
         );
+        assert!(!publisher.intent_lanes_prepared.load(Ordering::Acquire));
+        assert!(publisher.intent_lanes.iter().all(|lane| lane
+            .lock()
+            .unwrap()
+            .service_bus_sender
+            .is_some()));
+    }
+
+    #[test]
+    fn executable_lane_preparation_reuses_every_lane_and_fails_closed_until_complete() {
+        let lanes = (0..OPERATOR_DIRECT_INTENT_PUBLISH_LANES)
+            .map(|_| StdMutex::new(()))
+            .collect::<Vec<_>>();
+        let prepared = AtomicBool::new(false);
+        let mut visited = 0;
+
+        assert!(prepare_all_lanes(&lanes, &prepared, |_| {
+            visited += 1;
+            (visited < OPERATOR_DIRECT_INTENT_PUBLISH_LANES)
+                .then_some(())
+                .ok_or_else(|| "simulated cold lane".to_owned())
+        })
+        .is_err());
+        assert_eq!(visited, OPERATOR_DIRECT_INTENT_PUBLISH_LANES);
+        assert!(!prepared.load(Ordering::Acquire));
+
+        visited = 0;
+        prepare_all_lanes(&lanes, &prepared, |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, OPERATOR_DIRECT_INTENT_PUBLISH_LANES);
+        assert!(prepared.load(Ordering::Acquire));
     }
 
     #[test]
