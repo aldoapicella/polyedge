@@ -2962,9 +2962,33 @@ mod tests {
     use super::*;
     use polyedge_domain::RuntimeEvent;
     use serde_json::json;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpStream;
 
     const TEST_TENANT_ID: &str = "11111111-2222-3333-4444-555555555555";
     const TEST_CLIENT_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn read_http_request(stream: &TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            request.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let content_length = request
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .unwrap_or(0);
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        request
+    }
 
     fn external_auth_options(
         tenant_id: Option<&str>,
@@ -3491,7 +3515,6 @@ mod tests {
 
     #[test]
     fn immutable_blob_put_retries_with_the_create_only_precondition() {
-        use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3501,22 +3524,13 @@ mod tests {
                 .into_iter()
                 .map(|status| {
                     let (mut stream, _) = listener.accept().unwrap();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut headers = String::new();
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        headers.push_str(&line);
-                        if line == "\r\n" {
-                            break;
-                        }
-                    }
+                    let request = read_http_request(&stream);
                     write!(
                         stream,
                         "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                     .unwrap();
-                    headers
+                    request
                 })
                 .collect::<Vec<_>>()
         });
@@ -3541,7 +3555,6 @@ mod tests {
 
     #[test]
     fn immutable_blob_put_accepts_forbidden_create_only_after_existing_blob_is_readable() {
-        use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3551,16 +3564,7 @@ mod tests {
                 .into_iter()
                 .map(|status| {
                     let (mut stream, _) = listener.accept().unwrap();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request = String::new();
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        request.push_str(&line);
-                        if line == "\r\n" {
-                            break;
-                        }
-                    }
+                    let request = read_http_request(&stream);
                     write!(
                         stream,
                         "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -3592,7 +3596,6 @@ mod tests {
 
     #[test]
     fn immutable_blob_existing_read_retains_safe_forbidden_headers() {
-        use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3600,14 +3603,7 @@ mod tests {
         let server = thread::spawn(move || {
             for status in ["412 Precondition Failed", "403 Forbidden"] {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
+                read_http_request(&stream);
                 write!(
                     stream,
                     "HTTP/1.1 {status}\r\n{}Content-Length: 11\r\n\
