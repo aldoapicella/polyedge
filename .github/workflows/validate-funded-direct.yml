@@ -555,7 +555,9 @@ jobs:
           v8_index_etag=$(jq -r --arg index "$v8_index" '
             .[] | select(.name == $index) | .properties.etag
           ' dormant-v8-campaign-prefix.json)
-          test -n "$v8_index_etag"
+          v8_index_etag=${v8_index_etag#\"}
+          v8_index_etag=${v8_index_etag%\"}
+          [[ "$v8_index_etag" =~ ^0x[0-9A-Fa-f]+$ ]]
           az storage blob download \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -663,12 +665,16 @@ jobs:
             rm -f "$audit_file"
           done < <(jq -r '.[] | select(.name | endswith(".json")) | .name' \
             all-authorization-consumptions.json)
-          test "$(az storage blob show \
+          current_v8_index_etag=$(az storage blob show \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
             --name "$v8_index" \
             --auth-mode login \
-            --query properties.etag -o tsv)" = "$v8_index_etag"
+            --query properties.etag -o tsv)
+          current_v8_index_etag=${current_v8_index_etag#\"}
+          current_v8_index_etag=${current_v8_index_etag%\"}
+          [[ "$current_v8_index_etag" =~ ^0x[0-9A-Fa-f]+$ ]]
+          test "$current_v8_index_etag" = "$v8_index_etag"
           az containerapp revision list \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
