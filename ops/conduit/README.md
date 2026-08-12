@@ -88,11 +88,11 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260812T180000Z.json` is the current formal
-window. It started with zero inherited credit at `2026-08-12T18:00:00Z`,
-supersedes the zero-credit `15:00` and `16:00` ledgers, keeps Azure authoritative
-and `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-15T18:00:00Z`. Completion still requires 72 consecutive accepted hours,
+Ledger `/srv/polyedge-ring/parity/20260812T200000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-12T20:00:00Z`,
+supersedes the zero-credit `15:00`, `16:00`, and `18:00` ledgers, keeps Azure
+authoritative and `azureDeletionAllowed:false`, and cannot finish before
+`2026-08-15T20:00:00Z`. Completion still requires 72 consecutive accepted hours,
 two successful OCI daily cycles, reboot and rollback proof, and explicit qset,
 funded, and deletion gates.
 
@@ -117,9 +117,12 @@ and `ALLOW_LIVE=false`. Azure provenance at `2026-08-12T17:48:18Z` then emitted
 the exact OCI decision-config hash
 `sha256:001c4279754bea3c85c16081b631cea4ae522736a36370cfae5835b096b1d5f0`.
 The first formal-window OCI provenance observation at
-`2026-08-12T18:00:56Z` had that hash and all four essential feeds healthy. Qset
-remains disabled, the local funded signer remains masked, and no Azure compute
-or network resource is deletion-eligible yet.
+`2026-08-12T18:00:56Z` had that hash and all four essential feeds healthy, but
+the hour contained one Chainlink stall and four CLOB disconnect or HTTP 503
+errors. The fail-closed collector rejected the hour and the replacement window
+starts at the next declared full-hour boundary. Qset remains disabled, the
+local funded signer remains masked, and no Azure compute or network resource is
+deletion-eligible yet.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
