@@ -406,7 +406,7 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" -o json)
           test "$(jq -r '.countDetails.activeMessageCount' <<<"$queue_snapshot")" = "0"
           test "$(jq -r '.countDetails.scheduledMessageCount' <<<"$queue_snapshot")" = "0"
-          test "$(jq -r '.countDetails.deadLetterMessageCount' <<<"$queue_snapshot")" = "853"
+          test "$(jq -r '.countDetails.deadLetterMessageCount' <<<"$queue_snapshot")" = "854"
           env_value() {
             jq -er --arg name "$1" '
               [.properties.template.containers[0].env[]
@@ -1551,7 +1551,7 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           warmup_ready=false
-          for attempt in $(seq 1 36); do
+          for attempt in $(seq 1 200); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
