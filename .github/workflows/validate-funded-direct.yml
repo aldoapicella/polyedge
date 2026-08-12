@@ -273,6 +273,10 @@ jobs:
             "pointer_preflight_cutoff_epoch=$(date -u +%s)", pointerPreflightDeployment);
           const pointerSnapshot = workflow.indexOf("pointer-before-preflight.json", cutoff);
           const workerStart = workflow.indexOf("- name: Run the zero-write v9 preflight", pointerSnapshot);
+          const workerStep = workflow.slice(
+            workerStart, workflow.indexOf("\n      - name:", workerStart + 1));
+          assert.match(workerStep,
+            /readonly v5_etag_before="\$\{PREFLIGHT_V5_ETAG_BEFORE:\?\}"[\s\S]*readonly intent_container="\$\{PREFLIGHT_INTENT_CONTAINER:\?\}"[\s\S]*readonly intent_prefix="\$\{PREFLIGHT_INTENT_PREFIX:\?\}"/);
           const pointerAfter = workflow.indexOf("pointer-after-preflight.json", workerStart);
           const queueInvariance = workflow.indexOf(
             "funded-queue-after-pointer-preflight.snapshot.json", pointerAfter);
@@ -1459,6 +1463,11 @@ jobs:
         id: funded_preflight
         run: |
           set -euo pipefail
+          readonly v5_etag_before="${PREFLIGHT_V5_ETAG_BEFORE:?}"
+          readonly intent_container="${PREFLIGHT_INTENT_CONTAINER:?}"
+          readonly intent_prefix="${PREFLIGHT_INTENT_PREFIX:?}"
+          [[ "$v5_etag_before" =~ ^\"?0x[[:xdigit:]]+\"?$ ]]
+          [[ "$intent_prefix" =~ /intents$ ]]
           test -s funded-preflight-execution.yaml
           jq -e '
             .containers | length == 1
