@@ -88,38 +88,38 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260811T160000Z.json` is the current formal
-window. It supersedes the zero-credit `15:00` ledger, which already superseded
-the `13:00` and `06:00` ledgers, keeps Azure authoritative and
-`azureDeletionAllowed:false`, and cannot finish before
-`2026-08-14T16:00:00Z`. Completion still requires 72 consecutive accepted hours,
+Ledger `/srv/polyedge-ring/parity/20260812T180000Z.json` is the current formal
+window. It started with zero inherited credit at `2026-08-12T18:00:00Z`,
+supersedes the zero-credit `15:00` and `16:00` ledgers, keeps Azure authoritative
+and `azureDeletionAllowed:false`, and cannot finish before
+`2026-08-15T18:00:00Z`. Completion still requires 72 consecutive accepted hours,
 two successful OCI daily cycles, reboot and rollback proof, and explicit qset,
 funded, and deletion gates.
 
 The OCI API, ring uploader, and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:83fd7a2111ff0b7fe2c4cd3532091173f4b649fcd58d288520793b31062f23d8`
-from source `66514da3302a83aad8cd3d1d472fa788d48795d0`. Publication run
-`31498111571` and PR validation run `31497940354` passed for both AMD64 and
-ARM64. The API deployed healthy with zero restarts at `2026-08-11T14:52:20Z`.
-Rollback state is retained in
-`/etc/polyedge/rollback/20260811T144916Z-feed-parity` and
-`/etc/polyedge/rollback/20260811T145209Z-polyedge-api.container`.
+`sha256:4b27d0ed4a2932bdbcd8d6671ae91e2591c9f94eaa91939e22c4d028a07eca3e`
+from source `8be79d323261be94f4c3e6b8501123f46130abe9`. Publication run
+`31599743316` passed, and the manifest contains both Linux AMD64 and ARM64. The
+API has remained healthy with zero restarts since `2026-08-12T14:22:56Z`.
+Rollback state is retained under `/etc/polyedge/rollback`, including
+`20260812T141958Z-polyedge-api.container` and
+`20260812T141958Z-ring-primary-image`.
 
-The deployment-spanning `14:50` segment is preserved outside the formal window
-as schema 2 with 267,312 events. Its local source and deterministic gzip hashes
-match its manifest, and Azure verified its immutable payload and manifest at
-`2026-08-11T15:03:39Z`; it receives no parity credit. The last transition event
-used recorder UUID `d14ec298-2a6b-4cb7-8532-5b47bc3ac5f2`, sequence 144,171,
-and the first `15:00` event used the same UUID, sequence 144,172. The first five
-minute-level provenance observations from `15:00:20Z` through `15:04:20Z` had
-all four essential feeds healthy and zero essential-feed errors. The first
-new-digest freshness cycle also completed successfully. Qset remains disabled,
-the local funded signer remains masked, and no Azure compute or network resource
-is deletion-eligible yet. The `15:00` hour receives zero credit because an exact
-`PolymarketClobMarket` WebSocket reset produced an essential-feed error at
-`2026-08-11T15:15:59.981557808Z`; recorder sequence durability and both strict
-schema-3 segment uploads remained intact.
+The `15:00` hour receives zero credit because seven durable essential-feed
+reconnect errors occurred even though recorder sequence durability and all six
+strict segment uploads remained intact. The clean `16:00` feed hour also
+receives zero credit because the collector found different Azure and OCI
+decision-config hashes. Azure primary revision `polyedge-dev--0000124` changed
+only `RTDS_CHAINLINK_WATCHDOG_SECONDS` from its 30-second default to the
+OCI-proven 290 seconds while preserving its immutable image, paper execution,
+and `ALLOW_LIVE=false`. Azure provenance at `2026-08-12T17:48:18Z` then emitted
+the exact OCI decision-config hash
+`sha256:001c4279754bea3c85c16081b631cea4ae522736a36370cfae5835b096b1d5f0`.
+The first formal-window OCI provenance observation at
+`2026-08-12T18:00:56Z` had that hash and all four essential feeds healthy. Qset
+remains disabled, the local funded signer remains masked, and no Azure compute
+or network resource is deletion-eligible yet.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
