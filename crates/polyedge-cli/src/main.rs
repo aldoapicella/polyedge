@@ -1891,23 +1891,20 @@ fn run_ring_upload(
                 manifest_path.display()
             )
         })?;
-        match schema_version {
-            3 => validate_ring_source_v3(&source_path, &manifest)?,
-            4 => validate_ring_source_v4(&source_path, &manifest)?,
-            _ => {}
-        }
         let manifest_sha = sha256_prefixed(&manifest_bytes);
         let manifest_blob = format!("{blob_name}.manifest.json");
 
         if receipt_path.exists() {
-            let receipt: serde_json::Value = serde_json::from_slice(
-                &fs::read(&receipt_path)
-                    .with_context(|| format!("reading {}", receipt_path.display()))?,
-            )?;
-            if receipt["manifest_sha256"].as_str() != Some(&manifest_sha) {
-                bail!("ring receipt disagrees with {}", manifest_path.display());
-            }
+            let receipt_bytes = fs::read(&receipt_path)
+                .with_context(|| format!("reading {}", receipt_path.display()))?;
+            validate_ring_upload_receipt(&receipt_bytes, &manifest_sha, &blob_name, &manifest_blob)
+                .with_context(|| format!("invalid ring receipt {}", receipt_path.display()))?;
         } else {
+            match schema_version {
+                3 => validate_ring_source_v3(&source_path, &manifest)?,
+                4 => validate_ring_source_v4(&source_path, &manifest)?,
+                _ => {}
+            }
             if schema_version >= 2 {
                 let source_bytes = fs::read(&source_path)
                     .with_context(|| format!("reading {}", source_path.display()))?;
@@ -2023,6 +2020,60 @@ fn accepted_ring_blob_prefix<'a>(
     } else {
         current_prefix
     }
+}
+
+fn validate_ring_upload_receipt(
+    receipt_bytes: &[u8],
+    manifest_sha256: &str,
+    blob_name: &str,
+    manifest_blob_name: &str,
+) -> Result<()> {
+    let receipt: serde_json::Value =
+        serde_json::from_slice(receipt_bytes).context("ring receipt must be valid JSON")?;
+    let receipt = receipt
+        .as_object()
+        .context("ring receipt must be a JSON object")?;
+    if receipt.len() != 5
+        || !receipt.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "schema_version"
+                    | "manifest_sha256"
+                    | "blob_name"
+                    | "manifest_blob_name"
+                    | "verified_ts"
+            )
+        })
+    {
+        bail!("ring receipt must contain exactly the expected fields");
+    }
+    if receipt
+        .get("schema_version")
+        .and_then(|value| value.as_u64())
+        != Some(1)
+    {
+        bail!("ring receipt schema_version must equal 1");
+    }
+    if receipt
+        .get("manifest_sha256")
+        .and_then(|value| value.as_str())
+        != Some(manifest_sha256)
+        || receipt.get("blob_name").and_then(|value| value.as_str()) != Some(blob_name)
+        || receipt
+            .get("manifest_blob_name")
+            .and_then(|value| value.as_str())
+            != Some(manifest_blob_name)
+    {
+        bail!("ring receipt identity disagrees with its manifest");
+    }
+    let verified_ts = receipt
+        .get("verified_ts")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .context("ring receipt verified_ts must be a nonempty string")?;
+    DateTime::parse_from_rfc3339(verified_ts)
+        .context("ring receipt verified_ts must be an RFC 3339 timestamp")?;
+    Ok(())
 }
 
 fn collect_ring_manifests(path: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
@@ -2587,8 +2638,8 @@ mod tests {
         accepted_ring_blob_prefix, profitability_authorization_flags, ring_blob_name,
         ring_relative_path, ring_sha256, terminate_lease_child_tree, validate_ring_identity,
         validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
-        validate_ring_source_v3, validate_ring_source_v4, Cli, Command, Path, PathBuf,
-        ResearchCommand,
+        validate_ring_source_v3, validate_ring_source_v4, validate_ring_upload_receipt, Cli,
+        Command, Path, PathBuf, ResearchCommand,
     };
     use clap::Parser;
     use serde_json::json;
@@ -2788,6 +2839,84 @@ mod tests {
             accepted_ring_blob_prefix(&manifest, "events-oci-hot7-v1", false),
             "events-oci-hot7-v1"
         );
+    }
+
+    #[test]
+    fn ring_upload_receipt_accepts_exact_bound_identity() {
+        let manifest_sha = format!("sha256:{}", "a".repeat(64));
+        let blob_name = "events-oci-hot7-v1/2026/08/05/22/1785969000.jsonl.gz";
+        let manifest_blob = format!("{blob_name}.manifest.json");
+        let receipt = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "manifest_sha256": manifest_sha,
+            "blob_name": blob_name,
+            "manifest_blob_name": manifest_blob,
+            "verified_ts": "2026-08-12T00:00:00Z",
+        }))
+        .unwrap();
+
+        assert!(validate_ring_upload_receipt(
+            &receipt,
+            &format!("sha256:{}", "a".repeat(64)),
+            blob_name,
+            &format!("{blob_name}.manifest.json"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ring_upload_receipt_rejects_malformed_or_mismatched_fields() {
+        let manifest_sha = format!("sha256:{}", "a".repeat(64));
+        let blob_name = "events-oci-hot7-v1/2026/08/05/22/1785969000.jsonl.gz";
+        let manifest_blob = format!("{blob_name}.manifest.json");
+        let valid = json!({
+            "schema_version": 1,
+            "manifest_sha256": manifest_sha,
+            "blob_name": blob_name,
+            "manifest_blob_name": manifest_blob,
+            "verified_ts": "2026-08-12T00:00:00Z",
+        });
+        assert!(
+            validate_ring_upload_receipt(b"{", &manifest_sha, blob_name, &manifest_blob).is_err()
+        );
+
+        let mut invalid_receipts = vec![json!([])];
+        for (field, value) in [
+            ("schema_version", json!(2)),
+            ("schema_version", json!("1")),
+            ("manifest_sha256", json!("sha256:wrong")),
+            ("manifest_sha256", json!(1)),
+            ("blob_name", json!("events-oci-hot7-v1/wrong.jsonl.gz")),
+            ("blob_name", json!(1)),
+            ("manifest_blob_name", json!("wrong.manifest.json")),
+            ("manifest_blob_name", json!(1)),
+            ("verified_ts", json!("")),
+            ("verified_ts", json!("not-a-timestamp")),
+            ("verified_ts", json!(1)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            invalid_receipts.push(invalid);
+        }
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("verified_ts");
+        invalid_receipts.push(missing);
+        let mut extra = valid.clone();
+        extra["unexpected"] = json!(true);
+        invalid_receipts.push(extra);
+
+        for receipt in invalid_receipts {
+            assert!(
+                validate_ring_upload_receipt(
+                    &serde_json::to_vec(&receipt).unwrap(),
+                    &manifest_sha,
+                    blob_name,
+                    &manifest_blob,
+                )
+                .is_err(),
+                "accepted invalid receipt: {receipt}"
+            );
+        }
     }
 
     #[test]
