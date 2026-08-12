@@ -3441,6 +3441,7 @@ fn compact_recorded_book(book: &BookState) -> BookState {
 }
 
 fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str {
+    let now = Utc::now();
     let healthy = |name: &str| {
         data.feed_status
             .get(name)
@@ -3448,10 +3449,11 @@ fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str 
             .and_then(Value::as_str)
             == Some("ok")
     };
+    let fresh = |name: &str| fresh_market_feed_ok(data.feed_status.get(name), now);
     if healthy("Discovery")
-        && fresh_market_feed_ok(data.feed_status.get("PolymarketClobMarket"), Utc::now())
-        && (!settings.target.enable_polymarket_rtds_chainlink || healthy("PolymarketRtdsChainlink"))
-        && (!settings.target.enable_polymarket_rtds_binance || healthy("PolymarketRtdsBinance"))
+        && fresh("PolymarketClobMarket")
+        && (!settings.target.enable_polymarket_rtds_chainlink || fresh("PolymarketRtdsChainlink"))
+        && (!settings.target.enable_polymarket_rtds_binance || fresh("PolymarketRtdsBinance"))
     {
         "running"
     } else if data.feed_status.values().any(|status| {
@@ -3459,7 +3461,13 @@ fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str 
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|status| status == "error" || status == "disconnected")
-    }) {
+    }) || (settings.target.enable_polymarket_rtds_chainlink
+        && healthy("PolymarketRtdsChainlink")
+        && !fresh("PolymarketRtdsChainlink"))
+        || (settings.target.enable_polymarket_rtds_binance
+            && healthy("PolymarketRtdsBinance")
+            && !fresh("PolymarketRtdsBinance"))
+    {
         "degraded"
     } else {
         "starting"
@@ -3971,6 +3979,31 @@ mod tests {
         let data = controller.inner.data.read().await;
         assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
         assert_eq!(feed_summary(&data, &controller.inner.settings), "running");
+        drop(data);
+
+        for source in [
+            FeedName::PolymarketRtdsChainlink,
+            FeedName::PolymarketRtdsBinance,
+        ] {
+            let name = format!("{source:?}");
+            {
+                let mut data = controller.inner.data.write().await;
+                data.feed_status.get_mut(&name).unwrap()["updated_at"] =
+                    json!(Utc::now() - chrono::Duration::minutes(6));
+            }
+            {
+                let data = controller.inner.data.read().await;
+                assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+            }
+            controller
+                .handle_feed_event(FeedEvent::Heartbeat {
+                    source,
+                    ts: Utc::now(),
+                })
+                .await;
+            let data = controller.inner.data.read().await;
+            assert_eq!(feed_summary(&data, &controller.inner.settings), "running");
+        }
     }
 
     #[tokio::test]

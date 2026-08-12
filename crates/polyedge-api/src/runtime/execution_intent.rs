@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::sync::{
+    Mutex as StdMutex, MutexGuard as StdMutexGuard, RwLock as StdRwLock,
+    RwLockReadGuard as StdRwLockReadGuard,
+};
 use std::time::Instant;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
@@ -51,6 +54,7 @@ pub(super) struct IntentPublisherConfig {
 pub(super) struct IntentPublisher {
     intent_lanes: Vec<StdMutex<IntentPublisherLane>>,
     current_intent_lane: Option<StdMutex<AzureBlobClient>>,
+    intent_preparation_gate: StdRwLock<()>,
     intent_lanes_prepared: AtomicBool,
     next_intent_lane: AtomicUsize,
     prefix: String,
@@ -218,6 +222,7 @@ impl IntentPublisherConfig {
         Ok(IntentPublisher {
             intent_lanes,
             current_intent_lane,
+            intent_preparation_gate: StdRwLock::new(()),
             intent_lanes_prepared: AtomicBool::new(!self.operator_direct),
             next_intent_lane: AtomicUsize::new(0),
             prefix: self.prefix,
@@ -235,9 +240,8 @@ impl IntentPublisher {
     }
 
     pub(super) fn publish(&self, intent: &ExecutionIntentV1) -> Result<PublishedIntent, String> {
-        if !self.intent_lanes_prepared.load(Ordering::Acquire) {
-            return Err("executable intent publisher lanes are not prepared".to_owned());
-        }
+        let _prepared =
+            prepared_publish_guard(&self.intent_preparation_gate, &self.intent_lanes_prepared)?;
         let publish_started = Instant::now();
         intent.validate()?;
         let bytes = serde_json::to_vec_pretty(intent).map_err(|error| error.to_string())?;
@@ -323,17 +327,16 @@ impl IntentPublisher {
     }
 
     pub(super) fn warm_market(&self, market: &MarketSpec) -> Result<bool, String> {
-        let has_sender = self
-            .intent_lanes
-            .first()
-            .ok_or_else(|| "persistent intent publisher has no lanes".to_owned())?
-            .lock()
-            .map_err(|_| "persistent intent publisher lane lock is poisoned".to_owned())?
-            .service_bus_sender
-            .is_some();
-        if !has_sender {
+        let Some(current_intent_lane) = self.current_intent_lane.as_ref() else {
             return Ok(false);
-        }
+        };
+        let _preparation = self
+            .intent_preparation_gate
+            .write()
+            .map_err(|_| "executable intent preparation lock is poisoned".to_owned())?;
+        self.intent_lanes_prepared.store(false, Ordering::Release);
+        let pointer_name = current_funded_intent_blob_name(&self.prefix)?;
+        prepare_current_intent_lane(current_intent_lane, &pointer_name)?;
         let marker = funded_market_warmup_marker(market);
         let marker_bytes = serde_json::to_vec_pretty(&marker).map_err(|error| error.to_string())?;
         let marker_name = funded_market_warmup_blob_name(&self.prefix, market)?;
@@ -374,11 +377,23 @@ impl IntentPublisher {
     }
 }
 
+fn prepare_current_intent_lane<S: CurrentFundedIntentStore>(
+    lane: &StdMutex<S>,
+    pointer_name: &str,
+) -> Result<(), String> {
+    let mut store = lane
+        .lock()
+        .map_err(|_| "current funded intent pointer lock is poisoned".to_owned())?;
+    let _ = store.read_versioned(pointer_name)?;
+    Ok(())
+}
+
 fn prepare_all_lanes<T>(
     lanes: &[StdMutex<T>],
     prepared: &AtomicBool,
     mut prepare: impl FnMut(&mut T) -> Result<(), String>,
 ) -> Result<(), String> {
+    prepared.store(false, Ordering::Release);
     for lane in lanes {
         let mut lane = lane
             .lock()
@@ -387,6 +402,19 @@ fn prepare_all_lanes<T>(
     }
     prepared.store(true, Ordering::Release);
     Ok(())
+}
+
+fn prepared_publish_guard<'a>(
+    gate: &'a StdRwLock<()>,
+    prepared: &AtomicBool,
+) -> Result<StdRwLockReadGuard<'a, ()>, String> {
+    let guard = gate
+        .read()
+        .map_err(|_| "executable intent preparation lock is poisoned".to_owned())?;
+    if !prepared.load(Ordering::Acquire) {
+        return Err("executable intent publisher lanes are not prepared".to_owned());
+    }
+    Ok(guard)
 }
 
 fn publish_operator_direct_after_immutable<T>(
@@ -1258,10 +1286,12 @@ mod tests {
         compare_conflicts: usize,
         fail_update: bool,
         compare_calls: usize,
+        read_calls: usize,
     }
 
     impl CurrentFundedIntentStore for TestCurrentFundedIntentStore {
         fn read_versioned(&mut self, _name: &str) -> Result<Option<(Vec<u8>, String)>, String> {
+            self.read_calls += 1;
             Ok(self.current.clone())
         }
 
@@ -1942,13 +1972,22 @@ mod tests {
     }
 
     #[test]
-    fn executable_lane_preparation_reuses_every_lane_and_fails_closed_until_complete() {
+    fn executable_lane_preparation_resets_before_failed_retry() {
         let lanes = (0..OPERATOR_DIRECT_INTENT_PUBLISH_LANES)
             .map(|_| StdMutex::new(()))
             .collect::<Vec<_>>();
         let prepared = AtomicBool::new(false);
         let mut visited = 0;
 
+        prepare_all_lanes(&lanes, &prepared, |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, OPERATOR_DIRECT_INTENT_PUBLISH_LANES);
+        assert!(prepared.load(Ordering::Acquire));
+
+        visited = 0;
         assert!(prepare_all_lanes(&lanes, &prepared, |_| {
             visited += 1;
             (visited < OPERATOR_DIRECT_INTENT_PUBLISH_LANES)
@@ -1967,6 +2006,42 @@ mod tests {
         .unwrap();
         assert_eq!(visited, OPERATOR_DIRECT_INTENT_PUBLISH_LANES);
         assert!(prepared.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_refresh_excludes_concurrent_publish_and_stays_closed() {
+        let gate = std::sync::Arc::new(StdRwLock::new(()));
+        let prepared = std::sync::Arc::new(AtomicBool::new(true));
+        let preparation = gate.write().unwrap();
+        prepared.store(false, Ordering::Release);
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::sync_channel(0);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(0);
+        let publish_gate = std::sync::Arc::clone(&gate);
+        let publish_prepared = std::sync::Arc::clone(&prepared);
+        let publish = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            result_tx
+                .send(prepared_publish_guard(&publish_gate, &publish_prepared).is_ok())
+                .unwrap();
+        });
+
+        attempted_rx.recv().unwrap();
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(preparation);
+        assert!(!result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap());
+        publish.join().unwrap();
+    }
+
+    #[test]
+    fn current_intent_pointer_client_participates_in_preparation() {
+        let lane = StdMutex::new(TestCurrentFundedIntentStore::default());
+        prepare_current_intent_lane(&lane, "reports/funded/current-funded-intent.json").unwrap();
+        assert_eq!(lane.lock().unwrap().read_calls, 1);
     }
 
     #[test]

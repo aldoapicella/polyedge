@@ -110,10 +110,13 @@ The `15:00` hour receives zero credit because seven durable essential-feed
 reconnect errors occurred even though recorder sequence durability and all six
 strict segment uploads remained intact. The clean `16:00` feed hour also
 receives zero credit because the collector found different Azure and OCI
-decision-config hashes. Azure primary revision `polyedge-dev--0000124` changed
-only `RTDS_CHAINLINK_WATCHDOG_SECONDS` from its 30-second default to the
-OCI-proven 290 seconds while preserving its immutable image, paper execution,
-and `ALLOW_LIVE=false`. Azure provenance at `2026-08-12T17:48:18Z` then emitted
+decision-config hashes. Azure primary revision `polyedge-dev--0000124`
+temporarily aligned `RTDS_CHAINLINK_WATCHDOG_SECONDS` to 290 seconds, but
+immutable ring evidence showed that both RTDS topics froze together while
+ping/pong stayed live. Azure revision `polyedge-dev--0000125` and OCI therefore
+restored the native 30-second watchdog while preserving immutable images, paper
+execution, and `ALLOW_LIVE=false`. Azure provenance at
+`2026-08-12T17:48:18Z` had emitted
 the exact OCI decision-config hash
 `sha256:001c4279754bea3c85c16081b631cea4ae522736a36370cfae5835b096b1d5f0`.
 The first formal-window OCI provenance observation at
