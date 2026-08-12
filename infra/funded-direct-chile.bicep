@@ -496,7 +496,7 @@ resource fundedJob 'Microsoft.App/jobs@2024-03-01' = {
     configuration: {
       triggerType: 'Manual'
       replicaRetryLimit: 0
-      replicaTimeout: 1900
+      replicaTimeout: 11400
       registries: [
         {
           server: registry.properties.loginServer

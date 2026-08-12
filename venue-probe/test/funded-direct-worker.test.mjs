@@ -254,6 +254,80 @@ test("worker TTL gates reserve time for the authenticated child preflight", () =
   );
 });
 
+test("three-hour preflight polls inside the funded intent acceptance window", () => {
+  const fundedSession = preflightSession();
+  const config = loadFundedDirectConfig(preflightEnv(fundedSession, {
+    FUNDED_DIRECT_MAX_ITERATIONS: "10801",
+    FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+    FUNDED_DIRECT_MAX_IDLE_MS: "10800000"
+  }));
+  assert.equal(config.maxIterations, 10_801);
+  assert.equal(config.pollIntervalMs, 1_000);
+  assert.throws(
+    () => loadFundedDirectConfig(preflightEnv(fundedSession, {
+      FUNDED_DIRECT_MAX_ITERATIONS: "2000",
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "6000",
+      FUNDED_DIRECT_MAX_IDLE_MS: "10800000"
+    })),
+    new RegExp("requires a 1000ms poll interval")
+  );
+  assert.throws(
+    () => loadFundedDirectConfig(preflightEnv(fundedSession, {
+      FUNDED_DIRECT_MAX_ITERATIONS: "10800",
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_MAX_IDLE_MS: "10800000"
+    })),
+    new RegExp("enough iterations to reach its idle timeout")
+  );
+  assert.throws(
+    () => loadFundedDirectConfig(env({ FUNDED_DIRECT_MAX_ITERATIONS: "10801" })),
+    new RegExp("must be in \\[1, 2000\\]")
+  );
+});
+
+test("three-hour preflight can accept a pointer after two thousand polls without writes", async () => {
+  const started = new Date("2026-07-27T12:00:00Z");
+  let now = started;
+  const fundedSession = preflightSession();
+  const stale = intent(new Date(started.getTime() - 20_000), "d".repeat(64));
+  const control = new Container({
+    [fundedSession.capital_policy.prior_state_blob_name]:
+      Buffer.from(JSON.stringify(predecessorState()))
+  });
+  const intents = new Container({
+    ["intents/" + stale.decision_id + ".json"]: Buffer.from(JSON.stringify(stale)),
+    "current-funded-intent.json": Buffer.from(JSON.stringify(handoff(stale)))
+  });
+  let sleeps = 0;
+
+  const output = await runFundedDirectWorker({
+    env: preflightEnv(fundedSession, {
+      FUNDED_DIRECT_MAX_ITERATIONS: "10801",
+      FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
+      FUNDED_DIRECT_MAX_IDLE_MS: "10800000"
+    }),
+    containers: { control, intents },
+    clock: () => now,
+    sleep: async () => {
+      sleeps += 1;
+      now = new Date(now.getTime() + 1_000);
+      if (sleeps === 2_001) {
+        const fresh = intent(now, "e".repeat(64));
+        intents.values.set("intents/" + fresh.decision_id + ".json", Buffer.from(JSON.stringify(fresh)));
+        intents.values.set("current-funded-intent.json", Buffer.from(JSON.stringify(handoff(fresh))));
+      }
+    },
+    invokeChild: async () => assert.fail("preflight must not invoke a child")
+  });
+
+  assert.equal(output.status, "preflight_validated");
+  assert.equal(output.iteration, 2_002);
+  assert.equal(sleeps, 2_001);
+  assert.equal(control.uploadCalls, 0);
+  assert.equal(intents.uploadCalls, 0);
+  assert.equal(intents.listCalls, 0);
+});
+
 test("operator-funded config accepts only an explicit non-compounding profit quarantine", () => {
   const value = session();
   value.session_id = "dynamic-quote-funded-test-v6";
@@ -383,6 +457,7 @@ test("pure preflight rejects a contradictory write-capable dry-run setting", () 
 
 test("pure preflight alone permits a three-hour fresh-intent wait", () => {
   assert.equal(loadFundedDirectConfig(preflightEnv(preflightSession(), {
+    FUNDED_DIRECT_MAX_ITERATIONS: "10801",
     FUNDED_DIRECT_MAX_IDLE_MS: "10800000"
   })).maxIdleMs, 10_800_000);
   assert.throws(

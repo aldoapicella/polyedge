@@ -85,9 +85,19 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!config.intentPrefix || !config.intentContainerName || !config.controlContainerName || !config.storageAccount) {
     errors.push("isolated intent/control storage configuration is required");
   }
-  if (!(config.maxIterations >= 1 && config.maxIterations <= 2_000)) errors.push("FUNDED_DIRECT_MAX_ITERATIONS must be in [1, 2000]");
+  const maxIterations = config.preflightOnly ? 10_801 : 2_000;
+  if (!(config.maxIterations >= 1 && config.maxIterations <= maxIterations)) {
+    errors.push("FUNDED_DIRECT_MAX_ITERATIONS must be in [1, " + maxIterations + "]");
+  }
   if (!(config.pollIntervalMs >= 1_000 && config.pollIntervalMs <= 60_000)) errors.push("FUNDED_DIRECT_POLL_INTERVAL_MS must be in [1000, 60000]");
+  if (config.preflightOnly && config.pollIntervalMs !== 1_000) {
+    errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY requires a 1000ms poll interval");
+  }
   const maxIdleMs = config.preflightOnly ? MAX_PREFLIGHT_IDLE_MS : 3_600_000;
+  if (config.preflightOnly && config.maxIdleMs === MAX_PREFLIGHT_IDLE_MS &&
+      (config.maxIterations - 1) * config.pollIntervalMs < config.maxIdleMs) {
+    errors.push("three-hour preflight requires enough iterations to reach its idle timeout");
+  }
   if (!(config.maxIdleMs >= config.pollIntervalMs && config.maxIdleMs <= maxIdleMs)) {
     errors.push(`FUNDED_DIRECT_MAX_IDLE_MS must be between the poll interval and ${maxIdleMs}`);
   }

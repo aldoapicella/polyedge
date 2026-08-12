@@ -240,6 +240,11 @@ jobs:
             resource.properties.template.containers[0].name === "funded-warmup");
           assert.equal(warmup.properties.template.containers[0].command.join(" "), "node src/funded-direct-warmup.mjs");
           assert.equal(warmup.properties.template.containers[0].env.some((entry) => entry.name === "POLYMARKET_PRIVATE_KEY"), false);
+          const fundedJob = template.resources.find((resource) =>
+            resource.type === "Microsoft.App/jobs" &&
+            resource.properties.template.containers[0].name === "funded-direct");
+          assert.equal(fundedJob.properties.configuration.replicaTimeout, 11400);
+          assert.equal(fundedJob.properties.configuration.replicaRetryLimit, 0);
           NODE
           git diff --check
 
@@ -1047,6 +1052,7 @@ jobs:
             -o json > funded-preflight-job.json
           intent_container=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_CONTAINER_NAME") | .value' funded-preflight-job.json)
           intent_prefix=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_PREFIX") | .value' funded-preflight-job.json)
+          test "$(jq -r '.properties.configuration.replicaTimeout' funded-preflight-job.json)" = "11400"
           test -n "$intent_container"
           test -n "$intent_prefix"
           jq '
@@ -1066,8 +1072,8 @@ jobs:
                       {name:"ALLOW_FUNDED_DIRECT",value:"true"},
                       {name:"FUNDED_DIRECT_DRY_RUN",value:"true"},
                       {name:"FUNDED_DIRECT_PREFLIGHT_ONLY",value:"true"},
-                      {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"2000"},
-                      {name:"FUNDED_DIRECT_POLL_INTERVAL_MS",value:"6000"},
+                      {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"10801"},
+                      {name:"FUNDED_DIRECT_POLL_INTERVAL_MS",value:"1000"},
                       {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"10800000"}
                     ]
                   )
@@ -1085,9 +1091,9 @@ jobs:
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_PREFLIGHT_ONLY" and .value == "true")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "2000")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "10801")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_POLL_INTERVAL_MS" and .value == "6000")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_POLL_INTERVAL_MS" and .value == "1000")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "10800000")] | length) == 1
           ' funded-preflight-execution.yaml
@@ -1098,7 +1104,7 @@ jobs:
             --query name -o tsv)
           test -n "$preflight_execution"
           status=Running
-          for attempt in $(seq 1 1100); do
+          for attempt in $(seq 1 1200); do
             status=$(az containerapp job execution show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_JOB" \
