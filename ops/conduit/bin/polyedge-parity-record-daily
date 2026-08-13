@@ -61,7 +61,10 @@ window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'forma
   || die 'formal window start is not canonical UTC'
 first_date=$(date -u -d "@$window_epoch" +%Y-%m-%d)
 first_epoch=$(date -u -d "$first_date 00:00:00Z" +%s)
-[ "$target_epoch" -ge "$first_epoch" ] || die 'cycle date predates the formal window'
+if [ "$target_epoch" -lt "$first_epoch" ]; then
+  echo "daily cycle $target excluded before formal window; ledger unchanged"
+  exit 0
+fi
 
 ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
 parity_root=$ring/parity

@@ -79,6 +79,13 @@ run_recorder() {
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" "$recorder" "$date"
 }
 
+prewindow=$root/prewindow
+fixture "$prewindow"
+prewindow_ledger_sha=$(sha256sum "$prewindow/ring/parity/ledger.json")
+run_recorder "$prewindow" 2026-08-10 >/dev/null
+[ "$(sha256sum "$prewindow/ring/parity/ledger.json")" = "$prewindow_ledger_sha" ]
+[ ! -e "$prewindow/ring/parity/daily" ]
+
 success=$root/success
 fixture "$success"
 make_bundle "$success" 2026-08-11 2026-08-12T08:00:00Z
