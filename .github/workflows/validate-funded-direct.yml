@@ -296,7 +296,9 @@ jobs:
           assert.ok(pause < active && active < warmupStep && warmupStep < ready &&
             ready < enable && enable < first);
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
-          assert.match(activation, /\(\.market_id \| tostring\) == \$warmup_market/);
+          assert.match(activation, /funded-v10-rollover-warmup\.json/);
+          assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
+          assert.match(activation, /TimeGenerated <= datetime\(\$lifecycle_completed_at\)/);
           const rollback = workflow.slice(
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
           assert.match(rollback,
@@ -2567,11 +2569,83 @@ jobs:
             --overwrite \
             --only-show-errors -o none
           test "$intent_sha256" = "sha256:$(sha256sum funded-v10-intent.json | cut -d' ' -f1)"
-          jq -e --arg decision "$decision_id" --arg warmup_market "$warmup_market" '
+          jq -e --arg decision "$decision_id" '
             .decision_id == $decision
-            and (.market_id | tostring) == $warmup_market
+            and (.market_id | tostring | test("^[0-9]+$"))
             and .notional == "10.5"
           ' funded-v10-intent.json
+          intent_market=$(jq -er '.market_id | tostring' funded-v10-intent.json)
+          intent_market_end_ts=$(jq -er '.market_end_ts | select(type == "string")' funded-v10-intent.json)
+          lifecycle_completed_at=$(jq -er '.[0].TimeGenerated | select(type == "string")' \
+            funded-v10-lifecycle-latency.json)
+          node - funded-v10-intent.json <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+          const intent = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const decisionAt = Date.parse(intent.decision_ts);
+          const validUntil = Date.parse(intent.valid_until);
+          const marketEnd = Date.parse(intent.market_end_ts);
+          assert.ok(Number.isFinite(decisionAt) && Number.isFinite(validUntil) && Number.isFinite(marketEnd));
+          assert.equal(intent.ttl_ms, 15_000);
+          assert.equal(validUntil, decisionAt + intent.ttl_ms);
+          assert.ok(marketEnd - decisionAt >= 360_000 && marketEnd - decisionAt <= 900_000,
+            "funded intent is outside the configured market-expiry window");
+          assert.ok(validUntil < marketEnd, "funded intent outlives its exact market");
+          NODE
+          if [ "$intent_market" != "$warmup_market" ]; then
+            rollover_ready=false
+            for attempt in $(seq 1 18); do
+              az monitor log-analytics query \
+                --workspace "$workspace_customer_id" \
+                --analytics-query "ContainerAppConsoleLogs_CL
+                  | where ContainerAppName_s == '$FUNDED_APP'
+                  | where RevisionName_s == '$funded_revision'
+                  | where TimeGenerated >= datetime($producer_enabled_at)
+                  | where TimeGenerated <= datetime($lifecycle_completed_at)
+                  | extend record = parse_json(Log_s)
+                  | where tostring(record.status) == 'market_warmed'
+                  | where tostring(record.market_id) == '$intent_market'
+                  | top 1 by TimeGenerated desc
+                  | project TimeGenerated, Log_s" \
+                -o json > funded-v10-rollover-warmup.json || { sleep 10; continue; }
+              rollover_warmup_time=$(jq -r '.[0].TimeGenerated // ""' \
+                funded-v10-rollover-warmup.json)
+              if [ -z "$rollover_warmup_time" ]; then
+                sleep 10
+                continue
+              fi
+              az monitor log-analytics query \
+                --workspace "$workspace_customer_id" \
+                --analytics-query "ContainerAppConsoleLogs_CL
+                  | where ContainerAppName_s == '$FUNDED_APP'
+                  | where RevisionName_s == '$funded_revision'
+                  | where TimeGenerated >= datetime($rollover_warmup_time)
+                  | where TimeGenerated <= datetime($lifecycle_completed_at)
+                  | extend record = parse_json(Log_s)
+                  | where tostring(record.status) == 'persistent_service_heartbeat'
+                  | where tostring(record.executor.warmed_market.market_id) == '$intent_market'
+                  | where todatetime(record.executor.warmed_market.market_end_ts) == datetime($intent_market_end_ts)
+                  | top 1 by TimeGenerated desc
+                  | project Log_s" \
+                -o json > funded-v10-rollover-heartbeat.json || { sleep 10; continue; }
+              if jq -e '
+                length == 1
+                and (.[0].Log_s | fromjson
+                  | .executor.user_channel_ready == true
+                  and .executor.market_channel_ready == true
+                  and .executor.safety_snapshot_cache_ready == true
+                  and .executor.safety_snapshot_cache_error == null
+                  and .executor.reconnect_reconciliation_required == false
+                  and .executor.user_channel_gaps == 0
+                  and .executor.market_channel_gaps == 0)
+              ' funded-v10-rollover-heartbeat.json >/dev/null; then
+                rollover_ready=true
+                break
+              fi
+              sleep 10
+            done
+            test "$rollover_ready" = true
+          fi
           consumption_blob="reports/research/venue-probe/control/strategy-canary/consumed/$authorization_id.json"
           az storage blob download \
             --account-name "$STORAGE_ACCOUNT" \
