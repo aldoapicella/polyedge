@@ -297,6 +297,10 @@ jobs:
             ready < enable && enable < first);
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /\(\.market_id \| tostring\) == \$warmup_market/);
+          const rollback = workflow.slice(
+            workflow.lastIndexOf("- name: Restore the dormant funded service"));
+          assert.match(rollback,
+            /for attempt in \$\(seq 1 30\); do[\s\S]*ContainerAppOperationInProgress[\s\S]*sleep 10/);
           for (const retry of [
             "-o json > funded-preflight-logs.json || { sleep 10; continue; }",
             "--query '[0].Count' -o tsv) || { sleep 10; continue; }",
@@ -2759,14 +2763,13 @@ jobs:
             intent-producer-restored.json)" = "0"
           if [ -n "${FUNDED_ROLLBACK_REVISION:-}" ]; then
             test -s funded-rollback-template.json
-            az containerapp revision copy \
+            rollback_command=(az containerapp revision copy \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
-              --from-revision "$FUNDED_ROLLBACK_REVISION" \
-              --only-show-errors -o none
+              --from-revision "$FUNDED_ROLLBACK_REVISION")
             exact_rollback=true
           else
-            az containerapp update \
+            rollback_command=(az containerapp update \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
               --min-replicas 0 \
@@ -2779,10 +2782,24 @@ jobs:
                 FUNDED_DIRECT_DRY_RUN=true \
                 ALLOW_LIVE=false \
                 ALLOW_STRATEGY_CANARY=false \
-                ENABLE_TAKER_ORDERS=false \
-              --only-show-errors -o none
+                ENABLE_TAKER_ORDERS=false)
             exact_rollback=false
           fi
+          rollback_applied=false
+          for attempt in $(seq 1 30); do
+            if "${rollback_command[@]}" --only-show-errors -o none \
+              2> funded-rollback.stderr; then
+              rollback_applied=true
+              break
+            fi
+            if ! grep -Fq 'ContainerAppOperationInProgress' funded-rollback.stderr || \
+              [ "$attempt" -eq 30 ]; then
+              cat funded-rollback.stderr >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          test "$rollback_applied" = true
           test "$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
