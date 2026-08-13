@@ -557,7 +557,12 @@ if run_collector "$metric_failure" >/dev/null 2>&1; then echo 'recorder metric f
 feed_failure=$root/feed-failure
 fixture "$feed_failure"
 jq '.feed_status.PolymarketClobMarket.status="error"' "$feed_failure/api-status.json" >"$feed_failure/status.tmp" && mv "$feed_failure/status.tmp" "$feed_failure/api-status.json"
-if run_collector "$feed_failure" >/dev/null 2>&1; then echo 'essential feed failure unexpectedly passed' >&2; exit 1; fi
+if run_collector "$feed_failure" >/dev/null 2>&1; then
+  echo 'essential feed failure unexpectedly passed' >&2
+  exit 1
+else
+  [ "$?" -eq 1 ]
+fi
 
 stale_feed=$root/stale-feed
 fixture "$stale_feed"
@@ -573,7 +578,12 @@ jq -nc '{event_type:"feed_error",recorded_ts:"2026-08-09T15:59:30Z",
 refresh_segment "$source"
 jq '.recorder_metrics.last_assigned_sequence=61 | .recorder_metrics.enqueued_total=61 | .recorder_metrics.persisted_total=61' \
   "$hour_feed_failure/api-status.json" >"$hour_feed_failure/status.tmp" && mv "$hour_feed_failure/status.tmp" "$hour_feed_failure/api-status.json"
-if run_collector "$hour_feed_failure" >/dev/null 2>&1; then echo 'target-hour feed error unexpectedly passed' >&2; exit 1; fi
+if run_collector "$hour_feed_failure" >/dev/null 2>&1; then
+  echo 'target-hour feed error unexpectedly passed' >&2
+  exit 1
+else
+  [ "$?" -eq 78 ]
+fi
 
 hour_health_gap=$root/hour-health-gap
 fixture "$hour_health_gap"
@@ -906,5 +916,6 @@ if grep -R -F 'fixture-access-token' "$root"/*/calls >/dev/null || grep -R -F 'f
   exit 1
 fi
 grep -F '/usr/bin/flock -w 300 9' "$collector" >/dev/null
+grep -Fx 'RestartPreventExitStatus=78' "$(dirname "$collector")/../systemd/polyedge-parity-hourly.service" >/dev/null
 
 echo 'parity hourly collector self-test passed'

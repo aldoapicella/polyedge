@@ -2,6 +2,7 @@
 set -eu
 
 die() { echo "polyedge-parity-hourly: $*" >&2; exit 1; }
+immutable_hour_rejection() { echo "polyedge-parity-hourly: $*" >&2; exit 78; }
 sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
 
 expected_uid=${POLYEDGE_PARITY_EXPECTED_UID:-0}
@@ -606,7 +607,7 @@ continuous_feed=$(jq -sce --argjson start "$target_epoch" --argjson end "$end_ep
       firstObservationUtc:$health[0].recordedAt,lastObservationUtc:$health[-1].recordedAt,maxGapSeconds:$gap}
     else error("essential feed health was not continuous") end
   else error("essential feed health observations are incomplete") end
-' "$feed_tmp") || die 'target hour lacks continuous essential feed health proof'
+' "$feed_tmp") || immutable_hour_rejection 'target hour lacks continuous essential feed health proof'
 hour_runs=$(printf '%s' "$segments" | jq -ce '
   . as $segments |
   ([$segments[].recorderRuns[]]) as $runs |
