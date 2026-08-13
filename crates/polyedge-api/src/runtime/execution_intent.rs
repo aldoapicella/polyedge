@@ -863,9 +863,21 @@ pub(super) fn build_execution_intent_with_model(
     if &token_id != expected_token {
         return Err("decision outcome does not match the selected token".to_owned());
     }
-    let price = decision
+    let requested_price = decision
         .price
         .ok_or_else(|| "decision price is missing".to_owned())?;
+    let best_ask = book
+        .best_ask()
+        .ok_or_else(|| "captured book has no ask".to_owned())?
+        .price;
+    let price = if settings.azure.strategy_intent_operator_direct {
+        if market.tick_size <= Decimal::ZERO {
+            return Err("venue tick_size must be positive".to_owned());
+        }
+        requested_price.min(best_ask - market.tick_size * Decimal::from(2))
+    } else {
+        requested_price
+    };
     if price <= Decimal::ZERO || price >= Decimal::ONE {
         return Err("decision price must be strictly between zero and one".to_owned());
     }
@@ -919,10 +931,6 @@ pub(super) fn build_execution_intent_with_model(
                 .to_owned(),
         );
     }
-    let best_ask = book
-        .best_ask()
-        .ok_or_else(|| "captured book has no ask".to_owned())?
-        .price;
     if price >= best_ask {
         return Err("post-only BUY would cross the captured ask".to_owned());
     }
@@ -2563,6 +2571,30 @@ mod tests {
         )
         .unwrap_err()
         .contains("outside the configured execution-intent expiry window"));
+    }
+
+    #[test]
+    fn operator_direct_reserves_two_ticks_of_post_only_handoff_headroom() {
+        let (mut settings, market, fair, reference, book, mut decision, metadata, now) = fixture();
+        decision.price = Some(Decimal::new(49, 2));
+
+        let ordinary = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(ordinary.price, Decimal::new(49, 2));
+
+        settings.azure.strategy_intent_operator_direct = true;
+        let funded = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        assert_eq!(funded.price, Decimal::new(48, 2));
+        let captured_ask = book.best_ask().unwrap().price;
+        let ask_after_one_tick_drop = captured_ask - market.tick_size;
+        let ask_after_two_tick_drop = captured_ask - market.tick_size * Decimal::from(2);
+        assert!(funded.price < ask_after_one_tick_drop);
+        assert!(funded.price >= ask_after_two_tick_drop);
     }
 
     #[test]
