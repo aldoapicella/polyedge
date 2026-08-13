@@ -1596,7 +1596,7 @@ test("all per-fill markout deadlines are scheduled concurrently", async () => {
       return { bids: [{ price: "0.45", size: "3" }], asks: [{ price: "0.55", size: "3" }], hash: "a".repeat(40) };
     }
   }, "token-1", () => visible, {
-    horizons: [10, 20, 30], horizonScaleMs: 1, pollMs: 1,
+    horizons: [100, 200, 300], horizonScaleMs: 1, pollMs: 1,
     feeParameters: { rate: 0, rateBps: 0, exponent: 0, takerOnly: true }
   });
   await new Promise((resolve) => setTimeout(resolve, 2));
@@ -1604,7 +1604,7 @@ test("all per-fill markout deadlines are scheduled concurrently", async () => {
   const rows = await capture.finish(fills);
   assert.equal(rows.length, 6);
   assert.deepEqual([...new Set(rows.map((row) => row.fill_id))], ["fill-a", "fill-b"]);
-  assert.deepEqual([...new Set(rows.map((row) => row.horizon_seconds))], [10, 20, 30]);
+  assert.deepEqual([...new Set(rows.map((row) => row.horizon_seconds))], [100, 200, 300]);
   assert.equal(calls.length, 6);
   assert.ok(rows.every((row) => row.fill_size > 0));
   assert.ok(rows.every((row) => row.midpoint !== null && row.executable_price !== null));
@@ -1612,7 +1612,7 @@ test("all per-fill markout deadlines are scheduled concurrently", async () => {
   assert.ok(rows.every((row) => row.observed_at === row.response_completed_at));
   assert.ok(rows.every((row) => row.response_duration_ms >= 0));
   assert.ok(rows.every((row) => /^sha256:[0-9a-f]{64}$/.test(row.book_hash)));
-  assert.ok(Date.now() - started < 100, "concurrent deadlines should complete near the longest horizon");
+  assert.ok(Date.now() - started < 500, "concurrent deadlines should complete near the longest horizon");
 });
 
 test("markout delay is measured after the order-book response completes", async () => {
