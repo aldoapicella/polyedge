@@ -19,6 +19,7 @@ const SESSION_SCHEMA_V1 = "polyedge.operator_funded_session.v1";
 const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
 const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
+const EXECUTION_HANDOFF_TTL_MS = 10_000;
 const MAX_INTENT_TTL_MS = 30_000;
 const MAX_PREFLIGHT_IDLE_MS = 10_800_000;
 
@@ -900,8 +901,7 @@ function qualificationRejection(
   if (!(validUntilMs <= sessionExpiryMs
     && Number.isFinite(venueExpiryMs)
     && venueExpiryMs === validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS
-    && Number(intent.ttl_ms) > 0
-    && Number(intent.ttl_ms) <= MAX_INTENT_TTL_MS
+    && Number(intent.ttl_ms) === EXECUTION_HANDOFF_TTL_MS
     && validUntilMs === decisionMs + Number(intent.ttl_ms))) return "expiry_binding";
   if (!(Number.isFinite(marketEndMs)
     && marketEndMs - decisionMs >= config.minimumSecondsToExpiry * 1_000
