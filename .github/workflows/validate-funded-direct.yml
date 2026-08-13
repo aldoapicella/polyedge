@@ -301,6 +301,8 @@ jobs:
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
           assert.match(rollback,
             /for attempt in \$\(seq 1 30\); do[\s\S]*ContainerAppOperationInProgress[\s\S]*sleep 10/);
+          assert.match(rollback,
+            /cmp funded-rollback-template\.json restored-funded-template\.json[\s\S]*az containerapp revision deactivate[\s\S]*properties\.active == true/);
           for (const retry of [
             "-o json > funded-preflight-logs.json || { sleep 10; continue; }",
             "--query '[0].Count' -o tsv) || { sleep 10; continue; }",
@@ -2827,6 +2829,27 @@ jobs:
           if [ "$exact_rollback" = true ]; then
             jq -S '.properties.template' restored-funded-revision.json > restored-funded-template.json
             cmp funded-rollback-template.json restored-funded-template.json
+            test "$(jq -r '.properties.active' restored-funded-revision.json)" = "true"
+            while read -r active_revision; do
+              if [ -n "$active_revision" ] && [ "$active_revision" != "$restored_revision" ]; then
+                az containerapp revision deactivate \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --name "$FUNDED_APP" \
+                  --revision "$active_revision" \
+                  --only-show-errors -o none
+              fi
+            done < <(az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --query '[?properties.active].name' -o tsv)
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              -o json > restored-funded-revisions.json
+            jq -e --arg revision "$restored_revision" '
+              ([.[] | select(.properties.active == true)] | length) == 1
+              and ([.[] | select(.properties.active == true)][0].name == $revision)
+            ' restored-funded-revisions.json >/dev/null
           else
             restored_env_value() {
               jq -er --arg name "$1" '
