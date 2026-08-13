@@ -806,10 +806,12 @@ async function currentPreflightIntent(clients, config, session, now, clock) {
       !hash(handoff?.intent_sha256)) {
     throw new Error("fail closed: funded current intent pointer binding is invalid");
   }
-  if (!Number.isFinite(decisionMs) ||
-      decisionMs < Date.parse(session.created_at) ||
-      decisionMs > now.getTime()) {
+  if (!Number.isFinite(decisionMs) || decisionMs > now.getTime()) {
     throw new Error("fail closed: funded current intent pointer decision time is invalid");
+  }
+  if (decisionMs < Date.parse(session.created_at)) {
+    recordIntentRejection(diagnostics, "decision_time", remainingTtlMs);
+    return { selected: null, diagnostics };
   }
   if (!Number.isFinite(validUntilMs) || validUntilMs <= decisionMs) {
     throw new Error("fail closed: funded current intent pointer expiry is invalid");

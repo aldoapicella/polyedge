@@ -573,6 +573,39 @@ test("pure preflight rejects a handoff that loses TTL during download then accep
   assert.equal(intents.listCalls, 0);
 });
 
+test("pure preflight waits past a valid pointer from before the funded session", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const fundedSession = preflightSession();
+  const stale = intent(new Date("2026-07-26T23:59:59Z"), "4".repeat(64));
+  const fresh = intent(now, "5".repeat(64));
+  const control = new Container({
+    [fundedSession.capital_policy.prior_state_blob_name]:
+      Buffer.from(JSON.stringify(predecessorState()))
+  });
+  const intents = new Container({
+    [`intents/${fresh.decision_id}.json`]: Buffer.from(JSON.stringify(fresh)),
+    "current-funded-intent.json": [
+      Buffer.from(JSON.stringify(handoff(stale))),
+      Buffer.from(JSON.stringify(handoff(fresh)))
+    ]
+  });
+
+  const output = await runFundedDirectWorker({
+    env: preflightEnv(fundedSession, { FUNDED_DIRECT_MAX_ITERATIONS: "2" }),
+    containers: { control, intents },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("preflight must not invoke a child")
+  });
+
+  assert.equal(output.status, "preflight_validated");
+  assert.equal(output.iteration, 2);
+  assert.equal(output.decisionId, fresh.decision_id);
+  assert.equal(control.uploadCalls, 0);
+  assert.equal(intents.uploadCalls, 0);
+  assert.equal(intents.listCalls, 0);
+});
+
 test("pure preflight fails closed for tampered current intent pointer bindings", async (t) => {
   const now = new Date("2026-07-27T12:00:00Z");
   const fundedSession = preflightSession();
