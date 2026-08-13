@@ -297,6 +297,14 @@ jobs:
             ready < enable && enable < first);
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /\(\.market_id \| tostring\) == \$warmup_market/);
+          for (const retry of [
+            "-o json > funded-preflight-logs.json || { sleep 10; continue; }",
+            "--query '[0].Count' -o tsv) || { sleep 10; continue; }",
+            "-o json > funded-heartbeat-final.json || { sleep 10; continue; }",
+            "-o json > funded-warmup-after-reopen.json || { sleep 5; continue; }",
+            "-o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }",
+            "-o json > funded-v9-lifecycle-latency.json || { sleep 10; continue; }"
+          ]) assert.ok(workflow.includes(retry), `missing bounded Log Analytics retry: ${retry}`);
           NODE
           git diff --check
 
@@ -1578,7 +1586,7 @@ jobs:
                 | where tostring(record.status) == 'preflight_validated'
                 | project TimeGenerated, Log_s
                 | order by TimeGenerated asc" \
-              -o json > funded-preflight-logs.json
+              -o json > funded-preflight-logs.json || { sleep 10; continue; }
             if jq -e --arg session_blob "$v9_prefix" --arg session_sha "sha256:15f7b4e2c749d401e9dbab01a6a9dca8ce81166948a5621a8b4c6dff536f4d22" --arg v5_state "$v5_state" --arg v5_sha "$v5_state_sha256" --arg intent_prefix "$intent_prefix" '
               length == 1
               and (.[0].Log_s | fromjson
@@ -2050,7 +2058,7 @@ jobs:
                 | where TimeGenerated >= datetime($replica_started_at)
                 | where Log_s contains '\"status\":\"persistent_service_started\"'
                 | count" \
-              --query '[0].Count' -o tsv)
+              --query '[0].Count' -o tsv) || { sleep 10; continue; }
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
@@ -2061,7 +2069,7 @@ jobs:
                 | where tostring(record.status) == 'persistent_service_heartbeat'
                 | top 1 by TimeGenerated desc
                 | project Log_s" \
-              -o json > funded-heartbeat-final.json
+              -o json > funded-heartbeat-final.json || { sleep 10; continue; }
             if [ "${startup_count:-0}" -ge 1 ] && jq -e '
                 length == 1
                 and .[0].properties.runningState == "Running"
@@ -2269,7 +2277,7 @@ jobs:
                 | where tostring(record.status) == 'market_warmed'
                 | top 1 by TimeGenerated desc
                 | project TimeGenerated, Log_s" \
-              -o json > funded-warmup-after-reopen.json
+              -o json > funded-warmup-after-reopen.json || { sleep 5; continue; }
             warmup_market=$(jq -r '.[0].Log_s // "{}" | fromjson | .market_id // ""' \
               funded-warmup-after-reopen.json)
             warmup_time=$(jq -r '.[0].TimeGenerated // ""' funded-warmup-after-reopen.json)
@@ -2285,7 +2293,7 @@ jobs:
                   | where tostring(record.executor.warmed_market.market_id) == '$warmup_market'
                   | top 1 by TimeGenerated desc
                   | project Log_s" \
-                -o json > funded-heartbeat-after-reopen.json
+                -o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }
               if jq -e '
                 length == 1
                 and (.[0].Log_s | fromjson
@@ -2440,7 +2448,7 @@ jobs:
                 | where tolong(record.signal_to_send_slo_ms) == 2000
                 | top 1 by TimeGenerated asc
                 | project TimeGenerated, Log_s" \
-              -o json > funded-v9-lifecycle-latency.json
+              -o json > funded-v9-lifecycle-latency.json || { sleep 10; continue; }
             if jq -e '
               length == 1
               and (.[0].Log_s | fromjson
