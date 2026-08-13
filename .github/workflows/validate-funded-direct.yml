@@ -1253,7 +1253,6 @@ jobs:
             --num-results '*' \
             --auth-mode login \
             --only-show-errors -o json > existing-v10-risk-reservations.json
-          completed_count=0
           while IFS= read -r existing_decision; do
             [[ "$existing_decision" =~ ^[0-9a-f]{64}$ ]]
             authorization_blob="${v10_authorization_prefix}${existing_decision}.json"
@@ -1320,12 +1319,14 @@ jobs:
             ' "$completion_file" >/dev/null
             auth_run=$(jq -r '.child_run_id' "$authorization_file")
             test "$(jq -r '.child_run_id' "$completion_file")" = "$auth_run"
+            reservation_count=$(jq --arg decision "$existing_decision" '
+              [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))] | length
+            ' existing-v10-risk-reservations.json)
             if [ "$(jq -r '.status' "$completion_file")" = "child_completed" ]; then
+              test "$reservation_count" = "1"
               reservation_blob=$(jq -r --arg decision "$existing_decision" '
-                [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))]
-                | if length == 1 then .[0].name else empty end
+                [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))][0].name
               ' existing-v10-risk-reservations.json)
-              test -n "$reservation_blob"
               reservation_file=$(mktemp)
               az storage blob download \
                 --account-name "$STORAGE_ACCOUNT" --container-name "$FUNDED_CONTAINER" \
@@ -1350,10 +1351,10 @@ jobs:
                       or .settlement_evidence_source == "polymarket_data_api_redeemable"))
                 )
               ' "$reservation_file" >/dev/null
-              completed_count=$((completed_count + 1))
+            else
+              test "$reservation_count" = "0"
             fi
           done < existing-v10-authorization-decisions.txt
-          test "$completed_count" -ge 1
           else
             test "$(jq --arg prefix "$v10_authorization_prefix" \
               '[.[].name | select(startswith($prefix))] | length' \
