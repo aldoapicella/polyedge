@@ -182,10 +182,10 @@ function containerSnapshot(container) {
     .map(([name, bytes]) => [name, Buffer.from(bytes).toString("hex")]);
 }
 
-function intent(now, id = "c".repeat(64), ttlMs = 10_000) {
+function intent(now, id = "c".repeat(64)) {
   const value = session();
   const decision = new Date(now.getTime() - 1_000);
-  const valid = new Date(decision.getTime() + ttlMs);
+  const valid = new Date(decision.getTime() + 10_000);
   return {
     schema: "polyedge.execution_intent.v1",
     decision_id: id,
@@ -210,7 +210,7 @@ function intent(now, id = "c".repeat(64), ttlMs = 10_000) {
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 300_000).toISOString(),
-    ttl_ms: ttlMs
+    ttl_ms: 10_000
   };
 }
 
@@ -530,7 +530,7 @@ test("pure preflight validates embedded session, predecessor, and fresh intent w
 
 test("pure preflight rejects a handoff that loses TTL during download then accepts the next pointer", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
-  const afterDownload = new Date(now.getTime() + 3_000);
+  const afterDownload = new Date(Date.parse(intent(now).valid_until) - 1_999);
   const fundedSession = preflightSession();
   const first = intent(now, "4".repeat(64));
   const second = intent(afterDownload, "5".repeat(64));
@@ -777,9 +777,9 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
   assert.equal(output.childInvocations, 1);
 });
 
-test("worker accepts a fifteen-second handoff with the reviewed seven-second margin", async () => {
+test("worker accepts the exact ten-second handoff at the reviewed seven-second boundary", async () => {
   const decisionClock = new Date("2026-07-27T12:00:00Z");
-  const value = intent(decisionClock, "9".repeat(64), 15_000);
+  const value = intent(decisionClock, "9".repeat(64));
   const observedClock = new Date(Date.parse(value.valid_until) - 7_000);
   const output = await runFundedDirectWorker({
     env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
@@ -792,6 +792,26 @@ test("worker accepts a fifteen-second handoff with the reviewed seven-second mar
     invokeChild: async () => ({ exitCode: 0, error: "" })
   });
   assert.equal(output.childInvocations, 1);
+});
+
+test("worker rejects a handoff whose immutable TTL is not exactly ten seconds", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "8".repeat(64));
+  value.ttl_ms = 15_000;
+  value.valid_until = new Date(Date.parse(value.decision_ts) + value.ttl_ms).toISOString();
+  value.gtd_expiry_ts = new Date(Date.parse(value.valid_until) + 300_000).toISOString();
+  const output = await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: {
+      control: new Container(),
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => assert.fail("non-ten-second handoff must not execute")
+  });
+  assert.equal(output.intent_scan.last_rejection, "expiry_binding");
+  assert.equal(output.childInvocations, 0);
 });
 
 test("worker rejects principal-only sizing that exceeds the funded target after fees", async () => {
@@ -812,24 +832,53 @@ test("worker rejects principal-only sizing that exceeds the funded target after 
   assert.equal(output.childInvocations, 0);
 });
 
-test("stale handoff is rejected before authorization and creates no reservation", async () => {
+test("handoff that exhausts the child margin before authorization creates no authorization", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "1".repeat(64));
   const control = new Container();
-  let clockCalls = 0;
+  const admittedAt = new Date(Date.parse(value.valid_until) - 7_000);
+  const exhaustedAt = new Date(Date.parse(value.valid_until) - 1_999);
+  const times = [admittedAt, exhaustedAt];
   const output = await runFundedDirectWorker({
     env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
     containers: {
       control,
       intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
     },
-    clock: () => clockCalls++ === 0 ? now : new Date(now.getTime() + 3_000),
+    clock: () => times.shift() || exhaustedAt,
     sleep: async () => {},
     invokeChild: async () => assert.fail("stale handoff must not launch a child")
   });
   assert.equal(output.childInvocations, 0);
   assert.equal([...control.values.keys()].some((name) => name.includes("/authorizations/")), false);
   assert.equal([...control.values.keys()].some((name) => name.includes("risk-reservations")), false);
+});
+
+test("admitted handoff can spend the worker margin before the child gate", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "6".repeat(64));
+  const bytes = Buffer.from(JSON.stringify(value));
+  const validUntilMs = Date.parse(value.valid_until);
+  const admittedAt = new Date(validUntilMs - 7_000);
+  const verifiedAt = new Date(validUntilMs - 3_500);
+  const launchAt = new Date(validUntilMs - 2_500);
+  const times = [admittedAt, verifiedAt, verifiedAt, launchAt];
+  let executions = 0;
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: {
+      control: new Container(),
+      intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+    },
+    clock: () => times.shift() || launchAt,
+    executeCanary: async () => {
+      executions += 1;
+      return { order_submission_attempted: false };
+    }
+  });
+  const output = await processor.process(handoff(value));
+  assert.equal(output.status, "persistent_intent_completed");
+  assert.equal(executions, 1);
 });
 
 test("worker reports when scan latency leaves less than the reviewed intent TTL", async () => {

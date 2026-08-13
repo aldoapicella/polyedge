@@ -19,6 +19,7 @@ const SESSION_SCHEMA_V1 = "polyedge.operator_funded_session.v1";
 const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
 const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
 const AUTHORIZATION_SCHEMA = "polyedge.operator_funded_intent_authorization.v1";
+const EXECUTION_HANDOFF_TTL_MS = 10_000;
 const MAX_INTENT_TTL_MS = 30_000;
 const MAX_PREFLIGHT_IDLE_MS = 10_800_000;
 
@@ -109,7 +110,7 @@ export function loadFundedDirectConfig(env = process.env) {
   }
   if (String(env.FUNDED_DIRECT_ENGINE || "") === "persistent_v1" &&
       (config.minRemainingTtlMs !== 7_000 || config.childMinRemainingTtlMs !== 2_000)) {
-    errors.push("persistent_v1 requires the reviewed 7000ms authorization and 2000ms child TTL gates");
+    errors.push("persistent_v1 requires the reviewed 7000ms admission and 2000ms child TTL gates");
   }
   if (errors.length) throw new Error(`funded_direct_worker blocked: ${errors.join("; ")}`);
   validateSession(config);
@@ -307,7 +308,7 @@ async function executeSelectedIntent({
   executionTiming = {}
 }) {
   const authorizationNow = clock();
-  if (!hasMinimumRemainingTtl(selected.value, authorizationNow, config.minRemainingTtlMs)) {
+  if (!hasMinimumRemainingTtl(selected.value, authorizationNow, config.childMinRemainingTtlMs)) {
     return {
       childInvocations,
       result: result("stale_handoff_rejected", config, {
@@ -516,10 +517,10 @@ async function selectedFromHandoff(
   const bytes = await streamToBuffer(response.readableStreamBody);
   const downloadedAt = clock();
   const remainingTtlMs = Date.parse(handoff.valid_until) - downloadedAt.getTime();
-  if (!Number.isFinite(remainingTtlMs) || remainingTtlMs < config.minRemainingTtlMs) {
+  if (!Number.isFinite(remainingTtlMs) || remainingTtlMs < config.childMinRemainingTtlMs) {
     throw fundedHandoffRejection(
       "remaining_ttl",
-      "fail closed: funded intent handoff expired during immutable intent download",
+      "fail closed: funded intent handoff has insufficient child TTL after immutable intent download",
       remainingTtlMs
     );
   }
@@ -531,7 +532,15 @@ async function selectedFromHandoff(
   if (value.decision_id !== decisionId ||
       value.decision_ts !== handoff.decision_ts ||
       value.valid_until !== handoff.valid_until ||
-      !qualifies(value, blobName, actualHash, config, session, downloadedAt)) {
+      !qualifies(
+        value,
+        blobName,
+        actualHash,
+        config,
+        session,
+        downloadedAt,
+        config.childMinRemainingTtlMs
+      )) {
     throw new Error("fail closed: funded intent handoff does not qualify for execution");
   }
   const authorizationName = authorizationBlobName(config, session, value);
@@ -851,7 +860,15 @@ function fundedHandoffRejection(code, message, remainingTtlMs = null) {
   return error;
 }
 
-function qualificationRejection(intent, blobName, intentHash, config, session, now) {
+function qualificationRejection(
+  intent,
+  blobName,
+  intentHash,
+  config,
+  session,
+  now,
+  minimumRemainingTtlMs = config.minRemainingTtlMs
+) {
   const decisionMs = Date.parse(intent?.decision_ts);
   const validUntilMs = Date.parse(intent?.valid_until);
   const venueExpiryMs = Date.parse(intent?.gtd_expiry_ts);
@@ -880,12 +897,11 @@ function qualificationRejection(intent, blobName, intentHash, config, session, n
     && intent.post_only === true
     && intent.order_kind === "post_only_gtd")) return "execution_policy";
   if (!(Number.isFinite(decisionMs) && decisionMs >= sessionStartMs && decisionMs <= nowMs)) return "decision_time";
-  if (!(Number.isFinite(validUntilMs) && validUntilMs - nowMs >= config.minRemainingTtlMs)) return "remaining_ttl";
+  if (!(Number.isFinite(validUntilMs) && validUntilMs - nowMs >= minimumRemainingTtlMs)) return "remaining_ttl";
   if (!(validUntilMs <= sessionExpiryMs
     && Number.isFinite(venueExpiryMs)
     && venueExpiryMs === validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS
-    && Number(intent.ttl_ms) > 0
-    && Number(intent.ttl_ms) <= MAX_INTENT_TTL_MS
+    && Number(intent.ttl_ms) === EXECUTION_HANDOFF_TTL_MS
     && validUntilMs === decisionMs + Number(intent.ttl_ms))) return "expiry_binding";
   if (!(Number.isFinite(marketEndMs)
     && marketEndMs - decisionMs >= config.minimumSecondsToExpiry * 1_000
@@ -907,8 +923,16 @@ function qualificationRejection(intent, blobName, intentHash, config, session, n
   return null;
 }
 
-function qualifies(intent, blobName, intentHash, config, session, now) {
-  return qualificationRejection(intent, blobName, intentHash, config, session, now) === null;
+function qualifies(intent, blobName, intentHash, config, session, now, minimumRemainingTtlMs) {
+  return qualificationRejection(
+    intent,
+    blobName,
+    intentHash,
+    config,
+    session,
+    now,
+    minimumRemainingTtlMs
+  ) === null;
 }
 
 function intentScanDiagnostics() {
