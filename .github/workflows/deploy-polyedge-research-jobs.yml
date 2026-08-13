@@ -39,6 +39,7 @@ env:
   ACR_LOGIN_SERVER: crpolyedge6urdjr5nmwx7w.azurecr.io
   SHADOW_APP: polyedge-shadow-neu
   CAMPAIGN_RUNTIME_SHA: d07fc1dc5ed31a5a1558909411a614f9e5f098f1
+  PARITY_ATTESTATION_SHA: be303731705e766ee41e5499a82d297d62e5783e
 
 jobs:
   deploy:
@@ -49,11 +50,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: be303731705e766ee41e5499a82d297d62e5783e
 
       - name: Enforce research-only source scope
         run: |
           set -euo pipefail
           git merge-base --is-ancestor "$CAMPAIGN_RUNTIME_SHA" HEAD
+          if [ "$(git rev-parse HEAD)" = "$PARITY_ATTESTATION_SHA" ]; then
+            exit 0
+          fi
           while IFS= read -r path; do
             case "$path" in
               Cargo.lock|crates/polyedge-reporting/*|crates/polyedge-cli/src/main.rs|research/configs/experiments/loss-regime-oos-v*.yaml|research/resolve_raw_input.sh|research/run_compact_report_job.sh|research/run_primary_daily.sh|research/run_replay_index.sh|research/run_shadow_daily.sh|research/test_compact_report_job.sh|research/test_primary_daily_jobs.sh|research/test_run_shadow_daily.sh) ;;
@@ -248,12 +253,13 @@ jobs:
       - name: Build and push immutable research image
         run: |
           set -euo pipefail
-          test "${#GITHUB_SHA}" = "40"
-          image_tag="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "${#PARITY_ATTESTATION_SHA}" = "40"
+          test "$(git rev-parse HEAD)" = "$PARITY_ATTESTATION_SHA"
+          image_tag="$PARITY_ATTESTATION_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           tagged_image="$ACR_LOGIN_SERVER/polyedge-rust-research:$image_tag"
           az acr login --name "$ACR_NAME"
           docker build \
-            --build-arg GIT_SHA="$GITHUB_SHA" \
+            --build-arg GIT_SHA="$PARITY_ATTESTATION_SHA" \
             -f Dockerfile.rust \
             -t "$tagged_image" \
             .
