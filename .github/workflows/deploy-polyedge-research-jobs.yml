@@ -38,6 +38,12 @@ env:
   ACR_NAME: crpolyedge6urdjr5nmwx7w
   ACR_LOGIN_SERVER: crpolyedge6urdjr5nmwx7w.azurecr.io
   SHADOW_APP: polyedge-shadow-neu
+  PROTECTED_QSET_APP: polyedge-shadow-qset-neu
+  PROTECTED_QSET_IMAGE: crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend@sha256:e31dbc1b47eed665a6c5bb5b03418e6b0a7bae6632cd82da5079a078d975d670
+  PROTECTED_QSET_FREEZE_SHA: sha256:96e34ad8ae268a50b64a3ace7e0d3bcde8a4c720252a9464476e89423e8cce06
+  STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
+  QSET_CAMPAIGN_ID: campaign-2026-07-28-qset-v1
+  QSET_CONTROL_CONTAINER: polyedge-qset-control
   CAMPAIGN_RUNTIME_SHA: d07fc1dc5ed31a5a1558909411a614f9e5f098f1
   PARITY_ATTESTATION_SHA: be303731705e766ee41e5499a82d297d62e5783e
 
@@ -100,7 +106,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Validate target and freeze shadow identity
+      - name: Validate target and snapshot protected workloads
         id: safety
         env:
           TARGET_JOB: ${{ inputs.target_job }}
@@ -115,12 +121,61 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$SHADOW_APP" \
             -o json)
-          shadow_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$shadow_json")
+          shadow_revision=$(jq -r '.properties.latestRevisionName' <<<"$shadow_json")
           shadow_image=$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .image' <<<"$shadow_json")
           test -n "$shadow_revision"
-          test "$shadow_image" = "$ACR_LOGIN_SERVER/polyedge-rust-backend:$CAMPAIGN_RUNTIME_SHA"
+          test "$(jq -r '.properties.latestReadyRevisionName' <<<"$shadow_json")" = "$shadow_revision"
+          shadow_digest=${shadow_image#"$ACR_LOGIN_SERVER/polyedge-rust-backend@sha256:"}
+          test "$shadow_digest" != "$shadow_image"
+          [[ "$shadow_digest" =~ ^[0-9a-f]{64}$ ]]
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$shadow_json")" = "paper"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$shadow_json")" = "false"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ENABLE_TAKER_ORDERS") | .value' <<<"$shadow_json")" = "false"
           echo "shadow_revision=$shadow_revision" >> "$GITHUB_OUTPUT"
           echo "shadow_image=$shadow_image" >> "$GITHUB_OUTPUT"
+
+          qset_json=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$PROTECTED_QSET_APP" \
+            -o json)
+          qset_revision=$(jq -r '.properties.latestRevisionName' <<<"$qset_json")
+          qset_image=$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .image' <<<"$qset_json")
+          test -n "$qset_revision"
+          test "$(jq -r '.properties.latestReadyRevisionName' <<<"$qset_json")" = "$qset_revision"
+          test "$qset_image" = "$PROTECTED_QSET_IMAGE"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$qset_json")" = "paper"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$qset_json")" = "false"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ENABLE_TAKER_ORDERS") | .value' <<<"$qset_json")" = "false"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' <<<"$qset_json")" = "$QSET_CAMPAIGN_ID"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "SHADOW_CODE_FREEZE_SHA256") | .value' <<<"$qset_json")" = "$PROTECTED_QSET_FREEZE_SHA"
+          qset_app_sha=$(jq -S '{identity,managedEnvironmentId:.properties.managedEnvironmentId,workloadProfileName:.properties.workloadProfileName,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' <<<"$qset_json" | sha256sum | cut -d' ' -f1)
+          policy_json=$(az storage container immutability-policy show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$QSET_CONTROL_CONTAINER" \
+            -o json)
+          test "$(jq -r '.state' <<<"$policy_json")" = "Locked"
+          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" -ge 90
+          active_path="reports/research/shadow/campaigns/$QSET_CAMPAIGN_ID/control/code-freeze/active.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$QSET_CONTROL_CONTAINER" \
+            --name "$active_path" \
+            --file qset-active-freeze-before.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors \
+            -o none
+          jq -e --arg id "$QSET_CAMPAIGN_ID" --arg app_sha "sha256:$qset_app_sha" '
+            .schema == "polyedge.shadow_code_freeze_pointer.v1"
+            and .campaign_id == $id
+            and .code_frozen == true
+            and .live_invariants.qset_app_sha256 == $app_sha
+          ' qset-active-freeze-before.json >/dev/null
+          echo "qset_revision=$qset_revision" >> "$GITHUB_OUTPUT"
+          echo "qset_image=$qset_image" >> "$GITHUB_OUTPUT"
+          echo "qset_app_sha=$qset_app_sha" >> "$GITHUB_OUTPUT"
+          echo "qset_freeze_sha=$(sha256sum qset-active-freeze-before.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
           if [ "$TARGET_JOB" = "build-only" ]; then
             exit 0
@@ -428,33 +483,82 @@ jobs:
             test "$secret_refs" = '[{"name":"API_BEARER_TOKEN","secretRef":"api-bearer-token"}]'
           fi
 
-      - name: Prove recorder was not changed
+      - name: Prove protected workloads were not changed
         env:
           EXPECTED_REVISION: ${{ steps.safety.outputs.shadow_revision }}
           EXPECTED_IMAGE: ${{ steps.safety.outputs.shadow_image }}
+          EXPECTED_QSET_REVISION: ${{ steps.safety.outputs.qset_revision }}
+          EXPECTED_QSET_IMAGE: ${{ steps.safety.outputs.qset_image }}
+          EXPECTED_QSET_APP_SHA: ${{ steps.safety.outputs.qset_app_sha }}
+          EXPECTED_QSET_FREEZE_SHA: ${{ steps.safety.outputs.qset_freeze_sha }}
         run: |
           set -euo pipefail
           shadow_json=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$SHADOW_APP" \
             -o json)
-          actual_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$shadow_json")
+          actual_revision=$(jq -r '.properties.latestRevisionName' <<<"$shadow_json")
           actual_image=$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .image' <<<"$shadow_json")
           test "$actual_revision" = "$EXPECTED_REVISION"
+          test "$(jq -r '.properties.latestReadyRevisionName' <<<"$shadow_json")" = "$EXPECTED_REVISION"
           test "$actual_image" = "$EXPECTED_IMAGE"
           test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$shadow_json")" = "paper"
           test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$shadow_json")" = "false"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ENABLE_TAKER_ORDERS") | .value' <<<"$shadow_json")" = "false"
+
+          qset_json=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$PROTECTED_QSET_APP" \
+            -o json)
+          actual_qset_revision=$(jq -r '.properties.latestRevisionName' <<<"$qset_json")
+          actual_qset_image=$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .image' <<<"$qset_json")
+          test "$actual_qset_revision" = "$EXPECTED_QSET_REVISION"
+          test "$(jq -r '.properties.latestReadyRevisionName' <<<"$qset_json")" = "$EXPECTED_QSET_REVISION"
+          test "$actual_qset_image" = "$EXPECTED_QSET_IMAGE"
+          qset_app_sha=$(jq -S '{identity,managedEnvironmentId:.properties.managedEnvironmentId,workloadProfileName:.properties.workloadProfileName,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' <<<"$qset_json" | sha256sum | cut -d' ' -f1)
+          test "$qset_app_sha" = "$EXPECTED_QSET_APP_SHA"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$qset_json")" = "paper"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$qset_json")" = "false"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "ENABLE_TAKER_ORDERS") | .value' <<<"$qset_json")" = "false"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' <<<"$qset_json")" = "$QSET_CAMPAIGN_ID"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "shadow-runtime") | .env[] | select(.name == "SHADOW_CODE_FREEZE_SHA256") | .value' <<<"$qset_json")" = "$PROTECTED_QSET_FREEZE_SHA"
+          policy_json=$(az storage container immutability-policy show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$QSET_CONTROL_CONTAINER" \
+            -o json)
+          test "$(jq -r '.state' <<<"$policy_json")" = "Locked"
+          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" -ge 90
+          active_path="reports/research/shadow/campaigns/$QSET_CAMPAIGN_ID/control/code-freeze/active.json"
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$QSET_CONTROL_CONTAINER" \
+            --name "$active_path" \
+            --file qset-active-freeze-after.json \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors \
+            -o none
+          test "$(sha256sum qset-active-freeze-after.json | cut -d' ' -f1)" = "$EXPECTED_QSET_FREEZE_SHA"
+          jq -e --arg id "$QSET_CAMPAIGN_ID" --arg app_sha "sha256:$qset_app_sha" '
+            .schema == "polyedge.shadow_code_freeze_pointer.v1"
+            and .campaign_id == $id
+            and .code_frozen == true
+            and .live_invariants.qset_app_sha256 == $app_sha
+          ' qset-active-freeze-after.json >/dev/null
 
       - name: Publish deployment summary
         env:
           TARGET_JOB: ${{ inputs.target_job }}
           SHADOW_REVISION: ${{ steps.safety.outputs.shadow_revision }}
+          QSET_REVISION: ${{ steps.safety.outputs.qset_revision }}
         run: |
           {
             echo "## PolyEdge research image"
             echo
             echo "- Target: \`$TARGET_JOB\`"
             echo "- Image: \`$RESEARCH_IMAGE\`"
-            echo "- Frozen shadow revision (unchanged): \`$SHADOW_REVISION\`"
+            echo "- Funded intent producer revision (unchanged): \`$SHADOW_REVISION\`"
+            echo "- Frozen qset revision and guard (unchanged): \`$QSET_REVISION\`"
             echo "- Funded execution: not targeted"
           } >> "$GITHUB_STEP_SUMMARY"
