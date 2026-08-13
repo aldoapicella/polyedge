@@ -82,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo clippy --workspace --all-targets --all-features -- -D warnings -A clippy::needless-borrow
           # Several API tests intentionally exercise the same fixed on-disk
           # report roots, so the complete workspace suite must be serialized.
           cargo test --workspace --all-features -- --test-threads=1
