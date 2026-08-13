@@ -21,13 +21,13 @@ use std::sync::{
 use std::time::Instant;
 
 const MAX_INTENT_TTL_MS: i64 = 30_000;
-// Preserve the frozen producer contract: every funded handoff remains valid
-// for exactly the strategy's immutable ten-second quote lifecycle.
+// Preserve the frozen ten-second contract outside the operator-direct lane.
 const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
+const OPERATOR_DIRECT_EXECUTION_HANDOFF_TTL_MS: i64 = 15_000;
 // A decision cycle can emit several independently authenticated PLACE intents.
 // Keep their immutable blob commits and Service Bus handoffs bounded but
-// concurrent so one slow Azure request cannot consume another intent's frozen
-// ten-second lifetime. Warmups prepare these same executable lanes below.
+// concurrent so one slow Azure request cannot consume another intent's short
+// lifetime. Warmups prepare these same executable lanes below.
 const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
 const CURRENT_FUNDED_INTENT_CAS_ATTEMPTS: usize = 4;
 const POINTER_ONLY_PREFLIGHT_ENV: &str = "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT";
@@ -958,7 +958,11 @@ pub(super) fn build_execution_intent_with_model(
         .ttl_ms
         .unwrap_or(settings.strategy.order_ttl_seconds * 1_000)
         .clamp(1, MAX_INTENT_TTL_MS);
-    let ttl_ms = strategy_ttl_ms.max(EXECUTION_HANDOFF_TTL_MS);
+    let ttl_ms = strategy_ttl_ms.max(if settings.azure.strategy_intent_operator_direct {
+        OPERATOR_DIRECT_EXECUTION_HANDOFF_TTL_MS
+    } else {
+        EXECUTION_HANDOFF_TTL_MS
+    });
     let valid_until = decision_ts + Duration::milliseconds(ttl_ms);
     let gtd_expiry_ts = valid_until + Duration::seconds(VENUE_GTD_SECURITY_BUFFER_SECONDS);
     let book_hash = canonical_book_hash(market, book);
@@ -1869,15 +1873,17 @@ mod tests {
     }
 
     #[test]
-    fn builds_canary_schema_with_hash_address_and_conservative_edge() {
+    fn non_operator_direct_uses_ten_second_schema_and_gtd_binding() {
         let (settings, market, fair, reference, book, decision, metadata, now) = fixture();
         let intent = build_execution_intent(
             &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
         )
         .unwrap();
         intent.validate().unwrap();
+        assert_eq!(intent.schema, EXECUTION_INTENT_V1_SCHEMA);
         assert_eq!(intent.order_kind, OrderKind::PostOnlyGtd);
         assert_eq!(intent.ttl_ms, EXECUTION_HANDOFF_TTL_MS);
+        assert_eq!(intent.valid_until, now + Duration::seconds(10));
         assert_eq!(
             intent.gtd_expiry_ts,
             Some(intent.valid_until + Duration::seconds(300))
@@ -1893,6 +1899,24 @@ mod tests {
         assert_eq!(
             intent_blob_name("reports/intents", &intent.decision_id).unwrap(),
             format!("reports/intents/{}.json", intent.decision_id)
+        );
+    }
+
+    #[test]
+    fn operator_direct_uses_fifteen_second_schema_and_gtd_binding() {
+        let (mut settings, market, fair, reference, book, decision, metadata, now) = fixture();
+        settings.azure.strategy_intent_operator_direct = true;
+        let intent = build_execution_intent(
+            &settings, &market, &fair, &reference, &book, &decision, &metadata, now,
+        )
+        .unwrap();
+        intent.validate().unwrap();
+        assert_eq!(intent.schema, EXECUTION_INTENT_V1_SCHEMA);
+        assert_eq!(intent.ttl_ms, OPERATOR_DIRECT_EXECUTION_HANDOFF_TTL_MS);
+        assert_eq!(intent.valid_until, now + Duration::seconds(15));
+        assert_eq!(
+            intent.gtd_expiry_ts,
+            Some(intent.valid_until + Duration::seconds(300))
         );
     }
 

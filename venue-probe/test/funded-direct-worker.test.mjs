@@ -182,10 +182,10 @@ function containerSnapshot(container) {
     .map(([name, bytes]) => [name, Buffer.from(bytes).toString("hex")]);
 }
 
-function intent(now, id = "c".repeat(64)) {
+function intent(now, id = "c".repeat(64), ttlMs = 10_000) {
   const value = session();
   const decision = new Date(now.getTime() - 1_000);
-  const valid = new Date(decision.getTime() + 10_000);
+  const valid = new Date(decision.getTime() + ttlMs);
   return {
     schema: "polyedge.execution_intent.v1",
     decision_id: id,
@@ -210,7 +210,7 @@ function intent(now, id = "c".repeat(64)) {
     market_end_ts: new Date(decision.getTime() + 600_000).toISOString(),
     valid_until: valid.toISOString(),
     gtd_expiry_ts: new Date(valid.getTime() + 300_000).toISOString(),
-    ttl_ms: 10_000
+    ttl_ms: ttlMs
   };
 }
 
@@ -774,6 +774,23 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
   });
   assert.equal(calls, 1);
   assert.equal(output.status, "iteration_limit_reached");
+  assert.equal(output.childInvocations, 1);
+});
+
+test("worker accepts a fifteen-second handoff with the reviewed seven-second margin", async () => {
+  const decisionClock = new Date("2026-07-27T12:00:00Z");
+  const value = intent(decisionClock, "9".repeat(64), 15_000);
+  const observedClock = new Date(Date.parse(value.valid_until) - 7_000);
+  const output = await runFundedDirectWorker({
+    env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
+    containers: {
+      control: new Container(),
+      intents: new Container({ [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value)) })
+    },
+    clock: () => observedClock,
+    sleep: async () => {},
+    invokeChild: async () => ({ exitCode: 0, error: "" })
+  });
   assert.equal(output.childInvocations, 1);
 });
 

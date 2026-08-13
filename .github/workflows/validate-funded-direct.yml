@@ -164,7 +164,7 @@ jobs:
           assert.equal(queue.properties.status, "[parameters('fundedDirectQueueStatus')]");
           assert.equal(queue.properties.requiresDuplicateDetection, true);
           assert.equal(queue.properties.duplicateDetectionHistoryTimeWindow, "PT10M");
-          assert.equal(queue.properties.defaultMessageTimeToLive, "PT10S");
+          assert.equal(queue.properties.defaultMessageTimeToLive, "PT15S");
           assert.equal(queue.properties.lockDuration, "PT30S");
           assert.equal(queue.properties.deadLetteringOnMessageExpiration, true);
           assert.equal(queue.properties.maxDeliveryCount, 3);
@@ -1659,7 +1659,7 @@ jobs:
             Number.isFinite(validUntil) && Number.isFinite(gtdExpiry) && Number.isFinite(modifiedAt));
           assert.ok(decisionAt >= parsedStarted, "intent decision predates pointer-only cutoff");
           assert.ok(modifiedAt >= parsedStarted, "intent blob predates pointer-only cutoff");
-          assert.ok(Number.isInteger(intent.ttl_ms) && intent.ttl_ms >= 1_000 && intent.ttl_ms <= 30_000);
+          assert.equal(intent.ttl_ms, 15_000);
           assert.equal(validUntil, decisionAt + intent.ttl_ms);
           assert.equal(gtdExpiry, validUntil + 300_000);
           assert.ok(intent.market_end_ts && Date.parse(intent.market_end_ts) > validUntil);
@@ -1993,7 +1993,7 @@ jobs:
           test "$(jq -r '.requiresDuplicateDetection' service-bus-queue.json)" = "true"
           test "$(jq -r '.status' service-bus-queue.json)" = "SendDisabled"
           test "$(jq -r '.duplicateDetectionHistoryTimeWindow' service-bus-queue.json)" = "PT10M"
-          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT10S"
+          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT15S"
           test "$(jq -r '.deadLetteringOnMessageExpiration' service-bus-queue.json)" = "true"
           test "$(jq -r '.maxDeliveryCount' service-bus-queue.json)" = "3"
           az servicebus namespace network-rule-set show \
