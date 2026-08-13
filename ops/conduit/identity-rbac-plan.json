@@ -8,7 +8,8 @@
     "blobContributor": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
     "blobReader": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
     "tableContributor": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
-    "serviceBusReceiver": "4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0"
+    "serviceBusReceiver": "4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0",
+    "acaJobExecutionReader": "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
   },
   "scopePrefixes": {
     "storage": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/",
@@ -19,19 +20,58 @@
       "identity": "id-polyedge-conduit-api",
       "subject": "spiffe://polyedge.local/conduit/api",
       "assignments": [
-        { "role": "blobContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotEventIndex" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotChartSeries" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotMarketCatalog" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeDataFreshness" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeResearchRuns" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeProspectiveResults" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeExclusionWindows" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeResearchArtifacts" },
-        { "role": "tableContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeJobStatus" }
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotEventIndex"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotChartSeries"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotMarketCatalog"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeDataFreshness"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeResearchRuns"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeProspectiveResults"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeExclusionWindows"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeResearchArtifacts"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeJobStatus"
+        }
       ],
       "negativeAssertions": [
         "no subscription, resource-group, storage-account, Key Vault, or Service Bus role",
@@ -43,18 +83,32 @@
       "identity": "id-polyedge-conduit-research",
       "subject": "spiffe://polyedge.local/conduit/research",
       "assignments": [
-        { "role": "blobContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events" }
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events"
+        },
+        {
+          "role": "acaJobExecutionReader",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job",
+          "id": "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
+        }
       ],
       "negativeAssertions": [
-        "no table, Service Bus, qset, funded-evidence, storage-account, resource-group, or subscription role"
+        "no table, Service Bus, qset, funded-evidence, storage-account, resource-group, subscription, or broad Microsoft.App jobs role"
       ]
     },
     "shadow-qset": {
       "identity": "id-polyedge-conduit-shadow-qset",
       "subject": "spiffe://polyedge.local/conduit/shadow-qset",
       "assignments": [
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events" },
-        { "role": "blobContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset" }
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events"
+        },
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset"
+        }
       ],
       "negativeAssertions": [
         "no primary, funded, control, table, Service Bus, storage-account, resource-group, or subscription role"
@@ -64,11 +118,26 @@
       "identity": "id-polyedge-conduit-funded-signer",
       "subject": "spiffe://polyedge.local/conduit/funded-signer",
       "assignments": [
-        { "role": "blobContributor", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research" },
-        { "role": "blobReader", "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models" },
-        { "role": "serviceBusReceiver", "scope": "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents" }
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models"
+        },
+        {
+          "role": "serviceBusReceiver",
+          "scope": "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+        }
       ],
       "negativeAssertions": [
         "no Service Bus sender, qset, bot-events, table, storage-account, namespace, resource-group, or subscription role"
@@ -82,6 +151,23 @@
     "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events",
     "negativeAssertions": [
       "no reuse by api, research, shadow-qset, or funded-signer"
+    ]
+  },
+  "githubDeployment": {
+    "identity": "id-github-polyedge-dev",
+    "clientId": "cdd9f62c-bbdf-4d4b-80a9-9514b76ca1e8",
+    "principalId": "0c41f66d-fe14-42e1-b6c1-643d7fc2a2a3",
+    "assignment": {
+      "id": "839dda8c-f69d-4f3c-8fb5-052ddcaaa9fd",
+      "role": "blobReader",
+      "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events"
+    },
+    "purpose": "read-only current-funded-intent pointer proof",
+    "controlPlaneRoles": "preexisting resource-group Contributor and User Access Administrator are out of this migration data-plane proof",
+    "negativeAssertions": [
+      "no blob write role",
+      "no storage-account scope data-plane role",
+      "no storage account keys or SAS"
     ]
   }
 }

@@ -8,6 +8,7 @@ on:
       - 'crates/polyedge-cli/**'
       - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
+      - 'infra/conduit-data-roles.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
       - '.github/workflows/validate-conduit-federation.yml'
@@ -19,6 +20,7 @@ on:
       - 'crates/polyedge-cli/**'
       - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
+      - 'infra/conduit-data-roles.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
       - '.github/workflows/validate-conduit-federation.yml'
@@ -90,19 +92,39 @@ jobs:
             .status == "applied-live-verified"
             and .proof == "identity-rbac-proof.json"
             and (.lanes | keys == ["api", "funded-signer", "research", "shadow-qset"])
-            and ([.lanes[].assignments[]] | length == 21)
+            and ([.lanes[].assignments[]] | length == 22)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
+            and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+            and (.lanes.research.assignments[] | select(
+              .role == "acaJobExecutionReader"
+              and .id == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
+              and .scope == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job"
+            ))
+            and .githubDeployment.assignment.role == "blobReader"
+            and (.githubDeployment.negativeAssertions | length) == 3
           ' ops/conduit/identity-rbac-plan.json
           jq -e '
             .status == "live-verified"
             and .secretsOrTokensCaptured == false
             and .issuer.validTls
             and .jwtSvid.perLaneOwnerOnlyFiles
-            and ([.lanes[].assignmentCount] | add) == 21
+            and ([.lanes[].assignmentCount] | add) == 22
             and all(.lanes[]; .exactPlanMatch)
             and all(.lanes[]; all(.negativeAssertions[]; .passed))
             and .arc.unchanged
+            and .roleDefinitions.acaJobExecutionReader.id == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+            and .roleDefinitions.acaJobExecutionReader.actions == ["Microsoft.App/jobs/execution/read"]
+            and .roleDefinitions.acaJobExecutionReader.dataActions == []
+            and .roleDefinitions.acaJobExecutionReader.exactDefinitionMatch
+            and (.lanes.research.positiveChecks[] | select(
+              .operation == "Microsoft.App/jobs/execution/read"
+              and .assignmentId == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
+              and .result == "success"
+            ))
+            and .githubDeployment.assignment.id == "839dda8c-f69d-4f3c-8fb5-052ddcaaa9fd"
+            and .githubDeployment.assignment.role == "Storage Blob Data Reader"
+            and all(.githubDeployment.negativeAssertions[]; .passed)
           ' ops/conduit/identity-rbac-proof.json
 
       - name: Validate isolated UAMI federation template
@@ -125,6 +147,21 @@ jobs:
               | length]
             == [1])
           ' conduit-federated-identity.json
+          az bicep build --file infra/conduit-data-roles.bicep --stdout > conduit-data-roles.json
+          jq -e '
+            ([.resources[] | select(.type == "Microsoft.Authorization/roleDefinitions")] | length) == 3
+            and (.resources[] | select(
+              .name == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+              and .properties.roleName == "PolyEdge ACA Job Execution Reader"
+              and .properties.permissions == [{
+                actions: ["Microsoft.App/jobs/execution/read"],
+                notActions: [],
+                dataActions: [],
+                notDataActions: []
+              }]
+              and .properties.assignableScopes == ["[subscription().id]"]
+            ))
+          ' conduit-data-roles.json
           az bicep build --file infra/main.bicep --stdout > main.json
           jq -e '
             [.resources[]

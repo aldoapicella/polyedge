@@ -49,5 +49,28 @@ resource tableWriter 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   }
 }
 
+resource acaJobExecutionReader 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: 'a6f3874a-dc9c-4880-8039-ed1a4e57e4ea'
+  properties: {
+    roleName: 'PolyEdge ACA Job Execution Reader'
+    description: 'Read only the exact Azure Container Apps job execution required for parity provenance.'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: [
+          'Microsoft.App/jobs/execution/read'
+        ]
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      subscription().id
+    ]
+  }
+}
+
 output blobWriterRoleDefinitionId string = blobWriter.id
 output tableWriterRoleDefinitionId string = tableWriter.id
+output acaJobExecutionReaderRoleDefinitionId string = acaJobExecutionReader.id
