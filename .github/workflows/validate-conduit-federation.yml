@@ -103,6 +103,8 @@ jobs:
             ))
             and .githubDeployment.assignment.role == "blobReader"
             and (.githubDeployment.negativeAssertions | length) == 3
+            and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
+            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFourWorkloadUamiProof)
           ' ops/conduit/identity-rbac-plan.json
           jq -e '
             .status == "live-verified"
@@ -124,7 +126,11 @@ jobs:
             ))
             and .githubDeployment.assignment.id == "839dda8c-f69d-4f3c-8fb5-052ddcaaa9fd"
             and .githubDeployment.assignment.role == "Storage Blob Data Reader"
+            and .githubDeployment.scopeOfThisDataPlaneProof == "only the new Storage Blob Data Reader assignment on polyedge-shadow-events"
             and all(.githubDeployment.negativeAssertions[]; .passed)
+            and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
+            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFourWorkloadUamiProof)
+            and ([.githubDeployment.legacyDeploymentPlaneExceptions[].role] | sort == ["AcrPush", "Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Reader", "Storage Blob Data Reader", "Storage Blob Data Reader", "User Access Administrator"])
           ' ops/conduit/identity-rbac-proof.json
 
       - name: Validate isolated UAMI federation template

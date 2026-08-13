@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "capturedAtUtc": "2026-08-12T23:56:17Z",
+  "capturedAtUtc": "2026-08-13T00:51:22Z",
   "status": "live-verified",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -244,16 +244,89 @@
     "controlPlaneRoles": "preexisting resource-group Contributor and User Access Administrator are out of this migration data-plane proof",
     "negativeAssertions": [
       {
-        "assertion": "no blob write role",
+        "assertion": "the new shadow-events pointer assignment grants no blob write",
         "passed": true
       },
       {
-        "assertion": "no storage-account scope data-plane role",
+        "assertion": "the new shadow-events pointer assignment is container scoped, not storage-account scoped",
         "passed": true
       },
       {
-        "assertion": "no storage account keys or SAS",
+        "assertion": "the new shadow-events pointer assignment grants no storage account keys or SAS",
         "passed": true
+      }
+    ],
+    "scopeOfThisDataPlaneProof": "only the new Storage Blob Data Reader assignment on polyedge-shadow-events",
+    "legacyDeploymentPlaneExceptions": [
+      {
+        "assignmentId": "e6152393-352d-40de-b869-8d340099b44e",
+        "role": "Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "95398a59-3179-4e58-b405-6f252bf0f1c2",
+        "role": "User Access Administrator",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "0a94d279-4bdd-44e8-92de-888809e040a4",
+        "role": "AcrPush",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/crpolyedge6urdjr5nmwx7w",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "b123dbdd-9610-5448-9a7c-317d691ab9b6",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "0f4009ea-b3ae-59d0-9c42-8dc8bc6eac42",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "9ada4ddb-6d77-5699-905b-6c3a2c60b4b0",
+        "role": "Storage Blob Data Reader",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "dd25ddf8-3283-5d7f-8be0-b3f3b943944a",
+        "role": "Storage Blob Data Reader",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-validation",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "b5d447b9-ad93-5524-8291-d13430228ab0",
+        "role": "Storage Blob Data Reader",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "d0d6c86a-8603-590f-9250-bd82a3dda3e1",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "2eac4dd1-7c7b-5d55-8a5f-7a2f12056fbc",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control",
+        "preexisting": true,
+        "outsideFourWorkloadUamiProof": true
       }
     ]
   }
