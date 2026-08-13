@@ -49,21 +49,32 @@ pub async fn run_rtds_feed(
     let mut ping = tokio::time::interval(Duration::from_secs_f64(
         settings.target.rtds_ping_interval_seconds.max(1.0),
     ));
-    let chainlink_timeout =
+    let source_timeout =
         Duration::from_secs_f64(settings.target.rtds_chainlink_watchdog_seconds.max(5.0));
-    let mut chainlink_watchdog = tokio::time::interval(Duration::from_secs(1));
-    chainlink_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut source_watchdog = tokio::time::interval(Duration::from_secs(1));
+    source_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_chainlink = Instant::now();
+    let mut last_binance = Instant::now();
     loop {
         tokio::select! {
             _ = ping.tick() => {
                 write.send(Message::Text("PING".to_owned())).await?;
             }
-            _ = chainlink_watchdog.tick(), if settings.target.enable_polymarket_rtds_chainlink => {
-                if source_watchdog_expired(last_chainlink, chainlink_timeout) {
+            _ = source_watchdog.tick() => {
+                if settings.target.enable_polymarket_rtds_chainlink
+                    && source_watchdog_expired(last_chainlink, source_timeout)
+                {
                     return Err(FeedError::SourceStalled(format!(
                         "polymarket RTDS Chainlink produced no matching update for {:.0}s while the socket remained connected",
-                        chainlink_timeout.as_secs_f64()
+                        source_timeout.as_secs_f64()
+                    )));
+                }
+                if settings.target.enable_polymarket_rtds_binance
+                    && source_watchdog_expired(last_binance, source_timeout)
+                {
+                    return Err(FeedError::SourceStalled(format!(
+                        "polymarket RTDS Binance produced no matching update for {:.0}s while the socket remained connected",
+                        source_timeout.as_secs_f64()
                     )));
                 }
             }
@@ -77,6 +88,7 @@ pub async fn run_rtds_feed(
                         last_chainlink = Instant::now();
                         FeedName::PolymarketRtdsChainlink
                     } else {
+                        last_binance = Instant::now();
                         FeedName::PolymarketRtdsBinance
                     };
                     publish(&sender, FeedEvent::Reference(reference)).await?;
@@ -617,6 +629,45 @@ mod tests {
         assert_eq!(raw.price.as_deref(), Some("0.50"));
         assert_eq!(raw.size.as_deref(), Some("2"));
         assert_eq!(books[&TokenId::new("token")].bids[0].size, Decimal::from(2));
+    }
+
+    #[tokio::test]
+    async fn binance_connected_socket_without_matching_updates_exits_for_reconnect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
+            let subscription: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(subscription["subscriptions"].as_array().unwrap().len(), 1);
+            assert_eq!(subscription["subscriptions"][0]["topic"], "crypto_prices");
+            while socket.read().is_ok() {}
+        });
+
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_rtds_url = format!("ws://{address}");
+        settings.target.enable_polymarket_rtds_chainlink = false;
+        settings.target.enable_polymarket_rtds_binance = true;
+        settings.target.rtds_chainlink_watchdog_seconds = 5.0;
+        settings.target.rtds_ping_interval_seconds = 1.0;
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let error = tokio::time::timeout(Duration::from_secs(8), run_rtds_feed(settings, sender))
+            .await
+            .expect("Binance watchdog did not return the stalled socket for reconnect")
+            .unwrap_err();
+        match error {
+            FeedError::SourceStalled(message) => {
+                assert!(message.contains("RTDS Binance"));
+                assert!(message.contains("5s"));
+            }
+            other => panic!("unexpected RTDS result: {other}"),
+        }
+        server.join().unwrap();
     }
 }
 #[test]
