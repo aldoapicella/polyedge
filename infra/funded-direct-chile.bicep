@@ -184,7 +184,7 @@ resource serviceBusQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   properties: {
     status: fundedDirectQueueStatus
     lockDuration: 'PT30S'
-    defaultMessageTimeToLive: 'PT10S'
+    defaultMessageTimeToLive: 'PT15S'
     deadLetteringOnMessageExpiration: true
     maxDeliveryCount: 3
     requiresDuplicateDetection: true
@@ -695,7 +695,7 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_HEARTBEAT_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_MAX_CYCLES', value: '0' }
-            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED', value: 'false' }
+            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY', value: '30' }
             { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY', value: '350' }
