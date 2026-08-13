@@ -2354,6 +2354,19 @@ jobs:
           [[ "$dlq_before" =~ ^[0-9]+$ ]]
           test -n "$warmup_market"
           test -n "$warmup_market_end_ts"
+          environment_id=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.environmentId -o tsv)
+          workspace_customer_id=$(az containerapp env show \
+            --ids "$environment_id" \
+            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId -o tsv)
+          funded_revision=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --query properties.latestRevisionName -o tsv)
+          test -n "$workspace_customer_id"
+          test -n "$funded_revision"
           producer_enabled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           test "$(( $(date -u -d "$warmup_market_end_ts" +%s) - $(date -u -d "$producer_enabled_at" +%s) ))" -ge 360
           az containerapp update \
