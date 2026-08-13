@@ -18,15 +18,15 @@ for attempt in $(seq 1 36); do
       | where TimeGenerated >= datetime($producer_enabled_at)
       | extend record = parse_json(Log_s)
       | where tostring(record.schema) == 'polyedge.funded_capital_snapshot.v1'
-      | where tostring(record.session_id) == 'dynamic-quote-funded-2026-08-12-v9'
+      | where tostring(record.session_id) == 'dynamic-quote-funded-2026-08-13-v10'
       | where tostring(record.decision_id) == '$decision_id'
       | top 1 by TimeGenerated asc
       | project TimeGenerated, Log_s" \
-    -o json > funded-v9-capital-snapshot.json
+    -o json > funded-v10-capital-snapshot.json
   if jq -e --arg decision "$decision_id" '
     length == 1
     and (.[0].Log_s | fromjson
-      | .session_id == "dynamic-quote-funded-2026-08-12-v9"
+      | .session_id == "dynamic-quote-funded-2026-08-13-v10"
       and .decision_id == $decision
       and (.snapshot_source == "persistent_safety_cache"
         or .snapshot_source == "live_preflight")
@@ -39,7 +39,7 @@ for attempt in $(seq 1 36); do
       and .unresolved_position_count == 0
       and .unresolved_risk_reservation_count == 0
       and .account_equity > 0
-      and .account_equity <= 31.655501
+      and .account_equity <= 29.505501
       and .historical_high_water_equity >= 102.78112
       and .reserve_basis == "fully_reconciled_current_equity"
       and .continue_after_loss == true
@@ -50,7 +50,7 @@ for attempt in $(seq 1 36); do
       and .order_notional < 10.5
       and .proposed_notional >= .order_notional
       and .proposed_notional <= .operable_capital)
-  ' funded-v9-capital-snapshot.json >/dev/null; then
+  ' funded-v10-capital-snapshot.json >/dev/null; then
     capital_snapshot_ready=true
     break
   fi
@@ -58,19 +58,19 @@ for attempt in $(seq 1 36); do
 done
 test "$capital_snapshot_ready" = true
 
-snapshot_equity=$(jq -r '.[0].Log_s | fromjson | .account_equity' funded-v9-capital-snapshot.json)
-v9_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-12-v9/capital-reserve-state.json"
+snapshot_equity=$(jq -r '.[0].Log_s | fromjson | .account_equity' funded-v10-capital-snapshot.json)
+v10_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/capital-reserve-state.json"
 az storage blob download \
   --account-name "$STORAGE_ACCOUNT" \
   --container-name "$FUNDED_CONTAINER" \
-  --name "$v9_state" \
-  --file v9-capital-reserve-state.json \
+  --name "$v10_state" \
+  --file v10-capital-reserve-state.json \
   --auth-mode login \
   --overwrite \
   --only-show-errors -o none
 jq -e --argjson snapshot_equity "$snapshot_equity" '
   .schema == "polyedge.protected_compounding_state.v2"
-  and .session_id == "dynamic-quote-funded-2026-08-12-v9"
+  and .session_id == "dynamic-quote-funded-2026-08-13-v10"
   and .reconciliation_complete == true
   and .reserve_ratio == 0.1
   and .minimum_reserve == 2
@@ -81,11 +81,11 @@ jq -e --argjson snapshot_equity "$snapshot_equity" '
   and .loss_response == "resize_from_fully_reconciled_current_equity"
   and .prior_state_session_id == "dynamic-quote-funded-2026-07-29-v5"
   and .prior_state_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
-  and .prior_state_sha256 == "sha256:617b0bd69466dc7d6ff7d61b26f5a4ed1bcfd557d5d9e4b62688b7fb13bf28c6"
+  and .prior_state_sha256 == "sha256:9e63db7ef8c22d3af53a14f1858b817b8769ca7ba737e6668a900ffb73330c15"
   and .reserve_monotonic == false
   and .continue_after_loss == true
   and .last_reconciled_equity > 0
-  and .authorized_equity_ceiling == 31.655501
+  and .authorized_equity_ceiling == 29.505501
   and .last_reconciled_equity <= .authorized_equity_ceiling
   and .verified_realized_pnl == 0
   and .verified_settlement_ids == []
@@ -97,9 +97,9 @@ jq -e --argjson snapshot_equity "$snapshot_equity" '
   and (.operable_capital - ([0, (.last_reconciled_equity - .protected_reserve - .operating_buffer)] | max) | fabs) <= 0.0000011
   and .operable_capital >= .minimum_order_notional
   and ([keys[] | select(startswith("migration_"))] | length) == 0
-' v9-capital-reserve-state.json >/dev/null
+' v10-capital-reserve-state.json >/dev/null
 
-jq -e --slurpfile state v9-capital-reserve-state.json '
+jq -e --slurpfile state v10-capital-reserve-state.json '
   length == 1
   and (.[0].Log_s | fromjson) as $snapshot
   | ($state[0]) as $durable
@@ -111,4 +111,4 @@ jq -e --slurpfile state v9-capital-reserve-state.json '
     and $snapshot.open_order_count == 0
     and $snapshot.unresolved_position_count == 0
     and $snapshot.unresolved_risk_reservation_count == 0
-' funded-v9-capital-snapshot.json >/dev/null
+' funded-v10-capital-snapshot.json >/dev/null

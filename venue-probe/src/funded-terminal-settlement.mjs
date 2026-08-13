@@ -14,7 +14,7 @@ const TENANT_ID = "9767f0dc-e83f-4cc1-94e1-0d5f9d287d32";
 const STORAGE_ACCOUNT = "stpolyedge6urdjr5nmwx7w";
 const STORAGE_CONTAINER = "polyedge-funded-evidence";
 const FUNDED_UAMI_CLIENT_ID = "d9ce9154-66a6-4bdb-839f-0da7b02b38da";
-const CAMPAIGN_ID = "dynamic-quote-funded-2026-08-12-v9";
+const CAMPAIGN_ID = "dynamic-quote-funded-2026-08-13-v10";
 const FUNDER_ADDRESS = "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8";
 const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 

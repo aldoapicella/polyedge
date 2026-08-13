@@ -552,9 +552,16 @@ impl RuntimeController {
             self.spawn_runtime_telemetry_loop(),
             self.spawn_runtime_provenance_loop(),
             self.spawn_market_feed_loop(sender.clone()),
-            self.spawn_rtds_loop(sender.clone()),
             self.spawn_chainlink_http_loop(sender.clone()),
         ];
+        if self.inner.settings.target.enable_polymarket_rtds_chainlink {
+            background_tasks
+                .push(self.spawn_rtds_loop(sender.clone(), FeedName::PolymarketRtdsChainlink));
+        }
+        if self.inner.settings.target.enable_polymarket_rtds_binance {
+            background_tasks
+                .push(self.spawn_rtds_loop(sender.clone(), FeedName::PolymarketRtdsBinance));
+        }
         if self.inner.settings.target.enable_direct_binance_book_ticker {
             background_tasks.push(self.spawn_binance_loop(sender));
         } else {
@@ -961,31 +968,25 @@ impl RuntimeController {
         })
     }
 
-    fn spawn_rtds_loop(&self, sender: mpsc::Sender<FeedEvent>) -> JoinHandle<()> {
+    fn spawn_rtds_loop(&self, sender: mpsc::Sender<FeedEvent>, source: FeedName) -> JoinHandle<()> {
         let runtime = self.clone();
+        let settings = rtds_source_settings(&self.inner.settings, &source);
         tokio::spawn(async move {
             loop {
                 runtime
-                    .set_feed_status("polymarket_rtds", "connecting", None)
+                    .set_feed_status(&format!("{source:?}"), "connecting", None)
                     .await;
-                match polyedge_feeds::run_rtds_feed(runtime.inner.settings.clone(), sender.clone())
-                    .await
-                {
+                match polyedge_feeds::run_rtds_feed(settings.clone(), sender.clone()).await {
                     Ok(()) => {
                         runtime
                             .record_feed_disconnect(
-                                &[
-                                    FeedName::PolymarketRtdsChainlink,
-                                    FeedName::PolymarketRtdsBinance,
-                                ],
+                                &[source.clone()],
                                 "RTDS feed ended without a close error",
                             )
                             .await;
                     }
                     Err(error) => {
-                        runtime
-                            .feed_error(FeedName::PolymarketRtdsChainlink, error.to_string())
-                            .await;
+                        runtime.feed_error(source.clone(), error.to_string()).await;
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3007,6 +3008,15 @@ impl RuntimeController {
     }
 }
 
+fn rtds_source_settings(settings: &RuntimeSettings, source: &FeedName) -> RuntimeSettings {
+    let mut scoped = settings.clone();
+    scoped.target.enable_polymarket_rtds_chainlink =
+        matches!(source, FeedName::PolymarketRtdsChainlink);
+    scoped.target.enable_polymarket_rtds_binance =
+        matches!(source, FeedName::PolymarketRtdsBinance);
+    scoped
+}
+
 fn spawn_recorder_worker(
     recorder: Arc<StdMutex<RuntimeRecorder>>,
     receiver: std_mpsc::Receiver<RecorderRequest>,
@@ -4120,6 +4130,53 @@ mod tests {
                 .filter(|event| event.event_type == "feed_error")
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn rtds_source_settings_enable_only_the_requested_subscription() {
+        let settings = RuntimeSettings::default();
+        let chainlink = rtds_source_settings(&settings, &FeedName::PolymarketRtdsChainlink);
+        assert!(chainlink.target.enable_polymarket_rtds_chainlink);
+        assert!(!chainlink.target.enable_polymarket_rtds_binance);
+
+        let binance = rtds_source_settings(&settings, &FeedName::PolymarketRtdsBinance);
+        assert!(!binance.target.enable_polymarket_rtds_chainlink);
+        assert!(binance.target.enable_polymarket_rtds_binance);
+    }
+
+    #[tokio::test]
+    async fn rtds_disconnect_is_scoped_to_the_failed_source() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        for source in [
+            "Discovery",
+            "PolymarketClobMarket",
+            "PolymarketRtdsChainlink",
+            "PolymarketRtdsBinance",
+        ] {
+            controller.set_feed_status(source, "ok", None).await;
+        }
+
+        controller
+            .record_feed_disconnect(
+                &[FeedName::PolymarketRtdsChainlink],
+                "injected Chainlink disconnect",
+            )
+            .await;
+
+        let data = controller.inner.data.read().await;
+        assert_eq!(
+            data.feed_status["PolymarketRtdsChainlink"]["status"],
+            "error"
+        );
+        assert_eq!(data.feed_status["PolymarketRtdsBinance"]["status"], "ok");
+        assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "feed_error")
+                .count(),
+            1
         );
     }
 
