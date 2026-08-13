@@ -386,7 +386,6 @@ jobs:
             -o json > current-funded-app.json
           current_revision=$(jq -r '.properties.latestRevisionName // ""' current-funded-app.json)
           test -n "$current_revision"
-          test "$(jq -r '.properties.latestReadyRevisionName // ""' current-funded-app.json)" = "$current_revision"
           test "$(jq -r '.properties.configuration.ingress // ""' current-funded-app.json)" = ""
           az containerapp revision show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -408,7 +407,6 @@ jobs:
             and ([.[] | select(.properties.active == true)][0].name == $revision)
           ' current-funded-revisions.json >/dev/null
           test "$(jq -r '.properties.active' current-funded-revision.json)" = "true"
-          test "$(jq -r '.properties.healthState' current-funded-revision.json)" = "Healthy"
           test "$(jq -r '.properties.template.scale.maxReplicas' current-funded-revision.json)" = "1"
           test "$(jq -r '.properties.template.containers[0].command | join(" ")' current-funded-revision.json)" = \
             "node src/funded-direct-service.mjs"
@@ -453,6 +451,10 @@ jobs:
               ' current-funded-queue.json >/dev/null
               ;;
             dynamic-quote-funded-2026-07-29-v5)
+              test "$(jq -r '.properties.latestReadyRevisionName // ""' current-funded-app.json)" = \
+                "$current_revision"
+              test "$(jq -r '.properties.healthState' current-funded-revision.json)" = "Healthy"
+              test "$(jq -r '.properties.replicas' current-funded-revision.json)" = "1"
               test "$(jq -r '.properties.template.scale.minReplicas' current-funded-revision.json)" = "1"
               test "$(env_value FUNDED_DIRECT_SERVICE_ENABLED)" = "true"
               test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "false"
@@ -1427,12 +1429,50 @@ jobs:
           if [ -n "${FUNDED_ROLLBACK_REVISION:-}" ] && \
               [ -s funded-rollback-template.json ] && \
               copy_revision "$FUNDED_APP" "$FUNDED_ROLLBACK_REVISION"; then
+            restored_funded_revision=$(az containerapp show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --query properties.latestRevisionName -o tsv 2>/dev/null || true)
+            if [ -n "$restored_funded_revision" ] && \
+                az containerapp revision show \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --name "$FUNDED_APP" \
+                  --revision "$restored_funded_revision" \
+                  --only-show-errors \
+                  -o json > restored-funded-target.json && \
+                jq -e '.properties.active == true' restored-funded-target.json >/dev/null && \
+                jq -S '.properties.template' restored-funded-target.json \
+                  > restored-funded-target-template.json && \
+                cmp funded-rollback-template.json restored-funded-target-template.json; then
+              while read -r active_revision; do
+                if [ -n "$active_revision" ] && [ "$active_revision" != "$restored_funded_revision" ]; then
+                  az containerapp revision deactivate \
+                    --resource-group "$AZURE_RESOURCE_GROUP" \
+                    --name "$FUNDED_APP" \
+                    --revision "$active_revision" \
+                    --only-show-errors -o none || rollback_failed=true
+                fi
+              done < <(az containerapp revision list \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$FUNDED_APP" \
+                --query '[?properties.active].name' -o tsv)
+            else
+              rollback_failed=true
+            fi
             az containerapp show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
-              -o json > restored-funded-app.json
+              -o json > restored-funded-app.json || rollback_failed=true
             jq -S '.properties.template' restored-funded-app.json > restored-funded-template.json
-            if cmp funded-rollback-template.json restored-funded-template.json; then
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              -o json > restored-funded-revisions.json
+            if cmp funded-rollback-template.json restored-funded-template.json && \
+                jq -e --arg revision "$restored_funded_revision" '
+                  ([.[] | select(.properties.active == true)] | length) == 1
+                  and ([.[] | select(.properties.active == true)][0].name == $revision)
+                ' restored-funded-revisions.json >/dev/null; then
               funded_restored=true
             fi
           fi
