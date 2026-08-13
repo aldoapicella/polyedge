@@ -88,23 +88,31 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260812T200000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-12T20:00:00Z`,
-supersedes the zero-credit `15:00`, `16:00`, and `18:00` ledgers, keeps Azure
-authoritative and `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-15T20:00:00Z`. Completion still requires 72 consecutive accepted hours,
-two successful OCI daily cycles, reboot and rollback proof, and explicit qset,
-funded, and deletion gates.
+Ledger `/srv/polyedge-ring/parity/20260813T030000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-13T03:00:00Z`,
+supersedes every earlier zero-credit ledger, keeps Azure authoritative and
+`azureDeletionAllowed:false`, and cannot finish before
+`2026-08-16T03:00:00Z`. Completion still requires 72 consecutive accepted
+hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
+qset, funded, and deletion gates.
 
 The OCI API, ring uploader, and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:4b27d0ed4a2932bdbcd8d6671ae91e2591c9f94eaa91939e22c4d028a07eca3e`
-from source `8be79d323261be94f4c3e6b8501123f46130abe9`. Publication run
-`31599743316` passed, and the manifest contains both Linux AMD64 and ARM64. The
-API has remained healthy with zero restarts since `2026-08-12T14:22:56Z`.
+`sha256:ff8c41086d9be7d98a8b645362c378d23bb5cdce4c156f7042592ffbec65c410`
+from source `be303731705e766ee41e5499a82d297d62e5783e`. Publication run
+`31652541561` passed, and the manifest contains both Linux AMD64 and ARM64. The
+API has remained healthy with zero restarts since `2026-08-13T01:01:58Z`.
 Rollback state is retained under `/etc/polyedge/rollback`, including
-`20260812T141958Z-polyedge-api.container` and
-`20260812T141958Z-ring-primary-image`.
+`20260813T010147Z-polyedge-api.container`, `20260813T010300Z-job-images-be303`,
+`20260813T010500Z-ring.env`, and the `20260813T012656Z` hourly/parity bindings.
+
+Azure primary revision `polyedge-dev--0000127` is healthy on exact source
+`be303731705e766ee41e5499a82d297d62e5783e` and immutable ACR digest
+`sha256:22b6994d0e5c40fae466ce75d9ce4cbee8c4dcb4c523979f4485f2fc96c6b326`.
+Guarded workflow run `31657198674` deployed the Azure hourly job at `:10` on
+digest `sha256:c3231b6e7bbaa72a3128b227053da519da7283d3e079329cb18b99de62318142`,
+with exact generator provenance and paper-only controls. The protected funded
+producer and frozen qset revision were unchanged by that deployment.
 
 The `15:00` hour receives zero credit because seven durable essential-feed
 reconnect errors occurred even though recorder sequence durability and all six
@@ -122,8 +130,11 @@ the exact OCI decision-config hash
 The first formal-window OCI provenance observation at
 `2026-08-12T18:00:56Z` had that hash and all four essential feeds healthy, but
 the hour contained one Chainlink stall and four CLOB disconnect or HTTP 503
-errors. The fail-closed collector rejected the hour and the replacement window
-starts at the next declared full-hour boundary. Qset remains disabled, the
+errors. The fail-closed collector rejected that hour. Later replacement windows
+also remain at zero because of feed continuity or superseded source/image
+bindings; no credit is inherited. The exact Azure hourly deployment completed
+too late to prove its first scheduled execution before `02:00`, so the current
+window starts at the untouched `03:00` boundary. Qset remains disabled, the
 local funded signer remains masked, and no Azure compute or network resource is
 deletion-eligible yet.
 
