@@ -88,13 +88,25 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260814T060000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-14T06:00:00Z`,
+Ledger `/srv/polyedge-ring/parity/20260814T110000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-14T11:00:00Z`,
 supersedes every earlier zero-credit ledger, keeps Azure authoritative and
 `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-17T06:00:00Z`. Completion still requires 72 consecutive accepted
+`2026-08-17T11:00:00Z`. Completion still requires 72 consecutive accepted
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates.
+
+The superseded `20260814T060000Z.json` ledger retained zero credit. A canary
+from source `6fe5e23` serialized the Binance RTDS subscription filter as a bare
+symbol, which the upstream service accepted but did not deliver. The watchdog
+detected the stalled venue and the API was rolled back. The documented RTDS
+contract requires `filters` to contain a JSON string, so source `777d9e1`
+encodes the exact `{"symbol":"btcusdt"}` object. The corrected image was
+deployed at `2026-08-14T09:52:49Z` and passed a ten-minute soak across 10:00 UTC
+with all four essential feeds advancing, zero explicit recorder errors or
+drops, zero restarts, and a healthy API. The next untouched hourly boundary is
+therefore 11:00 UTC. The complete pre-reset bindings and old ledger are retained
+under `/etc/polyedge/rollback/20260814T100407Z-rtds-json-filter-parity-reset`.
 
 The superseded `20260814T030000Z.json` ledger also retained zero credit. Its
 first hour had all 60 one-minute health observations, a 60-second maximum gap,
@@ -114,17 +126,21 @@ remain recoverable under
 
 The OCI API, ring uploader, and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:4ba3dfc95c8c1cf0efcda80ef4465ef679b479b1f33453cf38f5c555239f2a48`
-from source `71782cb81779bfe691d6268eea1b703fc60a1eae`. Publication run
-`31754922264` passed, and the manifest contains both Linux AMD64 and ARM64. The
-API has remained healthy with zero restarts since `2026-08-14T00:40:41Z`;
-independent Binance and Chainlink timestamps advanced throughout the post-deploy
-watchdog soak with zero recorder failures. The superseded
-`20260813T220000Z.json` ledger retains zero credit after the pre-fix Binance
-stall and is not inherited by the new window.
-Rollback state is retained under `/etc/polyedge/rollback`, including
-`20260814T004030Z-polyedge-api.container` and the complete pre-reset job/parity
-bindings in `20260814T004400Z-rtds-parity-reset`.
+`sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`
+from source `777d9e1e89151edb9dc94881b25de8e27c7df90c`. Publication run
+`31785829764` and validation run `31785809845` passed, and the manifest contains
+both Linux AMD64 and ARM64. The API has remained healthy with zero restarts
+since the corrected deployment; independent Binance and Chainlink timestamps
+advanced throughout the post-deploy watchdog soak with zero explicit recorder
+failures or drops. Rollback state is retained under `/etc/polyedge/rollback`,
+including the corrected-image predecessor
+`20260814T095239Z-polyedge-api.container`, the failed bare-filter canary
+`20260814T085128Z-polyedge-api.container`, and the complete pre-reset bindings
+in `20260814T100407Z-rtds-json-filter-parity-reset`.
+The first rebound freshness and hourly timers completed successfully on this
+digest. The hourly report had advisory historical-coverage warnings but no
+critical issue. At 10:18 UTC the parity collector wrote the 09:00 hour as
+`excluded_pre_window`; the formal ledger remained at zero accepted hours.
 
 Azure primary revision `polyedge-dev--0000127` is healthy on exact source
 `be303731705e766ee41e5499a82d297d62e5783e` and immutable ACR digest
@@ -363,6 +379,20 @@ research jobs get neither. It has no install target and remains disabled until
 the funded identity, exact non-secret environment, origin check, queue repair,
 and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review all pass. Root remains the
 single-host trust ceiling and can administer both containers.
+
+The live funded trader remains the Azure Container App revision
+`polyedge-funded-direct-cl--0000158`; the local OCI funded signer is still
+disabled. Its signed v10 session has five terminal records: three settled
+positions and two finalized no-fills, with all five reservations reconciled and
+zero unresolved reservations or open orders. Post-loss current-equity resizing
+is proven. Recent intents completed within the seven-second send bound, while
+post-only crossing and venue rejection paths continued to fail closed and
+release risk. The worker remained healthy and processing after one message took
+the shared persistent fail-closed path at 10:05 UTC. Sanitized logs do not reveal
+whether that message was a warmup or intent; the schema-only DLQ peek was
+rate-limited and remains a read-only audit follow-up. The Service Bus queue has
+zero active or scheduled messages and 859 quarantined messages. Nothing is
+replayed or purged without classification.
 
 Primary research jobs share one serialized workspace so daily normalization,
 replay, prospective validation, and backfills reuse local artifacts. The qset

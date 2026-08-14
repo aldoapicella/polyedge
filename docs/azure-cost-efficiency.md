@@ -74,11 +74,21 @@ added without a successful billing export.
 Delete child apps and jobs first, then their managed environments, NAT
 gateways, public IPs, and virtual networks. Delete shared ACR, storage, Log
 Analytics, alerts, identities, and Service Bus last, only after image
-restorability, evidence retention/export, and the 855-message funded dead-letter
+restorability, evidence retention/export, and the funded dead-letter
 quarantine are resolved. The required gates remain 72 consecutive accepted
 hours, two accepted OCI daily cycles, reboot and rollback proof, exact-one-writer
 cutover, and separate funded/qset approval. Azure remains authoritative and no
 resource in this recheck is currently deletion-eligible.
+
+The latest accepted planning model keeps immediate deletions and immediate
+savings at zero. After every migration gate passes, the main compute-plane
+opportunity is about $279.39/month: roughly $125.45 for Container Apps and 19
+jobs, $113.27 for NAT/public-IP/VNet egress stacks, and $28.41 for two managed
+load balancers, with smaller residual compute/network items. The theoretical
+full-Azure ceiling is about $421.96/month, but retained evidence storage is
+projected near $95.78/month, Monitor and Log Analytics near $33.87/month, and
+ACR near $9.72/month. The August 1-15 Cost Management refresh returned HTTP
+429, so these are the last accepted planning projections, not a current invoice.
 
 ### Live utilization evidence
 
