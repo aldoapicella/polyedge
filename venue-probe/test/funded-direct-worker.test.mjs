@@ -810,9 +810,9 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
   assert.equal(output.childInvocations, 1);
 });
 
-test("worker accepts the exact ten-second handoff with the reviewed seven-second margin", async () => {
+test("worker accepts a fifteen-second handoff with the reviewed seven-second margin", async () => {
   const decisionClock = new Date("2026-07-27T12:00:00Z");
-  const value = intent(decisionClock, "9".repeat(64), 10_000);
+  const value = intent(decisionClock, "9".repeat(64), 15_000);
   const observedClock = new Date(Date.parse(value.valid_until) - 7_000);
   const output = await runFundedDirectWorker({
     env: env({ FUNDED_DIRECT_MAX_ITERATIONS: "1" }),
@@ -869,7 +869,7 @@ test("handoff that exhausts the child margin before authorization creates no aut
 
 test("admitted handoff can spend the worker margin before the child gate", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
-  const value = intent(now, "6".repeat(64), 10_000);
+  const value = intent(now, "6".repeat(64), 15_000);
   const bytes = Buffer.from(JSON.stringify(value));
   const validUntilMs = Date.parse(value.valid_until);
   const admittedAt = new Date(validUntilMs - 7_000);

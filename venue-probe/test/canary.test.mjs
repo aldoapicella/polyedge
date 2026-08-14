@@ -716,23 +716,23 @@ test("funded executor fails closed at the reviewed signal-to-send deadline", () 
   const decisionMs = Date.parse("2026-07-30T12:00:00.000Z");
   const intent = {
     decision_ts: new Date(decisionMs).toISOString(),
-    valid_until: new Date(decisionMs + 10_000).toISOString(),
-    ttl_ms: 10_000
+    valid_until: new Date(decisionMs + 15_000).toISOString(),
+    ttl_ms: 15_000
   };
-  assert.deepEqual(assertFundedSignalToSendDeadline(intent, 7_000, 2_000, decisionMs + 7_000), {
+  assert.deepEqual(assertFundedSignalToSendDeadline(intent, 7_000, decisionMs + 7_000), {
     elapsedMs: 7_000,
-    remainingTtlMs: 3_000
+    remainingTtlMs: 8_000
   });
   assert.throws(
-    () => assertFundedSignalToSendDeadline(intent, 7_000, 2_000, decisionMs + 7_001),
+    () => assertFundedSignalToSendDeadline(intent, 7_000, decisionMs + 7_001),
     /signal-to-send latency exceeded 7000ms \(7001ms\)/
   );
   assert.throws(
     () => assertFundedSignalToSendDeadline({
       decision_ts: new Date(decisionMs).toISOString(),
-      valid_until: new Date(decisionMs + 8_999).toISOString()
-    }, 7_000, 2_000, decisionMs + 7_000),
-    /less than 2000ms TTL at transport \(1999ms\)/
+      valid_until: new Date(decisionMs + 10_000).toISOString()
+    }, 7_000, decisionMs + 7_000),
+    /less than 8000ms TTL at transport \(3000ms\)/
   );
 });
 
@@ -755,11 +755,10 @@ test("async order construction cannot cross the deadline into venue transport", 
     client,
     intent: {
       decision_ts: new Date(decisionMs).toISOString(),
-      valid_until: new Date(decisionMs + 10_000).toISOString(),
-      ttl_ms: 10_000
+      valid_until: new Date(decisionMs + 15_000).toISOString(),
+      ttl_ms: 15_000
     },
     sloMs: 7_000,
-    minimumRemainingTtlMs: 2_000,
     reservation,
     userOrder: {},
     orderOptions: {},
@@ -798,10 +797,9 @@ test("a failure after the first order transport remains ambiguous and reserved",
     client,
     intent: {
       decision_ts: new Date(decisionMs).toISOString(),
-      valid_until: new Date(decisionMs + 10_000).toISOString()
+      valid_until: new Date(decisionMs + 15_000).toISOString()
     },
     sloMs: 7_000,
-    minimumRemainingTtlMs: 2_000,
     reservation: { probe_id: "funded-direct-decision" },
     userOrder: {},
     orderOptions: {},
@@ -829,10 +827,9 @@ test("funded order transport rejects SDK endpoint drift before any venue call", 
     client,
     intent: {
       decision_ts: new Date(decisionMs).toISOString(),
-      valid_until: new Date(decisionMs + 10_000).toISOString()
+      valid_until: new Date(decisionMs + 15_000).toISOString()
     },
     sloMs: 7_000,
-    minimumRemainingTtlMs: 2_000,
     reservation: { probe_id: "funded-direct-decision" },
     userOrder: {},
     orderOptions: {},

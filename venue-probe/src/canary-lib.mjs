@@ -736,14 +736,8 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
   };
 }
 
-export function assertFundedSignalToSendDeadline(
-  intent,
-  sloMs,
-  minimumRemainingTtlMs,
-  nowMs = Date.now()
-) {
+export function assertFundedSignalToSendDeadline(intent, sloMs, nowMs = Date.now()) {
   const slo = Number(sloMs);
-  const minimumRemaining = Number(minimumRemainingTtlMs);
   const decisionMs = Date.parse(intent?.decision_ts);
   const validUntilMs = Date.parse(intent?.valid_until);
   const elapsedMs = nowMs - decisionMs;
@@ -754,9 +748,8 @@ export function assertFundedSignalToSendDeadline(
     error.signalToSendDeadlineExceeded = true;
     throw error;
   }
-  if (!Number.isFinite(minimumRemaining) || minimumRemaining !== 2_000 ||
-      !Number.isFinite(remainingTtlMs) || remainingTtlMs < minimumRemaining) {
-    const error = new Error(`fail closed: funded intent has less than ${minimumRemaining}ms TTL at transport (${remainingTtlMs}ms)`);
+  if (!Number.isFinite(remainingTtlMs) || remainingTtlMs < 8_000) {
+    const error = new Error(`fail closed: funded intent has less than 8000ms TTL at transport (${remainingTtlMs}ms)`);
     error.signalToSendDeadlineExceeded = true;
     throw error;
   }

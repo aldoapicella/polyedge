@@ -1720,7 +1720,6 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
         client,
         intent,
         sloMs: config.signalToSendSloMs,
-        minimumRemainingTtlMs: config.minRemainingTtlMs,
         reservation,
         userOrder,
         orderOptions,
@@ -2165,7 +2164,6 @@ export async function createAndPostFundedOrderWithinSignalToSendDeadline({
   client,
   intent,
   sloMs,
-  minimumRemainingTtlMs,
   reservation,
   userOrder,
   orderOptions,
@@ -2191,7 +2189,7 @@ export async function createAndPostFundedOrderWithinSignalToSendDeadline({
         throw new Error("fail closed: funded order transport was not one exact /order request");
       }
       const wallMs = nowMs();
-      assertFundedSignalToSendDeadline(intent, sloMs, minimumRemainingTtlMs, wallMs);
+      assertFundedSignalToSendDeadline(intent, sloMs, wallMs);
       const startedMonotonicMs = monotonicMs();
       const pending = originalPost.call(this, endpoint, options, skipThrow);
       transportInitiated = true;
