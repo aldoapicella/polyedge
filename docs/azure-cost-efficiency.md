@@ -47,6 +47,39 @@ captured in `ops/conduit/storage-lifecycle-proof.json`. The live rule matched
 996 future-prefix block blobs (18,205,708,074 bytes), while the legacy
 `events/` append-blob corpus matched neither the rule prefix nor its blob type.
 
+### Gated deletion recheck on 2026-08-14
+
+A fresh subscription inventory found no resource that is both unused and safe
+to delete before migration acceptance. There are no Azure Load Balancers,
+Private Endpoints, or private DNS zones in `rg-polyedge-dev`. Both Standard NAT
+gateways and both Standard public IPv4 addresses are attached to live North
+Europe or Chile Container Apps infrastructure; an unattached-IP field must not
+be treated as orphan proof because each address is referenced through its NAT
+gateway. Microsoft bills a NAT gateway's hourly rate while the resource exists,
+even without subnet or public-IP attachments, and separately bills processed
+data and outbound transfer. See the official
+[NAT Gateway pricing](https://azure.microsoft.com/pricing/details/azure-nat-gateway/)
+and [public IP pricing](https://azure.microsoft.com/pricing/details/ip-addresses/)
+pages.
+
+Using the prior US list-price assumptions of $0.045 per NAT gateway-hour and
+$0.005 per Standard public-IP-hour, deleting both complete egress stacks after
+all gates would remove a modeled fixed floor of about $73 per 730-hour month,
+plus NAT processing. This is not a current invoice claim: Cost Management and
+Retail Prices returned HTTP 429 during the recheck, and contract, region, date,
+and currency can change the billed amount. Container Apps, storage, Log
+Analytics, ACR, and Service Bus savings remain usage-dependent and are not
+added without a successful billing export.
+
+Delete child apps and jobs first, then their managed environments, NAT
+gateways, public IPs, and virtual networks. Delete shared ACR, storage, Log
+Analytics, alerts, identities, and Service Bus last, only after image
+restorability, evidence retention/export, and the 855-message funded dead-letter
+quarantine are resolved. The required gates remain 72 consecutive accepted
+hours, two accepted OCI daily cycles, reboot and rollback proof, exact-one-writer
+cutover, and separate funded/qset approval. Azure remains authoritative and no
+resource in this recheck is currently deletion-eligible.
+
 ### Live utilization evidence
 
 | Driver | 2026-07-31 observation | Decision |
