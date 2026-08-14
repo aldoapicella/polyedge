@@ -255,6 +255,9 @@ jobs:
           const preparePreflightEnd = workflow.lastIndexOf(
             "\n      - name: Run the zero-write v10 preflight against a fresh producer intent");
           assert.ok(preparePreflightStart >= 0 && preparePreflightStart < preparePreflightEnd);
+          const preflightLogin = workflow.lastIndexOf(
+            "\n      - name: Refresh Azure login before zero-write v10 preflight", preparePreflightEnd);
+          assert.ok(preparePreflightStart < preflightLogin && preflightLogin < preparePreflightEnd);
           const preparePreflight = workflow.slice(preparePreflightStart, preparePreflightEnd);
           assert.equal(preparePreflight.includes(
             "cmp existing-v10-authorization-decisions.txt existing-v10-completion-decisions.txt"), false);
@@ -315,6 +318,43 @@ jobs:
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
           assert.match(activation, /TimeGenerated <= datetime\(\$lifecycle_completed_at\)/);
+          const lifecycleLogin = activation.indexOf("Refresh Azure login before submitted v10 lifecycle");
+          const childRunValidation = activation.indexOf(
+            '[[ "$child_run_id" =~ ^funded-direct-[0-9]{17}-[0-9a-f]{8}$ ]]', lifecycleLogin);
+          const reservationValidation = activation.indexOf(
+            '[[ "$reservation_blob" =~ ^reports/research/venue-probe/risk-reservations/', childRunValidation);
+          const terminalLogin = activation.indexOf(
+            "Refresh Azure login before terminal reservation verification", reservationValidation);
+          const explicitFence = activation.lastIndexOf("--status SendDisabled", terminalLogin);
+          const fenceReadback = activation.indexOf(
+            '--query status -o tsv)" = "SendDisabled"', explicitFence);
+          const safeHandoff = activation.indexOf(
+            "printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\\n'", fenceReadback);
+          const terminalLoop = activation.indexOf(
+            "terminal_deadline_epoch=$(( $(date -u +%s) + 2400 ))", terminalLogin);
+          const terminalIdentity = activation.indexOf(".schema_version == 1", terminalLoop);
+          const terminalProof = activation.indexOf('test "$terminal_reservation_ready" = true', terminalLoop);
+          const terminalPredicate = activation.indexOf('.state == "position_settled"', terminalLoop);
+          const queueReopen = activation.lastIndexOf("--status Active");
+          const cutoverComplete = activation.indexOf("FUNDED_CUTOVER_COMPLETE=true", queueReopen);
+          assert.ok(lifecycleLogin < childRunValidation && childRunValidation < reservationValidation);
+          assert.ok(reservationValidation < explicitFence && explicitFence < fenceReadback &&
+            fenceReadback < safeHandoff && safeHandoff < terminalLogin);
+          assert.ok(terminalLogin < terminalLoop && terminalLoop < terminalIdentity &&
+            terminalIdentity < terminalPredicate &&
+            terminalPredicate < terminalProof && terminalProof < queueReopen && queueReopen < cutoverComplete);
+          const terminalStep = activation.slice(terminalLoop);
+          assert.match(terminalStep, /\.schema_version == 1[\s\S]*\.campaign_id == "dynamic-quote-funded-2026-08-13-v10"[\s\S]*\.run_id == \$run[\s\S]*\.probe_id == \("funded-direct-" \+ \$decision\)[\s\S]*\.order_submitted == true[\s\S]*\.order_id == \$order_id/);
+          assert.match(activation, /\.state == "finalized_no_fill"[\s\S]*\.state == "position_settled"[\s\S]*settlement_evidence_source == "verified_onchain_redemption"[\s\S]*settlement_evidence_source == "polymarket_data_api_redeemable"/);
+          assert.equal(activation.includes('echo "FUNDED_LIFECYCLE_'), false);
+          assert.equal(activation.includes("for attempt in $(seq 1 360); do"), false);
+          const legacyPreflightLoop = ["for attempt in $(seq 1 ", "1200); do"].join("");
+          assert.equal(workflow.includes(legacyPreflightLoop), false);
+          const waitBounds = Object.fromEntries([...workflow.matchAll(
+            /(preflight|lifecycle|terminal)_deadline_epoch=\$\(\( \$\(date -u \+%s\) \+ ([0-9]+) \)\)/g
+          )].map((match) => [match[1], Number(match[2])]));
+          assert.deepEqual(waitBounds, { preflight: 2700, lifecycle: 2400, terminal: 2400 });
+          assert.ok(Object.values(waitBounds).reduce((sum, value) => sum + value, 0) <= 180 * 60);
           const rollback = workflow.slice(
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
           assert.match(rollback,
@@ -326,8 +366,7 @@ jobs:
             "--query '[0].Count' -o tsv) || { sleep 10; continue; }",
             "-o json > funded-heartbeat-final.json || { sleep 10; continue; }",
             "-o json > funded-warmup-after-reopen.json || { sleep 5; continue; }",
-            "-o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }",
-            "-o json > funded-v10-lifecycle-latency.json || { sleep 10; continue; }"
+            "-o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }"
           ]) assert.ok(workflow.includes(retry), `missing bounded Log Analytics retry: ${retry}`);
           NODE
           git diff --check
@@ -1530,9 +1569,9 @@ jobs:
                       {name:"ALLOW_FUNDED_DIRECT",value:"true"},
                       {name:"FUNDED_DIRECT_DRY_RUN",value:"true"},
                       {name:"FUNDED_DIRECT_PREFLIGHT_ONLY",value:"true"},
-                      {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"10801"},
+                      {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"2401"},
                       {name:"FUNDED_DIRECT_POLL_INTERVAL_MS",value:"1000"},
-                      {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"10800000"}
+                      {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"2400000"}
                     ]
                   )
                 else . end
@@ -1541,6 +1580,13 @@ jobs:
           echo "PREFLIGHT_V5_ETAG_BEFORE=$v5_etag_before" >> "$GITHUB_ENV"
           echo "PREFLIGHT_INTENT_CONTAINER=$intent_container" >> "$GITHUB_ENV"
           echo "PREFLIGHT_INTENT_PREFIX=$intent_prefix" >> "$GITHUB_ENV"
+
+      - name: Refresh Azure login before zero-write v10 preflight
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run the zero-write v10 preflight against a fresh producer intent
         id: funded_preflight
@@ -1563,11 +1609,11 @@ jobs:
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_PREFLIGHT_ONLY" and .value == "true")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "10801")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "2401")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_POLL_INTERVAL_MS" and .value == "1000")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "10800000")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "2400000")] | length) == 1
           ' funded-preflight-execution.yaml
           preflight_execution=$(az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -1576,17 +1622,27 @@ jobs:
             --query name -o tsv)
           test -n "$preflight_execution"
           status=Running
-          for attempt in $(seq 1 1200); do
-            status=$(az containerapp job execution show \
+          preflight_deadline_epoch=$(( $(date -u +%s) + 2700 ))
+          sleep_before_preflight_deadline() {
+            local remaining=$(( preflight_deadline_epoch - $(date -u +%s) ))
+            [ "$remaining" -gt 0 ] || return 1
+            [ "$remaining" -le 10 ] || remaining=10
+            sleep "$remaining"
+          }
+          while [ "$(date -u +%s)" -lt "$preflight_deadline_epoch" ]; do
+            if ! status=$(az containerapp job execution show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_JOB" \
               --job-execution-name "$preflight_execution" \
-              --query properties.status -o tsv)
+              --query properties.status -o tsv); then
+              sleep_before_preflight_deadline || break
+              continue
+            fi
             case "$status" in
               Succeeded) break ;;
               Failed|Stopped|Degraded) exit 1 ;;
             esac
-            sleep 10
+            sleep_before_preflight_deadline || break
           done
           test "$status" = "Succeeded"
           echo "execution=$preflight_execution" >> "$GITHUB_OUTPUT"
@@ -2395,7 +2451,14 @@ jobs:
           echo "FUNDED_WARMUP_MARKET_END_TS=$warmup_market_end_ts" >> "$GITHUB_ENV"
           trap - EXIT
 
-      - name: Rewarm the producer and prove one complete v10 lifecycle before cutover
+      - name: Refresh Azure login before submitted v10 lifecycle
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Rewarm the producer and prove one submitted v10 child lifecycle
         run: |
           set -euo pipefail
           cutover_complete=false
@@ -2519,8 +2582,15 @@ jobs:
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           lifecycle_ready=false
           # Observe several 15-minute markets; warmup is not proof of a qualifying Place intent.
-          for attempt in $(seq 1 360); do
-            az monitor log-analytics query \
+          lifecycle_deadline_epoch=$(( $(date -u +%s) + 2400 ))
+          sleep_before_lifecycle_deadline() {
+            local remaining=$(( lifecycle_deadline_epoch - $(date -u +%s) ))
+            [ "$remaining" -gt 0 ] || return 1
+            [ "$remaining" -le 10 ] || remaining=10
+            sleep "$remaining"
+          }
+          while [ "$(date -u +%s)" -lt "$lifecycle_deadline_epoch" ]; do
+            if ! az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
                 | where ContainerAppName_s == '$FUNDED_APP'
@@ -2535,7 +2605,10 @@ jobs:
                 | where tolong(record.signal_to_send_slo_ms) == 7000
                 | top 1 by TimeGenerated asc
                 | project TimeGenerated, Log_s" \
-              -o json > funded-v10-lifecycle-latency.json || { sleep 10; continue; }
+              -o json > funded-v10-lifecycle-latency.json; then
+              sleep_before_lifecycle_deadline || break
+              continue
+            fi
             if jq -e '
               length == 1
               and (.[0].Log_s | fromjson
@@ -2550,7 +2623,7 @@ jobs:
               lifecycle_ready=true
               break
             fi
-            sleep 10
+            sleep_before_lifecycle_deadline || break
           done
           test "$lifecycle_ready" = true
           decision_id=$(jq -r '.[0].Log_s | fromjson | .decision_id' funded-v10-lifecycle-latency.json)
@@ -2602,6 +2675,7 @@ jobs:
             and (.child_run_id | type == "string" and length > 0)
           ' funded-v10-completion.json
           child_run_id=$(jq -r '.child_run_id' funded-v10-completion.json)
+          [[ "$child_run_id" =~ ^funded-direct-[0-9]{17}-[0-9a-f]{8}$ ]]
           jq -e --arg decision "$decision_id" --arg run "$child_run_id" --arg authorization_blob "$authorization_blob" --arg authorization_sha "$authorization_sha256" '
             .schema == "polyedge.operator_funded_intent_authorization.v1"
             and .authorization_mode == "operator_direct"
@@ -2733,6 +2807,7 @@ jobs:
             | if length == 1 then .[0].name else empty end
           ' funded-v10-risk-reservations.json)
           test -n "$reservation_blob"
+          [[ "$reservation_blob" =~ ^reports/research/venue-probe/risk-reservations/[0-9]{4}-[0-9]{2}-[0-9]{2}/funded-direct-${decision_id}\.json$ ]]
           az storage blob download \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -2789,7 +2864,75 @@ jobs:
             and .probe_id == ("funded-direct-" + $decision)
             and .order_submitted == true
             and .order_id == $order_id
-            and (
+          ' funded-v10-risk-reservation.json
+          az servicebus queue update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --status SendDisabled \
+            --only-show-errors -o none
+          test "$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --query status -o tsv)" = "SendDisabled"
+          {
+            printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\n' "$decision_id"
+            printf 'FUNDED_LIFECYCLE_CHILD_RUN_ID=%s\n' "$child_run_id"
+            printf 'FUNDED_LIFECYCLE_ORDER_ID=%s\n' "$order_id"
+            printf 'FUNDED_LIFECYCLE_RESERVATION_BLOB=%s\n' "$reservation_blob"
+          } >> "$GITHUB_ENV"
+          trap - EXIT
+
+      - name: Refresh Azure login before terminal reservation verification
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Wait for the exact terminal v10 reservation before cutover
+        run: |
+          set -euo pipefail
+          readonly decision_id="${FUNDED_LIFECYCLE_DECISION_ID:?}"
+          readonly child_run_id="${FUNDED_LIFECYCLE_CHILD_RUN_ID:?}"
+          readonly order_id="${FUNDED_LIFECYCLE_ORDER_ID:?}"
+          readonly reservation_blob="${FUNDED_LIFECYCLE_RESERVATION_BLOB:?}"
+          readonly dlq_before="${FUNDED_CUTOVER_DLQ_BEFORE:?}"
+          [[ "$decision_id" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$child_run_id" =~ ^funded-direct-[0-9]{17}-[0-9a-f]{8}$ ]]
+          [[ "$order_id" =~ ^0x[0-9a-fA-F]{64}$ ]]
+          [[ "$dlq_before" =~ ^[0-9]+$ ]]
+          [[ "$reservation_blob" =~ ^reports/research/venue-probe/risk-reservations/[0-9]{4}-[0-9]{2}-[0-9]{2}/funded-direct-${decision_id}\.json$ ]]
+          terminal_reservation_ready=false
+          terminal_deadline_epoch=$(( $(date -u +%s) + 2400 ))
+          sleep_before_terminal_deadline() {
+            local remaining=$(( terminal_deadline_epoch - $(date -u +%s) ))
+            [ "$remaining" -gt 0 ] || return 1
+            [ "$remaining" -le 10 ] || remaining=10
+            sleep "$remaining"
+          }
+          while [ "$(date -u +%s)" -lt "$terminal_deadline_epoch" ]; do
+            if ! az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$reservation_blob" \
+              --file funded-v10-terminal-risk-reservation.json \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none; then
+              sleep_before_terminal_deadline || break
+              continue
+            fi
+            jq -e --arg decision "$decision_id" --arg run "$child_run_id" --arg order_id "$order_id" '
+              .schema_version == 1
+              and .campaign_id == "dynamic-quote-funded-2026-08-13-v10"
+              and .run_id == $run
+              and .probe_id == ("funded-direct-" + $decision)
+              and .order_submitted == true
+              and .order_id == $order_id
+            ' funded-v10-terminal-risk-reservation.json >/dev/null
+            if jq -e '
               (.state == "finalized_no_fill"
                 and .matched_notional == 0
                 and .reconciliation_complete == true
@@ -2800,20 +2943,34 @@ jobs:
                 and .settlement_verified == true
                 and (.settlement_evidence_source == "verified_onchain_redemption"
                   or .settlement_evidence_source == "polymarket_data_api_redeemable"))
-            )
-          ' funded-v10-risk-reservation.json
+            ' funded-v10-terminal-risk-reservation.json >/dev/null; then
+              terminal_reservation_ready=true
+              break
+            fi
+            sleep_before_terminal_deadline || break
+          done
+          test "$terminal_reservation_ready" = true
           az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             -o json > funded-queue-after-lifecycle.json
-          test "$(jq -r '.status' funded-queue-after-lifecycle.json)" = "Active"
+          test "$(jq -r '.status' funded-queue-after-lifecycle.json)" = "SendDisabled"
           test "$(jq -r '.countDetails.activeMessageCount' funded-queue-after-lifecycle.json)" = "0"
           test "$(jq -r '.countDetails.scheduledMessageCount' funded-queue-after-lifecycle.json)" = "0"
           test "$(jq -r '.countDetails.deadLetterMessageCount' funded-queue-after-lifecycle.json)" = "$dlq_before"
+          az servicebus queue update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --status Active \
+            --only-show-errors -o none
+          test "$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --query status -o tsv)" = "Active"
           echo "FUNDED_CUTOVER_COMPLETE=true" >> "$GITHUB_ENV"
-          cutover_complete=true
-          trap - EXIT
 
       - name: Restore the dormant funded service after an incomplete cutover
         if: ${{ always() && (env.FUNDED_QUEUE_FENCED == 'true' || env.FUNDED_POINTER_PREFLIGHT_REQUESTED == 'true') && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
