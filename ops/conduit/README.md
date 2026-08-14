@@ -88,23 +88,27 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260813T030000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-13T03:00:00Z`,
+Ledger `/srv/polyedge-ring/parity/20260814T010000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-14T01:00:00Z`,
 supersedes every earlier zero-credit ledger, keeps Azure authoritative and
 `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-16T03:00:00Z`. Completion still requires 72 consecutive accepted
+`2026-08-17T01:00:00Z`. Completion still requires 72 consecutive accepted
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates.
 
 The OCI API, ring uploader, and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:ff8c41086d9be7d98a8b645362c378d23bb5cdce4c156f7042592ffbec65c410`
-from source `be303731705e766ee41e5499a82d297d62e5783e`. Publication run
-`31652541561` passed, and the manifest contains both Linux AMD64 and ARM64. The
-API has remained healthy with zero restarts since `2026-08-13T01:01:58Z`.
+`sha256:4ba3dfc95c8c1cf0efcda80ef4465ef679b479b1f33453cf38f5c555239f2a48`
+from source `71782cb81779bfe691d6268eea1b703fc60a1eae`. Publication run
+`31754922264` passed, and the manifest contains both Linux AMD64 and ARM64. The
+API has remained healthy with zero restarts since `2026-08-14T00:40:41Z`;
+independent Binance and Chainlink timestamps advanced throughout the post-deploy
+watchdog soak with zero recorder failures. The superseded
+`20260813T220000Z.json` ledger retains zero credit after the pre-fix Binance
+stall and is not inherited by the new window.
 Rollback state is retained under `/etc/polyedge/rollback`, including
-`20260813T010147Z-polyedge-api.container`, `20260813T010300Z-job-images-be303`,
-`20260813T010500Z-ring.env`, and the `20260813T012656Z` hourly/parity bindings.
+`20260814T004030Z-polyedge-api.container` and the complete pre-reset job/parity
+bindings in `20260814T004400Z-rtds-parity-reset`.
 
 Azure primary revision `polyedge-dev--0000127` is healthy on exact source
 `be303731705e766ee41e5499a82d297d62e5783e` and immutable ACR digest
