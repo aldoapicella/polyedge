@@ -365,7 +365,7 @@ jobs:
           const safeHandoff = activation.indexOf(
             "printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\\n'", fenceReadback);
           const terminalLoop = activation.indexOf(
-            "terminal_deadline_epoch=$(( $(date -u +%s) + 2400 ))", terminalLogin);
+            "terminal_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))", terminalLogin);
           const terminalIdentity = activation.indexOf(".schema_version == 1", terminalLoop);
           const terminalProof = activation.indexOf('test "$terminal_reservation_ready" = true', terminalLoop);
           const terminalPredicate = activation.indexOf('.state == "position_settled"', terminalLoop);
@@ -385,9 +385,11 @@ jobs:
           const legacyPreflightLoop = ["for attempt in $(seq 1 ", "1200); do"].join("");
           assert.equal(workflow.includes(legacyPreflightLoop), false);
           const waitBounds = Object.fromEntries([...workflow.matchAll(
-            /(preflight|lifecycle|terminal)_deadline_epoch=\$\(\( \$\(date -u \+%s\) \+ ([0-9]+) \)\)/g
+            /(capital_reconcile|preflight|lifecycle|terminal)_deadline_monotonic=\$\(\( \$\(monotonic_seconds\) \+ ([0-9]+) \)\)/g
           )].map((match) => [match[1], Number(match[2])]));
-          assert.deepEqual(waitBounds, { preflight: 2700, lifecycle: 2400, terminal: 2400 });
+          assert.deepEqual(waitBounds,
+            { capital_reconcile: 900, preflight: 2700, lifecycle: 2400, terminal: 2400 });
+          assert.equal((workflow.match(/python3 -c 'import time; print\(int\(time\.monotonic\(\)\)\)'/g) || []).length, 4);
           assert.ok(Object.values(waitBounds).reduce((sum, value) => sum + value, 0) <= 180 * 60);
           const rollback = workflow.slice(
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
@@ -1301,8 +1303,11 @@ jobs:
             --query name -o tsv)
           test -n "$capital_reconcile_execution"
           status=Running
-          capital_reconcile_deadline_epoch=$(( $(date -u +%s) + 900 ))
-          while [ "$(date -u +%s)" -lt "$capital_reconcile_deadline_epoch" ]; do
+          monotonic_seconds() {
+            python3 -c 'import time; print(int(time.monotonic()))'
+          }
+          capital_reconcile_deadline_monotonic=$(( $(monotonic_seconds) + 900 ))
+          while [ "$(monotonic_seconds)" -lt "$capital_reconcile_deadline_monotonic" ]; do
             if status=$(az containerapp job execution show \
                 --resource-group "$AZURE_RESOURCE_GROUP" \
                 --name "$FUNDED_JOB" \
@@ -1892,14 +1897,17 @@ jobs:
             --query name -o tsv)
           test -n "$preflight_execution"
           status=Running
-          preflight_deadline_epoch=$(( $(date -u +%s) + 2700 ))
+          monotonic_seconds() {
+            python3 -c 'import time; print(int(time.monotonic()))'
+          }
+          preflight_deadline_monotonic=$(( $(monotonic_seconds) + 2700 ))
           sleep_before_preflight_deadline() {
-            local remaining=$(( preflight_deadline_epoch - $(date -u +%s) ))
+            local remaining=$(( preflight_deadline_monotonic - $(monotonic_seconds) ))
             [ "$remaining" -gt 0 ] || return 1
             [ "$remaining" -le 10 ] || remaining=10
             sleep "$remaining"
           }
-          while [ "$(date -u +%s)" -lt "$preflight_deadline_epoch" ]; do
+          while [ "$(monotonic_seconds)" -lt "$preflight_deadline_monotonic" ]; do
             if ! status=$(az containerapp job execution show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_JOB" \
@@ -2852,14 +2860,17 @@ jobs:
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           lifecycle_ready=false
           # Observe several 15-minute markets; warmup is not proof of a qualifying Place intent.
-          lifecycle_deadline_epoch=$(( $(date -u +%s) + 2400 ))
+          monotonic_seconds() {
+            python3 -c 'import time; print(int(time.monotonic()))'
+          }
+          lifecycle_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))
           sleep_before_lifecycle_deadline() {
-            local remaining=$(( lifecycle_deadline_epoch - $(date -u +%s) ))
+            local remaining=$(( lifecycle_deadline_monotonic - $(monotonic_seconds) ))
             [ "$remaining" -gt 0 ] || return 1
             [ "$remaining" -le 10 ] || remaining=10
             sleep "$remaining"
           }
-          while [ "$(date -u +%s)" -lt "$lifecycle_deadline_epoch" ]; do
+          while [ "$(monotonic_seconds)" -lt "$lifecycle_deadline_monotonic" ]; do
             if ! az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
@@ -3175,14 +3186,17 @@ jobs:
           [[ "$dlq_before" =~ ^[0-9]+$ ]]
           [[ "$reservation_blob" =~ ^reports/research/venue-probe/risk-reservations/[0-9]{4}-[0-9]{2}-[0-9]{2}/funded-direct-${decision_id}\.json$ ]]
           terminal_reservation_ready=false
-          terminal_deadline_epoch=$(( $(date -u +%s) + 2400 ))
+          monotonic_seconds() {
+            python3 -c 'import time; print(int(time.monotonic()))'
+          }
+          terminal_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))
           sleep_before_terminal_deadline() {
-            local remaining=$(( terminal_deadline_epoch - $(date -u +%s) ))
+            local remaining=$(( terminal_deadline_monotonic - $(monotonic_seconds) ))
             [ "$remaining" -gt 0 ] || return 1
             [ "$remaining" -le 10 ] || remaining=10
             sleep "$remaining"
           }
-          while [ "$(date -u +%s)" -lt "$terminal_deadline_epoch" ]; do
+          while [ "$(monotonic_seconds)" -lt "$terminal_deadline_monotonic" ]; do
             if ! az storage blob download \
               --account-name "$STORAGE_ACCOUNT" \
               --container-name "$FUNDED_CONTAINER" \
