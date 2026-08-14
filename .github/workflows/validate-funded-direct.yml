@@ -291,6 +291,8 @@ jobs:
             /authorized_equity_ceiling - \(29\.505501 \+ \$settlement_pnl\)/);
           assert.equal(preparePreflight.includes(".verified_realized_pnl == 0"), false);
           assert.equal(preparePreflight.includes(".verified_settlement_ids == []"), false);
+          assert.match(preparePreflight,
+            /expired_before_child_launch[\s\S]*order_submission_attempted == false[\s\S]*risk_reservation_created == false/);
           const pointerPreflightMarker = workflow.indexOf(
             "FUNDED_POINTER_PREFLIGHT_REQUESTED=true", pointerPreflightDeployment);
           const pointerPreflight = workflow.indexOf(
@@ -1589,6 +1591,11 @@ jobs:
                   and .authorization_consumed == false
                   and .risk_reservation_created == false
                   and (.error | type == "string" and length > 0))
+                or
+                (.status == "expired_before_child_launch"
+                  and .order_submission_attempted == false
+                  and .authorization_consumed == false
+                  and .risk_reservation_created == false)
                 or
                 (.status == "child_completed"
                   and .order_submission_attempted == true
