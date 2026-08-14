@@ -293,6 +293,8 @@ jobs:
           assert.equal(preparePreflight.includes(".verified_settlement_ids == []"), false);
           assert.match(preparePreflight,
             /expired_before_child_launch[\s\S]*order_submission_attempted == false[\s\S]*risk_reservation_created == false/);
+          assert.match(preparePreflight,
+            /child_failed_closed_post_submission_unresolved[\s\S]*released_no_order[\s\S]*order_submitted == false[\s\S]*zero_open_orders_confirmed == true/);
           const pointerPreflightMarker = workflow.indexOf(
             "FUNDED_POINTER_PREFLIGHT_REQUESTED=true", pointerPreflightDeployment);
           const pointerPreflight = workflow.indexOf(
@@ -1597,6 +1599,16 @@ jobs:
                   and .authorization_consumed == false
                   and .risk_reservation_created == false)
                 or
+                (.status == "child_failed_closed_post_submission_unresolved"
+                  and .order_submission_attempted == true
+                  and .authorization_consumed == true
+                  and .risk_reservation_created == true
+                  and .order_id == null
+                  and .matched_notional == 0
+                  and .reconciliation_complete == false
+                  and .zero_open_orders_confirmed == false
+                  and (.post_submission_error | type == "string" and length > 0))
+                or
                 (.status == "child_completed"
                   and .order_submission_attempted == true
                   and .authorization_consumed == true
@@ -1608,7 +1620,9 @@ jobs:
             reservation_count=$(jq --arg decision "$existing_decision" '
               [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))] | length
             ' existing-v10-risk-reservations.json)
-            if [ "$(jq -r '.status' "$completion_file")" = "child_completed" ]; then
+            completion_status=$(jq -r '.status' "$completion_file")
+            if [ "$completion_status" = "child_completed" ] || \
+              [ "$completion_status" = "child_failed_closed_post_submission_unresolved" ]; then
               test "$reservation_count" = "1"
               reservation_blob=$(jq -r --arg decision "$existing_decision" '
                 [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))][0].name
@@ -1618,24 +1632,33 @@ jobs:
                 --account-name "$STORAGE_ACCOUNT" --container-name "$FUNDED_CONTAINER" \
                 --name "$reservation_blob" --file "$reservation_file" \
                 --auth-mode login --overwrite --only-show-errors -o none
-              jq -e --arg decision "$existing_decision" --arg run "$auth_run" '
+              jq -e --arg decision "$existing_decision" --arg run "$auth_run" \
+                --arg completion_status "$completion_status" '
                 .schema_version == 1
                 and .campaign_id == "dynamic-quote-funded-2026-08-13-v10"
                 and .run_id == $run
                 and .probe_id == ("funded-direct-" + $decision)
-                and .order_submitted == true
-                and (
-                  (.state == "finalized_no_fill"
-                    and .matched_notional == 0
-                    and .reconciliation_complete == true
-                    and .zero_open_orders_confirmed == true)
-                  or
-                  (.state == "position_settled"
-                    and .matched_notional > 0
-                    and .settlement_verified == true
-                    and (.settlement_evidence_source == "verified_onchain_redemption"
-                      or .settlement_evidence_source == "polymarket_data_api_redeemable"))
-                )
+                and (if $completion_status == "child_completed" then
+                  .order_submitted == true
+                  and (
+                    (.state == "finalized_no_fill"
+                      and .matched_notional == 0
+                      and .reconciliation_complete == true
+                      and .zero_open_orders_confirmed == true)
+                    or
+                    (.state == "position_settled"
+                      and .matched_notional > 0
+                      and .settlement_verified == true
+                      and (.settlement_evidence_source == "verified_onchain_redemption"
+                        or .settlement_evidence_source == "polymarket_data_api_redeemable"))
+                  )
+                else
+                  .state == "released_no_order"
+                  and .order_submitted == false
+                  and .matched_notional == 0
+                  and .reconciliation_complete == true
+                  and .zero_open_orders_confirmed == true
+                end)
               ' "$reservation_file" >/dev/null
             else
               test "$reservation_count" = "0"
