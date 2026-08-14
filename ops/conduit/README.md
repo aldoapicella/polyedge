@@ -124,39 +124,47 @@ zero-essential-feed-error gate rejected the hour. The old bindings and ledger
 remain recoverable under
 `/etc/polyedge/rollback/20260814T022900Z-parity-0300-reset`.
 
-The OCI API is pinned to multi-architecture digest
+The OCI API, ring uploader, and all seven primary research jobs are pinned to
+multi-architecture digest
 `sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`
 from source `777d9e1e89151edb9dc94881b25de8e27c7df90c`. Publication run
 `31785829764` and validation run `31785809845` passed, and the manifest contains
 both Linux AMD64 and ARM64. The API has remained healthy with zero restarts
 since the corrected deployment; independent Binance and Chainlink timestamps
 advanced throughout the post-deploy watchdog soak with zero explicit recorder
-failures or drops. The ring uploader and all seven primary research jobs remain
-pinned separately to multi-architecture digest
-`sha256:ff8c41086d9be7d98a8b645362c378d23bb5cdce4c156f7042592ffbec65c410`
-from source `be303731705e766ee41e5499a82d297d62e5783e`. That exact source matches the
-Azure hourly comparator image
-`sha256:c3231b6e7bbaa72a3128b227053da519da7283d3e079329cb18b99de62318142`;
-the API-only feed fix does not alter the research comparator. A bounded OCI
-freshness run passed on the rebound research image before the formal window.
+failures or drops. The same manifest was imported without rebuild into ACR as
+`polyedge-rust-research@sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`.
+Azure primary revision `polyedge-dev--0000128` and the Azure hourly comparator
+job use that digest and source. The Azure revision became healthy before
+traffic moved; its protected configuration hash, frontend, identity, secrets,
+paper guards, and scaling remained unchanged. Two authenticated runtime samples
+showed all four essential feeds current and explicit recorder errors and drops
+at zero. A scheduled OCI freshness run also passed on the unified image before
+the formal window. At the 11:00 UTC boundary, authenticated Azure and OCI
+samples both reported the exact source, all four feeds current, drained recorder
+queues, persisted-equals-enqueued, and zero explicit errors or drops. The ring
+was caught up and the boot disk retained 33 GiB free. The ledger remains at zero
+until the first complete hour is audited at 12:18 UTC.
 Rollback state is retained under `/etc/polyedge/rollback`, including the
 corrected-image predecessor
 `20260814T095239Z-polyedge-api.container`, the failed bare-filter canary
 `20260814T085128Z-polyedge-api.container`, and the complete pre-reset bindings
-in `20260814T100407Z-rtds-json-filter-parity-reset`. The provenance-correct
-research bindings are recoverable under
-`20260814T103458Z-azure-comparator-parity-rebind`. The pre-window hourly report
-had advisory historical-coverage warnings but no critical issue. At 10:18 UTC
-the parity collector wrote the 09:00 hour as `excluded_pre_window`; the formal
-ledger remained at zero accepted hours.
+in `20260814T100407Z-rtds-json-filter-parity-reset`. Additional rollback captures
+retain the prior Azure app, Azure hourly job, OCI job bindings, and ring binding
+under `20260814T104049Z-azure-primary-777d9e1`,
+`20260814T104325Z-azure-hourly-777d9e1`,
+`20260814T104535Z-unified-777d9e1-parity-rebind`, and
+`20260814T104853Z-ring-777d9e1`. The pre-window hourly report had advisory
+historical-coverage warnings but no critical issue. At 10:18 UTC the parity
+collector wrote the 09:00 hour as `excluded_pre_window`; the formal ledger
+remained at zero accepted hours.
 
-Azure primary revision `polyedge-dev--0000127` is healthy on exact source
-`be303731705e766ee41e5499a82d297d62e5783e` and immutable ACR digest
-`sha256:22b6994d0e5c40fae466ce75d9ce4cbee8c4dcb4c523979f4485f2fc96c6b326`.
-Guarded workflow run `31657198674` deployed the Azure hourly job at `:10` on
-digest `sha256:c3231b6e7bbaa72a3128b227053da519da7283d3e079329cb18b99de62318142`,
-with exact generator provenance and paper-only controls. The protected funded
-producer and frozen qset revision were unchanged by that deployment.
+Azure primary revision `polyedge-dev--0000128` is healthy on exact source
+`777d9e1e89151edb9dc94881b25de8e27c7df90c` and immutable ACR digest
+`sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`.
+The guarded hourly job binding at `:10` uses the same digest with exact generator
+provenance and paper-only controls. The protected funded producer and frozen
+qset revision were unchanged by both image-only updates.
 
 The `15:00` hour receives zero credit because seven durable essential-feed
 reconnect errors occurred even though recorder sequence durability and all six
