@@ -122,14 +122,27 @@ pub async fn run_market_feed(
     let (stream, _) = connect_async(settings.target.polymarket_ws_url.as_str()).await?;
     let (mut write, mut read) = stream.split();
     write.send(Message::Text(subscribe)).await?;
-    let mut books = BTreeMap::new();
-    while let Some(message) = read.next().await {
-        let message = message?;
-        for event in parse_market_message(message, &mut books) {
-            publish(&sender, event).await?;
+    let ping_loop = async move {
+        let mut ping = tokio::time::interval(Duration::from_secs(10));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ping.tick().await;
+            write.send(Message::Text("PING".to_owned())).await?;
         }
+    };
+    let read_loop = async move {
+        let mut books = BTreeMap::new();
+        while let Some(message) = read.next().await {
+            for event in parse_market_message(message?, &mut books) {
+                publish(&sender, event).await?;
+            }
+        }
+        Ok::<(), FeedError>(())
+    };
+    tokio::select! {
+        result = ping_loop => result,
+        result = read_loop => result,
     }
-    Ok(())
 }
 
 pub async fn run_binance_book_ticker_feed(
@@ -698,6 +711,42 @@ mod tests {
             }
             other => panic!("unexpected RTDS result: {other}"),
         }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn market_socket_sends_required_ping() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(12)))
+                .unwrap();
+            let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
+            let subscription: Value =
+                serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(subscription["type"], "market");
+            assert_eq!(subscription["assets_ids"], json!(["token"]));
+            assert_eq!(socket.read().unwrap(), Message::Text("PING".to_owned()));
+            let first_ping = Instant::now();
+            socket.send(Message::Text("PONG".to_owned())).unwrap();
+            assert_eq!(socket.read().unwrap(), Message::Text("PING".to_owned()));
+            assert!(first_ping.elapsed() >= Duration::from_secs(9));
+            socket.close(None).unwrap();
+        });
+
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_ws_url = format!("ws://{address}");
+        let (sender, _receiver) = mpsc::channel(8);
+
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            run_market_feed(settings, vec![TokenId::new("token")], sender),
+        )
+        .await
+        .expect("market socket did not send its required PING")
+        .unwrap();
         server.join().unwrap();
     }
 }
