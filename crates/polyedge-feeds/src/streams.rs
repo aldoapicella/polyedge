@@ -32,7 +32,7 @@ pub async fn run_rtds_feed(
         subscriptions.push(json!({
             "topic": "crypto_prices",
             "type": "update",
-            "filters": settings.target.binance_symbol
+            "filters": json!({"symbol": settings.target.binance_symbol}).to_string()
         }));
     }
     if subscriptions.is_empty() {
@@ -672,7 +672,10 @@ mod tests {
             assert_eq!(subscription["subscriptions"].as_array().unwrap().len(), 1);
             assert_eq!(subscription["subscriptions"][0]["topic"], "crypto_prices");
             assert_eq!(subscription["subscriptions"][0]["type"], "update");
-            assert_eq!(subscription["subscriptions"][0]["filters"], "btcusdt");
+            assert_eq!(
+                subscription["subscriptions"][0]["filters"],
+                r#"{"symbol":"btcusdt"}"#
+            );
             while socket.read().is_ok() {}
         });
 
