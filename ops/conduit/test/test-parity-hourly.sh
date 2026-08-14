@@ -58,9 +58,21 @@ case "$1" in
     printf '%s\n' "$*" >>"$FAKE_CALLS/podman"
     execution=${POLYEDGE_GENERATOR_EXECUTION_ID:-}
     [ -n "$execution" ] || exit 2
+    evidence_dir=
+    previous=
+    for arg do
+      if [ "$previous" = volume ]; then
+        case "$arg" in *:/evidence:rw,Z) evidence_dir=${arg%:/evidence:rw,Z} ;; esac
+      fi
+      previous=
+      [ "$arg" != -v ] || previous=volume
+    done
+    [ -n "$evidence_dir" ] || exit 2
     jq --arg execution "$execution" '.generator_provenance.execution_id=$execution' \
       "$FAKE_SAME_REPORT" >"$FAKE_CALLS/container-audit.json"
     : >"$FAKE_CALLS/container-audit.md"
+    cp "$FAKE_CALLS/container-audit.json" "$evidence_dir/audit.json"
+    cp "$FAKE_CALLS/container-audit.md" "$evidence_dir/audit.md"
     ;;
   cp)
     shift
@@ -633,7 +645,7 @@ jq -e '.acceptedForParityWindow == true and .sameInput.deterministicResultExactM
   "$success/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
 grep -q -- "--user $uid:$gid" "$success/calls/podman"
 grep -q -- "$success/token/azure-federated-token:/run/credentials/azure-federated-token:ro,Z" "$success/calls/podman"
-grep -q -- '/evidence:rw,noexec,nosuid,size=64m,mode=1777' "$success/calls/podman"
+grep -q -- ':/evidence:rw,Z' "$success/calls/podman"
 ! grep -q -- '--security-opt=no-new-privileges' "$success/calls/podman"
 [ "$(protected "$success/ring/parity/ledger.json")" = "$before" ]
 runs=$(wc -l <"$success/calls/podman")
