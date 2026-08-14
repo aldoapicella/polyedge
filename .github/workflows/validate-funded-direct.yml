@@ -289,6 +289,14 @@ jobs:
             /verify-funded-v10-settlement\.mjs[\s\S]*verified_settlement_ids == \$settlement_ids/);
           assert.match(preparePreflight,
             /authorized_equity_ceiling - \(29\.505501 \+ \$settlement_pnl\)/);
+          assert.match(preparePreflight,
+            /redeemed_and_verified[\s\S]*internal_settlement_blobs[\s\S]*settlement_bindings/);
+          assert.match(preparePreflight,
+            /blob_name == \$latest or \.status == "nothing_to_redeem"[\s\S]*\.status == "nothing_to_redeem"/);
+          assert.match(preparePreflight,
+            /settlement_bindings[\s\S]*internal_automatic_settlement[\s\S]*transaction_hash == \$transaction_hash[\s\S]*gross_payout/);
+          assert.match(preparePreflight,
+            /blob_name == \$latest[\s\S]*authorized_ceiling[\s\S]*29\.505501/);
           assert.equal(preparePreflight.includes(".verified_realized_pnl == 0"), false);
           assert.equal(preparePreflight.includes(".verified_settlement_ids == []"), false);
           assert.match(preparePreflight,
@@ -1421,6 +1429,7 @@ jobs:
             --overwrite \
             --only-show-errors -o none
           : > existing-v10-internal-settlement-accounting.jsonl
+          : > existing-v10-internal-settlement-bindings.jsonl
           while IFS= read -r settlement_blob; do
             settlement_file=$(mktemp)
             az storage blob download \
@@ -1434,12 +1443,23 @@ jobs:
             node .github/workflows/verify-funded-v10-settlement.mjs \
               "$settlement_file" "$settlement_blob" \
               >> existing-v10-internal-settlement-accounting.jsonl
+            jq -c --arg blob_name "$settlement_blob" '{
+              blob_name: $blob_name,
+              type,
+              transaction_hash,
+              condition_id,
+              payout
+            }' "$settlement_file" >> existing-v10-internal-settlement-bindings.jsonl
             rm -f "$settlement_file"
           done < <(jq -r --arg prefix "$v10_internal_settlement_prefix" '
             .[].name | select(startswith($prefix))
           ' v10-prefix-before-preflight.json)
           jq -se '([.[].id] | length == (unique | length))' \
             existing-v10-internal-settlement-accounting.jsonl >/dev/null
+          settlement_bindings=$(jq -sc '
+            ([.[].blob_name] | length == (unique | length)) as $unique
+            | if $unique then sort_by(.blob_name) else error("duplicate settlement blob") end
+          ' existing-v10-internal-settlement-bindings.jsonl)
           settlement_ids=$(jq -sc '[.[].id] | sort' \
             existing-v10-internal-settlement-accounting.jsonl)
           settlement_pnl=$(jq -s '[.[].realized_pnl] | add // 0' \
@@ -1699,9 +1719,10 @@ jobs:
               --auth-mode login \
               --overwrite \
               --only-show-errors -o none
-            jq -e --argjson authorized_ceiling "$authorized_ceiling" '
+            jq -e --argjson authorized_ceiling "$authorized_ceiling" \
+              --argjson settlement_bindings "$settlement_bindings" \
+              --arg blob_name "$blob_name" --arg latest "$v10_latest_redemption" '
               .schema_version == 1
-              and .status == "nothing_to_redeem"
               and (.finished_ts | type == "string")
               and (.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
               and .execution_origin == "azure_chile_central_static_egress"
@@ -1709,18 +1730,64 @@ jobs:
               and .static_egress_verified == true
               and .dry_run == false
               and .redemption_enabled == true
-              and .redemption_submitted == false
               and .zero_open_orders_confirmed == true
-              and .selection.selected == []
-              and .selection.selected_gross_payout == 0
-              and .planned_calls == []
               and .derived_wallet_match == true
               and .wallet_type == "legacy_uups_deposit_wallet"
               and .research_only == false
               and .live_strategy_enabled == true
               and (.liquid_collateral_before | type == "number")
               and .liquid_collateral_before > 0
-              and .liquid_collateral_before <= $authorized_ceiling
+              and .liquid_collateral_before <=
+                (if $blob_name == $latest then $authorized_ceiling else 29.505501 end)
+              and (if $blob_name == $latest or .status == "nothing_to_redeem" then
+                .status == "nothing_to_redeem"
+                and
+                .redemption_submitted == false
+                and .selection.selected == []
+                and .selection.selected_gross_payout == 0
+                and .planned_calls == []
+              elif .status == "redeemed_and_verified" then
+                .redemption_submitted == true
+                and (.selection.selected | type == "array" and length >= 1)
+                and (.selection.selected_gross_payout | type == "number" and . > 0)
+                and (.planned_calls | type == "array" and length >= 1)
+                and (.transaction_id | type == "string" and length > 0)
+                and (.transaction_hash | type == "string"
+                  and test("^0x[0-9a-fA-F]{64}$"))
+                and (.liquid_collateral_after | type == "number" and . >= 0)
+                and (.realized_payout | type == "number" and . > 0)
+                and ((.realized_payout - .selection.selected_gross_payout) | fabs)
+                  <= 0.0000011
+                and ((.liquid_collateral_after - .liquid_collateral_before
+                  - .realized_payout) | fabs) <= 0.0000011
+                and (.internal_settlement_blobs | type == "array" and length >= 1)
+                and (.internal_settlement_blobs | length) == (.selection.selected | length)
+                and (.internal_settlement_blobs | length) ==
+                  (.internal_settlement_blobs | unique | length)
+                and (.internal_settlement_blobs as $references
+                  | .selection.selected as $selected
+                  | .transaction_hash as $transaction_hash
+                  | .realized_payout as $realized_payout
+                  | [$settlement_bindings[]
+                    | select(.blob_name as $candidate
+                      | ($references | index($candidate)) != null)] as $bound
+                  | ($bound | length) == ($references | length)
+                  and all($bound[];
+                    .type == "internal_automatic_settlement"
+                    and .transaction_hash == $transaction_hash)
+                  and ([$bound[] | {
+                    condition_id: (.condition_id | ascii_downcase),
+                    payout
+                  }] | sort_by(.condition_id, .payout)) ==
+                    ([$selected[] | {
+                      condition_id: (.condition_id | ascii_downcase),
+                      payout: .gross_payout
+                    }] | sort_by(.condition_id, .payout))
+                  and ((([$bound[].payout] | add) - $realized_payout) | fabs)
+                    <= 0.0000011
+                )
+              else false
+              end)
             ' "$redemption_file" >/dev/null
             redemption_sha="sha256:$(sha256sum "$redemption_file" | cut -d' ' -f1)"
             if [ "$blob_name" = "$v10_latest_redemption" ]; then
