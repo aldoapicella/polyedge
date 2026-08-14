@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/validate-funded-direct.yml"
+      - ".github/workflows/validate-funded-direct.test.mjs"
       - "crates/polyedge-api/**"
       - "crates/polyedge-config/**"
       - "crates/polyedge-domain/**"
@@ -113,6 +114,7 @@ jobs:
           assert.equal(parameters.fundedDirectStartingCollateral.value, "29.505501");
           assert.equal(parameters.fundedDirectMaxAccountLoss.value, "29.505501");
           NODE
+          node --test .github/workflows/validate-funded-direct.test.mjs
 
       - uses: actions/setup-node@v4
         with:
@@ -2570,11 +2572,78 @@ jobs:
             --overwrite \
             --only-show-errors -o none
           test "$intent_sha256" = "sha256:$(sha256sum funded-v10-intent.json | cut -d' ' -f1)"
-          jq -e --arg decision "$decision_id" '
-            .decision_id == $decision
-            and (.market_id | tostring | test("^[0-9]+$"))
-            and .notional == "10.5"
-          ' funded-v10-intent.json
+          # funded-v10-intent-risk-proof-begin
+          node - funded-v10-intent.json "$decision_id" <<'NODE'
+          const assert = require("node:assert/strict");
+          const fs = require("node:fs");
+
+          function decimal(value, name) {
+            assert.equal(typeof value, "string", `${name} must be a decimal string`);
+            const match = /^(0|[1-9][0-9]*)(?:\.([0-9]+))?$/.exec(value);
+            assert.ok(match, `${name} must be a canonical nonnegative decimal string`);
+            const fraction = match[2] ?? "";
+            return { coefficient: BigInt(`${match[1]}${fraction}`), scale: fraction.length };
+          }
+
+          function scaledCoefficient(value, scale) {
+            return value.coefficient * (10n ** BigInt(scale - value.scale));
+          }
+
+          function compare(left, right) {
+            const scale = Math.max(left.scale, right.scale);
+            const leftCoefficient = scaledCoefficient(left, scale);
+            const rightCoefficient = scaledCoefficient(right, scale);
+            return leftCoefficient < rightCoefficient ? -1 : leftCoefficient > rightCoefficient ? 1 : 0;
+          }
+
+          function add(left, right) {
+            const scale = Math.max(left.scale, right.scale);
+            return {
+              coefficient: scaledCoefficient(left, scale) + scaledCoefficient(right, scale),
+              scale
+            };
+          }
+
+          function multiply(left, right) {
+            return {
+              coefficient: left.coefficient * right.coefficient,
+              scale: left.scale + right.scale
+            };
+          }
+
+          const intent = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          const authorizedTarget = decimal("10.5", "authorized target");
+          const zero = decimal("0", "zero");
+          const one = decimal("1", "one");
+          assert.equal(intent.decision_id, process.argv[3]);
+          assert.equal(typeof intent.market_id, "string", "market_id must use the Rust string wire type");
+          assert.match(intent.market_id, /^[0-9]+$/);
+
+          const price = decimal(intent.price, "price");
+          const shares = decimal(intent.shares, "shares");
+          const notional = decimal(intent.notional, "notional");
+          const fee = decimal(intent.fee_allowance, "fee_allowance");
+          const minimum = decimal(intent.minimum_order_size, "minimum_order_size");
+          assert.ok(compare(price, zero) > 0 && compare(price, one) < 0);
+          assert.ok(compare(shares, zero) > 0);
+          assert.ok(compare(minimum, zero) > 0);
+
+          const riskPerShare = add(price, fee);
+          const targetCentsNumerator = authorizedTarget.coefficient
+            * 100n
+            * (10n ** BigInt(riskPerShare.scale));
+          const targetCentsDenominator = riskPerShare.coefficient
+            * (10n ** BigInt(authorizedTarget.scale));
+          const sizedShares = {
+            coefficient: targetCentsNumerator / targetCentsDenominator,
+            scale: 2
+          };
+          const expectedShares = compare(sizedShares, minimum) >= 0 ? sizedShares : minimum;
+          assert.equal(compare(shares, expectedShares), 0, "shares do not match fee-aware 2dp floor");
+          assert.equal(compare(notional, multiply(price, shares)), 0, "notional does not equal price * shares");
+          assert.ok(compare(notional, authorizedTarget) <= 0, "principal notional exceeds authorization cap");
+          NODE
+          # funded-v10-intent-risk-proof-end
           intent_market=$(jq -er '.market_id | tostring' funded-v10-intent.json)
           intent_market_end_ts=$(jq -er '.market_end_ts | select(type == "string")' funded-v10-intent.json)
           lifecycle_completed_at=$(jq -er '.[0].TimeGenerated | select(type == "string")' \
