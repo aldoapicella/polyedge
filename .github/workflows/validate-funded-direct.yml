@@ -250,6 +250,20 @@ jobs:
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
           assert.equal(workflow.includes(
             ["FUNDED_DIRECT_SERVICE_BUS_ENABLED", "false"].join("=")), false);
+          const preparePreflightStart = workflow.lastIndexOf(
+            "\n      - name: Prepare zero-write v10 preflight inputs");
+          const preparePreflightEnd = workflow.lastIndexOf(
+            "\n      - name: Run the zero-write v10 preflight against a fresh producer intent");
+          assert.ok(preparePreflightStart >= 0 && preparePreflightStart < preparePreflightEnd);
+          const preparePreflight = workflow.slice(preparePreflightStart, preparePreflightEnd);
+          assert.equal(preparePreflight.includes(
+            "cmp existing-v10-authorization-decisions.txt existing-v10-completion-decisions.txt"), false);
+          assert.match(preparePreflight,
+            /comm -23 existing-v10-authorization-decisions\.txt existing-v10-completion-decisions\.txt/);
+          assert.match(preparePreflight,
+            /comm -13 existing-v10-authorization-decisions\.txt existing-v10-completion-decisions\.txt/);
+          assert.match(preparePreflight,
+            /\.authorization_blob_name == null[\s\S]*\.status == "one_workflow_busy"[\s\S]*\.risk_reservation_created == false/);
           const pointerPreflightDeployment = workflow.indexOf(
             "\n      - name: Deploy and verify the pointer-only preflight Dynamic Quote intent producer"
           );
@@ -1184,6 +1198,15 @@ jobs:
           ' v10-prefix-before-preflight.json >/dev/null
           jq -S '[.[] | {name, etag: .properties.etag, size: .properties.contentLength}]' \
             v10-prefix-before-preflight.json > v10-prefix-before-preflight.snapshot.json
+          az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_JOB" \
+            -o json > funded-preflight-job.json
+          intent_container=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_CONTAINER_NAME") | .value' funded-preflight-job.json)
+          intent_prefix=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_PREFIX") | .value' funded-preflight-job.json)
+          test "$(jq -r '.properties.configuration.replicaTimeout' funded-preflight-job.json)" = "11400"
+          test "$intent_container" = "polyedge-shadow-events"
+          test "$intent_prefix" = "reports/research/venue-probe/control/strategy-canary/intents"
           if jq -e --arg session "$v10_session_blob" \
               '[.[].name] | index($session) != null' \
               v10-prefix-before-preflight.json >/dev/null; then
@@ -1247,7 +1270,11 @@ jobs:
             | sort | .[]
           ' v10-prefix-before-preflight.json > existing-v10-completion-decisions.txt
           test -s existing-v10-authorization-decisions.txt
-          cmp existing-v10-authorization-decisions.txt existing-v10-completion-decisions.txt
+          comm -23 existing-v10-authorization-decisions.txt existing-v10-completion-decisions.txt \
+            > existing-v10-authorization-only-decisions.txt
+          comm -13 existing-v10-authorization-decisions.txt existing-v10-completion-decisions.txt \
+            > existing-v10-completion-only-decisions.txt
+          test ! -s existing-v10-authorization-only-decisions.txt
           az storage blob list \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
@@ -1255,6 +1282,48 @@ jobs:
             --num-results '*' \
             --auth-mode login \
             --only-show-errors -o json > existing-v10-risk-reservations.json
+          now_epoch=$(date -u +%s)
+          while IFS= read -r existing_decision; do
+            [[ "$existing_decision" =~ ^[0-9a-f]{64}$ ]]
+            completion_blob="${v10_completion_prefix}${existing_decision}.json"
+            completion_file=$(mktemp)
+            intent_file=$(mktemp)
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" --container-name "$FUNDED_CONTAINER" \
+              --name "$completion_blob" --file "$completion_file" \
+              --auth-mode login --overwrite --only-show-errors -o none
+            jq -e --arg decision "$existing_decision" --arg intent_prefix "$intent_prefix" '
+              .schema == "polyedge.operator_funded_intent_completion.v1"
+              and .session_id == "dynamic-quote-funded-2026-08-13-v10"
+              and .decision_id == $decision
+              and .intent_blob_name == ($intent_prefix + "/" + $decision + ".json")
+              and (.intent_sha256 | test("^sha256:[0-9a-f]{64}$"))
+              and .authorization_blob_name == null
+              and .authorization_sha256 == null
+              and .child_run_id == null
+              and (.completed_at | type == "string" and length > 0)
+              and .status == "one_workflow_busy"
+              and .order_submission_attempted == false
+              and .authorization_consumed == false
+              and .risk_reservation_created == false
+            ' "$completion_file" >/dev/null
+            intent_blob=$(jq -r '.intent_blob_name' "$completion_file")
+            intent_sha=$(jq -r '.intent_sha256' "$completion_file")
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" --container-name "$intent_container" \
+              --name "$intent_blob" --file "$intent_file" \
+              --auth-mode login --overwrite --only-show-errors -o none
+            test "$intent_sha" = "sha256:$(sha256sum "$intent_file" | cut -d' ' -f1)"
+            jq -e --arg decision "$existing_decision" --argjson now "$now_epoch" '
+              .schema == "polyedge.execution_intent.v1"
+              and .decision_id == $decision
+              and ((.valid_until | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) < $now)
+            ' "$intent_file" >/dev/null
+            reservation_count=$(jq --arg decision "$existing_decision" '
+              [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))] | length
+            ' existing-v10-risk-reservations.json)
+            test "$reservation_count" = "0"
+          done < existing-v10-completion-only-decisions.txt
           while IFS= read -r existing_decision; do
             [[ "$existing_decision" =~ ^[0-9a-f]{64}$ ]]
             authorization_blob="${v10_authorization_prefix}${existing_decision}.json"
@@ -1444,15 +1513,6 @@ jobs:
             --only-show-errors -o none
           v5_sha_before="sha256:$(sha256sum v5-state-before-preflight.json | cut -d' ' -f1)"
           test "$v5_sha_before" = "$v5_state_sha256"
-          az containerapp job show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$FUNDED_JOB" \
-            -o json > funded-preflight-job.json
-          intent_container=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_CONTAINER_NAME") | .value' funded-preflight-job.json)
-          intent_prefix=$(jq -r '.properties.template.containers[0].env[] | select(.name == "STRATEGY_CANARY_INTENT_PREFIX") | .value' funded-preflight-job.json)
-          test "$(jq -r '.properties.configuration.replicaTimeout' funded-preflight-job.json)" = "11400"
-          test -n "$intent_container"
-          test -n "$intent_prefix"
           jq '
             .properties.template
             | .containers |= map(
