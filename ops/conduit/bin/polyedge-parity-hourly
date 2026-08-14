@@ -927,7 +927,7 @@ printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header"
 unset access_token
 azure_execution_tmp=$(mktemp "$runtime_dir/azure-execution.XXXXXX")
 chmod 0600 "$azure_execution_tmp"
-# The exact execution GET requires Microsoft.App/jobs/execution/read on this job.
+# The exact execution GET requires Microsoft.App/jobs/executions/read on this job.
 curl --silent --show-error --fail --output "$azure_execution_tmp" --header @"$auth_header" \
   "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP/providers/Microsoft.App/jobs/$POLYEDGE_PARITY_AZURE_JOB_NAME/executions/$azure_execution_id?api-version=2025-07-01" \
   || die 'exact Azure job execution read failed'

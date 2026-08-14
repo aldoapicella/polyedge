@@ -116,11 +116,11 @@ jobs:
             and all(.lanes[]; all(.negativeAssertions[]; .passed))
             and .arc.unchanged
             and .roleDefinitions.acaJobExecutionReader.id == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
-            and .roleDefinitions.acaJobExecutionReader.actions == ["Microsoft.App/jobs/execution/read"]
+            and .roleDefinitions.acaJobExecutionReader.actions == ["Microsoft.App/jobs/executions/read"]
             and .roleDefinitions.acaJobExecutionReader.dataActions == []
             and .roleDefinitions.acaJobExecutionReader.exactDefinitionMatch
             and (.lanes.research.positiveChecks[] | select(
-              .operation == "Microsoft.App/jobs/execution/read"
+              .operation == "Microsoft.App/jobs/executions/read"
               and .assignmentId == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
               and .result == "success"
             ))
@@ -160,7 +160,7 @@ jobs:
               .name == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
               and .properties.roleName == "PolyEdge ACA Job Execution Reader"
               and .properties.permissions == [{
-                actions: ["Microsoft.App/jobs/execution/read"],
+                actions: ["Microsoft.App/jobs/executions/read"],
                 notActions: [],
                 dataActions: [],
                 notDataActions: []

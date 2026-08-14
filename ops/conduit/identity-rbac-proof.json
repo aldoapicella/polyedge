@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "capturedAtUtc": "2026-08-13T00:51:22Z",
+  "capturedAtUtc": "2026-08-14T18:03:45Z",
   "status": "live-verified",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -95,7 +95,7 @@
           "result": "success"
         },
         {
-          "operation": "Microsoft.App/jobs/execution/read",
+          "operation": "Microsoft.App/jobs/executions/read",
           "target": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job",
           "assignmentId": "324fb8fa-c71c-4cdf-a22a-391d290feaa0",
           "result": "success"
@@ -220,7 +220,7 @@
       "id": "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea",
       "name": "PolyEdge ACA Job Execution Reader",
       "actions": [
-        "Microsoft.App/jobs/execution/read"
+        "Microsoft.App/jobs/executions/read"
       ],
       "dataActions": [],
       "assignableScopes": [

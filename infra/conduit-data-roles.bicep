@@ -58,7 +58,7 @@ resource acaJobExecutionReader 'Microsoft.Authorization/roleDefinitions@2022-04-
     permissions: [
       {
         actions: [
-          'Microsoft.App/jobs/execution/read'
+          'Microsoft.App/jobs/executions/read'
         ]
         notActions: []
         dataActions: []
