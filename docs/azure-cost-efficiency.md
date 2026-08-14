@@ -100,6 +100,14 @@ workspace retention would not save ingestion cost, and moving console logs to
 Basic would save at most about $0.53/month while risking alert compatibility;
 no live logging-plan change is justified before compute retirement.
 
+The OCI hot-ring volume was expanded online from 210 GB to 260 GB on
+2026-08-14 after the measured 48-hour worst-case projection exceeded the old
+capacity gate. The approved incremental estimate is about $1.28/month; it is a
+planning estimate, not an invoice claim. The change preserves the 48-hour local
+retention and 32-GiB ring reserve while enabling the much larger gated Azure
+compute/network savings above. It does not change the separate free-space gate
+on the boot filesystem.
+
 ### Live utilization evidence
 
 | Driver | 2026-07-31 observation | Decision |

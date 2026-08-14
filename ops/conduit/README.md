@@ -14,7 +14,7 @@ and funded identities remain separate gates; a read SAS is not sufficient for
 the writers or leases.
 
 The API Quadlet persists its local recorder under `/srv/polyedge-ring`. Verify
-that path is the 210-GB block-volume mount (not a directory on `/`) before every
+that path is the 260-GB block-volume mount (not a directory on `/`) before every
 start: `findmnt -T /srv/polyedge-ring && df -h /srv/polyedge-ring`.
 
 Do **not** enable daily, replay, or qset shadow work on the boot disk. Their
@@ -88,13 +88,22 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260814T110000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-14T11:00:00Z`,
+Ledger `/srv/polyedge-ring/parity/20260814T150000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-14T15:00:00Z`,
 supersedes every earlier zero-credit ledger, keeps Azure authoritative and
 `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-17T11:00:00Z`. Completion still requires 72 consecutive accepted
+`2026-08-17T15:00:00Z`. Completion still requires 72 consecutive accepted
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates.
+
+The superseded `20260814T110000Z.json` ledger retained zero credit. Its first
+hour had all 60 minute observations but recorded a Chainlink RTDS clean end at
+`2026-08-14T11:52:51Z`; the second recorded a Binance RTDS clean end at
+`2026-08-14T12:04:01Z`. Both recovered automatically, but the strict continuous
+feed gate correctly rejected both hours. The `13:00` hour included the guarded
+runtime image transition and its bounded startup reconnects, so the `14:18`
+collector also failed closed. None of these hours was carried into the new
+ledger.
 
 The superseded `20260814T060000Z.json` ledger retained zero credit. A canary
 from source `6fe5e23` serialized the Binance RTDS subscription filter as a bare
@@ -126,49 +135,44 @@ remain recoverable under
 
 The OCI API, ring uploader, and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`
-from source `777d9e1e89151edb9dc94881b25de8e27c7df90c`. Publication run
-`31785829764` and validation run `31785809845` passed, and the manifest contains
-both Linux AMD64 and ARM64. The API has remained healthy with zero restarts
-since the corrected deployment; independent Binance and Chainlink timestamps
-advanced throughout the post-deploy watchdog soak with zero explicit recorder
-failures or drops. The same manifest was imported without rebuild into ACR as
-`polyedge-rust-research@sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`.
-Azure primary revision `polyedge-dev--0000128` and the Azure hourly comparator
-job use that digest and source. The Azure revision became healthy before
-traffic moved; its protected configuration hash, frontend, identity, secrets,
-paper guards, and scaling remained unchanged. Two authenticated runtime samples
-showed all four essential feeds current and explicit recorder errors and drops
-at zero. A scheduled OCI freshness run also passed on the unified image before
-the formal window. At the 11:00 UTC boundary, authenticated Azure and OCI
-samples both reported the exact source, all four feeds current, drained recorder
-queues, persisted-equals-enqueued, and zero explicit errors or drops. The ring
-was caught up and the boot disk retained 33 GiB free. The ledger remains at zero
-until the first complete hour is audited at 12:18 UTC.
-Rollback state is retained under `/etc/polyedge/rollback`, including the
-corrected-image predecessor
-`20260814T095239Z-polyedge-api.container`, the failed bare-filter canary
-`20260814T085128Z-polyedge-api.container`, and the complete pre-reset bindings
-in `20260814T100407Z-rtds-json-filter-parity-reset`. Additional rollback captures
-retain the prior Azure app, Azure hourly job, OCI job bindings, and ring binding
-under `20260814T104049Z-azure-primary-777d9e1`,
-`20260814T104325Z-azure-hourly-777d9e1`,
-`20260814T104535Z-unified-777d9e1-parity-rebind`, and
-`20260814T104853Z-ring-777d9e1`. The pre-window hourly report had advisory
-historical-coverage warnings but no critical issue. At 10:18 UTC the parity
-collector wrote the 09:00 hour as `excluded_pre_window`; the formal ledger
-remained at zero accepted hours.
+`sha256:b7a2c5302b293eecaa4b2e35373ffe5dc282fb6f25f6691b22e0c716542295cc`
+from source `e504c5152fdb280e51c41d66685e3e2e420fd3a8`. Publication run
+`31800952530` and validation run `31800946029` passed, and the registry manifest
+contains both Linux AMD64 and ARM64. This source adds the required 10-second
+text heartbeat to the CLOB market WebSocket without changing the existing RTDS
+watchdogs, recorder gates, reconnect accounting, or paper-only controls. The
+same manifest was imported without rebuild into ACR as
+`polyedge-rust-research@sha256:b7a2c5302b293eecaa4b2e35373ffe5dc282fb6f25f6691b22e0c716542295cc`.
 
-Azure primary revision `polyedge-dev--0000128` is healthy on exact source
-`777d9e1e89151edb9dc94881b25de8e27c7df90c` and immutable ACR digest
-`sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`.
-The guarded hourly job binding at `:10` uses the same digest with exact generator
-provenance and paper-only controls. The protected funded producer and frozen
-qset revision were unchanged by both image-only updates.
+Azure primary revision `polyedge-dev--0000129` is healthy with one replica and
+100% traffic on the exact ACR digest. The protected configuration excluding the
+image is unchanged, and the frontend, identity, secrets, scaling, and paper
+guards remain intact. The Azure hourly comparator uses the same ACR digest for
+both its container and nested generator. OCI deployed the exact GHCR digest at
+`2026-08-14T13:52:03Z`; the API remains healthy with zero restarts, and scheduled
+freshness and ring upload checks passed on the new source. The first aligned
+scheduled pair completed successfully: Azure ran from `14:10` through `14:12`,
+and OCI ran from `14:12` through `14:13:57`. OCI reported advisory historical
+coverage warnings but no critical issue. From the `14:00` boundary through the
+post-deploy soak, every minute provenance sample used source `e504c51`, all four
+essential feeds were healthy, and the immutable ring recorded no feed error.
 
-The `15:00` hour receives zero credit because seven durable essential-feed
-reconnect errors occurred even though recorder sequence durability and all six
-strict segment uploads remained intact. The clean `16:00` feed hour also
+The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
+48-hour worst-case projection above the old capacity gate. The mounted
+filesystem now exposes 273,655,873,536 bytes, the conservative projection is
+213,297,534,144 bytes, and the 32-GiB ring reserve, sealing, and upload gates are
+all green. The boot filesystem remains separate with more than 32 GiB free.
+Rollback state is retained under `/etc/polyedge/rollback`, including
+`20260814T134524Z-azure-primary-e504c51`,
+`20260814T134805Z-azure-hourly-e504c51`,
+`20260814T135152Z-polyedge-api.container`,
+`20260814T135500Z-unified-e504c51-parity-rebind`, and
+`20260814T142500Z-parity-1500-reset`.
+
+In the superseded August 12 window, the `15:00` hour received zero credit
+because seven durable essential-feed reconnect errors occurred even though
+recorder sequence durability and all six strict segment uploads remained
+intact. The clean `16:00` feed hour also
 receives zero credit because the collector found different Azure and OCI
 decision-config hashes. Azure primary revision `polyedge-dev--0000124`
 temporarily aligned `RTDS_CHAINLINK_WATCHDOG_SECONDS` to 290 seconds, but
@@ -185,10 +189,10 @@ the hour contained one Chainlink stall and four CLOB disconnect or HTTP 503
 errors. The fail-closed collector rejected that hour. Later replacement windows
 also remain at zero because of feed continuity or superseded source/image
 bindings; no credit is inherited. The exact Azure hourly deployment completed
-too late to prove its first scheduled execution before `02:00`, so the current
-window starts at the untouched `03:00` boundary. Qset remains disabled, the
-local funded signer remains masked, and no Azure compute or network resource is
-deletion-eligible yet.
+too late to prove its first scheduled execution before `02:00`, so that
+historical window started at the untouched `03:00` boundary. Qset remains
+disabled, the local funded signer remains masked, and no Azure compute or
+network resource is deletion-eligible yet.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
@@ -419,7 +423,7 @@ hashes in a v2 manifest, uploads the compressed payload as an immutable Azure
 Hot-tier blob without any remote listing, and verifies retry collisions byte
 for byte. V1 uncompressed receipts remain valid. Local source, sidecar, and
 manifest files are retained for 48 hours to leave job-workspace headroom on the
-210-GB volume, then removed only after the immutable remote manifest is re-read
+260-GB volume, then removed only after the immutable remote manifest is re-read
 successfully. A separate health timer checks upload age and projected capacity
 and stops the API before free space falls below 32 GiB. Azure tiers only the
 future `events-oci-hot7-v1/` prefix to Cool after seven days and Archive after
