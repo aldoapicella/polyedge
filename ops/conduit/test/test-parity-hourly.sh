@@ -633,6 +633,7 @@ jq -e '.acceptedForParityWindow == true and .sameInput.deterministicResultExactM
   "$success/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
 grep -q -- "--user $uid:$gid" "$success/calls/podman"
 grep -q -- "$success/token/azure-federated-token:/run/credentials/azure-federated-token:ro,Z" "$success/calls/podman"
+grep -q -- '/evidence:rw,noexec,nosuid,size=64m,mode=1777' "$success/calls/podman"
 ! grep -q -- '--security-opt=no-new-privileges' "$success/calls/podman"
 [ "$(protected "$success/ring/parity/ledger.json")" = "$before" ]
 runs=$(wc -l <"$success/calls/podman")

@@ -807,7 +807,7 @@ if [ -z "$same_candidate" ]; then
   timeout --preserve-status 1800 podman run --pull=never --log-driver=journald --name "$same_container" --network polyedge \
     --cpus 0.5 --memory 1g --pids-limit 1024 --read-only --cap-drop=all \
     --user "$token_uid:$token_gid" --tmpfs /tmp:rw,noexec,nosuid,size=128m \
-    --tmpfs "/evidence:rw,noexec,nosuid,size=64m,mode=0700,uid=$token_uid,gid=$token_gid" --env-file "$hourly_env" \
+    --tmpfs /evidence:rw,noexec,nosuid,size=64m,mode=1777 --env-file "$hourly_env" \
     -v "$token_file:/run/credentials/azure-federated-token:ro,Z" \
     --env POLYEDGE_GENERATOR_EXECUTION_ID --env POLYEDGE_GENERATOR_PLATFORM --env POLYEDGE_GENERATOR_IMAGE \
     "$POLYEDGE_RESEARCH_IMAGE" polyedge-rs research audit \
