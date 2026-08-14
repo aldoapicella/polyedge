@@ -25,14 +25,18 @@ export function validateFundedReconciliationSnapshot(value, sessionId) {
 
 export async function runFundedDirectReconciliation({
   env = process.env,
+  writeState = false,
   createExecutor = createPersistentCanaryExecutor,
   discoverMarket = activeBtcFifteenMinuteMarket,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   logger = (value) => console.log(JSON.stringify(value))
 } = {}) {
+  if (typeof writeState !== "boolean") {
+    throw new Error("fail closed: funded reconciliation write mode is invalid");
+  }
   const sessionId = String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "");
   const executor = await createExecutor({
-    readOnly: true,
+    readOnly: !writeState,
     env: {
       ...persistentCanaryBootstrapEnv(env),
       STRATEGY_CANARY_DRY_RUN: "true",
@@ -104,13 +108,26 @@ function parseTokenIds(value) {
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  runFundedDirectReconciliation().catch((error) => {
+  const writeState = process.env.FUNDED_DIRECT_RECONCILE_STATE_WRITE === "true";
+  runFundedDirectReconciliation({
+    writeState,
+    ...(writeState ? {
+      logger: (value) => console.log(JSON.stringify({
+        schema: "polyedge.funded_state_reconciliation.v1",
+        status: "reconciled",
+        risk_passed: value.risk_passed,
+        open_order_count: value.open_order_count,
+        unresolved_position_count: value.unresolved_position_count,
+        unresolved_risk_reservation_count: value.unresolved_risk_reservation_count
+      }))
+    } : {})
+  }).catch((error) => {
     process.exitCode = 1;
     console.error(JSON.stringify(sanitize({
       schema: "polyedge.funded_reconciliation_proof.v1",
       status: "failed_closed",
       order_submission_attempted: false,
-      error: error.message
+      error: writeState ? "funded state reconciliation failed closed" : error.message
     })));
   });
 }

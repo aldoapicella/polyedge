@@ -60,6 +60,43 @@ test("bounded reconciliation emits one clean no-order safety snapshot", async ()
   assert.equal(closed, true);
 });
 
+test("opt-in state reconciliation writes only through the no-order warmup path", async () => {
+  let closed = false;
+  const snapshot = await runFundedDirectReconciliation({
+    env: {
+      VENUE_PROBE_FUNDED_CAMPAIGN_ID: sessionId,
+      FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify({ execution_model: {} })
+    },
+    writeState: true,
+    createExecutor: async ({ env, readOnly }) => {
+      assert.equal(readOnly, false);
+      assert.equal(env.STRATEGY_CANARY_DRY_RUN, "true");
+      assert.equal(env.ALLOW_LIVE, "false");
+      assert.equal(env.ALLOW_STRATEGY_CANARY, "false");
+      assert.equal(env.ENABLE_TAKER_ORDERS, "false");
+      return {
+        warmMarket: async () => {},
+        status: () => ({
+          safety_snapshot_cache_ready: true,
+          safety_snapshot_cache_in_flight: 0,
+          safety_snapshot_cache_error: null
+        }),
+        reconciliationSnapshot: () => clean,
+        close: async () => { closed = true; }
+      };
+    },
+    discoverMarket: async () => ({
+      id: "market",
+      conditionId: "condition",
+      clobTokenIds: ["up", "down"],
+      endDate: "2026-08-12T08:00:00Z"
+    }),
+    logger: () => {}
+  });
+  assert.equal(snapshot, clean);
+  assert.equal(closed, true);
+});
+
 test("reconciliation remains fail-closed on any live risk blocker", () => {
   assert.throws(
     () => validateFundedReconciliationSnapshot({

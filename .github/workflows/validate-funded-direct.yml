@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/validate-funded-direct.yml"
       - ".github/workflows/verify-funded-v10-intent.mjs"
+      - ".github/workflows/verify-funded-v10-settlement.mjs"
       - "crates/polyedge-api/**"
       - "crates/polyedge-config/**"
       - "crates/polyedge-domain/**"
@@ -271,6 +272,25 @@ jobs:
             "\n      - name: Deploy and verify the pointer-only preflight Dynamic Quote intent producer"
           );
           assert.ok(pointerPreflightDeployment >= 0);
+          const capitalReconcileStart = workflow.indexOf(
+            "\n      - name: Reconcile v10 capital state with no executable order path",
+            pointerPreflightDeployment
+          );
+          assert.ok(pointerPreflightDeployment < capitalReconcileStart &&
+            capitalReconcileStart < preparePreflightStart);
+          const capitalReconcile = workflow.slice(capitalReconcileStart, preparePreflightStart);
+          assert.match(capitalReconcile,
+            /src\/funded-direct-reconciliation\.mjs[\s\S]*FUNDED_DIRECT_RECONCILE_STATE_WRITE[\s\S]*value:"true"/);
+          assert.match(capitalReconcile,
+            /FUNDED_DIRECT_DRY_RUN[\s\S]*ALLOW_LIVE[\s\S]*ENABLE_TAKER_ORDERS[\s\S]*value:"false"/);
+          assert.match(capitalReconcile,
+            /cmp funded-queue-before-capital-reconcile\.snapshot\.json[\s\S]*funded-queue-after-capital-reconcile\.snapshot\.json/);
+          assert.match(preparePreflight,
+            /verify-funded-v10-settlement\.mjs[\s\S]*verified_settlement_ids == \$settlement_ids/);
+          assert.match(preparePreflight,
+            /authorized_equity_ceiling - \(29\.505501 \+ \$settlement_pnl\)/);
+          assert.equal(preparePreflight.includes(".verified_realized_pnl == 0"), false);
+          assert.equal(preparePreflight.includes(".verified_settlement_ids == []"), false);
           const pointerPreflightMarker = workflow.indexOf(
             "FUNDED_POINTER_PREFLIGHT_REQUESTED=true", pointerPreflightDeployment);
           const pointerPreflight = workflow.indexOf(
@@ -1179,6 +1199,123 @@ jobs:
           echo "pointer_before_exists=$pointer_before_exists" >> "$GITHUB_OUTPUT"
           echo "pointer_before_etag=$pointer_before_etag" >> "$GITHUB_OUTPUT"
 
+      - name: Reconcile v10 capital state with no executable order path
+        run: |
+          set -Eeuo pipefail
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-before-capital-reconcile.json
+          jq -e '
+            .status == "SendDisabled"
+            and (.countDetails.activeMessageCount | tonumber) == 0
+            and (.countDetails.scheduledMessageCount | tonumber) == 0
+          ' funded-queue-before-capital-reconcile.json >/dev/null
+          test "$(jq -r '.countDetails.deadLetterMessageCount' \
+            funded-queue-before-capital-reconcile.json)" = "$(cat funded-fenced-dlq-before.txt)"
+          jq -S '{
+            status,
+            active: .countDetails.activeMessageCount,
+            scheduled: .countDetails.scheduledMessageCount,
+            dead_letter: .countDetails.deadLetterMessageCount
+          }' funded-queue-before-capital-reconcile.json > funded-queue-before-capital-reconcile.snapshot.json
+          az containerapp job show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_JOB" \
+            -o json > funded-capital-reconcile-job.json
+          jq '
+            .properties.template
+            | .containers |= map(
+                if .name == "funded-direct" then
+                  .command = ["node", "src/funded-direct-reconciliation.mjs"]
+                  | .env = (
+                      [.env[] | select(.name != "FUNDED_DIRECT_RECONCILE_STATE_WRITE"
+                        and .name != "FUNDED_DIRECT_WORKER_ENABLED"
+                        and .name != "FUNDED_DIRECT_SERVICE_ENABLED"
+                        and .name != "FUNDED_DIRECT_DRY_RUN"
+                        and .name != "FUNDED_DIRECT_PREFLIGHT_ONLY"
+                        and .name != "FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED"
+                        and .name != "ALLOW_FUNDED_DIRECT"
+                        and .name != "ALLOW_LIVE"
+                        and .name != "ALLOW_STRATEGY_CANARY"
+                        and .name != "ENABLE_TAKER_ORDERS")]
+                      + [
+                        {name:"FUNDED_DIRECT_RECONCILE_STATE_WRITE",value:"true"},
+                        {name:"FUNDED_DIRECT_WORKER_ENABLED",value:"false"},
+                        {name:"FUNDED_DIRECT_SERVICE_ENABLED",value:"false"},
+                        {name:"FUNDED_DIRECT_DRY_RUN",value:"true"},
+                        {name:"FUNDED_DIRECT_PREFLIGHT_ONLY",value:"false"},
+                        {name:"FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED",value:"false"},
+                        {name:"ALLOW_FUNDED_DIRECT",value:"false"},
+                        {name:"ALLOW_LIVE",value:"false"},
+                        {name:"ALLOW_STRATEGY_CANARY",value:"false"},
+                        {name:"ENABLE_TAKER_ORDERS",value:"false"}
+                      ]
+                    )
+                else . end
+              )
+          ' funded-capital-reconcile-job.json > funded-capital-reconcile-execution.yaml
+          jq -e '
+            (.containers | length) == 1
+            and .containers[0].name == "funded-direct"
+            and .containers[0].command == ["node", "src/funded-direct-reconciliation.mjs"]
+            and ([.containers[0].env[] | select(
+              .name == "FUNDED_DIRECT_RECONCILE_STATE_WRITE" and .value == "true")] | length) == 1
+            and ([.containers[0].env[] | select(.name == "FUNDED_DIRECT_DRY_RUN"
+              or .name == "FUNDED_DIRECT_WORKER_ENABLED"
+              or .name == "FUNDED_DIRECT_SERVICE_ENABLED"
+              or .name == "FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED"
+              or .name == "ALLOW_FUNDED_DIRECT"
+              or .name == "ALLOW_LIVE"
+              or .name == "ALLOW_STRATEGY_CANARY"
+              or .name == "ENABLE_TAKER_ORDERS")] | length) == 8
+            and all(.containers[0].env[] | select(.name == "FUNDED_DIRECT_DRY_RUN"
+              or .name == "FUNDED_DIRECT_WORKER_ENABLED"
+              or .name == "FUNDED_DIRECT_SERVICE_ENABLED"
+              or .name == "FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED"
+              or .name == "ALLOW_FUNDED_DIRECT"
+              or .name == "ALLOW_LIVE"
+              or .name == "ALLOW_STRATEGY_CANARY"
+              or .name == "ENABLE_TAKER_ORDERS");
+              if .name == "FUNDED_DIRECT_DRY_RUN" then .value == "true" else .value == "false" end)
+          ' funded-capital-reconcile-execution.yaml >/dev/null
+          capital_reconcile_execution=$(az containerapp job start \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_JOB" \
+            --yaml funded-capital-reconcile-execution.yaml \
+            --query name -o tsv)
+          test -n "$capital_reconcile_execution"
+          status=Running
+          capital_reconcile_deadline_epoch=$(( $(date -u +%s) + 900 ))
+          while [ "$(date -u +%s)" -lt "$capital_reconcile_deadline_epoch" ]; do
+            if status=$(az containerapp job execution show \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$FUNDED_JOB" \
+                --job-execution-name "$capital_reconcile_execution" \
+                --query properties.status -o tsv); then
+              case "$status" in
+                Succeeded) break ;;
+                Failed|Stopped|Degraded) exit 1 ;;
+              esac
+            fi
+            sleep 10
+          done
+          test "$status" = "Succeeded"
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-after-capital-reconcile.json
+          jq -S '{
+            status,
+            active: .countDetails.activeMessageCount,
+            scheduled: .countDetails.scheduledMessageCount,
+            dead_letter: .countDetails.deadLetterMessageCount
+          }' funded-queue-after-capital-reconcile.json > funded-queue-after-capital-reconcile.snapshot.json
+          cmp funded-queue-before-capital-reconcile.snapshot.json \
+            funded-queue-after-capital-reconcile.snapshot.json
+
       - name: Prepare zero-write v10 preflight inputs
         run: |
           set -Eeuo pipefail
@@ -1277,7 +1414,32 @@ jobs:
             --auth-mode login \
             --overwrite \
             --only-show-errors -o none
-          jq -e '
+          : > existing-v10-internal-settlement-accounting.jsonl
+          while IFS= read -r settlement_blob; do
+            settlement_file=$(mktemp)
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$settlement_blob" \
+              --file "$settlement_file" \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none
+            node .github/workflows/verify-funded-v10-settlement.mjs \
+              "$settlement_file" "$settlement_blob" \
+              >> existing-v10-internal-settlement-accounting.jsonl
+            rm -f "$settlement_file"
+          done < <(jq -r --arg prefix "$v10_internal_settlement_prefix" '
+            .[].name | select(startswith($prefix))
+          ' v10-prefix-before-preflight.json)
+          jq -se '([.[].id] | length == (unique | length))' \
+            existing-v10-internal-settlement-accounting.jsonl >/dev/null
+          settlement_ids=$(jq -sc '[.[].id] | sort' \
+            existing-v10-internal-settlement-accounting.jsonl)
+          settlement_pnl=$(jq -s '[.[].realized_pnl] | add // 0' \
+            existing-v10-internal-settlement-accounting.jsonl)
+          jq -e --argjson settlement_ids "$settlement_ids" \
+            --argjson settlement_pnl "$settlement_pnl" '
             .schema == "polyedge.protected_compounding_state.v2"
             and .session_id == "dynamic-quote-funded-2026-08-13-v10"
             and .reconciliation_complete == true
@@ -1294,10 +1456,10 @@ jobs:
             and .prior_state_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
             and .prior_state_sha256 == "sha256:9e63db7ef8c22d3af53a14f1858b817b8769ca7ba737e6668a900ffb73330c15"
             and .last_reconciled_equity > 0
-            and .authorized_equity_ceiling == 29.505501
+            and ((.authorized_equity_ceiling - (29.505501 + $settlement_pnl)) | fabs) <= 0.0000011
             and .last_reconciled_equity <= .authorized_equity_ceiling
-            and .verified_realized_pnl == 0
-            and .verified_settlement_ids == []
+            and ((.verified_realized_pnl - $settlement_pnl) | fabs) <= 0.0000011
+            and .verified_settlement_ids == $settlement_ids
             and .high_water_equity >= 102.78112
             and .historical_high_water_equity >= 102.78112
             and (.protected_reserve - ([2, (.last_reconciled_equity * .reserve_ratio)] | max) | fabs) <= 0.0000011

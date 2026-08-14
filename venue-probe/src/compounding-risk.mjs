@@ -1166,6 +1166,20 @@ export function internalSettlementBlobName(sessionId, transactionHash, condition
   return `reports/funded/dynamic-quote/sessions/${sessionId}/internal-settlements/${identity}.json`;
 }
 
+export function validatedDurableInternalSettlementAccounting(value, sessionId, blobName) {
+  if (value?.schema !== "polyedge.verified_internal_settlement.v1"
+      || !validDurableInternalSettlement(value)
+      || value.session_id !== sessionId
+      || internalSettlementBlobName(
+        sessionId,
+        value.transaction_hash,
+        value.condition_id
+      ) !== blobName) {
+    throw new Error("fail closed: durable internal settlement binding is invalid");
+  }
+  return { id: value.id, realized_pnl: money(value.realized_pnl) };
+}
+
 export async function putVerifiedInternalSettlement(container, settlement) {
   if (!validDurableInternalSettlement(settlement)) {
     throw new Error("fail closed: invalid verified internal settlement record");
@@ -1206,9 +1220,7 @@ export async function loadDurableInternalSettlements(container, sessionId) {
   for await (const item of container.listBlobsFlat({ prefix })) {
     if (!item.name.endsWith(".json")) continue;
     const row = (await readBlob(container, item.name)).value;
-    if (!validDurableInternalSettlement(row) || row.session_id !== sessionId) {
-      throw new Error("fail closed: durable internal settlement ledger is invalid");
-    }
+    validatedDurableInternalSettlementAccounting(row, sessionId, item.name);
     values.push(row);
   }
   return values;

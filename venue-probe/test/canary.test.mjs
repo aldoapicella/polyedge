@@ -35,6 +35,7 @@ import {
   waitForSafetySnapshotIdle
 } from "../src/canary.mjs";
 import { automaticSettlementReceiptEvidence } from "../src/redeem.mjs";
+import { internalSettlementBlobName } from "../src/compounding-risk.mjs";
 
 const now = new Date("2026-07-12T12:00:20.000Z");
 const book = {
@@ -341,8 +342,11 @@ test("protected-compounding successor imports exact durable predecessor settleme
     receipt_block_number: "123",
     receipt_confirmations: 2
   };
-  const predecessorBlob =
-    `reports/funded/dynamic-quote/sessions/${predecessorSessionId}/internal-settlements/manual.json`;
+  const predecessorBlob = internalSettlementBlobName(
+    predecessorSessionId,
+    settlement.transaction_hash,
+    settlement.condition_id
+  );
   const values = new Map([[predecessorBlob, Buffer.from(JSON.stringify(settlement))]]);
   const container = {
     async *listBlobsFlat({ prefix }) {

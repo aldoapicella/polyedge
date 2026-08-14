@@ -9,6 +9,7 @@ import {
   putVerifiedInternalSettlement,
   reconcileProtectedCompoundingState,
   sizeProtectedOrder,
+  validatedDurableInternalSettlementAccounting,
   validateProtectedCompoundingManifest,
   validateProtectedCompoundingPredecessorState,
   verifyAutomaticSettlementEvidence
@@ -1078,6 +1079,21 @@ test("automatic settlement binds exact reservation, CLOB, Data API, wallet, and 
     schema: "polyedge.verified_internal_settlement.v1",
     ...settlements[0]
   });
+  assert.deepEqual(validatedDurableInternalSettlementAccounting(
+    durable[0],
+    "dynamic-quote-funded-test-v5",
+    internalSettlementBlobName(
+      "dynamic-quote-funded-test-v5",
+      automaticRedemption,
+      automaticCondition
+    )
+  ), { id: settlements[0].id, realized_pnl: 8 });
+  assert.throws(() => validatedDurableInternalSettlementAccounting(
+    durable[0],
+    "dynamic-quote-funded-test-v5",
+    "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v5/internal-settlements/" +
+      `${"0".repeat(64)}.json`
+  ), /binding is invalid/);
   const state = await reconcileProtectedCompoundingState({
     container,
     manifest: manifest(),
