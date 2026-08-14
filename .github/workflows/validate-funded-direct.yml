@@ -1181,7 +1181,8 @@ jobs:
 
       - name: Prepare zero-write v10 preflight inputs
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          trap 'status=$?; printf "funded v10 preflight input validation failed at shell line %s (exit %s)\n" "$LINENO" "$status" >&2' ERR
           v10_prefix="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/"
           readonly v10_session_blob="${v10_prefix}session.json"
           readonly v10_state_blob="${v10_prefix}capital-reserve-state.json"
