@@ -431,12 +431,17 @@ async function executeSelectedIntent({
         })
       };
     }
+    const authorizationConsumed = await authorizationWasConsumed(
+      clients.control,
+      authorization,
+      selected
+    );
     if (/existing_unresolved_position_blocks_submission|unresolved_risk_reservation|equity_floor_breached|campaign_drawdown_exhausted|projected_equity_floor_breach|projected_campaign_drawdown_breach|authorized_starting_collateral|external_cash_flow_record|protected_reserve|protected_order|operable_capital/.test(child.error || "")) {
       await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
         status: "child_failed_closed_pre_submission",
         order_submission_attempted: false,
-        authorization_consumed: false,
-        risk_reservation_created: false,
+        authorization_consumed: authorizationConsumed,
+        risk_reservation_created: authorizationConsumed,
         error: child.error
       });
       return {
@@ -452,8 +457,8 @@ async function executeSelectedIntent({
     await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
       status: "child_failed_closed_pre_submission",
       order_submission_attempted: false,
-      authorization_consumed: false,
-      risk_reservation_created: false,
+      authorization_consumed: authorizationConsumed,
+      risk_reservation_created: authorizationConsumed,
       error: child.error || "unknown pre-submission failure"
     });
     executionTiming.completion_persisted_wall_ms = Date.now();
@@ -1172,6 +1177,26 @@ async function loadTerminalNoFillReservation(container, selected, authorization,
 
 async function readJsonBlob(container, blobName) {
   return (await readJsonBlobDocument(container, blobName)).value;
+}
+
+async function authorizationWasConsumed(container, authorization, selected) {
+  const authorizationId = clean(authorization.value?.authorization_id);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(authorizationId)) return false;
+  const blobName = `reports/research/venue-probe/control/strategy-canary/consumed/${authorizationId}.json`;
+  if (!await container.getBlobClient(blobName).exists()) return false;
+  const consumption = await readJsonBlob(container, blobName);
+  const consumedAt = Date.parse(consumption?.consumed_at);
+  if (consumption?.schema !== "polyedge.strategy_canary_authorization_consumption.v1" ||
+      consumption.authorization_id !== authorizationId ||
+      hash(consumption.authorization_sha256) !== authorization.hash ||
+      consumption.decision_id !== selected.value.decision_id ||
+      consumption.run_id !== authorization.value.child_run_id ||
+      !Number.isFinite(consumedAt) ||
+      consumedAt < Date.parse(authorization.value.authorized_at) ||
+      consumedAt > Date.parse(authorization.value.expires_at)) {
+    throw new Error("fail closed: durable funded authorization consumption is not exactly bound");
+  }
+  return true;
 }
 
 async function readJsonBlobDocument(container, blobName) {

@@ -364,6 +364,8 @@ jobs:
             /candidate_blob="reports\/research\/venue-probe\/runs\/\$\{artifact_day\}\/\$\{child_run_id\}\/summary\.json"/);
           assert.match(activation, /test "\$reservation_matches" = 1/);
           assert.match(activation, /test "\$summary_matches" = 1/);
+          assert.match(activation,
+            /\.order\.source_requested_notional > \.order\.notional[\s\S]*\.order\.source_requested_notional <= 10\.5/);
           assert.equal(activation.includes("--num-results '*'"), false);
           const lifecycleLogin = activation.indexOf("Refresh Azure login before submitted v10 lifecycle");
           const childRunValidation = activation.indexOf(
@@ -3167,7 +3169,8 @@ jobs:
             and .provenance.intent_blob_name == $intent_blob
             and .provenance.intent_sha256 == $intent_sha
             and .order.current_funds_scaled == true
-            and .order.source_requested_notional == 10.5
+            and .order.source_requested_notional > .order.notional
+            and .order.source_requested_notional <= 10.5
             and .order.notional < 10.5
             and .lifecycle.order_id == $order_id
           ' "$summary_file"

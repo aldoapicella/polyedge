@@ -1013,7 +1013,7 @@ test("worker reports projected account-risk blockers as a pause without retrying
   assert.equal(output.childInvocations, 1);
 });
 
-test("persistent pre-submission failure is terminally sealed without authorization leakage", async () => {
+test("persistent pre-consumption failure is terminally sealed without authorization leakage", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "6".repeat(64));
   value.market_id = "btc-market";
@@ -1049,6 +1049,57 @@ test("persistent pre-submission failure is terminally sealed without authorizati
   assert.equal(duplicate.status, "already_completed_idempotent");
   assert.equal(duplicate.completion.authorization_consumed, false);
   assert.equal(duplicate.completion.risk_reservation_created, false);
+  assert.equal(duplicate.completion.order_submission_attempted, false);
+});
+
+test("persistent post-consumption pre-submission failure records exact authorization provenance", async () => {
+  const now = new Date("2026-07-27T12:00:00Z");
+  const value = intent(now, "4".repeat(64));
+  value.market_id = "btc-market";
+  value.condition_id = "condition";
+  value.token_id = "token-up";
+  const bytes = Buffer.from(JSON.stringify(value));
+  const control = new Container();
+  const processor = await createFundedDirectProcessor({
+    env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+    containers: {
+      control,
+      intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+    },
+    clock: () => now,
+    executeCanary: async (childEnv) => {
+      const authorization = JSON.parse(control.values.get(
+        childEnv.STRATEGY_CANARY_AUTHORIZATION_BLOB_NAME
+      ).toString("utf8"));
+      const consumptionName =
+        `reports/research/venue-probe/control/strategy-canary/consumed/${authorization.authorization_id}.json`;
+      control.values.set(consumptionName, Buffer.from(JSON.stringify({
+        schema: "polyedge.strategy_canary_authorization_consumption.v1",
+        authorization_id: authorization.authorization_id,
+        authorization_sha256: childEnv.STRATEGY_CANARY_AUTHORIZATION_SHA256,
+        decision_id: value.decision_id,
+        run_id: childEnv.STRATEGY_CANARY_RUN_ID,
+        consumed_at: now.toISOString()
+      })));
+      throw new Error("fail closed: post-only BUY would cross the current ask");
+    }
+  });
+  const handoff = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: value.decision_id,
+    intent_blob_name: `intents/${value.decision_id}.json`,
+    intent_sha256: sha256(bytes),
+    decision_ts: value.decision_ts,
+    valid_until: value.valid_until
+  };
+
+  const first = await processor.process(handoff);
+  const duplicate = await processor.process(handoff);
+
+  assert.equal(first.status, "child_failed_closed_pre_submission");
+  assert.equal(duplicate.status, "already_completed_idempotent");
+  assert.equal(duplicate.completion.authorization_consumed, true);
+  assert.equal(duplicate.completion.risk_reservation_created, true);
   assert.equal(duplicate.completion.order_submission_attempted, false);
 });
 
