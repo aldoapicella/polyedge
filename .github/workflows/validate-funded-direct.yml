@@ -295,6 +295,8 @@ jobs:
             /expired_before_child_launch[\s\S]*order_submission_attempted == false[\s\S]*risk_reservation_created == false/);
           assert.match(preparePreflight,
             /child_failed_closed_post_submission_unresolved[\s\S]*released_no_order[\s\S]*order_submitted == false[\s\S]*zero_open_orders_confirmed == true/);
+          assert.match(preparePreflight,
+            /child_failed_closed_pre_submission[\s\S]*reservation_count[\s\S]*released_no_order/);
           const pointerPreflightMarker = workflow.indexOf(
             "FUNDED_POINTER_PREFLIGHT_REQUESTED=true", pointerPreflightDeployment);
           const pointerPreflight = workflow.indexOf(
@@ -1622,7 +1624,9 @@ jobs:
             ' existing-v10-risk-reservations.json)
             completion_status=$(jq -r '.status' "$completion_file")
             if [ "$completion_status" = "child_completed" ] || \
-              [ "$completion_status" = "child_failed_closed_post_submission_unresolved" ]; then
+              [ "$completion_status" = "child_failed_closed_post_submission_unresolved" ] || \
+              { [ "$completion_status" = "child_failed_closed_pre_submission" ] && \
+                [ "$reservation_count" = "1" ]; }; then
               test "$reservation_count" = "1"
               reservation_blob=$(jq -r --arg decision "$existing_decision" '
                 [.[] | select(.name | endswith("/funded-direct-" + $decision + ".json"))][0].name
