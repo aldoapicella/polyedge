@@ -124,23 +124,31 @@ zero-essential-feed-error gate rejected the hour. The old bindings and ledger
 remain recoverable under
 `/etc/polyedge/rollback/20260814T022900Z-parity-0300-reset`.
 
-The OCI API, ring uploader, and all seven primary research jobs are pinned to
-multi-architecture digest
+The OCI API is pinned to multi-architecture digest
 `sha256:bad294b64dde62f450443be63d3ba31313e71bee87f61d8d9665e6576a72cef1`
 from source `777d9e1e89151edb9dc94881b25de8e27c7df90c`. Publication run
 `31785829764` and validation run `31785809845` passed, and the manifest contains
 both Linux AMD64 and ARM64. The API has remained healthy with zero restarts
 since the corrected deployment; independent Binance and Chainlink timestamps
 advanced throughout the post-deploy watchdog soak with zero explicit recorder
-failures or drops. Rollback state is retained under `/etc/polyedge/rollback`,
-including the corrected-image predecessor
+failures or drops. The ring uploader and all seven primary research jobs remain
+pinned separately to multi-architecture digest
+`sha256:ff8c41086d9be7d98a8b645362c378d23bb5cdce4c156f7042592ffbec65c410`
+from source `be303731705e766ee41e5499a82d297d62e5783e`. That exact source matches the
+Azure hourly comparator image
+`sha256:c3231b6e7bbaa72a3128b227053da519da7283d3e079329cb18b99de62318142`;
+the API-only feed fix does not alter the research comparator. A bounded OCI
+freshness run passed on the rebound research image before the formal window.
+Rollback state is retained under `/etc/polyedge/rollback`, including the
+corrected-image predecessor
 `20260814T095239Z-polyedge-api.container`, the failed bare-filter canary
 `20260814T085128Z-polyedge-api.container`, and the complete pre-reset bindings
-in `20260814T100407Z-rtds-json-filter-parity-reset`.
-The first rebound freshness and hourly timers completed successfully on this
-digest. The hourly report had advisory historical-coverage warnings but no
-critical issue. At 10:18 UTC the parity collector wrote the 09:00 hour as
-`excluded_pre_window`; the formal ledger remained at zero accepted hours.
+in `20260814T100407Z-rtds-json-filter-parity-reset`. The provenance-correct
+research bindings are recoverable under
+`20260814T103458Z-azure-comparator-parity-rebind`. The pre-window hourly report
+had advisory historical-coverage warnings but no critical issue. At 10:18 UTC
+the parity collector wrote the 09:00 hour as `excluded_pre_window`; the formal
+ledger remained at zero accepted hours.
 
 Azure primary revision `polyedge-dev--0000127` is healthy on exact source
 `be303731705e766ee41e5499a82d297d62e5783e` and immutable ACR digest
