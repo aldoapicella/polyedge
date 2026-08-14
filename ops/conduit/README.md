@@ -88,13 +88,21 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260814T030000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-14T03:00:00Z`,
+Ledger `/srv/polyedge-ring/parity/20260814T060000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-14T06:00:00Z`,
 supersedes every earlier zero-credit ledger, keeps Azure authoritative and
 `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-17T03:00:00Z`. Completion still requires 72 consecutive accepted
+`2026-08-17T06:00:00Z`. Completion still requires 72 consecutive accepted
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates.
+
+The superseded `20260814T030000Z.json` ledger also retained zero credit. Its
+first hour had all 60 one-minute health observations, a 60-second maximum gap,
+and no unhealthy observation, but the immutable ring recorded one
+`PolymarketRtdsChainlink` disconnect at `2026-08-14T03:48:24Z`. The feed
+recovered within the next observation, but the strict zero-essential-feed-error
+gate correctly rejected the hour. The old bindings and ledger remain
+recoverable under `/etc/polyedge/rollback/20260814T050739Z-parity-0600-reset`.
 
 The superseded `20260814T010000Z.json` ledger retained zero credit. Its first
 hour had all 60 one-minute health observations, a 60-second maximum observation
