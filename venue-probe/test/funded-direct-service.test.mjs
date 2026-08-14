@@ -31,6 +31,14 @@ test("funded service validates the one-second Service Bus receive interval", () 
   );
 });
 
+test("funded service caps the SLO to retain eight seconds of immutable intent TTL", () => {
+  assert.equal(loadFundedDirectServiceConfig(persistentEnv()).signalToSendSloMs, 7_000);
+  assert.throws(
+    () => loadFundedDirectServiceConfig(persistentEnv({ FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS: "7001" })),
+    /FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS must be in \[500, 7000\]/
+  );
+});
+
 test("continuous funded service immediately restarts bounded worker cycles", async () => {
   const sleeps = [];
   const logs = [];
@@ -68,7 +76,7 @@ function persistentEnv(overrides = {}) {
     FUNDED_DIRECT_ENGINE: "persistent_v1",
     FUNDED_DIRECT_SERVICE_BUS_NAMESPACE: "sb-funded",
     FUNDED_DIRECT_SERVICE_BUS_QUEUE: "funded-intents",
-    FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS: "2000",
+    FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS: "7000",
     FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2",
     ...overrides
   });
@@ -551,7 +559,7 @@ test("persistent service preserves attempted-order observability for an idempote
   assert.deepEqual(bus.completed, ["duplicate-post-submit"]);
 });
 
-test("persistent service pauses after three consecutive transitions above three seconds", async () => {
+test("persistent service pauses after three consecutive transitions above the reviewed SLO", async () => {
   const messages = Array.from({ length: 4 }, (_, index) => {
     const decisionTs = new Date(Date.now() - 500 - index).toISOString();
     return {
@@ -580,7 +588,7 @@ test("persistent service pauses after three consecutive transitions above three 
       process: async (handoff) => ({
         execution: {
           order_submission_attempted: true,
-          lifecycle: { send_wall_ms: Date.parse(handoff.decision_ts) + 3_500 }
+          lifecycle: { send_wall_ms: Date.parse(handoff.decision_ts) + 7_500 }
         }
       }),
       rejectBusy: async () => ({ status: "one_workflow_busy" })

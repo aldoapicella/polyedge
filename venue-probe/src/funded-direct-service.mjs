@@ -24,7 +24,7 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     engine: String(env.FUNDED_DIRECT_ENGINE || "legacy_spawn").trim(),
     serviceBusNamespace: String(env.FUNDED_DIRECT_SERVICE_BUS_NAMESPACE || "").trim(),
     serviceBusQueue: String(env.FUNDED_DIRECT_SERVICE_BUS_QUEUE || "").trim(),
-    signalToSendSloMs: integer(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, 2_000),
+    signalToSendSloMs: integer(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, 7_000),
     maxMessages: integer(env.FUNDED_DIRECT_SERVICE_MAX_MESSAGES, 0),
     autoRedemptionEnabled: env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true",
     autoRedemptionIntervalMs: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, 60_000),
@@ -54,8 +54,8 @@ export function loadFundedDirectServiceConfig(env = process.env) {
   if (config.engine === "persistent_v1" && (!config.serviceBusNamespace || !config.serviceBusQueue)) {
     errors.push("persistent_v1 requires the exact Service Bus namespace and queue");
   }
-  if (!(config.signalToSendSloMs >= 500 && config.signalToSendSloMs <= 10_000)) {
-    errors.push("FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS must be in [500, 10000]");
+  if (!(config.signalToSendSloMs >= 500 && config.signalToSendSloMs <= 7_000)) {
+    errors.push("FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS must be in [500, 7000]");
   }
   if (!(config.maxMessages >= 0 && config.maxMessages <= 10_000)) {
     errors.push("FUNDED_DIRECT_SERVICE_MAX_MESSAGES must be in [0, 10000]");
@@ -379,8 +379,7 @@ export async function runPersistentFundedDirectService({
       const queueToReceiveMs = Number.isFinite(decisionWallMs)
         ? Math.max(0, receivedWallMs - decisionWallMs) : null;
       const breached = signalToSendMs !== null && signalToSendMs > config.signalToSendSloMs;
-      const severeBreach = signalToSendMs !== null && signalToSendMs > 3_000;
-      consecutiveLatencyBreaches = severeBreach ? consecutiveLatencyBreaches + 1 : 0;
+      consecutiveLatencyBreaches = breached ? consecutiveLatencyBreaches + 1 : 0;
       if (signalToSendMs !== null) {
         signalToSendSamples.push(signalToSendMs);
         if (signalToSendSamples.length > 100) signalToSendSamples.shift();
@@ -398,7 +397,7 @@ export async function runPersistentFundedDirectService({
       if (result?.status === "paused_by_account_risk_state") logger({ schema: "polyedge.funded_direct_alert.v1", status: "paused_by_account_risk_state", decision_id: body.decision_id, account_risk_pause: true, error: result.error || null });
       if (consecutiveLatencyBreaches >= 3) {
         stopping = true;
-        logger({ schema: "polyedge.funded_direct_alert.v1", status: "engine_paused_by_consecutive_latency_breaches", decision_id: body.decision_id, consecutive_transitions_above_3000_ms: consecutiveLatencyBreaches, account_risk_pause: true });
+        logger({ schema: "polyedge.funded_direct_alert.v1", status: "engine_paused_by_consecutive_latency_breaches", decision_id: body.decision_id, consecutive_transitions_above_slo: consecutiveLatencyBreaches, signal_to_send_slo_ms: config.signalToSendSloMs, account_risk_pause: true });
       }
     } catch (error) {
       await failMessage(entry, error);

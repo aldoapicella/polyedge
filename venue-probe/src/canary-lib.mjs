@@ -97,6 +97,7 @@ export function loadCanaryConfig(env = process.env) {
       env.FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY,
       0
     ),
+    signalToSendSloMs: integer(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, 7_000),
     minRemainingTtlMs: integer(env.STRATEGY_CANARY_MIN_REMAINING_TTL_MS, 5_000)
   };
   validateCanaryConfig(config);
@@ -178,6 +179,9 @@ export function validateCanaryConfig(config) {
   }
   if (!(config.minRemainingTtlMs >= 1_000 && config.minRemainingTtlMs <= MAX_ACTIVE_INTENT_TTL_MS)) {
     errors.push(`STRATEGY_CANARY_MIN_REMAINING_TTL_MS must be in [1000, ${MAX_ACTIVE_INTENT_TTL_MS}]`);
+  }
+  if (!(config.signalToSendSloMs >= 500 && config.signalToSendSloMs <= 7_000)) {
+    errors.push("FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS must be in [500, 7000]");
   }
   for (const [name, value] of [
     ["POLYMARKET_PRIVATE_KEY", config.privateKey],
@@ -730,6 +734,26 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
     },
     lifecycle
   };
+}
+
+export function assertFundedSignalToSendDeadline(intent, sloMs, nowMs = Date.now()) {
+  const slo = Number(sloMs);
+  const decisionMs = Date.parse(intent?.decision_ts);
+  const validUntilMs = Date.parse(intent?.valid_until);
+  const elapsedMs = nowMs - decisionMs;
+  const remainingTtlMs = validUntilMs - nowMs;
+  if (!Number.isFinite(slo) || slo < 500 || slo > 7_000 ||
+      !Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > slo) {
+    const error = new Error(`fail closed: signal-to-send latency exceeded ${slo}ms (${elapsedMs}ms)`);
+    error.signalToSendDeadlineExceeded = true;
+    throw error;
+  }
+  if (!Number.isFinite(remainingTtlMs) || remainingTtlMs < 8_000) {
+    const error = new Error(`fail closed: funded intent has less than 8000ms TTL at transport (${remainingTtlMs}ms)`);
+    error.signalToSendDeadlineExceeded = true;
+    throw error;
+  }
+  return { elapsedMs, remainingTtlMs };
 }
 
 export function beginFillMarkoutCapture(client, tokenId, currentFills, options = {}) {

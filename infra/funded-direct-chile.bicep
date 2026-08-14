@@ -690,7 +690,7 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_SERVICE_BUS_ENABLED', value: 'true' }
             { name: 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE', value: serviceBusNamespace.name }
             { name: 'FUNDED_DIRECT_SERVICE_BUS_QUEUE', value: serviceBusQueue.name }
-            { name: 'FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS', value: '2000' }
+            { name: 'FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS', value: '7000' }
             { name: 'FUNDED_DIRECT_SERVICE_RESTART_DELAY_MS', value: '1000' }
             { name: 'FUNDED_DIRECT_SERVICE_RISK_PAUSE_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_SERVICE_HEARTBEAT_MS', value: '60000' }

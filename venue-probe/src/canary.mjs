@@ -28,6 +28,7 @@ import {
 } from "./lib.mjs";
 import {
   consumeOneShotAuthorization,
+  assertFundedSignalToSendDeadline,
   beginFillMarkoutCapture,
   artifactLocationFromUri,
   deterministicNoOrderRejection,
@@ -1661,6 +1662,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       current_book_hash: preSendValidation.actualBookHash,
       intent_book_hash_matched: preSendValidation.bookHashMatched
     };
+    while (Date.now() <= preSendCapturedWallMs) await sleep(1);
   } catch (error) {
     try {
       await finalizeProbeRisk(config, reservation, {
@@ -1676,36 +1678,66 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     throw error;
   }
   const expiration = Math.floor(Date.parse(intent.gtd_expiry_ts) / 1000);
-  while (Date.now() <= preSendCapturedWallMs) await sleep(1);
-  const sentAt = new Date();
-  const sentMonotonicMs = performance.now();
+  let sentAt;
+  let sentMonotonicMs;
   let response;
   try {
-    orderSubmissionAttempted = true;
-    ledger.record("venue_order_send", {
-      probe_id: reservation.probe_id,
-      wall_ms: Date.now(),
-      monotonic_ms: sentMonotonicMs,
-      active_valid_until: intent.valid_until,
-      venue_gtd_expiry_ts: intent.gtd_expiry_ts,
-      order: {
-        token_id: intent.token_id,
-        price: intent.price,
-        shares: intent.shares,
-        notional: intent.notional,
-        source_requested_shares: intent.source_requested_shares,
-        source_requested_notional: intent.source_requested_notional,
-        current_funds_scaled: intent.current_funds_scaled === true,
-        post_only: true
-      }
-    });
-    response = await client.createAndPostOrder(
-      { tokenID: intent.token_id, price: Number(intent.price), size: Number(intent.shares), side: Side.BUY, expiration },
-      { tickSize: String(refreshed.book.tick_size ?? refreshed.book.tickSize), negRisk: refreshed.book.neg_risk === true || refreshed.book.negRisk === true },
-      OrderType.GTD,
-      true
-    );
+    const userOrder = {
+      tokenID: intent.token_id,
+      price: Number(intent.price),
+      size: Number(intent.shares),
+      side: Side.BUY,
+      expiration
+    };
+    const orderOptions = {
+      tickSize: String(refreshed.book.tick_size ?? refreshed.book.tickSize),
+      negRisk: refreshed.book.neg_risk === true || refreshed.book.negRisk === true
+    };
+    const recordTransportStarted = ({ wallMs, monotonicMs }) => {
+      sentAt = new Date(wallMs);
+      sentMonotonicMs = monotonicMs;
+      orderSubmissionAttempted = true;
+      ledger.record("venue_order_send", {
+        probe_id: reservation.probe_id,
+        wall_ms: wallMs,
+        monotonic_ms: sentMonotonicMs,
+        active_valid_until: intent.valid_until,
+        venue_gtd_expiry_ts: intent.gtd_expiry_ts,
+        order: {
+          token_id: intent.token_id,
+          price: intent.price,
+          shares: intent.shares,
+          notional: intent.notional,
+          source_requested_shares: intent.source_requested_shares,
+          source_requested_notional: intent.source_requested_notional,
+          current_funds_scaled: intent.current_funds_scaled === true,
+          post_only: true
+        }
+      });
+    };
+    if (config.operatorDirect) {
+      response = await createAndPostFundedOrderWithinSignalToSendDeadline({
+        client,
+        intent,
+        sloMs: config.signalToSendSloMs,
+        reservation,
+        userOrder,
+        orderOptions,
+        finalizeNoOrder: (value, finalization) =>
+          finalizeProbeRisk(config, value, finalization),
+        onTransportStarted: recordTransportStarted
+      });
+    } else {
+      recordTransportStarted({ wallMs: Date.now(), monotonicMs: performance.now() });
+      response = await client.createAndPostOrder(
+        userOrder,
+        orderOptions,
+        OrderType.GTD,
+        true
+      );
+    }
   } catch (error) {
+    if (error.riskReleasedNoOrder === true) throw error;
     const rejection = deterministicNoOrderRejection(error);
     if (rejection) {
       await releaseDeterministicRejectedOrder(client, {
@@ -2126,6 +2158,69 @@ export function assertPersistentIntentRemainingTtl(intent, minimumMs, nowMs = Da
     throw new Error(`fail closed: persistent executor has less than ${minimum}ms of intent TTL before signing`);
   }
   return remaining;
+}
+
+export async function createAndPostFundedOrderWithinSignalToSendDeadline({
+  client,
+  intent,
+  sloMs,
+  reservation,
+  userOrder,
+  orderOptions,
+  finalizeNoOrder,
+  onTransportStarted,
+  nowMs = Date.now,
+  monotonicMs = () => performance.now()
+}) {
+  let transportInitiated = false;
+  let interceptCount = 0;
+  try {
+    if (client.retryOnError === true) {
+      throw new Error("fail closed: funded order transport retries must remain disabled");
+    }
+    const order = await client.createOrder(userOrder, orderOptions);
+    const originalPost = client.post;
+    if (typeof originalPost !== "function") {
+      throw new Error("fail closed: funded order transport hook is unavailable");
+    }
+    client.post = function(endpoint, options, skipThrow) {
+      interceptCount += 1;
+      if (interceptCount !== 1 || endpoint !== `${client.host}/order`) {
+        throw new Error("fail closed: funded order transport was not one exact /order request");
+      }
+      const wallMs = nowMs();
+      assertFundedSignalToSendDeadline(intent, sloMs, wallMs);
+      const startedMonotonicMs = monotonicMs();
+      const pending = originalPost.call(this, endpoint, options, skipThrow);
+      transportInitiated = true;
+      onTransportStarted({ wallMs, monotonicMs: startedMonotonicMs });
+      return pending;
+    };
+    try {
+      const response = await client.postOrder(order, OrderType.GTD, true);
+      if (interceptCount !== 1) {
+        throw new Error(`fail closed: funded order transport intercept count was ${interceptCount}`);
+      }
+      return response;
+    } finally {
+      client.post = originalPost;
+    }
+  } catch (error) {
+    if (transportInitiated) throw error;
+    try {
+      await finalizeNoOrder(reservation, {
+        state: "released_no_order",
+        order_submitted: false,
+        matched_notional: 0,
+        reconciliation_complete: true,
+        zero_open_orders_confirmed: true
+      });
+    } catch (releaseError) {
+      throw new Error(`fail closed: pre-submit lifecycle failed and no-order risk release also failed (${error.message}; ${releaseError.message})`);
+    }
+    error.riskReleasedNoOrder = true;
+    throw error;
+  }
 }
 
 async function uploadFailedPostAckEvidence({ intent, runtime, reservation, orderId, acknowledgedAt, sentAt, acknowledgementLatencyMs, preSendContext, emergency, originalError }) {

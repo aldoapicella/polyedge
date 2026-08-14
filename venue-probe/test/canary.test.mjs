@@ -9,6 +9,7 @@ import {
   consumeOneShotAuthorization,
   deterministicNoOrderRejection,
   executeStrategyCanary,
+  assertFundedSignalToSendDeadline,
   loadHashedJson,
   sha256,
   validateDeterministicNoOrderReconciliation
@@ -30,6 +31,7 @@ import {
   selectFreshCachedSafetySnapshot,
   startSafetySnapshotCache,
   streamBookEvidence,
+  createAndPostFundedOrderWithinSignalToSendDeadline,
   waitForSafetySnapshotIdle
 } from "../src/canary.mjs";
 import { automaticSettlementReceiptEvidence } from "../src/redeem.mjs";
@@ -708,6 +710,135 @@ test("persistent executor honors the configured child TTL gate", () => {
     ),
     /less than 2000ms/
   );
+});
+
+test("funded executor fails closed at the reviewed signal-to-send deadline", () => {
+  const decisionMs = Date.parse("2026-07-30T12:00:00.000Z");
+  const intent = {
+    decision_ts: new Date(decisionMs).toISOString(),
+    valid_until: new Date(decisionMs + 15_000).toISOString(),
+    ttl_ms: 15_000
+  };
+  assert.deepEqual(assertFundedSignalToSendDeadline(intent, 7_000, decisionMs + 7_000), {
+    elapsedMs: 7_000,
+    remainingTtlMs: 8_000
+  });
+  assert.throws(
+    () => assertFundedSignalToSendDeadline(intent, 7_000, decisionMs + 7_001),
+    /signal-to-send latency exceeded 7000ms \(7001ms\)/
+  );
+  assert.throws(
+    () => assertFundedSignalToSendDeadline({
+      decision_ts: new Date(decisionMs).toISOString(),
+      valid_until: new Date(decisionMs + 10_000).toISOString()
+    }, 7_000, decisionMs + 7_000),
+    /less than 8000ms TTL at transport \(3000ms\)/
+  );
+});
+
+test("async order construction cannot cross the deadline into venue transport", async () => {
+  const decisionMs = Date.parse("2026-07-30T12:00:00.000Z");
+  const reservation = { probe_id: "funded-direct-decision" };
+  let clockMs = decisionMs + 7_000;
+  let venueCalls = 0;
+  const finalized = [];
+  const client = {
+    host: "https://clob.example",
+    retryOnError: false,
+    post: async () => { venueCalls += 1; },
+    createOrder: async () => { clockMs += 1; return { signed: true }; },
+    async postOrder() {
+      return this.post(`${this.host}/order`, { data: {} }, true);
+    }
+  };
+  await assert.rejects(createAndPostFundedOrderWithinSignalToSendDeadline({
+    client,
+    intent: {
+      decision_ts: new Date(decisionMs).toISOString(),
+      valid_until: new Date(decisionMs + 15_000).toISOString(),
+      ttl_ms: 15_000
+    },
+    sloMs: 7_000,
+    reservation,
+    userOrder: {},
+    orderOptions: {},
+    nowMs: () => clockMs,
+    finalizeNoOrder: async (value, finalization) => finalized.push({
+      reservation: value,
+      ...finalization
+    }),
+    onTransportStarted: () => assert.fail("late order must not start transport")
+  }), /signal-to-send latency exceeded 7000ms/);
+  assert.equal(venueCalls, 0);
+  assert.deepEqual(finalized, [{
+    reservation,
+    state: "released_no_order",
+    order_submitted: false,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
+  }]);
+  assert.equal(client.post.name, "post");
+});
+
+test("a failure after the first order transport remains ambiguous and reserved", async () => {
+  const decisionMs = Date.parse("2026-07-30T12:00:00.000Z");
+  let transportStarts = 0;
+  let finalized = 0;
+  const originalPost = async () => { throw new Error("network acknowledgement lost"); };
+  const client = {
+    host: "https://clob.example",
+    retryOnError: false,
+    post: originalPost,
+    createOrder: async () => ({ signed: true }),
+    async postOrder() { return this.post(`${this.host}/order`, { data: {} }, true); }
+  };
+  await assert.rejects(createAndPostFundedOrderWithinSignalToSendDeadline({
+    client,
+    intent: {
+      decision_ts: new Date(decisionMs).toISOString(),
+      valid_until: new Date(decisionMs + 15_000).toISOString()
+    },
+    sloMs: 7_000,
+    reservation: { probe_id: "funded-direct-decision" },
+    userOrder: {},
+    orderOptions: {},
+    nowMs: () => decisionMs + 6_000,
+    finalizeNoOrder: async () => { finalized += 1; },
+    onTransportStarted: () => { transportStarts += 1; }
+  }), /network acknowledgement lost/);
+  assert.equal(transportStarts, 1);
+  assert.equal(finalized, 0);
+  assert.equal(client.post, originalPost);
+});
+
+test("funded order transport rejects SDK endpoint drift before any venue call", async () => {
+  const decisionMs = Date.parse("2026-07-30T12:00:00.000Z");
+  let venueCalls = 0;
+  let finalized = 0;
+  const client = {
+    host: "https://clob.example",
+    retryOnError: false,
+    post: async () => { venueCalls += 1; },
+    createOrder: async () => ({ signed: true }),
+    async postOrder() { return this.post(`${this.host}/orders`, { data: {} }, true); }
+  };
+  await assert.rejects(createAndPostFundedOrderWithinSignalToSendDeadline({
+    client,
+    intent: {
+      decision_ts: new Date(decisionMs).toISOString(),
+      valid_until: new Date(decisionMs + 15_000).toISOString()
+    },
+    sloMs: 7_000,
+    reservation: { probe_id: "funded-direct-decision" },
+    userOrder: {},
+    orderOptions: {},
+    nowMs: () => decisionMs + 6_000,
+    finalizeNoOrder: async () => { finalized += 1; },
+    onTransportStarted: () => assert.fail("drifted endpoint must not start transport")
+  }), /not one exact \/order request/);
+  assert.equal(venueCalls, 0);
+  assert.equal(finalized, 1);
 });
 
 test("safety cache permits only one pending preflight across warmup generations", async () => {
