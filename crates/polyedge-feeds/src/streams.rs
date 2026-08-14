@@ -31,7 +31,8 @@ pub async fn run_rtds_feed(
     if settings.target.enable_polymarket_rtds_binance {
         subscriptions.push(json!({
             "topic": "crypto_prices",
-            "type": "update"
+            "type": "update",
+            "filters": settings.target.binance_symbol
         }));
     }
     if subscriptions.is_empty() {
@@ -596,6 +597,31 @@ mod tests {
     }
 
     #[test]
+    fn binance_rtds_update_matches_the_explicit_subscription_symbol() {
+        let settings = RuntimeSettings::default();
+        let reference = parse_rtds_message(
+            Message::Text(
+                json!({
+                    "topic": "crypto_prices",
+                    "type": "update",
+                    "timestamp": 1_786_687_200_000_i64,
+                    "payload": {
+                        "symbol": "btcusdt",
+                        "value": 118500.25,
+                        "timestamp": 1_786_687_200_000_i64
+                    }
+                })
+                .to_string(),
+            ),
+            &settings,
+        )
+        .expect("documented Binance RTDS update did not match the configured symbol");
+        assert_eq!(reference.source, settings.rtds_binance_source_name());
+        assert_eq!(reference.price, Decimal::new(11_850_025, 2));
+        assert!(!reference.exact_resolution_source);
+    }
+
+    #[test]
     fn direct_price_change_is_applied_and_child_fields_take_priority() {
         let mut books = BTreeMap::new();
         let direct = json!({
@@ -645,6 +671,8 @@ mod tests {
                 serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(subscription["subscriptions"].as_array().unwrap().len(), 1);
             assert_eq!(subscription["subscriptions"][0]["topic"], "crypto_prices");
+            assert_eq!(subscription["subscriptions"][0]["type"], "update");
+            assert_eq!(subscription["subscriptions"][0]["filters"], "btcusdt");
             while socket.read().is_ok() {}
         });
 
