@@ -1189,6 +1189,7 @@ jobs:
           readonly v10_session_sha256="sha256:c516c052fc5c01eed5403842ff24bf4b08512d6c38e8260e2d064580c82322f8"
           readonly v10_latest_redemption="${v10_prefix}latest-redemption.json"
           readonly v10_redemption_prefix="${v10_prefix}redemptions/"
+          readonly v10_redemption_control="${v10_prefix}control/redemption-state.json"
           readonly v10_authorization_prefix="${v10_prefix}authorizations/"
           readonly v10_completion_prefix="${v10_prefix}completed/"
           v5_state="reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json"
@@ -1224,6 +1225,7 @@ jobs:
             --arg state "$v10_state_blob" \
             --arg latest "$v10_latest_redemption" \
             --arg archive "$v10_redemption_prefix" \
+            --arg redemption_control "$v10_redemption_control" \
             --arg authorizations "$v10_authorization_prefix" \
             --arg completions "$v10_completion_prefix" '
             ([.[].name] | length == (unique | length))
@@ -1232,6 +1234,7 @@ jobs:
               . == $session
               or . == $state
               or . == $latest
+              or . == $redemption_control
               or test("^" + $archive + "[0-9]{4}-[0-9]{2}-[0-9]{2}/venue-redemption-[0-9]{17}-[0-9a-f]{8}\\.json$")
               or test("^" + $authorizations + "[0-9a-f]{64}\\.json$")
               or test("^" + $completions + "[0-9a-f]{64}\\.json$"))
