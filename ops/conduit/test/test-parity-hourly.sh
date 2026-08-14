@@ -40,7 +40,20 @@ case "$1" in
       *) exit 2 ;;
     esac
     ;;
-  exec) printf 'HTTP/1.0 200 OK\r\n\r\n'; cat "$FAKE_API_STATUS" ;;
+  exec)
+    printf 'HTTP/1.0 200 OK\r\n\r\n'
+    attempt_file=$FAKE_CALLS/api-status-attempts
+    attempt=0
+    [ ! -f "$attempt_file" ] || attempt=$(cat "$attempt_file")
+    attempt=$((attempt + 1))
+    printf '%s\n' "$attempt" >"$attempt_file"
+    if [ "$attempt" -le "${FAKE_API_BUSY_ATTEMPTS:-0}" ]; then
+      jq '.recorder_status.error_count=null | .recorder_status.dropped_count=null | .recorder_metrics.queued=1' \
+        "$FAKE_API_STATUS"
+    else
+      cat "$FAKE_API_STATUS"
+    fi
+    ;;
   run)
     printf '%s\n' "$*" >>"$FAKE_CALLS/podman"
     execution=${POLYEDGE_GENERATOR_EXECUTION_ID:-}
@@ -329,6 +342,7 @@ run_collector() {
     FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_AZURE_ATTESTATION="$case_root/azure.json.attestation.json" \
     FAKE_AZURE_EXECUTION="$case_root/azure-execution.json" FAKE_SAME_REPORT="$case_root/same.json" \
     FAKE_OCI_IMAGE="$oci_image" FAKE_OCI_IMAGE_DIGEST="$oci_image_digest" FAKE_API_STATUS="$case_root/api-status.json" \
+    FAKE_API_BUSY_ATTEMPTS="${FAKE_API_BUSY_ATTEMPTS:-0}" \
     "$collector"
 }
 
@@ -553,6 +567,11 @@ metric_failure=$root/metric-failure
 fixture "$metric_failure"
 jq '.recorder_metrics.queued=1' "$metric_failure/api-status.json" >"$metric_failure/status.tmp" && mv "$metric_failure/status.tmp" "$metric_failure/api-status.json"
 if run_collector "$metric_failure" >/dev/null 2>&1; then echo 'recorder metric failure unexpectedly passed' >&2; exit 1; fi
+
+transient_recorder_busy=$root/transient-recorder-busy
+fixture "$transient_recorder_busy"
+FAKE_API_BUSY_ATTEMPTS=3 run_collector "$transient_recorder_busy" >/dev/null
+[ "$(cat "$transient_recorder_busy/calls/api-status-attempts")" -eq 4 ]
 
 feed_failure=$root/feed-failure
 fixture "$feed_failure"

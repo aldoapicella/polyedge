@@ -706,8 +706,8 @@ while :; do
     break
   fi
   attempt=$((attempt + 1))
-  [ "$attempt" -lt 3 ] || { rm -f "$api_status"; api_status=; die 'protected API recorder or essential feed status is unhealthy'; }
-  sleep 2
+  [ "$attempt" -lt 6 ] || { rm -f "$api_status"; api_status=; die 'protected API recorder or essential feed status is unhealthy'; }
+  sleep 1
 done
 rm -f "$api_status"
 api_status=
