@@ -336,7 +336,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
     needs: funded-safety
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
     concurrency:
       group: polyedge-funded-direct-cl
       cancel-in-progress: false
@@ -2518,9 +2518,8 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           lifecycle_ready=false
-          # Cover at least two BTC 15-minute market boundaries; warmup is readiness,
-          # not proof that the strategy has emitted a qualifying Place intent.
-          for attempt in $(seq 1 180); do
+          # Observe several 15-minute markets; warmup is not proof of a qualifying Place intent.
+          for attempt in $(seq 1 360); do
             az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
