@@ -9,9 +9,10 @@ use polyedge_config::RuntimeSettings;
 use polyedge_domain::{BookLevel, BookState, ReferencePrice, TokenId};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -19,6 +20,377 @@ use tokio_tungstenite::tungstenite::Message;
 pub async fn run_rtds_feed(
     settings: RuntimeSettings,
     sender: mpsc::Sender<FeedEvent>,
+) -> Result<(), FeedError> {
+    run_rtds_feed_inner(settings, sender, None).await
+}
+
+async fn run_rtds_feed_inner(
+    settings: RuntimeSettings,
+    sender: mpsc::Sender<FeedEvent>,
+    observation_processed: Option<mpsc::UnboundedSender<(usize, u64)>>,
+) -> Result<(), FeedError> {
+    if !settings.target.enable_polymarket_rtds_chainlink
+        && !settings.target.enable_polymarket_rtds_binance
+    {
+        return Ok(());
+    }
+    if settings.target.enable_polymarket_rtds_chainlink
+        && settings.target.enable_polymarket_rtds_binance
+    {
+        return Err(FeedError::SourceStalled(
+            "redundant RTDS feed requires exactly one enabled logical source".to_owned(),
+        ));
+    }
+
+    let source_timeout =
+        Duration::from_secs_f64(settings.target.rtds_chainlink_watchdog_seconds.max(5.0));
+    let (observation_sender, mut observations) = mpsc::channel(256);
+    let mut connections = JoinSet::new();
+    let mut generations = [0_u64, 0_u64];
+    spawn_rtds_connection(
+        &mut connections,
+        0,
+        generations[0],
+        Duration::ZERO,
+        settings.clone(),
+        observation_sender.clone(),
+    );
+    spawn_rtds_connection(
+        &mut connections,
+        1,
+        generations[1],
+        Duration::from_secs(2),
+        settings.clone(),
+        observation_sender.clone(),
+    );
+
+    let mut running = [true, true];
+    let mut last_observed: [Option<RtdsSlotObservation>; 2] = [None, None];
+    let mut forward_state = RtdsForwardState::default();
+    'supervisor: loop {
+        tokio::select! {
+            biased;
+            Some((slot, generation, reference)) = observations.recv() => {
+                if !rtds_slot_is_current(&running, &generations, slot, generation) {
+                    continue;
+                }
+                last_observed[slot] = Some(RtdsSlotObservation {
+                    arrived_at: Instant::now(),
+                    key: reference_key(&reference),
+                });
+                if should_forward_rtds_reference(&reference, &mut forward_state) {
+                    forward_rtds_reference(&sender, reference).await?;
+                }
+                if let Some(observation_processed) = &observation_processed {
+                    let _ = observation_processed.send((slot, generation));
+                }
+            }
+            result = connections.join_next() => {
+                let Some(result) = result else {
+                    return Err(rtds_continuity_error());
+                };
+                let (slot, generation, result) = result.map_err(|error| {
+                    FeedError::SourceStalled(format!("RTDS connection task failed: {error}"))
+                })?;
+                if !rtds_slot_is_current(&running, &generations, slot, generation) {
+                    continue;
+                }
+                let had_observation = last_observed[slot].is_some();
+                running[slot] = false;
+                last_observed[slot] = None;
+                let peer = 1 - slot;
+                if !rtds_slot_covers(
+                    &running,
+                    &last_observed,
+                    peer,
+                    forward_state.last.as_ref(),
+                    source_timeout,
+                ) {
+                    let synchronization_deadline =
+                        Instant::now() + Duration::from_millis(250);
+                    let synchronization_timeout =
+                        tokio::time::sleep_until(synchronization_deadline);
+                    tokio::pin!(synchronization_timeout);
+                    loop {
+                        if rtds_synchronization_expired(synchronization_deadline) {
+                            let peer_result = try_current_rtds_terminal_result(
+                                &mut connections,
+                                &running,
+                                &generations,
+                            );
+                            return uncovered_rtds_result(result, peer_result);
+                        }
+                        tokio::select! {
+                            biased;
+                            Some((observed_slot, observed_generation, reference)) = observations.recv() => {
+                                if !rtds_slot_is_current(
+                                    &running,
+                                    &generations,
+                                    observed_slot,
+                                    observed_generation,
+                                ) {
+                                    continue;
+                                }
+                                last_observed[observed_slot] = Some(RtdsSlotObservation {
+                                    arrived_at: Instant::now(),
+                                    key: reference_key(&reference),
+                                });
+                                if should_forward_rtds_reference(&reference, &mut forward_state) {
+                                    forward_rtds_reference(&sender, reference).await?;
+                                }
+                                if let Some(observation_processed) = &observation_processed {
+                                    let _ = observation_processed.send((observed_slot, observed_generation));
+                                }
+                                if rtds_slot_covers(
+                                    &running,
+                                    &last_observed,
+                                    peer,
+                                    forward_state.last.as_ref(),
+                                    source_timeout,
+                                ) {
+                                    break;
+                                }
+                            }
+                            peer_result = connections.join_next() => {
+                                let Some(peer_result) = peer_result else {
+                                    return uncovered_rtds_result(result, None);
+                                };
+                                let peer_result = match peer_result {
+                                    Ok((peer_slot, peer_generation, peer_result))
+                                        if rtds_slot_is_current(
+                                            &running,
+                                            &generations,
+                                            peer_slot,
+                                            peer_generation,
+                                        ) => {
+                                            Some(peer_result)
+                                        }
+                                    Ok(_) => continue,
+                                    Err(error) => Some(Err(FeedError::SourceStalled(format!(
+                                        "RTDS connection task failed: {error}"
+                                    )))),
+                                };
+                                return uncovered_rtds_result(result, peer_result);
+                            }
+                            _ = &mut synchronization_timeout => {
+                                let peer_result = try_current_rtds_terminal_result(
+                                    &mut connections,
+                                    &running,
+                                    &generations,
+                                );
+                                return uncovered_rtds_result(result, peer_result);
+                            }
+                        }
+                    }
+                }
+                if let Some(peer_result) = try_current_rtds_terminal_result(
+                    &mut connections,
+                    &running,
+                    &generations,
+                ) {
+                    return uncovered_rtds_result(result, Some(peer_result));
+                }
+
+                tracing::warn!(
+                    failed_slot = slot,
+                    failed_generation = generation,
+                    synchronized_slot = peer,
+                    error = ?result.as_ref().err(),
+                    "RTDS connection ended; fresh sequence-synchronized peer preserved feed continuity"
+                );
+                generations[slot] = generations[slot].wrapping_add(1);
+                spawn_rtds_connection(
+                    &mut connections,
+                    slot,
+                    generations[slot],
+                    rtds_replacement_delay(had_observation),
+                    settings.clone(),
+                    observation_sender.clone(),
+                );
+                running[slot] = true;
+                continue 'supervisor;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RtdsSlotObservation {
+    arrived_at: Instant,
+    key: (FeedName, chrono::DateTime<Utc>, Decimal),
+}
+
+const RTDS_MAX_PRICES_PER_SOURCE_TIMESTAMP: usize = 64;
+
+#[derive(Default)]
+struct RtdsForwardState {
+    last: Option<(FeedName, chrono::DateTime<Utc>, Decimal)>,
+    prices_at_timestamp: BTreeSet<Decimal>,
+}
+
+fn rtds_slot_covers(
+    running: &[bool; 2],
+    observations: &[Option<RtdsSlotObservation>; 2],
+    slot: usize,
+    last_forwarded: Option<&(FeedName, chrono::DateTime<Utc>, Decimal)>,
+    source_timeout: Duration,
+) -> bool {
+    running[slot]
+        && observations[slot].as_ref().is_some_and(|observation| {
+            !source_watchdog_expired(observation.arrived_at, source_timeout)
+                && last_forwarded
+                    .is_some_and(|last| rtds_key_is_synchronized(&observation.key, last))
+        })
+}
+
+fn rtds_key_is_synchronized(
+    observed: &(FeedName, chrono::DateTime<Utc>, Decimal),
+    last: &(FeedName, chrono::DateTime<Utc>, Decimal),
+) -> bool {
+    observed == last || (observed.0 == last.0 && observed.1 > last.1)
+}
+
+fn rtds_synchronization_expired(deadline: Instant) -> bool {
+    Instant::now() >= deadline
+}
+
+fn rtds_continuity_error() -> FeedError {
+    FeedError::SourceStalled(
+        "RTDS continuity unavailable: no fresh sequence-synchronized connection".to_owned(),
+    )
+}
+
+fn uncovered_rtds_result(
+    current: Result<(), FeedError>,
+    peer: Option<Result<(), FeedError>>,
+) -> Result<(), FeedError> {
+    if current.is_err() {
+        current
+    } else if peer.as_ref().is_some_and(Result::is_err) {
+        peer.unwrap_or(Ok(()))
+    } else {
+        Err(rtds_continuity_error())
+    }
+}
+
+fn try_current_rtds_terminal_result(
+    connections: &mut JoinSet<(usize, u64, Result<(), FeedError>)>,
+    running: &[bool; 2],
+    generations: &[u64; 2],
+) -> Option<Result<(), FeedError>> {
+    while let Some(result) = connections.try_join_next() {
+        match result {
+            Ok((slot, generation, result))
+                if rtds_slot_is_current(running, generations, slot, generation) =>
+            {
+                return Some(result);
+            }
+            Ok(_) => continue,
+            Err(error) => {
+                return Some(Err(FeedError::SourceStalled(format!(
+                    "RTDS connection task failed: {error}"
+                ))));
+            }
+        }
+    }
+    None
+}
+
+fn rtds_replacement_delay(had_observation: bool) -> Duration {
+    if had_observation {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
+fn should_forward_rtds_reference(reference: &ReferencePrice, state: &mut RtdsForwardState) -> bool {
+    let key = reference_key(reference);
+    let Some(last) = state.last.as_ref() else {
+        state.prices_at_timestamp.insert(key.2);
+        state.last = Some(key);
+        return true;
+    };
+    if key.0 != last.0 || key.1 < last.1 {
+        return false;
+    }
+    if key.1 > last.1 {
+        state.prices_at_timestamp.clear();
+        state.prices_at_timestamp.insert(key.2);
+        state.last = Some(key);
+        return true;
+    }
+    if state.prices_at_timestamp.contains(&key.2)
+        || state.prices_at_timestamp.len() >= RTDS_MAX_PRICES_PER_SOURCE_TIMESTAMP
+    {
+        return false;
+    }
+    state.prices_at_timestamp.insert(key.2);
+    state.last = Some(key);
+    true
+}
+
+fn rtds_slot_is_current(
+    running: &[bool; 2],
+    generations: &[u64; 2],
+    slot: usize,
+    generation: u64,
+) -> bool {
+    running[slot] && generations[slot] == generation
+}
+
+fn spawn_rtds_connection(
+    connections: &mut JoinSet<(usize, u64, Result<(), FeedError>)>,
+    slot: usize,
+    generation: u64,
+    delay: Duration,
+    settings: RuntimeSettings,
+    sender: mpsc::Sender<(usize, u64, ReferencePrice)>,
+) {
+    connections.spawn(async move {
+        tokio::time::sleep(delay).await;
+        (
+            slot,
+            generation,
+            run_rtds_connection(settings, slot, generation, sender).await,
+        )
+    });
+}
+
+async fn forward_rtds_reference(
+    sender: &mpsc::Sender<FeedEvent>,
+    reference: ReferencePrice,
+) -> Result<(), FeedError> {
+    let source = if reference.exact_resolution_source {
+        FeedName::PolymarketRtdsChainlink
+    } else {
+        FeedName::PolymarketRtdsBinance
+    };
+    publish(sender, FeedEvent::Reference(reference)).await?;
+    publish(
+        sender,
+        FeedEvent::Heartbeat {
+            source,
+            ts: Utc::now(),
+        },
+    )
+    .await
+}
+
+fn reference_key(reference: &ReferencePrice) -> (FeedName, chrono::DateTime<Utc>, Decimal) {
+    let source = if reference.exact_resolution_source {
+        FeedName::PolymarketRtdsChainlink
+    } else {
+        FeedName::PolymarketRtdsBinance
+    };
+    (source, reference.source_ts, reference.price)
+}
+
+async fn run_rtds_connection(
+    settings: RuntimeSettings,
+    slot: usize,
+    generation: u64,
+    sender: mpsc::Sender<(usize, u64, ReferencePrice)>,
 ) -> Result<(), FeedError> {
     let mut subscriptions = Vec::new();
     if settings.target.enable_polymarket_rtds_chainlink {
@@ -85,15 +457,15 @@ pub async fn run_rtds_feed(
                 };
                 let message = message?;
                 if let Some(reference) = parse_rtds_message(message, &settings) {
-                    let source = if reference.exact_resolution_source {
+                    if reference.exact_resolution_source {
                         last_chainlink = Instant::now();
-                        FeedName::PolymarketRtdsChainlink
                     } else {
                         last_binance = Instant::now();
-                        FeedName::PolymarketRtdsBinance
-                    };
-                    publish(&sender, FeedEvent::Reference(reference)).await?;
-                    publish(&sender, FeedEvent::Heartbeat { source, ts: Utc::now() }).await?;
+                    }
+                    sender
+                        .send((slot, generation, reference))
+                        .await
+                        .map_err(|_| FeedError::ChannelClosed)?;
                 }
             }
         }
@@ -700,10 +1072,13 @@ mod tests {
         settings.target.rtds_ping_interval_seconds = 1.0;
         let (sender, _receiver) = mpsc::channel(8);
 
-        let error = tokio::time::timeout(Duration::from_secs(8), run_rtds_feed(settings, sender))
-            .await
-            .expect("Binance watchdog did not return the stalled socket for reconnect")
-            .unwrap_err();
+        let error = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_rtds_connection(settings, 0, 0, sender),
+        )
+        .await
+        .expect("Binance watchdog did not return the stalled socket for reconnect")
+        .unwrap_err();
         match error {
             FeedError::SourceStalled(message) => {
                 assert!(message.contains("RTDS Binance"));
@@ -711,6 +1086,515 @@ mod tests {
             }
             other => panic!("unexpected RTDS result: {other}"),
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn replaced_rtds_slot_rejects_late_old_generation() {
+        let running = [true, true];
+        let generations = [1, 0];
+        assert!(!rtds_slot_is_current(&running, &generations, 0, 0));
+        assert!(rtds_slot_is_current(&running, &generations, 0, 1));
+    }
+
+    #[test]
+    fn observed_rtds_slot_reconnects_immediately_but_never_healthy_slot_backs_off() {
+        assert_eq!(rtds_replacement_delay(true), Duration::ZERO);
+        assert_eq!(rtds_replacement_delay(false), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn rtds_a_b_a_same_timestamp_forwards_only_a_b_and_replay_a_does_not_cover_b() {
+        let now = Utc::now();
+        let reference = |source_ts, price| ReferencePrice {
+            source: "polymarket_rtds_binance_btcusdt".to_owned(),
+            price,
+            source_ts,
+            local_ts: now,
+            latency_ms: 0.0,
+            stale: false,
+            exact_resolution_source: false,
+            quality_flags: Vec::new(),
+        };
+        let mut state = RtdsForwardState::default();
+        assert!(should_forward_rtds_reference(
+            &reference(now, Decimal::new(100, 0)),
+            &mut state,
+        ));
+        assert!(!should_forward_rtds_reference(
+            &reference(
+                now - chrono::Duration::milliseconds(1),
+                Decimal::new(101, 0)
+            ),
+            &mut state,
+        ));
+        assert!(!should_forward_rtds_reference(
+            &reference(now, Decimal::new(100, 0)),
+            &mut state,
+        ));
+        assert!(should_forward_rtds_reference(
+            &reference(now, Decimal::new(101, 0)),
+            &mut state,
+        ));
+        assert!(!should_forward_rtds_reference(
+            &reference(now, Decimal::new(100, 0)),
+            &mut state,
+        ));
+        let replaying_peer = [
+            Some(RtdsSlotObservation {
+                arrived_at: Instant::now(),
+                key: reference_key(&reference(now, Decimal::new(100, 0))),
+            }),
+            None,
+        ];
+        assert!(!rtds_slot_covers(
+            &[true, true],
+            &replaying_peer,
+            0,
+            state.last.as_ref(),
+            Duration::from_secs(5),
+        ));
+        assert!(should_forward_rtds_reference(
+            &reference(
+                now + chrono::Duration::milliseconds(1),
+                Decimal::new(100, 0)
+            ),
+            &mut state,
+        ));
+        assert_eq!(state.prices_at_timestamp.len(), 1);
+    }
+
+    #[test]
+    fn rtds_same_timestamp_correction_history_is_bounded_until_time_advances() {
+        let now = Utc::now();
+        let reference = |source_ts, price| ReferencePrice {
+            source: "polymarket_rtds_binance_btcusdt".to_owned(),
+            price,
+            source_ts,
+            local_ts: now,
+            latency_ms: 0.0,
+            stale: false,
+            exact_resolution_source: false,
+            quality_flags: Vec::new(),
+        };
+        let mut state = RtdsForwardState::default();
+        for price in 0..RTDS_MAX_PRICES_PER_SOURCE_TIMESTAMP {
+            assert!(should_forward_rtds_reference(
+                &reference(now, Decimal::from(price)),
+                &mut state,
+            ));
+        }
+        assert!(!should_forward_rtds_reference(
+            &reference(now, Decimal::from(RTDS_MAX_PRICES_PER_SOURCE_TIMESTAMP + 1),),
+            &mut state,
+        ));
+        assert_eq!(
+            state.prices_at_timestamp.len(),
+            RTDS_MAX_PRICES_PER_SOURCE_TIMESTAMP,
+        );
+        assert!(should_forward_rtds_reference(
+            &reference(
+                now + chrono::Duration::milliseconds(1),
+                Decimal::new(100, 0),
+            ),
+            &mut state,
+        ));
+        assert_eq!(state.prices_at_timestamp.len(), 1);
+    }
+
+    #[test]
+    fn rtds_sequence_readiness_rejects_replaying_and_lagging_peers() {
+        let now = Utc::now();
+        let last = (FeedName::PolymarketRtdsBinance, now, Decimal::new(102, 0));
+        let running = [true, true];
+        let observations = [
+            Some(RtdsSlotObservation {
+                arrived_at: Instant::now(),
+                key: (
+                    FeedName::PolymarketRtdsBinance,
+                    now - chrono::Duration::milliseconds(1),
+                    Decimal::new(101, 0),
+                ),
+            }),
+            None,
+        ];
+        assert!(!rtds_slot_covers(
+            &running,
+            &observations,
+            0,
+            Some(&last),
+            Duration::from_secs(5),
+        ));
+
+        let stale = [
+            Some(RtdsSlotObservation {
+                arrived_at: Instant::now() - Duration::from_secs(6),
+                key: last.clone(),
+            }),
+            None,
+        ];
+        assert!(!rtds_slot_covers(
+            &running,
+            &stale,
+            0,
+            Some(&last),
+            Duration::from_secs(5),
+        ));
+
+        let synchronized = [
+            Some(RtdsSlotObservation {
+                arrived_at: Instant::now(),
+                key: last.clone(),
+            }),
+            None,
+        ];
+        assert!(rtds_slot_covers(
+            &running,
+            &synchronized,
+            0,
+            Some(&last),
+            Duration::from_secs(5),
+        ));
+        assert!(rtds_key_is_synchronized(
+            &(
+                FeedName::PolymarketRtdsBinance,
+                now + chrono::Duration::milliseconds(1),
+                Decimal::new(103, 0),
+            ),
+            &last,
+        ));
+        assert!(!rtds_key_is_synchronized(
+            &(FeedName::PolymarketRtdsBinance, now, Decimal::new(101, 0),),
+            &last,
+        ));
+        assert!(!rtds_key_is_synchronized(
+            &(
+                FeedName::PolymarketRtdsChainlink,
+                now + chrono::Duration::milliseconds(1),
+                Decimal::new(103, 0),
+            ),
+            &last,
+        ));
+    }
+
+    #[tokio::test]
+    async fn rtds_synchronization_deadline_survives_a_continuous_replay_flood() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let (replays, mut replay_receiver) = mpsc::channel(1_024);
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_stop = Arc::clone(&stop);
+        let producer = std::thread::spawn(move || {
+            while !producer_stop.load(Ordering::Relaxed) {
+                if replays.blocking_send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(25);
+        let timeout = tokio::time::sleep_until(deadline);
+        tokio::pin!(timeout);
+        let mut replay_count = 0_u64;
+        loop {
+            if rtds_synchronization_expired(deadline) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                Some(()) = replay_receiver.recv() => replay_count += 1,
+                _ = &mut timeout => break,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        drop(replay_receiver);
+        producer.join().unwrap();
+
+        assert!(replay_count > 0);
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn rtds_expired_deadline_drain_preserves_a_queued_peer_error() {
+        let mut connections = JoinSet::new();
+        let (queued, mut queued_receiver) = mpsc::unbounded_channel();
+        connections.spawn(async move {
+            queued.send(()).unwrap();
+            (
+                1,
+                0,
+                Err(FeedError::SourceStalled("queued peer error".to_owned())),
+            )
+        });
+        queued_receiver
+            .recv()
+            .await
+            .expect("peer task did not queue its terminal result");
+        tokio::task::yield_now().await;
+
+        let deadline = Instant::now() - Duration::from_millis(1);
+        assert!(rtds_synchronization_expired(deadline));
+        let peer_result =
+            try_current_rtds_terminal_result(&mut connections, &[false, true], &[0, 0]);
+        let result = uncovered_rtds_result(Ok(()), peer_result);
+        assert!(matches!(
+            result,
+            Err(FeedError::SourceStalled(message)) if message == "queued peer error"
+        ));
+    }
+
+    #[test]
+    fn both_ended_rtds_results_prefer_real_errors() {
+        let result = uncovered_rtds_result(
+            Ok(()),
+            Some(Err(FeedError::SourceStalled("peer error".to_owned()))),
+        );
+        assert!(matches!(
+            result,
+            Err(FeedError::SourceStalled(message)) if message == "peer error"
+        ));
+        let result = uncovered_rtds_result(
+            Err(FeedError::SourceStalled("current error".to_owned())),
+            Some(Err(FeedError::SourceStalled("peer error".to_owned()))),
+        );
+        assert!(matches!(
+            result,
+            Err(FeedError::SourceStalled(message)) if message == "current error"
+        ));
+        let result = uncovered_rtds_result(Ok(()), Some(Ok(())));
+        assert!(matches!(
+            result,
+            Err(FeedError::SourceStalled(message)) if message.contains("no fresh sequence-synchronized connection")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rtds_feed_rejects_ambiguous_dual_topic_pooling() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let error = run_rtds_feed(RuntimeSettings::default(), sender)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            FeedError::SourceStalled(message) if message.contains("exactly one enabled")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rtds_merge_forwards_newest_and_survives_queued_peer_sync_without_duplicates() {
+        enum Command {
+            Send { timestamp: i64, price: &'static str },
+            Close,
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (primary, primary_commands) = std::sync::mpsc::channel();
+        let (secondary, secondary_commands) = std::sync::mpsc::channel();
+        let (connected, mut connections) = mpsc::unbounded_channel();
+        let (primary_closed, mut primary_closures) = mpsc::unbounded_channel();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            let mut command_receivers = [Some(primary_commands), Some(secondary_commands)];
+            for slot in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let commands = command_receivers[slot].take().unwrap();
+                let connected = connected.clone();
+                let primary_closed = primary_closed.clone();
+                handlers.push(std::thread::spawn(move || {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(8)))
+                        .unwrap();
+                    let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
+                    let subscription: Value =
+                        serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(subscription["subscriptions"][0]["topic"], "crypto_prices");
+                    connected.send(slot).unwrap();
+                    while let Ok(command) = commands.recv_timeout(Duration::from_secs(8)) {
+                        match command {
+                            Command::Send { timestamp, price } => socket
+                                .send(Message::Text(
+                                    json!({
+                                        "topic": "crypto_prices",
+                                        "type": "update",
+                                        "timestamp": timestamp,
+                                        "payload": {
+                                            "symbol": "btcusdt",
+                                            "value": price,
+                                            "timestamp": timestamp
+                                        }
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap(),
+                            Command::Close => break,
+                        }
+                    }
+                    drop(socket);
+                    if slot == 0 {
+                        primary_closed.send(()).unwrap();
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_rtds_url = format!("ws://{address}");
+        settings.target.enable_polymarket_rtds_chainlink = false;
+        settings.target.enable_polymarket_rtds_binance = true;
+        settings.target.rtds_chainlink_watchdog_seconds = 5.0;
+        settings.target.rtds_ping_interval_seconds = 60.0;
+        let (sender, mut receiver) = mpsc::channel(16);
+        let (observation_processed, mut processed_observations) = mpsc::unbounded_channel();
+        let feed = tokio::spawn(run_rtds_feed_inner(
+            settings,
+            sender,
+            Some(observation_processed),
+        ));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), connections.recv())
+                .await
+                .expect("primary RTDS connection was not established"),
+            Some(0)
+        );
+        primary
+            .send(Command::Send {
+                timestamp: 1_786_687_200_000,
+                price: "118500.25",
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), processed_observations.recv())
+                .await
+                .expect("primary observation was not processed"),
+            Some((0, 0))
+        );
+        let mut reference_prices = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let FeedEvent::Reference(reference) = event {
+                reference_prices.push(reference.price);
+            }
+        }
+        assert_eq!(reference_prices, [Decimal::new(11_850_025, 2)]);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(4), connections.recv())
+                .await
+                .expect("secondary RTDS connection was not established"),
+            Some(1)
+        );
+        secondary
+            .send(Command::Send {
+                timestamp: 1_786_687_200_000,
+                price: "118501.25",
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), processed_observations.recv())
+                .await
+                .expect("newer secondary observation was not processed"),
+            Some((1, 0))
+        );
+        while let Ok(event) = receiver.try_recv() {
+            if let FeedEvent::Reference(reference) = event {
+                reference_prices.push(reference.price);
+            }
+        }
+        assert_eq!(
+            reference_prices,
+            [Decimal::new(11_850_025, 2), Decimal::new(11_850_125, 2)]
+        );
+
+        primary
+            .send(Command::Send {
+                timestamp: 1_786_687_200_000,
+                price: "118500.25",
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), processed_observations.recv())
+                .await
+                .expect("replayed primary observation was not processed"),
+            Some((0, 0))
+        );
+        while let Ok(event) = receiver.try_recv() {
+            assert!(!matches!(event, FeedEvent::Reference(_)));
+        }
+
+        primary
+            .send(Command::Send {
+                timestamp: 1_786_687_202_000,
+                price: "118502.25",
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), processed_observations.recv())
+                .await
+                .expect("new primary observation was not processed"),
+            Some((0, 0))
+        );
+        while let Ok(event) = receiver.try_recv() {
+            if let FeedEvent::Reference(reference) = event {
+                reference_prices.push(reference.price);
+            }
+        }
+
+        primary.send(Command::Close).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), primary_closures.recv())
+            .await
+            .expect("primary test socket did not close")
+            .expect("primary close coordinator ended unexpectedly");
+        secondary
+            .send(Command::Send {
+                timestamp: 1_786_687_202_000,
+                price: "118502.25",
+            })
+            .unwrap();
+        let synchronized =
+            tokio::time::timeout(Duration::from_secs(2), processed_observations.recv())
+                .await
+                .expect("queued peer synchronization observation was not processed");
+        assert_eq!(synchronized, Some((1, 0)));
+        while let Ok(event) = receiver.try_recv() {
+            assert!(!matches!(event, FeedEvent::Reference(_)));
+        }
+        assert!(!feed.is_finished());
+
+        secondary
+            .send(Command::Send {
+                timestamp: 1_786_687_203_000,
+                price: "118503.25",
+            })
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), processed_observations.recv())
+                .await
+                .expect("post-failover secondary observation was not processed"),
+            Some((1, 0))
+        );
+        while let Ok(event) = receiver.try_recv() {
+            if let FeedEvent::Reference(reference) = event {
+                reference_prices.push(reference.price);
+            }
+        }
+        assert_eq!(
+            reference_prices,
+            [
+                Decimal::new(11_850_025, 2),
+                Decimal::new(11_850_125, 2),
+                Decimal::new(11_850_225, 2),
+                Decimal::new(11_850_325, 2),
+            ]
+        );
+
+        feed.abort();
+        let _ = feed.await;
+        let _ = secondary.send(Command::Close);
         server.join().unwrap();
     }
 
