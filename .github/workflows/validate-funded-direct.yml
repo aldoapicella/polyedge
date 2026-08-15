@@ -8,6 +8,7 @@ on:
       - ".github/workflows/verify-funded-v10-settlement.mjs"
       - "scripts/test-verify-funded-v10-capital.sh"
       - "scripts/verify-funded-v10-capital.sh"
+      - "scripts/fence-funded-queue-and-wait-empty.sh"
       - "crates/polyedge-api/**"
       - "crates/polyedge-config/**"
       - "crates/polyedge-domain/**"
@@ -426,7 +427,10 @@ jobs:
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /where tobool\(record\.order_submitted\) == true/);
           assert.match(activation,
-            /lifecycle_signal_deadline_monotonic=.*\+ 2400[\s\S]*lifecycle_ingestion_deadline_monotonic=.*\+ 300[\s\S]*queue_fenced_for_ingestion=false[\s\S]*--status SendDisabled[\s\S]*queue_drained=true[\s\S]*funded-v10-lifecycle-latency\.json/);
+            /lifecycle_signal_deadline_monotonic=.*\+ 2400[\s\S]*lifecycle_ingestion_deadline_monotonic=.*\+ 300[\s\S]*queue_fenced_for_ingestion=false[\s\S]*fence-funded-queue-and-wait-empty\.sh[\s\S]*funded-v10-lifecycle-latency\.json/);
+          const ingestionFence = fs.readFileSync("scripts/fence-funded-queue-and-wait-empty.sh", "utf8");
+          assert.match(ingestionFence,
+            /for attempt in 1 2 3[\s\S]*--status SendDisabled[\s\S]*for attempt in \$\(seq 1 36\)[\s\S]*activeMessageCount == 0[\s\S]*scheduledMessageCount == 0[\s\S]*test "\$queue_drained" = true/);
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
           assert.match(activation,
@@ -491,8 +495,8 @@ jobs:
           const legacyPreflightLoop = ["for attempt in $(seq 1 ", "1200); do"].join("");
           assert.equal(workflow.includes(legacyPreflightLoop), false);
           const waitBounds = Object.fromEntries([...workflow.matchAll(
-            /(capital_reconcile|preflight|lifecycle|terminal)_deadline_monotonic=\$\(\( \$\(monotonic_seconds\) \+ ([0-9]+) \)\)/g
-          )].map((match) => [match[1], Number(match[2])]));
+            /(capital_reconcile|preflight|lifecycle_signal|terminal)_deadline_monotonic=\$\(\( \$\(monotonic_seconds\) \+ ([0-9]+) \)\)/g
+          )].map((match) => [match[1].replace("_signal", ""), Number(match[2])]));
           assert.deepEqual(waitBounds,
             { capital_reconcile: 900, preflight: 2700, lifecycle: 2400, terminal: 2400 });
           assert.equal((workflow.match(/python3 -c 'import time; print\(int\(time\.monotonic\(\)\)\)'/g) || []).length, 4);
@@ -3018,37 +3022,9 @@ jobs:
           while [ "$(monotonic_seconds)" -lt "$lifecycle_ingestion_deadline_monotonic" ]; do
             if [ "$(monotonic_seconds)" -ge "$lifecycle_signal_deadline_monotonic" ] && \
               [ "$queue_fenced_for_ingestion" = false ]; then
-              for attempt in 1 2 3; do
-                if az servicebus queue update \
-                  --resource-group "$AZURE_RESOURCE_GROUP" \
-                  --namespace-name "$SERVICE_BUS_NAMESPACE" \
-                  --name "$SERVICE_BUS_QUEUE" \
-                  --status SendDisabled \
-                  --only-show-errors -o none; then
-                  queue_fenced_for_ingestion=true
-                  break
-                fi
-                sleep "$((attempt * 5))"
-              done
-              test "$queue_fenced_for_ingestion" = true
-              queue_drained=false
-              for attempt in $(seq 1 36); do
-                az servicebus queue show \
-                  --resource-group "$AZURE_RESOURCE_GROUP" \
-                  --namespace-name "$SERVICE_BUS_NAMESPACE" \
-                  --name "$SERVICE_BUS_QUEUE" \
-                  -o json > funded-queue-ingestion-grace.json
-                if jq -e '
-                  .status == "SendDisabled"
-                  and .countDetails.activeMessageCount == 0
-                  and .countDetails.scheduledMessageCount == 0
-                ' funded-queue-ingestion-grace.json >/dev/null; then
-                  queue_drained=true
-                  break
-                fi
-                sleep 5
-              done
-              test "$queue_drained" = true
+              bash scripts/fence-funded-queue-and-wait-empty.sh \
+                funded-queue-ingestion-grace.json
+              queue_fenced_for_ingestion=true
             fi
             if ! az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
