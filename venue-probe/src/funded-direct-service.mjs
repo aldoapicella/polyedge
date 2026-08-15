@@ -393,6 +393,7 @@ export async function runPersistentFundedDirectService({
         rolling_p95_slo_breached: rollingP95Ms !== null && rollingP95Ms > config.signalToSendSloMs,
         consecutive_latency_breaches: consecutiveLatencyBreaches,
         order_submission_attempted: result?.execution?.order_submission_attempted === true || result?.completion?.order_submission_attempted === true,
+        order_submitted: result?.execution?.order_submitted === true,
         worker_status: result?.status || null, worker_error: result?.error || null, execution_timing: result?.execution_timing || null });
       if (result?.status === "paused_by_account_risk_state") logger({ schema: "polyedge.funded_direct_alert.v1", status: "paused_by_account_risk_state", decision_id: body.decision_id, account_risk_pause: true, error: result.error || null });
       if (consecutiveLatencyBreaches >= 3) {

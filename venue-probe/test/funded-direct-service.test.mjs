@@ -208,6 +208,7 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   let executorCreations = 0;
   let warmups = 0;
   let executions = 0;
+  const logs = [];
   const result = await runPersistentFundedDirectService({
     env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
     createBusClient: () => bus.client,
@@ -226,12 +227,13 @@ test("persistent service reuses one warm executor and processes warmup plus inte
         return {
           execution: {
             order_submission_attempted: true,
+            order_submitted: true,
             lifecycle: { send_wall_ms: Date.parse(decisionTs) + 750 }
           }
         };
       }
     }),
-    logger: () => {}
+    logger: (value) => logs.push(value)
   });
   assert.equal(result.status, "persistent_service_stopped");
   assert.equal(executorCreations, 1);
@@ -244,6 +246,7 @@ test("persistent service reuses one warm executor and processes warmup plus inte
     maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
   ));
   assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
+  assert.equal(logs.find((value) => value.schema === "polyedge.funded_direct_latency.v1")?.order_submitted, true);
 });
 
 test("persistent service coalesces only duplicate market-token warmups", async () => {
@@ -555,6 +558,7 @@ test("persistent service preserves attempted-order observability for an idempote
     value.decision_id === "b".repeat(64)
   );
   assert.equal(completion.order_submission_attempted, true);
+  assert.equal(completion.order_submitted, false);
   assert.equal(completion.worker_status, "already_completed_idempotent");
   assert.deepEqual(bus.completed, ["duplicate-post-submit"]);
 });

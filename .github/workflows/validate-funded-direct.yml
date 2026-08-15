@@ -413,6 +413,7 @@ jobs:
           assert.ok(pause < active && active < warmupStep && warmupStep < ready &&
             ready < enable && enable < first);
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
+          assert.match(activation, /where tobool\(record\.order_submitted\) == true/);
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
           assert.match(activation,
@@ -2994,6 +2995,7 @@ jobs:
                 | where tostring(record.schema) == 'polyedge.funded_direct_latency.v1'
                 | where tostring(record.status) == 'intent_completed'
                 | where tobool(record.order_submission_attempted) == true
+                | where tobool(record.order_submitted) == true
                 | where tostring(record.worker_status) == 'persistent_intent_completed'
                 | where todouble(record.signal_to_send_ms) <= todouble(record.signal_to_send_slo_ms)
                 | where tolong(record.signal_to_send_slo_ms) == 7000
@@ -3009,6 +3011,7 @@ jobs:
                 | (.decision_id | test("^[0-9a-f]{64}$"))
                 and .status == "intent_completed"
                 and .order_submission_attempted == true
+                and .order_submitted == true
                 and .worker_status == "persistent_intent_completed"
                 and (.signal_to_send_ms | type == "number")
                 and .signal_to_send_ms <= .signal_to_send_slo_ms
