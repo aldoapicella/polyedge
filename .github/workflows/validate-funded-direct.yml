@@ -331,6 +331,10 @@ jobs:
           assert.match(capitalReconcile,
             /FUNDED_DIRECT_DRY_RUN[\s\S]*ALLOW_LIVE[\s\S]*ENABLE_TAKER_ORDERS[\s\S]*value:"false"/);
           assert.match(capitalReconcile,
+            /for reconcile_attempt in 1 2 3; do[\s\S]*Failed\|Stopped\|Degraded\) break/);
+          assert.match(capitalReconcile,
+            /\[ "\$status" = Succeeded \] && break[\s\S]*Failed\|Stopped\|Degraded\) ;;[\s\S]*\*\) break/);
+          assert.match(capitalReconcile,
             /cmp funded-queue-before-capital-reconcile\.snapshot\.json[\s\S]*funded-queue-after-capital-reconcile\.snapshot\.json/);
           assert.match(preparePreflight,
             /verify-funded-v10-settlement\.mjs[\s\S]*verified_settlement_ids == \$settlement_ids/);
@@ -1390,29 +1394,38 @@ jobs:
               or .name == "ENABLE_TAKER_ORDERS");
               if .name == "FUNDED_DIRECT_DRY_RUN" then .value == "true" else .value == "false" end)
           ' funded-capital-reconcile-execution.yaml >/dev/null
-          capital_reconcile_execution=$(az containerapp job start \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$FUNDED_JOB" \
-            --yaml funded-capital-reconcile-execution.yaml \
-            --query name -o tsv)
-          test -n "$capital_reconcile_execution"
-          status=Running
           monotonic_seconds() {
             python3 -c 'import time; print(int(time.monotonic()))'
           }
-          capital_reconcile_deadline_monotonic=$(( $(monotonic_seconds) + 900 ))
-          while [ "$(monotonic_seconds)" -lt "$capital_reconcile_deadline_monotonic" ]; do
-            if status=$(az containerapp job execution show \
-                --resource-group "$AZURE_RESOURCE_GROUP" \
-                --name "$FUNDED_JOB" \
-                --job-execution-name "$capital_reconcile_execution" \
-                --query properties.status -o tsv); then
-              case "$status" in
-                Succeeded) break ;;
-                Failed|Stopped|Degraded) exit 1 ;;
-              esac
-            fi
-            sleep 10
+          status=Failed
+          for reconcile_attempt in 1 2 3; do
+            capital_reconcile_execution=$(az containerapp job start \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_JOB" \
+              --yaml funded-capital-reconcile-execution.yaml \
+              --query name -o tsv)
+            test -n "$capital_reconcile_execution"
+            status=Running
+            capital_reconcile_deadline_monotonic=$(( $(monotonic_seconds) + 900 ))
+            while [ "$(monotonic_seconds)" -lt "$capital_reconcile_deadline_monotonic" ]; do
+              if status=$(az containerapp job execution show \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --name "$FUNDED_JOB" \
+                  --job-execution-name "$capital_reconcile_execution" \
+                  --query properties.status -o tsv); then
+                case "$status" in
+                  Succeeded) break ;;
+                  Failed|Stopped|Degraded) break ;;
+                esac
+              fi
+              sleep 10
+            done
+            [ "$status" = Succeeded ] && break
+            case "$status" in
+              Failed|Stopped|Degraded) ;;
+              *) break ;;
+            esac
+            [ "$reconcile_attempt" = 3 ] || sleep 10
           done
           test "$status" = "Succeeded"
           az servicebus queue show \
