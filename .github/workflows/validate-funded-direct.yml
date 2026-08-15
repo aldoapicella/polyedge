@@ -246,6 +246,53 @@ jobs:
           reject_latest_archive "$valid_verified"
           reject_latest_archive "$valid_verified" \
             "$(printf '%s\n' "$valid_verified" | jq -c '.transaction_id="mismatched-archive"')"
+          reservation_filter=$(awk '
+            /--arg completion_status "\$completion_status" \047$/ {capture=1; next}
+            capture && /^[[:space:]]*\047 "\$reservation_file"/ {exit}
+            capture {sub(/^              /, ""); print}
+          ' .github/workflows/validate-funded-direct.yml)
+          test -n "$reservation_filter"
+          decision_id=$(printf 'd%.0s' {1..64})
+          reservation_base=$(jq -cn --arg decision "$decision_id" '{
+            schema_version: 1,
+            campaign_id: "dynamic-quote-funded-2026-08-13-v10",
+            run_id: "fixture-run",
+            probe_id: ("funded-direct-" + $decision)
+          }')
+          released_no_order=$(printf '%s\n' "$reservation_base" | jq -c '. + {
+            state: "released_no_order",
+            order_submitted: false,
+            matched_notional: 0,
+            reconciliation_complete: true,
+            zero_open_orders_confirmed: true
+          }')
+          settled=$(printf '%s\n' "$reservation_base" | jq -c '. + {
+            state: "position_settled",
+            order_submitted: true,
+            matched_notional: 1,
+            settlement_verified: true,
+            settlement_evidence_source: "verified_onchain_redemption"
+          }')
+          unresolved=$(printf '%s\n' "$settled" | jq -c '.state="position_unresolved"')
+          validate_reservation() {
+            printf '%s\n' "$2" | jq -e \
+              --arg decision "$decision_id" --arg run "fixture-run" \
+              --arg completion_status "$1" "$reservation_filter" >/dev/null
+          }
+          reject_reservation() {
+            if validate_reservation "$@"; then
+              echo "unexpected accepted reservation fixture" >&2
+              exit 1
+            fi
+          }
+          validate_reservation "child_failed_closed_post_submission_unresolved" "$released_no_order"
+          validate_reservation "child_failed_closed_post_submission_unresolved" "$settled"
+          validate_reservation "child_completed" "$settled"
+          validate_reservation "child_failed_closed_pre_submission" "$released_no_order"
+          reject_reservation "child_failed_closed_post_submission_unresolved" "$unresolved"
+          reject_reservation "child_completed" "$released_no_order"
+          reject_reservation "child_failed_closed_pre_submission" "$settled"
+          reject_reservation "child_failed_closed_post_submission_unresolved" '{}'
 
       - uses: actions/setup-node@v4
         with:
@@ -464,7 +511,7 @@ jobs:
           assert.match(preparePreflight,
             /child_failed_closed_pre_submission[\s\S]*authorization_consumed == false[\s\S]*risk_reservation_created == false[\s\S]*authorization_consumed == true[\s\S]*risk_reservation_created == true/);
           assert.match(preparePreflight,
-            /\["child_completed", "child_failed_closed_post_submission_unresolved"\]\s*\|\s*index\(\$completion_status\)[\s\S]*position_settled/);
+            /\["child_completed", "child_failed_closed_post_submission_unresolved"\]\s*\|\s*index\(\$completion_status\)[\s\S]*\["child_failed_closed_post_submission_unresolved", "child_failed_closed_pre_submission"\]\s*\|\s*index\(\$completion_status\)[\s\S]*released_no_order/);
           assert.match(preparePreflight,
             /child_failed_closed_pre_submission[\s\S]*reservation_count[\s\S]*released_no_order/);
           const pointerPreflightMarker = workflow.indexOf(
@@ -1882,28 +1929,31 @@ jobs:
                 and .campaign_id == "dynamic-quote-funded-2026-08-13-v10"
                 and .run_id == $run
                 and .probe_id == ("funded-direct-" + $decision)
-                and (if ["child_completed", "child_failed_closed_post_submission_unresolved"]
-                  | index($completion_status) then
-                  .order_submitted == true
-                  and (
-                    (.state == "finalized_no_fill"
-                      and .matched_notional == 0
-                      and .reconciliation_complete == true
-                      and .zero_open_orders_confirmed == true)
-                    or
-                    (.state == "position_settled"
-                      and .matched_notional > 0
-                      and .settlement_verified == true
-                      and (.settlement_evidence_source == "verified_onchain_redemption"
-                        or .settlement_evidence_source == "polymarket_data_api_redeemable"))
-                  )
-                else
-                  .state == "released_no_order"
-                  and .order_submitted == false
-                  and .matched_notional == 0
-                  and .reconciliation_complete == true
-                  and .zero_open_orders_confirmed == true
-                end)
+                and (
+                  ((["child_completed", "child_failed_closed_post_submission_unresolved"]
+                    | index($completion_status))
+                    and .order_submitted == true
+                    and (
+                      (.state == "finalized_no_fill"
+                        and .matched_notional == 0
+                        and .reconciliation_complete == true
+                        and .zero_open_orders_confirmed == true)
+                      or
+                      (.state == "position_settled"
+                        and .matched_notional > 0
+                        and .settlement_verified == true
+                        and (.settlement_evidence_source == "verified_onchain_redemption"
+                          or .settlement_evidence_source == "polymarket_data_api_redeemable"))
+                    ))
+                  or
+                  ((["child_failed_closed_post_submission_unresolved", "child_failed_closed_pre_submission"]
+                    | index($completion_status))
+                    and .state == "released_no_order"
+                    and .order_submitted == false
+                    and .matched_notional == 0
+                    and .reconciliation_complete == true
+                    and .zero_open_orders_confirmed == true)
+                )
               ' "$reservation_file" >/dev/null
             else
               test "$reservation_count" = "0"
