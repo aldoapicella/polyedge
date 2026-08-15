@@ -372,7 +372,19 @@ export async function runPersistentFundedDirectService({
         });
         return;
       }
-      const sendWallMs = Number(result?.execution?.lifecycle?.send_wall_ms);
+      const execution = result?.execution;
+      const lifecycle = execution?.lifecycle;
+      const sendWallMs = Number(lifecycle?.send_wall_ms);
+      const ackWallMs = Number(lifecycle?.ack_wall_ms);
+      const lifecycleAcknowledged = execution?.order_submission_attempted === true &&
+        typeof lifecycle?.order_id === "string" && lifecycle.order_id.trim() !== "" &&
+        Number.isFinite(sendWallMs) && sendWallMs > 0 &&
+        Number.isFinite(ackWallMs) && ackWallMs > 0 && ackWallMs >= sendWallMs;
+      const terminalNoFillSubmitted = execution?.status === "terminal_no_fill_evidence_degraded" &&
+        execution?.order_submitted === true && execution?.order_submission_attempted === true &&
+        typeof lifecycle?.order_id === "string" && lifecycle.order_id.trim() !== "" &&
+        lifecycle?.reconciliation_complete === true &&
+        lifecycle?.zero_open_orders_confirmed === true && lifecycle?.matched_notional === 0;
       const decisionWallMs = Date.parse(body.decision_ts);
       const signalToSendMs = Number.isFinite(sendWallMs) && Number.isFinite(decisionWallMs)
         ? Math.max(0, sendWallMs - decisionWallMs) : null;
@@ -393,7 +405,8 @@ export async function runPersistentFundedDirectService({
         rolling_p95_slo_breached: rollingP95Ms !== null && rollingP95Ms > config.signalToSendSloMs,
         consecutive_latency_breaches: consecutiveLatencyBreaches,
         order_submission_attempted: result?.execution?.order_submission_attempted === true || result?.completion?.order_submission_attempted === true,
-        order_submitted: result?.execution?.order_submitted === true,
+        order_submitted: execution?.order_submitted !== false &&
+          (lifecycleAcknowledged || terminalNoFillSubmitted),
         worker_status: result?.status || null, worker_error: result?.error || null, execution_timing: result?.execution_timing || null });
       if (result?.status === "paused_by_account_risk_state") logger({ schema: "polyedge.funded_direct_alert.v1", status: "paused_by_account_risk_state", decision_id: body.decision_id, account_risk_pause: true, error: result.error || null });
       if (consecutiveLatencyBreaches >= 3) {

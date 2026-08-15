@@ -228,7 +228,11 @@ test("persistent service reuses one warm executor and processes warmup plus inte
           execution: {
             order_submission_attempted: true,
             order_submitted: true,
-            lifecycle: { send_wall_ms: Date.parse(decisionTs) + 750 }
+            lifecycle: {
+              order_id: "acknowledged-order",
+              send_wall_ms: Date.parse(decisionTs) + 750,
+              ack_wall_ms: Date.parse(decisionTs) + 751
+            }
           }
         };
       }
@@ -561,6 +565,84 @@ test("persistent service preserves attempted-order observability for an idempote
   assert.equal(completion.order_submitted, false);
   assert.equal(completion.worker_status, "already_completed_idempotent");
   assert.deepEqual(bus.completed, ["duplicate-post-submit"]);
+});
+
+test("persistent service derives submission only from an acknowledged lifecycle", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const bus = fakeBus(["acknowledged", "send-only", "attempt-only", "explicit-false", "ambiguous-true", "terminal-no-fill"].map((messageId) => ({
+    messageId,
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: messageId.repeat(16),
+      decision_ts: decisionTs
+    }
+  })));
+  const logs = [];
+  await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "6" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async (handoff) => ({
+        execution: handoff.decision_id.startsWith("acknowledged")
+          ? {
+              order_submission_attempted: true,
+              lifecycle: {
+                order_id: "acknowledged-order",
+                send_wall_ms: Date.parse(decisionTs) + 1,
+                ack_wall_ms: Date.parse(decisionTs) + 2
+              }
+            }
+          : handoff.decision_id.startsWith("send-only")
+            ? {
+                order_submission_attempted: true,
+                lifecycle: { order_id: "send-only-order", send_wall_ms: Date.parse(decisionTs) + 1 }
+              }
+            : handoff.decision_id.startsWith("explicit-false")
+              ? {
+                  order_submission_attempted: true,
+                  order_submitted: false,
+                  lifecycle: {
+                    order_id: "explicit-false-order",
+                    send_wall_ms: Date.parse(decisionTs) + 1,
+                    ack_wall_ms: Date.parse(decisionTs) + 2
+                  }
+                }
+              : handoff.decision_id.startsWith("ambiguous-true")
+                ? { order_submission_attempted: true, order_submitted: true, lifecycle: null }
+                : handoff.decision_id.startsWith("terminal-no-fill")
+                  ? {
+                      status: "terminal_no_fill_evidence_degraded",
+                      order_submission_attempted: true,
+                      order_submitted: true,
+                      lifecycle: {
+                        order_id: "terminal-no-fill-order",
+                        reconciliation_complete: true,
+                        zero_open_orders_confirmed: true,
+                        matched_notional: 0
+                      }
+                    }
+                  : { order_submission_attempted: true }
+      })
+    }),
+    logger: (value) => logs.push(value)
+  });
+
+  const latency = Object.fromEntries(logs
+    .filter((value) => value.schema === "polyedge.funded_direct_latency.v1")
+    .map((value) => [value.decision_id, value]));
+  assert.equal(latency["acknowledged".repeat(16)].order_submitted, true);
+  assert.equal(latency["send-only".repeat(16)].order_submitted, false);
+  assert.equal(latency["attempt-only".repeat(16)].order_submitted, false);
+  assert.equal(latency["explicit-false".repeat(16)].order_submitted, false);
+  assert.equal(latency["ambiguous-true".repeat(16)].order_submitted, false);
+  assert.equal(latency["terminal-no-fill".repeat(16)].order_submitted, true);
 });
 
 test("persistent service pauses after three consecutive transitions above the reviewed SLO", async () => {
