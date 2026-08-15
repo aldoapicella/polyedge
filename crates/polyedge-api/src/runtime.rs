@@ -26,7 +26,7 @@ use polyedge_engine::{
     RegimeReferencePoint, RestingMakerOrder, RiskManager, StrategyDecisionMetadata,
 };
 use polyedge_execution::{ExecutionClient, PaperExecutionClient};
-use polyedge_feeds::{self, FeedEvent, FeedName};
+use polyedge_feeds::{self, ClobGenerationLease, ClobResyncBarrier, FeedEvent, FeedName};
 use polyedge_storage::{canonical_json_sha256, wire_normalized_json, RecordedRuntimeEvent};
 use recorder::RuntimeRecorder;
 use reference::ReferenceAggregator;
@@ -377,6 +377,13 @@ struct RuntimeData {
     pause_reason: Option<String>,
     paused_at: Option<DateTime<Utc>>,
     kill_switch: bool,
+    clob_generation: Option<u64>,
+    clob_pending_generation: Option<u64>,
+    clob_terminal_generation: u64,
+    clob_lease: Option<ClobGenerationLease>,
+    clob_last_sequence: u64,
+    clob_tokens: BTreeSet<TokenId>,
+    clob_pending_tokens: BTreeSet<TokenId>,
     markets: BTreeMap<MarketId, MarketSpec>,
     books: BTreeMap<TokenId, BookState>,
     reference: Option<ReferencePrice>,
@@ -445,6 +452,13 @@ impl RuntimeController {
             pause_reason: None,
             paused_at: None,
             kill_switch: false,
+            clob_generation: None,
+            clob_pending_generation: None,
+            clob_terminal_generation: 0,
+            clob_lease: None,
+            clob_last_sequence: 0,
+            clob_tokens: BTreeSet::new(),
+            clob_pending_tokens: BTreeSet::new(),
             markets: BTreeMap::new(),
             books: BTreeMap::new(),
             reference: None,
@@ -596,6 +610,8 @@ impl RuntimeController {
         if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.terminate_all_clob_generations("runtime shutdown")
+            .await;
         let background_tasks = self
             .inner
             .background_tasks
@@ -911,6 +927,7 @@ impl RuntimeController {
     fn spawn_market_feed_loop(&self, sender: mpsc::Sender<FeedEvent>) -> JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
+            let mut generation = 0_u64;
             loop {
                 let token_ids = runtime.market_token_ids().await;
                 if token_ids.is_empty() {
@@ -921,16 +938,21 @@ impl RuntimeController {
                     continue;
                 }
                 runtime.mark_market_feed_connecting().await;
+                generation = generation.wrapping_add(1);
+                let lease = runtime.begin_clob_generation(generation, &token_ids).await;
                 let subscribed_tokens = token_ids.clone();
-                let mut feed = tokio::spawn(polyedge_feeds::run_market_feed(
+                let mut feed = tokio::spawn(polyedge_feeds::run_market_feed_generation_with_lease(
                     runtime.inner.settings.clone(),
                     token_ids,
+                    generation,
+                    lease,
                     sender.clone(),
                 ));
                 let mut refresh = tokio::time::interval(Duration::from_secs(2));
                 loop {
                     tokio::select! {
                         result = &mut feed => {
+                            runtime.terminate_clob_generation(generation, "market feed generation ended").await;
                             match result {
                                 Ok(Ok(())) => {
                                     runtime
@@ -956,6 +978,7 @@ impl RuntimeController {
                         }
                         _ = refresh.tick() => {
                             if runtime.market_token_ids().await != subscribed_tokens {
+                                runtime.terminate_clob_generation(generation, "market token set changed").await;
                                 feed.abort();
                                 let _ = feed.await;
                                 break;
@@ -1075,13 +1098,27 @@ impl RuntimeController {
             FeedEvent::RawMarketEvent(event) => {
                 self.set_feed_status_at("PolymarketClobMarket", "ok", None, event.recorded_ts)
                     .await;
-                self.handle_raw_market_event(event).await;
+                self.handle_raw_market_event(event, None).await;
             }
             FeedEvent::Book(book) => {
                 self.set_feed_status_at("PolymarketClobMarket", "ok", None, book.local_ts)
                     .await;
-                self.handle_book(book).await;
+                self.handle_book(book, None).await;
             }
+            FeedEvent::ClobResyncBarrier(barrier) => self.handle_clob_resync_barrier(barrier).await,
+            FeedEvent::ClobRawMarketEvent {
+                generation,
+                sequence,
+                event,
+            } => {
+                self.handle_raw_market_event(event, Some((generation, sequence)))
+                    .await
+            }
+            FeedEvent::ClobBook {
+                generation,
+                sequence,
+                book,
+            } => self.handle_book(book, Some((generation, sequence))).await,
             FeedEvent::Error {
                 source,
                 message,
@@ -1095,10 +1132,47 @@ impl RuntimeController {
     }
 
     async fn replace_markets(&self, markets: Vec<MarketSpec>) {
+        let next_tokens = markets
+            .iter()
+            .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
+            .collect::<BTreeSet<_>>();
         let _decision_guard = self.inner.decision_gate.lock().await;
         let mut data = self.inner.data.write().await;
         let existing = data.markets.clone();
         let now = Utc::now();
+        let mut final_tokens = existing
+            .values()
+            .filter(|market| {
+                !data.settled_markets.contains(&market.market_id)
+                    && now.signed_duration_since(market.end_ts).num_seconds()
+                        <= PENDING_SETTLEMENT_RETENTION_SECONDS
+            })
+            .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
+            .collect::<BTreeSet<_>>();
+        final_tokens.extend(next_tokens);
+        let current_tokens = if data.clob_pending_generation.is_some() {
+            &data.clob_pending_tokens
+        } else {
+            &data.clob_tokens
+        };
+        let revoked_generation = (current_tokens != &final_tokens)
+            .then(|| Self::revoke_clob_generation_locked(&mut data))
+            .flatten();
+        if let Some(generation) = revoked_generation {
+            drop(data);
+            let _ = self
+                .record_required_events(vec![(
+                    "clob_resync_aborted".to_owned(),
+                    json!({
+                        "generation": generation,
+                        "reason": "market token set changed",
+                        "fail_closed": true,
+                        "ready": false
+                    }),
+                )])
+                .await;
+            data = self.inner.data.write().await;
+        }
         let settled = data.settled_markets.clone();
         data.markets = existing
             .values()
@@ -1309,13 +1383,16 @@ impl RuntimeController {
             .await;
     }
 
-    async fn handle_book(&self, book: BookState) {
+    async fn handle_book(&self, book: BookState, clob_sequence: Option<(u64, u64)>) {
         if self.retry_pending_decision_application().await == PendingApplicationRetry::Retained {
             return;
         }
         let (market, quality_events) = {
             let _decision_guard = self.inner.decision_gate.lock().await;
             let mut data = self.inner.data.write().await;
+            if !self.accept_clob_sequence(&mut data, clob_sequence) {
+                return;
+            }
             data.books.insert(book.token_id.clone(), book.clone());
             data.decision_generation = data.decision_generation.wrapping_add(1);
             let market = markets_by_token_from_data(&data)
@@ -1346,15 +1423,26 @@ impl RuntimeController {
             self.record_event(event.event_type, event.payload, None, None)
                 .await;
         }
-        self.handle_paper_fills(&book).await;
+        self.handle_paper_fills(&book, clob_sequence.map(|(generation, _)| generation))
+            .await;
     }
 
-    async fn handle_raw_market_event(&self, event: polyedge_feeds::MarketChannelEvent) {
+    async fn handle_raw_market_event(
+        &self,
+        event: polyedge_feeds::MarketChannelEvent,
+        clob_sequence: Option<(u64, u64)>,
+    ) {
         if self.retry_pending_decision_application().await == PendingApplicationRetry::Retained {
             return;
         }
         let quality_events = {
             let _decision_guard = self.inner.decision_gate.lock().await;
+            {
+                let mut data = self.inner.data.write().await;
+                if !self.accept_clob_sequence(&mut data, clob_sequence) {
+                    return;
+                }
+            }
             let mut engine = self.inner.engine.lock().await;
             let events = engine.execution_quality.observe_market_event(&event);
             engine.decision_generation = engine.decision_generation.wrapping_add(1);
@@ -1390,13 +1478,24 @@ impl RuntimeController {
         }
     }
 
-    async fn handle_paper_fills(&self, book: &BookState) {
+    async fn handle_paper_fills(&self, book: &BookState, clob_generation: Option<u64>) {
         let markets_by_token = {
             let data = self.inner.data.read().await;
             markets_by_token_from_data(&data)
         };
         let reports = {
             let _decision_guard = self.inner.decision_gate.lock().await;
+            if let Some(generation) = clob_generation {
+                let data = self.inner.data.read().await;
+                if data.clob_generation != Some(generation)
+                    || data
+                        .clob_lease
+                        .as_ref()
+                        .is_none_or(ClobGenerationLease::is_terminal)
+                {
+                    return;
+                }
+            }
             let mut engine = self.inner.engine.lock().await;
             let resting: Vec<_> = engine
                 .execution
@@ -1525,9 +1624,26 @@ impl RuntimeController {
         if self.retry_pending_decision_application().await == PendingApplicationRetry::Retained {
             return;
         }
-        let (reference, references, markets, books, paused, kill_switch, data_generation) = {
+        let (
+            reference,
+            references,
+            markets,
+            books,
+            paused,
+            kill_switch,
+            data_generation,
+            clob_generation,
+        ) = {
             let _decision_guard = self.inner.decision_gate.lock().await;
             let data = self.inner.data.read().await;
+            if data.clob_generation.is_none()
+                || data
+                    .clob_lease
+                    .as_ref()
+                    .is_none_or(ClobGenerationLease::is_terminal)
+            {
+                return;
+            }
             (
                 data.reference.clone(),
                 data.exact_references.clone(),
@@ -1551,6 +1667,7 @@ impl RuntimeController {
                 data.paused,
                 data.kill_switch,
                 data.decision_generation,
+                data.clob_generation.expect("checked above"),
             )
         };
         let Some(reference) = reference else {
@@ -1810,6 +1927,17 @@ impl RuntimeController {
                     .map(|prepared| ("decision".to_owned(), prepared.payload.clone())),
             );
             let _decision_guard = self.inner.decision_gate.lock().await;
+            {
+                let data = self.inner.data.read().await;
+                if data.clob_generation != Some(clob_generation)
+                    || data
+                        .clob_lease
+                        .as_ref()
+                        .is_none_or(ClobGenerationLease::is_terminal)
+                {
+                    continue;
+                }
+            }
             let observed_data_generation = {
                 let data = self.inner.data.read().await;
                 data.decision_generation
@@ -1958,6 +2086,7 @@ impl RuntimeController {
                         &decision,
                         metadata.as_ref(),
                         decision_ts,
+                        clob_generation,
                     )
                     .await;
                 }
@@ -1986,6 +2115,7 @@ impl RuntimeController {
         decision: &TradeDecision,
         metadata: Option<&StrategyDecisionMetadata>,
         decision_ts: DateTime<Utc>,
+        clob_generation: u64,
     ) {
         if !self.inner.settings.azure.publish_strategy_canary_intents {
             return;
@@ -2111,17 +2241,34 @@ impl RuntimeController {
         tokio::spawn(async move {
             let publish_intent = intent.clone();
             let publisher_runtime = runtime.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let publisher = publisher_runtime
-                    .inner
-                    .intent_publisher
-                    .as_ref()
-                    .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
-                publisher.publish(&publish_intent)
-            })
-            .await;
-            match result {
-                Ok(Ok(published)) => {
+            match runtime
+                .execute_live_clob_publication(clob_generation, move || {
+                    let publisher = publisher_runtime
+                        .inner
+                        .intent_publisher
+                        .as_ref()
+                        .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
+                    publisher.publish(&publish_intent)
+                })
+                .await
+            {
+                Ok(None) => {
+                    runtime
+                        .record_event(
+                            "execution_intent_not_published",
+                            json!({
+                                "decision_id": intent.decision_id,
+                                "market_id": intent.market_id,
+                                "reason": "CLOB generation changed or is not ready",
+                                "fail_closed": true,
+                                "order_submission_attempted": false
+                            }),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Ok(Some(published)) => {
                     info!(
                         decision_id = %intent.decision_id,
                         market_id = %intent.market_id,
@@ -2160,7 +2307,7 @@ impl RuntimeController {
                         )
                         .await;
                 }
-                Ok(Err(reason)) => {
+                Err(reason) => {
                     warn!(
                         decision_id = %intent.decision_id,
                         market_id = %intent.market_id,
@@ -2182,30 +2329,38 @@ impl RuntimeController {
                         )
                         .await;
                 }
-                Err(error) => {
-                    warn!(
-                        decision_id = %intent.decision_id,
-                        market_id = %intent.market_id,
-                        error = %error,
-                        "execution intent not published"
-                    );
-                    runtime
-                        .record_event(
-                            "execution_intent_not_published",
-                            json!({
-                                "decision_id": intent.decision_id,
-                                "market_id": intent.market_id,
-                                "reason": format!("publisher task failed: {error}"),
-                                "fail_closed": true,
-                                "order_submission_attempted": false
-                            }),
-                            None,
-                            None,
-                        )
-                        .await;
-                }
             }
         });
+    }
+
+    // The decision gate is the linearization point for every external intent
+    // commit.  Tests inject a blocking closure here; production supplies the
+    // real persistent publisher from maybe_publish_execution_intent above.
+    async fn execute_live_clob_publication<T, F>(
+        &self,
+        clob_generation: u64,
+        publish: F,
+    ) -> Result<Option<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        let decision_guard = self.inner.decision_gate.lock().await;
+        let data = self.inner.data.read().await;
+        let live = data.clob_generation == Some(clob_generation)
+            && data
+                .clob_lease
+                .as_ref()
+                .is_some_and(|lease| !lease.is_terminal());
+        drop(data);
+        if !live {
+            return Ok(None);
+        }
+        let result = tokio::task::spawn_blocking(publish)
+            .await
+            .map_err(|error| format!("publisher task failed: {error}"))?;
+        drop(decision_guard);
+        result.map(Some)
     }
 
     async fn push_decision_with_metadata(
@@ -2965,6 +3120,257 @@ impl RuntimeController {
         self.feed_error_at(source, message, Utc::now()).await;
     }
 
+    fn accept_clob_sequence(&self, data: &mut RuntimeData, sequence: Option<(u64, u64)>) -> bool {
+        let Some((generation, sequence)) = sequence else {
+            return true;
+        };
+        if data.clob_generation != Some(generation)
+            || data
+                .clob_lease
+                .as_ref()
+                .is_none_or(ClobGenerationLease::is_terminal)
+            || sequence <= data.clob_last_sequence
+        {
+            return false;
+        }
+        data.clob_last_sequence = sequence;
+        true
+    }
+
+    async fn begin_clob_generation(
+        &self,
+        generation: u64,
+        token_ids: &[TokenId],
+    ) -> ClobGenerationLease {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let mut data = self.inner.data.write().await;
+        let replaced_generation = Self::revoke_clob_generation_locked(&mut data);
+        let lease = ClobGenerationLease::new();
+        data.clob_pending_generation = Some(generation);
+        data.clob_pending_tokens = token_ids.iter().cloned().collect();
+        data.clob_lease = Some(lease.clone());
+        data.decision_generation = data.decision_generation.wrapping_add(1);
+        drop(data);
+        if let Some(replaced_generation) = replaced_generation {
+            let _ = self
+                .record_required_events(vec![(
+                    "clob_resync_aborted".to_owned(),
+                    json!({
+                        "generation": replaced_generation,
+                        "reason": "replaced by a newer CLOB generation",
+                        "fail_closed": true,
+                        "ready": false
+                    }),
+                )])
+                .await;
+        }
+        lease
+    }
+
+    // Must be called while decision_gate and the RuntimeData write lock are
+    // held.  It is deliberately idempotent: exactly one caller wins the
+    // terminal transition and is therefore responsible for its abort audit.
+    fn revoke_clob_generation_locked(data: &mut RuntimeData) -> Option<u64> {
+        let generation = data.clob_generation.or(data.clob_pending_generation)?;
+        if let Some(lease) = &data.clob_lease {
+            lease.terminate();
+        }
+        data.clob_generation = None;
+        data.clob_pending_generation = None;
+        data.clob_tokens.clear();
+        data.clob_pending_tokens.clear();
+        data.clob_last_sequence = 0;
+        data.clob_terminal_generation = data.clob_terminal_generation.max(generation);
+        data.decision_generation = data.decision_generation.wrapping_add(1);
+        Some(generation)
+    }
+
+    async fn abort_clob_generation_while_gated(&self, generation: u64, reason: &str) -> bool {
+        let revoked = {
+            let mut data = self.inner.data.write().await;
+            (data.clob_generation == Some(generation)
+                || data.clob_pending_generation == Some(generation))
+            .then(|| Self::revoke_clob_generation_locked(&mut data))
+            .flatten()
+        };
+        let Some(generation) = revoked else {
+            return false;
+        };
+        if !self
+            .record_required_events(vec![(
+                "clob_resync_aborted".to_owned(),
+                json!({
+                    "generation": generation,
+                    "reason": reason,
+                    "fail_closed": true,
+                    "ready": false
+                }),
+            )])
+            .await
+        {
+            warn!(
+                generation,
+                "CLOB resync abort audit was not durable; canonical feed error remains required"
+            );
+        }
+        true
+    }
+
+    async fn handle_clob_resync_barrier(&self, barrier: ClobResyncBarrier) {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let (expected, pending_generation, terminal_generation) = {
+            let data = self.inner.data.read().await;
+            (
+                data.clob_pending_tokens.clone(),
+                data.clob_pending_generation,
+                data.clob_terminal_generation,
+            )
+        };
+        let anchored = barrier.token_ids().cloned().collect::<BTreeSet<_>>();
+        let valid = !barrier.lease.is_terminal()
+            && pending_generation == Some(barrier.generation)
+            && terminal_generation < barrier.generation
+            && !expected.is_empty()
+            && expected == anchored
+            && expected.len() == barrier.token_count
+            && clob_token_set_digest(&expected) == barrier.token_set_digest;
+        if !valid {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "barrier token set no longer matches the pending generation",
+            )
+            .await;
+            let _ = barrier.ready_ack.send(Err(
+                "barrier token set no longer matches the pending generation".to_owned(),
+            ));
+            return;
+        }
+        let pre_ready_evidence = barrier
+            .pre_ready_events
+            .iter()
+            .map(|event| {
+                (
+                    "raw_market_event".to_owned(),
+                    serde_json::to_value(event).unwrap_or(Value::Null),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !self.record_required_events(pre_ready_evidence).await {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "durable pre-ready market evidence failed",
+            )
+            .await;
+            let _ = barrier
+                .ready_ack
+                .send(Err("durable pre-ready market evidence failed".to_owned()));
+            return;
+        }
+        let authorization_event = json!({
+            "generation": barrier.generation,
+            "sequence": barrier.sequence,
+            "token_count": barrier.token_count,
+            "token_set_digest": barrier.token_set_digest,
+            "authorization": "single_transport_snapshot_barrier",
+            "ready": false,
+            "authorized": true
+        });
+        if !self
+            .record_required_events(vec![(
+                "clob_resync_authorized".to_owned(),
+                authorization_event,
+            )])
+            .await
+        {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "durable readiness authorization failed",
+            )
+            .await;
+            let _ = barrier
+                .ready_ack
+                .send(Err("durable readiness authorization failed".to_owned()));
+            return;
+        }
+        {
+            let mut data = self.inner.data.write().await;
+            // The producer is blocked on ready_ack.  This transition therefore
+            // follows the only possible final drain boundary with no await.
+            if barrier.lease.is_terminal()
+                || data.clob_pending_generation != Some(barrier.generation)
+                || data.clob_terminal_generation >= barrier.generation
+            {
+                drop(data);
+                self.abort_clob_generation_while_gated(
+                    barrier.generation,
+                    "generation terminated before readiness install",
+                )
+                .await;
+                let _ = barrier.ready_ack.send(Err(
+                    "generation terminated before readiness install".to_owned(),
+                ));
+                return;
+            }
+            data.books.retain(|token, _| !expected.contains(token));
+            for book in barrier.anchors {
+                data.books.insert(book.token_id.clone(), book);
+            }
+            data.clob_generation = Some(barrier.generation);
+            data.clob_pending_generation = None;
+            data.clob_pending_tokens.clear();
+            data.clob_lease = Some(barrier.lease.clone());
+            data.clob_last_sequence = barrier.sequence;
+            data.clob_tokens = expected;
+            data.decision_generation = data.decision_generation.wrapping_add(1);
+            data.feed_status.insert(
+                "PolymarketClobMarket".to_owned(),
+                json!({"status": "ok", "message": Value::Null, "updated_at": Utc::now()}),
+            );
+        }
+        if barrier.ready_ack.send(Ok(())).is_err() {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "CLOB readiness receiver dropped",
+            )
+            .await;
+        }
+    }
+
+    async fn terminate_clob_generation(&self, generation: u64, reason: &str) {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let revoked = {
+            let mut data = self.inner.data.write().await;
+            (data.clob_generation == Some(generation)
+                || data.clob_pending_generation == Some(generation))
+            .then(|| Self::revoke_clob_generation_locked(&mut data))
+            .flatten()
+        };
+        if let Some(generation) = revoked {
+            let event = json!({
+                "generation": generation,
+                "reason": reason,
+                "fail_closed": true,
+                "ready": false
+            });
+            if !self
+                .record_required_events(vec![("clob_resync_aborted".to_owned(), event)])
+                .await
+            {
+                warn!(generation, "CLOB resync abort audit was not durable; canonical feed error remains required");
+            }
+        }
+    }
+
+    async fn terminate_all_clob_generations(&self, reason: &str) {
+        let generation = {
+            let data = self.inner.data.read().await;
+            data.clob_generation.or(data.clob_pending_generation)
+        };
+        if let Some(generation) = generation {
+            self.terminate_clob_generation(generation, reason).await;
+        }
+    }
+
     async fn mark_market_feed_connecting(&self) {
         let now = Utc::now();
         let fresh = {
@@ -3006,6 +3412,17 @@ impl RuntimeController {
             .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
             .collect()
     }
+}
+
+fn clob_token_set_digest(tokens: &BTreeSet<TokenId>) -> String {
+    let mut hasher = 0xcbf2_9ce4_8422_2325_u64;
+    for token in tokens {
+        for byte in token.as_ref().bytes().chain(std::iter::once(0)) {
+            hasher ^= u64::from(byte);
+            hasher = hasher.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{hasher:016x}")
 }
 
 fn rtds_source_settings(settings: &RuntimeSettings, source: &FeedName) -> RuntimeSettings {
@@ -3925,6 +4342,37 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
+    fn clob_test_book(token: &str) -> BookState {
+        BookState {
+            token_id: TokenId::new(token),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            last_trade_price: None,
+            exchange_ts: None,
+            local_ts: Utc::now(),
+            book_hash: None,
+        }
+    }
+
+    fn clob_test_event(token: &str) -> polyedge_feeds::MarketChannelEvent {
+        polyedge_feeds::MarketChannelEvent {
+            event_type: "price_change".to_owned(),
+            recorded_ts: Utc::now(),
+            source_ts: None,
+            market_id: None,
+            condition_id: None,
+            token_id: Some(token.to_owned()),
+            asset_id: Some(token.to_owned()),
+            side: Some("BUY".to_owned()),
+            price: Some("0.5".to_owned()),
+            size: Some("1".to_owned()),
+            best_bid: None,
+            best_ask: None,
+            book_hash: None,
+            raw_payload: json!({"event_type": "price_change", "asset_id": token}),
+        }
+    }
+
     #[tokio::test]
     async fn finished_runtime_task_marks_runtime_unhealthy() {
         let controller = RuntimeController::new(RuntimeSettings::default());
@@ -3944,6 +4392,328 @@ mod tests {
             controller.status().await["task_health"]["runtime_loop"],
             "failed"
         );
+    }
+
+    #[tokio::test]
+    async fn clob_generation_rejects_pre_ready_and_stale_frames() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let mut data = controller.inner.data.write().await;
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1))));
+        data.clob_generation = Some(7);
+        data.clob_lease = Some(ClobGenerationLease::new());
+        assert!(controller.accept_clob_sequence(&mut data, Some((7, 1))));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1))));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((6, 2))));
+        assert!(controller.accept_clob_sequence(&mut data, Some((7, 2))));
+        data.clob_lease.as_ref().unwrap().terminate();
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 3))));
+    }
+
+    #[tokio::test]
+    async fn terminal_tombstone_precedes_an_unpolled_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(42, &[TokenId::new("test-token")])
+            .await;
+        assert!(!lease.is_terminal());
+        controller
+            .terminate_clob_generation(42, "test pre-install cancellation")
+            .await;
+        let data = controller.inner.data.read().await;
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_terminal_generation, 42);
+    }
+
+    #[tokio::test]
+    async fn same_token_pending_replacement_tombstones_the_prior_lease() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let first = controller
+            .begin_clob_generation(421, &[TokenId::new("same-token")])
+            .await;
+        let second = controller
+            .begin_clob_generation(422, &[TokenId::new("same-token")])
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(first.is_terminal());
+        assert!(!second.is_terminal());
+        assert_eq!(data.clob_pending_generation, Some(422));
+        assert_eq!(data.clob_terminal_generation, 421);
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_signals_emit_one_abort_for_the_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(423, &[TokenId::new("terminal-token")])
+            .await;
+        let left = controller.terminate_clob_generation(423, "concurrent left");
+        let right = controller.terminate_clob_generation(423, "concurrent right");
+        tokio::join!(left, right);
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "clob_resync_aborted")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_first_prevents_the_real_live_publication_helper_from_calling_publisher() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(424, &[TokenId::new("publish-token")])
+            .await;
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(424);
+            data.clob_pending_generation = None;
+        }
+        controller
+            .terminate_clob_generation(424, "terminal before external publish")
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publisher_calls = Arc::clone(&calls);
+        assert_eq!(
+            controller
+                .execute_live_clob_publication(424, move || {
+                    publisher_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(lease.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn publish_first_makes_terminal_wait_for_the_real_live_publication_helper() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(425, &[TokenId::new("publish-token")])
+            .await;
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(425);
+            data.clob_pending_generation = None;
+        }
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let published = Arc::new(AtomicUsize::new(0));
+        let publication = {
+            let controller = controller.clone();
+            let published = Arc::clone(&published);
+            tokio::spawn(async move {
+                controller
+                    .execute_live_clob_publication(425, move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        published.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(StdDuration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let terminator = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .terminate_clob_generation(425, "terminal after external publish start")
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!lease.is_terminal());
+        release_tx.send(()).unwrap();
+        assert_eq!(publication.await.unwrap().unwrap(), Some(()));
+        terminator.await.unwrap();
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert!(lease.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn rejected_clob_barrier_atomically_tombstones_its_pending_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(43, &[TokenId::new("expected-token")])
+            .await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 43,
+                sequence: 0,
+                token_set_digest: "not-the-pending-set".to_owned(),
+                token_count: 0,
+                anchors: Vec::new(),
+                pre_ready_events: Vec::new(),
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_err());
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_terminal_generation, 43);
+    }
+
+    #[tokio::test]
+    async fn clob_pre_ready_evidence_recorder_failure_rejects_the_barrier() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let token = TokenId::new("pre-ready-token");
+        let lease = controller.begin_clob_generation(44, &[token.clone()]).await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 44,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&BTreeSet::from([token])),
+                token_count: 1,
+                anchors: vec![clob_test_book("pre-ready-token")],
+                pre_ready_events: vec![clob_test_event("pre-ready-token")],
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_err());
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+    }
+
+    #[tokio::test]
+    async fn clob_authorization_recorder_failure_rejects_the_barrier() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let token = TokenId::new("authorization-token");
+        let lease = controller.begin_clob_generation(45, &[token.clone()]).await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 45,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&BTreeSet::from([token])),
+                token_count: 1,
+                anchors: vec![clob_test_book("authorization-token")],
+                pre_ready_events: Vec::new(),
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_err());
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+    }
+
+    #[tokio::test]
+    async fn dropped_clob_ready_ack_revokes_the_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("ack-token");
+        let lease = controller.begin_clob_generation(46, &[token.clone()]).await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        drop(ready_result);
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 46,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&BTreeSet::from([token])),
+                token_count: 1,
+                anchors: vec![clob_test_book("ack-token")],
+                pre_ready_events: Vec::new(),
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_terminal_generation, 46);
+    }
+
+    #[tokio::test]
+    async fn token_refresh_and_repeated_terminal_signal_abort_once() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(47, &[TokenId::new("old-token")])
+            .await;
+        controller.replace_markets(Vec::new()).await;
+        controller
+            .terminate_clob_generation(47, "duplicate terminal signal")
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_terminal_generation, 47);
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "clob_resync_aborted")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn clob_abort_recorder_failure_keeps_the_generation_terminal() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let lease = controller
+            .begin_clob_generation(48, &[TokenId::new("abort-audit-token")])
+            .await;
+        controller
+            .terminate_clob_generation(48, "injected abort audit failure")
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_terminal_generation, 48);
     }
 
     #[tokio::test]
