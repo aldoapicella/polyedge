@@ -425,6 +425,8 @@ jobs:
             ready < enable && enable < first);
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /where tobool\(record\.order_submitted\) == true/);
+          assert.match(activation,
+            /lifecycle_signal_deadline_monotonic=.*\+ 2400[\s\S]*lifecycle_ingestion_deadline_monotonic=.*\+ 300[\s\S]*queue_fenced_for_ingestion=false[\s\S]*--status SendDisabled[\s\S]*queue_drained=true[\s\S]*funded-v10-lifecycle-latency\.json/);
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
           assert.match(activation,
@@ -3004,14 +3006,50 @@ jobs:
           monotonic_seconds() {
             python3 -c 'import time; print(int(time.monotonic()))'
           }
-          lifecycle_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))
+          lifecycle_signal_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))
+          lifecycle_ingestion_deadline_monotonic=$(( lifecycle_signal_deadline_monotonic + 300 ))
+          queue_fenced_for_ingestion=false
           sleep_before_lifecycle_deadline() {
-            local remaining=$(( lifecycle_deadline_monotonic - $(monotonic_seconds) ))
+            local remaining=$(( lifecycle_ingestion_deadline_monotonic - $(monotonic_seconds) ))
             [ "$remaining" -gt 0 ] || return 1
             [ "$remaining" -le 10 ] || remaining=10
             sleep "$remaining"
           }
-          while [ "$(monotonic_seconds)" -lt "$lifecycle_deadline_monotonic" ]; do
+          while [ "$(monotonic_seconds)" -lt "$lifecycle_ingestion_deadline_monotonic" ]; do
+            if [ "$(monotonic_seconds)" -ge "$lifecycle_signal_deadline_monotonic" ] && \
+              [ "$queue_fenced_for_ingestion" = false ]; then
+              for attempt in 1 2 3; do
+                if az servicebus queue update \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --namespace-name "$SERVICE_BUS_NAMESPACE" \
+                  --name "$SERVICE_BUS_QUEUE" \
+                  --status SendDisabled \
+                  --only-show-errors -o none; then
+                  queue_fenced_for_ingestion=true
+                  break
+                fi
+                sleep "$((attempt * 5))"
+              done
+              test "$queue_fenced_for_ingestion" = true
+              queue_drained=false
+              for attempt in $(seq 1 36); do
+                az servicebus queue show \
+                  --resource-group "$AZURE_RESOURCE_GROUP" \
+                  --namespace-name "$SERVICE_BUS_NAMESPACE" \
+                  --name "$SERVICE_BUS_QUEUE" \
+                  -o json > funded-queue-ingestion-grace.json
+                if jq -e '
+                  .status == "SendDisabled"
+                  and .countDetails.activeMessageCount == 0
+                  and .countDetails.scheduledMessageCount == 0
+                ' funded-queue-ingestion-grace.json >/dev/null; then
+                  queue_drained=true
+                  break
+                fi
+                sleep 5
+              done
+              test "$queue_drained" = true
+            fi
             if ! az monitor log-analytics query \
               --workspace "$workspace_customer_id" \
               --analytics-query "ContainerAppConsoleLogs_CL
