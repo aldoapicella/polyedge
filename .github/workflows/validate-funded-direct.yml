@@ -432,6 +432,13 @@ jobs:
           assert.match(activation, /test "\$summary_matches" = 1/);
           assert.match(activation,
             /\.order\.source_requested_notional > \.order\.notional[\s\S]*\.order\.source_requested_notional <= 10\.5/);
+          assert.equal(activation.includes("az storage blob exists"), false);
+          assert.equal((activation.match(
+            /if download_v10_blob "\$candidate_blob" "\$candidate_file"; then/g) || []).length, 2);
+          assert.equal((activation.match(/candidate_status=\$\?/g) || []).length, 2);
+          assert.equal((activation.match(
+            /test "\$candidate_status" = 2 \|\| exit "\$candidate_status"/g) || []).length, 2);
+          assert.match(activation, /grep -Fq "BlobNotFound" "\$error_file"/);
           assert.equal(activation.includes("--num-results '*'"), false);
           const lifecycleLogin = activation.indexOf("Refresh Azure login before submitted v10 lifecycle");
           const childRunValidation = activation.indexOf(
@@ -3033,7 +3040,8 @@ jobs:
           authorization_blob="$control_prefix/sessions/dynamic-quote-funded-2026-08-13-v10/authorizations/$decision_id.json"
           completion_blob="$control_prefix/sessions/dynamic-quote-funded-2026-08-13-v10/completed/$decision_id.json"
           download_v10_blob() {
-            local blob_name=$1 output_file=$2
+            local blob_name=$1 output_file=$2 error_file
+            error_file=$(mktemp)
             for attempt in 1 2 3; do
               if az storage blob download \
                   --account-name "$STORAGE_ACCOUNT" \
@@ -3042,11 +3050,17 @@ jobs:
                   --file "$output_file" \
                   --auth-mode login \
                   --overwrite \
-                  --only-show-errors -o none; then
+                  --only-show-errors -o none 2>"$error_file"; then
+                rm -f -- "$error_file"
                 return 0
               fi
               [ "$attempt" = 3 ] || sleep "$((attempt * 5))"
             done
+            if grep -Fq "BlobNotFound" "$error_file"; then
+              rm -f -- "$error_file"
+              return 2
+            fi
+            rm -f -- "$error_file"
             return 1
           }
           download_v10_blob "$authorization_blob" funded-v10-authorization.json
@@ -3198,24 +3212,14 @@ jobs:
           for artifact_day in "${artifact_days[@]}"; do
             [[ "$artifact_day" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
             candidate_blob="reports/research/venue-probe/risk-reservations/${artifact_day}/funded-direct-${decision_id}.json"
-            if [ "$(az storage blob exists \
-              --account-name "$STORAGE_ACCOUNT" \
-              --container-name "$FUNDED_CONTAINER" \
-              --name "$candidate_blob" \
-              --auth-mode login \
-              --only-show-errors --query exists -o tsv)" = true ]; then
-              candidate_file="funded-v10-risk-reservation-${artifact_day}.json"
-              az storage blob download \
-                --account-name "$STORAGE_ACCOUNT" \
-                --container-name "$FUNDED_CONTAINER" \
-                --name "$candidate_blob" \
-                --file "$candidate_file" \
-                --auth-mode login \
-                --overwrite \
-                --only-show-errors -o none
+            candidate_file="funded-v10-risk-reservation-${artifact_day}.json"
+            if download_v10_blob "$candidate_blob" "$candidate_file"; then
               reservation_matches=$((reservation_matches + 1))
               reservation_blob=$candidate_blob
               reservation_file=$candidate_file
+            else
+              candidate_status=$?
+              test "$candidate_status" = 2 || exit "$candidate_status"
             fi
           done
           test "$reservation_matches" = 1
@@ -3225,24 +3229,14 @@ jobs:
           summary_file=
           for artifact_day in "${artifact_days[@]}"; do
             candidate_blob="reports/research/venue-probe/runs/${artifact_day}/${child_run_id}/summary.json"
-            if [ "$(az storage blob exists \
-              --account-name "$STORAGE_ACCOUNT" \
-              --container-name "$FUNDED_CONTAINER" \
-              --name "$candidate_blob" \
-              --auth-mode login \
-              --only-show-errors --query exists -o tsv)" = true ]; then
-              candidate_file="funded-v10-run-summary-${artifact_day}.json"
-              az storage blob download \
-                --account-name "$STORAGE_ACCOUNT" \
-                --container-name "$FUNDED_CONTAINER" \
-                --name "$candidate_blob" \
-                --file "$candidate_file" \
-                --auth-mode login \
-                --overwrite \
-                --only-show-errors -o none
+            candidate_file="funded-v10-run-summary-${artifact_day}.json"
+            if download_v10_blob "$candidate_blob" "$candidate_file"; then
               summary_matches=$((summary_matches + 1))
               summary_blob=$candidate_blob
               summary_file=$candidate_file
+            else
+              candidate_status=$?
+              test "$candidate_status" = 2 || exit "$candidate_status"
             fi
           done
           test "$summary_matches" = 1
