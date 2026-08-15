@@ -97,6 +97,52 @@ test("opt-in state reconciliation writes only through the no-order warmup path",
   assert.equal(closed, true);
 });
 
+test("reconciliation waits through a transient cache error but not a persistent one", async () => {
+  const env = {
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: sessionId,
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify({ execution_model: {} })
+  };
+  const market = {
+    id: "market",
+    conditionId: "condition",
+    clobTokenIds: ["up", "down"],
+    endDate: "2026-08-12T08:00:00Z"
+  };
+  let statusCalls = 0;
+  const snapshot = await runFundedDirectReconciliation({
+    env,
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      status: () => (++statusCalls === 1 ? {
+        safety_snapshot_cache_error: "temporary venue timeout"
+      } : {
+        safety_snapshot_cache_ready: true,
+        safety_snapshot_cache_in_flight: 0,
+        safety_snapshot_cache_error: null
+      }),
+      reconciliationSnapshot: () => clean,
+      close: async () => {}
+    }),
+    discoverMarket: async () => market,
+    sleep: async () => {},
+    logger: () => {}
+  });
+  assert.equal(snapshot, clean);
+
+  await assert.rejects(runFundedDirectReconciliation({
+    env,
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      status: () => ({ safety_snapshot_cache_error: "persistent risk blocker" }),
+      reconciliationSnapshot: () => { throw new Error("must not read a blocked snapshot"); },
+      close: async () => {}
+    }),
+    discoverMarket: async () => market,
+    sleep: async () => {},
+    logger: () => {}
+  }), /persistent risk blocker/);
+});
+
 test("reconciliation remains fail-closed on any live risk blocker", () => {
   assert.throws(
     () => validateFundedReconciliationSnapshot({

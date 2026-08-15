@@ -44,6 +44,7 @@ export async function runFundedDirectReconciliation({
     }
   });
   let snapshot;
+  let lastCacheError = null;
   try {
     const market = await discoverMarket();
     const tokenIds = parseTokenIds(market.clobTokenIds);
@@ -57,7 +58,9 @@ export async function runFundedDirectReconciliation({
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const status = executor.status();
       if (status.safety_snapshot_cache_error) {
-        throw new Error(`fail closed: ${status.safety_snapshot_cache_error}`);
+        lastCacheError = status.safety_snapshot_cache_error;
+        await sleep(100);
+        continue;
       }
       if (status.safety_snapshot_cache_ready &&
           status.safety_snapshot_cache_in_flight === 0) {
@@ -70,6 +73,7 @@ export async function runFundedDirectReconciliation({
       await sleep(100);
     }
     if (!snapshot) {
+      if (lastCacheError) throw new Error(`fail closed: ${lastCacheError}`);
       throw new Error("fail closed: funded live reconciliation timed out");
     }
   } finally {
