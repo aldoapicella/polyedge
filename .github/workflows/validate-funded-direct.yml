@@ -347,6 +347,8 @@ jobs:
           assert.match(preparePreflight,
             /expired_before_child_launch[\s\S]*order_submission_attempted == false[\s\S]*risk_reservation_created == false/);
           assert.match(preparePreflight,
+            /child_failed_closed_pre_submission[\s\S]*authorization_consumed == false[\s\S]*risk_reservation_created == false[\s\S]*authorization_consumed == true[\s\S]*risk_reservation_created == true/);
+          assert.match(preparePreflight,
             /child_failed_closed_post_submission_unresolved[\s\S]*released_no_order[\s\S]*order_submitted == false[\s\S]*zero_open_orders_confirmed == true/);
           assert.match(preparePreflight,
             /child_failed_closed_pre_submission[\s\S]*reservation_count[\s\S]*released_no_order/);
@@ -1681,8 +1683,10 @@ jobs:
               and (
                 (.status == "child_failed_closed_pre_submission"
                   and .order_submission_attempted == false
-                  and .authorization_consumed == false
-                  and .risk_reservation_created == false
+                  and ((.authorization_consumed == false
+                      and .risk_reservation_created == false)
+                    or (.authorization_consumed == true
+                      and .risk_reservation_created == true))
                   and (.error | type == "string" and length > 0))
                 or
                 (.status == "expired_before_child_launch"
