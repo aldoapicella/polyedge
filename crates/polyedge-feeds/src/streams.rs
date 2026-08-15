@@ -490,29 +490,43 @@ pub async fn run_market_feed(
         "custom_feature_enabled": true
     })
     .to_string();
+    let source_timeout =
+        Duration::from_secs_f64(settings.target.polymarket_market_watchdog_seconds.max(5.0));
     let (stream, _) = connect_async(settings.target.polymarket_ws_url.as_str()).await?;
     let (mut write, mut read) = stream.split();
     write.send(Message::Text(subscribe)).await?;
-    let ping_loop = async move {
-        let mut ping = tokio::time::interval(Duration::from_secs(10));
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ping.tick().await;
-            write.send(Message::Text("PING".to_owned())).await?;
-        }
-    };
-    let read_loop = async move {
-        let mut books = BTreeMap::new();
-        while let Some(message) = read.next().await {
-            for event in parse_market_message(message?, &mut books) {
-                publish(&sender, event).await?;
+    let mut ping = tokio::time::interval(Duration::from_secs(10));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut source_watchdog = tokio::time::interval(Duration::from_secs(1));
+    source_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_observation = Instant::now();
+    let mut books = BTreeMap::new();
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                write.send(Message::Text("PING".to_owned())).await?;
+            }
+            _ = source_watchdog.tick() => {
+                if source_watchdog_expired(last_observation, source_timeout) {
+                    return Err(FeedError::SourceStalled(format!(
+                        "Polymarket CLOB market feed produced no matching event for {:.0}s while the socket remained connected",
+                        source_timeout.as_secs_f64()
+                    )));
+                }
+            }
+            message = read.next() => {
+                let Some(message) = message else {
+                    return Ok(());
+                };
+                let events = parse_market_message(message?, &mut books);
+                if !events.is_empty() {
+                    last_observation = Instant::now();
+                }
+                for event in events {
+                    publish(&sender, event).await?;
+                }
             }
         }
-        Ok::<(), FeedError>(())
-    };
-    tokio::select! {
-        result = ping_loop => result,
-        result = read_loop => result,
     }
 }
 
@@ -1635,6 +1649,46 @@ mod tests {
         .await
         .expect("market socket did not send its required PING")
         .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connected_market_socket_without_events_exits_for_reconnect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
+            let _: Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            while let Ok(message) = socket.read() {
+                if message == Message::Text("PING".to_owned()) {
+                    socket.send(Message::Text("PONG".to_owned())).unwrap();
+                }
+            }
+        });
+
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_ws_url = format!("ws://{address}");
+        settings.target.polymarket_market_watchdog_seconds = 5.0;
+        let (sender, _receiver) = mpsc::channel(8);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_market_feed(settings, vec![TokenId::new("token")], sender),
+        )
+        .await
+        .expect("market watchdog did not return the stalled socket for reconnect")
+        .unwrap_err();
+        match error {
+            FeedError::SourceStalled(message) => {
+                assert!(message.contains("CLOB market feed"));
+                assert!(message.contains("5s"));
+            }
+            other => panic!("unexpected market feed result: {other}"),
+        }
         server.join().unwrap();
     }
 }

@@ -109,6 +109,7 @@ pub struct TargetConfig {
     pub enable_polymarket_rtds_chainlink: bool,
     pub enable_polymarket_rtds_binance: bool,
     pub enable_direct_binance_book_ticker: bool,
+    pub polymarket_market_watchdog_seconds: f64,
     pub rtds_ping_interval_seconds: f64,
     pub rtds_chainlink_watchdog_seconds: f64,
     pub start_price_capture_grace_seconds: f64,
@@ -137,6 +138,7 @@ impl Default for TargetConfig {
             enable_polymarket_rtds_chainlink: true,
             enable_polymarket_rtds_binance: true,
             enable_direct_binance_book_ticker: false,
+            polymarket_market_watchdog_seconds: 60.0,
             rtds_ping_interval_seconds: 5.0,
             rtds_chainlink_watchdog_seconds: 30.0,
             start_price_capture_grace_seconds: 5.0,
@@ -425,6 +427,10 @@ impl RuntimeSettings {
         settings.target.enable_direct_binance_book_ticker = env_bool(
             "ENABLE_DIRECT_BINANCE_BOOK_TICKER",
             settings.target.enable_direct_binance_book_ticker,
+        );
+        settings.target.polymarket_market_watchdog_seconds = env_f64(
+            "POLYMARKET_MARKET_WATCHDOG_SECONDS",
+            settings.target.polymarket_market_watchdog_seconds,
         );
         settings.target.rtds_ping_interval_seconds = env_f64(
             "RTDS_PING_INTERVAL_SECONDS",
