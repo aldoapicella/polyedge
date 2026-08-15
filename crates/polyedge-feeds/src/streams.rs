@@ -106,8 +106,7 @@ async fn run_rtds_feed_inner(
                     forward_state.last.as_ref(),
                     source_timeout,
                 ) {
-                    let synchronization_deadline =
-                        Instant::now() + Duration::from_millis(250);
+                    let synchronization_deadline = Instant::now() + source_timeout;
                     let synchronization_timeout =
                         tokio::time::sleep_until(synchronization_deadline);
                     tokio::pin!(synchronization_timeout);
@@ -1382,7 +1381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rtds_merge_forwards_newest_and_survives_queued_peer_sync_without_duplicates() {
+    async fn rtds_merge_survives_peer_sync_after_legacy_handoff_window_without_duplicates() {
         enum Command {
             Send { timestamp: i64, price: &'static str },
             Close,
@@ -1549,6 +1548,11 @@ mod tests {
             .await
             .expect("primary test socket did not close")
             .expect("primary close coordinator ended unexpectedly");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !feed.is_finished(),
+            "feed stopped before its source-timeout handoff window elapsed"
+        );
         secondary
             .send(Command::Send {
                 timestamp: 1_786_687_202_000,

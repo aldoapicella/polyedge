@@ -420,8 +420,9 @@ jobs:
           const terminalLogin = activation.indexOf(
             "Refresh Azure login before terminal reservation verification", reservationValidation);
           const explicitFence = activation.lastIndexOf("--status SendDisabled", terminalLogin);
+          const fencePoll = activation.indexOf("for attempt in $(seq 1 12); do", explicitFence);
           const fenceReadback = activation.indexOf(
-            '--query status -o tsv)" = "SendDisabled"', explicitFence);
+            'test "$queue_status" = "SendDisabled"', fencePoll);
           const safeHandoff = activation.indexOf(
             "printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\\n'", fenceReadback);
           const terminalLoop = activation.indexOf(
@@ -432,8 +433,11 @@ jobs:
           const queueReopen = activation.lastIndexOf("--status Active");
           const cutoverComplete = activation.indexOf("FUNDED_CUTOVER_COMPLETE=true", queueReopen);
           assert.ok(lifecycleLogin < childRunValidation && childRunValidation < reservationValidation);
-          assert.ok(reservationValidation < explicitFence && explicitFence < fenceReadback &&
+          assert.ok(reservationValidation < explicitFence && explicitFence < fencePoll &&
+            fencePoll < fenceReadback &&
             fenceReadback < safeHandoff && safeHandoff < terminalLogin);
+          assert.match(activation.slice(explicitFence, safeHandoff),
+            /for attempt in \$\(seq 1 12\); do[\s\S]*queue_status=\$\(az servicebus queue show[\s\S]*\[ "\$queue_status" = "SendDisabled" \] && break[\s\S]*sleep 5[\s\S]*done[\s\S]*test "\$queue_status" = "SendDisabled"/);
           assert.ok(terminalLogin < terminalLoop && terminalLoop < terminalIdentity &&
             terminalIdentity < terminalPredicate &&
             terminalPredicate < terminalProof && terminalProof < queueReopen && queueReopen < cutoverComplete);
@@ -3251,11 +3255,17 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" \
             --status SendDisabled \
             --only-show-errors -o none
-          test "$(az servicebus queue show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --query status -o tsv)" = "SendDisabled"
+          queue_status=
+          for attempt in $(seq 1 12); do
+            queue_status=$(az servicebus queue show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --namespace-name "$SERVICE_BUS_NAMESPACE" \
+              --name "$SERVICE_BUS_QUEUE" \
+              --query status -o tsv) || true
+            [ "$queue_status" = "SendDisabled" ] && break
+            sleep 5
+          done
+          test "$queue_status" = "SendDisabled"
           {
             printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\n' "$decision_id"
             printf 'FUNDED_LIFECYCLE_CHILD_RUN_ID=%s\n' "$child_run_id"
