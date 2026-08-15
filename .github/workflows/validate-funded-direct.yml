@@ -296,6 +296,13 @@ jobs:
           assert.equal(fundedJob.properties.configuration.replicaTimeout, 11400);
           assert.equal(fundedJob.properties.configuration.replicaRetryLimit, 0);
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
+          const imagePublishStart = workflow.indexOf(
+            "- name: Build and publish immutable producer and funded worker images");
+          const imagePublish = workflow.slice(
+            imagePublishStart,
+            workflow.indexOf("\n      - name:", imagePublishStart + 1));
+          assert.match(imagePublish,
+            /retry_registry\(\)[\s\S]*for attempt in 1 2 3[\s\S]*retry_registry az acr login[\s\S]*retry_registry docker push "\$producer_tag"[\s\S]*retry_registry docker push "\$funded_tag"/);
           assert.equal(workflow.includes(
             ["FUNDED_DIRECT_SERVICE_BUS_ENABLED", "false"].join("=")), false);
           const preparePreflightStart = workflow.lastIndexOf(
@@ -563,11 +570,18 @@ jobs:
           login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
           producer_tag="$login_server/polyedge-rust-backend:${GITHUB_SHA}"
           funded_tag="$login_server/polyedge-venue-probe:${GITHUB_SHA}"
-          az acr login --name "$ACR_NAME"
+          retry_registry() {
+            for attempt in 1 2 3; do
+              if "$@"; then return 0; fi
+              [ "$attempt" = 3 ] || sleep "$((attempt * 10))"
+            done
+            return 1
+          }
+          retry_registry az acr login --name "$ACR_NAME"
           docker build --build-arg GIT_SHA="$GITHUB_SHA" -f Dockerfile.rust -t "$producer_tag" .
           docker build -f Dockerfile.venue-probe -t "$funded_tag" .
-          docker push "$producer_tag"
-          docker push "$funded_tag"
+          retry_registry docker push "$producer_tag"
+          retry_registry docker push "$funded_tag"
           producer_digest=$(az acr repository show \
             --name "$ACR_NAME" \
             --image "polyedge-rust-backend:${GITHUB_SHA}" \
