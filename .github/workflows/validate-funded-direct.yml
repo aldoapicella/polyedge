@@ -129,6 +129,12 @@ jobs:
             capture {sub(/^              /, ""); print}
           ' .github/workflows/validate-funded-direct.yml)
           test -n "$redemption_filter"
+          binding_diagnostic_filter=$(awk '
+            /binding_diagnostic=\$\(jq -er --argjson settlement_bindings .*\047$/ {capture=1; next}
+            capture && /^[[:space:]]*\047 "\$redemption_file"/ {exit}
+            capture {sub(/^                /, ""); print}
+          ' .github/workflows/validate-funded-direct.yml)
+          test -n "$binding_diagnostic_filter"
           prefix='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/'
           latest="${prefix}latest-redemption.json"
           archive_prefix="${prefix}redemptions/"
@@ -220,6 +226,45 @@ jobs:
               realized_payout: 2,
               internal_settlement_blobs: [$settlement_blob]
             }')
+          classify_binding() {
+            printf '%s\n' "$1" | jq -er \
+              --argjson settlement_bindings "$2" \
+              "$binding_diagnostic_filter"
+          }
+          assert_binding_diagnostic() {
+            local expected="$1"
+            local document="$2"
+            local bindings="$3"
+            local actual
+            actual=$(classify_binding "$document" "$bindings")
+            if [ "$actual" != "$expected" ]; then
+              printf '%s\n' \
+                "binding diagnostic self-check failed: expected_category=${expected%%$'\t'*} actual_category=${actual%%$'\t'*}" >&2
+              exit 1
+            fi
+          }
+          assert_binding_diagnostic $'ok\t1\t1' \
+            "$valid_verified" "$settlement_bindings"
+          assert_binding_diagnostic $'settlement_reference_count_mismatch\t1\t0' \
+            "$valid_verified" '[]'
+          assert_binding_diagnostic $'settlement_type_mismatch\t1\t1' \
+            "$valid_verified" \
+            "$(printf '%s\n' "$settlement_bindings" | jq -c \
+              '.[0].type="fixture_wrong_type"')"
+          assert_binding_diagnostic $'settlement_transaction_mismatch\t1\t1' \
+            "$valid_verified" \
+            "$(printf '%s\n' "$settlement_bindings" | jq -c \
+              '.[0].transaction_hash=("0x" + ("d" * 64))')"
+          assert_binding_diagnostic $'settlement_selection_mismatch\t1\t1' \
+            "$valid_verified" \
+            "$(printf '%s\n' "$settlement_bindings" | jq -c \
+              '.[0].condition_id=("0x" + ("e" * 64))')"
+          payout_mismatch=$(printf '%s\n' "$valid_verified" | jq -c \
+            '.realized_payout=3
+            | .selection.selected_gross_payout=3
+            | .liquid_collateral_after=8')
+          assert_binding_diagnostic $'settlement_payout_sum_mismatch\t1\t1' \
+            "$payout_mismatch" "$settlement_bindings"
           verified_archive="${archive_prefix}2026-08-15/venue-redemption-20260815001556008-f00dbabe.json"
           validate_record "$verified_archive" "$valid_verified" "$settlement_bindings"
           validate_record "$latest" "$valid_verified" "$settlement_bindings"
@@ -1980,7 +2025,10 @@ jobs:
             test "$latest_count" = "1"
           fi
           : > existing-v10-redemption-sha256.txt
+          redemption_ordinal=0
+          redemption_total=$((archive_count + latest_count))
           while IFS= read -r blob_name; do
+            redemption_ordinal=$((redemption_ordinal + 1))
             redemption_file=$(mktemp)
             az storage blob download \
               --account-name "$STORAGE_ACCOUNT" \
@@ -1990,6 +2038,54 @@ jobs:
               --auth-mode login \
               --overwrite \
               --only-show-errors -o none
+            redemption_status=$(jq -r '.status' "$redemption_file")
+            if [ "$redemption_status" = "redeemed_and_verified" ]; then
+              if ! binding_diagnostic=$(jq -er --argjson settlement_bindings "$settlement_bindings" '
+                .internal_settlement_blobs as $references
+                | .selection.selected as $selected
+                | .transaction_hash as $transaction_hash
+                | .realized_payout as $realized_payout
+                | [$settlement_bindings[]
+                  | select(.blob_name as $candidate
+                    | ($references | index($candidate)) != null)] as $bound
+                | (if ($bound | length) != ($references | length) then
+                    "settlement_reference_count_mismatch"
+                  elif any($bound[];
+                    .type != "internal_automatic_settlement") then
+                    "settlement_type_mismatch"
+                  elif any($bound[];
+                    .transaction_hash != $transaction_hash) then
+                    "settlement_transaction_mismatch"
+                  elif ([$bound[] | {
+                    condition_id: (.condition_id | ascii_downcase),
+                    payout
+                  }] | sort_by(.condition_id, .payout)) !=
+                    ([$selected[] | {
+                      condition_id: (.condition_id | ascii_downcase),
+                      payout: .gross_payout
+                    }] | sort_by(.condition_id, .payout)) then
+                    "settlement_selection_mismatch"
+                  elif ((([$bound[].payout] | add) - $realized_payout) | fabs)
+                    > 0.0000011 then
+                    "settlement_payout_sum_mismatch"
+                  else
+                    "ok"
+                  end) as $category
+                | [$category, ($references | length), ($bound | length)]
+                | @tsv
+              ' "$redemption_file" 2>/dev/null); then
+                printf '%s\n' \
+                  "funded v10 redemption binding validation failed: status=redeemed_and_verified ordinal=${redemption_ordinal}/${redemption_total} category=diagnostic_evaluation_error" >&2
+                exit 1
+              fi
+              IFS=$'\t' read -r binding_category binding_reference_count \
+                binding_bound_count <<< "$binding_diagnostic"
+              if [ "$binding_category" != "ok" ]; then
+                printf '%s\n' \
+                  "funded v10 redemption binding validation failed: status=redeemed_and_verified ordinal=${redemption_ordinal}/${redemption_total} category=${binding_category} reference_count=${binding_reference_count} bound_count=${binding_bound_count}" >&2
+                exit 1
+              fi
+            fi
             jq -e --argjson authorized_ceiling "$authorized_ceiling" \
               --argjson settlement_bindings "$settlement_bindings" \
               --arg blob_name "$blob_name" --arg latest "$v10_latest_redemption" '
