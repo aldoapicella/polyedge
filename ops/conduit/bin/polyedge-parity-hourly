@@ -113,7 +113,7 @@ feed_evidence() {
 }
 
 
-validate_evidence_artifacts() {
+validate_evidence_artifacts() (
   file=$1
   start=$(jq -er '.hourStartUtc | select(type == "string")' "$file") || die "evidence hour is missing: $file"
   epoch=$(date -u -d "$start" +%s) || die "invalid evidence hour: $file"
@@ -165,7 +165,7 @@ validate_evidence_artifacts() {
     check_artifact "$receipt_path" "$(jq -er ".segments[$i].receipt.sha256" "$file")"
     i=$((i + 1))
   done
-}
+)
 
 env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
 secure_file "$env_file" 640
@@ -647,7 +647,7 @@ if [ "$target_epoch" -gt "$first_epoch" ]; then
   prior_runs=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
   feed_evidence "$prior" || die 'prior accepted evidence lacks continuous essential feed proof'
   printf '%s\n%s\n' "$prior_runs" "$hour_runs" | jq -se '
-    .[0] + .[1] as $runs |
+    (.[0] + .[1]) as $runs |
     all(range(1; ($runs | length)); . as $index |
       if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
         $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)

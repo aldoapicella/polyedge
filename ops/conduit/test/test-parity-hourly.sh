@@ -9,6 +9,26 @@ gid=$(id -g)
 fake=$root/fake-bin
 mkdir -p "$fake"
 
+grep -Fq '(.[0] + .[1]) as $runs |' "$collector"
+grep -Fq 'validate_evidence_artifacts() (' "$collector"
+printf '%s\n%s\n' \
+  '[{"recorder_instance_id":"a","recorder_first_sequence":1,"recorder_last_sequence":1}]' \
+  '[{"recorder_instance_id":"a","recorder_first_sequence":2,"recorder_last_sequence":2}]' | jq -se '
+  (.[0] + .[1]) as $runs |
+  all(range(1; ($runs | length)); . as $index |
+    $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1))
+' >/dev/null
+if printf '%s\n%s\n' \
+    '[{"recorder_instance_id":"a","recorder_first_sequence":1,"recorder_last_sequence":1}]' \
+    '[{"recorder_instance_id":"a","recorder_first_sequence":3,"recorder_last_sequence":3}]' | jq -se '
+    (.[0] + .[1]) as $runs |
+    all(range(1; ($runs | length)); . as $index |
+      $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1))
+  ' >/dev/null; then
+  echo 'gapped cross-hour recorder sequence unexpectedly passed' >&2
+  exit 1
+fi
+
 cat >"$fake/curl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$FAKE_CALLS/curl"

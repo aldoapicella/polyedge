@@ -88,19 +88,29 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260815T050000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-15T05:00:00Z`,
+Ledger `/srv/polyedge-ring/parity/20260815T070000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-15T07:00:00Z`,
 supersedes every earlier zero-credit ledger, keeps Azure authoritative and
 `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-18T05:00:00Z`. Completion still requires 72 consecutive accepted
+`2026-08-18T07:00:00Z`. Completion still requires 72 consecutive accepted
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates.
 
-The `05:00` hour is the first accepted hour. At `06:22:32Z`, the collector
-validated all immutable segment/upload/recorder continuity, 60/60 healthy
-provenance observations, exact source and image attestations, and equal Azure,
-OCI, and same-input results. The ledger advanced to one clean live hour while
-remaining `in_progress`, Azure-authoritative, and deletion-locked.
+The `07:00`, `08:00`, and `09:00` hours are accepted. Each has six immutable segment and
+upload proofs, 60/60 healthy feed observations, zero essential-feed errors, a
+60-second maximum gap, and exact Azure/OCI same-input results. The ledger is at
+three consecutive clean live hours while remaining `in_progress`,
+Azure-authoritative, and deletion-locked. The first multi-hour collection also
+exposed two collector defects: missing parentheses in the cross-hour jq merge,
+then a shell-function state leak that selected the prior hour's Azure report.
+Both root causes are fixed, covered by the collector self-test, and proved by
+the accepted real `08:00` retry. Pre-fix scripts remain under
+`/etc/polyedge/rollback/20260815T092707Z-parity-adjacency-fix` and
+`/etc/polyedge/rollback/20260815T093800Z-parity-validator-scope`.
+
+The superseded `20260815T050000Z.json` ledger retained one accepted hour. Its
+`06:00` hour recorded two `PolymarketClobMarket` feed errors, so strict
+continuous-feed parity rejected the hour and no credit was carried forward.
 
 The superseded `20260815T010000Z.json` ledger retained zero credit. The clean
 `01:00` feed hour could not be accepted because the Azure hourly container ran
@@ -186,7 +196,7 @@ The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
 48-hour worst-case projection above the old capacity gate. The mounted
 filesystem now exposes 273,655,873,536 bytes, the conservative projection is
 213,297,534,144 bytes, and the 32-GiB ring reserve, sealing, and upload gates are
-all green. The boot filesystem remains separate with 34.3 GB (31.9 GiB) free,
+all green. The boot filesystem remains separate with 33.3 GB (31.0 GiB) free,
 above the 15-GiB hard deployment floor and below the 75% warning threshold.
 Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260814T134524Z-azure-primary-e504c51`,
