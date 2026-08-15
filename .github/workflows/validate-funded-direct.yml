@@ -296,7 +296,7 @@ jobs:
           assert.equal(fundedJob.properties.configuration.replicaTimeout, 11400);
           assert.equal(fundedJob.properties.configuration.replicaRetryLimit, 0);
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
-          const imagePublishStart = workflow.indexOf(
+          const imagePublishStart = workflow.lastIndexOf(
             "- name: Build and publish immutable producer and funded worker images");
           const imagePublish = workflow.slice(
             imagePublishStart,
