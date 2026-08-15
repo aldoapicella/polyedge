@@ -94,6 +94,28 @@ printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
   exit 64
 }
 
+if [ "$job" = daily ]; then
+  daily_image=$POLYEDGE_RESEARCH_IMAGE
+  parity_env=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+  [ ! -L "$parity_env" ] && [ -f "$parity_env" ] && [ "$(stat -c %h "$parity_env")" = 1 ] || {
+    echo 'daily parity environment is unsafe or missing' >&2
+    exit 64
+  }
+  set -- $(stat -c '%u %g %a' "$parity_env")
+  [ "$1" = "${POLYEDGE_PARITY_EXPECTED_UID:-0}" ] \
+    && [ "$2" = "${POLYEDGE_PARITY_EXPECTED_GID:-0}" ] \
+    && [ "$3" = 640 ] || {
+      echo 'daily parity environment has wrong owner or mode' >&2
+      exit 64
+    }
+  set -a
+  . "$parity_env"
+  set +a
+  POLYEDGE_RESEARCH_IMAGE=$daily_image
+  POLYEDGE_PARITY_BINDINGS_FROZEN=1
+  export POLYEDGE_RESEARCH_IMAGE POLYEDGE_PARITY_BINDINGS_FROZEN
+fi
+
 if [ "$job" != shadow-qset ]; then
   test "${POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH:-}" = true || {
     echo 'POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH must equal true for primary OCI jobs' >&2

@@ -27,10 +27,12 @@ secure_dir() {
 }
 
 env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
-secure_owned_file "$env_file" 640
-set -a
-. "$env_file"
-set +a
+if [ "${POLYEDGE_PARITY_BINDINGS_FROZEN:-}" != 1 ]; then
+  secure_owned_file "$env_file" 640
+  set -a
+  . "$env_file"
+  set +a
+fi
 
 lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
 lock_ledger() {

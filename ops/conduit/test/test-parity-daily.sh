@@ -79,6 +79,25 @@ run_recorder() {
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" "$recorder" "$date"
 }
 
+frozen=$root/frozen
+fixture "$frozen"
+make_bundle "$frozen" 2026-08-11 2026-08-12T08:00:00Z
+set -a
+. "$frozen/parity.env"
+set +a
+printf '%s\n' 'POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' \
+  >"$frozen/parity.env"
+chmod 0640 "$frozen/parity.env"
+env PATH="$fake:$PATH" POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
+  POLYEDGE_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  POLYEDGE_PARITY_BINDINGS_FROZEN=1 POLYEDGE_PARITY_ENV_FILE="$frozen/parity.env" \
+  "$recorder" 2026-08-11 >/dev/null
+[ "$(jq -r '.completedDailyCycles' "$frozen/ring/parity/ledger.json")" = 1 ]
+unset POLYEDGE_PARITY_WINDOW_START_UTC POLYEDGE_PARITY_LEDGER POLYEDGE_PARITY_RING_ROOT \
+  POLYEDGE_PARITY_DAILY_REPORT_ROOT POLYEDGE_PARITY_DAILY_DATA_ROOT POLYEDGE_PARITY_RING_STATUS \
+  POLYEDGE_PARITY_BOOT_ROOT POLYEDGE_PARITY_PAUSE_FILE POLYEDGE_PARITY_LOCK_FILE \
+  POLYEDGE_PARITY_EXPECTED_GIT_SHA POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE
+
 prewindow=$root/prewindow
 fixture "$prewindow"
 prewindow_ledger_sha=$(sha256sum "$prewindow/ring/parity/ledger.json")
