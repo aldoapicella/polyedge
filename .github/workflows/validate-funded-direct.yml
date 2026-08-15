@@ -133,12 +133,16 @@ jobs:
           latest="${prefix}latest-redemption.json"
           archive_prefix="${prefix}redemptions/"
           archive="${archive_prefix}2026-08-15/venue-redemption-20260815001356008-deadbeef.json"
-          common=(--argjson authorized_ceiling 29.505501 --argjson settlement_bindings '[]' --arg latest "$latest")
+          common=(--argjson authorized_ceiling 29.505501 --arg latest "$latest")
           valid_failed='{"schema_version":1,"finished_ts":"2026-08-15T00:13:56.008Z","run_id":"venue-redemption-20260815001356008-deadbeef","status":"failed_closed","error":"Data API positions returned HTTP 429","redemption_submitted":false,"research_only":false,"live_strategy_enabled":true}'
+          valid_timeout="$(printf '%s\n' "$valid_failed" | jq -c \
+            '.error="The operation was aborted due to timeout"')"
           validate_record() {
             local blob_name="$1"
             local document="$2"
+            local settlement_bindings="${3:-[]}"
             printf '%s\n' "$document" | jq -e "${common[@]}" \
+              --argjson settlement_bindings "$settlement_bindings" \
               --arg blob_name "$blob_name" "$redemption_filter" >/dev/null || return 1
             if [ "$blob_name" != "$latest" ]; then
               local redemption_date redemption_run
@@ -154,7 +158,15 @@ jobs:
             fi
           }
           validate_record "$archive" "$valid_failed"
+          validate_record "$archive" "$valid_timeout"
           reject_record "$latest" "$valid_failed"
+          reject_record "$latest" "$valid_timeout"
+          reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.redemption_submitted=true')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.research_only=true')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.live_strategy_enabled=false')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.unexpected="no"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c 'del(.research_only)')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.error="The operation was aborted due to timeout."')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.error="Data API positions returned HTTP 500"')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.redemption_submitted=true')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.unexpected="no"')"
@@ -164,6 +176,76 @@ jobs:
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.finished_ts="2026-02-30T00:13:56.008Z"')"
           valid_noop='{"schema_version":1,"finished_ts":"2026-08-15T00:14:56.008Z","run_id":"venue-redemption-20260815001456008-acde1234","status":"nothing_to_redeem","execution_origin":"azure_chile_central_static_egress","execution_country":"CL","static_egress_verified":true,"dry_run":false,"redemption_enabled":true,"zero_open_orders_confirmed":true,"derived_wallet_match":true,"wallet_type":"legacy_uups_deposit_wallet","research_only":false,"live_strategy_enabled":true,"liquid_collateral_before":5,"redemption_submitted":false,"selection":{"selected":[],"selected_gross_payout":0},"planned_calls":[]}'
           validate_record "$latest" "$valid_noop"
+          transaction_hash="0x$(printf 'a%.0s' {1..64})"
+          condition_id="0x$(printf 'b%.0s' {1..64})"
+          settlement_blob="${prefix}internal-settlements/$(printf 'c%.0s' {1..64}).json"
+          settlement_bindings=$(jq -cn \
+            --arg blob_name "$settlement_blob" \
+            --arg transaction_hash "$transaction_hash" \
+            --arg condition_id "$condition_id" '[{
+              blob_name: $blob_name,
+              type: "internal_automatic_settlement",
+              transaction_hash: $transaction_hash,
+              condition_id: $condition_id,
+              payout: 2
+            }]')
+          valid_verified=$(jq -cn \
+            --arg transaction_hash "$transaction_hash" \
+            --arg condition_id "$condition_id" \
+            --arg settlement_blob "$settlement_blob" '{
+              schema_version: 1,
+              finished_ts: "2026-08-15T00:15:56.008Z",
+              run_id: "venue-redemption-20260815001556008-f00dbabe",
+              status: "redeemed_and_verified",
+              execution_origin: "azure_chile_central_static_egress",
+              execution_country: "CL",
+              static_egress_verified: true,
+              dry_run: false,
+              redemption_enabled: true,
+              zero_open_orders_confirmed: true,
+              derived_wallet_match: true,
+              wallet_type: "legacy_uups_deposit_wallet",
+              research_only: false,
+              live_strategy_enabled: true,
+              liquid_collateral_before: 5,
+              redemption_submitted: true,
+              selection: {
+                selected: [{condition_id: $condition_id, gross_payout: 2}],
+                selected_gross_payout: 2
+              },
+              planned_calls: [{}],
+              transaction_id: "fixture-transaction",
+              transaction_hash: $transaction_hash,
+              liquid_collateral_after: 7,
+              realized_payout: 2,
+              internal_settlement_blobs: [$settlement_blob]
+            }')
+          verified_archive="${archive_prefix}2026-08-15/venue-redemption-20260815001556008-f00dbabe.json"
+          validate_record "$verified_archive" "$valid_verified" "$settlement_bindings"
+          validate_record "$latest" "$valid_verified" "$settlement_bindings"
+          validate_latest_archive() {
+            local latest_document="$1"
+            shift
+            local latest_sha archive_document archive_sha
+            validate_record "$latest" "$latest_document" "$settlement_bindings"
+            latest_sha=$(printf '%s' "$latest_document" | sha256sum | cut -d' ' -f1)
+            for archive_document in "$@"; do
+              validate_record "$verified_archive" "$archive_document" "$settlement_bindings"
+              archive_sha=$(printf '%s' "$archive_document" | sha256sum | cut -d' ' -f1)
+              [ "$latest_sha" = "$archive_sha" ] && return 0
+            done
+            return 1
+          }
+          reject_latest_archive() {
+            if validate_latest_archive "$@"; then
+              echo "unexpected accepted latest redemption archive fixture" >&2
+              exit 1
+            fi
+          }
+          validate_latest_archive "$valid_verified" "$valid_verified"
+          reject_latest_archive "$valid_verified"
+          reject_latest_archive "$valid_verified" \
+            "$(printf '%s\n' "$valid_verified" | jq -c '.transaction_id="mismatched-archive"')"
 
       - uses: actions/setup-node@v4
         with:
@@ -351,7 +433,11 @@ jobs:
           assert.match(preparePreflight,
             /redeemed_and_verified[\s\S]*internal_settlement_blobs[\s\S]*settlement_bindings/);
           assert.match(preparePreflight,
-            /blob_name == \$latest or \.status == "nothing_to_redeem"[\s\S]*\.status == "nothing_to_redeem"/);
+            /if \.status == "nothing_to_redeem" then[\s\S]*elif \.status == "redeemed_and_verified" then/);
+          assert.match(preparePreflight,
+            /\.error == "Data API positions returned HTTP 429"[\s\S]*\.error == "The operation was aborted due to timeout"/);
+          assert.match(preparePreflight,
+            /if \[ "\$archive_count" != "0" \]; then[\s\S]*grep -Fqx "\$latest_redemption_sha" existing-v10-redemption-sha256\.txt/);
           assert.match(preparePreflight,
             /settlement_bindings[\s\S]*internal_automatic_settlement[\s\S]*transaction_hash == \$transaction_hash[\s\S]*gross_payout/);
           assert.match(preparePreflight,
@@ -378,7 +464,7 @@ jobs:
           assert.match(preparePreflight,
             /child_failed_closed_pre_submission[\s\S]*authorization_consumed == false[\s\S]*risk_reservation_created == false[\s\S]*authorization_consumed == true[\s\S]*risk_reservation_created == true/);
           assert.match(preparePreflight,
-            /child_failed_closed_post_submission_unresolved[\s\S]*released_no_order[\s\S]*order_submitted == false[\s\S]*zero_open_orders_confirmed == true/);
+            /\["child_completed", "child_failed_closed_post_submission_unresolved"\]\s*\|\s*index\(\$completion_status\)[\s\S]*position_settled/);
           assert.match(preparePreflight,
             /child_failed_closed_pre_submission[\s\S]*reservation_count[\s\S]*released_no_order/);
           const pointerPreflightMarker = workflow.indexOf(
@@ -1796,7 +1882,8 @@ jobs:
                 and .campaign_id == "dynamic-quote-funded-2026-08-13-v10"
                 and .run_id == $run
                 and .probe_id == ("funded-direct-" + $decision)
-                and (if $completion_status == "child_completed" then
+                and (if ["child_completed", "child_failed_closed_post_submission_unresolved"]
+                  | index($completion_status) then
                   .order_submitted == true
                   and (
                     (.state == "finalized_no_fill"
@@ -1866,7 +1953,8 @@ jobs:
               and (.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}\\z"))
               and (if .status == "failed_closed" then
                 $blob_name != $latest
-                and .error == "Data API positions returned HTTP 429"
+                and (.error == "Data API positions returned HTTP 429"
+                  or .error == "The operation was aborted due to timeout")
                 and .redemption_submitted == false
                 and .research_only == false
                 and .live_strategy_enabled == true
@@ -1890,9 +1978,7 @@ jobs:
                 and .liquid_collateral_before > 0
                 and .liquid_collateral_before <=
                   (if $blob_name == $latest then $authorized_ceiling else 29.505501 end)
-                and (if $blob_name == $latest or .status == "nothing_to_redeem" then
-                .status == "nothing_to_redeem"
-                and
+                and (if .status == "nothing_to_redeem" then
                 .redemption_submitted == false
                 and .selection.selected == []
                 and .selection.selected_gross_payout == 0
