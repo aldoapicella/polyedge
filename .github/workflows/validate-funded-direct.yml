@@ -117,6 +117,51 @@ jobs:
           NODE
           node --test .github/workflows/verify-funded-v10-intent.mjs
 
+      - name: Validate archived failed-closed redemption guard
+        run: |
+          set -euo pipefail
+          redemption_filter=$(awk '
+            /--arg blob_name .*--arg latest .*v10_latest_redemption.*\047$/ {capture=1; next}
+            capture && /^[[:space:]]*\047 "\$redemption_file"/ {exit}
+            capture {sub(/^              /, ""); print}
+          ' .github/workflows/validate-funded-direct.yml)
+          test -n "$redemption_filter"
+          prefix='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/'
+          latest="${prefix}latest-redemption.json"
+          archive_prefix="${prefix}redemptions/"
+          archive="${archive_prefix}2026-08-15/venue-redemption-20260815001356008-deadbeef.json"
+          common=(--argjson authorized_ceiling 29.505501 --argjson settlement_bindings '[]' --arg latest "$latest")
+          valid_failed='{"schema_version":1,"finished_ts":"2026-08-15T00:13:56.008Z","run_id":"venue-redemption-20260815001356008-deadbeef","status":"failed_closed","error":"Data API positions returned HTTP 429","redemption_submitted":false,"research_only":false,"live_strategy_enabled":true}'
+          validate_record() {
+            local blob_name="$1"
+            local document="$2"
+            printf '%s\n' "$document" | jq -e "${common[@]}" \
+              --arg blob_name "$blob_name" "$redemption_filter" >/dev/null || return 1
+            if [ "$blob_name" != "$latest" ]; then
+              local redemption_date redemption_run
+              redemption_date=$(printf '%s\n' "$document" | jq -r '.finished_ts[0:10]')
+              redemption_run=$(printf '%s\n' "$document" | jq -r '.run_id')
+              test "$blob_name" = "${archive_prefix}${redemption_date}/${redemption_run}.json"
+            fi
+          }
+          reject_record() {
+            if validate_record "$1" "$2"; then
+              echo "unexpected accepted redemption fixture" >&2
+              exit 1
+            fi
+          }
+          validate_record "$archive" "$valid_failed"
+          reject_record "$latest" "$valid_failed"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.error="Data API positions returned HTTP 500"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.redemption_submitted=true')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.unexpected="no"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c 'del(.research_only)')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.run_id += "\n"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.finished_ts="2026-08-15garbage"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.finished_ts="2026-02-30T00:13:56.008Z"')"
+          valid_noop='{"schema_version":1,"finished_ts":"2026-08-15T00:14:56.008Z","run_id":"venue-redemption-20260815001456008-acde1234","status":"nothing_to_redeem","execution_origin":"azure_chile_central_static_egress","execution_country":"CL","static_egress_verified":true,"dry_run":false,"redemption_enabled":true,"zero_open_orders_confirmed":true,"derived_wallet_match":true,"wallet_type":"legacy_uups_deposit_wallet","research_only":false,"live_strategy_enabled":true,"liquid_collateral_before":5,"redemption_submitted":false,"selection":{"selected":[],"selected_gross_payout":0},"planned_calls":[]}'
+          validate_record "$latest" "$valid_noop"
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -1744,22 +1789,39 @@ jobs:
               --arg blob_name "$blob_name" --arg latest "$v10_latest_redemption" '
               .schema_version == 1
               and (.finished_ts | type == "string")
-              and (.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
-              and .execution_origin == "azure_chile_central_static_egress"
-              and .execution_country == "CL"
-              and .static_egress_verified == true
-              and .dry_run == false
-              and .redemption_enabled == true
-              and .zero_open_orders_confirmed == true
-              and .derived_wallet_match == true
-              and .wallet_type == "legacy_uups_deposit_wallet"
-              and .research_only == false
-              and .live_strategy_enabled == true
-              and (.liquid_collateral_before | type == "number")
-              and .liquid_collateral_before > 0
-              and .liquid_collateral_before <=
-                (if $blob_name == $latest then $authorized_ceiling else 29.505501 end)
-              and (if $blob_name == $latest or .status == "nothing_to_redeem" then
+              and (.finished_ts
+                | test("^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z\\z")
+                and (sub("\\.[0-9]{3}Z\\z"; "Z") as $whole_seconds
+                  | (try ($whole_seconds | fromdateiso8601 | todateiso8601) catch null)
+                    == $whole_seconds))
+              and (.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}\\z"))
+              and (if .status == "failed_closed" then
+                $blob_name != $latest
+                and .error == "Data API positions returned HTTP 429"
+                and .redemption_submitted == false
+                and .research_only == false
+                and .live_strategy_enabled == true
+                and ((keys | sort) == ([
+                  "error", "finished_ts", "live_strategy_enabled",
+                  "redemption_submitted", "research_only", "run_id",
+                  "schema_version", "status"
+                ] | sort))
+              else
+                .execution_origin == "azure_chile_central_static_egress"
+                and .execution_country == "CL"
+                and .static_egress_verified == true
+                and .dry_run == false
+                and .redemption_enabled == true
+                and .zero_open_orders_confirmed == true
+                and .derived_wallet_match == true
+                and .wallet_type == "legacy_uups_deposit_wallet"
+                and .research_only == false
+                and .live_strategy_enabled == true
+                and (.liquid_collateral_before | type == "number")
+                and .liquid_collateral_before > 0
+                and .liquid_collateral_before <=
+                  (if $blob_name == $latest then $authorized_ceiling else 29.505501 end)
+                and (if $blob_name == $latest or .status == "nothing_to_redeem" then
                 .status == "nothing_to_redeem"
                 and
                 .redemption_submitted == false
@@ -1807,6 +1869,7 @@ jobs:
                     <= 0.0000011
                 )
               else false
+              end)
               end)
             ' "$redemption_file" >/dev/null
             redemption_sha="sha256:$(sha256sum "$redemption_file" | cut -d' ' -f1)"
