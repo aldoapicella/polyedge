@@ -6,6 +6,8 @@ on:
       - ".github/workflows/validate-funded-direct.yml"
       - ".github/workflows/verify-funded-v10-intent.mjs"
       - ".github/workflows/verify-funded-v10-settlement.mjs"
+      - "scripts/test-verify-funded-v10-capital.sh"
+      - "scripts/verify-funded-v10-capital.sh"
       - "crates/polyedge-api/**"
       - "crates/polyedge-config/**"
       - "crates/polyedge-domain/**"
@@ -344,6 +346,21 @@ jobs:
             /blob_name == \$latest[\s\S]*authorized_ceiling[\s\S]*29\.505501/);
           assert.equal(preparePreflight.includes(".verified_realized_pnl == 0"), false);
           assert.equal(preparePreflight.includes(".verified_settlement_ids == []"), false);
+          const capitalVerifier = fs.readFileSync("scripts/verify-funded-v10-capital.sh", "utf8");
+          assert.equal(capitalVerifier.includes(".account_equity <= 29.505501"), false);
+          assert.equal(capitalVerifier.includes(".authorized_equity_ceiling == 29.505501"), false);
+          assert.equal(capitalVerifier.includes(".verified_realized_pnl == 0"), false);
+          assert.equal(capitalVerifier.includes(".verified_settlement_ids == []"), false);
+          assert.match(capitalVerifier,
+            /verify-funded-v10-settlement\.mjs[\s\S]*authorized_equity_ceiling - \(29\.505501 \+ \$settlement_pnl\)/);
+          assert.match(capitalVerifier,
+            /--if-match "\$settlement_etag"[\s\S]*--if-match "\$state_etag"/);
+          assert.match(capitalVerifier,
+            /cmp "\$attempt_dir\/settlements-before\.json"[\s\S]*settlements-after\.json[\s\S]*cmp "\$attempt_dir\/state-before\.json"[\s\S]*state-after\.json/);
+          assert.match(capitalVerifier,
+            /\.high_water_equity >= \.authorized_equity_ceiling[\s\S]*\.historical_high_water_equity >= \.high_water_equity/);
+          assert.match(capitalVerifier,
+            /> "\$attempt_dir\/settlements\.tsv" \|\| return 1[\s\S]*done < "\$attempt_dir\/settlements\.tsv"/);
           assert.match(preparePreflight,
             /expired_before_child_launch[\s\S]*order_submission_attempted == false[\s\S]*risk_reservation_created == false/);
           assert.match(preparePreflight,
@@ -473,6 +490,7 @@ jobs:
             "-o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }"
           ]) assert.ok(workflow.includes(retry), `missing bounded Log Analytics retry: ${retry}`);
           NODE
+          bash scripts/test-verify-funded-v10-capital.sh
           git diff --check
 
   deploy-funded-service:
