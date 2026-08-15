@@ -398,6 +398,8 @@ jobs:
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
+          assert.match(activation,
+            /download_v10_blob\(\)[\s\S]*for attempt in 1 2 3[\s\S]*download_v10_blob "\$authorization_blob" funded-v10-authorization\.json[\s\S]*download_v10_blob "\$completion_blob" funded-v10-completion\.json/);
           assert.match(activation, /TimeGenerated <= datetime\(\$lifecycle_completed_at\)/);
           assert.match(activation,
             /authorization_day=\$\(date -u -d "\$authorization_at" \+%Y-%m-%d\)/);
@@ -3012,23 +3014,26 @@ jobs:
           test "$intent_prefix" = "reports/research/venue-probe/control/strategy-canary/intents"
           authorization_blob="$control_prefix/sessions/dynamic-quote-funded-2026-08-13-v10/authorizations/$decision_id.json"
           completion_blob="$control_prefix/sessions/dynamic-quote-funded-2026-08-13-v10/completed/$decision_id.json"
-          az storage blob download \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$FUNDED_CONTAINER" \
-            --name "$authorization_blob" \
-            --file funded-v10-authorization.json \
-            --auth-mode login \
-            --overwrite \
-            --only-show-errors -o none
+          download_v10_blob() {
+            local blob_name=$1 output_file=$2
+            for attempt in 1 2 3; do
+              if az storage blob download \
+                  --account-name "$STORAGE_ACCOUNT" \
+                  --container-name "$FUNDED_CONTAINER" \
+                  --name "$blob_name" \
+                  --file "$output_file" \
+                  --auth-mode login \
+                  --overwrite \
+                  --only-show-errors -o none; then
+                return 0
+              fi
+              [ "$attempt" = 3 ] || sleep "$((attempt * 5))"
+            done
+            return 1
+          }
+          download_v10_blob "$authorization_blob" funded-v10-authorization.json
           authorization_sha256="sha256:$(sha256sum funded-v10-authorization.json | cut -d' ' -f1)"
-          az storage blob download \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$FUNDED_CONTAINER" \
-            --name "$completion_blob" \
-            --file funded-v10-completion.json \
-            --auth-mode login \
-            --overwrite \
-            --only-show-errors -o none
+          download_v10_blob "$completion_blob" funded-v10-completion.json
           jq -e --arg decision "$decision_id" --arg authorization_blob "$authorization_blob" --arg authorization_sha "$authorization_sha256" '
             .schema == "polyedge.operator_funded_intent_completion.v1"
             and .session_id == "dynamic-quote-funded-2026-08-13-v10"
