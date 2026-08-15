@@ -96,6 +96,12 @@ supersedes every earlier zero-credit ledger, keeps Azure authoritative and
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates.
 
+The `05:00` hour is the first accepted hour. At `06:22:32Z`, the collector
+validated all immutable segment/upload/recorder continuity, 60/60 healthy
+provenance observations, exact source and image attestations, and equal Azure,
+OCI, and same-input results. The ledger advanced to one clean live hour while
+remaining `in_progress`, Azure-authoritative, and deletion-locked.
+
 The superseded `20260815T010000Z.json` ledger retained zero credit. The clean
 `01:00` feed hour could not be accepted because the Azure hourly container ran
 the correct image while its nested generator provenance still named the prior
@@ -165,7 +171,8 @@ manifest was imported without rebuild into ACR as
 `polyedge-rust-research@sha256:1c75b1883fa68c41bdfb30d1805ff82bda5f559993cd426b02b82f6af3bed204`.
 
 Azure primary revision `polyedge-dev--0000131` is healthy with one replica on
-the exact ACR digest; healthy revision `0000130` remains active as the immediate
+the exact ACR digest. The app remains in single-revision mode, so the prior
+digest and protected template—not a second live replica—are the immediate
 rollback target. The protected configuration excluding the image is unchanged,
 and the frontend, identity, secrets, scaling, and paper guards remain intact.
 The Azure hourly comparator uses the same ACR digest for both its container and
@@ -424,19 +431,19 @@ the funded identity, exact non-secret environment, origin check, queue repair,
 and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review all pass. Root remains the
 single-host trust ceiling and can administer both containers.
 
-The live funded trader remains the Azure Container App revision
-`polyedge-funded-direct-cl--0000158`; the local OCI funded signer is still
-disabled. Its signed v10 session has five terminal records: three settled
-positions and two finalized no-fills, with all five reservations reconciled and
-zero unresolved reservations or open orders. Post-loss current-equity resizing
-is proven. Recent intents completed within the seven-second send bound, while
-post-only crossing and venue rejection paths continued to fail closed and
-release risk. The worker remained healthy and processing after one message took
-the shared persistent fail-closed path at 10:05 UTC. Sanitized logs do not reveal
-whether that message was a warmup or intent; the schema-only DLQ peek was
-rate-limited and remains a read-only audit follow-up. The Service Bus queue has
-zero active or scheduled messages and 859 quarantined messages. Nothing is
-replayed or purged without classification.
+The continuous funded v10 cutover is not yet live; the local OCI funded signer
+is also still disabled. Guarded run `31865237346` passed safety/history,
+zero-write preflight, exact controls, Service Bus, qset isolation, and warmup.
+Three intents then failed closed before submission at the final volatile,
+post-only-cross, and WebSocket gates. One more lifecycle completed within the
+seven-second send bound and attempted submission, but did not prove an accepted
+order or reach terminal reservation verification, so the workflow refused the
+cutover and rolled back. Azure revision `polyedge-funded-direct-cl--0000201` is
+healthy in the dormant state with minimum replicas zero, dry-run true, and all
+live/trading controls false. The queue is `SendDisabled` with zero active or
+scheduled messages and 860 quarantined messages. No matching application
+dead-letter event identifies the newest quarantine, so nothing is replayed or
+purged without classification.
 
 Primary research jobs share one serialized workspace so daily normalization,
 replay, prospective validation, and backfills reuse local artifacts. The qset
