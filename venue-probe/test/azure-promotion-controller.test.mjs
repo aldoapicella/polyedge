@@ -14,7 +14,7 @@ import {
   surface,
   validateTarget
 } from "../src/azure-promotion-controller.mjs";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -210,7 +210,7 @@ function promotionEnvironment(overrides = {}) {
     AZURE_SUBSCRIPTION_ID: "11111111-1111-1111-1111-111111111111",
     AZURE_TENANT_ID: "22222222-2222-2222-2222-222222222222",
     AZURE_CLIENT_ID: "33333333-3333-3333-3333-333333333333",
-    AZURE_FEDERATED_TOKEN_FILE: "/run/polyedge-federated-promotion/azure-federated-token",
+    AZURE_FEDERATED_TOKEN_FILE: "/run/credentials/polyedge-azure-promotion.service/azure-federated-token",
     AZURE_TOKEN_CREDENTIALS: "WorkloadIdentityCredential",
     AZURE_RESOURCE_GROUP: "rg-polyedge-dev",
     POLYEDGE_PROMOTION_IMAGE: candidate,
@@ -239,8 +239,14 @@ function freezeAttestation(overrides = {}) {
 test("config pins the dedicated workload-identity credential lane", () => {
   assert.equal(loadConfig(promotionEnvironment()).candidateRunId, "123456");
   assert.throws(() => loadConfig(promotionEnvironment({ AZURE_TOKEN_CREDENTIALS: "prod" })), /pin WorkloadIdentityCredential/);
-  assert.throws(() => loadConfig(promotionEnvironment({ AZURE_FEDERATED_TOKEN_FILE: "/tmp/token" })), /dedicated promotion-controller lane/);
+  assert.throws(() => loadConfig(promotionEnvironment({ AZURE_FEDERATED_TOKEN_FILE: "/tmp/token" })), /dedicated systemd promotion credential/);
   assert.throws(() => loadConfig(promotionEnvironment({ POLYEDGE_PROMOTION_STATE_DIR: "/tmp/state" })), /systemd StateDirectory path/);
+});
+
+test("systemd bridges only the dedicated rotating promotion token", async () => {
+  const unit = await readFile(new URL("../../ops/conduit/systemd/polyedge-azure-promotion.service", import.meta.url), "utf8");
+  assert.match(unit, /^LoadCredential=azure-federated-token:\/run\/polyedge-federated-promotion\/azure-federated-token$/m);
+  assert.match(unit, /^Environment=AZURE_FEDERATED_TOKEN_FILE=%d\/azure-federated-token$/m);
 });
 
 test("freeze marker rejects expiry and an unbound candidate", async () => {
