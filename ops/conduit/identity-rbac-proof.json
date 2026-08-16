@@ -205,6 +205,63 @@
           "passed": true
         }
       ]
+    },
+    "promotion-controller": {
+      "capturedAtUtc": "2026-08-16T02:47:30Z",
+      "identity": {
+        "resourceId": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-promotion-controller",
+        "clientId": "53998a46-82cb-4f4b-aa25-f08ec679c316",
+        "principalId": "9a3f6f30-7105-41ac-bb47-8a16046ee02b"
+      },
+      "federatedCredential": {
+        "name": "fic-spire-conduit-promotion-controller",
+        "issuer": "https://oidc.jupiterlabs.dev",
+        "subject": "spiffe://polyedge.local/conduit/promotion-controller",
+        "audiences": [
+          "api://AzureADTokenExchange"
+        ]
+      },
+      "assignmentCount": 2,
+      "deploymentTemplate": "../../infra/conduit-promotion-identity.bicep",
+      "exactDeploymentTemplateMatch": true,
+      "workloadEnabled": false,
+      "role": "PolyEdge OCI Promotion Controller",
+      "exactPositiveScopes": [
+        "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.App/containerApps/polyedge-dev",
+        "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job"
+      ],
+      "assignments": [
+        {
+          "id": "412457fc-1da9-541b-9c77-1278359e6ecb",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job"
+        },
+        {
+          "id": "ee790e0f-9d9a-590f-9545-1a0b56953955",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.App/containerApps/polyedge-dev"
+        }
+      ],
+      "readOnlySdkChecks": {
+        "tokenIdentityMatched": true,
+        "primaryAppGetStatusCode": 200,
+        "hourlyJobGetStatusCode": 200,
+        "fundedAppGetStatusCode": 403,
+        "resourceGroupGetStatusCode": 403,
+        "roleAssignmentListStatusCode": 403,
+        "resourceGroupResourcesList": {
+          "statusCode": 200,
+          "returnedExactly": [
+            "Microsoft.App/containerApps/polyedge-dev",
+            "Microsoft.App/jobs/polyedge-hourly-quality-job"
+          ],
+          "semantics": "Azure returns a filtered collection response for resources individually readable by this identity; this is not resource-group read access."
+        }
+      },
+      "negativeAssertions": [
+        {
+          "assertion": "no funded application, resource-group read, or role-assignment list permission",
+          "passed": true
+        }
+      ]
     }
   },
   "arc": {
@@ -225,6 +282,26 @@
       "dataActions": [],
       "assignableScopes": [
         "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c"
+      ],
+      "exactDefinitionMatch": true
+    },
+    "promotionController": {
+      "id": "e4d113d2-e955-4259-8214-2b919eaef2c0",
+      "name": "PolyEdge OCI Promotion Controller",
+      "actions": [
+        "Microsoft.App/containerApps/read",
+        "Microsoft.App/containerApps/write",
+        "Microsoft.App/jobs/read",
+        "Microsoft.App/jobs/write",
+        "Microsoft.App/jobs/executions/read",
+        "Microsoft.App/jobs/start/action",
+        "Microsoft.App/jobs/stop/execution/action"
+      ],
+      "dataActions": [],
+      "notActions": [],
+      "notDataActions": [],
+      "assignableScopes": [
+        "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev"
       ],
       "exactDefinitionMatch": true
     }

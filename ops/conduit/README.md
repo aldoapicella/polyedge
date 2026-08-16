@@ -434,6 +434,33 @@ only the positive scopes in `identity-rbac-plan.json` were assigned. Live IDs,
 role counts, positive reads, and cross-lane 403 checks are captured without
 credentials in `identity-rbac-proof.json`.
 
+The isolated promotion controller is a fifth UAMI,
+`id-polyedge-conduit-promotion-controller`, with only the custom `PolyEdge OCI
+Promotion Controller` role assigned directly to `polyedge-dev` and
+`polyedge-hourly-quality-job`. Its local `promotion` lane maps exactly to
+`spiffe://polyedge.local/conduit/promotion-controller`; its live UAMI, FIC,
+two assignments, and isolated SDK 200/403 proof are recorded in
+`identity-rbac-proof.json`. A resource-group resources-list response can be
+200 while returning only those two individually readable resources; it is Azure
+filtered-list behavior, not resource-group read access. The controller remains
+disabled.
+
+## Promotion controller runtime
+
+`polyedge-azure-promotion.service` uses the checksum-verified isolated Node
+v24 LTS runtime at `/opt/polyedge-node`. The installed runtime is `v24.19.0`
+Linux ARM64, verified from the release archive SHA-256
+`01443c1e1a29e531ccad5a46fefa6df490d2189c49f7955904aecdbb0fe86fdc`.
+Extract it with `sudo tar --no-same-owner -xJf ... -C /opt`, or explicitly fix
+ownership, then require this to print nothing before a root unit uses it:
+
+```sh
+find -L /opt/polyedge-node -xdev \( ! -user root -o ! -group root -o -perm /022 \) -print
+```
+
+Do not substitute system `/usr/bin/node` 18: it is EOL and unsupported by the
+installed Azure SDK.
+
 The funded signer is a separate, no-ingress, read-only container. Only it gets
 the Podman wallet secrets and its dedicated Azure funded identity; the API and
 research jobs get neither. It has no install target and remains disabled until

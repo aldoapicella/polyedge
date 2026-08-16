@@ -16,7 +16,7 @@ UMask=0077
 Environment=PATH=/usr/local/bin:/usr/bin
 Environment=AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential
 EnvironmentFile=/etc/polyedge/promotion-controller.env
-ExecStart=/usr/bin/node /srv/polyedge/venue-probe/src/azure-promotion-controller.mjs
+ExecStart=/opt/polyedge-node/bin/node /srv/polyedge/venue-probe/src/azure-promotion-controller.mjs
 TimeoutStartSec=75min
 Restart=on-failure
 RestartPreventExitStatus=64 78
