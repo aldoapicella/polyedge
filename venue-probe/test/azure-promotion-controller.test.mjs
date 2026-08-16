@@ -432,7 +432,7 @@ test("a never-resolving workload token is bounded by the shared forward deadline
   globalThis.fetch = async () => { fetched = true; throw new Error("fetch must not run without a token"); };
   try {
     const now = performance.now();
-    const timing = Object.freeze({ forwardDeadlineMonotonicMs: now + 20, transactionDeadlineMonotonicMs: now + 600_020 });
+    const timing = Object.freeze({ forwardDeadlineMonotonicMs: now + 20, transactionDeadlineMonotonicMs: now + 600_025 });
     const arm = new ArmClient({ getToken: () => new Promise(() => {}) }, async () => {}, () => performance.now());
     const store = journalStore();
     await assert.rejects(runPromotion({ arm, config: { ...config, monotonicNow: () => performance.now(), promotionTiming: timing }, ...store }), /token acquisition exceeded its phase deadline/);
