@@ -602,6 +602,16 @@ jobs:
           assert.equal(fundedJob.properties.configuration.replicaTimeout, 11400);
           assert.equal(fundedJob.properties.configuration.replicaRetryLimit, 0);
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
+          const rerunFenceStart = workflow.lastIndexOf(
+            "\n      - name: Fence queue and verify predecessor before dormant v8 audit");
+          const rerunFenceEnd = workflow.indexOf(
+            "\n      - name: Retire exact dormant v8 before any v10 deployment",
+            rerunFenceStart);
+          const rerunFence = workflow.slice(rerunFenceStart, rerunFenceEnd)
+            .replace(/\\\s+/g, " ")
+            .replace(/\s+/g, " ");
+          assert.match(rerunFence,
+            /1\) for name in FUNDED_DIRECT_SERVICE_ENABLED FUNDED_DIRECT_WORKER_ENABLED FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED ALLOW_FUNDED_DIRECT; do[\s\S]*= "true"[\s\S]*for name in ALLOW_LIVE ALLOW_STRATEGY_CANARY ENABLE_TAKER_ORDERS; do[\s\S]*= "false"/);
           const imagePublishStart = workflow.lastIndexOf(
             "- name: Build and publish immutable producer and funded worker images");
           const imagePublish = workflow.slice(
@@ -1443,13 +1453,16 @@ jobs:
                     FUNDED_DIRECT_SERVICE_ENABLED \
                     FUNDED_DIRECT_WORKER_ENABLED \
                     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED \
-                    ALLOW_FUNDED_DIRECT \
-                    ALLOW_LIVE \
-                    ALLOW_STRATEGY_CANARY; do
+                    ALLOW_FUNDED_DIRECT; do
                     test "$(env_value "$name")" = "true"
                   done
+                  for name in \
+                    ALLOW_LIVE \
+                    ALLOW_STRATEGY_CANARY \
+                    ENABLE_TAKER_ORDERS; do
+                    test "$(env_value "$name")" = "false"
+                  done
                   test "$(env_value FUNDED_DIRECT_DRY_RUN)" = "false"
-                  test "$(env_value ENABLE_TAKER_ORDERS)" = "false"
                   ;;
                 *)
                   echo "Refusing v10 rerun from invalid replica configuration: $current_min_replicas" >&2
