@@ -994,6 +994,12 @@ jobs:
             }
           };
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
+          assert.equal(
+            require("node:child_process").execFileSync("jq", ["-cj", "."], {
+              input: "{\"binding\":true}\n"
+            }).toString("utf8"),
+            "{\"binding\":true}"
+          );
           const rerunFenceStart = workflow.lastIndexOf(
             "\n      - name: Fence queue and verify predecessor before dormant v8 audit");
           const dormantV8StorageAuditStart = workflow.indexOf(
@@ -1090,6 +1096,8 @@ jobs:
             /recovery-controls\/\$\{predecessor_run_id\}\.json/);
           assert.match(recoveryBackfill,
             /mutable_control_sha256="sha256:[0-9a-f]{64}"[\s\S]*predecessor_sha256="sha256:[0-9a-f]{64}"[\s\S]*recovery_sha256="sha256:[0-9a-f]{64}"[\s\S]*recovery_binding_sha256="sha256:[0-9a-f]{64}"/);
+          assert.match(recoveryBackfill,
+            /jq -cj '[\s\S]*"\$recovery_file" > recovery-binding\.json/);
           assert.match(recoveryBackfill,
             /test "\$predecessor_sha256"[\s\S]*test "\$recovery_sha256"[\s\S]*test "\$recovery_binding_sha256"[\s\S]*redemption_recovery_journal/);
           assert.match(recoveryBackfill,
@@ -2923,7 +2931,7 @@ jobs:
             printf '%s\n' 'funded_recovery_backfill_recovery_contract_invalid' >&2
             exit 1
           fi
-          jq -c '{
+          jq -cj '{
             transaction_hash: (.transaction_hash | ascii_downcase),
             internal_settlement_blobs: (.internal_settlement_blobs | sort)
           }' "$recovery_file" > recovery-binding.json
