@@ -1672,6 +1672,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
         reconciliation_complete: true,
         zero_open_orders_confirmed: true
       });
+      await refreshCampaignRiskSnapshot(activeResources);
     } catch (releaseError) {
       throw new Error(`fail closed: pre-submit lifecycle failed and no-order risk release also failed (${error.message}; ${releaseError.message})`);
     }
@@ -1723,8 +1724,11 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
         reservation,
         userOrder,
         orderOptions,
-        finalizeNoOrder: (value, finalization) =>
-          finalizeProbeRisk(config, value, finalization),
+        finalizeNoOrder: async (value, finalization) => {
+          const finalized = await finalizeProbeRisk(config, value, finalization);
+          await refreshCampaignRiskSnapshot(activeResources);
+          return finalized;
+        },
         onTransportStarted: recordTransportStarted
       });
     } else {
@@ -2420,6 +2424,7 @@ async function releaseDeterministicRejectedOrder(client, {
       post_send_authenticated_trade_count: 0
     }
   });
+  await refreshCampaignRiskSnapshot(activeResources);
 }
 
 async function getOpenOrdersStrict(client) {
