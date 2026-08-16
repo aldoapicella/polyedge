@@ -56,14 +56,17 @@ jobs:
             dockerfile: Dockerfile.rust
             image: polyedge-rust-backend
             build_args: GIT_SHA=${{ github.sha }}
+            expected_revision: ${{ github.sha }}
           - name: frontend
             dockerfile: Dockerfile.frontend
             image: polyedge-frontend
-            build_args: ''
+            build_args: GIT_SHA=${{ github.sha }}
+            expected_revision: ${{ github.sha }}
           - name: venue-probe
             dockerfile: Dockerfile.venue-probe
             image: polyedge-venue-probe
             build_args: ''
+            expected_revision: ''
 
     steps:
       - uses: actions/checkout@v5
@@ -75,6 +78,7 @@ jobs:
       - name: Build and validate multi-architecture image
         env:
           BUILD_ARGS: ${{ matrix.build_args }}
+          EXPECTED_REVISION: ${{ matrix.expected_revision }}
         run: |
           set -euo pipefail
           args=(
@@ -89,6 +93,7 @@ jobs:
           docker buildx build "${args[@]}" --output "type=oci,dest=image.oci.tar" .
           python3 - image.oci.tar <<'PY'
           import json
+          import os
           import tarfile
           import sys
 
@@ -123,6 +128,9 @@ jobs:
                   image_config = blob(config)
                   platform = (image_config.get("os"), image_config.get("architecture"))
                   if platform in expected:
+                      expected_revision = os.environ.get("EXPECTED_REVISION")
+                      if expected_revision and image_config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != expected_revision:
+                          raise SystemExit(f"image revision metadata does not match {expected_revision}")
                       platforms.add(platform)
                   elif platform not in {(None, None), ("unknown", "unknown")}:
                       raise SystemExit(f"unexpected OCI platform: {platform}")
@@ -151,7 +159,7 @@ jobs:
           - name: frontend
             dockerfile: Dockerfile.frontend
             image: polyedge-frontend
-            build_args: ''
+            build_args: GIT_SHA=${{ github.sha }}
           - name: venue-probe
             dockerfile: Dockerfile.venue-probe
             image: polyedge-venue-probe
