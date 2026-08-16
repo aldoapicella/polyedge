@@ -88,23 +88,22 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260815T070000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-15T07:00:00Z`,
-supersedes every earlier zero-credit ledger, keeps Azure authoritative and
-`azureDeletionAllowed:false`, and cannot finish before
-`2026-08-18T07:00:00Z`. Completion still requires 72 consecutive accepted
-hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
-qset, funded, and deletion gates.
+Ledger `/srv/polyedge-ring/parity/20260816T090000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-16T09:00:00Z`, keeps
+Azure authoritative and `azureDeletionAllowed:false`, and cannot finish before
+`2026-08-19T09:00:00Z`. The pre-window catch-up was recorded only as excluded
+evidence. Completion still requires 72 consecutive accepted hours, two
+successful OCI daily cycles, reboot and rollback proof, and explicit qset,
+funded, and deletion gates.
 
-The `07:00`, `08:00`, and `09:00` hours are accepted. Each has six immutable segment and
-upload proofs, 60/60 healthy feed observations, zero essential-feed errors, a
-60-second maximum gap, and exact Azure/OCI same-input results. The ledger is at
-three consecutive clean live hours while remaining `in_progress`,
-Azure-authoritative, and deletion-locked. The first multi-hour collection also
-exposed two collector defects: missing parentheses in the cross-hour jq merge,
-then a shell-function state leak that selected the prior hour's Azure report.
-Both root causes are fixed, covered by the collector self-test, and proved by
-the accepted real `08:00` retry. Pre-fix scripts remain under
+The superseded `20260815T070000Z.json` ledger retained three accepted hours at
+`07:00`, `08:00`, and `09:00`. Each has six immutable segment and upload proofs,
+60/60 healthy feed observations, zero essential-feed errors, a 60-second
+maximum gap, and exact Azure/OCI same-input results. The first multi-hour
+collection also exposed two collector defects: missing parentheses in the
+cross-hour jq merge, then a shell-function state leak that selected the prior
+hour's Azure report. Both root causes are fixed and covered by the collector
+self-test. Pre-fix scripts remain under
 `/etc/polyedge/rollback/20260815T092707Z-parity-adjacency-fix` and
 `/etc/polyedge/rollback/20260815T093800Z-parity-validator-scope`.
 
@@ -167,37 +166,29 @@ remain recoverable under
 
 The OCI API and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:1c75b1883fa68c41bdfb30d1805ff82bda5f559993cd426b02b82f6af3bed204`
-from source `8af04f6bb254392cd5eb3f33d35805be84de14bc`. Publication run
-`31860741585` passed, its registry and independently computed index digests
-match, and the manifest contains exactly the runnable Linux AMD64 and ARM64
-images plus their provenance/SBOM attestations. This source keeps staggered
-RTDS connections per logical topic and merges only current-generation,
-monotonic events so one clean EOF can be replaced without interrupting the
-peer stream, and gives that peer the configured source timeout to become
-current before rebuilding the socket. Existing watchdogs, recorder gates,
-reconnect accounting, and paper-only controls remain fail closed. The same
-manifest was imported without rebuild into ACR as
-`polyedge-rust-research@sha256:1c75b1883fa68c41bdfb30d1805ff82bda5f559993cd426b02b82f6af3bed204`.
+`sha256:274b9b942bb415eaed56a0fa27c5a0bb95e1db9c72ccd32d31b8084fb46618c0`
+from source `60f1a7cb7b61ffaa95a9743db65ffcf031cdfac6`. The registry index
+contains the runnable Linux AMD64 and ARM64 images, and the same manifest was
+imported without rebuild into ACR. OCI passed its guarded deployment and
+15-minute soak with a healthy API, healthy frontend, zero restarts, current
+essential feeds, and all seven primary job bindings on the exact source and
+digest.
 
-Azure primary revision `polyedge-dev--0000131` is healthy with one replica on
-the exact ACR digest. The app remains in single-revision mode, so the prior
-digest and protected template—not a second live replica—are the immediate
-rollback target. The protected configuration excluding the image is unchanged,
-and the frontend, identity, secrets, scaling, and paper guards remain intact.
-The Azure hourly comparator uses the same ACR digest for both its container and
-nested generator. OCI deployed the exact GHCR digest at
-`2026-08-15T04:38:40Z`; the API came up healthy with zero restarts, the embedded
-Git SHA matches, all four essential feeds are current and `ok`, and all seven
-job bindings moved to the same digest. The untouched `05:00` boundary begins
-the formal counter; none of the deployment soak receives parity credit.
+The isolated promotion controller then moved the Azure primary app, hourly
+job template, and a bounded hourly proof execution to the exact imported ACR
+digest. Its proof passed before the fresh one-use marker was archived; the
+controller remains disabled at boot and inactive. Azure remains in
+single-revision authoritative mode with its protected prior template retained
+for rollback. None of the deployment or promotion soak receives parity credit;
+the untouched `2026-08-16T09:00:00Z` boundary begins the current counter.
 
 The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
 48-hour worst-case projection above the old capacity gate. The mounted
 filesystem now exposes 273,655,873,536 bytes, the conservative projection is
 213,297,534,144 bytes, and the 32-GiB ring reserve, sealing, and upload gates are
-all green. The boot filesystem remains separate with 33.3 GB (31.0 GiB) free,
-above the 15-GiB hard deployment floor and below the 75% warning threshold.
+all green. The boot filesystem remains separate with 26 GB free at 74% used,
+above the 15-GiB hard deployment floor. The five-minute disk guard and capped
+journald growth remain active; image pulls are not paused.
 Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260814T134524Z-azure-primary-e504c51`,
 `20260814T134805Z-azure-hourly-e504c51`,
