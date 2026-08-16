@@ -141,6 +141,12 @@ jobs:
             capture {sub(/^                /, ""); print}
           ' .github/workflows/validate-funded-direct.yml)
           test -n "$binding_diagnostic_filter"
+          redemption_contract_diagnostic_filter=$(awk '
+            /redemption_contract_category=\$\(jq -er .*\047$/ {capture=1; next}
+            capture && /^[[:space:]]*\047 "\$redemption_file"/ {exit}
+            capture {sub(/^                /, ""); print}
+          ' .github/workflows/validate-funded-direct.yml)
+          test -n "$redemption_contract_diagnostic_filter"
           prefix='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/'
           latest="${prefix}latest-redemption.json"
           archive_prefix="${prefix}redemptions/"
@@ -163,6 +169,16 @@ jobs:
               test "$blob_name" = "${archive_prefix}${redemption_date}/${redemption_run}.json"
             fi
           }
+          assert_contract_category() {
+            local expected="$1"
+            local blob_name="$2"
+            local document="$3"
+            local actual
+            actual=$(printf '%s\n' "$document" | jq -er "${common[@]}" \
+              --arg blob_name "$blob_name" \
+              "$redemption_contract_diagnostic_filter")
+            test "$actual" = "$expected"
+          }
           reject_record() {
             if validate_record "$1" "$2" "${3:-[]}"; then
               echo "unexpected accepted redemption fixture" >&2
@@ -171,6 +187,10 @@ jobs:
           }
           validate_record "$archive" "$valid_failed"
           validate_record "$archive" "$valid_timeout"
+          assert_contract_category ok "$archive" "$valid_failed"
+          assert_contract_category failed_closed_contract "$latest" "$valid_failed"
+          assert_contract_category record_header "$archive" \
+            "$(printf '%s\n' "$valid_failed" | jq -c '.finished_ts="2026-02-30T00:13:56.008Z"')"
           reject_record "$latest" "$valid_failed"
           reject_record "$latest" "$valid_timeout"
           reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.redemption_submitted=true')"
@@ -188,6 +208,13 @@ jobs:
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.finished_ts="2026-02-30T00:13:56.008Z"')"
           valid_noop='{"schema_version":1,"finished_ts":"2026-08-15T00:14:56.008Z","run_id":"venue-redemption-20260815001456008-acde1234","status":"nothing_to_redeem","execution_origin":"azure_chile_central_static_egress","execution_country":"CL","static_egress_verified":true,"dry_run":false,"redemption_enabled":true,"zero_open_orders_confirmed":true,"derived_wallet_match":true,"wallet_type":"legacy_uups_deposit_wallet","research_only":false,"live_strategy_enabled":true,"liquid_collateral_before":5,"redemption_submitted":false,"selection":{"selected":[],"selected_gross_payout":0},"planned_calls":[]}'
           validate_record "$latest" "$valid_noop"
+          assert_contract_category ok "$latest" "$valid_noop"
+          assert_contract_category active_execution_contract "$latest" \
+            "$(printf '%s\n' "$valid_noop" | jq -c '.dry_run=true')"
+          assert_contract_category nothing_to_redeem_contract "$latest" \
+            "$(printf '%s\n' "$valid_noop" | jq -c '.planned_calls=[{}]')"
+          assert_contract_category unsupported_status "$latest" \
+            "$(printf '%s\n' "$valid_noop" | jq -c '.status="unexpected"')"
           transaction_hash="0x$(printf 'a%.0s' {1..64})"
           condition_id="0x$(printf 'b%.0s' {1..64})"
           settlement_blob="${prefix}internal-settlements/$(printf 'c%.0s' {1..64}).json"
@@ -232,6 +259,9 @@ jobs:
               realized_payout: 2,
               internal_settlement_blobs: [$settlement_blob]
             }')
+          assert_contract_category ok "$latest" "$valid_verified"
+          assert_contract_category redeemed_and_verified_contract "$latest" \
+            "$(printf '%s\n' "$valid_verified" | jq -c '.planned_calls=[]')"
           classify_binding() {
             printf '%s\n' "$1" | jq -er \
               --argjson settlement_bindings "$2" \
@@ -2358,7 +2388,7 @@ jobs:
                 exit 1
               fi
             fi
-            jq -e --argjson authorized_ceiling "$authorized_ceiling" \
+            if ! jq -e --argjson authorized_ceiling "$authorized_ceiling" \
               --argjson settlement_bindings "$settlement_bindings" \
               --arg blob_name "$blob_name" --arg latest "$v10_latest_redemption" '
               .schema_version == 1
@@ -2459,7 +2489,95 @@ jobs:
               else false
               end)
               end)
-            ' "$redemption_file" >/dev/null
+            ' "$redemption_file" >/dev/null; then
+              if ! redemption_contract_category=$(jq -er --argjson authorized_ceiling "$authorized_ceiling" --arg blob_name "$blob_name" --arg latest "$v10_latest_redemption" '
+                def valid($predicate): try $predicate catch false;
+                if (valid(
+                  .schema_version == 1
+                  and (.finished_ts | type == "string")
+                  and (.finished_ts
+                    | test("^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z\\z")
+                    and (sub("\\.[0-9]{3}Z\\z"; "Z") as $whole_seconds
+                      | (try ($whole_seconds | fromdateiso8601 | todateiso8601)
+                          catch null) == $whole_seconds))
+                  and (.run_id
+                    | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}\\z"))))
+                  | not then
+                  "record_header"
+                elif .status == "failed_closed" then
+                  if valid(
+                    $blob_name != $latest
+                    and (.error == "Data API positions returned HTTP 429"
+                      or .error == "The operation was aborted due to timeout")
+                    and .redemption_submitted == false
+                    and .research_only == false
+                    and .live_strategy_enabled == true
+                    and ((keys | sort) == ([
+                      "error", "finished_ts", "live_strategy_enabled",
+                      "redemption_submitted", "research_only", "run_id",
+                      "schema_version", "status"
+                    ] | sort))) then "ok" else "failed_closed_contract" end
+                elif .status != "nothing_to_redeem"
+                    and .status != "redeemed_and_verified" then
+                  "unsupported_status"
+                elif (valid(
+                  .execution_origin == "azure_chile_central_static_egress"
+                  and .execution_country == "CL"
+                  and .static_egress_verified == true
+                  and .dry_run == false
+                  and .redemption_enabled == true
+                  and .zero_open_orders_confirmed == true
+                  and .derived_wallet_match == true
+                  and .wallet_type == "legacy_uups_deposit_wallet"
+                  and .research_only == false
+                  and .live_strategy_enabled == true
+                  and (.liquid_collateral_before | type == "number")
+                  and .liquid_collateral_before > 0
+                  and .liquid_collateral_before <=
+                    (if $blob_name == $latest then $authorized_ceiling
+                    else 29.505501 end))) | not then
+                  "active_execution_contract"
+                elif .status == "nothing_to_redeem" then
+                  if valid(
+                    .redemption_submitted == false
+                    and .selection.selected == []
+                    and .selection.selected_gross_payout == 0
+                    and .planned_calls == []) then
+                    "ok"
+                  else "nothing_to_redeem_contract" end
+                elif valid(
+                  .redemption_submitted == true
+                  and (.selection.selected | type == "array" and length >= 1)
+                  and (.selection.selected_gross_payout
+                    | type == "number" and . > 0)
+                  and (.planned_calls | type == "array" and length >= 1)
+                  and (.transaction_id | type == "string" and length > 0)
+                  and (.transaction_hash | type == "string"
+                    and test("^0x[0-9a-fA-F]{64}$"))
+                  and (.liquid_collateral_after | type == "number" and . >= 0)
+                  and (.realized_payout | type == "number" and . > 0)
+                  and ((.realized_payout
+                    - .selection.selected_gross_payout) | fabs) <= 0.0000011
+                  and ((.liquid_collateral_after - .liquid_collateral_before
+                    - .realized_payout) | fabs) <= 0.0000011
+                  and (.internal_settlement_blobs
+                    | type == "array" and length >= 1)
+                  and (.internal_settlement_blobs | length) ==
+                    (.selection.selected | length)
+                  and (.internal_settlement_blobs | length) ==
+                    (.internal_settlement_blobs | unique | length)) then
+                  "ok"
+                else "redeemed_and_verified_contract" end
+              ' "$redemption_file" 2>/dev/null); then
+                redemption_contract_category=diagnostic_evaluation_error
+              fi
+              if [ "$redemption_contract_category" = "ok" ]; then
+                redemption_contract_category=diagnostic_logic_gap
+              fi
+              printf '%s\n' \
+                "funded v10 redemption contract validation failed: category=${redemption_contract_category}" >&2
+              exit 1
+            fi
             redemption_sha="sha256:$(sha256sum "$redemption_file" | cut -d' ' -f1)"
             if [ "$blob_name" = "$v10_latest_redemption" ]; then
               latest_redemption_sha="$redemption_sha"
