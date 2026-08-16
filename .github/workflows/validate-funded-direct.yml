@@ -1019,6 +1019,7 @@ jobs:
             --auth-mode login \
             --only-show-errors -o json > v10-redemption-diagnostic-list.json
           category_file=$(mktemp)
+          mismatch_signature_file=$(mktemp)
           while IFS= read -r blob_name; do
             redemption_file=$(mktemp)
             az storage blob download \
@@ -1031,12 +1032,54 @@ jobs:
               --only-show-errors -o none > /dev/null 2> download-error.log || {
                 echo 'funded redemption diagnostic artifact download failed' >&2
                 exit 1
-              }
+            }
             if [ "$(jq -r '.status' "$redemption_file")" = failed_closed ]; then
-              jq -er --argjson authorized_ceiling 0 \
+              category=$(jq -er --argjson authorized_ceiling 0 \
                 --arg blob_name "$blob_name" --arg latest "$latest" \
                 "$redemption_contract_diagnostic_filter" \
-                "$redemption_file" >> "$category_file"
+                "$redemption_file")
+              printf '%s\n' "$category" >> "$category_file"
+              if [ "$category" != ok ]; then
+                jq -cer --arg blob_name "$blob_name" --arg latest "$latest" '
+                  def error_family:
+                    if (.error | type) != "string" then "non_string"
+                    elif .error | startswith("fail closed:") then "safety_gate"
+                    elif .error | startswith("Data API positions returned HTTP ") then
+                      "data_api_positions_http"
+                    elif .error | startswith("Data API activity returned HTTP ") then
+                      "data_api_activity_http"
+                    elif .error | startswith("venue_redemption blocked:") then
+                      "configuration_block"
+                    elif .error | startswith("relayer /submit returned HTTP 4") then
+                      "relayer_submit_4xx"
+                    elif .error | startswith("relayer /submit returned HTTP 5") then
+                      "relayer_submit_5xx"
+                    elif .error | startswith("relayer accepted response") then
+                      "relayer_acceptance_shape"
+                    elif .error | test("timeout"; "i") then "timeout_other"
+                    else "unclassified" end;
+                  {
+                    error_family: error_family,
+                    failed_fields: ([
+                      if $blob_name == $latest then "latest_pointer" else empty end,
+                      if (.error != "Data API positions returned HTTP 429"
+                          and .error != "The operation was aborted due to timeout")
+                        then "error_class" else empty end,
+                      if .redemption_submitted != false
+                        then "submission" else empty end,
+                      if .research_only != false
+                        then "research_mode" else empty end,
+                      if .live_strategy_enabled != true
+                        then "live_strategy" else empty end,
+                      if (keys | sort) != ([
+                          "error", "finished_ts", "live_strategy_enabled",
+                          "redemption_submitted", "research_only", "run_id",
+                          "schema_version", "status"
+                        ] | sort) then "field_set" else empty end
+                    ])
+                  }
+                ' "$redemption_file" >> "$mismatch_signature_file"
+              fi
             fi
           done < <(jq -r --arg latest "$latest" --arg archive "$archive" '
             .[] | .name | select(. == $latest or startswith($archive))
@@ -1044,6 +1087,14 @@ jobs:
           test -s "$category_file"
           jq -Rn '[inputs] | group_by(.)
             | map({category: .[0], count: length})' < "$category_file"
+          test -s "$mismatch_signature_file"
+          jq -s 'sort_by(.error_family, .failed_fields)
+            | group_by({error_family, failed_fields})
+            | map({
+                error_family: .[0].error_family,
+                failed_fields: .[0].failed_fields,
+                count: length
+              })' "$mismatch_signature_file"
 
   deploy-funded-service:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
