@@ -1325,6 +1325,29 @@ jobs:
             "-o json > funded-warmup-after-reopen.json || { sleep 5; continue; }",
             "-o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }"
           ]) assert.ok(workflow.includes(retry), `missing bounded Log Analytics retry: ${retry}`);
+          const recoveryJournalDiagnosticName =
+            "- name: Report recovery journal " + "integrity metadata";
+          const recoveryJournalDiagnosticStart = workflow.indexOf(
+            recoveryJournalDiagnosticName);
+          const recoveryJournalDiagnosticEnd = workflow.indexOf(
+            "- name: Report only failed-closed redemption contract categories",
+            recoveryJournalDiagnosticStart);
+          assert.ok(recoveryJournalDiagnosticStart >= 0);
+          assert.ok(recoveryJournalDiagnosticEnd > recoveryJournalDiagnosticStart);
+          const recoveryJournalDiagnostic = workflow.slice(
+            recoveryJournalDiagnosticStart, recoveryJournalDiagnosticEnd);
+          assert.match(recoveryJournalDiagnostic, /if: \$\{\{ always\(\) \}\}/);
+          assert.deepEqual([...recoveryJournalDiagnostic.matchAll(
+            /az storage blob ([a-z-]+)/g
+          )].map((match) => match[1]), ["show", "download"]);
+          assert.match(recoveryJournalDiagnostic,
+            /--if-match "\$etag"[\s\S]*sha256sum[\s\S]*root_type[\s\S]*predecessor_run_id_type[\s\S]*finalized_control_run_id_type/);
+          assert.match(recoveryJournalDiagnostic,
+            /type == "object"[\s\S]*predecessor_run_id \| type == "array"[\s\S]*finalized_control\.run_id \| type == "array"[\s\S]*recovery_run_id == \$recovery/);
+          assert.match(recoveryJournalDiagnostic,
+            /readonly recovery_run_id='venue-redemption-20260816164043326-56add08b'/);
+          assert.match(recoveryJournalDiagnostic,
+            /readonly journal_blob='reports\/funded\/dynamic-quote\/sessions\/dynamic-quote-funded-2026-08-13-v10\/recovery-controls\/venue-redemption-20260816163934709-03fccfd5\.json'/);
           NODE
           bash scripts/test-fence-funded-queue-and-wait-empty.sh
           bash scripts/test-verify-funded-v10-capital.sh
@@ -1490,6 +1513,69 @@ jobs:
               summary_passed_count: $summary[0].passed_count,
                 summary_total: $summary[0].total
               }' | tee lifecycle-diagnostic.json
+
+      - name: Report recovery journal integrity metadata
+        if: ${{ always() }}
+        env:
+          STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
+          FUNDED_CONTAINER: polyedge-funded-evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          readonly journal_blob='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/recovery-controls/venue-redemption-20260816163934709-03fccfd5.json'
+          readonly recovery_run_id='venue-redemption-20260816164043326-56add08b'
+          metadata_file=$(mktemp)
+          journal_file=$(mktemp)
+          trap 'rm -f -- "$metadata_file" "$journal_file"' EXIT
+          az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$journal_blob" \
+            --auth-mode login \
+            --query '{etag: properties.etag, contentLength: properties.contentLength, lastModified: properties.lastModified}' \
+            --only-show-errors -o json > "$metadata_file"
+          etag=$(jq -er '.etag | select(type == "string" and length > 0)' "$metadata_file")
+          content_length=$(jq -er '.contentLength | select(type == "number" and . > 0 and floor == . and . <= 1048576)' "$metadata_file")
+          last_modified=$(jq -er '.lastModified | select(type == "string" and length > 0)' "$metadata_file")
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$journal_blob" \
+            --file "$journal_file" \
+            --if-match "$etag" \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          test "$(stat --printf='%s' "$journal_file")" = "$content_length"
+          journal_sha256="sha256:$(sha256sum "$journal_file" | cut -d' ' -f1)"
+          jq -e --arg blob "$journal_blob" --arg recovery "$recovery_run_id" '
+            type == "object"
+            and (.predecessor_run_id | type == "array")
+            and (.finalized_control | type == "object")
+            and (.finalized_control.run_id | type == "array")
+            and .predecessor_run_id == .finalized_control.run_id
+            and .recovery_run_id == $recovery
+            and .recovery_journal_blob_name == $blob
+          ' "$journal_file" >/dev/null
+          jq -c --arg blob_path "$journal_blob" --arg sha256 "$journal_sha256" \
+            --arg etag "$etag" --argjson content_length "$content_length" \
+            --arg last_modified "$last_modified" --arg recovery "$recovery_run_id" '
+              {
+                blob_path: $blob_path,
+                sha256: $sha256,
+                etag: $etag,
+                content_length: $content_length,
+                last_modified: $last_modified,
+                root_type: type,
+                predecessor_run_id_type: (.predecessor_run_id | type),
+                finalized_control_run_id_type: (.finalized_control.run_id | type),
+                predecessor_and_finalized_run_id_arrays_equal:
+                  (.predecessor_run_id == .finalized_control.run_id),
+                recovery_run_id_binding: (.recovery_run_id == $recovery),
+                recovery_journal_blob_binding: (.recovery_journal_blob_name == $blob_path),
+                top_level_sorted_keys: (keys | sort)
+              }
+            ' "$journal_file"
 
       - name: Report only failed-closed redemption contract categories
         if: ${{ always() }}
