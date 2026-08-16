@@ -176,10 +176,7 @@ async function run() {
       liquidCollateral: liquidBefore
     });
   }
-  const selection = await validateOnchainSelection(
-    publicClient,
-    selectRedeemableConditions(positions, config.maxPayout, config.maxConditions)
-  );
+  const selection = await discoverOnchainRedeemableConditions(publicClient, positions);
   const redemptionControl = await reconcilePriorRejectedSubmission(
     initialRedemptionControl,
     selection
@@ -232,9 +229,9 @@ async function run() {
   await checkOrigin("pre_submit");
   const finalOrders = await clob.getOpenOrders(undefined, true);
   if (!Array.isArray(finalOrders) || finalOrders.length) throw new Error("fail closed: open-order state changed before redemption");
-  const finalSelection = await validateOnchainSelection(
+  const finalSelection = await discoverOnchainRedeemableConditions(
     publicClient,
-    selectRedeemableConditions(await fetchPositions(), config.maxPayout, config.maxConditions)
+    await fetchPositions()
   );
   if (JSON.stringify(finalSelection.selected) !== JSON.stringify(selection.selected)) {
     throw new Error("fail closed: redeemable position set changed after preflight");
@@ -804,7 +801,35 @@ async function adapterApprovals(publicClient, selection) {
   return result;
 }
 
-async function validateOnchainSelection(publicClient, selection) {
+export async function discoverOnchainRedeemableConditions(
+  publicClient,
+  positions,
+  {
+    funderAddress = config?.funderAddress,
+    maxPayout = config ? config.maxPayout : 25,
+    maxConditions = config?.maxConditions ?? 5
+  } = {}
+) {
+  // Data API identifies candidates; chain state below determines eligibility and payout.
+  const discovered = selectRedeemableConditions(
+    (Array.isArray(positions) ? positions : []).map((row) =>
+      row?.redeemable === true ? { ...row, currentValue: 1 } : row
+    ),
+    null,
+    Number.MAX_SAFE_INTEGER
+  );
+  return validateOnchainSelection(publicClient, discovered, {
+    funderAddress,
+    maxPayout,
+    maxConditions
+  });
+}
+
+async function validateOnchainSelection(publicClient, selection, {
+  funderAddress,
+  maxPayout,
+  maxConditions
+}) {
   const ctfAbi = [
     {
       type: "function", name: "getCollectionId", stateMutability: "view",
@@ -871,22 +896,19 @@ async function validateOnchainSelection(publicClient, selection) {
         address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "payoutNumerators", args: [row.condition_id, index]
       }))),
       Promise.all(derivedAssets.map((asset) => publicClient.readContract({
-        address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "balanceOf", args: [config.funderAddress, asset]
+        address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "balanceOf", args: [funderAddress, asset]
       })))
     ]);
-    if (denominator === 0n) throw new Error(`fail closed: condition is not resolved onchain (${row.condition_id})`);
+    if (denominator === 0n) continue;
     const payoutBaseUnits = balances.reduce(
       (sum, balance, index) => sum + (balance * numerators[index]) / denominator,
       0n
     );
     const expectedPayout = Number(formatUnits(payoutBaseUnits, 6));
-    if (!(expectedPayout > 0)) throw new Error(`fail closed: selected condition has no positive onchain payout (${row.condition_id})`);
-    if (Math.abs(expectedPayout - row.gross_payout) > 0.01) {
-      throw new Error(`fail closed: Data API payout disagrees with onchain payout for ${row.condition_id}`);
-    }
-    totalPayout += expectedPayout;
+    if (!(expectedPayout > 0)) continue;
     rows.push({
       ...row,
+      gross_payout: expectedPayout,
       adapter: row.negative_risk ? NEG_RISK_CTF_COLLATERAL_ADAPTER : CTF_COLLATERAL_ADAPTER,
       underlying_collateral: collateral,
       asset_ids: derivedAssets.map(String),
@@ -896,13 +918,21 @@ async function validateOnchainSelection(publicClient, selection) {
       onchain_expected_payout: expectedPayout
     });
   }
-  if (hasPayoutCap(config.maxPayout) && totalPayout > Number(config.maxPayout) + 1e-9) {
-    throw new Error(`fail closed: exact onchain payout ${totalPayout} exceeds the configured redemption cap`);
+  const selected = [];
+  for (const row of rows) {
+    if (selected.length >= Number(maxConditions)) break;
+    if (hasPayoutCap(maxPayout) && totalPayout + row.gross_payout > Number(maxPayout) + 1e-9) {
+      continue;
+    }
+    selected.push(row);
+    totalPayout += row.gross_payout;
   }
   return {
     ...selection,
-    selected: rows,
+    selected,
     selected_gross_payout: Math.round(totalPayout * 1_000_000) / 1_000_000,
+    available_winner_conditions: rows.length,
+    skipped_winner_conditions: rows.length - selected.length,
     payout_source: "onchain_balances_and_payout_vector"
   };
 }

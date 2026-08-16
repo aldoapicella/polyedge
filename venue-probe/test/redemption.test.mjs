@@ -9,6 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import {
   RELAYER_DEADLINE_BUFFER_SECONDS,
   confirmedRedemptionControlMatches,
+  discoverOnchainRedeemableConditions,
   expectedRecoveredAdapterApprovals,
   rejectedRelayerSubmissionMatches,
   safeRelayerErrorDetail
@@ -329,6 +330,50 @@ test("funded redemption selects the full winning condition without a payout cap"
   assert.equal(selection.selected[0].condition_id, conditionA);
   assert.equal(selection.selected_gross_payout, 28.69);
   assert.equal(selection.skipped_winner_conditions, 1);
+});
+
+test("onchain discovery skips stale candidates and uses authoritative payout", async () => {
+  const conditionC = `0x${"33".repeat(32)}`;
+  const collections = new Map([
+    [`${conditionA}:1`, "a1"],
+    [`${conditionA}:2`, "a2"],
+    [`${conditionB}:1`, "b1"],
+    [`${conditionB}:2`, "b2"],
+    [`${conditionC}:1`, "c1"],
+    [`${conditionC}:2`, "c2"]
+  ]);
+  const assets = new Map([
+    ["a1", 101n], ["a2", 102n],
+    ["b1", 201n], ["b2", 202n],
+    ["c1", 301n], ["c2", 302n]
+  ]);
+  const publicClient = {
+    async readContract({ functionName, args }) {
+      if (functionName === "getCollectionId") return collections.get(`${args[1]}:${args[2]}`);
+      if (functionName === "getPositionId") return assets.get(args[1]);
+      if (functionName === "payoutDenominator") return args[0] === conditionA ? 0n : 1n;
+      if (functionName === "payoutNumerators") return args[1] === 0n ? 1n : 0n;
+      if (functionName === "balanceOf") return args[1] === 301n ? 7_000_000n : 0n;
+      throw new Error(`unexpected contract call: ${functionName}`);
+    }
+  };
+  const positions = [
+    { conditionId: conditionA, redeemable: true, currentValue: 5, negativeRisk: false, asset: "101", oppositeAsset: "102", outcomeIndex: 0 },
+    { conditionId: conditionB, redeemable: true, currentValue: 999, negativeRisk: false, asset: "201", oppositeAsset: "202", outcomeIndex: 0 },
+    { conditionId: conditionC, redeemable: true, currentValue: 0, negativeRisk: false, asset: "301", oppositeAsset: "302", outcomeIndex: 0 }
+  ];
+
+  const selection = await discoverOnchainRedeemableConditions(publicClient, positions, {
+    funderAddress: funder,
+    maxPayout: null,
+    maxConditions: 1
+  });
+
+  assert.equal(selection.selected.length, 1);
+  assert.equal(selection.selected[0].condition_id, conditionC);
+  assert.equal(selection.selected[0].gross_payout, 7);
+  assert.equal(selection.selected_gross_payout, 7);
+  assert.equal(selection.payout_source, "onchain_balances_and_payout_vector");
 });
 
 test("recent redemption activity is attributed only to a matching durable worker control record", () => {
