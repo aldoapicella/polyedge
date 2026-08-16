@@ -8,15 +8,26 @@ audience=api://AzureADTokenExchange
 socket=${SPIRE_AGENT_SOCKET:-/run/spire/agent.sock}
 spire_agent=${SPIRE_AGENT_BIN:-/opt/spire/bin/spire-agent}
 token_root=${POLYEDGE_FEDERATED_TOKEN_ROOT:-/run}
+expected_uid=${POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID:-$(id -u)}
+expected_gid=${POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID:-$(id -g)}
 
 case "$lane" in
-  api|research|shadow-qset|funded-signer) ;;
+  api|research|shadow-qset|funded-signer|promotion-controller) ;;
   *) echo 'unknown identity lane' >&2; exit 64 ;;
 esac
 subject=spiffe://polyedge.local/conduit/$lane
 expected_destination=$token_root/polyedge-federated-$lane/azure-federated-token
 [ "$destination" = "$expected_destination" ] || {
   echo 'token destination does not match the identity lane' >&2
+  exit 64
+}
+[ -d "$(dirname "$destination")" ] && [ ! -L "$(dirname "$destination")" ] || {
+  echo 'token directory is missing or unsafe' >&2
+  exit 64
+}
+set -- $(stat -c '%u %g %a' "$(dirname "$destination")")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || {
+  echo 'token directory has wrong owner or mode' >&2
   exit 64
 }
 case "$issuer" in
@@ -84,4 +95,13 @@ if (
 PY
 
 mv "$temporary" "$destination"
+[ ! -L "$destination" ] && [ -f "$destination" ] || {
+  echo 'token file is unsafe after write' >&2
+  exit 1
+}
+set -- $(stat -c '%u %g %a' "$destination")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 600 ] || {
+  echo 'token file has wrong owner or mode after write' >&2
+  exit 1
+}
 trap - EXIT HUP INT TERM
