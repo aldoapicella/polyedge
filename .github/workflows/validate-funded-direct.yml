@@ -996,10 +996,22 @@ jobs:
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
           const rerunFenceStart = workflow.lastIndexOf(
             "\n      - name: Fence queue and verify predecessor before dormant v8 audit");
-          const rerunFenceEnd = workflow.indexOf(
-            "\n      - name: Retire exact dormant v8 before any v10 deployment",
+          const dormantV8StorageAuditStart = workflow.indexOf(
+            "\n      - name: Audit exact dormant v8 storage and history before log retirement checks",
             rerunFenceStart);
-          assertOrdered(rerunFenceStart, rerunFenceEnd);
+          const dormantV8RefreshLogin = workflow.indexOf(
+            "\n      - name: Refresh Azure login before dormant v8 Log Analytics and final retirement checks",
+            dormantV8StorageAuditStart);
+          const dormantV8LogAuditStart = workflow.indexOf(
+            "\n      - name: Verify exact dormant v8 Log Analytics and final retirement checks",
+            dormantV8RefreshLogin);
+          assertOrdered(rerunFenceStart, dormantV8StorageAuditStart,
+            dormantV8RefreshLogin, dormantV8LogAuditStart);
+          const dormantV8Refresh = workflow.slice(dormantV8RefreshLogin,
+            dormantV8LogAuditStart);
+          assert.match(dormantV8Refresh,
+            /uses: azure\/login@v2[\s\S]*client-id:[\s\S]*tenant-id:[\s\S]*subscription-id:/);
+          const rerunFenceEnd = dormantV8StorageAuditStart;
           const rerunFence = workflow.slice(rerunFenceStart, rerunFenceEnd)
             .replace(/\\\s+/g, " ")
             .replace(/\s+/g, " ");
@@ -2146,15 +2158,10 @@ jobs:
           }
           readonly v8_campaign_prefix="reports/research/venue-probe/control/campaign-risk/dynamic-quote-funded-2026-08-11-v8/"
           echo "FUNDED_RETIRE_WORKSPACE_CUSTOMER_ID=$workspace_customer_id" >> "$GITHUB_ENV"
-          echo "FUNDED_RETIRE_CURRENT_REVISION=$current_revision" >> "$GITHUB_ENV"
 
-      - name: Retire exact dormant v8 before any v10 deployment
+      - name: Audit exact dormant v8 storage and history before log retirement checks
         run: |
           set -euo pipefail
-          readonly workspace_customer_id="$FUNDED_RETIRE_WORKSPACE_CUSTOMER_ID"
-          readonly current_revision="$FUNDED_RETIRE_CURRENT_REVISION"
-          test -n "$workspace_customer_id"
-          test -n "$current_revision"
           readonly v8_campaign_prefix="reports/research/venue-probe/control/campaign-risk/dynamic-quote-funded-2026-08-11-v8/"
           readonly v8_baseline="${v8_campaign_prefix}baseline.json"
           readonly v8_index="${v8_campaign_prefix}unresolved-reservations-index.json"
@@ -2282,6 +2289,23 @@ jobs:
             rm -f "$audit_file"
           done < <(jq -r '.[] | select(.name | endswith(".json")) | .name' \
             all-authorization-consumptions.json)
+          printf '%s\n' "$v8_index_etag" > dormant-v8-index-etag-before.txt
+
+      - name: Refresh Azure login before dormant v8 Log Analytics and final retirement checks
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify exact dormant v8 Log Analytics and final retirement checks
+        run: |
+          set -euo pipefail
+          readonly workspace_customer_id="$FUNDED_RETIRE_WORKSPACE_CUSTOMER_ID"
+          test -n "$workspace_customer_id"
+          readonly v8_index="reports/research/venue-probe/control/campaign-risk/dynamic-quote-funded-2026-08-11-v8/unresolved-reservations-index.json"
+          readonly v8_index_etag="$(cat dormant-v8-index-etag-before.txt)"
+          [[ "$v8_index_etag" =~ ^0x[0-9A-Fa-f]+$ ]]
           current_v8_index_etag=$(az storage blob show \
             --account-name "$STORAGE_ACCOUNT" \
             --container-name "$FUNDED_CONTAINER" \
