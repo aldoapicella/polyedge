@@ -484,10 +484,19 @@ child lifecycle within the seven-second signal-to-send bound and waited for its
 exact terminal risk reservation before completing the cutover. The funded app
 has one ready replica with minimum and maximum replicas both one; the producer
 and funded queue handoff are enabled. The queue is `Active` with zero active or
-scheduled messages and 862 unchanged quarantined messages. Nothing was replayed
-or purged. Post-submission failures release their reservation, so later orders
-resize from fully reconciled current equity under the v3 loss-tolerant reserve
-profile instead of inheriting stale campaign risk.
+scheduled messages and 863 quarantined messages. The newest visible
+failed-closed service event predates the producer repair described below;
+nothing was replayed or purged. Post-submission failures release their
+reservation, so later orders resize from fully reconciled current equity under
+the v3 loss-tolerant reserve profile instead of inheriting stale campaign risk.
+
+The post-promotion audit found that a later primary template no longer carried
+the four non-secret operator-direct Service Bus producer bindings. They were
+restored on the unchanged image in one healthy Single-mode revision with paper
+execution, `ALLOW_LIVE=false`, and taker orders still disabled. The next two
+eligible intents both submitted successfully in 4,442 ms and 5,118 ms against a
+7,000 ms bound. The active Bicep profile now owns those bindings, and the
+promotion controller refuses to run when any is absent.
 
 Primary research jobs share one serialized workspace so daily normalization,
 replay, prospective validation, and backfills reuse local artifacts. The qset

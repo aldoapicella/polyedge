@@ -315,6 +315,9 @@ jobs:
           test "$(grep -Fc -- 'daily-replay.lock' infra/main.bicep)" -eq 2
           grep -Fq -- "name: 'POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS'" infra/main.bicep
           grep -Fq -- "value: '64'" infra/main.bicep
+          grep -Fxq -- "param fundedDirectServiceBusEnabled = true" infra/parameters/polyedge-active.bicepparam
+          grep -Fxq -- "param fundedDirectServiceBusNamespace = 'sb-polyedge-funded-cl-6urdjr5nmwx7w'" infra/parameters/polyedge-active.bicepparam
+          grep -Fxq -- "param fundedDirectServiceBusQueue = 'funded-dynamic-quote-intents'" infra/parameters/polyedge-active.bicepparam
           grep -Fq -- 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)' infra/main.bicep
           ! grep -Fq -- 'HOUR=$(date -u -d "10 minutes ago" +%H)' infra/main.bicep
           test "$(( $(grep -Fc -- 'validate-prospective --since "2026-07-13T00:00:00Z"' infra/main.bicep) + $(grep -Fc -- 'validate-prospective' research/run_primary_daily.sh) ))" -eq 2
@@ -571,6 +574,10 @@ jobs:
             --name "$api_app" \
             -o json > api-containerapp.json
           run_on_startup=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "RUN_BOT_ON_STARTUP") | .value' api-containerapp.json)
+          operator_direct=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "STRATEGY_INTENT_OPERATOR_DIRECT") | .value' api-containerapp.json)
+          funded_bus_enabled=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_ENABLED") | .value' api-containerapp.json)
+          funded_bus_namespace=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE") | .value' api-containerapp.json)
+          funded_bus_queue=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_QUEUE") | .value' api-containerapp.json)
           azure_client_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_CLIENT_ID") | .value' api-containerapp.json)
           backend_base=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' frontend-containerapp.json)
           backend_ws=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_WS_URL") | .value' frontend-containerapp.json)
@@ -582,6 +589,10 @@ jobs:
           shadow_correction_root=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value' api-containerapp.json)
           event_index_types=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value' api-containerapp.json)
           test "$run_on_startup" = "true"
+          test "$operator_direct" = "true"
+          test "$funded_bus_enabled" = "true"
+          test "$funded_bus_namespace" = "sb-polyedge-funded-cl-6urdjr5nmwx7w"
+          test "$funded_bus_queue" = "funded-dynamic-quote-intents"
           test -n "$azure_client_id"
           test "$backend_base" = "https://$api_fqdn/api/v1"
           test "$backend_ws" = "wss://$api_fqdn/api/v1/ws/live"

@@ -39,6 +39,15 @@ param maxReplicas int = 1
 @description('Whether the backend starts the market data writer on startup. Keep true for the active paper-mode stack.')
 param runBotOnStartup bool = true
 
+@description('Whether the active paper-mode backend publishes operator-funded intents to the managed-identity Service Bus handoff.')
+param fundedDirectServiceBusEnabled bool = false
+
+@description('Exact Service Bus namespace used by the funded intent handoff when enabled.')
+param fundedDirectServiceBusNamespace string = ''
+
+@description('Exact Service Bus queue used by the funded intent handoff when enabled.')
+param fundedDirectServiceBusQueue string = ''
+
 @description('Container CPU allocation.')
 param cpu string = '0.5'
 
@@ -643,6 +652,22 @@ resource apiContainerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'RUN_BOT_ON_STARTUP'
               value: runBotOnStartup ? 'true' : 'false'
+            }
+            {
+              name: 'STRATEGY_INTENT_OPERATOR_DIRECT'
+              value: fundedDirectServiceBusEnabled ? 'true' : 'false'
+            }
+            {
+              name: 'FUNDED_DIRECT_SERVICE_BUS_ENABLED'
+              value: fundedDirectServiceBusEnabled ? 'true' : 'false'
+            }
+            {
+              name: 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE'
+              value: fundedDirectServiceBusNamespace
+            }
+            {
+              name: 'FUNDED_DIRECT_SERVICE_BUS_QUEUE'
+              value: fundedDirectServiceBusQueue
             }
             {
               name: 'REQUIRE_API_AUTH'

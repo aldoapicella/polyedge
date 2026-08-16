@@ -39,7 +39,7 @@ function fixture() {
     properties: {
       provisioningState: "Succeeded", latestRevisionName: "revision-1", latestReadyRevisionName: "revision-1",
       configuration: { activeRevisionsMode: "Single", secrets: [{ name: "api-bearer-token", value: "must-never-reach-the-journal" }] },
-      template: { containers: [{ name: "bot", image: oldImage, env: [{ name: "EXECUTION_MODE", value: "paper" }, { name: "ALLOW_LIVE", value: "false" }, { name: "ENABLE_TAKER_ORDERS", value: "false" }] }, { name: "frontend", image: "frontend@sha256:ok", env: [] }] }
+      template: { containers: [{ name: "bot", image: oldImage, env: [{ name: "EXECUTION_MODE", value: "paper" }, { name: "ALLOW_LIVE", value: "false" }, { name: "RUN_BOT_ON_STARTUP", value: "true" }, { name: "ENABLE_TAKER_ORDERS", value: "false" }, { name: "STRATEGY_INTENT_OPERATOR_DIRECT", value: "true" }, { name: "FUNDED_DIRECT_SERVICE_BUS_ENABLED", value: "true" }, { name: "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE", value: "sb-polyedge-funded-cl-6urdjr5nmwx7w" }, { name: "FUNDED_DIRECT_SERVICE_BUS_QUEUE", value: "funded-dynamic-quote-intents" }] }, { name: "frontend", image: "frontend@sha256:ok", env: [] }] }
     }
   };
   const job = {
@@ -186,6 +186,12 @@ test("read-only revision drift is ignored but mutable safety drift is not", () =
   const unsafe = clone(job);
   unsafe.properties.template.containers[0].env.find(({ name }) => name === "ALLOW_LIVE").value = "true";
   assert.throws(() => validateTarget(app, unsafe), /ALLOW_LIVE/);
+});
+
+test("promotion rejects a primary app without the continuous funded handoff", () => {
+  const { app, job } = fixture();
+  app.properties.template.containers[0].env = app.properties.template.containers[0].env.filter(({ name }) => name !== "FUNDED_DIRECT_SERVICE_BUS_QUEUE");
+  assert.throws(() => validateTarget(app, job), /FUNDED_DIRECT_SERVICE_BUS_QUEUE/);
 });
 
 test("ARM 202 operations are polled and never returned as update resources", async () => {

@@ -128,7 +128,12 @@ export function validateTarget(app, job) {
   const bot = exactContainer(app, "bot");
   exactEnvValue(bot, "EXECUTION_MODE", "paper");
   exactEnvValue(bot, "ALLOW_LIVE", "false");
+  exactEnvValue(bot, "RUN_BOT_ON_STARTUP", "true");
   exactEnvValue(bot, "ENABLE_TAKER_ORDERS", "false");
+  exactEnvValue(bot, "STRATEGY_INTENT_OPERATOR_DIRECT", "true");
+  exactEnvValue(bot, "FUNDED_DIRECT_SERVICE_BUS_ENABLED", "true");
+  exactEnvValue(bot, "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE", "sb-polyedge-funded-cl-6urdjr5nmwx7w");
+  exactEnvValue(bot, "FUNDED_DIRECT_SERVICE_BUS_QUEUE", "funded-dynamic-quote-intents");
 
   const configuration = job.properties?.configuration;
   if (job.properties?.provisioningState !== "Succeeded" || configuration?.triggerType !== "Schedule" || configuration?.replicaTimeout !== 1800 || configuration?.replicaRetryLimit !== 1 || configuration?.scheduleTriggerConfig?.cronExpression !== "10 * * * *" || configuration?.scheduleTriggerConfig?.parallelism !== 1 || configuration?.scheduleTriggerConfig?.replicaCompletionCount !== 1) fail("hourly job schedule or timeout drifted");
