@@ -88,13 +88,20 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260816T100000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-16T10:00:00Z`, keeps
+Ledger `/srv/polyedge-ring/parity/20260817T000000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-17T00:00:00Z`, keeps
 Azure authoritative and `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-19T10:00:00Z`. The pre-window catch-up was recorded only as excluded
-evidence. Completion still requires 72 consecutive accepted hours, two
+`2026-08-20T00:00:00Z`. Pre-window collections are excluded evidence only.
+Completion still requires 72 consecutive accepted hours, two
 successful OCI daily cycles, reboot and rollback proof, and explicit qset,
 funded, and deletion gates.
+
+The superseded `20260816T100000Z.json` ledger retained three accepted hours at
+`10:00`, `11:00`, and `12:00`. None is carried forward because source
+`6b567ac` and its new image fix primary daily decision-grade applicability,
+stable runtime provenance, and bounded executable-markout evidence. The new
+window begins at a clean UTC-day boundary so its first daily cycle cannot mix
+old and new binaries.
 
 The superseded `20260816T090000Z.json` ledger retained zero credit. Its first
 hour had 60/60 healthy observations and a 60-second maximum gap, but the
@@ -172,21 +179,25 @@ remain recoverable under
 
 The OCI API and all seven primary research jobs are pinned to
 multi-architecture digest
-`sha256:274b9b942bb415eaed56a0fa27c5a0bb95e1db9c72ccd32d31b8084fb46618c0`
-from source `60f1a7cb7b61ffaa95a9743db65ffcf031cdfac6`. The registry index
-contains the runnable Linux AMD64 and ARM64 images, and the same manifest was
-imported without rebuild into ACR. OCI passed its guarded deployment and
-15-minute soak with a healthy API, healthy frontend, zero restarts, current
-essential feeds, and all seven primary job bindings on the exact source and
-digest.
+`sha256:93a5cf52a77e35460a598f7cd461184d1f56c31090ceb4ae15554a9e4a81eea6`
+from source `6b567ac84baa8113e84d5fceae63bd14d13656e8`. Build run
+`31950191236` proved the Linux AMD64 and ARM64 index and published the dependent
+research-validation image. The same index was imported without rebuild into
+ACR. OCI passed its guarded deployment and 15-minute soak with authenticated
+status 200, zero restarts, repeated research-UAMI freshness success, a healthy
+ring, all seven primary job bindings on the exact digest, and 25 GiB boot space
+remaining.
 
-The isolated promotion controller then moved the Azure primary app, hourly
-job template, and a bounded hourly proof execution to the exact imported ACR
-digest. Its proof passed before the fresh one-use marker was archived; the
+The isolated promotion controller then moved the Azure primary app, hourly job
+template, and a bounded hourly proof execution to the exact imported ACR
+digest. A prior attempt rolled back exactly after a transient proof poll; the
+controller role gained only `Microsoft.App/jobs/stop/action` on the existing
+exact hourly-job scope so an emergency proof stop cannot be denied. The clean
+retry and proof passed before the fresh one-use marker was archived. The
 controller remains disabled at boot and inactive. Azure remains in
 single-revision authoritative mode with its protected prior template retained
 for rollback. None of the deployment or promotion soak receives parity credit;
-the untouched `2026-08-16T10:00:00Z` boundary begins the current counter.
+the untouched `2026-08-17T00:00:00Z` boundary begins the current counter.
 
 The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
 48-hour worst-case projection above the old capacity gate. The mounted
@@ -201,11 +212,11 @@ Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260814T135152Z-polyedge-api.container`,
 `20260814T135500Z-unified-e504c51-parity-rebind`, and
 `20260814T142500Z-parity-1500-reset`. The current guarded deployment added
-`20260815T001144Z-polyedge-api.container` and
-`20260815T043829Z-polyedge-api.container`; the seven job environments have
-dated pre-`8af04f6` copies from `20260815T044216Z` and `20260815T044240Z`, and
-the formal parity bindings have copies from `20260815T044322Z`. The old image,
-Azure revision, failed ledgers, and evidence data remain present.
+`20260816T143153Z-polyedge-api.container`,
+`20260816T143244Z-research-image-6b567ac`,
+`20260816T152556Z-azure-promotion-retry-6b567ac`, and
+`20260816T153012Z-parity-20260817-reset`. The old image, Azure revision,
+superseded ledgers, controller journals, and evidence data remain present.
 
 In the superseded August 12 window, the `15:00` hour received zero credit
 because seven durable essential-feed reconnect errors occurred even though
@@ -465,19 +476,18 @@ the funded identity, exact non-secret environment, origin check, queue repair,
 and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review all pass. Root remains the
 single-host trust ceiling and can administer both containers.
 
-The continuous funded v10 cutover is not yet live; the local OCI funded signer
-is also still disabled. Guarded run `31865237346` passed safety/history,
-zero-write preflight, exact controls, Service Bus, qset isolation, and warmup.
-Three intents then failed closed before submission at the final volatile,
-post-only-cross, and WebSocket gates. One more lifecycle completed within the
-seven-second send bound and attempted submission, but did not prove an accepted
-order or reach terminal reservation verification, so the workflow refused the
-cutover and rolled back. Azure revision `polyedge-funded-direct-cl--0000201` is
-healthy in the dormant state with minimum replicas zero, dry-run true, and all
-live/trading controls false. The queue is `SendDisabled` with zero active or
-scheduled messages and 860 quarantined messages. No matching application
-dead-letter event identifies the newest quarantine, so nothing is replayed or
-purged without classification.
+The continuous funded v10 Azure service is live; the local OCI funded signer
+remains disabled. Guarded run `31946702630` passed safety/history, zero-write
+preflight, exact controls, Service Bus, origin and identity checks, qset
+isolation, warmup, and rollback checks. It then proved one genuinely submitted
+child lifecycle within the seven-second signal-to-send bound and waited for its
+exact terminal risk reservation before completing the cutover. The funded app
+has one ready replica with minimum and maximum replicas both one; the producer
+and funded queue handoff are enabled. The queue is `Active` with zero active or
+scheduled messages and 862 unchanged quarantined messages. Nothing was replayed
+or purged. Post-submission failures release their reservation, so later orders
+resize from fully reconciled current equity under the v3 loss-tolerant reserve
+profile instead of inheriting stale campaign risk.
 
 Primary research jobs share one serialized workspace so daily normalization,
 replay, prospective validation, and backfills reuse local artifacts. The qset

@@ -41,11 +41,12 @@ resource promotionRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
         actions: [
           'Microsoft.App/containerApps/read'
           'Microsoft.App/containerApps/write'
-          'Microsoft.App/jobs/read'
-          'Microsoft.App/jobs/write'
           'Microsoft.App/jobs/executions/read'
+          'Microsoft.App/jobs/read'
           'Microsoft.App/jobs/start/action'
+          'Microsoft.App/jobs/stop/action'
           'Microsoft.App/jobs/stop/execution/action'
+          'Microsoft.App/jobs/write'
         ]
         notActions: []
         dataActions: []

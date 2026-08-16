@@ -288,14 +288,16 @@
     "promotionController": {
       "id": "e4d113d2-e955-4259-8214-2b919eaef2c0",
       "name": "PolyEdge OCI Promotion Controller",
+      "verifiedAtUtc": "2026-08-16T15:38:32Z",
       "actions": [
         "Microsoft.App/containerApps/read",
         "Microsoft.App/containerApps/write",
-        "Microsoft.App/jobs/read",
-        "Microsoft.App/jobs/write",
         "Microsoft.App/jobs/executions/read",
+        "Microsoft.App/jobs/read",
         "Microsoft.App/jobs/start/action",
-        "Microsoft.App/jobs/stop/execution/action"
+        "Microsoft.App/jobs/stop/action",
+        "Microsoft.App/jobs/stop/execution/action",
+        "Microsoft.App/jobs/write"
       ],
       "dataActions": [],
       "notActions": [],
