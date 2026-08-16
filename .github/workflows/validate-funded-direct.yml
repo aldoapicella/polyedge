@@ -246,6 +246,27 @@ jobs:
           jq '.properties.template.scale.maxReplicas=2' "$maintenance_fixture" \
             > "$candidate_test_dir/maintenance-wrong-template.json"
           reject_maintenance_fixture "$candidate_test_dir/maintenance-wrong-template.json"
+          producer_selector='[.[] | select(.properties.active == true)] as $active
+            | if ($active | length) == 1
+                and $active[0].properties.healthState == "Healthy"
+                and $active[0].properties.replicas >= 1
+              then $active[0].name
+              else error("expected one active healthy producer revision")
+              end'
+          jq -n '[{
+            name: "producer--ready",
+            properties: {active: true, healthState: "Healthy", replicas: 1}
+          }]' > "$candidate_test_dir/producer-selector.json"
+          test "$(jq -er "$producer_selector" \
+            "$candidate_test_dir/producer-selector.json")" = "producer--ready"
+          jq '. += [{name:"producer--unexpected", properties:{active:true,healthState:"Healthy",replicas:1}}]' \
+            "$candidate_test_dir/producer-selector.json" \
+            > "$candidate_test_dir/producer-selector-ambiguous.json"
+          if jq -er "$producer_selector" \
+              "$candidate_test_dir/producer-selector-ambiguous.json" >/dev/null; then
+            echo "unexpected accepted ambiguous producer revision" >&2
+            exit 1
+          fi
           prefix='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/'
           latest="${prefix}latest-redemption.json"
           archive_prefix="${prefix}redemptions/"
@@ -966,36 +987,56 @@ jobs:
             resource.properties.template.containers[0].name === "funded-direct");
           assert.equal(fundedJob.properties.configuration.replicaTimeout, 11400);
           assert.equal(fundedJob.properties.configuration.replicaRetryLimit, 0);
+          const assertOrdered = (...positions) => {
+            for (const position of positions) assert.ok(position >= 0);
+            for (let index = 1; index < positions.length; index += 1) {
+              assert.ok(positions[index - 1] < positions[index]);
+            }
+          };
           const workflow = fs.readFileSync(".github/workflows/validate-funded-direct.yml", "utf8");
           const rerunFenceStart = workflow.lastIndexOf(
             "\n      - name: Fence queue and verify predecessor before dormant v8 audit");
           const rerunFenceEnd = workflow.indexOf(
             "\n      - name: Retire exact dormant v8 before any v10 deployment",
             rerunFenceStart);
+          assertOrdered(rerunFenceStart, rerunFenceEnd);
           const rerunFence = workflow.slice(rerunFenceStart, rerunFenceEnd)
             .replace(/\\\s+/g, " ")
             .replace(/\s+/g, " ");
           assert.match(rerunFence,
             /1\) for name in FUNDED_DIRECT_SERVICE_ENABLED FUNDED_DIRECT_WORKER_ENABLED ALLOW_FUNDED_DIRECT; do[\s\S]*= "true"[\s\S]*for name in ALLOW_LIVE ALLOW_STRATEGY_CANARY ENABLE_TAKER_ORDERS; do[\s\S]*= "false"/);
           assert.match(rerunFence,
-            /verify_exact_maintenance_predecessor[\s\S]*polyedge-funded-direct-cl--redpin1843[\s\S]*polyedge-venue-probe@sha256:[0-9a-f]{64}[\s\S]*sha256:[0-9a-f]{64}[\s\S]*FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED[\s\S]*= "true"/);
+            /expected_revision_pattern[\s\S]*=~ \$expected_revision_pattern[\s\S]*verify_exact_maintenance_predecessor[\s\S]*polyedge-venue-probe@sha256:[0-9a-f]{64}[\s\S]*sha256:2d9af6a7af5ff8885dc4afa6e7126de170005cb83d6e511269d5c3927e8b49ad/);
+          assertOrdered(
+            rerunFence.indexOf("FUNDED_ROLLBACK_REVISION=$current_revision"),
+            rerunFence.indexOf("FUNDED_QUEUE_FENCE_REQUESTED=true"),
+            rerunFence.indexOf("--status SendDisabled")
+          );
+          assert.equal(rerunFence.includes("latestReadyRevisionName"), false);
           const imagePublishStart = workflow.lastIndexOf(
             "- name: Build and publish immutable producer and funded worker images");
-          const imagePublish = workflow.slice(
-            imagePublishStart,
-            workflow.indexOf("\n      - name:", imagePublishStart + 1));
+          const imagePublishEnd = workflow.indexOf("\n      - name:", imagePublishStart + 1);
+          assertOrdered(imagePublishStart, imagePublishEnd);
+          const imagePublish = workflow.slice(imagePublishStart, imagePublishEnd);
           assert.match(imagePublish,
             /retry_registry\(\)[\s\S]*for attempt in 1 2 3[\s\S]*retry_registry az acr login[\s\S]*retry_registry docker push "\$producer_tag"[\s\S]*retry_registry docker push "\$funded_tag"/);
           assert.equal(workflow.includes(
             ["FUNDED_DIRECT_SERVICE_BUS_ENABLED", "false"].join("=")), false);
+          const disabledDeploymentStart = workflow.indexOf(
+            "\n      - name: Deploy continuous funded Dynamic Quote service", rerunFenceEnd);
+          const disabledDeploymentEnd = workflow.indexOf("\n      - name:", disabledDeploymentStart + 1);
+          assertOrdered(disabledDeploymentStart, disabledDeploymentEnd);
+          const disabledDeployment = workflow.slice(disabledDeploymentStart, disabledDeploymentEnd);
+          assert.match(disabledDeployment,
+            /FUNDED_DIRECT_SERVICE_ENABLED" and \.value == "false"[\s\S]*FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED" and \.value == "false"[\s\S]*FUNDED_DIRECT_DRY_RUN" and \.value == "true"[\s\S]*FUNDED_WORKFLOW_ACTIVE_REVISION[\s\S]*FUNDED_WORKFLOW_ACTIVE_TEMPLATE_SHA256/);
           const preparePreflightStart = workflow.lastIndexOf(
             "\n      - name: Prepare zero-write v10 preflight inputs");
           const preparePreflightEnd = workflow.lastIndexOf(
             "\n      - name: Run the zero-write v10 preflight against a fresh producer intent");
-          assert.ok(preparePreflightStart >= 0 && preparePreflightStart < preparePreflightEnd);
+          assertOrdered(preparePreflightStart, preparePreflightEnd);
           const preflightLogin = workflow.lastIndexOf(
             "\n      - name: Refresh Azure login before zero-write v10 preflight", preparePreflightEnd);
-          assert.ok(preparePreflightStart < preflightLogin && preflightLogin < preparePreflightEnd);
+          assertOrdered(preparePreflightStart, preflightLogin, preparePreflightEnd);
           const preparePreflight = workflow.slice(preparePreflightStart, preparePreflightEnd);
           assert.equal(preparePreflight.includes(
             "cmp existing-v10-authorization-decisions.txt existing-v10-completion-decisions.txt"), false);
@@ -1017,9 +1058,8 @@ jobs:
             "\n      - name: Backfill canonical v10 recovery journal from matched legacy evidence",
             capitalReconcileStart
           );
-          assert.ok(pointerPreflightDeployment < capitalReconcileStart &&
-            capitalReconcileStart < recoveryBackfillStart &&
-            recoveryBackfillStart < preparePreflightStart);
+          assertOrdered(pointerPreflightDeployment, capitalReconcileStart,
+            recoveryBackfillStart, preparePreflightStart);
           const capitalReconcile = workflow.slice(capitalReconcileStart, recoveryBackfillStart);
           const recoveryBackfill = workflow.slice(recoveryBackfillStart, preparePreflightStart);
           assert.match(capitalReconcile,
@@ -1105,41 +1145,42 @@ jobs:
             "--remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT", pointerPreflight);
           const enableService = workflow.indexOf(
             "- name: Enable v10 only after the zero-write preflight passes", pointerPreflightRestore);
-          assert.ok(pointerPreflightMarker >= 0 && pointerPreflightMarker < pointerPreflight);
-          assert.ok(pointerPreflight < pointerPreflightRestore && pointerPreflightRestore < enableService);
+          assertOrdered(pointerPreflightMarker, pointerPreflight,
+            pointerPreflightRestore, enableService);
           const producerConsoleQuery = "ContainerAppName_s == '$" + "INTENT_PRODUCER_APP'";
           assert.equal(workflow.includes(producerConsoleQuery), false);
           const workerPreflightLog = workflow.indexOf(
             "funded-preflight-logs.json", pointerPreflightDeployment);
           const exactIntentProof = workflow.indexOf(
             "pointer-preflight-exact-intent.json", pointerPreflightDeployment);
-          assert.ok(workerPreflightLog >= 0 && workerPreflightLog < exactIntentProof);
+          assertOrdered(workerPreflightLog, exactIntentProof);
           const cutoff = workflow.indexOf(
             "pointer_preflight_cutoff_epoch=$(date -u +%s)", pointerPreflightDeployment);
           const pointerSnapshot = workflow.indexOf("pointer-before-preflight.json", cutoff);
           const workerStart = workflow.indexOf("- name: Run the zero-write v10 preflight", pointerSnapshot);
-          const workerStep = workflow.slice(
-            workerStart, workflow.indexOf("\n      - name:", workerStart + 1));
+          const workerStepEnd = workflow.indexOf("\n      - name:", workerStart + 1);
+          assertOrdered(workerStart, workerStepEnd);
+          const workerStep = workflow.slice(workerStart, workerStepEnd);
           assert.match(workerStep,
             /readonly v5_etag_before="\$\{PREFLIGHT_V5_ETAG_BEFORE:\?\}"[\s\S]*readonly intent_container="\$\{PREFLIGHT_INTENT_CONTAINER:\?\}"[\s\S]*readonly intent_prefix="\$\{PREFLIGHT_INTENT_PREFIX:\?\}"/);
           const pointerAfter = workflow.indexOf("pointer-after-preflight.json", workerStart);
           const queueInvariance = workflow.indexOf(
             "funded-queue-after-pointer-preflight.snapshot.json", pointerAfter);
-          assert.ok(exactIntentProof < queueInvariance);
-          assert.ok(pointerPreflight < cutoff && cutoff < pointerSnapshot && pointerSnapshot < workerStart);
-          assert.ok(workerStart < pointerAfter && pointerAfter < queueInvariance);
+          assertOrdered(exactIntentProof, queueInvariance);
+          assertOrdered(pointerPreflight, cutoff, pointerSnapshot, workerStart);
+          assertOrdered(workerStart, pointerAfter, queueInvariance);
           assert.match(workflow, /pointer_after_etag[\s\S]*pointer_before_etag/);
-          const activation = workflow.slice(
-            workflow.lastIndexOf("- name: Pause producer and warm funded intent"),
-            workflow.lastIndexOf("- name: Restore the dormant funded service"));
+          const activationStart = workflow.lastIndexOf("- name: Pause producer and warm funded intent");
+          const activationEnd = workflow.lastIndexOf("- name: Restore the dormant funded service");
+          assertOrdered(activationStart, activationEnd);
+          const activation = workflow.slice(activationStart, activationEnd);
           const pause = activation.indexOf("RUN_BOT_ON_STARTUP=false");
           const active = activation.indexOf("--status Active", pause);
           const warmupStep = activation.indexOf('--name "$FUNDED_WARMUP_JOB"', active);
           const ready = activation.indexOf('test "$warmup_ready" = true', warmupStep);
           const enable = activation.indexOf("RUN_BOT_ON_STARTUP=true", ready);
           const first = activation.indexOf("top 1 by TimeGenerated asc", enable);
-          assert.ok(pause < active && active < warmupStep && warmupStep < ready &&
-            ready < enable && enable < first);
+          assertOrdered(pause, active, warmupStep, ready, enable, first);
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /where tobool\(record\.order_submitted\) == true/);
           assert.match(activation,
@@ -1161,9 +1202,8 @@ jobs:
             capitalVerification,
             authorizationDownload
           ]) assert.ok(index >= 0);
-          assert.ok(lifecycleAccepted < postLifecycleFence &&
-            postLifecycleFence < capitalVerification &&
-            capitalVerification < authorizationDownload);
+          assertOrdered(lifecycleAccepted, postLifecycleFence,
+            capitalVerification, authorizationDownload);
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
           assert.match(activation,
@@ -1207,11 +1247,10 @@ jobs:
           const terminalPredicate = activation.indexOf('.state == "position_settled"', terminalLoop);
           const queueReopen = activation.lastIndexOf("--status Active");
           const cutoverComplete = activation.indexOf("FUNDED_CUTOVER_COMPLETE=true", queueReopen);
-          assert.ok(lifecycleLogin < childRunValidation && childRunValidation < reservationValidation);
-          assert.ok(reservationValidation < safeHandoff && safeHandoff < terminalLogin);
-          assert.ok(terminalLogin < terminalLoop && terminalLoop < terminalIdentity &&
-            terminalIdentity < terminalPredicate &&
-            terminalPredicate < terminalProof && terminalProof < queueReopen && queueReopen < cutoverComplete);
+          assertOrdered(lifecycleLogin, childRunValidation, reservationValidation);
+          assertOrdered(reservationValidation, safeHandoff, terminalLogin);
+          assertOrdered(terminalLogin, terminalLoop, terminalIdentity,
+            terminalPredicate, terminalProof, queueReopen, cutoverComplete);
           const terminalStep = activation.slice(terminalLoop);
           assert.match(terminalStep, /\.schema_version == 1[\s\S]*\.campaign_id == "dynamic-quote-funded-2026-08-13-v10"[\s\S]*\.run_id == \$run[\s\S]*\.probe_id == \("funded-direct-" \+ \$decision\)[\s\S]*\.order_submitted == true[\s\S]*\.order_id == \$order_id/);
           assert.match(activation, /\.state == "finalized_no_fill"[\s\S]*\.state == "position_settled"[\s\S]*settlement_evidence_source == "verified_onchain_redemption"[\s\S]*settlement_evidence_source == "polymarket_data_api_redeemable"/);
@@ -1233,17 +1272,28 @@ jobs:
           assert.match(rollback,
             /for attempt in \$\(seq 1 30\); do[\s\S]*ContainerAppOperationInProgress[\s\S]*sleep 10/);
           assert.match(rollback,
-            /cmp funded-rollback-template\.json restored-funded-template\.json[\s\S]*az containerapp revision deactivate[\s\S]*properties\.active == true/);
+            /cmp funded-rollback-template\.json restored-funded-template\.json[\s\S]*properties\.active == true/);
+          assert.equal(rollback.includes("az containerapp revision deactivate"), false);
+          assert.equal(rollback.includes("latestReadyRevisionName"), false);
+          assert.equal(rollback.includes("latestRevisionName"), false);
+          assert.match(rollback,
+            /FUNDED_WORKFLOW_ACTIVE_REVISION[\s\S]*FUNDED_WORKFLOW_ACTIVE_TEMPLATE_SHA256[\s\S]*funded_rollback_precopy_guard_failed/);
+          assert.match(rollback,
+            /producer-revisions-restored\.json[\s\S]*\[\.\[\] \| select\(\.properties\.active == true\)\] as \$active[\s\S]*az containerapp revision show[\s\S]*--revision "\$restored_producer_revision"/);
           assert.match(rollback,
             /properties\.healthState == "Healthy"[\s\S]*producer-revisions-before-rollback-reopen\.json[\s\S]*funded-queue-before-rollback-reopen\.json[\s\S]*--status Active[\s\S]*funded-queue-after-rollback-reopen\.json/);
-          const exactRollback = rollback.slice(
-            rollback.indexOf('if [ "$exact_rollback" = true ]'));
-          const fallbackRollback = exactRollback.slice(exactRollback.indexOf("\n          else"));
-          assert.ok(exactRollback.indexOf("cmp funded-rollback-template.json") <
-            exactRollback.indexOf("--status Active"));
+          const exactRollbackStart = rollback.indexOf('if [ "$exact_rollback" = true ]');
+          const fallbackRollbackStart = rollback.indexOf("\n          else", exactRollbackStart);
+          assertOrdered(exactRollbackStart, fallbackRollbackStart);
+          const exactRollback = rollback.slice(exactRollbackStart, fallbackRollbackStart);
+          const fallbackRollback = rollback.slice(fallbackRollbackStart);
+          assertOrdered(
+            exactRollback.indexOf("cmp funded-rollback-template.json"),
+            exactRollback.indexOf("--status Active")
+          );
           const postRollbackReopen = exactRollback.slice(
             exactRollback.indexOf("--status Active"),
-            exactRollback.indexOf("\n          else"));
+            exactRollback.length);
           assert.equal(postRollbackReopen.includes("activeMessageCount"), false);
           assert.equal(postRollbackReopen.includes("scheduledMessageCount"), false);
           assert.equal(postRollbackReopen.includes("deadLetterMessageCount"), false);
@@ -1690,9 +1740,29 @@ jobs:
           az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
-            -o json > current-funded-app.json
-          current_revision=$(jq -r '.properties.latestReadyRevisionName // ""' current-funded-app.json)
-          test -n "$current_revision"
+            --only-show-errors -o json > current-funded-app.json
+          jq -e '.properties.configuration.activeRevisionsMode == "Single"' \
+            current-funded-app.json >/dev/null || {
+            printf '%s\n' 'funded_predecessor_selection_failed' >&2
+            exit 1
+          }
+          az containerapp revision list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --only-show-errors -o json > current-funded-revisions.json
+          if ! current_revision=$(jq -er '
+            [.[] | select(.properties.active == true)]
+            | if length == 1
+                and .[0].properties.healthState == "Healthy"
+                and ((. [0].properties.template.scale.minReplicas // 0 | tonumber) != 1
+                  or ((. [0].properties.replicas // 0) | tonumber) >= 1)
+              then .[0].name
+              else error("expected exactly one active healthy funded predecessor")
+              end
+          ' current-funded-revisions.json); then
+            printf '%s\n' 'funded_predecessor_selection_failed' >&2
+            exit 1
+          fi
           az containerapp revision show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$FUNDED_APP" \
@@ -1715,38 +1785,6 @@ jobs:
           test -n "$current_revision"
           test -n "$current_revision_created_at"
           test -n "$workspace_customer_id"
-          fence_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          az servicebus queue update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --status SendDisabled \
-            --only-show-errors -o none
-          echo "FUNDED_QUEUE_FENCED=true" >> "$GITHUB_ENV"
-          test "$(az servicebus queue show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --query status -o tsv)" = "SendDisabled"
-          for attempt in $(seq 1 30); do
-            active_messages=$(az servicebus queue show \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --namespace-name "$SERVICE_BUS_NAMESPACE" \
-              --name "$SERVICE_BUS_QUEUE" \
-              --query countDetails.activeMessageCount -o tsv)
-            if [ "${active_messages:-0}" = "0" ]; then break; fi
-            sleep 5
-          done
-          test "${active_messages:-0}" = "0"
-          queue_snapshot=$(az servicebus queue show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" -o json)
-          test "$(jq -r '.countDetails.activeMessageCount' <<<"$queue_snapshot")" = "0"
-          test "$(jq -r '.countDetails.scheduledMessageCount' <<<"$queue_snapshot")" = "0"
-          fenced_dlq=$(jq -r '.countDetails.deadLetterMessageCount' <<<"$queue_snapshot")
-          [[ "$fenced_dlq" =~ ^[0-9]+$ ]]
-          printf '%s\n' "$fenced_dlq" > funded-fenced-dlq-before.txt
           env_value() {
             jq -er --arg name "$1" '
               [.properties.template.containers[0].env[]
@@ -1759,12 +1797,11 @@ jobs:
           # maintenance_predecessor_verifier_begin
           verify_exact_maintenance_predecessor() {
             local revision_file=$1
-            local expected_revision=$2
+            local expected_revision_pattern=$2
             local expected_image=$3
             local expected_template_sha256=$4
             local canonical_template_file=$5
-            test "$(jq -r '.name' "$revision_file")" = \
-              "$expected_revision" || return 1
+            [[ "$(jq -r '.name' "$revision_file")" =~ $expected_revision_pattern ]] || return 1
             test "$(jq -r '.properties.active' "$revision_file")" = \
               "true" || return 1
             test "$(jq -r '.properties.healthState' "$revision_file")" = \
@@ -1782,6 +1819,11 @@ jobs:
               "$expected_template_sha256"
           }
           # maintenance_predecessor_verifier_end
+          predecessor_contract_failed() {
+            printf '%s\n' 'funded_predecessor_contract_invalid' >&2
+            exit 1
+          }
+          trap predecessor_contract_failed ERR
           case "$current_session" in
             dynamic-quote-funded-2026-07-29-v5)
               test "$(jq -r '.properties.template.scale.minReplicas' current-funded-revision.json)" = "0"
@@ -1946,11 +1988,10 @@ jobs:
                     test "$(env_value "$name")" = "false"
                   done
                   test "$(env_value FUNDED_DIRECT_DRY_RUN)" = "false"
-                  if [ "$current_revision" = \
-                      "polyedge-funded-direct-cl--redpin1843" ]; then
+                  if [ "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "false" ]; then
                     verify_exact_maintenance_predecessor \
                       current-funded-revision.json \
-                      "polyedge-funded-direct-cl--redpin1843" \
+                      '^polyedge-funded-direct-cl--[a-z0-9][a-z0-9-]*$' \
                       "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-venue-probe@sha256:9dc88f6f91728d858339fa6942e0ac9f57b9ecc71c8e5da2e4782df2e72b4d32" \
                       "sha256:2d9af6a7af5ff8885dc4afa6e7126de170005cb83d6e511269d5c3927e8b49ad" \
                       current-funded-maintenance-template.json
@@ -1960,15 +2001,149 @@ jobs:
                   ;;
                 *)
                   echo "Refusing v10 rerun from invalid replica configuration: $current_min_replicas" >&2
-                  exit 1
+                  predecessor_contract_failed
                   ;;
               esac
               ;;
             *)
               echo "Refusing cutover from unexpected funded session: ${current_session:-<unset>}" >&2
-              exit 1
+              predecessor_contract_failed
               ;;
           esac
+          trap - ERR
+          if ! jq -S '.properties.template' current-funded-revision.json \
+              > funded-rollback-template.json; then
+            printf '%s\n' 'funded_predecessor_rollback_capture_failed' >&2
+            exit 1
+          fi
+          rollback_template_sha256="sha256:$(sha256sum funded-rollback-template.json | cut -d' ' -f1)"
+          [[ "$rollback_template_sha256" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            printf '%s\n' 'funded_predecessor_rollback_capture_failed' >&2
+            exit 1
+          }
+          printf '%s\n' "$current_revision" > funded-rollback-revision.txt
+          printf '%s\n' "$rollback_template_sha256" > funded-rollback-template.sha256
+          {
+            echo "FUNDED_ROLLBACK_REVISION=$current_revision"
+            echo "FUNDED_ROLLBACK_TEMPLATE_SHA256=$rollback_template_sha256"
+            echo "FUNDED_ROLLBACK_CAPTURED=true"
+          } >> "$GITHUB_ENV"
+          predecessor_live=false
+          if [ "$(jq -r '.properties.template.scale.minReplicas' current-funded-revision.json)" = "1" ]; then
+            predecessor_live=true
+          fi
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            -o json > funded-queue-before-fence.json
+          jq -e '
+            .status == "Active"
+            and ([.countDetails.activeMessageCount,
+                  .countDetails.scheduledMessageCount,
+                  .countDetails.deadLetterMessageCount]
+                 | all(type == "number" or type == "string"))
+          ' funded-queue-before-fence.json >/dev/null || {
+            printf '%s\n' 'funded_predecessor_queue_prefence_invalid' >&2
+            exit 1
+          }
+          cp funded-queue-before-fence.json funded-queue-rollback-baseline.next.json
+          mv funded-queue-rollback-baseline.next.json funded-queue-rollback-baseline.json
+          pre_fence_dlq=$(jq -r '.countDetails.deadLetterMessageCount' funded-queue-before-fence.json)
+          [[ "$pre_fence_dlq" =~ ^[0-9]+$ ]]
+          printf '%s\n' "$pre_fence_dlq" > funded-fenced-dlq-before.next.txt
+          mv funded-fenced-dlq-before.next.txt funded-fenced-dlq-before.txt
+          if [ "$predecessor_live" = true ]; then
+            echo "FUNDED_ROLLBACK_REOPEN_AUTHORIZED=true" >> "$GITHUB_ENV"
+          fi
+          az containerapp revision list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --only-show-errors -o json > funded-revisions-before-fence.json
+          jq -e --arg revision "$current_revision" '
+            ([.[] | select(.properties.active == true)] | length) == 1
+            and ([.[] | select(.properties.active == true)][0].name == $revision)
+            and ([.[] | select(.properties.active == true)][0].properties.healthState == "Healthy")
+            and (([.[] | select(.properties.active == true)][0].properties.template.scale.minReplicas // 0 | tonumber) != 1
+              or (([.[] | select(.properties.active == true)][0].properties.replicas // 0) | tonumber) >= 1)
+          ' funded-revisions-before-fence.json >/dev/null || {
+            printf '%s\n' 'funded_predecessor_changed_before_fence' >&2
+            exit 1
+          }
+          az containerapp revision show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --revision "$current_revision" \
+            --only-show-errors -o json > current-funded-revision-before-fence.json
+          jq -S '.properties.template' current-funded-revision-before-fence.json \
+            > funded-rollback-template-before-fence.json
+          cmp funded-rollback-template.json funded-rollback-template-before-fence.json || {
+            printf '%s\n' 'funded_predecessor_changed_before_fence' >&2
+            exit 1
+          }
+          echo "FUNDED_QUEUE_FENCE_REQUESTED=true" >> "$GITHUB_ENV"
+          fence_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          az servicebus queue update \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --status SendDisabled \
+            --only-show-errors -o none
+          echo "FUNDED_QUEUE_FENCED=true" >> "$GITHUB_ENV"
+          test "$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --query status -o tsv)" = "SendDisabled"
+          for attempt in $(seq 1 30); do
+            active_messages=$(az servicebus queue show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --namespace-name "$SERVICE_BUS_NAMESPACE" \
+              --name "$SERVICE_BUS_QUEUE" \
+              --query countDetails.activeMessageCount -o tsv)
+            if [ "${active_messages:-0}" = "0" ]; then break; fi
+            sleep 5
+          done
+          test "${active_messages:-0}" = "0"
+          az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" -o json > funded-fenced-queue-snapshot.json
+          jq -e '
+            .status == "SendDisabled"
+            and (.countDetails.activeMessageCount | tonumber) == 0
+            and (.countDetails.scheduledMessageCount | tonumber) == 0
+            and (.countDetails.deadLetterMessageCount | tonumber) >= 0
+          ' funded-fenced-queue-snapshot.json >/dev/null
+          jq -r '.countDetails.deadLetterMessageCount' \
+            funded-fenced-queue-snapshot.json > funded-fenced-dlq-before.next.txt
+          mv funded-fenced-queue-snapshot.json funded-queue-rollback-baseline.json
+          mv funded-fenced-dlq-before.next.txt funded-fenced-dlq-before.txt
+          az containerapp revision list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --only-show-errors -o json > funded-revisions-after-fence.json
+          jq -e --arg revision "$current_revision" '
+            ([.[] | select(.properties.active == true)] | length) == 1
+            and ([.[] | select(.properties.active == true)][0].name == $revision)
+            and ([.[] | select(.properties.active == true)][0].properties.healthState == "Healthy")
+            and (([.[] | select(.properties.active == true)][0].properties.template.scale.minReplicas // 0 | tonumber) != 1
+              or (([.[] | select(.properties.active == true)][0].properties.replicas // 0) | tonumber) >= 1)
+          ' funded-revisions-after-fence.json >/dev/null || {
+            printf '%s\n' 'funded_predecessor_changed_after_fence' >&2
+            exit 1
+          }
+          az containerapp revision show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --revision "$current_revision" \
+            --only-show-errors -o json > current-funded-revision-after-fence.json
+          jq -S '.properties.template' current-funded-revision-after-fence.json \
+            > funded-rollback-template-after-fence.json
+          cmp funded-rollback-template.json funded-rollback-template-after-fence.json || {
+            printf '%s\n' 'funded_predecessor_changed_after_fence' >&2
+            exit 1
+          }
           readonly v8_campaign_prefix="reports/research/venue-probe/control/campaign-risk/dynamic-quote-funded-2026-08-11-v8/"
           echo "FUNDED_RETIRE_WORKSPACE_CUSTOMER_ID=$workspace_customer_id" >> "$GITHUB_ENV"
           echo "FUNDED_RETIRE_CURRENT_REVISION=$current_revision" >> "$GITHUB_ENV"
@@ -2214,9 +2389,6 @@ jobs:
             and .historical_high_water_equity >= 102.78112
             and (.last_reconciled_equity - 29.505501 | fabs) <= 0.01
           ' current-v5-capital-reserve-state.json >/dev/null
-          jq -S '.properties.template' current-funded-revision.json > funded-rollback-template.json
-          echo "FUNDED_ROLLBACK_REVISION=$current_revision" >> "$GITHUB_ENV"
-
       - name: Deploy continuous funded Dynamic Quote service
         run: |
           set -euo pipefail
@@ -2243,6 +2415,73 @@ jobs:
           done
           test "$deployed" = true
           test "$(jq -r '.properties.provisioningState' funded-deployment.json)" = "Succeeded"
+          workflow_revision_captured=false
+          for attempt in $(seq 1 36); do
+            az containerapp revision list \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --only-show-errors -o json > funded-workflow-revisions.json
+            if ! workflow_revision=$(jq -er '
+              [.[] | select(.properties.active == true)]
+              | if length == 1 then .[0].name
+                else error("expected one workflow-created funded revision")
+                end
+            ' funded-workflow-revisions.json); then
+              sleep 5
+              continue
+            fi
+            az containerapp revision show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --revision "$workflow_revision" \
+              --only-show-errors -o json > funded-workflow-revision.json
+            jq -S '.properties.template' funded-workflow-revision.json \
+              > funded-workflow-template.json
+            if [ "$workflow_revision" != "$FUNDED_ROLLBACK_REVISION" ] \
+                && ! cmp -s funded-rollback-template.json funded-workflow-template.json \
+                && jq -e --arg image "${{ steps.images.outputs.funded_reference }}" '
+                  .properties.template.scale.minReplicas == 0
+                  and .properties.template.scale.maxReplicas == 1
+                  and .properties.template.containers[0].image == $image
+                  and (.properties.template.containers[0].command | join(" "))
+                    == "node src/funded-direct-service.mjs"
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "VENUE_PROBE_FUNDED_CAMPAIGN_ID"
+                      and .value == "dynamic-quote-funded-2026-08-13-v10")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME"
+                      and .value == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/session.json")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "FUNDED_DIRECT_SESSION_MANIFEST_SHA256"
+                      and .value == "sha256:c516c052fc5c01eed5403842ff24bf4b08512d6c38e8260e2d064580c82322f8")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "FUNDED_DIRECT_SERVICE_ENABLED" and .value == "false")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "FUNDED_DIRECT_WORKER_ENABLED" and .value == "false")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED" and .value == "false")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "ALLOW_FUNDED_DIRECT" and .value == "false")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "FUNDED_DIRECT_DRY_RUN" and .value == "true")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "ALLOW_LIVE" and .value == "false")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "ALLOW_STRATEGY_CANARY" and .value == "false")] | length) == 1
+                  and ([.properties.template.containers[0].env[]
+                    | select(.name == "ENABLE_TAKER_ORDERS" and .value == "false")] | length) == 1
+                ' funded-workflow-revision.json >/dev/null; then
+              workflow_template_sha256="sha256:$(sha256sum funded-workflow-template.json | cut -d' ' -f1)"
+              {
+                echo "FUNDED_WORKFLOW_ACTIVE_REVISION=$workflow_revision"
+                echo "FUNDED_WORKFLOW_ACTIVE_TEMPLATE_SHA256=$workflow_template_sha256"
+              } >> "$GITHUB_ENV"
+              workflow_revision_captured=true
+              break
+            fi
+            sleep 5
+          done
+          test "$workflow_revision_captured" = true
 
       - name: Keep the obsolete North Europe funded job fail-closed
         run: |
@@ -4357,6 +4596,18 @@ jobs:
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_NAMESPACE)" = "$SERVICE_BUS_NAMESPACE"
           test "$(producer_env_value FUNDED_DIRECT_SERVICE_BUS_QUEUE)" = "$SERVICE_BUS_QUEUE"
           test "$(producer_env_value LOCAL_JSONL_RECORDER_ENABLED)" = "false"
+          az containerapp revision show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$FUNDED_APP" \
+            --revision "$target_revision" \
+            --only-show-errors -o json > funded-workflow-revision.json
+          jq -S '.properties.template' funded-workflow-revision.json \
+            > funded-workflow-template.json
+          workflow_template_sha256="sha256:$(sha256sum funded-workflow-template.json | cut -d' ' -f1)"
+          {
+            echo "FUNDED_WORKFLOW_ACTIVE_REVISION=$target_revision"
+            echo "FUNDED_WORKFLOW_ACTIVE_TEMPLATE_SHA256=$workflow_template_sha256"
+          } >> "$GITHUB_ENV"
 
       - name: Refresh Azure login for post-deployment verification
         uses: azure/login@v2
@@ -5252,7 +5503,7 @@ jobs:
           echo "FUNDED_CUTOVER_COMPLETE=true" >> "$GITHUB_ENV"
 
       - name: Restore the dormant funded service after an incomplete cutover
-        if: ${{ always() && (env.FUNDED_QUEUE_FENCED == 'true' || env.FUNDED_POINTER_PREFLIGHT_REQUESTED == 'true') && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
+        if: ${{ always() && (env.FUNDED_QUEUE_FENCE_REQUESTED == 'true' || env.FUNDED_QUEUE_FENCED == 'true' || env.FUNDED_POINTER_PREFLIGHT_REQUESTED == 'true') && env.FUNDED_CUTOVER_COMPLETE != 'true' }}
         run: |
           set -euo pipefail
           queue_fenced=false
@@ -5273,51 +5524,52 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" --query status -o tsv)" = "SendDisabled"
-          producer_cleanup_updated=false
-          for attempt in 1 2 3; do
-            if az containerapp update \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$INTENT_PRODUCER_APP" \
-              --remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT \
-              --set-env-vars \
-                RUN_BOT_ON_STARTUP=true \
-                FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
-                FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
-                FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
-              --only-show-errors -o none; then
-              producer_cleanup_updated=true
-              break
-            fi
-            sleep "$((attempt * 10))"
-          done
-          test "$producer_cleanup_updated" = true
-          restored_producer_revision=$(az containerapp show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$INTENT_PRODUCER_APP" \
-            --query properties.latestRevisionName -o tsv)
-          test -n "$restored_producer_revision"
+          if [ "${FUNDED_POINTER_PREFLIGHT_REQUESTED:-false}" = true ]; then
+            producer_cleanup_updated=false
+            for attempt in 1 2 3; do
+              if az containerapp update \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$INTENT_PRODUCER_APP" \
+                --remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT \
+                --set-env-vars \
+                  RUN_BOT_ON_STARTUP=true \
+                  FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
+                  FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
+                  FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
+                --only-show-errors -o none; then
+                producer_cleanup_updated=true
+                break
+              fi
+              sleep "$((attempt * 10))"
+            done
+            test "$producer_cleanup_updated" = true
+          fi
           producer_restored=false
           for attempt in $(seq 1 36); do
             az containerapp revision list \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$INTENT_PRODUCER_APP" \
               -o json > producer-revisions-restored.json
-            if jq -e --arg revision "$restored_producer_revision" '
-              ([.[] | select(.properties.active == true)] | length) == 1
-              and ([.[] | select(.properties.active == true)][0].name == $revision)
-              and ([.[] | select(.name == $revision)] | length) == 1
-              and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
-              and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
-            ' producer-revisions-restored.json >/dev/null; then
+            if restored_producer_revision=$(jq -er '
+              [.[] | select(.properties.active == true)] as $active
+              | if ($active | length) == 1
+                  and $active[0].properties.healthState == "Healthy"
+                  and $active[0].properties.replicas >= 1
+                then $active[0].name
+                else error("expected one active healthy producer revision")
+                end
+            ' producer-revisions-restored.json); then
               producer_restored=true
               break
             fi
             sleep 5
           done
           test "$producer_restored" = true
-          az containerapp show \
+          az containerapp revision show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$INTENT_PRODUCER_APP" \
+            --revision "$restored_producer_revision" \
+            --only-show-errors \
             -o json > intent-producer-restored.json
           restored_producer_env() {
             jq -er --arg name "$1" '
@@ -5338,11 +5590,42 @@ jobs:
             intent-producer-restored.json)" = "0"
           if [ -n "${FUNDED_ROLLBACK_REVISION:-}" ]; then
             test -s funded-rollback-template.json
-            rollback_command=(az containerapp revision copy \
+            exact_rollback=true
+            rollback_noop=false
+            az containerapp revision list \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
-              --from-revision "$FUNDED_ROLLBACK_REVISION")
-            exact_rollback=true
+              --only-show-errors -o json > funded-revisions-before-rollback-copy.json
+            current_rollback_revision=$(jq -er '
+              [.[] | select(.properties.active == true)]
+              | if length == 1 then .[0].name
+                else error("expected one active funded revision before rollback copy")
+                end
+            ' funded-revisions-before-rollback-copy.json) || {
+              printf '%s\n' 'funded_rollback_precopy_guard_failed' >&2
+              exit 1
+            }
+            az containerapp revision show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --revision "$current_rollback_revision" \
+              --only-show-errors -o json > funded-revision-before-rollback-copy.json
+            jq -S '.properties.template' funded-revision-before-rollback-copy.json \
+              > funded-template-before-rollback-copy.json
+            if cmp -s funded-rollback-template.json funded-template-before-rollback-copy.json; then
+              rollback_noop=true
+            elif [ "$current_rollback_revision" = "${FUNDED_WORKFLOW_ACTIVE_REVISION:-}" ] \
+                && test -n "${FUNDED_WORKFLOW_ACTIVE_TEMPLATE_SHA256:-}" \
+                && test "sha256:$(sha256sum funded-template-before-rollback-copy.json | cut -d' ' -f1)" = \
+                  "$FUNDED_WORKFLOW_ACTIVE_TEMPLATE_SHA256"; then
+              rollback_command=(az containerapp revision copy \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --name "$FUNDED_APP" \
+                --from-revision "$FUNDED_ROLLBACK_REVISION")
+            else
+              printf '%s\n' 'funded_rollback_precopy_guard_failed' >&2
+              exit 1
+            fi
           else
             rollback_command=(az containerapp update \
               --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -5361,64 +5644,74 @@ jobs:
             exact_rollback=false
           fi
           rollback_applied=false
-          for attempt in $(seq 1 30); do
-            if "${rollback_command[@]}" --only-show-errors -o none \
-              2> funded-rollback.stderr; then
-              rollback_applied=true
-              break
-            fi
-            if ! grep -Fq 'ContainerAppOperationInProgress' funded-rollback.stderr || \
-              [ "$attempt" -eq 30 ]; then
-              cat funded-rollback.stderr >&2
-              exit 1
-            fi
-            sleep 10
-          done
+          if [ "${rollback_noop:-false}" = true ]; then
+            rollback_applied=true
+          else
+            for attempt in $(seq 1 30); do
+              if "${rollback_command[@]}" --only-show-errors -o none \
+                2> funded-rollback.stderr; then
+                rollback_applied=true
+                break
+              fi
+              if ! grep -Fq 'ContainerAppOperationInProgress' funded-rollback.stderr || \
+                [ "$attempt" -eq 30 ]; then
+                cat funded-rollback.stderr >&2
+                exit 1
+              fi
+              sleep 10
+            done
+          fi
           test "$rollback_applied" = true
           test "$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             --name "$SERVICE_BUS_QUEUE" \
             --query status -o tsv)" = "SendDisabled"
-          restored_revision=$(az containerapp show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$FUNDED_APP" \
-            --query properties.latestRevisionName -o tsv)
-          test -n "$restored_revision"
+          restored_revision=""
+          restored_ready=false
           for attempt in $(seq 1 60); do
-            ready_revision=$(az containerapp show \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$FUNDED_APP" \
-              --query properties.latestReadyRevisionName -o tsv)
-            if [ "$ready_revision" = "$restored_revision" ]; then break; fi
-            sleep 5
-          done
-          test "$ready_revision" = "$restored_revision"
-          az containerapp revision show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$FUNDED_APP" \
-            --revision "$restored_revision" \
-            --only-show-errors -o json > restored-funded-revision.json
-          if [ "$exact_rollback" = true ]; then
-            jq -S '.properties.template' restored-funded-revision.json > restored-funded-template.json
-            cmp funded-rollback-template.json restored-funded-template.json
-            test "$(jq -r '.properties.active' restored-funded-revision.json)" = "true"
-            while read -r active_revision; do
-              if [ -n "$active_revision" ] && [ "$active_revision" != "$restored_revision" ]; then
-                az containerapp revision deactivate \
-                  --resource-group "$AZURE_RESOURCE_GROUP" \
-                  --name "$FUNDED_APP" \
-                  --revision "$active_revision" \
-                  --only-show-errors -o none
-              fi
-            done < <(az containerapp revision list \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --name "$FUNDED_APP" \
-              --query '[?properties.active].name' -o tsv)
             az containerapp revision list \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$FUNDED_APP" \
-              -o json > restored-funded-revisions.json
+              --only-show-errors -o json > restored-funded-revisions.json
+            if ! restored_revision=$(jq -er '
+              [.[] | select(.properties.active == true)]
+              | if length == 1 then .[0].name
+                else error("expected exactly one active funded rollback revision")
+                end
+            ' restored-funded-revisions.json); then
+              sleep 5
+              continue
+            fi
+            az containerapp revision show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --name "$FUNDED_APP" \
+              --revision "$restored_revision" \
+              --only-show-errors -o json > restored-funded-revision.json
+            if [ "$exact_rollback" = true ]; then
+              jq -S '.properties.template' restored-funded-revision.json \
+                > restored-funded-template.json
+              if test "$(jq -r '.properties.healthState' restored-funded-revision.json)" = "Healthy" \
+                  && test "$(jq -r '.properties.replicas' restored-funded-revision.json)" -ge 1 \
+                  && test "sha256:$(sha256sum restored-funded-template.json | cut -d' ' -f1)" = \
+                    "$FUNDED_ROLLBACK_TEMPLATE_SHA256" \
+                  && cmp -s funded-rollback-template.json restored-funded-template.json; then
+                restored_ready=true
+                break
+              fi
+            else
+              restored_ready=true
+              break
+            fi
+            sleep 5
+          done
+          test "$restored_ready" = true
+          if [ "$exact_rollback" = true ]; then
+            test "${FUNDED_ROLLBACK_REOPEN_AUTHORIZED:-false}" = true
+            test -s funded-rollback-template.sha256
+            test "$(cat funded-rollback-template.sha256)" = "$FUNDED_ROLLBACK_TEMPLATE_SHA256"
+            cmp funded-rollback-template.json restored-funded-template.json
+            test "$(jq -r '.properties.active' restored-funded-revision.json)" = "true"
             jq -e --arg revision "$restored_revision" '
               ([.[] | select(.properties.active == true)] | length) == 1
               and ([.[] | select(.properties.active == true)][0].name == $revision)
@@ -5437,9 +5730,11 @@ jobs:
               and ([.[] | select(.name == $revision)][0].properties.healthState == "Healthy")
               and ([.[] | select(.name == $revision)][0].properties.replicas >= 1)
             ' producer-revisions-before-rollback-reopen.json >/dev/null
-            az containerapp show \
+            az containerapp revision show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --name "$INTENT_PRODUCER_APP" \
+              --revision "$restored_producer_revision" \
+              --only-show-errors \
               -o json > intent-producer-restored.json
             test "$(restored_producer_env RUN_BOT_ON_STARTUP)" = "true"
             test "$(restored_producer_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
@@ -5449,18 +5744,17 @@ jobs:
             test "$(jq '[.properties.template.containers[0].env[]
               | select(.name == "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT")] | length' \
               intent-producer-restored.json)" = "0"
-            rollback_dlq_before=$(cat funded-fenced-dlq-before.txt)
-            [[ "$rollback_dlq_before" =~ ^[0-9]+$ ]]
+            test -s funded-queue-rollback-baseline.json
             az servicebus queue show \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --namespace-name "$SERVICE_BUS_NAMESPACE" \
               --name "$SERVICE_BUS_QUEUE" \
               -o json > funded-queue-before-rollback-reopen.json
-            jq -e --argjson dlq "$rollback_dlq_before" '
+            jq -e --slurpfile fenced funded-queue-rollback-baseline.json '
               .status == "SendDisabled"
-              and (.countDetails.activeMessageCount | tonumber) == 0
-              and (.countDetails.scheduledMessageCount | tonumber) == 0
-              and (.countDetails.deadLetterMessageCount | tonumber) == $dlq
+              and .countDetails.activeMessageCount == $fenced[0].countDetails.activeMessageCount
+              and .countDetails.scheduledMessageCount == $fenced[0].countDetails.scheduledMessageCount
+              and .countDetails.deadLetterMessageCount == $fenced[0].countDetails.deadLetterMessageCount
             ' funded-queue-before-rollback-reopen.json >/dev/null
             queue_reopened=false
             for attempt in 1 2 3; do
