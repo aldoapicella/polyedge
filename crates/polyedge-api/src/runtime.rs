@@ -1399,7 +1399,7 @@ impl RuntimeController {
         let (market, quality_events) = {
             let _decision_guard = self.inner.decision_gate.lock().await;
             let mut data = self.inner.data.write().await;
-            if !self.accept_clob_sequence(&mut data, clob_sequence) {
+            if !self.accept_clob_sequence(&mut data, clob_sequence, book.local_ts) {
                 return;
             }
             data.books.insert(book.token_id.clone(), book.clone());
@@ -1439,7 +1439,7 @@ impl RuntimeController {
     async fn invalidate_book(&self, token_id: TokenId, clob_sequence: Option<(u64, u64)>) {
         let _decision_guard = self.inner.decision_gate.lock().await;
         let mut data = self.inner.data.write().await;
-        if !self.accept_clob_sequence(&mut data, clob_sequence) {
+        if !self.accept_clob_sequence(&mut data, clob_sequence, Utc::now()) {
             return;
         }
         data.books.remove(&token_id);
@@ -1461,7 +1461,7 @@ impl RuntimeController {
             let _decision_guard = self.inner.decision_gate.lock().await;
             {
                 let mut data = self.inner.data.write().await;
-                if !self.accept_clob_sequence(&mut data, clob_sequence) {
+                if !self.accept_clob_sequence(&mut data, clob_sequence, event.recorded_ts) {
                     return;
                 }
             }
@@ -3131,6 +3131,16 @@ impl RuntimeController {
         observed_at: DateTime<Utc>,
     ) {
         let mut data = self.inner.data.write().await;
+        Self::set_feed_status_at_locked(&mut data, name, status, message, observed_at);
+    }
+
+    fn set_feed_status_at_locked(
+        data: &mut RuntimeData,
+        name: &str,
+        status: &str,
+        message: Option<String>,
+        observed_at: DateTime<Utc>,
+    ) {
         if data.feed_status.get(name).and_then(|value| {
             value["updated_at"]
                 .as_str()
@@ -3154,7 +3164,12 @@ impl RuntimeController {
         self.feed_error_at(source, message, Utc::now()).await;
     }
 
-    fn accept_clob_sequence(&self, data: &mut RuntimeData, sequence: Option<(u64, u64)>) -> bool {
+    fn accept_clob_sequence(
+        &self,
+        data: &mut RuntimeData,
+        sequence: Option<(u64, u64)>,
+        observed_at: DateTime<Utc>,
+    ) -> bool {
         let Some((generation, sequence)) = sequence else {
             return true;
         };
@@ -3168,6 +3183,7 @@ impl RuntimeController {
             return false;
         }
         data.clob_last_sequence = sequence;
+        Self::set_feed_status_at_locked(data, "PolymarketClobMarket", "ok", None, observed_at);
         true
     }
 
@@ -4433,15 +4449,122 @@ mod tests {
     async fn clob_generation_rejects_pre_ready_and_stale_frames() {
         let controller = RuntimeController::new(RuntimeSettings::default());
         let mut data = controller.inner.data.write().await;
-        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1))));
+        let observed_at = Utc::now();
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1)), observed_at));
         data.clob_generation = Some(7);
         data.clob_lease = Some(ClobGenerationLease::new());
-        assert!(controller.accept_clob_sequence(&mut data, Some((7, 1))));
-        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1))));
-        assert!(!controller.accept_clob_sequence(&mut data, Some((6, 2))));
-        assert!(controller.accept_clob_sequence(&mut data, Some((7, 2))));
+        assert!(controller.accept_clob_sequence(&mut data, Some((7, 1)), observed_at));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1)), observed_at));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((6, 2)), observed_at));
+        assert!(controller.accept_clob_sequence(&mut data, Some((7, 2)), observed_at));
         data.clob_lease.as_ref().unwrap().terminate();
-        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 3))));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 3)), observed_at));
+    }
+
+    #[tokio::test]
+    async fn accepted_clob_events_refresh_feed_status_but_rejected_events_do_not() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(7);
+            data.clob_lease = Some(ClobGenerationLease::new());
+        }
+
+        let book_ts = Utc::now() - chrono::Duration::seconds(2);
+        let mut book = clob_test_book("test-token");
+        book.local_ts = book_ts;
+        controller
+            .handle_feed_event(FeedEvent::ClobBook {
+                generation: 7,
+                sequence: 1,
+                book,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"]["updated_at"],
+            json!(book_ts)
+        );
+
+        let raw_ts = book_ts + chrono::Duration::seconds(1);
+        let mut event = clob_test_event("test-token");
+        event.recorded_ts = raw_ts;
+        controller
+            .handle_feed_event(FeedEvent::ClobRawMarketEvent {
+                generation: 7,
+                sequence: 2,
+                event,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"]["updated_at"],
+            json!(raw_ts)
+        );
+
+        let invalidated_after = Utc::now();
+        controller
+            .handle_feed_event(FeedEvent::ClobBookInvalidated {
+                generation: 7,
+                sequence: 3,
+                token_id: TokenId::new("test-token"),
+            })
+            .await;
+        let accepted_status =
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"].clone();
+        let invalidated_at = accepted_status["updated_at"]
+            .as_str()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .expect("invalidation freshness timestamp");
+        assert!(invalidated_at >= invalidated_after);
+
+        let mut stale_book = clob_test_book("test-token");
+        stale_book.local_ts = Utc::now() + chrono::Duration::hours(1);
+        controller
+            .handle_feed_event(FeedEvent::ClobBook {
+                generation: 7,
+                sequence: 3,
+                book: stale_book,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            accepted_status
+        );
+
+        let mut rejected_event = clob_test_event("test-token");
+        rejected_event.recorded_ts = Utc::now() + chrono::Duration::hours(1);
+        controller
+            .handle_feed_event(FeedEvent::ClobRawMarketEvent {
+                generation: 6,
+                sequence: 4,
+                event: rejected_event,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            accepted_status
+        );
+
+        controller
+            .inner
+            .data
+            .write()
+            .await
+            .clob_lease
+            .as_ref()
+            .unwrap()
+            .terminate();
+        controller
+            .handle_feed_event(FeedEvent::ClobBookInvalidated {
+                generation: 7,
+                sequence: 4,
+                token_id: TokenId::new("test-token"),
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            accepted_status
+        );
     }
 
     #[tokio::test]
