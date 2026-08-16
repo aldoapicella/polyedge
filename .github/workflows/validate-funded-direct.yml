@@ -26,6 +26,11 @@ on:
         required: true
         default: false
         type: boolean
+      diagnose_latest_lifecycle:
+        description: Read the latest funded lifecycle and report only failed summary field names
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -774,6 +779,131 @@ jobs:
           NODE
           bash scripts/test-verify-funded-v10-capital.sh
           git diff --check
+
+  diagnose-funded-lifecycle:
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnose_latest_lifecycle
+    needs: funded-safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Report only failed lifecycle summary fields
+        env:
+          AZURE_RESOURCE_GROUP: rg-polyedge-dev
+          CONTAINER_APP_ENVIRONMENT: polyedge-dev-env
+          FUNDED_APP: polyedge-funded-direct-cl
+          STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
+          FUNDED_CONTAINER: polyedge-funded-evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          workspace_id=$(az containerapp env show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$CONTAINER_APP_ENVIRONMENT" \
+            --query properties.appLogsConfiguration.logAnalyticsConfiguration.customerId \
+            -o tsv)
+          test -n "$workspace_id"
+          az monitor log-analytics query \
+            --workspace "$workspace_id" \
+            --analytics-query "ContainerAppConsoleLogs_CL
+              | where ContainerAppName_s == '$FUNDED_APP'
+              | where TimeGenerated >= ago(24h)
+              | extend record = parse_json(Log_s)
+              | where tostring(record.schema) == 'polyedge.funded_direct_latency.v1'
+              | where tostring(record.status) == 'intent_completed'
+              | where tobool(record.order_submission_attempted) == true
+              | where tobool(record.order_submitted) == true
+              | where tostring(record.worker_status) == 'persistent_intent_completed'
+              | top 1 by TimeGenerated desc
+              | project Log_s" \
+            -o json > lifecycle.json
+          decision_id=$(jq -er \
+            '.[0].Log_s | fromjson | .decision_id | select(test("^[0-9a-f]{64}$"))' \
+            lifecycle.json)
+          control_prefix=reports/funded/dynamic-quote
+          session_id=dynamic-quote-funded-2026-08-13-v10
+          authorization_blob="$control_prefix/sessions/$session_id/authorizations/$decision_id.json"
+          completion_blob="$control_prefix/sessions/$session_id/completed/$decision_id.json"
+          download_blob() {
+            local blob_name=$1 output_file=$2
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$blob_name" \
+              --file "$output_file" \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none > /dev/null 2> download-error.log || {
+                echo 'funded diagnostic artifact download failed' >&2
+                exit 1
+              }
+          }
+          download_blob "$authorization_blob" authorization.json
+          download_blob "$completion_blob" completion.json
+          authorization_sha="sha256:$(sha256sum authorization.json | cut -d' ' -f1)"
+          child_run_id=$(jq -er '.child_run_id | select(test("^funded-direct-[0-9]{17}-[0-9a-f]{8}$"))' completion.json)
+          intent_blob=$(jq -er '.intent_blob_name | select(type == "string")' authorization.json)
+          intent_sha=$(jq -er '.intent_sha256 | select(test("^sha256:[0-9a-f]{64}$"))' authorization.json)
+          authorization_at=$(jq -er '.authorized_at | select(type == "string")' authorization.json)
+          completion_at=$(jq -er '.completed_at | select(type == "string")' completion.json)
+          authorization_day=$(date -u -d "$authorization_at" +%Y-%m-%d)
+          completion_day=$(date -u -d "$completion_at" +%Y-%m-%d)
+          summary_matches=0
+          while read -r artifact_day; do
+            candidate_blob="reports/research/venue-probe/runs/$artifact_day/$child_run_id/summary.json"
+            if az storage blob download \
+                --account-name "$STORAGE_ACCOUNT" \
+                --container-name "$FUNDED_CONTAINER" \
+                --name "$candidate_blob" \
+                --file summary.json \
+                --auth-mode login \
+                --overwrite \
+                --only-show-errors -o none > /dev/null 2> download-error.log; then
+              summary_matches=$((summary_matches + 1))
+            fi
+          done < <(printf '%s\n' "$authorization_day" "$completion_day" | sort -u)
+          test "$summary_matches" = 1
+          order_id=$(jq -er '.lifecycle.order_id | select(test("^0x[0-9a-fA-F]{64}$"))' summary.json)
+          jq -c \
+            --arg decision "$decision_id" \
+            --arg run "$child_run_id" \
+            --arg authorization_blob "$authorization_blob" \
+            --arg authorization_sha "$authorization_sha" \
+            --arg intent_blob "$intent_blob" \
+            --arg intent_sha "$intent_sha" \
+            --arg order_id "$order_id" '
+              [
+                {field:"schema_version", ok:(.schema_version == 3)},
+                {field:"status", ok:(.status == "completed")},
+                {field:"run_binding", ok:(.run_id == $run)},
+                {field:"submission_attempted", ok:(.order_submission_attempted == true)},
+                {field:"submission_confirmed", ok:(.order_submitted == true)},
+                {field:"decision_binding", ok:(.provenance.decision_id == $decision)},
+                {field:"authorization_kind", ok:(.provenance.authorization_kind == "operator_direct")},
+                {field:"session_binding", ok:(.provenance.operator_session_id == "dynamic-quote-funded-2026-08-13-v10")},
+                {field:"promotion_mode", ok:(.provenance.research_promotion_bypassed == true)},
+                {field:"authorization_blob_binding", ok:(.provenance.authorization_blob_name == $authorization_blob)},
+                {field:"authorization_hash_binding", ok:(.provenance.authorization_sha256 == $authorization_sha)},
+                {field:"intent_blob_binding", ok:(.provenance.intent_blob_name == $intent_blob)},
+                {field:"intent_hash_binding", ok:(.provenance.intent_sha256 == $intent_sha)},
+                {field:"current_funds_scaled", ok:(.order.current_funds_scaled == true)},
+                {field:"requested_notional_reduced", ok:(.order.source_requested_notional > .order.notional)},
+                {field:"requested_notional_cap", ok:(.order.source_requested_notional <= 10.5)},
+                {field:"executed_notional_cap", ok:(.order.notional < 10.5)},
+                {field:"order_binding", ok:(.lifecycle.order_id == $order_id)}
+              ]
+              | {
+                  failed_fields: [.[] | select(.ok | not) | .field],
+                  passed_count: ([.[] | select(.ok)] | length),
+                  total: length
+                }
+            ' summary.json | tee lifecycle-summary-diagnostic.json
 
   deploy-funded-service:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
