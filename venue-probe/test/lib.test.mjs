@@ -520,6 +520,25 @@ test("secret fields are recursively redacted", () => {
       value: 1
     }
   });
+  for (const key of [
+    "authorization_kind",
+    "authorization_blob_name",
+    "authorization_container_name",
+    "authorization_sha256"
+  ]) {
+    assert.equal(sanitize({ [key]: "Bearer token-value" })[key], "[REDACTED]");
+  }
+  assert.deepEqual(sanitize({
+    authorization_kind: "operator_direct\nBearer token-value",
+    authorization_blob_name: "../authorization.json",
+    authorization_container_name: "Evidence",
+    authorization_sha256: `sha256:${"g".repeat(64)}`
+  }), {
+    authorization_kind: "[REDACTED]",
+    authorization_blob_name: "[REDACTED]",
+    authorization_container_name: "[REDACTED]",
+    authorization_sha256: "[REDACTED]"
+  });
 });
 
 test("effective queue model remains collecting below evidence threshold", () => {

@@ -424,6 +424,20 @@ export function campaignRestSchedule(count, horizons, seed = "polyedge") {
   return values;
 }
 
+function isSafeAuthorizationMetadata(key, value) {
+  if (typeof value !== "string") return false;
+  if (key === "authorization_kind") {
+    return ["checkpoint_1_canary", "funded_stage", "operator_direct"].includes(value);
+  }
+  if (key === "authorization_sha256") return /^sha256:[0-9a-f]{64}$/.test(value);
+  if (key === "authorization_container_name") {
+    return /^(?=.{3,63}$)[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
+  }
+  return key === "authorization_blob_name"
+    && value.length <= 1024
+    && /^(?:[a-z0-9][a-z0-9._-]*\/)*[a-z0-9][a-z0-9._-]*\.json$/.test(value);
+}
+
 export function sanitize(value) {
   if (Array.isArray(value)) return value.map(sanitize);
   if (!value || typeof value !== "object") return value;
@@ -431,7 +445,7 @@ export function sanitize(value) {
     Object.entries(value).map(([key, child]) => [
       key,
       /secret|passphrase|private.?key|api.?key|signature|authorization|auth$|^(?:owner|order_owner)$/i.test(key)
-        && !/^(?:authorization_kind|authorization_(?:blob|container)_name|authorization_sha256)$/.test(key)
+        && !isSafeAuthorizationMetadata(key, child)
         ? "[REDACTED]"
         : sanitize(child)
     ])

@@ -9,6 +9,7 @@ on:
       - "scripts/test-verify-funded-v10-capital.sh"
       - "scripts/verify-funded-v10-capital.sh"
       - "scripts/fence-funded-queue-and-wait-empty.sh"
+      - "scripts/test-fence-funded-queue-and-wait-empty.sh"
       - "crates/polyedge-api/**"
       - "crates/polyedge-config/**"
       - "crates/polyedge-domain/**"
@@ -701,6 +702,12 @@ jobs:
           const authorizationDownload = activation.indexOf(
             'download_v10_blob "$authorization_blob" funded-v10-authorization.json',
             capitalVerification);
+          for (const index of [
+            lifecycleAccepted,
+            postLifecycleFence,
+            capitalVerification,
+            authorizationDownload
+          ]) assert.ok(index >= 0);
           assert.ok(lifecycleAccepted < postLifecycleFence &&
             postLifecycleFence < capitalVerification &&
             capitalVerification < authorizationDownload);
@@ -769,6 +776,8 @@ jobs:
           const rollback = workflow.slice(
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
           assert.match(rollback,
+            /if: \$\{\{ always\(\) &&[\s\S]*FUNDED_CUTOVER_COMPLETE != 'true'/);
+          assert.match(rollback,
             /for attempt in \$\(seq 1 30\); do[\s\S]*ContainerAppOperationInProgress[\s\S]*sleep 10/);
           assert.match(rollback,
             /cmp funded-rollback-template\.json restored-funded-template\.json[\s\S]*az containerapp revision deactivate[\s\S]*properties\.active == true/);
@@ -780,6 +789,7 @@ jobs:
             "-o json > funded-heartbeat-after-reopen.json || { sleep 5; continue; }"
           ]) assert.ok(workflow.includes(retry), `missing bounded Log Analytics retry: ${retry}`);
           NODE
+          bash scripts/test-fence-funded-queue-and-wait-empty.sh
           bash scripts/test-verify-funded-v10-capital.sh
           git diff --check
 
