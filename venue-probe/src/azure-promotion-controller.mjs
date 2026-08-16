@@ -538,7 +538,7 @@ export function loadConfig(environment = process.env) {
   for (const name of ["AZURE_TENANT_ID", "AZURE_CLIENT_ID"]) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(environment[name] ?? "")) fail(`${name} is invalid`);
   }
-  if (environment.AZURE_FEDERATED_TOKEN_FILE !== "/run/polyedge-federated-promotion-controller/azure-federated-token") fail("AZURE_FEDERATED_TOKEN_FILE must use the dedicated promotion-controller lane");
+  if (environment.AZURE_FEDERATED_TOKEN_FILE !== "/run/polyedge-federated-promotion/azure-federated-token") fail("AZURE_FEDERATED_TOKEN_FILE must use the dedicated promotion-controller lane");
   if (environment.AZURE_TOKEN_CREDENTIALS !== "WorkloadIdentityCredential") fail("AZURE_TOKEN_CREDENTIALS must pin WorkloadIdentityCredential");
   if (environment.AZURE_RESOURCE_GROUP !== RESOURCE_GROUP) fail("AZURE_RESOURCE_GROUP must be rg-polyedge-dev");
   if (environment.POLYEDGE_PROMOTION_STATE_DIR !== "/var/lib/polyedge/azure-promotion" || !environment.POLYEDGE_PROMOTION_FREEZE_MARKER) fail("state directory must be the systemd StateDirectory path and freeze marker is required");

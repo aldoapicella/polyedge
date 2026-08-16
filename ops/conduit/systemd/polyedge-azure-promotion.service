@@ -34,7 +34,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadOnlyPaths=/run/polyedge-federated-promotion-controller
+ReadOnlyPaths=/run/polyedge-federated-promotion
 ReadOnlyPaths=/srv/polyedge/venue-probe
 
 [Install]

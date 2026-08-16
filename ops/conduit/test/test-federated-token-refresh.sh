@@ -4,7 +4,7 @@ set -eu
 root=$(mktemp -d)
 socket=$root/agent.sock
 fake=$root/spire-agent
-token_dir=$root/polyedge-federated-promotion-controller
+token_dir=$root/polyedge-federated-promotion
 token=$token_dir/azure-federated-token
 research_dir=$root/polyedge-federated-research
 research_token=$research_dir/azure-federated-token
@@ -72,7 +72,7 @@ fi
 
 POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPIRE_AGENT_BIN=$fake \
   POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID=$(id -u) POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID=$(id -g) \
-  ops/conduit/bin/polyedge-federated-token-refresh promotion-controller "$token" "$issuer"
+  ops/conduit/bin/polyedge-federated-token-refresh promotion "$token" "$issuer"
 [ "$(stat -c %a "$token")" = 600 ]
 if POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPIRE_AGENT_BIN=$fake \
   ops/conduit/bin/polyedge-federated-token-refresh invalid-lane "$token" "$issuer" 2>/dev/null; then

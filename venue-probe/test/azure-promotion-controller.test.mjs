@@ -210,7 +210,7 @@ function promotionEnvironment(overrides = {}) {
     AZURE_SUBSCRIPTION_ID: "11111111-1111-1111-1111-111111111111",
     AZURE_TENANT_ID: "22222222-2222-2222-2222-222222222222",
     AZURE_CLIENT_ID: "33333333-3333-3333-3333-333333333333",
-    AZURE_FEDERATED_TOKEN_FILE: "/run/polyedge-federated-promotion-controller/azure-federated-token",
+    AZURE_FEDERATED_TOKEN_FILE: "/run/polyedge-federated-promotion/azure-federated-token",
     AZURE_TOKEN_CREDENTIALS: "WorkloadIdentityCredential",
     AZURE_RESOURCE_GROUP: "rg-polyedge-dev",
     POLYEDGE_PROMOTION_IMAGE: candidate,
