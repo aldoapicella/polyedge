@@ -1041,6 +1041,8 @@ jobs:
           assert.match(recoveryBackfill,
             /test "\$predecessor_sha256"[\s\S]*test "\$recovery_sha256"[\s\S]*test "\$recovery_binding_sha256"[\s\S]*redemption_recovery_journal/);
           assert.match(recoveryBackfill,
+            /funded_recovery_backfill_predecessor_sha_mismatch[\s\S]*funded_recovery_backfill_recovery_sha_mismatch[\s\S]*funded_recovery_backfill_predecessor_contract_invalid[\s\S]*funded_recovery_backfill_recovery_contract_invalid[\s\S]*funded_recovery_backfill_binding_sha_mismatch/);
+          assert.match(recoveryBackfill,
             /if az storage blob download[\s\S]*cmp "\$journal_file" "\$existing_file"[\s\S]*exit 0[\s\S]*test "\$mutable_control_sha256"[\s\S]*az storage blob upload/);
           assert.match(recoveryBackfill,
             /redemption_recovery_journal[\s\S]*predecessor_run_id[\s\S]*finalized_control[\s\S]*recovered_summary/);
@@ -2616,11 +2618,17 @@ jobs:
               --auth-mode login \
               --overwrite \
               --only-show-errors -o none
-          test "$predecessor_sha256" = \
-            "sha256:$(sha256sum "$predecessor_file" | cut -d' ' -f1)"
-          test "$recovery_sha256" = \
-            "sha256:$(sha256sum "$recovery_file" | cut -d' ' -f1)"
-          jq -e --arg predecessor "$predecessor_run_id" '
+          if ! test "$predecessor_sha256" = \
+            "sha256:$(sha256sum "$predecessor_file" | cut -d' ' -f1)"; then
+            printf '%s\n' 'funded_recovery_backfill_predecessor_sha_mismatch' >&2
+            exit 1
+          fi
+          if ! test "$recovery_sha256" = \
+            "sha256:$(sha256sum "$recovery_file" | cut -d' ' -f1)"; then
+            printf '%s\n' 'funded_recovery_backfill_recovery_sha_mismatch' >&2
+            exit 1
+          fi
+          if ! jq -e --arg predecessor "$predecessor_run_id" '
             .schema_version == 1
             and .status == "failed_closed"
             and .run_id == $predecessor
@@ -2628,8 +2636,11 @@ jobs:
             and .research_only == false
             and .live_strategy_enabled == true
             and (.error | test("^fail closed: terminal evidence requires zero durable unresolved risk reservations \\(observed [1-9][0-9]*\\)$"))
-          ' "$predecessor_file" >/dev/null
-          jq -e --arg recovery "$recovery_run_id" \
+          ' "$predecessor_file" >/dev/null; then
+            printf '%s\n' 'funded_recovery_backfill_predecessor_contract_invalid' >&2
+            exit 1
+          fi
+          if ! jq -e --arg recovery "$recovery_run_id" \
             --arg recovery_blob "$recovery_blob" '
             .schema_version == 1
             and .status == "recovered_confirmed_and_verified"
@@ -2645,13 +2656,19 @@ jobs:
               and length == (unique | length))
             and $recovery_blob == ("reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/redemptions/"
               + .finished_ts[0:10] + "/" + .run_id + ".json")
-          ' "$recovery_file" >/dev/null
+          ' "$recovery_file" >/dev/null; then
+            printf '%s\n' 'funded_recovery_backfill_recovery_contract_invalid' >&2
+            exit 1
+          fi
           jq -c '{
             transaction_hash: (.transaction_hash | ascii_downcase),
             internal_settlement_blobs: (.internal_settlement_blobs | sort)
           }' "$recovery_file" > recovery-binding.json
-          test "$recovery_binding_sha256" = \
-            "sha256:$(sha256sum recovery-binding.json | cut -d' ' -f1)"
+          if ! test "$recovery_binding_sha256" = \
+            "sha256:$(sha256sum recovery-binding.json | cut -d' ' -f1)"; then
+            printf '%s\n' 'funded_recovery_backfill_binding_sha_mismatch' >&2
+            exit 1
+          fi
           jq -n --slurpfile predecessor "$predecessor_file" \
             --slurpfile summary "$recovery_file" \
             --arg predecessor "$predecessor_run_id" \
