@@ -662,7 +662,13 @@ pub async fn run_market_feed_generation_with_lease(
                     if anchored {
                         last_observation = Instant::now();
                     }
-                    if anchors.len() == expected_tokens.len() {
+                    // The CLOB endpoint does not promise one initial snapshot for
+                    // every subscribed asset: inactive assets may be omitted and
+                    // active assets may repeat. The first valid wire batch is the
+                    // generation boundary. The runtime clears the whole subscribed
+                    // set before installing this exact anchored subset; subsequent
+                    // same-generation snapshots fill the remaining books.
+                    if anchored && !anchors.is_empty() {
                         books = anchors.clone();
                         let mut pre_ready_events = Vec::new();
                         while let Some(payload) = anchored_deltas.pop_front() {
@@ -826,11 +832,17 @@ fn collect_snapshot_anchors(
                         "CLOB snapshot included an unsubscribed token".to_owned(),
                     ));
                 }
-                if anchors.insert(book.token_id.clone(), book).is_some() {
-                    return Err(FeedError::MarketProtocol(
-                        "CLOB generation repeated a snapshot token".to_owned(),
-                    ));
+                if anchors.contains_key(&book.token_id) {
+                    // A newer full snapshot supersedes every retained delta for
+                    // that token. Keeping those deltas would replay pre-snapshot
+                    // state over the newer anchor after authorization.
+                    retained.retain(|event| !incremental_tokens(event).contains(&book.token_id));
+                    *retained_bytes = retained
+                        .iter()
+                        .map(|event| serde_json::to_vec(event).map_or(0, |bytes| bytes.len()))
+                        .sum();
                 }
+                anchors.insert(book.token_id.clone(), book);
                 saw_snapshot = true;
             }
             "price_change" | "pricechange" | "last_trade_price" | "trade" | "last_trade" => {
@@ -1160,6 +1172,7 @@ fn strict_market_events(
             .map(value_text)
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let mut unanchored = BTreeSet::new();
         if matches!(event_type.as_str(), "book") {
             let book = strict_snapshot(item)?;
             if !expected.contains(&book.token_id) {
@@ -1172,19 +1185,48 @@ fn strict_market_events(
             "price_change" | "pricechange" | "last_trade_price" | "trade" | "last_trade"
         ) {
             validate_incremental(item, expected)?;
+            unanchored.extend(
+                incremental_tokens(item)
+                    .into_iter()
+                    .filter(|token| !books.contains_key(token)),
+            );
         }
-        let events = handle_market_event(item, books);
-        for event in &events {
-            if let FeedEvent::Book(book) = event {
-                if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                    if bid.price >= ask.price {
-                        return Err(FeedError::MarketProtocol(
-                            "CLOB resulting book is crossed".to_owned(),
-                        ));
-                    }
+        let mut events = handle_market_event(item, books);
+        let crossed = events
+            .iter()
+            .filter_map(|event| match event {
+                FeedEvent::Book(book)
+                    if matches!(
+                        (book.best_bid(), book.best_ask()),
+                        (Some(bid), Some(ask)) if bid.price >= ask.price
+                    ) =>
+                {
+                    Some(book.token_id.clone())
                 }
-            }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for token in &crossed {
+            // A crossed incremental state is never installed or published. Drop
+            // the token until a later valid snapshot/delta rebuilds it, while
+            // retaining the raw event as durable diagnostic evidence.
+            books.remove(token);
         }
+        for token in &unanchored {
+            // Deltas cannot establish a trustworthy depth baseline. A token
+            // omitted from the initial batch remains absent until its own full
+            // snapshot arrives.
+            books.remove(token);
+        }
+        let invalidated = crossed
+            .iter()
+            .chain(&unanchored)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        events.retain(
+            |event| !matches!(event, FeedEvent::Book(book) if invalidated.contains(&book.token_id)),
+        );
+        events.splice(0..0, crossed.into_iter().map(FeedEvent::BookInvalidated));
         output.extend(events);
     }
     Ok(output)
@@ -1208,6 +1250,11 @@ async fn forward_market_events(
                 generation,
                 sequence: *sequence,
                 book,
+            },
+            FeedEvent::BookInvalidated(token_id) => FeedEvent::ClobBookInvalidated {
+                generation,
+                sequence: *sequence,
+                token_id,
             },
             _ => continue,
         };
@@ -1585,7 +1632,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clob_anchor_requires_documented_wire_order_and_exact_tokens() {
+    fn clob_anchor_replaces_repeated_snapshot_and_keeps_strict_wire_validation() {
         let expected = BTreeSet::from([TokenId::new("yes"), TokenId::new("no")]);
         let mut anchors = BTreeMap::new();
         let mut retained = VecDeque::new();
@@ -1605,8 +1652,24 @@ mod tests {
         .unwrap());
         assert_eq!(anchors.len(), 1);
 
+        let delta = json!({
+            "event_type": "price_change",
+            "price_changes": [{"asset_id": "yes", "side": "BUY", "price": "0.41", "size": "2"}]
+        });
+        assert!(!collect_snapshot_anchors(
+            Message::Text(delta.to_string()),
+            &expected,
+            &mut anchors,
+            &mut retained,
+            &mut retained_bytes,
+        )
+        .unwrap());
+        assert_eq!(retained.len(), 1);
+
         let duplicate = json!({
-            "event_type": "book", "asset_id": "yes", "bids": [], "asks": []
+            "event_type": "book", "asset_id": "yes",
+            "bids": [{"price": "0.42", "size": "1"}],
+            "asks": [{"price": "0.58", "size": "1"}]
         });
         assert!(collect_snapshot_anchors(
             Message::Text(duplicate.to_string()),
@@ -1615,7 +1678,13 @@ mod tests {
             &mut retained,
             &mut retained_bytes,
         )
-        .is_err());
+        .unwrap());
+        assert_eq!(
+            anchors[&TokenId::new("yes")].best_bid().unwrap().price,
+            Decimal::new(42, 2)
+        );
+        assert!(retained.is_empty());
+        assert_eq!(retained_bytes, 0);
 
         let crossed = json!({
             "event_type": "book", "asset_id": "no",
@@ -1767,7 +1836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_token_blank_optional_price_reaches_one_barrier_and_holds_events_until_ack() {
+    async fn partial_snapshot_batch_reaches_one_barrier_and_later_tokens_wait_for_ack() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1810,7 +1879,9 @@ mod tests {
             .iter()
             .find(|book| book.token_id == TokenId::new("yes"))
             .unwrap();
-        assert_eq!(yes_anchor.best_bid().unwrap().price, Decimal::new(41, 2));
+        assert_eq!(barrier.token_count, 2);
+        assert_eq!(barrier.anchors.len(), 1);
+        assert_eq!(yes_anchor.best_bid().unwrap().price, Decimal::new(40, 2));
         assert!(barrier
             .anchors
             .iter()
@@ -1824,6 +1895,7 @@ mod tests {
         barrier.ready_ack.send(Ok(())).unwrap();
         let mut barrier_count = 1;
         let mut saw_later_book = false;
+        let mut saw_later_token = false;
         while let Some(event) = receiver.recv().await {
             match event {
                 FeedEvent::ClobResyncBarrier(_) => barrier_count += 1,
@@ -1833,18 +1905,90 @@ mod tests {
                     book,
                     ..
                 } => {
-                    saw_later_book = book.token_id == TokenId::new("yes")
+                    saw_later_book |= book.token_id == TokenId::new("yes")
                         && book
                             .best_bid()
                             .is_some_and(|bid| bid.price == Decimal::new(42, 2));
+                    saw_later_token |= book.token_id == TokenId::new("no");
                 }
                 _ => panic!("unexpected event or stale generation after authorization"),
             }
         }
         assert_eq!(barrier_count, 1);
         assert!(saw_later_book);
+        assert!(saw_later_token);
         let _ = feed.await.unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn crossed_incremental_is_evidenced_but_never_installed_or_published() {
+        let expected = BTreeSet::from([TokenId::new("token")]);
+        let mut books = BTreeMap::from([(
+            TokenId::new("token"),
+            strict_snapshot(&json!({
+                "event_type":"book", "asset_id":"token",
+                "bids":[{"price":"0.40","size":"1"}],
+                "asks":[{"price":"0.60","size":"1"}]
+            }))
+            .unwrap(),
+        )]);
+        let crossed = json!({
+            "event_type":"price_change",
+            "price_changes":[{"asset_id":"token","side":"BUY","price":"0.61","size":"1"}]
+        });
+        let events =
+            strict_market_events(Message::Text(crossed.to_string()), &expected, &mut books)
+                .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, FeedEvent::RawMarketEvent(_))));
+        assert!(matches!(
+            events.first(),
+            Some(FeedEvent::BookInvalidated(token)) if token == &TokenId::new("token")
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, FeedEvent::Book(_))));
+        assert!(!books.contains_key(&TokenId::new("token")));
+    }
+
+    #[test]
+    fn unanchored_token_ignores_deltas_until_its_full_snapshot_arrives() {
+        let expected = BTreeSet::from([TokenId::new("yes"), TokenId::new("no")]);
+        let mut books = BTreeMap::from([(
+            TokenId::new("yes"),
+            strict_snapshot(&json!({
+                "event_type":"book", "asset_id":"yes", "bids":[], "asks":[]
+            }))
+            .unwrap(),
+        )]);
+        let delta = json!({
+            "event_type":"price_change",
+            "price_changes":[{"asset_id":"no","side":"BUY","price":"0.40","size":"1"}]
+        });
+        let events =
+            strict_market_events(Message::Text(delta.to_string()), &expected, &mut books).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, FeedEvent::RawMarketEvent(_))));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, FeedEvent::Book(_))));
+        assert!(!books.contains_key(&TokenId::new("no")));
+
+        let snapshot = json!({
+            "event_type":"book", "asset_id":"no",
+            "bids":[{"price":"0.40","size":"1"}],
+            "asks":[{"price":"0.60","size":"1"}]
+        });
+        let events =
+            strict_market_events(Message::Text(snapshot.to_string()), &expected, &mut books)
+                .unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, FeedEvent::Book(book) if book.token_id == TokenId::new("no"))
+        ));
+        assert!(books.contains_key(&TokenId::new("no")));
     }
 
     #[tokio::test]

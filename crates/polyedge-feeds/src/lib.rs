@@ -38,6 +38,7 @@ pub enum FeedName {
 pub enum FeedEvent {
     Reference(ReferencePrice),
     Book(BookState),
+    BookInvalidated(TokenId),
     RawMarketEvent(MarketChannelEvent),
     Error {
         source: FeedName,
@@ -48,9 +49,10 @@ pub enum FeedEvent {
         source: FeedName,
         ts: DateTime<Utc>,
     },
-    /// A market socket has collected one exact full-book snapshot per subscribed
-    /// asset and is stopped at its producer barrier.  The runtime must durably
-    /// authorize this generation before the socket may forward any deltas.
+    /// A market socket has collected its first valid full-book snapshot batch
+    /// and is stopped at its producer barrier. The runtime must durably clear
+    /// every subscribed token from the prior generation and authorize this one
+    /// before the socket may forward any later snapshots or deltas.
     ClobResyncBarrier(ClobResyncBarrier),
     ClobRawMarketEvent {
         generation: u64,
@@ -61,6 +63,11 @@ pub enum FeedEvent {
         generation: u64,
         sequence: u64,
         book: BookState,
+    },
+    ClobBookInvalidated {
+        generation: u64,
+        sequence: u64,
+        token_id: TokenId,
     },
 }
 

@@ -1105,6 +1105,7 @@ impl RuntimeController {
                     .await;
                 self.handle_book(book, None).await;
             }
+            FeedEvent::BookInvalidated(token_id) => self.invalidate_book(token_id, None).await,
             FeedEvent::ClobResyncBarrier(barrier) => self.handle_clob_resync_barrier(barrier).await,
             FeedEvent::ClobRawMarketEvent {
                 generation,
@@ -1119,6 +1120,14 @@ impl RuntimeController {
                 sequence,
                 book,
             } => self.handle_book(book, Some((generation, sequence))).await,
+            FeedEvent::ClobBookInvalidated {
+                generation,
+                sequence,
+                token_id,
+            } => {
+                self.invalidate_book(token_id, Some((generation, sequence)))
+                    .await
+            }
             FeedEvent::Error {
                 source,
                 message,
@@ -1425,6 +1434,19 @@ impl RuntimeController {
         }
         self.handle_paper_fills(&book, clob_sequence.map(|(generation, _)| generation))
             .await;
+    }
+
+    async fn invalidate_book(&self, token_id: TokenId, clob_sequence: Option<(u64, u64)>) {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let mut data = self.inner.data.write().await;
+        if !self.accept_clob_sequence(&mut data, clob_sequence) {
+            return;
+        }
+        data.books.remove(&token_id);
+        data.decision_generation = data.decision_generation.wrapping_add(1);
+        drop(data);
+        let mut engine = self.inner.engine.lock().await;
+        engine.decision_generation = engine.decision_generation.wrapping_add(1);
     }
 
     async fn handle_raw_market_event(
@@ -2238,18 +2260,27 @@ impl RuntimeController {
             }
         };
         let runtime = self.clone();
+        let publication_token_id = token_id.clone();
+        let publication_book = book.clone();
         tokio::spawn(async move {
             let publish_intent = intent.clone();
             let publisher_runtime = runtime.clone();
             match runtime
-                .execute_live_clob_publication(clob_generation, move || {
-                    let publisher = publisher_runtime
-                        .inner
-                        .intent_publisher
-                        .as_ref()
-                        .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
-                    publisher.publish(&publish_intent)
-                })
+                .execute_live_clob_publication(
+                    clob_generation,
+                    &publication_token_id,
+                    &publication_book,
+                    move || {
+                        let publisher = publisher_runtime
+                            .inner
+                            .intent_publisher
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "persistent intent publisher is unavailable".to_owned()
+                            })?;
+                        publisher.publish(&publish_intent)
+                    },
+                )
                 .await
             {
                 Ok(None) => {
@@ -2339,6 +2370,8 @@ impl RuntimeController {
     async fn execute_live_clob_publication<T, F>(
         &self,
         clob_generation: u64,
+        token_id: &TokenId,
+        expected_book: &BookState,
         publish: F,
     ) -> Result<Option<T>, String>
     where
@@ -2351,7 +2384,8 @@ impl RuntimeController {
             && data
                 .clob_lease
                 .as_ref()
-                .is_some_and(|lease| !lease.is_terminal());
+                .is_some_and(|lease| !lease.is_terminal())
+            && data.books.get(token_id) == Some(expected_book);
         drop(data);
         if !live {
             return Ok(None);
@@ -3231,7 +3265,8 @@ impl RuntimeController {
             && pending_generation == Some(barrier.generation)
             && terminal_generation < barrier.generation
             && !expected.is_empty()
-            && expected == anchored
+            && !anchored.is_empty()
+            && anchored.is_subset(&expected)
             && expected.len() == barrier.token_count
             && clob_token_set_digest(&expected) == barrier.token_set_digest;
         if !valid {
@@ -4464,13 +4499,16 @@ mod tests {
     #[tokio::test]
     async fn terminal_first_prevents_the_real_live_publication_helper_from_calling_publisher() {
         let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("publish-token");
+        let book = clob_test_book(token.as_ref());
         let lease = controller
-            .begin_clob_generation(424, &[TokenId::new("publish-token")])
+            .begin_clob_generation(424, std::slice::from_ref(&token))
             .await;
         {
             let mut data = controller.inner.data.write().await;
             data.clob_generation = Some(424);
             data.clob_pending_generation = None;
+            data.books.insert(token.clone(), book.clone());
         }
         controller
             .terminate_clob_generation(424, "terminal before external publish")
@@ -4479,7 +4517,7 @@ mod tests {
         let publisher_calls = Arc::clone(&calls);
         assert_eq!(
             controller
-                .execute_live_clob_publication(424, move || {
+                .execute_live_clob_publication(424, &token, &book, move || {
                     publisher_calls.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 })
@@ -4494,13 +4532,16 @@ mod tests {
     #[tokio::test]
     async fn publish_first_makes_terminal_wait_for_the_real_live_publication_helper() {
         let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("publish-token");
+        let book = clob_test_book(token.as_ref());
         let lease = controller
-            .begin_clob_generation(425, &[TokenId::new("publish-token")])
+            .begin_clob_generation(425, std::slice::from_ref(&token))
             .await;
         {
             let mut data = controller.inner.data.write().await;
             data.clob_generation = Some(425);
             data.clob_pending_generation = None;
+            data.books.insert(token.clone(), book.clone());
         }
         let (started_tx, started_rx) = std_mpsc::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
@@ -4510,7 +4551,7 @@ mod tests {
             let published = Arc::clone(&published);
             tokio::spawn(async move {
                 controller
-                    .execute_live_clob_publication(425, move || {
+                    .execute_live_clob_publication(425, &token, &book, move || {
                         started_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                         published.fetch_add(1, Ordering::SeqCst);
@@ -4565,6 +4606,72 @@ mod tests {
         assert_eq!(data.clob_pending_generation, None);
         assert_eq!(data.clob_generation, None);
         assert_eq!(data.clob_terminal_generation, 43);
+    }
+
+    #[tokio::test]
+    async fn partial_clob_barrier_clears_unanchored_stale_book_before_authorization() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let expected = BTreeSet::from([TokenId::new("yes"), TokenId::new("no")]);
+        {
+            let mut data = controller.inner.data.write().await;
+            data.books.insert(TokenId::new("no"), clob_test_book("no"));
+        }
+        let tokens = expected.iter().cloned().collect::<Vec<_>>();
+        let lease = controller.begin_clob_generation(431, &tokens).await;
+        let authorized_book = clob_test_book("yes");
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 431,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&expected),
+                token_count: expected.len(),
+                anchors: vec![authorized_book.clone()],
+                pre_ready_events: Vec::new(),
+                lease,
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_ok());
+        {
+            let data = controller.inner.data.read().await;
+            assert_eq!(data.clob_generation, Some(431));
+            assert_eq!(data.clob_tokens, expected);
+            assert!(data.books.contains_key(&TokenId::new("yes")));
+            assert!(!data.books.contains_key(&TokenId::new("no")));
+            assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
+        }
+
+        let yes = TokenId::new("yes");
+        controller
+            .handle_feed_event(FeedEvent::ClobBookInvalidated {
+                generation: 431,
+                sequence: 1,
+                token_id: yes.clone(),
+            })
+            .await;
+        assert!(!controller.inner.data.read().await.books.contains_key(&yes));
+        controller
+            .handle_feed_event(FeedEvent::ClobBook {
+                generation: 431,
+                sequence: 2,
+                book: clob_test_book("yes"),
+            })
+            .await;
+        assert!(controller.inner.data.read().await.books.contains_key(&yes));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+        assert_eq!(
+            controller
+                .execute_live_clob_publication(431, &yes, &authorized_book, move || {
+                    publish_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
