@@ -155,6 +155,8 @@ jobs:
           valid_failed='{"schema_version":1,"finished_ts":"2026-08-15T00:13:56.008Z","run_id":"venue-redemption-20260815001356008-deadbeef","status":"failed_closed","error":"Data API positions returned HTTP 429","redemption_submitted":false,"research_only":false,"live_strategy_enabled":true}'
           valid_timeout="$(printf '%s\n' "$valid_failed" | jq -c \
             '.error="The operation was aborted due to timeout"')"
+          valid_activity_rate_limit="$(printf '%s\n' "$valid_failed" | jq -c \
+            '.error="Data API activity returned HTTP 429"')"
           validate_record() {
             local blob_name="$1"
             local document="$2"
@@ -187,7 +189,9 @@ jobs:
           }
           validate_record "$archive" "$valid_failed"
           validate_record "$archive" "$valid_timeout"
+          validate_record "$archive" "$valid_activity_rate_limit"
           assert_contract_category ok "$archive" "$valid_failed"
+          assert_contract_category ok "$archive" "$valid_activity_rate_limit"
           assert_contract_category failed_closed_latest_pointer "$latest" "$valid_failed"
           assert_contract_category failed_closed_error_class "$archive" \
             "$(printf '%s\n' "$valid_failed" | jq -c '.error="unexpected"')"
@@ -210,6 +214,8 @@ jobs:
           reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c 'del(.research_only)')"
           reject_record "$archive" "$(printf '%s\n' "$valid_timeout" | jq -c '.error="The operation was aborted due to timeout."')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.error="Data API positions returned HTTP 500"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.error="Data API activity returned HTTP 500"')"
+          reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.error="Data API activity returned HTTP 429 extra"')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.redemption_submitted=true')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c '.unexpected="no"')"
           reject_record "$archive" "$(printf '%s\n' "$valid_failed" | jq -c 'del(.research_only)')"
@@ -1065,6 +1071,7 @@ jobs:
                     failed_fields: ([
                       if $blob_name == $latest then "latest_pointer" else empty end,
                       if (.error != "Data API positions returned HTTP 429"
+                          and .error != "Data API activity returned HTTP 429"
                           and .error != "The operation was aborted due to timeout")
                         then "error_class" else empty end,
                       if .redemption_submitted != false
@@ -2516,6 +2523,7 @@ jobs:
               and (if .status == "failed_closed" then
                 $blob_name != $latest
                 and (.error == "Data API positions returned HTTP 429"
+                  or .error == "Data API activity returned HTTP 429"
                   or .error == "The operation was aborted due to timeout")
                 and .redemption_submitted == false
                 and .research_only == false
@@ -2622,6 +2630,7 @@ jobs:
                   if $blob_name == $latest then
                     "failed_closed_latest_pointer"
                   elif valid(.error != "Data API positions returned HTTP 429"
+                      and .error != "Data API activity returned HTTP 429"
                       and .error != "The operation was aborted due to timeout") then
                     "failed_closed_error_class"
                   elif .redemption_submitted != false then
