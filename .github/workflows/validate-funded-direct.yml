@@ -852,6 +852,31 @@ jobs:
           intent_sha=$(jq -er '.intent_sha256 | select(test("^sha256:[0-9a-f]{64}$"))' authorization.json)
           authorization_at=$(jq -er '.authorized_at | select(type == "string")' authorization.json)
           completion_at=$(jq -er '.completed_at | select(type == "string")' completion.json)
+          jq -c \
+            --arg decision "$decision_id" \
+            --arg run "$child_run_id" '
+              [
+                {field:"schema", ok:(.schema == "polyedge.operator_funded_intent_authorization.v1")},
+                {field:"authorization_mode", ok:(.authorization_mode == "operator_direct")},
+                {field:"session_binding", ok:(.session_id == "dynamic-quote-funded-2026-08-13-v10")},
+                {field:"decision_binding", ok:(.decision_id == $decision)},
+                {field:"run_binding", ok:(.child_run_id == $run)},
+                {field:"manifest_blob_binding", ok:(.promotion_manifest_blob_name == "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/session.json")},
+                {field:"manifest_hash_binding", ok:(.promotion_manifest_sha256 == "sha256:c516c052fc5c01eed5403842ff24bf4b08512d6c38e8260e2d064580c82322f8")},
+                {field:"operator_manifest_blob_binding", ok:(.operator_session_manifest_blob_name == .promotion_manifest_blob_name)},
+                {field:"operator_manifest_hash_binding", ok:(.operator_session_manifest_sha256 == .promotion_manifest_sha256)},
+                {field:"promotion_mode", ok:(.research_promotion_bypassed == true)},
+                {field:"notional_cap", ok:(.max_order_notional == 10.5)},
+                {field:"authorization_id_shape", ok:((.authorization_id | type) == "string" and (.authorization_id | length) > 0)},
+                {field:"intent_blob_shape", ok:((.intent_blob_name | type) == "string")},
+                {field:"intent_hash_shape", ok:((.intent_sha256 | type) == "string" and (.intent_sha256 | test("^sha256:[0-9a-f]{64}$")))}
+              ]
+              | {
+                  failed_fields: [.[] | select(.ok | not) | .field],
+                  passed_count: ([.[] | select(.ok)] | length),
+                  total: length
+                }
+            ' authorization.json > authorization-diagnostic.json
           authorization_day=$(date -u -d "$authorization_at" +%Y-%m-%d)
           completion_day=$(date -u -d "$completion_at" +%Y-%m-%d)
           summary_matches=0
@@ -903,7 +928,18 @@ jobs:
                   passed_count: ([.[] | select(.ok)] | length),
                   total: length
                 }
-            ' summary.json | tee lifecycle-summary-diagnostic.json
+            ' summary.json > summary-diagnostic.json
+          jq -cn \
+            --slurpfile authorization authorization-diagnostic.json \
+            --slurpfile summary summary-diagnostic.json \
+            '{
+              authorization_failed_fields: $authorization[0].failed_fields,
+              authorization_passed_count: $authorization[0].passed_count,
+              authorization_total: $authorization[0].total,
+              summary_failed_fields: $summary[0].failed_fields,
+              summary_passed_count: $summary[0].passed_count,
+              summary_total: $summary[0].total
+            }' | tee lifecycle-diagnostic.json
 
   deploy-funded-service:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
