@@ -111,14 +111,29 @@ jobs:
             and .secretsOrTokensCaptured == false
             and .issuer.validTls
             and .jwtSvid.perLaneOwnerOnlyFiles
-            and ([.lanes[].assignmentCount] | add) == 22
-            and all(.lanes[]; .exactPlanMatch)
+            and ([
+              .lanes.api,
+              .lanes.research,
+              .lanes["shadow-qset"],
+              .lanes["funded-signer"]
+            ] | map(.assignmentCount) | add) == 22
+            and all([
+              .lanes.api,
+              .lanes.research,
+              .lanes["shadow-qset"],
+              .lanes["funded-signer"]
+            ][]; .exactPlanMatch)
             and all(.lanes[]; all(.negativeAssertions[]; .passed))
+            and .lanes["promotion-controller"].assignmentCount == 2
+            and .lanes["promotion-controller"].exactDeploymentTemplateMatch
+            and (.lanes["promotion-controller"].workloadEnabled == false)
             and .arc.unchanged
             and .roleDefinitions.acaJobExecutionReader.id == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
             and .roleDefinitions.acaJobExecutionReader.actions == ["Microsoft.App/jobs/executions/read"]
             and .roleDefinitions.acaJobExecutionReader.dataActions == []
             and .roleDefinitions.acaJobExecutionReader.exactDefinitionMatch
+            and .roleDefinitions.promotionController.dataActions == []
+            and .roleDefinitions.promotionController.exactDefinitionMatch
             and (.lanes.research.positiveChecks[] | select(
               .operation == "Microsoft.App/jobs/executions/read"
               and .assignmentId == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
