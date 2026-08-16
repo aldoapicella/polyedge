@@ -579,6 +579,7 @@ pub async fn run_market_feed_generation_with_lease(
     let mut resync_bytes = 0_usize;
     let mut resync_frames = 0_usize;
     let mut barrier_started: Option<Instant> = None;
+    let mut authorized = false;
     loop {
         tokio::select! {
             biased;
@@ -590,6 +591,7 @@ pub async fn run_market_feed_generation_with_lease(
                         // drain boundary, not a best-effort timing assumption.
                         ready_ack = None;
                         barrier_started = None;
+                        authorized = true;
                         while let Some(message) = buffered.pop_front() {
                             let events = strict_market_events(message, &expected_tokens, &mut books)?;
                             forward_market_events(&sender, generation, &mut sequence, events).await?;
@@ -600,13 +602,13 @@ pub async fn run_market_feed_generation_with_lease(
                     Err(_) => return Err(FeedError::MarketProtocol("CLOB resync authorization channel closed".to_owned())),
                 }
             }
-            _ = tokio::time::sleep_until(generation_deadline), if ready_ack.is_some() || anchors.len() != expected_tokens.len() => {
+            _ = tokio::time::sleep_until(generation_deadline), if !authorized => {
                 return Err(FeedError::MarketProtocol("CLOB generation exceeded its absolute deadline".to_owned()));
             }
             _ = ping.tick() => {
                 let write_deadline = market_write_deadline(
                     generation_deadline,
-                    ready_ack.is_some() || anchors.len() != expected_tokens.len(),
+                    !authorized,
                 );
                 websocket_send_before_deadline(
                     &mut write,
@@ -631,7 +633,7 @@ pub async fn run_market_feed_generation_with_lease(
                     return Ok(());
                 };
                 let message = message?;
-                if ready_ack.is_some() || anchors.len() != expected_tokens.len() {
+                if !authorized {
                     resync_frames = resync_frames.saturating_add(1);
                     resync_bytes = resync_bytes.saturating_add(market_message_bytes(&message));
                     if resync_frames > MARKET_RESYNC_MAX_FRAMES
@@ -649,7 +651,7 @@ pub async fn run_market_feed_generation_with_lease(
                     buffered.push_back(message);
                     continue;
                 }
-                if ready_ack.is_none() {
+                if !authorized && ready_ack.is_none() {
                     let anchored = collect_snapshot_anchors(
                         message,
                         &expected_tokens,
@@ -996,10 +998,11 @@ fn strict_snapshot(event: &Value) -> Result<BookState, FeedError> {
             ));
         }
     }
-    let last_trade_price = event
-        .get("last_trade_price")
-        .map(|value| strict_price(value, "last_trade_price"))
-        .transpose()?;
+    let last_trade_price = match event.get("last_trade_price") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(value) => Some(strict_price(value, "last_trade_price")?),
+    };
     Ok(BookState {
         token_id,
         bids,
@@ -1623,6 +1626,44 @@ mod tests {
     }
 
     #[test]
+    fn optional_snapshot_last_trade_price_preserves_the_decimal_contract() {
+        let snapshot = |last_trade_price: Option<Value>| {
+            let mut snapshot = json!({
+                "event_type": "book",
+                "asset_id": "token",
+                "bids": [],
+                "asks": []
+            });
+            if let Some(value) = last_trade_price {
+                snapshot["last_trade_price"] = value;
+            }
+            snapshot
+        };
+
+        for value in [None, Some(Value::Null), Some(json!("  \t"))] {
+            assert_eq!(
+                strict_snapshot(&snapshot(value)).unwrap().last_trade_price,
+                None
+            );
+        }
+        assert_eq!(
+            strict_snapshot(&snapshot(Some(json!("0.42"))))
+                .unwrap()
+                .last_trade_price,
+            Some(Decimal::new(42, 2))
+        );
+        assert_eq!(
+            strict_snapshot(&snapshot(Some(json!(0.42))))
+                .unwrap()
+                .last_trade_price,
+            Some(Decimal::new(42, 2))
+        );
+        for value in [json!("not-a-price"), json!("1.01"), json!(-0.01)] {
+            assert!(strict_snapshot(&snapshot(Some(value))).is_err());
+        }
+    }
+
+    #[test]
     fn clob_incrementals_are_strict_after_the_snapshot_barrier() {
         let expected = BTreeSet::from([TokenId::new("yes")]);
         let mut books = BTreeMap::from([(
@@ -1726,8 +1767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_token_generation_replays_retained_delta_in_anchor_and_holds_later_delta_until_ack()
-    {
+    async fn two_token_blank_optional_price_reaches_one_barrier_and_holds_events_until_ack() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1735,9 +1775,9 @@ mod tests {
             let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
             let _ = socket.read().unwrap();
             for event in [
-                json!({"event_type":"book", "asset_id":"yes", "bids":[{"price":"0.40","size":"1"}], "asks":[{"price":"0.60","size":"1"}]}),
+                json!({"event_type":"book", "asset_id":"yes", "last_trade_price":"", "bids":[{"price":"0.40","size":"1"}], "asks":[{"price":"0.60","size":"1"}]}),
                 json!({"event_type":"price_change", "price_changes":[{"asset_id":"yes","side":"BUY","price":"0.41","size":"2"}]}),
-                json!({"event_type":"book", "asset_id":"no", "bids":[], "asks":[]}),
+                json!({"event_type":"book", "asset_id":"no", "last_trade_price":"  ", "bids":[], "asks":[]}),
             ] {
                 socket.send(Message::Text(event.to_string())).unwrap();
             }
@@ -1771,6 +1811,10 @@ mod tests {
             .find(|book| book.token_id == TokenId::new("yes"))
             .unwrap();
         assert_eq!(yes_anchor.best_bid().unwrap().price, Decimal::new(41, 2));
+        assert!(barrier
+            .anchors
+            .iter()
+            .all(|book| book.last_trade_price.is_none()));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(20), receiver.recv())
@@ -1778,15 +1822,26 @@ mod tests {
                 .is_err()
         );
         barrier.ready_ack.send(Ok(())).unwrap();
+        let mut barrier_count = 1;
         let mut saw_later_book = false;
-        for _ in 0..2 {
-            if let Some(FeedEvent::ClobBook { book, .. }) = receiver.recv().await {
-                saw_later_book = book.token_id == TokenId::new("yes")
-                    && book
-                        .best_bid()
-                        .is_some_and(|bid| bid.price == Decimal::new(42, 2));
+        while let Some(event) = receiver.recv().await {
+            match event {
+                FeedEvent::ClobResyncBarrier(_) => barrier_count += 1,
+                FeedEvent::ClobRawMarketEvent { generation: 14, .. } => {}
+                FeedEvent::ClobBook {
+                    generation: 14,
+                    book,
+                    ..
+                } => {
+                    saw_later_book = book.token_id == TokenId::new("yes")
+                        && book
+                            .best_bid()
+                            .is_some_and(|bid| bid.price == Decimal::new(42, 2));
+                }
+                _ => panic!("unexpected event or stale generation after authorization"),
             }
         }
+        assert_eq!(barrier_count, 1);
         assert!(saw_later_book);
         let _ = feed.await.unwrap();
         server.join().unwrap();
