@@ -88,13 +88,19 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260816T090000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-16T09:00:00Z`, keeps
+Ledger `/srv/polyedge-ring/parity/20260816T100000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-16T10:00:00Z`, keeps
 Azure authoritative and `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-19T09:00:00Z`. The pre-window catch-up was recorded only as excluded
+`2026-08-19T10:00:00Z`. The pre-window catch-up was recorded only as excluded
 evidence. Completion still requires 72 consecutive accepted hours, two
 successful OCI daily cycles, reboot and rollback proof, and explicit qset,
 funded, and deletion gates.
+
+The superseded `20260816T090000Z.json` ledger retained zero credit. Its first
+hour had 60/60 healthy observations and a 60-second maximum gap, but the
+immutable ring recorded one `PolymarketClobMarket` WebSocket connection reset
+at `2026-08-16T09:35:16Z`. The strict zero-essential-feed-error rule rejected
+the hour; no credit was carried into the `10:00` window.
 
 The superseded `20260815T070000Z.json` ledger retained three accepted hours at
 `07:00`, `08:00`, and `09:00`. Each has six immutable segment and upload proofs,
@@ -180,7 +186,7 @@ digest. Its proof passed before the fresh one-use marker was archived; the
 controller remains disabled at boot and inactive. Azure remains in
 single-revision authoritative mode with its protected prior template retained
 for rollback. None of the deployment or promotion soak receives parity credit;
-the untouched `2026-08-16T09:00:00Z` boundary begins the current counter.
+the untouched `2026-08-16T10:00:00Z` boundary begins the current counter.
 
 The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
 48-hour worst-case projection above the old capacity gate. The mounted
