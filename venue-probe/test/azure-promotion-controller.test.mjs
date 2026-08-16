@@ -55,7 +55,7 @@ function fixture() {
 
 function clone(value) { return structuredClone(value); }
 
-function armFixture({ crashAfterApp = false, proofStatus = null, unsafeProof = false } = {}) {
+function armFixture({ crashAfterApp = false, proofStatus = null, unsafeProof = false, proofSecretRef = "cappjob-polyedge-hourly-quality-job" } = {}) {
   const state = fixture();
   let crash = crashAfterApp;
   let execution = null;
@@ -79,6 +79,7 @@ function armFixture({ crashAfterApp = false, proofStatus = null, unsafeProof = f
     setExecution(value) { execution = value; },
     async startJob() {
       execution = { name: "proof-execution", properties: { status: proofStatus ?? "Succeeded", template: clone(state.job.properties.template) } };
+      execution.properties.template.containers[0].env.find(({ name }) => name === "API_BEARER_TOKEN").secretRef = proofSecretRef;
       if (unsafeProof) execution.properties.template.containers[0].env.find(({ name }) => name === "ALLOW_LIVE").value = "true";
       return { name: execution.name };
     },
@@ -118,6 +119,14 @@ test("promotion waits for both resources and records a successful exact hourly p
   assert.equal(result.status, "promoted");
   assert.equal(store.value().phase, "promoted");
   assert.equal(store.value().proof.executionName, "proof-execution");
+});
+
+test("proof accepts only Azure's exact execution secret reference", async () => {
+  const arm = armFixture({ proofSecretRef: "cappjob-other" });
+  const store = journalStore();
+  await assert.rejects(runPromotion({ arm, config: { ...config, proveExecution: true, proofTimeoutMs: 1_000, clock: () => Date.parse("2026-08-16T00:30:00Z"), sleep: async () => {} }, ...store }), /bearer reference drifted/);
+  assert.equal(validateTarget(arm.state.app, arm.state.job).appImage, oldImage);
+  assert.equal(store.value().phase, "rolled_back");
 });
 
 test("failed or overdue proofs stop exactly that execution and roll back", async () => {

@@ -337,13 +337,14 @@ function appReady(app) {
 
 function jobReady(job) { return job.properties?.provisioningState === "Succeeded"; }
 
-function validateResearchTemplate(resource) {
+function validateResearchTemplate(resource, execution = false) {
   const containers = resource.properties?.template?.containers;
   if (!Array.isArray(containers) || containers.length !== 1) fail("hourly proof template container count drifted");
   const container = exactContainer(resource, "research-job");
   if (JSON.stringify(container.command) !== JSON.stringify(HOURLY_COMMAND) || JSON.stringify(container.args) !== JSON.stringify(HOURLY_ARGS)) fail("hourly proof command or argv drifted");
   const bearer = (container.env ?? []).filter((entry) => entry.name === "API_BEARER_TOKEN");
-  if (bearer.length !== 1 || bearer[0].secretRef !== "api-bearer-token" || bearer[0].value || (container.env ?? []).filter((entry) => entry.secretRef).length !== 1) fail("hourly proof bearer reference drifted");
+  const expectedBearerRef = execution ? `cappjob-${JOB_NAME}` : "api-bearer-token";
+  if (bearer.length !== 1 || bearer[0].secretRef !== expectedBearerRef || bearer[0].value || (container.env ?? []).filter((entry) => entry.secretRef).length !== 1) fail("hourly proof bearer reference drifted");
   for (const [name, expected] of Object.entries(EXPECTED_HOURLY_ENVIRONMENT)) exactEnvValue(container, name, expected);
   if (!imageIsImmutable(exactEnv(container, "POLYEDGE_GENERATOR_IMAGE").value)) fail("hourly proof generator image is not immutable");
   const expectedEnv = ["API_BEARER_TOKEN", "POLYEDGE_GENERATOR_IMAGE", ...Object.keys(EXPECTED_HOURLY_ENVIRONMENT)];
@@ -353,7 +354,7 @@ function validateResearchTemplate(resource) {
 }
 
 function validateProofExecution(execution, image) {
-  const container = validateResearchTemplate(execution);
+  const container = validateResearchTemplate(execution, true);
   if (container.image !== image || exactEnv(container, "POLYEDGE_GENERATOR_IMAGE").value !== image) fail("hourly proof used a different image");
 }
 
