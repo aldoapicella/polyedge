@@ -199,6 +199,13 @@ single-revision authoritative mode with its protected prior template retained
 for rollback. None of the deployment or promotion soak receives parity credit;
 the untouched `2026-08-17T00:00:00Z` boundary begins the current counter.
 
+The August 16 pre-boundary daily container completed every research stage, but
+its superseded bundle was correctly rejected by the parity recorder because it
+predated the approved source and corrected primary decision-grade evidence. It
+received zero credit. The installed runner, recorder, image revision, and
+formal bindings now match the approved source; the first eligible daily cycle
+is the run after the formal boundary.
+
 The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
 48-hour worst-case projection above the old capacity gate. The mounted
 filesystem now exposes 273,655,873,536 bytes, the conservative projection is
@@ -215,7 +222,9 @@ Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260816T143153Z-polyedge-api.container`,
 `20260816T143244Z-research-image-6b567ac`,
 `20260816T152556Z-azure-promotion-retry-6b567ac`, and
-`20260816T153012Z-parity-20260817-reset`. The old image, Azure revision,
+`20260816T153012Z-parity-20260817-reset`. The funded-handoff controller update
+retains its prior runtime source in
+`20260816T160010Z-funded-handoff-controller`. The old image, Azure revision,
 superseded ledgers, controller journals, and evidence data remain present.
 
 In the superseded August 12 window, the `15:00` hour received zero credit
@@ -494,9 +503,13 @@ The post-promotion audit found that a later primary template no longer carried
 the four non-secret operator-direct Service Bus producer bindings. They were
 restored on the unchanged image in one healthy Single-mode revision with paper
 execution, `ALLOW_LIVE=false`, and taker orders still disabled. The next two
-eligible intents both submitted successfully in 4,442 ms and 5,118 ms against a
-7,000 ms bound. The active Bicep profile now owns those bindings, and the
-promotion controller refuses to run when any is absent.
+eligible intents submitted successfully in 4,442 ms and 5,118 ms against a
+7,000 ms bound. The service then held new exposure while one position and its
+risk reservation were unresolved, automatically returned to zero blockers at
+fully reconciled equity of `$21.084301`, recomputed its protected reserve to
+`$2.10843`, and submitted the next `$2.30` eligible order in 4,041 ms. The
+active Bicep profile now owns those bindings, and the promotion controller
+refuses to run when any is absent.
 
 Primary research jobs share one serialized workspace so daily normalization,
 replay, prospective validation, and backfills reuse local artifacts. The qset
