@@ -255,13 +255,16 @@ jobs:
             "$valid_verified" \
             "$(printf '%s\n' "$settlement_bindings" | jq -c \
               '.[0].transaction_hash=("0x" + ("d" * 64))')"
-          assert_binding_diagnostic $'settlement_selection_mismatch\t1\t1' \
+          assert_binding_diagnostic $'settlement_condition_mismatch\t1\t1' \
             "$valid_verified" \
             "$(printf '%s\n' "$settlement_bindings" | jq -c \
               '.[0].condition_id=("0x" + ("e" * 64))')"
+          assert_binding_diagnostic $'settlement_selected_payout_mismatch\t1\t1' \
+            "$valid_verified" \
+            "$(printf '%s\n' "$settlement_bindings" | jq -c \
+              '.[0].payout=3')"
           payout_mismatch=$(printf '%s\n' "$valid_verified" | jq -c \
             '.realized_payout=3
-            | .selection.selected_gross_payout=3
             | .liquid_collateral_after=8')
           assert_binding_diagnostic $'settlement_payout_sum_mismatch\t1\t1' \
             "$payout_mismatch" "$settlement_bindings"
@@ -2056,6 +2059,9 @@ jobs:
                   elif any($bound[];
                     .transaction_hash != $transaction_hash) then
                     "settlement_transaction_mismatch"
+                  elif ([$bound[].condition_id | ascii_downcase] | sort) !=
+                    ([$selected[].condition_id | ascii_downcase] | sort) then
+                    "settlement_condition_mismatch"
                   elif ([$bound[] | {
                     condition_id: (.condition_id | ascii_downcase),
                     payout
@@ -2064,7 +2070,7 @@ jobs:
                       condition_id: (.condition_id | ascii_downcase),
                       payout: .gross_payout
                     }] | sort_by(.condition_id, .payout)) then
-                    "settlement_selection_mismatch"
+                    "settlement_selected_payout_mismatch"
                   elif ((([$bound[].payout] | add) - $realized_payout) | fabs)
                     > 0.0000011 then
                     "settlement_payout_sum_mismatch"
