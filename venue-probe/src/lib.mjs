@@ -431,6 +431,7 @@ export function sanitize(value) {
     Object.entries(value).map(([key, child]) => [
       key,
       /secret|passphrase|private.?key|api.?key|signature|authorization|auth$|^(?:owner|order_owner)$/i.test(key)
+        && !/^(?:authorization_kind|authorization_(?:blob|container)_name|authorization_sha256)$/.test(key)
         ? "[REDACTED]"
         : sanitize(child)
     ])

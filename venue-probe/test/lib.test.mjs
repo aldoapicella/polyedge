@@ -491,10 +491,34 @@ test("normal unsafe market transitions stop a campaign safely instead of failing
 });
 
 test("secret fields are recursively redacted", () => {
-  assert.deepEqual(sanitize({ apiSecret: "x", apiKey: "k", nested: { passphrase: "y", owner: "o", order_owner: "oo", value: 1 } }), {
+  assert.deepEqual(sanitize({
+    apiSecret: "x",
+    apiKey: "k",
+    authorization: "Bearer secret",
+    nested: {
+      passphrase: "y",
+      owner: "o",
+      order_owner: "oo",
+      authorization_kind: "operator_direct",
+      authorization_blob_name: "control/authorization.json",
+      authorization_container_name: "evidence",
+      authorization_sha256: `sha256:${"a".repeat(64)}`,
+      value: 1
+    }
+  }), {
     apiSecret: "[REDACTED]",
     apiKey: "[REDACTED]",
-    nested: { passphrase: "[REDACTED]", owner: "[REDACTED]", order_owner: "[REDACTED]", value: 1 }
+    authorization: "[REDACTED]",
+    nested: {
+      passphrase: "[REDACTED]",
+      owner: "[REDACTED]",
+      order_owner: "[REDACTED]",
+      authorization_kind: "operator_direct",
+      authorization_blob_name: "control/authorization.json",
+      authorization_container_name: "evidence",
+      authorization_sha256: `sha256:${"a".repeat(64)}`,
+      value: 1
+    }
   });
 });
 

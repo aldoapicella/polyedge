@@ -693,6 +693,17 @@ jobs:
           const ingestionFence = fs.readFileSync("scripts/fence-funded-queue-and-wait-empty.sh", "utf8");
           assert.match(ingestionFence,
             /for attempt in 1 2 3[\s\S]*--status SendDisabled[\s\S]*for attempt in \$\(seq 1 36\)[\s\S]*activeMessageCount == 0[\s\S]*scheduledMessageCount == 0[\s\S]*test "\$queue_drained" = true/);
+          const lifecycleAccepted = activation.indexOf('test "$lifecycle_ready" = true');
+          const postLifecycleFence = activation.indexOf(
+            "funded-queue-after-lifecycle.json", lifecycleAccepted);
+          const capitalVerification = activation.indexOf(
+            ". scripts/verify-funded-v10-capital.sh", postLifecycleFence);
+          const authorizationDownload = activation.indexOf(
+            'download_v10_blob "$authorization_blob" funded-v10-authorization.json',
+            capitalVerification);
+          assert.ok(lifecycleAccepted < postLifecycleFence &&
+            postLifecycleFence < capitalVerification &&
+            capitalVerification < authorizationDownload);
           assert.match(activation, /funded-v10-rollover-warmup\.json/);
           assert.match(activation, /funded-v10-rollover-heartbeat\.json/);
           assert.match(activation,
@@ -727,12 +738,8 @@ jobs:
             '[[ "$reservation_blob" =~ ^reports/research/venue-probe/risk-reservations/', childRunValidation);
           const terminalLogin = activation.indexOf(
             "Refresh Azure login before terminal reservation verification", reservationValidation);
-          const explicitFence = activation.lastIndexOf("--status SendDisabled", terminalLogin);
-          const fencePoll = activation.indexOf("for attempt in $(seq 1 12); do", explicitFence);
-          const fenceReadback = activation.indexOf(
-            'test "$queue_status" = "SendDisabled"', fencePoll);
           const safeHandoff = activation.indexOf(
-            "printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\\n'", fenceReadback);
+            "printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\\n'", reservationValidation);
           const terminalLoop = activation.indexOf(
             "terminal_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))", terminalLogin);
           const terminalIdentity = activation.indexOf(".schema_version == 1", terminalLoop);
@@ -741,11 +748,7 @@ jobs:
           const queueReopen = activation.lastIndexOf("--status Active");
           const cutoverComplete = activation.indexOf("FUNDED_CUTOVER_COMPLETE=true", queueReopen);
           assert.ok(lifecycleLogin < childRunValidation && childRunValidation < reservationValidation);
-          assert.ok(reservationValidation < explicitFence && explicitFence < fencePoll &&
-            fencePoll < fenceReadback &&
-            fenceReadback < safeHandoff && safeHandoff < terminalLogin);
-          assert.match(activation.slice(explicitFence, safeHandoff),
-            /for attempt in \$\(seq 1 12\); do[\s\S]*queue_status=\$\(az servicebus queue show[\s\S]*\[ "\$queue_status" = "SendDisabled" \] && break[\s\S]*sleep 5[\s\S]*done[\s\S]*test "\$queue_status" = "SendDisabled"/);
+          assert.ok(reservationValidation < safeHandoff && safeHandoff < terminalLogin);
           assert.ok(terminalLogin < terminalLoop && terminalLoop < terminalIdentity &&
             terminalIdentity < terminalPredicate &&
             terminalPredicate < terminalProof && terminalProof < queueReopen && queueReopen < cutoverComplete);
@@ -3570,6 +3573,11 @@ jobs:
             sleep_before_lifecycle_deadline || break
           done
           test "$lifecycle_ready" = true
+          if [ "$queue_fenced_for_ingestion" = false ]; then
+            bash scripts/fence-funded-queue-and-wait-empty.sh \
+              funded-queue-after-lifecycle.json
+            queue_fenced_for_ingestion=true
+          fi
           decision_id=$(jq -r '.[0].Log_s | fromjson | .decision_id' funded-v10-lifecycle-latency.json)
           . scripts/verify-funded-v10-capital.sh
           az containerapp show \
@@ -3820,23 +3828,6 @@ jobs:
             and .order_submitted == true
             and .order_id == $order_id
           ' "$reservation_file"
-          az servicebus queue update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --namespace-name "$SERVICE_BUS_NAMESPACE" \
-            --name "$SERVICE_BUS_QUEUE" \
-            --status SendDisabled \
-            --only-show-errors -o none
-          queue_status=
-          for attempt in $(seq 1 12); do
-            queue_status=$(az servicebus queue show \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --namespace-name "$SERVICE_BUS_NAMESPACE" \
-              --name "$SERVICE_BUS_QUEUE" \
-              --query status -o tsv) || true
-            [ "$queue_status" = "SendDisabled" ] && break
-            sleep 5
-          done
-          test "$queue_status" = "SendDisabled"
           {
             printf 'FUNDED_LIFECYCLE_DECISION_ID=%s\n' "$decision_id"
             printf 'FUNDED_LIFECYCLE_CHILD_RUN_ID=%s\n' "$child_run_id"
