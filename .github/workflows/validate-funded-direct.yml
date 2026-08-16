@@ -188,7 +188,17 @@ jobs:
           validate_record "$archive" "$valid_failed"
           validate_record "$archive" "$valid_timeout"
           assert_contract_category ok "$archive" "$valid_failed"
-          assert_contract_category failed_closed_contract "$latest" "$valid_failed"
+          assert_contract_category failed_closed_latest_pointer "$latest" "$valid_failed"
+          assert_contract_category failed_closed_error_class "$archive" \
+            "$(printf '%s\n' "$valid_failed" | jq -c '.error="unexpected"')"
+          assert_contract_category failed_closed_submission "$archive" \
+            "$(printf '%s\n' "$valid_failed" | jq -c '.redemption_submitted=true')"
+          assert_contract_category failed_closed_research_mode "$archive" \
+            "$(printf '%s\n' "$valid_failed" | jq -c '.research_only=true')"
+          assert_contract_category failed_closed_live_strategy "$archive" \
+            "$(printf '%s\n' "$valid_failed" | jq -c '.live_strategy_enabled=false')"
+          assert_contract_category failed_closed_field_set "$archive" \
+            "$(printf '%s\n' "$valid_failed" | jq -c '.unexpected="no"')"
           assert_contract_category record_header "$archive" \
             "$(printf '%s\n' "$valid_failed" | jq -c '.finished_ts="2026-02-30T00:13:56.008Z"')"
           reject_record "$latest" "$valid_failed"
@@ -981,8 +991,59 @@ jobs:
               authorization_total: $authorization[0].total,
               summary_failed_fields: $summary[0].failed_fields,
               summary_passed_count: $summary[0].passed_count,
-              summary_total: $summary[0].total
-            }' | tee lifecycle-diagnostic.json
+                summary_total: $summary[0].total
+              }' | tee lifecycle-diagnostic.json
+
+      - name: Report only failed-closed redemption contract categories
+        if: ${{ always() }}
+        env:
+          STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
+          FUNDED_CONTAINER: polyedge-funded-evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          prefix='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/'
+          latest="${prefix}latest-redemption.json"
+          archive="${prefix}redemptions/"
+          redemption_contract_diagnostic_filter=$(awk '
+            /redemption_contract_category=\$\(jq -er .*\047$/ {capture=1; next}
+            capture && /^[[:space:]]*\047 "\$redemption_file"/ {exit}
+            capture {sub(/^                /, ""); print}
+          ' .github/workflows/validate-funded-direct.yml)
+          test -n "$redemption_contract_diagnostic_filter"
+          az storage blob list \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --prefix "$prefix" \
+            --num-results '*' \
+            --auth-mode login \
+            --only-show-errors -o json > v10-redemption-diagnostic-list.json
+          category_file=$(mktemp)
+          while IFS= read -r blob_name; do
+            redemption_file=$(mktemp)
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$blob_name" \
+              --file "$redemption_file" \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none > /dev/null 2> download-error.log || {
+                echo 'funded redemption diagnostic artifact download failed' >&2
+                exit 1
+              }
+            if [ "$(jq -r '.status' "$redemption_file")" = failed_closed ]; then
+              jq -er --argjson authorized_ceiling 0 \
+                --arg blob_name "$blob_name" --arg latest "$latest" \
+                "$redemption_contract_diagnostic_filter" \
+                "$redemption_file" >> "$category_file"
+            fi
+          done < <(jq -r --arg latest "$latest" --arg archive "$archive" '
+            .[] | .name | select(. == $latest or startswith($archive))
+          ' v10-redemption-diagnostic-list.json)
+          test -s "$category_file"
+          jq -Rn '[inputs] | group_by(.)
+            | map({category: .[0], count: length})' < "$category_file"
 
   deploy-funded-service:
     if: github.event_name == 'workflow_dispatch' && inputs.deploy_funded_service
@@ -2505,18 +2566,24 @@ jobs:
                   | not then
                   "record_header"
                 elif .status == "failed_closed" then
-                  if valid(
-                    $blob_name != $latest
-                    and (.error == "Data API positions returned HTTP 429"
-                      or .error == "The operation was aborted due to timeout")
-                    and .redemption_submitted == false
-                    and .research_only == false
-                    and .live_strategy_enabled == true
-                    and ((keys | sort) == ([
-                      "error", "finished_ts", "live_strategy_enabled",
-                      "redemption_submitted", "research_only", "run_id",
-                      "schema_version", "status"
-                    ] | sort))) then "ok" else "failed_closed_contract" end
+                  if $blob_name == $latest then
+                    "failed_closed_latest_pointer"
+                  elif valid(.error != "Data API positions returned HTTP 429"
+                      and .error != "The operation was aborted due to timeout") then
+                    "failed_closed_error_class"
+                  elif .redemption_submitted != false then
+                    "failed_closed_submission"
+                  elif .research_only != false then
+                    "failed_closed_research_mode"
+                  elif .live_strategy_enabled != true then
+                    "failed_closed_live_strategy"
+                  elif valid((keys | sort) != ([
+                    "error", "finished_ts", "live_strategy_enabled",
+                    "redemption_submitted", "research_only", "run_id",
+                    "schema_version", "status"
+                  ] | sort)) then
+                    "failed_closed_field_set"
+                  else "ok" end
                 elif .status != "nothing_to_redeem"
                     and .status != "redeemed_and_verified" then
                   "unsupported_status"
