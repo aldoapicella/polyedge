@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   encodeAbiParameters,
   encodeEventTopics,
@@ -9,10 +10,16 @@ import { privateKeyToAccount } from "viem/accounts";
 import {
   RELAYER_DEADLINE_BUFFER_SECONDS,
   confirmedRedemptionControlMatches,
+  commitCanonicalRecoveryJournal,
   discoverOnchainRedeemableConditions,
   expectedRecoveredAdapterApprovals,
+  persistCanonicalRecoveryJournal,
+  putCanonicalRecoveryJournal,
+  recoveryEvidenceOwnershipAfterResume,
   rejectedRelayerSubmissionMatches,
-  safeRelayerErrorDetail
+  safeRelayerErrorDetail,
+  shouldUploadRedemptionEvidence,
+  validateCanonicalRecoveryJournal
 } from "../src/redeem.mjs";
 import {
   CONDITIONAL_TOKENS,
@@ -31,6 +38,414 @@ const owner = "0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921";
 const funder = "0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8";
 const conditionA = `0x${"11".repeat(32)}`;
 const conditionB = `0x${"22".repeat(32)}`;
+
+function recoveryJournalFixture() {
+  const prefix = "reports/funded/dynamic-quote/sessions/campaign";
+  const predecessorRunId = "venue-redemption-20260815001356008-deadbeef";
+  const recoveryRunId = "venue-redemption-20260815001656008-acde1234";
+  const journalBlobName = `${prefix}/recovery-controls/${predecessorRunId}.json`;
+  const summaryBlobName = `${prefix}/redemptions/2026-08-15/${recoveryRunId}.json`;
+  const transactionHash = `0x${"ab".repeat(32)}`;
+  const settlementBlob = `${prefix}/internal-settlements/${"cd".repeat(32)}.json`;
+  const summary = {
+    schema_version: 1,
+    run_id: recoveryRunId,
+    status: "recovered_confirmed_and_verified",
+    finished_ts: "2026-08-15T00:16:56.008Z",
+    execution_origin: "azure_chile_central_static_egress",
+    execution_country: "CL",
+    static_egress_verified: true,
+    funder,
+    redemption_submitted: true,
+    new_submission_attempted: false,
+    confirmed_transaction_reused: true,
+    zero_open_orders_confirmed: true,
+    research_only: false,
+    live_strategy_enabled: true,
+    predecessor_run_id: predecessorRunId,
+    recovery_journal_blob_name: journalBlobName,
+    transaction_id: "fixture-transaction",
+    transaction_hash: transactionHash,
+    selection: {
+      selected: [{ condition_id: conditionA, gross_payout: 2 }],
+      selected_gross_payout: 2
+    },
+    realized_payout: 2,
+    internal_settlement_blobs: [settlementBlob]
+  };
+  const summaryPayload = Buffer.from(JSON.stringify(summary, null, 2));
+  const finalizedControl = {
+    schema_version: 1,
+    state: "confirmed_and_verified",
+    run_id: predecessorRunId,
+    owner: "[REDACTED]",
+    signer_address: "[REDACTED]",
+    funder,
+    submission_attempted: true,
+    transaction_id: "fixture-transaction",
+    transaction_hash: transactionHash,
+    condition_ids: [conditionA],
+    expected_gross_payout: 2,
+    recovery_run_id: recoveryRunId,
+    recovery_journal_blob_name: journalBlobName,
+    recovery_summary_blob_name: summaryBlobName,
+    recovery_summary_sha256:
+      `sha256:${createHash("sha256").update(summaryPayload).digest("hex")}`,
+    recovery_publication_complete: true,
+    realized_payout: 2,
+    internal_settlement_blobs: [settlementBlob]
+  };
+  return {
+    prefix,
+    journalBlobName,
+    summaryBlobName,
+    summary,
+    finalizedControl,
+    journal: {
+      schema_version: 1,
+      type: "redemption_recovery_journal",
+      predecessor_run_id: predecessorRunId,
+      recovery_run_id: recoveryRunId,
+      recovery_journal_blob_name: journalBlobName,
+      finalized_control: finalizedControl,
+      recovered_summary: summary
+    }
+  };
+}
+
+function memoryBlobContainer({
+  ambiguousSuccessOnceAt = null,
+  downloadErrorsRemaining = 0,
+  failOnceAt = null
+} = {}) {
+  const values = new Map();
+  let failed = false;
+  let ambiguousSuccessFailed = false;
+  let remainingDownloadErrors = downloadErrorsRemaining;
+  const maybeFail = (label) => {
+    if (!failed && failOnceAt === label) {
+      failed = true;
+      throw new Error(`injected ${label} failure`);
+    }
+  };
+  return {
+    values,
+    getBlockBlobClient(blobName) {
+      return {
+        async uploadData(payload, options = {}) {
+          const label = blobName.includes("/recovery-controls/")
+            ? "journal"
+            : blobName.includes("/redemptions/")
+              ? "archive"
+              : "latest";
+          maybeFail(label);
+          if (options.conditions?.ifNoneMatch === "*" && values.has(blobName)) {
+            const error = new Error("already exists");
+            error.statusCode = 412;
+            throw error;
+          }
+          values.set(blobName, Buffer.from(payload));
+          if (!ambiguousSuccessFailed && ambiguousSuccessOnceAt === label) {
+            ambiguousSuccessFailed = true;
+            const error = new Error(`injected ${label} timeout after durable write`);
+            error.code = "ETIMEDOUT";
+            throw error;
+          }
+        },
+        async download() {
+          if (remainingDownloadErrors > 0) {
+            remainingDownloadErrors -= 1;
+            const error = new Error("injected read-back failure");
+            error.code = "ETIMEDOUT";
+            throw error;
+          }
+          if (!values.has(blobName)) {
+            const error = new Error("not found");
+            error.statusCode = 404;
+            throw error;
+          }
+          return {
+            readableStreamBody: (async function* () {
+              yield values.get(blobName);
+            })()
+          };
+        }
+      };
+    },
+    maybeFail
+  };
+}
+
+test("canonical recovery journal is predecessor keyed and collision checked", async () => {
+  const fixture = recoveryJournalFixture();
+  const container = memoryBlobContainer();
+  const created = await putCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    fixture.journal
+  );
+  assert.equal(created.blob_name, fixture.journalBlobName);
+  assert.equal(created.created, true);
+  const originalBytes = Buffer.from(container.values.get(fixture.journalBlobName));
+  const replay = await putCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    fixture.journal
+  );
+  assert.equal(replay.created, false);
+  assert.deepEqual(container.values.get(fixture.journalBlobName), originalBytes);
+  await assert.rejects(
+    putCanonicalRecoveryJournal(container, fixture.prefix, {
+      ...fixture.journal,
+      recovery_run_id: "venue-redemption-20260815001656008-ffffffff"
+    }),
+    /immutable recovery journal collision/
+  );
+});
+
+test("ambiguous journal upload success is confirmed by exact read-back", async () => {
+  const fixture = recoveryJournalFixture();
+  const container = memoryBlobContainer({
+    ambiguousSuccessOnceAt: "journal"
+  });
+  const persisted = await putCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    fixture.journal
+  );
+  assert.equal(persisted.created, false);
+  assert.equal(persisted.immutable_write_outcome, "accepted_owned");
+  const durableBytes = Buffer.from(container.values.get(fixture.journalBlobName));
+  const replay = await putCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    fixture.journal
+  );
+  assert.equal(replay.created, false);
+  assert.deepEqual(container.values.get(fixture.journalBlobName), durableBytes);
+  await commitCanonicalRecoveryJournal(container, fixture.prefix,
+    fixture.journal, { writeControl: async () => {} });
+  assert.deepEqual(
+    JSON.parse(container.values.get(fixture.summaryBlobName).toString("utf8")),
+    fixture.summary
+  );
+});
+
+test("ambiguous journal upload with indeterminate read-back owns evidence and resumes", async () => {
+  const fixture = recoveryJournalFixture();
+  const container = memoryBlobContainer({
+    ambiguousSuccessOnceAt: "journal",
+    downloadErrorsRemaining: 3
+  });
+  let ownsEvidence = false;
+  await assert.rejects(
+    persistCanonicalRecoveryJournal(
+      container,
+      fixture.prefix,
+      fixture.journal,
+      { claimEvidence: () => { ownsEvidence = true; } }
+    ),
+    /upload outcome is indeterminate after 3 read-back attempts/
+  );
+  assert.equal(ownsEvidence, true);
+  assert.equal(
+    shouldUploadRedemptionEvidence({ status: "failed_closed" }, ownsEvidence),
+    false
+  );
+  const journalBytes = Buffer.from(container.values.get(fixture.journalBlobName));
+  const restartedJournal = JSON.parse(journalBytes.toString("utf8"));
+
+  let restartOwnsEvidence = false;
+  const replay = await persistCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    restartedJournal,
+    { claimEvidence: () => { restartOwnsEvidence = true; } }
+  );
+  assert.equal(replay.created, false);
+  assert.equal(restartOwnsEvidence, true);
+  await commitCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    restartedJournal,
+    { writeControl: async () => {} }
+  );
+  assert.deepEqual(container.values.get(fixture.journalBlobName), journalBytes);
+  assert.deepEqual(
+    JSON.parse(container.values.get(fixture.summaryBlobName).toString("utf8")),
+    fixture.summary
+  );
+});
+
+test("known pre-write journal failure with reliable absence leaves evidence unowned", async () => {
+  const fixture = recoveryJournalFixture();
+  const container = memoryBlobContainer({ failOnceAt: "journal" });
+  let ownsEvidence = false;
+  await assert.rejects(
+    persistCanonicalRecoveryJournal(
+      container,
+      fixture.prefix,
+      fixture.journal,
+      { claimEvidence: () => { ownsEvidence = true; } }
+    ),
+    /injected journal failure/
+  );
+  assert.equal(ownsEvidence, false);
+  assert.equal(container.values.has(fixture.journalBlobName), false);
+  assert.equal(
+    shouldUploadRedemptionEvidence({ status: "failed_closed" }, ownsEvidence),
+    true
+  );
+});
+
+test("different immutable journal bytes claim the evidence lane and fail closed", async () => {
+  const fixture = recoveryJournalFixture();
+  const container = memoryBlobContainer();
+  await putCanonicalRecoveryJournal(container, fixture.prefix, fixture.journal);
+  let ownsEvidence = false;
+  await assert.rejects(
+    persistCanonicalRecoveryJournal(
+      container,
+      fixture.prefix,
+      {
+        ...fixture.journal,
+        recovery_run_id: "venue-redemption-20260815001656008-ffffffff"
+      },
+      { claimEvidence: () => { ownsEvidence = true; } }
+    ),
+    /immutable recovery journal collision/
+  );
+  assert.equal(ownsEvidence, true);
+  assert.equal(
+    shouldUploadRedemptionEvidence({ status: "failed_closed" }, ownsEvidence),
+    false
+  );
+});
+
+test("canonical recovery validates predecessor transaction settlement and origin bindings", () => {
+  const fixture = recoveryJournalFixture();
+  const control = {
+    ...fixture.finalizedControl,
+    state: "confirmed_pending_verification"
+  };
+  assert.equal(validateCanonicalRecoveryJournal(fixture.journal, {
+    account: owner,
+    config: {
+      funderAddress: funder,
+      executionOrigin: "azure_chile_central_static_egress",
+      expectedCountry: "CL"
+    },
+    control,
+    journalBlobName: fixture.journalBlobName
+  }), true);
+  assert.throws(() => validateCanonicalRecoveryJournal({
+    ...fixture.journal,
+    recovered_summary: {
+      ...fixture.summary,
+      execution_country: "US"
+    }
+  }, {
+    account: owner,
+    config: {
+      funderAddress: funder,
+      executionOrigin: "azure_chile_central_static_egress",
+      expectedCountry: "CL"
+    },
+    control,
+    journalBlobName: fixture.journalBlobName
+  }), /canonical recovery journal binding is invalid/);
+});
+
+test("every recovery publication write boundary resumes with exact journal bytes", async () => {
+  for (const boundary of ["journal", "archive", "pending", "latest", "final"]) {
+    const fixture = recoveryJournalFixture();
+    const container = memoryBlobContainer({
+      failOnceAt: ["journal", "archive", "latest"].includes(boundary)
+        ? boundary
+        : null
+    });
+    const controls = [];
+    let controlFailureInjected = false;
+    const writeControl = async (value) => {
+      const label = value.state === "recovery_commit_pending_publication"
+        ? "pending"
+        : "final";
+      if (!controlFailureInjected && boundary === label) {
+        controlFailureInjected = true;
+        throw new Error(`injected ${label} failure`);
+      }
+      controls.push(structuredClone(value));
+    };
+    if (boundary === "journal") {
+      await assert.rejects(
+        putCanonicalRecoveryJournal(container, fixture.prefix, fixture.journal),
+        /injected journal failure/
+      );
+    }
+    await putCanonicalRecoveryJournal(container, fixture.prefix, fixture.journal);
+    const journalBytes = Buffer.from(container.values.get(fixture.journalBlobName));
+    if (boundary !== "journal") {
+      await assert.rejects(
+        commitCanonicalRecoveryJournal(container, fixture.prefix,
+          fixture.journal, { writeControl }),
+        new RegExp(`injected ${boundary} failure`)
+      );
+    }
+    await putCanonicalRecoveryJournal(container, fixture.prefix, fixture.journal);
+    await commitCanonicalRecoveryJournal(container, fixture.prefix,
+      fixture.journal, { writeControl });
+    assert.deepEqual(container.values.get(fixture.journalBlobName), journalBytes);
+    assert.deepEqual(
+      JSON.parse(container.values.get(fixture.summaryBlobName).toString("utf8")),
+      fixture.summary
+    );
+    assert.deepEqual(
+      JSON.parse(container.values.get(`${fixture.prefix}/latest-redemption.json`)
+        .toString("utf8")),
+      fixture.summary
+    );
+    assert.deepEqual(controls.at(-1), fixture.finalizedControl);
+  }
+});
+
+test("finalized recovery repairs missing archive and latest without a new run", async () => {
+  const fixture = recoveryJournalFixture();
+  const container = memoryBlobContainer();
+  await putCanonicalRecoveryJournal(container, fixture.prefix, fixture.journal);
+  const controls = [];
+  const publication = await commitCanonicalRecoveryJournal(
+    container,
+    fixture.prefix,
+    fixture.journal,
+    {
+      finalizedResume: true,
+      writeControl: async (value) => controls.push(structuredClone(value))
+    }
+  );
+  assert.equal(publication.repaired, true);
+  assert.deepEqual(controls, [fixture.finalizedControl]);
+  assert.ok(container.values.has(fixture.summaryBlobName));
+  assert.ok(container.values.has(`${fixture.prefix}/latest-redemption.json`));
+});
+
+test("canonical recovery owns its archive even when publication fails", () => {
+  assert.equal(shouldUploadRedemptionEvidence({ status: "failed_closed" }, true), false);
+  assert.equal(shouldUploadRedemptionEvidence({ status: "failed_closed" }, false), true);
+  assert.equal(shouldUploadRedemptionEvidence({
+    status: "recovered_confirmed_and_verified"
+  }, false), false);
+});
+
+test("no-op finalized resume releases normal evidence publication", () => {
+  const ownership = recoveryEvidenceOwnershipAfterResume(null);
+  assert.equal(ownership, false);
+  assert.equal(shouldUploadRedemptionEvidence({
+    status: "nothing_to_redeem"
+  }, ownership), true);
+  assert.equal(shouldUploadRedemptionEvidence({
+    status: "failed_closed"
+  }, ownership), true);
+});
 
 test("redemption uses the current Polymarket collateral adapters", () => {
   assert.equal(CTF_COLLATERAL_ADAPTER, "0xAdA100Db00Ca00073811820692005400218FcE1f");

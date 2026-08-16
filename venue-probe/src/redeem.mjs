@@ -44,12 +44,14 @@ import {
 } from "./compounding-risk.mjs";
 import { decodeSettlementReceiptEvidence } from "./canary.mjs";
 import { tradeFillsFromRest } from "./canary-lifecycle-lib.mjs";
+import { sha256 } from "./canary-lib.mjs";
 
 let config;
 let runId;
 let ledger;
 let lease;
 let redemptionRunning = false;
+let canonicalRecoveryOwnsEvidence = false;
 export const RELAYER_DEADLINE_BUFFER_SECONDS = 600;
 const APPROVAL_FOR_ALL_TOPIC =
   "0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31";
@@ -71,6 +73,7 @@ export async function runVenueRedemption({
 } = {}) {
   if (redemptionRunning) throw new Error("fail closed: a venue redemption is already running");
   redemptionRunning = true;
+  canonicalRecoveryOwnsEvidence = false;
   try {
     config = loadRedemptionConfig(env);
     runId = `venue-redemption-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
@@ -95,10 +98,15 @@ export async function runVenueRedemption({
       };
     }
 
-    try {
-      await uploadRedemptionEvidence(summary);
-    } catch (error) {
-      failure ||= new Error(`redemption evidence upload failed: ${error.message}`);
+    if (shouldUploadRedemptionEvidence(
+      summary,
+      canonicalRecoveryOwnsEvidence
+    )) {
+      try {
+        await uploadRedemptionEvidence(summary);
+      } catch (error) {
+        failure ||= new Error(`redemption evidence upload failed: ${error.message}`);
+      }
     }
 
     try {
@@ -116,6 +124,11 @@ export async function runVenueRedemption({
     runId = null;
     redemptionRunning = false;
   }
+}
+
+export function shouldUploadRedemptionEvidence(summary, recoveryOwnsEvidence) {
+  return recoveryOwnsEvidence !== true &&
+    summary?.status !== "recovered_confirmed_and_verified";
 }
 
 async function run() {
@@ -175,6 +188,19 @@ async function run() {
       control: initialRedemptionControl,
       liquidCollateral: liquidBefore
     });
+  }
+  if ([
+    "recovery_commit_pending_publication",
+    "confirmed_and_verified"
+  ].includes(initialRedemptionControl?.state) &&
+      initialRedemptionControl?.recovery_journal_blob_name) {
+    const resumed = await resumeCanonicalRecovery({
+      account,
+      geoblock,
+      control: initialRedemptionControl
+    });
+    canonicalRecoveryOwnsEvidence = recoveryEvidenceOwnershipAfterResume(resumed);
+    if (resumed) return resumed;
   }
   const selection = await discoverOnchainRedeemableConditions(publicClient, positions);
   const redemptionControl = await reconcilePriorRejectedSubmission(
@@ -403,6 +429,36 @@ async function recoverConfirmedRedemption({
   })) {
     throw new Error("fail closed: confirmed redemption control binding is invalid");
   }
+  const container = storageContainer(config);
+  const evidencePrefix = redemptionEvidencePrefix();
+  const journalBlobName = canonicalRecoveryJournalBlobName(
+    evidencePrefix,
+    control.run_id
+  );
+  const existingJournal = await readJsonBlobIfExists(
+    container,
+    journalBlobName
+  );
+  if (existingJournal) {
+    validateCanonicalRecoveryJournal(existingJournal.value, {
+      account: account.address,
+      config,
+      control,
+      journalBlobName
+    });
+    await persistCanonicalRecoveryJournal(
+      container,
+      evidencePrefix,
+      existingJournal.value
+    );
+    await commitCanonicalRecoveryJournal(
+      container,
+      evidencePrefix,
+      existingJournal.value,
+      { writeControl: writeRedemptionControl }
+    );
+    return existingJournal.value.recovered_summary;
+  }
   const transactionHash = String(control.transaction_hash).toLowerCase();
   const conditionIds = control.condition_ids.map((value) => String(value).toLowerCase());
   ledger.record("venue_redemption_recovery_started", {
@@ -425,7 +481,6 @@ async function recoverConfirmedRedemption({
     signature_type: config.signatureType
   });
 
-  const container = storageContainer(config);
   const manifest = JSON.parse(config.fundedSessionManifestJson);
   const reservationRecords = await loadCampaignRiskReservationRecords(config);
   const durableSettlements = await loadDurableInternalSettlements(
@@ -494,28 +549,17 @@ async function recoverConfirmedRedemption({
     reservationRecords
   });
 
-  const finalized = {
-    ...control,
-    state: "confirmed_and_verified",
-    recovery_run_id: runId,
-    liquid_collateral_after: verified.liquid_collateral_after,
-    realized_payout: verified.realized_payout,
-    internal_settlement_blobs: settlements.map((row) => row.blob_name),
-    updated_ts: new Date().toISOString()
-  };
-  await writeRedemptionControl(finalized);
-  ledger.record("venue_redemption_recovery_verified", {
-    prior_run_id: control.run_id,
-    transaction_hash: transactionHash,
-    condition_ids: conditionIds,
-    realized_payout: verified.realized_payout,
-    zero_open_orders_confirmed: true
-  });
-  return {
+  const finishedTs = new Date().toISOString();
+  const recoverySummaryBlobName = redemptionArchiveBlobName(
+    evidencePrefix,
+    finishedTs,
+    runId
+  );
+  const recoveredSummary = {
     schema_version: 1,
     run_id: runId,
     status: "recovered_confirmed_and_verified",
-    finished_ts: new Date().toISOString(),
+    finished_ts: finishedTs,
     execution_origin: config.executionOrigin,
     execution_country: geoblock.country,
     static_egress_verified: geoblock.ip === config.expectedEgressIp,
@@ -544,12 +588,91 @@ async function recoverConfirmedRedemption({
     redemption_submitted: true,
     new_submission_attempted: false,
     confirmed_transaction_reused: true,
+    predecessor_run_id: control.run_id,
+    recovery_journal_blob_name: journalBlobName,
     transaction_id: control.transaction_id,
     transaction_hash: transactionHash,
     internal_settlement_blobs: settlements.map((row) => row.blob_name),
     research_only: false,
     live_strategy_enabled: true
   };
+  const finalizedControl = {
+    ...control,
+    state: "confirmed_and_verified",
+    recovery_run_id: runId,
+    recovery_journal_blob_name: journalBlobName,
+    recovery_summary_blob_name: recoverySummaryBlobName,
+    recovery_summary_sha256: sha256(jsonPayload(recoveredSummary)),
+    recovery_publication_complete: true,
+    liquid_collateral_after: verified.liquid_collateral_after,
+    realized_payout: verified.realized_payout,
+    internal_settlement_blobs: settlements.map((row) => row.blob_name),
+    updated_ts: finishedTs
+  };
+  const journal = {
+    schema_version: 1,
+    type: "redemption_recovery_journal",
+    predecessor_run_id: control.run_id,
+    recovery_run_id: runId,
+    recovery_journal_blob_name: journalBlobName,
+    finalized_control: finalizedControl,
+    recovered_summary: recoveredSummary
+  };
+  await persistCanonicalRecoveryJournal(container, evidencePrefix, journal);
+  await commitCanonicalRecoveryJournal(
+    container,
+    evidencePrefix,
+    journal,
+    { writeControl: writeRedemptionControl }
+  );
+  ledger.record("venue_redemption_recovery_verified", {
+    prior_run_id: control.run_id,
+    transaction_hash: transactionHash,
+    condition_ids: conditionIds,
+    realized_payout: verified.realized_payout,
+    zero_open_orders_confirmed: true
+  });
+  return recoveredSummary;
+}
+
+async function resumeCanonicalRecovery({ account, control }) {
+  const container = storageContainer(config);
+  const prefix = redemptionEvidencePrefix();
+  const journalBlobName = canonicalRecoveryJournalBlobName(
+    prefix,
+    control.run_id
+  );
+  if (control.recovery_journal_blob_name !== journalBlobName) {
+    throw new Error("fail closed: mutable recovery journal binding is invalid");
+  }
+  const existing = await readJsonBlobIfExists(container, journalBlobName);
+  if (!existing) {
+    throw new Error("fail closed: canonical recovery journal is missing");
+  }
+  validateCanonicalRecoveryJournal(existing.value, {
+    account: account.address,
+    config,
+    control,
+    journalBlobName
+  });
+  await persistCanonicalRecoveryJournal(container, prefix, existing.value);
+  if (control.state === "confirmed_and_verified" &&
+      control.recovery_publication_complete === true) {
+    const publication = await commitCanonicalRecoveryJournal(
+      container,
+      prefix,
+      existing.value,
+      { writeControl: writeRedemptionControl, finalizedResume: true }
+    );
+    return publication.repaired ? existing.value.recovered_summary : null;
+  }
+  await commitCanonicalRecoveryJournal(
+    container,
+    prefix,
+    existing.value,
+    { writeControl: writeRedemptionControl }
+  );
+  return existing.value.recovered_summary;
 }
 
 export function confirmedRedemptionControlMatches(control, {
@@ -1324,15 +1447,385 @@ async function writeRedemptionControl(value) {
   );
 }
 
+function canonicalRecoveryJournalBlobName(prefix, predecessorRunId) {
+  return `${prefix}/recovery-controls/${predecessorRunId}.json`;
+}
+
+function redemptionArchiveBlobName(prefix, finishedTs, recoveryRunId) {
+  return `${prefix}/redemptions/${String(finishedTs).slice(0, 10)}/${recoveryRunId}.json`;
+}
+
+function jsonPayload(value) {
+  return Buffer.from(JSON.stringify(sanitize(value), null, 2));
+}
+
+async function readBlobBytesIfExists(blob) {
+  try {
+    const response = await blob.download();
+    return Buffer.from(await streamToString(response.readableStreamBody), "utf8");
+  } catch (error) {
+    if (Number(error?.statusCode) === 404) return null;
+    throw error;
+  }
+}
+
+async function readJsonBlobIfExists(container, blobName) {
+  const payload = await readBlobBytesIfExists(
+    container.getBlockBlobClient(blobName)
+  );
+  if (!payload) return null;
+  let value;
+  try {
+    value = JSON.parse(payload.toString("utf8"));
+  } catch {
+    throw new Error("fail closed: canonical recovery journal is not valid JSON");
+  }
+  return { payload, value };
+}
+
+const IMMUTABLE_WRITE_OUTCOME = Object.freeze({
+  NOT_OWNED: "not_owned",
+  ACCEPTED_OWNED: "accepted_owned",
+  COLLISION_OWNED: "collision_owned",
+  UNKNOWN_MAY_OWN: "unknown_may_own"
+});
+const IMMUTABLE_WRITE_READBACK_ATTEMPTS = 3;
+
+function immutableWriteError(message, outcome, cause = undefined) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.immutableWriteOutcome = outcome;
+  return error;
+}
+
+function isKnownPreWriteFailure(error) {
+  return error?.immutableWriteOutcome === IMMUTABLE_WRITE_OUTCOME.NOT_OWNED ||
+    [400, 401, 403, 404].includes(Number(error?.statusCode));
+}
+
+async function readImmutableWriteResult(blob) {
+  let lastError;
+  for (let attempt = 0; attempt < IMMUTABLE_WRITE_READBACK_ATTEMPTS; attempt += 1) {
+    try {
+      return {
+        determinate: true,
+        payload: await readBlobBytesIfExists(blob)
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return { determinate: false, error: lastError };
+}
+
+async function putImmutableJsonExact(container, blobName, value, label) {
+  const payload = jsonPayload(value);
+  const blob = container.getBlockBlobClient(blobName);
+  let created = false;
+  try {
+    await blob.uploadData(payload, {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    created = true;
+  } catch (error) {
+    const readback = await readImmutableWriteResult(blob);
+    if (readback.determinate && readback.payload?.equals(payload)) {
+      return {
+        blob_name: blobName,
+        sha256: sha256(payload),
+        created: false,
+        immutable_write_outcome: IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED
+      };
+    }
+    if (readback.determinate && readback.payload) {
+      throw immutableWriteError(
+        `fail closed: immutable ${label} collision`,
+        IMMUTABLE_WRITE_OUTCOME.COLLISION_OWNED,
+        error
+      );
+    }
+    if (readback.determinate || isKnownPreWriteFailure(error)) {
+      throw immutableWriteError(
+        String(error?.message || `immutable ${label} upload failed before write`),
+        IMMUTABLE_WRITE_OUTCOME.NOT_OWNED,
+        error
+      );
+    }
+    throw immutableWriteError(
+      `fail closed: immutable ${label} upload outcome is indeterminate after ` +
+        `${IMMUTABLE_WRITE_READBACK_ATTEMPTS} read-back attempts`,
+      IMMUTABLE_WRITE_OUTCOME.UNKNOWN_MAY_OWN,
+      error
+    );
+  }
+  let verifiedPayload;
+  try {
+    verifiedPayload = await readBlobBytesIfExists(blob);
+  } catch {
+    const error = new Error(
+      `fail closed: immutable ${label} byte verification failed`
+    );
+    error.immutableWriteOutcome = IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED;
+    throw error;
+  }
+  if (!verifiedPayload?.equals(payload)) {
+    const error = new Error(
+      `fail closed: immutable ${label} byte verification failed`
+    );
+    error.immutableWriteOutcome = IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED;
+    throw error;
+  }
+  return {
+    blob_name: blobName,
+    sha256: sha256(payload),
+    created,
+    immutable_write_outcome: IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED
+  };
+}
+
+export function recoveryEvidenceOwnershipAfterResume(summary) {
+  return Boolean(summary);
+}
+
+export async function putCanonicalRecoveryJournal(container, prefix, journal) {
+  const predecessorRunId = String(journal?.predecessor_run_id || "");
+  if (!/^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(predecessorRunId)) {
+    throw new Error("fail closed: recovery journal predecessor run id is invalid");
+  }
+  const blobName = canonicalRecoveryJournalBlobName(prefix, predecessorRunId);
+  if (journal?.recovery_journal_blob_name !== blobName) {
+    throw new Error("fail closed: recovery journal blob binding is invalid");
+  }
+  return putImmutableJsonExact(
+    container,
+    blobName,
+    journal,
+    "recovery journal"
+  );
+}
+
+export async function persistCanonicalRecoveryJournal(container, prefix, journal, {
+  claimEvidence = () => { canonicalRecoveryOwnsEvidence = true; }
+} = {}) {
+  try {
+    const persisted = await putCanonicalRecoveryJournal(container, prefix, journal);
+    claimEvidence();
+    return persisted;
+  } catch (error) {
+    if ([
+      IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED,
+      IMMUTABLE_WRITE_OUTCOME.COLLISION_OWNED,
+      IMMUTABLE_WRITE_OUTCOME.UNKNOWN_MAY_OWN
+    ].includes(error?.immutableWriteOutcome)) {
+      claimEvidence();
+    }
+    throw error;
+  }
+}
+
+function sameLowercaseValues(left, right) {
+  return JSON.stringify((left || []).map((value) =>
+    String(value).toLowerCase()).sort()) ===
+    JSON.stringify((right || []).map((value) =>
+      String(value).toLowerCase()).sort());
+}
+
+export function validateCanonicalRecoveryJournal(journal, {
+  account,
+  config: recoveryConfig,
+  control,
+  journalBlobName
+}) {
+  const finalized = journal?.finalized_control;
+  const summary = journal?.recovered_summary;
+  const predecessorRunId = String(journal?.predecessor_run_id || "");
+  const recoveryRunId = String(journal?.recovery_run_id || "");
+  const transactionHash = String(finalized?.transaction_hash || "").toLowerCase();
+  const expectedSummaryBlob = redemptionArchiveBlobName(
+    journalBlobName.slice(0, journalBlobName.lastIndexOf("/recovery-controls/")),
+    summary?.finished_ts,
+    recoveryRunId
+  );
+  const owner = String(account || "").toLowerCase();
+  const storedOwner = String(finalized?.owner || "").toLowerCase();
+  const storedSigner = String(finalized?.signer_address || "").toLowerCase();
+  const ownerBound = storedOwner === owner || finalized?.owner === "[REDACTED]";
+  const signerBound = storedSigner === owner || finalized?.signer_address === "[REDACTED]";
+  const valid = journal?.schema_version === 1 &&
+    journal?.type === "redemption_recovery_journal" &&
+    /^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(predecessorRunId) &&
+    /^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(recoveryRunId) &&
+    predecessorRunId !== recoveryRunId &&
+    journal.recovery_journal_blob_name === journalBlobName &&
+    finalized?.state === "confirmed_and_verified" &&
+    finalized?.run_id === predecessorRunId &&
+    finalized?.recovery_run_id === recoveryRunId &&
+    finalized?.recovery_journal_blob_name === journalBlobName &&
+    finalized?.recovery_publication_complete === true &&
+    finalized?.recovery_summary_blob_name === expectedSummaryBlob &&
+    finalized?.recovery_summary_sha256 === sha256(jsonPayload(summary)) &&
+    finalized?.submission_attempted === true &&
+    ownerBound && signerBound &&
+    String(finalized?.funder || "").toLowerCase() ===
+      String(recoveryConfig?.funderAddress || "").toLowerCase() &&
+    String(control?.run_id || "") === predecessorRunId &&
+    String(control?.transaction_id || "") === String(finalized?.transaction_id || "") &&
+    String(control?.transaction_hash || "").toLowerCase() === transactionHash &&
+    sameLowercaseValues(control?.condition_ids, finalized?.condition_ids) &&
+    Math.abs(Number(control?.expected_gross_payout) -
+      Number(finalized?.expected_gross_payout)) <= 0.0000011 &&
+    /^0x[0-9a-f]{64}$/.test(transactionHash) &&
+    Array.isArray(finalized?.condition_ids) && finalized.condition_ids.length > 0 &&
+    sameLowercaseValues(finalized.condition_ids,
+      summary?.selection?.selected?.map((row) => row.condition_id)) &&
+    Array.isArray(finalized?.internal_settlement_blobs) &&
+    finalized.internal_settlement_blobs.length > 0 &&
+    sameLowercaseValues(finalized.internal_settlement_blobs,
+      summary?.internal_settlement_blobs) &&
+    summary?.schema_version === 1 &&
+    summary?.status === "recovered_confirmed_and_verified" &&
+    summary?.run_id === recoveryRunId &&
+    summary?.predecessor_run_id === predecessorRunId &&
+    summary?.recovery_journal_blob_name === journalBlobName &&
+    summary?.transaction_id === finalized?.transaction_id &&
+    String(summary?.transaction_hash || "").toLowerCase() === transactionHash &&
+    summary?.execution_origin === recoveryConfig?.executionOrigin &&
+    summary?.execution_country === recoveryConfig?.expectedCountry &&
+    summary?.static_egress_verified === true &&
+    summary?.funder?.toLowerCase() ===
+      String(recoveryConfig?.funderAddress || "").toLowerCase() &&
+    summary?.redemption_submitted === true &&
+    summary?.new_submission_attempted === false &&
+    summary?.confirmed_transaction_reused === true &&
+    summary?.zero_open_orders_confirmed === true &&
+    summary?.research_only === false &&
+    summary?.live_strategy_enabled === true &&
+    Number.isFinite(Date.parse(String(summary?.finished_ts || ""))) &&
+    Math.abs(Number(summary?.selection?.selected_gross_payout) -
+      Number(finalized?.expected_gross_payout)) <= 0.0000011 &&
+    Math.abs(Number(summary?.realized_payout) -
+      Number(finalized?.realized_payout)) <= 0.0000011;
+  if (!valid) {
+    throw new Error("fail closed: canonical recovery journal binding is invalid");
+  }
+  return true;
+}
+
+async function latestPointerAliasesNewerArchive(
+  container,
+  prefix,
+  latestPayload,
+  recoveryFinishedTs
+) {
+  let latest;
+  try {
+    latest = JSON.parse(latestPayload.toString("utf8"));
+  } catch {
+    return false;
+  }
+  if (!/^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(String(latest?.run_id || "")) ||
+      !Number.isFinite(Date.parse(String(latest?.finished_ts || ""))) ||
+      Date.parse(latest.finished_ts) <= Date.parse(recoveryFinishedTs)) {
+    return false;
+  }
+  const archivePayload = await readBlobBytesIfExists(
+    container.getBlockBlobClient(redemptionArchiveBlobName(
+      prefix,
+      latest.finished_ts,
+      latest.run_id
+    ))
+  );
+  return Boolean(archivePayload?.equals(latestPayload));
+}
+
+async function ensureCanonicalRecoveryPublished(
+  container,
+  prefix,
+  journal,
+  { forceLatest = false } = {}
+) {
+  const summary = journal.recovered_summary;
+  const summaryPayload = jsonPayload(summary);
+  const archiveBlobName = journal.finalized_control.recovery_summary_blob_name;
+  const archive = await putImmutableJsonExact(
+    container,
+    archiveBlobName,
+    summary,
+    "recovered redemption archive"
+  );
+  const latestBlob = container.getBlockBlobClient(`${prefix}/latest-redemption.json`);
+  const latestPayload = await readBlobBytesIfExists(latestBlob);
+  let latestWritten = false;
+  if (forceLatest || !latestPayload || latestPayload.equals(summaryPayload)) {
+    if (!latestPayload || !latestPayload.equals(summaryPayload)) {
+      await latestBlob.uploadData(summaryPayload, {
+        blobHTTPHeaders: { blobContentType: "application/json" }
+      });
+      latestWritten = true;
+    }
+  } else if (!await latestPointerAliasesNewerArchive(
+    container,
+    prefix,
+    latestPayload,
+    summary.finished_ts
+  )) {
+    await latestBlob.uploadData(summaryPayload, {
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    latestWritten = true;
+  }
+  return { repaired: archive.created || latestWritten };
+}
+
+export async function commitCanonicalRecoveryJournal(
+  container,
+  prefix,
+  journal,
+  { writeControl, finalizedResume = false } = {}
+) {
+  if (typeof writeControl !== "function") {
+    throw new Error("fail closed: recovery journal control writer is unavailable");
+  }
+  if (finalizedResume) {
+    const publication = await ensureCanonicalRecoveryPublished(
+      container,
+      prefix,
+      journal
+    );
+    if (publication.repaired) await writeControl(journal.finalized_control);
+    return publication;
+  }
+  await putImmutableJsonExact(
+    container,
+    journal.finalized_control.recovery_summary_blob_name,
+    journal.recovered_summary,
+    "recovered redemption archive"
+  );
+  await writeControl({
+    ...journal.finalized_control,
+    state: "recovery_commit_pending_publication",
+    recovery_publication_complete: false
+  });
+  await ensureCanonicalRecoveryPublished(
+    container,
+    prefix,
+    journal,
+    { forceLatest: true }
+  );
+  await writeControl(journal.finalized_control);
+  return { repaired: true };
+}
+
 async function uploadRedemptionEvidence(value) {
   const container = storageContainer(config);
-  const payload = Buffer.from(JSON.stringify(sanitize(value), null, 2));
-  const date = new Date().toISOString().slice(0, 10);
   const prefix = redemptionEvidencePrefix();
-  await container.getBlockBlobClient(`${prefix}/redemptions/${date}/${runId}.json`).uploadData(payload, {
-    conditions: { ifNoneMatch: "*" },
-    blobHTTPHeaders: { blobContentType: "application/json" }
-  });
+  const payload = jsonPayload(value);
+  await putImmutableJsonExact(
+    container,
+    redemptionArchiveBlobName(prefix, value.finished_ts, value.run_id),
+    value,
+    "redemption archive"
+  );
   await container.getBlockBlobClient(`${prefix}/latest-redemption.json`).uploadData(payload, {
     blobHTTPHeaders: { blobContentType: "application/json" }
   });
