@@ -28,7 +28,12 @@ make_bundle() {
   mkdir -p "$bundle" "${marker%/*}"
   artifacts='{}'
   for name in baseline calibration data_audit execution_quality final_report markets_summary raw_data_audit regimes sample_size; do
-    printf '{"result":{"fixture":"%s"}}\n' "$name" >"$bundle/$name.json"
+    case "$quality:$name" in
+      primary-na*:data_audit)
+        jq -n --arg git "$git" --arg quality "$quality" --arg date "$date" '{result:{decision_grade_applicable:false,strategy_evaluations:(if $quality == "primary-na-nonzero" then 1 else 0 end),decision_grade_evaluations:0,decision_grade_coverage:null,final_decision_grade_coverage:null,runtime_provenance:{observations:1440,valid_observations:1440,invalid_observations:0,first_timestamp:(if $quality == "primary-na-malformed-window" then "garbage" elif $quality == "primary-na-partial-window" then ($date + "T12:00:00Z") else ($date + "T00:00:01Z") end),last_timestamp:(if $quality == "primary-na-partial-window" then ($date + "T12:01:00Z") else ($date + "T23:59:59Z") end),max_gap_ms:60000,distinct_identity_count:1,invalid_reasons:[],identities:[{schema_version:1,backend_impl:"rust",git_sha:$git,runtime_config_hash:("sha256:" + ("a" * 64)),app_name:(if $quality == "primary-na-shadow" then "polyedge-shadow-neu" else "polyedge" end),runtime_role:(if $quality == "primary-na-shadow" then "profitability_shadow" else "primary" end),shadow_only:($quality == "primary-na-shadow"),execution_mode:"paper",allow_live:false,enable_taker_orders:false,allow_emergency_account_cancel:false,paper_maker_fill_policy:(if $quality == "primary-na-shadow" then "none" else "touch_after_quote_was_live" end),adaptive_regime_enabled:($quality == "primary-na-shadow"),adaptive_regime_mode:(if $quality == "primary-na-shadow" then "dynamic_quote_style" else "paper_only" end),decision_pipeline_schema:"polyedge.strategy_decision_batch.v4",decision_pipeline_parity_scope:"full_decision_pipeline_recomputation",decision_config_schema:"polyedge.decision_config.v1",decision_config_sha256:("sha256:" + ("b" * 64)),candidate:null,publish_strategy_canary_intents:false,research_only:true,authoritative_recorder_backend:"local_jsonl",storage_account:null,storage_container:"bot-events",event_blob_prefix:"events"}]}}}' >"$bundle/$name.json"
+        ;;
+      *) printf '{"result":{"fixture":"%s"}}\n' "$name" >"$bundle/$name.json" ;;
+    esac
     hash=$(sha256sum "$bundle/$name.json" | awk '{print $1}')
     bytes=$(stat -c %s "$bundle/$name.json")
     artifacts=$(printf '%s' "$artifacts" | jq --arg key "${name}_json" --arg path "$name.json" --arg hash "$hash" --argjson bytes "$bytes" \
@@ -36,7 +41,7 @@ make_bundle() {
   done
   input=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   jq -n --arg date "$date" --arg run "$run" --arg completed "$completed" --arg input "$input" --arg git "$git" --arg role "$role" \
-    --arg quality "$quality" --argjson artifacts "$artifacts" '{schema_version:2,git_sha:$git,runtime_role:$role,date:$date,run_id:$run,created_at:$completed,completed_at:$completed,input_sha256:$input,status:"COMPLETE",artifacts:$artifacts,data_quality:{registry_version:"research-data-quality-v5",total_events:1,decision_grade_coverage:"1",fatal_issues:(if $quality == "pass" then [] else ["fixture"] end),warnings:[],out_of_order_events:0,event_time_ordering_restored:true,coverage_breakdown:{start_price_capture_rate:"1",settlement_rate:"1",exact_reference_hour_coverage:"1",decision_metadata_coverage:"1",decision_grade_coverage:"1",final_decision_grade_coverage:"1",execution_field_coverage:"1",decision_parity_rate:"1",queue_position_coverage:null,queue_position_applicable:false,markout_1s_completion:null,markout_1s_applicable:false,markout_5s_completion:null,markout_5s_applicable:false,markout_30s_completion:null,markout_30s_applicable:false}}}' \
+    --arg quality "$quality" --argjson artifacts "$artifacts" '($quality | startswith("primary-na")) as $na | {schema_version:2,git_sha:$git,runtime_role:$role,date:$date,run_id:$run,created_at:$completed,completed_at:$completed,input_sha256:$input,status:"COMPLETE",artifacts:$artifacts,data_quality:{registry_version:"research-data-quality-v5",total_events:1,decision_grade_coverage:(if $na then "0" else "1" end),fatal_issues:(if $quality == "fail" then ["fixture"] else [] end),warnings:[],out_of_order_events:0,event_time_ordering_restored:true,coverage_breakdown:{start_price_capture_rate:"1",settlement_rate:"1",exact_reference_hour_coverage:"1",decision_metadata_coverage:"1",decision_grade_coverage:(if $na then null else "1" end),decision_grade_applicable:($na | not),final_decision_grade_coverage:(if $na then null else "1" end),execution_field_coverage:"1",decision_parity_rate:"1",queue_position_coverage:null,queue_position_applicable:false,markout_1s_completion:null,markout_1s_applicable:false,markout_5s_completion:null,markout_5s_applicable:false,markout_30s_completion:null,markout_30s_applicable:false}}}' \
     >"$bundle/run_manifest.json"
   manifest_sha=$(sha256sum "$bundle/run_manifest.json" | awk '{print $1}')
   jq -n --arg date "$date" --arg run "$run" --arg path "runs/$run/run_manifest.json" --arg sha "$manifest_sha" --arg completed "$completed" \
@@ -119,6 +124,38 @@ run_recorder "$success" 2026-08-11 >/dev/null
 make_bundle "$success" 2026-08-12 2026-08-13T08:00:00Z
 run_recorder "$success" 2026-08-12 >/dev/null
 [ "$(jq -r '.completedDailyCycles' "$success/ring/parity/ledger.json")" = 2 ]
+
+primary_na=$root/primary-na
+fixture "$primary_na"
+make_bundle "$primary_na" 2026-08-11 2026-08-12T08:00:00Z primary primary-na
+run_recorder "$primary_na" 2026-08-11 >/dev/null
+[ "$(jq -r '.completedDailyCycles' "$primary_na/ring/parity/ledger.json")" = 1 ]
+
+primary_na_nonzero=$root/primary-na-nonzero
+fixture "$primary_na_nonzero"
+make_bundle "$primary_na_nonzero" 2026-08-11 2026-08-12T08:00:00Z primary primary-na-nonzero
+if run_recorder "$primary_na_nonzero" 2026-08-11 >/dev/null 2>&1; then
+  echo 'decision-grade N/A with nonzero evaluations unexpectedly passed' >&2
+  exit 1
+fi
+
+primary_na_shadow=$root/primary-na-shadow
+fixture "$primary_na_shadow"
+make_bundle "$primary_na_shadow" 2026-08-11 2026-08-12T08:00:00Z primary primary-na-shadow
+if run_recorder "$primary_na_shadow" 2026-08-11 >/dev/null 2>&1; then
+  echo 'decision-grade N/A with shadow provenance unexpectedly passed' >&2
+  exit 1
+fi
+
+for quality in primary-na-malformed-window primary-na-partial-window; do
+  invalid_window=$root/$quality
+  fixture "$invalid_window"
+  make_bundle "$invalid_window" 2026-08-11 2026-08-12T08:00:00Z primary "$quality"
+  if run_recorder "$invalid_window" 2026-08-11 >/dev/null 2>&1; then
+    echo "decision-grade N/A with $quality unexpectedly passed" >&2
+    exit 1
+  fi
+done
 
 legacy=$root/legacy
 fixture "$legacy"

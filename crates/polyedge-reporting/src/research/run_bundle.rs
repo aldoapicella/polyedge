@@ -197,6 +197,14 @@ pub fn classify_warning(message: impl Into<String>) -> WarningClassification {
             WarningSeverity::Blocking,
             true,
         )
+    } else if message
+        == "decision-grade applicability contradicts runtime provenance or evaluation counts"
+    {
+        (
+            "decision_grade_applicability_invalid",
+            WarningSeverity::Blocking,
+            true,
+        )
     } else if message.starts_with("exact raw duplicate events are promotion-blocking: ") {
         (
             "raw_event_duplicate",
@@ -445,6 +453,8 @@ pub struct DataQualityCoverageBreakdown {
     #[serde(default)]
     pub decision_grade_coverage: Option<Decimal>,
     #[serde(default)]
+    pub decision_grade_applicable: Option<bool>,
+    #[serde(default)]
     pub final_decision_grade_coverage: Option<Decimal>,
     #[serde(default)]
     pub execution_field_coverage: Option<Decimal>,
@@ -530,15 +540,28 @@ impl DataQualitySummary {
                 Some(false) => value.is_none(),
                 Some(true) | None => complete(value),
             };
+        let decision_grade_complete = match self.coverage_breakdown.decision_grade_applicable {
+            Some(false) => {
+                self.decision_grade_coverage == Decimal::ZERO
+                    && self.coverage_breakdown.decision_grade_coverage.is_none()
+                    && self
+                        .coverage_breakdown
+                        .final_decision_grade_coverage
+                        .is_none()
+            }
+            Some(true) | None => {
+                self.decision_grade_coverage >= minimum
+                    && complete(self.coverage_breakdown.decision_grade_coverage)
+                    && complete(self.coverage_breakdown.final_decision_grade_coverage)
+            }
+        };
         self.total_events > 0
             && self.registry_version == WARNING_REGISTRY_VERSION
-            && self.decision_grade_coverage >= minimum
+            && decision_grade_complete
             && complete(self.coverage_breakdown.start_price_capture_rate)
             && complete(self.coverage_breakdown.settlement_rate)
             && complete(self.coverage_breakdown.exact_reference_hour_coverage)
             && complete(self.coverage_breakdown.decision_metadata_coverage)
-            && complete(self.coverage_breakdown.decision_grade_coverage)
-            && complete(self.coverage_breakdown.final_decision_grade_coverage)
             && complete(self.coverage_breakdown.execution_field_coverage)
             && self.coverage_breakdown.decision_parity_rate == Some(Decimal::ONE)
             && complete_or_not_applicable(
@@ -1033,6 +1056,9 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
     let strategy_evaluations = result
         .get("strategy_evaluations")
         .and_then(serde_json::Value::as_u64);
+    let declared_decision_grade_applicable = result
+        .get("decision_grade_applicable")
+        .and_then(serde_json::Value::as_bool);
     let fatal_issues = result
         .get("fatal_data_quality_issues")
         .and_then(serde_json::Value::as_array)
@@ -1152,6 +1178,7 @@ pub(super) fn quality_from_audit(audit: &serde_json::Value) -> DataQualitySummar
             .get("decision_metadata_coverage")
             .and_then(decimal_from_json),
         decision_grade_coverage: explicit_coverage,
+        decision_grade_applicable: declared_decision_grade_applicable,
         final_decision_grade_coverage: result
             .get("final_decision_grade_coverage")
             .and_then(decimal_from_json),
@@ -1252,6 +1279,43 @@ fn quality_from_audit_for_date(
         )));
     }
     validate_daily_runtime_provenance(result, date, expected_runtime_role, &mut quality);
+    if quality.coverage_breakdown.decision_grade_applicable == Some(false) {
+        let provenance = result
+            .pointer("/runtime_provenance/identities")
+            .and_then(serde_json::Value::as_array);
+        let valid_primary_na = expected_runtime_role == &RuntimeRole::Primary
+            && result
+                .get("strategy_evaluations")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+            && result
+                .get("decision_grade_evaluations")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+            && result
+                .get("decision_grade_coverage")
+                .is_none_or(serde_json::Value::is_null)
+            && result
+                .get("final_decision_grade_coverage")
+                .is_none_or(serde_json::Value::is_null)
+            && provenance.is_some_and(|identities| {
+                identities.len() == 1
+                    && identities
+                        .iter()
+                        .all(|identity| primary_runtime_provenance_errors(identity).is_empty())
+            });
+        if valid_primary_na {
+            quality
+                .warnings
+                .retain(|warning| warning.rule_id != "decision_grade_denominator_missing");
+        } else {
+            quality.coverage_breakdown.decision_grade_applicable = None;
+            quality.warnings.push(classify_warning(
+                "decision-grade applicability contradicts runtime provenance or evaluation counts"
+                    .to_owned(),
+            ));
+        }
+    }
     quality
 }
 
@@ -1583,7 +1647,7 @@ pub(super) fn shadow_runtime_provenance_errors(payload: &serde_json::Value) -> V
     errors
 }
 
-fn primary_runtime_provenance_errors(payload: &serde_json::Value) -> Vec<String> {
+pub(super) fn primary_runtime_provenance_errors(payload: &serde_json::Value) -> Vec<String> {
     let mut errors = runtime_provenance_common_errors(payload);
     require_provenance_text(payload, "/app_name", "polyedge", &mut errors);
     require_provenance_text(payload, "/runtime_role", "primary", &mut errors);
@@ -1605,6 +1669,31 @@ fn primary_runtime_provenance_errors(payload: &serde_json::Value) -> Vec<String>
     );
     require_provenance_bool(payload, "/adaptive_regime_enabled", false, &mut errors);
     require_provenance_text(payload, "/adaptive_regime_mode", "paper_only", &mut errors);
+    require_provenance_text(
+        payload,
+        "/decision_pipeline_schema",
+        "polyedge.strategy_decision_batch.v4",
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/decision_pipeline_parity_scope",
+        "full_decision_pipeline_recomputation",
+        &mut errors,
+    );
+    require_provenance_text(
+        payload,
+        "/decision_config_schema",
+        "polyedge.decision_config.v1",
+        &mut errors,
+    );
+    if payload
+        .get("decision_config_sha256")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| !is_prefixed_sha256(value))
+    {
+        errors.push("/decision_config_sha256 must be a canonical sha256 digest".to_owned());
+    }
     require_provenance_bool(
         payload,
         "/publish_strategy_canary_intents",

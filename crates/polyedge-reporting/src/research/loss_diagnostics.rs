@@ -583,7 +583,7 @@ impl LossDiagnosticsAccumulator {
             )));
         }
 
-        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance);
+        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance, false);
         let runtime_stable_identity = summarize_stable_runtime_identity(&self.runtime_provenance);
         let runtime_v3 = self.runtime_provenance_is_stable_v3(&runtime_stable_identity);
         let runtime_hashes = self

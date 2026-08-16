@@ -2487,11 +2487,6 @@ fn aggregate_profitability_metrics(
         missing.push("daily_data_quality".to_owned());
     }
     let total_events = qualities.iter().map(|quality| quality.total_events).sum();
-    let coverage = qualities
-        .iter()
-        .map(|quality| quality.decision_grade_coverage)
-        .min()
-        .unwrap_or(Decimal::ZERO);
     let fatal_issues = qualities
         .iter()
         .flat_map(|quality| quality.fatal_issues.clone())
@@ -2533,10 +2528,24 @@ fn aggregate_profitability_metrics(
         |row| row.markout_30s_completion,
         |row| row.markout_30s_applicable,
     );
+    let (decision_grade_coverage, decision_grade_applicable) = minimum_applicable_component(
+        &qualities,
+        |row| row.decision_grade_coverage,
+        |row| row.decision_grade_applicable,
+    );
+    let (final_decision_grade_coverage, final_decision_grade_applicable) =
+        minimum_applicable_component(
+            &qualities,
+            |row| row.final_decision_grade_coverage,
+            |row| row.decision_grade_applicable,
+        );
+    let decision_grade_applicable = (decision_grade_applicable == final_decision_grade_applicable)
+        .then_some(decision_grade_applicable)
+        .flatten();
     let quality = DataQualitySummary {
         registry_version: WARNING_REGISTRY_VERSION.to_owned(),
         total_events,
-        decision_grade_coverage: coverage,
+        decision_grade_coverage: decision_grade_coverage.unwrap_or(Decimal::ZERO),
         fatal_issues,
         warnings,
         out_of_order_events: qualities
@@ -2553,10 +2562,9 @@ fn aggregate_profitability_metrics(
                 row.exact_reference_hour_coverage
             }),
             decision_metadata_coverage: minimum_component(|row| row.decision_metadata_coverage),
-            decision_grade_coverage: minimum_component(|row| row.decision_grade_coverage),
-            final_decision_grade_coverage: minimum_component(|row| {
-                row.final_decision_grade_coverage
-            }),
+            decision_grade_coverage,
+            decision_grade_applicable,
+            final_decision_grade_coverage,
             execution_field_coverage: minimum_component(|row| row.execution_field_coverage),
             decision_parity_rate: minimum_component(|row| row.decision_parity_rate),
             queue_snapshot_coverage,
@@ -3579,6 +3587,7 @@ mod wallet_metric_tests {
             exact_reference_hour_coverage: Some(coverage),
             decision_metadata_coverage: Some(coverage),
             decision_grade_coverage: Some(coverage),
+            decision_grade_applicable: Some(true),
             final_decision_grade_coverage: Some(coverage),
             execution_field_coverage: Some(coverage),
             decision_parity_rate: Some(Decimal::ONE),

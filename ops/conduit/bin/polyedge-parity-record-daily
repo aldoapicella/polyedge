@@ -145,13 +145,18 @@ jq -e --arg date "$target" --arg run "$run_id" --arg expected_git "$POLYEDGE_PAR
     (.value.bytes | type == "number" and . >= 0 and floor == .)) and
   .data_quality.registry_version == "research-data-quality-v5" and
   (.data_quality.total_events | type == "number" and . > 0 and floor == .) and
-  (.data_quality.decision_grade_coverage | complete) and
+  (.data_quality.coverage_breakdown.decision_grade_applicable == null or
+    (.data_quality.coverage_breakdown.decision_grade_applicable | type == "boolean")) and
+  (if .data_quality.coverage_breakdown.decision_grade_applicable == false
+    then (.data_quality.decision_grade_coverage | tonumber) == 0
+    else (.data_quality.decision_grade_coverage | complete)
+  end) and
   (.data_quality.coverage_breakdown.start_price_capture_rate | complete) and
   (.data_quality.coverage_breakdown.settlement_rate | complete) and
   (.data_quality.coverage_breakdown.exact_reference_hour_coverage | complete) and
   (.data_quality.coverage_breakdown.decision_metadata_coverage | complete) and
-  (.data_quality.coverage_breakdown.decision_grade_coverage | complete) and
-  (.data_quality.coverage_breakdown.final_decision_grade_coverage | complete) and
+  complete_or_na(.data_quality.coverage_breakdown.decision_grade_coverage; .data_quality.coverage_breakdown.decision_grade_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.final_decision_grade_coverage; .data_quality.coverage_breakdown.decision_grade_applicable) and
   (.data_quality.coverage_breakdown.execution_field_coverage | complete) and
   (.data_quality.coverage_breakdown.decision_parity_rate | tonumber) == 1 and
   (.data_quality.coverage_breakdown.queue_snapshot_coverage | decimal_or_null) and
@@ -185,6 +190,76 @@ while IFS="$(printf '\t')" read -r relative expected_sha expected_bytes; do
   [ "$(stat -c %s "$artifact")" = "$expected_bytes" ] || die "daily artifact size mismatch: $relative"
   [ "$(sha_raw "$artifact")" = "$expected_sha" ] || die "daily artifact hash mismatch: $relative"
 done
+
+if [ "$(jq -r '.data_quality.coverage_breakdown.decision_grade_applicable' "$manifest")" = false ]; then
+  data_audit_rel=$(jq -er '.artifacts.data_audit_json.relative_path' "$manifest") \
+    || die 'decision-grade N/A has no bound data audit'
+  data_audit=$bundle_dir/$data_audit_rel
+  secure_file "$data_audit"
+  jq -e '
+    (.result // .) as $result |
+    $result.decision_grade_applicable == false and
+    $result.strategy_evaluations == 0 and
+    $result.decision_grade_evaluations == 0 and
+    $result.decision_grade_coverage == null and
+    $result.final_decision_grade_coverage == null and
+    ($result.runtime_provenance.observations | type == "number" and . > 0 and floor == .) and
+    $result.runtime_provenance.valid_observations == $result.runtime_provenance.observations and
+    $result.runtime_provenance.distinct_identity_count == 1 and
+    $result.runtime_provenance.invalid_observations == 0 and
+    ($result.runtime_provenance.invalid_reasons | type == "array" and length == 0) and
+    ($result.runtime_provenance.first_timestamp | type == "string" and length > 0) and
+    ($result.runtime_provenance.last_timestamp | type == "string" and length > 0) and
+    ($result.runtime_provenance.max_gap_ms | type == "number" and . >= 0 and . <= 300000) and
+    ($result.runtime_provenance.identities | length) == 1 and
+    ($result.runtime_provenance.identities[0] as $identity |
+      $identity.schema_version == 1 and
+      $identity.backend_impl == "rust" and
+      ($identity.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+      ($identity.runtime_config_hash | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      $identity.app_name == "polyedge" and
+      $identity.runtime_role == "primary" and
+      $identity.shadow_only == false and
+      $identity.execution_mode == "paper" and
+      $identity.allow_live == false and
+      $identity.enable_taker_orders == false and
+      $identity.allow_emergency_account_cancel == false and
+      $identity.paper_maker_fill_policy == "touch_after_quote_was_live" and
+      $identity.adaptive_regime_enabled == false and
+      $identity.adaptive_regime_mode == "paper_only" and
+      $identity.decision_pipeline_schema == "polyedge.strategy_decision_batch.v4" and
+      $identity.decision_pipeline_parity_scope == "full_decision_pipeline_recomputation" and
+      $identity.decision_config_schema == "polyedge.decision_config.v1" and
+      ($identity.decision_config_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      $identity.candidate == null and
+      $identity.publish_strategy_canary_intents == false and
+      $identity.research_only == true and
+      (($identity.authoritative_recorder_backend == "local_jsonl" and $identity.storage_account == null) or
+       ($identity.authoritative_recorder_backend == "azure_append_blob" and
+        ($identity.storage_account | type == "string" and length > 0))) and
+      $identity.storage_container == "bot-events" and
+      $identity.event_blob_prefix == "events")
+  ' "$data_audit" >/dev/null || die 'decision-grade N/A is not proven by the bound primary audit'
+  provenance_first=$(jq -er '(.result // .).runtime_provenance.first_timestamp' "$data_audit")
+  provenance_last=$(jq -er '(.result // .).runtime_provenance.last_timestamp' "$data_audit")
+  timestamp_pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+  printf '%s\n' "$provenance_first" | grep -Eq "$timestamp_pattern" \
+    || die 'decision-grade N/A provenance start is not RFC3339'
+  printf '%s\n' "$provenance_last" | grep -Eq "$timestamp_pattern" \
+    || die 'decision-grade N/A provenance end is not RFC3339'
+  provenance_first_ns=$(date -u -d "$provenance_first" +%s%N) \
+    || die 'decision-grade N/A provenance start is invalid'
+  provenance_last_ns=$(date -u -d "$provenance_last" +%s%N) \
+    || die 'decision-grade N/A provenance end is invalid'
+  day_start_ns=${target_epoch}000000000
+  day_end_ns=$(( (target_epoch + 86400) * 1000000000 ))
+  tolerance_ns=300000000000
+  [ "$provenance_first_ns" -ge "$day_start_ns" ] \
+    && [ "$provenance_first_ns" -le "$((day_start_ns + tolerance_ns))" ] \
+    && [ "$provenance_last_ns" -ge "$((day_end_ns - tolerance_ns))" ] \
+    && [ "$provenance_last_ns" -lt "$day_end_ns" ] \
+    || die 'decision-grade N/A provenance does not span the UTC day'
+fi
 
 marker=$normalized_root/$target/normalized/.polyedge-daily-complete.json
 secure_dir "$normalized_root"

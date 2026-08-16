@@ -3833,6 +3833,12 @@ impl AuditAccumulator {
                     .and_then(Value::as_str)
                     == Some("full_decision_pipeline_recomputation")
         });
+        let decision_grade_applicable = !(self.strategy_evaluations == 0
+            && self.decision_grade_evaluations == 0
+            && !self.runtime_provenance.is_empty()
+            && self.runtime_provenance.iter().all(|(_, payload)| {
+                run_bundle::primary_runtime_provenance_errors(payload).is_empty()
+            }));
         self.finalize_settlement_journals();
         self.decision_config_sha256s
             .extend(self.runtime_provenance.iter().filter_map(|(_, payload)| {
@@ -3852,7 +3858,7 @@ impl AuditAccumulator {
         let decision_config_sha256 = (self.decision_config_sha256s.len() == 1)
             .then(|| self.decision_config_sha256s.iter().next().cloned())
             .flatten();
-        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance);
+        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance, true);
         self.finalize_market_truth();
         self.finalize_strategy_batch_parity();
         let markets_with_start = self
@@ -3869,10 +3875,12 @@ impl AuditAccumulator {
         let settlement_rate = ratio_f64(markets_settled, self.markets.len());
         let decision_metadata_coverage =
             ratio_f64(self.decisions_with_final_metadata, self.decisions);
-        let final_decision_grade_coverage =
-            ratio_f64(self.decision_grade_decisions, self.decisions);
-        let decision_grade_coverage =
-            ratio_f64(self.decision_grade_evaluations, self.strategy_evaluations);
+        let final_decision_grade_coverage = decision_grade_applicable
+            .then(|| ratio_f64(self.decision_grade_decisions, self.decisions))
+            .flatten();
+        let decision_grade_coverage = decision_grade_applicable
+            .then(|| ratio_f64(self.decision_grade_evaluations, self.strategy_evaluations))
+            .flatten();
         let execution_field_coverage = if self.place_decisions == 0 {
             Some(1.0)
         } else {
@@ -3988,7 +3996,10 @@ impl AuditAccumulator {
                 self.decision_grade_evaluations, self.strategy_evaluations
             )));
         }
-        if self.decisions > 0 && final_decision_grade_coverage.is_none_or(|rate| rate < 0.95) {
+        if decision_grade_applicable
+            && self.decisions > 0
+            && final_decision_grade_coverage.is_none_or(|rate| rate < 0.95)
+        {
             warnings.push(json!(format!(
                 "final-decision grade coverage below 95%: {}/{}",
                 self.decision_grade_decisions, self.decisions
@@ -4000,7 +4011,7 @@ impl AuditAccumulator {
                 self.place_decisions_with_complete_execution_fields, self.place_decisions
             )));
         }
-        if self.decisions > 0 && self.strategy_evaluations == 0 {
+        if decision_grade_applicable && self.decisions > 0 && self.strategy_evaluations == 0 {
             warnings.push(json!("decision parity evidence missing"));
         } else if self.strategy_evaluation_invalid > 0
             || self.strategy_evaluation_matches != self.strategy_evaluations
@@ -4124,6 +4135,7 @@ impl AuditAccumulator {
             "decision_metadata_coverage": decision_metadata_coverage,
             "decision_grade_decisions": self.decision_grade_decisions,
             "decision_grade_by_action": self.decision_grade_by_action,
+            "decision_grade_applicable": decision_grade_applicable,
             "final_decision_grade_coverage": final_decision_grade_coverage,
             "decision_grade_evaluations": self.decision_grade_evaluations,
             "decision_grade_failure_reasons": self.decision_grade_failure_reasons,
@@ -4972,7 +4984,10 @@ fn decision_grade_failure_reasons(metadata: &StrategyDecisionMetadata) -> Vec<St
     reasons
 }
 
-fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Value {
+fn summarize_runtime_provenance(
+    observations: &[(DateTime<Utc>, Value)],
+    stable_identity: bool,
+) -> Value {
     let mut valid_timestamps = Vec::new();
     let mut identities = BTreeMap::<String, Value>::new();
     let mut invalid_reasons = BTreeSet::new();
@@ -4981,8 +4996,21 @@ fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Valu
         let errors = run_bundle::runtime_provenance_common_errors(payload);
         if errors.is_empty() {
             valid_timestamps.push(*timestamp);
-            let key = serde_json::to_string(payload).unwrap_or_else(|_| "invalid-json".to_owned());
-            identities.entry(key).or_insert_with(|| payload.clone());
+            let mut identity = payload.clone();
+            if stable_identity {
+                if let Some(identity) = identity.as_object_mut() {
+                    identity.remove("essential_feed_health");
+                    if let Some(routing) = identity
+                        .get_mut("event_blob_prefix_routing")
+                        .and_then(Value::as_object_mut)
+                    {
+                        routing.remove("evaluated_event_ts");
+                    }
+                }
+            }
+            let key =
+                serde_json::to_string(&identity).unwrap_or_else(|_| "invalid-json".to_owned());
+            identities.entry(key).or_insert(identity);
         } else {
             invalid_observations += 1;
             invalid_reasons.extend(errors);
@@ -12007,6 +12035,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_provenance_identity_ignores_observation_health_and_time() {
+        let first = wallet_ts("2026-07-20T12:00:00Z");
+        let mut payload = json!({
+            "schema_version": 1,
+            "backend_impl": "rust",
+            "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+            "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+            "app_name": "polyedge",
+            "runtime_role": "primary",
+            "execution_mode": "paper",
+            "paper_maker_fill_policy": "touch_after_quote_was_live",
+            "authoritative_recorder_backend": "local_jsonl",
+            "storage_account": null,
+            "storage_container": "bot-events",
+            "event_blob_prefix": "events",
+            "shadow_only": false,
+            "allow_live": false,
+            "enable_taker_orders": false,
+            "allow_emergency_account_cancel": false,
+            "adaptive_regime_enabled": false,
+            "publish_strategy_canary_intents": false,
+            "research_only": true,
+            "essential_feed_health": {"feed_status": "healthy"},
+            "event_blob_prefix_routing": {
+                "effective_prefix": "events",
+                "evaluated_event_ts": first
+            }
+        });
+        let mut later = payload.clone();
+        later["essential_feed_health"]["feed_status"] = json!("recovering");
+        later["event_blob_prefix_routing"]["evaluated_event_ts"] =
+            json!(first + Duration::minutes(1));
+
+        let summary = summarize_runtime_provenance(
+            &[
+                (first, payload.clone()),
+                (first + Duration::minutes(1), later),
+            ],
+            true,
+        );
+        assert_eq!(summary["distinct_identity_count"], 1);
+        assert!(summary["identities"][0]
+            .get("essential_feed_health")
+            .is_none());
+        assert!(summary["identities"][0]["event_blob_prefix_routing"]
+            .get("evaluated_event_ts")
+            .is_none());
+
+        payload["runtime_config_hash"] = json!(format!("sha256:{}", "b".repeat(64)));
+        let changed = summarize_runtime_provenance(
+            &[
+                (first, summary["identities"][0].clone()),
+                (first + Duration::minutes(1), payload),
+            ],
+            true,
+        );
+        assert_eq!(changed["distinct_identity_count"], 2);
+    }
+
+    #[test]
     fn azure_event_reader_accepts_plain_and_gzip_jsonl_only() {
         let raw = b"{\"event\":1}\n";
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
@@ -14530,6 +14618,38 @@ mod tests {
         let (batch, decisions) = decision_pipeline_v4_evidence(&input);
         assert!(batch["candidate"].is_null());
         let mut audit = AuditAccumulator::default();
+        audit.observe(&EventLine {
+            event_type: "runtime_provenance".to_owned(),
+            recorded_ts: now,
+            payload: json!({
+                "schema_version": 1,
+                "backend_impl": "rust",
+                "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+                "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+                "app_name": "polyedge",
+                "runtime_role": "primary",
+                "shadow_only": false,
+                "execution_mode": "paper",
+                "allow_live": false,
+                "enable_taker_orders": false,
+                "allow_emergency_account_cancel": false,
+                "paper_maker_fill_policy": "touch_after_quote_was_live",
+                "adaptive_regime_enabled": false,
+                "adaptive_regime_mode": "paper_only",
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
+                "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
+                "decision_config_schema": "polyedge.decision_config.v1",
+                "decision_config_sha256": batch["decision_config_sha256"],
+                "candidate": null,
+                "authoritative_recorder_backend": "local_jsonl",
+                "storage_account": null,
+                "storage_container": "bot-events",
+                "event_blob_prefix": "events",
+                "publish_strategy_canary_intents": false,
+                "research_only": true
+            }),
+            raw: Value::Null,
+        });
         observe_v3_evidence(&mut audit, now, batch);
         for decision in decisions {
             observe_bound_v3_decision(&mut audit, now, decision);
@@ -14543,6 +14663,14 @@ mod tests {
         assert_eq!(result["decision_pipeline_replay_rate"], 1.0);
         assert_eq!(result["decision_output_binding_rate"], 1.0);
         assert_eq!(result["decision_parity_rate"], 1.0);
+        assert_eq!(result["decision_grade_applicable"], false);
+        assert!(result["decision_grade_coverage"].is_null());
+        assert!(result["final_decision_grade_coverage"].is_null());
+        assert!(!result["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning == "decision parity evidence missing"));
     }
 
     #[test]
