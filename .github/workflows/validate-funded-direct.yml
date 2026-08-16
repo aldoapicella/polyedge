@@ -1046,8 +1046,10 @@ jobs:
                     elif .error | startswith("fail closed:") then "safety_gate"
                     elif .error | startswith("Data API positions returned HTTP ") then
                       "data_api_positions_http"
+                    elif .error == "Data API activity returned HTTP 429" then
+                      "data_api_activity_http_429"
                     elif .error | startswith("Data API activity returned HTTP ") then
-                      "data_api_activity_http"
+                      "data_api_activity_http_other"
                     elif .error | startswith("venue_redemption blocked:") then
                       "configuration_block"
                     elif .error | startswith("relayer /submit returned HTTP 4") then
