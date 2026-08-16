@@ -158,7 +158,7 @@ jobs:
             fi
           }
           reject_record() {
-            if validate_record "$1" "$2"; then
+            if validate_record "$1" "$2" "${3:-[]}"; then
               echo "unexpected accepted redemption fixture" >&2
               exit 1
             fi
@@ -263,6 +263,60 @@ jobs:
             "$valid_verified" \
             "$(printf '%s\n' "$settlement_bindings" | jq -c \
               '.[0].payout=3')"
+          legacy_payout_mismatch=$(printf '%s\n' "$valid_verified" | jq -c \
+            '.selection.selected[0].gross_payout=2.000001')
+          assert_binding_diagnostic $'settlement_selected_payout_mismatch\t1\t1' \
+            "$legacy_payout_mismatch" "$settlement_bindings"
+          canonical_verified=$(printf '%s\n' "$valid_verified" | jq -c \
+            '.selection.selected[0].gross_payout=2.01
+            | .selection.selected[0].onchain_expected_payout=2')
+          assert_binding_diagnostic $'ok\t1\t1' \
+            "$canonical_verified" "$settlement_bindings"
+          assert_binding_diagnostic $'ok\t1\t1' \
+            "$(printf '%s\n' "$canonical_verified" | jq -c \
+              '.selection.selected[0].onchain_expected_payout=2.000001')" \
+            "$settlement_bindings"
+          assert_binding_diagnostic $'settlement_selected_payout_mismatch\t1\t1' \
+            "$(printf '%s\n' "$canonical_verified" | jq -c \
+              '.selection.selected[0].onchain_expected_payout=2.000002')" \
+            "$settlement_bindings"
+          second_condition_id="0x$(printf 'f%.0s' {1..64})"
+          second_settlement_blob="${prefix}internal-settlements/$(printf 'e%.0s' {1..64}).json"
+          multi_bindings=$(printf '%s\n' "$settlement_bindings" | jq -c \
+            --arg blob_name "$second_settlement_blob" \
+            --arg transaction_hash "$transaction_hash" \
+            --arg condition_id "$second_condition_id" \
+            '. + [{
+              blob_name: $blob_name,
+              type: "internal_automatic_settlement",
+              transaction_hash: $transaction_hash,
+              condition_id: $condition_id,
+              payout: 3
+            }]')
+          multi_verified=$(printf '%s\n' "$canonical_verified" | jq -c \
+            --arg condition_id "$second_condition_id" \
+            --arg settlement_blob "$second_settlement_blob" '
+            .selection.selected += [{
+              condition_id: $condition_id,
+              gross_payout: 2.99,
+              onchain_expected_payout: 3
+            }]
+            | .selection.selected_gross_payout=5
+            | .realized_payout=5
+            | .liquid_collateral_after=10
+            | .internal_settlement_blobs += [$settlement_blob]')
+          assert_binding_diagnostic $'ok\t2\t2' \
+            "$multi_verified" "$multi_bindings"
+          assert_binding_diagnostic $'settlement_selected_payout_mismatch\t2\t2' \
+            "$(printf '%s\n' "$multi_verified" | jq -c '
+              .selection.selected[0].onchain_expected_payout=3
+              | .selection.selected[1].onchain_expected_payout=2')" \
+            "$multi_bindings"
+          assert_binding_diagnostic $'settlement_selected_payout_mismatch\t2\t2' \
+            "$(printf '%s\n' "$multi_verified" | jq -c '
+              .selection.selected[0].onchain_expected_payout=2.000002
+              | .selection.selected[1].onchain_expected_payout=2.999998')" \
+            "$multi_bindings"
           payout_mismatch=$(printf '%s\n' "$valid_verified" | jq -c \
             '.realized_payout=3
             | .liquid_collateral_after=8')
@@ -271,6 +325,28 @@ jobs:
           verified_archive="${archive_prefix}2026-08-15/venue-redemption-20260815001556008-f00dbabe.json"
           validate_record "$verified_archive" "$valid_verified" "$settlement_bindings"
           validate_record "$latest" "$valid_verified" "$settlement_bindings"
+          reject_record "$verified_archive" \
+            "$legacy_payout_mismatch" "$settlement_bindings"
+          validate_record "$verified_archive" "$canonical_verified" "$settlement_bindings"
+          validate_record "$verified_archive" \
+            "$(printf '%s\n' "$canonical_verified" | jq -c \
+              '.selection.selected[0].onchain_expected_payout=2.000001')" \
+            "$settlement_bindings"
+          reject_record "$verified_archive" \
+            "$(printf '%s\n' "$canonical_verified" | jq -c \
+              '.selection.selected[0].onchain_expected_payout=2.000002')" \
+            "$settlement_bindings"
+          validate_record "$verified_archive" "$multi_verified" "$multi_bindings"
+          reject_record "$verified_archive" \
+            "$(printf '%s\n' "$multi_verified" | jq -c '
+              .selection.selected[0].onchain_expected_payout=3
+              | .selection.selected[1].onchain_expected_payout=2')" \
+            "$multi_bindings"
+          reject_record "$verified_archive" \
+            "$(printf '%s\n' "$multi_verified" | jq -c '
+              .selection.selected[0].onchain_expected_payout=2.000002
+              | .selection.selected[1].onchain_expected_payout=2.999998')" \
+            "$multi_bindings"
           validate_latest_archive() {
             local latest_document="$1"
             shift
@@ -2062,14 +2138,25 @@ jobs:
                   elif ([$bound[].condition_id | ascii_downcase] | sort) !=
                     ([$selected[].condition_id | ascii_downcase] | sort) then
                     "settlement_condition_mismatch"
-                  elif ([$bound[] | {
+                  elif (([$bound[] | {
                     condition_id: (.condition_id | ascii_downcase),
                     payout
-                  }] | sort_by(.condition_id, .payout)) !=
-                    ([$selected[] | {
+                  }] | sort_by(.condition_id, .payout)) as $bound_pairs
+                    | ([$selected[] | {
                       condition_id: (.condition_id | ascii_downcase),
-                      payout: .gross_payout
-                    }] | sort_by(.condition_id, .payout)) then
+                      payout: (if has("onchain_expected_payout") then
+                        .onchain_expected_payout
+                      else .gross_payout end),
+                      canonical: has("onchain_expected_payout")
+                    }] | sort_by(.condition_id, .payout)) as $selected_pairs
+                    | any(range(0; $bound_pairs | length); . as $index
+                      | if $selected_pairs[$index].canonical then
+                          (($bound_pairs[$index].payout
+                            - $selected_pairs[$index].payout) | fabs) > 0.0000011
+                        else
+                          $bound_pairs[$index].payout
+                            != $selected_pairs[$index].payout
+                        end)) then
                     "settlement_selected_payout_mismatch"
                   elif ((([$bound[].payout] | add) - $realized_payout) | fabs)
                     > 0.0000011 then
@@ -2164,14 +2251,29 @@ jobs:
                   and all($bound[];
                     .type == "internal_automatic_settlement"
                     and .transaction_hash == $transaction_hash)
-                  and ([$bound[] | {
+                  and (([$bound[] | {
                     condition_id: (.condition_id | ascii_downcase),
                     payout
-                  }] | sort_by(.condition_id, .payout)) ==
+                  }] | sort_by(.condition_id, .payout)) as $bound_pairs
+                    |
                     ([$selected[] | {
                       condition_id: (.condition_id | ascii_downcase),
-                      payout: .gross_payout
-                    }] | sort_by(.condition_id, .payout))
+                      payout: (if has("onchain_expected_payout") then
+                        .onchain_expected_payout
+                      else .gross_payout end),
+                      canonical: has("onchain_expected_payout")
+                    }] | sort_by(.condition_id, .payout)) as $selected_pairs
+                    | ($bound_pairs | length) == ($selected_pairs | length)
+                    and all(range(0; $bound_pairs | length); . as $index
+                      | $bound_pairs[$index].condition_id
+                          == $selected_pairs[$index].condition_id
+                      and (if $selected_pairs[$index].canonical then
+                          (($bound_pairs[$index].payout
+                            - $selected_pairs[$index].payout) | fabs) <= 0.0000011
+                        else
+                          $bound_pairs[$index].payout
+                            == $selected_pairs[$index].payout
+                        end)))
                   and ((([$bound[].payout] | add) - $realized_payout) | fabs)
                     <= 0.0000011
                 )
