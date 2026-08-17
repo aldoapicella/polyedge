@@ -50,6 +50,28 @@ lock_ledger() {
 : "${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}"
 : "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}"
 : "${POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE:?set the approved formal-window image digest}"
+funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
+case "$funded_mode" in
+  disabled)
+    funded_enabled=false
+    funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    ;;
+  active)
+    funded_enabled=true
+    funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:?set the approved funded image}
+    funded_user=${POLYEDGE_PARITY_FUNDED_UID:?set the funded UID}:${POLYEDGE_PARITY_FUNDED_GID:?set the funded GID}
+    funded_session=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:?set the funded session}
+    funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:?set the funded session hash}
+    funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:?set the funded config hash}
+    printf '%s' "$funded_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' || die 'expected funded image is malformed'
+    printf '%s' "$funded_user" | grep -Eq '^[0-9]+:[0-9]+$' || die 'expected funded user is malformed'
+    printf '%s' "$funded_session" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' || die 'expected funded session is malformed'
+    for funded_hash in "$funded_session_sha" "$funded_config_sha"; do
+      printf '%s' "$funded_hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded binding hash is malformed'
+    done
+    ;;
+  *) die 'formal funded mode must equal disabled or active' ;;
+esac
 printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'expected source commit is malformed'
 printf '%s' "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
   || die 'expected research image is malformed'
@@ -87,16 +109,27 @@ ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
 ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
 [ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
   || die 'formal ledger must be a direct .json child of the parity root'
+if [ "$funded_mode" = active ]; then
+  printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
+    || die 'active funded parity requires a distinct funded-active ledger'
+fi
 secure_owned_file "$POLYEDGE_PARITY_LEDGER" 640
 validate_ledger() {
-  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$funded_mode" --arg image "$funded_image" \
+    --arg user "$funded_user" --arg session "$funded_session" --arg session_sha "$funded_session_sha" \
+    --arg config_sha "$funded_config_sha" --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "in_progress" and .windowStartUtc == $start and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
     ((.acceptedHourlyEvidence? // []) | type == "array") and
     ((.completedDailyCycles? // 0) | type == "number" and . >= 0 and floor == .) and
     ((.acceptedDailyEvidence? // []) | type == "array") and
-    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == false
+    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
+    (if $funded then .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
+      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha
+     else (.fundedSignerMode? // "disabled") == "disabled" and (.fundedSignerImage? // null) == null and
+      (.fundedSignerUser? // null) == null and (.fundedSessionId? // null) == null and
+      (.fundedSessionManifestSha256? // null) == null and (.fundedConfigSha256? // null) == null end)
   ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
 }
 validate_ledger
@@ -285,10 +318,19 @@ if [ -e "$evidence" ]; then
   jq -e --arg date "$target" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
     --arg latest "$latest" --arg latest_sha "$(sha "$latest")" --arg manifest "$manifest" --arg manifest_sha "$(sha "$manifest")" \
     --arg marker "$marker" --arg marker_sha "$(sha "$marker")" \
-    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg expected_image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" '
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg expected_image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" \
+    --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .cycleDate == $date and .windowStartUtc == $window and .ledgerPath == $ledger and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .fundedSignerMode == $funded_mode and .fundedSignerEnabled == $funded and
+    (if $funded then .fundedSignerImage == $funded_image and .fundedSignerUser == $funded_user and
+      .fundedSessionId == $funded_session and .fundedSessionManifestSha256 == $funded_session_sha and
+      .fundedConfigSha256 == $funded_config_sha
+     else .fundedSignerImage == null and .fundedSignerUser == null and .fundedSessionId == null and
+      .fundedSessionManifestSha256 == null and .fundedConfigSha256 == null end) and
     .gitSha == $expected_git and .researchImage == $expected_image and
     .dailyBundle.latest.path == $latest and .dailyBundle.latest.sha256 == $latest_sha and
     .dailyBundle.manifest.path == $manifest and .dailyBundle.manifest.sha256 == $manifest_sha and
@@ -303,8 +345,14 @@ else
     --arg run "$run_id" --arg git "$git_sha" --arg image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" --arg input "$input_sha" \
     --arg latest "$latest" --arg latest_sha "$(sha "$latest")" --arg manifest "$manifest" --arg manifest_sha "$(sha "$manifest")" \
     --arg marker "$marker" --arg marker_sha "$(sha "$marker")" --argjson artifacts "$artifact_count" \
+    --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" \
     --argjson boot "$boot_available" --argjson boot_floor "$boot_floor" --argjson ring "$ring_available" --argjson ring_floor "$ring_floor" \
-    '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,cycleDate:$date,completedAtUtc:$completed,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,ledgerPath:$ledger,runId:$run,gitSha:$git,researchImage:$image,inputSha256:$input,artifactCount:$artifacts,dailyBundle:{latest:{path:$latest,sha256:$latest_sha},manifest:{path:$manifest,sha256:$manifest_sha}},normalizedCompletion:{path:$marker,sha256:$marker_sha},disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring,ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}}' >"$tmp"
+    '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,cycleDate:$date,completedAtUtc:$completed,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,fundedSignerMode:$funded_mode,fundedSignerEnabled:$funded,
+      fundedSignerImage:(if $funded then $funded_image else null end),fundedSignerUser:(if $funded then $funded_user else null end),
+      fundedSessionId:(if $funded then $funded_session else null end),fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),
+      fundedConfigSha256:(if $funded then $funded_config_sha else null end),ledgerPath:$ledger,runId:$run,gitSha:$git,researchImage:$image,inputSha256:$input,artifactCount:$artifacts,dailyBundle:{latest:{path:$latest,sha256:$latest_sha},manifest:{path:$manifest,sha256:$manifest_sha}},normalizedCompletion:{path:$marker,sha256:$marker_sha},disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring,ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}}' >"$tmp"
   chmod 0640 "$tmp"
   sync -f "$tmp"
   mv "$tmp" "$evidence"
@@ -328,7 +376,14 @@ find "$daily_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | w
   [ "$(date -u -d "@$epoch" +%Y-%m-%d)" = "$date_value" ] || die "non-canonical accepted daily date: $file"
   [ "$file" = "$daily_root/$date_value/evidence.json" ] || die "accepted daily evidence is stored under the wrong date: $file"
   jq -e --arg git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" \
-    '.schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and .azureAuthoritative == true and .azureDeletionAllowed == false and .gitSha == $git and .researchImage == $image' "$file" >/dev/null \
+    --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" \
+    '.schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and .azureAuthoritative == true and .azureDeletionAllowed == false and .gitSha == $git and .researchImage == $image and .fundedSignerMode == $funded_mode and .fundedSignerEnabled == $funded and
+      (if $funded then .fundedSignerImage == $funded_image and .fundedSignerUser == $funded_user and
+        .fundedSessionId == $funded_session and .fundedSessionManifestSha256 == $funded_session_sha and .fundedConfigSha256 == $funded_config_sha
+       else .fundedSignerImage == null and .fundedSignerUser == null and .fundedSessionId == null and
+        .fundedSessionManifestSha256 == null and .fundedConfigSha256 == null end)' "$file" >/dev/null \
     || die "accepted daily evidence failed its invariant: $file"
   [ "$epoch" -le "$target_epoch" ] || continue
   jq -nc --argjson epoch "$epoch" --arg date "$date_value" --arg path "$file" --arg sha "$(sha "$file")" \
@@ -351,13 +406,13 @@ fi
 [ "$ledger_count" -eq $((count - 1)) ] || die 'ledger daily count was not at the strictly previous count'
 jq -e --argjson refs "$refs" '(.acceptedDailyEvidence // []) == ($refs[0:-1])' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
   || die 'ledger daily references are incomplete or divergent'
-protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$POLYEDGE_PARITY_LEDGER")
+protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$POLYEDGE_PARITY_LEDGER")
 ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
 trap 'rm -f "$refs_tmp" "$ledger_tmp"' EXIT HUP INT TERM
 jq --argjson count "$count" --argjson refs "$refs" '.completedDailyCycles = $count | .acceptedDailyEvidence = $refs' \
   "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
 chmod 0640 "$ledger_tmp"
-[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$ledger_tmp")" = "$protected_before" ] \
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$ledger_tmp")" = "$protected_before" ] \
   || die 'protected ledger fields changed'
 sync -f "$ledger_tmp"
 mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"

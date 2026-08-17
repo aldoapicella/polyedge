@@ -5,6 +5,13 @@ die() { echo "polyedge-parity-hourly: $*" >&2; exit 1; }
 immutable_hour_rejection() { echo "polyedge-parity-hourly: $*" >&2; exit 78; }
 sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
 
+if [ "${POLYEDGE_PARITY_UTILITY_LOCKED:-0}" != 1 ]; then
+  POLYEDGE_PARITY_TARGET_HOUR_UTC=${POLYEDGE_PARITY_TARGET_HOUR_UTC:-$(date -u -d '1 hour ago' +%Y-%m-%dT%H:00:00Z)}
+  export POLYEDGE_PARITY_TARGET_HOUR_UTC
+  exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock \
+    /usr/bin/env POLYEDGE_PARITY_UTILITY_LOCKED=1 "$0" "$@"
+fi
+
 expected_uid=${POLYEDGE_PARITY_EXPECTED_UID:-0}
 expected_gid=${POLYEDGE_PARITY_EXPECTED_GID:-0}
 secure_file() {
@@ -175,6 +182,13 @@ set +a
 formal_expected_git_sha=${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}
 formal_expected_azure_image=${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?set the approved Azure image digest}
 formal_expected_oci_image=${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?set the approved OCI multiarch image digest}
+formal_funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
+formal_expected_funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:-}
+formal_funded_uid=${POLYEDGE_PARITY_FUNDED_UID:-986}
+formal_funded_gid=${POLYEDGE_PARITY_FUNDED_GID:-982}
+formal_expected_funded_session_id=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}
+formal_expected_funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:-}
+formal_expected_funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}
 formal_window_start=${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}
 formal_ledger=${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}
 formal_subscription=${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}
@@ -204,6 +218,13 @@ set +a
 [ "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:-}" = "$formal_expected_git_sha" ] || die 'hourly environment overrides the formal source commit'
 [ "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:-}" = "$formal_expected_azure_image" ] || die 'hourly environment overrides the formal Azure image'
 [ "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:-}" = "$formal_expected_oci_image" ] || die 'hourly environment overrides the formal OCI image'
+[ "${POLYEDGE_PARITY_FUNDED_MODE:-disabled}" = "$formal_funded_mode" ] || die 'hourly environment overrides the formal funded mode'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:-}" = "$formal_expected_funded_image" ] || die 'hourly environment overrides the formal funded image'
+[ "${POLYEDGE_PARITY_FUNDED_UID:-986}" = "$formal_funded_uid" ] || die 'hourly environment overrides the formal funded UID'
+[ "${POLYEDGE_PARITY_FUNDED_GID:-982}" = "$formal_funded_gid" ] || die 'hourly environment overrides the formal funded GID'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}" = "$formal_expected_funded_session_id" ] || die 'hourly environment overrides the formal funded session'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:-}" = "$formal_expected_funded_session_sha" ] || die 'hourly environment overrides the formal funded session hash'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}" = "$formal_expected_funded_config_sha" ] || die 'hourly environment overrides the formal funded config hash'
 [ "${POLYEDGE_PARITY_WINDOW_START_UTC:-}" = "$formal_window_start" ] || die 'hourly environment overrides the formal window start'
 [ "${POLYEDGE_PARITY_LEDGER:-}" = "$formal_ledger" ] || die 'hourly environment overrides the formal ledger path'
 [ "${AZURE_SUBSCRIPTION_ID:-}" = "$formal_subscription" ] || die 'hourly environment overrides the Azure subscription'
@@ -212,6 +233,13 @@ set +a
 POLYEDGE_PARITY_EXPECTED_GIT_SHA=$formal_expected_git_sha
 POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE=$formal_expected_azure_image
 POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=$formal_expected_oci_image
+POLYEDGE_PARITY_FUNDED_MODE=$formal_funded_mode
+POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=$formal_expected_funded_image
+POLYEDGE_PARITY_FUNDED_UID=$formal_funded_uid
+POLYEDGE_PARITY_FUNDED_GID=$formal_funded_gid
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=$formal_expected_funded_session_id
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=$formal_expected_funded_session_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=$formal_expected_funded_config_sha
 POLYEDGE_PARITY_WINDOW_START_UTC=$formal_window_start
 POLYEDGE_PARITY_LEDGER=$formal_ledger
 AZURE_SUBSCRIPTION_ID=$formal_subscription
@@ -237,6 +265,31 @@ for image in "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_
   printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
     || die 'expected research image is not an immutable registry digest'
 done
+case "$POLYEDGE_PARITY_FUNDED_MODE" in
+  disabled)
+    funded_enabled=false
+    funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    ;;
+  active)
+    funded_enabled=true
+    printf '%s' "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" \
+      | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' \
+      || die 'expected funded image is not an immutable venue-probe digest'
+    printf '%s:%s' "$POLYEDGE_PARITY_FUNDED_UID" "$POLYEDGE_PARITY_FUNDED_GID" | grep -Eq '^[0-9]+:[0-9]+$' \
+      || die 'expected funded user is malformed'
+    printf '%s' "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' \
+      || die 'expected funded session is malformed'
+    for funded_hash in "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256" "$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256"; do
+      printf '%s' "$funded_hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded binding hash is malformed'
+    done
+    funded_image=$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE
+    funded_user=$POLYEDGE_PARITY_FUNDED_UID:$POLYEDGE_PARITY_FUNDED_GID
+    funded_session=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID
+    funded_session_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256
+    funded_config_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256
+    ;;
+  *) die 'formal funded mode must equal disabled or active' ;;
+esac
 [ "$POLYEDGE_RESEARCH_IMAGE" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] || die 'hourly OCI job image differs from the formal multiarch image'
 printf '%s' "$AZURE_SUBSCRIPTION_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || die 'Azure subscription ID is malformed'
 printf '%s/%s' "$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP" "$POLYEDGE_PARITY_AZURE_JOB_NAME" | grep -Eq '^[A-Za-z0-9._()-]+/[A-Za-z0-9._()-]+$' || die 'Azure job resource identity is malformed'
@@ -264,10 +317,16 @@ ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
 ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
 [ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
   || die 'formal ledger must be a direct .json child of the parity root'
+if [ "$POLYEDGE_PARITY_FUNDED_MODE" = active ]; then
+  printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
+    || die 'active funded parity requires a distinct funded-active ledger'
+fi
 
 secure_file "$POLYEDGE_PARITY_LEDGER" 640
 validate_ledger() {
-  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$POLYEDGE_PARITY_FUNDED_MODE" \
+    --arg image "$funded_image" --arg user "$funded_user" --arg session "$funded_session" \
+    --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "in_progress" and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     .windowStartUtc == $start and
@@ -275,7 +334,14 @@ validate_ledger() {
     ((.acceptedHourlyEvidence? // []) | type == "array") and
     ((.completedDailyCycles? // 0) | type == "number" and . >= 0 and floor == .) and
     ((.acceptedDailyEvidence? // []) | type == "array") and
-    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == false
+    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
+    (if $funded then
+      .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
+      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha
+     else (.fundedSignerMode? // "disabled") == "disabled" and
+      (.fundedSignerImage? // null) == null and (.fundedSignerUser? // null) == null and
+      (.fundedSessionId? // null) == null and (.fundedSessionManifestSha256? // null) == null and
+      (.fundedConfigSha256? // null) == null end)
   ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
 }
 validate_ledger
@@ -360,26 +426,51 @@ collect_refs() {
       expected_file="$hourly_root/$(date -u -d "@$epoch" +%Y%m%dT%H)/evidence.json"
       [ "$file" = "$expected_file" ] || die "accepted evidence is stored under the wrong hour: $file"
       jq -e --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
-        '.status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true and
-         .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image' "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
+        --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+        --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+        --argjson funded "$funded_enabled" '
+        .status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true and
+         .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image and
+         .services.fundedSignerMode == $funded_mode and .services.fundedSignerEnabled == $funded and
+         (if $funded then .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
+           .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+           .services.fundedSessionId == $funded_session and .services.fundedSessionManifestSha256 == $funded_session_sha and
+           .services.fundedConfigSha256 == $funded_config_sha and
+           (.services.fundedRuntime.invocationId | test("^[0-9a-f]{32}$")) and
+           (.services.fundedRuntime.containerId | test("^[0-9a-f]{64}$")) and
+           .services.fundedRuntime.heartbeatCount >= 50 and .services.fundedRuntime.alertCount == 0 and
+           .services.fundedRuntime.failedClosedCount == 0 and .services.fundedRuntime.restartCount == 0 and
+           .services.fundedRuntime.maxHeartbeatGapSeconds <= 75 and .services.fundedRuntime.tokenRefreshCount >= 20 and
+           .services.fundedRuntime.maxTokenRefreshGapSeconds <= 180
+          else .services.fundedSignerActive == false and .services.fundedSignerMasked == true and
+           .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
+           .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null and .services.fundedRuntime == null end)' \
+        "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
       validate_evidence_artifacts "$file"
       sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
       feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
       file_sha=$(sha "$file")
+      funded_invocation=$(jq -r '.services.fundedRuntime.invocationId // ""' "$file")
+      funded_container=$(jq -r '.services.fundedRuntime.containerId // ""' "$file")
       jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" --argjson runs "$sequence" \
+        --arg funded_invocation "$funded_invocation" --arg funded_container "$funded_container" \
         '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha} +
-         (if ($runs | length) == 1 then {recorderSequence:$runs[0]} else {recorderRuns:$runs} end)' >>"$refs_tmp"
+         (if ($runs | length) == 1 then {recorderSequence:$runs[0]} else {recorderRuns:$runs} end) +
+         (if $funded_invocation == "" then {} else {fundedInvocationId:$funded_invocation,fundedContainerId:$funded_container} end)' >>"$refs_tmp"
     fi
   done
   refs=$(jq -sc 'sort_by(.hourStartEpoch)' "$refs_tmp")
   count=$(printf '%s' "$refs" | jq 'length')
   [ "$count" -eq $(( (target_epoch - first_epoch) / 3600 + 1 )) ] || die 'accepted evidence has a gap'
-  printf '%s' "$refs" | jq -e --argjson first "$first_epoch" '
+  printf '%s' "$refs" | jq -e --argjson first "$first_epoch" --argjson funded "$funded_enabled" '
     def runs: if .recorderSequence? != null then [.recorderSequence] else .recorderRuns end;
     . as $refs |
     ([$refs[] | runs[]]) as $runs |
     ($refs | to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600)))) and
     ([$refs[].hourStartEpoch] | length == (unique | length)) and
+    (if $funded then ([$refs[].fundedInvocationId] | unique | length) == 1 and
+      ([$refs[].fundedContainerId] | unique | length) == 1
+     else all($refs[]; has("fundedInvocationId") | not) end) and
     all(range(1; ($runs | length)); . as $index |
       if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
         $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
@@ -397,13 +488,13 @@ update_ledger() {
   expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
   [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
 
-  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
   ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
   trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
   jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
     "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
   chmod 0640 "$ledger_tmp"
-  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
     || die 'protected ledger fields changed'
   sync -f "$ledger_tmp"
   mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
@@ -413,12 +504,21 @@ update_ledger() {
 if [ -e "$evidence" ]; then
   secure_file "$evidence" 640
   jq -e --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
-    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" '
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+    --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .hourStartUtc == $hour and .hourEndUtc == $end and .ledgerPath == $ledger and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     .sameInput.deterministicResultExactMatch == true and
-    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image
+    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image and
+    .services.fundedSignerMode == $funded_mode and .services.fundedSignerEnabled == $funded and
+    (if $funded then .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+      .services.fundedSessionId == $funded_session and .services.fundedSessionManifestSha256 == $funded_session_sha and
+      .services.fundedConfigSha256 == $funded_config_sha
+     else .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
+      .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null end)
   ' "$evidence" >/dev/null || die 'existing accepted evidence is invalid'
   validate_evidence_artifacts "$evidence"
   sequence_evidence "$evidence" >/dev/null || die 'existing accepted evidence lacks recorder sequence proof'
@@ -458,8 +558,104 @@ systemctl is-active --quiet polyedge-frontend.service || die 'frontend service i
 [ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-frontend)" = healthy ] || die 'frontend container is unhealthy'
 case "$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
 if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
-[ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
-if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
+funded_runtime=null
+if [ "$POLYEDGE_PARITY_FUNDED_MODE" = disabled ]; then
+  [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
+  if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
+else
+  [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = enabled ] || die 'funded signer is not enabled for reboot recovery'
+  [ "$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)" = enabled ] \
+    || die 'funded token rotation timer is not enabled for reboot recovery'
+  systemctl is-active --quiet polyedge-funded-signer.service || die 'funded signer is inactive'
+  systemctl is-active --quiet polyedge-federated-token@funded-signer.timer || die 'funded token rotation timer is inactive'
+  [ "$(podman inspect --format '{{.State.Status}}' polyedge-funded-signer)" = running ] || die 'funded signer container is not running'
+  [ "$(podman inspect --format '{{.Config.Image}}' polyedge-funded-signer)" = "$funded_image" ] \
+    || die 'funded signer image differs from the formal digest'
+  [ "$(podman inspect --format '{{.Config.User}}' polyedge-funded-signer)" = "$funded_user" ] \
+    || die 'funded signer container user is not the isolated lane identity'
+  funded_container=$(podman inspect --format '{{.Id}}' polyedge-funded-signer)
+  printf '%s' "$funded_container" | grep -Eq '^[0-9a-f]{64}$' || die 'funded signer container ID is malformed'
+  funded_invocation=$(systemctl show polyedge-funded-signer.service --property=InvocationID --value)
+  printf '%s' "$funded_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'funded signer invocation ID is malformed'
+  funded_env_value() {
+    podman inspect --format '{{json .Config.Env}}' polyedge-funded-signer \
+      | jq -er --arg name "$1" '($name + "=") as $prefix |
+          [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+          if length == 1 then .[0] else error("funded runtime binding is absent or duplicate") end'
+  }
+  [ "$(funded_env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = "$funded_session" ] \
+    || die 'funded signer campaign differs from the formal session'
+  [ "$(funded_env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = "$funded_session_sha" ] \
+    || die 'funded signer manifest hash differs from the formal session'
+  [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] \
+    || die 'funded signer config hash differs from the formal config'
+  funded_token=${POLYEDGE_PARITY_FUNDED_TOKEN_FILE:-/run/polyedge-federated-funded-signer/azure-federated-token}
+  [ ! -L "$funded_token" ] && [ -f "$funded_token" ] || die 'funded JWT-SVID is missing or unsafe'
+  set -- $(stat -c '%u %g %a %h %Y' "$funded_token")
+  [ "$1:$2" = "$funded_user" ] && [ "$3" = 600 ] && [ "$4" = 1 ] \
+    || die 'funded JWT-SVID has wrong owner, mode, or link count'
+  funded_token_age=$((now_epoch - $5))
+  [ "$funded_token_age" -ge 0 ] && [ "$funded_token_age" -le 240 ] || die 'funded JWT-SVID rotation is stale'
+  funded_runtime=$(journalctl -u polyedge-funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager \
+    | jq -Rsc --arg invocation "$funded_invocation" --arg container "$funded_container" \
+      --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
+        {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
+         invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] as $events |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_alert.v1")] as $alerts |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")] as $failed |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_service.v2" and
+        (.event.status == "persistent_service_started" or .event.status == "persistent_service_stopped"))] as $restarts |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")] as $all_heartbeats |
+      [$all_heartbeats[] | select(.invocation == $invocation and .container == $container)] | sort_by(.timestamp) as $heartbeats |
+      ([$all_heartbeats[] | select(.invocation != $invocation or .container != $container)] | length) as $foreign |
+      [$heartbeats[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($alerts | length) == 0 and ($failed | length) == 0 and ($restarts | length) == 0 and $foreign == 0 and
+        ($heartbeats | length) >= 50 and $times[0] >= $start and $times[0] <= ($start + 60) and
+        $times[-1] >= ($end - 60) and $times[-1] < $end and $max_gap <= 75 and all($heartbeats[].event;
+          (.processed_messages | type == "number" and floor == . and . >= 0) and
+          .failed_messages == 0 and .consecutive_latency_breaches == 0 and .redemption_failures == 0 and
+          .executor.user_channel_ready == true and .executor.market_channel_ready == true and
+          .executor.user_channel_gaps == 0 and .executor.market_channel_gaps == 0 and
+          .executor.user_channel_unparsed == 0 and .executor.market_channel_unparsed == 0 and
+          .executor.reconnect_reconciliation_required == false and
+          .executor.safety_snapshot_cache_ready == true and .executor.safety_snapshot_cache_error == null and
+          .executor.risk_reservation_index_ready == true)
+      then ($heartbeats[-1].event | {
+        invocationId:$invocation,containerId:$container,
+        heartbeatCount:($heartbeats | length),firstHeartbeatUtc:($times[0] | todateiso8601),
+        lastHeartbeatUtc:($times[-1] | todateiso8601),maxHeartbeatGapSeconds:$max_gap,
+        alertCount:($alerts | length),failedClosedCount:($failed | length),restartCount:(($restarts | length) + $foreign),
+        processedMessages:.processed_messages,failedMessages:.failed_messages,
+        consecutiveLatencyBreaches:.consecutive_latency_breaches,redemptionFailures:.redemption_failures,
+        executor:{userChannelReady:.executor.user_channel_ready,marketChannelReady:.executor.market_channel_ready,
+          userChannelGaps:.executor.user_channel_gaps,marketChannelGaps:.executor.market_channel_gaps,
+          userChannelUnparsed:.executor.user_channel_unparsed,marketChannelUnparsed:.executor.market_channel_unparsed,
+          reconnectReconciliationRequired:.executor.reconnect_reconciliation_required,
+          safetySnapshotCacheReady:.executor.safety_snapshot_cache_ready,
+          safetySnapshotCacheError:.executor.safety_snapshot_cache_error,
+          riskReservationIndexReady:.executor.risk_reservation_index_ready}})
+      else error("funded signer lacks continuous bound heartbeat evidence") end
+    ') || die 'funded signer lacks continuous healthy heartbeat evidence'
+  token_runtime=$(journalctl -u polyedge-federated-token@funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager \
+    | jq -Rsc --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") |
+        {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),message:(.MESSAGE // "")}] as $events |
+      [$events[] | select(.message | startswith("Finished polyedge-federated-token@funded-signer.service"))] | sort_by(.timestamp) as $refreshes |
+      [$events[] | select(.message | test("failed|failure|status=[1-9]"; "i"))] as $failures |
+      [$refreshes[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($refreshes | length) >= 20 and ($failures | length) == 0 and
+        $times[0] >= $start and $times[0] <= ($start + 180) and
+        $times[-1] >= ($end - 180) and $times[-1] < $end and $max_gap <= 180
+      then {tokenRefreshCount:($refreshes | length),firstTokenRefreshUtc:($times[0] | todateiso8601),
+        lastTokenRefreshUtc:($times[-1] | todateiso8601),maxTokenRefreshGapSeconds:$max_gap,tokenRefreshFailureCount:0}
+      else error("funded token rotation was not continuous") end
+    ') || die 'funded token rotation lacks continuous success evidence'
+  funded_runtime=$(jq -nc --argjson signer "$funded_runtime" --argjson token "$token_runtime" '$signer + $token')
+fi
 
 source_dir=$segments_root/$day/$hour
 : >"$feed_tmp"
@@ -635,13 +831,22 @@ if [ "$target_epoch" -gt "$first_epoch" ]; then
   prior=$hourly_root/$(date -u -d "@$prior_epoch" +%Y%m%dT%H)/evidence.json
   secure_file "$prior" 640
   jq -e --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" --argjson epoch "$prior_epoch" \
-    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" '
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+    --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .windowStartUtc == $window and .ledgerPath == $ledger and
     .hourStartUtc == ($epoch | strftime("%Y-%m-%dT%H:00:00Z")) and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     .sameInput.deterministicResultExactMatch == true and
-    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image
+    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image and
+    .services.fundedSignerMode == $funded_mode and .services.fundedSignerEnabled == $funded and
+    (if $funded then .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+      .services.fundedSessionId == $funded_session and .services.fundedSessionManifestSha256 == $funded_session_sha and
+      .services.fundedConfigSha256 == $funded_config_sha
+     else .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
+      .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null end)
   ' "$prior" >/dev/null || die 'prior accepted evidence is invalid'
   validate_evidence_artifacts "$prior"
   prior_runs=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
@@ -1018,6 +1223,9 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
   --arg oci_attestation "$oci_attestation" --arg oci_attestation_sha "$(sha "$oci_attestation")" \
   --arg same_path "$same_report" --arg same_sha "$(sha "$same_report")" --arg result_sha "$azure_result" --arg decision_config_sha256 "$azure_decision_config" \
   --arg same_attestation "$same_attestation" --arg same_attestation_sha "$(sha "$same_attestation")" \
+  --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+  --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+  --argjson funded "$funded_enabled" --argjson funded_runtime "$funded_runtime" \
   --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
   --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
   --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
@@ -1030,7 +1238,14 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
       oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null,attestation:{path:$oci_attestation,sha256:$oci_attestation_sha}}},
     sameInput:{path:$same_path,sha256:$same_sha,attestation:{path:$same_attestation,sha256:$same_attestation_sha},azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},
     disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},
-    services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMasked:true},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
+    services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMode:$funded_mode,
+      fundedSignerEnabled:$funded,fundedSignerMasked:($funded | not),fundedSignerActive:$funded,
+      fundedSignerImage:(if $funded then $funded_image else null end),
+      fundedSignerUser:(if $funded then $funded_user else null end),
+      fundedSessionId:(if $funded then $funded_session else null end),
+      fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),
+      fundedConfigSha256:(if $funded then $funded_config_sha else null end),fundedRuntime:$funded_runtime},
+    ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
   .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
 chmod 0640 "$tmp"
 sync -f "$tmp"

@@ -77,6 +77,29 @@ EOF
   chmod 0640 "$case_root/parity.env"
 }
 
+activate_funded_fixture() {
+  case_root=$1
+  active_ledger=$case_root/ring/parity/20260811T000000Z-funded-active.json
+  jq --arg user "$uid:$gid" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
+    .fundedSignerImage="ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
+    .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
+    .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
+    .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+    "$case_root/ring/parity/ledger.json" >"$active_ledger"
+  rm "$case_root/ring/parity/ledger.json"
+  chmod 0640 "$active_ledger"
+  sed -i "s#POLYEDGE_PARITY_LEDGER=.*#POLYEDGE_PARITY_LEDGER=$active_ledger#" "$case_root/parity.env"
+  cat >>"$case_root/parity.env" <<EOF
+POLYEDGE_PARITY_FUNDED_MODE=active
+POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+POLYEDGE_PARITY_FUNDED_UID=$uid
+POLYEDGE_PARITY_FUNDED_GID=$gid
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:9999999999999999999999999999999999999999999999999999999999999999
+EOF
+}
+
 run_recorder() {
   case_root=$1 date=$2
   env PATH="$fake:$PATH" POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
@@ -127,11 +150,11 @@ run_recorder "$noon" 2026-08-19 >/dev/null
 success=$root/success
 fixture "$success"
 make_bundle "$success" 2026-08-11 2026-08-12T08:00:00Z
-before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")
+before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(jq -r '.completedDailyCycles' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(jq -r '.acceptedDailyEvidence | length' "$success/ring/parity/ledger.json")" = 1 ]
-[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")" = "$before" ]
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")" = "$before" ]
 evidence_sha=$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")" = "$evidence_sha" ]
@@ -139,6 +162,28 @@ jq -e '.completedDailyCycles == 1 and (.acceptedDailyEvidence | length) == 1' "$
 make_bundle "$success" 2026-08-12 2026-08-13T08:00:00Z
 run_recorder "$success" 2026-08-12 >/dev/null
 [ "$(jq -r '.completedDailyCycles' "$success/ring/parity/ledger.json")" = 2 ]
+
+unexpected_active_ledger=$root/unexpected-active-ledger
+fixture "$unexpected_active_ledger"
+jq '.fundedSignerEnabled=true' "$unexpected_active_ledger/ring/parity/ledger.json" >"$unexpected_active_ledger/ledger.tmp"
+mv "$unexpected_active_ledger/ledger.tmp" "$unexpected_active_ledger/ring/parity/ledger.json"
+chmod 0640 "$unexpected_active_ledger/ring/parity/ledger.json"
+make_bundle "$unexpected_active_ledger" 2026-08-11 2026-08-12T08:00:00Z
+if run_recorder "$unexpected_active_ledger" 2026-08-11 >/dev/null 2>&1; then
+  echo 'active funded ledger unexpectedly passed in the default masked mode' >&2
+  exit 1
+fi
+
+active_funded=$root/active-funded
+fixture "$active_funded"
+activate_funded_fixture "$active_funded"
+make_bundle "$active_funded" 2026-08-11 2026-08-12T08:00:00Z
+run_recorder "$active_funded" 2026-08-11 >/dev/null
+jq -e '.fundedSignerEnabled == true and .completedDailyCycles == 1 and
+  (.acceptedDailyEvidence | length) == 1' "$active_funded/ring/parity/20260811T000000Z-funded-active.json" >/dev/null
+jq -e '.fundedSignerMode == "active" and .fundedSignerEnabled == true and
+  .fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and .fundedSignerUser == "'"$uid:$gid"'"' \
+  "$active_funded/ring/parity/daily/2026-08-11/evidence.json" >/dev/null
 
 primary_na=$root/primary-na
 fixture "$primary_na"

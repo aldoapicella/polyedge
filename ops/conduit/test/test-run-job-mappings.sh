@@ -8,6 +8,14 @@ for job in prospective chart-backfill backfill; do
   grep -F "  $job)" "$runner" >/dev/null
 done
 grep -F 'if [ "$job" = origin-check ]; then' "$runner" >/dev/null
+grep -F 'freshness:0|hourly:0)' "$runner" >/dev/null
+grep -F 'exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock' "$runner" >/dev/null
+grep -F 'POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d' "$runner" >/dev/null
+grep -F 'audit_target=$POLYEDGE_AUDIT_TARGET' "$runner" >/dev/null
+target_line=$(grep -n 'POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d' "$runner" | cut -d: -f1)
+lock_line=$(grep -n 'exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock' "$runner" | cut -d: -f1)
+use_line=$(grep -n 'audit_target=$POLYEDGE_AUDIT_TARGET' "$runner" | cut -d: -f1)
+[ "$target_line" -lt "$lock_line" ] && [ "$lock_line" -lt "$use_line" ]
 grep -F 'POLYEDGE_ORIGIN_EXPECTED_COUNTRY must equal CO' "$runner" >/dev/null
 grep -F 'getent ahostsv4 polymarket.com' "$runner" >/dev/null
 grep -F -- '--network polyedge' "$runner" >/dev/null

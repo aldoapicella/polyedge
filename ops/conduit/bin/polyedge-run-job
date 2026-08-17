@@ -3,6 +3,22 @@ set -eu
 
 job=${1:?usage: polyedge-run-job JOB}
 
+if [ "$job" = hourly ]; then
+  POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d '1 hour ago' +%Y/%m/%d/%H)}
+  printf '%s' "$POLYEDGE_AUDIT_TARGET" | grep -Eq '^[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{2}$' \
+    || { echo 'POLYEDGE_AUDIT_TARGET is malformed' >&2; exit 64; }
+  [ "$(date -u -d "${POLYEDGE_AUDIT_TARGET%/*} ${POLYEDGE_AUDIT_TARGET##*/}:00:00Z" +%Y/%m/%d/%H)" = "$POLYEDGE_AUDIT_TARGET" ] \
+    || { echo 'POLYEDGE_AUDIT_TARGET is not canonical UTC' >&2; exit 64; }
+  export POLYEDGE_AUDIT_TARGET
+fi
+
+case "$job:${POLYEDGE_UTILITY_LOCKED:-0}" in
+  freshness:0|hourly:0)
+    exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock \
+      /usr/bin/env POLYEDGE_UTILITY_LOCKED=1 "$0" "$job"
+    ;;
+esac
+
 # This is intentionally separate from Azure-backed research jobs: it receives no
 # credentials or mounts, and must prove this OCI host is the expected CO origin.
 if [ "$job" = origin-check ]; then
@@ -49,7 +65,7 @@ case "$job" in
     ;;
   hourly)
     cpus=0.5 memory=1g limit=1800
-    audit_target=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)
+    audit_target=$POLYEDGE_AUDIT_TARGET
     audit_day=${audit_target%/*}
     audit_hour=${audit_target##*/}
     command='OUT="reports/research/hourly/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "${POLYEDGE_LOCAL_RAW_ROOT%/}/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/" --out "$OUT" --markdown "reports/research/hourly/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'

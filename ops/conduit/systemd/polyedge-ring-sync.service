@@ -6,10 +6,10 @@ Requires=polyedge-network.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/flock -n /run/polyedge-ring-sync.lock /usr/local/libexec/polyedge-ring-sync
+ExecStart=/usr/bin/flock -n /run/polyedge-ring-sync.lock /usr/bin/flock -w 3600 /run/polyedge/utility.lock /usr/local/libexec/polyedge-ring-sync
 CPUQuota=50%
 MemoryMax=10G
-TimeoutStartSec=2h
+TimeoutStartSec=3h
 
 [Install]
 WantedBy=multi-user.target

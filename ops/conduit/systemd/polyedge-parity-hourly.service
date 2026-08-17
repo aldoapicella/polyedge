@@ -14,7 +14,8 @@ Group=root
 UMask=0027
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/usr/local/libexec/polyedge-parity-hourly
-TimeoutStartSec=45min
+TimeoutStartSec=2h
+CPUQuota=50%
 Restart=on-failure
 RestartPreventExitStatus=78
 RestartSec=60s

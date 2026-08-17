@@ -83,14 +83,14 @@ minutes and hourly quality by two minutes. Azure daily and replay remain at
 00:30 and 03:00; OCI daily starts at 03:10 after both, and OCI replay at 03:15
 waits behind it on the host lock. Azure remains authoritative. Daily, replay,
 shadow, and manual data-producing jobs share the research lock; the bounded
-freshness, hourly, and parity audits stay independent so a long daily cycle
-cannot create a monitoring or parity gap. Their combined CPU caps remain within
-the four-core host. Revisit the offsets only after Azure compute deletion, not
-during parity.
+freshness, hourly, parity, and ring-upload utilities share a separate utility
+lock, so a long daily cycle cannot create a monitoring or parity gap and only
+one utility consumes its 0.5-CPU allocation at a time. Revisit the offsets only
+after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260817T120000Z.json` is the current formal
+Ledger `/srv/polyedge-ring/parity/20260817T120000Z.json` is the staged masked-funded
 window. It starts with zero inherited credit at `2026-08-17T12:00:00Z`, keeps
 Azure authoritative and `azureDeletionAllowed:false`, and cannot finish before
 `2026-08-20T12:00:00Z`. Pre-window collections are excluded evidence only. A
@@ -99,6 +99,11 @@ so `2026-08-18` is the first eligible full daily cycle. Completion still
 requires 72 consecutive accepted hours, two successful OCI daily cycles,
 reboot and rollback proof, and explicit qset, funded, and deletion gates. The
 superseded `20260817T000000Z.json` ledger remains immutable with zero credit.
+If OCI funded ownership activates, leave this ledger and its evidence immutable
+and start a new full-hour `*-funded-active.json` ledger with
+`POLYEDGE_PARITY_FUNDED_MODE=active`, `fundedSignerEnabled:true`, and the exact
+image, UID:GID, session ID, session-manifest hash, and candidate-config hash.
+No masked-funded hour carries into that window.
 
 The superseded `20260816T100000Z.json` ledger retained three accepted hours at
 `10:00`, `11:00`, and `12:00`. None is carried forward because source
@@ -332,6 +337,12 @@ across all three reports. It advances only the sequential clean-hour count. It
 never changes Azure authority, deletion, reboot, qset, or funded gates and
 fails closed on a gap, duplicate, instance change, unhealthy recorder,
 degraded or stale essential feed, decision-config mismatch, or result mismatch.
+An active-funded window additionally requires the signer and token-rotation
+timer to be reboot-enabled and active, the exact image and isolated UID, a JWT
+rotated within four minutes, at least 50 healthy per-minute heartbeats, ready
+market/user channels and safety cache, zero gaps/unparsed frames, zero alerts,
+zero failed messages, and zero reconciliation or latency blockers. The evidence
+stores only this bounded status summary, never a token or wallet secret.
 After a successful OCI daily container exits, `polyedge-parity-record-daily`
 verifies the immutable primary bundle, normalized completion marker, every
 artifact hash/size, approved source/image, promotion-quality predicate, ring
@@ -652,10 +663,12 @@ Schedules are UTC: freshness every five minutes; hourly quality at `:12`;
 primary daily at 03:10; replay at 03:15; the disabled qset shadow timer remains
 configured for 02:15. Data-producing jobs use one
 `flock -w 129600 /run/polyedge/research.lock` (36 hours); bounded audits bypass
-it. Daily, replay, and qset are each capped at 1.5 CPU. During parity, qset and
-funded are disabled, so API/frontend (1 CPU), one writer (1.5), freshness (0.5),
-ordered hourly or parity (0.5), and the ring uploader (0.5) total 4 OCPUs.
-Origin check is manual and unscheduled; re-budget before enabling funded.
+it. Daily, replay, and qset are each capped at 1.5 CPU. Freshness, hourly,
+parity, and ring upload share `/run/polyedge/utility.lock`, so only one 0.5-CPU
+utility runs at a time. With qset disabled, API/frontend (1 CPU), funded signer
+(0.5), one writer (1.5), and one utility (0.5) allocate at most 3.5 OCPUs to
+heavy workloads, leaving 0.5 OCPU for the OS, Caddy, SPIRE, and token refresh.
+Origin check is manual and unscheduled.
 
 ## Verify, reboot, rollback
 

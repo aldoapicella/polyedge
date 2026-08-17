@@ -53,6 +53,15 @@ cat >"$fake/podman" <<'EOF'
 case "$1" in
   inspect)
     case "$*" in
+      *State.Status*polyedge-funded-signer*) [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] && printf '%s\n' running || exit 2 ;;
+      *Config.Image*polyedge-funded-signer*) printf '%s\n' "$FAKE_FUNDED_IMAGE" ;;
+      *Config.User*polyedge-funded-signer*) printf '%s\n' "$FAKE_FUNDED_UID:$FAKE_FUNDED_GID" ;;
+      *Config.Env*polyedge-funded-signer*) jq -nc \
+        --arg session "${FAKE_FUNDED_SESSION:-dynamic-quote-funded-2026-08-13-v10}" \
+        --arg manifest "${FAKE_FUNDED_SESSION_SHA:-sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}" \
+        --arg config "${FAKE_FUNDED_CONFIG_SHA:-sha256:9999999999999999999999999999999999999999999999999999999999999999}" \
+        '["VENUE_PROBE_FUNDED_CAMPAIGN_ID="+$session,"FUNDED_DIRECT_SESSION_MANIFEST_SHA256="+$manifest,
+          "STRATEGY_CANARY_CANDIDATE_CONFIG_HASH="+$config]' ;;
       *State.Health.Status*) printf '%s\n' healthy ;;
       *Config.Image*) printf '%s\n' "$FAKE_OCI_IMAGE" ;;
       *ImageDigest*) printf '%s\n' "$FAKE_OCI_IMAGE_DIGEST" ;;
@@ -113,12 +122,78 @@ cat >"$fake/systemctl" <<'EOF'
 #!/bin/sh
 case "$1" in
   is-active)
-    case "$3" in polyedge-job@shadow-qset.service|polyedge-funded-signer.service) exit 3 ;; *) exit 0 ;; esac
+    unit=${3:-${2:-}}
+    case "$unit" in
+      polyedge-job@shadow-qset.service) [ "${FAKE_QSET_ACTIVE:-0}" = 1 ] && exit 0 || exit 3 ;;
+      polyedge-funded-signer.service|polyedge-federated-token@funded-signer.timer)
+        [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] && exit 0 || exit 3
+        ;;
+      *) exit 0 ;;
+    esac
     ;;
   is-enabled)
-    case "$2" in polyedge-shadow-qset.timer) printf '%s\n' not-found; exit 1 ;; polyedge-funded-signer.service) printf '%s\n' masked ;; *) exit 2 ;; esac
+    case "$2" in
+      polyedge-shadow-qset.timer) printf '%s\n' not-found; exit 1 ;;
+      polyedge-funded-signer.service|polyedge-federated-token@funded-signer.timer)
+        if [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ]; then printf '%s\n' enabled; else printf '%s\n' masked; fi
+        ;;
+      *) exit 2 ;;
+    esac
     ;;
+  show) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
   *) exit 2 ;;
+esac
+EOF
+
+cat >"$fake/journalctl" <<'EOF'
+#!/bin/sh
+[ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] || exit 0
+start=$(date -u -d '2026-08-09T15:00:00Z' +%s)
+case "$*" in
+  *polyedge-federated-token@funded-signer.service*)
+    i=0
+    while [ "$i" -lt 30 ]; do
+      if [ "${FAKE_FUNDED_TOKEN_GAP:-0}" = 1 ] && [ "$i" -eq 15 ]; then i=$((i + 1)); continue; fi
+      timestamp=$(( (start + 60 + i * 120) * 1000000 ))
+      message='Finished polyedge-federated-token@funded-signer.service - Rotate the funded-signer PolyEdge JWT-SVID token file.'
+      jq -nc --arg timestamp "$timestamp" --arg message "$message" \
+        '{__REALTIME_TIMESTAMP:$timestamp,MESSAGE:$message}'
+      i=$((i + 1))
+    done
+    [ "${FAKE_FUNDED_TOKEN_FAILURE:-0}" != 1 ] || jq -nc --arg timestamp "$(( (start + 1800) * 1000000 ))" \
+      '{__REALTIME_TIMESTAMP:$timestamp,MESSAGE:"Failed to start funded token refresh"}'
+    ;;
+  *)
+    i=0
+    while [ "$i" -lt 60 ]; do
+      if [ "${FAKE_FUNDED_GAP:-0}" = 1 ] && [ "$i" -eq 30 ]; then i=$((i + 1)); continue; fi
+      if [ "${FAKE_FUNDED_BURST:-0}" = 1 ]; then second=$((start + 30 + i)); else second=$((start + 30 + i * 60)); fi
+      timestamp=$((second * 1000000))
+      invocation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      [ "${FAKE_FUNDED_RESTART:-0}" != 1 ] || [ "$i" -ne 30 ] || invocation=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      message=$(jq -nc '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",
+        processed_messages:1,failed_messages:0,consecutive_latency_breaches:0,redemption_failures:0,
+        executor:{user_channel_ready:true,market_channel_ready:true,user_channel_gaps:0,market_channel_gaps:0,
+          user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,
+          safety_snapshot_cache_ready:true,safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
+      jq -nc --arg timestamp "$timestamp" --arg invocation "$invocation" \
+        --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --arg message "$message" \
+        '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+      i=$((i + 1))
+    done
+    if [ "${FAKE_FUNDED_ALERT:-0}" = 1 ]; then
+      message=$(jq -nc '{schema:"polyedge.funded_direct_alert.v1",status:"websocket_gap_or_reconciliation_required"}')
+      jq -nc --arg timestamp "$(( (start + 1800) * 1000000 ))" --arg invocation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --arg message "$message" \
+        '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+    fi
+    if [ "${FAKE_FUNDED_FAILED_CLOSED:-0}" = 1 ]; then
+      message=$(jq -nc '{schema:"polyedge.funded_direct_service.v1",status:"failed_closed"}')
+      jq -nc --arg timestamp "$(( (start + 1800) * 1000000 ))" --arg invocation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --arg message "$message" \
+        '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+    fi
+    ;;
 esac
 EOF
 
@@ -221,7 +296,9 @@ fixture() {
   chmod 0700 "$case_root/run" "$case_root/token"
   chmod 0750 "$case_root/ring/parity"
   : >"$case_root/token/azure-federated-token"
+  : >"$case_root/token/funded-azure-federated-token"
   chmod 0600 "$case_root/token/azure-federated-token"
+  chmod 0600 "$case_root/token/funded-azure-federated-token"
   jq -n --arg start "$window" '{
     schemaVersion:1,status:"in_progress",azureAuthoritative:true,azureDeletionAllowed:false,
     windowStartUtc:$start,acceptedCleanLiveHours:0,acceptedHourlyEvidence:[],
@@ -233,6 +310,7 @@ fixture() {
   chmod 0640 "$case_root/ring/status.json"
   fixture_now=$(date -u -d '2026-08-09T16:20:00Z' +%s)
   touch -d "@$fixture_now" "$case_root/ring/status.json"
+  touch -d "@$fixture_now" "$case_root/token/funded-azure-federated-token"
   cat >"$case_root/hourly.env" <<'EOF'
 POLYEDGE_RESEARCH_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true
@@ -343,6 +421,30 @@ EOF
   done
 }
 
+activate_funded_fixture() {
+  case_root=$1
+  active_ledger=$case_root/ring/parity/20260809T141000Z-funded-active.json
+  jq --arg user "$uid:$gid" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
+    .fundedSignerImage="ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
+    .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
+    .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
+    .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+    "$case_root/ring/parity/ledger.json" >"$active_ledger"
+  rm "$case_root/ring/parity/ledger.json"
+  chmod 0640 "$active_ledger"
+  sed -i "s#POLYEDGE_PARITY_LEDGER=.*#POLYEDGE_PARITY_LEDGER=$active_ledger#" "$case_root/parity.env"
+  cat >>"$case_root/parity.env" <<EOF
+POLYEDGE_PARITY_FUNDED_MODE=active
+POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+POLYEDGE_PARITY_FUNDED_UID=$uid
+POLYEDGE_PARITY_FUNDED_GID=$gid
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:9999999999999999999999999999999999999999999999999999999999999999
+POLYEDGE_PARITY_FUNDED_TOKEN_FILE=$case_root/token/funded-azure-federated-token
+EOF
+}
+
 refresh_segment() {
   source=$1
   gzip_file=$(printf '%s\n' "$source" | sed 's#/segments/#/archive/#').gz
@@ -368,18 +470,30 @@ refresh_segment() {
 run_collector() {
   case_root=$1
   env PATH="$fake:$PATH" \
+    POLYEDGE_PARITY_UTILITY_LOCKED=1 \
     POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" \
     FAKE_CALLS="$case_root/calls" FAKE_DF_AVAILABLE="${FAKE_DF_AVAILABLE:-20000000000}" FAKE_MOUNTPOINT_OK="${FAKE_MOUNTPOINT_OK:-1}" \
     FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_AZURE_ATTESTATION="$case_root/azure.json.attestation.json" \
     FAKE_AZURE_EXECUTION="$case_root/azure-execution.json" FAKE_SAME_REPORT="$case_root/same.json" \
     FAKE_OCI_IMAGE="$oci_image" FAKE_OCI_IMAGE_DIGEST="$oci_image_digest" FAKE_API_STATUS="$case_root/api-status.json" \
+    FAKE_FUNDED_ACTIVE="${FAKE_FUNDED_ACTIVE:-0}" FAKE_QSET_ACTIVE="${FAKE_QSET_ACTIVE:-0}" \
+    FAKE_FUNDED_ALERT="${FAKE_FUNDED_ALERT:-0}" FAKE_FUNDED_FAILED_CLOSED="${FAKE_FUNDED_FAILED_CLOSED:-0}" \
+    FAKE_FUNDED_BURST="${FAKE_FUNDED_BURST:-0}" FAKE_FUNDED_GAP="${FAKE_FUNDED_GAP:-0}" \
+    FAKE_FUNDED_RESTART="${FAKE_FUNDED_RESTART:-0}" FAKE_FUNDED_TOKEN_GAP="${FAKE_FUNDED_TOKEN_GAP:-0}" \
+    FAKE_FUNDED_TOKEN_FAILURE="${FAKE_FUNDED_TOKEN_FAILURE:-0}" \
+    FAKE_FUNDED_IMAGE="${FAKE_FUNDED_IMAGE:-ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}" \
+    FAKE_FUNDED_UID="${FAKE_FUNDED_UID:-$uid}" FAKE_FUNDED_GID="${FAKE_FUNDED_GID:-$gid}" \
+    FAKE_FUNDED_SESSION="${FAKE_FUNDED_SESSION:-dynamic-quote-funded-2026-08-13-v10}" \
+    FAKE_FUNDED_SESSION_SHA="${FAKE_FUNDED_SESSION_SHA:-sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff}" \
+    FAKE_FUNDED_CONFIG_SHA="${FAKE_FUNDED_CONFIG_SHA:-sha256:9999999999999999999999999999999999999999999999999999999999999999}" \
     FAKE_API_BUSY_ATTEMPTS="${FAKE_API_BUSY_ATTEMPTS:-0}" \
     "$collector"
 }
 
 protected() {
-  jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled}' "$1"
+  jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,
+    fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256}' "$1"
 }
 seed_artifacts() {
   case_root=$1
@@ -652,6 +766,102 @@ touch -d "@$early" "$late_status_sample/ring/status.json"
 run_collector "$late_status_sample" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$late_status_sample/ring/parity/ledger.json")" = 1 ]
 
+unexpected_active_ledger=$root/unexpected-active-ledger
+fixture "$unexpected_active_ledger"
+jq '.fundedSignerEnabled=true' "$unexpected_active_ledger/ring/parity/ledger.json" >"$unexpected_active_ledger/ledger.tmp"
+mv "$unexpected_active_ledger/ledger.tmp" "$unexpected_active_ledger/ring/parity/ledger.json"
+chmod 0640 "$unexpected_active_ledger/ring/parity/ledger.json"
+if run_collector "$unexpected_active_ledger" >/dev/null 2>&1; then
+  echo 'active funded ledger unexpectedly passed in the default masked mode' >&2
+  exit 1
+fi
+
+active_funded=$root/active-funded
+fixture "$active_funded"
+activate_funded_fixture "$active_funded"
+FAKE_FUNDED_ACTIVE=1 run_collector "$active_funded" >/dev/null
+jq -e '.acceptedCleanLiveHours == 1 and .fundedSignerEnabled == true and
+  (.acceptedHourlyEvidence | length) == 1' "$active_funded/ring/parity/20260809T141000Z-funded-active.json" >/dev/null
+jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled == true and
+  .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
+  .services.fundedSignerUser == "'"$uid:$gid"'" and .services.fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and
+  .services.fundedRuntime.heartbeatCount == 60 and .services.fundedRuntime.alertCount == 0 and
+  .services.fundedRuntime.maxHeartbeatGapSeconds == 60 and .services.fundedRuntime.tokenRefreshCount == 30 and
+  .services.fundedRuntime.maxTokenRefreshGapSeconds == 120' \
+  "$active_funded/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
+
+reused_masked_ledger=$root/reused-masked-ledger
+fixture "$reused_masked_ledger"
+activate_funded_fixture "$reused_masked_ledger"
+mv "$reused_masked_ledger/ring/parity/20260809T141000Z-funded-active.json" "$reused_masked_ledger/ring/parity/ledger.json"
+sed -i "s#POLYEDGE_PARITY_LEDGER=.*#POLYEDGE_PARITY_LEDGER=$reused_masked_ledger/ring/parity/ledger.json#" "$reused_masked_ledger/parity.env"
+if FAKE_FUNDED_ACTIVE=1 run_collector "$reused_masked_ledger" >/dev/null 2>&1; then
+  echo 'reused masked ledger path unexpectedly passed active funded parity' >&2
+  exit 1
+fi
+
+inactive_funded=$root/inactive-funded
+fixture "$inactive_funded"
+activate_funded_fixture "$inactive_funded"
+if run_collector "$inactive_funded" >/dev/null 2>&1; then
+  echo 'inactive funded signer unexpectedly passed an active parity window' >&2
+  exit 1
+fi
+
+active_qset=$root/active-qset
+fixture "$active_qset"
+activate_funded_fixture "$active_qset"
+if FAKE_FUNDED_ACTIVE=1 FAKE_QSET_ACTIVE=1 run_collector "$active_qset" >/dev/null 2>&1; then
+  echo 'active qset unexpectedly passed the funded parity window' >&2
+  exit 1
+fi
+
+wrong_funded_image=$root/wrong-funded-image
+fixture "$wrong_funded_image"
+activate_funded_fixture "$wrong_funded_image"
+if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_IMAGE=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+    run_collector "$wrong_funded_image" >/dev/null 2>&1; then
+  echo 'wrong funded image unexpectedly passed the funded parity window' >&2
+  exit 1
+fi
+
+stale_funded_token=$root/stale-funded-token
+fixture "$stale_funded_token"
+activate_funded_fixture "$stale_funded_token"
+touch -d "@$((fixture_now - 241))" "$stale_funded_token/token/funded-azure-federated-token"
+if FAKE_FUNDED_ACTIVE=1 run_collector "$stale_funded_token" >/dev/null 2>&1; then
+  echo 'stale funded token unexpectedly passed the funded parity window' >&2
+  exit 1
+fi
+
+funded_alert=$root/funded-alert
+fixture "$funded_alert"
+activate_funded_fixture "$funded_alert"
+if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_ALERT=1 run_collector "$funded_alert" >/dev/null 2>&1; then
+  echo 'funded alert unexpectedly passed the funded parity window' >&2
+  exit 1
+fi
+
+for funded_case in burst gap restart failed-closed token-gap token-failure wrong-user wrong-config; do
+  case_root=$root/funded-$funded_case
+  fixture "$case_root"
+  activate_funded_fixture "$case_root"
+  case "$funded_case" in
+    burst) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_BURST=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    gap) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_GAP=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    restart) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_RESTART=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    failed-closed) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_FAILED_CLOSED=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    token-gap) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_TOKEN_GAP=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    token-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_TOKEN_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    wrong-user) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_UID=999 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    wrong-config) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_CONFIG_SHA=sha256:8888888888888888888888888888888888888888888888888888888888888888 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+  esac
+  if [ "$passed" -eq 1 ]; then
+    echo "invalid funded runtime unexpectedly passed: $funded_case" >&2
+    exit 1
+  fi
+done
+
 success=$root/success
 fixture "$success"
 jq '.rebootRecoveryPassed = true' "$success/ring/parity/ledger.json" >"$success/reboot.tmp"
@@ -877,6 +1087,7 @@ mkdir -p "$launcher_root/bin" "$launcher_root/etc/jobs" "$launcher_root/run/poly
 sed -e "s#/etc/polyedge/jobs/#$launcher_root/etc/jobs/#g" \
   -e "s#/srv/polyedge-ring#$launcher_root/ring#g" \
   -e "s#/run/polyedge-federated-#$launcher_root/run/polyedge-federated-#g" \
+  -e "s#/run/polyedge/utility.lock#$launcher_root/run/utility.lock#g" \
   -e "s#/etc/polyedge/credentials/#$launcher_root/etc/credentials/#g" \
   -e "s#/usr/bin/timeout#$launcher_root/bin/timeout#g" \
   -e "s#/usr/bin/podman#$launcher_root/bin/podman#g" \
