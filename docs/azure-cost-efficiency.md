@@ -363,6 +363,16 @@ daily cycles, reboot recovery, rollback, funded, and qset gates pass. The
 machine-readable inventory and per-lane disposition are in
 `ops/conduit/compute-plane-mapping.json`.
 
+A straight-line 30.4375-day extrapolation of those 16 observed days is $430.31
+per month for the resource group and $281.22 per month for the direct
+compute/network subtotal. After the approved $1.28 monthly OCI volume increase,
+the estimated net reduction is $279.94 per month, leaving about $149.09 per
+month in Azure at the same run rate. This is a simple run-rate estimate, not an
+Azure forecast, and compute/network migration alone therefore does not meet the
+$15-$35 target. Later removal of compute-only logs and ACR, plus separately
+proven storage optimization, must close the remaining gap without deleting
+evidence or weakening retention.
+
 ## Storage growth follow-up
 
 Raw event growth is the remaining unbounded cost driver. The current update does

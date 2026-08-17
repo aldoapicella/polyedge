@@ -21,7 +21,19 @@
       "containerAppsUsd": 89.69,
       "natGatewayUsd": 54.36,
       "virtualNetworkUsd": 3.78,
-      "directComputeNetworkSubtotalUsd": 147.83
+      "directComputeNetworkSubtotalUsd": 147.83,
+      "simpleRunRateEstimate": {
+        "observedDays": 16,
+        "projectionDays": 30.4375,
+        "resourceGroupMonthlyUsd": 430.31,
+        "directComputeNetworkMonthlyUsd": 281.22,
+        "ociVolumeIncrementMonthlyUsd": 1.28,
+        "netMonthlySavingsUsd": 279.94,
+        "remainingAzureMonthlyUsd": 149.09,
+        "targetMonthlyRangeUsd": [15, 35],
+        "targetMetByComputeNetworkMigrationAlone": false,
+        "method": "straight-line extrapolation, not an Azure forecast"
+      }
     }
   },
   "apps": [
