@@ -1095,19 +1095,83 @@ jobs:
           assert.match(recoveryBackfill,
             /recovery-controls\/\$\{predecessor_run_id\}\.json/);
           assert.match(recoveryBackfill,
-            /mutable_control_sha256="sha256:[0-9a-f]{64}"[\s\S]*predecessor_sha256="sha256:[0-9a-f]{64}"[\s\S]*recovery_sha256="sha256:[0-9a-f]{64}"[\s\S]*recovery_binding_sha256="sha256:[0-9a-f]{64}"/);
+            /mutable_control_sha256="sha256:88522acc5914116b7a22292e5936547d1f8d831773907911f0d887f0cd00a5fa"[\s\S]*predecessor_sha256="sha256:89d08792ef8a5a2d7da9f271f370c2abd4b993837f400e38c2f052751cb6b384"[\s\S]*recovery_sha256="sha256:eee7f1dcec132cc1cf71cb6fc97ea14a0eaa8ceffd8b9b94d8bd55c73041e9d9"[\s\S]*recovery_binding_sha256="sha256:adb4ddcc5d445dafaf78df758d1a102d7f2460b753f5eb0d0dd82c4eb07c6b50"/);
           assert.match(recoveryBackfill,
             /jq -cj '[\s\S]*"\$recovery_file" > recovery-binding\.json/);
           assert.match(recoveryBackfill,
             /test "\$predecessor_sha256"[\s\S]*test "\$recovery_sha256"[\s\S]*test "\$recovery_binding_sha256"[\s\S]*redemption_recovery_journal/);
           assert.match(recoveryBackfill,
             /funded_recovery_backfill_predecessor_sha_mismatch[\s\S]*funded_recovery_backfill_recovery_sha_mismatch[\s\S]*funded_recovery_backfill_predecessor_contract_invalid[\s\S]*funded_recovery_backfill_recovery_contract_invalid[\s\S]*funded_recovery_backfill_binding_sha_mismatch/);
+          assert.equal((recoveryBackfill.match(/readonly malformed_journal_sha256="sha256:abfa6beb115f41e302eba8aa0bb24e6b46083c4271a4eda7f058be12edf12df3"/g) || []).length, 1);
+          const malformedConstructor = recoveryBackfill.slice(
+            recoveryBackfill.indexOf("# Preserve the original jq collision semantics"),
+            recoveryBackfill.indexOf("jq -n --slurpfile predecessor_doc"));
+          assert.match(malformedConstructor,
+            /--slurpfile predecessor "\$predecessor_file"[\s\S]*--arg predecessor "\$predecessor_run_id"/);
+          const correctedConstructor = recoveryBackfill.slice(
+            recoveryBackfill.indexOf("jq -n --slurpfile predecessor_doc"),
+            recoveryBackfill.indexOf("validate_receipt()"));
+          assert.match(correctedConstructor,
+            /--slurpfile predecessor_doc "\$predecessor_file"[\s\S]*--slurpfile recovery_doc "\$recovery_file"[\s\S]*--arg predecessor_run_id "\$predecessor_run_id"[\s\S]*--arg recovery_run_id "\$recovery_run_id"[\s\S]*--arg journal_blob_name "\$journal"/);
+          assert.match(correctedConstructor,
+            /jq --arg predecessor "\$predecessor_run_id"[\s\S]*\.predecessor_run_id = \$predecessor[\s\S]*\.finalized_control\.run_id = \$predecessor[\s\S]*"\$malformed_file" > "\$minimal_repair_file"[\s\S]*cmp "\$journal_file" "\$minimal_repair_file"/);
+          const journalTypeFilter = 'type == "object" and (.predecessor_run_id | type == "string") and (.finalized_control.run_id | type == "string") and .predecessor_run_id == .finalized_control.run_id';
+          const { execFileSync } = require("node:child_process");
+          const correctedJournal = { predecessor_run_id: "p", finalized_control: { run_id: "p" } };
+          const malformedJournal = { predecessor_run_id: [], finalized_control: { run_id: [] } };
+          assert.equal(execFileSync("jq", ["-e", journalTypeFilter], {
+            input: JSON.stringify(correctedJournal)
+          }).toString().trim(), "true");
+          assert.throws(() => execFileSync("jq", ["-e", journalTypeFilter], {
+            input: JSON.stringify(malformedJournal), stdio: ["pipe", "pipe", "pipe"]
+          }));
           assert.match(recoveryBackfill,
-            /if az storage blob download[\s\S]*cmp "\$journal_file" "\$existing_file"[\s\S]*exit 0[\s\S]*test "\$mutable_control_sha256"[\s\S]*az storage blob upload/);
+            /az storage blob show[\s\S]*etag:properties\.etag,size:properties\.contentLength[\s\S]*az storage blob download[\s\S]*--if-match "\$canonical_etag"/);
           assert.match(recoveryBackfill,
-            /redemption_recovery_journal[\s\S]*predecessor_run_id[\s\S]*finalized_control[\s\S]*recovered_summary/);
+            /canonical_size=\$\(jq -er '\.size \| numbers \| select\(\. > 0 and \. <= 1048576 and floor == \.\)' "\$metadata_file"\)/);
+          const receiptValidator = recoveryBackfill.slice(
+            recoveryBackfill.indexOf("validate_receipt()"),
+            recoveryBackfill.indexOf("verify_snapshot()"));
+          assert.match(receiptValidator,
+            /test -f "\$1"[\s\S]*receipt_size=\$\(stat --printf='%s' "\$1"\)[\s\S]*test "\$receipt_size" -gt 0[\s\S]*test "\$receipt_size" -le 16384/);
           assert.match(recoveryBackfill,
-            /az storage blob upload[\s\S]*--overwrite false[\s\S]*az storage blob download[\s\S]*cmp "\$journal_file" "\$existing_file"/);
+            /if \[ "\$receipt_exists" != true \]; then[\s\S]*funded_recovery_backfill_repair_receipt_required_for_corrected_canonical/);
+          const recoveryMutations = recoveryBackfill.split("az storage blob ").slice(1);
+          const snapshotMutation = recoveryMutations.find((command) => command.startsWith("snapshot"));
+          assert.match(snapshotMutation,
+            /--name "\$journal"[\s\S]*--if-match "\$canonical_etag"/);
+          const recoveryUploads = recoveryMutations.filter((command) => command.startsWith("upload"));
+          assert.equal(recoveryUploads.length, 2);
+          const receiptUpload = recoveryUploads.find((command) => command.includes('--name "$receipt"'));
+          const canonicalUpload = recoveryUploads.find((command) => command.includes('--name "$journal"'));
+          assert.match(receiptUpload, /--overwrite false/);
+          assert.match(canonicalUpload, /--if-match "\$canonical_etag"[\s\S]*--overwrite true/);
+          assert.equal((recoveryBackfill.match(/--overwrite true/g) || []).length, 1);
+          const receiptPredicate = preparePreflight.match(
+            /or test\("\^" \+ \$recovery_repair_receipts \+ "([^"]+)"\)/);
+          assert.ok(receiptPredicate);
+          assert.equal(receiptPredicate[1],
+            "venue-redemption-[0-9]{17}-[0-9a-f]{8}/sha256-[0-9a-f]{64}\\\\.json\\\\z");
+          const receiptRegexSuffix = execFileSync("jq", ["-nr", `"${receiptPredicate[1]}"`])
+            .toString().trimEnd();
+          const receiptPrefix = "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/recovery-repair-receipts/";
+          const receiptMatches = (name) => execFileSync("jq", ["-nr",
+            "--arg", "name", name, "--arg", "prefix", receiptPrefix,
+            "--arg", "suffix", receiptRegexSuffix,
+            "$name | test(\"^\" + $prefix + $suffix)"
+          ]).toString().trim() === "true";
+          const validReceiptName = receiptPrefix
+            + "venue-redemption-20260816163934709-03fccfd5/sha256-"
+            + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+          assert.equal(receiptMatches(validReceiptName), true);
+          assert.equal(receiptMatches(validReceiptName + "\n"), false);
+          assert.equal(receiptMatches(validReceiptName + "/../other.json"), false);
+          assert.equal(receiptMatches(receiptPrefix
+            + "venue-redemption-20260816163934709-03fccfd5/sha256-"
+            + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"), false);
+          assert.equal(receiptMatches(receiptPrefix
+            + "venue-redemption-20260816163934709-03fccfd5/sha256-"
+            + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.json"), false);
           assert.match(preparePreflight,
             /verify-funded-v10-settlement\.mjs[\s\S]*verified_settlement_ids == \$settlement_ids/);
           assert.match(preparePreflight,
@@ -1341,9 +1405,11 @@ jobs:
             /az storage blob ([a-z-]+)/g
           )].map((match) => match[1]), ["show", "download"]);
           assert.match(recoveryJournalDiagnostic,
-            /--if-match "\$etag"[\s\S]*sha256sum[\s\S]*root_type[\s\S]*predecessor_run_id_type[\s\S]*finalized_control_run_id_type/);
+            /--if-match "\$etag"[\s\S]*sha256sum[\s\S]*journal_state[\s\S]*root_type[\s\S]*predecessor_run_id_type[\s\S]*finalized_control_run_id_type/);
           assert.match(recoveryJournalDiagnostic,
-            /type == "object"[\s\S]*predecessor_run_id \| type == "array"[\s\S]*finalized_control\.run_id \| type == "array"[\s\S]*recovery_run_id == \$recovery/);
+            /malformed_journal_sha256='sha256:abfa6beb115f41e302eba8aa0bb24e6b46083c4271a4eda7f058be12edf12df3'[\s\S]*\$journal_sha256 == \$malformed_sha256[\s\S]*predecessor_run_id \| type == "array"[\s\S]*finalized_control\.run_id \| type == "array"[\s\S]*"pinned_malformed"[\s\S]*elif common and corrected then[\s\S]*"corrected"/);
+          assert.match(recoveryJournalDiagnostic,
+            /keys \| sort\) == \["finalized_control", "predecessor_run_id", "recovered_summary", "recovery_journal_blob_name", "recovery_run_id", "schema_version", "type"\][\s\S]*finalized_control\.transaction_id[\s\S]*recovered_summary\.transaction_id == \.finalized_control\.transaction_id[\s\S]*journal_state: \$journal_state/);
           assert.match(recoveryJournalDiagnostic,
             /readonly recovery_run_id='venue-redemption-20260816164043326-56add08b'/);
           assert.match(recoveryJournalDiagnostic,
@@ -1523,7 +1589,9 @@ jobs:
           set -euo pipefail
           umask 077
           readonly journal_blob='reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/recovery-controls/venue-redemption-20260816163934709-03fccfd5.json'
+          readonly predecessor_run_id='venue-redemption-20260816163934709-03fccfd5'
           readonly recovery_run_id='venue-redemption-20260816164043326-56add08b'
+          readonly malformed_journal_sha256='sha256:abfa6beb115f41e302eba8aa0bb24e6b46083c4271a4eda7f058be12edf12df3'
           metadata_file=$(mktemp)
           journal_file=$(mktemp)
           trap 'rm -f -- "$metadata_file" "$journal_file"' EXIT
@@ -1548,18 +1616,64 @@ jobs:
             --only-show-errors -o none
           test "$(stat --printf='%s' "$journal_file")" = "$content_length"
           journal_sha256="sha256:$(sha256sum "$journal_file" | cut -d' ' -f1)"
-          jq -e --arg blob "$journal_blob" --arg recovery "$recovery_run_id" '
-            type == "object"
-            and (.predecessor_run_id | type == "array")
-            and (.finalized_control | type == "object")
-            and (.finalized_control.run_id | type == "array")
-            and .predecessor_run_id == .finalized_control.run_id
-            and .recovery_run_id == $recovery
-            and .recovery_journal_blob_name == $blob
-          ' "$journal_file" >/dev/null
+          journal_state=$(jq -er \
+            --arg blob "$journal_blob" \
+            --arg predecessor "$predecessor_run_id" \
+            --arg recovery "$recovery_run_id" \
+            --arg malformed_sha256 "$malformed_journal_sha256" \
+            --arg journal_sha256 "$journal_sha256" '
+            def common:
+              type == "object"
+              and (keys | sort) == ["finalized_control", "predecessor_run_id", "recovered_summary", "recovery_journal_blob_name", "recovery_run_id", "schema_version", "type"]
+              and .schema_version == 1
+              and .type == "redemption_recovery_journal"
+              and (.finalized_control | type == "object")
+              and .recovery_run_id == $recovery
+              and .recovery_journal_blob_name == $blob
+              and .finalized_control.recovery_run_id == $recovery;
+            def corrected:
+              (.predecessor_run_id | type == "string" and . == $predecessor)
+              and (.finalized_control.run_id | type == "string" and . == $predecessor)
+              and .finalized_control.schema_version == 1
+              and .finalized_control.state == "confirmed_and_verified"
+              and .finalized_control.submission_attempted == true
+              and (.finalized_control.transaction_id | type == "string" and length > 0)
+              and (.finalized_control.transaction_hash | type == "string" and test("^0x[0-9a-fA-F]{64}$"))
+              and (.finalized_control.condition_ids | type == "array" and length > 0
+                and length == (unique | length)
+                and all(.[]; type == "string" and test("^0x[0-9a-fA-F]{64}$")))
+              and (.finalized_control.expected_gross_payout | type == "number" and . > 0)
+              and (.finalized_control.internal_settlement_blobs | type == "array" and length > 0
+                and length == (unique | length)
+                and all(.[]; type == "string" and length > 0))
+              and .recovered_summary.schema_version == 1
+              and .recovered_summary.status == "recovered_confirmed_and_verified"
+              and .recovered_summary.run_id == $recovery
+              and .recovered_summary.redemption_submitted == true
+              and .recovered_summary.new_submission_attempted == false
+              and .recovered_summary.confirmed_transaction_reused == true
+              and .recovered_summary.transaction_id == .finalized_control.transaction_id
+              and (.recovered_summary.transaction_hash | ascii_downcase)
+                == (.finalized_control.transaction_hash | ascii_downcase)
+              and ([.recovered_summary.selection.selected[].condition_id | ascii_downcase] | sort)
+                == ([.finalized_control.condition_ids[] | ascii_downcase] | sort)
+              and (.recovered_summary.internal_settlement_blobs | sort)
+                == (.finalized_control.internal_settlement_blobs | sort);
+            if common and $journal_sha256 == $malformed_sha256
+              and (.predecessor_run_id | type == "array")
+              and (.finalized_control.run_id | type == "array")
+              and .predecessor_run_id == .finalized_control.run_id then
+              "pinned_malformed"
+            elif common and corrected then
+              "corrected"
+            else
+              error("funded_recovery_journal_integrity_invalid")
+            end
+          ' "$journal_file")
           jq -c --arg blob_path "$journal_blob" --arg sha256 "$journal_sha256" \
             --arg etag "$etag" --argjson content_length "$content_length" \
-            --arg last_modified "$last_modified" --arg recovery "$recovery_run_id" '
+            --arg last_modified "$last_modified" --arg recovery "$recovery_run_id" \
+            --arg journal_state "$journal_state" '
               {
                 blob_path: $blob_path,
                 sha256: $sha256,
@@ -1569,10 +1683,11 @@ jobs:
                 root_type: type,
                 predecessor_run_id_type: (.predecessor_run_id | type),
                 finalized_control_run_id_type: (.finalized_control.run_id | type),
-                predecessor_and_finalized_run_id_arrays_equal:
+                predecessor_and_finalized_run_ids_equal:
                   (.predecessor_run_id == .finalized_control.run_id),
                 recovery_run_id_binding: (.recovery_run_id == $recovery),
                 recovery_journal_blob_binding: (.recovery_journal_blob_name == $blob_path),
+                journal_state: $journal_state,
                 top_level_sorted_keys: (keys | sort)
               }
             ' "$journal_file"
@@ -2925,16 +3040,24 @@ jobs:
           readonly recovery_blob="${v10_prefix}redemptions/2026-08-16/venue-redemption-20260816164043326-56add08b.json"
           readonly recovery_sha256="sha256:eee7f1dcec132cc1cf71cb6fc97ea14a0eaa8ceffd8b9b94d8bd55c73041e9d9"
           readonly recovery_binding_sha256="sha256:adb4ddcc5d445dafaf78df758d1a102d7f2460b753f5eb0d0dd82c4eb07c6b50"
+          readonly malformed_journal_sha256="sha256:abfa6beb115f41e302eba8aa0bb24e6b46083c4271a4eda7f058be12edf12df3"
           readonly predecessor_run_id="venue-redemption-20260816163934709-03fccfd5"
           readonly recovery_run_id="venue-redemption-20260816164043326-56add08b"
           readonly journal="${v10_prefix}recovery-controls/${predecessor_run_id}.json"
+          readonly receipt="${v10_prefix}recovery-repair-receipts/${predecessor_run_id}/sha256-${malformed_journal_sha256#sha256:}.json"
           queue_file=queue-before-recovery-journal-backfill.json
           app_file=app-before-recovery-journal-backfill.json
           control_file=$(mktemp)
           recovery_file=$(mktemp)
           predecessor_file=$(mktemp)
           journal_file=$(mktemp)
+          malformed_file=$(mktemp)
+          minimal_repair_file=$(mktemp)
           existing_file=$(mktemp)
+          receipt_file=$(mktemp)
+          receipt_expected=$(mktemp)
+          snapshot_file=$(mktemp)
+          metadata_file=$(mktemp)
           operation_stderr=$(mktemp)
           az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -3026,6 +3149,18 @@ jobs:
             printf '%s\n' 'funded_recovery_backfill_binding_sha_mismatch' >&2
             exit 1
           fi
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$mutable_control" \
+            --file "$control_file" \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          test "$mutable_control_sha256" = \
+            "sha256:$(sha256sum "$control_file" | cut -d' ' -f1)"
+
+          # Preserve the original jq collision semantics so only the known bad bytes repair.
           jq -n --slurpfile predecessor "$predecessor_file" \
             --slurpfile summary "$recovery_file" \
             --arg predecessor "$predecessor_run_id" \
@@ -3056,62 +3191,260 @@ jobs:
                 internal_settlement_blobs: $summary[0].internal_settlement_blobs
               },
               recovered_summary: $summary[0]
-            }' > "$journal_file"
+            }' > "$malformed_file"
+          test "$malformed_journal_sha256" = \
+            "sha256:$(sha256sum "$malformed_file" | cut -d' ' -f1)"
+          jq -e --arg recovery "$recovery_run_id" --arg blob "$journal" '
+            type == "object"
+            and (.predecessor_run_id | type == "array")
+            and (.finalized_control.run_id | type == "array")
+            and .predecessor_run_id == .finalized_control.run_id
+            and .recovery_run_id == $recovery
+            and .finalized_control.recovery_run_id == $recovery
+            and .recovery_journal_blob_name == $blob
+          ' "$malformed_file" >/dev/null
 
-          if az storage blob download \
+          jq -n --slurpfile predecessor_doc "$predecessor_file" \
+            --slurpfile recovery_doc "$recovery_file" \
+            --arg predecessor_run_id "$predecessor_run_id" \
+            --arg recovery_run_id "$recovery_run_id" \
+            --arg journal_blob_name "$journal" '{
+              schema_version: 1,
+              type: "redemption_recovery_journal",
+              predecessor_run_id: $predecessor_run_id,
+              recovery_run_id: $recovery_run_id,
+              recovery_journal_blob_name: $journal_blob_name,
+              finalized_control: {
+                schema_version: 1,
+                state: "confirmed_and_verified",
+                run_id: $predecessor_run_id,
+                owner: $recovery_doc[0].owner,
+                signer_address: "[REDACTED]",
+                funder: $recovery_doc[0].funder,
+                condition_ids: [$recovery_doc[0].selection.selected[].condition_id],
+                expected_gross_payout: $recovery_doc[0].selection.selected_gross_payout,
+                submission_attempted: true,
+                transaction_id: $recovery_doc[0].transaction_id,
+                transaction_hash: $recovery_doc[0].transaction_hash,
+                created_ts: $predecessor_doc[0].finished_ts,
+                updated_ts: $recovery_doc[0].finished_ts,
+                recovery_run_id: $recovery_run_id,
+                liquid_collateral_after: $recovery_doc[0].liquid_collateral_after,
+                realized_payout: $recovery_doc[0].realized_payout,
+                internal_settlement_blobs: $recovery_doc[0].internal_settlement_blobs
+              },
+              recovered_summary: $recovery_doc[0]
+            }' > "$journal_file"
+          journal_sha256="sha256:$(sha256sum "$journal_file" | cut -d' ' -f1)"
+          jq -e --arg predecessor "$predecessor_run_id" \
+            --arg recovery "$recovery_run_id" --arg blob "$journal" '
+            type == "object"
+            and (.predecessor_run_id | type == "string" and . == $predecessor)
+            and (.recovery_run_id | type == "string" and . == $recovery)
+            and .recovery_journal_blob_name == $blob
+            and (.finalized_control.run_id | type == "string" and . == $predecessor)
+            and .finalized_control.recovery_run_id == $recovery
+          ' "$journal_file" >/dev/null
+          jq --arg predecessor "$predecessor_run_id" \
+            '.predecessor_run_id = $predecessor
+             | .finalized_control.run_id = $predecessor' \
+            "$malformed_file" > "$minimal_repair_file"
+          cmp "$journal_file" "$minimal_repair_file"
+
+          validate_receipt() {
+            test -f "$1"
+            receipt_size=$(stat --printf='%s' "$1")
+            [[ "$receipt_size" =~ ^[0-9]+$ ]]
+            test "$receipt_size" -gt 0
+            test "$receipt_size" -le 16384
+            jq -e --arg canonical_blob "$journal" \
+              --arg bad_sha256 "$malformed_journal_sha256" \
+              --arg good_sha256 "$journal_sha256" \
+              --arg predecessor_run "$predecessor_run_id" \
+              --arg predecessor_source_blob "$predecessor_blob" \
+              --arg predecessor_source_sha256 "$predecessor_sha256" \
+              --arg recovery_run "$recovery_run_id" \
+              --arg recovery_source_blob "$recovery_blob" \
+              --arg recovery_source_sha256 "$recovery_sha256" '
+              keys == ["bad_sha256", "canonical_blob", "good_sha256", "predecessor_run_id", "predecessor_source_blob", "predecessor_source_sha256", "recovery_run_id", "recovery_source_blob", "recovery_source_sha256", "schema_version", "snapshot_id", "type"]
+              and .schema_version == 1
+              and .type == "funded_recovery_journal_repair_receipt"
+              and .canonical_blob == $canonical_blob
+              and .bad_sha256 == $bad_sha256
+              and .good_sha256 == $good_sha256
+              and (.snapshot_id | type == "string" and length > 0)
+              and .predecessor_run_id == $predecessor_run
+              and .predecessor_source_blob == $predecessor_source_blob
+              and .predecessor_source_sha256 == $predecessor_source_sha256
+              and .recovery_run_id == $recovery_run
+              and .recovery_source_blob == $recovery_source_blob
+              and .recovery_source_sha256 == $recovery_source_sha256
+            ' "$1" >/dev/null
+          }
+          verify_snapshot() {
+            az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$journal" \
+              --snapshot "$1" \
+              --file "$snapshot_file" \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none
+            cmp "$malformed_file" "$snapshot_file"
+            test "$malformed_journal_sha256" = \
+              "sha256:$(sha256sum "$snapshot_file" | cut -d' ' -f1)"
+          }
+          az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$journal" \
+            --auth-mode login \
+            --query '{etag:properties.etag,size:properties.contentLength}' \
+            --only-show-errors -o json > "$metadata_file"
+          canonical_etag=$(jq -er '.etag | strings | select(length > 0)' "$metadata_file")
+          canonical_size=$(jq -er '.size | numbers | select(. > 0 and . <= 1048576 and floor == .)' "$metadata_file")
+          az storage blob download \
               --account-name "$STORAGE_ACCOUNT" \
               --container-name "$FUNDED_CONTAINER" \
               --name "$journal" \
               --file "$existing_file" \
+              --if-match "$canonical_etag" \
+              --auth-mode login \
+              --overwrite \
+              --only-show-errors -o none
+          test "$(stat --printf='%s' "$existing_file")" = "$canonical_size"
+          existing_sha256="sha256:$(sha256sum "$existing_file" | cut -d' ' -f1)"
+          receipt_exists=false
+          if az storage blob download \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$receipt" \
+              --file "$receipt_file" \
               --auth-mode login \
               --overwrite \
               --only-show-errors -o none 2>"$operation_stderr"; then
-            cmp "$journal_file" "$existing_file"
-            exit 0
+            receipt_exists=true
           elif ! grep -Eq 'BlobNotFound|404' "$operation_stderr"; then
-            cat "$operation_stderr" >&2
+            printf '%s\n' 'funded_recovery_backfill_receipt_read_failed' >&2
             exit 1
           fi
-
-          az storage blob download \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$FUNDED_CONTAINER" \
-            --name "$mutable_control" \
-            --file "$control_file" \
-            --auth-mode login \
-            --overwrite \
-            --only-show-errors -o none
-          test "$mutable_control_sha256" = \
-            "sha256:$(sha256sum "$control_file" | cut -d' ' -f1)"
-          if ! az storage blob upload \
+          if cmp -s "$journal_file" "$existing_file"; then
+            test "$existing_sha256" = "$journal_sha256"
+            if [ "$receipt_exists" != true ]; then
+              printf '%s\n' 'funded_recovery_backfill_repair_receipt_required_for_corrected_canonical' >&2
+              exit 1
+            fi
+            validate_receipt "$receipt_file"
+            verify_snapshot "$(jq -r '.snapshot_id' "$receipt_file")"
+            exit 0
+          fi
+          if ! cmp -s "$malformed_file" "$existing_file" || \
+              ! test "$existing_sha256" = "$malformed_journal_sha256"; then
+            printf '%s\n' 'funded_recovery_backfill_canonical_bytes_unrecognized' >&2
+            exit 1
+          fi
+          if "$receipt_exists"; then
+            validate_receipt "$receipt_file"
+            snapshot_id=$(jq -r '.snapshot_id' "$receipt_file")
+            verify_snapshot "$snapshot_id"
+          else
+            snapshot_id=$(az storage blob snapshot \
+              --account-name "$STORAGE_ACCOUNT" \
+              --container-name "$FUNDED_CONTAINER" \
+              --name "$journal" \
+              --if-match "$canonical_etag" \
+              --auth-mode login \
+              --only-show-errors --query snapshot -o tsv)
+            test -n "$snapshot_id"
+            verify_snapshot "$snapshot_id"
+            jq -n \
+              --arg canonical_blob "$journal" \
+              --arg bad_sha256 "$malformed_journal_sha256" \
+              --arg good_sha256 "$journal_sha256" \
+              --arg snapshot_id "$snapshot_id" \
+              --arg predecessor_run "$predecessor_run_id" \
+              --arg predecessor_source_blob "$predecessor_blob" \
+              --arg predecessor_source_sha256 "$predecessor_sha256" \
+              --arg recovery_run "$recovery_run_id" \
+              --arg recovery_source_blob "$recovery_blob" \
+              --arg recovery_source_sha256 "$recovery_sha256" '{
+                schema_version: 1,
+                type: "funded_recovery_journal_repair_receipt",
+                canonical_blob: $canonical_blob,
+                bad_sha256: $bad_sha256,
+                good_sha256: $good_sha256,
+                snapshot_id: $snapshot_id,
+                predecessor_run_id: $predecessor_run,
+                predecessor_source_blob: $predecessor_source_blob,
+                predecessor_source_sha256: $predecessor_source_sha256,
+                recovery_run_id: $recovery_run,
+                recovery_source_blob: $recovery_source_blob,
+                recovery_source_sha256: $recovery_source_sha256
+              }' > "$receipt_expected"
+            if ! az storage blob upload \
+                --account-name "$STORAGE_ACCOUNT" \
+                --container-name "$FUNDED_CONTAINER" \
+                --name "$receipt" \
+                --file "$receipt_expected" \
+                --auth-mode login \
+                --overwrite false \
+                --content-type application/json \
+                --only-show-errors -o none 2>"$operation_stderr"; then
+              az storage blob download \
+                --account-name "$STORAGE_ACCOUNT" \
+                --container-name "$FUNDED_CONTAINER" \
+                --name "$receipt" \
+                --file "$receipt_file" \
+                --auth-mode login \
+                --overwrite \
+                --only-show-errors -o none
+              validate_receipt "$receipt_file"
+              cmp "$receipt_expected" "$receipt_file"
+            else
+              az storage blob download \
+                --account-name "$STORAGE_ACCOUNT" \
+                --container-name "$FUNDED_CONTAINER" \
+                --name "$receipt" \
+                --file "$receipt_file" \
+                --auth-mode login \
+                --overwrite \
+                --only-show-errors -o none
+              validate_receipt "$receipt_file"
+              cmp "$receipt_expected" "$receipt_file"
+            fi
+          fi
+          az storage blob upload \
               --account-name "$STORAGE_ACCOUNT" \
               --container-name "$FUNDED_CONTAINER" \
               --name "$journal" \
               --file "$journal_file" \
               --auth-mode login \
-              --overwrite false \
+              --if-match "$canonical_etag" \
+              --overwrite true \
               --content-type application/json \
-              --only-show-errors -o none 2>"$operation_stderr"; then
-            az storage blob download \
-              --account-name "$STORAGE_ACCOUNT" \
-              --container-name "$FUNDED_CONTAINER" \
-              --name "$journal" \
-              --file "$existing_file" \
-              --auth-mode login \
-              --overwrite \
               --only-show-errors -o none
-            cmp "$journal_file" "$existing_file"
-          else
-            az storage blob download \
-              --account-name "$STORAGE_ACCOUNT" \
-              --container-name "$FUNDED_CONTAINER" \
-              --name "$journal" \
-              --file "$existing_file" \
-              --auth-mode login \
-              --overwrite \
-              --only-show-errors -o none
-            cmp "$journal_file" "$existing_file"
-          fi
+          az storage blob show \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$journal" \
+            --auth-mode login \
+            --query '{etag:properties.etag,size:properties.contentLength}' \
+            --only-show-errors -o json > "$metadata_file"
+          repaired_etag=$(jq -er '.etag | strings | select(length > 0)' "$metadata_file")
+          repaired_size=$(jq -er '.size | numbers | select(. >= 0)' "$metadata_file")
+          az storage blob download \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$FUNDED_CONTAINER" \
+            --name "$journal" \
+            --file "$existing_file" \
+            --if-match "$repaired_etag" \
+            --auth-mode login \
+            --overwrite \
+            --only-show-errors -o none
+          test "$(stat --printf='%s' "$existing_file")" = "$repaired_size"
+          cmp "$journal_file" "$existing_file"
+          test "$journal_sha256" = "sha256:$(sha256sum "$existing_file" | cut -d' ' -f1)"
 
       - name: Prepare zero-write v10 preflight inputs
         run: |
@@ -3125,6 +3458,7 @@ jobs:
           readonly v10_redemption_prefix="${v10_prefix}redemptions/"
           readonly v10_redemption_control="${v10_prefix}control/redemption-state.json"
           readonly v10_recovery_control_prefix="${v10_prefix}recovery-controls/"
+          readonly v10_recovery_repair_receipt_prefix="${v10_prefix}recovery-repair-receipts/"
           readonly v10_internal_settlement_prefix="${v10_prefix}internal-settlements/"
           readonly v10_authorization_prefix="${v10_prefix}authorizations/"
           readonly v10_completion_prefix="${v10_prefix}completed/"
@@ -3180,6 +3514,7 @@ jobs:
             --arg archive "$v10_redemption_prefix" \
             --arg redemption_control "$v10_redemption_control" \
             --arg recovery_controls "$v10_recovery_control_prefix" \
+            --arg recovery_repair_receipts "$v10_recovery_repair_receipt_prefix" \
             --arg internal_settlements "$v10_internal_settlement_prefix" \
             --arg authorizations "$v10_authorization_prefix" \
             --arg completions "$v10_completion_prefix" '
@@ -3191,6 +3526,7 @@ jobs:
               or . == $latest
               or . == $redemption_control
               or test("^" + $recovery_controls + "venue-redemption-[0-9]{17}-[0-9a-f]{8}\\.json$")
+              or test("^" + $recovery_repair_receipts + "venue-redemption-[0-9]{17}-[0-9a-f]{8}/sha256-[0-9a-f]{64}\\.json\\z")
               or test("^" + $internal_settlements + "[0-9a-f]{64}\\.json$")
               or test("^" + $archive + "[0-9]{4}-[0-9]{2}-[0-9]{2}/venue-redemption-[0-9]{17}-[0-9a-f]{8}\\.json$")
               or test("^" + $authorizations + "[0-9a-f]{64}\\.json$")
@@ -3522,15 +3858,17 @@ jobs:
               --arg prefix "$v10_recovery_control_prefix" '
               .schema_version == 1
               and .type == "redemption_recovery_journal"
-              and (.predecessor_run_id
-                | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
-              and (.recovery_run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
+              and (.predecessor_run_id | type == "string"
+                and test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
+              and (.recovery_run_id | type == "string"
+                and test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$"))
               and .predecessor_run_id != .recovery_run_id
               and .recovery_journal_blob_name == $blob
               and $blob == ($prefix + .predecessor_run_id + ".json")
               and .finalized_control.schema_version == 1
               and .finalized_control.state == "confirmed_and_verified"
               and .finalized_control.submission_attempted == true
+              and (.finalized_control.run_id | type == "string")
               and .finalized_control.run_id == .predecessor_run_id
               and .finalized_control.recovery_run_id == .recovery_run_id
               and (.finalized_control.transaction_id
