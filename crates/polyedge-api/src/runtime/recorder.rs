@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 pub(super) struct RuntimeRecorder {
     recorders: Vec<Box<dyn EventRecorder + Send>>,
-    authoritative_remote: bool,
     error_count: usize,
     dropped_count: usize,
     last_error: Option<String>,
+    pending_recorded_batch: bool,
 }
 
 impl RuntimeRecorder {
@@ -54,10 +54,10 @@ impl RuntimeRecorder {
         }
         Self {
             recorders,
-            authoritative_remote,
             error_count: 0,
             dropped_count: 0,
             last_error: None,
+            pending_recorded_batch: false,
         }
     }
 
@@ -65,35 +65,34 @@ impl RuntimeRecorder {
     pub(super) fn new_for_path(path: PathBuf) -> Self {
         Self {
             recorders: vec![Box::new(JsonlRecorder::new(path))],
-            authoritative_remote: false,
             error_count: 0,
             dropped_count: 0,
             last_error: None,
+            pending_recorded_batch: false,
         }
     }
 
     #[cfg(test)]
     pub(super) fn new_for_test_recorder(
         recorder: Box<dyn EventRecorder + Send>,
-        authoritative_remote: bool,
+        _authoritative_remote: bool,
     ) -> Self {
         Self {
             recorders: vec![recorder],
-            authoritative_remote,
             error_count: 0,
             dropped_count: 0,
             last_error: None,
+            pending_recorded_batch: false,
         }
-    }
-
-    pub(super) fn has_authoritative_remote(&self) -> bool {
-        self.authoritative_remote
     }
 
     pub(super) fn record_recorded_batch(
         &mut self,
         events: &[RecordedRuntimeEvent],
     ) -> Result<(), String> {
+        if self.pending_recorded_batch {
+            return Err("runtime recorder has a pending recorded batch".to_owned());
+        }
         let mut last_error = None;
         for recorder in &mut self.recorders {
             if let Err(error) = recorder.record_recorded_batch(events) {
@@ -102,6 +101,7 @@ impl RuntimeRecorder {
             }
         }
         if let Some(error) = last_error {
+            self.pending_recorded_batch = true;
             self.last_error = Some(error.clone());
             Err(error)
         } else {
@@ -121,19 +121,13 @@ impl RuntimeRecorder {
             self.last_error = Some(error.clone());
             Err(error)
         } else {
+            self.pending_recorded_batch = false;
             Ok(())
         }
     }
 
-    /// Resume a previously staged authoritative append without re-recording
-    /// the logical events. Local JSONL recorders do not buffer failed writes,
-    /// so they cannot acknowledge a retry-only durable request.
+    /// Resume a previously staged append without re-recording its logical events.
     pub(super) fn retry_pending(&mut self) -> Result<(), String> {
-        if !self.authoritative_remote {
-            return Err(
-                "runtime recorder has no authoritative remote pending append to retry".to_owned(),
-            );
-        }
         self.flush()
     }
 

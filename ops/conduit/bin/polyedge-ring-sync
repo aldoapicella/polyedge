@@ -14,6 +14,7 @@ fi
 root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 segments=$root/segments
 archive=$root/archive
+quarantine=$root/quarantine/recorder-sequence-proof-v1
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
 prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}
@@ -35,7 +36,141 @@ printf '%s' "$prefix" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$' || {
 }
 mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
 command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 1; }
-install -d -m 0750 "$segments" "$archive"
+install -d -m 0750 "$segments" "$archive" "$quarantine"
+segments_real=$(realpath -e -- "$segments") || exit 1
+
+receipt_id() {
+  # Length-prefixing makes the content address unambiguous without trusting paths.
+  printf '%s:%s:%s' "${#1}" "$1" "$2" | sha256sum | awk '{print $1}'
+}
+
+source_state() {
+  [ ! -L "$1" ] && [ -f "$1" ] || return 1
+  stat -c '%d:%i:%s:%y:%z' "$1"
+}
+
+validate_quarantine_receipt_entry() {
+  receipt_candidate=$1
+    [ ! -L "$receipt_candidate" ] && [ -f "$receipt_candidate" ] || {
+      echo "non-regular quarantine entry: $receipt_candidate" >&2
+      return 1
+    }
+    case "$receipt_candidate" in
+      *.json) ;;
+      *) echo "invalid quarantine receipt name: $receipt_candidate" >&2; return 1 ;;
+    esac
+    if ! jq -e '
+      type == "object" and
+      keys == ["reason_code","schema","source_bytes","source_lines","source_segment_path","source_sha256","type"] and
+      .schema == "polyedge_ring_quarantine.v1" and
+      .type == "quarantine_receipt" and
+      (.source_segment_path | type == "string") and
+      (.source_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.source_bytes | type == "number" and floor == . and . >= 0) and
+      (.source_lines | type == "number" and floor == . and . >= 0) and
+      .reason_code == "invalid_recorder_sequence_proof"
+    ' "$receipt_candidate" >/dev/null; then
+      echo "invalid quarantine receipt: $receipt_candidate" >&2
+      return 1
+    fi
+    receipt_candidate_path=$(jq -r '.source_segment_path' "$receipt_candidate")
+    case "/$receipt_candidate_path/" in
+      /segments/*/) ;;
+      *) echo "invalid quarantine receipt path: $receipt_candidate" >&2; return 1 ;;
+    esac
+    case "/$receipt_candidate_path/" in
+      *'/./'*|*'/../'*|*'//'*) echo "non-canonical quarantine receipt path: $receipt_candidate" >&2; return 1 ;;
+    esac
+    receipt_candidate_sha=$(jq -r '.source_sha256' "$receipt_candidate")
+    receipt_candidate_id=$(receipt_id "$receipt_candidate_path" "$receipt_candidate_sha")
+    [ "$receipt_candidate" = "$quarantine/$receipt_candidate_id.json" ] || {
+      echo "quarantine receipt content address disagrees: $receipt_candidate" >&2
+      return 1
+    }
+    receipt_source=$root/$receipt_candidate_path
+    receipt_source_real=$(realpath -e -- "$receipt_source") || {
+      echo "quarantine receipt source is missing: $receipt_candidate" >&2
+      return 1
+    }
+    case "$receipt_source_real" in
+      "$segments_real"/*) ;;
+      *) echo "quarantine receipt source escapes segments: $receipt_candidate" >&2; return 1 ;;
+    esac
+    receipt_source_state=$(source_state "$receipt_source") || {
+      echo "quarantine receipt source is not a regular file: $receipt_candidate" >&2
+      return 1
+    }
+    receipt_source_sha=sha256:$(sha256sum "$receipt_source" | awk '{print $1}')
+    receipt_source_bytes=$(wc -c < "$receipt_source")
+    receipt_source_lines=$(wc -l < "$receipt_source")
+    [ "$receipt_source_state" = "$(source_state "$receipt_source")" ] || {
+      echo "quarantine receipt source changed while validating: $receipt_candidate" >&2
+      return 1
+    }
+    receipt_sha=$(jq -r '.source_sha256' "$receipt_candidate")
+    receipt_bytes=$(jq -r '.source_bytes' "$receipt_candidate")
+    receipt_lines=$(jq -r '.source_lines' "$receipt_candidate")
+    [ "$receipt_sha" = "$receipt_source_sha" ] &&
+      [ "$receipt_bytes" = "$receipt_source_bytes" ] &&
+      [ "$receipt_lines" = "$receipt_source_lines" ] || {
+      echo "quarantined source changed: $receipt_candidate_path" >&2
+      return 1
+    }
+    receipt_expected=$(mktemp "$root/.ring-receipt.XXXXXX") || return 1
+    jq -cn \
+      --arg source_segment_path "$receipt_candidate_path" \
+      --arg source_sha256 "$receipt_source_sha" \
+      --argjson source_bytes "$receipt_source_bytes" \
+      --argjson source_lines "$receipt_source_lines" \
+      '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:$source_bytes,source_lines:$source_lines,reason_code:"invalid_recorder_sequence_proof"}' \
+      > "$receipt_expected" || { rm -f "$receipt_expected"; return 1; }
+    cmp -s "$receipt_expected" "$receipt_candidate" || {
+      echo "quarantine receipt differs from source: $receipt_candidate" >&2
+      rm -f "$receipt_expected"
+      return 1
+    }
+    rm -f "$receipt_expected"
+    receipt_archive=$archive/${receipt_candidate_path#segments/}.gz
+    for receipt_sidecar in "$receipt_source.manifest.json" "$receipt_archive" "$receipt_archive.manifest.json"; do
+      [ ! -e "$receipt_sidecar" ] && [ ! -L "$receipt_sidecar" ] || {
+        echo "quarantined segment has a sealed sidecar: $receipt_candidate_path" >&2
+        return 1
+      }
+    done
+}
+
+quarantine_preflight() {
+  quarantine_found=0
+  for receipt_candidate in "$quarantine"/* "$quarantine"/.[!.]* "$quarantine"/..?*; do
+    [ -e "$receipt_candidate" ] || [ -L "$receipt_candidate" ] || continue
+    validate_quarantine_receipt_entry "$receipt_candidate" || return 1
+    quarantine_found=1
+  done
+}
+
+create_quarantine_receipt() {
+  receipt_expected=$(mktemp "$quarantine/.receipt.XXXXXX") || return 1
+  chmod 0640 "$receipt_expected"
+  jq -cn \
+    --arg source_segment_path "$source_relative" \
+    --arg source_sha256 "$source_sha" \
+    --argjson source_bytes "$source_bytes" \
+    --argjson source_lines "$lines" \
+    '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:$source_bytes,source_lines:$source_lines,reason_code:"invalid_recorder_sequence_proof"}' \
+    > "$receipt_expected" || { rm -f "$receipt_expected"; return 1; }
+  receipt=$quarantine/$(receipt_id "$source_relative" "$source_sha").json
+  sync -f "$receipt_expected"
+  [ "$source_state_before" = "$(source_state "$segment")" ] || {
+    echo "source changed before quarantine receipt: $segment" >&2
+    rm -f "$receipt_expected"
+    return 1
+  }
+  if ln "$receipt_expected" "$receipt" 2>/dev/null; then
+    sync -f "$receipt"
+  fi
+  rm -f "$receipt_expected"
+  validate_quarantine_receipt_entry "$receipt"
+}
 
 sequence_summary() {
   segment=$1
@@ -74,7 +209,12 @@ sequence_summary() {
 
 now=$(date -u +%s)
 cutoff=$((now - grace_seconds))
-find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segment; do
+segment_list=$(mktemp "$root/.ring-sync-segments.XXXXXX")
+trap 'rm -f "$segment_list"' EXIT HUP INT TERM
+find "$segments" -type f -name '*.jsonl' -print | LC_ALL=C sort > "$segment_list"
+quarantine_found=0
+quarantine_preflight
+while IFS= read -r segment; do
   name=${segment##*/}
   start=${name%.jsonl}
   printf '%s' "$start" | grep -Eq '^[0-9]+$' || { echo "invalid segment name: $segment" >&2; exit 1; }
@@ -85,6 +225,21 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
   archive_segment=$root/$archive_relative
   manifest=$archive_segment.manifest.json
   legacy_manifest=$segment.manifest.json
+  source_state_before=$(source_state "$segment") || {
+    echo "segment is not a regular source: $segment" >&2
+    exit 1
+  }
+  source_sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
+  source_bytes=$(wc -c < "$segment")
+  lines=$(wc -l < "$segment")
+  [ "$source_state_before" = "$(source_state "$segment")" ] || {
+    echo "source changed while reading: $segment" >&2
+    exit 1
+  }
+  receipt=$quarantine/$(receipt_id "$source_relative" "$source_sha").json
+  if [ -e "$receipt" ]; then
+    continue
+  fi
   if [ -e "$legacy_manifest" ] || [ -e "$manifest" ]; then
     continue
   fi
@@ -94,9 +249,6 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
   }
   hour=$(date -u -d "@$start" +%Y/%m/%d/%H)
   blob=$prefix/$hour/$start.jsonl.gz
-  source_sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
-  source_bytes=$(wc -c < "$segment")
-  lines=$(wc -l < "$segment")
   if [ -n "$legacy_cutoff" ] && [ "$start" -lt "$legacy_cutoff" ]; then
     schema_version=2
     recorder='{}'
@@ -104,7 +256,9 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
     schema_version=4
     recorder=$(sequence_summary "$segment") || {
       echo "invalid recorder sequence proof: $segment" >&2
-      exit 1
+      create_quarantine_receipt || exit 1
+      quarantine_found=1
+      continue
     }
   fi
   install -d -m 0750 "${archive_segment%/*}"
@@ -148,9 +302,13 @@ find "$segments" -type f -name '*.jsonl' -print | sort | while IFS= read -r segm
   sync -f "$segment"
   mv "$temporary" "$manifest"
   trap - EXIT HUP INT TERM
-done
+done < "$segment_list"
+rm -f "$segment_list"
+trap - EXIT HUP INT TERM
+quarantine_preflight
 
 if [ "${POLYEDGE_RING_SEAL_ONLY:-}" = 1 ]; then
+  [ "$quarantine_found" -eq 0 ] || exit 1
   exit 0
 fi
 

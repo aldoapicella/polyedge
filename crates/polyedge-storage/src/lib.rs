@@ -64,6 +64,10 @@ pub enum StorageError {
     UnterminatedJsonlTail,
     #[error("local JSONL recorder append was short: wrote {actual} of {expected} bytes")]
     ShortJsonlWrite { expected: usize, actual: usize },
+    #[error("local JSONL recorder pending append diverged from disk")]
+    PendingJsonlAppendDiverged,
+    #[error("local JSONL recorder already has a pending append")]
+    PendingJsonlAppend,
 }
 
 pub trait EventRecorder {
@@ -176,6 +180,14 @@ pub fn wire_normalized_json<T: Serialize>(value: &T) -> Result<Value, serde_json
 pub struct JsonlRecorder {
     path: PathBuf,
     segment_seconds: Option<i64>,
+    pending_append: Option<PendingJsonlAppend>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingJsonlAppend {
+    path: PathBuf,
+    original_offset: Option<u64>,
+    bytes: Vec<u8>,
 }
 
 impl JsonlRecorder {
@@ -183,6 +195,7 @@ impl JsonlRecorder {
         Self {
             path: path.into(),
             segment_seconds: None,
+            pending_append: None,
         }
     }
 
@@ -191,6 +204,7 @@ impl JsonlRecorder {
         Self {
             path: path.into(),
             segment_seconds: Some(segment_seconds as i64),
+            pending_append: None,
         }
     }
 
@@ -208,44 +222,92 @@ impl JsonlRecorder {
             .join(format!("{start}.jsonl"))
     }
 
-    fn append_lines(&self, lines: &[Vec<u8>]) -> Result<(), StorageError> {
+    fn append_lines(&mut self, lines: &[Vec<u8>]) -> Result<(), StorageError> {
+        if self.pending_append.is_some() {
+            return Err(StorageError::PendingJsonlAppend);
+        }
         let path = self.active_path(Utc::now());
-        if let Some(parent) = path.parent() {
+        let bytes = lines.concat();
+        self.pending_append = Some(PendingJsonlAppend {
+            path,
+            original_offset: None,
+            bytes,
+        });
+        self.resume_pending_append()
+    }
+
+    fn resume_pending_append(&mut self) -> Result<(), StorageError> {
+        let Some(pending) = self.pending_append.clone() else {
+            return Ok(());
+        };
+        if let Some(parent) = pending.path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(path)?;
+            .open(&pending.path)?;
         let length = file.metadata()?.len();
-        if length > 0 {
-            let mut tail = [0_u8; 1];
+        let original_offset = match pending.original_offset {
+            Some(offset) => offset,
+            None => {
+                if length > 0 {
+                    let mut tail = [0_u8; 1];
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileExt;
+                        file.read_exact_at(&mut tail, length - 1)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        use std::io::{Seek, SeekFrom};
+                        file.seek(SeekFrom::Start(length - 1))?;
+                        file.read_exact(&mut tail)?;
+                    }
+                    if tail[0] != b'\n' {
+                        return Err(StorageError::UnterminatedJsonlTail);
+                    }
+                }
+                self.pending_append
+                    .as_mut()
+                    .expect("pending append remains while staged")
+                    .original_offset = Some(length);
+                length
+            }
+        };
+        let expected_end = original_offset
+            .checked_add(
+                u64::try_from(pending.bytes.len())
+                    .map_err(|_| StorageError::PendingJsonlAppendDiverged)?,
+            )
+            .ok_or(StorageError::PendingJsonlAppendDiverged)?;
+        if length < original_offset || length > expected_end {
+            return Err(StorageError::PendingJsonlAppendDiverged);
+        }
+        let present = (length - original_offset) as usize;
+        if present > 0 {
+            let mut existing = vec![0_u8; present];
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
-                file.read_exact_at(&mut tail, length - 1)?;
+                file.read_exact_at(&mut existing, original_offset)?;
             }
             #[cfg(not(unix))]
             {
                 use std::io::{Seek, SeekFrom};
-                file.seek(SeekFrom::Start(length - 1))?;
-                file.read_exact(&mut tail)?;
+                file.seek(SeekFrom::Start(original_offset))?;
+                file.read_exact(&mut existing)?;
             }
-            if tail[0] != b'\n' {
-                return Err(StorageError::UnterminatedJsonlTail);
+            if existing != pending.bytes[..present] {
+                return Err(StorageError::PendingJsonlAppendDiverged);
             }
         }
-        for line in lines {
-            let actual = file.write(line)?;
-            if actual != line.len() {
-                return Err(StorageError::ShortJsonlWrite {
-                    expected: line.len(),
-                    actual,
-                });
-            }
+        if present < pending.bytes.len() {
+            file.write_all(&pending.bytes[present..])?;
         }
         file.sync_all()?;
+        self.pending_append = None;
         Ok(())
     }
 }
@@ -278,6 +340,10 @@ impl EventRecorder for JsonlRecorder {
             .map(jsonl_recorded_event_line)
             .collect::<Result<Vec<_>, _>>()?;
         self.append_lines(&lines)
+    }
+
+    fn flush(&mut self) -> Result<(), StorageError> {
+        self.resume_pending_append()
     }
 }
 
@@ -3773,6 +3839,101 @@ mod tests {
             recorder.active_path(first),
             PathBuf::from("/srv/polyedge-ring/segments/2026/08/05/22/1785969000.jsonl")
         );
+    }
+
+    fn segmented_pending_append(
+        root: &Path,
+        original: &[u8],
+        observed: &[u8],
+        bytes: &[u8],
+    ) -> (JsonlRecorder, PathBuf) {
+        let path = root.join("2026/08/05/22/1785969000.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut existing = original.to_vec();
+        existing.extend_from_slice(observed);
+        fs::write(&path, existing).unwrap();
+        let mut recorder = JsonlRecorder::segmented(root, 600);
+        recorder.pending_append = Some(PendingJsonlAppend {
+            path: path.clone(),
+            original_offset: Some(original.len() as u64),
+            bytes: bytes.to_vec(),
+        });
+        (recorder, path)
+    }
+
+    #[test]
+    fn pending_segmented_jsonl_append_resumes_an_exact_prefix() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-jsonl-prefix-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let (mut recorder, path) = segmented_pending_append(&root, b"first\n", b"next", b"next\n");
+
+        recorder.flush().unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"first\nnext\n");
+        assert!(recorder.pending_append.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_segmented_jsonl_append_resumes_a_mid_line_prefix() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-jsonl-mid-line-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let bytes = b"{\"event_type\":\"book\"}\n";
+        let (mut recorder, path) =
+            segmented_pending_append(&root, b"first\n", b"{\"event_type\":", bytes);
+
+        recorder.flush().unwrap();
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"first\n{\"event_type\":\"book\"}\n"
+        );
+        assert!(recorder.pending_append.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_segmented_jsonl_append_recognizes_a_full_synced_write() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-jsonl-full-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let (mut recorder, path) =
+            segmented_pending_append(&root, b"first\n", b"next\n", b"next\n");
+
+        recorder.flush().unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"first\nnext\n");
+        assert!(recorder.pending_append.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_segmented_jsonl_append_rejects_divergence_without_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-jsonl-divergence-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let existing = b"first\nnope\n";
+        let (mut recorder, path) =
+            segmented_pending_append(&root, b"first\n", b"nope\n", b"next\n");
+
+        assert!(matches!(
+            recorder.flush(),
+            Err(StorageError::PendingJsonlAppendDiverged)
+        ));
+
+        assert_eq!(fs::read(&path).unwrap(), existing);
+        assert!(recorder.pending_append.is_some());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

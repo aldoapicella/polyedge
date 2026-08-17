@@ -6,15 +6,24 @@ fake=$root/fake-bin
 fixture_dir=$root/segments/ring-sync-selftest-$$
 legacy=$fixture_dir/1785960000.jsonl
 fixture=$fixture_dir/1785960600.jsonl
-post_upload=$fixture_dir/1785961800.jsonl
+post_upload=$fixture_dir/1785962400.jsonl
 bad=$fixture_dir/1785961200.jsonl
+later=$fixture_dir/1785961800.jsonl
+quarantined_post_upload=$fixture_dir/1785963600.jsonl
+near_miss=$fixture_dir/1785963000.jsonl
 archive_dir=$root/archive/ring-sync-selftest-$$
 legacy_archive=$archive_dir/1785960000.jsonl.gz
 archive_fixture=$archive_dir/1785960600.jsonl.gz
 legacy_manifest=$legacy_archive.manifest.json
 manifest=$archive_fixture.manifest.json
-post_upload_manifest=$archive_dir/1785961800.jsonl.gz.manifest.json
+post_upload_manifest=$archive_dir/1785962400.jsonl.gz.manifest.json
+bad_archive=$archive_dir/1785961200.jsonl.gz
+later_archive=$archive_dir/1785961800.jsonl.gz
+later_manifest=$later_archive.manifest.json
+quarantined_post_archive=$archive_dir/1785963600.jsonl.gz
+quarantined_post_manifest=$quarantined_post_archive.manifest.json
 env_file=$root/ring.env
+quarantine=$root/quarantine/recorder-sequence-proof-v1
 cleanup() { rm -rf "$root"; }
 trap cleanup EXIT HUP INT TERM
 
@@ -87,9 +96,129 @@ PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
 [ -e "$post_upload_manifest" ]
 [ "$(wc -l < "$upload_log")" = 2 ]
 [ "$(gzip -dc "$archive_fixture" | jq -s 'length')" = 2 ]
-printf '{"test":"bad"}
-' > "$bad"
-if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 ops/conduit/bin/polyedge-ring-sync >/dev/null 2>&1; then echo 'unsequenced post-cutoff segment unexpectedly passed' >&2; exit 1; fi
+printf '%s\n' \
+  '{"test":"bad-1","recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":1}' \
+  '{"test":"bad-3","recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":3}' > "$bad"
+printf '%s\n' \
+  '{"test":4,"recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":4}' \
+  '{"test":5,"recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":5}' > "$later"
+bad_hash=$(sha256sum "$bad" | awk '{print $1}')
+bad_relative=segments/ring-sync-selftest-$$/1785961200.jsonl
+receipt_id=$(printf '%s:%s:%s' "${#bad_relative}" "$bad_relative" "sha256:$bad_hash" | sha256sum | awk '{print $1}')
+receipt=$quarantine/$receipt_id.json
+receipt_expected=$root/receipt-expected.json
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$sync" >/dev/null 2>&1; then
+  echo 'quarantined post-cutoff segment unexpectedly passed' >&2
+  exit 1
+fi
+[ "$(sha256sum "$bad" | awk '{print $1}')" = "$bad_hash" ]
+[ ! -e "$bad.manifest.json" ]
+[ ! -e "$bad_archive" ]
+[ ! -e "$bad_archive.manifest.json" ]
+jq -cn \
+  --arg source_segment_path "$bad_relative" \
+  --arg source_sha256 "sha256:$bad_hash" \
+  --argjson source_bytes "$(wc -c < "$bad")" \
+  --argjson source_lines "$(wc -l < "$bad")" \
+  '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:$source_bytes,source_lines:$source_lines,reason_code:"invalid_recorder_sequence_proof"}' > "$receipt_expected"
+cmp -s "$receipt_expected" "$receipt"
+jq -e 'keys == ["reason_code","schema","source_bytes","source_lines","source_segment_path","source_sha256","type"] and (. | tostring | contains("\\\"test\\\"")) | not' "$receipt" >/dev/null
+[ -e "$later_archive" ]
+[ -e "$later_manifest" ]
+later_sha=$(sha256sum "$later_archive" | awk '{print $1}')
+receipt_hash=$(sha256sum "$receipt" | awk '{print $1}')
+upload_count=$(wc -l < "$upload_log")
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$quarantined_post_upload "$sync" >/dev/null 2>&1; then
+  echo 'quarantined upload unexpectedly passed' >&2
+  exit 1
+fi
+[ "$(wc -l < "$upload_log")" = "$((upload_count + 1))" ]
+[ -e "$quarantined_post_archive" ]
+[ -e "$quarantined_post_manifest" ]
+[ "$(sha256sum "$bad" | awk '{print $1}')" = "$bad_hash" ]
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$sync" >/dev/null 2>&1; then
+  echo 'quarantined rerun unexpectedly passed' >&2
+  exit 1
+fi
+[ "$(sha256sum "$later_archive" | awk '{print $1}')" = "$later_sha" ]
+[ "$(sha256sum "$receipt" | awk '{print $1}')" = "$receipt_hash" ]
+upload_count=$(wc -l < "$upload_log")
+printf '{}' > "$quarantine/orphan.json"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$quarantined_post_upload "$sync" >"$root/orphan.log" 2>&1; then
+  echo 'malformed orphan receipt unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'invalid quarantine receipt' "$root/orphan.log" >/dev/null
+[ "$(wc -l < "$upload_log")" = "$upload_count" ]
+rm -f "$quarantine/orphan.json"
+ln -s /dev/null "$quarantine/link.json"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$quarantined_post_upload "$sync" >"$root/link.log" 2>&1; then
+  echo 'symlink receipt unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'non-regular quarantine entry' "$root/link.log" >/dev/null
+[ "$(wc -l < "$upload_log")" = "$upload_count" ]
+rm -f "$quarantine/link.json"
+mkfifo "$quarantine/fifo.json"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$quarantined_post_upload "$sync" >"$root/fifo.log" 2>&1; then
+  echo 'FIFO receipt unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'non-regular quarantine entry' "$root/fifo.log" >/dev/null
+[ "$(wc -l < "$upload_log")" = "$upload_count" ]
+rm -f "$quarantine/fifo.json"
+missing_relative=segments/ring-sync-selftest-$$/missing.jsonl
+missing_sha=sha256:$(printf '2%.0s' $(seq 1 64))
+missing_receipt=$quarantine/$(printf '%s:%s:%s' "${#missing_relative}" "$missing_relative" "$missing_sha" | sha256sum | awk '{print $1}').json
+jq -cn \
+  --arg source_segment_path "$missing_relative" \
+  --arg source_sha256 "$missing_sha" \
+  '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:0,source_lines:0,reason_code:"invalid_recorder_sequence_proof"}' > "$missing_receipt"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$quarantined_post_upload "$sync" >"$root/missing.log" 2>&1; then
+  echo 'missing quarantine source unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'quarantine receipt source is missing' "$root/missing.log" >/dev/null
+[ "$(wc -l < "$upload_log")" = "$upload_count" ]
+rm -f "$missing_receipt"
+printf '{"test":"near-miss"}
+' > "$near_miss"
+near_relative=segments/ring-sync-selftest-$$/1785963000.jsonl
+zeros=$(printf '0%.0s' $(seq 1 64))
+near_receipt=$quarantine/$(printf '%s:%s:%s' "${#near_relative}" "$near_relative" "sha256:$zeros" | sha256sum | awk '{print $1}').json
+jq -cn \
+  --arg source_segment_path "$near_relative" \
+  --arg source_sha256 "sha256:$zeros" \
+  '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:0,source_lines:0,reason_code:"invalid_recorder_sequence_proof"}' > "$near_receipt"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$sync" >"$root/near-miss.log" 2>&1; then
+  echo 'near-miss quarantine receipt unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'quarantined source changed' "$root/near-miss.log" >/dev/null
+rm -f "$near_receipt"
+traversal_relative=segments/../escape.jsonl
+ones=$(printf '1%.0s' $(seq 1 64))
+traversal_receipt=$quarantine/$(printf '%s:%s:%s' "${#traversal_relative}" "$traversal_relative" "sha256:$ones" | sha256sum | awk '{print $1}').json
+jq -cn \
+  --arg source_segment_path "$traversal_relative" \
+  --arg source_sha256 "sha256:$ones" \
+  '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:0,source_lines:0,reason_code:"invalid_recorder_sequence_proof"}' > "$traversal_receipt"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$sync" >"$root/traversal.log" 2>&1; then
+  echo 'traversal quarantine receipt unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'non-canonical quarantine receipt path' "$root/traversal.log" >/dev/null
+[ ! -e "$root/escape.jsonl" ]
 [ ! -e "$bad.sequence."* ]
 grep -F -- '--cap-drop=all --cap-add=DAC_OVERRIDE' ops/conduit/bin/polyedge-ring-sync >/dev/null
 grep -F -- '-v "$segments:/srv/polyedge-ring/segments:Z"' ops/conduit/bin/polyedge-ring-sync >/dev/null

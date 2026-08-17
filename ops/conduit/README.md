@@ -213,6 +213,17 @@ filesystem now exposes 273,655,873,536 bytes, the conservative projection is
 all green. The boot filesystem remains separate with 26 GB free at 74% used,
 above the 15-GiB hard deployment floor. The five-minute disk guard and capped
 journald growth remain active; image pulls are not paused.
+
+For v4 recorder segments, a discontinuous sequence proof is never repaired or
+sealed. The sync process writes a content-addressed receipt under
+`/srv/polyedge-ring/quarantine/recorder-sequence-proof-v1`, preserves the exact
+source without an archive or manifest, continues sealing and uploading later
+valid segments, and still exits nonzero so ring health and parity remain red.
+Receipt/source changes, missing sources, sidecars, malformed entries, and path
+escapes fail before upload. Recorder write failures retain and reconcile the
+exact staged JSONL bytes before later sequence-bound events are admitted; they
+are not re-recorded as a new batch.
+
 Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260814T134524Z-azure-primary-e504c51`,
 `20260814T134805Z-azure-hourly-e504c51`,

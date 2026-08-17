@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -48,7 +48,14 @@ const RECENT_LIMIT: usize = 1_000;
 const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
 const RECORDER_BATCH_LIMIT: usize = 500;
+const RECORDER_QUEUE_CAPACITY: usize = 1_000;
 const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+const RECORDER_RETRY_DELAY: Duration = Duration::from_millis(250);
+const SHUTDOWN_TERMINATION_AUDIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const RECORDER_COMPLETED_DURABLE_BATCH_LIMIT: usize = 10_000;
 const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
 const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
@@ -72,6 +79,7 @@ struct RuntimeInner {
     recorder: Arc<StdMutex<RuntimeRecorder>>,
     recorder_enqueue_gate: StdMutex<()>,
     recorder_tx: std_mpsc::Sender<RecorderRequest>,
+    recorder_admission: Arc<Semaphore>,
     recorder_metrics: Arc<RecorderMetrics>,
     persistence_filter: StdMutex<PersistenceFilter>,
     intent_publisher: Option<IntentPublisher>,
@@ -161,6 +169,7 @@ struct RecorderRequest {
     durable_batch_key: Option<String>,
     logical_event_count: usize,
     durable_ack: Option<oneshot::Sender<Result<(), String>>>,
+    _admission_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl RecorderRequest {
@@ -170,7 +179,14 @@ impl RecorderRequest {
             durable_batch_key: None,
             logical_event_count: 1,
             durable_ack: None,
+            _admission_permit: None,
         }
+    }
+
+    fn admitted_best_effort(event: RecordedRuntimeEvent, permit: OwnedSemaphorePermit) -> Self {
+        let mut request = Self::best_effort(event);
+        request._admission_permit = Some(permit);
+        request
     }
 
     fn durable(
@@ -189,7 +205,18 @@ impl RecorderRequest {
             durable_batch_key: Some(durable_batch_key),
             logical_event_count,
             durable_ack: Some(durable_ack),
+            _admission_permit: None,
         }
+    }
+
+    fn admitted_durable(
+        events: Vec<RecordedRuntimeEvent>,
+        durable_ack: oneshot::Sender<Result<(), String>>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let mut request = Self::durable(events, durable_ack);
+        request._admission_permit = Some(permit);
+        request
     }
 }
 
@@ -248,6 +275,33 @@ impl RecorderMetrics {
             self.recorder_instance_id.clone(),
             previous + 1,
         ))
+    }
+
+    fn rollback_bound_tail(&self, events: &[RecordedRuntimeEvent]) -> bool {
+        let Some(last_sequence) = events.last().map(RecordedRuntimeEvent::recorder_sequence) else {
+            return true;
+        };
+        let Ok(event_count) = u64::try_from(events.len()) else {
+            return false;
+        };
+        let Some(previous_sequence) = last_sequence.checked_sub(event_count) else {
+            return false;
+        };
+        if events
+            .iter()
+            .enumerate()
+            .any(|(index, event)| event.recorder_sequence() != previous_sequence + index as u64 + 1)
+        {
+            return false;
+        }
+        self.last_assigned_sequence
+            .compare_exchange(
+                last_sequence,
+                previous_sequence,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 
     fn snapshot(&self) -> Value {
@@ -438,6 +492,23 @@ impl RuntimeController {
     }
 
     fn new_with_recorder(settings: RuntimeSettings, recorder: RuntimeRecorder) -> Self {
+        Self::new_with_recorder_capacity(settings, recorder, RECORDER_QUEUE_CAPACITY)
+    }
+
+    #[cfg(test)]
+    fn new_with_recorder_and_capacity(
+        settings: RuntimeSettings,
+        recorder: RuntimeRecorder,
+        capacity: usize,
+    ) -> Self {
+        Self::new_with_recorder_capacity(settings, recorder, capacity)
+    }
+
+    fn new_with_recorder_capacity(
+        settings: RuntimeSettings,
+        recorder: RuntimeRecorder,
+        recorder_queue_capacity: usize,
+    ) -> Self {
         let (broadcaster, _) = broadcast::channel(1_000);
         let intent_publisher =
             IntentPublisherConfig::optional_connect(&settings).unwrap_or_else(|error| {
@@ -496,6 +567,7 @@ impl RuntimeController {
         let recorder = Arc::new(StdMutex::new(recorder));
         let recorder_metrics = Arc::new(RecorderMetrics::default());
         let (recorder_tx, recorder_rx) = std_mpsc::channel();
+        let recorder_admission = Arc::new(Semaphore::new(recorder_queue_capacity));
         spawn_recorder_worker(
             Arc::clone(&recorder),
             recorder_rx,
@@ -510,6 +582,7 @@ impl RuntimeController {
                 recorder,
                 recorder_enqueue_gate: StdMutex::new(()),
                 recorder_tx,
+                recorder_admission,
                 recorder_metrics,
                 persistence_filter: StdMutex::new(PersistenceFilter::default()),
                 intent_publisher,
@@ -606,12 +679,35 @@ impl RuntimeController {
             && background_tasks.iter().all(|task| !task.is_finished())
     }
 
+    async fn acquire_recorder_admission(&self) -> Result<OwnedSemaphorePermit, String> {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err("runtime recorder is shutting down".to_owned());
+        }
+        let permit = Arc::clone(&self.inner.recorder_admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| "runtime recorder is shutting down".to_owned())?;
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            drop(permit);
+            return Err("runtime recorder is shutting down".to_owned());
+        }
+        Ok(permit)
+    }
+
     pub async fn shutdown(&self) -> Result<(), String> {
         if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.terminate_all_clob_generations("runtime shutdown")
-            .await;
+        self.inner.recorder_admission.close();
+        let mut shutdown_error = match tokio::time::timeout(
+            SHUTDOWN_TERMINATION_AUDIT_TIMEOUT,
+            self.terminate_all_clob_generations("runtime shutdown", true),
+        )
+        .await
+        {
+            Ok(()) => None,
+            Err(_) => Some("runtime shutdown CLOB termination audit timed out".to_owned()),
+        };
         let background_tasks = self
             .inner
             .background_tasks
@@ -635,27 +731,38 @@ impl RuntimeController {
         if let Some(mut feed_task) = feed_task {
             match tokio::time::timeout(Duration::from_secs(10), &mut feed_task).await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(format!("runtime feed drain failed: {error}")),
+                Ok(Err(error)) => {
+                    shutdown_error.get_or_insert(format!("runtime feed drain failed: {error}"));
+                }
                 Err(_) => {
                     feed_task.abort();
                     let _ = feed_task.await;
-                    return Err("runtime feed drain timed out".to_owned());
+                    shutdown_error.get_or_insert_with(|| "runtime feed drain timed out".to_owned());
                 }
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + RECORDER_SHUTDOWN_DRAIN_TIMEOUT;
         while self.inner.recorder_metrics.queued.load(Ordering::Relaxed) != 0 {
             if Instant::now() >= deadline {
-                return Err("runtime recorder drain timed out".to_owned());
+                shutdown_error.get_or_insert_with(|| "runtime recorder drain timed out".to_owned());
+                break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        self.inner
-            .recorder
-            .lock()
-            .map_err(|error| format!("runtime recorder lock poisoned: {error}"))?
-            .flush()
+        let flush_result = if self.inner.recorder_metrics.queued.load(Ordering::Relaxed) == 0 {
+            self.inner
+                .recorder
+                .lock()
+                .map_err(|error| format!("runtime recorder lock poisoned: {error}"))?
+                .flush()
+        } else {
+            Ok(())
+        };
+        if let Some(error) = shutdown_error {
+            return Err(error);
+        }
+        flush_result
     }
 
     fn persist_startup_provenance(&self, payload: Value) -> Result<(), String> {
@@ -676,7 +783,15 @@ impl RuntimeController {
             .recorder_metrics
             .last_batch_size
             .store(1, Ordering::Relaxed);
-        let mut authoritative_staged = false;
+        let recorded_event = {
+            let _enqueue_gate = self
+                .inner
+                .recorder_enqueue_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner.recorder_metrics.bind(event.clone())?
+        };
+        let mut staged = false;
         let mut last_error = None;
         let mut result = Err("startup provenance persistence was not attempted".to_owned());
         for attempt in 1..=STARTUP_PROVENANCE_ATTEMPTS {
@@ -686,22 +801,11 @@ impl RuntimeController {
                 .lock()
                 .map_err(|error| format!("runtime recorder lock poisoned: {error}"))
                 .and_then(|mut recorder| {
-                    if authoritative_staged {
+                    if staged {
                         return recorder.retry_pending();
                     }
-                    let authoritative_remote = recorder.has_authoritative_remote();
-                    let _enqueue_gate = self
-                        .inner
-                        .recorder_enqueue_gate
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let recorded_event = self.inner.recorder_metrics.bind(event.clone())?;
-                    let staged =
-                        recorder.record_recorded_batch(std::slice::from_ref(&recorded_event));
-                    if authoritative_remote {
-                        authoritative_staged = true;
-                    }
-                    staged?;
+                    staged = true;
+                    recorder.record_recorded_batch(std::slice::from_ref(&recorded_event))?;
                     recorder.flush()
                 });
             if result.is_ok() {
@@ -2081,8 +2185,9 @@ impl RuntimeController {
                         .flat_map(|applied| applied.reports.iter().cloned())
                         .collect(),
                 });
-            let application_evidence_durable =
-                self.record_required_runtime_events(applied_events).await;
+            let application_evidence_durable = self
+                .record_required_runtime_events(applied_events, false)
+                .await;
             if !application_evidence_durable {
                 if let Some(pending) = pending_application {
                     let mut engine = self.inner.engine.lock().await;
@@ -2593,7 +2698,7 @@ impl RuntimeController {
         };
         for (market_id, event) in pending {
             if !self
-                .record_required_runtime_events(vec![event.clone()])
+                .record_required_runtime_events(vec![event.clone()], false)
                 .await
             {
                 continue;
@@ -2619,7 +2724,7 @@ impl RuntimeController {
             pending
         };
         if !self
-            .record_required_runtime_events(pending.events.clone())
+            .record_required_runtime_events(pending.events.clone(), false)
             .await
         {
             warn!(
@@ -2669,7 +2774,7 @@ impl RuntimeController {
             pending
         };
         if !self
-            .record_required_runtime_events(pending.events.clone())
+            .record_required_runtime_events(pending.events.clone(), false)
             .await
         {
             warn!(
@@ -2872,70 +2977,82 @@ impl RuntimeController {
     }
 
     async fn record_required_events(&self, entries: Vec<(String, Value)>) -> bool {
-        self.record_required_runtime_events(required_runtime_events(entries, Utc::now()))
+        self.record_required_runtime_events(required_runtime_events(entries, Utc::now()), false)
             .await
     }
 
-    async fn record_required_runtime_events(&self, events: Vec<RuntimeEvent>) -> bool {
+    async fn record_required_events_during_shutdown(&self, entries: Vec<(String, Value)>) -> bool {
+        self.record_required_runtime_events(required_runtime_events(entries, Utc::now()), true)
+            .await
+    }
+
+    async fn record_required_runtime_events(
+        &self,
+        events: Vec<RuntimeEvent>,
+        allow_during_shutdown: bool,
+    ) -> bool {
         if events.is_empty() {
             return true;
         }
-        let mut last_error = None;
-        for attempt in 1..=REQUIRED_RECORDER_ATTEMPTS {
-            match self.persist_required_batch(events.clone()).await {
-                Ok(()) => {
-                    if self
-                        .inner
-                        .recorder_metrics
-                        .mark_durable_batch_recovered(&events)
-                    {
-                        info!(
-                            event_count = events.len(),
-                            recovered_on_attempt = attempt,
-                            "required runtime evidence recovered after recorder retry"
-                        );
-                    }
-                    self.accept_durable_events(&events).await;
-                    return true;
-                }
-                Err(error) => {
-                    self.inner
-                        .recorder_metrics
-                        .mark_durable_batch_unrecovered(&events);
-                    warn!(
-                        attempt,
-                        max_attempts = REQUIRED_RECORDER_ATTEMPTS,
+        match self
+            .persist_required_batch(events.clone(), allow_during_shutdown)
+            .await
+        {
+            Ok(()) => {
+                if self
+                    .inner
+                    .recorder_metrics
+                    .mark_durable_batch_recovered(&events)
+                {
+                    info!(
                         event_count = events.len(),
-                        "required runtime evidence was not durably persisted: {error}"
+                        "required runtime evidence recovered after recorder retry"
                     );
-                    last_error = Some(error);
                 }
+                self.accept_durable_events(&events).await;
+                true
+            }
+            Err(error) => {
+                self.inner
+                    .recorder_metrics
+                    .mark_durable_batch_unrecovered(&events);
+                let mut state = self.inner.data.write().await;
+                *state
+                    .drop_counts
+                    .entry("required_recorder_write_error".to_owned())
+                    .or_insert(0) += events.len();
+                warn!(
+                    event_count = events.len(),
+                    error, "required runtime evidence exhausted durable recorder retries"
+                );
+                false
             }
         }
-        let mut state = self.inner.data.write().await;
-        *state
-            .drop_counts
-            .entry("required_recorder_write_error".to_owned())
-            .or_insert(0) += events.len();
-        warn!(
-            event_count = events.len(),
-            error = last_error.as_deref().unwrap_or("unknown recorder error"),
-            "required runtime evidence exhausted durable recorder retries"
-        );
-        false
     }
 
-    async fn persist_required_batch(&self, events: Vec<RuntimeEvent>) -> Result<(), String> {
+    async fn persist_required_batch(
+        &self,
+        events: Vec<RuntimeEvent>,
+        allow_during_shutdown: bool,
+    ) -> Result<(), String> {
         let event_count = events.len();
         let (ack_tx, ack_rx) = oneshot::channel();
+        let permit = if allow_during_shutdown {
+            None
+        } else {
+            Some(self.acquire_recorder_admission().await?)
+        };
         // Keep sequence allocation and FIFO queue admission inseparable: a
         // later caller must not send N+1 before this caller sends N.
-        let queued = {
+        let queue_failed = {
             let _enqueue_gate = self
                 .inner
                 .recorder_enqueue_gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !allow_during_shutdown && self.inner.shutting_down.load(Ordering::SeqCst) {
+                return Err("runtime recorder is shutting down".to_owned());
+            }
             let events = events
                 .into_iter()
                 .map(|event| self.inner.recorder_metrics.bind(event))
@@ -2948,11 +3065,25 @@ impl RuntimeController {
                 .recorder_metrics
                 .enqueued_total
                 .fetch_add(event_count as u64, Ordering::Relaxed);
-            self.inner
-                .recorder_tx
-                .send(RecorderRequest::durable(events, ack_tx))
+            let request = match permit {
+                Some(permit) => RecorderRequest::admitted_durable(events, ack_tx, permit),
+                None => RecorderRequest::durable(events, ack_tx),
+            };
+            match self.inner.recorder_tx.send(request) {
+                Ok(()) => false,
+                Err(error) => {
+                    if !self
+                        .inner
+                        .recorder_metrics
+                        .rollback_bound_tail(&error.0.events)
+                    {
+                        warn!("runtime recorder rejected durable tail could not be rolled back");
+                    }
+                    true
+                }
+            }
         };
-        if queued.is_err() {
+        if queue_failed {
             saturating_sub_atomic(&self.inner.recorder_metrics.queued, event_count);
             self.inner
                 .recorder_metrics
@@ -3011,31 +3142,54 @@ impl RuntimeController {
                 force_persistence,
             );
         let (recorder_queue_failed, recorder_queue_incremented) = if persist {
-            let _enqueue_gate = self
-                .inner
-                .recorder_enqueue_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match self.inner.recorder_metrics.bind(event.clone()) {
-                Ok(event) => {
-                    self.inner
-                        .recorder_metrics
-                        .queued
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.inner
-                        .recorder_metrics
-                        .enqueued_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    (
-                        self.inner
-                            .recorder_tx
-                            .send(RecorderRequest::best_effort(event))
-                            .is_err(),
-                        true,
-                    )
+            match self.acquire_recorder_admission().await {
+                Ok(permit) => {
+                    let _enqueue_gate = self
+                        .inner
+                        .recorder_enqueue_gate
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if self.inner.shutting_down.load(Ordering::SeqCst) {
+                        (true, false)
+                    } else {
+                        match self.inner.recorder_metrics.bind(event.clone()) {
+                            Ok(event) => {
+                                self.inner
+                                    .recorder_metrics
+                                    .queued
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.inner
+                                    .recorder_metrics
+                                    .enqueued_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let queue_failed = match self
+                                    .inner
+                                    .recorder_tx
+                                    .send(RecorderRequest::admitted_best_effort(event, permit))
+                                {
+                                    Ok(()) => false,
+                                    Err(error) => {
+                                        if !self
+                                            .inner
+                                            .recorder_metrics
+                                            .rollback_bound_tail(&error.0.events)
+                                        {
+                                            warn!("runtime recorder rejected best-effort tail could not be rolled back");
+                                        }
+                                        true
+                                    }
+                                };
+                                (queue_failed, true)
+                            }
+                            Err(error) => {
+                                warn!("runtime recorder sequence allocation failed: {error}");
+                                (true, false)
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
-                    warn!("runtime recorder sequence allocation failed: {error}");
+                    warn!("runtime recorder admission failed: {error}");
                     (true, false)
                 }
             }
@@ -3388,6 +3542,16 @@ impl RuntimeController {
     }
 
     async fn terminate_clob_generation(&self, generation: u64, reason: &str) {
+        self.terminate_clob_generation_inner(generation, reason, false)
+            .await;
+    }
+
+    async fn terminate_clob_generation_inner(
+        &self,
+        generation: u64,
+        reason: &str,
+        allow_during_shutdown: bool,
+    ) {
         let _decision_guard = self.inner.decision_gate.lock().await;
         let revoked = {
             let mut data = self.inner.data.write().await;
@@ -3403,22 +3567,30 @@ impl RuntimeController {
                 "fail_closed": true,
                 "ready": false
             });
-            if !self
-                .record_required_events(vec![("clob_resync_aborted".to_owned(), event)])
+            let recorded = if allow_during_shutdown {
+                self.record_required_events_during_shutdown(vec![(
+                    "clob_resync_aborted".to_owned(),
+                    event,
+                )])
                 .await
-            {
+            } else {
+                self.record_required_events(vec![("clob_resync_aborted".to_owned(), event)])
+                    .await
+            };
+            if !recorded {
                 warn!(generation, "CLOB resync abort audit was not durable; canonical feed error remains required");
             }
         }
     }
 
-    async fn terminate_all_clob_generations(&self, reason: &str) {
+    async fn terminate_all_clob_generations(&self, reason: &str, allow_during_shutdown: bool) {
         let generation = {
             let data = self.inner.data.read().await;
             data.clob_generation.or(data.clob_pending_generation)
         };
         if let Some(generation) = generation {
-            self.terminate_clob_generation(generation, reason).await;
+            self.terminate_clob_generation_inner(generation, reason, allow_during_shutdown)
+                .await;
         }
     }
 
@@ -3495,78 +3667,131 @@ fn spawn_recorder_worker(
         .spawn(move || {
             let mut last_flush = Instant::now();
             let mut deferred_request = None;
+            let mut pending_best_effort: Option<Vec<RecorderRequest>> = None;
             let mut durability = RecorderDurabilityState::default();
             loop {
-                let request = match deferred_request.take() {
-                    Some(request) => request,
-                    None => match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
-                        Ok(request) => request,
-                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                            flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
-                            last_flush = Instant::now();
-                            continue;
-                        }
-                        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                            flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
-                            break;
-                        }
-                    },
-                };
-                if let Some(batch_key) = request.durable_batch_key.as_deref() {
-                    let event_count = request.logical_event_count;
-                    metrics.batches_total.fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .last_batch_size
-                        .store(event_count, Ordering::Relaxed);
-                    let result = persist_durable_recorder_request(
-                        &recorder,
-                        &metrics,
-                        &mut durability,
-                        batch_key,
-                        &request.events,
-                    );
-                    saturating_sub_atomic(&metrics.queued, event_count);
+                if let Some(requests) = pending_best_effort.as_ref() {
+                    std::thread::sleep(RECORDER_RETRY_DELAY);
+                    let event_count = requests
+                        .iter()
+                        .map(|request| request.logical_event_count)
+                        .sum::<usize>();
+                    let result = match recorder.lock() {
+                        Ok(mut recorder) => recorder.retry_pending(),
+                        Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
+                    };
+                    update_recorder_flush_health(&metrics, &result);
                     match &result {
                         Ok(()) => {
+                            saturating_sub_atomic(&metrics.queued, event_count);
                             metrics
                                 .persisted_total
                                 .fetch_add(event_count as u64, Ordering::Relaxed);
+                            pending_best_effort = None;
                         }
                         Err(error) => {
                             metrics
                                 .failed_total
                                 .fetch_add(event_count as u64, Ordering::Relaxed);
-                            warn!("runtime recorder durable batch failed: {error}");
+                            warn!("runtime recorder retry failed: {error}");
                         }
                     }
-                    if let Some(ack) = request.durable_ack {
-                        let _ = ack.send(result);
-                    }
                     continue;
                 }
-                if durability.pending_batch_key.is_some()
-                    && resume_pending_durable(&recorder, &metrics, &mut durability).is_err()
-                {
-                    deferred_request = Some(request);
-                    std::thread::sleep(Duration::from_millis(250));
-                    continue;
-                }
-                let mut requests = vec![request];
-                let mut event_count = requests[0].logical_event_count;
-                while event_count < RECORDER_BATCH_LIMIT {
-                    match receiver.try_recv() {
-                        Ok(request) => {
-                            if request.durable_batch_key.is_some() {
-                                deferred_request = Some(request);
+                let requests = loop {
+                    let request = match deferred_request.take() {
+                        Some(request) => request,
+                        None => match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
+                            Ok(request) => request,
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                                flush_or_resume_runtime_recorder(
+                                    &recorder,
+                                    &metrics,
+                                    &mut durability,
+                                );
+                                last_flush = Instant::now();
+                                continue;
+                            }
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                                flush_or_resume_runtime_recorder(
+                                    &recorder,
+                                    &metrics,
+                                    &mut durability,
+                                );
+                                return;
+                            }
+                        },
+                    };
+                    if let Some(batch_key) = request.durable_batch_key.as_deref() {
+                        let event_count = request.logical_event_count;
+                        metrics.batches_total.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .last_batch_size
+                            .store(event_count, Ordering::Relaxed);
+                        let mut result = Err("durable recorder retry was not attempted".to_owned());
+                        for attempt in 1..=REQUIRED_RECORDER_ATTEMPTS {
+                            result = persist_durable_recorder_request(
+                                &recorder,
+                                &metrics,
+                                &mut durability,
+                                batch_key,
+                                &request.events,
+                            );
+                            if result.is_ok() {
                                 break;
                             }
-                            event_count += request.logical_event_count;
-                            requests.push(request);
+                            metrics
+                                .failed_total
+                                .fetch_add(event_count as u64, Ordering::Relaxed);
+                            if attempt < REQUIRED_RECORDER_ATTEMPTS {
+                                std::thread::sleep(RECORDER_RETRY_DELAY);
+                            }
                         }
-                        Err(std_mpsc::TryRecvError::Empty) => break,
-                        Err(std_mpsc::TryRecvError::Disconnected) => break,
+                        saturating_sub_atomic(&metrics.queued, event_count);
+                        match &result {
+                            Ok(()) => {
+                                metrics
+                                    .persisted_total
+                                    .fetch_add(event_count as u64, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                warn!("runtime recorder durable batch failed: {error}");
+                            }
+                        }
+                        if let Some(ack) = request.durable_ack {
+                            let _ = ack.send(result);
+                        }
+                        continue;
                     }
-                }
+                    if durability.pending_batch_key.is_some()
+                        && resume_pending_durable(&recorder, &metrics, &mut durability).is_err()
+                    {
+                        deferred_request = Some(request);
+                        std::thread::sleep(RECORDER_RETRY_DELAY);
+                        continue;
+                    }
+                    let mut requests = vec![request];
+                    let mut event_count = requests[0].logical_event_count;
+                    while event_count < RECORDER_BATCH_LIMIT {
+                        match receiver.try_recv() {
+                            Ok(request) => {
+                                if request.durable_batch_key.is_some() {
+                                    deferred_request = Some(request);
+                                    break;
+                                }
+                                event_count += request.logical_event_count;
+                                requests.push(request);
+                            }
+                            Err(std_mpsc::TryRecvError::Empty) => break,
+                            Err(std_mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    break requests;
+                };
+                let event_count = requests
+                    .iter()
+                    .map(|request| request.logical_event_count)
+                    .sum::<usize>();
                 metrics.batches_total.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .last_batch_size
@@ -3584,9 +3809,10 @@ fn spawn_recorder_worker(
                 // the recorder's immutable retry queue, even though these
                 // best-effort requests do not wait for a durable ack.
                 update_recorder_flush_health(&metrics, &result);
-                saturating_sub_atomic(&metrics.queued, event_count);
+                debug_assert!(requests.iter().all(|request| request.durable_ack.is_none()));
                 match &result {
                     Ok(()) => {
+                        saturating_sub_atomic(&metrics.queued, event_count);
                         metrics
                             .persisted_total
                             .fetch_add(event_count as u64, Ordering::Relaxed);
@@ -3596,10 +3822,10 @@ fn spawn_recorder_worker(
                             .failed_total
                             .fetch_add(event_count as u64, Ordering::Relaxed);
                         warn!("runtime recorder failed: {error}");
+                        pending_best_effort = Some(requests);
                     }
                 }
-                debug_assert!(requests.iter().all(|request| request.durable_ack.is_none()));
-                if last_flush.elapsed() >= RECORDER_FLUSH_INTERVAL {
+                if result.is_ok() && last_flush.elapsed() >= RECORDER_FLUSH_INTERVAL {
                     flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
                     last_flush = Instant::now();
                 }
@@ -3632,35 +3858,21 @@ fn persist_durable_recorder_request(
     // can never determine the journal's acknowledgment.
     recorder_flush_result(recorder, metrics, false)?;
     durability.pending_batch_key = Some(batch_key.to_owned());
-    let (authoritative_remote, result, flush_attempted) = match recorder.lock() {
-        Ok(mut recorder) => {
-            let authoritative_remote = recorder.has_authoritative_remote();
-            match recorder.record_recorded_batch(events) {
-                Ok(()) => (authoritative_remote, recorder.flush(), true),
-                Err(error) => (authoritative_remote, Err(error), false),
-            }
-        }
-        Err(error) => (
-            false,
-            Err(format!("runtime recorder lock poisoned: {error}")),
-            false,
-        ),
+    let result = match recorder.lock() {
+        Ok(mut recorder) => match recorder.record_recorded_batch(events) {
+            Ok(()) => recorder.flush(),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
     };
-    if flush_attempted {
-        update_recorder_flush_health(metrics, &result);
-    }
+    update_recorder_flush_health(metrics, &result);
     match result {
         Ok(()) => {
             durability.pending_batch_key = None;
             durability.remember_completed(batch_key.to_owned());
             Ok(())
         }
-        Err(error) => {
-            if !authoritative_remote {
-                durability.pending_batch_key = None;
-            }
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -5183,9 +5395,14 @@ mod tests {
     #[derive(Default)]
     struct BufferedRecorderTestState {
         pending: Vec<RuntimeEvent>,
+        pending_sequences: Vec<u64>,
+        retry_pending: Vec<RuntimeEvent>,
+        retry_sequences: Vec<u64>,
         committed_event_types: Vec<Vec<String>>,
+        committed_sequences: Vec<Vec<u64>>,
         record_batch_calls: Vec<Vec<String>>,
         best_effort_record_failures_remaining: usize,
+        retry_flush_failures_remaining: usize,
         durable_flush_failures_remaining: usize,
     }
 
@@ -5206,19 +5423,65 @@ mod tests {
                     .map(|event| event.event_type.clone())
                     .collect(),
             );
-            state.pending.extend_from_slice(events);
             let best_effort_only = events.iter().all(|event| event.event_type == "book");
             if best_effort_only && state.best_effort_record_failures_remaining > 0 {
                 state.best_effort_record_failures_remaining -= 1;
+                state.retry_pending.extend_from_slice(events);
                 return Err(StorageError::Io(std::io::Error::other(
                     "injected best-effort record failure",
                 )));
             }
+            state.pending.extend_from_slice(events);
+            Ok(())
+        }
+
+        fn record_recorded_batch(
+            &mut self,
+            events: &[RecordedRuntimeEvent],
+        ) -> Result<(), StorageError> {
+            let mut state = self.state.lock().unwrap();
+            state.record_batch_calls.push(
+                events
+                    .iter()
+                    .map(|event| event.event().event_type.clone())
+                    .collect(),
+            );
+            let best_effort_only = events
+                .iter()
+                .all(|event| event.event().event_type == "book");
+            if best_effort_only && state.best_effort_record_failures_remaining > 0 {
+                state.best_effort_record_failures_remaining -= 1;
+                state
+                    .retry_pending
+                    .extend(events.iter().map(|event| event.event().clone()));
+                state
+                    .retry_sequences
+                    .extend(events.iter().map(RecordedRuntimeEvent::recorder_sequence));
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected best-effort record failure",
+                )));
+            }
+            state
+                .pending
+                .extend(events.iter().map(|event| event.event().clone()));
+            state
+                .pending_sequences
+                .extend(events.iter().map(RecordedRuntimeEvent::recorder_sequence));
             Ok(())
         }
 
         fn flush(&mut self) -> Result<(), StorageError> {
             let mut state = self.state.lock().unwrap();
+            let mut retry_pending = std::mem::take(&mut state.retry_pending);
+            let mut retry_sequences = std::mem::take(&mut state.retry_sequences);
+            state.pending.append(&mut retry_pending);
+            state.pending_sequences.append(&mut retry_sequences);
+            if state.retry_flush_failures_remaining > 0 {
+                state.retry_flush_failures_remaining -= 1;
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected retry flush failure",
+                )));
+            }
             let durable_pending = state.pending.iter().any(|event| event.event_type != "book");
             if durable_pending && state.durable_flush_failures_remaining > 0 {
                 state.durable_flush_failures_remaining -= 1;
@@ -5232,7 +5495,9 @@ mod tests {
                     .iter()
                     .map(|event| event.event_type.clone())
                     .collect();
+                let sequences = std::mem::take(&mut state.pending_sequences);
                 state.committed_event_types.push(event_types);
+                state.committed_sequences.push(sequences);
                 state.pending.clear();
             }
             Ok(())
@@ -5855,7 +6120,7 @@ mod tests {
     }
 
     #[test]
-    fn recorder_sequence_is_monotonic_and_queue_failures_leave_a_gap() {
+    fn recorder_queue_rejection_rolls_back_an_unentered_tail() {
         let metrics = RecorderMetrics::default();
         let event = || RuntimeEvent {
             event_type: "book".to_owned(),
@@ -5865,12 +6130,16 @@ mod tests {
         let first = metrics.bind(event()).unwrap();
         let (sender, receiver) = std_mpsc::channel();
         drop(receiver);
-        assert!(sender.send(RecorderRequest::best_effort(first)).is_err());
+        let rejected = match sender.send(RecorderRequest::best_effort(first)) {
+            Ok(()) => panic!("recorder queue unexpectedly accepted a request"),
+            Err(error) => error.0,
+        };
+        assert!(metrics.rollback_bound_tail(&rejected.events));
         let second = metrics.bind(event()).unwrap();
-        assert_eq!(second.recorder_sequence(), 2);
+        assert_eq!(second.recorder_sequence(), 1);
         let status = metrics.snapshot();
         assert!(uuid::Uuid::parse_str(status["recorder_instance_id"].as_str().unwrap()).is_ok());
-        assert_eq!(status["last_assigned_sequence"], 2);
+        assert_eq!(status["last_assigned_sequence"], 1);
     }
 
     #[tokio::test]
@@ -5903,6 +6172,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recorder_admission_yields_while_capacity_is_held() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        let heartbeat = tokio::time::timeout(
+            StdDuration::from_millis(100),
+            tokio::time::sleep(StdDuration::from_millis(1)),
+        )
+        .await;
+        assert!(heartbeat.is_ok());
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        tokio::time::timeout(StdDuration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        controller.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_recorder_admission_and_bounds_pending_drain() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+
+        let shutdown = tokio::time::timeout(StdDuration::from_secs(1), controller.shutdown())
+            .await
+            .unwrap();
+        assert!(shutdown.is_err());
+        waiting.await.unwrap();
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn shutdown_drains_and_flushes_the_recorder_queue() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
         let controller = RuntimeController::new_with_recorder(
@@ -5928,7 +6306,7 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_failure_stays_unrecovered_until_retry_flush_succeeds() {
+    fn best_effort_failure_retries_before_later_requests_and_durable() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
             best_effort_record_failures_remaining: 1,
             ..BufferedRecorderTestState::default()
@@ -5962,35 +6340,86 @@ mod tests {
             }
             thread::sleep(StdDuration::from_millis(10));
         }
-        assert_eq!(metrics.snapshot()["queued"], 0);
+        assert_eq!(metrics.snapshot()["failed_total"], 1);
+        assert_eq!(metrics.snapshot()["queued"], 1);
+        assert_eq!(metrics.snapshot()["persisted_total"], 0);
         assert_eq!(metrics.snapshot()["flush_unrecovered"], true);
         assert_eq!(metrics.snapshot()["flush_failed_total"], 1);
+        assert!(state.lock().unwrap().pending.is_empty());
 
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::best_effort(
+                metrics
+                    .bind(RuntimeEvent {
+                        event_type: "book".to_owned(),
+                        ts: Utc::now(),
+                        data: json!({"sequence": 2}),
+                    })
+                    .unwrap(),
+            ))
+            .unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::durable(
+                vec![metrics
+                    .bind(RuntimeEvent {
+                        event_type: "required_evidence".to_owned(),
+                        ts: Utc::now(),
+                        data: json!({"journal_id": "after-recovered-books"}),
+                    })
+                    .unwrap()],
+                ack_tx,
+            ))
+            .unwrap();
+
+        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
         drop(sender);
         for _ in 0..100 {
-            if metrics.snapshot()["flush_unrecovered"] == false {
+            if metrics.snapshot()["queued"] == 0 {
                 break;
             }
             thread::sleep(StdDuration::from_millis(10));
         }
+        assert_eq!(metrics.snapshot()["queued"], 0);
         assert_eq!(metrics.snapshot()["flush_unrecovered"], false);
         assert_eq!(metrics.snapshot()["flush_recovered_total"], 1);
+        assert_eq!(metrics.snapshot()["persisted_total"], 3);
+        let state = state.lock().unwrap();
+        assert_eq!(state.committed_sequences, vec![vec![1], vec![2], vec![3]]);
         assert_eq!(
-            state.lock().unwrap().committed_event_types,
-            vec![vec!["book"]]
+            state
+                .record_batch_calls
+                .iter()
+                .filter(|events| events.as_slice() == ["book"])
+                .count(),
+            2
+        );
+        assert_eq!(
+            state.committed_event_types,
+            vec![
+                vec!["book".to_owned()],
+                vec!["book".to_owned()],
+                vec!["required_evidence".to_owned()]
+            ]
         );
     }
 
     #[test]
-    fn durable_recorder_ack_fails_then_retries_the_same_journal() {
-        let dir = std::env::temp_dir().join(format!(
-            "polyedge-recorder-ack-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let path = dir.join("events.jsonl");
-        fs::create_dir_all(&path).unwrap();
-        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_path(path.clone())));
+    fn durable_recorder_retries_the_same_bound_request_without_restaging() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: 1,
+            ..BufferedRecorderTestState::default()
+        }));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
         let metrics = Arc::new(RecorderMetrics::default());
         let (sender, receiver) = std_mpsc::channel();
         spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
@@ -6000,36 +6429,24 @@ mod tests {
             data: json!({"journal_id": "stable-journal-1"}),
         };
 
-        let (failed_ack_tx, failed_ack_rx) = oneshot::channel();
-        metrics.queued.fetch_add(1, Ordering::Relaxed);
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        sender
-            .send(RecorderRequest::durable(
-                vec![metrics.bind(event.clone()).unwrap()],
-                failed_ack_tx,
-            ))
-            .unwrap();
-        assert!(failed_ack_rx.blocking_recv().unwrap().is_err());
-
-        fs::remove_dir_all(&path).unwrap();
-        let (success_ack_tx, success_ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         metrics.queued.fetch_add(1, Ordering::Relaxed);
         metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
         sender
             .send(RecorderRequest::durable(
                 vec![metrics.bind(event).unwrap()],
-                success_ack_tx,
+                ack_tx,
             ))
             .unwrap();
-        assert_eq!(success_ack_rx.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
         drop(sender);
 
-        let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 1);
-        assert!(text.contains("stable-journal-1"));
+        let state = state.lock().unwrap();
+        assert_eq!(state.committed_sequences, vec![vec![1]]);
+        assert_eq!(state.record_batch_calls, vec![vec!["required_evidence"]]);
         assert_eq!(metrics.snapshot()["persisted_total"], 1);
         assert_eq!(metrics.snapshot()["failed_total"], 1);
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(metrics.snapshot()["last_assigned_sequence"], 1);
     }
 
     #[test]
@@ -6190,91 +6607,6 @@ mod tests {
         );
         assert_eq!(
             controller.inner.recorder_metrics.snapshot()["persisted_total"],
-            1
-        );
-    }
-
-    #[test]
-    fn completed_durable_batch_is_acknowledged_without_resubmission() {
-        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
-            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
-            ..BufferedRecorderTestState::default()
-        }));
-        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
-            Box::new(BufferedRecorderTestDouble {
-                state: Arc::clone(&state),
-            }),
-            true,
-        )));
-        let metrics = Arc::new(RecorderMetrics::default());
-        let (sender, receiver) = std_mpsc::channel();
-        spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
-        let durable = RuntimeEvent {
-            event_type: "required_evidence".to_owned(),
-            ts: Utc::now(),
-            data: json!({"journal_id": "delayed-commit-journal-1"}),
-        };
-
-        for _ in 0..REQUIRED_RECORDER_ATTEMPTS {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            metrics.queued.fetch_add(1, Ordering::Relaxed);
-            metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-            sender
-                .send(RecorderRequest::durable(
-                    vec![metrics.bind(durable.clone()).unwrap()],
-                    ack_tx,
-                ))
-                .unwrap();
-            assert!(ack_rx.blocking_recv().unwrap().is_err());
-        }
-
-        metrics.queued.fetch_add(1, Ordering::Relaxed);
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        sender
-            .send(RecorderRequest::best_effort(
-                metrics
-                    .bind(RuntimeEvent {
-                        event_type: "book".to_owned(),
-                        ts: Utc::now(),
-                        data: json!({"sequence": 1}),
-                    })
-                    .unwrap(),
-            ))
-            .unwrap();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        metrics.queued.fetch_add(1, Ordering::Relaxed);
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        sender
-            .send(RecorderRequest::durable(
-                vec![metrics.bind(durable).unwrap()],
-                ack_tx,
-            ))
-            .unwrap();
-        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
-        drop(sender);
-
-        for _ in 0..100 {
-            if metrics.snapshot()["queued"] == 0 {
-                break;
-            }
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        let state = state.lock().unwrap();
-        assert_eq!(
-            state
-                .record_batch_calls
-                .iter()
-                .filter(|events| events.as_slice() == ["required_evidence"])
-                .count(),
-            1
-        );
-        assert_eq!(
-            state
-                .committed_event_types
-                .iter()
-                .flatten()
-                .filter(|event_type| event_type.as_str() == "required_evidence")
-                .count(),
             1
         );
     }
