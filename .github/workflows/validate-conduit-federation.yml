@@ -9,6 +9,7 @@ on:
       - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
       - 'infra/conduit-data-roles.bicep'
+      - 'infra/conduit-funded-access.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
       - '.github/workflows/validate-conduit-federation.yml'
@@ -21,6 +22,7 @@ on:
       - 'crates/polyedge-reporting/**'
       - 'infra/conduit-federated-identity.bicep'
       - 'infra/conduit-data-roles.bicep'
+      - 'infra/conduit-funded-access.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
       - '.github/workflows/validate-conduit-federation.yml'
@@ -87,6 +89,7 @@ jobs:
           ops/conduit/test/test-ring-sync.sh
           ops/conduit/test/test-parity-hourly.sh
           ops/conduit/test/test-parity-daily.sh
+          ops/conduit/test/test-funded-secret-bootstrap.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"
@@ -183,6 +186,19 @@ jobs:
               and .properties.assignableScopes == ["[subscription().id]"]
             ))
           ' conduit-data-roles.json
+          az bicep build --file infra/conduit-funded-access.bicep --stdout > conduit-funded-access.json
+          jq -e '
+            (.resources | length) == 6
+            and all(.resources[];
+              .type == "Microsoft.Authorization/roleAssignments"
+              and .properties.principalType == "ServicePrincipal")
+            and ([.resources[] | select(.scope | contains("Microsoft.KeyVault/vaults/secrets"))] | length) == 5
+            and ([.resources[] | select(.scope | contains("Microsoft.ServiceBus/namespaces/queues"))] | length) == 1
+            and ([.resources[] | select(.properties.roleDefinitionId == "[variables(\u0027keyVaultSecretsUserRoleId\u0027)]")] | length) == 5
+            and ([.resources[] | select(.properties.roleDefinitionId == "[variables(\u0027serviceBusReceiverRoleId\u0027)]")] | length) == 1
+            and .variables.keyVaultSecretsUserRoleId == "[subscriptionResourceId(\u0027Microsoft.Authorization/roleDefinitions\u0027, \u00274633458b-17de-408a-b874-0445c86b69e6\u0027)]"
+            and .variables.serviceBusReceiverRoleId == "[subscriptionResourceId(\u0027Microsoft.Authorization/roleDefinitions\u0027, \u00274f6d3b9b-027b-4f4c-9142-0e5a2a2247e0\u0027)]"
+          ' conduit-funded-access.json
           az bicep build --file infra/main.bicep --stdout > main.json
           jq -e '
             [.resources[]

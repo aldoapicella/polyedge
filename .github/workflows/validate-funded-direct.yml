@@ -10,6 +10,7 @@ on:
       - "scripts/verify-funded-v10-capital.sh"
       - "scripts/test-verify-funded-receiver-role-contract.sh"
       - "scripts/verify-funded-receiver-role-contract.sh"
+      - "scripts/verify-funded-network-rule-contract.sh"
       - "scripts/fence-funded-queue-and-wait-empty.sh"
       - "scripts/test-fence-funded-queue-and-wait-empty.sh"
       - "crates/polyedge-api/**"
@@ -906,10 +907,20 @@ jobs:
           assert.equal(resources("Microsoft.ServiceBus/namespaces").length, 1);
           assert.equal(namespace.sku.name, "Standard");
           assert.equal(namespace.properties.disableLocalAuth, true);
+          assert.equal(namespace.properties.minimumTlsVersion, "1.2");
           assert.equal(namespace.properties.publicNetworkAccess, "Enabled");
           const [networkRules] = resources("Microsoft.ServiceBus/namespaces/networkRuleSets");
           assert.equal(networkRules.properties.defaultAction, "Deny");
-          assert.equal(networkRules.properties.ipRules.length, 2);
+          assert.equal(template.parameters.fundedReceiverTransitionPhase.defaultValue, "azure-only");
+          assert.deepEqual(template.parameters.fundedReceiverTransitionPhase.allowedValues,
+            ["azure-only", "azure-oci-transition"]);
+          assert.equal(typeof networkRules.properties.ipRules, "string");
+          assert.equal((networkRules.properties.ipRules.match(/'ipMask'/g) || []).length, 3);
+          assert.match(networkRules.properties.ipRules, /parameters\('producerPublicIpName'\)/);
+          assert.match(networkRules.properties.ipRules, /variables\('publicIpName'\)/);
+          assert.match(networkRules.properties.ipRules, /fundedReceiverTransitionPhase/);
+          assert.match(networkRules.properties.ipRules, /azure-oci-transition/);
+          assert.match(networkRules.properties.ipRules, /149\.130\.186\.60/);
           assert.equal(template.parameters.fundedDirectQueueStatus.defaultValue, "Active");
           assert.deepEqual(template.parameters.fundedDirectQueueStatus.allowedValues, ["Active", "SendDisabled"]);
           const [queue] = resources("Microsoft.ServiceBus/namespaces/queues");
@@ -1430,6 +1441,7 @@ jobs:
           bash scripts/test-fence-funded-queue-and-wait-empty.sh
           bash scripts/test-verify-funded-v10-capital.sh
           bash scripts/test-verify-funded-receiver-role-contract.sh
+          bash scripts/verify-funded-network-rule-contract.sh --self-test
           git diff --check
 
   diagnose-funded-lifecycle:
@@ -1952,6 +1964,7 @@ jobs:
             --parameters @infra/funded-direct-chile.parameters.json \
             --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
             --parameters fundedDirectQueueStatus=SendDisabled \
+            --parameters fundedReceiverTransitionPhase="$FUNDED_RECEIVER_TRANSITION_PHASE" \
             --result-format ResourceIdOnly \
             --no-pretty-print \
             -o json > funded-what-if.json
@@ -2649,6 +2662,7 @@ jobs:
               --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
               --parameters fundedDirectEnabled=false \
               --parameters fundedDirectQueueStatus=SendDisabled \
+              --parameters fundedReceiverTransitionPhase="$FUNDED_RECEIVER_TRANSITION_PHASE" \
               --only-show-errors \
               -o json > funded-deployment.json 2> funded-deployment.stderr; then
               deployed=true
@@ -4941,6 +4955,7 @@ jobs:
               --parameters venueProbeImage="${{ steps.images.outputs.funded_reference }}" \
               --parameters fundedDirectEnabled=true \
               --parameters fundedDirectQueueStatus=SendDisabled \
+              --parameters fundedReceiverTransitionPhase="$FUNDED_RECEIVER_TRANSITION_PHASE" \
               --only-show-errors \
               -o json > funded-enabled-deployment.json 2> funded-enabled-deployment.stderr; then
               deployed=true
@@ -5097,6 +5112,7 @@ jobs:
             -o json > service-bus-namespace.json
           test "$(jq -r '.sku.name' service-bus-namespace.json)" = "Standard"
           test "$(jq -r '.disableLocalAuth' service-bus-namespace.json)" = "true"
+          test "$(jq -r '.minimumTlsVersion' service-bus-namespace.json)" = "1.2"
           az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
@@ -5112,8 +5128,6 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \
             -o json > service-bus-network.json
-          test "$(jq -r '.defaultAction' service-bus-network.json)" = "Deny"
-          test "$(jq '.ipRules | length' service-bus-network.json)" = "2"
           producer_egress_ip=$(az network public-ip show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name pip-polyedge-venue-neu-egress-2 \
@@ -5122,9 +5136,11 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name pip-polyedge-execution-cl-egress \
             --query ipAddress -o tsv)
-          jq -e --arg producer "$producer_egress_ip" --arg executor "$executor_egress_ip" '
-            ([.ipRules[].ipMask] | sort) == ([$producer, $executor] | sort)
-          ' service-bus-network.json
+          scripts/verify-funded-network-rule-contract.sh \
+            service-bus-network.json \
+            "$FUNDED_RECEIVER_TRANSITION_PHASE" \
+            "$producer_egress_ip" \
+            "$executor_egress_ip"
           queue_id=$(az servicebus queue show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --namespace-name "$SERVICE_BUS_NAMESPACE" \

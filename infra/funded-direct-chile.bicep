@@ -19,6 +19,11 @@ param serviceBusQueueName string = 'funded-dynamic-quote-intents'
   'SendDisabled'
 ])
 param fundedDirectQueueStatus string = 'Active'
+@allowed([
+  'azure-only'
+  'azure-oci-transition'
+])
+param fundedReceiverTransitionPhase string = 'azure-only'
 param producerIdentityName string = 'polyedge-shadow-neu-id'
 param producerPublicIpName string = 'pip-polyedge-venue-neu-egress-2'
 param alertActionGroupName string = 'polyedge-dev-research-alerts'
@@ -165,7 +170,7 @@ resource serviceBusNetworkRules 'Microsoft.ServiceBus/namespaces/networkRuleSets
     defaultAction: 'Deny'
     trustedServiceAccessEnabled: false
     virtualNetworkRules: []
-    ipRules: [
+    ipRules: concat([
       {
         ipMask: producerPublicIp.properties.ipAddress
         action: 'Allow'
@@ -174,7 +179,12 @@ resource serviceBusNetworkRules 'Microsoft.ServiceBus/namespaces/networkRuleSets
         ipMask: publicIp.properties.ipAddress
         action: 'Allow'
       }
-    ]
+    ], fundedReceiverTransitionPhase == 'azure-oci-transition' ? [
+      {
+        ipMask: '149.130.186.60'
+        action: 'Allow'
+      }
+    ] : [])
   }
 }
 
