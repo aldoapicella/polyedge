@@ -1815,6 +1815,25 @@ impl AzureBlobClient {
         }
     }
 
+    /// Build a managed-identity client for a single large immutable object and
+    /// its mandatory read-back verification.
+    pub fn with_managed_identity_for_large_immutable_upload(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            container: container.into(),
+            auth: AzureBlobAuth::ManagedIdentity(ManagedIdentityToken::new(client_id)),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(7200))
+                .timeout_write(Duration::from_secs(7200))
+                .build(),
+        }
+    }
+
     /// Build a client whose individual network operations are short enough for
     /// a finite Azure lease watchdog. Lease renewal is additionally single-shot
     /// so a transient outage cannot keep a protected child alive past expiry.
@@ -1918,6 +1937,23 @@ impl AzureBlobClient {
             encode_blob_path(name)
         );
         self.get_bytes_with_retry(&url)
+    }
+
+    /// Downloads an exact immutable object without allowing a corrupt remote
+    /// response to allocate beyond the caller's evidence bound.
+    pub fn download_blob_bytes_exact_bounded(
+        &mut self,
+        name: &str,
+        expected_bytes: u64,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, AzureBlobError> {
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        self.read_response_bytes_exact_bounded(&url, expected_bytes, maximum_bytes)
     }
 
     /// Reads the exact blob bytes together with the Azure ETag needed for a
@@ -2219,6 +2255,43 @@ impl AzureBlobClient {
         let response = self.get_response(url)?;
         let mut bytes = Vec::new();
         response.into_reader().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_response_bytes_exact_bounded(
+        &mut self,
+        url: &str,
+        expected_bytes: u64,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, AzureBlobError> {
+        if expected_bytes > maximum_bytes {
+            return Err(AzureBlobError::Transport(
+                "bounded Azure Blob download expectation exceeds its limit".to_owned(),
+            ));
+        }
+        let response = self.get_response(url)?;
+        if let Some(content_length) = response.header("content-length") {
+            let advertised = content_length.parse::<u64>().map_err(|_| {
+                AzureBlobError::Transport(
+                    "bounded Azure Blob download has an invalid Content-Length".to_owned(),
+                )
+            })?;
+            if advertised != expected_bytes || advertised > maximum_bytes {
+                return Err(AzureBlobError::Transport(
+                    "bounded Azure Blob download Content-Length disagrees".to_owned(),
+                ));
+            }
+        }
+        let limit = expected_bytes.checked_add(1).ok_or_else(|| {
+            AzureBlobError::Transport("bounded Azure Blob download length overflows".to_owned())
+        })?;
+        let mut bytes = Vec::with_capacity(expected_bytes as usize);
+        response.into_reader().take(limit).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != expected_bytes {
+            return Err(AzureBlobError::Transport(
+                "bounded Azure Blob download body length disagrees".to_owned(),
+            ));
+        }
         Ok(bytes)
     }
 
@@ -3033,6 +3106,59 @@ mod tests {
 
     const TEST_TENANT_ID: &str = "11111111-2222-3333-4444-555555555555";
     const TEST_CLIENT_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    #[test]
+    fn large_immutable_upload_client_keeps_managed_identity_binding() {
+        let client = AzureBlobClient::with_managed_identity_for_large_immutable_upload(
+            "account",
+            "container",
+            Some(TEST_CLIENT_ID.to_owned()),
+        );
+        assert_eq!(client.account, "account");
+        assert_eq!(client.container, "container");
+        assert!(matches!(client.auth, AzureBlobAuth::ManagedIdentity(_)));
+    }
+
+    #[test]
+    fn bounded_blob_download_rejects_oversized_header_and_body_without_leaking_body() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nsecret-body"
+            )
+            .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nsecret-body"
+            )
+            .unwrap();
+        });
+
+        let mut client = AzureBlobClient::new("unused", "unused", "test=sas");
+        let url = format!("http://{address}/bounded");
+        for error in [
+            client
+                .read_response_bytes_exact_bounded(&url, 4, 8)
+                .unwrap_err(),
+            client
+                .read_response_bytes_exact_bounded(&url, 4, 8)
+                .unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("bounded Azure Blob download"));
+            assert!(!message.contains("secret-body"));
+        }
+        server.join().unwrap();
+    }
 
     fn read_http_request(stream: &TcpStream) -> String {
         let mut reader = BufReader::new(stream.try_clone().unwrap());

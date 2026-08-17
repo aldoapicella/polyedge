@@ -7,7 +7,7 @@ fixture_dir=$root/segments/ring-sync-selftest-$$
 legacy=$fixture_dir/1785960000.jsonl
 fixture=$fixture_dir/1785960600.jsonl
 post_upload=$fixture_dir/1785962400.jsonl
-bad=$fixture_dir/1785961200.jsonl
+bad=$root/segments/2026/08/05/20/1785961200.jsonl
 later=$fixture_dir/1785961800.jsonl
 quarantined_post_upload=$fixture_dir/1785963600.jsonl
 near_miss=$fixture_dir/1785963000.jsonl
@@ -17,7 +17,7 @@ archive_fixture=$archive_dir/1785960600.jsonl.gz
 legacy_manifest=$legacy_archive.manifest.json
 manifest=$archive_fixture.manifest.json
 post_upload_manifest=$archive_dir/1785962400.jsonl.gz.manifest.json
-bad_archive=$archive_dir/1785961200.jsonl.gz
+bad_archive=$root/archive/2026/08/05/20/1785961200.jsonl.gz
 later_archive=$archive_dir/1785961800.jsonl.gz
 later_manifest=$later_archive.manifest.json
 quarantined_post_archive=$archive_dir/1785963600.jsonl.gz
@@ -27,9 +27,16 @@ quarantine=$root/quarantine/recorder-sequence-proof-v1
 cleanup() { rm -rf "$root"; }
 trap cleanup EXIT HUP INT TERM
 
-install -d -m 0750 "$fixture_dir" "$fake"
+install -d -m 0750 "$fixture_dir" "${bad%/*}" "$fake"
 printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake/mountpoint"
 chmod 0755 "$fake/mountpoint"
+real_sha256sum=$(command -v sha256sum)
+printf '%s\n' \
+  '#!/bin/sh' \
+  '[ -n "${POLYEDGE_TEST_FORBIDDEN_HASH:-}" ] && [ "${1:-}" = "$POLYEDGE_TEST_FORBIDDEN_HASH" ] && { echo "sealed source was re-read" >&2; exit 99; }' \
+  'exec "$POLYEDGE_TEST_REAL_SHA256SUM" "$@"' >"$fake/sha256sum"
+chmod 0755 "$fake/sha256sum"
+export POLYEDGE_TEST_REAL_SHA256SUM=$real_sha256sum
 printf '{"test":"legacy"}
 ' > "$legacy"
 printf '%s\n' \
@@ -59,6 +66,8 @@ printf '%s\n' \
 
 PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 \
   "$sync"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 \
+  POLYEDGE_TEST_FORBIDDEN_HASH=$fixture "$sync"
 jq -e '
   .schema_version == 4 and
   .recorder_runs == [
@@ -103,7 +112,7 @@ printf '%s\n' \
   '{"test":4,"recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":4}' \
   '{"test":5,"recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":5}' > "$later"
 bad_hash=$(sha256sum "$bad" | awk '{print $1}')
-bad_relative=segments/ring-sync-selftest-$$/1785961200.jsonl
+bad_relative=segments/2026/08/05/20/1785961200.jsonl
 receipt_id=$(printf '%s:%s:%s' "${#bad_relative}" "$bad_relative" "sha256:$bad_hash" | sha256sum | awk '{print $1}')
 receipt=$quarantine/$receipt_id.json
 receipt_expected=$root/receipt-expected.json
@@ -218,11 +227,67 @@ if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD
   exit 1
 fi
 grep -F 'non-canonical quarantine receipt path' "$root/traversal.log" >/dev/null
+rm -f "$traversal_receipt" "$near_miss"
+
+resolved=$root/quarantine/resolved-recorder-sequence-proof-v1/$receipt_id
+install -d -m 0750 "$resolved"
+cp "$bad" "$resolved/source.jsonl"
+cp "$receipt" "$resolved/quarantine-receipt.json"
+remote_prefix=events-oci-quarantine-v1/invalid-recorder-sequence-proof/$receipt_id
+receipt_sha=sha256:$(sha256sum "$receipt" | awk '{print $1}')
+jq -n \
+  --arg receipt_id "$receipt_id" \
+  --arg source_path "$bad_relative" \
+  --arg source_sha "sha256:$bad_hash" \
+  --argjson source_bytes "$(wc -c < "$bad")" \
+  --argjson source_lines "$(wc -l < "$bad")" \
+  --arg receipt_sha "$receipt_sha" \
+  --arg remote_prefix "$remote_prefix" \
+  '{schema:"polyedge_ring_quarantine_resolution.v1",type:"invalid_recorder_sequence_proof_resolution",disposition:"preserved_historical_pre_boundary_non_parity",active_ring:false,parity_eligible:false,retention_policy:"indefinite_outside_lifecycle",receipt_id:$receipt_id,approval_reference:"approved-test-change",formal_boundary_epoch:1785962400,segment_start_epoch:1785961200,segment_end_epoch:1785961800,source_segment_path:$source_path,source_sha256:$source_sha,source_bytes:$source_bytes,source_lines:$source_lines,quarantine_receipt_sha256:$receipt_sha,remote_prefix:$remote_prefix,source_blob_name:($remote_prefix+"/source.jsonl"),quarantine_receipt_blob_name:($remote_prefix+"/quarantine-receipt.json"),resolution_blob_name:($remote_prefix+"/resolution.json")}' \
+  > "$resolved/resolution.json"
+resolution_sha=sha256:$(sha256sum "$resolved/resolution.json" | awk '{print $1}')
+jq -n \
+  --arg receipt_id "$receipt_id" \
+  --arg source_sha "sha256:$bad_hash" \
+  --arg receipt_sha "$receipt_sha" \
+  --arg resolution_sha "$resolution_sha" \
+  --arg remote_prefix "$remote_prefix" \
+  '{schema:"polyedge_ring_quarantine_resolution_upload.v1",receipt_id:$receipt_id,source_blob_name:($remote_prefix+"/source.jsonl"),quarantine_receipt_blob_name:($remote_prefix+"/quarantine-receipt.json"),resolution_blob_name:($remote_prefix+"/resolution.json"),source_sha256:$source_sha,quarantine_receipt_sha256:$receipt_sha,resolution_sha256:$resolution_sha,verified_ts:"2026-08-17T00:00:00Z"}' \
+  > "$resolved/resolution.uploaded.json"
+chmod 0640 "$resolved/source.jsonl" "$resolved/quarantine-receipt.json" "$resolved/resolution.json" "$resolved/resolution.uploaded.json"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$sync"
+[ ! -e "$bad.manifest.json" ]
+[ ! -e "$bad_archive" ]
 [ ! -e "$root/escape.jsonl" ]
 [ ! -e "$bad.sequence."* ]
+mv "$root/quarantine" "$root/quarantine-real"
+ln -s "$root/quarantine-real" "$root/quarantine"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_RING_POST_UPLOAD_SEAL=1 \
+  "$sync" >"$root/symlink.log" 2>&1; then
+  echo 'symlinked quarantine ancestor unexpectedly passed' >&2
+  exit 1
+fi
+grep -F 'unsafe ring directory' "$root/symlink.log" >/dev/null
+printf '%s\n' '#!/bin/sh' 'echo 0' > "$fake/id"
+chmod 0755 "$fake/id"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  ops/conduit/bin/polyedge-ring-quarantine "$receipt_id" 1785962400 approved-test-change \
+  >"$root/quarantine-helper-symlink.log" 2>&1; then
+  echo 'quarantine helper accepted a symlinked ancestor' >&2
+  exit 1
+fi
+grep -F 'unsafe or missing ring directory' "$root/quarantine-helper-symlink.log" >/dev/null
 grep -F -- '--cap-drop=all --cap-add=DAC_OVERRIDE' ops/conduit/bin/polyedge-ring-sync >/dev/null
 grep -F -- '-v "$segments:/srv/polyedge-ring/segments:Z"' ops/conduit/bin/polyedge-ring-sync >/dev/null
 grep -F -- '-v "$archive:/srv/polyedge-ring/archive:Z"' ops/conduit/bin/polyedge-ring-sync >/dev/null
 grep -F 'prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}' ops/conduit/bin/polyedge-ring-sync >/dev/null
+grep -F '[ "$(id -u)" -eq 0 ]' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+grep -F '/usr/bin/flock -n 9' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+grep -F '[ "${POLYEDGE_AZURE_ARC_IDENTITY:-}" = 1 ]' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+grep -F '/usr/bin/timeout --signal=TERM --kill-after=60s 3h' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+! grep -F 'AZURE_CLIENT_SECRET_FILE' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+grep -F -- '-v "$segments:/srv/polyedge-ring/segments:ro,Z"' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+grep -F 'ring-quarantine-resolve' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
+grep -F 'events-oci-quarantine-v1/invalid-recorder-sequence-proof' crates/polyedge-cli/src/main.rs >/dev/null
 
 echo 'ring sealer self-test passed'

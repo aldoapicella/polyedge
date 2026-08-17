@@ -37,7 +37,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
 use std::sync::{mpsc, Arc, Mutex};
@@ -45,6 +46,9 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 const LEGACY_RING_BLOB_PREFIX: &str = "events-oci-dual";
+const RING_QUARANTINE_BLOB_PREFIX: &str =
+    "events-oci-quarantine-v1/invalid-recorder-sequence-proof";
+const MAX_RING_QUARANTINE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
@@ -118,6 +122,27 @@ enum Command {
         container: String,
         #[arg(long, default_value_t = 48)]
         retention_hours: u64,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Preserve and verify an approved pre-boundary recorder quarantine.
+    RingQuarantineResolve {
+        #[arg(long, default_value = "/srv/polyedge-ring")]
+        root: PathBuf,
+        #[arg(long)]
+        receipt_id: String,
+        #[arg(long)]
+        formal_boundary_epoch: i64,
+        #[arg(long)]
+        approval_reference: String,
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(
+            long,
+            default_value = "bot-events",
+            env = "AZURE_STORAGE_CONTAINER_NAME"
+        )]
+        container: String,
         #[arg(long, env = "AZURE_CLIENT_ID")]
         client_id: Option<String>,
     },
@@ -789,6 +814,23 @@ async fn main() -> Result<()> {
             account,
             container,
             retention_hours,
+            client_id,
+        )?),
+        Command::RingQuarantineResolve {
+            root,
+            receipt_id,
+            formal_boundary_epoch,
+            approval_reference,
+            account,
+            container,
+            client_id,
+        } => print_json(run_ring_quarantine_resolve(
+            &root,
+            &receipt_id,
+            formal_boundary_epoch,
+            &approval_reference,
+            account,
+            container,
             client_id,
         )?),
         Command::BenchApiSnapshot { iterations } => print_json(benchmark_snapshot(iterations)),
@@ -2006,6 +2048,602 @@ fn run_ring_upload(
     }))
 }
 
+struct RingQuarantineResolution {
+    source_path: PathBuf,
+    receipt_bytes: Vec<u8>,
+    resolution_bytes: Vec<u8>,
+    source_sha256: String,
+    source_bytes: u64,
+    receipt_sha256: String,
+    source_blob_name: String,
+    receipt_blob_name: String,
+    resolution_blob_name: String,
+    final_directory: PathBuf,
+}
+
+fn run_ring_quarantine_resolve(
+    root: &Path,
+    receipt_id: &str,
+    formal_boundary_epoch: i64,
+    approval_reference: &str,
+    account: String,
+    container: String,
+    client_id: Option<String>,
+) -> Result<serde_json::Value> {
+    let resolution = prepare_ring_quarantine_resolution(
+        root,
+        receipt_id,
+        formal_boundary_epoch,
+        approval_reference,
+    )?;
+    let staging = recover_ring_quarantine_staging(&resolution)?;
+    let already_resolved = resolution.final_directory.exists();
+    if already_resolved {
+        validate_local_ring_quarantine_resolution(&resolution)?;
+    }
+
+    let mut client = AzureBlobClient::with_managed_identity_for_large_immutable_upload(
+        account, container, client_id,
+    );
+    let source = read_ring_quarantine_source(&resolution.source_path, resolution.source_bytes)?;
+    if source.len() as u64 != resolution.source_bytes
+        || sha256_prefixed(&source) != resolution.source_sha256
+    {
+        bail!("quarantined source changed before upload");
+    }
+    let source_created = upload_verified_quarantine_blob(
+        &mut client,
+        &resolution.source_blob_name,
+        &source,
+        "application/x-ndjson",
+        &resolution.source_sha256,
+    )?;
+    drop(source);
+    let receipt_created = upload_verified_quarantine_blob(
+        &mut client,
+        &resolution.receipt_blob_name,
+        &resolution.receipt_bytes,
+        "application/json",
+        &resolution.receipt_sha256,
+    )?;
+    let resolution_sha256 = sha256_prefixed(&resolution.resolution_bytes);
+    // The resolution object is the remote commit marker and must stay last.
+    let resolution_created = upload_verified_quarantine_blob(
+        &mut client,
+        &resolution.resolution_blob_name,
+        &resolution.resolution_bytes,
+        "application/json",
+        &resolution_sha256,
+    )?;
+
+    if !already_resolved {
+        publish_local_ring_quarantine_resolution(&resolution, &staging, &resolution_sha256)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "receipt_id": receipt_id,
+        "already_resolved": already_resolved,
+        "source_blob_created": source_created,
+        "receipt_blob_created": receipt_created,
+        "resolution_blob_created": resolution_created,
+        "remote_prefix": format!("{RING_QUARANTINE_BLOB_PREFIX}/{receipt_id}"),
+    }))
+}
+
+fn prepare_ring_quarantine_resolution(
+    root: &Path,
+    receipt_id: &str,
+    formal_boundary_epoch: i64,
+    approval_reference: &str,
+) -> Result<RingQuarantineResolution> {
+    if receipt_id.len() != 64
+        || !receipt_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("quarantine receipt ID must be a lowercase sha256 digest");
+    }
+    if approval_reference.trim() != approval_reference
+        || approval_reference.is_empty()
+        || approval_reference.len() > 256
+        || approval_reference.chars().any(char::is_control)
+    {
+        bail!("approval reference must be a nonempty single-line value of at most 256 bytes");
+    }
+    if formal_boundary_epoch <= 0 || formal_boundary_epoch % 600 != 0 {
+        bail!("quarantine boundary is invalid");
+    }
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("resolving ring root {}", root.display()))?;
+    let segments = root
+        .join("segments")
+        .canonicalize()
+        .context("resolving segments")?;
+    let quarantine_path = root.join("quarantine");
+    let quarantine_metadata =
+        fs::symlink_metadata(&quarantine_path).context("reading quarantine directory metadata")?;
+    if quarantine_metadata.file_type().is_symlink() || !quarantine_metadata.is_dir() {
+        bail!("quarantine path is not a regular directory");
+    }
+    let quarantine = quarantine_path
+        .canonicalize()
+        .context("resolving quarantine directory")?;
+    if !quarantine.starts_with(&root) {
+        bail!("quarantine directory escapes ring root");
+    }
+    let receipt_root = quarantine.join("recorder-sequence-proof-v1");
+    let receipt_root_metadata = fs::symlink_metadata(&receipt_root)
+        .context("reading quarantine receipt directory metadata")?;
+    if receipt_root_metadata.file_type().is_symlink() || !receipt_root_metadata.is_dir() {
+        bail!("quarantine receipt path is not a regular directory");
+    }
+    let receipt_root = receipt_root
+        .canonicalize()
+        .context("resolving quarantine receipt directory")?;
+    if !receipt_root.starts_with(&quarantine) {
+        bail!("quarantine receipt directory escapes quarantine root");
+    }
+    let receipt_path = receipt_root.join(format!("{receipt_id}.json"));
+    require_regular_file(&receipt_path)?;
+    let receipt_bytes =
+        fs::read(&receipt_path).with_context(|| format!("reading {}", receipt_path.display()))?;
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_bytes).context("quarantine receipt must be valid JSON")?;
+    let receipt_object = receipt
+        .as_object()
+        .context("quarantine receipt must be a JSON object")?;
+    let expected_fields = [
+        "reason_code",
+        "schema",
+        "source_bytes",
+        "source_lines",
+        "source_segment_path",
+        "source_sha256",
+        "type",
+    ];
+    if receipt_object.len() != expected_fields.len()
+        || !receipt_object
+            .keys()
+            .all(|key| expected_fields.contains(&key.as_str()))
+        || receipt["schema"].as_str() != Some("polyedge_ring_quarantine.v1")
+        || receipt["type"].as_str() != Some("quarantine_receipt")
+        || receipt["reason_code"].as_str() != Some("invalid_recorder_sequence_proof")
+    {
+        bail!("quarantine receipt has an invalid schema");
+    }
+    let source_relative = receipt["source_segment_path"]
+        .as_str()
+        .context("quarantine receipt source path must be a string")?;
+    let source_relative_path = Path::new(source_relative);
+    if source_relative_path.is_absolute()
+        || !source_relative.starts_with("segments/")
+        || !source_relative.ends_with(".jsonl")
+        || source_relative
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || b"._-/".contains(&byte)))
+        || source_relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("quarantine receipt source path is invalid");
+    }
+    let source_sha256 = ring_sha256(&receipt, "source_sha256")?;
+    let expected_id = format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}:{source_relative}:{source_sha256}",
+            source_relative.len()
+        ))
+    );
+    if expected_id != receipt_id {
+        bail!("quarantine receipt content address disagrees");
+    }
+    let source_path = root.join(source_relative_path);
+    require_regular_file(&source_path)?;
+    let source_real = source_path
+        .canonicalize()
+        .with_context(|| format!("resolving {}", source_path.display()))?;
+    if !source_real.starts_with(&segments) {
+        bail!("quarantine source escapes segments");
+    }
+    let source_bytes = receipt["source_bytes"]
+        .as_u64()
+        .context("quarantine receipt source_bytes must be an unsigned integer")?;
+    let source_lines = receipt["source_lines"]
+        .as_u64()
+        .context("quarantine receipt source_lines must be an unsigned integer")?;
+    validate_ring_quarantine_source_size(source_bytes, fs::metadata(&source_path)?.len())?;
+    let (actual_sha256, actual_bytes, actual_lines) = file_sha_bytes_lines(&source_path)?;
+    if actual_sha256 != source_sha256
+        || actual_bytes != source_bytes
+        || actual_lines != source_lines
+    {
+        bail!("quarantined source disagrees with its receipt");
+    }
+    let start = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.parse::<i64>().ok())
+        .context("quarantine source filename must be an epoch")?;
+    let hour = DateTime::<Utc>::from_timestamp(start, 0)
+        .context("quarantine source epoch is outside the UTC timestamp range")?
+        .format("%Y/%m/%d/%H")
+        .to_string();
+    if source_relative != format!("segments/{hour}/{start}.jsonl") {
+        bail!("quarantine source path is not exactly bound to its UTC epoch");
+    }
+    let end = start
+        .checked_add(600)
+        .context("quarantine segment end overflows")?;
+    if end > formal_boundary_epoch {
+        bail!("quarantined segment is not wholly pre-boundary");
+    }
+    for sidecar in [
+        PathBuf::from(format!("{}.manifest.json", source_path.display())),
+        root.join(format!("archive/{hour}/{start}.jsonl.gz")),
+        root.join(format!("archive/{hour}/{start}.jsonl.gz.manifest.json")),
+    ] {
+        if fs::symlink_metadata(&sidecar).is_ok() {
+            bail!(
+                "quarantined segment has a sealed sidecar: {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    let remote_prefix = format!("{RING_QUARANTINE_BLOB_PREFIX}/{receipt_id}");
+    let source_blob_name = format!("{remote_prefix}/source.jsonl");
+    let receipt_blob_name = format!("{remote_prefix}/quarantine-receipt.json");
+    let resolution_blob_name = format!("{remote_prefix}/resolution.json");
+    let receipt_sha256 = sha256_prefixed(&receipt_bytes);
+    let mut resolution_bytes = serde_json::to_vec_pretty(&json!({
+        "schema": "polyedge_ring_quarantine_resolution.v1",
+        "type": "invalid_recorder_sequence_proof_resolution",
+        "disposition": "preserved_historical_pre_boundary_non_parity",
+        "active_ring": false,
+        "parity_eligible": false,
+        "retention_policy": "indefinite_outside_lifecycle",
+        "receipt_id": receipt_id,
+        "approval_reference": approval_reference,
+        "formal_boundary_epoch": formal_boundary_epoch,
+        "segment_start_epoch": start,
+        "segment_end_epoch": end,
+        "source_segment_path": source_relative,
+        "source_sha256": source_sha256,
+        "source_bytes": source_bytes,
+        "source_lines": source_lines,
+        "quarantine_receipt_sha256": receipt_sha256,
+        "remote_prefix": remote_prefix,
+        "source_blob_name": source_blob_name,
+        "quarantine_receipt_blob_name": receipt_blob_name,
+        "resolution_blob_name": resolution_blob_name,
+    }))?;
+    resolution_bytes.push(b'\n');
+    Ok(RingQuarantineResolution {
+        source_path,
+        receipt_bytes,
+        resolution_bytes,
+        source_sha256,
+        source_bytes,
+        receipt_sha256,
+        source_blob_name,
+        receipt_blob_name,
+        resolution_blob_name,
+        final_directory: quarantine
+            .join("resolved-recorder-sequence-proof-v1")
+            .join(receipt_id),
+    })
+}
+
+fn validate_ring_quarantine_source_size(receipt_bytes: u64, actual_bytes: u64) -> Result<()> {
+    if receipt_bytes != actual_bytes || actual_bytes > MAX_RING_QUARANTINE_SOURCE_BYTES {
+        bail!("quarantine source exceeds 512 MiB or disagrees with its receipt");
+    }
+    Ok(())
+}
+
+fn read_ring_quarantine_source(path: &Path, expected_bytes: u64) -> Result<Vec<u8>> {
+    validate_ring_quarantine_source_size(expected_bytes, fs::metadata(path)?.len())?;
+    let mut source = Vec::with_capacity(expected_bytes as usize);
+    fs::File::open(path)
+        .with_context(|| format!("opening {}", path.display()))?
+        .take(MAX_RING_QUARANTINE_SOURCE_BYTES + 1)
+        .read_to_end(&mut source)
+        .with_context(|| format!("reading {}", path.display()))?;
+    validate_ring_quarantine_source_size(expected_bytes, source.len() as u64)?;
+    Ok(source)
+}
+
+fn upload_verified_quarantine_blob(
+    client: &mut AzureBlobClient,
+    blob_name: &str,
+    bytes: &[u8],
+    content_type: &str,
+    expected_sha256: &str,
+) -> Result<bool> {
+    let created = matches!(
+        client
+            .upload_block_blob_bytes_if_absent(blob_name, bytes, content_type)
+            .with_context(|| format!("uploading {blob_name}"))?,
+        ImmutableBlobWrite::Created
+    );
+    let remote = client
+        .download_blob_bytes_exact_bounded(
+            blob_name,
+            bytes.len() as u64,
+            MAX_RING_QUARANTINE_SOURCE_BYTES,
+        )
+        .with_context(|| format!("verifying {blob_name}"))?;
+    if remote.len() != bytes.len() || sha256_prefixed(&remote) != expected_sha256 {
+        bail!("remote quarantine object disagrees: {blob_name}");
+    }
+    Ok(created)
+}
+
+fn publish_local_ring_quarantine_resolution(
+    resolution: &RingQuarantineResolution,
+    staging: &Path,
+    resolution_sha256: &str,
+) -> Result<()> {
+    let parent = resolution
+        .final_directory
+        .parent()
+        .context("resolved quarantine directory has no parent")?;
+    let receipt_id = resolution
+        .final_directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("resolved quarantine directory has an invalid receipt ID")?;
+    let expected_staging = parent.join(format!(".{receipt_id}.staging"));
+    if staging != expected_staging {
+        bail!("resolved quarantine staging path is not exactly bound");
+    }
+    fs::create_dir(staging).with_context(|| format!("creating {}", staging.display()))?;
+    set_mode(staging, 0o750)?;
+    let result = (|| -> Result<()> {
+        let source_copy = staging.join("source.jsonl");
+        fs::copy(&resolution.source_path, &source_copy)
+            .with_context(|| format!("copying {}", resolution.source_path.display()))?;
+        set_mode(&source_copy, 0o640)?;
+        require_evidence_file(&source_copy)?;
+        let (copied_sha, copied_bytes, _) = file_sha_bytes_lines(&source_copy)?;
+        if copied_sha != resolution.source_sha256 || copied_bytes != resolution.source_bytes {
+            bail!("local quarantine source copy disagrees");
+        }
+        fs::File::open(&source_copy)?.sync_all()?;
+        write_new_exact(
+            &staging.join("quarantine-receipt.json"),
+            &resolution.receipt_bytes,
+        )?;
+        write_new_exact(
+            &staging.join("resolution.json"),
+            &resolution.resolution_bytes,
+        )?;
+        let mut uploaded = serde_json::to_vec_pretty(&json!({
+            "schema": "polyedge_ring_quarantine_resolution_upload.v1",
+            "receipt_id": receipt_id,
+            "source_blob_name": resolution.source_blob_name,
+            "quarantine_receipt_blob_name": resolution.receipt_blob_name,
+            "resolution_blob_name": resolution.resolution_blob_name,
+            "source_sha256": resolution.source_sha256,
+            "quarantine_receipt_sha256": resolution.receipt_sha256,
+            "resolution_sha256": resolution_sha256,
+            "verified_ts": Utc::now().to_rfc3339(),
+        }))?;
+        uploaded.push(b'\n');
+        write_new_exact(&staging.join("resolution.uploaded.json"), &uploaded)?;
+        fs::File::open(staging)?.sync_all()?;
+        fs::rename(staging, &resolution.final_directory).with_context(|| {
+            format!(
+                "publishing resolved quarantine {}",
+                resolution.final_directory.display()
+            )
+        })?;
+        set_mode(&resolution.final_directory, 0o750)?;
+        fs::File::open(parent)?.sync_all()?;
+        validate_local_ring_quarantine_resolution(resolution)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    result
+}
+
+fn recover_ring_quarantine_staging(resolution: &RingQuarantineResolution) -> Result<PathBuf> {
+    let parent = resolution
+        .final_directory
+        .parent()
+        .context("resolved quarantine directory has no parent")?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("resolved quarantine parent is not a regular directory")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    set_mode(parent, 0o750)?;
+    let receipt_id = resolution
+        .final_directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("resolved quarantine directory has an invalid receipt ID")?;
+    let staging = parent.join(format!(".{receipt_id}.staging"));
+    match fs::symlink_metadata(&staging) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("stale quarantine staging entry is not a regular directory")
+        }
+        Ok(_) => {
+            fs::remove_dir_all(&staging)
+                .with_context(|| format!("removing stale {}", staging.display()))?;
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(staging)
+}
+
+fn validate_local_ring_quarantine_resolution(resolution: &RingQuarantineResolution) -> Result<()> {
+    require_directory_mode(&resolution.final_directory, 0o750)?;
+    let mut names = fs::read_dir(&resolution.final_directory)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    let expected = [
+        "quarantine-receipt.json",
+        "resolution.json",
+        "resolution.uploaded.json",
+        "source.jsonl",
+    ];
+    if names.len() != expected.len()
+        || names
+            .iter()
+            .zip(expected)
+            .any(|(actual, expected)| actual != expected)
+    {
+        bail!("resolved quarantine bundle does not contain exactly four expected files");
+    }
+    let source = resolution.final_directory.join("source.jsonl");
+    let receipt = resolution.final_directory.join("quarantine-receipt.json");
+    let resolution_path = resolution.final_directory.join("resolution.json");
+    let uploaded_path = resolution.final_directory.join("resolution.uploaded.json");
+    for path in [&source, &receipt, &resolution_path, &uploaded_path] {
+        require_evidence_file(path)?;
+    }
+    let (source_sha, source_bytes, _) = file_sha_bytes_lines(&source)?;
+    if source_sha != resolution.source_sha256 || source_bytes != resolution.source_bytes {
+        bail!("resolved quarantine source disagrees");
+    }
+    if fs::read(&receipt)? != resolution.receipt_bytes
+        || fs::read(&resolution_path)? != resolution.resolution_bytes
+    {
+        bail!("resolved quarantine evidence disagrees");
+    }
+    let uploaded_bytes = fs::read(&uploaded_path)?;
+    let uploaded: serde_json::Value = serde_json::from_slice(&uploaded_bytes)
+        .context("resolved quarantine upload receipt must be valid JSON")?;
+    let object = uploaded
+        .as_object()
+        .context("resolved quarantine upload receipt must be an object")?;
+    let expected_fields = [
+        "quarantine_receipt_blob_name",
+        "quarantine_receipt_sha256",
+        "receipt_id",
+        "resolution_blob_name",
+        "resolution_sha256",
+        "schema",
+        "source_blob_name",
+        "source_sha256",
+        "verified_ts",
+    ];
+    if object.len() != expected_fields.len()
+        || !object
+            .keys()
+            .all(|key| expected_fields.contains(&key.as_str()))
+        || uploaded["schema"].as_str() != Some("polyedge_ring_quarantine_resolution_upload.v1")
+        || uploaded["receipt_id"].as_str()
+            != resolution
+                .final_directory
+                .file_name()
+                .and_then(|value| value.to_str())
+        || uploaded["source_blob_name"].as_str() != Some(&resolution.source_blob_name)
+        || uploaded["quarantine_receipt_blob_name"].as_str() != Some(&resolution.receipt_blob_name)
+        || uploaded["resolution_blob_name"].as_str() != Some(&resolution.resolution_blob_name)
+        || uploaded["source_sha256"].as_str() != Some(&resolution.source_sha256)
+        || uploaded["quarantine_receipt_sha256"].as_str() != Some(&resolution.receipt_sha256)
+        || uploaded["resolution_sha256"].as_str()
+            != Some(&sha256_prefixed(&resolution.resolution_bytes))
+    {
+        bail!("resolved quarantine upload receipt disagrees");
+    }
+    let verified_ts = uploaded["verified_ts"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .context("resolved quarantine verified_ts must be nonempty")?;
+    DateTime::parse_from_rfc3339(verified_ts)
+        .context("resolved quarantine verified_ts must be RFC 3339")?;
+    Ok(())
+}
+
+fn require_regular_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("path is not a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
+fn require_evidence_file(path: &Path) -> Result<()> {
+    require_regular_file(path)?;
+    let mode = fs::symlink_metadata(path)?.permissions().mode() & 0o777;
+    if mode != 0o640 {
+        bail!("evidence file mode must be 0640: {}", path.display());
+    }
+    Ok(())
+}
+
+fn require_directory_mode(path: &Path, expected: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.permissions().mode() & 0o777 != expected
+    {
+        bail!("directory mode or type is invalid: {}", path.display());
+    }
+    Ok(())
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode on {}", path.display()))
+}
+
+fn file_sha_bytes_lines(path: &Path) -> Result<(String, u64, u64)> {
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut lines = 0_u64;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .context("quarantine source size overflows")?;
+        if bytes > MAX_RING_QUARANTINE_SOURCE_BYTES {
+            bail!("quarantine source exceeds 512 MiB");
+        }
+        lines = lines
+            .checked_add(buffer[..read].iter().filter(|byte| **byte == b'\n').count() as u64)
+            .context("quarantine source line count overflows")?;
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), bytes, lines))
+}
+
+fn write_new_exact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o640)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.set_permissions(fs::Permissions::from_mode(0o640))?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn accepted_ring_blob_prefix<'a>(
     manifest: &serde_json::Value,
     current_prefix: &'a str,
@@ -2635,15 +3273,264 @@ fn profitability_authorization_flags(
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_ring_blob_prefix, profitability_authorization_flags, ring_blob_name,
-        ring_relative_path, ring_sha256, terminate_lease_child_tree, validate_ring_identity,
-        validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
-        validate_ring_source_v3, validate_ring_source_v4, validate_ring_upload_receipt, Cli,
-        Command, Path, PathBuf, ResearchCommand,
+        accepted_ring_blob_prefix, prepare_ring_quarantine_resolution,
+        profitability_authorization_flags, publish_local_ring_quarantine_resolution,
+        recover_ring_quarantine_staging, ring_blob_name, ring_relative_path, ring_sha256,
+        sha256_prefixed, terminate_lease_child_tree, validate_local_ring_quarantine_resolution,
+        validate_ring_identity, validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
+        validate_ring_quarantine_source_size, validate_ring_source_v3, validate_ring_source_v4,
+        validate_ring_upload_receipt, Cli, Command, Path, PathBuf, ResearchCommand,
+        MAX_RING_QUARANTINE_SOURCE_BYTES, RING_QUARANTINE_BLOB_PREFIX,
     };
     use clap::Parser;
     use serde_json::json;
     use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn quarantine_fixture() -> (PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-ring-quarantine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source_relative = "segments/2026/08/16/17/1786900200.jsonl";
+        let source = root.join(source_relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("archive/2026/08/16/17")).unwrap();
+        fs::create_dir_all(root.join("quarantine/recorder-sequence-proof-v1")).unwrap();
+        fs::write(
+            &source,
+            b"{\"recorder_instance_id\":\"7c66d77b-a911-4f9b-95f2-98ca9395255e\",\"recorder_sequence\":1}\n{\"recorder_instance_id\":\"7c66d77b-a911-4f9b-95f2-98ca9395255e\",\"recorder_sequence\":3}\n",
+        )
+        .unwrap();
+        let source_bytes = fs::read(&source).unwrap();
+        let source_sha = sha256_prefixed(&source_bytes);
+        let identity = format!("{}:{source_relative}:{source_sha}", source_relative.len());
+        let receipt_id = sha256_prefixed(identity.as_bytes())[7..].to_owned();
+        let receipt = json!({
+            "schema": "polyedge_ring_quarantine.v1",
+            "type": "quarantine_receipt",
+            "source_segment_path": source_relative,
+            "source_sha256": source_sha,
+            "source_bytes": source_bytes.len(),
+            "source_lines": 2,
+            "reason_code": "invalid_recorder_sequence_proof",
+        });
+        fs::write(
+            root.join(format!(
+                "quarantine/recorder-sequence-proof-v1/{receipt_id}.json"
+            )),
+            format!("{}\n", serde_json::to_string(&receipt).unwrap()),
+        )
+        .unwrap();
+        (root, receipt_id)
+    }
+
+    #[test]
+    fn ring_quarantine_resolution_is_fixed_pre_boundary_and_idempotent() {
+        let (root, receipt_id) = quarantine_fixture();
+        let resolution = prepare_ring_quarantine_resolution(
+            &root,
+            &receipt_id,
+            1786924800,
+            "approved-change-123",
+        )
+        .unwrap();
+        assert_eq!(
+            resolution.source_blob_name,
+            format!("{RING_QUARANTINE_BLOB_PREFIX}/{receipt_id}/source.jsonl")
+        );
+        let resolution_json: serde_json::Value =
+            serde_json::from_slice(&resolution.resolution_bytes).unwrap();
+        assert_eq!(resolution_json["active_ring"], false);
+        assert_eq!(resolution_json["parity_eligible"], false);
+        assert_eq!(
+            resolution_json["retention_policy"],
+            "indefinite_outside_lifecycle"
+        );
+        let resolution_sha = sha256_prefixed(&resolution.resolution_bytes);
+        let staging = recover_ring_quarantine_staging(&resolution).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"interrupted").unwrap();
+        let staging = recover_ring_quarantine_staging(&resolution).unwrap();
+        assert!(!staging.exists());
+        publish_local_ring_quarantine_resolution(&resolution, &staging, &resolution_sha).unwrap();
+        validate_local_ring_quarantine_resolution(&resolution).unwrap();
+        assert_eq!(
+            fs::metadata(&resolution.final_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        for name in [
+            "source.jsonl",
+            "quarantine-receipt.json",
+            "resolution.json",
+            "resolution.uploaded.json",
+        ] {
+            assert_eq!(
+                fs::metadata(resolution.final_directory.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"interrupted").unwrap();
+        recover_ring_quarantine_staging(&resolution).unwrap();
+        assert!(!staging.exists());
+        validate_local_ring_quarantine_resolution(&resolution).unwrap();
+        symlink("/tmp", &staging).unwrap();
+        assert!(recover_ring_quarantine_staging(&resolution).is_err());
+        assert!(staging.symlink_metadata().unwrap().file_type().is_symlink());
+        fs::remove_file(&staging).unwrap();
+        assert!(prepare_ring_quarantine_resolution(
+            &root,
+            &receipt_id,
+            1786924800,
+            "approved-change-123",
+        )
+        .is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ring_quarantine_resolution_fails_closed_on_boundary_tamper_and_partial_bundle() {
+        let (root, receipt_id) = quarantine_fixture();
+        assert!(prepare_ring_quarantine_resolution(
+            &root,
+            &receipt_id,
+            1786900200,
+            "approved-change-123",
+        )
+        .is_err());
+        let resolution = prepare_ring_quarantine_resolution(
+            &root,
+            &receipt_id,
+            1786924800,
+            "approved-change-123",
+        )
+        .unwrap();
+        let resolution_sha = sha256_prefixed(&resolution.resolution_bytes);
+        let staging = recover_ring_quarantine_staging(&resolution).unwrap();
+        publish_local_ring_quarantine_resolution(&resolution, &staging, &resolution_sha).unwrap();
+        fs::write(
+            resolution.final_directory.join("source.jsonl"),
+            b"tampered\n",
+        )
+        .unwrap();
+        assert!(validate_local_ring_quarantine_resolution(&resolution).is_err());
+        fs::copy(
+            &resolution.source_path,
+            resolution.final_directory.join("source.jsonl"),
+        )
+        .unwrap();
+        fs::set_permissions(
+            resolution.final_directory.join("source.jsonl"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(validate_local_ring_quarantine_resolution(&resolution).is_err());
+        fs::set_permissions(
+            resolution.final_directory.join("source.jsonl"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        fs::remove_file(resolution.final_directory.join("resolution.uploaded.json")).unwrap();
+        assert!(validate_local_ring_quarantine_resolution(&resolution).is_err());
+        fs::write(&resolution.source_path, b"tampered\n").unwrap();
+        assert!(prepare_ring_quarantine_resolution(
+            &root,
+            &receipt_id,
+            1786924800,
+            "approved-change-123",
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, receipt_id) = quarantine_fixture();
+        let receipt_root = root.join("quarantine/recorder-sequence-proof-v1");
+        let actual = root.join("quarantine/actual-receipts");
+        fs::rename(&receipt_root, &actual).unwrap();
+        symlink(&actual, &receipt_root).unwrap();
+        assert!(prepare_ring_quarantine_resolution(
+            &root,
+            &receipt_id,
+            1786924800,
+            "approved-change-123",
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ring_quarantine_resolution_cli_requires_identity_boundary_and_approval() {
+        let cli = Cli::try_parse_from([
+            "polyedge-rs",
+            "ring-quarantine-resolve",
+            "--root",
+            "/srv/polyedge-ring",
+            "--receipt-id",
+            &"a".repeat(64),
+            "--formal-boundary-epoch",
+            "1786924800",
+            "--approval-reference",
+            "approved-change-123",
+            "--account",
+            "storage",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::RingQuarantineResolve { .. }));
+        assert!(Cli::try_parse_from([
+            "polyedge-rs",
+            "ring-quarantine-resolve",
+            "--receipt-id",
+            &"a".repeat(64),
+            "--formal-boundary-epoch",
+            "1786924800",
+            "--account",
+            "storage",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "polyedge-rs",
+            "ring-quarantine-resolve",
+            "--receipt-id",
+            &"a".repeat(64),
+            "--formal-boundary-epoch",
+            "1786924800",
+            "--approval-reference",
+            "approved-change-123",
+            "--segment-seconds",
+            "300",
+            "--account",
+            "storage",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn ring_quarantine_source_size_accepts_boundary_and_rejects_oversize() {
+        assert!(validate_ring_quarantine_source_size(
+            MAX_RING_QUARANTINE_SOURCE_BYTES,
+            MAX_RING_QUARANTINE_SOURCE_BYTES,
+        )
+        .is_ok());
+        assert!(validate_ring_quarantine_source_size(
+            MAX_RING_QUARANTINE_SOURCE_BYTES + 1,
+            MAX_RING_QUARANTINE_SOURCE_BYTES + 1,
+        )
+        .is_err());
+        assert!(validate_ring_quarantine_source_size(1, 2).is_err());
+    }
 
     #[test]
     fn ring_manifest_v3_requires_contiguous_lowercase_uuid_v4_sequences() {

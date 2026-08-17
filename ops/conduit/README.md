@@ -41,6 +41,7 @@ sudo install -m 0644 ops/conduit/quadlets/* /etc/containers/systemd/
 sudo install -m 0644 ops/conduit/systemd/* /etc/systemd/system/
 sudo install -m 0755 ops/conduit/bin/polyedge-run-job /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-sync /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-ring-quarantine /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-ring-health /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-boot-disk-guard /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-parity-hourly /usr/local/libexec/
@@ -223,6 +224,31 @@ Receipt/source changes, missing sources, sidecars, malformed entries, and path
 escapes fail before upload. Recorder write failures retain and reconcile the
 exact staged JSONL bytes before later sequence-bound events are admitted; they
 are not re-recorded as a new batch.
+
+An explicitly approved segment that ends on or before the formal evidence
+boundary can be preserved without sealing or parity credit. Run the root-only
+operator command with the content-addressed receipt ID, exact boundary epoch,
+and the real approval reference (do not substitute the placeholder):
+
+```sh
+sudo /usr/local/libexec/polyedge-ring-quarantine \
+  RECEIPT_ID FORMAL_BOUNDARY_EPOCH APPROVAL_REFERENCE
+```
+
+The command serializes with ring sync, requires the host's Azure Arc managed
+identity, and is bounded by a three-hour outer timeout. It uses create-only
+uploads under
+`events-oci-quarantine-v1/invalid-recorder-sequence-proof/<receipt-id>/`,
+uploads `resolution.json` last, and downloads every object for hash
+verification. Only then does it atomically publish the four-file local bundle
+under `quarantine/resolved-recorder-sequence-proof-v1/<receipt-id>/`. The
+original source and receipt deliberately remain in place; the resolved bundle
+is a content-addressed local copy, not a move. Its resolution declares
+`active_ring:false`, `parity_eligible:false`, and indefinite retention outside
+the normal lifecycle, so neither copy gains an archive or normal manifest.
+Idempotent reruns still perform create-if-absent and remote read-back
+verification for all three objects before succeeding. Missing, partial,
+tampered, post-boundary, or orphan resolution state keeps ring health red.
 
 Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260814T134524Z-azure-primary-e504c51`,

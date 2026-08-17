@@ -8,17 +8,29 @@ set -a
 set +a
 
 root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
+[ ! -L "$root" ] && [ -d "$root" ] || { echo "ring root is not a regular directory: $root" >&2; exit 1; }
+root_requested=$root
+root=$(realpath -e -- "$root") || exit 1
+[ "$root_requested" = "$root" ] || { echo "ring root path contains a symlink or is non-canonical: $root_requested" >&2; exit 1; }
+mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
 segments=$root/segments
 archive=$root/archive
+quarantine_parent=$root/quarantine
+quarantine=$root/quarantine/recorder-sequence-proof-v1
+resolved_quarantine=$root/quarantine/resolved-recorder-sequence-proof-v1
 status=${POLYEDGE_RING_STATUS:-$root/status.json}
 segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
 grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
 retention_hours=${POLYEDGE_RING_RETENTION_HOURS:-48}
 minimum_free=${POLYEDGE_RING_MIN_FREE_BYTES:-34359738368}
 maximum_unuploaded_age=${POLYEDGE_RING_MAX_UNUPLOADED_SECONDS:-1200}
+max_quarantine_source_bytes=536870912
 
-mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
-test -d "$segments" || { echo "$segments does not exist" >&2; exit 1; }
+for ring_dir in "$segments" "$archive" "$quarantine_parent" "$quarantine" "$resolved_quarantine"; do
+  [ ! -L "$ring_dir" ] && [ -d "$ring_dir" ] || { echo "unsafe or missing ring directory: $ring_dir" >&2; exit 1; }
+  ring_dir_real=$(realpath -e -- "$ring_dir") || exit 1
+  case "$ring_dir_real" in "$root"/*) ;; *) echo "ring directory escapes mount root: $ring_dir" >&2; exit 1 ;; esac
+done
 now=$(date -u +%s)
 size=$(df -P -B1 "$root" | awk 'NR == 2 {print $2}')
 available=$(df -P -B1 "$root" | awk 'NR == 2 {print $4}')
@@ -28,6 +40,153 @@ unsealed_closed_count=0
 unuploaded_count=0
 oldest_unuploaded_age=0
 maximum_segment_bytes=0
+unresolved_quarantine_count=0
+resolved_quarantine_count=0
+resolved_quarantine_bytes=0
+malformed_quarantine_count=0
+quarantined_sources=$(mktemp "$root/.ring-health-quarantine.XXXXXX")
+trap 'rm -f "$quarantined_sources"' EXIT HUP INT TERM
+
+receipt_id() {
+  printf '%s:%s:%s' "${#1}" "$1" "$2" | sha256sum | awk '{print $1}'
+}
+
+validate_quarantine_receipt() {
+  candidate=$1
+  [ ! -L "$candidate" ] && [ -f "$candidate" ] || return 1
+  jq -e '
+    type == "object" and
+    keys == ["reason_code","schema","source_bytes","source_lines","source_segment_path","source_sha256","type"] and
+    .schema == "polyedge_ring_quarantine.v1" and .type == "quarantine_receipt" and
+    .reason_code == "invalid_recorder_sequence_proof" and
+    (.source_segment_path | type == "string") and
+    (.source_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+    (.source_bytes | type == "number" and floor == . and . >= 0) and
+    (.source_lines | type == "number" and floor == . and . >= 0)
+  ' "$candidate" >/dev/null || return 1
+  candidate_path=$(jq -r '.source_segment_path' "$candidate")
+  case "$candidate_path" in
+    segments/*.jsonl) ;;
+    *) return 1 ;;
+  esac
+  case "$candidate_path" in
+    *[!A-Za-z0-9._/-]*|*'/./'*|*'/../'*|*'//'*) return 1 ;;
+  esac
+  candidate_sha=$(jq -r '.source_sha256' "$candidate")
+  candidate_id=$(receipt_id "$candidate_path" "$candidate_sha")
+  [ "$candidate" = "$quarantine/$candidate_id.json" ] || return 1
+  candidate_source=$root/$candidate_path
+  [ ! -L "$candidate_source" ] && [ -f "$candidate_source" ] || return 1
+  candidate_source_real=$(realpath -e -- "$candidate_source") || return 1
+  segments_real=$(realpath -e -- "$segments") || return 1
+  case "$candidate_source_real" in "$segments_real"/*) ;; *) return 1 ;; esac
+  [ "$(stat -c %s "$candidate_source")" -le "$max_quarantine_source_bytes" ] || return 1
+  candidate_bytes=$(jq -r '.source_bytes' "$candidate")
+  candidate_lines=$(jq -r '.source_lines' "$candidate")
+  [ "sha256:$(sha256sum "$candidate_source" | awk '{print $1}')" = "$candidate_sha" ] &&
+    [ "$(wc -c < "$candidate_source")" = "$candidate_bytes" ] &&
+    [ "$(wc -l < "$candidate_source")" = "$candidate_lines" ] || return 1
+  source_name=${candidate_path##*/}
+  candidate_start=${source_name%.jsonl}
+  printf '%s' "$candidate_start" | grep -Eq '^[0-9]+$' || return 1
+  candidate_hour=$(date -u -d "@$candidate_start" +%Y/%m/%d/%H) || return 1
+  [ "$candidate_path" = "segments/$candidate_hour/$candidate_start.jsonl" ] || return 1
+  candidate_archive=$archive/${candidate_path#segments/}.gz
+  for sidecar in "$candidate_source.manifest.json" "$candidate_archive" "$candidate_archive.manifest.json"; do
+    [ ! -e "$sidecar" ] && [ ! -L "$sidecar" ] || return 1
+  done
+}
+
+validate_resolved_quarantine() {
+  resolved=$resolved_quarantine/$candidate_id
+  [ ! -L "$resolved" ] && [ -d "$resolved" ] || return 1
+  [ "$(stat -c %a "$resolved")" = 750 ] || return 1
+  [ "$(find "$resolved" -mindepth 1 -maxdepth 1 -printf . | wc -c)" -eq 4 ] || return 1
+  resolved_source=$resolved/source.jsonl
+  resolved_receipt=$resolved/quarantine-receipt.json
+  resolution=$resolved/resolution.json
+  uploaded=$resolved/resolution.uploaded.json
+  for file in "$resolved_source" "$resolved_receipt" "$resolution" "$uploaded"; do
+    [ ! -L "$file" ] && [ -f "$file" ] || return 1
+    [ "$(stat -c %a "$file")" = 640 ] || return 1
+  done
+  cmp -s "$candidate" "$resolved_receipt" || return 1
+  [ "sha256:$(sha256sum "$resolved_source" | awk '{print $1}')" = "$candidate_sha" ] &&
+    [ "$(wc -c < "$resolved_source")" = "$candidate_bytes" ] &&
+    [ "$(wc -l < "$resolved_source")" = "$candidate_lines" ] || return 1
+  receipt_hash=sha256:$(sha256sum "$resolved_receipt" | awk '{print $1}')
+  candidate_end=$((candidate_start + 600))
+  remote_prefix=events-oci-quarantine-v1/invalid-recorder-sequence-proof/$candidate_id
+  source_blob=$remote_prefix/source.jsonl
+  receipt_blob=$remote_prefix/quarantine-receipt.json
+  resolution_blob=$remote_prefix/resolution.json
+  jq -e \
+    --arg receipt_id "$candidate_id" --arg source_path "$candidate_path" \
+    --arg source_sha "$candidate_sha" --argjson source_bytes "$candidate_bytes" \
+    --argjson source_lines "$candidate_lines" --arg receipt_hash "$receipt_hash" \
+    --arg remote_prefix "$remote_prefix" --arg source_blob "$source_blob" \
+    --arg receipt_blob "$receipt_blob" --arg resolution_blob "$resolution_blob" \
+    --argjson segment_start "$candidate_start" --argjson segment_end "$candidate_end" '
+      type == "object" and
+      keys == ["active_ring","approval_reference","disposition","formal_boundary_epoch","parity_eligible","quarantine_receipt_blob_name","quarantine_receipt_sha256","receipt_id","remote_prefix","resolution_blob_name","retention_policy","schema","segment_end_epoch","segment_start_epoch","source_blob_name","source_bytes","source_lines","source_segment_path","source_sha256","type"] and
+      .schema == "polyedge_ring_quarantine_resolution.v1" and
+      .type == "invalid_recorder_sequence_proof_resolution" and
+      .disposition == "preserved_historical_pre_boundary_non_parity" and
+      .active_ring == false and .parity_eligible == false and
+      .retention_policy == "indefinite_outside_lifecycle" and .receipt_id == $receipt_id and
+      (.approval_reference | type == "string" and length > 0 and length <= 256 and (explode | all(.[]; . >= 32 and . != 127))) and
+      (.formal_boundary_epoch | type == "number" and floor == . and . > 0 and (. % 600) == 0) and
+      .segment_start_epoch == $segment_start and .segment_end_epoch == $segment_end and
+      .segment_end_epoch <= .formal_boundary_epoch and .source_segment_path == $source_path and
+      .source_sha256 == $source_sha and .source_bytes == $source_bytes and .source_lines == $source_lines and
+      .quarantine_receipt_sha256 == $receipt_hash and .remote_prefix == $remote_prefix and
+      .source_blob_name == $source_blob and .quarantine_receipt_blob_name == $receipt_blob and
+      .resolution_blob_name == $resolution_blob
+    ' "$resolution" >/dev/null || return 1
+  resolution_hash=sha256:$(sha256sum "$resolution" | awk '{print $1}')
+  verified_ts=$(jq -r '.verified_ts // empty' "$uploaded")
+  jq -e \
+    --arg receipt_id "$candidate_id" --arg source_blob "$source_blob" \
+    --arg receipt_blob "$receipt_blob" --arg resolution_blob "$resolution_blob" \
+    --arg source_sha "$candidate_sha" --arg receipt_hash "$receipt_hash" \
+    --arg resolution_hash "$resolution_hash" '
+      type == "object" and
+      keys == ["quarantine_receipt_blob_name","quarantine_receipt_sha256","receipt_id","resolution_blob_name","resolution_sha256","schema","source_blob_name","source_sha256","verified_ts"] and
+      .schema == "polyedge_ring_quarantine_resolution_upload.v1" and .receipt_id == $receipt_id and
+      .source_blob_name == $source_blob and .quarantine_receipt_blob_name == $receipt_blob and
+      .resolution_blob_name == $resolution_blob and .source_sha256 == $source_sha and
+      .quarantine_receipt_sha256 == $receipt_hash and .resolution_sha256 == $resolution_hash and
+      (.verified_ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"))
+    ' "$uploaded" >/dev/null && date -d "$verified_ts" +%s >/dev/null 2>&1
+}
+
+for candidate in "$quarantine"/* "$quarantine"/.[!.]* "$quarantine"/..?*; do
+  [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+  if validate_quarantine_receipt "$candidate"; then
+    printf '%s\n' "$candidate_path" >> "$quarantined_sources"
+    if [ -e "$resolved_quarantine/$candidate_id" ] || [ -L "$resolved_quarantine/$candidate_id" ]; then
+      if validate_resolved_quarantine; then
+        resolved_quarantine_count=$((resolved_quarantine_count + 1))
+        resolved_quarantine_bytes=$((resolved_quarantine_bytes + candidate_bytes))
+      else
+        unresolved_quarantine_count=$((unresolved_quarantine_count + 1))
+        malformed_quarantine_count=$((malformed_quarantine_count + 1))
+      fi
+    else
+      unresolved_quarantine_count=$((unresolved_quarantine_count + 1))
+    fi
+  else
+    unresolved_quarantine_count=$((unresolved_quarantine_count + 1))
+    malformed_quarantine_count=$((malformed_quarantine_count + 1))
+  fi
+done
+for resolved in "$resolved_quarantine"/* "$resolved_quarantine"/.[!.]* "$resolved_quarantine"/..?*; do
+  [ -e "$resolved" ] || [ -L "$resolved" ] || continue
+  resolved_id=${resolved##*/}
+  printf '%s' "$resolved_id" | grep -Eq '^[0-9a-f]{64}$' &&
+    [ -f "$quarantine/$resolved_id.json" ] && [ ! -L "$quarantine/$resolved_id.json" ] ||
+    malformed_quarantine_count=$((malformed_quarantine_count + 1))
+done
 
 for segment in $(find "$segments" -type f -name '*.jsonl' -print); do
   segment_count=$((segment_count + 1))
@@ -57,6 +216,8 @@ for segment in $(find "$segments" -type f -name '*.jsonl' -print); do
       age=$((now - $(stat -c %Y "$manifest")))
       [ "$age" -le "$oldest_unuploaded_age" ] || oldest_unuploaded_age=$age
     fi
+  elif grep -Fx -- "segments/$source_relative" "$quarantined_sources" >/dev/null 2>&1; then
+    :
   elif printf '%s' "$start" | grep -Eq '^[0-9]+$' && [ $((start + segment_seconds + grace_seconds)) -le "$now" ]; then
     unsealed_closed_count=$((unsealed_closed_count + 1))
   fi
@@ -74,7 +235,7 @@ if [ "${POLYEDGE_RING_SEAL_ONLY:-}" != 1 ] && [ "$oldest_unuploaded_age" -gt "$m
 fi
 
 temporary=$(mktemp "$status.XXXXXX")
-trap 'rm -f "$temporary"' EXIT HUP INT TERM
+trap 'rm -f "$temporary" "$quarantined_sources"' EXIT HUP INT TERM
 jq -n \
   --arg generated_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson size_bytes "$size" \
@@ -91,10 +252,15 @@ jq -n \
   --argjson capacity_ok "$capacity_ok" \
   --argjson free_ok "$free_ok" \
   --argjson upload_fresh "$upload_fresh" \
-  '{schema_version:1,generated_ts:$generated_ts,size_bytes:$size_bytes,available_bytes:$available_bytes,minimum_free_bytes:$minimum_free_bytes,segment_count:$segment_count,sealed_count:$sealed_count,unsealed_closed_count:$unsealed_closed_count,unuploaded_count:$unuploaded_count,oldest_unuploaded_age_seconds:$oldest_unuploaded_age_seconds,projected_retention_bytes:$projected_retention_bytes,retention_hours:$retention_hours,seal_only:($seal_only == 1),capacity_ok:$capacity_ok,free_ok:$free_ok,upload_fresh:$upload_fresh}' \
+  --argjson unresolved_quarantine_count "$unresolved_quarantine_count" \
+  --argjson resolved_quarantine_count "$resolved_quarantine_count" \
+  --argjson resolved_quarantine_bytes "$resolved_quarantine_bytes" \
+  --argjson malformed_quarantine_count "$malformed_quarantine_count" \
+  '{schema_version:1,generated_ts:$generated_ts,size_bytes:$size_bytes,available_bytes:$available_bytes,minimum_free_bytes:$minimum_free_bytes,segment_count:$segment_count,sealed_count:$sealed_count,unsealed_closed_count:$unsealed_closed_count,unuploaded_count:$unuploaded_count,oldest_unuploaded_age_seconds:$oldest_unuploaded_age_seconds,projected_retention_bytes:$projected_retention_bytes,retention_hours:$retention_hours,seal_only:($seal_only == 1),capacity_ok:$capacity_ok,free_ok:$free_ok,upload_fresh:$upload_fresh,unresolved_quarantine_count:$unresolved_quarantine_count,resolved_quarantine_count:$resolved_quarantine_count,resolved_quarantine_bytes:$resolved_quarantine_bytes,malformed_quarantine_count:$malformed_quarantine_count}' \
   > "$temporary"
 chmod 0640 "$temporary"
 mv "$temporary" "$status"
+rm -f "$quarantined_sources"
 trap - EXIT HUP INT TERM
 
 if [ "$free_ok" != true ]; then
@@ -104,7 +270,8 @@ if [ "$free_ok" != true ]; then
   fi
   exit 1
 fi
-if [ "$capacity_ok" != true ] || [ "$upload_fresh" != true ] || [ "$unsealed_closed_count" -ne 0 ]; then
+if [ "$capacity_ok" != true ] || [ "$upload_fresh" != true ] || [ "$unsealed_closed_count" -ne 0 ] ||
+  [ "$unresolved_quarantine_count" -ne 0 ] || [ "$malformed_quarantine_count" -ne 0 ]; then
   logger -p daemon.err -t polyedge-ring-health "ring capacity, sealing, or upload freshness requires attention; see $status"
   exit 1
 fi
