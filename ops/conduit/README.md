@@ -89,13 +89,15 @@ during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260817T000000Z.json` is the current formal
-window. It starts with zero inherited credit at `2026-08-17T00:00:00Z`, keeps
+Ledger `/srv/polyedge-ring/parity/20260817T120000Z.json` is the current formal
+window. It starts with zero inherited credit at `2026-08-17T12:00:00Z`, keeps
 Azure authoritative and `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-20T00:00:00Z`. Pre-window collections are excluded evidence only.
-Completion still requires 72 consecutive accepted hours, two
-successful OCI daily cycles, reboot and rollback proof, and explicit qset,
-funded, and deletion gates.
+`2026-08-20T12:00:00Z`. Pre-window collections are excluded evidence only. A
+non-midnight start also excludes that partial UTC date from daily-cycle credit,
+so `2026-08-18` is the first eligible full daily cycle. Completion still
+requires 72 consecutive accepted hours, two successful OCI daily cycles,
+reboot and rollback proof, and explicit qset, funded, and deletion gates. The
+superseded `20260817T000000Z.json` ledger remains immutable with zero credit.
 
 The superseded `20260816T100000Z.json` ledger retained three accepted hours at
 `10:00`, `11:00`, and `12:00`. None is carried forward because source
@@ -249,6 +251,21 @@ the normal lifecycle, so neither copy gains an archive or normal manifest.
 Idempotent reruns still perform create-if-absent and remote read-back
 verification for all three objects before succeeding. Missing, partial,
 tampered, post-boundary, or orphan resolution state keeps ring health red.
+
+The approved production resolution completed on `2026-08-17` for receipt
+`29b09463cc8554f1a950ea7c5860be1573a102bc1c07d6f64877239972f48958`.
+It preserves the 399,238,014-byte source with SHA-256
+`723290d5c5a569220cf2d21e58db43cc7bc07b0021e66bb0c2000c3ac5ea716b`
+under the fixed remote quarantine prefix and binds it before the exact
+`2026-08-17T12:00:00Z` boundary. The first run created all three objects; the
+second returned `already_resolved:true` with zero new objects after bounded
+read-back verification. Catch-up then uploaded and verified 22 segments, and
+removed 17 local segments only after their existing remote proofs and the
+48-hour retention check. Ring health at `2026-08-17T06:48:13Z` reported zero
+unresolved or malformed quarantine entries, one resolved entry, zero unsealed
+closed segments, zero unuploaded segments, fresh uploads, all capacity/free
+gates green, and 116 GiB free on the ring volume. The API stayed healthy and
+the enabled sync timer was restored.
 
 Rollback state is retained under `/etc/polyedge/rollback`, including
 `20260814T134524Z-azure-primary-e504c51`,
