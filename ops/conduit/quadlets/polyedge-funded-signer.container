@@ -9,6 +9,7 @@ Requires=polyedge-network.service
 Image=registry.example.invalid/polyedge-venue-probe@sha256:0000000000000000000000000000000000000000000000000000000000000000
 ContainerName=polyedge-funded-signer
 Network=polyedge.network
+User=986:982
 EnvironmentFile=/etc/polyedge/funded-signer.env
 Volume=/run/polyedge-federated-funded-signer:/run/credentials:ro,Z
 Secret=polyedge-polymarket-private-key,type=env,target=POLYMARKET_PRIVATE_KEY
@@ -17,7 +18,9 @@ Secret=polyedge-polymarket-api-secret,type=env,target=POLYMARKET_API_SECRET
 Secret=polyedge-polymarket-api-passphrase,type=env,target=POLYMARKET_API_PASSPHRASE
 Secret=polyedge-polymarket-relayer-api-key,type=env,target=POLYMARKET_RELAYER_API_KEY
 Exec=node src/funded-direct-service.mjs
-PodmanArgs=--cpus=0.75 --memory=2g --pids-limit=512 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges --pull=never --log-driver=journald
+# ponytail: OCI Podman 4.9 returns EACCES for container UDP with no-new-privileges;
+# restore it after a runtime upgrade passes the funded DNS/token smoke test.
+PodmanArgs=--cpus=0.75 --memory=2g --pids-limit=512 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --pull=never --log-driver=journald
 
 [Service]
 Restart=on-failure

@@ -69,3 +69,8 @@ grep -F 'Authorization: Bearer %%s' "$root/quadlets/polyedge-api.container" >/de
 grep -F '"$$API_BEARER_TOKEN"' "$root/quadlets/polyedge-api.container" >/dev/null
 grep -Fx 'HealthOnFailure=kill' "$root/quadlets/polyedge-api.container" >/dev/null
 grep -F -- '--pull=never --log-driver=journald' "$root/quadlets/polyedge-api.container" >/dev/null
+grep -Fx 'User=986:982' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+if grep -Fq -- '--security-opt=no-new-privileges' "$root/quadlets/polyedge-funded-signer.container"; then
+  echo 'funded signer cannot use the OCI Podman 4.9 no-new-privileges network path' >&2
+  exit 1
+fi
