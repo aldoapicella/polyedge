@@ -57,6 +57,7 @@ phase_pair_allowed() {
   case "$1:$2:$3" in
     azure-only:azure-only:azure-only | \
       azure-oci-transition:azure-only:azure-only | \
+      azure-oci-transition:azure-oci-transition:azure-only | \
       azure-oci-transition:azure-oci-transition:azure-oci-transition) return 0 ;;
     *) return 1 ;;
   esac
@@ -145,7 +146,7 @@ self_test() (
   accept_pair azure-oci-transition azure-only azure-only
   accept_pair azure-oci-transition azure-oci-transition azure-oci-transition
   reject_pair azure-oci-transition azure-only azure-oci-transition
-  reject_pair azure-oci-transition azure-oci-transition azure-only
+  accept_pair azure-oci-transition azure-oci-transition azure-only
   reject_pair azure-oci-transition invalid azure-oci-transition
   reject_pair azure-oci-transition azure-oci-transition invalid
 )
