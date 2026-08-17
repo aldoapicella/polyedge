@@ -1055,7 +1055,15 @@ jobs:
           const imagePublishStart = workflow.lastIndexOf(
             "- name: Build and publish immutable producer and funded worker images");
           const imagePublishEnd = workflow.indexOf("\n      - name:", imagePublishStart + 1);
-          assertOrdered(imagePublishStart, imagePublishEnd);
+          const preMutationPhaseGuardStart = workflow.lastIndexOf(
+            "\n      - name: Verify exact funded receiver and network phase before mutation",
+            imagePublishStart);
+          assertOrdered(preMutationPhaseGuardStart, imagePublishStart, imagePublishEnd);
+          const preMutationPhaseGuard = workflow.slice(preMutationPhaseGuardStart, imagePublishStart);
+          assert.match(preMutationPhaseGuard,
+            /verify-funded-network-rule-contract\.sh[\s\\]*--pre-mutation/);
+          for (const mutation of ["docker push", "az deployment group", "az role assignment create",
+            "az servicebus queue update"]) assert.equal(preMutationPhaseGuard.includes(mutation), false);
           const imagePublish = workflow.slice(imagePublishStart, imagePublishEnd);
           assert.match(imagePublish,
             /retry_registry\(\)[\s\S]*for attempt in 1 2 3[\s\S]*retry_registry az acr login[\s\S]*retry_registry docker push "\$producer_tag"[\s\S]*retry_registry docker push "\$funded_tag"/);
@@ -1920,6 +1928,41 @@ jobs:
             --query properties.latestRevisionName \
             -o tsv > protected-qset-revision-before.txt
           test -s protected-qset-revision-before.txt
+
+      - name: Verify exact funded receiver and network phase before mutation
+        run: |
+          set -euo pipefail
+          queue_id=$(az servicebus queue show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --name "$SERVICE_BUS_QUEUE" \
+            --query id -o tsv)
+          test -n "$queue_id"
+          az role assignment list \
+            --scope "$queue_id" \
+            --fill-principal-name false \
+            --only-show-errors \
+            -o json > funded-receiver-assignments-before-mutation.json
+          az servicebus namespace network-rule-set show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --namespace-name "$SERVICE_BUS_NAMESPACE" \
+            --only-show-errors \
+            -o json > funded-network-before-mutation.json
+          producer_egress_ip=$(az network public-ip show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name pip-polyedge-venue-neu-egress-2 \
+            --query ipAddress -o tsv)
+          executor_egress_ip=$(az network public-ip show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name pip-polyedge-execution-cl-egress \
+            --query ipAddress -o tsv)
+          scripts/verify-funded-network-rule-contract.sh --pre-mutation \
+            funded-network-before-mutation.json \
+            funded-receiver-assignments-before-mutation.json \
+            "$queue_id" \
+            "$FUNDED_RECEIVER_TRANSITION_PHASE" \
+            "$producer_egress_ip" \
+            "$executor_egress_ip"
 
       - name: Build and publish immutable producer and funded worker images
         id: images
@@ -5149,7 +5192,6 @@ jobs:
           test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Sender'] | length(@)" -o tsv)" = "1"
           az role assignment list \
             --scope "$queue_id" \
-            --all \
             --fill-principal-name false \
             --only-show-errors \
             -o json > service-bus-queue-role-assignments.json
