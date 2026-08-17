@@ -1223,13 +1223,15 @@ jobs:
             /child_failed_closed_pre_submission[\s\S]*reservation_count[\s\S]*released_no_order/);
           const pointerPreflightMarker = workflow.indexOf(
             "FUNDED_POINTER_PREFLIGHT_REQUESTED=true", pointerPreflightDeployment);
+          const pointerPreflightRun = workflow.indexOf(
+            "RUN_BOT_ON_STARTUP=true", pointerPreflightDeployment);
           const pointerPreflight = workflow.indexOf(
             "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true", pointerPreflightDeployment);
           const pointerPreflightRestore = workflow.indexOf(
             "--remove-env-vars STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT", pointerPreflight);
           const enableService = workflow.indexOf(
             "- name: Enable v10 only after the zero-write preflight passes", pointerPreflightRestore);
-          assertOrdered(pointerPreflightMarker, pointerPreflight,
+          assertOrdered(pointerPreflightMarker, pointerPreflightRun, pointerPreflight,
             pointerPreflightRestore, enableService);
           const producerConsoleQuery = "ContainerAppName_s == '$" + "INTENT_PRODUCER_APP'";
           assert.equal(workflow.includes(producerConsoleQuery), false);
@@ -2801,6 +2803,7 @@ jobs:
             --name "$INTENT_PRODUCER_APP" \
             --image "${{ steps.images.outputs.producer_reference }}" \
             --set-env-vars \
+              RUN_BOT_ON_STARTUP=true \
               FUNDED_DIRECT_SERVICE_BUS_ENABLED=true \
               FUNDED_DIRECT_SERVICE_BUS_NAMESPACE="$SERVICE_BUS_NAMESPACE" \
               FUNDED_DIRECT_SERVICE_BUS_QUEUE="$SERVICE_BUS_QUEUE" \
@@ -2856,6 +2859,7 @@ jobs:
           }
           test "$(producer_pointer_env EXECUTION_MODE)" = "paper"
           test "$(producer_pointer_env ALLOW_LIVE)" = "false"
+          test "$(producer_pointer_env RUN_BOT_ON_STARTUP)" = "true"
           test "$(producer_pointer_env STRATEGY_INTENT_OPERATOR_DIRECT)" = "true"
           test "$(producer_pointer_env STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT)" = "true"
           test "$(producer_pointer_env FUNDED_DIRECT_SERVICE_BUS_ENABLED)" = "true"
