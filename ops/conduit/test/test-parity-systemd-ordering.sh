@@ -8,7 +8,8 @@ health=$root/ops/conduit/systemd/polyedge-ring-health.service
 parity=$root/ops/conduit/systemd/polyedge-parity-hourly.service
 
 grep -Fx 'OnBootSec=2min' "$timer"
-grep -Fx 'OnUnitInactiveSec=1min' "$timer"
+grep -Fx 'OnCalendar=*-*-* *:01/5:00 UTC' "$timer"
+grep -Fx 'Persistent=true' "$timer"
 ! grep -Eq '^(OnCalendar|Persistent)=' "$timer"
 grep -Fx 'AccuracySec=1s' "$timer"
 grep -Fx 'RandomizedDelaySec=0' "$timer"
