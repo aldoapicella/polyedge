@@ -8,6 +8,8 @@ on:
       - ".github/workflows/verify-funded-v10-settlement.mjs"
       - "scripts/test-verify-funded-v10-capital.sh"
       - "scripts/verify-funded-v10-capital.sh"
+      - "scripts/test-verify-funded-receiver-role-contract.sh"
+      - "scripts/verify-funded-receiver-role-contract.sh"
       - "scripts/fence-funded-queue-and-wait-empty.sh"
       - "scripts/test-fence-funded-queue-and-wait-empty.sh"
       - "crates/polyedge-api/**"
@@ -32,6 +34,14 @@ on:
         required: true
         default: false
         type: boolean
+      funded_receiver_transition_phase:
+        description: Exact funded queue receiver contract; Azure-only remains the fail-closed default
+        required: true
+        default: azure-only
+        type: choice
+        options:
+          - azure-only
+          - azure-oci-transition
 
 permissions:
   contents: read
@@ -1419,6 +1429,7 @@ jobs:
           NODE
           bash scripts/test-fence-funded-queue-and-wait-empty.sh
           bash scripts/test-verify-funded-v10-capital.sh
+          bash scripts/test-verify-funded-receiver-role-contract.sh
           git diff --check
 
   diagnose-funded-lifecycle:
@@ -1862,6 +1873,7 @@ jobs:
       PROTECTED_QSET_APP: polyedge-shadow-qset-neu
       SERVICE_BUS_NAMESPACE: sb-polyedge-funded-cl-6urdjr5nmwx7w
       SERVICE_BUS_QUEUE: funded-dynamic-quote-intents
+      FUNDED_RECEIVER_TRANSITION_PHASE: ${{ inputs.funded_receiver_transition_phase }}
       FUNDED_JOB: polyedge-funded-direct-cl-job
       FUNDED_WARMUP_JOB: polyedge-funded-warmup-cl
       LEGACY_NEU_FUNDED_JOB: polyedge-funded-ladder-neu-job
@@ -5119,7 +5131,16 @@ jobs:
             --name "$SERVICE_BUS_QUEUE" \
             --query id -o tsv)
           test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Sender'] | length(@)" -o tsv)" = "1"
-          test "$(az role assignment list --scope "$queue_id" --query "[?roleDefinitionName=='Azure Service Bus Data Receiver'] | length(@)" -o tsv)" = "1"
+          az role assignment list \
+            --scope "$queue_id" \
+            --all \
+            --fill-principal-name false \
+            --only-show-errors \
+            -o json > service-bus-queue-role-assignments.json
+          scripts/verify-funded-receiver-role-contract.sh \
+            service-bus-queue-role-assignments.json \
+            "$queue_id" \
+            "$FUNDED_RECEIVER_TRANSITION_PHASE"
 
       - name: Verify service startup and qset isolation
         run: |

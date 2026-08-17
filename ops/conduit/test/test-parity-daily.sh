@@ -52,17 +52,17 @@ make_bundle() {
 }
 
 fixture() {
-  case_root=$1
+  case_root=$1 window_start=${2:-2026-08-11T00:00:00Z}
   mkdir -p "$case_root/run" "$case_root/ring/parity" "$case_root/ring/jobs/research/reports/research/daily" \
     "$case_root/ring/jobs/research/data/research/daily"
   chmod 0750 "$case_root/ring/parity"
-  jq -n '{schemaVersion:1,status:"in_progress",windowStartUtc:"2026-08-11T06:00:00Z",azureAuthoritative:true,azureDeletionAllowed:false,acceptedCleanLiveHours:7,acceptedHourlyEvidence:[{fixture:true}],completedDailyCycles:0,acceptedDailyEvidence:[],rebootRecoveryPassed:false,shadowQsetEnabled:false,fundedSignerEnabled:false}' \
+  jq -n --arg start "$window_start" '{schemaVersion:1,status:"in_progress",windowStartUtc:$start,azureAuthoritative:true,azureDeletionAllowed:false,acceptedCleanLiveHours:7,acceptedHourlyEvidence:[{fixture:true}],completedDailyCycles:0,acceptedDailyEvidence:[],rebootRecoveryPassed:false,shadowQsetEnabled:false,fundedSignerEnabled:false}' \
     >"$case_root/ring/parity/ledger.json"
   chmod 0640 "$case_root/ring/parity/ledger.json"
   jq -n '{capacity_ok:true,free_ok:true,upload_fresh:true,unsealed_closed_count:0,unuploaded_count:0}' >"$case_root/ring/status.json"
   chmod 0640 "$case_root/ring/status.json"
   cat >"$case_root/parity.env" <<EOF
-POLYEDGE_PARITY_WINDOW_START_UTC=2026-08-11T06:00:00Z
+POLYEDGE_PARITY_WINDOW_START_UTC=$window_start
 POLYEDGE_PARITY_LEDGER=$case_root/ring/parity/ledger.json
 POLYEDGE_PARITY_RING_ROOT=$case_root/ring
 POLYEDGE_PARITY_DAILY_REPORT_ROOT=$case_root/ring/jobs/research/reports/research/daily
@@ -110,6 +110,20 @@ run_recorder "$prewindow" 2026-08-10 >/dev/null
 [ "$(sha256sum "$prewindow/ring/parity/ledger.json")" = "$prewindow_ledger_sha" ]
 [ ! -e "$prewindow/ring/parity/daily" ]
 
+noon=$root/noon
+fixture "$noon" 2026-08-17T12:00:00Z
+noon_ledger_sha=$(sha256sum "$noon/ring/parity/ledger.json")
+run_recorder "$noon" 2026-08-17 >/dev/null
+[ "$(sha256sum "$noon/ring/parity/ledger.json")" = "$noon_ledger_sha" ]
+[ ! -e "$noon/ring/parity/daily" ]
+make_bundle "$noon" 2026-08-18 2026-08-19T08:00:00Z
+run_recorder "$noon" 2026-08-18 >/dev/null
+jq -e '.completedDailyCycles == 1 and (.acceptedDailyEvidence | length) == 1 and .acceptedDailyEvidence[0].cycleDate == "2026-08-18"' \
+  "$noon/ring/parity/ledger.json" >/dev/null
+make_bundle "$noon" 2026-08-19 2026-08-20T08:00:00Z
+run_recorder "$noon" 2026-08-19 >/dev/null
+[ "$(jq -r '.completedDailyCycles' "$noon/ring/parity/ledger.json")" = 2 ]
+
 success=$root/success
 fixture "$success"
 make_bundle "$success" 2026-08-11 2026-08-12T08:00:00Z
@@ -121,6 +135,7 @@ run_recorder "$success" 2026-08-11 >/dev/null
 evidence_sha=$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")" = "$evidence_sha" ]
+jq -e '.completedDailyCycles == 1 and (.acceptedDailyEvidence | length) == 1' "$success/ring/parity/ledger.json" >/dev/null
 make_bundle "$success" 2026-08-12 2026-08-13T08:00:00Z
 run_recorder "$success" 2026-08-12 >/dev/null
 [ "$(jq -r '.completedDailyCycles' "$success/ring/parity/ledger.json")" = 2 ]

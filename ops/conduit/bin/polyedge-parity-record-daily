@@ -63,8 +63,11 @@ window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'forma
   || die 'formal window start is not canonical UTC'
 first_date=$(date -u -d "@$window_epoch" +%Y-%m-%d)
 first_epoch=$(date -u -d "$first_date 00:00:00Z" +%s)
+if [ "$window_epoch" -ne "$first_epoch" ]; then
+  first_epoch=$((first_epoch + 86400))
+fi
 if [ "$target_epoch" -lt "$first_epoch" ]; then
-  echo "daily cycle $target excluded before formal window; ledger unchanged"
+  echo "daily cycle $target excluded before first full UTC day; ledger unchanged"
   exit 0
 fi
 
