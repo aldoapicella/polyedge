@@ -1,9 +1,87 @@
 {
-  "schemaVersion": 1,
-  "capturedAtUtc": "2026-08-09T15:34:00Z",
+  "schemaVersion": 2,
+  "capturedAtUtc": "2026-08-17T06:58:49Z",
   "azureJobCount": 19,
   "liveOciEquivalentCount": 8,
   "azureDeletionAllowed": false,
+  "azureLiveInventory": {
+    "containerAppCount": 4,
+    "containerAppJobCount": 19,
+    "managedEnvironmentCount": 3,
+    "natGatewayCount": 2,
+    "vnetCount": 2,
+    "publicIpCount": 4,
+    "managedLoadBalancerCount": 2,
+    "allContainerAppsRunningWithMinimumReplica": true,
+    "networkDeletionCandidateCount": 0,
+    "costManagement": {
+      "periodStartUtc": "2026-08-01T00:00:00Z",
+      "usageAvailableThroughUtc": "2026-08-16T23:59:59Z",
+      "resourceGroupPretaxUsd": 226.2,
+      "containerAppsUsd": 89.69,
+      "natGatewayUsd": 54.36,
+      "virtualNetworkUsd": 3.78,
+      "directComputeNetworkSubtotalUsd": 147.83
+    }
+  },
+  "apps": [
+    {
+      "azureApp": "polyedge-dev",
+      "status": "running",
+      "ociUnits": ["polyedge-api.service", "polyedge-frontend.service"],
+      "classification": "oci_candidate_azure_authoritative",
+      "azureDeletionAllowed": false,
+      "requiredProof": ["72_hour_parity", "two_daily_cycles", "reboot_recovery", "rollback"]
+    },
+    {
+      "azureApp": "polyedge-shadow-neu",
+      "status": "running",
+      "classification": "human_identity_or_retirement_decision",
+      "azureDeletionAllowed": false,
+      "requiredDecision": "Close the shadow correction lane and either map its separate identity to OCI or explicitly retire it."
+    },
+    {
+      "azureApp": "polyedge-shadow-qset-neu",
+      "status": "running",
+      "classification": "qset_blocked",
+      "azureDeletionAllowed": false,
+      "requiredDecision": "Retire campaign-2026-07-28-qset-v1 or approve a new complete sealed campaign; no evidence waiver."
+    },
+    {
+      "azureApp": "polyedge-funded-direct-cl",
+      "status": "running",
+      "ociUnit": "polyedge-funded-signer.service",
+      "classification": "funded_cutover_blocked",
+      "azureDeletionAllowed": false,
+      "requiredProof": ["funded_lifecycle", "settlement", "queue_and_dlq", "identity", "origin", "parity", "rollback"]
+    }
+  ],
+  "networkDependencies": [
+    {
+      "managedEnvironment": "polyedge-dev-env",
+      "occupancy": "polyedge-dev plus 8 jobs",
+      "network": "platform_managed",
+      "azureDeletionAllowed": false
+    },
+    {
+      "managedEnvironment": "polyedge-venue-neu-env",
+      "occupancy": "2 apps plus 8 jobs",
+      "vnet": "vnet-polyedge-venue-neu",
+      "natGateway": "nat-polyedge-venue-neu",
+      "natSubnetAttached": true,
+      "managedLoadBalancerBackendPoolCount": 1,
+      "azureDeletionAllowed": false
+    },
+    {
+      "managedEnvironment": "polyedge-execution-cl-env",
+      "occupancy": "polyedge-funded-direct-cl plus 3 jobs",
+      "vnet": "vnet-polyedge-execution-cl",
+      "natGateway": "nat-polyedge-execution-cl",
+      "natSubnetAttached": true,
+      "managedLoadBalancerBackendPoolCount": 1,
+      "azureDeletionAllowed": false
+    }
+  ],
   "jobs": [
     {
       "azureJob": "polyedge-data-freshness-job",

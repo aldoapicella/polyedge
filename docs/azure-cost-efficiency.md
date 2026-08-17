@@ -346,6 +346,23 @@ qset campaign gate.
   subnet template, then re-run storage and recorder checks. Do not detach either
   NAT gateway or delegation.
 
+## OCI migration live cost snapshot (2026-08-17)
+
+The live `rg-polyedge-dev` reconciliation found four running Container Apps,
+19 provisioned jobs, three occupied managed environments, two attached NAT
+gateways, two delegated VNets, four allocated public IPs, and two
+managed-environment load balancers with active backend pools. None is currently
+an unused standalone deletion target.
+
+Cost Management actuals from August 1 through usage available on August 16 are
+$226.20 pretax. Container Apps are $89.69, NAT Gateway is $54.36, and Virtual
+Network is $3.78, for a $147.83 direct compute/network subtotal. Treat that
+subtotal as the near-term migration savings target, not realized savings: Azure
+remains authoritative until every app and job mapping, 72-hour parity, two full
+daily cycles, reboot recovery, rollback, funded, and qset gates pass. The
+machine-readable inventory and per-lane disposition are in
+`ops/conduit/compute-plane-mapping.json`.
+
 ## Storage growth follow-up
 
 Raw event growth is the remaining unbounded cost driver. The current update does

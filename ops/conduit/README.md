@@ -306,6 +306,17 @@ historical window started at the untouched `03:00` boundary. Qset remains
 disabled, the local funded signer remains masked, and no Azure compute or
 network resource is deletion-eligible yet.
 
+The live Azure reconciliation at `2026-08-17T06:58:49Z` is captured in
+`compute-plane-mapping.json`. All four Container Apps remain running with a
+minimum replica, all three managed environments are occupied, and both NAT
+gateways and managed load balancers are attached to active environment
+networks; the current network deletion-candidate count is therefore zero.
+Cost Management usage available through August 16 totals $226.20 pretax for
+the resource group. Container Apps ($89.69), NAT Gateway ($54.36), and Virtual
+Network ($3.78) account for $147.83 of that total and remain the direct
+compute/network savings target after the mapping, parity, reboot, rollback,
+funded, and qset gates pass.
+
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
 requires one recorder instance with exact in-segment and cross-hour sequence
