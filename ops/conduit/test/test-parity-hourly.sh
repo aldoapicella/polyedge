@@ -143,7 +143,12 @@ case "$1" in
       *) exit 2 ;;
     esac
     ;;
-  show) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+  show)
+    case "${2:-}" in
+      multi-user.target) printf '%s\n' "${FAKE_FUNDED_TARGET_WANTS:-polyedge-funded-signer.service}" ;;
+      *) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+    esac
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -482,6 +487,7 @@ run_collector() {
     FAKE_OCI_IMAGE="$oci_image" FAKE_OCI_IMAGE_DIGEST="$oci_image_digest" FAKE_API_STATUS="$case_root/api-status.json" \
     FAKE_FUNDED_ACTIVE="${FAKE_FUNDED_ACTIVE:-0}" FAKE_QSET_ACTIVE="${FAKE_QSET_ACTIVE:-0}" \
     FAKE_FUNDED_ENABLEMENT="${FAKE_FUNDED_ENABLEMENT:-enabled}" \
+    FAKE_FUNDED_TARGET_WANTS="${FAKE_FUNDED_TARGET_WANTS:-polyedge-funded-signer.service}" \
     FAKE_FUNDED_ALERT="${FAKE_FUNDED_ALERT:-0}" FAKE_FUNDED_FAILED_CLOSED="${FAKE_FUNDED_FAILED_CLOSED:-0}" \
     FAKE_FUNDED_BURST="${FAKE_FUNDED_BURST:-0}" FAKE_FUNDED_GAP="${FAKE_FUNDED_GAP:-0}" \
     FAKE_FUNDED_RESTART="${FAKE_FUNDED_RESTART:-0}" FAKE_FUNDED_TOKEN_GAP="${FAKE_FUNDED_TOKEN_GAP:-0}" \
@@ -798,6 +804,15 @@ generated_funded=$root/generated-funded
 fixture "$generated_funded"
 activate_funded_fixture "$generated_funded"
 FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_ENABLEMENT=generated run_collector "$generated_funded" >/dev/null
+
+generated_not_wanted=$root/generated-not-wanted
+fixture "$generated_not_wanted"
+activate_funded_fixture "$generated_not_wanted"
+if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_ENABLEMENT=generated FAKE_FUNDED_TARGET_WANTS=polyedge-api.service \
+  run_collector "$generated_not_wanted" >/dev/null 2>&1; then
+  echo 'generated funded signer without a reboot-target dependency unexpectedly passed' >&2
+  exit 1
+fi
 
 reused_masked_ledger=$root/reused-masked-ledger
 fixture "$reused_masked_ledger"

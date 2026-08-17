@@ -563,8 +563,14 @@ if [ "$POLYEDGE_PARITY_FUNDED_MODE" = disabled ]; then
   [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
   if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
 else
-  case "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" in
-    enabled|generated) ;;
+  funded_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
+  case "$funded_enablement" in
+    enabled) ;;
+    generated)
+      systemctl show multi-user.target --property=Wants --value | tr ' ' '\n' \
+        | grep -Fx polyedge-funded-signer.service >/dev/null \
+        || die 'generated funded signer is not wanted by the reboot target'
+      ;;
     *) die 'funded signer is not enabled for reboot recovery' ;;
   esac
   [ "$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)" = enabled ] \
