@@ -48,6 +48,7 @@ sudo install -m 0755 ops/conduit/bin/polyedge-parity-hourly /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-parity-record-daily /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-github-deploy /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-quadlet-deploy /usr/local/sbin/
+sudo install -m 0755 ops/conduit/bin/polyedge-funded-secret-bootstrap /usr/local/sbin/
 sudo install -m 0440 ops/conduit/sudoers/polyedge-deploy /etc/sudoers.d/
 sudo install -m 0644 ops/conduit/journald/polyedge.conf /etc/systemd/journald.conf.d/
 sudo install -m 0644 ops/conduit/caddy/Caddyfile /etc/caddy/Caddyfile
@@ -401,6 +402,25 @@ with mode `0600`; each container receives only its lane at `/run/credentials`.
 The Rust client still supports the reviewed client-secret-file rollback, but a
 lane must set exactly one credential-file variable. Never put a JWT, client
 secret, private key, or join token in Git, shell arguments, chat, or logs.
+
+After the funded-signer identity has read access to the existing Key Vault
+secrets, and while `polyedge-funded-signer.service` is stopped, bootstrap its
+five rootful Podman secrets exactly once:
+
+```sh
+sudo env \
+  AZURE_TENANT_ID=9767f0dc-e83f-4cc1-94e1-0d5f9d287d32 \
+  AZURE_CLIENT_ID=d9ce9154-66a6-4bdb-839f-0da7b02b38da \
+  /usr/local/sbin/polyedge-funded-secret-bootstrap
+```
+
+The helper accepts only those identity bindings, the five funded Key Vault
+names, and the five Quadlet secret names. It refuses to overwrite or delete a
+pre-existing Podman secret. If a later create fails, it exits nonzero and lists
+only the names created before the failure. Keep the service stopped, inspect
+those names with `sudo podman secret inspect NAME`, manually remove that exact
+partial set with `sudo podman secret rm NAME...`, and rerun; the helper never
+performs that destructive recovery itself.
 
 ## Separate UAMI workload identities
 
