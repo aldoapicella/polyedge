@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "capturedAtUtc": "2026-08-14T18:03:45Z",
+  "capturedAtUtc": "2026-08-17T08:35:14Z",
   "status": "live-verified",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -177,31 +177,181 @@
           "api://AzureADTokenExchange"
         ]
       },
-      "assignmentCount": 5,
+      "assignmentCount": 10,
       "exactPlanMatch": true,
       "workloadEnabled": false,
+      "roleAssignments": [
+        {
+          "id": "5d3e8e9b-2d87-4455-9751-b2f5e76f46dc",
+          "role": "Storage Blob Data Contributor",
+          "roleDefinitionId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence"
+        },
+        {
+          "id": "fcb56a4f-ebd6-4735-b248-8ea164e0f2df",
+          "role": "Storage Blob Data Reader",
+          "roleDefinitionId": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events"
+        },
+        {
+          "id": "bd77814b-525e-4522-adac-92784228bd06",
+          "role": "Storage Blob Data Reader",
+          "roleDefinitionId": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research"
+        },
+        {
+          "id": "58cb8856-1069-4ebc-8dc6-6418e2a004e5",
+          "role": "Storage Blob Data Reader",
+          "roleDefinitionId": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models"
+        },
+        {
+          "id": "fa593ab9-fa6a-58d8-b1ca-696b38843edf",
+          "role": "Azure Service Bus Data Receiver",
+          "roleDefinitionId": "4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.ServiceBus/namespaces/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+        },
+        {
+          "id": "7e0c070f-beda-5845-a895-2b3efcef5063",
+          "role": "Key Vault Secrets User",
+          "roleDefinitionId": "4633458b-17de-408a-b874-0445c86b69e6",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-private-key"
+        },
+        {
+          "id": "0965ea81-a451-5029-8070-6e319b3c233d",
+          "role": "Key Vault Secrets User",
+          "roleDefinitionId": "4633458b-17de-408a-b874-0445c86b69e6",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-key"
+        },
+        {
+          "id": "8ae6d49a-402d-5431-a82d-e95c64c9d61a",
+          "role": "Key Vault Secrets User",
+          "roleDefinitionId": "4633458b-17de-408a-b874-0445c86b69e6",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-secret"
+        },
+        {
+          "id": "eb9e7b65-1391-5237-95d4-ffc77078b42d",
+          "role": "Key Vault Secrets User",
+          "roleDefinitionId": "4633458b-17de-408a-b874-0445c86b69e6",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-passphrase"
+        },
+        {
+          "id": "0fc8d996-6b8e-5b19-98e8-b9ba72f0108a",
+          "role": "Key Vault Secrets User",
+          "roleDefinitionId": "4633458b-17de-408a-b874-0445c86b69e6",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-relayer-api-key"
+        }
+      ],
       "positiveChecks": [
         {
           "operation": "blobContainer.getProperties",
           "target": "polyedge-funded-evidence",
+          "result": "success"
+        },
+        {
+          "operation": "blobContainer.getProperties",
+          "target": "polyedge-shadow-events",
+          "result": "success"
+        },
+        {
+          "operation": "blobContainer.getProperties",
+          "target": "polyedge-research",
+          "result": "success"
+        },
+        {
+          "operation": "blobContainer.getProperties",
+          "target": "polyedge-models",
+          "result": "success"
+        },
+        {
+          "operation": "workloadIdentityTokenExchange",
+          "target": "https://servicebus.azure.net/.default",
+          "tokenCaptured": false,
+          "result": "success"
+        },
+        {
+          "operation": "jwtSvidAtomicRotation",
+          "target": "/run/polyedge-federated-funded-signer/azure-federated-token",
+          "sameContainerObservedReplacement": true,
+          "algorithm": "RS256",
+          "issuer": "https://oidc.jupiterlabs.dev",
+          "subject": "spiffe://polyedge.local/conduit/funded-signer",
+          "audiences": [
+            "api://AzureADTokenExchange"
+          ],
+          "lifetimeSeconds": 300,
+          "tokenCaptured": false,
+          "result": "success"
+        },
+        {
+          "operation": "keyVault.secretGet",
+          "target": "kvpolyedge6urdjr5nmwx7w",
+          "secrets": [
+            "polymarket-api-key",
+            "polymarket-api-passphrase",
+            "polymarket-api-secret",
+            "polymarket-private-key",
+            "polymarket-relayer-api-key"
+          ],
+          "valuesCaptured": false,
+          "result": "success"
+        },
+        {
+          "operation": "podmanSecrets.bootstrap",
+          "target": "rootful funded signer store",
+          "secrets": [
+            "polyedge-polymarket-api-key",
+            "polyedge-polymarket-api-passphrase",
+            "polyedge-polymarket-api-secret",
+            "polyedge-polymarket-private-key",
+            "polyedge-polymarket-relayer-api-key"
+          ],
+          "valuesCaptured": false,
+          "result": "success"
+        },
+        {
+          "operation": "serviceBus.peekMessages",
+          "target": "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents",
+          "activePeekedMessageCount": 0,
+          "deadLetterMessageCount": 868,
+          "consumed": false,
           "result": "success"
         }
       ],
       "negativeChecks": [
         {
           "target": "bot-events",
+          "operation": "blobContainer.getProperties",
           "statusCode": 403,
           "result": "denied"
         },
         {
           "target": "polyedge-research-qset",
+          "operation": "blobContainer.getProperties",
           "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "kvpolyedge6urdjr5nmwx7w/secrets",
+          "operation": "secretList",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "kvpolyedge6urdjr5nmwx7w/secrets/dashboard-auth-password",
+          "operation": "secretGet",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "rootful funded signer Podman secret store",
+          "operation": "nonRootRead",
           "result": "denied"
         }
       ],
       "negativeAssertions": [
         {
-          "assertion": "no Service Bus sender, qset, bot-events, table, storage-account, namespace, resource-group, or subscription role",
+          "assertion": "no Service Bus sender, qset, bot-events, table, storage-account, Service Bus namespace, Key Vault vault-level or non-approved-secret, resource-group, or subscription role",
           "passed": true
         }
       ]
