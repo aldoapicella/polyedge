@@ -90,6 +90,7 @@ jobs:
           ops/conduit/test/test-parity-hourly.sh
           ops/conduit/test/test-parity-daily.sh
           ops/conduit/test/test-funded-secret-bootstrap.sh
+          ops/conduit/test/test-funded-signer-env-example.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"
