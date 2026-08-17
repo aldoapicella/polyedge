@@ -1268,7 +1268,7 @@ jobs:
           assert.match(activation, /signal_to_send_ms <= \.signal_to_send_slo_ms/);
           assert.match(activation, /where tobool\(record\.order_submitted\) == true/);
           assert.match(activation,
-            /lifecycle_signal_deadline_monotonic=.*\+ 2400[\s\S]*lifecycle_ingestion_deadline_monotonic=.*\+ 300[\s\S]*queue_fenced_for_ingestion=false[\s\S]*fence-funded-queue-and-wait-empty\.sh[\s\S]*funded-v10-lifecycle-latency\.json/);
+            /lifecycle_signal_deadline_monotonic=.*\+ 5400[\s\S]*lifecycle_ingestion_deadline_monotonic=.*\+ 300[\s\S]*queue_fenced_for_ingestion=false[\s\S]*fence-funded-queue-and-wait-empty\.sh[\s\S]*funded-v10-lifecycle-latency\.json/);
           const ingestionFence = fs.readFileSync("scripts/fence-funded-queue-and-wait-empty.sh", "utf8");
           assert.match(ingestionFence,
             /for attempt in 1 2 3[\s\S]*--status SendDisabled[\s\S]*for attempt in \$\(seq 1 36\)[\s\S]*activeMessageCount == 0[\s\S]*scheduledMessageCount == 0[\s\S]*test "\$queue_drained" = true/);
@@ -1346,9 +1346,9 @@ jobs:
             /(capital_reconcile|preflight|lifecycle_signal|terminal)_deadline_monotonic=\$\(\( \$\(monotonic_seconds\) \+ ([0-9]+) \)\)/g
           )].map((match) => [match[1].replace("_signal", ""), Number(match[2])]));
           assert.deepEqual(waitBounds,
-            { capital_reconcile: 900, preflight: 2700, lifecycle: 2400, terminal: 2400 });
+            { capital_reconcile: 900, preflight: 5700, lifecycle: 5400, terminal: 2400 });
           assert.equal((workflow.match(/python3 -c 'import time; print\(int\(time\.monotonic\(\)\)\)'/g) || []).length, 4);
-          assert.ok(Object.values(waitBounds).reduce((sum, value) => sum + value, 0) <= 180 * 60);
+          assert.ok(Object.values(waitBounds).reduce((sum, value) => sum + value, 0) <= 240 * 60);
           const rollback = workflow.slice(
             workflow.lastIndexOf("- name: Restore the dormant funded service"));
           assert.match(rollback,
@@ -4519,9 +4519,9 @@ jobs:
                       {name:"ALLOW_FUNDED_DIRECT",value:"true"},
                       {name:"FUNDED_DIRECT_DRY_RUN",value:"true"},
                       {name:"FUNDED_DIRECT_PREFLIGHT_ONLY",value:"true"},
-                      {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"2401"},
+                      {name:"FUNDED_DIRECT_MAX_ITERATIONS",value:"5401"},
                       {name:"FUNDED_DIRECT_POLL_INTERVAL_MS",value:"1000"},
-                      {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"2400000"}
+                      {name:"FUNDED_DIRECT_MAX_IDLE_MS",value:"5400000"}
                     ]
                   )
                 else . end
@@ -4559,11 +4559,11 @@ jobs:
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_PREFLIGHT_ONLY" and .value == "true")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "2401")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_MAX_ITERATIONS" and .value == "5401")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
               | select(.name == "FUNDED_DIRECT_POLL_INTERVAL_MS" and .value == "1000")] | length) == 1
             and ([.[] | select(.name == "funded-direct") | .env[]
-              | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "2400000")] | length) == 1
+              | select(.name == "FUNDED_DIRECT_MAX_IDLE_MS" and .value == "5400000")] | length) == 1
           ' funded-preflight-execution.yaml
           preflight_execution=$(az containerapp job start \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -4575,7 +4575,7 @@ jobs:
           monotonic_seconds() {
             python3 -c 'import time; print(int(time.monotonic()))'
           }
-          preflight_deadline_monotonic=$(( $(monotonic_seconds) + 2700 ))
+          preflight_deadline_monotonic=$(( $(monotonic_seconds) + 5700 ))
           sleep_before_preflight_deadline() {
             local remaining=$(( preflight_deadline_monotonic - $(monotonic_seconds) ))
             [ "$remaining" -gt 0 ] || return 1
@@ -5546,11 +5546,11 @@ jobs:
             --name "$FUNDED_APP" \
             --query properties.latestReadyRevisionName -o tsv)" = "$funded_revision"
           lifecycle_ready=false
-          # Observe several 15-minute markets; warmup is not proof of a qualifying Place intent.
+          # Observe up to six 15-minute markets; warmup is not proof of a qualifying Place intent.
           monotonic_seconds() {
             python3 -c 'import time; print(int(time.monotonic()))'
           }
-          lifecycle_signal_deadline_monotonic=$(( $(monotonic_seconds) + 2400 ))
+          lifecycle_signal_deadline_monotonic=$(( $(monotonic_seconds) + 5400 ))
           lifecycle_ingestion_deadline_monotonic=$(( lifecycle_signal_deadline_monotonic + 300 ))
           queue_fenced_for_ingestion=false
           sleep_before_lifecycle_deadline() {
