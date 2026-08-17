@@ -70,10 +70,13 @@ grep -F '"$$API_BEARER_TOKEN"' "$root/quadlets/polyedge-api.container" >/dev/nul
 grep -Fx 'HealthOnFailure=kill' "$root/quadlets/polyedge-api.container" >/dev/null
 grep -F -- '--pull=never --log-driver=journald' "$root/quadlets/polyedge-api.container" >/dev/null
 grep -Fx 'User=986:982' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fx 'IP=10.89.0.250' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
 grep -Fx 'WantedBy=multi-user.target' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
 grep -Fx 'Wants=network-online.target polyedge-federated-token@funded-signer.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
-grep -Fx 'After=network-online.target polyedge-network.service polyedge-federated-token@funded-signer.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
-grep -Fx 'Requires=polyedge-network.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fx 'After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fx 'Requires=polyedge-network.service polyedge-funded-egress.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fq '10.89.0.250/32 ! -d 10.89.0.0/24' "$root/systemd/polyedge-funded-egress.service"
+grep -Fq -- '--to-source 10.0.0.81' "$root/systemd/polyedge-funded-egress.service"
 grep -Fq 'ExecStartPre=/usr/bin/bash -ec' "$root/quadlets/polyedge-funded-signer.container"
 grep -Fq '986:982:600:1' "$root/quadlets/polyedge-funded-signer.container"
 grep -Fq -- 'PodmanArgs=--cpus=0.5 ' "$root/quadlets/polyedge-funded-signer.container"

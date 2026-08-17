@@ -1,14 +1,15 @@
 [Unit]
 Description=PolyEdge isolated funded signer
 Wants=network-online.target polyedge-federated-token@funded-signer.service
-After=network-online.target polyedge-network.service polyedge-federated-token@funded-signer.service
-Requires=polyedge-network.service
+After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service
+Requires=polyedge-network.service polyedge-funded-egress.service
 
 [Container]
 # Replace the all-zero digest with the reviewed ARM64 venue-probe image digest.
 Image=registry.example.invalid/polyedge-venue-probe@sha256:0000000000000000000000000000000000000000000000000000000000000000
 ContainerName=polyedge-funded-signer
 Network=polyedge.network
+IP=10.89.0.250
 User=986:982
 EnvironmentFile=/etc/polyedge/funded-signer.env
 Volume=/run/polyedge-federated-funded-signer:/run/credentials:ro,Z

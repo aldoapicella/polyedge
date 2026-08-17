@@ -414,6 +414,13 @@ The Rust client still supports the reviewed client-secret-file rollback, but a
 lane must set exactly one credential-file variable. Never put a JWT, client
 secret, private key, or join token in Git, shell arguments, chat, or logs.
 
+The funded signer alone uses fixed container IP `10.89.0.250`. The required
+`polyedge-funded-egress.service` SNATs only that address to secondary private IP
+`10.0.0.81`, whose reserved OCI public IP is `149.130.186.60`; it does not
+change the host default route or SSH traffic. Before activation, require the
+unit to be active and the exact rule to pass `iptables -t nat -C`, then verify
+the signer container observes the reserved public IP.
+
 After the funded-signer identity has read access to the existing Key Vault
 secrets, and while `polyedge-funded-signer.service` is stopped, bootstrap its
 five rootful Podman secrets exactly once:

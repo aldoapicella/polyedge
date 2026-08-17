@@ -563,7 +563,10 @@ if [ "$POLYEDGE_PARITY_FUNDED_MODE" = disabled ]; then
   [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
   if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
 else
-  [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = enabled ] || die 'funded signer is not enabled for reboot recovery'
+  case "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" in
+    enabled|generated) ;;
+    *) die 'funded signer is not enabled for reboot recovery' ;;
+  esac
   [ "$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)" = enabled ] \
     || die 'funded token rotation timer is not enabled for reboot recovery'
   systemctl is-active --quiet polyedge-funded-signer.service || die 'funded signer is inactive'

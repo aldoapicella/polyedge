@@ -134,7 +134,10 @@ case "$1" in
   is-enabled)
     case "$2" in
       polyedge-shadow-qset.timer) printf '%s\n' not-found; exit 1 ;;
-      polyedge-funded-signer.service|polyedge-federated-token@funded-signer.timer)
+      polyedge-funded-signer.service)
+        if [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ]; then printf '%s\n' "${FAKE_FUNDED_ENABLEMENT:-enabled}"; else printf '%s\n' masked; fi
+        ;;
+      polyedge-federated-token@funded-signer.timer)
         if [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ]; then printf '%s\n' enabled; else printf '%s\n' masked; fi
         ;;
       *) exit 2 ;;
@@ -478,6 +481,7 @@ run_collector() {
     FAKE_AZURE_EXECUTION="$case_root/azure-execution.json" FAKE_SAME_REPORT="$case_root/same.json" \
     FAKE_OCI_IMAGE="$oci_image" FAKE_OCI_IMAGE_DIGEST="$oci_image_digest" FAKE_API_STATUS="$case_root/api-status.json" \
     FAKE_FUNDED_ACTIVE="${FAKE_FUNDED_ACTIVE:-0}" FAKE_QSET_ACTIVE="${FAKE_QSET_ACTIVE:-0}" \
+    FAKE_FUNDED_ENABLEMENT="${FAKE_FUNDED_ENABLEMENT:-enabled}" \
     FAKE_FUNDED_ALERT="${FAKE_FUNDED_ALERT:-0}" FAKE_FUNDED_FAILED_CLOSED="${FAKE_FUNDED_FAILED_CLOSED:-0}" \
     FAKE_FUNDED_BURST="${FAKE_FUNDED_BURST:-0}" FAKE_FUNDED_GAP="${FAKE_FUNDED_GAP:-0}" \
     FAKE_FUNDED_RESTART="${FAKE_FUNDED_RESTART:-0}" FAKE_FUNDED_TOKEN_GAP="${FAKE_FUNDED_TOKEN_GAP:-0}" \
@@ -789,6 +793,11 @@ jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled 
   .services.fundedRuntime.maxHeartbeatGapSeconds == 60 and .services.fundedRuntime.tokenRefreshCount == 30 and
   .services.fundedRuntime.maxTokenRefreshGapSeconds == 120' \
   "$active_funded/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
+
+generated_funded=$root/generated-funded
+fixture "$generated_funded"
+activate_funded_fixture "$generated_funded"
+FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_ENABLEMENT=generated run_collector "$generated_funded" >/dev/null
 
 reused_masked_ledger=$root/reused-masked-ledger
 fixture "$reused_masked_ledger"

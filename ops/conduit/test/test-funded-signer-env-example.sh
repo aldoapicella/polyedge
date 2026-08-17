@@ -3,19 +3,21 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$root"
-set -a
-. "$root/ops/conduit/env/funded-signer.env.example"
-set +a
 
 node --input-type=module <<'NODE'
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-const session = JSON.parse(process.env.FUNDED_DIRECT_SESSION_MANIFEST_JSON);
+const envText = readFileSync("ops/conduit/env/funded-signer.env.example", "utf8");
+const env = Object.fromEntries(envText
+  .split("\n")
+  .filter((line) => line && !line.startsWith("#"))
+  .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+const session = JSON.parse(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON);
 const source = JSON.parse(readFileSync("research/configs/funded_direct_dynamic_quote_2026-08-13_v10.json", "utf8"));
 assert.deepEqual(session, source);
-assert.equal(`sha256:${createHash("sha256").update(JSON.stringify(session, null, 2)).digest("hex")}`, process.env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256);
+assert.equal(`sha256:${createHash("sha256").update(JSON.stringify(session, null, 2)).digest("hex")}`, env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256);
 const expected = {
   FUNDED_DIRECT_SERVICE_ENABLED: "false",
   FUNDED_DIRECT_ENGINE: "persistent_v1",
@@ -84,7 +86,7 @@ const expected = {
   POLYMARKET_RELAYER_API_KEY_ADDRESS: "0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921",
   VENUE_REDEMPTION_MAX_CONDITIONS: "1"
 };
-const declared = readFileSync("ops/conduit/env/funded-signer.env.example", "utf8")
+const declared = envText
   .split("\n")
   .filter((line) => line && !line.startsWith("#"))
   .map((line) => line.slice(0, line.indexOf("=")));
@@ -93,9 +95,9 @@ assert.deepEqual([...declared].sort(), [...Object.keys(expected), "FUNDED_DIRECT
 const assertExactBindings = (env) => {
   for (const [name, value] of Object.entries(expected)) assert.equal(env[name], value, name);
 };
-assertExactBindings(process.env);
+assertExactBindings(env);
 for (const name of Object.keys(expected)) {
-  assert.throws(() => assertExactBindings({ ...process.env, [name]: "wrong" }), { name: "AssertionError" });
+  assert.throws(() => assertExactBindings({ ...env, [name]: "wrong" }), { name: "AssertionError" });
 }
 NODE
 
