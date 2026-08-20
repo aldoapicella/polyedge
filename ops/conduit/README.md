@@ -14,7 +14,7 @@ and funded identities remain separate gates; a read SAS is not sufficient for
 the writers or leases.
 
 The API Quadlet persists its local recorder under `/srv/polyedge-ring`. Verify
-that path is the 260-GB block-volume mount (not a directory on `/`) before every
+that path is the 310-GB block-volume mount (not a directory on `/`) before every
 start: `findmnt -T /srv/polyedge-ring && df -h /srv/polyedge-ring`.
 
 Do **not** enable daily, replay, or qset shadow work on the boot disk. Their
@@ -90,20 +90,21 @@ after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260817T120000Z.json` is the staged masked-funded
-window. It starts with zero inherited credit at `2026-08-17T12:00:00Z`, keeps
-Azure authoritative and `azureDeletionAllowed:false`, and cannot finish before
-`2026-08-20T12:00:00Z`. Pre-window collections are excluded evidence only. A
-non-midnight start also excludes that partial UTC date from daily-cycle credit,
-so `2026-08-18` is the first eligible full daily cycle. Completion still
-requires 72 consecutive accepted hours, two successful OCI daily cycles,
-reboot and rollback proof, and explicit qset, funded, and deletion gates. The
-superseded `20260817T000000Z.json` ledger remains immutable with zero credit.
-If OCI funded ownership activates, leave this ledger and its evidence immutable
-and start a new full-hour `*-funded-active.json` ledger with
+Ledger `/srv/polyedge-ring/parity/20260820T160000Z-funded-active.json` is the
+current funded-active window. It starts with zero inherited credit at
+`2026-08-20T16:00:00Z`, keeps Azure authoritative and
+`azureDeletionAllowed:false`, and cannot finish before `2026-08-23T16:00:00Z`.
+Pre-window collections are excluded evidence only. A non-midnight start excludes
+that partial UTC date from daily-cycle credit, so `2026-08-21` is the first
+eligible full daily cycle. Completion still requires 72 consecutive accepted
+hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
+qset, funded, and deletion gates. The superseded
+`20260817T120000Z-funded-active.json` ledger remains immutable with zero credit
+after ring-capacity and funded-continuity failures. The new ledger binds
 `POLYEDGE_PARITY_FUNDED_MODE=active`, `fundedSignerEnabled:true`, and the exact
-image, UID:GID, session ID, session-manifest hash, and candidate-config hash.
-No masked-funded hour carries into that window.
+image, UID:GID, session ID, session-manifest hash, and candidate-config hash. No
+earlier hour carries into this window; the first eligible hourly credit is the
+completed `16:00-17:00Z` hour collected at `17:18Z`.
 
 The superseded `20260816T100000Z.json` ledger retained three accepted hours at
 `10:00`, `11:00`, and `12:00`. None is carried forward because source
@@ -215,13 +216,15 @@ received zero credit. The installed runner, recorder, image revision, and
 formal bindings now match the approved source; the first eligible daily cycle
 is the run after the formal boundary.
 
-The hot ring was expanded online from 210 GB to 260 GB after a burst raised the
-48-hour worst-case projection above the old capacity gate. The mounted
-filesystem now exposes 273,655,873,536 bytes, the conservative projection is
-213,297,534,144 bytes, and the 32-GiB ring reserve, sealing, and upload gates are
-all green. The boot filesystem remains separate with 26 GB free at 74% used,
-above the 15-GiB hard deployment floor. The five-minute disk guard and capped
-journald growth remain active; image pulls are not paused.
+The hot ring was expanded online from 210 GB to 260 GB on August 14 and from
+260 GB to 310 GB on August 20 after the measured 48-hour projection again
+exceeded the capacity gate. OCI reports 310 GB at 0 VPU/GB; the mounted
+filesystem exposes 326,492,274,688 bytes, with 131,765,489,664 bytes free. The
+conservative projection is 257,210,376,768 bytes, and the 32-GiB reserve,
+sealing, quarantine, and upload gates are all green. The boot filesystem remains
+separate with 25,461,936,128 bytes free at 75% used, above the 15-GiB hard
+deployment floor. The five-minute disk guard and capped journald growth remain
+active; image pulls are not paused.
 
 For v4 recorder segments, a discontinuous sequence proof is never repaired or
 sealed. The sync process writes a content-addressed receipt under
@@ -309,19 +312,18 @@ also remain at zero because of feed continuity or superseded source/image
 bindings; no credit is inherited. The exact Azure hourly deployment completed
 too late to prove its first scheduled execution before `02:00`, so that
 historical window started at the untouched `03:00` boundary. Qset remains
-disabled, the local funded signer remains masked, and no Azure compute or
-network resource is deletion-eligible yet.
+disabled and no Azure compute or network resource is
+deletion-eligible yet.
 
-The live Azure reconciliation at `2026-08-17T06:58:49Z` is captured in
-`compute-plane-mapping.json`. All four Container Apps remain running with a
-minimum replica, all three managed environments are occupied, and both NAT
-gateways and managed load balancers are attached to active environment
-networks; the current network deletion-candidate count is therefore zero.
-Cost Management usage available through August 16 totals $226.20 pretax for
-the resource group. Container Apps ($89.69), NAT Gateway ($54.36), and Virtual
-Network ($3.78) account for $147.83 of that total and remain the direct
-compute/network savings target after the mapping, parity, reboot, rollback,
-funded, and qset gates pass.
+The live Azure reconciliation on `2026-08-20` is captured in
+`compute-plane-mapping.json`. All four Container Apps remain provisioned, all
+three managed environments are occupied, and both NAT gateways and managed load
+balancers are attached to active environment networks; the current network
+deletion-candidate count is therefore zero. Cost Management usage for August
+1-19 totals $278.51 pretax, about $440/month when normalized. The
+evidence-backed removable compute/network opportunity is about $300-330/month
+after mapping, parity, reboot, rollback, funded, and qset gates pass. Immediate
+safe deletion savings remain $0.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
@@ -583,24 +585,30 @@ installed Azure SDK.
 
 The funded signer is a separate, no-ingress, read-only container. Only it gets
 the Podman wallet secrets and its dedicated Azure funded identity; the API and
-research jobs get neither. It has no install target and remains disabled until
+research jobs get neither. It was enabled only after
 the funded identity, exact non-secret environment, origin check, queue repair,
-and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review all pass. Root remains the
+and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review passed. Root remains the
 single-host trust ceiling and can administer both containers.
 
-The continuous funded v10 Azure service is live; the local OCI funded signer
-remains disabled. Guarded run `31946702630` passed safety/history, zero-write
-preflight, exact controls, Service Bus, origin and identity checks, qset
-isolation, warmup, and rollback checks. It then proved one genuinely submitted
-child lifecycle within the seven-second signal-to-send bound and waited for its
-exact terminal risk reservation before completing the cutover. The funded app
-has one ready replica with minimum and maximum replicas both one; the producer
-and funded queue handoff are enabled. The queue is `Active` with zero active or
-scheduled messages and 863 quarantined messages. The newest visible
-failed-closed service event predates the producer repair described below;
-nothing was replayed or purged. Post-submission failures release their
-reservation, so later orders resize from fully reconciled current equity under
-the v3 loss-tolerant reserve profile instead of inheriting stale campaign risk.
+The continuous funded v10 OCI signer is active on
+`ghcr.io/aldoapicella/polyedge-venue-probe:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
+as UID:GID `986:982`; the Azure signer is stopped with zero
+replicas and its controls disabled. The producer and funded queue handoff remain
+enabled. The queue is `Active` with zero active or scheduled messages and 930
+historical quarantined messages; nothing was replayed or purged. The
+loss-tolerant v3 profile preserves at least `$2` or 10% of fully reconciled
+current equity and resizes later orders to 5% of current equity after losses
+without martingale.
+
+On `2026-08-20`, exact reservation
+`e3ced30000241eaec55b59c437b00af5fd642c4de080afaa04807951eaf72e91` was
+reconciled after an ambiguous post-submission RPC failure. The reviewed recovery
+bound the immutable reservation and completion hashes, waited more than 24
+hours, authenticated against the production CLOB, proved zero open orders,
+post-reservation trades, unresolved positions, and exact positions, then used
+the reservation ETag for a single conditional finalization. Read-back reports
+`finalized_no_fill`, `order_submitted:true`, matched notional zero, complete
+reconciliation, zero-open proof, and an unresolved campaign index count of zero.
 
 The post-promotion audit found that a later primary template no longer carried
 the four non-secret operator-direct Service Bus producer bindings. They were

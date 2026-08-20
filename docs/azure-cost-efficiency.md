@@ -145,12 +145,13 @@ shortening the 30-day workspace retention does not reduce ingestion cost, and
 no live logging-plan change is justified before compute retirement.
 
 The OCI hot-ring volume was expanded online from 210 GB to 260 GB on
-2026-08-14 after the measured 48-hour worst-case projection exceeded the old
-capacity gate. The approved incremental estimate is about $1.28/month; it is a
-planning estimate, not an invoice claim. The change preserves the 48-hour local
-retention and 32-GiB ring reserve while enabling the much larger gated Azure
-compute/network savings above. It does not change the separate free-space gate
-on the boot filesystem.
+2026-08-14 and from 260 GB to 310 GB on 2026-08-20 as the measured 48-hour
+projection crossed the capacity gate. Each 50-GB increment is estimated at about
+$1.28/month at 0 VPU/GB; the total 100-GB increase is about $2.55/month versus
+the original volume. These are planning estimates, not invoice claims. The
+change preserves 48-hour local retention and the 32-GiB ring reserve while
+enabling the much larger gated Azure compute/network savings above. It does not
+change the separate 15-GiB free-space gate on the boot filesystem.
 
 ### Live utilization evidence
 
@@ -346,32 +347,21 @@ qset campaign gate.
   subnet template, then re-run storage and recorder checks. Do not detach either
   NAT gateway or delegation.
 
-## OCI migration live cost snapshot (2026-08-17)
+## OCI migration live cost snapshot (2026-08-20)
 
-The live `rg-polyedge-dev` reconciliation found four running Container Apps,
-19 provisioned jobs, three occupied managed environments, two attached NAT
-gateways, two delegated VNets, four allocated public IPs, and two
-managed-environment load balancers with active backend pools. None is currently
-an unused standalone deletion target.
+The live reconciliation found four provisioned Container Apps, 19 jobs, three
+occupied managed environments, two attached NAT gateways, four allocated public
+IPs, and two managed-environment load balancers. No network resource is an
+unused standalone deletion target. The qset job failure is an immutable evidence
+gap, not idle-resource proof.
 
-Cost Management actuals from August 1 through usage available on August 16 are
-$226.20 pretax. Container Apps are $89.69, NAT Gateway is $54.36, and Virtual
-Network is $3.78, for a $147.83 direct compute/network subtotal. Treat that
-subtotal as the near-term migration savings target, not realized savings: Azure
-remains authoritative until every app and job mapping, 72-hour parity, two full
-daily cycles, reboot recovery, rollback, funded, and qset gates pass. The
-machine-readable inventory and per-lane disposition are in
-`ops/conduit/compute-plane-mapping.json`.
-
-A straight-line 30.4375-day extrapolation of those 16 observed days is $430.31
-per month for the resource group and $281.22 per month for the direct
-compute/network subtotal. After the approved $1.28 monthly OCI volume increase,
-the estimated net reduction is $279.94 per month, leaving about $149.09 per
-month in Azure at the same run rate. This is a simple run-rate estimate, not an
-Azure forecast, and compute/network migration alone therefore does not meet the
-$15-$35 target. Later removal of compute-only logs and ACR, plus separately
-proven storage optimization, must close the remaining gap without deleting
-evidence or weakening retention.
+Cost Management actuals for August 1-19 are $278.51 pretax, roughly $440/month
+when normalized. The evidence-backed removable compute/network opportunity is
+about $300-330/month after executable mappings, 72 accepted hours, two OCI
+daily cycles, reboot recovery, rollback, funded acceptance, and a valid qset
+disposition all pass. Immediate safe Azure deletion savings are $0. After the
+approved second $1.28/month OCI volume increment, the post-gate net opportunity
+remains about $299-329/month. This is a run-rate range, not an Azure forecast.
 
 ## Storage growth follow-up
 
