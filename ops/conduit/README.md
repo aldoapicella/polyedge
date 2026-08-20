@@ -201,7 +201,14 @@ primary revision `polyedge-dev--0000139` and the hourly image/generator to ACR
 are unchanged. Its marker is archived under
 `/etc/polyedge/rollback/20260820T194400Z-primary-103d-parity-2100`; the journal
 is retained and the controller is disabled and inactive. This promotion receives
-no parity credit.
+no parity credit. The rollback controller restored the exact prior ACR `93a`
+app, hourly, and generator at 20:27; its journal reached `rolled_back`, protected
+hashes remained unchanged, and the archived rollback-journal SHA-256 begins
+`4c09f80d`. Fresh transaction `60724954-fed1-44bf-aacd-ff97be066418` then
+re-promoted exact `f644`/`103d`; proof execution
+`polyedge-hourly-quality-job-ttm273a` succeeded. The current live journal is
+retained, its used marker is archived, protected hashes remain unchanged, and
+this re-promotion also receives no parity credit.
 
 The August 16 pre-boundary daily container completed every research stage, but
 its superseded bundle was correctly rejected by the parity recorder because it
@@ -318,6 +325,13 @@ deletion-candidate count is therefore zero. Cost Management usage for August
 evidence-backed removable compute/network opportunity is about $300-330/month
 after mapping, parity, reboot, rollback, funded, and qset gates pass. Immediate
 safe deletion savings remain $0.
+
+The canonical legacy correction `shadow-2026-07-23-through-2026-07-23` pointer
+and state hash match immutable state, but it remains `in_progress`: `completed_at`
+is absent and `daily/2026-07-23/latest.json` is absent. It must resume through
+the existing legacy shadow recovery gates, not be force-completed. This is
+independent of frozen `campaign-2026-07-28-qset-v1`; qset and Azure deletion
+remain blocked.
 
 `polyedge-parity-hourly.timer` runs at `:18` after the Azure `:10` and OCI
 `:12` audits. It hash-verifies the six local segments and upload receipts,
