@@ -17,6 +17,8 @@ export const PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 export const CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f";
 export const NEG_RISK_CTF_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab";
 
+const DEFAULT_POLYGON_RPC_URL = "https://tenderly.rpc.polygon.community";
+
 const ERC1967_CONST1 = "0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3";
 const ERC1967_CONST2 = "0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076";
 const ERC1967_PREFIX = 0x61003d3d8160233d3973n;
@@ -65,6 +67,7 @@ export function loadRedemptionConfig(env = process.env) {
       fundedSession = JSON.parse(fundedSessionManifestJson);
     } catch {}
   }
+  const rpcUrls = configuredPolygonRpcUrls(env);
   const config = {
     executionMode: env.EXECUTION_MODE,
     enabled: env.VENUE_REDEMPTION_ENABLED === "true",
@@ -107,7 +110,8 @@ export function loadRedemptionConfig(env = process.env) {
     clobUrl: env.POLYMARKET_CLOB_URL || "https://clob.polymarket.com",
     dataUrl: env.POLYMARKET_DATA_URL || "https://data-api.polymarket.com",
     relayerUrl: env.POLYMARKET_RELAYER_URL || "https://relayer-v2.polymarket.com",
-    rpcUrl: env.POLYGON_RPC_URL || "https://polygon-bor-rpc.publicnode.com",
+    rpcUrl: rpcUrls[0],
+    rpcUrls,
     storageAccount: env.AZURE_STORAGE_ACCOUNT_NAME,
     storageContainer: env.AZURE_STORAGE_CONTAINER_NAME || "bot-events",
     storageAccountKey: env.AZURE_STORAGE_ACCOUNT_KEY,
@@ -115,6 +119,24 @@ export function loadRedemptionConfig(env = process.env) {
   };
   validateRedemptionConfig(config);
   return config;
+}
+
+function configuredPolygonRpcUrls(env) {
+  const urls = [env.POLYGON_RPC_URL || DEFAULT_POLYGON_RPC_URL];
+  const configuredFallbacks = String(env.POLYGON_RPC_FALLBACK_URLS || "");
+  if (configuredFallbacks) urls.push(...configuredFallbacks.split(","));
+  return [...new Set(urls.filter(Boolean).map((value) => {
+    let url;
+    try {
+      url = new URL(String(value).trim());
+    } catch {
+      throw new Error("POLYGON_RPC_URL and POLYGON_RPC_FALLBACK_URLS must contain HTTPS URLs");
+    }
+    if (url.protocol !== "https:" || !url.hostname) {
+      throw new Error("POLYGON_RPC_URL and POLYGON_RPC_FALLBACK_URLS must contain HTTPS URLs");
+    }
+    return url.href;
+  }))];
 }
 
 export function validateRedemptionConfig(config) {

@@ -7,6 +7,7 @@ import {
   createPublicClient,
   createWalletClient,
   decodeEventLog,
+  fallback,
   formatUnits,
   http
 } from "viem";
@@ -148,7 +149,10 @@ async function run() {
   if (derivedWallet.toLowerCase() !== config.funderAddress.toLowerCase()) {
     throw new Error("fail closed: signer does not derive the configured legacy UUPS deposit wallet");
   }
-  const transport = http(config.rpcUrl, { timeout: 15_000, retryCount: 2 });
+  const transports = config.rpcUrls.map((url) => http(url, { timeout: 15_000, retryCount: 2 }));
+  const transport = transports.length === 1
+    ? transports[0]
+    : fallback(transports, { retryCount: 2 });
   const publicClient = createPublicClient({ chain: polygon, transport });
   const walletClient = createWalletClient({ account, chain: polygon, transport });
   const deployedCode = await publicClient.getCode({ address: config.funderAddress });

@@ -502,6 +502,35 @@ test("redemption defaults to disabled dry-run and requires separate relayer auth
   assert.equal(live.dryRun, false);
 });
 
+test("redemption defaults to Tenderly Polygon RPC", () => {
+  const config = loadRedemptionConfig(safeEnv);
+  assert.equal(config.rpcUrl, "https://tenderly.rpc.polygon.community/");
+  assert.deepEqual(config.rpcUrls, [config.rpcUrl]);
+});
+
+test("redemption accepts an explicit HTTPS Polygon RPC fallback", () => {
+  assert.deepEqual(loadRedemptionConfig({
+    ...safeEnv,
+    POLYGON_RPC_URL: "https://primary.example/rpc",
+    POLYGON_RPC_FALLBACK_URLS: " https://secondary.example/rpc "
+  }).rpcUrls, ["https://primary.example/rpc", "https://secondary.example/rpc"]);
+});
+
+test("redemption deduplicates explicit Polygon RPC endpoints", () => {
+  assert.deepEqual(loadRedemptionConfig({
+    ...safeEnv,
+    POLYGON_RPC_URL: "https://primary.example/rpc",
+    POLYGON_RPC_FALLBACK_URLS: "https://secondary.example/rpc,https://primary.example/rpc"
+  }).rpcUrls, ["https://primary.example/rpc", "https://secondary.example/rpc"]);
+});
+
+test("redemption rejects non-HTTPS Polygon RPC endpoints", () => {
+  assert.throws(() => loadRedemptionConfig({
+    ...safeEnv,
+    POLYGON_RPC_FALLBACK_URLS: "http://not-secure.example"
+  }), /POLYGON_RPC_URL and POLYGON_RPC_FALLBACK_URLS must contain HTTPS URLs/);
+});
+
 test("a rejected relayer submission is retryable only from exact immutable and onchain evidence", () => {
   const control = {
     state: "submission_attempted",
