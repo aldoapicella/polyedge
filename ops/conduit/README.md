@@ -95,10 +95,22 @@ failed closed with zero credit at 19:26: its audit outer Git provenance was `6b`
 while OCI API runtime provenance was `103d`. It remains immutable, with Azure
 authoritative and `azureDeletionAllowed:false`.
 
-The replacement 21:00 funded-active ledger is staged at zero credit, but its
-collector timer is paused: two recovered pre-order warmup retries left
-invocation-cumulative `failed_messages=2`, and the strict zero-failure gate
-remains. Neither gate weakening nor a signer restart has explicit approval.
+The 21:00 funded-active ledger remains zero and is irrecoverably invalid: after
+natural order `0x883fab...af6d` finalized `no_fill` with zero matched, reconciled
+state, open orders, and unresolved reservations all zero, the signer failed closed
+with `Failed to connect` at 21:09:11. Systemd automatically restarted it at
+21:09:16. The new invocation warmed naturally at 21:24:04; its 21:25:48 heartbeat
+was `processed/failed=1/0`, with channels, safety, and reservation index ready,
+zero gaps, and no reconciliation or exposure. The user approved a guarded restart,
+but no second restart was needed.
+
+Direct-child ledger `/srv/polyedge-ring/parity/20260820T220000Z-funded-active.json`
+is live at zero credit with Azure authoritative and deletion, reboot, and qset
+false plus exact funded bindings. Only window and ledger keys changed in both
+environments; rollback is
+`/etc/polyedge/rollback/20260820T211651Z-parity-funded-active-2200`, and the old
+ledger remains untouched. The collector stays inactive until transient activation
+at 23:18:05/10 after the 23:10/23:12 audits; no credit is claimed.
 
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
