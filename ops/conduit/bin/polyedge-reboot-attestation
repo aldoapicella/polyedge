@@ -1,0 +1,619 @@
+#!/bin/sh
+set -eu
+
+die() { echo "polyedge-reboot-attestation: $*" >&2; exit 1; }
+sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
+json_sha() { jq -cS "$1" "$2" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
+
+[ "$#" -eq 1 ] || die 'usage: polyedge-reboot-attestation prepare|complete|validate-ledger'
+command=$1
+case "$command" in prepare|complete|validate-ledger) ;; *) die 'unsupported command' ;; esac
+
+expected_uid=${POLYEDGE_REBOOT_EXPECTED_UID:-0}
+expected_gid=${POLYEDGE_REBOOT_EXPECTED_GID:-0}
+[ "$(id -u)" = "$expected_uid" ] || die 'must run as the configured root identity'
+
+secure_dir() (
+  path=$1 required_mode=$2
+  [ ! -L "$path" ] && [ -d "$path" ] || die "unsafe or missing directory: $path"
+  set -- $(stat -c '%u %g %a' "$path")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$required_mode" ] \
+    || die "wrong owner or mode: $path"
+)
+
+secure_file() (
+  path=$1 required_mode=$2 size_limit=$3
+  [ ! -L "$path" ] && [ -f "$path" ] || die "unsafe or missing file: $path"
+  set -- $(stat -c '%u %g %a %h %s' "$path")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$required_mode" ] && [ "$4" = 1 ] \
+    && [ "$5" -gt 0 ] && [ "$5" -le "$size_limit" ] || die "wrong owner, mode, link count, or size: $path"
+)
+
+make_dir() {
+  md_path=$1 md_parent=$2
+  if [ -e "$md_path" ]; then
+    secure_dir "$md_path" 750
+  else
+    secure_dir "$md_parent" 750
+    install -d -m 0750 "$md_path"
+    secure_dir "$md_path" 750
+  fi
+}
+
+env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+if [ "${POLYEDGE_PARITY_BINDINGS_FROZEN:-}" != 1 ]; then
+  secure_file "$env_file" 640 1048576
+  set -a
+  . "$env_file"
+  set +a
+fi
+
+: "${POLYEDGE_PARITY_WINDOW_START_UTC:?missing formal window start}"
+: "${POLYEDGE_PARITY_LEDGER:?missing formal ledger path}"
+: "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?missing formal source commit}"
+: "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?missing formal Azure image}"
+: "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?missing formal OCI image}"
+
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'formal source commit is malformed'
+for image in "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"; do
+  printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+    || die 'formal image is not an immutable registry digest'
+done
+
+window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
+[ "$(date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$POLYEDGE_PARITY_WINDOW_START_UTC" ] \
+  || die 'formal window start is not canonical UTC'
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+reboot_root=$parity_root/reboot
+pending=$reboot_root/pending.json
+runtime_dir=${POLYEDGE_REBOOT_RUNTIME_DIR:-/run/polyedge/reboot-attestation}
+lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
+boot_id_file=${POLYEDGE_REBOOT_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
+proc_stat=${POLYEDGE_REBOOT_PROC_STAT:-/proc/stat}
+ring_status=${POLYEDGE_PARITY_RING_STATUS:-$ring/status.json}
+boot_root=${POLYEDGE_PARITY_BOOT_ROOT:-/}
+boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
+ring_floor=${POLYEDGE_JOB_MIN_FREE_BYTES:-42949672960}
+pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
+api_token=${POLYEDGE_REBOOT_API_TOKEN_FILE:-/run/polyedge-federated-api/azure-federated-token}
+research_token=${POLYEDGE_REBOOT_RESEARCH_TOKEN_FILE:-/run/polyedge-federated-research/azure-federated-token}
+funded_token=${POLYEDGE_REBOOT_FUNDED_TOKEN_FILE:-/run/polyedge-federated-funded-signer/azure-federated-token}
+
+case "$ring:$parity_root:$POLYEDGE_PARITY_LEDGER" in *'/../'*|*'/..:'*|../*|*':../'*) die 'unsafe parity path' ;; esac
+[ "${ring#/}" != "$ring" ] || die 'ring root must be absolute'
+mountpoint -q "$ring" || die 'ring root is not a mount point'
+secure_dir "$parity_root" 750
+ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
+ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
+[ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
+  || die 'formal ledger must be a direct .json child of the parity root'
+secure_file "$POLYEDGE_PARITY_LEDGER" 640 1048576
+ledger_read=$POLYEDGE_PARITY_LEDGER
+
+funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
+case "$funded_mode" in
+  disabled)
+    funded_enabled=false
+    funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    ;;
+  active)
+    funded_enabled=true
+    funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:?missing funded image}
+    funded_user=${POLYEDGE_PARITY_FUNDED_UID:?missing funded UID}:${POLYEDGE_PARITY_FUNDED_GID:?missing funded GID}
+    funded_session=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:?missing funded session}
+    funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:?missing funded session hash}
+    funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:?missing funded config hash}
+    printf '%s' "$funded_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' \
+      || die 'funded image is malformed'
+    printf '%s' "$funded_user" | grep -Eq '^[0-9]+:[0-9]+$' || die 'funded user is malformed'
+    printf '%s' "$funded_session" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' || die 'funded session is malformed'
+    for hash in "$funded_session_sha" "$funded_config_sha"; do
+      printf '%s' "$hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded binding hash is malformed'
+    done
+    printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
+      || die 'active funded parity requires a funded-active ledger'
+    ;;
+  *) die 'formal funded mode must equal disabled or active' ;;
+esac
+
+protected_json() {
+  jq -cS --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" \
+    --arg azure "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" \
+    --arg oci "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+    --arg mode "$funded_mode" --arg image "$funded_image" --arg user "$funded_user" \
+    --arg session "$funded_session" --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
+      {schemaVersion,status,windowStartUtc,azureAuthoritative,azureDeletionAllowed,shadowQsetEnabled,
+       fundedSignerEnabled,fundedSignerMode:(.fundedSignerMode // "disabled"),
+       fundedSignerImage:(.fundedSignerImage // null),fundedSignerUser:(.fundedSignerUser // null),
+       fundedSessionId:(.fundedSessionId // null),fundedSessionManifestSha256:(.fundedSessionManifestSha256 // null),
+       fundedConfigSha256:(.fundedConfigSha256 // null),gitSha:$git,azureResearchImage:$azure,ociResearchImage:$oci} as $p |
+      if $p.schemaVersion == 1 and $p.status == "in_progress" and
+         $p.windowStartUtc == $start and
+         $p.azureAuthoritative == true and $p.azureDeletionAllowed == false and $p.shadowQsetEnabled == false and
+         $p.fundedSignerEnabled == $funded and
+         (if $funded then $p.fundedSignerMode == $mode and $p.fundedSignerImage == $image and
+           $p.fundedSignerUser == $user and $p.fundedSessionId == $session and
+           $p.fundedSessionManifestSha256 == $session_sha and $p.fundedConfigSha256 == $config_sha
+          else $p.fundedSignerMode == "disabled" and $p.fundedSignerImage == null and $p.fundedSignerUser == null and
+           $p.fundedSessionId == null and $p.fundedSessionManifestSha256 == null and $p.fundedConfigSha256 == null end)
+      then $p else error("protected ledger binding changed") end
+    ' "$ledger_read"
+}
+
+validate_base_ledger() {
+  jq -e '
+    . as $ledger |
+    (($ledger.acceptedCleanLiveHours | type) == "number" and $ledger.acceptedCleanLiveHours >= 0 and ($ledger.acceptedCleanLiveHours | floor) == $ledger.acceptedCleanLiveHours) and
+    ((($ledger.completedDailyCycles // 0) | type) == "number" and ($ledger.completedDailyCycles // 0) >= 0 and (($ledger.completedDailyCycles // 0) | floor) == ($ledger.completedDailyCycles // 0)) and
+    (($ledger.acceptedHourlyEvidence | type) == "array" and ($ledger.acceptedHourlyEvidence | length) == $ledger.acceptedCleanLiveHours) and
+    ((($ledger.acceptedDailyEvidence // []) | type) == "array" and (($ledger.acceptedDailyEvidence // []) | length) == ($ledger.completedDailyCycles // 0)) and
+    ($ledger.rebootRecoveryPassed | type == "boolean")
+  ' "$ledger_read" >/dev/null || die 'formal ledger evidence counters are malformed'
+  protected_json >/dev/null || die 'formal ledger protected bindings are invalid'
+}
+
+lock_ledger() {
+  lock_dir=${lock_file%/*}
+  [ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] || die 'unsafe parity lock directory'
+  set -- $(stat -c '%u %g %a' "$lock_dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die 'wrong parity lock directory owner'
+  case "$3" in 700|750|755) ;; *) die 'unsafe parity lock directory mode' ;; esac
+  if [ ! -e "$lock_file" ]; then (umask 027; : >"$lock_file"); fi
+  [ ! -L "$lock_file" ] && [ -f "$lock_file" ] || die 'unsafe parity lock file'
+  set -- $(stat -c '%u %g %a %h %s' "$lock_file")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 640 ] && [ "$4" = 1 ] && [ "$5" -le 4096 ] \
+    || die 'wrong owner, mode, link count, or size for parity lock file'
+  exec 9<>"$lock_file"
+  /usr/bin/flock -w 300 9 || die 'timed out waiting for the parity ledger lock'
+}
+
+valid_boot_id() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; }
+
+validate_system_evidence() {
+  file=$1 funded=$2
+  jq -e --argjson funded "$funded" \
+    --arg api_token "$api_token" --arg research_token "$research_token" --arg funded_token "$funded_token" '
+    .healthy == true and
+    (.units | type == "array" and length == (if $funded then 18 else 16 end)) and
+    ([.units[].name] | length == (unique | length)) and
+    ([.units[].name] | sort) == (([
+      "spire-server.service","spire-agent.service","spire-oidc-discovery-provider.service","caddy.service",
+      "polyedge-api.service","polyedge-frontend.service","polyedge-ring-sync.timer","polyedge-ring-health.timer",
+      "polyedge-boot-disk-guard.timer","polyedge-freshness.timer","polyedge-hourly.timer","polyedge-daily.timer",
+      "polyedge-replay.timer","polyedge-parity-hourly.timer","polyedge-federated-token@api.timer",
+      "polyedge-federated-token@research.timer"] +
+      (if $funded then ["polyedge-funded-signer.service","polyedge-federated-token@funded-signer.timer"] else [] end)) | sort) and
+    all(.units[]; (.name | type == "string") and (.enablement == "enabled" or .enablement == "generated") and .active == true) and
+    (.containers | type == "array" and length == (if $funded then 3 else 2 end)) and
+    ([.containers[].name] | length == (unique | length)) and
+    all(.containers[]; (.id | test("^[0-9a-f]{64}$")) and
+      (.image | test("^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$")) and
+      (.user | type == "string") and .state == "running" and
+      (if .name == "polyedge-funded-signer" then .health == "not_configured" else .health == "healthy" end)) and
+    (.tokens | type == "array" and length == (if $funded then 3 else 2 end)) and
+    ([.tokens[].name] | length == (unique | length)) and
+    ([.tokens[] | [.name,.path]] | sort) == (([["api",$api_token],["research",$research_token]] +
+      (if $funded then [["funded-signer",$funded_token]] else [] end)) | sort) and
+    all(.tokens[]; (.path | type == "string") and
+      (.uid | type == "number") and (.gid | type == "number") and .mode == 600 and .linkCount == 1 and
+      (.sizeBytes | type == "number" and . > 0 and . <= 65536) and
+      (.modifiedEpoch | type == "number" and . > 0) and (.ageSeconds | type == "number" and . >= 0 and . <= 240)) and
+    (.qset.timerEnablement == "disabled" or .qset.timerEnablement == "masked" or .qset.timerEnablement == "not-found") and
+    .qset.timerActive == false and .qset.jobActive == false and
+    .funded.mode == (if $funded then "active" else "disabled" end) and
+    (if $funded then
+      (.funded.signerEnablement == "enabled" or .funded.signerEnablement == "generated") and
+      .funded.signerActive == true and .funded.tokenTimerEnablement == "enabled" and
+      .funded.tokenTimerActive == true
+    else
+      .funded.signerEnablement == "masked" and .funded.signerActive == false and
+      (.funded.tokenTimerEnablement == "disabled" or .funded.tokenTimerEnablement == "masked") and
+      .funded.tokenTimerActive == false
+    end) and
+    .ring.capacityOk == true and .ring.freeOk == true and .ring.uploadFresh == true and
+    .ring.unsealedClosedCount == 0 and .ring.unuploadedCount == 0 and
+    (.ring.statusModifiedEpoch | type == "number" and . > 0) and (.ring.statusAgeSeconds | type == "number" and . >= 0 and . <= 600) and
+    .disk.imagePullsPaused == false and .disk.bootAvailableBytes >= .disk.bootMinimumFreeBytes and
+    .disk.ringAvailableBytes >= .disk.ringMinimumFreeBytes
+  ' "$file" >/dev/null
+}
+
+validate_evidence_file() {
+  file=$1 phase=$2
+  secure_file "$file" 640 1048576
+  jq -e --arg phase "$phase" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+    .schemaVersion == 1 and .phase == $phase and .status == "validated" and
+    .ledger.path == $ledger and (.ledger.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+    .protectedBindings.windowStartUtc == $window and
+    (.boot.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) and
+    (.boot.btime | type == "number" and floor == . and . > 0) and
+    (.boot.observedAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.acceptedEvidence.cleanLiveHours | type == "number" and floor == . and . >= 72) and
+    (.acceptedEvidence.completedDailyCycles | type == "number" and floor == . and . >= 2) and
+    (.acceptedEvidence.hourlyPrefixSha256 | test("^sha256:[0-9a-f]{64}$")) and
+    (.acceptedEvidence.dailyPrefixSha256 | test("^sha256:[0-9a-f]{64}$"))
+  ' "$file" >/dev/null || die "invalid $phase evidence"
+  validate_system_evidence "$file" "$funded_enabled" || die "invalid $phase system evidence"
+}
+
+validate_gate() {
+  validate_base_ledger
+  passed=$(jq -r '.rebootRecoveryPassed' "$ledger_read")
+  if [ "$passed" = false ]; then
+    jq -e 'has("rebootRecovery") | not' "$ledger_read" >/dev/null \
+      || die 'false reboot gate has a rebootRecovery object'
+    return 0
+  fi
+  jq -e '
+    .rebootRecovery == {
+      schemaVersion:1,status:"validated",completedAtUtc:.rebootRecovery.completedAtUtc,
+      preboot:.rebootRecovery.preboot,postboot:.rebootRecovery.postboot
+    } and
+    (.rebootRecovery.completedAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.rebootRecovery.preboot.path | type == "string") and
+    (.rebootRecovery.preboot.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+    (.rebootRecovery.postboot.path | type == "string") and
+    (.rebootRecovery.postboot.sha256 | test("^sha256:[0-9a-f]{64}$"))
+  ' "$ledger_read" >/dev/null || die 'validated reboot gate lacks its exact evidence references'
+  pre=$(jq -r '.rebootRecovery.preboot.path' "$ledger_read")
+  post=$(jq -r '.rebootRecovery.postboot.path' "$ledger_read")
+  pre_id=${pre%/preboot.json}; pre_id=${pre_id##*/}
+  post_id=${post%/postboot.json}; post_id=${post_id##*/}
+  valid_boot_id "$pre_id" && valid_boot_id "$post_id" && [ "$pre_id" != "$post_id" ] \
+    || die 'reboot evidence boot IDs are invalid or equal'
+  [ "$pre" = "$reboot_root/$pre_id/preboot.json" ] && [ "$post" = "$reboot_root/$post_id/postboot.json" ] \
+    || die 'reboot evidence is outside its canonical parity path'
+  secure_dir "$reboot_root" 750
+  secure_dir "$reboot_root/$pre_id" 750
+  secure_dir "$reboot_root/$post_id" 750
+  [ "$(sha "$pre")" = "$(jq -r '.rebootRecovery.preboot.sha256' "$ledger_read")" ] \
+    || die 'preboot evidence hash mismatch'
+  [ "$(sha "$post")" = "$(jq -r '.rebootRecovery.postboot.sha256' "$ledger_read")" ] \
+    || die 'postboot evidence hash mismatch'
+  validate_evidence_file "$pre" preboot
+  validate_evidence_file "$post" postboot
+  current_protected=$(protected_json)
+  [ "$(jq -cS '.protectedBindings' "$pre")" = "$current_protected" ] \
+    && [ "$(jq -cS '.protectedBindings' "$post")" = "$current_protected" ] \
+    || die 'reboot evidence protected bindings differ from the ledger'
+  [ "$(jq -r '.boot.id' "$pre")" = "$pre_id" ] && [ "$(jq -r '.boot.id' "$post")" = "$post_id" ] \
+    || die 'reboot evidence path and boot ID disagree'
+  pre_btime=$(jq -r '.boot.btime' "$pre")
+  post_btime=$(jq -r '.boot.btime' "$post")
+  [ "$post_btime" -gt "$pre_btime" ] || die 'postboot evidence does not prove a later boot'
+  jq -e --arg path "$pre" --arg hash "$(sha "$pre")" \
+    '.preboot == {path:$path,sha256:$hash}' "$post" >/dev/null || die 'postboot evidence does not bind preboot evidence'
+  [ "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$post")" ] \
+    || die 'preboot and postboot container bindings differ'
+  [ "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$post")" ] \
+    || die 'preboot and postboot unit bindings differ'
+  [ "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$post")" ] \
+    || die 'preboot and postboot token bindings differ'
+  [ "$(jq -cS '.funded' "$pre")" = "$(jq -cS '.funded' "$post")" ] \
+    || die 'preboot and postboot funded service state differs'
+  for phase_file in "$pre" "$post"; do
+    hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$phase_file")
+    days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$phase_file")
+    [ "$(json_sha ".acceptedHourlyEvidence[0:$hours]" "$ledger_read")" = "$(jq -r '.acceptedEvidence.hourlyPrefixSha256' "$phase_file")" ] \
+      || die 'hourly evidence prefix regressed after reboot'
+    [ "$(json_sha ".acceptedDailyEvidence[0:$days]" "$ledger_read")" = "$(jq -r '.acceptedEvidence.dailyPrefixSha256' "$phase_file")" ] \
+      || die 'daily evidence prefix regressed after reboot'
+  done
+  pre_hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$pre")
+  post_hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$post")
+  pre_days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$pre")
+  post_days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$post")
+  current_hours=$(jq -r '.acceptedCleanLiveHours' "$ledger_read")
+  current_days=$(jq -r '.completedDailyCycles' "$ledger_read")
+  [ "$post_hours" -ge "$pre_hours" ] && [ "$current_hours" -ge "$post_hours" ] \
+    && [ "$post_days" -ge "$pre_days" ] && [ "$current_days" -ge "$post_days" ] \
+    || die 'accepted evidence counts regressed after reboot'
+}
+
+if [ "$command" = validate-ledger ]; then
+  validate_gate
+  exit 0
+fi
+
+lock_ledger
+secure_file "$POLYEDGE_PARITY_LEDGER" 640 1048576
+validate_base_ledger
+
+if [ "$command" = prepare ]; then
+  jq -e '.rebootRecoveryPassed == false and (has("rebootRecovery") | not) and
+    .acceptedCleanLiveHours >= 72 and .completedDailyCycles >= 2' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+    || die 'prepare requires 72 clean hours, two daily cycles, and an unpassed reboot gate'
+else
+  [ -e "$pending" ] || die 'no reboot attestation is pending'
+  secure_file "$pending" 640 65536
+  jq -e --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+    .schemaVersion == 1 and .status == "pending" and .ledgerPath == $ledger and .windowStartUtc == $window and
+    (.preboot.path | type == "string") and (.preboot.sha256 | test("^sha256:[0-9a-f]{64}$"))
+  ' "$pending" >/dev/null || die 'pending reboot marker is invalid'
+fi
+
+if [ ! -e "$runtime_dir" ]; then
+  runtime_parent=${runtime_dir%/*}
+  [ ! -L "$runtime_parent" ] && [ -d "$runtime_parent" ] || die 'unsafe runtime parent'
+  set -- $(stat -c '%u %g %a' "$runtime_parent")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die 'wrong runtime parent owner'
+  case "$3" in 700|750|755) ;; *) die 'unsafe runtime parent mode' ;; esac
+  install -d -m 0700 "$runtime_dir"
+fi
+[ ! -L "$runtime_dir" ] && [ -d "$runtime_dir" ] || die 'unsafe runtime directory'
+set -- $(stat -c '%u %g %a' "$runtime_dir")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] \
+  || die 'unsafe runtime directory ownership or mode'
+
+units_tmp=$(mktemp "$runtime_dir/units.XXXXXX")
+containers_tmp=$(mktemp "$runtime_dir/containers.XXXXXX")
+tokens_tmp=$(mktemp "$runtime_dir/tokens.XXXXXX")
+system_tmp=$(mktemp "$runtime_dir/system.XXXXXX")
+evidence_tmp=
+ledger_tmp=
+pending_tmp=
+trap 'rm -f "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp" "$evidence_tmp" "$ledger_tmp" "$pending_tmp"' EXIT HUP INT TERM
+chmod 0600 "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp"
+: >"$units_tmp"; : >"$containers_tmp"; : >"$tokens_tmp"
+
+unit_state() {
+  unit=$1
+  enablement=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  case "$enablement" in
+    enabled) ;;
+    generated)
+      systemctl show multi-user.target --property=Wants --value | tr ' ' '\n' | grep -Fx "$unit" >/dev/null \
+        || die "generated unit is not wanted at boot: $unit"
+      ;;
+    *) die "unit is not enabled for reboot recovery: $unit" ;;
+  esac
+  systemctl is-active --quiet "$unit" || die "unit is inactive: $unit"
+  jq -nc --arg name "$unit" --arg enablement "$enablement" '{name:$name,enablement:$enablement,active:true}' >>"$units_tmp"
+}
+
+for unit in \
+  spire-server.service spire-agent.service spire-oidc-discovery-provider.service caddy.service \
+  polyedge-api.service polyedge-frontend.service \
+  polyedge-ring-sync.timer polyedge-ring-health.timer polyedge-boot-disk-guard.timer \
+  polyedge-freshness.timer polyedge-hourly.timer polyedge-daily.timer polyedge-replay.timer \
+  polyedge-parity-hourly.timer polyedge-federated-token@api.timer polyedge-federated-token@research.timer
+do unit_state "$unit"; done
+if [ "$funded_enabled" = true ]; then
+  unit_state polyedge-funded-signer.service
+  unit_state polyedge-federated-token@funded-signer.timer
+  funded_signer_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
+  funded_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)
+  funded_state=$(jq -nc --arg signer "$funded_signer_enablement" --arg token "$funded_token_enablement" \
+    '{mode:"active",signerEnablement:$signer,signerActive:true,
+      tokenTimerEnablement:$token,tokenTimerActive:true}')
+else
+  funded_signer_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
+  [ "$funded_signer_enablement" = masked ] || die 'disabled funded signer is not masked'
+  if systemctl is-active --quiet polyedge-funded-signer.service; then die 'disabled funded signer is active'; fi
+  funded_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)
+  case "$funded_token_enablement" in disabled|masked) ;; *) die 'disabled funded token timer is enabled' ;; esac
+  if systemctl is-active --quiet polyedge-federated-token@funded-signer.timer; then
+    die 'disabled funded token timer is active'
+  fi
+  funded_state=$(jq -nc --arg signer "$funded_signer_enablement" --arg token "$funded_token_enablement" \
+    '{mode:"disabled",signerEnablement:$signer,signerActive:false,
+      tokenTimerEnablement:$token,tokenTimerActive:false}')
+fi
+qset_enablement=$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)
+case "$qset_enablement" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
+if systemctl is-active --quiet polyedge-shadow-qset.timer; then die 'qset timer is active'; fi
+if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
+
+
+container_state() {
+  name=$1
+  id=$(podman inspect --format '{{.Id}}' "$name") || die "container is missing: $name"
+  image=$(podman inspect --format '{{.Config.Image}}' "$name") || die "container image is unreadable: $name"
+  user=$(podman inspect --format '{{.Config.User}}' "$name") || die "container user is unreadable: $name"
+  state=$(podman inspect --format '{{.State.Status}}' "$name") || die "container state is unreadable: $name"
+  health=$(podman inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}not_configured{{end}}' "$name") \
+    || die "container health is unreadable: $name"
+  [ -n "$health" ] || health=not_configured
+  printf '%s' "$id" | grep -Eq '^[0-9a-f]{64}$' || die "container ID is malformed: $name"
+  printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+    || die "container image is not immutable: $name"
+  [ "$state" = running ] || die "container is not running: $name"
+  case "$name:$health" in polyedge-funded-signer:not_configured|polyedge-api:healthy|polyedge-frontend:healthy) ;; *) die "container is unhealthy: $name" ;; esac
+  jq -nc --arg name "$name" --arg id "$id" --arg image "$image" --arg user "$user" --arg state "$state" --arg health "$health" \
+    '{name:$name,id:$id,image:$image,user:$user,state:$state,health:$health}' >>"$containers_tmp"
+}
+
+container_state polyedge-api
+container_state polyedge-frontend
+[ "$(jq -r 'select(.name == "polyedge-api") | .image' "$containers_tmp")" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] \
+  || die 'API container differs from the formal OCI image'
+if [ "$funded_enabled" = true ]; then
+  container_state polyedge-funded-signer
+  [ "$(jq -r 'select(.name == "polyedge-funded-signer") | .image' "$containers_tmp")" = "$funded_image" ] \
+    && [ "$(jq -r 'select(.name == "polyedge-funded-signer") | .user' "$containers_tmp")" = "$funded_user" ] \
+    || die 'funded container differs from its formal binding'
+  funded_env_value() {
+    podman inspect --format '{{json .Config.Env}}' polyedge-funded-signer \
+      | jq -er --arg name "$1" '($name + "=") as $prefix |
+          [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+          if length == 1 then .[0] else error("funded runtime binding is absent or duplicate") end'
+  }
+  [ "$(funded_env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = "$funded_session" ] \
+    || die 'funded container campaign differs from the formal session'
+  [ "$(funded_env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = "$funded_session_sha" ] \
+    || die 'funded container manifest hash differs from the formal session'
+  [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] \
+    || die 'funded container config hash differs from the formal config'
+fi
+
+now_epoch=$(date -u +%s)
+token_state() {
+  name=$1 path=$2 uid=$3 gid=$4
+  token_dir=${path%/*}
+  [ ! -L "$token_dir" ] && [ -d "$token_dir" ] || die "token directory is missing or unsafe: $name"
+  set -- $(stat -c '%u %g %a' "$token_dir")
+  [ "$1" = "$uid" ] && [ "$2" = "$gid" ] && [ "$3" = 700 ] || die "token directory metadata is unsafe: $name"
+  [ ! -L "$path" ] && [ -f "$path" ] || die "token is missing or unsafe: $name"
+  set -- $(stat -c '%u %g %a %h %s %Y' "$path")
+  [ "$1" = "$uid" ] && [ "$2" = "$gid" ] && [ "$3" = 600 ] && [ "$4" = 1 ] \
+    && [ "$5" -gt 0 ] && [ "$5" -le 65536 ] || die "token metadata is unsafe: $name"
+  age=$((now_epoch - $6))
+  [ "$age" -ge 0 ] && [ "$age" -le 240 ] || die "token rotation is stale: $name"
+  jq -nc --arg name "$name" --arg path "$path" --argjson uid "$1" --argjson gid "$2" \
+    --argjson size "$5" --argjson modified "$6" --argjson age "$age" \
+    '{name:$name,path:$path,uid:$uid,gid:$gid,mode:600,linkCount:1,sizeBytes:$size,modifiedEpoch:$modified,ageSeconds:$age}' >>"$tokens_tmp"
+}
+
+api_uid=${POLYEDGE_REBOOT_API_UID:-$(id -u polyedge-identity-api)}
+api_gid=${POLYEDGE_REBOOT_API_GID:-$(id -g polyedge-identity-api)}
+research_uid=${POLYEDGE_REBOOT_RESEARCH_UID:-$(id -u polyedge-identity-research)}
+research_gid=${POLYEDGE_REBOOT_RESEARCH_GID:-$(id -g polyedge-identity-research)}
+token_state api "$api_token" "$api_uid" "$api_gid"
+token_state research "$research_token" "$research_uid" "$research_gid"
+if [ "$funded_enabled" = true ]; then
+  token_state funded-signer "$funded_token" \
+    "${POLYEDGE_PARITY_FUNDED_UID}" "${POLYEDGE_PARITY_FUNDED_GID}"
+fi
+
+[ ! -e "$pause_file" ] || die 'image pulls are paused'
+boot_available=$(df -P -B1 "$boot_root" | awk 'NR == 2 {print $4}')
+ring_available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
+printf '%s:%s:%s:%s' "$boot_available" "$boot_floor" "$ring_available" "$ring_floor" | grep -Eq '^[0-9]+:[0-9]+:[0-9]+:[0-9]+$' \
+  || die 'disk capacity is unreadable'
+[ "$boot_available" -ge "$boot_floor" ] && [ "$ring_available" -ge "$ring_floor" ] || die 'disk floor is not satisfied'
+secure_file "$ring_status" 640 1048576
+ring_mtime=$(stat -c %Y "$ring_status")
+ring_age=$((now_epoch - ring_mtime))
+[ "$ring_age" -ge 0 ] && [ "$ring_age" -le 600 ] || die 'ring status is stale'
+ring_json=$(jq -ce '
+  if .capacity_ok == true and .free_ok == true and .upload_fresh == true and
+     .unsealed_closed_count == 0 and .unuploaded_count == 0
+  then {capacityOk:.capacity_ok,freeOk:.free_ok,uploadFresh:.upload_fresh,
+    unsealedClosedCount:.unsealed_closed_count,unuploadedCount:.unuploaded_count}
+  else error("ring is unhealthy") end
+' "$ring_status") || die 'ring is unhealthy'
+units=$(jq -sc '.' "$units_tmp")
+containers=$(jq -sc '.' "$containers_tmp")
+tokens=$(jq -sc '.' "$tokens_tmp")
+jq -n --argjson units "$units" --argjson containers "$containers" --argjson tokens "$tokens" \
+  --argjson funded_state "$funded_state" \
+  --argjson ring "$ring_json" --argjson ring_mtime "$ring_mtime" --argjson ring_age "$ring_age" \
+  --argjson boot "$boot_available" --argjson boot_floor "$boot_floor" \
+  --argjson ring_free "$ring_available" --argjson ring_floor "$ring_floor" --arg qset_enablement "$qset_enablement" \
+  '{healthy:true,units:$units,containers:$containers,tokens:$tokens,
+    qset:{timerEnablement:$qset_enablement,timerActive:false,jobActive:false},
+    funded:$funded_state,
+    ring:($ring + {statusModifiedEpoch:$ring_mtime,statusAgeSeconds:$ring_age}),
+    disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring_free,
+      ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false}}' >"$system_tmp"
+validate_system_evidence "$system_tmp" "$funded_enabled" || die 'captured system evidence is invalid'
+
+boot_id=$(tr -d '\n' <"$boot_id_file")
+valid_boot_id "$boot_id" || die 'boot ID is malformed'
+btime=$(awk '$1 == "btime" {print $2; found=1} END {if (!found) exit 1}' "$proc_stat") || die 'boot time is missing'
+printf '%s' "$btime" | grep -Eq '^[0-9]+$' && [ "$btime" -gt 0 ] || die 'boot time is malformed'
+observed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+protected=$(protected_json)
+hours=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+days=$(jq -r '.completedDailyCycles' "$POLYEDGE_PARITY_LEDGER")
+[ "$hours" -ge 72 ] && [ "$days" -ge 2 ] || die 'reboot proof requires 72 clean hours and two daily cycles'
+hourly_sha=$(json_sha '.acceptedHourlyEvidence' "$POLYEDGE_PARITY_LEDGER")
+daily_sha=$(json_sha '.acceptedDailyEvidence' "$POLYEDGE_PARITY_LEDGER")
+ledger_sha=$(sha "$POLYEDGE_PARITY_LEDGER")
+
+if [ "$command" = prepare ]; then
+  [ ! -e "$pending" ] || die 'a reboot attestation is already pending'
+  make_dir "$reboot_root" "$parity_root"
+  boot_dir=$reboot_root/$boot_id
+  make_dir "$boot_dir" "$reboot_root"
+  pre=$boot_dir/preboot.json
+  [ ! -e "$pre" ] || die 'preboot evidence already exists for this boot'
+  evidence_tmp=$(mktemp "$boot_dir/.preboot.XXXXXX")
+  jq -n --arg observed "$observed" --arg boot "$boot_id" --argjson btime "$btime" \
+    --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg ledger_sha "$ledger_sha" --argjson protected "$protected" \
+    --argjson hours "$hours" --argjson days "$days" --arg hourly_sha "$hourly_sha" --arg daily_sha "$daily_sha" \
+    --slurpfile system "$system_tmp" \
+    '{schemaVersion:1,phase:"preboot",status:"validated",generatedAtUtc:$observed,
+      boot:{id:$boot,btime:$btime,observedAtUtc:$observed},ledger:{path:$ledger,sha256:$ledger_sha},
+      protectedBindings:$protected,acceptedEvidence:{cleanLiveHours:$hours,completedDailyCycles:$days,
+        hourlyPrefixSha256:$hourly_sha,dailyPrefixSha256:$daily_sha}} + $system[0]' >"$evidence_tmp"
+  chmod 0640 "$evidence_tmp"; sync -f "$evidence_tmp"; mv -n "$evidence_tmp" "$pre"; evidence_tmp=
+  secure_file "$pre" 640 1048576
+  pre_sha=$(sha "$pre")
+  pending_tmp=$(mktemp "$reboot_root/.pending.XXXXXX")
+  jq -n --arg created "$observed" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+    --arg pre "$pre" --arg pre_sha "$pre_sha" \
+    '{schemaVersion:1,status:"pending",createdAtUtc:$created,ledgerPath:$ledger,windowStartUtc:$window,
+      preboot:{path:$pre,sha256:$pre_sha}}' >"$pending_tmp"
+  chmod 0640 "$pending_tmp"; sync -f "$pending_tmp"; mv -n "$pending_tmp" "$pending"; pending_tmp=
+  secure_file "$pending" 640 65536
+  echo "reboot attestation prepared for boot $boot_id"
+  exit 0
+fi
+
+pre=$(jq -r '.preboot.path' "$pending")
+pre_sha=$(jq -r '.preboot.sha256' "$pending")
+pre_id=${pre%/preboot.json}; pre_id=${pre_id##*/}
+valid_boot_id "$pre_id" && [ "$pre" = "$reboot_root/$pre_id/preboot.json" ] || die 'pending preboot path is not canonical'
+secure_dir "$reboot_root" 750
+secure_dir "$reboot_root/$pre_id" 750
+[ "$(sha "$pre")" = "$pre_sha" ] || die 'pending preboot hash mismatch'
+validate_evidence_file "$pre" preboot
+[ "$boot_id" != "$pre_id" ] || die 'complete requires a different boot ID'
+[ "$btime" -gt "$(jq -r '.boot.btime' "$pre")" ] || die 'complete requires a later boot time'
+[ "$(jq -cS '.protectedBindings' "$pre")" = "$protected" ] || die 'protected bindings changed across reboot'
+[ "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$pre")" = \
+  "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$system_tmp")" ] \
+  || die 'container image, user, or health binding changed across reboot'
+[ "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$system_tmp")" ] || die 'unit enablement changed across reboot'
+[ "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$system_tmp")" ] || die 'token ownership or path binding changed across reboot'
+pre_hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$pre")
+pre_days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$pre")
+[ "$hours" -ge "$pre_hours" ] && [ "$days" -ge "$pre_days" ] || die 'accepted evidence counts regressed across reboot'
+[ "$(json_sha ".acceptedHourlyEvidence[0:$pre_hours]" "$POLYEDGE_PARITY_LEDGER")" = "$(jq -r '.acceptedEvidence.hourlyPrefixSha256' "$pre")" ] \
+  || die 'accepted hourly evidence changed across reboot'
+[ "$(json_sha ".acceptedDailyEvidence[0:$pre_days]" "$POLYEDGE_PARITY_LEDGER")" = "$(jq -r '.acceptedEvidence.dailyPrefixSha256' "$pre")" ] \
+  || die 'accepted daily evidence changed across reboot'
+
+post_dir=$reboot_root/$boot_id
+make_dir "$post_dir" "$reboot_root"
+post=$post_dir/postboot.json
+if [ ! -e "$post" ]; then
+  evidence_tmp=$(mktemp "$post_dir/.postboot.XXXXXX")
+  jq -n --arg observed "$observed" --arg boot "$boot_id" --argjson btime "$btime" \
+    --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg ledger_sha "$ledger_sha" --argjson protected "$protected" \
+    --argjson hours "$hours" --argjson days "$days" --arg hourly_sha "$hourly_sha" --arg daily_sha "$daily_sha" \
+    --arg pre "$pre" --arg pre_sha "$pre_sha" --slurpfile system "$system_tmp" \
+    '{schemaVersion:1,phase:"postboot",status:"validated",generatedAtUtc:$observed,
+      boot:{id:$boot,btime:$btime,observedAtUtc:$observed},ledger:{path:$ledger,sha256:$ledger_sha},
+      preboot:{path:$pre,sha256:$pre_sha},protectedBindings:$protected,
+      acceptedEvidence:{cleanLiveHours:$hours,completedDailyCycles:$days,
+        hourlyPrefixSha256:$hourly_sha,dailyPrefixSha256:$daily_sha}} + $system[0]' >"$evidence_tmp"
+  chmod 0640 "$evidence_tmp"; sync -f "$evidence_tmp"; mv -n "$evidence_tmp" "$post"; evidence_tmp=
+fi
+secure_file "$post" 640 1048576
+validate_evidence_file "$post" postboot
+jq -e --arg pre "$pre" --arg pre_sha "$pre_sha" '.preboot == {path:$pre,sha256:$pre_sha}' "$post" >/dev/null \
+  || die 'postboot evidence does not bind the pending preboot evidence'
+post_sha=$(sha "$post")
+
+protected_before=$(jq -cS 'del(.rebootRecoveryPassed,.rebootRecovery)' "$POLYEDGE_PARITY_LEDGER")
+ledger_tmp=$(mktemp "$parity_root/.ledger.XXXXXX")
+jq --arg completed "$observed" --arg pre "$pre" --arg pre_sha "$pre_sha" --arg post "$post" --arg post_sha "$post_sha" '
+  .rebootRecoveryPassed = true |
+  .rebootRecovery = {schemaVersion:1,status:"validated",completedAtUtc:$completed,
+    preboot:{path:$pre,sha256:$pre_sha},postboot:{path:$post,sha256:$post_sha}}
+' "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+chmod 0640 "$ledger_tmp"
+[ "$(jq -cS 'del(.rebootRecoveryPassed,.rebootRecovery)' "$ledger_tmp")" = "$protected_before" ] \
+  || die 'reboot commit changed a non-reboot ledger field'
+ledger_read=$ledger_tmp
+validate_gate
+ledger_read=$POLYEDGE_PARITY_LEDGER
+sync -f "$ledger_tmp"; mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"; ledger_tmp=
+rm -f "$pending"
+echo "reboot recovery validated for boot $boot_id"

@@ -4,6 +4,7 @@ set -eu
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT HUP INT TERM
 recorder=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-parity-record-daily
+reboot_attestor=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-reboot-attestation
 uid=$(id -u)
 gid=$(id -g)
 fake=$root/fake-bin
@@ -56,7 +57,7 @@ fixture() {
   mkdir -p "$case_root/run" "$case_root/ring/parity" "$case_root/ring/jobs/research/reports/research/daily" \
     "$case_root/ring/jobs/research/data/research/daily"
   chmod 0750 "$case_root/ring/parity"
-  jq -n --arg start "$window_start" '{schemaVersion:1,status:"in_progress",windowStartUtc:$start,azureAuthoritative:true,azureDeletionAllowed:false,acceptedCleanLiveHours:7,acceptedHourlyEvidence:[{fixture:true}],completedDailyCycles:0,acceptedDailyEvidence:[],rebootRecoveryPassed:false,shadowQsetEnabled:false,fundedSignerEnabled:false}' \
+  jq -n --arg start "$window_start" '{schemaVersion:1,status:"in_progress",windowStartUtc:$start,azureAuthoritative:true,azureDeletionAllowed:false,acceptedCleanLiveHours:1,acceptedHourlyEvidence:[{fixture:true}],completedDailyCycles:0,acceptedDailyEvidence:[],rebootRecoveryPassed:false,shadowQsetEnabled:false,fundedSignerEnabled:false}' \
     >"$case_root/ring/parity/ledger.json"
   chmod 0640 "$case_root/ring/parity/ledger.json"
   jq -n '{capacity_ok:true,free_ok:true,upload_fresh:true,unsealed_closed_count:0,unuploaded_count:0}' >"$case_root/ring/status.json"
@@ -72,6 +73,8 @@ POLYEDGE_PARITY_BOOT_ROOT=$case_root
 POLYEDGE_PARITY_PAUSE_FILE=$case_root/run/image-pulls-paused
 POLYEDGE_PARITY_LOCK_FILE=$case_root/run/ledger.lock
 POLYEDGE_PARITY_EXPECTED_GIT_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE=crpolyedgefixture.azurecr.io/polyedge-rust-research@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 EOF
   chmod 0640 "$case_root/parity.env"
@@ -103,6 +106,7 @@ EOF
 run_recorder() {
   case_root=$1 date=$2
   env PATH="$fake:$PATH" POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
+    POLYEDGE_REBOOT_ATTESTATION_BIN="$reboot_attestor" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
     POLYEDGE_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" "$recorder" "$date"
 }
@@ -117,6 +121,7 @@ printf '%s\n' 'POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-
   >"$frozen/parity.env"
 chmod 0640 "$frozen/parity.env"
 env PATH="$fake:$PATH" POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
+  POLYEDGE_REBOOT_ATTESTATION_BIN="$reboot_attestor" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
   POLYEDGE_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   POLYEDGE_PARITY_BINDINGS_FROZEN=1 POLYEDGE_PARITY_ENV_FILE="$frozen/parity.env" \
   "$recorder" 2026-08-11 >/dev/null
@@ -150,11 +155,11 @@ run_recorder "$noon" 2026-08-19 >/dev/null
 success=$root/success
 fixture "$success"
 make_bundle "$success" 2026-08-11 2026-08-12T08:00:00Z
-before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")
+before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(jq -r '.completedDailyCycles' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(jq -r '.acceptedDailyEvidence | length' "$success/ring/parity/ledger.json")" = 1 ]
-[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")" = "$before" ]
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")" = "$before" ]
 evidence_sha=$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")" = "$evidence_sha" ]

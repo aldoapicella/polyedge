@@ -343,6 +343,9 @@ validate_ledger() {
       (.fundedSessionId? // null) == null and (.fundedSessionManifestSha256? // null) == null and
       (.fundedConfigSha256? // null) == null end)
   ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+  reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+  [ ! -L "$reboot_validator" ] && [ -x "$reboot_validator" ] || die 'reboot attestation validator is missing or unsafe'
+  "$reboot_validator" validate-ledger || die 'reboot recovery evidence is invalid'
 }
 validate_ledger
 
@@ -488,13 +491,13 @@ update_ledger() {
   expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
   [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
 
-  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
   ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
   trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
   jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
     "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
   chmod 0640 "$ledger_tmp"
-  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
     || die 'protected ledger fields changed'
   sync -f "$ledger_tmp"
   mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"

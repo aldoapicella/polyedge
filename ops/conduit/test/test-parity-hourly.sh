@@ -4,6 +4,7 @@ set -eu
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT HUP INT TERM
 collector=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-parity-hourly
+reboot_attestor=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-reboot-attestation
 uid=$(id -u)
 gid=$(id -g)
 fake=$root/fake-bin
@@ -480,6 +481,7 @@ run_collector() {
   env PATH="$fake:$PATH" \
     POLYEDGE_PARITY_UTILITY_LOCKED=1 \
     POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
+    POLYEDGE_REBOOT_ATTESTATION_BIN="$reboot_attestor" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" \
     FAKE_CALLS="$case_root/calls" FAKE_DF_AVAILABLE="${FAKE_DF_AVAILABLE:-20000000000}" FAKE_MOUNTPOINT_OK="${FAKE_MOUNTPOINT_OK:-1}" \
     FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_AZURE_ATTESTATION="$case_root/azure.json.attestation.json" \
@@ -502,7 +504,7 @@ run_collector() {
 }
 
 protected() {
-  jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,shadowQsetEnabled,fundedSignerEnabled,
+  jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,
     fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256}' "$1"
 }
 seed_artifacts() {
@@ -888,9 +890,6 @@ done
 
 success=$root/success
 fixture "$success"
-jq '.rebootRecoveryPassed = true' "$success/ring/parity/ledger.json" >"$success/reboot.tmp"
-chmod 0640 "$success/reboot.tmp"
-mv "$success/reboot.tmp" "$success/ring/parity/ledger.json"
 before=$(protected "$success/ring/parity/ledger.json")
 run_collector "$success" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$success/ring/parity/ledger.json")" = 1 ]

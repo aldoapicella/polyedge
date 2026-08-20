@@ -89,6 +89,8 @@ jobs:
           ops/conduit/test/test-ring-sync.sh
           ops/conduit/test/test-parity-hourly.sh
           ops/conduit/test/test-parity-daily.sh
+          ops/conduit/test/test-reboot-attestation.sh
+          ops/conduit/test/test-parity-systemd-ordering.sh
           ops/conduit/test/test-funded-secret-bootstrap.sh
           ops/conduit/test/test-funded-signer-env-example.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs

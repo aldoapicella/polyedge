@@ -1,0 +1,32 @@
+[Unit]
+Description=Complete pending PolyEdge production reboot attestation
+Wants=network-online.target
+Requires=polyedge-ring-health.service
+After=network-online.target spire-server.service spire-agent.service spire-oidc-discovery-provider.service caddy.service polyedge-api.service polyedge-frontend.service polyedge-ring-sync.timer polyedge-ring-health.service polyedge-ring-health.timer polyedge-boot-disk-guard.timer polyedge-freshness.timer polyedge-hourly.timer polyedge-daily.timer polyedge-replay.timer polyedge-parity-hourly.timer polyedge-federated-token@api.timer polyedge-federated-token@research.timer polyedge-funded-signer.service polyedge-federated-token@funded-signer.timer
+ConditionPathExists=/srv/polyedge-ring/parity/reboot/pending.json
+StartLimitIntervalSec=30min
+StartLimitBurst=10
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/local/libexec/polyedge-reboot-attestation complete
+TimeoutStartSec=10min
+Restart=on-failure
+RestartSec=60s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

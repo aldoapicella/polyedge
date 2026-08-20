@@ -46,6 +46,7 @@ sudo install -m 0755 ops/conduit/bin/polyedge-ring-health /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-boot-disk-guard /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-parity-hourly /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-parity-record-daily /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-reboot-attestation /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-github-deploy /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-quadlet-deploy /usr/local/sbin/
 sudo install -m 0755 ops/conduit/bin/polyedge-funded-secret-bootstrap /usr/local/sbin/
@@ -689,6 +690,7 @@ sudo systemctl enable --now polyedge-api.service polyedge-frontend.service caddy
 sudo systemctl enable --now polyedge-ring-sync.timer
 sudo systemctl enable --now polyedge-ring-health.timer
 sudo systemctl enable --now polyedge-boot-disk-guard.timer
+sudo systemctl enable polyedge-reboot-attestation.service
 sudo systemctl enable --now polyedge-parity-hourly.timer
 sudo systemctl enable --now polyedge-freshness.timer polyedge-hourly.timer
 # Enable daily/replay/qset individually only after their validation.
@@ -748,6 +750,20 @@ sudo systemd-run --unit=polyedge-lock-a --collect /usr/bin/flock /run/polyedge/r
 sudo systemd-run --unit=polyedge-lock-b --collect /usr/bin/flock /run/polyedge/research.lock /usr/bin/date
 journalctl -u polyedge-lock-a -u polyedge-lock-b --since '1 minute ago'
 ```
+
+For formal reboot proof, prepare only after the ledger has 72 accepted hours and
+two accepted daily cycles, then reboot:
+
+```bash
+sudo /usr/local/libexec/polyedge-reboot-attestation prepare
+sudo systemctl reboot
+# After reconnecting:
+sudo /usr/local/libexec/polyedge-reboot-attestation validate-ledger
+sudo systemctl status polyedge-reboot-attestation.service --no-pager
+sudo test ! -e /srv/polyedge-ring/parity/reboot/pending.json
+```
+
+The boot-enabled service writes post-boot evidence only after API, frontend, SPIRE, token timers, ring, disk, and qset-disabled checks pass. It observes but never starts the funded signer. It binds different pre/post kernel boot IDs, immutable image/user/health and unit/token bindings, and the exact formal ledger. A failure leaves `pending.json` in place for inspection and bounded systemd retry. Never edit the ledger gate manually: changing `rebootRecoveryPassed` alone fails validation.
 
 Reboot only after health passes, then repeat the health, status, `podman ps`,
 and `systemctl list-timers` checks. For rollback, restore the prior saved
