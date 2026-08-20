@@ -108,6 +108,15 @@ image, UID:GID, session ID, session-manifest hash, and candidate-config hash. No
 earlier hour carries into this window; the first eligible hourly credit is the
 completed `18:00-19:00Z` hour collected at `19:18Z`.
 
+The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
+still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
+while the fresh ledger and live signer pinned `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`;
+the ledger remained zero. At 17:20:15, that single non-secret image pin was
+atomically corrected with rollback
+`/etc/polyedge/rollback/20260820T171900Z-parity-funded-image/parity-hourly.env.before`.
+The clean 17:22:17 retry succeeded, created only valid excluded `16:00` evidence,
+and left the ledger at zero with deletion false.
+
 The superseded `20260816T100000Z.json` ledger retained three accepted hours at
 `10:00`, `11:00`, and `12:00`. None is carried forward because source
 `6b567ac` and its new image fix primary daily decision-grade applicability,
