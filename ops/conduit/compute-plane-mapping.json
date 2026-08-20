@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "capturedAtUtc": "2026-08-17T06:58:49Z",
+  "capturedAtUtc": "2026-08-20T16:32:38Z",
   "azureJobCount": 19,
   "liveOciEquivalentCount": 8,
   "azureDeletionAllowed": false,
@@ -236,5 +236,69 @@
     "shadowQset": "Only qset event reads and qset research writes; no primary, funded, table, Service Bus, or control access.",
     "fundedSigner": "Only exact funded evidence dependencies and receiver direction; no qset, primary bot-events, table, broad scope, or sender role.",
     "arc": "Retain the existing no-delete bot-events ring uploader assignment only."
+  },
+  "lastReadOnlyRecheck": {
+    "capturedAtUtc": "2026-08-20T16:32:38Z",
+    "azureDeletionAllowed": false,
+    "networkDeletionCandidateCount": 0,
+    "immediateSafeSavingsMonthlyUsd": 0,
+    "cost": {
+      "periodStartUtc": "2026-08-01T00:00:00Z",
+      "usageAvailableThroughUtc": "2026-08-19T23:59:59Z",
+      "polyedgeResourceGroupsPretaxUsd": 278.508948,
+      "normalizedMonthlyRunRateUsdApprox": 440,
+      "postGateComputeNetworkSavingsMonthlyUsd": [300, 330],
+      "method": "Usage Details actual pretax; 30-day straight-line normalization, not an Azure forecast"
+    },
+    "fundedQueue": {
+      "name": "funded-dynamic-quote-intents",
+      "activeMessageCount": 0,
+      "deadLetterMessageCount": 931,
+      "scheduledMessageCount": 0,
+      "deletionBlocked": true
+    },
+    "qset": {
+      "dailyScheduleEnabled": false,
+      "blocked": true,
+      "blocker": "campaign-2026-07-28-qset-v1 lacks exhaustive sealed D+1 inventory; no waiver"
+    },
+    "humanDecisionResources": [
+      {
+        "resource": "polyedge-shadow-neu",
+        "kind": "containerApp",
+        "state": "Running, minReplicas=1",
+        "blocker": "shadow correction closure plus separate identity mapping or explicit retirement"
+      },
+      {
+        "resource": "polyedge-shadow-daily-neu-job",
+        "kind": "containerAppJob",
+        "state": "Schedule 15 2 * * *; latest execution Failed",
+        "blocker": "shadow-2026-07-23-through-2026-07-23 remains in_progress"
+      },
+      {
+        "resource": "polyedge-shadow-val-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual; latest retained executions Failed",
+        "blocker": "separate validation identity/output requires completion or explicit retirement"
+      },
+      {
+        "resource": "polyedge-promotion-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual; no executions returned",
+        "blocker": "dedicated promotion identity writes funded evidence; explicit retirement or separate OCI mapping"
+      },
+      {
+        "resource": "polyedge-venue-model-job",
+        "kind": "containerAppJob",
+        "state": "Manual; no executions returned",
+        "blocker": "dedicated model identity writes execution model; explicit retirement or separate OCI mapping"
+      },
+      {
+        "resource": "polyedge-funded-warmup-cl",
+        "kind": "containerAppJob",
+        "state": "Manual; latest execution Succeeded 2026-08-17",
+        "blocker": "Service Bus sender identity and approved OCI origin, or explicit retirement"
+      }
+    ]
   }
 }
