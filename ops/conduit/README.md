@@ -90,22 +90,23 @@ after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260820T170000Z-funded-active.json` is the
+Ledger `/srv/polyedge-ring/parity/20260820T180000Z-funded-active.json` is the
 current funded-active window. It starts with zero inherited credit at
-`2026-08-20T17:00:00Z`, keeps Azure authoritative and
-`azureDeletionAllowed:false`, and cannot finish before `2026-08-23T17:00:00Z`.
+`2026-08-20T18:00:00Z`, keeps Azure authoritative and
+`azureDeletionAllowed:false`, and cannot finish before `2026-08-23T18:00:00Z`.
 Pre-window collections are excluded evidence only. A non-midnight start excludes
 that partial UTC date from daily-cycle credit, so `2026-08-21` is the first
 eligible full daily cycle. Completion still requires 72 consecutive accepted
 hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
 qset, funded, and deletion gates. The superseded
-`20260817T120000Z-funded-active.json` and `20260820T160000Z-funded-active.json`
-ledgers remain immutable with zero credit after ring-capacity, funded-continuity,
-and redemption-RPC failures. The new ledger binds
+`20260817T120000Z-funded-active.json`, `20260820T160000Z-funded-active.json`, and
+`20260820T170000Z-funded-active.json` ledgers remain immutable with zero credit
+after ring-capacity, funded-continuity, redemption-RPC, and warmup-expiry failures.
+The new ledger binds
 `POLYEDGE_PARITY_FUNDED_MODE=active`, `fundedSignerEnabled:true`, and the exact
 image, UID:GID, session ID, session-manifest hash, and candidate-config hash. No
 earlier hour carries into this window; the first eligible hourly credit is the
-completed `17:00-18:00Z` hour collected at `18:18Z`.
+completed `18:00-19:00Z` hour collected at `19:18Z`.
 
 The superseded `20260816T100000Z.json` ledger retained three accepted hours at
 `10:00`, `11:00`, and `12:00`. None is carried forward because source
@@ -592,10 +593,10 @@ and `FUNDED_EVIDENCE_TRUST_BOUNDARY_READY` review passed. Root remains the
 single-host trust ceiling and can administer both containers.
 
 The continuous funded v10 OCI signer is active on
-`ghcr.io/aldoapicella/polyedge-venue-probe@sha256:0593bd04165a483d60c39a3effd7887a47ad490dbb7a0ba9c425171220aff472`
+`ghcr.io/aldoapicella/polyedge-venue-probe@sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`
 as UID:GID `986:982`; the Azure signer is stopped with zero
 replicas and its controls disabled. The producer and funded queue handoff remain
-enabled. The queue is `Active` with zero active or scheduled messages and 931
+enabled. The queue is `Active` with zero active or scheduled messages and 932
 historical quarantined messages; nothing was replayed or purged. The
 loss-tolerant v3 profile preserves at least `$2` or 10% of fully reconciled
 current equity and resizes later orders to 5% of current equity after losses
@@ -605,8 +606,15 @@ An intermittent Polygon RPC response, `no nodes available for platform polygon-b
 previously failed closed during redemption reads. The guarded replacement deploys
 Tenderly with explicitly configured HTTPS-only dRPC and PublicNode fallbacks through
 the maintained `viem` fallback transport; a future private primary receives no
-silent public fallback. Post-deploy evidence has zero restarts, failed messages, and
-redemption failures, both WebSocket channels ready, and `startup_unresolved:0`.
+silent public fallback. The former 350-second window let synchronous automatic
+redemption take about 38 seconds while next-market non-executable warmup sequence
+18720, with a 30-second TTL, arrived and expired. The maximum is now 300 seconds
+inside the final-360-second safety boundary; the next 17:15 warmup was consumed,
+with gaps, reconciliation, cache, and unresolved state clean and the DLQ stable at
+932. After deploying `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`,
+the natural 17:30 UTC warmup was consumed with `processed=1`, `failed=0`, both
+channels ready, zero gaps, reconciliation false, cache error null,
+`startup_unresolved:0`, and DLQ stable at 932.
 
 On `2026-08-20`, exact reservation
 `e3ced30000241eaec55b59c437b00af5fd642c4de080afaa04807951eaf72e91` was

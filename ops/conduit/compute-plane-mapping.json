@@ -253,7 +253,7 @@
     "fundedQueue": {
       "name": "funded-dynamic-quote-intents",
       "activeMessageCount": 0,
-      "deadLetterMessageCount": 931,
+      "deadLetterMessageCount": 932,
       "scheduledMessageCount": 0,
       "deletionBlocked": true
     },
