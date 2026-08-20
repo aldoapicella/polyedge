@@ -1350,7 +1350,8 @@ export async function reserveProbeRisk(config, reservation, {
 }
 
 export async function finalizeProbeRisk(config, reservation, result, {
-  container = storageContainer(config)
+  container = storageContainer(config),
+  ifMatch = null
 } = {}) {
   if (!container) throw new Error("fail closed: durable storage is required to finalize order risk");
   const date = reservation.date || new Date().toISOString().slice(0, 10);
@@ -1371,6 +1372,7 @@ export async function finalizeProbeRisk(config, reservation, result, {
   await container
     .getBlockBlobClient(blobName)
     .uploadData(bytes, {
+      ...(ifMatch ? { conditions: { ifMatch } } : {}),
       blobHTTPHeaders: { blobContentType: "application/json" }
     });
   // Blob first: a crash can leave a conservative stale index entry, never a

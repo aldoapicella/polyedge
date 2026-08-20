@@ -1111,6 +1111,39 @@ test("funded unresolved index follows reserve, unresolved finalize, and settleme
   )).length, 0);
 });
 
+test("funded risk finalization honors an exact reservation ETag", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const reservation = await reserveProbeRisk(fundedRiskIndexConfig, {
+    date: "2026-07-31",
+    run_id: "run-cas",
+    probe_id: "probe-cas",
+    reserved_notional: 1,
+    principal_notional: 1,
+    condition_id: "condition-cas"
+  }, { container });
+  const reservationName =
+    "reports/research/venue-probe/risk-reservations/2026-07-31/probe-cas.json";
+  const etag = container.etags.get(reservationName);
+  await assert.rejects(finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "finalized_no_fill",
+    order_submitted: true,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
+  }, { container, ifMatch: '"stale"' }), (error) => error?.statusCode === 412);
+  assert.equal(container.etags.get(reservationName), etag);
+  assert.equal(container.json(reservationName).state, "reserved");
+  await finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "finalized_no_fill",
+    order_submitted: true,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
+  }, { container, ifMatch: etag });
+  assert.equal(container.json(reservationName).state, "finalized_no_fill");
+});
+
 test("funded unresolved index fails closed on stale blobs and internal count drift", async () => {
   const unresolvedName =
     "reports/research/venue-probe/risk-reservations/2026-07-31/probe-stale.json";

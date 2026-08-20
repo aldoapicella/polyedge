@@ -133,7 +133,7 @@ export async function runRejectedNoOrderReconciliation({
   };
 }
 
-function venueClient(env) {
+export function venueClient(env) {
   const account = privateKeyToAccount(normalizePrivateKey(env.POLYMARKET_PRIVATE_KEY));
   const signer = createWalletClient({
     account,
