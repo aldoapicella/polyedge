@@ -708,7 +708,7 @@ resource fundedService 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS', value: '60000' }
             { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY', value: '30' }
-            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY', value: '350' }
+            { name: 'FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY', value: '300' }
             { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'ALLOW_FUNDED_DIRECT', value: fundedDirectEnabled ? 'true' : 'false' }
             { name: 'FUNDED_DIRECT_DRY_RUN', value: fundedDirectEnabled ? 'false' : 'true' }

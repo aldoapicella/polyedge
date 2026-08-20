@@ -29,7 +29,7 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     autoRedemptionEnabled: env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true",
     autoRedemptionIntervalMs: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, 60_000),
     autoRedemptionMinSecondsToExpiry: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, 30),
-    autoRedemptionMaxSecondsToExpiry: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, 350)
+    autoRedemptionMaxSecondsToExpiry: integer(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, 300)
   };
   const errors = [];
   if (!config.enabled) errors.push("FUNDED_DIRECT_SERVICE_ENABLED must be true");
@@ -72,9 +72,9 @@ export function loadFundedDirectServiceConfig(env = process.env) {
       errors.push("FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS must be in [30000, 600000]");
     }
     if (!(config.autoRedemptionMinSecondsToExpiry >= 10 &&
-        config.autoRedemptionMaxSecondsToExpiry <= 359 &&
+        config.autoRedemptionMaxSecondsToExpiry <= 300 &&
         config.autoRedemptionMinSecondsToExpiry < config.autoRedemptionMaxSecondsToExpiry)) {
-      errors.push("automatic redemption window must remain strictly inside the final 360 seconds");
+      errors.push("automatic redemption window must remain within the configured minimum and 300 seconds of the final 360 seconds");
     }
     if (!env.POLYMARKET_RELAYER_API_KEY) {
       errors.push("POLYMARKET_RELAYER_API_KEY is required for automatic redemption");

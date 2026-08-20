@@ -94,7 +94,7 @@ function automaticRedemptionEnv(overrides = {}) {
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
     FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS: "60000",
     FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY: "30",
-    FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "350",
+    FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "300",
     FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
     VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
     POLYMARKET_RELAYER_API_KEY: "relayer-key",
@@ -105,6 +105,7 @@ function automaticRedemptionEnv(overrides = {}) {
 
 test("automatic redemption remains strictly inside the final no-trade window", () => {
   const config = loadFundedDirectServiceConfig(automaticRedemptionEnv());
+  assert.equal(config.autoRedemptionMaxSecondsToExpiry, 300);
   const status = (marketEndTs = "2026-07-30T12:15:00Z") => ({
     warmed_market: {
       market_id: "btc-market",
@@ -118,7 +119,7 @@ test("automatic redemption remains strictly inside the final no-trade window", (
   ).eligible, false);
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
-    Date.parse("2026-07-30T12:09:10Z"),
+    Date.parse("2026-07-30T12:10:00Z"),
     config
   ).eligible, true);
   assert.equal(fundedRedemptionMaintenanceWindow(
@@ -142,9 +143,9 @@ test("automatic redemption remains strictly inside the final no-trade window", (
   assert.equal(futureWarmup.clock_source, "btc_15m_utc_boundary");
   assert.throws(
     () => loadFundedDirectServiceConfig(automaticRedemptionEnv({
-      FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "360"
+      FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "301"
     })),
-    /strictly inside the final 360 seconds/
+    /300 seconds of the final 360 seconds/
   );
 });
 

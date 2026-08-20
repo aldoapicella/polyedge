@@ -969,7 +969,7 @@ jobs:
           assert.match(JSON.stringify(env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED), /fundedDirectEnabled/);
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS, "60000");
           assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY, "30");
-          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, "350");
+          assert.equal(env.FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY, "300");
           assert.equal("VENUE_REDEMPTION_MAX_PAYOUT" in env, false);
           assert.equal(env.VENUE_REDEMPTION_MAX_CONDITIONS, "1");
           assert.equal(
@@ -5071,7 +5071,7 @@ jobs:
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED)" = "true"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS)" = "60000"
           test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY)" = "30"
-          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY)" = "350"
+          test "$(env_value FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY)" = "300"
           test -z "$(env_value VENUE_REDEMPTION_MAX_PAYOUT)"
           test "$(env_value VENUE_REDEMPTION_MAX_CONDITIONS)" = "1"
           test "$(env_secret_ref POLYMARKET_RELAYER_API_KEY)" = "polymarket-relayer-api-key"
