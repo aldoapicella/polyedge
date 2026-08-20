@@ -6261,9 +6261,12 @@ mod tests {
         });
         started_rx.await.unwrap();
 
-        let shutdown = tokio::time::timeout(StdDuration::from_secs(1), controller.shutdown())
-            .await
-            .unwrap();
+        let shutdown = tokio::time::timeout(
+            RECORDER_SHUTDOWN_DRAIN_TIMEOUT + StdDuration::from_secs(1),
+            controller.shutdown(),
+        )
+        .await
+        .unwrap();
         assert!(shutdown.is_err());
         waiting.await.unwrap();
         assert_eq!(
