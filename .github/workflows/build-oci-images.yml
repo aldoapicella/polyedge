@@ -40,14 +40,50 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-oci-images-${{ github.ref }}
+  group: build-oci-images-${{ github.event_name == 'pull_request' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  validate:
+  image-inputs:
     if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.filter.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - id: filter
+        env:
+          PR_ACTION: ${{ github.event.action }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed=true
+          if [[ "$PR_ACTION" == 'synchronize' && -n "$BEFORE" && -n "$AFTER" ]] \
+            && git cat-file -e "$BEFORE^{commit}" \
+            && git cat-file -e "$AFTER^{commit}"; then
+            if git diff --quiet "$BEFORE" "$AFTER" -- \
+              .dockerignore Dockerfile.rust Dockerfile.frontend Dockerfile.venue-probe \
+              Dockerfile.research-validation Cargo.toml Cargo.lock crates data_quality \
+              research tests/fixtures frontend venue-probe .github/workflows/build-oci-images.yml; then
+              changed=false
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+  validate:
+    if: github.event_name == 'pull_request' && needs.image-inputs.outputs.changed == 'true'
+    needs: image-inputs
     name: ${{ matrix.name }} (validate)
     runs-on: ubuntu-latest
+    concurrency:
+      group: build-oci-images-${{ github.event.pull_request.number }}-${{ matrix.name }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       matrix:

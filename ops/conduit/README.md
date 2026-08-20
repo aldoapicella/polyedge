@@ -329,7 +329,10 @@ safe deletion savings remain $0.
 The canonical legacy correction `shadow-2026-07-23-through-2026-07-23` pointer
 and state hash match immutable state, but it remains `in_progress`: `completed_at`
 is absent and `daily/2026-07-23/latest.json` is absent. It must resume through
-the existing legacy shadow recovery gates, not be force-completed. This is
+the existing legacy shadow recovery gates, not be force-completed. Two exhaustive
+stable listings found 1,440 blobs / 7,473,225,576 bytes on `2026-07-23` and 782
+blobs / 4,187,252,980 bytes on D+1 `2026-07-24`; all are unsealed Append Blobs.
+Recovery is NO-GO: no job was started and no source was sealed or changed. This is
 independent of frozen `campaign-2026-07-28-qset-v1`; qset and Azure deletion
 remain blocked.
 
