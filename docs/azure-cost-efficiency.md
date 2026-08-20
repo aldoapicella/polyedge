@@ -103,6 +103,23 @@ prefix nor its blob type. The current operator identity can verify the live
 policy but cannot list blobs, so those object counts are historical supporting
 evidence rather than a current tier-distribution claim.
 
+### Live storage recheck on 2026-08-20
+
+The control-plane lifecycle policy remains unchanged since 2026-08-06 and
+exactly matches the safe design: delete only `bot-events/data/research/normalized/v1/`
+block blobs after seven days, and tier only future
+`bot-events/events-oci-hot7-v1/` block blobs to Cool after seven days and
+Archive after 30. No policy mutation is warranted. At 16:00 UTC, UsedCapacity
+was 2,956,186,017,208 bytes: Hot BlockBlob capacity was 2,895,426,439,470
+bytes and Cool BlockBlob capacity was 45,276,328,078 bytes. Azure metrics
+reported AppendBlock Hot ingress of 73,180,928,613 bytes across 443,039
+transactions on 2026-08-19, then 64,781,314,178 bytes across 314,029
+transactions through 17:00 UTC on 2026-08-20. That attribution to legacy raw
+append blobs is a code/metric inference: Azure metrics have no container
+dimension and the operator's bounded blob listing remains denied. This growth
+makes stopping the Azure append writer at the gated cutover the major storage
+savings lever; do not broaden lifecycle prefixes or claim immediate savings.
+
 ### Gated deletion recheck on 2026-08-14
 
 A fresh subscription inventory found no resource that is both unused and safe
