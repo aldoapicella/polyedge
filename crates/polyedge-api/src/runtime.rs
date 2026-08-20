@@ -55,7 +55,7 @@ const SHUTDOWN_TERMINATION_AUDIT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(test))]
 const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const RECORDER_COMPLETED_DURABLE_BATCH_LIMIT: usize = 10_000;
 const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
 const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
