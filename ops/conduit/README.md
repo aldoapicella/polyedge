@@ -90,23 +90,15 @@ after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
-Ledger `/srv/polyedge-ring/parity/20260820T180000Z-funded-active.json` is the
-current funded-active window. It starts with zero inherited credit at
-`2026-08-20T18:00:00Z`, keeps Azure authoritative and
-`azureDeletionAllowed:false`, and cannot finish before `2026-08-23T18:00:00Z`.
-Pre-window collections are excluded evidence only. A non-midnight start excludes
-that partial UTC date from daily-cycle credit, so `2026-08-21` is the first
-eligible full daily cycle. Completion still requires 72 consecutive accepted
-hours, two successful OCI daily cycles, reboot and rollback proof, and explicit
-qset, funded, and deletion gates. The superseded
-`20260817T120000Z-funded-active.json`, `20260820T160000Z-funded-active.json`, and
-`20260820T170000Z-funded-active.json` ledgers remain immutable with zero credit
-after ring-capacity, funded-continuity, redemption-RPC, and warmup-expiry failures.
-The new ledger binds
-`POLYEDGE_PARITY_FUNDED_MODE=active`, `fundedSignerEnabled:true`, and the exact
-image, UID:GID, session ID, session-manifest hash, and candidate-config hash. No
-earlier hour carries into this window; the first eligible hourly credit is the
-completed `18:00-19:00Z` hour collected at `19:18Z`.
+The funded-active ledger `/srv/polyedge-ring/parity/20260820T180000Z-funded-active.json`
+failed closed with zero credit at 19:26: its audit outer Git provenance was `6b`
+while OCI API runtime provenance was `103d`. It remains immutable, with Azure
+authoritative and `azureDeletionAllowed:false`.
+
+The replacement 21:00 funded-active ledger is staged at zero credit, but its
+collector timer is paused: two recovered pre-order warmup retries left
+invocation-cumulative `failed_messages=2`, and the strict zero-failure gate
+remains. Neither gate weakening nor a signer restart has explicit approval.
 
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
@@ -198,27 +190,18 @@ zero-essential-feed-error gate rejected the hour. The old bindings and ledger
 remain recoverable under
 `/etc/polyedge/rollback/20260814T022900Z-parity-0300-reset`.
 
-The OCI API and all seven primary research jobs are pinned to
-multi-architecture digest
-`sha256:93a5cf52a77e35460a598f7cd461184d1f56c31090ceb4ae15554a9e4a81eea6`
-from source `6b567ac84baa8113e84d5fceae63bd14d13656e8`. Build run
-`31950191236` proved the Linux AMD64 and ARM64 index and published the dependent
-research-validation image. The same index was imported without rebuild into
-ACR. OCI passed its guarded deployment and 15-minute soak with authenticated
-status 200, zero restarts, repeated research-UAMI freshness success, a healthy
-ring, all seven primary job bindings on the exact digest, and 25 GiB boot space
-remaining.
+The OCI API and all seven primary research-job environments now run the `f644`
+image with `103d` runtime provenance from build run `31984694797`. Freshness at
+19:48 and hourly quality at 20:12 succeeded; the ring is healthy and boot free
+space is 24 GiB.
 
-The isolated promotion controller then moved the Azure primary app, hourly job
-template, and a bounded hourly proof execution to the exact imported ACR
-digest. A prior attempt rolled back exactly after a transient proof poll; the
-controller role gained only `Microsoft.App/jobs/stop/action` on the existing
-exact hourly-job scope so an emergency proof stop cannot be denied. The clean
-retry and proof passed before the fresh one-use marker was archived. The
-controller remains disabled at boot and inactive. Azure remains in
-single-revision authoritative mode with its protected prior template retained
-for rollback. None of the deployment or promotion soak receives parity credit;
-the untouched `2026-08-17T00:00:00Z` boundary begins the current counter.
+Azure controller transaction `f646e7d4-194e-4aa9-b1ad-ed2fab1a8a54` promoted
+primary revision `polyedge-dev--0000139` and the hourly image/generator to ACR
+`f644`; proof execution `4xejmi6` succeeded at 20:17:31. Protected app hashes
+are unchanged. Its marker is archived under
+`/etc/polyedge/rollback/20260820T194400Z-primary-103d-parity-2100`; the journal
+is retained and the controller is disabled and inactive. This promotion receives
+no parity credit.
 
 The August 16 pre-boundary daily container completed every research stage, but
 its superseded bundle was correctly rejected by the parity recorder because it
