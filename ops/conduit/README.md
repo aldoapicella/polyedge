@@ -110,7 +110,11 @@ false plus exact funded bindings. Only window and ledger keys changed in both
 environments; rollback is
 `/etc/polyedge/rollback/20260820T211651Z-parity-funded-active-2200`, and the old
 ledger remains untouched. The collector stays inactive until transient activation
-at 23:18:05/10 after the 23:10/23:12 audits; no credit is claimed.
+at 23:18:05/10 after the 23:10/23:12 audits; no credit is claimed. The same
+signer invocation `3b8f...` opened cleanly at 22:00:48 UTC with `processed/failed=3/0`,
+user and market channels ready, zero gaps, reconnect reconciliation false,
+startup unresolved count zero, `busy=false`, and warmup through 22:15. This makes
+the 22:00 hour eligible for evaluation, not accepted or credited.
 
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
@@ -336,7 +340,9 @@ deletion-candidate count is therefore zero. Cost Management usage for August
 1-19 totals $278.51 pretax, about $440/month when normalized. The
 evidence-backed removable compute/network opportunity is about $300-330/month
 after mapping, parity, reboot, rollback, funded, and qset gates pass. Immediate
-safe deletion savings remain $0.
+safe deletion savings remain $0. Workflow-change run `32417497482` completed
+successfully, including all three multi-architecture validations; docs-only run
+`32419800018` also succeeded with matrices skipped.
 
 The canonical legacy correction `shadow-2026-07-23-through-2026-07-23` pointer
 and state hash match immutable state, but it remains `in_progress`: `completed_at`
