@@ -119,6 +119,11 @@ append blobs is a code/metric inference: Azure metrics have no container
 dimension and the operator's bounded blob listing remains denied. This growth
 makes stopping the Azure append writer at the gated cutover the major storage
 savings lever; do not broaden lifecycle prefixes or claim immediate savings.
+Hot capacity actuals for 2026-08-01 through 2026-08-19 were $24.596399,
+straight-lining to about $38.84/month: Hot capacity alone exceeds the $35 total
+target before writes, reads, or monitoring. Because existing-corpus tiering or
+deletion remains unauthorized, the immediate goal is to stop append growth at
+the gated cutover and measure the realized bill, not claim a $15-35 outcome.
 
 ### Gated deletion recheck on 2026-08-14
 
