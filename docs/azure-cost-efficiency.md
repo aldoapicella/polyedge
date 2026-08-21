@@ -140,6 +140,18 @@ compute and network is about $300-$330/month. The user accepted the retained
 hot-capacity floor of approximately $38.84/month; no existing evidence corpus
 tiering, movement, or deletion is part of this savings plan.
 
+The Cost Management API refresh for 2026-08-01 through 2026-08-21 returned
+$319.15 across the PolyEdge resource groups: $290.29 in rg-polyedge-dev and
+$28.86 in the two managed-environment resource groups. Within
+rg-polyedge-dev, Container Apps were $114.74, NAT Gateway $71.06, bandwidth
+$10.69, Virtual Network $4.81, and Storage $66.37; retained monitoring, ACR,
+Service Bus, and Key Vault added another $22.62. Billing data can lag, so this
+is an actual-cost checkpoint rather than a forecast. A straight-line check is
+consistent with the $300-$330 removable range, but it also proves that $38.84
+is the accepted hot-capacity floor, not the expected total post-migration
+Azure bill. Measure the remaining bill after gated deletion before claiming a
+new steady-state total.
+
 ### Gated deletion recheck on 2026-08-14
 
 A fresh subscription inventory found no resource that is both unused and safe
