@@ -1,866 +1,103 @@
-name: Deploy frozen PolyEdge qset shadow campaign
+name: Validate clean PolyEdge qset successor
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/deploy-polyedge-shadow-qset.yml"
+      - "crates/polyedge-reporting/src/research/projected_cache.rs"
+      - "ops/conduit/bin/polyedge-run-job"
+      - "ops/conduit/env/jobs.env.example"
+      - "research/configs/*qset*"
+      - "research/run_shadow_daily.sh"
+      - "research/verify_shadow_daily_bundle.sh"
+      - "research/test_*shadow_daily*.sh"
   workflow_dispatch:
     inputs:
-      operation:
-        description: Frozen campaign lifecycle operation
-        required: true
-        default: deploy-frozen-campaign
-        type: choice
-        options:
-          - deploy-frozen-campaign
-          - run-first-seal
-          - enable-daily-schedule
       confirm_campaign_id:
-        description: Type campaign-2026-07-28-qset-v1
+        description: Type campaign-2026-08-22-qset-v2
+        required: true
+        type: string
+      research_image:
+        description: Immutable multi-architecture GHCR research image digest
         required: true
         type: string
 
-concurrency:
-  group: polyedge-shadow-qset-v1-control-plane
-  cancel-in-progress: false
-
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: polyedge-shadow-qset-v2-validation
+  cancel-in-progress: false
 
 env:
-  AZURE_RESOURCE_GROUP: rg-polyedge-dev
-  AZURE_LOCATION: northeurope
-  ACR_NAME: crpolyedge6urdjr5nmwx7w
-  STORAGE_ACCOUNT: stpolyedge6urdjr5nmwx7w
-  CAMPAIGN_ID: campaign-2026-07-28-qset-v1
-  CAMPAIGN_START: "2026-07-28"
-  CAMPAIGN_CUTOVER_UTC: "2026-07-28T00:00:00Z"
-  INITIAL_DEPLOY_DEADLINE_UTC: "2026-07-27T23:30:00Z"
-  FIRST_SEALED_DAY: "2026-07-28"
-  CAMPAIGN_CONTRACT: research/configs/profitability_gate_v3_2026-07-28_qset_v1.yaml
-  FREEZE_POLICY: research/configs/campaign_freeze_2026-07-28_qset_v1.json
-  QSET_TEMPLATE: infra/shadow-profitability-qset-v1.bicep
-  QSET_APP: polyedge-shadow-qset-neu
-  QSET_JOB: polyedge-shadow-qset-neu-job
-  QSET_EVENTS_CONTAINER: polyedge-shadow-qset-events
-  QSET_RESEARCH_CONTAINER: polyedge-research-qset
-  QSET_CONTROL_CONTAINER: polyedge-qset-control
-  LEGACY_APP: polyedge-shadow-neu
-  LEGACY_JOB: polyedge-shadow-daily-neu-job
-  LEGACY_CAMPAIGN_ID: campaign-2026-07-23
-  MAIN_APP: polyedge-dev
-  GITHUB_DEPLOY_IDENTITY_NAME: id-github-polyedge-dev
+  CAMPAIGN_ID: campaign-2026-08-22-qset-v2
+  CAMPAIGN_START: "2026-08-22"
+  EVIDENCE_VERSION: protocol-v3-qset-v2
+  CAMPAIGN_CONTRACT: research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml
+  FREEZE_POLICY: research/configs/campaign_freeze_2026-08-22_qset_v2.json
+  DISPOSITION: research/configs/protocol-v3-campaign-disposition-2026-08-22-qset-v2.json
 
 jobs:
-  campaign-control:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
     steps:
-      - name: Checkout exact source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.operation == 'deploy-frozen-campaign' && github.sha || '298fc76da0f7cc482883b6503dd06d0a582f6ac6' }}
+      - uses: actions/checkout@v4
 
-      - name: Fail closed on identity or operation mismatch
+      - name: Validate exact successor and immutable retirement
         env:
-          OPERATION: ${{ inputs.operation }}
           CONFIRM_CAMPAIGN_ID: ${{ inputs.confirm_campaign_id }}
         run: |
           set -euo pipefail
-          test "$GITHUB_REF_NAME" = "main"
-          test "$CONFIRM_CAMPAIGN_ID" = "$CAMPAIGN_ID"
-          case "$OPERATION" in
-            deploy-frozen-campaign|run-first-seal|enable-daily-schedule) ;;
-            *) exit 1 ;;
-          esac
-          if [ "$OPERATION" = "deploy-frozen-campaign" ]; then
-            test "$(date -u +%s)" -lt "$(date -u -d "$INITIAL_DEPLOY_DEADLINE_UTC" +%s)"
+          if [ "${GITHUB_EVENT_NAME}" = workflow_dispatch ]; then
+            test "$CONFIRM_CAMPAIGN_ID" = "$CAMPAIGN_ID"
           fi
           test "$(jq -r '.campaign_id' "$FREEZE_POLICY")" = "$CAMPAIGN_ID"
-          test "$(jq -r '.freeze_on_initial_deploy' "$FREEZE_POLICY")" = "true"
-          test "$(jq -r '.change_requires_new_campaign_id' "$FREEZE_POLICY")" = "true"
-          test "$(jq -r '.freeze_control_container' "$FREEZE_POLICY")" = "$QSET_CONTROL_CONTAINER"
+          test "$(jq -r '.evidence_version' "$FREEZE_POLICY")" = "$EVIDENCE_VERSION"
+          test "$(jq -r '.start_date' "$FREEZE_POLICY")" = "$CAMPAIGN_START"
+          test "$(jq -r '.active_campaign.campaign_id' "$DISPOSITION")" = "$CAMPAIGN_ID"
+          test "$(jq -r '.active_campaign.code_frozen' "$DISPOSITION")" = false
+          jq -e '.archived_campaigns[] | select(.campaign_id == "campaign-2026-07-28-qset-v1") | .promotion_eligible == false and .artifacts_mutable == false' "$DISPOSITION"
           grep -Fx "  id: $CAMPAIGN_ID" "$CAMPAIGN_CONTRACT"
           grep -Fx "  start_date: $CAMPAIGN_START" "$CAMPAIGN_CONTRACT"
-          grep -Fx "  event_blob_container: $QSET_EVENTS_CONTAINER" "$CAMPAIGN_CONTRACT"
-          grep -Fx "  research_blob_container: $QSET_RESEARCH_CONTAINER" "$CAMPAIGN_CONTRACT"
+          grep -Fx "  event_blob_prefix: shadow-events/$CAMPAIGN_ID" "$CAMPAIGN_CONTRACT"
+          grep -Fx "  lease_blob: data/research/shadow/$CAMPAIGN_ID/control/replay.lock" "$CAMPAIGN_CONTRACT"
+          echo "1311fce312aee52f039b61024472118be030a083c40e0f48249c7dda61c4deac  research/configs/profitability_gate_v3_2026-07-28_qset_v1.yaml" | sha256sum -c -
+          echo "534fc08f695add40fe35cdff2d96555da2cd51c0ffc75008354265aa98e377b2  research/configs/campaign_freeze_2026-07-28_qset_v1.json" | sha256sum -c -
+          echo "942c50f1d95ff8aa64de608d5d938970943279bb635e3da2c3a561f740f35b4c  research/configs/protocol-v3-campaign-disposition-2026-07-28-qset-v1.json" | sha256sum -c -
 
-      - name: Set up Rust
-        if: inputs.operation == 'deploy-frozen-campaign'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Validate evidence-generating code
-        if: inputs.operation == 'deploy-frozen-campaign'
+      - name: Validate fail-closed runner and sealed source
         run: |
           set -euo pipefail
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features -- -D warnings
-          cargo test --workspace --all-features -- --test-threads=1
+          sh -n research/run_shadow_daily.sh research/verify_shadow_daily_bundle.sh ops/conduit/bin/polyedge-run-job
           sh research/test_run_shadow_daily.sh
           sh research/test_verify_shadow_daily_bundle.sh
-          sh -n research/verify_shadow_daily_bundle.sh
-          az bicep build --file "$QSET_TEMPLATE" --outfile /tmp/qset-template.json
-          test "$(jq '[.resources[] | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities")] | length' /tmp/qset-template.json)" = "2"
-          test "$(jq '[.resources[] | select(.type == "Microsoft.Storage/storageAccounts/blobServices/containers")] | length' /tmp/qset-template.json)" = "3"
-          test "$(jq '[.resources[] | select(.type == "Microsoft.Storage/storageAccounts/blobServices/containers/immutabilityPolicies")] | length' /tmp/qset-template.json)" = "1"
-          test "$(jq '[.resources[] | select(.type == "Microsoft.Storage/storageAccounts/tableServices/tables")] | length' /tmp/qset-template.json)" = "3"
-          test "$(jq '[.resources[] | select(.type == "Microsoft.Authorization/roleAssignments")] | length' /tmp/qset-template.json)" = "12"
-          test "$(jq '[.resources[] | select(.type == "Microsoft.App/containerApps")] | length' /tmp/qset-template.json)" = "1"
-          test "$(jq '[.resources[] | select(.type == "Microsoft.App/jobs")] | length' /tmp/qset-template.json)" = "1"
-          ! grep -Fq "$LEGACY_CAMPAIGN_ID" "$QSET_TEMPLATE"
-          ! grep -Eq 'POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)' "$QSET_TEMPLATE"
+          sh ops/conduit/test/test-run-job-mappings.sh
+          cargo test -p polyedge-reporting raw_inventory_field_mutation_changes_identity_and_requires_rehash
 
-      - name: Set up Node
-        if: inputs.operation == 'deploy-frozen-campaign'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
+  source-freeze:
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Validate frontend reader
-        if: inputs.operation == 'deploy-frozen-campaign'
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run typecheck
-          npm run build
-
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Validate Azure owner and funded boundary
+      - name: Build review-only immutable source manifest
         env:
-          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          RESEARCH_IMAGE: ${{ inputs.research_image }}
         run: |
           set -euo pipefail
-          test "$(az account show --query id -o tsv)" = "$EXPECTED_SUBSCRIPTION_ID"
-          az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv
-          expected_client_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query clientId -o tsv)
-          authenticated_client_id=$(az account show --query user.name -o tsv)
-          test "$(tr 'A-F' 'a-f' <<<"$authenticated_client_id")" = "$(tr 'A-F' 'a-f' <<<"$expected_client_id")"
-          for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
-            job_json=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json)
-            test "$(jq -r '.properties.configuration.triggerType' <<<"$job_json")" = "Manual"
-            test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
-          done
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-probe-neu-job --query "properties.template.containers[0].env[?name=='ALLOW_LIVE'].value | [0]" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-redeem-neu-job --query "properties.template.containers[0].env[?name=='VENUE_REDEMPTION_ENABLED'].value | [0]" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-strategy-canary-neu-job --query "properties.template.containers[0].env[?name=='STRATEGY_CANARY_CONTROLLER_ENABLED'].value | [0]" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-funded-ladder-neu-job --query "properties.template.containers[0].env[?name=='FUNDED_LADDER_CONTROLLER_ENABLED'].value | [0]" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-promotion-neu-job --query "properties.template.containers[0].env[?name=='PROMOTION_TRANSITION_ENABLED'].value | [0]" -o tsv)" = "false"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-venue-model-job --query "properties.template.containers[0].env[?name=='QUEUE_MODEL_TRAINING_ENABLED'].value | [0]" -o tsv)" = "false"
-
-      - name: Snapshot immutable predecessor resources and artifacts
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$LEGACY_JOB" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
-          az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$LEGACY_APP" -o json \
-            | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
-            > legacy-app-before.json
-          az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$LEGACY_JOB" -o json \
-            | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
-            > legacy-job-before.json
-          az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$MAIN_APP" -o json \
-            | jq -S '{
-                id,
-                identity,
-                configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),
-                template:(
-                  .properties.template
-                  | .containers = [
-                      .containers[]
-                      | if .name == "bot" then
-                          .image = "<active-reader-image>"
-                          | .env = [
-                              .env[]?
-                              | select(
-                                  .name != "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME"
-                                  and .name != "SHADOW_CAMPAIGN_ID"
-                                  and .name != "SHADOW_CAMPAIGN_START"
-                                  and .name != "SHADOW_CAMPAIGN_REPORT_ROOT"
-                                  and .name != "SHADOW_CORRECTION_ROOT"
-                                )
-                            ]
-                        elif .name == "frontend" then
-                          .image = "<active-reader-image>"
-                        else .
-                        end
-                    ]
-                )
-              }' > main-app-nonreader-before.json
-          for prefix in \
-            "data/research/shadow/$LEGACY_CAMPAIGN_ID/" \
-            "reports/research/shadow/campaigns/$LEGACY_CAMPAIGN_ID/"; do
-            az storage blob list \
-              --account-name "$STORAGE_ACCOUNT" \
-              --container-name polyedge-research \
-              --prefix "$prefix" \
-              --auth-mode login \
-              --query '[].{name:name,etag:properties.etag,size:properties.contentLength}' \
-              -o json
-          done | jq -s 'add | sort_by(.name)' > legacy-artifacts-before.json
-          sha256sum legacy-app-before.json legacy-job-before.json legacy-artifacts-before.json
-
-      - name: Reject an existing or partially initialized campaign
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          if az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" -o none 2>resource-error.txt; then
-            echo "qset-v1 app already exists: $QSET_APP" >&2
-            exit 1
-          elif ! grep -Eiq 'ResourceNotFound|could not be found|was not found|does not exist' resource-error.txt; then
-            cat resource-error.txt >&2
-            exit 1
-          fi
-          if az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o none 2>resource-error.txt; then
-            echo "qset-v1 job already exists: $QSET_JOB" >&2
-            exit 1
-          elif ! grep -Eiq 'ResourceNotFound|could not be found|was not found|does not exist' resource-error.txt; then
-            cat resource-error.txt >&2
-            exit 1
-          fi
-          storage_id=$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name "$STORAGE_ACCOUNT" --query id -o tsv)
-          for container in "$QSET_EVENTS_CONTAINER" "$QSET_RESEARCH_CONTAINER" "$QSET_CONTROL_CONTAINER"; do
-            container_id="$storage_id/blobServices/default/containers/$container"
-            if az resource show --ids "$container_id" --api-version 2023-05-01 -o none 2>resource-error.txt; then
-              echo "qset-v1 container already exists: $container" >&2
-              exit 1
-            elif ! grep -Eiq 'ResourceNotFound|ContainerNotFound|could not be found|was not found|does not exist' resource-error.txt; then
-              cat resource-error.txt >&2
-              exit 1
-            fi
-          done
-
-      - name: Build and push immutable images
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          az acr login --name "$ACR_NAME"
-          backend_tag="$ACR_NAME.azurecr.io/polyedge-rust-backend:$GITHUB_SHA"
-          frontend_tag="$ACR_NAME.azurecr.io/polyedge-frontend:$GITHUB_SHA"
-          docker build --build-arg GIT_SHA="$GITHUB_SHA" -f Dockerfile.rust -t "$backend_tag" .
-          docker build -f Dockerfile.frontend -t "$frontend_tag" .
-          docker push "$backend_tag"
-          docker push "$frontend_tag"
-          backend_digest=$(az acr manifest show-metadata --registry "$ACR_NAME" --name "polyedge-rust-backend:$GITHUB_SHA" --query digest -o tsv)
-          frontend_digest=$(az acr manifest show-metadata --registry "$ACR_NAME" --name "polyedge-frontend:$GITHUB_SHA" --query digest -o tsv)
-          test -n "$backend_digest"
-          test -n "$frontend_digest"
-          echo "BACKEND_IMAGE=$ACR_NAME.azurecr.io/polyedge-rust-backend@$backend_digest" >> "$GITHUB_ENV"
-          echo "FRONTEND_IMAGE=$ACR_NAME.azurecr.io/polyedge-frontend@$frontend_digest" >> "$GITHUB_ENV"
-
-      - name: Build immutable source freeze manifest
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
+          printf '%s' "$RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[^[:space:]@]+/[^[:space:]@]+@sha256:[0-9a-f]{64}$'
           : > critical-files.ndjson
           while IFS= read -r file; do
             test -f "$file"
-            sha=$(sha256sum "$file" | cut -d' ' -f1)
-            bytes=$(wc -c <"$file")
-            jq -nc --arg path "$file" --arg sha256 "sha256:$sha" --argjson bytes "$bytes" \
-              '{path:$path,sha256:$sha256,bytes:$bytes}' >> critical-files.ndjson
+            jq -nc --arg path "$file" --arg sha256 "sha256:$(sha256sum "$file" | cut -d' ' -f1)" --argjson bytes "$(wc -c <"$file")"               '{path:$path,sha256:$sha256,bytes:$bytes}' >> critical-files.ndjson
           done < <(jq -r '.protected_files[]' "$FREEZE_POLICY")
-          jq -s \
-            --arg campaign_id "$CAMPAIGN_ID" \
-            --arg evidence_version "protocol-v3-qset-v1" \
-            --arg source_commit "$GITHUB_SHA" \
-            --arg git_tree "$(git rev-parse 'HEAD^{tree}')" \
-            --arg backend_image "$BACKEND_IMAGE" \
-            --arg frontend_image "$FRONTEND_IMAGE" \
-            --arg contract_sha256 "sha256:$(sha256sum "$CAMPAIGN_CONTRACT" | cut -d' ' -f1)" \
-            --arg policy_sha256 "sha256:$(sha256sum "$FREEZE_POLICY" | cut -d' ' -f1)" \
-            '{
-              schema:"polyedge.shadow_source_freeze.v1",
-              campaign_id:$campaign_id,
-              evidence_version:$evidence_version,
-              source_commit:$source_commit,
-              git_tree:$git_tree,
-              backend_image:$backend_image,
-              frontend_image:$frontend_image,
-              campaign_contract_sha256:$contract_sha256,
-              freeze_policy_sha256:$policy_sha256,
-              critical_files:.
-            }' critical-files.ndjson > source-freeze.json
-          source_sha=$(sha256sum source-freeze.json | cut -d' ' -f1)
-          source_path="reports/research/shadow/campaigns/$CAMPAIGN_ID/control/code-freeze/source-$source_sha.json"
-          echo "SOURCE_FREEZE_SHA256=sha256:$source_sha" >> "$GITHUB_ENV"
-          echo "SOURCE_FREEZE_PATH=$source_path" >> "$GITHUB_ENV"
+          jq -s --arg campaign_id "$CAMPAIGN_ID" --arg evidence_version "$EVIDENCE_VERSION"             --arg source_commit "$GITHUB_SHA" --arg git_tree "$(git rev-parse 'HEAD^{tree}')"             --arg research_image "$RESEARCH_IMAGE"             --arg contract_sha256 "sha256:$(sha256sum "$CAMPAIGN_CONTRACT" | cut -d' ' -f1)"             --arg policy_sha256 "sha256:$(sha256sum "$FREEZE_POLICY" | cut -d' ' -f1)"             '{schema:"polyedge.shadow_source_freeze.v1",campaign_id:$campaign_id,evidence_version:$evidence_version,source_commit:$source_commit,git_tree:$git_tree,research_image:$research_image,campaign_contract_sha256:$contract_sha256,freeze_policy_sha256:$policy_sha256,critical_files:.}'             critical-files.ndjson > source-freeze.json
+          jq -e --arg id "$CAMPAIGN_ID" --arg version "$EVIDENCE_VERSION" '.campaign_id == $id and .evidence_version == $version and (.critical_files | length) > 0' source-freeze.json
 
-      - name: Prove isolated create-only Azure plan
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          az deployment group what-if \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --template-file "$QSET_TEMPLATE" \
-            --parameters backendImage="$BACKEND_IMAGE" enableDailySchedule=false initializeFreezeBoundary=true codeFreezeSha256="$SOURCE_FREEZE_SHA256" codeFreezeManifestPath="$SOURCE_FREEZE_PATH" \
-            --result-format ResourceIdOnly \
-            --no-pretty-print \
-            -o json > qset-what-if.json
-          jq -e '
-            [ .changes[] | select(.changeType != "Ignore") ] as $changes
-            | ($changes | length) == 23
-            and all($changes[]; .changeType == "Create")
-            and ([ $changes[]
-              | select(
-                  (.resourceId | ascii_downcase | contains("/microsoft.authorization/roleassignments/")) or
-                  (.resourceId | ascii_downcase | endswith("/microsoft.managedidentity/userassignedidentities/polyedge-shadow-qset-neu-id")) or
-                  (.resourceId | ascii_downcase | endswith("/microsoft.managedidentity/userassignedidentities/polyedge-qset-research-neu-id")) or
-                  (.resourceId | ascii_downcase | endswith("/blobservices/default/containers/polyedge-shadow-qset-events")) or
-                  (.resourceId | ascii_downcase | endswith("/blobservices/default/containers/polyedge-research-qset")) or
-                  (.resourceId | ascii_downcase | endswith("/blobservices/default/containers/polyedge-qset-control")) or
-                  (.resourceId | ascii_downcase | endswith("/blobservices/default/containers/polyedge-qset-control/immutabilitypolicies/default")) or
-                  (.resourceId | ascii_downcase | endswith("/tableservices/default/tables/shadowqseteventindex")) or
-                  (.resourceId | ascii_downcase | endswith("/tableservices/default/tables/shadowqsetchartseries")) or
-                  (.resourceId | ascii_downcase | endswith("/tableservices/default/tables/shadowqsetmarketcatalog")) or
-                  (.resourceId | ascii_downcase | endswith("/microsoft.app/containerapps/polyedge-shadow-qset-neu")) or
-                  (.resourceId | ascii_downcase | endswith("/microsoft.app/jobs/polyedge-shadow-qset-neu-job"))
-                )
-            ] | length) == 23
-          ' qset-what-if.json
-
-      - name: Deploy isolated qset-v1 resources
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          test "$(date -u +%s)" -lt "$(date -u -d "$INITIAL_DEPLOY_DEADLINE_UTC" +%s)"
-          az deployment group create \
-            --name polyedge-shadow-qset-v1 \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --template-file "$QSET_TEMPLATE" \
-            --parameters backendImage="$BACKEND_IMAGE" enableDailySchedule=false initializeFreezeBoundary=true codeFreezeSha256="$SOURCE_FREEZE_SHA256" codeFreezeManifestPath="$SOURCE_FREEZE_PATH"
-
-      - name: Publish immutable prior and source freeze
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          prior_file=research/configs/conservative_execution_prior_v1.json
-          prior_sha=91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4
-          prior_blob="reports/research/venue-probe/models/conservative-execution-prior-v1-$prior_sha.json"
-          test "$(sha256sum "$prior_file" | cut -d' ' -f1)" = "$prior_sha"
-          ready=false
-          for attempt in $(seq 1 30); do
-            if az storage container show --account-name "$STORAGE_ACCOUNT" --name "$QSET_RESEARCH_CONTAINER" --auth-mode login --only-show-errors -o none 2>/dev/null \
-              && az storage container show --account-name "$STORAGE_ACCOUNT" --name "$QSET_CONTROL_CONTAINER" --auth-mode login --only-show-errors -o none 2>/dev/null; then
-              ready=true
-              break
-            fi
-            sleep 10
-          done
-          test "$ready" = "true"
-          az storage blob upload --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_RESEARCH_CONTAINER" --name "$prior_blob" --file "$prior_file" --auth-mode login --overwrite false --content-type application/json --metadata sha256="$prior_sha" immutable_content="true" --only-show-errors -o none
-          az storage blob upload --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$SOURCE_FREEZE_PATH" --file source-freeze.json --auth-mode login --overwrite false --content-type application/json --metadata sha256="${SOURCE_FREEZE_SHA256#sha256:}" immutable_content="true" --only-show-errors -o none
-          az storage blob download --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$SOURCE_FREEZE_PATH" --file source-freeze-verified.json --auth-mode login --overwrite --only-show-errors -o none
-          test "sha256:$(sha256sum source-freeze-verified.json | cut -d' ' -f1)" = "$SOURCE_FREEZE_SHA256"
-
-      - name: Verify isolated paper runtime and manual reporter
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          app_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" -o json)
-          job_json=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json)
-          test "$(jq -r '.properties.template.containers[0].image' <<<"$app_json")" = "$BACKEND_IMAGE"
-          test "$(jq -r '.properties.template.containers[0].image' <<<"$job_json")" = "$BACKEND_IMAGE"
-          test "$(jq -r '.properties.configuration.ingress.external // false' <<<"$app_json")" = "false"
-          for pair in EXECUTION_MODE=paper ALLOW_LIVE=false ENABLE_TAKER_ORDERS=false PAPER_MAKER_FILL_POLICY=none; do
-            name=${pair%%=*}
-            value=${pair#*=}
-            test "$(jq -r --arg name "$name" '.properties.template.containers[0].env[] | select(.name == $name) | .value' <<<"$app_json")" = "$value"
-            test "$(jq -r --arg name "$name" '.properties.template.containers[0].env[] | select(.name == $name) | .value' <<<"$job_json")" = "$value"
-          done
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value' <<<"$app_json")" = "$QSET_EVENTS_CONTAINER"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER") | .value' <<<"$app_json")" = "shadow-events/$CAMPAIGN_ID"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC") | .value' <<<"$app_json")" = "${CAMPAIGN_START}T00:00:00Z"
-          test "$(jq -r '.properties.configuration.triggerType' <<<"$job_json")" = "Manual"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "AZURE_STORAGE_CONTAINER_NAME") | .value' <<<"$job_json")" = "$QSET_RESEARCH_CONTAINER"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_SOURCE_CONTAINER_NAME") | .value' <<<"$job_json")" = "$QSET_EVENTS_CONTAINER"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' <<<"$job_json")" = "$CAMPAIGN_ID"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CODE_FREEZE_SHA256") | .value' <<<"$job_json")" = "$SOURCE_FREEZE_SHA256"
-          test "$(jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CODE_FREEZE_MANIFEST") | .value' <<<"$job_json")" = "azure://$STORAGE_ACCOUNT/$QSET_CONTROL_CONTAINER/$SOURCE_FREEZE_PATH"
-          test "$(jq -r '[.properties.template.containers[].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length' <<<"$app_json")" = "0"
-          test "$(jq -r '[.properties.template.containers[].env[].name | select(test("POLYMARKET_(PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)"))] | length' <<<"$job_json")" = "0"
-          test "$(jq -r '(.properties.configuration.secrets // []) | length' <<<"$app_json")" = "0"
-          test "$(jq -r '(.properties.configuration.secrets // []) | length' <<<"$job_json")" = "0"
-
-      - name: Verify qset identities cannot reach Key Vault or funded storage
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          writer=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-shadow-qset-neu-id --query principalId -o tsv)
-          researcher=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-qset-research-neu-id --query principalId -o tsv)
-          key_vault_id=$(az keyvault show --resource-group "$AZURE_RESOURCE_GROUP" --name kvpolyedge6urdjr5nmwx7w --query id -o tsv)
-          storage_id=$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name "$STORAGE_ACCOUNT" --query id -o tsv)
-          funded_scope="$storage_id/blobServices/default/containers/polyedge-funded-evidence"
-          legacy_events_scope="$storage_id/blobServices/default/containers/polyedge-shadow-events"
-          legacy_research_scope="$storage_id/blobServices/default/containers/polyedge-research"
-          freeze_control_scope="$storage_id/blobServices/default/containers/$QSET_CONTROL_CONTAINER"
-          for principal in "$writer" "$researcher"; do
-            test "$(az role assignment list --scope "$key_vault_id" --assignee "$principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
-            test "$(az role assignment list --scope "$funded_scope" --assignee "$principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
-            test "$(az role assignment list --scope "$legacy_events_scope" --assignee "$principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
-            test "$(az role assignment list --scope "$legacy_research_scope" --assignee "$principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
-            test "$(az role assignment list --scope "$freeze_control_scope" --assignee "$principal" --include-inherited --query 'length(@)' -o tsv)" = "0"
-          done
-
-      - name: Wait for qset preflight evidence
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          ready=false
-          for attempt in $(seq 1 40); do
-            count=$(az storage blob list --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_EVENTS_CONTAINER" --prefix "shadow-events/preflight/$CAMPAIGN_ID/" --auth-mode login --query 'length(@)' -o tsv 2>/dev/null || echo 0)
-            if [ "$count" -gt 0 ]; then
-              ready=true
-              break
-            fi
-            sleep 15
-          done
-          test "$ready" = "true"
-          first_preflight_at=$(az storage blob list --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_EVENTS_CONTAINER" --prefix "shadow-events/preflight/$CAMPAIGN_ID/" --auth-mode login --query 'sort_by(@, &properties.lastModified)[0].properties.lastModified' -o tsv)
-          test -n "$first_preflight_at"
-          test "$(date -u -d "$first_preflight_at" +%s)" -lt "$(date -u -d "$CAMPAIGN_CUTOVER_UTC" +%s)"
-          revision=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" --query properties.latestReadyRevisionName -o tsv)
-          test -n "$revision"
-          az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" --revision "$revision" -o json > qset-replicas.json
-          jq -e 'length == 1 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' qset-replicas.json
-
-      - name: Deploy active Labs reader only
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          az containerapp update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$MAIN_APP" \
-            --container-name bot \
-            --image "$BACKEND_IMAGE" \
-            --set-env-vars \
-              "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME=$QSET_RESEARCH_CONTAINER" \
-              "SHADOW_CAMPAIGN_ID=$CAMPAIGN_ID" \
-              "SHADOW_CAMPAIGN_START=$CAMPAIGN_START" \
-              "SHADOW_CAMPAIGN_REPORT_ROOT=reports/research/shadow/campaigns/$CAMPAIGN_ID" \
-              "SHADOW_CORRECTION_ROOT=reports/research/shadow/campaigns/$CAMPAIGN_ID/corrections" \
-            --only-show-errors -o none
-          az containerapp update \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$MAIN_APP" \
-            --container-name frontend \
-            --image "$FRONTEND_IMAGE" \
-            --only-show-errors -o none
-
-      - name: Verify live Labs routing and predecessor preservation
-        if: inputs.operation == 'deploy-frozen-campaign'
-        env:
-          DASHBOARD_AUTH_PASSWORD: ${{ secrets.DASHBOARD_AUTH_PASSWORD }}
-        run: |
-          set -euo pipefail
-          app_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$MAIN_APP" -o json)
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$app_json")" = "$BACKEND_IMAGE"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")" = "$FRONTEND_IMAGE"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' <<<"$app_json")" = "$CAMPAIGN_ID"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME") | .value' <<<"$app_json")" = "$QSET_RESEARCH_CONTAINER"
-          for pair in EXECUTION_MODE=paper ALLOW_LIVE=false RUN_BOT_ON_STARTUP=true ENABLE_TAKER_ORDERS=false REQUIRE_API_AUTH=true; do
-            name=${pair%%=*}
-            value=${pair#*=}
-            test "$(jq -r --arg name "$name" '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == $name) | .value' <<<"$app_json")" = "$value"
-          done
-          test "$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' <<<"$app_json")" = "http://127.0.0.1:8081/api/v1"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_WS_URL") | .value' <<<"$app_json")" = "ws://127.0.0.1:8081/api/v1/ws/live"
-          fqdn=$(jq -r '.properties.configuration.ingress.fqdn' <<<"$app_json")
-          login_body=$(jq -nc --arg password "$DASHBOARD_AUTH_PASSWORD" '{password:$password}')
-          ready=false
-          for attempt in $(seq 1 40); do
-            code=$(curl -sS -o login.json -c cookies.txt -w '%{http_code}' -H 'content-type: application/json' --data "$login_body" "https://$fqdn/api/auth/login" || true)
-            if [ "$code" = 200 ]; then
-              ready=true
-              break
-            fi
-            sleep 10
-          done
-          unset login_body
-          test "$ready" = "true"
-          curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/status" -o live-status.json
-          curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/labs/reports/latest" -o live-labs-latest.json
-          curl --fail --silent --show-error -b cookies.txt "https://$fqdn/api/backend/labs/reports/daily/2026-07-23" -o live-labs-archived.json
-          jq -e --arg sha "$GITHUB_SHA" '.execution_mode == "paper" and .git_sha == $sha' live-status.json
-          jq -e --arg id "$CAMPAIGN_ID" '.campaign_id == $id and .status == "awaiting_first_sealed_day"' live-labs-latest.json
-          jq -e --arg id "$LEGACY_CAMPAIGN_ID" '.campaign_id == $id and .status == "historical_ineligible"' live-labs-archived.json
-
-      - name: Re-prove predecessor resources and artifacts are unchanged
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$LEGACY_APP" -o json \
-            | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
-            > legacy-app-after.json
-          az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$LEGACY_JOB" -o json \
-            | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
-            > legacy-job-after.json
-          az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$MAIN_APP" -o json \
-            | jq -S '{
-                id,
-                identity,
-                configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),
-                template:(
-                  .properties.template
-                  | .containers = [
-                      .containers[]
-                      | if .name == "bot" then
-                          .image = "<active-reader-image>"
-                          | .env = [
-                              .env[]?
-                              | select(
-                                  .name != "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME"
-                                  and .name != "SHADOW_CAMPAIGN_ID"
-                                  and .name != "SHADOW_CAMPAIGN_START"
-                                  and .name != "SHADOW_CAMPAIGN_REPORT_ROOT"
-                                  and .name != "SHADOW_CORRECTION_ROOT"
-                                )
-                            ]
-                        elif .name == "frontend" then
-                          .image = "<active-reader-image>"
-                        else .
-                        end
-                    ]
-                )
-              }' > main-app-nonreader-after.json
-          for prefix in \
-            "data/research/shadow/$LEGACY_CAMPAIGN_ID/" \
-            "reports/research/shadow/campaigns/$LEGACY_CAMPAIGN_ID/"; do
-            az storage blob list \
-              --account-name "$STORAGE_ACCOUNT" \
-              --container-name polyedge-research \
-              --prefix "$prefix" \
-              --auth-mode login \
-              --query '[].{name:name,etag:properties.etag,size:properties.contentLength}' \
-              -o json
-          done | jq -s 'add | sort_by(.name)' > legacy-artifacts-after.json
-          cmp -s legacy-app-before.json legacy-app-after.json
-          cmp -s legacy-job-before.json legacy-job-after.json
-          cmp -s legacy-artifacts-before.json legacy-artifacts-after.json
-          cmp -s main-app-nonreader-before.json main-app-nonreader-after.json
-
-      - name: Seal immutable deployment freeze pointer
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          qset_app_sha=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" -o json | jq -S '{identity,managedEnvironmentId:.properties.managedEnvironmentId,workloadProfileName:.properties.workloadProfileName,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' | sha256sum | cut -d' ' -f1)
-          qset_job_evidence_sha=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json | jq -S '{
-            identity,
-            environmentId:.properties.environmentId,
-            workloadProfileName:.properties.workloadProfileName,
-            evidence_configuration:{
-              registries:.properties.configuration.registries,
-              replicaRetryLimit:.properties.configuration.replicaRetryLimit,
-              replicaTimeout:.properties.configuration.replicaTimeout
-            },
-            template:.properties.template
-          }' | sha256sum | cut -d' ' -f1)
-          main_labs_reader_sha=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$MAIN_APP" -o json | jq -S '{
-            identity,
-            reader_containers:([
-              .properties.template.containers[]
-              | select(.name == "bot" or .name == "frontend")
-              | {
-                  name,
-                  image,
-                  env:([
-                    .env[]?
-                    | {name,value,secretRef}
-                  ] | sort_by(.name))
-                }
-            ] | sort_by(.name))
-          }' | sha256sum | cut -d' ' -f1)
-          legacy_app_sha=$(sha256sum legacy-app-after.json | cut -d' ' -f1)
-          legacy_job_sha=$(sha256sum legacy-job-after.json | cut -d' ' -f1)
-          legacy_artifacts_sha=$(sha256sum legacy-artifacts-after.json | cut -d' ' -f1)
-          jq -n \
-            --arg campaign_id "$CAMPAIGN_ID" \
-            --arg source_path "$SOURCE_FREEZE_PATH" \
-            --arg source_sha256 "$SOURCE_FREEZE_SHA256" \
-            --arg qset_app_sha256 "sha256:$qset_app_sha" \
-            --arg qset_job_evidence_sha256 "sha256:$qset_job_evidence_sha" \
-            --arg main_labs_reader_sha256 "sha256:$main_labs_reader_sha" \
-            --arg legacy_app_sha256 "sha256:$legacy_app_sha" \
-            --arg legacy_job_sha256 "sha256:$legacy_job_sha" \
-            --arg legacy_artifacts_sha256 "sha256:$legacy_artifacts_sha" \
-            --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{
-              schema:"polyedge.shadow_code_freeze_pointer.v1",
-              campaign_id:$campaign_id,
-              source_manifest:{path:$source_path,sha256:$source_sha256},
-              live_invariants:{
-                qset_app_sha256:$qset_app_sha256,
-                qset_job_evidence_sha256:$qset_job_evidence_sha256,
-                main_labs_reader_sha256:$main_labs_reader_sha256,
-                predecessor_app_sha256:$legacy_app_sha256,
-                predecessor_job_sha256:$legacy_job_sha256,
-                predecessor_artifacts_sha256:$legacy_artifacts_sha256
-              },
-              deployed_at:$deployed_at,
-              code_frozen:true
-            }' > active-freeze.json
-          active_path="reports/research/shadow/campaigns/$CAMPAIGN_ID/control/code-freeze/active.json"
-          az storage blob upload --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$active_path" --file active-freeze.json --auth-mode login --overwrite false --content-type application/json --only-show-errors -o none
-          az storage blob download --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$active_path" --file active-freeze-verified.json --auth-mode login --overwrite --only-show-errors -o none
-          cmp -s active-freeze.json active-freeze-verified.json
-
-      - name: Lock the dedicated freeze-control WORM boundary
-        if: inputs.operation == 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          policy_json=$(az storage container immutability-policy show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$QSET_CONTROL_CONTAINER" \
-            -o json)
-          test "$(jq -r '.state' <<<"$policy_json")" = "Unlocked"
-          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" = "90"
-          etag=$(jq -r '.etag' <<<"$policy_json")
-          test -n "$etag"
-          az storage container immutability-policy lock \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$QSET_CONTROL_CONTAINER" \
-            --if-match "$etag" \
-            --only-show-errors \
-            -o none
-          locked_json=$(az storage container immutability-policy show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$QSET_CONTROL_CONTAINER" \
-            -o json)
-          test "$(jq -r '.state' <<<"$locked_json")" = "Locked"
-          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$locked_json")" = "90"
-
-      - name: Load and verify frozen live binding
-        if: inputs.operation != 'deploy-frozen-campaign'
-        run: |
-          set -euo pipefail
-          policy_json=$(az storage container immutability-policy show \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --account-name "$STORAGE_ACCOUNT" \
-            --container-name "$QSET_CONTROL_CONTAINER" \
-            -o json)
-          test "$(jq -r '.state' <<<"$policy_json")" = "Locked"
-          test "$(jq -r '.immutabilityPeriodSinceCreationInDays' <<<"$policy_json")" -ge 90
-          active_path="reports/research/shadow/campaigns/$CAMPAIGN_ID/control/code-freeze/active.json"
-          az storage blob download --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$active_path" --file active-freeze.json --auth-mode login --overwrite --only-show-errors -o none
-          jq -e --arg id "$CAMPAIGN_ID" '.schema == "polyedge.shadow_code_freeze_pointer.v1" and .campaign_id == $id and .code_frozen == true' active-freeze.json
-          job_json=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json)
-          source_sha=$(jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CODE_FREEZE_SHA256") | .value' <<<"$job_json")
-          source_uri=$(jq -r '.properties.template.containers[0].env[] | select(.name == "SHADOW_CODE_FREEZE_MANIFEST") | .value' <<<"$job_json")
-          source_prefix="azure://$STORAGE_ACCOUNT/$QSET_CONTROL_CONTAINER/"
-          test "$source_uri" != "${source_uri#"$source_prefix"}"
-          source_path=${source_uri#"$source_prefix"}
-          test "$source_path" = "$(jq -r '.source_manifest.path' active-freeze.json)"
-          test "$source_sha" = "$(jq -r '.source_manifest.sha256' active-freeze.json)"
-          az storage blob download --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_CONTROL_CONTAINER" --name "$source_path" --file source-freeze.json --auth-mode login --overwrite --only-show-errors -o none
-          test "sha256:$(sha256sum source-freeze.json | cut -d' ' -f1)" = "$source_sha"
-          while IFS= read -r protected; do
-            path=$(jq -r '.path' <<<"$protected")
-            expected=$(jq -r '.sha256' <<<"$protected")
-            test -f "$path"
-            test "sha256:$(sha256sum "$path" | cut -d' ' -f1)" = "$expected"
-          done < <(jq -c '.critical_files[]' source-freeze.json)
-          backend_image=$(jq -r '.backend_image' source-freeze.json)
-          test "$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" --query 'properties.template.containers[0].image' -o tsv)" = "$backend_image"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query 'properties.template.containers[0].image' -o tsv)" = "$backend_image"
-          qset_app_sha=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_APP" -o json | jq -S '{identity,managedEnvironmentId:.properties.managedEnvironmentId,workloadProfileName:.properties.workloadProfileName,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' | sha256sum | cut -d' ' -f1)
-          qset_job_evidence_sha=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json | jq -S '{
-            identity,
-            environmentId:.properties.environmentId,
-            workloadProfileName:.properties.workloadProfileName,
-            evidence_configuration:{
-              registries:.properties.configuration.registries,
-              replicaRetryLimit:.properties.configuration.replicaRetryLimit,
-              replicaTimeout:.properties.configuration.replicaTimeout
-            },
-            template:.properties.template
-          }' | sha256sum | cut -d' ' -f1)
-          main_labs_reader_sha=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$MAIN_APP" -o json | jq -S '{
-            identity,
-            reader_containers:([
-              .properties.template.containers[]
-              | select(.name == "bot" or .name == "frontend")
-              | {
-                  name,
-                  image,
-                  env:([
-                    .env[]?
-                    | {name,value,secretRef}
-                  ] | sort_by(.name))
-                }
-            ] | sort_by(.name))
-          }' | sha256sum | cut -d' ' -f1)
-          test "sha256:$qset_app_sha" = "$(jq -r '.live_invariants.qset_app_sha256' active-freeze.json)"
-          test "sha256:$qset_job_evidence_sha" = "$(jq -r '.live_invariants.qset_job_evidence_sha256' active-freeze.json)"
-          test "sha256:$main_labs_reader_sha" = "$(jq -r '.live_invariants.main_labs_reader_sha256' active-freeze.json)"
-          echo "BACKEND_IMAGE=$backend_image" >> "$GITHUB_ENV"
-          echo "SOURCE_FREEZE_SHA256=$source_sha" >> "$GITHUB_ENV"
-          echo "SOURCE_FREEZE_PATH=$source_path" >> "$GITHUB_ENV"
-
-      - name: Run and verify first settlement-carry seal
-        if: inputs.operation == 'run-first-seal'
-        run: |
-          set -euo pipefail
-          test "$(date -u +%s)" -ge "$(date -u -d '2026-07-30T02:15:00Z' +%s)"
-          latest_sealed_day=$(date -u -d '2 days ago' +%Y-%m-%d)
-          test "$(date -u -d "$latest_sealed_day" +%s)" -ge "$(date -u -d "$FIRST_SEALED_DAY" +%s)"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query properties.configuration.triggerType -o tsv)" = "Manual"
-          test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
-          first_pointer="reports/research/shadow/campaigns/$CAMPAIGN_ID/daily/$FIRST_SEALED_DAY/latest.json"
-          test "$(az storage blob exists --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_RESEARCH_CONTAINER" --name "$first_pointer" --auth-mode login --query exists -o tsv)" = "false"
-          az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json \
-            | jq --arg report "$FIRST_SEALED_DAY" --arg through "$latest_sealed_day" '
-                .properties.template
-                | .containers[0].env = (
-                    [.containers[0].env[] | select(.name != "SHADOW_REPORT_DATE" and .name != "SHADOW_CASCADE_THROUGH")]
-                    + [
-                        {name:"SHADOW_REPORT_DATE",value:$report},
-                        {name:"SHADOW_CASCADE_THROUGH",value:$through}
-                      ]
-                  )
-              ' > first-seal-execution-template.json
-          jq -e --arg report "$FIRST_SEALED_DAY" --arg through "$latest_sealed_day" '
-            .containers[0].env
-            | ([.[] | select(.name == "SHADOW_REPORT_DATE" and .value == $report)] | length) == 1
-            and ([.[] | select(.name == "SHADOW_CASCADE_THROUGH" and .value == $through)] | length) == 1
-          ' first-seal-execution-template.json
-          execution=$(az containerapp job start \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --name "$QSET_JOB" \
-            --yaml first-seal-execution-template.json \
-            --query name -o tsv)
-          test -n "$execution"
-          status=Running
-          for attempt in $(seq 1 600); do
-            status=$(az containerapp job execution show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --job-execution-name "$execution" --query properties.status -o tsv)
-            case "$status" in
-              Succeeded) break ;;
-              Failed|Stopped|Degraded) exit 1 ;;
-            esac
-            sleep 30
-          done
-          if [ "$status" != "Succeeded" ]; then
-            az containerapp job stop --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --job-execution-name "$execution" --only-show-errors || true
-            exit 1
-          fi
-          cursor="$FIRST_SEALED_DAY"
-          while [ "$(date -u -d "$cursor" +%s)" -le "$(date -u -d "$latest_sealed_day" +%s)" ]; do
-            sh research/verify_shadow_daily_bundle.sh "$cursor"
-            cursor=$(date -u -d "$cursor + 1 day" +%Y-%m-%d)
-          done
-          profitability_path="reports/research/shadow/campaigns/$CAMPAIGN_ID/profitability/latest.json"
-          test "$(az storage blob exists --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_RESEARCH_CONTAINER" --name "$profitability_path" --auth-mode login --query exists -o tsv)" = "true"
-
-      - name: Enable unchanged daily schedule after first successful seal
-        if: inputs.operation == 'enable-daily-schedule'
-        run: |
-          set -euo pipefail
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query properties.configuration.triggerType -o tsv)" = "Manual"
-          test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query '[?properties.status==`Succeeded`] | length(@)' -o tsv)" -ge 1
-          test "$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query '[?properties.status==`Running`] | length(@)' -o tsv)" = "0"
-          daily_root="reports/research/shadow/campaigns/$CAMPAIGN_ID/daily"
-          while :; do
-            latest_sealed_day=$(date -u -d '2 days ago' +%Y-%m-%d)
-            test "$(date -u -d "$latest_sealed_day" +%s)" -ge "$(date -u -d "$FIRST_SEALED_DAY" +%s)"
-            first_missing=
-            cursor="$FIRST_SEALED_DAY"
-            while [ "$(date -u -d "$cursor" +%s)" -le "$(date -u -d "$latest_sealed_day" +%s)" ]; do
-              pointer="$daily_root/$cursor/latest.json"
-              exists=$(az storage blob exists --account-name "$STORAGE_ACCOUNT" --container-name "$QSET_RESEARCH_CONTAINER" --name "$pointer" --auth-mode login --query exists -o tsv)
-              if [ "$exists" = "false" ] && [ -z "$first_missing" ]; then
-                first_missing="$cursor"
-              elif [ "$exists" = "true" ] && [ -n "$first_missing" ]; then
-                echo "daily evidence has a non-contiguous gap before $cursor" >&2
-                exit 1
-              fi
-              cursor=$(date -u -d "$cursor + 1 day" +%Y-%m-%d)
-            done
-            if [ -n "$first_missing" ]; then
-              test "$first_missing" != "$FIRST_SEALED_DAY"
-              az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json \
-                | jq --arg report "$first_missing" --arg through "$latest_sealed_day" '
-                    .properties.template
-                    | .containers[0].env = (
-                        [.containers[0].env[] | select(.name != "SHADOW_REPORT_DATE" and .name != "SHADOW_CASCADE_THROUGH")]
-                        + [
-                            {name:"SHADOW_REPORT_DATE",value:$report},
-                            {name:"SHADOW_CASCADE_THROUGH",value:$through}
-                          ]
-                      )
-                  ' > catch-up-execution-template.json
-              jq -e --arg report "$first_missing" --arg through "$latest_sealed_day" '
-                .containers[0].env
-                | ([.[] | select(.name == "SHADOW_REPORT_DATE" and .value == $report)] | length) == 1
-                and ([.[] | select(.name == "SHADOW_CASCADE_THROUGH" and .value == $through)] | length) == 1
-              ' catch-up-execution-template.json
-              execution=$(az containerapp job start \
-                --resource-group "$AZURE_RESOURCE_GROUP" \
-                --name "$QSET_JOB" \
-                --yaml catch-up-execution-template.json \
-                --query name -o tsv)
-              test -n "$execution"
-              status=Running
-              for attempt in $(seq 1 600); do
-                status=$(az containerapp job execution show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --job-execution-name "$execution" --query properties.status -o tsv)
-                case "$status" in
-                  Succeeded) break ;;
-                  Failed|Stopped|Degraded) exit 1 ;;
-                esac
-                sleep 30
-              done
-              if [ "$status" != "Succeeded" ]; then
-                az containerapp job stop --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --job-execution-name "$execution" --only-show-errors || true
-                exit 1
-              fi
-            fi
-            cursor="$FIRST_SEALED_DAY"
-            while [ "$(date -u -d "$cursor" +%s)" -le "$(date -u -d "$latest_sealed_day" +%s)" ]; do
-              sh research/verify_shadow_daily_bundle.sh "$cursor"
-              cursor=$(date -u -d "$cursor + 1 day" +%Y-%m-%d)
-            done
-            current_sealed_day=$(date -u -d '2 days ago' +%Y-%m-%d)
-            [ "$current_sealed_day" = "$latest_sealed_day" ] && break
-          done
-          test "$(date -u -d '2 days ago' +%Y-%m-%d)" = "$latest_sealed_day"
-          az deployment group what-if \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --template-file "$QSET_TEMPLATE" \
-            --parameters backendImage="$BACKEND_IMAGE" enableDailySchedule=true initializeFreezeBoundary=false codeFreezeSha256="$SOURCE_FREEZE_SHA256" codeFreezeManifestPath="$SOURCE_FREEZE_PATH" \
-            --result-format ResourceIdOnly \
-            --no-pretty-print \
-            -o json > schedule-what-if.json
-          jq -e --arg job "$QSET_JOB" '
-            [ .changes[] | select(.changeType != "Ignore") ] as $changes
-            | ($changes | length) == 1
-            and $changes[0].changeType == "Modify"
-            and ($changes[0].resourceId | ascii_downcase | endswith("/microsoft.app/jobs/" + ($job | ascii_downcase)))
-          ' schedule-what-if.json
-          test "$(date -u -d '2 days ago' +%Y-%m-%d)" = "$latest_sealed_day"
-          az deployment group create \
-            --name polyedge-shadow-qset-v1 \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --template-file "$QSET_TEMPLATE" \
-            --parameters backendImage="$BACKEND_IMAGE" enableDailySchedule=true initializeFreezeBoundary=false codeFreezeSha256="$SOURCE_FREEZE_SHA256" codeFreezeManifestPath="$SOURCE_FREEZE_PATH"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query properties.configuration.triggerType -o tsv)" = "Schedule"
-          test "$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" --query properties.configuration.scheduleTriggerConfig.cronExpression -o tsv)" = "15 2 * * *"
-          qset_job_evidence_sha=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$QSET_JOB" -o json | jq -S '{
-            identity,
-            environmentId:.properties.environmentId,
-            workloadProfileName:.properties.workloadProfileName,
-            evidence_configuration:{
-              registries:.properties.configuration.registries,
-              replicaRetryLimit:.properties.configuration.replicaRetryLimit,
-              replicaTimeout:.properties.configuration.replicaTimeout
-            },
-            template:.properties.template
-          }' | sha256sum | cut -d' ' -f1)
-          test "sha256:$qset_job_evidence_sha" = "$(jq -r '.live_invariants.qset_job_evidence_sha256' active-freeze.json)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qset-v2-source-freeze-${{ github.sha }}
+          path: source-freeze.json
+          if-no-files-found: error
+          retention-days: 7

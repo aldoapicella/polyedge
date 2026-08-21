@@ -36,6 +36,10 @@ grep -F 'exec /usr/local/libexec/polyedge-parity-record-daily "$POLYEDGE_RESEARC
 test "$(grep -c 'cpus=1.5 memory=' "$runner")" -eq 3
 grep -F '*) work=$ring/jobs/research credential=research ;;' "$runner" >/dev/null
 grep -F 'shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;' "$runner" >/dev/null
+grep -F 'campaign-2026-08-22-qset-v2' "$runner" >/dev/null
+grep -F 'protocol-v3-qset-v2' "$runner" >/dev/null
+grep -F 'data/research/shadow/campaign-2026-08-22-qset-v2/control/replay.lock' "$runner" >/dev/null
+! grep -F 'only permits campaign-2026-07-28-qset-v1' "$runner" >/dev/null
 grep -F 'credential_dir=/run/polyedge-federated-$credential' "$runner" >/dev/null
 grep -F 'credential_dir=/etc/polyedge/credentials/$credential' "$runner" >/dev/null
 grep -F -- '-v "$credential_dir:/run/credentials:ro,Z"' "$runner" >/dev/null

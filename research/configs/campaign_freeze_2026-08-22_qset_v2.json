@@ -1,0 +1,41 @@
+{
+  "schema": "polyedge.shadow_campaign_freeze_policy.v1",
+  "campaign_id": "campaign-2026-08-22-qset-v2",
+  "evidence_version": "protocol-v3-qset-v2",
+  "start_date": "2026-08-22",
+  "terminal_date": "2026-10-20",
+  "freeze_on_initial_deploy": true,
+  "change_requires_new_campaign_id": true,
+  "literal_queue_rank_available": false,
+  "queue_position_source": "authenticated_lifecycle_plus_public_l2",
+  "queue_position_metric": "inferred_size_ahead",
+  "raw_container": "polyedge-shadow-qset-events",
+  "research_container": "polyedge-research-qset",
+  "freeze_control_container": "polyedge-qset-control",
+  "protected_files": [
+    "research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml",
+    "research/configs/campaign_freeze_2026-08-22_qset_v2.json",
+    "research/configs/frozen_candidates.yaml",
+    "research/configs/conservative_execution_prior_v1.json",
+    "research/run_shadow_daily.sh",
+    "research/verify_shadow_daily_bundle.sh",
+    "crates/polyedge-reporting/src/research/projected_cache.rs",
+    "ops/conduit/bin/polyedge-run-job",
+    ".github/workflows/deploy-polyedge-shadow-qset.yml"
+  ],
+  "allowed_post_freeze_operations": [
+    "read_only_monitoring",
+    "start_manual_daily_seal_after_required_utc_days_are_closed",
+    "run_controlled_missing_day_cascade_before_schedule",
+    "enable_the_existing_daily_schedule_after_first_successful_seal",
+    "stop_or_disable_failed_paper_shadow_execution"
+  ],
+  "forbidden_post_freeze_operations": [
+    "modify_evidence_generating_code_in_place",
+    "overwrite_freeze_manifest",
+    "mutate_campaign_2026_07_28_qset_v1_artifacts",
+    "retro_seal_or_force_complete_campaign_2026_07_28_qset_v1",
+    "enable_funded_execution",
+    "claim_literal_fifo_queue_rank"
+  ]
+}

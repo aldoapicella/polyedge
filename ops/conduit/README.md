@@ -23,8 +23,10 @@ start with less than 40 GiB free. All Azure jobs remain disabled unless
 `/etc/polyedge/ENABLE_AZURE_JOBS` exists, and their timers are not enabled by
 the install sequence.
 
-The legacy shadow schedule is intentionally absent. `shadow-qset` permits only
-`campaign-2026-07-28-qset-v1` and remains disabled until manually approved.
+The legacy shadow schedule is intentionally absent. Qset-v1 is retired as
+unchanged historical/ineligible evidence. `shadow-qset` permits only
+`campaign-2026-08-22-qset-v2` and remains disabled until its exact source
+freeze is reviewed and its first complete D+1 sealed inventory passes.
 
 ## Install after both gates are approved
 

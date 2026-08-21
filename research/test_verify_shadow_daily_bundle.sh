@@ -4,8 +4,8 @@ set -eu
 REPO="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-DATE=2026-07-28
-CAMPAIGN_ID=campaign-2026-07-28-qset-v1
+DATE=2026-08-22
+CAMPAIGN_ID=campaign-2026-08-22-qset-v2
 DAILY_ROOT="reports/research/shadow/campaigns/$CAMPAIGN_ID/daily"
 RUN_ID=test-run
 RUN_ROOT="$DAILY_ROOT/$DATE/runs/$RUN_ID"
@@ -43,9 +43,9 @@ EOF
 cat >"$TMP/blobs/$RUN_ROOT/code_freeze_binding.json" <<'EOF'
 {
   "schema": "polyedge.shadow_code_freeze_binding.v1",
-  "campaign_id": "campaign-2026-07-28-qset-v1",
-  "evidence_version": "protocol-v3-qset-v1",
-  "manifest_path": "azure://st/polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+  "campaign_id": "campaign-2026-08-22-qset-v2",
+  "evidence_version": "protocol-v3-qset-v2",
+  "manifest_path": "azure://st/polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
   "manifest_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 EOF
@@ -75,7 +75,7 @@ jq -n \
     schema_version:2,
     git_sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     runtime_role:"profitability_shadow",
-    date:"2026-07-28",
+    date:"2026-08-22",
     run_id:"test-run",
     status:"COMPLETE",
     artifacts:$artifacts,
@@ -114,7 +114,7 @@ write_pointer() {
   mkdir -p "$TMP/blobs/$DAILY_ROOT/$DATE"
   jq -n --arg sha "$manifest_sha" '{
     schema_version:1,
-    date:"2026-07-28",
+    date:"2026-08-22",
     run_id:"test-run",
     manifest_path:"runs/test-run/run_manifest.json",
     manifest_sha256:$sha
@@ -128,8 +128,9 @@ export STORAGE_ACCOUNT=st
 export QSET_RESEARCH_CONTAINER=research
 export QSET_CONTROL_CONTAINER=polyedge-qset-control
 export CAMPAIGN_ID
+export EVIDENCE_VERSION=protocol-v3-qset-v2
 export SOURCE_FREEZE_SHA256=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-export SOURCE_FREEZE_PATH=reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json
+export SOURCE_FREEZE_PATH=reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json
 export SOURCE_FREEZE_FILE="$TMP/source-freeze.json"
 
 sh "$REPO/research/verify_shadow_daily_bundle.sh" "$DATE"

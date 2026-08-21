@@ -92,11 +92,17 @@ case "$job" in
     ;;
   shadow-qset)
     cpus=1.5 memory=8g limit=16800
-    test "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-07-28-qset-v1 || {
-      echo 'shadow-qset only permits campaign-2026-07-28-qset-v1' >&2
+    test "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-08-22-qset-v2 \
+      && test "${SHADOW_CAMPAIGN_START:-}" = 2026-08-22 \
+      && test "${SHADOW_CAMPAIGN_PREFIX:-}" = shadow-events/campaign-2026-08-22-qset-v2 \
+      && test "${SHADOW_CAMPAIGN_REPORT_ROOT:-}" = reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2 \
+      && test "${SHADOW_CORRECTION_ROOT:-}" = reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/corrections \
+      && test "${SHADOW_CAMPAIGN_CONTRACT:-}" = research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml \
+      && test "${SHADOW_EVIDENCE_VERSION:-}" = protocol-v3-qset-v2 || {
+      echo 'shadow-qset only permits the exact clean qset-v2 successor binding' >&2
       exit 64
     }
-    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/shadow/campaign-2026-07-28-qset-v1/control/replay.lock" -- /bin/sh /app/research/run_shadow_daily.sh'
+    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/shadow/campaign-2026-08-22-qset-v2/control/replay.lock" -- /bin/sh /app/research/run_shadow_daily.sh'
     ;;
   *)
     echo "unknown PolyEdge job: $job" >&2
