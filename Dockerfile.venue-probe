@@ -5,7 +5,7 @@ WORKDIR /app
 COPY venue-probe/package.json venue-probe/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-COPY venue-probe/src ./src
+COPY --chown=node:node venue-probe/src ./src
 
 USER node
 
