@@ -24,6 +24,9 @@ const CAMPAIGN_ID = "dynamic-quote-funded-2026-08-13-v10";
 const FUNDER_ADDRESS = "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8";
 const AMBIGUOUS_REASON = "ambiguous_submission_no_fill";
 const ACKNOWLEDGED_REASON = "acknowledged_terminal_no_fill";
+const EVICTED_ACKNOWLEDGED_REASON = "acknowledged_evicted_order_no_fill";
+const FAILED_POST_ACK_ERROR =
+  "canary lifecycle did not reconcile across REST and authenticated user channel";
 const MINIMUM_COMPLETION_AGE_MS = 24 * 60 * 60 * 1_000;
 const MINIMUM_SNAPSHOT_INTERVAL_MS = 10_000;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
@@ -40,15 +43,30 @@ export function ambiguousNoOrderConfig(env = process.env) {
 
 export function acknowledgedNoFillConfig(
   env = process.env,
-  { requireFederatedToken = false } = {}
+  { requireFederatedToken = false, reason = ACKNOWLEDGED_REASON } = {}
 ) {
-  const config = recoveryConfig(env, ACKNOWLEDGED_REASON, failAcknowledged);
+  if (![ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON].includes(reason)) {
+    failAcknowledged("reconciliation reason is not exact");
+  }
+  const config = recoveryConfig(env, reason, failAcknowledged);
   const orderId = String(env.FUNDED_DIRECT_RECONCILE_ORDER_ID || "").trim();
   if (!ORDER_ID.test(orderId)) failAcknowledged("order ID is not exact");
   if (requireFederatedToken) {
     validateTerminalSettlementFederatedTokenFile(env.AZURE_FEDERATED_TOKEN_FILE);
   }
-  return { ...config, orderId };
+  if (reason === ACKNOWLEDGED_REASON) return { ...config, orderId };
+  const summaryBlobName =
+    String(env.FUNDED_DIRECT_RECONCILE_SUMMARY_BLOB_NAME || "").trim();
+  const summarySha256 =
+    String(env.FUNDED_DIRECT_RECONCILE_SUMMARY_SHA256 || "").trim();
+  const match = /^funded-direct-(\d{4})(\d{2})(\d{2})\d{9}-[0-9a-f]{8}$/.exec(config.runId);
+  const expectedSummaryPath = match
+    ? `reports/research/venue-probe/runs/${match[1]}-${match[2]}-${match[3]}/${config.runId}/summary.json`
+    : "";
+  if (!SHA256.test(summarySha256) || summaryBlobName !== expectedSummaryPath) {
+    failAcknowledged("failed summary binding is not exact");
+  }
+  return { ...config, orderId, summaryBlobName, summarySha256 };
 }
 
 function recoveryConfig(env, reason, failClosed) {
@@ -96,6 +114,7 @@ function recoveryConfig(env, reason, failClosed) {
     decisionId,
     runId,
     probeId,
+    reconciliationReason: reason,
     reservationBlobName,
     reservationSha256,
     completionBlobName,
@@ -319,6 +338,118 @@ export function validateAcknowledgedNoFillSnapshot({
   };
 }
 
+export function validateEvictedAcknowledgedNoFillBinding(value) {
+  const binding = validateAcknowledgedNoFillBinding(value);
+  const { config, summaryDocument } = value;
+  const summary = summaryDocument?.value;
+  const probe = Array.isArray(summary?.probes) && summary.probes.length === 1
+    ? summary.probes[0]
+    : null;
+  const market = summary?.market;
+  const order = summary?.order;
+  const lifecycle = summary?.lifecycle;
+  const completedMs = Date.parse(binding.completion.completed_at);
+  const updatedMs = Date.parse(binding.reservation.updated_ts);
+  const startedMs = Date.parse(summary?.started_ts);
+  const finishedMs = Date.parse(summary?.finished_ts);
+  const submittedMs = Date.parse(lifecycle?.submitted_ts);
+  const acknowledgedMs = Date.parse(lifecycle?.acknowledged_ts);
+  if (summaryDocument?.blobName !== config.summaryBlobName ||
+      summaryDocument?.sha256 !== config.summarySha256 ||
+      summary?.schema_version !== 3 ||
+      summary?.evidence_protocol_version !== EVIDENCE_PROTOCOL_VERSION ||
+      summary?.run_id !== config.runId ||
+      summary?.status !== "failed_closed" ||
+      summary?.order_submission_attempted !== true ||
+      summary?.order_submitted !== true ||
+      summary?.submitted_order_count !== 1 ||
+      summary?.completed_probe_count !== 0 ||
+      summary?.research_only !== false ||
+      summary?.live_trading_enabled !== true ||
+      summary?.evidence_trust_boundary_ready !== false ||
+      probe?.schema_version !== 3 ||
+      probe?.evidence_protocol_version !== EVIDENCE_PROTOCOL_VERSION ||
+      probe?.probe_id !== config.probeId ||
+      probe?.status !== "completed_ineligible" ||
+      probe?.order_submitted !== true ||
+      probe?.error !== FAILED_POST_ACK_ERROR ||
+      JSON.stringify(probe?.market) !== JSON.stringify(market) ||
+      JSON.stringify(probe?.order) !== JSON.stringify(order) ||
+      JSON.stringify(probe?.lifecycle) !== JSON.stringify(lifecycle) ||
+      JSON.stringify(probe?.model_observations) !== JSON.stringify(summary?.model_observations) ||
+      !order || typeof order !== "object" || Array.isArray(order) ||
+      order.side !== "BUY" || order.post_only !== true ||
+      !finiteNumeric(order.price) || Number(order.price) <= 0 ||
+      !finiteNumeric(order.size) || Number(order.size) <= 0 ||
+      !finiteNumeric(order.notional) || Number(order.notional) <= 0 ||
+      !Array.isArray(summary?.model_observations) || summary.model_observations.length === 0 ||
+      !Array.isArray(probe?.model_observations) || probe.model_observations.length === 0 ||
+      !Array.isArray(summary?.markouts) || summary.markouts.length !== 0 ||
+      !Array.isArray(probe?.markouts) || probe.markouts.length !== 0 ||
+      String(market?.id || "") !== String(binding.reservation.market_id || "") ||
+      market?.conditionId !== binding.reservation.condition_id ||
+      String(market?.tokenId || "") !== String(binding.reservation.token_id || "") ||
+      lifecycle?.order_id !== config.orderId ||
+      !exactZero(lifecycle?.actual_matched_size) ||
+      !Array.isArray(lifecycle?.related_trade_ids) || lifecycle.related_trade_ids.length !== 0 ||
+      lifecycle?.reconciliation_complete !== false ||
+      lifecycle?.zero_open_orders_confirmed !== true ||
+      lifecycle?.data_gap_detected !== true ||
+      lifecycle?.cancellation_failure !== false ||
+      !Number.isFinite(startedMs) || !Number.isFinite(finishedMs) ||
+      !Number.isFinite(submittedMs) || !Number.isFinite(acknowledgedMs) ||
+      summary.started_ts !== probe.started_ts || summary.finished_ts !== probe.finished_ts ||
+      lifecycle.send_wall_ms !== submittedMs || lifecycle.ack_wall_ms !== acknowledgedMs ||
+      startedMs !== submittedMs || acknowledgedMs < submittedMs || finishedMs < acknowledgedMs ||
+      !Number.isFinite(updatedMs) || finishedMs < updatedMs ||
+      !Number.isFinite(completedMs) || finishedMs > completedMs ||
+      !finiteNumeric(lifecycle?.client_to_http_ack_ms) ||
+      Number(lifecycle.client_to_http_ack_ms) < 0 ||
+      lifecycle?.acknowledgement_latency_ms !== lifecycle.client_to_http_ack_ms) {
+    failAcknowledged("failed summary binding is invalid");
+  }
+  return { ...binding, summary };
+}
+
+export function validateEvictedAcknowledgedNoFillSnapshot({
+  reservation,
+  config,
+  order,
+  openOrders,
+  authenticatedTrades,
+  positions,
+  observedAtMs
+}) {
+  const positionsValid = Array.isArray(positions) && positions.every((position) =>
+    finiteNumeric(position?.size) && Number(position.size) >= 0
+  );
+  const unresolvedPositions = positionsValid ? positions.filter((position) =>
+    Number(position?.size) > 1e-9 && position?.redeemable !== true
+  ) : [null];
+  const exactPositions = positionsValid ? positions.filter((position) =>
+    Number(position?.size) > 1e-9 &&
+    String(position?.conditionId || "").toLowerCase() ===
+      String(reservation?.condition_id || "").toLowerCase() &&
+    String(position?.asset || "") === String(reservation?.token_id || "")
+  ) : [null];
+  if (order !== null || !Array.isArray(openOrders) || openOrders.length !== 0 ||
+      !Array.isArray(authenticatedTrades) || authenticatedTrades.length !== 0 ||
+      unresolvedPositions.length !== 0 || exactPositions.length !== 0 ||
+      !Number.isFinite(observedAtMs) ||
+      config.reconciliationReason !== EVICTED_ACKNOWLEDGED_REASON) {
+    failAcknowledged("venue snapshot did not prove an evicted order with zero exposure");
+  }
+  return {
+    observed_at: new Date(observedAtMs).toISOString(),
+    terminal_order_status: "NOT_RETAINED_AFTER_DURABLE_CANCEL",
+    rest_order_matched_size: 0,
+    authenticated_open_order_count: 0,
+    authenticated_trade_count: 0,
+    unresolved_position_count: 0,
+    exact_position_count: 0
+  };
+}
+
 export function validateAcknowledgedNoFillSnapshots(first, second) {
   const firstMs = Date.parse(first?.observed_at);
   const secondMs = Date.parse(second?.observed_at);
@@ -331,13 +462,28 @@ export function validateAcknowledgedNoFillSnapshots(first, second) {
   return { first, second, observation_ms: secondMs - firstMs };
 }
 
-export async function observeAcknowledgedNoFill({
+export async function observeAcknowledgedNoFill(options) {
+  return observeAcknowledgedSnapshots({
+    ...options,
+    validateSnapshot: validateAcknowledgedNoFillSnapshot
+  });
+}
+
+export async function observeEvictedAcknowledgedNoFill(options) {
+  return observeAcknowledgedSnapshots({
+    ...options,
+    validateSnapshot: validateEvictedAcknowledgedNoFillSnapshot
+  });
+}
+
+async function observeAcknowledgedSnapshots({
   client,
   reservation,
   config,
   fetchImpl = fetch,
   now = () => Date.now(),
-  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  validateSnapshot
 }) {
   const snapshot = async () => {
     const [order, openOrders, authenticatedTrades, positions] = await Promise.all([
@@ -353,7 +499,7 @@ export async function observeAcknowledgedNoFill({
         }
       })
     ]);
-    return validateAcknowledgedNoFillSnapshot({
+    return validateSnapshot({
       reservation,
       config,
       order,
@@ -376,14 +522,20 @@ export async function runAcknowledgedNoFillReconciliation({
   loadRecords = loadCampaignUnresolvedRiskReservationRecords,
   loadDocument = downloadBlobDocument,
   createClient = () => venueClient(env),
-  observe = observeAcknowledgedNoFill,
+  observe,
   fetchImpl = fetch,
   finalize = finalizeProbeRisk,
-  logger = (value) => console.log(JSON.stringify(value))
+  logger = (value) => console.log(JSON.stringify(value)),
+  reason = ACKNOWLEDGED_REASON
 } = {}) {
   const config = acknowledgedNoFillConfig(env, {
-    requireFederatedToken: containerFactory === storageContainer
+    requireFederatedToken: containerFactory === storageContainer,
+    reason
   });
+  const evicted = reason === EVICTED_ACKNOWLEDGED_REASON;
+  const observeBound = observe || (evicted
+    ? observeEvictedAcknowledgedNoFill
+    : observeAcknowledgedNoFill);
   const container = containerFactory(config);
   if (!container) failAcknowledged("storage is unavailable");
   const records = await loadRecords(config, { container });
@@ -391,18 +543,23 @@ export async function runAcknowledgedNoFillReconciliation({
   if (records.length !== 1 || exact.length !== 1) {
     failAcknowledged("did not resolve exactly one account reservation");
   }
-  const [reservationDocument, completionDocument] = await Promise.all([
+  const [reservationDocument, completionDocument, summaryDocument] = await Promise.all([
     loadDocument(container, config.reservationBlobName),
-    loadDocument(container, config.completionBlobName)
+    loadDocument(container, config.completionBlobName),
+    evicted ? loadDocument(container, config.summaryBlobName) : undefined
   ]);
-  const binding = validateAcknowledgedNoFillBinding({
+  const bindingValue = {
     config,
     record: exact[0],
     reservationDocument,
     completionDocument,
+    summaryDocument,
     nowMs: now()
-  });
-  const evidence = await observe({
+  };
+  const binding = evicted
+    ? validateEvictedAcknowledgedNoFillBinding(bindingValue)
+    : validateAcknowledgedNoFillBinding(bindingValue);
+  const evidence = await observeBound({
     client: await createClient(),
     reservation: binding.reservation,
     config,
@@ -413,21 +570,28 @@ export async function runAcknowledgedNoFillReconciliation({
   const refreshedExact = refreshedRecords.filter((record) =>
     record?.blob_name === config.reservationBlobName
   );
-  const [refreshedReservationDocument, refreshedCompletionDocument] = await Promise.all([
-    loadDocument(container, config.reservationBlobName),
-    loadDocument(container, config.completionBlobName)
-  ]);
-  const refreshed = validateAcknowledgedNoFillBinding({
+  const [refreshedReservationDocument, refreshedCompletionDocument, refreshedSummaryDocument] =
+    await Promise.all([
+      loadDocument(container, config.reservationBlobName),
+      loadDocument(container, config.completionBlobName),
+      evicted ? loadDocument(container, config.summaryBlobName) : undefined
+    ]);
+  const refreshedValue = {
     config,
     record: refreshedExact[0],
     reservationDocument: refreshedReservationDocument,
     completionDocument: refreshedCompletionDocument,
+    summaryDocument: refreshedSummaryDocument,
     nowMs: now()
-  });
+  };
+  const refreshed = evicted
+    ? validateEvictedAcknowledgedNoFillBinding(refreshedValue)
+    : validateAcknowledgedNoFillBinding(refreshedValue);
   if (refreshedRecords.length !== 1 || refreshedExact.length !== 1 ||
       refreshed.etag !== binding.etag ||
       JSON.stringify(refreshed.reservation) !== JSON.stringify(binding.reservation) ||
-      JSON.stringify(refreshed.completion) !== JSON.stringify(binding.completion)) {
+      JSON.stringify(refreshed.completion) !== JSON.stringify(binding.completion) ||
+      JSON.stringify(refreshed.summary) !== JSON.stringify(binding.summary)) {
     failAcknowledged("durable evidence changed during venue observation");
   }
   const finalized = await finalize(config, binding.reservation, {
@@ -437,13 +601,17 @@ export async function runAcknowledgedNoFillReconciliation({
     matched_notional: 0,
     reconciliation_complete: true,
     zero_open_orders_confirmed: true,
-    reconciliation_reason: ACKNOWLEDGED_REASON,
+    reconciliation_reason: reason,
     reconciliation_evidence: {
       source: "authenticated_clob_rest_and_polymarket_data_api",
       reservation_blob_name: config.reservationBlobName,
       reservation_sha256: config.reservationSha256,
       completion_blob_name: config.completionBlobName,
       completion_sha256: config.completionSha256,
+      ...(evicted ? {
+        failed_summary_blob_name: config.summaryBlobName,
+        failed_summary_sha256: config.summarySha256
+      } : {}),
       observations: [evidence.first, evidence.second],
       observation_ms: evidence.observation_ms
     }
@@ -469,7 +637,7 @@ export async function runAcknowledgedNoFillReconciliation({
     recovery_order_submission_attempted: false,
     recovery_grant_consumed: false,
     recovery_risk_reservation_created: false,
-    reconciliation_reason: ACKNOWLEDGED_REASON,
+    reconciliation_reason: reason,
     evidence
   });
   logger(result);
@@ -482,14 +650,20 @@ function validateAcknowledgedTerminalReadback(config, document, finalized) {
   const expectedSha = "sha256:" + createHash("sha256")
     .update(Buffer.from(JSON.stringify(finalized, null, 2)))
     .digest("hex");
+  const summaryBindingValid = config.reconciliationReason === EVICTED_ACKNOWLEDGED_REASON
+    ? source?.failed_summary_blob_name === config.summaryBlobName &&
+      source?.failed_summary_sha256 === config.summarySha256
+    : source?.failed_summary_blob_name === undefined &&
+      source?.failed_summary_sha256 === undefined;
   if (document?.blobName !== config.reservationBlobName || document?.sha256 !== expectedSha ||
       JSON.stringify(value) !== JSON.stringify(finalized) ||
       value?.state !== "finalized_no_fill" || value?.order_submitted !== true ||
       value?.order_id !== config.orderId || !exactZero(value?.matched_notional) ||
       value?.reconciliation_complete !== true || value?.zero_open_orders_confirmed !== true ||
-      value?.reconciliation_reason !== ACKNOWLEDGED_REASON ||
+      value?.reconciliation_reason !== config.reconciliationReason ||
       source?.reservation_sha256 !== config.reservationSha256 ||
       source?.completion_sha256 !== config.completionSha256 ||
+      !summaryBindingValid ||
       !Array.isArray(source?.observations) || source.observations.length !== 2) {
     failAcknowledged("terminal reservation readback is invalid");
   }
@@ -595,13 +769,16 @@ async function downloadBlobDocument(container, blobName) {
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
-  const run = process.env.FUNDED_DIRECT_RECONCILIATION_REASON === ACKNOWLEDGED_REASON
+  const recoveryReason = process.env.FUNDED_DIRECT_RECONCILIATION_REASON;
+  const acknowledged = [ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON]
+    .includes(recoveryReason);
+  const run = acknowledged
     ? runAcknowledgedNoFillReconciliation
     : runAmbiguousNoOrderReconciliation;
-  run().catch((error) => {
+  run({ reason: recoveryReason }).catch((error) => {
     process.exitCode = 1;
     console.error(JSON.stringify(sanitize({
-      schema: process.env.FUNDED_DIRECT_RECONCILIATION_REASON === ACKNOWLEDGED_REASON
+      schema: acknowledged
         ? "polyedge.acknowledged_no_fill_reconciliation.v1"
         : "polyedge.ambiguous_no_order_reconciliation.v1",
       status: "failed_closed",
