@@ -21,6 +21,9 @@
     "research/verify_shadow_daily_bundle.sh",
     "crates/polyedge-reporting/src/research/projected_cache.rs",
     "ops/conduit/bin/polyedge-run-job",
+    "ops/conduit/bin/polyedge-quadlet-deploy",
+    "ops/conduit/env/shadow-qset.env.example",
+    "ops/conduit/quadlets/polyedge-shadow-qset.container",
     ".github/workflows/deploy-polyedge-shadow-qset.yml"
   ],
   "allowed_post_freeze_operations": [

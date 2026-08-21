@@ -24,9 +24,10 @@ start with less than 40 GiB free. All Azure jobs remain disabled unless
 the install sequence.
 
 The legacy shadow schedule is intentionally absent. Qset-v1 is retired as
-unchanged historical/ineligible evidence. `shadow-qset` permits only
-`campaign-2026-08-22-qset-v2` and remains disabled until its exact source
-freeze is reviewed and its first complete D+1 sealed inventory passes.
+unchanged historical/ineligible evidence. The isolated qset writer permits only
+`campaign-2026-08-22-qset-v2` and starts only after its exact source freeze is
+reviewed. The `shadow-qset` daily timer remains disabled until the first complete
+D+1 sealed inventory passes.
 
 ## Install after both gates are approved
 
@@ -56,6 +57,7 @@ sudo install -m 0440 ops/conduit/sudoers/polyedge-deploy /etc/sudoers.d/
 sudo install -m 0644 ops/conduit/journald/polyedge.conf /etc/systemd/journald.conf.d/
 sudo install -m 0644 ops/conduit/caddy/Caddyfile /etc/caddy/Caddyfile
 sudo install -m 0600 ops/conduit/env/api.env.example /etc/polyedge/api.env
+sudo install -m 0600 ops/conduit/env/shadow-qset.env.example /etc/polyedge/shadow-qset.env
 sudo install -m 0600 ops/conduit/env/frontend.env.example /etc/polyedge/frontend.env
 sudo install -m 0600 ops/conduit/env/funded-signer.env.example /etc/polyedge/funded-signer.env
 sudo install -m 0600 ops/conduit/env/ring.env.example /etc/polyedge/ring.env
@@ -813,7 +815,7 @@ sudo systemctl enable --now polyedge-freshness.timer polyedge-hourly.timer
 ## Digest deployment
 
 After the API/frontend are healthy, update one reviewed GHCR ARM64 digest at a
-time. The helper accepts only these three units, updates only their installed
+time. The helper accepts only these four units, updates only their installed
 `Image=` line, makes a timestamped rollback copy, pulls and checks
 `linux/arm64`, then restarts and verifies the running container's exact digest.
 Any restart or verification failure restores the prior Quadlet and restarts it.
@@ -823,13 +825,15 @@ sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-api \
   ghcr.io/OWNER/polyedge-rust-backend@sha256:LOWERCASE_64_HEX_DIGEST
 sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-frontend \
   ghcr.io/OWNER/polyedge-frontend@sha256:LOWERCASE_64_HEX_DIGEST
+sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-shadow-qset \
+  ghcr.io/OWNER/polyedge-rust-backend@sha256:LOWERCASE_64_HEX_DIGEST
 sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-funded-signer \
   ghcr.io/OWNER/polyedge-venue-probe@sha256:LOWERCASE_64_HEX_DIGEST
 ```
 
 Rollback copies live in `/etc/polyedge/rollback/`. The helper never accepts a
 tag, a non-GHCR registry, a mismatched image repository, or any unit other than
-API, frontend, or funded signer.
+API, frontend, qset writer, or funded signer.
 
 Schedules are UTC: freshness every five minutes; hourly quality at `:12`;
 primary daily at 03:10; replay at 03:15; the disabled qset shadow timer remains

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "applied-live-verified",
+  "status": "qset-writer-expansion-pending-live-proof",
   "proof": "identity-rbac-proof.json",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -104,16 +104,28 @@
       "subject": "spiffe://polyedge.local/conduit/shadow-qset",
       "assignments": [
         {
-          "role": "blobReader",
+          "role": "blobContributor",
           "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events"
         },
         {
           "role": "blobContributor",
           "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetEventIndex"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetChartSeries"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetMarketCatalog"
         }
       ],
       "negativeAssertions": [
-        "no primary, funded, control, table, Service Bus, storage-account, resource-group, or subscription role"
+        "no primary, funded, control, non-qset table, Service Bus, storage-account, resource-group, or subscription role"
       ]
     },
     "funded-signer": {

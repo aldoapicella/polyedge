@@ -6,7 +6,11 @@ on:
       - ".github/workflows/deploy-polyedge-shadow-qset.yml"
       - "crates/polyedge-reporting/src/research/projected_cache.rs"
       - "ops/conduit/bin/polyedge-run-job"
+      - "ops/conduit/bin/polyedge-quadlet-deploy"
       - "ops/conduit/env/jobs.env.example"
+      - "ops/conduit/env/shadow-qset.env.example"
+      - "ops/conduit/quadlets/polyedge-shadow-qset.container"
+      - "ops/conduit/test/test-quadlet-deploy.sh"
       - "research/configs/*qset*"
       - "research/run_shadow_daily.sh"
       - "research/verify_shadow_daily_bundle.sh"
@@ -72,6 +76,7 @@ jobs:
           sh research/test_run_shadow_daily.sh
           sh research/test_verify_shadow_daily_bundle.sh
           sh ops/conduit/test/test-run-job-mappings.sh
+          sh ops/conduit/test/test-quadlet-deploy.sh
           cargo test -p polyedge-reporting raw_inventory_field_mutation_changes_identity_and_requires_rehash
 
   source-freeze:

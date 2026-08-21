@@ -233,7 +233,7 @@
   "protectedTrustRules": {
     "api": "No qset or funded data, wallet, Key Vault, or Service Bus receiver access.",
     "research": "No qset or funded writer access.",
-    "shadowQset": "Only qset event reads and qset research writes; no primary, funded, table, Service Bus, or control access.",
+    "shadowQset": "Only qset event and research container access plus the three exact ShadowQset writer tables; no primary, funded, non-qset table, Service Bus, or control access.",
     "fundedSigner": "Only exact funded evidence dependencies and receiver direction; no qset, primary bot-events, table, broad scope, or sender role.",
     "arc": "Retain the existing no-delete bot-events ring uploader assignment only."
   },

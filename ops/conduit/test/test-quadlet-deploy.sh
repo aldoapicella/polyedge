@@ -11,6 +11,7 @@ new=ghcr.io/example/polyedge-rust-backend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 next=ghcr.io/example/polyedge-rust-backend@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 signer=ghcr.io/example/polyedge-venue-probe@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 printf '[Container]\nImage=%s\nContainerName=polyedge-api\n' "$old" >"$tmp/quadlets/polyedge-api.container"
+printf '[Container]\nImage=%s\nContainerName=polyedge-shadow-qset\n' "$old" >"$tmp/quadlets/polyedge-shadow-qset.container"
 printf '[Container]\nImage=%s\nContainerName=polyedge-funded-signer\n' "$old" >"$tmp/quadlets/polyedge-funded-signer.container"
 
 printf '%s\n' '#!/bin/sh' 'set -eu' 'printf "%s\\n" "$*" >>"$TEST_LOG"' \
@@ -47,6 +48,9 @@ grep -Fx 'restart polyedge-api.service' "$tmp/log" >/dev/null
 run "$signer" "$signer" 20260805T000002Z polyedge-funded-signer
 grep -Fx "Image=$signer" "$tmp/quadlets/polyedge-funded-signer.container" >/dev/null
 
+run "$next" "$next" 20260805T000004Z polyedge-shadow-qset
+grep -Fx "Image=$next" "$tmp/quadlets/polyedge-shadow-qset.container" >/dev/null
+
 if run "$new" "$new" 20260805T000003Z polyedge-funded-signer; then
   echo 'wrong repository was accepted for funded signer' >&2
   exit 1
@@ -82,5 +86,14 @@ grep -Fq '986:982:600:1' "$root/quadlets/polyedge-funded-signer.container"
 grep -Fq -- 'PodmanArgs=--cpus=0.5 ' "$root/quadlets/polyedge-funded-signer.container"
 if grep -Fq -- '--security-opt=no-new-privileges' "$root/quadlets/polyedge-funded-signer.container"; then
   echo 'funded signer cannot use the OCI Podman 4.9 no-new-privileges network path' >&2
+  exit 1
+fi
+grep -Fx 'User=987:983' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
+grep -Fx 'EnvironmentFile=/etc/polyedge/shadow-qset.env' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
+grep -Fx 'Volume=/run/polyedge-federated-shadow-qset:/run/credentials:ro,Z' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
+grep -Fq -- '--read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --pull=never' "$root/quadlets/polyedge-shadow-qset.container"
+grep -Fx 'WantedBy=multi-user.target' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
+if grep -q '^PublishPort=' "$root/quadlets/polyedge-shadow-qset.container"; then
+  echo 'qset writer must not publish a host port' >&2
   exit 1
 fi
