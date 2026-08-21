@@ -211,6 +211,22 @@ under its 1.5-CPU cap; observed host load was 3.25 on four cores with 20 GiB
 available, no swap, and a successful 05:15 funded warmup. The collector peaked at
 4.8 GiB without OOM or service restart.
 
+The `06:18` collector validated `05:00` through `06:00` and advanced the ledger
+to `4/72`. Evidence `/srv/polyedge-ring/parity/hourly/20260821T05/evidence.json`
+has SHA-256 `17b20fcc58dfb315669e4929833aefccc5ea40d0cd581da57c30d4266b09868b`;
+Azure and OCI same-input result hashes both equal
+`sha256:e66e90135dad408503413a47ffcd317468ba5b02be1614c4bdbcee5b6fe8aedd`.
+All 60 feed observations were healthy. Funded evidence recorded 60 heartbeats,
+28 token refreshes, 40 processed messages, and zero alerts, failed-closed events,
+restarts, failed messages, redemption failures, token refresh failures, or
+reconciliation gaps. Boot headroom was 26,887,708,672 bytes and ring status stayed
+green. Audit warnings remained explicit: same-input and Azure scheduled audits had
+11 out-of-order timestamps, OCI scheduled had 38, start-price capture was `5/8`,
+and settlement coverage was `4/8`. The collector overlapped OCI normalization
+under its 1.5-CPU cap; normalized output reached 2,428,817,357 bytes by evidence
+readback. Funded warmups at 05:00, 05:15, 05:30, and 05:45 all succeeded. The
+collector peaked at 3.0 GiB without OOM or service restart.
+
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
 while the fresh ledger and live signer pinned `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`;
