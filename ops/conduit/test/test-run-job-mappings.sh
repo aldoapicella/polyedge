@@ -49,3 +49,7 @@ test "$(grep -c '/usr/bin/flock -w 129600 /run/polyedge/research.lock' "$runner"
 test "$(grep -c -- '--pull=never --log-driver=journald' "$runner")" -eq 2
 grep -F 'OnCalendar=*-*-* 03:10:00 UTC' "$bundle/systemd/polyedge-daily.timer" >/dev/null
 grep -F 'OnCalendar=*-*-* 03:15:00 UTC' "$bundle/systemd/polyedge-replay.timer" >/dev/null
+grep -F 'OnCalendar=2026-08-24 02:15:00 UTC' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+grep -F 'Persistent=true' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+grep -F 'Unit=polyedge-job@shadow-qset.service' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+! grep -F 'OnCalendar=*-*-*' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null

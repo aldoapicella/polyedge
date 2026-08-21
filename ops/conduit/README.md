@@ -26,8 +26,10 @@ the install sequence.
 The legacy shadow schedule is intentionally absent. Qset-v1 is retired as
 unchanged historical/ineligible evidence. The isolated qset writer permits only
 `campaign-2026-08-22-qset-v2` and starts only after its exact source freeze is
-reviewed. The `shadow-qset` daily timer remains disabled until the first complete
-D+1 sealed inventory passes.
+reviewed. The recurring `shadow-qset` daily timer remains disabled until the first
+complete D+1 sealed inventory passes. Because `run_shadow_daily.sh` targets two
+days ago, the first valid day-closed seal for the August 22 start is scheduled
+for 2026-08-24 02:15 UTC; an August 23 run would target pre-campaign data.
 
 ## Install after both gates are approved
 
@@ -102,8 +104,10 @@ The funded intent producer is healthy as `984:980`, completed a real blob-plus-q
 warmup with zero publisher failures, and the unchanged signer consumed the natural
 handoff with zero processing failures. Qset v2 uses immutable source freeze
 `sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1`;
-its preflight is healthy with zero 403/auth failures, while the qset daily timer
-remains disabled pending the first complete day-closed sealed capture. Historical
+its preflight is healthy with zero 403/auth failures. The recurring qset daily
+timer remains disabled; a one-shot first seal is scheduled for 2026-08-24 02:15
+UTC, the first run whose two-days-ago target is the complete August 22 campaign
+day. Historical
 qset v1 remains unchanged and ineligible. The formal direct-child ledger
 `/srv/polyedge-ring/parity/20260821T170000Z-funded-active.json` starts at 17:00 UTC
 with zero credit, Azure authoritative, and deletion/reboot/qset gates false. The
@@ -823,6 +827,7 @@ sudo systemctl enable --now polyedge-boot-disk-guard.timer
 sudo systemctl enable polyedge-reboot-attestation.service
 sudo systemctl enable --now polyedge-parity-hourly.timer
 sudo systemctl enable --now polyedge-freshness.timer polyedge-hourly.timer
+sudo systemctl enable --now polyedge-qset-v2-first-seal.timer
 # Enable daily/replay/qset individually only after their validation.
 # sudo systemctl enable --now polyedge-daily.timer polyedge-replay.timer
 # sudo systemctl enable --now polyedge-shadow-qset.timer
