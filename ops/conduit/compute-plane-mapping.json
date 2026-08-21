@@ -303,17 +303,30 @@
     },
     {
       "azureJob": "polyedge-strategy-canary-neu-job",
-      "classification": "funded_gate",
-      "candidateLane": "funded-signer",
+      "classification": "disabled_never_executed_retirement_candidate",
+      "lane": null,
       "azureDeletionAllowed": false,
-      "requiredDecision": "Supply the exact human grant and immutable intent, promotion, authorization and evidence bindings."
+      "historicalDisposition": "manual and ALLOW_LIVE=false with no executions returned; retire after global gates without granting or activating a funded lane",
+      "requiredProof": [
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
     },
     {
       "azureJob": "polyedge-funded-ladder-neu-job",
-      "classification": "human_retirement_or_funded_activation_decision",
-      "candidateLane": "funded-signer",
+      "classification": "disabled_historical_retirement_candidate",
+      "lane": null,
       "azureDeletionAllowed": false,
-      "requiredDecision": "Prefer retirement of the geoblocked definition, or supply the exact funded ladder grants and immutable bindings."
+      "historicalDisposition": "manual and ALLOW_LIVE=false; retain the 2026-07-28 historical executions and retire compute after global gates without reactivation",
+      "requiredProof": [
+        "historical_evidence_retained",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
     },
     {
       "azureJob": "polyedge-funded-direct-cl-job",
@@ -412,6 +425,18 @@
         "kind": "containerAppJob",
         "state": "Manual, ALLOW_LIVE=false, QUEUE_MODEL_TRAINING_ENABLED=false, no executions returned",
         "disposition": "Retire after global gates; retain all model artifacts and the immutable funded-session model binding."
+      },
+      {
+        "resource": "polyedge-strategy-canary-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual, ALLOW_LIVE=false, no executions returned",
+        "disposition": "Retire after global gates without activation or new funded grants."
+      },
+      {
+        "resource": "polyedge-funded-ladder-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual, ALLOW_LIVE=false, latest retained executions are from 2026-07-28",
+        "disposition": "Retire after global gates; retain historical execution evidence and do not reactivate the geoblocked ladder."
       }
     ],
     "fundedIntentProducer": {
