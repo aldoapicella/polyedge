@@ -525,6 +525,58 @@ test("persistent service runs redemption under the inherited lease after enterin
   assert.equal(completion?.clock_source, "btc_15m_utc_boundary");
 });
 
+test("persistent service coalesces a duplicate warmup while redemption maintenance is running", async () => {
+  const now = Date.parse("2026-07-30T12:10:00Z");
+  const warmup = (messageId) => ({
+    messageId,
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "btc-market",
+      token_id: "token-up",
+      market_end_ts: "2026-07-30T12:15:00Z"
+    }
+  });
+  const bus = fakeBus([warmup("warmup-first"), warmup("warmup-duplicate")]);
+  let warmedMarket = null;
+  let releaseMaintenance;
+  let maintenanceStarted;
+  const maintenanceStartedPromise = new Promise((resolve) => { maintenanceStarted = resolve; });
+  const resultPromise = runPersistentFundedDirectService({
+    env: automaticRedemptionEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
+    now: () => now,
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async (value) => { warmedMarket = value; },
+      execute: async () => {},
+      runMaintenance: async (task) => {
+        await new Promise((resolve) => {
+          releaseMaintenance = resolve;
+          maintenanceStarted();
+        });
+        return task({ lease: { assertHealthy() {} } });
+      },
+      status: () => ({ warmed_market: warmedMarket }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    runRedemption: async () => ({ status: "nothing_to_redeem", redemption_submitted: false }),
+    logger: () => {}
+  });
+
+  await maintenanceStartedPromise;
+  for (let attempt = 0; attempt < 40 && bus.completed.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(bus.received, ["warmup-first", "warmup-duplicate"]);
+  assert.deepEqual(bus.completed, ["warmup-first", "warmup-duplicate"]);
+  assert.deepEqual(bus.deadLettered, []);
+  releaseMaintenance();
+  const result = await resultPromise;
+  assert.equal(result.failed_messages, 0);
+  assert.equal(result.redemption_results, 1);
+});
+
 test("persistent service preserves attempted-order observability for an idempotent completion", async () => {
   const decisionTs = new Date(Date.now() - 500).toISOString();
   const bus = fakeBus([{

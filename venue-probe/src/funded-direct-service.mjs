@@ -225,14 +225,7 @@ export async function runPersistentFundedDirectService({
     cloud_only: true,
     executor: executor.status()
   });
-  const maybeRunAutomaticRedemption = async () => {
-    if (!config.autoRedemptionEnabled) return;
-    const checkedAt = now();
-    if (checkedAt - lastRedemptionCheckMs < config.autoRedemptionIntervalMs) return;
-    lastRedemptionCheckMs = checkedAt;
-    redemptionChecks += 1;
-    const window = fundedRedemptionMaintenanceWindow(executor.status(), checkedAt, config);
-    if (!window.eligible) return;
+  const runAutomaticRedemption = async (window) => {
     try {
       const result = await executor.runMaintenance(({ lease: inheritedLease }) =>
         runRedemption({
@@ -443,10 +436,33 @@ export async function runPersistentFundedDirectService({
     }
   };
   let activeWorkflow = null;
+  let activeWorkflowKind = null;
+  const trackActiveWorkflow = (task, kind) => {
+    activeWorkflow = task;
+    activeWorkflowKind = kind;
+    const clear = () => {
+      if (activeWorkflow === task) {
+        activeWorkflow = null;
+        activeWorkflowKind = null;
+      }
+    };
+    void task.then(clear, clear);
+  };
+  const maybeStartAutomaticRedemption = () => {
+    if (!config.autoRedemptionEnabled || activeWorkflow) return;
+    const checkedAt = now();
+    if (checkedAt - lastRedemptionCheckMs < config.autoRedemptionIntervalMs) return;
+    lastRedemptionCheckMs = checkedAt;
+    redemptionChecks += 1;
+    const window = fundedRedemptionMaintenanceWindow(executor.status(), checkedAt, config);
+    if (window.eligible) trackActiveWorkflow(runAutomaticRedemption(window), "maintenance");
+  };
   const busyValidations = new Set();
   const trackBusyValidation = (entry) => {
-    const task = processIntent(entry, true).finally(() => busyValidations.delete(task));
+    const task = processIntent(entry, true);
     busyValidations.add(task);
+    const clear = () => busyValidations.delete(task);
+    void task.then(clear, clear);
   };
   try {
     while (!stopping) {
@@ -456,13 +472,13 @@ export async function runPersistentFundedDirectService({
         break;
       }
       if (busyValidations.size >= FUNDED_BUSY_VALIDATION_LIMIT ||
-          (config.maxMessages > 0 && processedMessages + failedMessages + busyValidations.size + (activeWorkflow ? 1 : 0) >= config.maxMessages)) {
+          (config.maxMessages > 0 && processedMessages + failedMessages + busyValidations.size + (activeWorkflowKind === "intent" ? 1 : 0) >= config.maxMessages)) {
         await Promise.race([activeWorkflow, ...busyValidations].filter(Boolean));
         continue;
       }
       const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs });
       if (!messages.length) {
-        if (!activeWorkflow) await maybeRunAutomaticRedemption();
+        maybeStartAutomaticRedemption();
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
@@ -482,23 +498,24 @@ export async function runPersistentFundedDirectService({
         if (activeWorkflow) {
           trackBusyValidation(entry);
         } else {
-          const task = processIntent(entry, false);
-          activeWorkflow = task;
-          task.finally(() => {
-            if (activeWorkflow === task) activeWorkflow = null;
-          });
+          trackActiveWorkflow(processIntent(entry, false), "intent");
         }
         continue;
       }
       if (body?.schema === "polyedge.funded_market_warmup.v1") {
         if (activeWorkflow) {
-          clearInterval(entry.renewal);
-          await receiver.completeMessage(message);
-          processedMessages += 1;
-          logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_deferred", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+          const key = body.market_id && body.token_id ? `${body.market_id}:${body.token_id}` : null;
+          if (activeWorkflowKind === "maintenance" && key && warmedMarketTokens.has(key)) {
+            await processWarmup(entry);
+          } else {
+            clearInterval(entry.renewal);
+            await receiver.completeMessage(message);
+            processedMessages += 1;
+            logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_deferred", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+          }
         } else {
           await processWarmup(entry);
-          await maybeRunAutomaticRedemption();
+          maybeStartAutomaticRedemption();
         }
         continue;
       }

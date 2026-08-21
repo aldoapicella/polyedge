@@ -117,6 +117,28 @@ user and market channels ready, zero gaps, reconnect reconciliation false,
 startup unresolved count zero, `busy=false`, and warmup through 22:15. This makes
 the 22:00 hour eligible for evaluation, not accepted or credited.
 
+The `22:00` hour was later rejected with zero credit after an authenticated-user
+WebSocket gap at `22:53:48`; repeated reconciliation alerts continued through
+`23:52:48`. A fresh authenticated preflight proved zero open orders, zero current
+position value, zero unresolved reservations, and an empty active/scheduled queue,
+so the user-approved signer-only restart completed at `23:54:00` without touching
+the DLQ. Invocation `1c2b...` started with zero gap counters and no unresolved
+reservations. The new zero-credit ledger
+`/srv/polyedge-ring/parity/20260821T000000Z-funded-active.json` and both root-owned
+environment files bound the exact `00:00` UTC window. The first formal heartbeat
+was fully ready with zero alerts or failures, but that window remains rejected with
+zero credit and its hourly timer is paused.
+
+Existing no-sign job `polyedge-funded-warmup-cl` was tested once with a native
+`*/15 * * * *` UTC schedule. Its `00:15` message expired in the DLQ while the
+signer synchronously awaited automatic redemption, so the job was restored to its
+exact manual pre-state before the next schedule. The digest-pinned image, UAMI,
+three non-secret environment values, resources, registry, timeout, retry limit,
+and tags match the pre-change invariant snapshot under
+`/etc/polyedge/rollback/20260821T001000Z-funded-warmup-schedule`. The formal timer
+will restart only from a later untouched UTC boundary after the receive loop fix
+proves at least two clean scheduled cycles without a DLQ increase.
+
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
 while the fresh ledger and live signer pinned `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`;
