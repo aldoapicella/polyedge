@@ -142,7 +142,8 @@ index `sha256:674ca63956a418b69834e9298b1c0c6a62ca0c916470ffe7d4966aa17de33f7d`.
 The no-sign job `polyedge-funded-warmup-cl` now uses corrected ACR digest
 `sha256:ca4b9178032a87295affd5c4fc0809e6869e822c052eaac14eecdeee8c5cbd5e`
 on its native `*/15 * * * *` UTC schedule. Manual `01:08` plus scheduled
-`01:15`, `01:30`, `01:45`, and `02:00` executions succeeded; OCI consumed or coalesced every warmup, the
+`01:15`, `01:30`, `01:45`, and `02:00` executions succeeded; OCI consumed or
+coalesced every warmup, the
 queue remained `0 active / 936 DLQ / 0 scheduled / 0 transfer`, and signer
 invocation `9a86217adfe54e83b8af828f38608469` stayed at zero restarts with both channels
 ready, zero gaps, and reconciliation false. Boot disk headroom remained 23 GiB.
@@ -150,10 +151,20 @@ The validated zero-credit ledger
 `/srv/polyedge-ring/parity/20260821T020000Z-funded-active.json` and both root-owned
 environment bindings were installed with rollback
 `/etc/polyedge/rollback/20260821T013200Z-parity-funded-active-0200`; Azure remains
-authoritative and deletion, reboot, and qset gates remain false. The parity timer started at `02:00:05`; its persistent
-catch-up created only
+authoritative and deletion, reboot, and qset gates remain false. The parity
+timer started at `02:00:05`; its persistent catch-up created only
 `excluded_pre_window` evidence for `01:00` and left the ledger at zero. The first
 eligible formal hour is `02:00` through `03:00`, evaluated at `03:18`.
+
+The `03:18` collector validated that first eligible hour and advanced the ledger
+to `1/72`. Azure and OCI same-input result hashes matched exactly; all 60 feed
+observations were healthy with no essential-feed errors. Funded evidence recorded
+60 heartbeats, 28 token refreshes, and zero alerts, failed-closed events, restarts,
+failed messages, redemption failures, or reconciliation gaps. The ring remained
+fresh with no unsealed or unuploaded batch, boot headroom stayed above 15 GiB,
+and deletion, reboot, qset, and both daily-cycle gates remain false. The audit
+retains eight out-of-order timestamp warnings at rate `1.9361927673519175e-6`;
+they did not change the exact deterministic parity result.
 
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
