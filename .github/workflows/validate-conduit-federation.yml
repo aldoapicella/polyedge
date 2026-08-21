@@ -97,13 +97,36 @@ jobs:
           jq -e '
             .status == "applied-live-verified"
             and .proof == "identity-rbac-proof.json"
-            and (.lanes | keys == ["api", "funded-signer", "research", "shadow-qset"])
-            and ([.lanes[].assignments[]] | length == 30)
+            and (.lanes | keys == ["api", "funded-intent-producer", "funded-signer", "research", "shadow-qset"])
+            and ([.lanes[].assignments[]] | length == 38)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
             and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
             and .roles.keyVaultSecretsUser == "4633458b-17de-408a-b874-0445c86b69e6"
+            and .roles.serviceBusSender == "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"
+            and .roles.acrPull == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
             and .scopePrefixes.keyVault == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/"
+            and .scopePrefixes.containerRegistry == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/"
+            and .lanes["funded-intent-producer"].identity == "id-polyedge-conduit-funded-intent-producer"
+            and .lanes["funded-intent-producer"].subject == "spiffe://polyedge.local/conduit/funded-intent-producer"
+            and (.lanes["funded-intent-producer"].assignments | length) == 8
+            and ([.lanes["funded-intent-producer"].assignments[].role] | sort) == [
+              "acrPull",
+              "blobContributor",
+              "blobReader", "blobReader",
+              "serviceBusSender",
+              "tableContributor", "tableContributor", "tableContributor"
+            ]
+            and ([.lanes["funded-intent-producer"].assignments[].scope] | sort) == [
+              "containerRegistry/crpolyedge6urdjr5nmwx7w",
+              "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events",
+              "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotChartSeries",
+              "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotEventIndex",
+              "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotMarketCatalog"
+            ]
             and (.lanes["funded-signer"].assignments | length) == 10
             and ([.lanes["funded-signer"].assignments[].role] | sort) == [
               "blobContributor",
@@ -136,7 +159,7 @@ jobs:
             and .githubDeployment.assignment.role == "blobReader"
             and (.githubDeployment.negativeAssertions | length) == 3
             and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
-            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFourWorkloadUamiProof)
+            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFiveWorkloadUamiProof)
           ' ops/conduit/identity-rbac-plan.json
           jq -e '
             .status == "live-verified"
@@ -147,13 +170,15 @@ jobs:
               .lanes.api,
               .lanes.research,
               .lanes["shadow-qset"],
-              .lanes["funded-signer"]
-            ] | map(.assignmentCount) | add) == 30
+              .lanes["funded-signer"],
+              .lanes["funded-intent-producer"]
+            ] | map(.assignmentCount) | add) == 38
             and all([
               .lanes.api,
               .lanes.research,
               .lanes["shadow-qset"],
-              .lanes["funded-signer"]
+              .lanes["funded-signer"],
+              .lanes["funded-intent-producer"]
             ][]; .exactPlanMatch)
             and all(.lanes[]; all(.negativeAssertions[]; .passed))
             and .lanes["promotion-controller"].assignmentCount == 2
@@ -166,6 +191,24 @@ jobs:
             and .roleDefinitions.acaJobExecutionReader.exactDefinitionMatch
             and .roleDefinitions.promotionController.dataActions == []
             and .roleDefinitions.promotionController.exactDefinitionMatch
+            and .lanes["funded-intent-producer"].identity.resourceId == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-funded-intent-producer"
+            and .lanes["funded-intent-producer"].identity.clientId == "54f0136b-5e72-4ad1-b23e-cb1269d356c1"
+            and .lanes["funded-intent-producer"].identity.principalId == "cb986c69-8a3c-424e-8461-f6953cd4d3f7"
+            and .lanes["funded-intent-producer"].federatedCredential.name == "fic-spire-conduit-funded-intent-producer"
+            and .lanes["funded-intent-producer"].federatedCredential.issuer == "https://oidc.jupiterlabs.dev"
+            and .lanes["funded-intent-producer"].federatedCredential.subject == "spiffe://polyedge.local/conduit/funded-intent-producer"
+            and .lanes["funded-intent-producer"].federatedCredential.audiences == ["api://AzureADTokenExchange"]
+            and .lanes["funded-intent-producer"].assignmentCount == 8
+            and (.lanes["funded-intent-producer"].roleAssignments | length) == 8
+            and ([.lanes["funded-intent-producer"].roleAssignments[].id] | length) ==
+              ([.lanes["funded-intent-producer"].roleAssignments[].id] | unique | length)
+            and ([.lanes["funded-intent-producer"].roleAssignments[].role] | sort) == [
+              "AcrPull",
+              "Azure Service Bus Data Sender",
+              "Storage Blob Data Contributor",
+              "Storage Blob Data Reader", "Storage Blob Data Reader",
+              "Storage Table Data Contributor", "Storage Table Data Contributor", "Storage Table Data Contributor"
+            ]
             and .lanes["funded-signer"].assignmentCount == 10
             and (.lanes["funded-signer"].roleAssignments | length) == 10
             and ([.lanes["funded-signer"].roleAssignments[].id] | length) ==
@@ -243,7 +286,7 @@ jobs:
             and .githubDeployment.scopeOfThisDataPlaneProof == "only the new Storage Blob Data Reader assignment on polyedge-shadow-events"
             and all(.githubDeployment.negativeAssertions[]; .passed)
             and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
-            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFourWorkloadUamiProof)
+            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFiveWorkloadUamiProof)
             and ([.githubDeployment.legacyDeploymentPlaneExceptions[].role] | sort == ["AcrPush", "Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Reader", "Storage Blob Data Reader", "Storage Blob Data Reader", "User Access Administrator"])
           ' ops/conduit/identity-rbac-proof.json
           jq -e -s '
@@ -260,11 +303,24 @@ jobs:
             | ([ $proof.lanes["funded-signer"].roleAssignments[]
                 | {id, roleDefinitionId, scope: (.scope | ascii_downcase)}
               ] | sort_by(.id)) as $observed
+            | ([ $plan.lanes["funded-intent-producer"].assignments[] as $assignment
+                | ($assignment.scope | split("/")) as $parts
+                | {
+                    id: $assignment.id,
+                    roleDefinitionId: $plan.roles[$assignment.role],
+                    scope: (($plan.scopePrefixes[$parts[0]] + ($parts[1:] | join("/"))) | ascii_downcase)
+                  }
+              ] | sort_by(.id)) as $producerExpected
+            | ([ $proof.lanes["funded-intent-producer"].roleAssignments[]
+                | {id, roleDefinitionId, scope: (.scope | ascii_downcase)}
+              ] | sort_by(.id)) as $producerObserved
             | ($expected | length) == 10
               and ($observed | length) == 10
               and $observed == $expected
+              and ($producerExpected | length) == 8
+              and ($producerObserved | length) == 8
+              and $producerObserved == $producerExpected
           ' ops/conduit/identity-rbac-plan.json ops/conduit/identity-rbac-proof.json
-
       - name: Validate isolated UAMI federation template
         run: |
           set -euo pipefail

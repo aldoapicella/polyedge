@@ -95,6 +95,22 @@ after Azure compute deletion, not during parity.
 The extra freshness minute lets the local ring upload finish before the Azure
 blob-age query runs.
 
+Current rollout checkpoint (2026-08-21 15:18 UTC): source commit `3195c8a`
+published the verified amd64/arm64 backend index
+`sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd`.
+The funded intent producer is healthy as `984:980`, completed a real blob-plus-queue
+warmup with zero publisher failures, and the unchanged signer consumed the natural
+handoff with zero processing failures. Qset v2 uses immutable source freeze
+`sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1`;
+its preflight is healthy with zero 403/auth failures, while the qset daily timer
+remains disabled pending the first complete day-closed sealed capture. Historical
+qset v1 remains unchanged and ineligible. The formal direct-child ledger
+`/srv/polyedge-ring/parity/20260821T170000Z-funded-active.json` starts at 17:00 UTC
+with zero credit, Azure authoritative, and deletion/reboot/qset gates false. The
+15:18 scheduled validator passed as excluded pre-window evidence. The retained
+funded DLQ baseline is 937 and was neither replayed nor purged. Boot free space
+remains 25 GiB, above the 15 GiB gate.
+
 The funded-active ledger `/srv/polyedge-ring/parity/20260820T180000Z-funded-active.json`
 failed closed with zero credit at 19:26: its audit outer Git provenance was `6b`
 while OCI API runtime provenance was `103d`. It remains immutable, with Azure

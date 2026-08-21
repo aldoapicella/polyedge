@@ -125,6 +125,21 @@ target before writes, reads, or monitoring. Because existing-corpus tiering or
 deletion remains unauthorized, the immediate goal is to stop append growth at
 the gated cutover and measure the realized bill, not claim a $15-35 outcome.
 
+### Live migration gate checkpoint on 2026-08-21
+
+The funded producer and signer are live on OCI with separate sender/receiver
+identities, and qset v2 preflight is live on its clean immutable source freeze.
+The qset daily timer remains disabled until the first complete day-closed sealed
+capture passes; qset v1 remains unchanged and ineligible. The fresh formal
+parity ledger starts at 2026-08-21 17:00 UTC with zero accepted hours and zero
+daily cycles. Azure stays authoritative, `azureDeletionAllowed` remains false,
+and immediate realized deletion savings remain $0 until 72 accepted hours, two
+daily cycles, qset/funded acceptance, reboot recovery, and rollback all pass.
+After those gates, the current measured planning range for removable Azure
+compute and network is about $300-$330/month. The user accepted the retained
+hot-capacity floor of approximately $38.84/month; no existing evidence corpus
+tiering, movement, or deletion is part of this savings plan.
+
 ### Gated deletion recheck on 2026-08-14
 
 A fresh subscription inventory found no resource that is both unused and safe

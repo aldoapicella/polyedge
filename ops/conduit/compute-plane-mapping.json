@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "capturedAtUtc": "2026-08-20T16:32:38Z",
+  "capturedAtUtc": "2026-08-21T15:18:28Z",
   "azureJobCount": 19,
   "liveOciEquivalentCount": 8,
   "azureDeletionAllowed": false,
@@ -30,9 +30,14 @@
         "ociVolumeIncrementMonthlyUsd": 1.28,
         "netMonthlySavingsUsd": 279.94,
         "remainingAzureMonthlyUsd": 149.09,
-        "targetMonthlyRangeUsd": [15, 35],
+        "targetMonthlyRangeUsd": [
+          15,
+          35
+        ],
         "targetMetByComputeNetworkMigrationAlone": false,
-        "method": "straight-line extrapolation, not an Azure forecast"
+        "method": "straight-line extrapolation, not an Azure forecast",
+        "acceptedRetainedHotStorageCapacityFloorMonthlyUsdApprox": 38.84,
+        "originalTargetSupersededByRetainedEvidenceDecision": true
       }
     }
   },
@@ -40,10 +45,18 @@
     {
       "azureApp": "polyedge-dev",
       "status": "running",
-      "ociUnits": ["polyedge-api.service", "polyedge-frontend.service"],
+      "ociUnits": [
+        "polyedge-api.service",
+        "polyedge-frontend.service"
+      ],
       "classification": "oci_candidate_azure_authoritative",
       "azureDeletionAllowed": false,
-      "requiredProof": ["72_hour_parity", "two_daily_cycles", "reboot_recovery", "rollback"]
+      "requiredProof": [
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
     },
     {
       "azureApp": "polyedge-shadow-neu",
@@ -55,17 +68,39 @@
     {
       "azureApp": "polyedge-shadow-qset-neu",
       "status": "running",
-      "classification": "qset_blocked",
+      "classification": "oci_qset_v2_preflight_azure_authoritative",
       "azureDeletionAllowed": false,
-      "requiredDecision": "Retire campaign-2026-07-28-qset-v1 or approve a new complete sealed campaign; no evidence waiver."
+      "ociUnit": "polyedge-shadow-qset.service",
+      "historicalCampaign": "campaign-2026-07-28-qset-v1",
+      "historicalDisposition": "preserved_unchanged_ineligible",
+      "successorCampaign": "campaign-2026-08-22-qset-v2",
+      "requiredProof": [
+        "first_complete_day_closed_sealed_capture",
+        "qset_acceptance",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
     },
     {
       "azureApp": "polyedge-funded-direct-cl",
       "status": "running",
-      "ociUnit": "polyedge-funded-signer.service",
-      "classification": "funded_cutover_blocked",
+      "classification": "oci_funded_active_parity_pending",
       "azureDeletionAllowed": false,
-      "requiredProof": ["funded_lifecycle", "settlement", "queue_and_dlq", "identity", "origin", "parity", "rollback"]
+      "requiredProof": [
+        "funded_lifecycle",
+        "settlement",
+        "queue_and_dlq",
+        "identity",
+        "origin",
+        "parity",
+        "rollback"
+      ],
+      "ociUnits": [
+        "polyedge-funded-intent-producer.service",
+        "polyedge-funded-signer.service"
+      ]
     }
   ],
   "networkDependencies": [
@@ -153,11 +188,18 @@
     },
     {
       "azureJob": "polyedge-shadow-qset-neu-job",
-      "classification": "qset_blocked_partial_mapping",
+      "classification": "oci_qset_v2_timer_disabled_pending_first_sealed_day",
       "ociUnit": "polyedge-job@shadow-qset.service",
       "lane": "shadow-qset",
       "azureDeletionAllowed": false,
-      "requiredDecision": "Retire campaign-2026-07-28-qset-v1 or approve a new campaign ID with complete sealed input; no waiver."
+      "requiredProof": [
+        "first_complete_day_closed_sealed_capture",
+        "qset_acceptance",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
     },
     {
       "azureJob": "polyedge-shadow-daily-neu-job",
@@ -224,10 +266,17 @@
     },
     {
       "azureJob": "polyedge-funded-warmup-cl",
-      "classification": "human_identity_or_retirement_decision",
-      "lane": null,
+      "classification": "retirement_candidate_after_funded_producer_parity",
       "azureDeletionAllowed": false,
-      "requiredDecision": "Create a sender-only Service Bus identity and approve the OCI IP, or explicitly retire; funded-signer remains receiver-only."
+      "candidateLane": "funded-intent-producer",
+      "requiredProof": [
+        "72_hour_parity",
+        "two_daily_cycles",
+        "funded_lifecycle",
+        "queue_and_dlq",
+        "reboot_recovery",
+        "rollback"
+      ]
     }
   ],
   "protectedTrustRules": {
@@ -235,10 +284,11 @@
     "research": "No qset or funded writer access.",
     "shadowQset": "Only qset event and research container access plus the three exact ShadowQset writer tables; no primary, funded, non-qset table, Service Bus, or control access.",
     "fundedSigner": "Only exact funded evidence dependencies and receiver direction; no qset, primary bot-events, table, broad scope, or sender role.",
-    "arc": "Retain the existing no-delete bot-events ring uploader assignment only."
+    "arc": "Retain the existing no-delete bot-events ring uploader assignment only.",
+    "fundedIntentProducer": "Only exact model/funded reads, shadow event/table writes, ACR pull, and sender direction; no receiver, qset, Key Vault, wallet, broad scope, or live execution access."
   },
   "lastReadOnlyRecheck": {
-    "capturedAtUtc": "2026-08-20T16:32:38Z",
+    "capturedAtUtc": "2026-08-21T15:18:28Z",
     "azureDeletionAllowed": false,
     "networkDeletionCandidateCount": 0,
     "immediateSafeSavingsMonthlyUsd": 0,
@@ -247,20 +297,29 @@
       "usageAvailableThroughUtc": "2026-08-19T23:59:59Z",
       "polyedgeResourceGroupsPretaxUsd": 278.508948,
       "normalizedMonthlyRunRateUsdApprox": 440,
-      "postGateComputeNetworkSavingsMonthlyUsd": [300, 330],
+      "postGateComputeNetworkSavingsMonthlyUsd": [
+        300,
+        330
+      ],
       "method": "Usage Details actual pretax; 30-day straight-line normalization, not an Azure forecast"
     },
     "fundedQueue": {
       "name": "funded-dynamic-quote-intents",
       "activeMessageCount": 0,
-      "deadLetterMessageCount": 932,
+      "deadLetterMessageCount": 937,
       "scheduledMessageCount": 0,
       "deletionBlocked": true
     },
     "qset": {
       "dailyScheduleEnabled": false,
       "blocked": true,
-      "blocker": "campaign-2026-07-28-qset-v1 lacks exhaustive sealed D+1 inventory; no waiver"
+      "historicalCampaign": "campaign-2026-07-28-qset-v1",
+      "historicalDisposition": "preserved unchanged and ineligible; no retro-seal or waiver",
+      "successorCampaign": "campaign-2026-08-22-qset-v2",
+      "sourceCommit": "3195c8a9bc85cbce55491a502cae2857c0154a32",
+      "sourceFreezeSha256": "sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1",
+      "image": "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd",
+      "blocker": "successor campaign awaits its first complete day-closed sealed capture and qset acceptance"
     },
     "humanDecisionResources": [
       {
@@ -292,13 +351,25 @@
         "kind": "containerAppJob",
         "state": "Manual; no executions returned",
         "blocker": "dedicated model identity writes execution model; explicit retirement or separate OCI mapping"
-      },
-      {
-        "resource": "polyedge-funded-warmup-cl",
-        "kind": "containerAppJob",
-        "state": "Manual; latest execution Succeeded 2026-08-17",
-        "blocker": "Service Bus sender identity and approved OCI origin, or explicit retirement"
       }
-    ]
+    ],
+    "fundedIntentProducer": {
+      "service": "polyedge-funded-intent-producer.service",
+      "mode": "paper_intent_only",
+      "image": "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd",
+      "user": "984:980",
+      "warmupSuccessCount": 2,
+      "publicationFailureCount": 0,
+      "signerNaturalHandoffObserved": true
+    },
+    "parity": {
+      "windowStartUtc": "2026-08-21T17:00:00Z",
+      "ledgerPath": "/srv/polyedge-ring/parity/20260821T170000Z-funded-active.json",
+      "acceptedCleanLiveHours": 0,
+      "completedDailyCycles": 0,
+      "rebootRecoveryPassed": false,
+      "azureDeletionAllowed": false,
+      "scheduledPreWindowRunPassed": true
+    }
   }
 }
