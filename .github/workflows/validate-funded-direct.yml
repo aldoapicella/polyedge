@@ -66,8 +66,8 @@ jobs:
         run: |
           set -euo pipefail
           git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > changed-files.txt
-          if grep -E '(^research/configs/.*qset|^infra/shadow-profitability-qset-v1\.bicep$|^\.github/workflows/deploy-polyedge-shadow-qset\.yml$)' changed-files.txt; then
-            echo "Funded repair must not modify the frozen qset lane" >&2
+          if grep -E '(^research/configs/(profitability_gate_v3_2026-07-28_qset_v1\.yaml|campaign_freeze_2026-07-28_qset_v1\.json|protocol-v3-campaign-disposition-2026-07-28-qset-v1\.json)$|^infra/shadow-profitability-qset-v1\.bicep$)' changed-files.txt; then
+            echo "Funded repair must not modify retired qset-v1" >&2
             exit 1
           fi
 
