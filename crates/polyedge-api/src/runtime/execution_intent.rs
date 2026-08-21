@@ -1061,8 +1061,8 @@ pub(super) fn resolve_execution_model(
     settings: &RuntimeSettings,
     decision_ts: DateTime<Utc>,
 ) -> Result<IntentExecutionModel, String> {
-    if settings.deploy.runtime_role.is_shadow() || settings.azure.strategy_intent_operator_direct {
-        return validated_conservative_prior(settings);
+    if let Some(model) = resolve_local_execution_model(settings) {
+        return model;
     }
     let account = settings
         .azure
@@ -1104,6 +1104,13 @@ pub(super) fn resolve_execution_model(
             .download_blob_bytes(&blob_name)
             .map_err(|error| format!("exact canonical queue model is unreadable: {error}"))
     })
+}
+
+pub(super) fn resolve_local_execution_model(
+    settings: &RuntimeSettings,
+) -> Option<Result<IntentExecutionModel, String>> {
+    (settings.deploy.runtime_role.is_shadow() || settings.azure.strategy_intent_operator_direct)
+        .then(|| validated_conservative_prior(settings))
 }
 
 fn select_execution_model_from_control<F>(
@@ -2679,7 +2686,9 @@ mod tests {
         let (mut settings, ..) = fixture();
         configure_validated_conservative_prior(&mut settings, "polyedge-shadow-events");
         settings.azure.strategy_intent_operator_direct = true;
-        let model = resolve_execution_model(&settings, Utc::now()).unwrap();
+        let model = resolve_local_execution_model(&settings)
+            .expect("operator-direct model must resolve locally")
+            .unwrap();
         assert_eq!(model.version, CONSERVATIVE_PRIOR_VERSION);
         assert_eq!(model.sha256, CONSERVATIVE_PRIOR_SHA256);
     }

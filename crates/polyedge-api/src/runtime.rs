@@ -10,8 +10,8 @@ use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
 use execution_intent::{
-    build_execution_intent_with_model, resolve_execution_model, IntentPublisher,
-    IntentPublisherConfig, IntentPublisherPreparation,
+    build_execution_intent_with_model, resolve_execution_model, resolve_local_execution_model,
+    IntentPublisher, IntentPublisherConfig, IntentPublisherPreparation,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
@@ -2301,13 +2301,18 @@ impl RuntimeController {
         // model control reads off the runtime/feed task so a transient storage
         // delay cannot stall recording or market-data processing.
         let model_settings = self.inner.settings.clone();
-        let execution_model = match tokio::task::spawn_blocking(move || {
-            resolve_execution_model(&model_settings, decision_ts)
-        })
-        .await
-        .map_err(|error| format!("execution-model control task failed: {error}"))
-        .and_then(|result| result)
-        {
+        let execution_model_result =
+            if let Some(model) = resolve_local_execution_model(&model_settings) {
+                model
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    resolve_execution_model(&model_settings, decision_ts)
+                })
+                .await
+                .map_err(|error| format!("execution-model control task failed: {error}"))
+                .and_then(|result| result)
+            };
+        let execution_model = match execution_model_result {
             Ok(model) => model,
             Err(reason) => {
                 warn!(
