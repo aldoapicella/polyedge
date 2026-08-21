@@ -857,10 +857,15 @@ configured for 02:15. Data-producing jobs use one
 `flock -w 129600 /run/polyedge/research.lock` (36 hours); bounded audits bypass
 it. Daily, replay, and qset are each capped at 1.5 CPU. Freshness, hourly,
 parity, and ring upload share `/run/polyedge/utility.lock`, so only one 0.5-CPU
-utility runs at a time. With qset disabled, API/frontend (1 CPU), funded signer
-(0.5), one writer (1.5), and one utility (0.5) allocate at most 3.5 OCPUs to
-heavy workloads, leaving 0.5 OCPU for the OS, Caddy, SPIRE, and token refresh.
-Origin check is manual and unscheduled.
+utility runs at a time. The funded producer and qset preflight writer add two
+0.5-CPU always-on lanes, so current container ceilings can briefly total 4.5
+OCPUs when one serialized research job and one utility overlap. The kernel
+cannot execute more than the four host OCPUs, but quota totals alone no longer
+prove headroom. Do not start any additional manual job during parity; accept
+capacity only from both formal daily cycles with clean latency, backlog, and
+health evidence. At 2026-08-21 16:02 UTC, the five always-on containers used
+about 0.58 CPU in aggregate, host load was 0.84, and 20 GiB memory was
+available. Origin check is manual and unscheduled.
 
 ## Verify, reboot, rollback
 
