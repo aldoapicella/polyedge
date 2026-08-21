@@ -809,7 +809,7 @@ function firstNonBlank(...values) {
   return values.find((value) => value !== null && value !== undefined && String(value).trim() !== "") ?? null;
 }
 
-function orderIds(row) {
+export function orderIds(row) {
   return [
     row?.maker_order_id,
     row?.taker_order_id,

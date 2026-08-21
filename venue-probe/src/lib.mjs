@@ -1300,6 +1300,7 @@ export async function loadCampaignUnresolvedRiskReservationRecords(config, {
     return {
       blob_name: entry.blob_name,
       etag: document.etag,
+      reservation_sha256: entry.reservation_sha256,
       reservation: document.value
     };
   }));
