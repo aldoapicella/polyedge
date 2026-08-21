@@ -217,6 +217,13 @@ impl IntentPublisherConfig {
         if !settings.azure.publish_strategy_canary_intents {
             return Err("strategy canary intent publication is disabled".to_owned());
         }
+        if settings.azure.storage_container_name == "polyedge-shadow-qset-events"
+            && settings.azure.strategy_intent_operator_direct
+        {
+            return Err(
+                "qset shadow intent publisher must not use operator-direct delivery".to_owned(),
+            );
+        }
         if pointer_only_preflight
             && (!settings.azure.strategy_intent_operator_direct
                 || settings.live.execution_mode != ExecutionMode::Paper
@@ -470,6 +477,10 @@ impl IntentPublisher {
                 .map_err(|error| error.to_string())
         })?;
         Ok(IntentPublisherPreparation::WarmupSent)
+    }
+
+    pub(super) fn is_prepared(&self) -> bool {
+        self.intent_lanes_prepared.load(Ordering::Acquire)
     }
 
     pub(super) fn is_pointer_only_preflight(&self) -> bool {
@@ -1050,7 +1061,7 @@ pub(super) fn resolve_execution_model(
     settings: &RuntimeSettings,
     decision_ts: DateTime<Utc>,
 ) -> Result<IntentExecutionModel, String> {
-    if settings.azure.strategy_intent_operator_direct {
+    if settings.deploy.runtime_role.is_shadow() || settings.azure.strategy_intent_operator_direct {
         return validated_conservative_prior(settings);
     }
     let account = settings
@@ -1195,9 +1206,38 @@ fn validated_conservative_prior(
     settings: &RuntimeSettings,
 ) -> Result<IntentExecutionModel, String> {
     let prior = IntentExecutionModel::from_static_settings(settings);
-    if prior.version != CONSERVATIVE_PRIOR_VERSION
-        || prior.sha256 != CONSERVATIVE_PRIOR_SHA256
-        || parse_azure_artifact_uri(&prior.blob_uri).is_err()
+    if prior.version != CONSERVATIVE_PRIOR_VERSION || prior.sha256 != CONSERVATIVE_PRIOR_SHA256 {
+        return Err("static execution model is not the exact frozen conservative prior".to_owned());
+    }
+    let Some(configured_account) = settings
+        .azure
+        .storage_account_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err("static execution model is not the exact frozen conservative prior".to_owned());
+    };
+    let (account, container, blob_name) =
+        parse_azure_artifact_uri(&prior.blob_uri).map_err(|_| {
+            "static execution model is not the exact frozen conservative prior".to_owned()
+        })?;
+    let expected_container = match settings.azure.storage_container_name.as_str() {
+        "polyedge-shadow-qset-events" => "polyedge-research-qset",
+        "polyedge-shadow-events" => "polyedge-research",
+        _ => {
+            return Err(
+                "static execution model is not the exact frozen conservative prior".to_owned(),
+            )
+        }
+    };
+    let expected_blob = format!(
+        "reports/research/venue-probe/models/{}-{}.json",
+        prior.version,
+        &prior.sha256[7..]
+    );
+    if account != configured_account
+        || container != expected_container
+        || blob_name != expected_blob
     {
         return Err("static execution model is not the exact frozen conservative prior".to_owned());
     }
@@ -1689,13 +1729,30 @@ mod tests {
             settings, market, fair_value, reference, book, decision, metadata, now,
         )
     }
+    fn configure_validated_conservative_prior(
+        settings: &mut RuntimeSettings,
+        shadow_container: &str,
+    ) {
+        settings.azure.storage_account_name = Some("test-account".to_owned());
+        settings.azure.storage_container_name = shadow_container.to_owned();
+        let research_container = match shadow_container {
+            "polyedge-shadow-qset-events" => "polyedge-research-qset",
+            "polyedge-shadow-events" => "polyedge-research",
+            _ => unreachable!(),
+        };
+        settings.azure.strategy_canary_execution_model_blob_uri = format!(
+            "azure://test-account/{research_container}/reports/research/venue-probe/models/{CONSERVATIVE_PRIOR_VERSION}-{}.json",
+            &CONSERVATIVE_PRIOR_SHA256[7..]
+        );
+        settings.azure.strategy_canary_execution_model_sha256 =
+            CONSERVATIVE_PRIOR_SHA256.to_owned();
+    }
 
     fn post_100_control(
         settings: &mut RuntimeSettings,
         decision_ts: DateTime<Utc>,
     ) -> (Vec<u8>, Vec<u8>) {
-        settings.azure.strategy_canary_execution_model_sha256 =
-            CONSERVATIVE_PRIOR_SHA256.to_owned();
+        configure_validated_conservative_prior(settings, "polyedge-shadow-events");
         let frozen = FrozenStrategyMode::DynamicQuoteStyle.candidate();
         let candidate = CandidateIdentity {
             name: frozen.name,
@@ -2221,11 +2278,29 @@ mod tests {
     }
 
     #[test]
+    fn qset_operator_direct_publisher_is_rejected() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_account_name = Some("storage".to_owned());
+        settings.azure.storage_container_name = "polyedge-shadow-qset-events".to_owned();
+        settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
+        settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
+
+        assert!(
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, false)
+                .unwrap_err()
+                .contains("qset shadow intent publisher must not use operator-direct delivery")
+        );
+    }
+
+    #[test]
     fn operator_direct_publisher_uses_only_bounded_executable_lanes() {
         let mut settings = RuntimeSettings::default();
         settings.azure.publish_strategy_canary_intents = true;
         settings.azure.storage_account_name = Some("storage".to_owned());
-        settings.azure.storage_container_name = "shadow".to_owned();
+        settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
         settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
         settings.azure.strategy_intent_operator_direct = true;
         settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
@@ -2602,11 +2677,61 @@ mod tests {
     #[test]
     fn operator_direct_uses_the_exact_conservative_prior_without_promotion_control() {
         let (mut settings, ..) = fixture();
+        configure_validated_conservative_prior(&mut settings, "polyedge-shadow-events");
         settings.azure.strategy_intent_operator_direct = true;
-        settings.azure.strategy_canary_execution_model_sha256 =
-            CONSERVATIVE_PRIOR_SHA256.to_owned();
         let model = resolve_execution_model(&settings, Utc::now()).unwrap();
         assert_eq!(model.version, CONSERVATIVE_PRIOR_VERSION);
         assert_eq!(model.sha256, CONSERVATIVE_PRIOR_SHA256);
+    }
+
+    #[test]
+    fn conservative_prior_requires_exact_shadow_provenance() {
+        let (mut settings, ..) = fixture();
+        configure_validated_conservative_prior(&mut settings, "polyedge-shadow-events");
+        assert_eq!(
+            validated_conservative_prior(&settings).unwrap().blob_uri,
+            format!(
+                "azure://test-account/polyedge-research/reports/research/venue-probe/models/{CONSERVATIVE_PRIOR_VERSION}-{}.json",
+                &CONSERVATIVE_PRIOR_SHA256[7..]
+            )
+        );
+
+        for uri in [
+            format!(
+                "azure://wrong-account/polyedge-research/reports/research/venue-probe/models/{CONSERVATIVE_PRIOR_VERSION}-{}.json",
+                &CONSERVATIVE_PRIOR_SHA256[7..]
+            ),
+            format!(
+                "azure://test-account/polyedge-research-qset/reports/research/venue-probe/models/{CONSERVATIVE_PRIOR_VERSION}-{}.json",
+                &CONSERVATIVE_PRIOR_SHA256[7..]
+            ),
+            "azure://test-account/polyedge-research/reports/research/venue-probe/models/not-the-frozen-prior.json".to_owned(),
+        ] {
+            settings.azure.strategy_canary_execution_model_blob_uri = uri;
+            assert!(validated_conservative_prior(&settings).is_err());
+        }
+
+        configure_validated_conservative_prior(&mut settings, "polyedge-shadow-qset-events");
+        assert!(validated_conservative_prior(&settings).is_ok());
+        settings.azure.storage_container_name = "bot-events".to_owned();
+        assert!(validated_conservative_prior(&settings).is_err());
+    }
+
+    #[test]
+    fn qset_shadow_uses_the_frozen_prior_without_funded_control() {
+        let (mut settings, ..) = fixture();
+        settings.deploy.runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
+        configure_validated_conservative_prior(&mut settings, "polyedge-shadow-qset-events");
+        settings.azure.strategy_canary_intent_prefix =
+            "control/strategy-canary/intents/campaign-2026-08-22-qset-v2".to_owned();
+
+        let model = resolve_execution_model(&settings, Utc::now()).unwrap();
+        assert_eq!(model.version, CONSERVATIVE_PRIOR_VERSION);
+        assert_eq!(model.sha256, CONSERVATIVE_PRIOR_SHA256);
+        assert_eq!(
+            intent_blob_name(&settings.azure.strategy_canary_intent_prefix, &"a".repeat(64))
+                .unwrap(),
+            "control/strategy-canary/intents/campaign-2026-08-22-qset-v2/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+        );
     }
 }

@@ -713,6 +713,20 @@ impl RuntimeSettings {
                 "operator-direct intent publication requires the managed-identity Service Bus handoff",
             );
         }
+        if self.azure.storage_container_name == "polyedge-shadow-qset-events"
+            && (self.azure.strategy_intent_operator_direct
+                || self.azure.funded_direct_service_bus_enabled
+                || !self
+                    .azure
+                    .funded_direct_service_bus_namespace
+                    .trim()
+                    .is_empty()
+                || !self.azure.funded_direct_service_bus_queue.trim().is_empty())
+        {
+            reasons.push(
+                "qset shadow evidence must not configure operator-direct or funded Service Bus delivery",
+            );
+        }
         if !matches!(
             self.azure.storage_container_name.as_str(),
             "polyedge-shadow-events" | "polyedge-shadow-qset-events"
@@ -970,6 +984,38 @@ mod tests {
     fn profitability_shadow_accepts_isolated_qset_evidence_container() {
         let mut settings = safe_shadow_settings();
         settings.azure.storage_container_name = "polyedge-shadow-qset-events".to_owned();
+        assert!(settings.validate_runtime_role().is_ok());
+    }
+
+    #[test]
+    fn qset_shadow_rejects_operator_direct_and_funded_service_bus_delivery() {
+        for (operator_direct, service_bus_enabled, namespace, queue) in [
+            (true, false, "", ""),
+            (false, true, "", ""),
+            (false, false, "namespace", ""),
+            (false, false, "", "queue"),
+        ] {
+            let mut settings = safe_shadow_settings();
+            settings.azure.storage_container_name = "polyedge-shadow-qset-events".to_owned();
+            settings.azure.strategy_intent_operator_direct = operator_direct;
+            settings.azure.funded_direct_service_bus_enabled = service_bus_enabled;
+            settings.azure.funded_direct_service_bus_namespace = namespace.to_owned();
+            settings.azure.funded_direct_service_bus_queue = queue.to_owned();
+            assert!(settings
+                .validate_runtime_role()
+                .unwrap_err()
+                .to_string()
+                .contains("qset shadow evidence must not configure operator-direct or funded Service Bus delivery"));
+        }
+    }
+
+    #[test]
+    fn standard_shadow_allows_operator_direct_funded_delivery() {
+        let mut settings = safe_shadow_settings();
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.funded_direct_service_bus_enabled = true;
+        settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
+        settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
         assert!(settings.validate_runtime_role().is_ok());
     }
 

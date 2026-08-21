@@ -87,7 +87,9 @@ activate_funded_fixture() {
     .fundedSignerImage="ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
-    .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+    .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999" |
+    .fundedIntentProducerEnabled=true | .fundedIntentProducerImage="ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc" |
+    .fundedIntentProducerUser="984:980" | .fundedIntentProducerConfigSha256="sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b"' \
     "$case_root/ring/parity/ledger.json" >"$active_ledger"
   rm "$case_root/ring/parity/ledger.json"
   chmod 0640 "$active_ledger"
@@ -100,6 +102,8 @@ POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:9999999999999999999999999999999999999999999999999999999999999999
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
 EOF
 }
 
@@ -155,11 +159,11 @@ run_recorder "$noon" 2026-08-19 >/dev/null
 success=$root/success
 fixture "$success"
 make_bundle "$success" 2026-08-11 2026-08-12T08:00:00Z
-before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")
+before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(jq -r '.completedDailyCycles' "$success/ring/parity/ledger.json")" = 1 ]
 [ "$(jq -r '.acceptedDailyEvidence | length' "$success/ring/parity/ledger.json")" = 1 ]
-[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")" = "$before" ]
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$success/ring/parity/ledger.json")" = "$before" ]
 evidence_sha=$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")
 run_recorder "$success" 2026-08-11 >/dev/null
 [ "$(sha256sum "$success/ring/parity/daily/2026-08-11/evidence.json")" = "$evidence_sha" ]
@@ -187,8 +191,24 @@ run_recorder "$active_funded" 2026-08-11 >/dev/null
 jq -e '.fundedSignerEnabled == true and .completedDailyCycles == 1 and
   (.acceptedDailyEvidence | length) == 1' "$active_funded/ring/parity/20260811T000000Z-funded-active.json" >/dev/null
 jq -e '.fundedSignerMode == "active" and .fundedSignerEnabled == true and
-  .fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and .fundedSignerUser == "'"$uid:$gid"'"' \
+  .fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and .fundedSignerUser == "'"$uid:$gid"'" and
+  .fundedIntentProducerEnabled == true and .fundedIntentProducerUser == "984:980" and
+  .fundedIntentProducerConfigSha256 == "sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b"' \
   "$active_funded/ring/parity/daily/2026-08-11/evidence.json" >/dev/null
+
+producer_drift=$root/producer-drift
+fixture "$producer_drift"
+activate_funded_fixture "$producer_drift"
+producer_ledger=$producer_drift/ring/parity/20260811T000000Z-funded-active.json
+jq '.fundedIntentProducerConfigSha256="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  "$producer_ledger" >"$producer_drift/ledger.tmp"
+chmod 0640 "$producer_drift/ledger.tmp"
+mv "$producer_drift/ledger.tmp" "$producer_ledger"
+make_bundle "$producer_drift" 2026-08-11 2026-08-12T08:00:00Z
+if run_recorder "$producer_drift" 2026-08-11 >/dev/null 2>&1; then
+  echo 'drifted producer config unexpectedly passed daily parity' >&2
+  exit 1
+fi
 
 primary_na=$root/primary-na
 fixture "$primary_na"

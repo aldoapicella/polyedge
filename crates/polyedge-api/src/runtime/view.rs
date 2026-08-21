@@ -39,6 +39,16 @@ impl RuntimeController {
         let shadow_only = self.inner.settings.deploy.runtime_role.is_shadow();
         let runtime_active = self.inner.started.load(Ordering::SeqCst);
         let runtime_tasks_running = !runtime_active || self.runtime_tasks_running();
+        let intent_publisher = self.inner.intent_publisher.as_ref().map_or_else(
+            || json!({"configured": false, "prepared": false, "pointer_only_preflight": false}),
+            |publisher| {
+                json!({
+                    "configured": true,
+                    "prepared": publisher.is_prepared(),
+                    "pointer_only_preflight": publisher.is_pointer_only_preflight()
+                })
+            },
+        );
         json!({
             "app": self.inner.settings.deploy.app_name,
             "backend_impl": "rust",
@@ -60,6 +70,7 @@ impl RuntimeController {
                 "pause_reason": data.pause_reason
             },
             "kill_switch": data.kill_switch,
+            "intent_publisher": intent_publisher,
             "task_health": {
                 "api": "ok",
                 "runtime_loop": if !runtime_active { "not_started" } else if runtime_tasks_running { "running" } else { "failed" },

@@ -120,6 +120,118 @@ feed_evidence() {
 }
 
 
+text_sha() { printf '%s\n' "$1" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
+
+producer_env_binding_expected() {
+  jq -cS -n '{
+    APP_NAME:"polyedge-funded-intent-producer",
+    RUNTIME_ROLE:"profitability_shadow",
+    EXECUTION_MODE:"paper",
+    ALLOW_LIVE:"false",
+    RUN_BOT_ON_STARTUP:"true",
+    STRATEGY_INTENT_OPERATOR_DIRECT:"true",
+    PUBLISH_STRATEGY_CANARY_INTENTS:"true",
+    STRATEGY_CANARY_INTENT_PREFIX:"reports/research/venue-probe/control/strategy-canary/intents",
+    STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:"conservative-execution-prior-v1",
+    STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:"azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    STRATEGY_CANARY_EXECUTION_MODEL_SHA256:"sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4",
+    STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MAX_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:"360",
+    STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:"900",
+    TARGET_ASSET:"BTC",TARGET_ASSET_NAME:"Bitcoin",TARGET_HORIZON:"15m",
+    TARGET_BINANCE_SYMBOL:"btcusdt",TARGET_CHAINLINK_SYMBOL:"btc/usd",TARGET_COINBASE_PRODUCT_ID:"BTC-USD",
+    AZURE_TENANT_ID:"9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
+    AZURE_CLIENT_ID:"54f0136b-5e72-4ad1-b23e-cb1269d356c1",
+    AZURE_FEDERATED_TOKEN_FILE:"/run/credentials/azure-federated-token",
+    AZURE_TOKEN_CREDENTIALS:"WorkloadIdentityCredential",
+    AZURE_STORAGE_ACCOUNT_NAME:"stpolyedge6urdjr5nmwx7w",
+    AZURE_STORAGE_CONTAINER_NAME:"polyedge-shadow-events",
+    AZURE_STORAGE_TABLE_NAME:"ShadowBotEventIndex",
+    AZURE_CHART_TABLE_NAME:"ShadowBotChartSeries",
+    AZURE_MARKET_TABLE_NAME:"ShadowBotMarketCatalog",
+    AZURE_FUNDED_STORAGE_CONTAINER_NAME:"polyedge-funded-evidence",
+    AZURE_MODEL_STORAGE_CONTAINER_NAME:"polyedge-models",
+    FUNDED_DIRECT_SERVICE_BUS_ENABLED:"true",
+    FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:"sb-polyedge-funded-cl-6urdjr5nmwx7w",
+    FUNDED_DIRECT_SERVICE_BUS_QUEUE:"funded-dynamic-quote-intents"
+  }'
+}
+
+
+validate_producer_evidence() {
+  jq -e --arg image "$funded_producer_image" --arg user "$funded_producer_user" \
+    --arg config_sha "$funded_producer_config_sha" --arg env_binding_sha "$funded_producer_env_binding_sha" \
+    --arg mount_binding_sha "$funded_producer_mount_binding_sha" --argjson funded "$funded_enabled" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    (.hourStartUtc | epoch) as $start |
+    (.hourEndUtc | epoch) as $end |
+    .services.fundedIntentProducerEnabled == $funded and
+    (if $funded then
+      .services.fundedIntentProducerActive == true and
+      (.services.fundedIntentProducerEnablement == "enabled" or .services.fundedIntentProducerEnablement == "generated") and
+      .services.fundedIntentProducerTokenTimerEnablement == "enabled" and
+      .services.fundedIntentProducerTokenTimerActive == true and
+      .services.fundedIntentProducerImage == $image and .services.fundedIntentProducerUser == $user and
+      .services.fundedIntentProducerConfigSha256 == $config_sha and
+      (.services.fundedIntentProducerRuntime.containerId | test("^[0-9a-f]{64}$")) and
+      (.services.fundedIntentProducerRuntime.invocationId | test("^[0-9a-f]{32}$")) and
+      .services.fundedIntentProducerRuntime.configEnvBindingSha256 == $env_binding_sha and
+      .services.fundedIntentProducerRuntime.tokenMountBindingSha256 == $mount_binding_sha and
+      .services.fundedIntentProducerRuntime.continuity.invocationId == .services.fundedIntentProducerRuntime.invocationId and
+      .services.fundedIntentProducerRuntime.continuity.containerId == .services.fundedIntentProducerRuntime.containerId and
+      .services.fundedIntentProducerRuntime.continuity.observationCount >= 50 and
+      .services.fundedIntentProducerRuntime.continuity.maxGapSeconds <= 75 and
+      .services.fundedIntentProducerRuntime.continuity.foreignObservationCount == 0 and
+      .services.fundedIntentProducerRuntime.continuity.restartCount == 0 and
+      ((.services.fundedIntentProducerRuntime.continuity.firstObservationUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.continuity.firstObservationUtc | epoch) <= ($start + 75)) and
+      ((.services.fundedIntentProducerRuntime.continuity.lastObservationUtc | epoch) >= ($end - 75)) and
+      ((.services.fundedIntentProducerRuntime.continuity.lastObservationUtc | epoch) < $end) and
+      .services.fundedIntentProducerRuntime.continuity.publisher.successCount >= 1 and
+      .services.fundedIntentProducerRuntime.continuity.publisher.successCount ==
+        (.services.fundedIntentProducerRuntime.continuity.publisher.warmupSentCount +
+         .services.fundedIntentProducerRuntime.continuity.publisher.intentPublishedCount) and
+      .services.fundedIntentProducerRuntime.continuity.publisher.infrastructureFailureCount == 0 and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.firstSuccessUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.firstSuccessUtc | epoch) < $end) and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.lastSuccessUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.lastSuccessUtc | epoch) < $end) and
+      .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshCount >= 20 and
+      .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshFailureCount == 0 and
+      .services.fundedIntentProducerRuntime.tokenContinuity.maxTokenRefreshGapSeconds <= 180 and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.firstTokenRefreshUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.firstTokenRefreshUtc | epoch) <= ($start + 180)) and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.lastTokenRefreshUtc | epoch) >= ($end - 180)) and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.lastTokenRefreshUtc | epoch) < $end) and
+      .services.fundedIntentProducerRuntime.health == {
+        ok:true,backendImpl:"rust",runtimeRole:"profitability_shadow",shadowOnly:true,
+        runtimeActive:true,executionMode:"paper",killSwitch:false} and
+      .services.fundedIntentProducerRuntime.status.app == "polyedge-funded-intent-producer" and
+      .services.fundedIntentProducerRuntime.status.runtimeRole == "profitability_shadow" and
+      .services.fundedIntentProducerRuntime.status.executionMode == "paper" and
+      .services.fundedIntentProducerRuntime.status.intentPublisher == {
+        configured:true,prepared:true,pointerOnlyPreflight:false} and
+      .services.fundedIntentProducerRuntime.status.taskHealth == {api:"ok",runtimeLoop:"running",feeds:"running"} and
+      all(.services.fundedIntentProducerRuntime.status.feedStatus[]; .status == "ok") and
+      .services.fundedIntentProducerRuntime.status.recorder.queued == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.enqueuedTotal == .services.fundedIntentProducerRuntime.status.recorder.persistedTotal and
+      .services.fundedIntentProducerRuntime.status.recorder.failedTotal == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.unrecoveredDurableEvents == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.flushUnrecovered == false and
+      .services.fundedIntentProducerRuntime.status.recorder.errorCount == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.droppedCount == 0
+     else .services.fundedIntentProducerActive == false and
+      (.services.fundedIntentProducerEnablement == "disabled" or
+       .services.fundedIntentProducerEnablement == "masked") and
+      .services.fundedIntentProducerTokenTimerActive == false and
+      (.services.fundedIntentProducerTokenTimerEnablement == "disabled" or
+       .services.fundedIntentProducerTokenTimerEnablement == "masked") and
+      .services.fundedIntentProducerImage == null and .services.fundedIntentProducerUser == null and
+      .services.fundedIntentProducerConfigSha256 == null and .services.fundedIntentProducerRuntime == null end)
+  ' "$1" >/dev/null
+}
+
 validate_evidence_artifacts() (
   file=$1
   start=$(jq -er '.hourStartUtc | select(type == "string")' "$file") || die "evidence hour is missing: $file"
@@ -189,6 +301,8 @@ formal_funded_gid=${POLYEDGE_PARITY_FUNDED_GID:-982}
 formal_expected_funded_session_id=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}
 formal_expected_funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:-}
 formal_expected_funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}
+formal_expected_funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:-}
+formal_expected_funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:-}
 formal_window_start=${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}
 formal_ledger=${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}
 formal_subscription=${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}
@@ -225,6 +339,8 @@ set +a
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}" = "$formal_expected_funded_session_id" ] || die 'hourly environment overrides the formal funded session'
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:-}" = "$formal_expected_funded_session_sha" ] || die 'hourly environment overrides the formal funded session hash'
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}" = "$formal_expected_funded_config_sha" ] || die 'hourly environment overrides the formal funded config hash'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:-}" = "$formal_expected_funded_producer_image" ] || die 'hourly environment overrides the formal funded producer image'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:-}" = "$formal_expected_funded_producer_config_sha" ] || die 'hourly environment overrides the formal funded producer config hash'
 [ "${POLYEDGE_PARITY_WINDOW_START_UTC:-}" = "$formal_window_start" ] || die 'hourly environment overrides the formal window start'
 [ "${POLYEDGE_PARITY_LEDGER:-}" = "$formal_ledger" ] || die 'hourly environment overrides the formal ledger path'
 [ "${AZURE_SUBSCRIPTION_ID:-}" = "$formal_subscription" ] || die 'hourly environment overrides the Azure subscription'
@@ -240,6 +356,8 @@ POLYEDGE_PARITY_FUNDED_GID=$formal_funded_gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=$formal_expected_funded_session_id
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=$formal_expected_funded_session_sha
 POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=$formal_expected_funded_config_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=$formal_expected_funded_producer_image
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=$formal_expected_funded_producer_config_sha
 POLYEDGE_PARITY_WINDOW_START_UTC=$formal_window_start
 POLYEDGE_PARITY_LEDGER=$formal_ledger
 AZURE_SUBSCRIPTION_ID=$formal_subscription
@@ -269,6 +387,8 @@ case "$POLYEDGE_PARITY_FUNDED_MODE" in
   disabled)
     funded_enabled=false
     funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_producer_image= funded_producer_user= funded_producer_config_sha=
+    funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
     ;;
   active)
     funded_enabled=true
@@ -287,9 +407,24 @@ case "$POLYEDGE_PARITY_FUNDED_MODE" in
     funded_session=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID
     funded_session_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256
     funded_config_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256
+    funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:?set the approved funded producer image}
+    funded_producer_user=984:980
+    funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:?set the funded producer config hash}
+    printf '%s' "$funded_producer_image" \
+      | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+      || die 'expected funded producer image is not an immutable rust-backend digest'
+    printf '%s' "$funded_producer_config_sha" | grep -Ex 'sha256:[0-9a-f]{64}' \
+      || die 'expected funded producer config hash is malformed'
+    funded_producer_env_binding_sha=$(text_sha "$(producer_env_binding_expected)")
     ;;
   *) die 'formal funded mode must equal disabled or active' ;;
 esac
+producer_token=${POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE:-/run/polyedge-federated-funded-intent-producer/azure-federated-token}
+if [ "$funded_enabled" = true ]; then
+  producer_token_dir=${producer_token%/*}
+  funded_producer_mount_binding_sha=$(text_sha "$(jq -cS -n --arg source "$producer_token_dir" \
+    '{source:$source,destination:"/run/credentials",readOnly:true}')")
+fi
 [ "$POLYEDGE_RESEARCH_IMAGE" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] || die 'hourly OCI job image differs from the formal multiarch image'
 printf '%s' "$AZURE_SUBSCRIPTION_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || die 'Azure subscription ID is malformed'
 printf '%s/%s' "$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP" "$POLYEDGE_PARITY_AZURE_JOB_NAME" | grep -Eq '^[A-Za-z0-9._()-]+/[A-Za-z0-9._()-]+$' || die 'Azure job resource identity is malformed'
@@ -326,7 +461,9 @@ secure_file "$POLYEDGE_PARITY_LEDGER" 640
 validate_ledger() {
   jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$POLYEDGE_PARITY_FUNDED_MODE" \
     --arg image "$funded_image" --arg user "$funded_user" --arg session "$funded_session" \
-    --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" --argjson funded "$funded_enabled" '
+    --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
+    --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
+    --arg producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "in_progress" and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     .windowStartUtc == $start and
@@ -337,11 +474,15 @@ validate_ledger() {
     (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
     (if $funded then
       .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
-      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha
+      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha and
+      .fundedIntentProducerEnabled == true and .fundedIntentProducerImage == $producer_image and
+      .fundedIntentProducerUser == $producer_user and .fundedIntentProducerConfigSha256 == $producer_config_sha
      else (.fundedSignerMode? // "disabled") == "disabled" and
       (.fundedSignerImage? // null) == null and (.fundedSignerUser? // null) == null and
       (.fundedSessionId? // null) == null and (.fundedSessionManifestSha256? // null) == null and
-      (.fundedConfigSha256? // null) == null end)
+      (.fundedConfigSha256? // null) == null and (.fundedIntentProducerEnabled? // false) == false and
+      (.fundedIntentProducerImage? // null) == null and (.fundedIntentProducerUser? // null) == null and
+      (.fundedIntentProducerConfigSha256? // null) == null end)
   ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
   reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
   [ ! -L "$reboot_validator" ] && [ -x "$reboot_validator" ] || die 'reboot attestation validator is missing or unsafe'
@@ -407,7 +548,13 @@ oauth_response=$(mktemp "$runtime_dir/oauth.XXXXXX")
 auth_header=$(mktemp "$runtime_dir/header.XXXXXX")
 sequence_tmp=
 api_status=
-trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$sequence_tmp" "$api_status"' EXIT HUP INT TERM
+producer_health_file=
+producer_status_file=
+funded_journal_file=
+funded_token_journal_file=
+producer_journal_file=
+producer_token_journal_file=
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$sequence_tmp" "$api_status" "$producer_health_file" "$producer_status_file" "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file"' EXIT HUP INT TERM
 chmod 0600 "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"
 
 collect_refs() {
@@ -452,14 +599,19 @@ collect_refs() {
       validate_evidence_artifacts "$file"
       sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
       feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
+      validate_producer_evidence "$file" || die "accepted evidence lacks funded producer proof: $file"
       file_sha=$(sha "$file")
       funded_invocation=$(jq -r '.services.fundedRuntime.invocationId // ""' "$file")
       funded_container=$(jq -r '.services.fundedRuntime.containerId // ""' "$file")
+      funded_producer_invocation=$(jq -r '.services.fundedIntentProducerRuntime.invocationId // ""' "$file")
+      funded_producer_container=$(jq -r '.services.fundedIntentProducerRuntime.containerId // ""' "$file")
       jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" --argjson runs "$sequence" \
         --arg funded_invocation "$funded_invocation" --arg funded_container "$funded_container" \
+        --arg funded_producer_invocation "$funded_producer_invocation" --arg funded_producer_container "$funded_producer_container" \
         '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha} +
          (if ($runs | length) == 1 then {recorderSequence:$runs[0]} else {recorderRuns:$runs} end) +
-         (if $funded_invocation == "" then {} else {fundedInvocationId:$funded_invocation,fundedContainerId:$funded_container} end)' >>"$refs_tmp"
+         (if $funded_invocation == "" then {} else {fundedInvocationId:$funded_invocation,fundedContainerId:$funded_container,
+           fundedProducerInvocationId:$funded_producer_invocation,fundedProducerContainerId:$funded_producer_container} end)' >>"$refs_tmp"
     fi
   done
   refs=$(jq -sc 'sort_by(.hourStartEpoch)' "$refs_tmp")
@@ -472,8 +624,11 @@ collect_refs() {
     ($refs | to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600)))) and
     ([$refs[].hourStartEpoch] | length == (unique | length)) and
     (if $funded then ([$refs[].fundedInvocationId] | unique | length) == 1 and
-      ([$refs[].fundedContainerId] | unique | length) == 1
-     else all($refs[]; has("fundedInvocationId") | not) end) and
+      ([$refs[].fundedContainerId] | unique | length) == 1 and
+      ([$refs[].fundedProducerInvocationId] | unique | length) == 1 and
+      ([$refs[].fundedProducerContainerId] | unique | length) == 1
+     else all($refs[]; has("fundedInvocationId") | not) and
+      all($refs[]; has("fundedProducerInvocationId") | not) end) and
     all(range(1; ($runs | length)); . as $index |
       if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
         $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
@@ -491,13 +646,13 @@ update_ledger() {
   expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
   [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
 
-  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
   ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
   trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
   jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
     "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
   chmod 0640 "$ledger_tmp"
-  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
     || die 'protected ledger fields changed'
   sync -f "$ledger_tmp"
   mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
@@ -526,6 +681,7 @@ if [ -e "$evidence" ]; then
   validate_evidence_artifacts "$evidence"
   sequence_evidence "$evidence" >/dev/null || die 'existing accepted evidence lacks recorder sequence proof'
   feed_evidence "$evidence" || die 'existing accepted evidence lacks continuous essential feed proof'
+  validate_producer_evidence "$evidence" || die 'existing accepted evidence lacks funded producer proof'
   lock_ledger
   validate_ledger
   collect_refs
@@ -562,10 +718,114 @@ systemctl is-active --quiet polyedge-frontend.service || die 'frontend service i
 case "$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
 if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
 funded_runtime=null
+funded_producer_runtime=null
+funded_journal_file=
+funded_token_journal_file=
+producer_journal_file=
+producer_token_journal_file=
 if [ "$POLYEDGE_PARITY_FUNDED_MODE" = disabled ]; then
   [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
   if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
+  producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  case "$producer_enablement" in disabled|masked) ;; *) die 'funded intent producer is enabled or absent' ;; esac
+  if systemctl is-active --quiet polyedge-funded-intent-producer.service; then die 'funded intent producer is active'; fi
+  producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  case "$producer_token_enablement" in disabled|masked) ;; *) die 'funded producer token timer is enabled or absent' ;; esac
+  if systemctl is-active --quiet polyedge-federated-token@funded-intent-producer.timer; then
+    die 'funded producer token timer is active'
+  fi
 else
+  producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  case "$producer_enablement" in
+    enabled) ;;
+    generated)
+      systemctl show multi-user.target --property=Wants --value | tr ' ' '\n' \
+        | grep -Fx polyedge-funded-intent-producer.service >/dev/null \
+        || die 'generated funded intent producer is not wanted by the reboot target'
+      ;;
+    *) die 'funded intent producer is not enabled for reboot recovery' ;;
+  esac
+  producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  [ "$producer_token_enablement" = enabled ] || die 'funded producer token rotation timer is not enabled for reboot recovery'
+  systemctl is-active --quiet polyedge-funded-intent-producer.service || die 'funded intent producer is inactive'
+  systemctl is-active --quiet polyedge-federated-token@funded-intent-producer.timer || die 'funded producer token rotation timer is inactive'
+  [ "$(podman inspect --format '{{.State.Status}}' polyedge-funded-intent-producer)" = running ] || die 'funded intent producer container is not running'
+  [ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-funded-intent-producer)" = healthy ] || die 'funded intent producer container is unhealthy'
+  [ "$(podman inspect --format '{{.Config.Image}}' polyedge-funded-intent-producer)" = "$funded_producer_image" ] \
+    || die 'funded intent producer image differs from the formal digest'
+  [ "$(podman inspect --format '{{.Config.User}}' polyedge-funded-intent-producer)" = "$funded_producer_user" ] \
+    || die 'funded intent producer container user is not 984:980'
+  funded_producer_container=$(podman inspect --format '{{.Id}}' polyedge-funded-intent-producer)
+  printf '%s' "$funded_producer_container" | grep -Eq '^[0-9a-f]{64}$' || die 'funded intent producer container ID is malformed'
+  funded_producer_invocation=$(systemctl show polyedge-funded-intent-producer.service --property=InvocationID --value)
+  printf '%s' "$funded_producer_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'funded intent producer invocation ID is malformed'
+  producer_config_file=${POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE:-/etc/polyedge/funded-intent-producer.env}
+  secure_file "$producer_config_file" 600
+  [ "$(sha "$producer_config_file")" = "$funded_producer_config_sha" ] \
+    || die 'funded intent producer environment hash differs from the formal config'
+  [ ! -L "$producer_token" ] && [ -f "$producer_token" ] || die 'funded producer JWT-SVID is missing or unsafe'
+  set -- $(stat -c '%u %g %a %h %s %Y' "$producer_token")
+  [ "$1:$2" = "$funded_producer_user" ] && [ "$3" = 600 ] && [ "$4" = 1 ] && [ "$5" -gt 0 ] && [ "$5" -le 65536 ] \
+    || die 'funded producer JWT-SVID has unsafe metadata'
+  funded_producer_token_age=$((now_epoch - $6))
+  [ "$funded_producer_token_age" -ge 0 ] && [ "$funded_producer_token_age" -le 240 ] || die 'funded producer JWT-SVID rotation is stale'
+
+  producer_env_raw=$(podman inspect --format '{{json .Config.Env}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer environment is unreadable'
+  producer_env_binding=$(printf '%s\n' "$producer_env_raw" | jq -cSe '
+    def one($name):
+      ($name + "=") as $prefix |
+      [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+      if length == 1 then .[0] else error("critical producer environment binding is absent or duplicate") end;
+    {
+      APP_NAME:one("APP_NAME"),RUNTIME_ROLE:one("RUNTIME_ROLE"),EXECUTION_MODE:one("EXECUTION_MODE"),
+      ALLOW_LIVE:one("ALLOW_LIVE"),RUN_BOT_ON_STARTUP:one("RUN_BOT_ON_STARTUP"),
+      STRATEGY_INTENT_OPERATOR_DIRECT:one("STRATEGY_INTENT_OPERATOR_DIRECT"),
+      PUBLISH_STRATEGY_CANARY_INTENTS:one("PUBLISH_STRATEGY_CANARY_INTENTS"),
+      STRATEGY_CANARY_INTENT_PREFIX:one("STRATEGY_CANARY_INTENT_PREFIX"),
+      STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:one("STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION"),
+      STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:one("STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI"),
+      STRATEGY_CANARY_EXECUTION_MODEL_SHA256:one("STRATEGY_CANARY_EXECUTION_MODEL_SHA256"),
+      STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:one("STRATEGY_INTENT_TARGET_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MAX_ORDER_NOTIONAL:one("STRATEGY_INTENT_MAX_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY"),
+      STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY"),
+      TARGET_ASSET:one("TARGET_ASSET"),TARGET_ASSET_NAME:one("TARGET_ASSET_NAME"),TARGET_HORIZON:one("TARGET_HORIZON"),
+      TARGET_BINANCE_SYMBOL:one("TARGET_BINANCE_SYMBOL"),TARGET_CHAINLINK_SYMBOL:one("TARGET_CHAINLINK_SYMBOL"),
+      TARGET_COINBASE_PRODUCT_ID:one("TARGET_COINBASE_PRODUCT_ID"),
+      AZURE_TENANT_ID:one("AZURE_TENANT_ID"),AZURE_CLIENT_ID:one("AZURE_CLIENT_ID"),
+      AZURE_FEDERATED_TOKEN_FILE:one("AZURE_FEDERATED_TOKEN_FILE"),
+      AZURE_TOKEN_CREDENTIALS:one("AZURE_TOKEN_CREDENTIALS"),
+      AZURE_STORAGE_ACCOUNT_NAME:one("AZURE_STORAGE_ACCOUNT_NAME"),
+      AZURE_STORAGE_CONTAINER_NAME:one("AZURE_STORAGE_CONTAINER_NAME"),
+      AZURE_STORAGE_TABLE_NAME:one("AZURE_STORAGE_TABLE_NAME"),
+      AZURE_CHART_TABLE_NAME:one("AZURE_CHART_TABLE_NAME"),
+      AZURE_MARKET_TABLE_NAME:one("AZURE_MARKET_TABLE_NAME"),
+      AZURE_FUNDED_STORAGE_CONTAINER_NAME:one("AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+      AZURE_MODEL_STORAGE_CONTAINER_NAME:one("AZURE_MODEL_STORAGE_CONTAINER_NAME"),
+      FUNDED_DIRECT_SERVICE_BUS_ENABLED:one("FUNDED_DIRECT_SERVICE_BUS_ENABLED"),
+      FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:one("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE"),
+      FUNDED_DIRECT_SERVICE_BUS_QUEUE:one("FUNDED_DIRECT_SERVICE_BUS_QUEUE")
+    }
+  ') || die 'funded intent producer critical environment binding is unsafe'
+  unset producer_env_raw
+  [ "$(text_sha "$producer_env_binding")" = "$funded_producer_env_binding_sha" ] \
+    || die 'funded intent producer critical environment differs from the approved binding'
+  unset producer_env_binding
+
+  producer_mount_raw=$(podman inspect --format '{{json .Mounts}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer mounts are unreadable'
+  producer_mount_binding=$(printf '%s\n' "$producer_mount_raw" | jq -cSe --arg source "$producer_token_dir" '
+    [.[] | select(.Destination == "/run/credentials")] as $mounts |
+    if ($mounts | length) == 1 and $mounts[0].Source == $source and $mounts[0].RW == false
+    then {source:$mounts[0].Source,destination:$mounts[0].Destination,readOnly:true}
+    else error("producer token mount is not exact and read-only") end
+  ') || die 'funded intent producer token mount is not exact and read-only'
+  unset producer_mount_raw
+  [ "$(text_sha "$producer_mount_binding")" = "$funded_producer_mount_binding_sha" ] \
+    || die 'funded intent producer token mount differs from the approved binding'
+  unset producer_mount_binding
+
   funded_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
   case "$funded_enablement" in
     enabled) ;;
@@ -581,36 +841,45 @@ else
   systemctl is-active --quiet polyedge-funded-signer.service || die 'funded signer is inactive'
   systemctl is-active --quiet polyedge-federated-token@funded-signer.timer || die 'funded token rotation timer is inactive'
   [ "$(podman inspect --format '{{.State.Status}}' polyedge-funded-signer)" = running ] || die 'funded signer container is not running'
-  [ "$(podman inspect --format '{{.Config.Image}}' polyedge-funded-signer)" = "$funded_image" ] \
-    || die 'funded signer image differs from the formal digest'
-  [ "$(podman inspect --format '{{.Config.User}}' polyedge-funded-signer)" = "$funded_user" ] \
-    || die 'funded signer container user is not the isolated lane identity'
+  [ "$(podman inspect --format '{{.Config.Image}}' polyedge-funded-signer)" = "$funded_image" ] || die 'funded signer image differs from the formal digest'
+  [ "$(podman inspect --format '{{.Config.User}}' polyedge-funded-signer)" = "$funded_user" ] || die 'funded signer container user is not the isolated lane identity'
   funded_container=$(podman inspect --format '{{.Id}}' polyedge-funded-signer)
   printf '%s' "$funded_container" | grep -Eq '^[0-9a-f]{64}$' || die 'funded signer container ID is malformed'
   funded_invocation=$(systemctl show polyedge-funded-signer.service --property=InvocationID --value)
   printf '%s' "$funded_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'funded signer invocation ID is malformed'
   funded_env_value() {
-    podman inspect --format '{{json .Config.Env}}' polyedge-funded-signer \
-      | jq -er --arg name "$1" '($name + "=") as $prefix |
-          [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
-          if length == 1 then .[0] else error("funded runtime binding is absent or duplicate") end'
+    raw=$(podman inspect --format '{{json .Config.Env}}' polyedge-funded-signer) || die 'funded signer environment is unreadable'
+    printf '%s\n' "$raw" | jq -er --arg name "$1" '($name + "=") as $prefix |
+      [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+      if length == 1 then .[0] else error("funded runtime binding is absent or duplicate") end'
+    unset raw
   }
-  [ "$(funded_env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = "$funded_session" ] \
-    || die 'funded signer campaign differs from the formal session'
-  [ "$(funded_env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = "$funded_session_sha" ] \
-    || die 'funded signer manifest hash differs from the formal session'
-  [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] \
-    || die 'funded signer config hash differs from the formal config'
+  [ "$(funded_env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = "$funded_session" ] || die 'funded signer campaign differs from the formal session'
+  [ "$(funded_env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = "$funded_session_sha" ] || die 'funded signer manifest hash differs from the formal session'
+  [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] || die 'funded signer config hash differs from the formal config'
   funded_token=${POLYEDGE_PARITY_FUNDED_TOKEN_FILE:-/run/polyedge-federated-funded-signer/azure-federated-token}
   [ ! -L "$funded_token" ] && [ -f "$funded_token" ] || die 'funded JWT-SVID is missing or unsafe'
   set -- $(stat -c '%u %g %a %h %Y' "$funded_token")
-  [ "$1:$2" = "$funded_user" ] && [ "$3" = 600 ] && [ "$4" = 1 ] \
-    || die 'funded JWT-SVID has wrong owner, mode, or link count'
+  [ "$1:$2" = "$funded_user" ] && [ "$3" = 600 ] && [ "$4" = 1 ] || die 'funded JWT-SVID has wrong owner, mode, or link count'
   funded_token_age=$((now_epoch - $5))
   [ "$funded_token_age" -ge 0 ] && [ "$funded_token_age" -le 240 ] || die 'funded JWT-SVID rotation is stale'
-  funded_runtime=$(journalctl -u polyedge-funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager \
-    | jq -Rsc --arg invocation "$funded_invocation" --arg container "$funded_container" \
-      --argjson start "$target_epoch" --argjson end "$end_epoch" '
+
+  funded_journal_file=$(mktemp "$runtime_dir/funded-journal.XXXXXX")
+  funded_token_journal_file=$(mktemp "$runtime_dir/funded-token-journal.XXXXXX")
+  producer_journal_file=$(mktemp "$runtime_dir/producer-journal.XXXXXX")
+  producer_token_journal_file=$(mktemp "$runtime_dir/producer-token-journal.XXXXXX")
+  chmod 0600 "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file"
+  journalctl -u polyedge-funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager >"$funded_journal_file" \
+    || die 'funded signer journal capture failed'
+  journalctl -u polyedge-federated-token@funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager >"$funded_token_journal_file" \
+    || die 'funded signer token journal capture failed'
+  journalctl -u polyedge-funded-intent-producer.service --since "$target" --until "$hour_end" -o json --no-pager >"$producer_journal_file" \
+    || die 'funded intent producer journal capture failed'
+  journalctl -u polyedge-federated-token@funded-intent-producer.service --since "$target" --until "$hour_end" -o json --no-pager >"$producer_token_journal_file" \
+    || die 'funded producer token journal capture failed'
+
+  funded_runtime=$(jq -Rsc --arg invocation "$funded_invocation" --arg container "$funded_container" \
+    --argjson start "$target_epoch" --argjson end "$end_epoch" '
       [split("\n")[] | fromjson? | select(type == "object") | . as $record |
         ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
         {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
@@ -636,23 +905,21 @@ else
           .executor.safety_snapshot_cache_ready == true and .executor.safety_snapshot_cache_error == null and
           .executor.risk_reservation_index_ready == true)
       then ($heartbeats[-1].event | {
-        invocationId:$invocation,containerId:$container,
-        heartbeatCount:($heartbeats | length),firstHeartbeatUtc:($times[0] | todateiso8601),
-        lastHeartbeatUtc:($times[-1] | todateiso8601),maxHeartbeatGapSeconds:$max_gap,
-        alertCount:($alerts | length),failedClosedCount:($failed | length),restartCount:(($restarts | length) + $foreign),
-        processedMessages:.processed_messages,failedMessages:.failed_messages,
-        consecutiveLatencyBreaches:.consecutive_latency_breaches,redemptionFailures:.redemption_failures,
+        invocationId:$invocation,containerId:$container,heartbeatCount:($heartbeats | length),
+        firstHeartbeatUtc:($times[0] | todateiso8601),lastHeartbeatUtc:($times[-1] | todateiso8601),
+        maxHeartbeatGapSeconds:$max_gap,alertCount:($alerts | length),failedClosedCount:($failed | length),
+        restartCount:(($restarts | length) + $foreign),processedMessages:.processed_messages,
+        failedMessages:.failed_messages,consecutiveLatencyBreaches:.consecutive_latency_breaches,
+        redemptionFailures:.redemption_failures,
         executor:{userChannelReady:.executor.user_channel_ready,marketChannelReady:.executor.market_channel_ready,
           userChannelGaps:.executor.user_channel_gaps,marketChannelGaps:.executor.market_channel_gaps,
           userChannelUnparsed:.executor.user_channel_unparsed,marketChannelUnparsed:.executor.market_channel_unparsed,
           reconnectReconciliationRequired:.executor.reconnect_reconciliation_required,
-          safetySnapshotCacheReady:.executor.safety_snapshot_cache_ready,
-          safetySnapshotCacheError:.executor.safety_snapshot_cache_error,
+          safetySnapshotCacheReady:.executor.safety_snapshot_cache_ready,safetySnapshotCacheError:.executor.safety_snapshot_cache_error,
           riskReservationIndexReady:.executor.risk_reservation_index_ready}})
       else error("funded signer lacks continuous bound heartbeat evidence") end
-    ') || die 'funded signer lacks continuous healthy heartbeat evidence'
-  token_runtime=$(journalctl -u polyedge-federated-token@funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager \
-    | jq -Rsc --argjson start "$target_epoch" --argjson end "$end_epoch" '
+    ' "$funded_journal_file") || die 'funded signer lacks continuous healthy heartbeat evidence'
+  token_runtime=$(jq -Rsc --argjson start "$target_epoch" --argjson end "$end_epoch" '
       [split("\n")[] | fromjson? | select(type == "object") |
         {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),message:(.MESSAGE // "")}] as $events |
       [$events[] | select(.message | startswith("Finished polyedge-federated-token@funded-signer.service"))] | sort_by(.timestamp) as $refreshes |
@@ -665,8 +932,136 @@ else
       then {tokenRefreshCount:($refreshes | length),firstTokenRefreshUtc:($times[0] | todateiso8601),
         lastTokenRefreshUtc:($times[-1] | todateiso8601),maxTokenRefreshGapSeconds:$max_gap,tokenRefreshFailureCount:0}
       else error("funded token rotation was not continuous") end
-    ') || die 'funded token rotation lacks continuous success evidence'
+    ' "$funded_token_journal_file") || die 'funded token rotation lacks continuous success evidence'
   funded_runtime=$(jq -nc --argjson signer "$funded_runtime" --argjson token "$token_runtime" '$signer + $token')
+
+  producer_continuity=$(jq -Rsc --arg invocation "$funded_producer_invocation" --arg container "$funded_producer_container" \
+    --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | if type == "array" then implode else . end |
+          capture("(?<json>\\{.*\\})").json | fromjson?) as $event | select($event.event == "runtime_health") |
+        {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
+         invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] as $all |
+      [$all[] | select(.invocation == $invocation and .container == $container)] | sort_by(.timestamp) as $events |
+      ([$all[] | select(.invocation != $invocation or .container != $container)] | length) as $foreign |
+      [$events[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($events | length) >= 50 and $foreign == 0 and
+        $times[0] >= $start and $times[0] <= ($start + 75) and
+        $times[-1] >= ($end - 75) and $times[-1] < $end and $max_gap <= 75 and
+        all($events[].event; .execution_mode == "paper" and .runtime_loop == "running" and .feeds == "running" and
+          .recorder_queued == 0 and .recorder_failed_total == 0 and .recorder_unrecovered_durable_events == 0 and
+          .recorder_flush_unrecovered == false and .recorder_dropped_count == 0 and .recorder_error_count == 0)
+      then {invocationId:$invocation,containerId:$container,observationCount:($events | length),
+        firstObservationUtc:($times[0] | todateiso8601),lastObservationUtc:($times[-1] | todateiso8601),
+        maxGapSeconds:$max_gap,foreignObservationCount:$foreign,restartCount:0}
+      else error("funded intent producer lacks continuous bound runtime health evidence") end
+    ' "$producer_journal_file") || die 'funded intent producer lacks continuous healthy runtime evidence'
+  publisher_outcomes=$(jq -Rsc --arg invocation "$funded_producer_invocation" --arg container "$funded_producer_container" \
+    --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") |
+        {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),invocation:(._SYSTEMD_INVOCATION_ID // ""),
+         container:(.CONTAINER_ID_FULL // ""),message:(.MESSAGE | if type == "array" then implode else (. // "") end)} |
+        select(.invocation == $invocation and .container == $container and .timestamp >= $start and .timestamp < $end)] as $events |
+      [$events[] | select(.message | contains("funded market warmup sent") or contains("execution intent published"))] | sort_by(.timestamp) as $successes |
+      [$events[] | select(.message | contains("funded market warmup not sent") or contains("execution intent publication failed"))] as $failures |
+      if ($successes | length) >= 1 and ($failures | length) == 0
+      then {successCount:($successes | length),
+        warmupSentCount:([$successes[] | select(.message | contains("funded market warmup sent"))] | length),
+        intentPublishedCount:([$successes[] | select(.message | contains("execution intent published"))] | length),
+        firstSuccessUtc:($successes[0].timestamp | todateiso8601),lastSuccessUtc:($successes[-1].timestamp | todateiso8601),
+        infrastructureFailureCount:0}
+      else error("publisher lacks successful hour-local executable output or has infrastructure failures") end
+    ' "$producer_journal_file") || die 'funded intent producer lacks successful hour-local publisher evidence'
+  producer_continuity=$(jq -nc --argjson continuity "$producer_continuity" --argjson publisher "$publisher_outcomes" \
+    '$continuity + {publisher:$publisher}')
+  producer_token_continuity=$(jq -Rsc --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") |
+        {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),message:(.MESSAGE // "")}] as $events |
+      [$events[] | select(.message | startswith("Finished polyedge-federated-token@funded-intent-producer.service"))] | sort_by(.timestamp) as $refreshes |
+      [$events[] | select(.message | test("failed|failure|status=[1-9]"; "i"))] as $failures |
+      [$refreshes[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($refreshes | length) >= 20 and ($failures | length) == 0 and
+        $times[0] >= $start and $times[0] <= ($start + 180) and
+        $times[-1] >= ($end - 180) and $times[-1] < $end and $max_gap <= 180
+      then {tokenRefreshCount:($refreshes | length),firstTokenRefreshUtc:($times[0] | todateiso8601),
+        lastTokenRefreshUtc:($times[-1] | todateiso8601),maxTokenRefreshGapSeconds:$max_gap,tokenRefreshFailureCount:0}
+      else error("funded producer token rotation was not continuous") end
+    ' "$producer_token_journal_file") || die 'funded producer token rotation lacks continuous success evidence'
+
+  producer_health_file=$(mktemp "$runtime_dir/producer-health.XXXXXX")
+  producer_status_file=$(mktemp "$runtime_dir/producer-status.XXXXXX")
+  chmod 0600 "$producer_health_file" "$producer_status_file"
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_health_file" || die 'funded intent producer private health request failed'
+  producer_health=$(tr -d '\r' <"$producer_health_file" | sed '1,/^$/d' | jq -ce '
+    if .ok == true and .backend_impl == "rust" and .runtime_role == "profitability_shadow" and
+      .shadow_only == true and .runtime_active == true and .execution_mode == "paper" and .kill_switch == false
+    then {ok,backendImpl:.backend_impl,runtimeRole:.runtime_role,shadowOnly:.shadow_only,
+      runtimeActive:.runtime_active,executionMode:.execution_mode,killSwitch:.kill_switch}
+    else error("funded intent producer native health is unsafe") end
+  ') || die 'funded intent producer native health is unsafe'
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_status_file" || die 'funded intent producer private status request failed'
+  producer_status=$(tr -d '\r' <"$producer_status_file" | sed '1,/^$/d' | jq -ce --argjson now "$now_epoch" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def feed_ok($name):
+      .feed_status[$name] as $feed | ($feed | type) == "object" and $feed.status == "ok" and
+      ($feed.updated_at | type) == "string" and (($feed.updated_at | epoch) as $updated |
+        $updated <= $now and $updated >= ($now - 300));
+    if .app == "polyedge-funded-intent-producer" and .backend_impl == "rust" and
+      .runtime_role == "profitability_shadow" and .shadow_only == true and .execution_mode == "paper" and
+      .intent_publisher == {configured:true,prepared:true,pointer_only_preflight:false} and
+      .task_health.api == "ok" and .task_health.runtime_loop == "running" and .task_health.feeds == "running" and
+      feed_ok("Discovery") and feed_ok("PolymarketClobMarket") and
+      feed_ok("PolymarketRtdsChainlink") and feed_ok("PolymarketRtdsBinance") and
+      (.drop_counts | type == "object" and length == 0) and
+      .recorder_status.error_count == 0 and .recorder_status.dropped_count == 0 and
+      .recorder_metrics.queued == 0 and .recorder_metrics.failed_total == 0 and
+      .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and
+      .recorder_metrics.enqueued_total == .recorder_metrics.persisted_total and
+      .recorder_metrics.last_assigned_sequence == .recorder_metrics.enqueued_total and
+      (.recorder_metrics.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_metrics.last_assigned_sequence | type == "number" and floor == . and . >= 1)
+    then {sampledAtUtc:($now | todateiso8601),app,runtimeRole:.runtime_role,executionMode:.execution_mode,
+      intentPublisher:{configured:.intent_publisher.configured,prepared:.intent_publisher.prepared,
+        pointerOnlyPreflight:.intent_publisher.pointer_only_preflight},
+      taskHealth:{api:.task_health.api,runtimeLoop:.task_health.runtime_loop,feeds:.task_health.feeds},
+      feedStatus:{Discovery:(.feed_status.Discovery | {status,updated_at}),
+        PolymarketClobMarket:(.feed_status.PolymarketClobMarket | {status,updated_at}),
+        PolymarketRtdsChainlink:(.feed_status.PolymarketRtdsChainlink | {status,updated_at}),
+        PolymarketRtdsBinance:(.feed_status.PolymarketRtdsBinance | {status,updated_at})},
+      recorder:{instanceId:.recorder_metrics.recorder_instance_id,lastAssignedSequence:.recorder_metrics.last_assigned_sequence,
+        queued:.recorder_metrics.queued,enqueuedTotal:.recorder_metrics.enqueued_total,persistedTotal:.recorder_metrics.persisted_total,
+        failedTotal:.recorder_metrics.failed_total,unrecoveredDurableEvents:.recorder_metrics.unrecovered_durable_events,
+        flushUnrecovered:.recorder_metrics.flush_unrecovered,errorCount:.recorder_status.error_count,droppedCount:.recorder_status.dropped_count}}
+    else error("funded intent producer native status is unsafe") end
+  ') || die 'funded intent producer native status is unsafe'
+  funded_producer_runtime=$(jq -nc --arg container "$funded_producer_container" --arg invocation "$funded_producer_invocation" \
+    --arg enablement "$producer_enablement" --arg token_enablement "$producer_token_enablement" \
+    --arg env_binding_sha "$funded_producer_env_binding_sha" --arg mount_binding_sha "$funded_producer_mount_binding_sha" \
+    --argjson continuity "$producer_continuity" --argjson token_continuity "$producer_token_continuity" \
+    --argjson health "$producer_health" --argjson status "$producer_status" \
+    '{containerId:$container,invocationId:$invocation,serviceEnablement:$enablement,serviceActive:true,
+      tokenTimerEnablement:$token_enablement,tokenTimerActive:true,
+      configEnvBindingSha256:$env_binding_sha,tokenMountBindingSha256:$mount_binding_sha,
+      continuity:$continuity,tokenContinuity:$token_continuity,health:$health,status:$status}')
+
+  rm -f "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file" \
+    "$producer_health_file" "$producer_status_file"
+  funded_journal_file=
+  funded_token_journal_file=
+  producer_journal_file=
+  producer_token_journal_file=
+  producer_health_file=
+  producer_status_file=
 fi
 
 source_dir=$segments_root/$day/$hour
@@ -861,6 +1256,7 @@ if [ "$target_epoch" -gt "$first_epoch" ]; then
       .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null end)
   ' "$prior" >/dev/null || die 'prior accepted evidence is invalid'
   validate_evidence_artifacts "$prior"
+  validate_producer_evidence "$prior" || die 'prior accepted evidence lacks funded producer proof'
   prior_runs=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
   feed_evidence "$prior" || die 'prior accepted evidence lacks continuous essential feed proof'
   printf '%s\n%s\n' "$prior_runs" "$hour_runs" | jq -se '
@@ -1237,7 +1633,9 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
   --arg same_attestation "$same_attestation" --arg same_attestation_sha "$(sha "$same_attestation")" \
   --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
   --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
-  --argjson funded "$funded_enabled" --argjson funded_runtime "$funded_runtime" \
+  --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" --arg producer_config_sha "$funded_producer_config_sha" \
+  --arg producer_enablement "$producer_enablement" --arg producer_token_enablement "$producer_token_enablement" \
+  --argjson funded "$funded_enabled" --argjson funded_runtime "$funded_runtime" --argjson funded_producer_runtime "$funded_producer_runtime" \
   --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
   --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
   --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
@@ -1256,7 +1654,14 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
       fundedSignerUser:(if $funded then $funded_user else null end),
       fundedSessionId:(if $funded then $funded_session else null end),
       fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),
-      fundedConfigSha256:(if $funded then $funded_config_sha else null end),fundedRuntime:$funded_runtime},
+      fundedConfigSha256:(if $funded then $funded_config_sha else null end),fundedRuntime:$funded_runtime,
+      fundedIntentProducerEnabled:$funded,fundedIntentProducerActive:$funded,
+      fundedIntentProducerEnablement:$producer_enablement,fundedIntentProducerTokenTimerEnablement:$producer_token_enablement,
+      fundedIntentProducerTokenTimerActive:$funded,
+      fundedIntentProducerImage:(if $funded then $producer_image else null end),
+      fundedIntentProducerUser:(if $funded then $producer_user else null end),
+      fundedIntentProducerConfigSha256:(if $funded then $producer_config_sha else null end),
+      fundedIntentProducerRuntime:$funded_producer_runtime},
     ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
   .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
 chmod 0640 "$tmp"

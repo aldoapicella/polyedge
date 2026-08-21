@@ -54,6 +54,34 @@ cat >"$fake/podman" <<'EOF'
 case "$1" in
   inspect)
     case "$*" in
+      *State.Status*polyedge-funded-intent-producer*) [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] && printf '%s\n' running || exit 2 ;;
+      *State.Health.Status*polyedge-funded-intent-producer*) printf '%s\n' healthy ;;
+      *Config.Image*polyedge-funded-intent-producer*) printf '%s\n' "$FAKE_FUNDED_PRODUCER_IMAGE" ;;
+      *Config.User*polyedge-funded-intent-producer*) printf '%s\n' "${FAKE_FUNDED_PRODUCER_USER:-984:980}" ;;
+      *Config.Env*polyedge-funded-intent-producer*) jq -nc --arg run_bot "${FAKE_PRODUCER_RUN_BOT:-true}" '[
+        "APP_NAME=polyedge-funded-intent-producer","RUNTIME_ROLE=profitability_shadow","EXECUTION_MODE=paper",
+        "ALLOW_LIVE=false","RUN_BOT_ON_STARTUP="+$run_bot,"STRATEGY_INTENT_OPERATOR_DIRECT=true",
+        "PUBLISH_STRATEGY_CANARY_INTENTS=true",
+        "STRATEGY_CANARY_INTENT_PREFIX=reports/research/venue-probe/control/strategy-canary/intents",
+        "STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION=conservative-execution-prior-v1",
+        "STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI=azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+        "STRATEGY_CANARY_EXECUTION_MODEL_SHA256=sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4",
+        "STRATEGY_INTENT_TARGET_ORDER_NOTIONAL=10.5","STRATEGY_INTENT_MAX_ORDER_NOTIONAL=10.5",
+        "STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY=360","STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY=900",
+        "TARGET_ASSET=BTC","TARGET_ASSET_NAME=Bitcoin","TARGET_HORIZON=15m","TARGET_BINANCE_SYMBOL=btcusdt",
+        "TARGET_CHAINLINK_SYMBOL=btc/usd","TARGET_COINBASE_PRODUCT_ID=BTC-USD",
+        "AZURE_TENANT_ID=9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
+        "AZURE_CLIENT_ID=54f0136b-5e72-4ad1-b23e-cb1269d356c1",
+        "AZURE_FEDERATED_TOKEN_FILE=/run/credentials/azure-federated-token",
+        "AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential","AZURE_STORAGE_ACCOUNT_NAME=stpolyedge6urdjr5nmwx7w",
+        "AZURE_STORAGE_CONTAINER_NAME=polyedge-shadow-events","AZURE_STORAGE_TABLE_NAME=ShadowBotEventIndex",
+        "AZURE_CHART_TABLE_NAME=ShadowBotChartSeries","AZURE_MARKET_TABLE_NAME=ShadowBotMarketCatalog",
+        "AZURE_FUNDED_STORAGE_CONTAINER_NAME=polyedge-funded-evidence","AZURE_MODEL_STORAGE_CONTAINER_NAME=polyedge-models",
+        "FUNDED_DIRECT_SERVICE_BUS_ENABLED=true","FUNDED_DIRECT_SERVICE_BUS_NAMESPACE=sb-polyedge-funded-cl-6urdjr5nmwx7w",
+        "FUNDED_DIRECT_SERVICE_BUS_QUEUE=funded-dynamic-quote-intents"]' ;;
+      *Mounts*polyedge-funded-intent-producer*) jq -nc --arg source "$FAKE_PRODUCER_MOUNT_SOURCE" \
+        --argjson rw "${FAKE_PRODUCER_MOUNT_RW:-false}" '[{Source:$source,Destination:"/run/credentials",RW:$rw}]' ;;
+      *Id*polyedge-funded-intent-producer*) printf '%064d\n' 4 ;;
       *State.Status*polyedge-funded-signer*) [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] && printf '%s\n' running || exit 2 ;;
       *Config.Image*polyedge-funded-signer*) printf '%s\n' "$FAKE_FUNDED_IMAGE" ;;
       *Config.User*polyedge-funded-signer*) printf '%s\n' "$FAKE_FUNDED_UID:$FAKE_FUNDED_GID" ;;
@@ -72,6 +100,10 @@ case "$1" in
     ;;
   exec)
     printf 'HTTP/1.0 200 OK\r\n\r\n'
+    case "$*" in
+      *polyedge-funded-intent-producer*'/api/v1/health'*) cat "$FAKE_PRODUCER_HEALTH"; exit ;;
+      *polyedge-funded-intent-producer*'/api/v1/status'*) cat "$FAKE_PRODUCER_STATUS"; exit ;;
+    esac
     attempt_file=$FAKE_CALLS/api-status-attempts
     attempt=0
     [ ! -f "$attempt_file" ] || attempt=$(cat "$attempt_file")
@@ -126,7 +158,7 @@ case "$1" in
     unit=${3:-${2:-}}
     case "$unit" in
       polyedge-job@shadow-qset.service) [ "${FAKE_QSET_ACTIVE:-0}" = 1 ] && exit 0 || exit 3 ;;
-      polyedge-funded-signer.service|polyedge-federated-token@funded-signer.timer)
+      polyedge-funded-signer.service|polyedge-federated-token@funded-signer.timer|polyedge-funded-intent-producer.service|polyedge-federated-token@funded-intent-producer.timer)
         [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] && exit 0 || exit 3
         ;;
       *) exit 0 ;;
@@ -138,15 +170,19 @@ case "$1" in
       polyedge-funded-signer.service)
         if [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ]; then printf '%s\n' "${FAKE_FUNDED_ENABLEMENT:-enabled}"; else printf '%s\n' masked; fi
         ;;
-      polyedge-federated-token@funded-signer.timer)
+      polyedge-federated-token@funded-signer.timer|polyedge-federated-token@funded-intent-producer.timer)
         if [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ]; then printf '%s\n' enabled; else printf '%s\n' masked; fi
+        ;;
+      polyedge-funded-intent-producer.service)
+        if [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ]; then printf '%s\n' "${FAKE_FUNDED_PRODUCER_ENABLEMENT:-enabled}"; else printf '%s\n' masked; fi
         ;;
       *) exit 2 ;;
     esac
     ;;
   show)
     case "${2:-}" in
-      multi-user.target) printf '%s\n' "${FAKE_FUNDED_TARGET_WANTS:-polyedge-funded-signer.service}" ;;
+      multi-user.target) printf '%s\n' "${FAKE_FUNDED_TARGET_WANTS:-polyedge-funded-signer.service polyedge-funded-intent-producer.service}" ;;
+      polyedge-funded-intent-producer.service) printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
       *) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
     esac
     ;;
@@ -154,11 +190,71 @@ case "$1" in
 esac
 EOF
 
+cat >"$fake/stat" <<'EOF'
+#!/bin/sh
+last=
+for arg do last=$arg; done
+case "$last" in
+  */funded-producer-azure-federated-token)
+    set -- $(/usr/bin/stat -c '%a %h %s %Y' "$last")
+    printf '984 980 %s %s %s %s\n' "$1" "$2" "$3" "$4"
+    ;;
+  *) exec /usr/bin/stat "$@" ;;
+esac
+EOF
+cat >"$fake/sha256sum" <<'EOF'
+#!/bin/sh
+case "$1" in
+  */funded-intent-producer.env) printf '%s  %s\n' 56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b "$1" ;;
+  *) exec /usr/bin/sha256sum "$@" ;;
+esac
+EOF
 cat >"$fake/journalctl" <<'EOF'
 #!/bin/sh
 [ "${FAKE_FUNDED_ACTIVE:-0}" = 1 ] || exit 0
 start=$(date -u -d '2026-08-09T15:00:00Z' +%s)
 case "$*" in
+  *polyedge-federated-token@funded-intent-producer.service*)
+    i=0
+    while [ "$i" -lt 30 ]; do
+      if [ "${FAKE_PRODUCER_TOKEN_GAP:-0}" = 1 ] && [ "$i" -eq 15 ]; then i=$((i + 1)); continue; fi
+      timestamp=$(( (start + 60 + i * 120) * 1000000 ))
+      message='Finished polyedge-federated-token@funded-intent-producer.service - Rotate the funded intent producer PolyEdge JWT-SVID token file.'
+      jq -nc --arg timestamp "$timestamp" --arg message "$message" \
+        '{__REALTIME_TIMESTAMP:$timestamp,MESSAGE:$message}'
+      i=$((i + 1))
+    done
+    [ "${FAKE_PRODUCER_TOKEN_FAILURE:-0}" != 1 ] || jq -nc --arg timestamp "$(( (start + 1800) * 1000000 ))" \
+      '{__REALTIME_TIMESTAMP:$timestamp,MESSAGE:"Failed to start producer token refresh"}'
+    ;;
+  *polyedge-funded-intent-producer.service*)
+    i=0
+    while [ "$i" -lt 60 ]; do
+      timestamp=$(( (start + 30 + i * 60) * 1000000 ))
+      event=$(jq -nc '{event:"runtime_health",execution_mode:"paper",runtime_loop:"running",feeds:"running",
+        recorder_queued:0,recorder_failed_total:0,recorder_unrecovered_durable_events:0,
+        recorder_flush_unrecovered:false,recorder_dropped_count:0,recorder_error_count:0}')
+      message=$(printf '\033[2m%s\033[0m' "$event" | jq -R 'explode')
+      jq -nc --arg timestamp "$timestamp" --argjson message "$message" \
+        --arg invocation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+        --arg container 0000000000000000000000000000000000000000000000000000000000000004 \
+        '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+      i=$((i + 1))
+    done
+    jq -nc --arg timestamp "$(( (start + 90) * 1000000 ))" \
+      --arg invocation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+      --arg container 0000000000000000000000000000000000000000000000000000000000000004 \
+      '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:"funded market warmup sent"}'
+    [ "${FAKE_PRODUCER_PUBLISH_FAILURE:-0}" != 1 ] || jq -nc --arg timestamp "$(( (start + 120) * 1000000 ))" \
+      --arg invocation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+      --arg container 0000000000000000000000000000000000000000000000000000000000000004 \
+      '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:"funded market warmup not sent"}'
+    [ "${FAKE_PRODUCER_INTENT_FAILURE:-0}" != 1 ] || jq -nc --arg timestamp "$(( (start + 150) * 1000000 ))" \
+      --arg invocation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+      --arg container 0000000000000000000000000000000000000000000000000000000000000004 \
+      '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:"execution intent publication failed"}'
+    [ "${FAKE_JOURNAL_PARTIAL_FAILURE:-0}" != 1 ] || exit 9
+    ;;
   *polyedge-federated-token@funded-signer.service*)
     i=0
     while [ "$i" -lt 30 ]; do
@@ -306,8 +402,11 @@ fixture() {
   chmod 0750 "$case_root/ring/parity"
   : >"$case_root/token/azure-federated-token"
   : >"$case_root/token/funded-azure-federated-token"
+  printf "%s\n" fixture-jwt-producer >"$case_root/token/funded-producer-azure-federated-token"
   chmod 0600 "$case_root/token/azure-federated-token"
-  chmod 0600 "$case_root/token/funded-azure-federated-token"
+  chmod 0600 "$case_root/token/funded-azure-federated-token" "$case_root/token/funded-producer-azure-federated-token"
+  printf '%s\n' 'fixture producer env; contents never emitted' >"$case_root/funded-intent-producer.env"
+  chmod 0600 "$case_root/funded-intent-producer.env"
   jq -n --arg start "$window" '{
     schemaVersion:1,status:"in_progress",azureAuthoritative:true,azureDeletionAllowed:false,
     windowStartUtc:$start,acceptedCleanLiveHours:0,acceptedHourlyEvidence:[],
@@ -319,7 +418,7 @@ fixture() {
   chmod 0640 "$case_root/ring/status.json"
   fixture_now=$(date -u -d '2026-08-09T16:20:00Z' +%s)
   touch -d "@$fixture_now" "$case_root/ring/status.json"
-  touch -d "@$fixture_now" "$case_root/token/funded-azure-federated-token"
+  touch -d "@$fixture_now" "$case_root/token/funded-azure-federated-token" "$case_root/token/funded-producer-azure-federated-token"
   cat >"$case_root/hourly.env" <<'EOF'
 POLYEDGE_RESEARCH_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true
@@ -387,6 +486,12 @@ EOF
     drop_counts:{},recorder_status:{error_count:0,dropped_count:0},
     recorder_metrics:{recorder_instance_id:"123e4567-e89b-42d3-a456-426614174000",last_assigned_sequence:60,queued:0,enqueued_total:60,persisted_total:60,failed_total:0,unrecovered_durable_events:0,flush_unrecovered:false}
   }' >"$case_root/api-status.json"
+  jq -n '{ok:true,backend_impl:"rust",runtime_role:"profitability_shadow",shadow_only:true,
+    runtime_active:true,execution_mode:"paper",kill_switch:false}' >"$case_root/producer-health.json"
+  jq '. + {app:"polyedge-funded-intent-producer",backend_impl:"rust",runtime_role:"profitability_shadow",
+    shadow_only:true,execution_mode:"paper",
+    intent_publisher:{configured:true,prepared:true,pointer_only_preflight:false}}' \
+    "$case_root/api-status.json" >"$case_root/producer-status.json"
 
   i=0
   start=$(date -u -d '2026-08-09T15:00:00Z' +%s)
@@ -437,7 +542,9 @@ activate_funded_fixture() {
     .fundedSignerImage="ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
-    .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999"' \
+    .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999" |
+    .fundedIntentProducerEnabled=true | .fundedIntentProducerImage="ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc" |
+    .fundedIntentProducerUser="984:980" | .fundedIntentProducerConfigSha256="sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b"' \
     "$case_root/ring/parity/ledger.json" >"$active_ledger"
   rm "$case_root/ring/parity/ledger.json"
   chmod 0640 "$active_ledger"
@@ -451,6 +558,10 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:9999999999999999999999999999999999999999999999999999999999999999
 POLYEDGE_PARITY_FUNDED_TOKEN_FILE=$case_root/token/funded-azure-federated-token
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
+POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE=$case_root/funded-intent-producer.env
+POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE=$case_root/token/funded-producer-azure-federated-token
 EOF
 }
 
@@ -487,6 +598,8 @@ run_collector() {
     FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_AZURE_ATTESTATION="$case_root/azure.json.attestation.json" \
     FAKE_AZURE_EXECUTION="$case_root/azure-execution.json" FAKE_SAME_REPORT="$case_root/same.json" \
     FAKE_OCI_IMAGE="$oci_image" FAKE_OCI_IMAGE_DIGEST="$oci_image_digest" FAKE_API_STATUS="$case_root/api-status.json" \
+    FAKE_PRODUCER_HEALTH="$case_root/producer-health.json" FAKE_PRODUCER_STATUS="$case_root/producer-status.json" \
+    FAKE_FUNDED_PRODUCER_IMAGE="ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc" \
     FAKE_FUNDED_ACTIVE="${FAKE_FUNDED_ACTIVE:-0}" FAKE_QSET_ACTIVE="${FAKE_QSET_ACTIVE:-0}" \
     FAKE_FUNDED_ENABLEMENT="${FAKE_FUNDED_ENABLEMENT:-enabled}" \
     FAKE_FUNDED_TARGET_WANTS="${FAKE_FUNDED_TARGET_WANTS:-polyedge-funded-signer.service}" \
@@ -494,6 +607,14 @@ run_collector() {
     FAKE_FUNDED_BURST="${FAKE_FUNDED_BURST:-0}" FAKE_FUNDED_GAP="${FAKE_FUNDED_GAP:-0}" \
     FAKE_FUNDED_RESTART="${FAKE_FUNDED_RESTART:-0}" FAKE_FUNDED_TOKEN_GAP="${FAKE_FUNDED_TOKEN_GAP:-0}" \
     FAKE_FUNDED_TOKEN_FAILURE="${FAKE_FUNDED_TOKEN_FAILURE:-0}" \
+    FAKE_PRODUCER_RUN_BOT="${FAKE_PRODUCER_RUN_BOT:-true}" \
+    FAKE_PRODUCER_MOUNT_SOURCE="${FAKE_PRODUCER_MOUNT_SOURCE:-$case_root/token}" \
+    FAKE_PRODUCER_MOUNT_RW="${FAKE_PRODUCER_MOUNT_RW:-false}" \
+    FAKE_PRODUCER_TOKEN_GAP="${FAKE_PRODUCER_TOKEN_GAP:-0}" \
+    FAKE_PRODUCER_TOKEN_FAILURE="${FAKE_PRODUCER_TOKEN_FAILURE:-0}" \
+    FAKE_PRODUCER_PUBLISH_FAILURE="${FAKE_PRODUCER_PUBLISH_FAILURE:-0}" \
+    FAKE_PRODUCER_INTENT_FAILURE="${FAKE_PRODUCER_INTENT_FAILURE:-0}" \
+    FAKE_JOURNAL_PARTIAL_FAILURE="${FAKE_JOURNAL_PARTIAL_FAILURE:-0}" \
     FAKE_FUNDED_IMAGE="${FAKE_FUNDED_IMAGE:-ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}" \
     FAKE_FUNDED_UID="${FAKE_FUNDED_UID:-$uid}" FAKE_FUNDED_GID="${FAKE_FUNDED_GID:-$gid}" \
     FAKE_FUNDED_SESSION="${FAKE_FUNDED_SESSION:-dynamic-quote-funded-2026-08-13-v10}" \
@@ -799,8 +920,35 @@ jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled 
   .services.fundedSignerUser == "'"$uid:$gid"'" and .services.fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and
   .services.fundedRuntime.heartbeatCount == 60 and .services.fundedRuntime.alertCount == 0 and
   .services.fundedRuntime.maxHeartbeatGapSeconds == 60 and .services.fundedRuntime.tokenRefreshCount == 30 and
-  .services.fundedRuntime.maxTokenRefreshGapSeconds == 120' \
+  .services.fundedRuntime.maxTokenRefreshGapSeconds == 120 and
+  .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshCount == 30 and
+  .services.fundedIntentProducerRuntime.tokenContinuity.maxTokenRefreshGapSeconds == 120 and
+  .services.fundedIntentProducerRuntime.continuity.publisher.successCount == 1 and
+  .services.fundedIntentProducerRuntime.continuity.publisher.infrastructureFailureCount == 0 and
+  .services.fundedIntentProducerRuntime.status.intentPublisher == {configured:true,prepared:true,pointerOnlyPreflight:false} and
+  (.services.fundedIntentProducerRuntime.configEnvBindingSha256 | test("^sha256:[0-9a-f]{64}$")) and
+  (.services.fundedIntentProducerRuntime.tokenMountBindingSha256 | test("^sha256:[0-9a-f]{64}$"))' \
   "$active_funded/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
+
+for producer_case in wrong-env rw-mount unprepared token-gap token-failure warmup-failure intent-failure journal-partial; do
+  case_root=$root/producer-$producer_case
+  fixture "$case_root"
+  activate_funded_fixture "$case_root"
+  case "$producer_case" in
+    wrong-env) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_RUN_BOT=false run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    rw-mount) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_MOUNT_RW=true run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    unprepared)
+      jq '.intent_publisher.prepared=false' "$case_root/producer-status.json" >"$case_root/status.tmp"
+      mv "$case_root/status.tmp" "$case_root/producer-status.json"
+      if FAKE_FUNDED_ACTIVE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    token-gap) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_TOKEN_GAP=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    token-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_TOKEN_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    warmup-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_PUBLISH_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    intent-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_INTENT_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    journal-partial) if FAKE_FUNDED_ACTIVE=1 FAKE_JOURNAL_PARTIAL_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+  esac
+  if [ "$passed" -eq 1 ]; then echo "invalid producer runtime unexpectedly passed: $producer_case" >&2; exit 1; fi
+done
 
 generated_funded=$root/generated-funded
 fixture "$generated_funded"

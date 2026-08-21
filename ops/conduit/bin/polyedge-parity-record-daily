@@ -55,6 +55,7 @@ case "$funded_mode" in
   disabled)
     funded_enabled=false
     funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_producer_image= funded_producer_user= funded_producer_config_sha=
     ;;
   active)
     funded_enabled=true
@@ -69,6 +70,13 @@ case "$funded_mode" in
     for funded_hash in "$funded_session_sha" "$funded_config_sha"; do
       printf '%s' "$funded_hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded binding hash is malformed'
     done
+    funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:?set the approved funded producer image}
+    funded_producer_user=984:980
+    funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:?set the funded producer config hash}
+    printf '%s' "$funded_producer_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+      || die 'expected funded producer image is malformed'
+    printf '%s' "$funded_producer_config_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+      || die 'expected funded producer config hash is malformed'
     ;;
   *) die 'formal funded mode must equal disabled or active' ;;
 esac
@@ -117,7 +125,9 @@ secure_owned_file "$POLYEDGE_PARITY_LEDGER" 640
 validate_ledger() {
   jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$funded_mode" --arg image "$funded_image" \
     --arg user "$funded_user" --arg session "$funded_session" --arg session_sha "$funded_session_sha" \
-    --arg config_sha "$funded_config_sha" --argjson funded "$funded_enabled" '
+    --arg config_sha "$funded_config_sha" --arg producer_image "$funded_producer_image" \
+    --arg producer_user "$funded_producer_user" --arg producer_config_sha "$funded_producer_config_sha" \
+    --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "in_progress" and .windowStartUtc == $start and
     .azureAuthoritative == true and .azureDeletionAllowed == false and
     (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
@@ -126,14 +136,28 @@ validate_ledger() {
     ((.acceptedDailyEvidence? // []) | type == "array") and
     (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
     (if $funded then .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
-      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha
+      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha and
+      .fundedIntentProducerEnabled == true and .fundedIntentProducerImage == $producer_image and
+      .fundedIntentProducerUser == $producer_user and .fundedIntentProducerConfigSha256 == $producer_config_sha
      else (.fundedSignerMode? // "disabled") == "disabled" and (.fundedSignerImage? // null) == null and
       (.fundedSignerUser? // null) == null and (.fundedSessionId? // null) == null and
-      (.fundedSessionManifestSha256? // null) == null and (.fundedConfigSha256? // null) == null end)
+      (.fundedSessionManifestSha256? // null) == null and (.fundedConfigSha256? // null) == null and
+      (.fundedIntentProducerEnabled? // false) == false and (.fundedIntentProducerImage? // null) == null and
+      (.fundedIntentProducerUser? // null) == null and (.fundedIntentProducerConfigSha256? // null) == null end)
   ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
   reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
   [ ! -L "$reboot_validator" ] && [ -x "$reboot_validator" ] || die 'reboot attestation validator is missing or unsafe'
   "$reboot_validator" validate-ledger || die 'reboot recovery evidence is invalid'
+}
+validate_daily_producer_binding() {
+  jq -e --arg image "$funded_producer_image" --arg user "$funded_producer_user" \
+    --arg config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
+    .fundedIntentProducerEnabled == $funded and
+    (if $funded then .fundedIntentProducerImage == $image and .fundedIntentProducerUser == $user and
+      .fundedIntentProducerConfigSha256 == $config_sha
+     else .fundedIntentProducerImage == null and .fundedIntentProducerUser == null and
+      .fundedIntentProducerConfigSha256 == null end)
+  ' "$1" >/dev/null
 }
 validate_ledger
 
@@ -340,6 +364,7 @@ if [ -e "$evidence" ]; then
     .normalizedCompletion.path == $marker and .normalizedCompletion.sha256 == $marker_sha
   ' "$evidence" >/dev/null \
     || die 'existing daily evidence is invalid or changed'
+  validate_daily_producer_binding "$evidence" || die 'existing daily evidence lacks funded producer binding'
 else
   tmp=$(mktemp "$daily_root/$target/.evidence.XXXXXX")
   trap 'rm -f "$tmp"' EXIT HUP INT TERM
@@ -350,12 +375,16 @@ else
     --arg marker "$marker" --arg marker_sha "$(sha "$marker")" --argjson artifacts "$artifact_count" \
     --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
     --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
-    --argjson funded "$funded_enabled" \
+    --arg funded_producer_image "$funded_producer_image" --arg funded_producer_user "$funded_producer_user" \
+    --arg funded_producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" \
     --argjson boot "$boot_available" --argjson boot_floor "$boot_floor" --argjson ring "$ring_available" --argjson ring_floor "$ring_floor" \
     '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,cycleDate:$date,completedAtUtc:$completed,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,fundedSignerMode:$funded_mode,fundedSignerEnabled:$funded,
       fundedSignerImage:(if $funded then $funded_image else null end),fundedSignerUser:(if $funded then $funded_user else null end),
       fundedSessionId:(if $funded then $funded_session else null end),fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),
-      fundedConfigSha256:(if $funded then $funded_config_sha else null end),ledgerPath:$ledger,runId:$run,gitSha:$git,researchImage:$image,inputSha256:$input,artifactCount:$artifacts,dailyBundle:{latest:{path:$latest,sha256:$latest_sha},manifest:{path:$manifest,sha256:$manifest_sha}},normalizedCompletion:{path:$marker,sha256:$marker_sha},disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring,ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}}' >"$tmp"
+      fundedConfigSha256:(if $funded then $funded_config_sha else null end),
+      fundedIntentProducerEnabled:$funded,fundedIntentProducerImage:(if $funded then $funded_producer_image else null end),
+      fundedIntentProducerUser:(if $funded then $funded_producer_user else null end),
+      fundedIntentProducerConfigSha256:(if $funded then $funded_producer_config_sha else null end),ledgerPath:$ledger,runId:$run,gitSha:$git,researchImage:$image,inputSha256:$input,artifactCount:$artifacts,dailyBundle:{latest:{path:$latest,sha256:$latest_sha},manifest:{path:$manifest,sha256:$manifest_sha}},normalizedCompletion:{path:$marker,sha256:$marker_sha},disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring,ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}}' >"$tmp"
   chmod 0640 "$tmp"
   sync -f "$tmp"
   mv "$tmp" "$evidence"
@@ -388,6 +417,7 @@ find "$daily_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | w
        else .fundedSignerImage == null and .fundedSignerUser == null and .fundedSessionId == null and
         .fundedSessionManifestSha256 == null and .fundedConfigSha256 == null end)' "$file" >/dev/null \
     || die "accepted daily evidence failed its invariant: $file"
+  validate_daily_producer_binding "$file" || die "accepted daily evidence lacks funded producer binding: $file"
   [ "$epoch" -le "$target_epoch" ] || continue
   jq -nc --argjson epoch "$epoch" --arg date "$date_value" --arg path "$file" --arg sha "$(sha "$file")" \
     '{cycleDateEpoch:$epoch,cycleDate:$date,path:$path,sha256:$sha}' >>"$refs_tmp"
@@ -409,13 +439,13 @@ fi
 [ "$ledger_count" -eq $((count - 1)) ] || die 'ledger daily count was not at the strictly previous count'
 jq -e --argjson refs "$refs" '(.acceptedDailyEvidence // []) == ($refs[0:-1])' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
   || die 'ledger daily references are incomplete or divergent'
-protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$POLYEDGE_PARITY_LEDGER")
+protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$POLYEDGE_PARITY_LEDGER")
 ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
 trap 'rm -f "$refs_tmp" "$ledger_tmp"' EXIT HUP INT TERM
 jq --argjson count "$count" --argjson refs "$refs" '.completedDailyCycles = $count | .acceptedDailyEvidence = $refs' \
   "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
 chmod 0640 "$ledger_tmp"
-[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$ledger_tmp")" = "$protected_before" ] \
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$ledger_tmp")" = "$protected_before" ] \
   || die 'protected ledger fields changed'
 sync -f "$ledger_tmp"
 mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"

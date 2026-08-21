@@ -1410,6 +1410,11 @@ impl RuntimeController {
         match result {
             Ok(IntentPublisherPreparation::PointerOnly) if pointer_only_preflight => true,
             Ok(IntentPublisherPreparation::WarmupSent) => {
+                info!(
+                    market_id = %market.market_id,
+                    condition_id = %market.condition_id,
+                    "funded market warmup sent"
+                );
                 self.record_event(
                     "funded_market_warmup_sent",
                     json!({
@@ -2448,7 +2453,7 @@ impl RuntimeController {
                         decision_id = %intent.decision_id,
                         market_id = %intent.market_id,
                         reason = %reason,
-                        "execution intent not published"
+                        "execution intent publication failed"
                     );
                     runtime
                         .record_event(

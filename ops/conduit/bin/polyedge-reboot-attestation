@@ -5,6 +5,44 @@ die() { echo "polyedge-reboot-attestation: $*" >&2; exit 1; }
 sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
 json_sha() { jq -cS "$1" "$2" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
 
+text_sha() { printf '%s\n' "$1" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
+
+producer_env_binding_expected() {
+  jq -cS -n '{
+    APP_NAME:"polyedge-funded-intent-producer",
+    RUNTIME_ROLE:"profitability_shadow",
+    EXECUTION_MODE:"paper",
+    ALLOW_LIVE:"false",
+    RUN_BOT_ON_STARTUP:"true",
+    STRATEGY_INTENT_OPERATOR_DIRECT:"true",
+    PUBLISH_STRATEGY_CANARY_INTENTS:"true",
+    STRATEGY_CANARY_INTENT_PREFIX:"reports/research/venue-probe/control/strategy-canary/intents",
+    STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:"conservative-execution-prior-v1",
+    STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:"azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    STRATEGY_CANARY_EXECUTION_MODEL_SHA256:"sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4",
+    STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MAX_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:"360",
+    STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:"900",
+    TARGET_ASSET:"BTC",TARGET_ASSET_NAME:"Bitcoin",TARGET_HORIZON:"15m",
+    TARGET_BINANCE_SYMBOL:"btcusdt",TARGET_CHAINLINK_SYMBOL:"btc/usd",TARGET_COINBASE_PRODUCT_ID:"BTC-USD",
+    AZURE_TENANT_ID:"9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
+    AZURE_CLIENT_ID:"54f0136b-5e72-4ad1-b23e-cb1269d356c1",
+    AZURE_FEDERATED_TOKEN_FILE:"/run/credentials/azure-federated-token",
+    AZURE_TOKEN_CREDENTIALS:"WorkloadIdentityCredential",
+    AZURE_STORAGE_ACCOUNT_NAME:"stpolyedge6urdjr5nmwx7w",
+    AZURE_STORAGE_CONTAINER_NAME:"polyedge-shadow-events",
+    AZURE_STORAGE_TABLE_NAME:"ShadowBotEventIndex",
+    AZURE_CHART_TABLE_NAME:"ShadowBotChartSeries",
+    AZURE_MARKET_TABLE_NAME:"ShadowBotMarketCatalog",
+    AZURE_FUNDED_STORAGE_CONTAINER_NAME:"polyedge-funded-evidence",
+    AZURE_MODEL_STORAGE_CONTAINER_NAME:"polyedge-models",
+    FUNDED_DIRECT_SERVICE_BUS_ENABLED:"true",
+    FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:"sb-polyedge-funded-cl-6urdjr5nmwx7w",
+    FUNDED_DIRECT_SERVICE_BUS_QUEUE:"funded-dynamic-quote-intents"
+  }'
+}
+
 [ "$#" -eq 1 ] || die 'usage: polyedge-reboot-attestation prepare|complete|validate-ledger'
 command=$1
 case "$command" in prepare|complete|validate-ledger) ;; *) die 'unsupported command' ;; esac
@@ -80,6 +118,8 @@ pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
 api_token=${POLYEDGE_REBOOT_API_TOKEN_FILE:-/run/polyedge-federated-api/azure-federated-token}
 research_token=${POLYEDGE_REBOOT_RESEARCH_TOKEN_FILE:-/run/polyedge-federated-research/azure-federated-token}
 funded_token=${POLYEDGE_REBOOT_FUNDED_TOKEN_FILE:-/run/polyedge-federated-funded-signer/azure-federated-token}
+funded_producer_token=${POLYEDGE_REBOOT_FUNDED_PRODUCER_TOKEN_FILE:-/run/polyedge-federated-funded-intent-producer/azure-federated-token}
+funded_producer_config=${POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE:-/etc/polyedge/funded-intent-producer.env}
 
 case "$ring:$parity_root:$POLYEDGE_PARITY_LEDGER" in *'/../'*|*'/..:'*|../*|*':../'*) die 'unsafe parity path' ;; esac
 [ "${ring#/}" != "$ring" ] || die 'ring root must be absolute'
@@ -97,6 +137,8 @@ case "$funded_mode" in
   disabled)
     funded_enabled=false
     funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_producer_image= funded_producer_user= funded_producer_config_sha=
+    funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
     ;;
   active)
     funded_enabled=true
@@ -112,6 +154,19 @@ case "$funded_mode" in
     for hash in "$funded_session_sha" "$funded_config_sha"; do
       printf '%s' "$hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded binding hash is malformed'
     done
+    funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:?missing funded producer image}
+    funded_producer_user=984:980
+    funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:?missing funded producer config hash}
+    printf '%s' "$funded_producer_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+      || die 'funded producer image is malformed'
+    printf '%s' "$funded_producer_config_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded producer config hash is malformed'
+    producer_env_binding_json=$(producer_env_binding_expected)
+    funded_producer_env_binding_sha=$(text_sha "$producer_env_binding_json")
+    unset producer_env_binding_json
+    producer_mount_binding_json=$(jq -cS -n --arg source "${funded_producer_token%/*}" \
+      '{source:$source,destination:"/run/credentials",readOnly:true}')
+    funded_producer_mount_binding_sha=$(text_sha "$producer_mount_binding_json")
+    unset producer_mount_binding_json
     printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
       || die 'active funded parity requires a funded-active ledger'
     ;;
@@ -124,21 +179,28 @@ protected_json() {
     --arg oci "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
     --arg mode "$funded_mode" --arg image "$funded_image" --arg user "$funded_user" \
     --arg session "$funded_session" --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
-    --argjson funded "$funded_enabled" '
+    --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
+    --arg producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
       {schemaVersion,status,windowStartUtc,azureAuthoritative,azureDeletionAllowed,shadowQsetEnabled,
        fundedSignerEnabled,fundedSignerMode:(.fundedSignerMode // "disabled"),
        fundedSignerImage:(.fundedSignerImage // null),fundedSignerUser:(.fundedSignerUser // null),
        fundedSessionId:(.fundedSessionId // null),fundedSessionManifestSha256:(.fundedSessionManifestSha256 // null),
-       fundedConfigSha256:(.fundedConfigSha256 // null),gitSha:$git,azureResearchImage:$azure,ociResearchImage:$oci} as $p |
+       fundedConfigSha256:(.fundedConfigSha256 // null),fundedIntentProducerEnabled:(.fundedIntentProducerEnabled // false),
+       fundedIntentProducerImage:(.fundedIntentProducerImage // null),fundedIntentProducerUser:(.fundedIntentProducerUser // null),
+       fundedIntentProducerConfigSha256:(.fundedIntentProducerConfigSha256 // null),gitSha:$git,azureResearchImage:$azure,ociResearchImage:$oci} as $p |
       if $p.schemaVersion == 1 and $p.status == "in_progress" and
          $p.windowStartUtc == $start and
          $p.azureAuthoritative == true and $p.azureDeletionAllowed == false and $p.shadowQsetEnabled == false and
          $p.fundedSignerEnabled == $funded and
          (if $funded then $p.fundedSignerMode == $mode and $p.fundedSignerImage == $image and
            $p.fundedSignerUser == $user and $p.fundedSessionId == $session and
-           $p.fundedSessionManifestSha256 == $session_sha and $p.fundedConfigSha256 == $config_sha
+           $p.fundedSessionManifestSha256 == $session_sha and $p.fundedConfigSha256 == $config_sha and
+           $p.fundedIntentProducerEnabled == true and $p.fundedIntentProducerImage == $producer_image and
+           $p.fundedIntentProducerUser == $producer_user and $p.fundedIntentProducerConfigSha256 == $producer_config_sha
           else $p.fundedSignerMode == "disabled" and $p.fundedSignerImage == null and $p.fundedSignerUser == null and
-           $p.fundedSessionId == null and $p.fundedSessionManifestSha256 == null and $p.fundedConfigSha256 == null end)
+           $p.fundedSessionId == null and $p.fundedSessionManifestSha256 == null and $p.fundedConfigSha256 == null and
+           $p.fundedIntentProducerEnabled == false and $p.fundedIntentProducerImage == null and
+           $p.fundedIntentProducerUser == null and $p.fundedIntentProducerConfigSha256 == null end)
       then $p else error("protected ledger binding changed") end
     ' "$ledger_read"
 }
@@ -175,9 +237,12 @@ valid_boot_id() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]
 validate_system_evidence() {
   file=$1 funded=$2
   jq -e --argjson funded "$funded" \
-    --arg api_token "$api_token" --arg research_token "$research_token" --arg funded_token "$funded_token" '
+    --arg api_token "$api_token" --arg research_token "$research_token" --arg funded_token "$funded_token" \
+    --arg producer_token "$funded_producer_token" \
+    --arg producer_env_binding_sha "$funded_producer_env_binding_sha" \
+    --arg producer_mount_binding_sha "$funded_producer_mount_binding_sha" '
     .healthy == true and
-    (.units | type == "array" and length == (if $funded then 18 else 16 end)) and
+    (.units | type == "array" and length == (if $funded then 20 else 16 end)) and
     ([.units[].name] | length == (unique | length)) and
     ([.units[].name] | sort) == (([
       "spire-server.service","spire-agent.service","spire-oidc-discovery-provider.service","caddy.service",
@@ -185,18 +250,21 @@ validate_system_evidence() {
       "polyedge-boot-disk-guard.timer","polyedge-freshness.timer","polyedge-hourly.timer","polyedge-daily.timer",
       "polyedge-replay.timer","polyedge-parity-hourly.timer","polyedge-federated-token@api.timer",
       "polyedge-federated-token@research.timer"] +
-      (if $funded then ["polyedge-funded-signer.service","polyedge-federated-token@funded-signer.timer"] else [] end)) | sort) and
+      (if $funded then ["polyedge-funded-signer.service","polyedge-federated-token@funded-signer.timer",
+        "polyedge-funded-intent-producer.service","polyedge-federated-token@funded-intent-producer.timer"] else [] end)) | sort) and
     all(.units[]; (.name | type == "string") and (.enablement == "enabled" or .enablement == "generated") and .active == true) and
-    (.containers | type == "array" and length == (if $funded then 3 else 2 end)) and
+    (.containers | type == "array" and length == (if $funded then 4 else 2 end)) and
     ([.containers[].name] | length == (unique | length)) and
+    ([.containers[].name] | sort) == ((["polyedge-api","polyedge-frontend"] +
+      (if $funded then ["polyedge-funded-signer","polyedge-funded-intent-producer"] else [] end)) | sort) and
     all(.containers[]; (.id | test("^[0-9a-f]{64}$")) and
       (.image | test("^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$")) and
       (.user | type == "string") and .state == "running" and
       (if .name == "polyedge-funded-signer" then .health == "not_configured" else .health == "healthy" end)) and
-    (.tokens | type == "array" and length == (if $funded then 3 else 2 end)) and
+    (.tokens | type == "array" and length == (if $funded then 4 else 2 end)) and
     ([.tokens[].name] | length == (unique | length)) and
     ([.tokens[] | [.name,.path]] | sort) == (([["api",$api_token],["research",$research_token]] +
-      (if $funded then [["funded-signer",$funded_token]] else [] end)) | sort) and
+      (if $funded then [["funded-signer",$funded_token],["funded-intent-producer",$producer_token]] else [] end)) | sort) and
     all(.tokens[]; (.path | type == "string") and
       (.uid | type == "number") and (.gid | type == "number") and .mode == 600 and .linkCount == 1 and
       (.sizeBytes | type == "number" and . > 0 and . <= 65536) and
@@ -207,11 +275,43 @@ validate_system_evidence() {
     (if $funded then
       (.funded.signerEnablement == "enabled" or .funded.signerEnablement == "generated") and
       .funded.signerActive == true and .funded.tokenTimerEnablement == "enabled" and
-      .funded.tokenTimerActive == true
+      .funded.tokenTimerActive == true and
+      (.funded.producerEnablement == "enabled" or .funded.producerEnablement == "generated") and
+      .funded.producerActive == true and .funded.producerTokenTimerEnablement == "enabled" and
+      .funded.producerTokenTimerActive == true and
+      .funded.producerConfigEnvBindingSha256 == $producer_env_binding_sha and
+      .funded.producerTokenMountBindingSha256 == $producer_mount_binding_sha and
+      .funded.producerNative.health == {ok:true,backendImpl:"rust",runtimeRole:"profitability_shadow",
+        shadowOnly:true,runtimeActive:true,executionMode:"paper",killSwitch:false} and
+      .funded.producerNative.status.app == "polyedge-funded-intent-producer" and
+      .funded.producerNative.status.runtimeRole == "profitability_shadow" and
+      .funded.producerNative.status.executionMode == "paper" and
+      .funded.producerNative.status.intentPublisher == {configured:true,prepared:true,pointerOnlyPreflight:false} and
+      .funded.producerNative.status.taskHealth == {api:"ok",runtimeLoop:"running",feeds:"running"} and
+      ([.funded.producerNative.status.feedStatus | keys[]] | sort) ==
+        (["Discovery","PolymarketClobMarket","PolymarketRtdsBinance","PolymarketRtdsChainlink"] | sort) and
+      all(.funded.producerNative.status.feedStatus[]; .status == "ok" and
+        (.updated_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z"))) and
+      (.funded.producerNative.status.sampledAtUtc | type == "string" and length == 20 and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")) and
+      (.funded.producerNative.status.recorder.instanceId | type == "string" and length == 36 and
+        test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")) and
+      (.funded.producerNative.status.recorder.lastAssignedSequence | type == "number" and floor == . and . >= 1) and
+      .funded.producerNative.status.recorder.enqueuedTotal == .funded.producerNative.status.recorder.persistedTotal and
+      .funded.producerNative.status.recorder.lastAssignedSequence == .funded.producerNative.status.recorder.enqueuedTotal and
+      .funded.producerNative.status.recorder.queued == 0 and
+      .funded.producerNative.status.recorder.failedTotal == 0 and
+      .funded.producerNative.status.recorder.unrecoveredDurableEvents == 0 and
+      .funded.producerNative.status.recorder.flushUnrecovered == false and
+      .funded.producerNative.status.recorder.errorCount == 0 and .funded.producerNative.status.recorder.droppedCount == 0
     else
       .funded.signerEnablement == "masked" and .funded.signerActive == false and
       (.funded.tokenTimerEnablement == "disabled" or .funded.tokenTimerEnablement == "masked") and
-      .funded.tokenTimerActive == false
+      .funded.tokenTimerActive == false and
+      (.funded.producerEnablement == "disabled" or .funded.producerEnablement == "masked") and
+      .funded.producerActive == false and
+      (.funded.producerTokenTimerEnablement == "disabled" or .funded.producerTokenTimerEnablement == "masked") and
+      .funded.producerTokenTimerActive == false and .funded.producerConfigEnvBindingSha256 == null and
+      .funded.producerTokenMountBindingSha256 == null and .funded.producerNative == null
     end) and
     .ring.capacityOk == true and .ring.freeOk == true and .ring.uploadFresh == true and
     .ring.unsealedClosedCount == 0 and .ring.unuploadedCount == 0 and
@@ -293,8 +393,8 @@ validate_gate() {
     || die 'preboot and postboot unit bindings differ'
   [ "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$post")" ] \
     || die 'preboot and postboot token bindings differ'
-  [ "$(jq -cS '.funded' "$pre")" = "$(jq -cS '.funded' "$post")" ] \
-    || die 'preboot and postboot funded service state differs'
+  [ "$(jq -cS '.funded | del(.producerNative)' "$pre")" = "$(jq -cS '.funded | del(.producerNative)' "$post")" ] \
+    || die 'preboot and postboot funded service binding differs'
   for phase_file in "$pre" "$post"; do
     hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$phase_file")
     days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$phase_file")
@@ -356,7 +456,9 @@ system_tmp=$(mktemp "$runtime_dir/system.XXXXXX")
 evidence_tmp=
 ledger_tmp=
 pending_tmp=
-trap 'rm -f "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp" "$evidence_tmp" "$ledger_tmp" "$pending_tmp"' EXIT HUP INT TERM
+producer_health_tmp=
+producer_status_tmp=
+trap 'rm -f "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp" "$evidence_tmp" "$ledger_tmp" "$pending_tmp" "$producer_health_tmp" "$producer_status_tmp"' EXIT HUP INT TERM
 chmod 0600 "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp"
 : >"$units_tmp"; : >"$containers_tmp"; : >"$tokens_tmp"
 
@@ -385,11 +487,17 @@ do unit_state "$unit"; done
 if [ "$funded_enabled" = true ]; then
   unit_state polyedge-funded-signer.service
   unit_state polyedge-federated-token@funded-signer.timer
+  unit_state polyedge-funded-intent-producer.service
+  unit_state polyedge-federated-token@funded-intent-producer.timer
   funded_signer_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
   funded_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)
+  funded_producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  funded_producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
   funded_state=$(jq -nc --arg signer "$funded_signer_enablement" --arg token "$funded_token_enablement" \
+    --arg producer "$funded_producer_enablement" --arg producer_token "$funded_producer_token_enablement" \
     '{mode:"active",signerEnablement:$signer,signerActive:true,
-      tokenTimerEnablement:$token,tokenTimerActive:true}')
+      tokenTimerEnablement:$token,tokenTimerActive:true,producerEnablement:$producer,producerActive:true,
+      producerTokenTimerEnablement:$producer_token,producerTokenTimerActive:true,producerNative:null}')
 else
   funded_signer_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
   [ "$funded_signer_enablement" = masked ] || die 'disabled funded signer is not masked'
@@ -399,9 +507,20 @@ else
   if systemctl is-active --quiet polyedge-federated-token@funded-signer.timer; then
     die 'disabled funded token timer is active'
   fi
+  funded_producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  case "$funded_producer_enablement" in disabled|masked) ;; *) die 'disabled funded producer service is enabled or absent' ;; esac
+  if systemctl is-active --quiet polyedge-funded-intent-producer.service; then die 'disabled funded producer is active'; fi
+  funded_producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  case "$funded_producer_token_enablement" in disabled|masked) ;; *) die 'disabled funded producer token timer is enabled' ;; esac
+  if systemctl is-active --quiet polyedge-federated-token@funded-intent-producer.timer; then
+    die 'disabled funded producer token timer is active'
+  fi
   funded_state=$(jq -nc --arg signer "$funded_signer_enablement" --arg token "$funded_token_enablement" \
+    --arg producer "$funded_producer_enablement" --arg producer_token "$funded_producer_token_enablement" \
     '{mode:"disabled",signerEnablement:$signer,signerActive:false,
-      tokenTimerEnablement:$token,tokenTimerActive:false}')
+      tokenTimerEnablement:$token,tokenTimerActive:false,producerEnablement:$producer,producerActive:false,
+      producerTokenTimerEnablement:$producer_token,producerTokenTimerActive:false,
+      producerConfigEnvBindingSha256:null,producerTokenMountBindingSha256:null,producerNative:null}')
 fi
 qset_enablement=$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)
 case "$qset_enablement" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
@@ -422,7 +541,7 @@ container_state() {
   printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
     || die "container image is not immutable: $name"
   [ "$state" = running ] || die "container is not running: $name"
-  case "$name:$health" in polyedge-funded-signer:not_configured|polyedge-api:healthy|polyedge-frontend:healthy) ;; *) die "container is unhealthy: $name" ;; esac
+  case "$name:$health" in polyedge-funded-signer:not_configured|polyedge-funded-intent-producer:healthy|polyedge-api:healthy|polyedge-frontend:healthy) ;; *) die "container is unhealthy: $name" ;; esac
   jq -nc --arg name "$name" --arg id "$id" --arg image "$image" --arg user "$user" --arg state "$state" --arg health "$health" \
     '{name:$name,id:$id,image:$image,user:$user,state:$state,health:$health}' >>"$containers_tmp"
 }
@@ -448,9 +567,137 @@ if [ "$funded_enabled" = true ]; then
     || die 'funded container manifest hash differs from the formal session'
   [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] \
     || die 'funded container config hash differs from the formal config'
+  container_state polyedge-funded-intent-producer
+  [ "$(jq -r 'select(.name == "polyedge-funded-intent-producer") | .image' "$containers_tmp")" = "$funded_producer_image" ] \
+    && [ "$(jq -r 'select(.name == "polyedge-funded-intent-producer") | .user' "$containers_tmp")" = "$funded_producer_user" ] \
+    || die 'funded intent producer container differs from its formal binding'
+  secure_file "$funded_producer_config" 600 1048576
+  [ "$(sha "$funded_producer_config")" = "$funded_producer_config_sha" ] \
+    || die 'funded intent producer environment hash differs from the formal config'
+  producer_env_raw=$(podman inspect --format '{{json .Config.Env}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer environment is unreadable'
+  producer_env_binding=$(printf '%s\n' "$producer_env_raw" | jq -cSe '
+    def one($name):
+      ($name + "=") as $prefix |
+      [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+      if length == 1 then .[0] else error("critical producer environment binding is absent or duplicate") end;
+    {
+      APP_NAME:one("APP_NAME"),RUNTIME_ROLE:one("RUNTIME_ROLE"),EXECUTION_MODE:one("EXECUTION_MODE"),
+      ALLOW_LIVE:one("ALLOW_LIVE"),RUN_BOT_ON_STARTUP:one("RUN_BOT_ON_STARTUP"),
+      STRATEGY_INTENT_OPERATOR_DIRECT:one("STRATEGY_INTENT_OPERATOR_DIRECT"),
+      PUBLISH_STRATEGY_CANARY_INTENTS:one("PUBLISH_STRATEGY_CANARY_INTENTS"),
+      STRATEGY_CANARY_INTENT_PREFIX:one("STRATEGY_CANARY_INTENT_PREFIX"),
+      STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:one("STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION"),
+      STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:one("STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI"),
+      STRATEGY_CANARY_EXECUTION_MODEL_SHA256:one("STRATEGY_CANARY_EXECUTION_MODEL_SHA256"),
+      STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:one("STRATEGY_INTENT_TARGET_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MAX_ORDER_NOTIONAL:one("STRATEGY_INTENT_MAX_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY"),
+      STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY"),
+      TARGET_ASSET:one("TARGET_ASSET"),TARGET_ASSET_NAME:one("TARGET_ASSET_NAME"),TARGET_HORIZON:one("TARGET_HORIZON"),
+      TARGET_BINANCE_SYMBOL:one("TARGET_BINANCE_SYMBOL"),TARGET_CHAINLINK_SYMBOL:one("TARGET_CHAINLINK_SYMBOL"),
+      TARGET_COINBASE_PRODUCT_ID:one("TARGET_COINBASE_PRODUCT_ID"),
+      AZURE_TENANT_ID:one("AZURE_TENANT_ID"),AZURE_CLIENT_ID:one("AZURE_CLIENT_ID"),
+      AZURE_FEDERATED_TOKEN_FILE:one("AZURE_FEDERATED_TOKEN_FILE"),
+      AZURE_TOKEN_CREDENTIALS:one("AZURE_TOKEN_CREDENTIALS"),
+      AZURE_STORAGE_ACCOUNT_NAME:one("AZURE_STORAGE_ACCOUNT_NAME"),
+      AZURE_STORAGE_CONTAINER_NAME:one("AZURE_STORAGE_CONTAINER_NAME"),
+      AZURE_STORAGE_TABLE_NAME:one("AZURE_STORAGE_TABLE_NAME"),
+      AZURE_CHART_TABLE_NAME:one("AZURE_CHART_TABLE_NAME"),
+      AZURE_MARKET_TABLE_NAME:one("AZURE_MARKET_TABLE_NAME"),
+      AZURE_FUNDED_STORAGE_CONTAINER_NAME:one("AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+      AZURE_MODEL_STORAGE_CONTAINER_NAME:one("AZURE_MODEL_STORAGE_CONTAINER_NAME"),
+      FUNDED_DIRECT_SERVICE_BUS_ENABLED:one("FUNDED_DIRECT_SERVICE_BUS_ENABLED"),
+      FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:one("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE"),
+      FUNDED_DIRECT_SERVICE_BUS_QUEUE:one("FUNDED_DIRECT_SERVICE_BUS_QUEUE")
+    }
+  ') || die 'funded intent producer critical environment binding is unsafe'
+  unset producer_env_raw
+  producer_env_binding_sha=$(text_sha "$producer_env_binding")
+  [ "$producer_env_binding_sha" = "$funded_producer_env_binding_sha" ] \
+    || die 'funded intent producer critical environment differs from the approved binding'
+  unset producer_env_binding
+
+  producer_mount_raw=$(podman inspect --format '{{json .Mounts}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer mounts are unreadable'
+  producer_mount_binding=$(printf '%s\n' "$producer_mount_raw" | jq -cSe --arg source "${funded_producer_token%/*}" '
+    [.[] | select(.Destination == "/run/credentials")] as $mounts |
+    if ($mounts | length) == 1 and $mounts[0].Source == $source and $mounts[0].RW == false
+    then {source:$mounts[0].Source,destination:$mounts[0].Destination,readOnly:true}
+    else error("producer token mount is not exact and read-only") end
+  ') || die 'funded intent producer token mount is not exact and read-only'
+  unset producer_mount_raw
+  producer_mount_binding_sha=$(text_sha "$producer_mount_binding")
+  [ "$producer_mount_binding_sha" = "$funded_producer_mount_binding_sha" ] \
+    || die 'funded intent producer token mount differs from the approved binding'
+  unset producer_mount_binding
 fi
 
 now_epoch=$(date -u +%s)
+if [ "$funded_enabled" = true ]; then
+  producer_health_tmp=$(mktemp "$runtime_dir/producer-health.XXXXXX")
+  producer_status_tmp=$(mktemp "$runtime_dir/producer-status.XXXXXX")
+  chmod 0600 "$producer_health_tmp" "$producer_status_tmp"
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_health_tmp" || die 'funded intent producer private health request failed'
+  producer_health=$(tr -d '\r' <"$producer_health_tmp" | sed '1,/^$/d' | jq -ce '
+    if .ok == true and .backend_impl == "rust" and .runtime_role == "profitability_shadow" and
+      .shadow_only == true and .runtime_active == true and .execution_mode == "paper" and .kill_switch == false
+    then {ok,backendImpl:.backend_impl,runtimeRole:.runtime_role,shadowOnly:.shadow_only,
+      runtimeActive:.runtime_active,executionMode:.execution_mode,killSwitch:.kill_switch}
+    else error("funded intent producer native health is unsafe") end
+  ') || die 'funded intent producer native health is unsafe'
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_status_tmp" || die 'funded intent producer private status request failed'
+  producer_status=$(tr -d '\r' <"$producer_status_tmp" | sed '1,/^$/d' | jq -ce --argjson now "$now_epoch" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def feed_ok($name):
+      .feed_status[$name] as $feed | ($feed | type) == "object" and $feed.status == "ok" and
+      ($feed.updated_at | type) == "string" and (($feed.updated_at | epoch) as $updated |
+        $updated <= $now and $updated >= ($now - 300));
+    if .app == "polyedge-funded-intent-producer" and .backend_impl == "rust" and
+      .runtime_role == "profitability_shadow" and .shadow_only == true and .execution_mode == "paper" and
+      .intent_publisher == {configured:true,prepared:true,pointer_only_preflight:false} and
+      .task_health.api == "ok" and .task_health.runtime_loop == "running" and .task_health.feeds == "running" and
+      feed_ok("Discovery") and feed_ok("PolymarketClobMarket") and
+      feed_ok("PolymarketRtdsChainlink") and feed_ok("PolymarketRtdsBinance") and
+      (.drop_counts | type == "object" and length == 0) and
+      .recorder_status.error_count == 0 and .recorder_status.dropped_count == 0 and
+      .recorder_metrics.queued == 0 and .recorder_metrics.failed_total == 0 and
+      .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and
+      .recorder_metrics.enqueued_total == .recorder_metrics.persisted_total and
+      .recorder_metrics.last_assigned_sequence == .recorder_metrics.enqueued_total and
+      (.recorder_metrics.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_metrics.last_assigned_sequence | type == "number" and floor == . and . >= 1)
+    then {sampledAtUtc:($now | todateiso8601),app,runtimeRole:.runtime_role,executionMode:.execution_mode,
+      intentPublisher:{configured:.intent_publisher.configured,prepared:.intent_publisher.prepared,
+        pointerOnlyPreflight:.intent_publisher.pointer_only_preflight},
+      taskHealth:{api:.task_health.api,runtimeLoop:.task_health.runtime_loop,feeds:.task_health.feeds},
+      feedStatus:{Discovery:(.feed_status.Discovery | {status,updated_at}),
+        PolymarketClobMarket:(.feed_status.PolymarketClobMarket | {status,updated_at}),
+        PolymarketRtdsChainlink:(.feed_status.PolymarketRtdsChainlink | {status,updated_at}),
+        PolymarketRtdsBinance:(.feed_status.PolymarketRtdsBinance | {status,updated_at})},
+      recorder:{instanceId:.recorder_metrics.recorder_instance_id,lastAssignedSequence:.recorder_metrics.last_assigned_sequence,
+        queued:.recorder_metrics.queued,enqueuedTotal:.recorder_metrics.enqueued_total,persistedTotal:.recorder_metrics.persisted_total,
+        failedTotal:.recorder_metrics.failed_total,unrecoveredDurableEvents:.recorder_metrics.unrecovered_durable_events,
+        flushUnrecovered:.recorder_metrics.flush_unrecovered,errorCount:.recorder_status.error_count,droppedCount:.recorder_status.dropped_count}}
+    else error("funded intent producer native status is unsafe") end
+  ') || die 'funded intent producer native status is unsafe'
+  funded_state=$(jq -nc --argjson state "$funded_state" --arg env_binding_sha "$producer_env_binding_sha" \
+    --arg mount_binding_sha "$producer_mount_binding_sha" --argjson health "$producer_health" --argjson status "$producer_status" \
+    '$state + {producerConfigEnvBindingSha256:$env_binding_sha,producerTokenMountBindingSha256:$mount_binding_sha,
+      producerNative:{health:$health,status:$status}}')
+  rm -f "$producer_health_tmp" "$producer_status_tmp"
+  producer_health_tmp=
+  producer_status_tmp=
+fi
+
 token_state() {
   name=$1 path=$2 uid=$3 gid=$4
   token_dir=${path%/*}
@@ -477,6 +724,7 @@ token_state research "$research_token" "$research_uid" "$research_gid"
 if [ "$funded_enabled" = true ]; then
   token_state funded-signer "$funded_token" \
     "${POLYEDGE_PARITY_FUNDED_UID}" "${POLYEDGE_PARITY_FUNDED_GID}"
+  token_state funded-intent-producer "$funded_producer_token" 984 980
 fi
 
 [ ! -e "$pause_file" ] || die 'image pulls are paused'
