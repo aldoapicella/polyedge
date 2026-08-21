@@ -98,7 +98,7 @@ jobs:
             .status == "applied-live-verified"
             and .proof == "identity-rbac-proof.json"
             and (.lanes | keys == ["api", "funded-signer", "research", "shadow-qset"])
-            and ([.lanes[].assignments[]] | length == 27)
+            and ([.lanes[].assignments[]] | length == 30)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
             and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
@@ -148,7 +148,7 @@ jobs:
               .lanes.research,
               .lanes["shadow-qset"],
               .lanes["funded-signer"]
-            ] | map(.assignmentCount) | add) == 27
+            ] | map(.assignmentCount) | add) == 30
             and all([
               .lanes.api,
               .lanes.research,

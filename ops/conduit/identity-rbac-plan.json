@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "qset-writer-expansion-pending-live-proof",
+  "status": "applied-live-verified",
   "proof": "identity-rbac-proof.json",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -105,23 +105,28 @@
       "assignments": [
         {
           "role": "blobContributor",
-          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events"
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events",
+          "id": "d6a6e447-5da3-4d73-889a-a3b7a020df0f"
         },
         {
           "role": "blobContributor",
-          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset"
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset",
+          "id": "33d54aba-4eb3-4b9e-9d85-214580a08440"
         },
         {
           "role": "tableContributor",
-          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetEventIndex"
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetEventIndex",
+          "id": "42456de0-61e8-4229-8526-ce7e6f6b7f9e"
         },
         {
           "role": "tableContributor",
-          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetChartSeries"
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetChartSeries",
+          "id": "c90132b3-5a28-4548-ae9e-2a64ce52efb6"
         },
         {
           "role": "tableContributor",
-          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetMarketCatalog"
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetMarketCatalog",
+          "id": "3dd2c5e2-10d2-4967-88fd-4d9559cd99bc"
         }
       ],
       "negativeAssertions": [
