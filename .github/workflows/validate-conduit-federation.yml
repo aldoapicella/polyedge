@@ -209,6 +209,51 @@ jobs:
               "Storage Blob Data Reader", "Storage Blob Data Reader",
               "Storage Table Data Contributor", "Storage Table Data Contributor", "Storage Table Data Contributor"
             ]
+            and (.lanes["funded-intent-producer"].positiveChecks | length) == 9
+            and any(.lanes["funded-intent-producer"].positiveChecks[];
+              .operation == "workloadIdentityTokenExchange"
+              and .target == "https://storage.azure.com/.default"
+              and .statusCode == 200
+              and .clientIdMatch and .principalIdMatch and .tenantIdMatch and .audienceMatch
+              and .tokenCaptured == false and .result == "success")
+            and ([.lanes["funded-intent-producer"].positiveChecks[]
+              | select(.operation == "blobContainer.getProperties")
+              | {operation, target, statusCode, result}] | sort_by(.target)) == [
+              {operation:"blobContainer.getProperties", target:"polyedge-funded-evidence", statusCode:200, result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-models", statusCode:200, result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-shadow-events", statusCode:200, result:"success"}
+            ]
+            and ([.lanes["funded-intent-producer"].positiveChecks[]
+              | select(.operation == "table.query")
+              | {operation, target, statusCode, result}] | sort_by(.target)) == [
+              {operation:"table.query", target:"ShadowBotChartSeries", statusCode:200, result:"success"},
+              {operation:"table.query", target:"ShadowBotEventIndex", statusCode:200, result:"success"},
+              {operation:"table.query", target:"ShadowBotMarketCatalog", statusCode:200, result:"success"}
+            ]
+            and any(.lanes["funded-intent-producer"].positiveChecks[];
+              .operation == "serviceBus.sendMessage"
+              and .target == "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+              and (.decisionId | test("^[0-9a-f]{64}$"))
+              and .messageBodyCaptured == false and .result == "success")
+            and any(.lanes["funded-intent-producer"].positiveChecks[];
+              .operation == "acr.manifestHead"
+              and .target == "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc"
+              and .statusCode == 200 and .result == "success")
+            and .lanes["funded-intent-producer"].negativeChecks == [
+              {target:"bot-events", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"polyedge-research-qset", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"polyedge-research", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"BotMarketCatalog", operation:"table.query", statusCode:403, result:"denied"},
+              {target:"ShadowQsetMarketCatalog", operation:"table.query", statusCode:403, result:"denied"},
+              {target:"kvpolyedge6urdjr5nmwx7w/secrets", operation:"secretList", statusCode:403, result:"denied"},
+              {target:"kvpolyedge6urdjr5nmwx7w/secrets/dashboard-auth-password", operation:"secretGet", statusCode:403, result:"denied"},
+              {target:"sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents", operation:"serviceBus.peekMessages", errorCode:"UnauthorizedAccess", consumed:false, result:"denied"},
+              {target:"rg-polyedge-dev", operation:"resourceGroup.get", statusCode:403, result:"denied"},
+              {target:"stpolyedge6urdjr5nmwx7w", operation:"storageAccount.get", statusCode:403, result:"denied"},
+              {target:"sb-polyedge-funded-cl-6urdjr5nmwx7w", operation:"serviceBusNamespace.get", statusCode:403, result:"denied"},
+              {target:"rg-polyedge-dev/providers/Microsoft.Authorization/roleAssignments", operation:"roleAssignments.list", statusCode:403, result:"denied"},
+              {target:"crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend", operation:"acr.pushScopeRequest", statusCode:200, pushGranted:false, result:"denied"}
+            ]
             and .lanes["funded-signer"].assignmentCount == 10
             and (.lanes["funded-signer"].roleAssignments | length) == 10
             and ([.lanes["funded-signer"].roleAssignments[].id] | length) ==

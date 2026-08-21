@@ -430,7 +430,7 @@
       ]
     },
     "funded-intent-producer": {
-      "capturedAtUtc": "2026-08-21T15:19:12Z",
+      "capturedAtUtc": "2026-08-21T22:09:08Z",
       "identity": {
         "resourceId": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-funded-intent-producer",
         "clientId": "54f0136b-5e72-4ad1-b23e-cb1269d356c1",
@@ -494,6 +494,152 @@
           "role": "Azure Service Bus Data Sender",
           "roleDefinitionId": "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
           "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ServiceBus/namespaces/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+        }
+      ],
+      "positiveChecks": [
+        {
+          "operation": "workloadIdentityTokenExchange",
+          "target": "https://storage.azure.com/.default",
+          "statusCode": 200,
+          "clientIdMatch": true,
+          "principalIdMatch": true,
+          "tenantIdMatch": true,
+          "audienceMatch": true,
+          "tokenCaptured": false,
+          "result": "success"
+        },
+        {
+          "operation": "blobContainer.getProperties",
+          "target": "polyedge-shadow-events",
+          "statusCode": 200,
+          "result": "success"
+        },
+        {
+          "operation": "blobContainer.getProperties",
+          "target": "polyedge-funded-evidence",
+          "statusCode": 200,
+          "result": "success"
+        },
+        {
+          "operation": "blobContainer.getProperties",
+          "target": "polyedge-models",
+          "statusCode": 200,
+          "result": "success"
+        },
+        {
+          "operation": "table.query",
+          "target": "ShadowBotMarketCatalog",
+          "statusCode": 200,
+          "result": "success"
+        },
+        {
+          "operation": "table.query",
+          "target": "ShadowBotEventIndex",
+          "statusCode": 200,
+          "result": "success"
+        },
+        {
+          "operation": "table.query",
+          "target": "ShadowBotChartSeries",
+          "statusCode": 200,
+          "result": "success"
+        },
+        {
+          "operation": "serviceBus.sendMessage",
+          "target": "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents",
+          "source": "live funded-intent-producer journal",
+          "decisionId": "67b938dd4aa33747a9a78de4c60c18725b20d9abc3f6add29992c98ec61f06a4",
+          "observedAtUtc": "2026-08-21T21:52:32Z",
+          "messageBodyCaptured": false,
+          "result": "success"
+        },
+        {
+          "operation": "acr.manifestHead",
+          "target": "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc",
+          "statusCode": 200,
+          "result": "success"
+        }
+      ],
+      "negativeChecks": [
+        {
+          "target": "bot-events",
+          "operation": "blobContainer.getProperties",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "polyedge-research-qset",
+          "operation": "blobContainer.getProperties",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "polyedge-research",
+          "operation": "blobContainer.getProperties",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "BotMarketCatalog",
+          "operation": "table.query",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "ShadowQsetMarketCatalog",
+          "operation": "table.query",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "kvpolyedge6urdjr5nmwx7w/secrets",
+          "operation": "secretList",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "kvpolyedge6urdjr5nmwx7w/secrets/dashboard-auth-password",
+          "operation": "secretGet",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents",
+          "operation": "serviceBus.peekMessages",
+          "errorCode": "UnauthorizedAccess",
+          "consumed": false,
+          "result": "denied"
+        },
+        {
+          "target": "rg-polyedge-dev",
+          "operation": "resourceGroup.get",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "stpolyedge6urdjr5nmwx7w",
+          "operation": "storageAccount.get",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "sb-polyedge-funded-cl-6urdjr5nmwx7w",
+          "operation": "serviceBusNamespace.get",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "rg-polyedge-dev/providers/Microsoft.Authorization/roleAssignments",
+          "operation": "roleAssignments.list",
+          "statusCode": 403,
+          "result": "denied"
+        },
+        {
+          "target": "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend",
+          "operation": "acr.pushScopeRequest",
+          "statusCode": 200,
+          "pushGranted": false,
+          "result": "denied"
         }
       ],
       "negativeAssertions": [
