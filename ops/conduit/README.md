@@ -195,6 +195,22 @@ This run predates the first fully eligible UTC day and therefore receives
 no daily-cycle credit; it proves the Azure-to-OCI lease transition and local
 serialization path only.
 
+The `05:18` collector validated `04:00` through `05:00` and advanced the ledger
+to `3/72`. Evidence `/srv/polyedge-ring/parity/hourly/20260821T04/evidence.json`
+has SHA-256 `a90c724c60f2e7bc060e9972c8a0fb5f5cffe55d57ed476cea7098369c9607e4`;
+Azure and OCI same-input result hashes both equal
+`sha256:433ecdeb3c396e6a64556566e0544d9ebe6eb49f761b4f0046cf9e39e049af56`.
+All 60 feed observations were healthy. Funded evidence recorded 60 heartbeats,
+28 token refreshes, 32 processed messages, and zero alerts, failed-closed events,
+restarts, failed messages, redemption failures, token refresh failures, or
+reconciliation gaps. Boot headroom was 26,896,171,008 bytes and ring status stayed
+green. Audit warnings remained explicit: same-input and Azure scheduled audits had
+six out-of-order timestamps, OCI scheduled had 17, start-price capture was `5/8`,
+and settlement coverage was `4/8`. The collector overlapped OCI normalization
+under its 1.5-CPU cap; observed host load was 3.25 on four cores with 20 GiB
+available, no swap, and a successful 05:15 funded warmup. The collector peaked at
+4.8 GiB without OOM or service restart.
+
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
 while the fresh ledger and live signer pinned `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`;
