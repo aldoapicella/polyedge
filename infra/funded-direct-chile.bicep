@@ -194,7 +194,7 @@ resource serviceBusQueue 'Microsoft.ServiceBus/namespaces/queues@2024-01-01' = {
   properties: {
     status: fundedDirectQueueStatus
     lockDuration: 'PT30S'
-    defaultMessageTimeToLive: 'PT15S'
+    defaultMessageTimeToLive: 'PT1H'
     deadLetteringOnMessageExpiration: true
     maxDeliveryCount: 3
     requiresDuplicateDetection: true

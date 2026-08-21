@@ -927,7 +927,7 @@ jobs:
           assert.equal(queue.properties.status, "[parameters('fundedDirectQueueStatus')]");
           assert.equal(queue.properties.requiresDuplicateDetection, true);
           assert.equal(queue.properties.duplicateDetectionHistoryTimeWindow, "PT10M");
-          assert.equal(queue.properties.defaultMessageTimeToLive, "PT15S");
+          assert.equal(queue.properties.defaultMessageTimeToLive, "PT1H");
           assert.equal(queue.properties.lockDuration, "PT30S");
           assert.equal(queue.properties.deadLetteringOnMessageExpiration, true);
           assert.equal(queue.properties.maxDeliveryCount, 3);
@@ -5164,7 +5164,7 @@ jobs:
           test "$(jq -r '.requiresDuplicateDetection' service-bus-queue.json)" = "true"
           test "$(jq -r '.status' service-bus-queue.json)" = "SendDisabled"
           test "$(jq -r '.duplicateDetectionHistoryTimeWindow' service-bus-queue.json)" = "PT10M"
-          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT15S"
+          test "$(jq -r '.defaultMessageTimeToLive' service-bus-queue.json)" = "PT1H"
           test "$(jq -r '.deadLetteringOnMessageExpiration' service-bus-queue.json)" = "true"
           test "$(jq -r '.maxDeliveryCount' service-bus-queue.json)" = "3"
           az servicebus namespace network-rule-set show \

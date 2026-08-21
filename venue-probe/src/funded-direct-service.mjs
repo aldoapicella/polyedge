@@ -328,11 +328,12 @@ export async function runPersistentFundedDirectService({
   };
   const failMessage = async (entry, error) => {
     failedMessages += 1;
-    const deterministic = /unsupported|schema|binding|TTL|stale|SHA-256|does not qualify|already has an authorization|latency|risk|reservation|cash.flow|equity|position|open order/i.test(error.message);
+    const errorText = safeErrorMessage(error);
+    const deterministic = /unsupported|schema|binding|TTL|stale|SHA-256|does not qualify|already has an authorization|latency|risk|reservation|cash.flow|equity|position|open order/i.test(errorText);
     if (deterministic || Number(entry.message.deliveryCount || 0) >= 2) {
       await receiver.deadLetterMessage(entry.message, {
         deadLetterReason: "FundedIntentFailedClosed",
-        deadLetterErrorDescription: String(error.message).slice(0, 4_000)
+        deadLetterErrorDescription: errorText.slice(0, 4_000)
       }).catch(() => null);
     } else {
       await receiver.abandonMessage(entry.message).catch(() => null);
@@ -342,17 +343,50 @@ export async function runPersistentFundedDirectService({
       status: "persistent_message_failed_closed",
       message_id: entry.message.messageId || null,
       delivery_count: entry.message.deliveryCount || 0,
-      error: error.message
+      error: errorText,
+      error_detail: safeErrorProjection(error)
+    });
+  };
+  const recordDurableSettlementLoss = (entry, result, error) => {
+    logger({
+      schema: "polyedge.funded_direct_service.v2",
+      status: "persistent_message_settlement_lost_after_durable_completion",
+      message_id: entry.message.messageId || null,
+      delivery_count: entry.message.deliveryCount || 0,
+      worker_status: result?.status || null,
+      order_submission_attempted: result?.execution?.order_submission_attempted === true ||
+        result?.completion?.order_submission_attempted === true,
+      broker_redelivery_expected: true,
+      error: safeErrorMessage(error),
+      error_detail: safeErrorProjection(error)
     });
   };
   const processIntent = async (entry, busy) => {
     const { message, body, queueReceiveMonotonicMs } = entry;
     try {
-      if (entry.renewalError) throw entry.renewalError;
+      if (entry.renewalError) {
+        await failMessage(entry, entry.renewalError);
+        return;
+      }
       const receivedWallMs = Date.now();
-      const result = busy ? await processor.rejectBusy(body) : await processor.process(body);
-      if (entry.renewalError) throw entry.renewalError;
-      await receiver.completeMessage(message);
+      let result;
+      try {
+        result = busy ? await processor.rejectBusy(body) : await processor.process(body);
+      } catch (error) {
+        await failMessage(entry, error);
+        return;
+      }
+      try {
+        if (entry.renewalError) throw entry.renewalError;
+        await receiver.completeMessage(message);
+      } catch (error) {
+        if (hasDurableCompletion(result)) {
+          recordDurableSettlementLoss(entry, result, error);
+          return;
+        }
+        await failMessage(entry, error);
+        return;
+      }
       processedMessages += 1;
       if (busy) {
         logger({
@@ -406,8 +440,6 @@ export async function runPersistentFundedDirectService({
         stopping = true;
         logger({ schema: "polyedge.funded_direct_alert.v1", status: "engine_paused_by_consecutive_latency_breaches", decision_id: body.decision_id, consecutive_transitions_above_slo: consecutiveLatencyBreaches, signal_to_send_slo_ms: config.signalToSendSloMs, account_risk_pause: true });
       }
-    } catch (error) {
-      await failMessage(entry, error);
     } finally {
       clearInterval(entry.renewal);
     }
@@ -626,6 +658,38 @@ function parseMessageBody(value) {
   const text = Buffer.isBuffer(value) ? value.toString("utf8") : String(value || "");
   try { return JSON.parse(text); }
   catch { throw new Error("fail closed: Service Bus message body is not valid JSON"); }
+}
+
+function hasDurableCompletion(result) {
+  return result?.completion?.schema === "polyedge.operator_funded_intent_completion.v1" ||
+    [
+      "already_completed_idempotent",
+      "child_failed_closed_pre_submission",
+      "expired_before_child_launch",
+      "one_workflow_busy",
+      "paused_by_account_risk_state",
+      "persistent_intent_completed"
+    ].includes(result?.status);
+}
+
+function safeErrorMessage(error) {
+  for (const value of [error?.message, error?.reason, error?.code, error?.name]) {
+    if (typeof value === "string" && value.trim()) return value.trim().slice(0, 4_000);
+  }
+  return "unknown error";
+}
+
+function safeErrorProjection(error) {
+  const text = (value) => typeof value === "string" && value.trim()
+    ? value.trim().slice(0, 4_000)
+    : null;
+  return {
+    name: text(error?.name),
+    code: text(error?.code),
+    reason: text(error?.reason),
+    message: text(error?.message),
+    status_code: Number.isFinite(Number(error?.statusCode)) ? Number(error.statusCode) : null
+  };
 }
 
 function integer(value, fallback) {

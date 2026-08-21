@@ -367,6 +367,104 @@ test("persistent service seals a fresh intent busy while the first child is dela
   assert.equal(processed.length, 1);
 });
 
+test("persistent service redelivers idempotently after durable completion loses its broker lock", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const body = {
+    schema: "polyedge.funded_intent_handoff.v1",
+    decision_id: "d".repeat(64),
+    decision_ts: decisionTs
+  };
+  const messages = [0, 1].map((deliveryCount) => ({
+    messageId: "durable-redelivery",
+    deliveryCount,
+    body
+  }));
+  const completed = [];
+  const abandoned = [];
+  const deadLettered = [];
+  let failRenewal;
+  const receiver = {
+    async receiveMessages(maxMessages) { return messages.splice(0, maxMessages); },
+    renewMessageLock(message) {
+      if (message.deliveryCount > 0) return Promise.resolve();
+      return new Promise((_, reject) => {
+        failRenewal = () => {
+          const error = new Error("");
+          error.name = "ServiceBusError";
+          error.code = "GeneralError";
+          error.reason = "MessageLockLost";
+          reject(error);
+        };
+      });
+    },
+    async completeMessage(message) { completed.push(message.deliveryCount); },
+    async abandonMessage(message) { abandoned.push(message.deliveryCount); },
+    async deadLetterMessage(message) { deadLettered.push(message.deliveryCount); },
+    async close() {}
+  };
+  const logs = [];
+  let executions = 0;
+  let processingCalls = 0;
+  const process = async () => {
+    processingCalls += 1;
+    if (processingCalls === 1) {
+      executions += 1;
+      failRenewal();
+      await new Promise((resolve) => setImmediate(resolve));
+      return {
+        status: "persistent_intent_completed",
+        execution: {
+          order_submission_attempted: true,
+          lifecycle: {
+            order_id: "durable-order",
+            send_wall_ms: Date.parse(decisionTs) + 1,
+            ack_wall_ms: Date.parse(decisionTs) + 2
+          }
+        }
+      };
+    }
+    return {
+      status: "already_completed_idempotent",
+      completion: {
+        schema: "polyedge.operator_funded_intent_completion.v1",
+        order_submission_attempted: true
+      }
+    };
+  };
+
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({
+      createReceiver: () => receiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {}, execute: async () => {}, status: () => ({ ready: true }), close: async () => {}
+    }),
+    createProcessor: async () => ({ process, rejectBusy: process }),
+    logger: (value) => logs.push(value)
+  });
+
+  assert.equal(result.processed_messages, 1);
+  assert.equal(result.failed_messages, 0);
+  assert.equal(executions, 1);
+  assert.equal(processingCalls, 2);
+  assert.deepEqual(completed, [1]);
+  assert.deepEqual(abandoned, []);
+  assert.deepEqual(deadLettered, []);
+  const lost = logs.find((value) =>
+    value.status === "persistent_message_settlement_lost_after_durable_completion"
+  );
+  assert.equal(lost?.message_id, "durable-redelivery");
+  assert.equal(lost?.delivery_count, 0);
+  assert.equal(lost?.broker_redelivery_expected, true);
+  assert.equal(lost?.error, "MessageLockLost");
+  assert.equal(lost?.error_detail?.name, "ServiceBusError");
+  assert.equal(lost?.error_detail?.code, "GeneralError");
+  assert.equal(lost?.error_detail?.reason, "MessageLockLost");
+  assert.equal(lost?.error_detail?.message, null);
+});
+
 test("persistent service settles a twelve-intent burst with one actual workflow", async () => {
   const decisionTs = new Date(Date.now() - 500).toISOString();
   const messages = Array.from({ length: 12 }, (_, index) => {

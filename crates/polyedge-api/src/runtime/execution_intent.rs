@@ -24,6 +24,7 @@ const MAX_INTENT_TTL_MS: i64 = 30_000;
 // Preserve the frozen ten-second contract outside the operator-direct lane.
 const EXECUTION_HANDOFF_TTL_MS: i64 = 10_000;
 const OPERATOR_DIRECT_EXECUTION_HANDOFF_TTL_MS: i64 = 15_000;
+const FUNDED_INTENT_TRANSPORT_TTL_SECONDS: u64 = 3_600;
 // A decision cycle can emit several independently authenticated PLACE intents.
 // Keep their immutable blob commits and Service Bus handoffs bounded but
 // concurrent so one slow Azure request cannot consume another intent's short
@@ -378,7 +379,7 @@ impl IntentPublisher {
                     sender
                         .send_json(
                             &intent.decision_id,
-                            ((remaining_ms + 999) / 1_000).clamp(1, 30) as u64,
+                            FUNDED_INTENT_TRANSPORT_TTL_SECONDS,
                             &handoff,
                         )
                         .map_err(|error| error.to_string())?;
@@ -1922,6 +1923,7 @@ mod tests {
         assert_eq!(intent.schema, EXECUTION_INTENT_V1_SCHEMA);
         assert_eq!(intent.ttl_ms, OPERATOR_DIRECT_EXECUTION_HANDOFF_TTL_MS);
         assert_eq!(intent.valid_until, now + Duration::seconds(15));
+        assert_eq!(FUNDED_INTENT_TRANSPORT_TTL_SECONDS, 3_600);
         assert_eq!(
             intent.gtd_expiry_ts,
             Some(intent.valid_until + Duration::seconds(300))
