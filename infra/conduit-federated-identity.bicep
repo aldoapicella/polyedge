@@ -6,6 +6,7 @@ targetScope = 'resourceGroup'
   'research'
   'shadow-qset'
   'funded-signer'
+  'funded-intent-producer'
 ])
 param lane string
 
@@ -41,6 +42,11 @@ var lanes = {
     identityName: 'id-polyedge-conduit-funded-signer'
     ficName: 'fic-spire-conduit-funded-signer'
     subject: 'spiffe://polyedge.local/conduit/funded-signer'
+  }
+  'funded-intent-producer': {
+    identityName: 'id-polyedge-conduit-funded-intent-producer'
+    ficName: 'fic-spire-conduit-funded-intent-producer'
+    subject: 'spiffe://polyedge.local/conduit/funded-intent-producer'
   }
 }
 var selected = lanes[lane]

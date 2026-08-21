@@ -8,9 +8,12 @@ token_dir=$root/polyedge-federated-promotion
 token=$token_dir/azure-federated-token
 research_dir=$root/polyedge-federated-research
 research_token=$research_dir/azure-federated-token
+producer_dir=$root/polyedge-federated-funded-intent-producer
+producer_token=$producer_dir/azure-federated-token
 issuer=https://oidc.example.invalid
 mkdir -m 0700 "$token_dir"
 mkdir -m 0700 "$research_dir"
+mkdir -m 0700 "$producer_dir"
 python3 - "$socket" <<'PY' &
 import socket
 import sys
@@ -26,7 +29,7 @@ cleanup() {
   kill "$socket_pid" 2>/dev/null || true
   find "$root" -type f -exec unlink {} \;
   find "$root" -type s -exec unlink {} \;
-  rmdir "$token_dir" "$research_dir" "$root" 2>/dev/null || true
+  rmdir "$token_dir" "$research_dir" "$producer_dir" "$root" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 while [ ! -S "$socket" ]; do sleep 0.1; done
@@ -44,6 +47,9 @@ encode = lambda value: base64.urlsafe_b64encode(json.dumps(value, separators=(",
 now = int(time.time())
 algorithm = "HS256" if os.environ.get("FAKE_BAD") else "RS256"
 subject = sys.argv[sys.argv.index("-spiffeID") + 1]
+if expected := os.environ.get("FAKE_EXPECTED_SUBJECT"):
+    if subject != expected:
+        raise SystemExit("unexpected SPIFFE ID")
 token = ".".join([
     encode({"alg": algorithm, "typ": "JWT"}),
     encode({"iss": "https://oidc.example.invalid", "sub": subject, "aud": ["api://AzureADTokenExchange"], "iat": now, "exp": now + 300}),
@@ -69,6 +75,12 @@ if FAKE_BAD=1 POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPI
   exit 1
 fi
 [ "$before" = "$(sha256sum "$research_token" | awk '{print $1}')" ]
+
+FAKE_EXPECTED_SUBJECT=spiffe://polyedge.local/conduit/funded-intent-producer \
+  POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPIRE_AGENT_BIN=$fake \
+  POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID=$(id -u) POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID=$(id -g) \
+  ops/conduit/bin/polyedge-federated-token-refresh funded-intent-producer "$producer_token" "$issuer"
+[ "$(stat -c %a "$producer_token")" = 600 ]
 
 POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPIRE_AGENT_BIN=$fake \
   POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID=$(id -u) POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID=$(id -g) \
