@@ -11,7 +11,7 @@ use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersist
 use chrono::{DateTime, Utc};
 use execution_intent::{
     build_execution_intent_with_model, resolve_execution_model, resolve_local_execution_model,
-    IntentPublisher, IntentPublisherConfig, IntentPublisherPreparation,
+    IntentExecutionModel, IntentPublisher, IntentPublisherConfig, IntentPublisherPreparation,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
@@ -39,7 +39,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -75,7 +77,7 @@ struct RuntimeInner {
     engine: Mutex<RuntimeEngine>,
     /// Serializes every mutation that can invalidate a decision snapshot with
     /// the final durable compare-and-apply section.
-    decision_gate: Mutex<()>,
+    decision_gate: Arc<Mutex<()>>,
     recorder: Arc<StdMutex<RuntimeRecorder>>,
     recorder_enqueue_gate: StdMutex<()>,
     recorder_tx: std_mpsc::Sender<RecorderRequest>,
@@ -578,7 +580,7 @@ impl RuntimeController {
                 settings,
                 data: RwLock::new(data),
                 engine: Mutex::new(engine),
-                decision_gate: Mutex::new(()),
+                decision_gate: Arc::new(Mutex::new(())),
                 recorder,
                 recorder_enqueue_gate: StdMutex::new(()),
                 recorder_tx,
@@ -2057,7 +2059,7 @@ impl RuntimeController {
                     .iter()
                     .map(|prepared| ("decision".to_owned(), prepared.payload.clone())),
             );
-            let _decision_guard = self.inner.decision_gate.lock().await;
+            let decision_guard = Arc::clone(&self.inner.decision_gate).lock_owned().await;
             {
                 let data = self.inner.data.read().await;
                 if data.clob_generation != Some(clob_generation)
@@ -2080,7 +2082,7 @@ impl RuntimeController {
                 decision_state_generation,
             ) {
                 drop(apply_engine);
-                drop(_decision_guard);
+                drop(decision_guard);
                 self.record_event(
                     "strategy_decision_batch_stale",
                     json!({
@@ -2101,7 +2103,7 @@ impl RuntimeController {
             }
             if !self.record_required_events(required_events).await {
                 drop(apply_engine);
-                drop(_decision_guard);
+                drop(decision_guard);
                 self.record_event(
                     "strategy_decision_batch_rejected",
                     json!({
@@ -2199,17 +2201,30 @@ impl RuntimeController {
                     engine.pending_decision_application = Some(pending);
                 }
             }
-            drop(_decision_guard);
+            let local_execution_model = self
+                .inner
+                .settings
+                .azure
+                .publish_strategy_canary_intents
+                .then(|| resolve_local_execution_model(&self.inner.settings))
+                .flatten();
+            let publication_guard = match local_execution_model {
+                Some(_) => Some(Arc::new(decision_guard)),
+                None => {
+                    drop(decision_guard);
+                    None
+                }
+            };
 
+            let mut persisted_reports = Vec::new();
             for (prepared, applied) in prepared_decisions.into_iter().zip(applied_outputs) {
                 let decision = prepared.decision;
                 let metadata = prepared.metadata;
                 self.accept_durable_decision(decision.clone()).await;
-                let actionable = matches!(
-                    decision.action,
-                    DecisionAction::Place | DecisionAction::CancelAll
-                );
-                if !actionable || (application_evidence_durable && applied.is_some()) {
+                if decision.action == DecisionAction::Place
+                    && application_evidence_durable
+                    && applied.is_some()
+                {
                     self.maybe_publish_execution_intent(
                         &market,
                         &fair_value,
@@ -2219,16 +2234,22 @@ impl RuntimeController {
                         metadata.as_ref(),
                         decision_ts,
                         clob_generation,
+                        local_execution_model
+                            .as_ref()
+                            .zip(publication_guard.as_ref())
+                            .map(|(model, guard)| (model.clone(), Arc::clone(guard))),
                     )
                     .await;
                 }
                 if application_evidence_durable {
                     if let Some(applied) = applied {
-                        for report in applied.reports {
-                            self.accept_persisted_execution_report(report, false).await;
-                        }
+                        persisted_reports.extend(applied.reports);
                     }
                 }
+            }
+            drop(publication_guard);
+            for report in persisted_reports {
+                self.accept_persisted_execution_report(report, false).await;
             }
         }
     }
@@ -2248,6 +2269,10 @@ impl RuntimeController {
         metadata: Option<&StrategyDecisionMetadata>,
         decision_ts: DateTime<Utc>,
         clob_generation: u64,
+        local_publication: Option<(
+            Result<IntentExecutionModel, String>,
+            Arc<OwnedMutexGuard<()>>,
+        )>,
     ) {
         if !self.inner.settings.azure.publish_strategy_canary_intents {
             return;
@@ -2300,18 +2325,19 @@ impl RuntimeController {
         // Azure's credential and blob clients are synchronous. Keep canonical
         // model control reads off the runtime/feed task so a transient storage
         // delay cannot stall recording or market-data processing.
-        let model_settings = self.inner.settings.clone();
-        let execution_model_result =
-            if let Some(model) = resolve_local_execution_model(&model_settings) {
-                model
-            } else {
-                tokio::task::spawn_blocking(move || {
+        let (execution_model_result, decision_guard) = match local_publication {
+            Some((model, guard)) => (model, Some(guard)),
+            None => {
+                let model_settings = self.inner.settings.clone();
+                let model = tokio::task::spawn_blocking(move || {
                     resolve_execution_model(&model_settings, decision_ts)
                 })
                 .await
                 .map_err(|error| format!("execution-model control task failed: {error}"))
-                .and_then(|result| result)
-            };
+                .and_then(|result| result);
+                (model, None)
+            }
+        };
         let execution_model = match execution_model_result {
             Ok(model) => model,
             Err(reason) => {
@@ -2377,27 +2403,40 @@ impl RuntimeController {
         let runtime = self.clone();
         let publication_token_id = token_id.clone();
         let publication_book = book.clone();
-        tokio::spawn(async move {
+        let wait_for_local_publication = decision_guard.is_some();
+        let join_decision_id = intent.decision_id.clone();
+        let join_market_id = intent.market_id.clone();
+        let publication = tokio::spawn(async move {
             let publish_intent = intent.clone();
             let publisher_runtime = runtime.clone();
-            match runtime
-                .execute_live_clob_publication(
-                    clob_generation,
-                    &publication_token_id,
-                    &publication_book,
-                    move || {
-                        let publisher = publisher_runtime
-                            .inner
-                            .intent_publisher
-                            .as_ref()
-                            .ok_or_else(|| {
-                                "persistent intent publisher is unavailable".to_owned()
-                            })?;
-                        publisher.publish(&publish_intent)
-                    },
-                )
-                .await
-            {
+            let publish = move || {
+                let publisher = publisher_runtime
+                    .inner
+                    .intent_publisher
+                    .as_ref()
+                    .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
+                publisher.publish(&publish_intent)
+            };
+            let result = if let Some(_decision_guard) = decision_guard {
+                runtime
+                    .execute_live_clob_publication_while_gated(
+                        clob_generation,
+                        &publication_token_id,
+                        &publication_book,
+                        publish,
+                    )
+                    .await
+            } else {
+                runtime
+                    .execute_live_clob_publication(
+                        clob_generation,
+                        &publication_token_id,
+                        &publication_book,
+                        publish,
+                    )
+                    .await
+            };
+            match result {
                 Ok(None) => {
                     runtime
                         .record_event(
@@ -2477,6 +2516,23 @@ impl RuntimeController {
                 }
             }
         });
+        if wait_for_local_publication {
+            if let Err(error) = publication.await {
+                self.record_event(
+                    "execution_intent_not_published",
+                    json!({
+                        "decision_id": join_decision_id,
+                        "market_id": join_market_id,
+                        "reason": format!("local publication task failed: {error}"),
+                        "fail_closed": true,
+                        "order_submission_attempted": false
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
     }
 
     // The decision gate is the linearization point for every external intent
@@ -2494,6 +2550,29 @@ impl RuntimeController {
         F: FnOnce() -> Result<T, String> + Send + 'static,
     {
         let decision_guard = self.inner.decision_gate.lock().await;
+        let result = self
+            .execute_live_clob_publication_while_gated(
+                clob_generation,
+                token_id,
+                expected_book,
+                publish,
+            )
+            .await;
+        drop(decision_guard);
+        result
+    }
+
+    async fn execute_live_clob_publication_while_gated<T, F>(
+        &self,
+        clob_generation: u64,
+        token_id: &TokenId,
+        expected_book: &BookState,
+        publish: F,
+    ) -> Result<Option<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
         let data = self.inner.data.read().await;
         let live = data.clob_generation == Some(clob_generation)
             && data
@@ -2508,7 +2587,6 @@ impl RuntimeController {
         let result = tokio::task::spawn_blocking(publish)
             .await
             .map_err(|error| format!("publisher task failed: {error}"))?;
-        drop(decision_guard);
         result.map(Some)
     }
 
@@ -4924,6 +5002,60 @@ mod tests {
         terminator.await.unwrap();
         assert_eq!(published.load(Ordering::SeqCst), 1);
         assert!(lease.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn transferred_decision_gate_publishes_before_a_queued_book_update() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("publish-token");
+        let book = clob_test_book(token.as_ref());
+        controller
+            .begin_clob_generation(426, std::slice::from_ref(&token))
+            .await;
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(426);
+            data.clob_pending_generation = None;
+            data.books.insert(token.clone(), book.clone());
+        }
+
+        let decision_guard = Arc::clone(&controller.inner.decision_gate)
+            .lock_owned()
+            .await;
+        let mut updated_book = book.clone();
+        updated_book.local_ts += chrono::Duration::seconds(1);
+        let update = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .handle_feed_event(FeedEvent::ClobBook {
+                        generation: 426,
+                        sequence: 1,
+                        book: updated_book,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+        assert_eq!(
+            controller
+                .execute_live_clob_publication_while_gated(426, &token, &book, move || {
+                    publish_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.inner.data.read().await.books[&token], book);
+
+        drop(decision_guard);
+        update.await.unwrap();
+        assert_ne!(controller.inner.data.read().await.books[&token], book);
     }
 
     #[tokio::test]
