@@ -949,12 +949,18 @@ else
       if ($events | length) >= 50 and $foreign == 0 and
         $times[0] >= $start and $times[0] <= ($start + 75) and
         $times[-1] >= ($end - 75) and $times[-1] < $end and $max_gap <= 75 and
+        any($events[].event; .recorder_queued == 0 and .recorder_dropped_count == 0 and .recorder_error_count == 0) and
         all($events[].event; .execution_mode == "paper" and .runtime_loop == "running" and .feeds == "running" and
-          .recorder_queued == 0 and .recorder_failed_total == 0 and .recorder_unrecovered_durable_events == 0 and
-          .recorder_flush_unrecovered == false and .recorder_dropped_count == 0 and .recorder_error_count == 0)
+          (.recorder_queued == 0 or .recorder_queued == 1) and
+          .recorder_failed_total == 0 and .recorder_unrecovered_durable_events == 0 and
+          .recorder_flush_unrecovered == false and
+          ((.recorder_dropped_count == 0 and .recorder_error_count == 0) or
+           (.recorder_queued == 1 and .recorder_dropped_count == null and .recorder_error_count == null)))
       then {invocationId:$invocation,containerId:$container,observationCount:($events | length),
         firstObservationUtc:($times[0] | todateiso8601),lastObservationUtc:($times[-1] | todateiso8601),
-        maxGapSeconds:$max_gap,foreignObservationCount:$foreign,restartCount:0}
+        maxGapSeconds:$max_gap,foreignObservationCount:$foreign,restartCount:0,
+        maxRecorderQueueDepth:([$events[].event.recorder_queued] | max),
+        recorderBusyObservationCount:([$events[].event | select(.recorder_dropped_count == null and .recorder_error_count == null)] | length)}
       else error("funded intent producer lacks continuous bound runtime health evidence") end
     ' "$producer_journal_file") || die 'funded intent producer lacks continuous healthy runtime evidence'
   publisher_outcomes=$(jq -Rsc --arg invocation "$funded_producer_invocation" --arg container "$funded_producer_container" \

@@ -231,9 +231,18 @@ case "$*" in
     i=0
     while [ "$i" -lt 60 ]; do
       timestamp=$(( (start + 30 + i * 60) * 1000000 ))
-      event=$(jq -nc '{event:"runtime_health",execution_mode:"paper",runtime_loop:"running",feeds:"running",
-        recorder_queued:0,recorder_failed_total:0,recorder_unrecovered_durable_events:0,
-        recorder_flush_unrecovered:false,recorder_dropped_count:0,recorder_error_count:0}')
+      queued=$((i % 2))
+      failed=0
+      dropped=0
+      errors=0
+      if [ "$i" -eq 15 ]; then dropped=null; errors=null; fi
+      if [ "${FAKE_PRODUCER_RECORDER_BACKLOG:-0}" = 1 ] && [ "$i" -eq 15 ]; then queued=2; dropped=0; errors=0; fi
+      if [ "${FAKE_PRODUCER_UNBOUND_NULL_STATUS:-0}" = 1 ] && [ "$i" -eq 15 ]; then queued=0; dropped=null; errors=null; fi
+      if [ "${FAKE_PRODUCER_RECORDER_FAILURE:-0}" = 1 ] && [ "$i" -eq 15 ]; then failed=1; fi
+      event=$(jq -nc --argjson queued "$queued" --argjson failed "$failed" --argjson dropped "$dropped" --argjson errors "$errors" \
+        '{event:"runtime_health",execution_mode:"paper",runtime_loop:"running",feeds:"running",
+          recorder_queued:$queued,recorder_failed_total:$failed,recorder_unrecovered_durable_events:0,
+          recorder_flush_unrecovered:false,recorder_dropped_count:$dropped,recorder_error_count:$errors}')
       message=$(printf '\033[2m%s\033[0m' "$event" | jq -R 'explode')
       jq -nc --arg timestamp "$timestamp" --argjson message "$message" \
         --arg invocation bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -925,12 +934,14 @@ jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled 
   .services.fundedIntentProducerRuntime.tokenContinuity.maxTokenRefreshGapSeconds == 120 and
   .services.fundedIntentProducerRuntime.continuity.publisher.successCount == 1 and
   .services.fundedIntentProducerRuntime.continuity.publisher.infrastructureFailureCount == 0 and
+  .services.fundedIntentProducerRuntime.continuity.maxRecorderQueueDepth == 1 and
+  .services.fundedIntentProducerRuntime.continuity.recorderBusyObservationCount == 1 and
   .services.fundedIntentProducerRuntime.status.intentPublisher == {configured:true,prepared:true,pointerOnlyPreflight:false} and
   (.services.fundedIntentProducerRuntime.configEnvBindingSha256 | test("^sha256:[0-9a-f]{64}$")) and
   (.services.fundedIntentProducerRuntime.tokenMountBindingSha256 | test("^sha256:[0-9a-f]{64}$"))' \
   "$active_funded/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
 
-for producer_case in wrong-env rw-mount unprepared token-gap token-failure warmup-failure intent-failure journal-partial; do
+for producer_case in wrong-env rw-mount unprepared token-gap token-failure warmup-failure intent-failure journal-partial recorder-backlog recorder-unbound-null recorder-failure final-backlog; do
   case_root=$root/producer-$producer_case
   fixture "$case_root"
   activate_funded_fixture "$case_root"
@@ -946,6 +957,13 @@ for producer_case in wrong-env rw-mount unprepared token-gap token-failure warmu
     warmup-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_PUBLISH_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
     intent-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_INTENT_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
     journal-partial) if FAKE_FUNDED_ACTIVE=1 FAKE_JOURNAL_PARTIAL_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    recorder-backlog) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_RECORDER_BACKLOG=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    recorder-unbound-null) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_UNBOUND_NULL_STATUS=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    recorder-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_PRODUCER_RECORDER_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    final-backlog)
+      jq '.recorder_metrics.queued=1 | .recorder_metrics.persisted_total=59' "$case_root/producer-status.json" >"$case_root/status.tmp"
+      mv "$case_root/status.tmp" "$case_root/producer-status.json"
+      if FAKE_FUNDED_ACTIVE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
   esac
   if [ "$passed" -eq 1 ]; then echo "invalid producer runtime unexpectedly passed: $producer_case" >&2; exit 1; fi
 done
