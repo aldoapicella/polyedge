@@ -129,15 +129,31 @@ environment files bound the exact `00:00` UTC window. The first formal heartbeat
 was fully ready with zero alerts or failures, but that window remains rejected with
 zero credit and its hourly timer is paused.
 
-Existing no-sign job `polyedge-funded-warmup-cl` was tested once with a native
-`*/15 * * * *` UTC schedule. Its `00:15` message expired in the DLQ while the
-signer synchronously awaited automatic redemption, so the job was restored to its
-exact manual pre-state before the next schedule. The digest-pinned image, UAMI,
-three non-secret environment values, resources, registry, timeout, retry limit,
-and tags match the pre-change invariant snapshot under
-`/etc/polyedge/rollback/20260821T001000Z-funded-warmup-schedule`. The formal timer
-will restart only from a later untouched UTC boundary after the receive loop fix
-proves at least two clean scheduled cycles without a DLQ increase.
+The funded receive-loop fix is source commit `2735ff8`; source ownership for the
+non-root image is corrected by `ff48f01`. The first ACR canary failed closed on
+an unreadable source module and was restored to its exact pre-state without a
+queue change. The old signer then failed closed with `Failed to connect` at
+`01:00:18`, restarted once, and the expired warmup raised the retained DLQ baseline
+to `936`; the `01:00` hour has zero parity credit. The corrected ARM64 signer was
+deployed at `01:07` with rollback
+`/etc/polyedge/rollback/20260821T010707Z-polyedge-funded-signer` and immutable GHCR
+index `sha256:674ca63956a418b69834e9298b1c0c6a62ca0c916470ffe7d4966aa17de33f7d`.
+
+The no-sign job `polyedge-funded-warmup-cl` now uses corrected ACR digest
+`sha256:ca4b9178032a87295affd5c4fc0809e6869e822c052eaac14eecdeee8c5cbd5e`
+on its native `*/15 * * * *` UTC schedule. Manual `01:08` plus scheduled
+`01:15`, `01:30`, `01:45`, and `02:00` executions succeeded; OCI consumed or coalesced every warmup, the
+queue remained `0 active / 936 DLQ / 0 scheduled / 0 transfer`, and signer
+invocation `9a86217adfe54e83b8af828f38608469` stayed at zero restarts with both channels
+ready, zero gaps, and reconciliation false. Boot disk headroom remained 23 GiB.
+The validated zero-credit ledger
+`/srv/polyedge-ring/parity/20260821T020000Z-funded-active.json` and both root-owned
+environment bindings were installed with rollback
+`/etc/polyedge/rollback/20260821T013200Z-parity-funded-active-0200`; Azure remains
+authoritative and deletion, reboot, and qset gates remain false. The parity timer started at `02:00:05`; its persistent
+catch-up created only
+`excluded_pre_window` evidence for `01:00` and left the ledger at zero. The first
+eligible formal hour is `02:00` through `03:00`, evaluated at `03:18`.
 
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
