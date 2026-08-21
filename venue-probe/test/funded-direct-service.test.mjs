@@ -367,6 +367,70 @@ test("persistent service seals a fresh intent busy while the first child is dela
   assert.equal(processed.length, 1);
 });
 
+test("persistent service warms a new market after the active intent finishes", async () => {
+  const decisionTs = new Date(Date.now() - 500).toISOString();
+  const bus = fakeBus([
+    {
+      messageId: "active-intent",
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_intent_handoff.v1",
+        decision_id: "e".repeat(64),
+        decision_ts: decisionTs
+      }
+    },
+    {
+      messageId: "next-market",
+      deliveryCount: 1,
+      body: {
+        schema: "polyedge.funded_market_warmup.v1",
+        market_id: "next-market",
+        condition_id: "next-condition",
+        token_id: "next-token",
+        token_ids: ["next-token", "other-token"],
+        market_end_ts: new Date(Date.now() + 600_000).toISOString()
+      }
+    }
+  ]);
+  let releaseIntent;
+  let intentStarted;
+  const intentStartedPromise = new Promise((resolve) => { intentStarted = resolve; });
+  const warmups = [];
+  const logs = [];
+  const resultPromise = runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async (value) => { warmups.push(value.market_id); },
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => {
+        intentStarted();
+        await new Promise((resolve) => { releaseIntent = resolve; });
+        return { execution: { lifecycle: { send_wall_ms: Date.parse(decisionTs) + 1 } } };
+      }
+    }),
+    logger: (value) => logs.push(value)
+  });
+  await intentStartedPromise;
+  for (let attempt = 0; attempt < 40 && bus.received.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(bus.received, ["active-intent", "next-market"]);
+  assert.deepEqual(warmups, []);
+  releaseIntent();
+  const result = await resultPromise;
+  assert.equal(result.processed_messages, 2);
+  assert.deepEqual(warmups, ["next-market"]);
+  assert.deepEqual(bus.completed, ["active-intent", "next-market"]);
+  assert.equal(logs.some((value) => value.status === "market_warmup_deferred"), false);
+  assert.equal(logs.some((value) => value.status === "market_warmup_waiting"), true);
+  assert.equal(logs.some((value) => value.status === "market_warmed"), true);
+});
+
 test("persistent service redelivers idempotently after durable completion loses its broker lock", async () => {
   const decisionTs = new Date(Date.now() - 500).toISOString();
   const body = {

@@ -540,10 +540,10 @@ export async function runPersistentFundedDirectService({
           if (activeWorkflowKind === "maintenance" && key && warmedMarketTokens.has(key)) {
             await processWarmup(entry);
           } else {
-            clearInterval(entry.renewal);
-            await receiver.completeMessage(message);
-            processedMessages += 1;
-            logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_deferred", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+            logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmup_waiting", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
+            await Promise.allSettled([activeWorkflow]);
+            if (stopping) await settleStoppedMessage(entry);
+            else await processWarmup(entry);
           }
         } else {
           await processWarmup(entry);
