@@ -687,18 +687,117 @@ async function ensurePersistentMarket(resources, { market_id, condition_id, toke
   return next;
 }
 
-async function reconcilePersistentChannels(resources, market) {
-  if (!resources.userChannel.requiresReconciliation() &&
-      !resources.marketChannel.requiresReconciliation()) return;
-  const [openOrders, trades] = await Promise.all([
-    getOpenOrdersStrict(resources.client),
-    resources.client.getTrades({ market: market.condition_id })
-  ]);
-  if (openOrders.length !== 0 || !Array.isArray(trades)) {
+export async function reconcilePersistentChannels(resources, market, {
+  capture = capturePreflight,
+  intent = conservativeWarmIntent(market)
+} = {}) {
+  const channels = [resources.userChannel, resources.marketChannel];
+  if (!channels.some((channel) => channel?.requiresReconciliation?.() === true)) return null;
+  const cache = resources.safetyCache;
+  const cacheGeneration = cache?.generation;
+  if (cache) cache.latest = null;
+  if (channels.some((channel) => !channel || typeof channel.ensureOpen !== "function" ||
+      typeof channel.isOpen !== "function" || typeof channel.markReconciled !== "function")) {
+    throw new Error("fail closed: websocket reconnect reconciliation lacks channel controls");
+  }
+  await Promise.all(channels.map((channel) => channel.ensureOpen()));
+  if (!channels.every((channel) => channel.isOpen() === true)) {
+    throw new Error("fail closed: websocket reconnect reconciliation lacks open channels");
+  }
+  const counters = (channel) => ({
+    gaps: Number(channel.gapCount()),
+    reconnects: Number(channel.reconnectCount()),
+    unparsed: Number(channel.unparsedCount())
+  });
+  const before = channels.map(counters);
+  const tradeSnapshot = (trades) => {
+    if (!Array.isArray(trades)) {
+      throw new Error("fail closed: authenticated trade history is invalid");
+    }
+    const identities = trades.map((trade) => {
+      if (!trade || typeof trade !== "object" || Array.isArray(trade)) return null;
+      const tradeId = String(trade.id || trade.trade_id || trade.transaction_hash || "").trim();
+      const condition = String(trade.market || trade.condition_id || trade.conditionId || "").toLowerCase();
+      if (!tradeId || condition !== String(market.condition_id).toLowerCase() ||
+          (trade.maker_orders !== undefined && !Array.isArray(trade.maker_orders))) return null;
+      return tradeId;
+    });
+    if (identities.some((value) => !value) || new Set(identities).size !== identities.length) {
+      throw new Error("fail closed: authenticated trade history is incoherent");
+    }
+    return sha256(Buffer.from(JSON.stringify(trades)));
+  };
+  const tradesBefore = tradeSnapshot(
+    await resources.client.getTrades({ market: market.condition_id })
+  );
+  const runtime = await capture(
+    resources.client,
+    intent,
+    resources.manifestDocument.value,
+    null,
+    {
+      recordLedger: false,
+      profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
+      protectedCompoundingContext: resources.protectedCompoundingContext,
+      preflightResources: resources,
+      readOnly: resources.readOnly
+    }
+  );
+  const tradesAfter = tradeSnapshot(
+    await resources.client.getTrades({ market: market.condition_id })
+  );
+  const after = channels.map(counters);
+  if (!channels.every((channel) => channel.isOpen() === true) ||
+      !before.every((value, index) => Object.keys(value).every(
+        (key) => value[key] === after[index][key]
+      ))) {
+    throw new Error("fail closed: websocket state changed during reconnect reconciliation");
+  }
+  const basis = runtime?.riskBasis;
+  const maximumDiscrepancy = Number(
+    resources.manifestDocument.value.max_reconciliation_discrepancy
+  );
+  const accountValues = [
+    basis?.liquidCollateral,
+    basis?.summedPositionValue,
+    basis?.reportedPositionValue,
+    basis?.accountEquity
+  ].map(Number);
+  if (tradesBefore !== tradesAfter || runtime?.openOrderCount !== 0 ||
+      basis?.unresolvedPositionCount !== 0 ||
+      basis?.unresolvedReservationCount !== 0 ||
+      !Number.isFinite(maximumDiscrepancy) || maximumDiscrepancy < 0 ||
+      !accountValues.every((value) => Number.isFinite(value) && value >= 0) ||
+      Math.abs(Number(basis.summedPositionValue) - Number(basis.reportedPositionValue)) >
+        maximumDiscrepancy + 1e-9) {
     throw new Error("fail closed: websocket reconnect reconciliation did not prove a coherent account");
   }
-  resources.userChannel.markReconciled();
-  resources.marketChannel.markReconciled();
+  const restBestAsk = Math.min(...(runtime.book?.asks || [])
+    .map((row) => Number(row.price)).filter(Number.isFinite));
+  const streamEvidence = streamBookEvidence(
+    resources.marketChannel.messages,
+    market.token_id
+  );
+  if (!Number.isFinite(restBestAsk) || !Number.isFinite(Number(streamEvidence?.bestAsk)) ||
+      !Number.isFinite(Number(streamEvidence?.receivedWallMs)) ||
+      Number(streamEvidence.receivedWallMs) < Number(runtime.capturedStartedWallMs) ||
+      Math.abs(restBestAsk - Number(streamEvidence.bestAsk)) > 1e-9) {
+    throw new Error("fail closed: reconnect reconciliation lacks fresh REST and stream book agreement");
+  }
+  for (const channel of channels) channel.markReconciled();
+  if (cache && cache.generation === cacheGeneration &&
+      cache.market_id === String(market.market_id) &&
+      cache.condition_id === String(market.condition_id) &&
+      cache.token_id === String(market.token_id)) {
+    cache.latest = {
+      market_id: String(market.market_id),
+      condition_id: String(market.condition_id),
+      token_id: String(market.token_id),
+      runtime
+    };
+    cache.lastError = null;
+  }
+  return runtime;
 }
 
 export const SAFETY_CACHE_MAINTENANCE_QUIESCE_MS = 30_000;
@@ -1208,7 +1307,7 @@ async function capturePreflight(
     openOrders,
     riskControl,
     balance,
-    positionsResponse,
+    positions,
     valueResponse,
     campaignReservationRecords
   ] = await Promise.all([
@@ -1223,10 +1322,9 @@ async function capturePreflight(
       asset_type: AssetType.COLLATERAL,
       signature_type: config.signatureType
     })),
-    timed("account_positions", () => fetch(
-      `https://data-api.polymarket.com/positions?user=${encodeURIComponent(config.funderAddress)}&sizeThreshold=0&limit=500`,
-      { signal: AbortSignal.timeout(10_000) }
-    )),
+    timed("account_positions", () => loadAccountPositions({
+      user: config.funderAddress
+    })),
     timed("account_value", () => fetch(
       `https://data-api.polymarket.com/value?user=${encodeURIComponent(config.funderAddress)}`,
       { signal: AbortSignal.timeout(10_000) }
@@ -1251,8 +1349,7 @@ async function capturePreflight(
       (feeRate > 0 && !feeTakerOnly)) {
     throw new Error("fail closed: Polymarket V2 market fee rate/exponent/taker-only parameters are invalid");
   }
-  if (!positionsResponse.ok || !valueResponse.ok) throw new Error("fail closed: account reconciliation endpoint failed");
-  const positions = await positionsResponse.json();
+  if (!valueResponse.ok) throw new Error("fail closed: account reconciliation endpoint failed");
   const reportedValues = await valueResponse.json();
   if (!Array.isArray(positions) || !Array.isArray(reportedValues)) throw new Error("fail closed: account reconciliation payload is invalid");
   const terminalConditionIds = [...new Set(positions
@@ -1498,19 +1595,45 @@ export function startSafetySnapshotCache(resources, market, {
         cache.inFlight >= SAFETY_CACHE_MAX_IN_FLIGHT) return;
     cache.inFlight += 1;
     try {
-      const runtime = await capture(
-        resources.client,
-        syntheticIntent,
-        resources.manifestDocument.value,
-        null,
-        {
-          recordLedger: false,
-          profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
-          protectedCompoundingContext: resources.protectedCompoundingContext,
-          preflightResources: resources,
-          readOnly: resources.readOnly
-        }
+      const channels = [resources.userChannel, resources.marketChannel].filter(Boolean);
+      if (channels.length === 1) {
+        throw new Error("fail closed: safety cache has an incomplete channel set");
+      }
+      const reconciliationRequired = channels.some(
+        (channel) => channel.requiresReconciliation?.() === true
       );
+      const before = reconciliationRequired ? null : channels.map((channel) => ({
+        gaps: Number(channel.gapCount()),
+        reconnects: Number(channel.reconnectCount()),
+        unparsed: Number(channel.unparsedCount())
+      }));
+      const runtime = reconciliationRequired
+        ? await reconcilePersistentChannels(resources, market, {
+            capture,
+            intent: syntheticIntent
+          })
+        : await capture(
+            resources.client,
+            syntheticIntent,
+            resources.manifestDocument.value,
+            null,
+            {
+              recordLedger: false,
+              profitQuarantineSnapshot: resources.profitQuarantineSnapshot,
+              protectedCompoundingContext: resources.protectedCompoundingContext,
+              preflightResources: resources,
+              readOnly: resources.readOnly
+            }
+          );
+      if (!reconciliationRequired && (
+          channels.some((channel) => channel.isOpen?.() !== true ||
+            channel.requiresReconciliation?.() === true) ||
+          !before.every((value, index) =>
+            value.gaps === Number(channels[index].gapCount()) &&
+            value.reconnects === Number(channels[index].reconnectCount()) &&
+            value.unparsed === Number(channels[index].unparsedCount())))) {
+        throw new Error("fail closed: websocket state changed during safety snapshot capture");
+      }
       if (cache.generation === generation) {
         cache.latest = {
           market_id: String(market.market_id),
@@ -1521,7 +1644,10 @@ export function startSafetySnapshotCache(resources, market, {
         cache.lastError = null;
       }
     } catch (error) {
-      if (cache.generation === generation) cache.lastError = error.message;
+      if (cache.generation === generation) {
+        cache.latest = null;
+        cache.lastError = error.message;
+      }
     } finally {
       cache.inFlight = Math.max(0, cache.inFlight - 1);
     }
@@ -1547,6 +1673,10 @@ function conservativeWarmIntent(market) {
 
 export function selectFreshCachedSafetySnapshot(resources, intent, nowMs = Date.now()) {
   const cached = resources?.safetyCache?.latest;
+  const channels = [resources?.userChannel, resources?.marketChannel].filter(Boolean);
+  if (channels.length === 1 || channels.some((channel) =>
+    channel.isOpen?.() !== true || channel.requiresReconciliation?.() === true
+  )) return null;
   const completedWallMs = Number(cached?.runtime?.capturedCompletedWallMs);
   if (!cached ||
       cached.market_id !== String(intent?.market_id || "") ||

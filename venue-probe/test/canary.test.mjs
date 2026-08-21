@@ -26,6 +26,7 @@ import {
   loadSettlementActivity,
   PREFLIGHT_COMPONENT_TIMEOUT_MS,
   refreshCampaignRiskSnapshot,
+  reconcilePersistentChannels,
   runBoundedPreflightComponent,
   SAFETY_CACHE_MAINTENANCE_QUIESCE_MS,
   selectFreshCachedSafetySnapshot,
@@ -843,6 +844,189 @@ test("funded order transport rejects SDK endpoint drift before any venue call", 
   }), /not one exact \/order request/);
   assert.equal(venueCalls, 0);
   assert.equal(finalized, 1);
+});
+
+function reconnectReconciliationFixture() {
+  const makeChannel = (messages = []) => {
+    let gaps = 1;
+    let reconnects = 1;
+    let unparsed = 0;
+    let open = true;
+    let required = true;
+    let marks = 0;
+    return {
+      messages,
+      requiresReconciliation: () => required,
+      ensureOpen: async () => true,
+      isOpen: () => open,
+      gapCount: () => gaps,
+      reconnectCount: () => reconnects,
+      unparsedCount: () => unparsed,
+      markReconciled: () => { marks += 1; required = false; },
+      markCount: () => marks,
+      bumpGap: () => { gaps += 1; },
+      requireReconciliation: () => { gaps += 1; required = true; },
+      disconnect: () => { open = false; }
+    };
+  };
+  const userChannel = makeChannel();
+  const marketChannel = makeChannel([{
+    event_type: "best_bid_ask",
+    asset_id: "token-a",
+    best_ask: "0.51",
+    _received_wall_ms: 101
+  }]);
+  const runtime = {
+    capturedStartedWallMs: 100,
+    capturedCompletedWallMs: 102,
+    openOrderCount: 0,
+    book: { asks: [{ price: "0.51" }] },
+    riskBasis: {
+      liquidCollateral: 5,
+      summedPositionValue: 0,
+      reportedPositionValue: 0,
+      unresolvedPositionCount: 0,
+      unresolvedReservationCount: 0,
+      accountEquity: 5
+    }
+  };
+  return {
+    market: { market_id: "market-a", condition_id: "condition-a", token_id: "token-a" },
+    intent: { market_id: "market-a", condition_id: "condition-a", token_id: "token-a" },
+    runtime,
+    userChannel,
+    marketChannel,
+    resources: {
+      busy: false,
+      client: { getTrades: async () => [] },
+      manifestDocument: { value: { max_reconciliation_discrepancy: 0.01 } },
+      profitQuarantineSnapshot: null,
+      protectedCompoundingContext: null,
+      readOnly: false,
+      userChannel,
+      marketChannel
+    }
+  };
+}
+
+test("persistent reconnect clears only after full account and fresh-book reconciliation", async () => {
+  const clean = reconnectReconciliationFixture();
+  clean.resources.safetyCache = {
+    generation: 7,
+    market_id: clean.market.market_id,
+    condition_id: clean.market.condition_id,
+    token_id: clean.market.token_id,
+    latest: { runtime: { capturedCompletedWallMs: 99 } },
+    lastError: "stale"
+  };
+  let releaseCapture;
+  const reconciliation = reconcilePersistentChannels(clean.resources, clean.market, {
+    capture: () => new Promise((resolve) => { releaseCapture = resolve; }),
+    intent: clean.intent
+  });
+  assert.equal(clean.resources.safetyCache.latest, null);
+  await flushMicrotasks();
+  releaseCapture(clean.runtime);
+  assert.strictEqual(await reconciliation, clean.runtime);
+  assert.equal(clean.userChannel.markCount(), 1);
+  assert.equal(clean.marketChannel.markCount(), 1);
+  assert.strictEqual(clean.resources.safetyCache.latest.runtime, clean.runtime);
+  assert.equal(clean.resources.safetyCache.lastError, null);
+
+  const cases = [
+    ["open order", (value) => { value.runtime.openOrderCount = 1; }],
+    ["unresolved position", (value) => { value.runtime.riskBasis.unresolvedPositionCount = 1; }],
+    ["unresolved reservation", (value) => { value.runtime.riskBasis.unresolvedReservationCount = 1; }],
+    ["invalid balance", (value) => { value.runtime.riskBasis.liquidCollateral = Number.NaN; }],
+    ["position value drift", (value) => { value.runtime.riskBasis.reportedPositionValue = 0.02; }],
+    ["REST and stream disagreement", (value) => { value.marketChannel.messages[0].best_ask = "0.52"; }],
+    ["stale stream book", (value) => { value.marketChannel.messages[0]._received_wall_ms = 99; }],
+    ["invalid trades", (value) => { value.resources.client.getTrades = async () => null; }],
+    ["malformed trade", (value) => { value.resources.client.getTrades = async () => [{}]; }],
+    ["wrong-market trade", (value) => {
+      value.resources.client.getTrades = async () => [{ id: "trade-1", market: "condition-b" }];
+    }],
+    ["trade appeared during capture", (value) => {
+      let calls = 0;
+      value.resources.client.getTrades = async () => calls++ === 0 ? [] : [{
+        id: "trade-1", market: "condition-a", maker_orders: []
+      }];
+    }],
+    ["counter changed during capture", (value) => { value.duringCapture = () => value.userChannel.bumpGap(); }],
+    ["channel closed during capture", (value) => { value.duringCapture = () => value.marketChannel.disconnect(); }]
+  ];
+  for (const [name, mutate] of cases) {
+    const value = reconnectReconciliationFixture();
+    mutate(value);
+    await assert.rejects(reconcilePersistentChannels(value.resources, value.market, {
+      capture: async () => {
+        value.duringCapture?.();
+        return value.runtime;
+      },
+      intent: value.intent
+    }), /fail closed/, name);
+    assert.equal(value.userChannel.markCount(), 0, name);
+    assert.equal(value.marketChannel.markCount(), 0, name);
+  }
+});
+
+test("safety cache autonomously reconciles a recovered same-market channel", async () => {
+  const value = reconnectReconciliationFixture();
+  value.resources.safetyCache = {
+    generation: 0, timer: null, inFlight: 0, latest: null, lastError: null,
+    market_id: null, condition_id: null, token_id: null
+  };
+  const timers = [];
+  startSafetySnapshotCache(value.resources, value.market, {
+    capture: async () => value.runtime,
+    createIntent: () => value.intent,
+    setIntervalFn: (callback) => {
+      const timer = { callback, unref() {} };
+      timers.push(timer);
+      return timer;
+    },
+    clearIntervalFn: () => {}
+  });
+  await flushMicrotasks(30);
+  assert.equal(value.userChannel.markCount(), 1);
+  assert.equal(value.marketChannel.markCount(), 1);
+  assert.strictEqual(value.resources.safetyCache.latest.runtime, value.runtime);
+  assert.equal(value.resources.safetyCache.lastError, null);
+  assert.equal(timers.length, 1);
+});
+
+test("safety cache invalidates an ordinary capture crossed by a reconnect", async () => {
+  const value = reconnectReconciliationFixture();
+  value.userChannel.markReconciled();
+  value.marketChannel.markReconciled();
+  value.resources.safetyCache = {
+    generation: 0, timer: null, inFlight: 0,
+    latest: {
+      market_id: value.market.market_id,
+      condition_id: value.market.condition_id,
+      token_id: value.market.token_id,
+      runtime: { capturedCompletedWallMs: Date.now() }
+    },
+    lastError: null, market_id: null, condition_id: null, token_id: null
+  };
+  let releaseCapture;
+  startSafetySnapshotCache(value.resources, value.market, {
+    capture: () => new Promise((resolve) => { releaseCapture = resolve; }),
+    createIntent: () => value.intent,
+    setIntervalFn: () => ({ unref() {} }),
+    clearIntervalFn: () => {}
+  });
+  await flushMicrotasks();
+  value.marketChannel.requireReconciliation();
+  assert.equal(selectFreshCachedSafetySnapshot(
+    value.resources,
+    value.intent,
+    Date.now()
+  ), null);
+  releaseCapture(value.runtime);
+  await flushMicrotasks(30);
+  assert.equal(value.resources.safetyCache.latest, null);
+  assert.match(value.resources.safetyCache.lastError, /websocket state changed/);
 });
 
 test("safety cache permits only one pending preflight across warmup generations", async () => {
