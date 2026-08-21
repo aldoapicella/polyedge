@@ -90,6 +90,7 @@ if grep -Fq -- '--security-opt=no-new-privileges' "$root/quadlets/polyedge-funde
 fi
 grep -Fx 'User=987:983' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
 grep -Fx 'EnvironmentFile=/etc/polyedge/shadow-qset.env' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
+grep -Fx 'LOCAL_JSONL_RECORDER_ENABLED=false' "$root/env/shadow-qset.env.example" >/dev/null
 grep -Fx 'Volume=/run/polyedge-federated-shadow-qset:/run/credentials:ro,Z' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
 grep -Fq -- '--read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --pull=never' "$root/quadlets/polyedge-shadow-qset.container"
 grep -Fx 'WantedBy=multi-user.target' "$root/quadlets/polyedge-shadow-qset.container" >/dev/null
