@@ -166,6 +166,24 @@ and deletion, reboot, qset, and both daily-cycle gates remain false. The audit
 retains eight out-of-order timestamp warnings at rate `1.9361927673519175e-6`;
 they did not change the exact deterministic parity result.
 
+The `04:18` collector validated `03:00` through `04:00` and advanced the same
+ledger to `2/72`. Evidence
+`/srv/polyedge-ring/parity/hourly/20260821T03/evidence.json` has SHA-256
+`c471f8f9a5c8ba269113169ad153540ca9ac7c7143dd0951596dd7afa8e40515`;
+Azure and OCI same-input result hashes both equal
+`sha256:f1505efd94bfbc329a62b0da85a5e9bb9601725acc1e50fc8b9c443075c46cd8`.
+All 60 feed observations were healthy, while funded evidence recorded 60
+heartbeats, 29 token refreshes, 24 processed messages, and zero alerts,
+failed-closed events, restarts, failed messages, redemption failures, token
+refresh failures, or reconciliation gaps. A transient recorder-health sample
+failed once during collection; the bounded retry recovered, and the accepted
+recorder snapshot had zero queued, failed, unrecovered, error, or dropped
+events. Boot headroom was 27,094,405,120 bytes and ring sealing/upload status
+remained green. The audit warnings remain explicit: the same-input report had
+13 out-of-order timestamps, and the scheduled OCI/Azure reports had 21/13;
+start-price capture was `5/8` and settlement coverage was `4/8`. Exact
+same-input output still matched, so the fail-closed collector accepted the hour.
+
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
 while the fresh ledger and live signer pinned `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`;
