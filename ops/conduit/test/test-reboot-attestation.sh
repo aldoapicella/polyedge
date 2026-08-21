@@ -58,6 +58,7 @@ if [ "${1:-}" = exec ]; then
       ;;
     *'/api/v1/status'*)
       printf 'HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
+      sleep "${FAKE_PRODUCER_STATUS_DELAY:-0}"
       updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       jq -nc --arg updated "$updated" --argjson queued "${FAKE_PRODUCER_QUEUED:-0}" \
         --argjson prepared "${FAKE_PRODUCER_PREPARED:-true}" '
@@ -255,6 +256,7 @@ run_attestor() {
     FAKE_FUNDED_CONFIG_SHA="${FAKE_FUNDED_CONFIG_SHA:-sha256:9999999999999999999999999999999999999999999999999999999999999999}" \
     FAKE_FRONTEND_IMAGE="${FAKE_FRONTEND_IMAGE:-}" FAKE_PRODUCER_IMAGE="${FAKE_PRODUCER_IMAGE:-}" \
     FAKE_PRODUCER_QUEUED="${FAKE_PRODUCER_QUEUED:-0}" FAKE_PRODUCER_PREPARED="${FAKE_PRODUCER_PREPARED:-true}" \
+    FAKE_PRODUCER_STATUS_DELAY="${FAKE_PRODUCER_STATUS_DELAY:-0}" \
     FAKE_PRODUCER_RUN_BOT="${FAKE_PRODUCER_RUN_BOT:-true}" FAKE_PRODUCER_MOUNT_RW="${FAKE_PRODUCER_MOUNT_RW:-false}" \
     "$attestor" "$1"
 }
@@ -271,7 +273,7 @@ fi
 jq '.rebootRecoveryPassed = false | del(.rebootRecovery)' "$ledger" >"$raw"
 chmod 0640 "$raw"
 mv "$raw" "$ledger"
-run_attestor validate-ledger
+FAKE_PRODUCER_STATUS_DELAY=1 run_attestor validate-ledger
 
 [ "$(stat -c %s "$case_root/run/ledger.lock")" -eq 0 ]
 disabled_ledger=$case_root/ring/parity/disabled-ledger.json

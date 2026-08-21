@@ -655,6 +655,7 @@ if [ "$funded_enabled" = true ]; then
     printf "GET /api/v1/status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
     cat <&3
   ' >"$producer_status_tmp" || die 'funded intent producer private status request failed'
+  now_epoch=$(date -u +%s)
   producer_status=$(tr -d '\r' <"$producer_status_tmp" | sed '1,/^$/d' | jq -ce --argjson now "$now_epoch" '
     def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
     def feed_ok($name):
