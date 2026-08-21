@@ -184,6 +184,17 @@ remained green. The audit warnings remain explicit: the same-input report had
 start-price capture was `5/8` and settlement coverage was `4/8`. Exact
 same-input output still matched, so the fail-closed collector accepted the hour.
 
+The authoritative daily lease handoff was proven on August 21 without overlap.
+`polyedge-daily-research-job-29787870`, processing date `2026-08-20`,
+ended successfully at `04:45:26Z`. The already-waiting OCI daily worker acquired
+the same `data/research/normalized/v1/control/daily-replay.lock` lease and
+started its raw audit at `04:46:15Z`.
+`polyedge-job@replay.service` remained queued behind the OCI daily worker's local
+research lock, preserving single-writer serialization across both layers.
+This run predates the first fully eligible UTC day and therefore receives
+no daily-cycle credit; it proves the Azure-to-OCI lease transition and local
+serialization path only.
+
 The scheduled 17:18 collector run failed closed because `/etc/polyedge/parity-hourly.env`
 still pinned superseded funded digest `sha256:218e4e20d5d8372fec8ae7262b370fd5507b3125815073b00ddbb5a97a01c637`
 while the fresh ledger and live signer pinned `sha256:912b5e345d14f3abbe666b5dd462208271f582a98ea83ef338f4fc391a41c1ee`;
