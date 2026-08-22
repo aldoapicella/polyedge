@@ -103,6 +103,13 @@ grep -F 'polyedge-qset-v3-first-seal.timer' "$guard" >/dev/null
 grep -F '.intent_publisher == {configured:true,prepared:true,pointer_only_preflight:true}' "$guard" >/dev/null
 grep -F 'systemctl disable --now "$v2_seal_timer"' "$guard" >/dev/null
 grep -F 'azureEvidenceMutationPerformed:false' "$guard" >/dev/null
+receipt_test_dir=$(mktemp -d)
+printf '{"schema":"polyedge.qset_v4_boundary_pre.v1"}\n' >"$receipt_test_dir/pre.json"
+receipt_test_sha="sha256:$(sha256sum "$receipt_test_dir/pre.json" | cut -d ' ' -f1)"
+jq -n --arg sha "$receipt_test_sha" '{schema:"polyedge.qset_v4_boundary_post.v1",boundaryUtc:"2026-08-24T00:00:00Z",preReceiptSha256:$sha,writerContinued:true,qsetV3:{stoppedAndDisabled:true},qsetV2:{healthyBeforeTimerDisable:true},azureEvidenceMutationPerformed:false}' >"$receipt_test_dir/post.json"
+QSET_V4_BOUNDARY_RECEIPT_TEST_ONLY=true "$guard" check "$receipt_test_dir/pre.json" "$receipt_test_dir/post.json"
+if QSET_V4_BOUNDARY_RECEIPT_TEST_ONLY=true "$guard" check "$receipt_test_dir/post.json" "$receipt_test_dir/pre.json" >/dev/null 2>&1; then echo 'qset-v4 boundary accepted an invalid post checkpoint' >&2; exit 1; fi
+rm -rf "$receipt_test_dir"
 jq -e '.generated_at == "2026-08-22T00:00:00Z" and .active_campaign.activation_status == "planned_draft_not_effective" and .active_campaign.effective_at_utc == "2026-08-24T00:00:00Z"' "$disposition" >/dev/null
 jq -r '.protected_files[]' "$policy" | while IFS= read -r protected; do test -f "$repo/$protected"; done
 grep -F 'research/run_shadow_daily.sh' "$policy" >/dev/null
@@ -126,6 +133,10 @@ grep -F '/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleD
 grep -F 'retired_seal_service' "$handoff" >/dev/null
 grep -F 'az containerapp job list' "$handoff" >/dev/null
 grep -F 'v4-assignments-after.json' "$handoff" >/dev/null
+grep -F 'assignment_is_restored' "$handoff" >/dev/null
+grep -F 'reconcile_rollback' "$handoff" >/dev/null
+grep -F 'rollback-result.json' "$handoff" >/dev/null
+grep -F 'if test -e "$before_receipt"' "$handoff" >/dev/null
 grep -F -- '--condition-version' "$handoff" >/dev/null
 grep -F -- '--parameters deployProcessorJob=false' "$handoff" >/dev/null
 ! grep -F 'V4_PROCESSOR_IMAGE:?V4_PROCESSOR_IMAGE is required' "$handoff" >/dev/null

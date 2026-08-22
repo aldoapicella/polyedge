@@ -120,6 +120,17 @@ commit_receipt() {
   sync -f "$final_receipt"
   sync -d "$(dirname "$final_receipt")"
 }
+validate_post_receipt() {
+  local pre=$1 post=$2 pre_sha
+  pre_sha="sha256:$(sha256sum "$pre" | cut -d' ' -f1)"
+  jq -e --arg pre_sha "$pre_sha" '.schema == "polyedge.qset_v4_boundary_post.v1" and .boundaryUtc == "2026-08-24T00:00:00Z" and .preReceiptSha256 == $pre_sha and .writerContinued == true and .qsetV3 == {stoppedAndDisabled:true} and .qsetV2 == {healthyBeforeTimerDisable:true} and .azureEvidenceMutationPerformed == false' "$post" >/dev/null
+}
+if test "${QSET_V4_BOUNDARY_RECEIPT_TEST_ONLY:-false}" = true; then
+  test "$#" = 3
+  validate_post_receipt "$2" "$3"
+  exit 0
+fi
+
 
 if test "$mode" = check; then common_guard; printf '%s\n' 'qset-v4 boundary guard check passed; no state changed'; exit 0; fi
 
@@ -134,6 +145,16 @@ if test "$mode" = pre; then
   runtime_status >"$status_tmp"; validate_v4_recorder <"$status_tmp"
   jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg pid "$(systemctl show "$v4_service" -p MainPID --value)" --arg invocation "$(systemctl show "$v4_service" -p InvocationID --value)" --arg container "$(podman inspect --format '{{.Id}}' "$v4_container")" --arg image "$POLYEDGE_QSET_V4_WRITER_IMAGE" --arg revision "$POLYEDGE_QSET_V4_WRITER_GIT_SHA" --arg freeze "$SHADOW_CODE_FREEZE_SHA256" --arg freeze_blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --slurpfile status "$status_tmp" '{schema:"polyedge.qset_v4_boundary_pre.v1",generatedAtUtc:$generated,boundaryUtc:"2026-08-24T00:00:00Z",writer:{mainPid:($pid|tonumber),invocationId:$invocation,containerId:$container,image:$image,revision:$revision,freezeSha256:$freeze,freezeBlob:$freeze_blob,status:$status[0]},qsetV3:{stoppedAndDisabled:true},qsetV2:{healthy:true,firstSealTimerStillEnabled:true},azureEvidenceMutationPerformed:false}' >"$receipt_tmp"
   test "$(date -u +%s)" -lt "$boundary_epoch"; commit_receipt "$receipt_tmp" "$pre_receipt"; exit 0
+fi
+
+if test -e "$post_receipt"; then
+  secure_file "$pre_receipt" 640 1048576
+  secure_file "$post_receipt" 640 1048576
+  validate_post_receipt "$pre_receipt" "$post_receipt"
+  systemctl disable --now "$v2_seal_timer"
+  disabled "$v2_seal_timer"
+  logger -p daemon.info -t polyedge-qset-v4-boundary 'resumed committed qset-v4 boundary post receipt; disabled unsafe qset-v2 first-seal timer without Azure evidence mutation'
+  exit 0
 fi
 
 now=$(date -u +%s); test "$now" -ge "$boundary_epoch" && test "$now" -le $((boundary_epoch + 900))

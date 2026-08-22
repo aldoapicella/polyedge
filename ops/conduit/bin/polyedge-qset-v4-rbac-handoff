@@ -9,6 +9,8 @@ readonly v3_processor_job=polyedge-shadow-qset-v3-neu-job
 readonly v4_writer_service=polyedge-shadow-qset-v4.service
 readonly token=/run/polyedge-federated-shadow-qset-v3-writer/azure-federated-token
 readonly receipt_root=/srv/polyedge-ring/migration/qset-v4/rbac-handoff
+readonly before_receipt=$receipt_root/v3-assignments-before.json
+readonly rollback_receipt=$receipt_root/rollback-result.json
 
 case "$mode" in check|apply) ;; *) echo "usage: ${0##*/} check|apply" >&2; exit 64 ;; esac
 : "${AZURE_RESOURCE_GROUP:?AZURE_RESOURCE_GROUP is required}"
@@ -124,6 +126,39 @@ prove_old_containers_denied() {
       } console.log(JSON.stringify({oldContainersDenied:true}));
     ' | jq -e '.oldContainersDenied == true' >/dev/null
 }
+assignment_is_restored() {
+  local assignment=$1 existing=$2
+  jq -e --argjson expected "$assignment" '
+    [.[] | select(.id == $expected.id)] as $found |
+    ($found | length) == 1 and
+    $found[0].principalId == $expected.principalId and
+    $found[0].scope == $expected.scope and
+    $found[0].roleDefinitionId == $expected.roleDefinitionId and
+    (($found[0].condition // "") == ($expected.condition // "")) and
+    (($found[0].conditionVersion // "") == ($expected.conditionVersion // ""))
+  ' <<<"$existing" >/dev/null
+}
+record_rollback_result() {
+  local temporary before_sha
+  before_sha="sha256:$(sha256sum "$before_receipt" | cut -d' ' -f1)"
+  if test -e "$rollback_receipt"; then
+    test ! -L "$rollback_receipt" && test "$(stat -c '%u:%g:%a:%h' "$rollback_receipt")" = 0:0:640:1
+    jq -e --arg before "$before_sha" '.schema == "polyedge.qset_v4_rbac_rollback_result.v1" and .beforeAssignmentsSha256 == $before and .v4AssignmentsRemoved == true and .v3AssignmentsRestored == true' "$rollback_receipt" >/dev/null
+    return
+  fi
+  temporary=$(mktemp "$receipt_root/.rollback.XXXXXX")
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg before "$before_sha" '{schema:"polyedge.qset_v4_rbac_rollback_result.v1",generatedAtUtc:$generated,beforeAssignmentsSha256:$before,v4AssignmentsRemoved:true,v3AssignmentsRestored:true}' >"$temporary"
+  chown root:root "$temporary" && chmod 0640 "$temporary"
+  sync -f "$temporary" && mv "$temporary" "$rollback_receipt" && sync -f "$rollback_receipt" && sync -d "$receipt_root"
+}
+reconcile_rollback() {
+  local remaining restored
+  delete_v4_assignments
+  restore_old_assignments
+  remaining=$(mktemp); collect_assignments qset-v4 >"$remaining"; jq -e '.all | length == 0' "$remaining" >/dev/null; rm -f "$remaining"
+  restored=$(mktemp); collect_assignments qset-v3 >"$restored"; assert_exact_eight qset-v3 "$restored"; rm -f "$restored"
+  record_rollback_result
+}
 delete_v4_assignments() {
   local partial
   partial=$(mktemp)
@@ -136,12 +171,15 @@ restore_old_assignments() {
     local id principal scope role condition condition_version
     id=$(jq -er '.id' <<<"$assignment"); principal=$(jq -er '.principalId' <<<"$assignment"); scope=$(jq -er '.scope' <<<"$assignment"); role=$(jq -er '.roleDefinitionId' <<<"$assignment")
     condition=$(jq -r '.condition // empty' <<<"$assignment"); condition_version=$(jq -r '.conditionVersion // empty' <<<"$assignment")
+    existing=$(az role assignment list --all --assignee-object-id "$principal" --scope "$scope" --role "$role" -o json)
+    if assignment_is_restored "$assignment" "$existing"; then continue; fi
+    test "$(jq 'length' <<<"$existing")" = 0
     if test -n "$condition"; then
       test "$condition_version" = 2.0
-      az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal --role "$role" --scope "$scope" --name "${id##*/}" --condition "$condition" --condition-version "$condition_version" >/dev/null
+      az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal --role "$role" --scope "$scope" --name "${id##*/}" --condition "$condition" --condition-version "$condition_version" >/dev/null || { existing=$(az role assignment list --all --assignee-object-id "$principal" --scope "$scope" --role "$role" -o json); assignment_is_restored "$assignment" "$existing"; }
     else
       test -z "$condition_version"
-      az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal --role "$role" --scope "$scope" --name "${id##*/}" >/dev/null
+      az role assignment create --assignee-object-id "$principal" --assignee-principal-type ServicePrincipal --role "$role" --scope "$scope" --name "${id##*/}" >/dev/null || { existing=$(az role assignment list --all --assignee-object-id "$principal" --scope "$scope" --role "$role" -o json); assignment_is_restored "$assignment" "$existing"; }
     fi
   done
 }
@@ -150,8 +188,7 @@ cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
   if test "$handoff_started" = true && test "$handoff_succeeded" != true; then
-    delete_v4_assignments || true
-    restore_old_assignments || true
+    reconcile_rollback || true
   fi
   rm -f "$before" "${after:-}"
   exit "$status"
@@ -169,9 +206,14 @@ if test "$mode" = check; then
 fi
 require_apply_bindings
 install -d -o root -g root -m 0750 "$receipt_root"
-capture=$(mktemp "$receipt_root/.v3-assignments.XXXXXX"); cp "$before" "$capture"; chown root:root "$capture" && chmod 0640 "$capture"
-test ! -e "$receipt_root/v3-assignments-before.json"
-sync -f "$capture" && mv "$capture" "$receipt_root/v3-assignments-before.json" && sync -f "$receipt_root/v3-assignments-before.json" && sync -d "$receipt_root"
+if test -e "$before_receipt"; then
+  test ! -L "$before_receipt" && test "$(stat -c %u:%g:%a:%h "$before_receipt")" = 0:0:640:1
+  assert_exact_eight qset-v3 "$before_receipt"
+  cp "$before_receipt" "$before"
+else
+  capture=$(mktemp "$receipt_root/.v3-assignments.XXXXXX"); cp "$before" "$capture"; chown root:root "$capture" && chmod 0640 "$capture"
+  sync -f "$capture" && mv "$capture" "$before_receipt" && sync -f "$before_receipt" && sync -d "$receipt_root"
+fi
 handoff_started=true
 jq -r '.all[].id' "$before" | while IFS= read -r assignment_id; do az role assignment delete --ids "$assignment_id"; done
 after=$(mktemp); collect_assignments qset-v3 >"$after"; jq -e '.all | length == 0' "$after" >/dev/null
