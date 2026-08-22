@@ -4,12 +4,13 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 runner=$root/bin/polyedge-run-job
 preflight=$root/bin/polyedge-qset-v4-processor-preflight
+handoff=$root/bin/polyedge-qset-v4-processor-handoff
 env_file=$root/env/qset-v4-processor.env.example
 service=$root/systemd/polyedge-qset-v4-processor.service
 mapping=$root/compute-plane-mapping.json
 disk_guard=$root/bin/polyedge-boot-disk-guard
 
-sh -n "$runner" "$preflight"
+sh -n "$runner" "$preflight" "$handoff"
 if env -i PATH="$PATH" "$preflight" >/dev/null 2>&1; then
   echo 'qset-v4 processor preflight accepted missing bindings' >&2
   exit 1
@@ -77,3 +78,4 @@ jq -e '
   }]
   and (.protectedTrustRules.shadowQsetV4Processor | contains("no funded, qset-v1/v2/v3, Key Vault, Service Bus"))
 ' "$mapping" >/dev/null
+"$root/test/test-qset-v4-processor-handoff.sh"

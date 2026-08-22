@@ -172,18 +172,17 @@ Do not deploy an Azure job. After both sealed-day receipts exist, the separately
 The local deployment guard must reject any image other than `researchImage`, any OCI revision other than `sourceCommit`, any different receipt hash/path, any Azure Container Apps qset-v4 job, and any funded/v1/v2/v3/KV/Service Bus access. Install the maintained local processor components without a timer or enablement:
 
 ```sh
-sudo install -m 0755 ops/conduit/bin/polyedge-run-job ops/conduit/bin/polyedge-qset-v4-processor-preflight /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-run-job ops/conduit/bin/polyedge-qset-v4-processor-preflight ops/conduit/bin/polyedge-qset-v4-processor-handoff /usr/local/libexec/
 sudo install -D -m 0640 ops/conduit/env/qset-v4-processor.env.example /etc/polyedge/jobs/qset-v4-processor.env
 sudo chown root:root /etc/polyedge/jobs/qset-v4-processor.env
 sudo install -m 0644 ops/conduit/systemd/polyedge-qset-v4-processor.service /etc/systemd/system/
 sudo systemctl daemon-reload
 ```
 
-Leave the service disabled. Only after the exact source-freeze receipt v2 and both 2026-08-24/2026-08-25 sealed receipts and inventory hashes pass preflight may the operator create the explicit manual gate and start one execution:
+Leave the service disabled. Only after the exact source-freeze receipt v2 and both 2026-08-24/2026-08-25 sealed receipts exist, run the root-only no-argument handoff. It first runs the maintained read-only `polyedge-qset-v4-rbac-handoff verify-live` gate, which proves exact v4 5/3/1 assignments, denied v1/v2/v3/funded/Key Vault/Service Bus access, unchanged v3, and no Azure qset-v4 processor job. The root caller uses the authenticated `ubuntu` Azure CLI context while retaining root-only token-file access. The handoff derives the four receipt/inventory hashes, preflights the candidate, fsyncs a blank-environment snapshot and `attempt.json`, installs the bound environment and gate, then fsyncs `dispatched.json` immediately before asking systemd to start. A durable attempt without dispatch may resume; a dispatch without a recoverable invocation is fail-closed and never replayed. After observing the invocation it binds `started.json`; on success it removes the gate, repeats the disk guard, and records terminal `completed.json`, which remains valid across reboot after the full marker chain is revalidated.
 
 ```sh
-sudo install -o root -g root -m 0640 /dev/null /etc/polyedge/ENABLE_QSET_V4_PROCESSOR_MANUAL
-sudo systemctl start polyedge-qset-v4-processor.service
+sudo /usr/local/libexec/polyedge-qset-v4-processor-handoff
 ```
 
 Do not add recurrence. Require successful output hash/readback and the processor negative-access proof first.

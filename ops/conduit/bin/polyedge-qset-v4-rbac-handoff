@@ -24,9 +24,19 @@ readonly apply_receipt=$receipt_root/apply-result.json
 readonly rollback_receipt=$receipt_root/rollback-result.json
 readonly template=infra/shadow-profitability-qset-v4.bicep
 
-case "$mode" in check|apply|rollback) ;; *) echo "usage: ${0##*/} check|apply|rollback" >&2; exit 64 ;; esac
+case "$mode" in check|apply|rollback|verify-live) ;; *) echo "usage: ${0##*/} check|apply|rollback|verify-live" >&2; exit 64 ;; esac
 : "${AZURE_RESOURCE_GROUP:?AZURE_RESOURCE_GROUP is required}"
 : "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
+
+az() {
+  if test -n "${QSET_V4_RBAC_RECEIPT_ROOT_TEST_ONLY:-}"; then
+    command az "$@"
+  elif test "$(id -u)" = 0; then
+    /usr/sbin/runuser -u ubuntu -- /usr/bin/az "$@"
+  else
+    /usr/bin/az "$@"
+  fi
+}
 
 secure_file() {
   local path=$1 expected_mode=$2 max=$3
@@ -317,6 +327,24 @@ if test "$mode" = check; then
   collect_api_v4 >"$api_current"; jq -e 'length==0' "$api_current" >/dev/null
   validate_template; assert_v3_unchanged "$v3_before"
   jq -nc '{schema:"polyedge.qset_v4_rbac_check.v1",v4PrincipalsHaveZeroAssignments:true,v3ActiveHealthyUnchanged:true,v3TimersDisabled:true,azureProcessorJobAbsent:true,template:{resources:16,roleAssignments:9,computeResources:0},azureMutationPerformed:false}'
+  exit 0
+fi
+
+if test "$mode" = verify-live; then
+  v4_current=$(mktemp); api_current=$(mktemp)
+  collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v4_current"
+  collect_api_v4 >"$api_current"
+  assert_campaign_assignments 4 "$v4_current" "$writer_principal" "$processor_principal"
+  assert_api_reader "$api_current"
+  negative_receipts=$(mktemp)
+  for _ in 1 2 3 4 5 6; do
+    if { probe_denials writer "$writer_token" "$writer_client_id"; probe_denials processor "$processor_token" "$processor_client_id"; } >"$negative_receipts"; then break; fi
+    sleep 10
+  done
+  jq -s -e 'length==2 and all(.[];.v1V2V3AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)' "$negative_receipts" >/dev/null
+  assert_v3_unchanged "$v3_before"
+  require_no_azure_processor_job
+  jq -n --slurpfile denials "$negative_receipts" '{schema:"polyedge.qset_v4_rbac_verify_live.v1",writerAssignments:5,processorAssignments:3,apiReaderAssignments:1,v1V2V3FundedKeyVaultAndServiceBusDenied:$denials,v3ActiveHealthyUnchanged:true,azureProcessorJobAbsent:true}'
   exit 0
 fi
 

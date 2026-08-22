@@ -213,6 +213,23 @@ test "$(wc -l <"$STATE/delete.log")" = 2
 jq -se 'all(.[];length==0)' "$STATE/assign-writer-pid.json" "$STATE/assign-processor-pid.json" "$STATE/assign-api-pid.json" >/dev/null
 test ! -e "$RECEIPTS/v4-assignments.json"
 
+setup_case verify-live
+cp "$STATE/full-writer.json" "$STATE/assign-writer-pid.json"
+cp "$STATE/full-processor.json" "$STATE/assign-processor-pid.json"
+cp "$STATE/full-api.json" "$STATE/assign-api-pid.json"
+run_handoff verify-live | jq -e '
+  .schema=="polyedge.qset_v4_rbac_verify_live.v1"
+  and .writerAssignments==5 and .processorAssignments==3 and .apiReaderAssignments==1
+  and (.v1V2V3FundedKeyVaultAndServiceBusDenied|length==2)
+  and ([.v1V2V3FundedKeyVaultAndServiceBusDenied[].lane]|sort==["processor","writer"])
+  and all(.v1V2V3FundedKeyVaultAndServiceBusDenied[]; .v1V2V3AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)
+' >/dev/null
+jq '[.[0]]' "$STATE/full-writer.json" >"$STATE/assign-writer-pid.json"
+if run_handoff verify-live >/dev/null 2>&1; then echo 'verify-live accepted missing assignment' >&2; exit 1; fi
+cp "$STATE/full-writer.json" "$STATE/assign-writer-pid.json"
+jq '. + [.[0] | .id="/assign/writer-extra"]' "$STATE/full-writer.json" >"$STATE/assign-writer-pid.json"
+if run_handoff verify-live >/dev/null 2>&1; then echo 'verify-live accepted extra assignment' >&2; exit 1; fi
+
 a="${EXTRA_FIC:-}"; setup_case extra-fic; EXTRA_FIC=writer
 if run_handoff check >/dev/null 2>&1; then echo 'extra federated credential accepted' >&2; exit 1; fi
 EXTRA_FIC=$a
