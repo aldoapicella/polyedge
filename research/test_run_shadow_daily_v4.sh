@@ -54,6 +54,8 @@ export SHADOW_EXECUTION_MODEL_BLOB_NAME=models/prior.json
 grep -F 'research normalize --input azure://stpolyedge/polyedge-shadow-qset-v4-events/shadow-events/campaign-2026-08-24-qset-v4/2026/08/24/' "$TMP/args" >/dev/null
 grep -F -- '--campaign-contract research/configs/profitability_gate_v3_2026-08-24_qset_v4.yaml' "$TMP/args" >/dev/null
 test "$(jq -r '.manifest_path' "$TMP/work/reports/research/shadow/campaigns/campaign-2026-08-24-qset-v4/staging/"*/code_freeze_binding.json)" = "$SHADOW_CODE_FREEZE_MANIFEST"
+if ( cd "$TMP/work"; PATH="$TMP/bin:$PATH" POLYEDGE_TEST_ARGS="$TMP/args" POLYEDGE_UTC_TODAY=2026-08-26 SHADOW_REPORT_DATE=2026-10-23 SHADOW_CASCADE_THROUGH=2026-10-23 sh "$REPO/research/run_shadow_daily_v4.sh" >/dev/null 2>&1 ); then echo "v4 runner accepted a terminal-past report date" >&2; exit 1; fi
+if ( cd "$TMP/work"; PATH="$TMP/bin:$PATH" POLYEDGE_TEST_ARGS="$TMP/args" POLYEDGE_UTC_TODAY=2026-08-26 SHADOW_REPORT_DATE=2026-08-24 SHADOW_CASCADE_THROUGH=2026-10-23 sh "$REPO/research/run_shadow_daily_v4.sh" >/dev/null 2>&1 ); then echo "v4 runner accepted a terminal-past cascade date" >&2; exit 1; fi
 
 for retired in campaign-2026-07-28-qset-v1 campaign-2026-08-22-qset-v2 campaign-2026-08-23-qset-v3; do
   if (

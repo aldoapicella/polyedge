@@ -1,6 +1,20 @@
 #!/bin/sh
 set -eu
 
+validate_campaign_date() {
+  date=$1
+  case "$date" in
+    2026-08-2[4-9]|2026-08-3[01]|2026-09-0[1-9]|2026-09-[12][0-9]|2026-09-30|2026-10-0[1-9]|2026-10-1[0-9]|2026-10-2[0-2]) ;;
+    2026-10-2[3-9]|2026-10-3[01]) echo "qset-v4 refuses date after terminal 2026-10-22" >&2; exit 64 ;;
+    *) echo "qset-v4 refuses date outside the 2026-08-24 through 2026-10-22 campaign" >&2; exit 64 ;;
+  esac
+}
+if [ "${QSET_V4_DATE_VALIDATION_ONLY:-false}" = true ]; then
+  [ "$#" = 1 ] || exit 64
+  validate_campaign_date "$1"
+  exit 0
+fi
+
 env_file=/etc/polyedge/qset-v4-sealer.env
 [ ! -L "$env_file" ] && [ -f "$env_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$env_file")" = 0:0:640:1 ] || {
   echo 'qset-v4 sealer environment is missing or unsafe' >&2; exit 64;
@@ -65,8 +79,8 @@ container_freeze_is "EXECUTION_FREEZE_ARTIFACT_PATH=$EXECUTION_FREEZE_ARTIFACT_P
 receipt_root=/srv/polyedge-ring/migration/qset-v4-seal
 install -d -m 0750 "$receipt_root"
 run_sealer() {
-  date=
-  case "" in 2026-08-24|2026-08-25|2026-08-26|2026-08-27|2026-08-28|2026-08-29|2026-08-30|2026-08-31|2026-09-??|2026-10-01|2026-10-02|2026-10-03|2026-10-04|2026-10-05|2026-10-06|2026-10-07|2026-10-08|2026-10-09|2026-10-10|2026-10-11|2026-10-12|2026-10-13|2026-10-14|2026-10-15|2026-10-16|2026-10-17|2026-10-18|2026-10-19|2026-10-20|2026-10-21|2026-10-22) ;; 2026-10-23|2026-10-24|2026-10-25|2026-10-26|2026-10-27|2026-10-28|2026-10-29|2026-10-30|2026-10-31) echo "qset-v4 refuses date after terminal 2026-10-22" >&2; exit 64 ;; *) echo "qset-v4 refuses date outside the 2026-08-24 through 2026-10-22 campaign" >&2; exit 64 ;; esac
+  date=$1
+  validate_campaign_date "$date"
   shift
   podman run --rm --pull=never --log-driver=journald --name "polyedge-qset-v4-seal-$date" --network polyedge \
     --user 983:979 --cpus 0.5 --memory 1g --pids-limit 256 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=32m --cap-drop=all \

@@ -6,6 +6,12 @@ test "$#" -ge 1 || {
   echo "usage: verify_shadow_daily_v4_bundle.sh YYYY-MM-DD [YYYY-MM-DD ...]" >&2
   exit 2
 }
+validate_qset_v4_bundle_date() {
+  value=$1
+  case "$value" in 2026-08-2[4-9]|2026-08-3[01]|2026-09-0[1-9]|2026-09-[12][0-9]|2026-09-30|2026-10-0[1-9]|2026-10-1[0-9]|2026-10-2[0-2]) ;; *) echo "qset-v4 verifier rejects date outside 2026-08-24 through 2026-10-22: $value" >&2; exit 2 ;; esac
+}
+for requested_date in "$@"; do validate_qset_v4_bundle_date "$requested_date"; done
+
 
 test "${SHADOW_CAMPAIGN_ID:?SHADOW_CAMPAIGN_ID is required}" = "campaign-2026-08-24-qset-v4" \
   && test "${SHADOW_EVIDENCE_VERSION:?SHADOW_EVIDENCE_VERSION is required}" = "protocol-v3-qset-v4" \

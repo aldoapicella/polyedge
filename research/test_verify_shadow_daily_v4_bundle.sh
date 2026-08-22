@@ -59,6 +59,8 @@ export SHADOW_CODE_FREEZE_SHA256="$FREEZE_SHA" EXECUTION_FREEZE_ARTIFACT_PATH="$
 export SOURCE_FREEZE_FILE
 
 sh "$REPO/research/verify_shadow_daily_v4_bundle.sh" "$DATE" "$DATE"
+if sh "$REPO/research/verify_shadow_daily_v4_bundle.sh" 2026-10-23 >/dev/null 2>&1; then echo "v4 verifier accepted terminal-past date" >&2; exit 1; fi
+if sh "$REPO/research/verify_shadow_daily_v4_bundle.sh" 2026-08-23 >/dev/null 2>&1; then echo "v4 verifier accepted pre-start date" >&2; exit 1; fi
 
 if SHADOW_CODE_FREEZE_FINALIZED=false sh "$REPO/research/verify_shadow_daily_v4_bundle.sh" "$DATE" >/dev/null 2>&1; then
   echo "v4 verifier accepted a draft freeze" >&2

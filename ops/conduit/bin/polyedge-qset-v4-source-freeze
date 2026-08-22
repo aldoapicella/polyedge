@@ -10,18 +10,23 @@ readonly control_container=polyedge-qset-v4-control
 
 usage() { echo "usage: ${0##*/} build OUTPUT | lock-and-upload MANIFEST" >&2; exit 64; }
 secure_manifest() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%s' "$1")" -gt 0 && test "$(stat -c '%s' "$1")" -le 1048576; }
+verify_image_binding() {
+  local image=$1 source_commit=$2
+  printf '%s' "$image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$'
+  test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$image")" = "linux/arm64|$source_commit"
+  podman manifest inspect "$image" | jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | index("linux/amd64") and index("linux/arm64")' >/dev/null
+}
+
 
 build() {
   local output=$1 temporary files
   test ! -e "$output"
   test -d "$(dirname "$output")"
   : "${FREEZE_RESEARCH_IMAGE:?FREEZE_RESEARCH_IMAGE is required}"
-  printf '%s' "$FREEZE_RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$'
-  test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$FREEZE_RESEARCH_IMAGE")" = "linux/arm64|$(git -C "$repo" rev-parse HEAD)"
-  docker buildx imagetools inspect "$FREEZE_RESEARCH_IMAGE" --raw | jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | index("linux/amd64") and index("linux/arm64")' >/dev/null
+  verify_image_binding "$FREEZE_RESEARCH_IMAGE" "$(git -C "$repo" rev-parse HEAD)"
   files=$(mktemp); temporary=$(mktemp "$(dirname "$output")/.qset-v4-freeze.XXXXXX")
   trap 'rm -f "$files" "$temporary"' EXIT HUP INT TERM
-  jq -r '.protected_files[]' "$policy" | LC_ALL=C sort -u >"$files"
+  git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-08-24_qset_v4.json | jq -r '.protected_files[]' | LC_ALL=C sort -u >"$files"
   test "$(wc -l <"$files")" -gt 0
   while IFS= read -r file; do
     git -C "$repo" cat-file -e "HEAD:$file"
@@ -35,9 +40,14 @@ build() {
 }
 
 lock_and_upload() {
-  local manifest=$1 digest blob temporary policy_json state etag remote receipt_root receipt_tmp receipt
+  local manifest=$1 digest blob temporary policy_json state etag remote receipt_root receipt_tmp receipt current_commit current_tree manifest_image
   : "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
   secure_manifest "$manifest"
+  current_commit=$(git -C "$repo" rev-parse HEAD)
+  current_tree=$(git -C "$repo" rev-parse 'HEAD^{tree}')
+  manifest_image=$(jq -er '.research_image' "$manifest")
+  jq -e --arg id "$campaign_id" --arg version "$evidence_version" --arg commit "$current_commit" --arg tree "$current_tree" --arg image "$manifest_image" '.campaign_id == $id and .evidence_version == $version and .source_commit == $commit and .git_tree == $tree and .research_image == $image' "$manifest" >/dev/null
+  verify_image_binding "$manifest_image" "$current_commit"
   digest=$(sha256sum "$manifest" | cut -d' ' -f1)
   blob="reports/research/shadow/campaigns/$campaign_id/control/code-freeze/source-$digest.json"
   jq -e --arg id "$campaign_id" --arg version "$evidence_version" '.campaign_id == $id and .evidence_version == $version' "$manifest" >/dev/null

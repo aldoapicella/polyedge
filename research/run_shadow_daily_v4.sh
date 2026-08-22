@@ -16,6 +16,15 @@ case "$CAMPAIGN_ID" in
     ;;
 esac
 
+validate_qset_v4_date() {
+  value=$1 label=$2
+  case "$value" in 2026-08-2[4-9]|2026-08-3[01]|2026-09-0[1-9]|2026-09-[12][0-9]|2026-09-30|2026-10-0[1-9]|2026-10-1[0-9]|2026-10-2[0-2]) ;; *) echo "$label is outside the qset-v4 2026-08-24 through 2026-10-22 boundary" >&2; exit 1 ;; esac
+}
+qset_v4_report_date=${SHADOW_REPORT_DATE:-$(date -u -d '2 days ago' +%Y-%m-%d)}
+qset_v4_cascade_through=${SHADOW_CASCADE_THROUGH:-$(date -u -d '2 days ago' +%Y-%m-%d)}
+validate_qset_v4_date "$qset_v4_report_date" SHADOW_REPORT_DATE
+validate_qset_v4_date "$qset_v4_cascade_through" SHADOW_CASCADE_THROUGH
+
 test "${SHADOW_CAMPAIGN_START:?SHADOW_CAMPAIGN_START is required}" = "2026-08-24" \
   && test "${SHADOW_CAMPAIGN_PREFIX:-shadow-events/$CAMPAIGN_ID}" = "shadow-events/$CAMPAIGN_ID" \
   && test "${SHADOW_CAMPAIGN_REPORT_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID}" = "reports/research/shadow/campaigns/$CAMPAIGN_ID" \
