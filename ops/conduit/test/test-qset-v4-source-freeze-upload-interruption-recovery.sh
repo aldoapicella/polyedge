@@ -35,7 +35,7 @@ case "$*" in
     printf '%s\n' '{"protected_files":["infra/test"]}'
     ;;
   *"show HEAD:") printf '%s\n' source ;;
-  *"cat-file -s HEAD:") printf '%s\n' 7 ;;
+  *"cat-file -s HEAD:"*) printf '%s\n' 7 ;;
   *"cat-file -e HEAD:"*|*"ls-files --error-unmatch "*) : ;;
   *) exit 64 ;;
 esac
