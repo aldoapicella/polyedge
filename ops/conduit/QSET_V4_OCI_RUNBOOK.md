@@ -38,8 +38,10 @@ bindings blank. The conservative-prior URI and hash are exact.
 ```sh
 sudo install -m 0755 ops/conduit/bin/polyedge-federated-token-refresh /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-seal-days /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-boundary-guard /usr/local/libexec/
 sudo install -m 0644 ops/conduit/quadlets/polyedge-shadow-qset-v4.container /etc/containers/systemd/
 sudo install -m 0644 ops/conduit/systemd/polyedge-qset-v4-seal-days.service ops/conduit/systemd/polyedge-qset-v4-first-seal.timer /etc/systemd/system/
+sudo install -m 0644 ops/conduit/systemd/polyedge-qset-v4-boundary@.service ops/conduit/systemd/polyedge-qset-v4-boundary-pre.timer ops/conduit/systemd/polyedge-qset-v4-boundary-post.timer /etc/systemd/system/
 sudo install -m 0600 ops/conduit/env/shadow-qset-v4.env.example /etc/polyedge/shadow-qset-v4.env
 sudo install -m 0640 ops/conduit/env/qset-v4-sealer.env.example /etc/polyedge/qset-v4-sealer.env
 sudo chown root:root /etc/polyedge/qset-v4-sealer.env
@@ -56,7 +58,7 @@ to the reviewed relative blob path, set `EXECUTION_FREEZE_SHA256` equal to
 `RELATIVE_PATH` and its hash to `seal-qset-v4-day`; it never passes the Azure URI. Replace only the installed
 v4 Quadlet's zero image digest, pull that exact digest after the boot-disk pull
 gate, and verify `linux/arm64` and `org.opencontainers.image.revision`. The
-v4 bundle intentionally does not use the frozen shared digest-deploy helper.
+v4 bundle intentionally does not use the frozen shared digest-deploy helper. Set `POLYEDGE_QSET_V4_WRITER_IMAGE` to that exact immutable digest and `POLYEDGE_QSET_V4_WRITER_GIT_SHA` to its matching full OCI revision; the boundary guard rejects a container whose image, revision, campaign resources, or final freeze binding differs.
 
 Before enabling the writer, copy the existing immutable conservative prior into
 the exact v4 research path. Use only a temporary source-container reader and
@@ -86,20 +88,24 @@ sudo systemctl enable --now polyedge-federated-token@shadow-qset-v3-writer.timer
 sudo systemctl start polyedge-shadow-qset-v4.service
 sudo podman healthcheck run polyedge-shadow-qset-v4
 sudo systemctl show -p MainPID -p ActiveEnterTimestamp polyedge-shadow-qset-v4.service
+sudo systemctl disable --now polyedge-shadow-qset-v3.service polyedge-qset-v3-boundary-pre.timer polyedge-qset-v3-boundary-post.timer polyedge-qset-v3-first-seal.timer
+sudo systemctl enable --now polyedge-qset-v4-boundary-pre.timer polyedge-qset-v4-boundary-post.timer
 ```
 
 Immediately before and after `2026-08-24T00:00:00Z`, verify the service remains
 active with the same `MainPID`. Do not restart it at the boundary. The runtime
 switches from the preflight prefix to
 `shadow-events/campaign-2026-08-24-qset-v4` from the configured UTC clock.
-Check its journal for the observed effective prefix and retain that evidence.
+The pre/post timers invoke the local-only guard at `2026-08-23 23:59:30 UTC` and `2026-08-24 00:01:30 UTC`. It fails closed unless the v4 recorder is clean and its intent publisher is exactly configured, prepared, and pointer-only preflight; the v3 writer and all v3 boundary/first-seal timers are stopped and disabled; and v2 remains healthy. It writes root-owned, no-overwrite receipts under `/srv/polyedge-ring/migration/qset-v4/boundary/` without mutating Azure evidence. After committing the post receipt, it disables only v2's unsafe first-seal timer. Check its journal and retain both receipts.
+
+Before any authorized rollout, use `ops/conduit/bin/polyedge-qset-v4-source-freeze build OUTPUT` from a clean committed checkout with `FREEZE_RESEARCH_IMAGE` set to the reviewed immutable digest. Only an explicitly authorized operator may run `lock-and-upload` to lock the v4 control-container policy, upload with overwrite disabled, and hash-readback the exact manifest. Then run `ops/conduit/bin/polyedge-qset-v4-rbac-handoff check` to prove the eight exact v3 writer/processor assignments and all retired initiators. Its `apply` mode is the only handoff path: it deletes those captured assignments, verifies zero old scopes, deploys v4-only scopes, proves old v3 containers deny the reused writer identity, and never starts v4. Do not run either mutating mode during review.
 
 The first seal is one-shot and disabled until the two complete UTC days exist.
 At `2026-08-26 02:15 UTC`, it validates exactly August 24 and August 25 while
 the writer is healthy, then takes the existing `/run/polyedge/research.lock`,
 fences the v4 writer, seals both days, writes deterministic receipts under
 `/srv/polyedge-ring/migration/qset-v4-seal/`, and restarts/health-checks only
-the v3 writer. It fails closed on any mismatch or a conflicting receipt.
+the v4 writer. It fails closed on any mismatch or a conflicting receipt.
 
 ```sh
 sudo systemctl enable --now polyedge-qset-v4-first-seal.timer

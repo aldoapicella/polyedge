@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+readonly mode=${1:-}
+readonly v3_writer_service=polyedge-shadow-qset-v3.service
+readonly v3_seal_service=polyedge-qset-v3-seal-days.service
+readonly v3_processor_job=polyedge-shadow-qset-v3-neu-job
+readonly v4_writer_service=polyedge-shadow-qset-v4.service
+readonly token=/run/polyedge-federated-shadow-qset-v3-writer/azure-federated-token
+readonly receipt_root=/srv/polyedge-ring/migration/qset-v4/rbac-handoff
+
+case "$mode" in check|apply) ;; *) echo "usage: ${0##*/} check|apply" >&2; exit 64 ;; esac
+: "${AZURE_RESOURCE_GROUP:?AZURE_RESOURCE_GROUP is required}"
+: "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
+
+disabled_or_masked() {
+  local unit=$1 state
+  ! systemctl is-active --quiet "$unit"
+  state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  case "$state" in disabled|masked) ;; *) echo "$unit must be disabled or masked, got ${state:-unknown}" >&2; exit 1 ;; esac
+}
+
+require_retired_initiators() {
+  disabled_or_masked "$v3_writer_service"
+  disabled_or_masked "$v3_seal_service"
+  disabled_or_masked polyedge-qset-v3-boundary-pre.timer
+  disabled_or_masked polyedge-qset-v3-boundary-post.timer
+  disabled_or_masked polyedge-qset-v3-first-seal.timer
+  disabled_or_masked "$v4_writer_service"
+  local job executions
+  job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$v3_processor_job" -o json)
+  jq -e '.properties.configuration.triggerType == "Manual"' <<<"$job" >/dev/null
+  executions=$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$v3_processor_job" -o json)
+  jq -e '[.[] | select((.properties.status // .status // "") | test("Running|Provisioning|Processing"))] | length == 0' <<<"$executions" >/dev/null
+}
+
+resolve_ids() {
+  subscription_id=$(az account show --query id -o tsv)
+  storage_id=$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_STORAGE_ACCOUNT_NAME" --query id -o tsv)
+  writer_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name id-polyedge-conduit-shadow-qset-v3-writer --query principalId -o tsv)
+  processor_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name id-polyedge-conduit-shadow-qset-v3-processor --query principalId -o tsv)
+  test -n "$subscription_id" && test -n "$storage_id" && test -n "$writer_principal" && test -n "$processor_principal"
+}
+
+collect_assignments() {
+  local campaign=$1 raw research control event_index chart_series market_catalog writer processor writer_roles processor_roles
+  raw=polyedge-shadow-qset-${campaign}-events
+  research=polyedge-research-${campaign}
+  control=polyedge-qset-${campaign}-control
+  event_index=ShadowQsetV${campaign#qset-v}EventIndex
+  chart_series=ShadowQsetV${campaign#qset-v}ChartSeries
+  market_catalog=ShadowQsetV${campaign#qset-v}MarketCatalog
+  writer_roles=$(az role assignment list --all --assignee-object-id "$writer_principal" -o json)
+  processor_roles=$(az role assignment list --all --assignee-object-id "$processor_principal" -o json)
+  jq -n --arg raw "$storage_id/blobServices/default/containers/$raw" --arg research "$storage_id/blobServices/default/containers/$research" --arg control "$storage_id/blobServices/default/containers/$control" --arg event "$storage_id/tableServices/default/tables/$event_index" --arg chart "$storage_id/tableServices/default/tables/$chart_series" --arg market "$storage_id/tableServices/default/tables/$market_catalog" --argjson writer "$writer_roles" --argjson processor "$processor_roles" '
+    [ $writer[] | select(.scope == $raw or .scope == $control or .scope == $event or .scope == $chart or .scope == $market) | {id,scope,roleDefinitionId,principalId} ] as $writer_found |
+    [ $processor[] | select(.scope == $raw or .scope == $research or .scope == $control) | {id,scope,roleDefinitionId,principalId} ] as $processor_found |
+    {writer:$writer_found,processor:$processor_found,all:($writer_found + $processor_found),expected:{writer:[$raw,$control,$event,$chart,$market],processor:[$raw,$research,$control]}}
+  '
+}
+
+assert_exact_eight() {
+  jq -e '
+    (.writer | length) == 5 and (.processor | length) == 3 and (.all | length) == 8 and
+    (([.all[].id] | length) == ([.all[].id] | unique | length)) and
+    ([.writer[].scope] | sort) == (.expected.writer | sort) and
+    ([.processor[].scope] | sort) == (.expected.processor | sort)
+  ' "$1" >/dev/null
+}
+
+require_apply_bindings() {
+  : "${V4_PROCESSOR_IMAGE:?V4_PROCESSOR_IMAGE is required}"
+  : "${V4_PROCESSOR_GIT_SHA:?V4_PROCESSOR_GIT_SHA is required}"
+  : "${V4_SEALED_DAY_ONE_INVENTORY_SHA256:?V4_SEALED_DAY_ONE_INVENTORY_SHA256 is required}"
+  : "${V4_SEALED_DAY_TWO_INVENTORY_SHA256:?V4_SEALED_DAY_TWO_INVENTORY_SHA256 is required}"
+  : "${V4_EXECUTION_FREEZE_SHA256:?V4_EXECUTION_FREEZE_SHA256 is required}"
+  : "${V4_EXECUTION_FREEZE_ARTIFACT_PATH:?V4_EXECUTION_FREEZE_ARTIFACT_PATH is required}"
+  : "${V4_ACCESS_PROBE_IMAGE:?V4_ACCESS_PROBE_IMAGE is required}"
+  printf '%s' "$V4_PROCESSOR_IMAGE" | grep -Eq '^ghcr\.io/.+@sha256:[0-9a-f]{64}$'
+  printf '%s' "$V4_PROCESSOR_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$'
+  printf '%s' "$V4_EXECUTION_FREEZE_SHA256" | grep -Eq '^sha256:[0-9a-f]{64}$'
+  case "$V4_EXECUTION_FREEZE_ARTIFACT_PATH" in reports/research/shadow/campaigns/campaign-2026-08-24-qset-v4/control/code-freeze/source-${V4_EXECUTION_FREEZE_SHA256#sha256:}.json) ;; *) exit 64 ;; esac
+}
+
+prove_old_containers_denied() {
+  test ! -L "$token" && test -f "$token" && test "$(stat -c '%u:%g:%a:%h' "$token")" = 983:979:600:1
+  podman run --rm --pull=never --network polyedge --user 983:979 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=16m --cap-drop=all \
+    --env AZURE_CLIENT_ID="$writer_client_id" --env AZURE_FEDERATED_TOKEN_FILE=/run/credentials/azure-federated-token --env AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential \
+    --env AZURE_STORAGE_ACCOUNT_NAME="$AZURE_STORAGE_ACCOUNT_NAME" --volume "$token":/run/credentials/azure-federated-token:ro,Z "$V4_ACCESS_PROBE_IMAGE" node --input-type=module -e '
+      import {DefaultAzureCredential} from "@azure/identity";
+      import {BlobServiceClient} from "@azure/storage-blob";
+      const credential=new DefaultAzureCredential({managedIdentityClientId:process.env.AZURE_CLIENT_ID});
+      const client=new BlobServiceClient(`https://${process.env.AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net`,credential);
+      for (const name of ["polyedge-shadow-qset-v3-events","polyedge-research-qset-v3","polyedge-qset-v3-control"]) {
+        try { await client.getContainerClient(name).getProperties(); throw new Error(`old container unexpectedly readable: ${name}`); }
+        catch (error) { if (error.statusCode !== 403) throw error; }
+      }
+      console.log(JSON.stringify({oldContainersDenied:true}));
+    ' | jq -e '.oldContainersDenied == true' >/dev/null
+}
+
+require_retired_initiators
+resolve_ids
+before=$(mktemp)
+trap 'rm -f "$before" "${after:-}"' EXIT HUP INT TERM
+collect_assignments qset-v3 >"$before"
+assert_exact_eight "$before"
+
+if test "$mode" = check; then
+  jq -r '.all[] | [.id,.scope,.roleDefinitionId,.principalId] | @tsv' "$before"
+  printf '%s\n' 'qset-v4 RBAC handoff check passed; no Azure mutation performed'
+  exit 0
+fi
+
+require_apply_bindings
+install -d -o root -g root -m 0750 "$receipt_root"
+capture=$(mktemp "$receipt_root/.v3-assignments.XXXXXX")
+cp "$before" "$capture"
+chown root:root "$capture" && chmod 0640 "$capture"
+test ! -e "$receipt_root/v3-assignments-before.json"
+ln "$capture" "$receipt_root/v3-assignments-before.json"
+jq -r '.all[].id' "$before" | while IFS= read -r assignment_id; do az role assignment delete --ids "$assignment_id"; done
+after=$(mktemp)
+collect_assignments qset-v3 >"$after"
+jq -e '.all | length == 0' "$after" >/dev/null
+az deployment group create --resource-group "$AZURE_RESOURCE_GROUP" --name qset-v4-rbac-handoff --template-file infra/shadow-profitability-qset-v4.bicep --parameters processorImage="$V4_PROCESSOR_IMAGE" expectedSourceRevision="$V4_PROCESSOR_GIT_SHA" sealedDayOneInventorySha256="$V4_SEALED_DAY_ONE_INVENTORY_SHA256" sealedDayTwoInventorySha256="$V4_SEALED_DAY_TWO_INVENTORY_SHA256" executionFreezeSha256="$V4_EXECUTION_FREEZE_SHA256" executionFreezeArtifactPath="$V4_EXECUTION_FREEZE_ARTIFACT_PATH" deployProcessorJob=false >/dev/null
+for _ in 1 2 3 4 5 6; do
+  collect_assignments qset-v4 >"$after"
+  if jq -e '.all | length == 8' "$after" >/dev/null; then break; fi
+  sleep 10
+done
+assert_exact_eight "$after"
+disabled_or_masked "$v4_writer_service"
+writer_client_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name id-polyedge-conduit-shadow-qset-v3-writer --query clientId -o tsv)
+prove_old_containers_denied
+printf '%s\n' 'qset-v4 RBAC handoff applied and verified; v4 writer remains stopped'

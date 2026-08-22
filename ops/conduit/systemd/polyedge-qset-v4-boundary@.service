@@ -1,0 +1,11 @@
+[Unit]
+Description=Fail-closed qset-v4 UTC boundary guard (%i)
+Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service polyedge-shadow-qset-v4.service
+Conflicts=polyedge-shadow-qset-v3.service
+After=network-online.target polyedge-shadow-qset-v4.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/polyedge-qset-v4-boundary-guard %i
+TimeoutStartSec=3min
+UMask=0027

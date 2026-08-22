@@ -1,6 +1,7 @@
 [Unit]
 Description=PolyEdge isolated qset-v4 shadow writer
-Wants=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service
+Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service
+Conflicts=polyedge-shadow-qset-v3.service
 After=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v3-writer.service
 Requires=polyedge-network.service
 
