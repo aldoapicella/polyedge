@@ -57,8 +57,7 @@ lock_and_upload() {
   test "$(sha256sum "$temporary"|cut -d' ' -f1)" = "$digest" && cmp -s "$manifest" "$temporary"
   remote=$(az storage blob show --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" -o json)
   jq -e --arg container "$control_container" --arg blob "$blob" --argjson bytes "$bytes" '
-    .container==$container and .name==$blob and .metadata=={} and .properties.blobType=="BlockBlob" and .properties.contentLength==$bytes and
-    .immutabilityPolicy.policyMode=="Locked" and (.immutabilityPolicy.expiryTime|type=="string" and length>0)
+    .container==$container and .name==$blob and .metadata=={} and .properties.blobType=="BlockBlob" and .properties.contentLength==$bytes
   ' <<<"$remote" >/dev/null
   etag=$(jq -er '.properties.etag//.etag' <<<"$remote")
   receipt_root=/srv/polyedge-ring/migration/qset-v4/source-freeze; install -d -o root -g root -m 0750 "$receipt_root"; receipt=$receipt_root/source-$digest.json

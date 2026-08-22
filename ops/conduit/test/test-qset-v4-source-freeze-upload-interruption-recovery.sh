@@ -73,7 +73,10 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$MOCK_AZ_LOG"
 case "$*" in
   *"storage container immutability-policy show"*)
-    printf '{"state":"Locked","immutabilityPeriodSinceCreationInDays":90,"etag":"policy-etag"}\n'
+    printf '{"state":"%s","immutabilityPeriodSinceCreationInDays":%s,"etag":"policy-etag"}\n' "${MOCK_POLICY_STATE:-Locked}" "${MOCK_POLICY_DAYS:-90}"
+    ;;
+  *"storage container immutability-policy lock"*)
+    :
     ;;
   *"storage blob exists"*)
     printf '{"exists":true}\n'
@@ -101,7 +104,6 @@ case "$*" in
     metadata='{}'
     test "${MOCK_METADATA_OK:-true}" = true || metadata='{"unexpected":"value"}'
     policy=null
-    test "${MOCK_IMMUTABLE:-true}" = true && policy='{"expiryTime":"2026-11-20T00:00:00Z","policyMode":"Locked"}'
     jq -n \
       --arg container "$container" --arg name "$name" --argjson metadata "$metadata" --argjson policy "$policy" \
       --argjson bytes "$(stat -c '%s' "$MOCK_REMOTE")" '{
@@ -163,8 +165,14 @@ if MOCK_METADATA_OK=false "$freeze" lock-and-upload "$manifest" >/dev/null 2>&1;
 fi
 test "$(sha256sum "$receipt")" = "$before"
 
-if MOCK_IMMUTABLE=false "$freeze" lock-and-upload "$manifest" >/dev/null 2>&1; then
-  echo 'recovery accepted a mutable blob' >&2
+if MOCK_POLICY_STATE=Unlocked "$freeze" lock-and-upload "$manifest" >/dev/null 2>&1; then
+  echo 'recovery accepted an unlocked container policy' >&2
+  exit 1
+fi
+test "$(sha256sum "$receipt")" = "$before"
+
+if MOCK_POLICY_DAYS=89 "$freeze" lock-and-upload "$manifest" >/dev/null 2>&1; then
+  echo 'recovery accepted a short container policy' >&2
   exit 1
 fi
 test "$(sha256sum "$receipt")" = "$before"
