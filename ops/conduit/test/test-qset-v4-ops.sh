@@ -38,6 +38,8 @@ grep -F '/run/polyedge-federated-shadow-qset-v4-writer' "$sealer" >/dev/null
 grep -F '/run/polyedge-federated-shadow-qset-v4-writer' "$service" >/dev/null
 ! grep -F 'shadow-qset-v3-writer' "$sealer"; ! grep -F 'Conflicts=polyedge-shadow-qset-v3.service' "$service"
 
+! grep -Eq '^Requires=.*polyedge-shadow-qset-v4\.service' "$service"
+grep -Fx 'sync -f "$receipt_root"' "$sealer" >/dev/null
 grep -F 'id-polyedge-conduit-shadow-qset-v4-writer' "$handoff" >/dev/null
 grep -F 'id-polyedge-conduit-shadow-qset-v4-processor' "$handoff" >/dev/null
 grep -F 'v4PrincipalsHaveZeroAssignments:true' "$handoff" >/dev/null

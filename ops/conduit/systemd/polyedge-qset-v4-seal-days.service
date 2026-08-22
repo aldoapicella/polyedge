@@ -1,6 +1,6 @@
 [Unit]
 Description=Seal the exact closed qset-v4 report and carry days
-Requires=network-online.target polyedge-federated-token@shadow-qset-v4-writer.service polyedge-shadow-qset-v4.service
+Requires=network-online.target polyedge-federated-token@shadow-qset-v4-writer.service
 After=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v4-writer.service polyedge-shadow-qset-v4.service
 Requires=polyedge-network.service
 RequiresMountsFor=/srv/polyedge-ring /run/polyedge-federated-shadow-qset-v4-writer

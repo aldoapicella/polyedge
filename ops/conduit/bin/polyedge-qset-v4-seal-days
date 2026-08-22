@@ -71,6 +71,7 @@ for date in 2026-08-24 2026-08-25; do
   if [ -e "$final" ]; then cmp -s "$temporary" "$final" || { echo "qset-v4 date already has a conflicting deterministic receipt: $date" >&2; exit 1; }; rm -f "$temporary"; else sync -f "$temporary"; mv "$temporary" "$final"; fi
   temporary=; logger -p daemon.info -t polyedge-qset-v4-seal-days "sealed qset-v4 date=$date receipt=$final sha256=$(sha256sum "$final"|awk '{print $1}')"
 done
+sync -f "$receipt_root"
 systemctl start "$writer"
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
   if systemctl is-active --quiet "$writer" && podman healthcheck run "$container" >/dev/null 2>&1; then
