@@ -153,11 +153,15 @@ record_rollback_result() {
 }
 reconcile_rollback() {
   local remaining restored
-  delete_v4_assignments
-  restore_old_assignments
-  remaining=$(mktemp); collect_assignments qset-v4 >"$remaining"; jq -e '.all | length == 0' "$remaining" >/dev/null; rm -f "$remaining"
-  restored=$(mktemp); collect_assignments qset-v3 >"$restored"; assert_exact_eight qset-v3 "$restored"; rm -f "$restored"
-  record_rollback_result
+  delete_v4_assignments || return 1
+  restore_old_assignments || return 1
+  remaining=$(mktemp) || return 1
+  collect_assignments qset-v4 >"$remaining" && jq -e '.all | length == 0' "$remaining" >/dev/null || { rm -f "$remaining"; return 1; }
+  rm -f "$remaining"
+  restored=$(mktemp) || return 1
+  collect_assignments qset-v3 >"$restored" && assert_exact_eight qset-v3 "$restored" || { rm -f "$restored"; return 1; }
+  rm -f "$restored"
+  record_rollback_result || return 1
 }
 delete_v4_assignments() {
   local partial
@@ -168,7 +172,7 @@ delete_v4_assignments() {
 }
 restore_old_assignments() {
   jq -c '.all[]' "$before" | while IFS= read -r assignment; do
-    local id principal scope role condition condition_version
+    local id principal scope role condition condition_version existing
     id=$(jq -er '.id' <<<"$assignment"); principal=$(jq -er '.principalId' <<<"$assignment"); scope=$(jq -er '.scope' <<<"$assignment"); role=$(jq -er '.roleDefinitionId' <<<"$assignment")
     condition=$(jq -r '.condition // empty' <<<"$assignment"); condition_version=$(jq -r '.conditionVersion // empty' <<<"$assignment")
     existing=$(az role assignment list --all --assignee-object-id "$principal" --scope "$scope" --role "$role" -o json)
@@ -185,10 +189,10 @@ restore_old_assignments() {
 }
 before=$(mktemp); after=; handoff_started=false; handoff_succeeded=false
 cleanup() {
-  local status=$?
+  local status=$? rollback_status=0
   trap - EXIT HUP INT TERM
   if test "$handoff_started" = true && test "$handoff_succeeded" != true; then
-    reconcile_rollback || true
+    if ( set -e; reconcile_rollback ); then :; else rollback_status=$?; logger -p daemon.err -t polyedge-qset-v4-rbac-handoff "CRITICAL: qset-v4 RBAC rollback failed; retain $before_receipt and retry apply recovery"; fi
   fi
   rm -f "$before" "${after:-}"
   exit "$status"

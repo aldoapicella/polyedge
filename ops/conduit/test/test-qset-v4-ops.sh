@@ -135,6 +135,9 @@ grep -F 'az containerapp job list' "$handoff" >/dev/null
 grep -F 'v4-assignments-after.json' "$handoff" >/dev/null
 grep -F 'assignment_is_restored' "$handoff" >/dev/null
 grep -F 'reconcile_rollback' "$handoff" >/dev/null
+! grep -F 'reconcile_rollback || true' "$handoff" >/dev/null
+grep -F 'delete_v4_assignments || return 1' "$handoff" >/dev/null
+grep -F 'CRITICAL: qset-v4 RBAC rollback failed' "$handoff" >/dev/null
 grep -F 'rollback-result.json' "$handoff" >/dev/null
 grep -F 'if test -e "$before_receipt"' "$handoff" >/dev/null
 grep -F -- '--condition-version' "$handoff" >/dev/null
