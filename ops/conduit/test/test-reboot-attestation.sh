@@ -195,12 +195,27 @@ jq -n '{capacity_ok:true,free_ok:true,upload_fresh:true,unsealed_closed_count:0,
 chmod 0640 "$case_root/ring/status.json"
 printf '%s\n' '11111111-1111-4111-8111-111111111111' >"$case_root/boot-id"
 printf '%s\n' 'cpu 1 1 1 1' 'btime 1000' >"$case_root/proc-stat"
-jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" '{schemaVersion:1,status:"in_progress",windowStartUtc:$start,
+funded_image=ghcr.io/fixture/polyedge-venue-probe@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+funded_revision=7777777777777777777777777777777777777777
+funded_dlq=936
+activation=$case_root/ring/parity/activation
+rollout=$activation/20260822T195013Z-funded-signer-rollout.json
+install -d -m 0750 "$activation"
+jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
+  '{schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
+    producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
+chmod 0640 "$rollout"
+rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
+jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" \
+  '{schemaVersion:1,status:"in_progress",windowStartUtc:$start,
   azureAuthoritative:true,azureDeletionAllowed:false,acceptedCleanLiveHours:72,
   acceptedHourlyEvidence:[range(72) | {hourIndex:.}],completedDailyCycles:2,
   acceptedDailyEvidence:[range(2) | {cycleIndex:.}],rebootRecoveryPassed:false,
   shadowQsetEnabled:false,fundedSignerEnabled:true,fundedSignerMode:"active",
   fundedSignerImage:"ghcr.io/fixture/polyedge-venue-probe@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  fundedSignerRevision:"7777777777777777777777777777777777777777",
+  fundedRolloutReceiptPath:$rollout,fundedRolloutReceiptSha256:$rollout_sha,
+  fundedServiceBusDlqBaseline:936,
   fundedSignerUser:$user,fundedSessionId:"fixture-funded-v3",
   fundedSessionManifestSha256:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   fundedConfigSha256:"sha256:9999999999999999999999999999999999999999999999999999999999999999",
@@ -225,6 +240,10 @@ POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backen
 POLYEDGE_PARITY_FUNDED_MODE=active
 POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=ghcr.io/fixture/polyedge-venue-probe@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 POLYEDGE_PARITY_FUNDED_UID=$uid
+POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
+POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
+POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
 POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=fixture-funded-v3
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -274,11 +293,22 @@ jq '.rebootRecoveryPassed = false | del(.rebootRecovery)' "$ledger" >"$raw"
 chmod 0640 "$raw"
 mv "$raw" "$ledger"
 FAKE_PRODUCER_STATUS_DELAY=1 run_attestor validate-ledger
+cp "$rollout" "$rollout.valid"
+jq '.queue.deadLetterMessageCount += 1' "$rollout" >"$rollout.drift"
+chmod 0640 "$rollout.drift"
+mv "$rollout.drift" "$rollout"
+if run_attestor validate-ledger >/dev/null 2>&1; then
+  echo 'drifted funded rollout receipt unexpectedly passed reboot validation' >&2
+  exit 1
+fi
+mv "$rollout.valid" "$rollout"
+chmod 0640 "$rollout"
 
 [ "$(stat -c %s "$case_root/run/ledger.lock")" -eq 0 ]
 disabled_ledger=$case_root/ring/parity/disabled-ledger.json
 jq '.fundedSignerEnabled = false | .fundedSignerMode = "disabled" | .fundedIntentProducerEnabled = false |
-  del(.fundedSignerImage,.fundedSignerUser,.fundedSessionId,.fundedSessionManifestSha256,.fundedConfigSha256,
+  del(.fundedSignerImage,.fundedSignerRevision,.fundedRolloutReceiptPath,.fundedRolloutReceiptSha256,
+    .fundedServiceBusDlqBaseline,.fundedSignerUser,.fundedSessionId,.fundedSessionManifestSha256,.fundedConfigSha256,
     .fundedIntentProducerImage,.fundedIntentProducerUser,.fundedIntentProducerConfigSha256)' \
   "$ledger" >"$disabled_ledger"
 chmod 0640 "$disabled_ledger"
@@ -288,6 +318,7 @@ awk -v ledger="$disabled_ledger" '
   /^POLYEDGE_PARITY_FUNDED_MODE=/ {print "POLYEDGE_PARITY_FUNDED_MODE=disabled"; next}
   /^POLYEDGE_PARITY_EXPECTED_FUNDED_/ {next}
   /^POLYEDGE_PARITY_FUNDED_UID=/ {next}
+  /^POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=/ {next}
   /^POLYEDGE_PARITY_FUNDED_GID=/ {next}
   {print}
 ' "$case_root/parity.env" >"$disabled_env"

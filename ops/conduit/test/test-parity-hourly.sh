@@ -590,9 +590,23 @@ EOF
 
 activate_funded_fixture() {
   case_root=$1
+  funded_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  funded_revision=7777777777777777777777777777777777777777
+  funded_dlq=936
+  activation=$case_root/ring/parity/activation
+  rollout=$activation/20260822T195013Z-funded-signer-rollout.json
+  install -d -m 0750 "$activation"
+  jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
+    '{schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
+      producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
+  chmod 0640 "$rollout"
+  rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
   active_ledger=$case_root/ring/parity/20260809T141000Z-funded-active.json
-  jq --arg user "$uid:$gid" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
+  jq --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
     .fundedSignerImage="ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
+    .fundedSignerRevision="7777777777777777777777777777777777777777" |
+    .fundedRolloutReceiptPath=$rollout | .fundedRolloutReceiptSha256=$rollout_sha |
+    .fundedServiceBusDlqBaseline=936 |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
     .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999" |
@@ -606,6 +620,9 @@ activate_funded_fixture() {
 POLYEDGE_PARITY_FUNDED_MODE=active
 POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 POLYEDGE_PARITY_FUNDED_UID=$uid
+POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
+POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
+POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
 POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -617,7 +634,12 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=936
 POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE=$case_root/funded-intent-producer.env
 POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE=$case_root/token/funded-producer-azure-federated-token
 EOF
-  printf '%s\n' 'POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=936' >>"$case_root/hourly.env"
+  cat >>"$case_root/hourly.env" <<EOF
+POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
+POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
+POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
+EOF
 }
 
 refresh_segment() {
@@ -979,6 +1001,10 @@ jq -e '.acceptedCleanLiveHours == 1 and .fundedSignerEnabled == true and
   (.acceptedHourlyEvidence | length) == 1' "$active_funded/ring/parity/20260809T141000Z-funded-active.json" >/dev/null
 jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled == true and
   .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
+  .services.fundedSignerRevision == "7777777777777777777777777777777777777777" and
+  (.services.fundedRolloutReceipt.path | endswith("/activation/20260822T195013Z-funded-signer-rollout.json")) and
+  (.services.fundedRolloutReceipt.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+  .services.fundedServiceBusDlqBaseline == 936 and
   .services.fundedSignerUser == "'"$uid:$gid"'" and .services.fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and
   .services.fundedRuntime.heartbeatCount == 60 and .services.fundedRuntime.alertCount == 0 and
   .services.fundedRuntime.maxHeartbeatGapSeconds == 60 and .services.fundedRuntime.tokenRefreshCount == 30 and
@@ -1327,6 +1353,9 @@ fi
 [ "$(jq -r '.acceptedCleanLiveHours' "$disk/ring/parity/ledger.json")" = 0 ]
 
 excluded=$root/excluded
+boundary_epoch=$(date -u -d '2026-08-08T20:15:00Z' +%s)
+first_full_epoch=$(( (boundary_epoch + 3599) / 3600 * 3600 ))
+[ "$(date -u -d "@$first_full_epoch" +%Y-%m-%dT%H:%M:%SZ)" = 2026-08-08T21:00:00Z ]
 mount_failure=$root/mount-failure
 fixture "$mount_failure"
 if FAKE_MOUNTPOINT_OK=0 run_collector "$mount_failure" >/dev/null 2>&1; then
@@ -1343,12 +1372,12 @@ if run_collector "$redirect" >/dev/null 2>&1; then
   echo 'redirected ledger unexpectedly passed' >&2
   exit 1
 fi
-fixture "$excluded" 2026-08-09T14:00:00Z 2026-08-09T14:10:00Z
+fixture "$excluded" 2026-08-08T20:00:00Z 2026-08-08T20:15:00Z
 before=$(protected "$excluded/ring/parity/ledger.json")
 run_collector "$excluded" >/dev/null
 [ "$(jq -r '.acceptedCleanLiveHours' "$excluded/ring/parity/ledger.json")" = 0 ]
 jq -e '.status == "excluded_pre_window" and .acceptedForParityWindow == false' \
-  "$excluded/ring/parity/hourly/20260809T14/evidence.json" >/dev/null
+  "$excluded/ring/parity/hourly/20260808T20/evidence.json" >/dev/null
 [ "$(protected "$excluded/ring/parity/ledger.json")" = "$before" ]
 
 launcher_root=$root/run-job

@@ -82,9 +82,23 @@ EOF
 
 activate_funded_fixture() {
   case_root=$1
+  funded_image=ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  funded_revision=7777777777777777777777777777777777777777
+  funded_dlq=936
+  activation=$case_root/ring/parity/activation
+  rollout=$activation/20260822T195013Z-funded-signer-rollout.json
+  install -d -m 0750 "$activation"
+  jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
+    '{schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
+      producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
+  chmod 0640 "$rollout"
+  rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
   active_ledger=$case_root/ring/parity/20260811T000000Z-funded-active.json
-  jq --arg user "$uid:$gid" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
+  jq --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
     .fundedSignerImage="ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
+    .fundedSignerRevision="7777777777777777777777777777777777777777" |
+    .fundedRolloutReceiptPath=$rollout | .fundedRolloutReceiptSha256=$rollout_sha |
+    .fundedServiceBusDlqBaseline=936 |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
     .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999" |
@@ -98,6 +112,10 @@ activate_funded_fixture() {
 POLYEDGE_PARITY_FUNDED_MODE=active
 POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 POLYEDGE_PARITY_FUNDED_UID=$uid
+POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
+POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
+POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
 POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -191,6 +209,10 @@ run_recorder "$active_funded" 2026-08-11 >/dev/null
 jq -e '.fundedSignerEnabled == true and .completedDailyCycles == 1 and
   (.acceptedDailyEvidence | length) == 1' "$active_funded/ring/parity/20260811T000000Z-funded-active.json" >/dev/null
 jq -e '.fundedSignerMode == "active" and .fundedSignerEnabled == true and
+  .fundedSignerRevision == "7777777777777777777777777777777777777777" and
+  (.fundedRolloutReceipt.path | endswith("/activation/20260822T195013Z-funded-signer-rollout.json")) and
+  (.fundedRolloutReceipt.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+  .fundedServiceBusDlqBaseline == 936 and
   .fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and .fundedSignerUser == "'"$uid:$gid"'" and
   .fundedIntentProducerEnabled == true and .fundedIntentProducerUser == "984:980" and
   .fundedIntentProducerConfigSha256 == "sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b"' \

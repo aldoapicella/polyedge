@@ -169,6 +169,14 @@ run_helper "$success"
 test "$(cat "$success/state/deploy-count")" = 1
 
 safe=$root/safe-failure
+cp "$success/signer.container" "$success/signer.container.valid"
+/usr/bin/sed -i "s|^Image=.*|Image=$old_image|" "$success/signer.container"
+if run_helper "$success"; then exit 1; fi
+mv "$success/signer.container.valid" "$success/signer.container"
+chmod 0600 "$success/signer.container"
+run_helper "$success"
+test "$(cat "$success/state/deploy-count")" = 1
+
 make_fixture "$safe"
 if run_helper "$safe" FAKE_DEPLOY_FAIL=1; then exit 1; fi
 test "$(cat "$safe/state/producer-active")" = 1

@@ -136,19 +136,28 @@ funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
 case "$funded_mode" in
   disabled)
     funded_enabled=false
-    funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_image= funded_revision= funded_rollout_receipt= funded_rollout_sha=
+    funded_service_bus_dlq=null
+    funded_user= funded_session= funded_session_sha= funded_config_sha=
     funded_producer_image= funded_producer_user= funded_producer_config_sha=
     funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
     ;;
   active)
     funded_enabled=true
     funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:?missing funded image}
+    funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:?missing funded revision}
+    funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:?missing funded rollout receipt}
+    funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:?missing funded rollout receipt hash}
+    funded_service_bus_dlq=${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:?missing funded DLQ baseline}
     funded_user=${POLYEDGE_PARITY_FUNDED_UID:?missing funded UID}:${POLYEDGE_PARITY_FUNDED_GID:?missing funded GID}
     funded_session=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:?missing funded session}
     funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:?missing funded session hash}
     funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:?missing funded config hash}
     printf '%s' "$funded_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' \
       || die 'funded image is malformed'
+    printf '%s' "$funded_revision" | grep -Eq '^[0-9a-f]{40}$' || die 'funded revision is malformed'
+    printf '%s' "$funded_rollout_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded rollout receipt hash is malformed'
+    printf '%s' "$funded_service_bus_dlq" | grep -Eq '^[0-9]+$' || die 'funded DLQ baseline is malformed'
     printf '%s' "$funded_user" | grep -Eq '^[0-9]+:[0-9]+$' || die 'funded user is malformed'
     printf '%s' "$funded_session" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' || die 'funded session is malformed'
     for hash in "$funded_session_sha" "$funded_config_sha"; do
@@ -172,18 +181,35 @@ case "$funded_mode" in
     ;;
   *) die 'formal funded mode must equal disabled or active' ;;
 esac
+if [ "$funded_enabled" = true ]; then
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260822T195013Z-funded-signer-rollout.json" ] \
+    || die 'funded rollout receipt path differs from the approved activation receipt'
+  secure_file "$funded_rollout_receipt" 640 1048576
+  [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
+  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_service_bus_dlq" '
+    .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+    .newImage == $image and .newRevision == $revision and .producerRestored == true and
+    .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
+      scheduledMessageCount:0,deadLetterMessageCount:$dlq}
+  ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
+fi
 
 protected_json() {
   jq -cS --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" \
     --arg azure "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" \
     --arg oci "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
     --arg mode "$funded_mode" --arg image "$funded_image" --arg user "$funded_user" \
+    --arg revision "$funded_revision" --arg rollout "$funded_rollout_receipt" --arg rollout_sha "$funded_rollout_sha" \
+    --argjson dlq "$funded_service_bus_dlq" \
     --arg session "$funded_session" --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
     --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
     --arg producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
       {schemaVersion,status,windowStartUtc,azureAuthoritative,azureDeletionAllowed,shadowQsetEnabled,
        fundedSignerEnabled,fundedSignerMode:(.fundedSignerMode // "disabled"),
        fundedSignerImage:(.fundedSignerImage // null),fundedSignerUser:(.fundedSignerUser // null),
+       fundedSignerRevision:(.fundedSignerRevision // null),fundedRolloutReceiptPath:(.fundedRolloutReceiptPath // null),
+       fundedRolloutReceiptSha256:(.fundedRolloutReceiptSha256 // null),
+       fundedServiceBusDlqBaseline:(.fundedServiceBusDlqBaseline // null),
        fundedSessionId:(.fundedSessionId // null),fundedSessionManifestSha256:(.fundedSessionManifestSha256 // null),
        fundedConfigSha256:(.fundedConfigSha256 // null),fundedIntentProducerEnabled:(.fundedIntentProducerEnabled // false),
        fundedIntentProducerImage:(.fundedIntentProducerImage // null),fundedIntentProducerUser:(.fundedIntentProducerUser // null),
@@ -193,11 +219,16 @@ protected_json() {
          $p.azureAuthoritative == true and $p.azureDeletionAllowed == false and $p.shadowQsetEnabled == false and
          $p.fundedSignerEnabled == $funded and
          (if $funded then $p.fundedSignerMode == $mode and $p.fundedSignerImage == $image and
+           $p.fundedSignerRevision == $revision and $p.fundedRolloutReceiptPath == $rollout and
+           $p.fundedRolloutReceiptSha256 == $rollout_sha and $p.fundedServiceBusDlqBaseline == $dlq and
            $p.fundedSignerUser == $user and $p.fundedSessionId == $session and
            $p.fundedSessionManifestSha256 == $session_sha and $p.fundedConfigSha256 == $config_sha and
            $p.fundedIntentProducerEnabled == true and $p.fundedIntentProducerImage == $producer_image and
            $p.fundedIntentProducerUser == $producer_user and $p.fundedIntentProducerConfigSha256 == $producer_config_sha
-          else $p.fundedSignerMode == "disabled" and $p.fundedSignerImage == null and $p.fundedSignerUser == null and
+          else $p.fundedSignerMode == "disabled" and $p.fundedSignerImage == null and
+           $p.fundedSignerRevision == null and $p.fundedRolloutReceiptPath == null and
+           $p.fundedRolloutReceiptSha256 == null and $p.fundedServiceBusDlqBaseline == null and
+           $p.fundedSignerUser == null and
            $p.fundedSessionId == null and $p.fundedSessionManifestSha256 == null and $p.fundedConfigSha256 == null and
            $p.fundedIntentProducerEnabled == false and $p.fundedIntentProducerImage == null and
            $p.fundedIntentProducerUser == null and $p.fundedIntentProducerConfigSha256 == null end)

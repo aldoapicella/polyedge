@@ -304,6 +304,9 @@ formal_expected_azure_image=${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?set
 formal_expected_oci_image=${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?set the approved OCI multiarch image digest}
 formal_funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
 formal_expected_funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:-}
+formal_expected_funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:-}
+formal_funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:-}
+formal_expected_funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:-}
 formal_funded_uid=${POLYEDGE_PARITY_FUNDED_UID:-986}
 formal_funded_gid=${POLYEDGE_PARITY_FUNDED_GID:-982}
 formal_expected_funded_session_id=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}
@@ -343,6 +346,9 @@ set +a
 [ "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:-}" = "$formal_expected_oci_image" ] || die 'hourly environment overrides the formal OCI image'
 [ "${POLYEDGE_PARITY_FUNDED_MODE:-disabled}" = "$formal_funded_mode" ] || die 'hourly environment overrides the formal funded mode'
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:-}" = "$formal_expected_funded_image" ] || die 'hourly environment overrides the formal funded image'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:-}" = "$formal_expected_funded_revision" ] || die 'hourly environment overrides the formal funded revision'
+[ "${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:-}" = "$formal_funded_rollout_receipt" ] || die 'hourly environment overrides the funded rollout receipt'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:-}" = "$formal_expected_funded_rollout_sha" ] || die 'hourly environment overrides the funded rollout receipt hash'
 [ "${POLYEDGE_PARITY_FUNDED_UID:-986}" = "$formal_funded_uid" ] || die 'hourly environment overrides the formal funded UID'
 [ "${POLYEDGE_PARITY_FUNDED_GID:-982}" = "$formal_funded_gid" ] || die 'hourly environment overrides the formal funded GID'
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}" = "$formal_expected_funded_session_id" ] || die 'hourly environment overrides the formal funded session'
@@ -361,6 +367,9 @@ POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE=$formal_expected_azure_image
 POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=$formal_expected_oci_image
 POLYEDGE_PARITY_FUNDED_MODE=$formal_funded_mode
 POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=$formal_expected_funded_image
+POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$formal_expected_funded_revision
+POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$formal_funded_rollout_receipt
+POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$formal_expected_funded_rollout_sha
 POLYEDGE_PARITY_FUNDED_UID=$formal_funded_uid
 POLYEDGE_PARITY_FUNDED_GID=$formal_funded_gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=$formal_expected_funded_session_id
@@ -397,10 +406,10 @@ done
 case "$POLYEDGE_PARITY_FUNDED_MODE" in
   disabled)
     funded_enabled=false
-    funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_image= funded_revision= funded_rollout_receipt= funded_rollout_sha= funded_user= funded_session= funded_session_sha= funded_config_sha=
     funded_producer_image= funded_producer_user= funded_producer_config_sha=
     funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
-    funded_service_bus_namespace= funded_service_bus_queue= funded_service_bus_dlq=
+    funded_service_bus_namespace= funded_service_bus_queue= funded_service_bus_dlq=null
     ;;
   active)
     funded_enabled=true
@@ -415,6 +424,11 @@ case "$POLYEDGE_PARITY_FUNDED_MODE" in
       printf '%s' "$funded_hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded binding hash is malformed'
     done
     funded_image=$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE
+    funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:?set the approved funded revision}
+    funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:?set the funded rollout receipt}
+    funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:?set the funded rollout receipt hash}
+    printf '%s' "$funded_revision" | grep -Eq '^[0-9a-f]{40}$' || die 'expected funded revision is malformed'
+    printf '%s' "$funded_rollout_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded rollout receipt hash is malformed'
     funded_user=$POLYEDGE_PARITY_FUNDED_UID:$POLYEDGE_PARITY_FUNDED_GID
     funded_session=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID
     funded_session_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256
@@ -475,10 +489,24 @@ if [ "$POLYEDGE_PARITY_FUNDED_MODE" = active ]; then
 fi
 
 secure_file "$POLYEDGE_PARITY_LEDGER" 640
+if [ "$funded_enabled" = true ]; then
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260822T195013Z-funded-signer-rollout.json" ] \
+    || die 'funded rollout receipt path differs from the approved activation receipt'
+  secure_file "$funded_rollout_receipt" 640
+  [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
+  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_service_bus_dlq" '
+    .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+    .newImage == $image and .newRevision == $revision and .producerRestored == true and
+    .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
+      scheduledMessageCount:0,deadLetterMessageCount:$dlq}
+  ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
+fi
+
 validate_ledger() {
   jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$POLYEDGE_PARITY_FUNDED_MODE" \
     --arg image "$funded_image" --arg user "$funded_user" --arg session "$funded_session" \
-    --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
+    --arg revision "$funded_revision" --arg rollout "$funded_rollout_receipt" --arg rollout_sha "$funded_rollout_sha" \
+    --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" --argjson dlq "$funded_service_bus_dlq" \
     --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
     --arg producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
     .schemaVersion == 1 and .status == "in_progress" and
@@ -491,11 +519,15 @@ validate_ledger() {
     (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
     (if $funded then
       .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
+      .fundedSignerRevision == $revision and .fundedRolloutReceiptPath == $rollout and
+      .fundedRolloutReceiptSha256 == $rollout_sha and .fundedServiceBusDlqBaseline == $dlq and
       .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha and
       .fundedIntentProducerEnabled == true and .fundedIntentProducerImage == $producer_image and
       .fundedIntentProducerUser == $producer_user and .fundedIntentProducerConfigSha256 == $producer_config_sha
      else (.fundedSignerMode? // "disabled") == "disabled" and
       (.fundedSignerImage? // null) == null and (.fundedSignerUser? // null) == null and
+      (.fundedSignerRevision? // null) == null and (.fundedRolloutReceiptPath? // null) == null and
+      (.fundedRolloutReceiptSha256? // null) == null and (.fundedServiceBusDlqBaseline? // null) == null and
       (.fundedSessionId? // null) == null and (.fundedSessionManifestSha256? // null) == null and
       (.fundedConfigSha256? // null) == null and (.fundedIntentProducerEnabled? // false) == false and
       (.fundedIntentProducerImage? // null) == null and (.fundedIntentProducerUser? // null) == null and
@@ -574,6 +606,23 @@ producer_token_journal_file=
 trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$sequence_tmp" "$api_status" "$producer_health_file" "$producer_status_file" "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file"' EXIT HUP INT TERM
 chmod 0600 "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"
 
+validate_funded_evidence_binding() {
+  jq -e --arg revision "$funded_revision" --arg receipt "$funded_rollout_receipt" \
+    --arg receipt_sha "$funded_rollout_sha" --argjson dlq "$funded_service_bus_dlq" \
+    --argjson funded "$funded_enabled" '
+    if $funded then
+      .services.fundedSignerRevision == $revision and
+      .services.fundedRolloutReceipt == {path:$receipt,sha256:$receipt_sha} and
+      .services.fundedServiceBusDlqBaseline == $dlq and
+      .services.fundedServiceBusRuntime.deadLetterMessageCount == $dlq and
+      .services.fundedServiceBusRuntime.expectedDeadLetterMessageCount == $dlq
+    else
+      .services.fundedSignerRevision == null and .services.fundedRolloutReceipt == null and
+      .services.fundedServiceBusDlqBaseline == null
+    end
+  ' "$1" >/dev/null
+}
+
 collect_refs() {
   : >"$refs_tmp"
   find "$hourly_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | while IFS= read -r file; do
@@ -619,6 +668,7 @@ collect_refs() {
            .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
            .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null and .services.fundedRuntime == null end)' \
         "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
+      validate_funded_evidence_binding "$file" || die "accepted evidence lacks funded rollout binding: $file"
       validate_evidence_artifacts "$file"
       sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
       feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
@@ -669,13 +719,13 @@ update_ledger() {
   expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
   [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
 
-  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerRevision,fundedRolloutReceiptPath,fundedRolloutReceiptSha256,fundedServiceBusDlqBaseline,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
   ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
   trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
   jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
     "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
   chmod 0640 "$ledger_tmp"
-  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerRevision,fundedRolloutReceiptPath,fundedRolloutReceiptSha256,fundedServiceBusDlqBaseline,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
     || die 'protected ledger fields changed'
   sync -f "$ledger_tmp"
   mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
@@ -1692,6 +1742,8 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
   --arg same_path "$same_report" --arg same_sha "$(sha "$same_report")" --arg result_sha "$azure_result" --arg decision_config_sha256 "$azure_decision_config" \
   --arg same_attestation "$same_attestation" --arg same_attestation_sha "$(sha "$same_attestation")" \
   --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+  --arg funded_revision "$funded_revision" --arg funded_rollout "$funded_rollout_receipt" \
+  --arg funded_rollout_sha "$funded_rollout_sha" --argjson funded_dlq "$funded_service_bus_dlq" \
   --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
   --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" --arg producer_config_sha "$funded_producer_config_sha" \
   --arg producer_enablement "$producer_enablement" --arg producer_token_enablement "$producer_token_enablement" \
@@ -1711,6 +1763,9 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
     services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMode:$funded_mode,
       fundedSignerEnabled:$funded,fundedSignerMasked:($funded | not),fundedSignerActive:$funded,
       fundedSignerImage:(if $funded then $funded_image else null end),
+      fundedSignerRevision:(if $funded then $funded_revision else null end),
+      fundedRolloutReceipt:(if $funded then {path:$funded_rollout,sha256:$funded_rollout_sha} else null end),
+      fundedServiceBusDlqBaseline:(if $funded then $funded_dlq else null end),
       fundedSignerUser:(if $funded then $funded_user else null end),
       fundedSessionId:(if $funded then $funded_session else null end),
       fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),

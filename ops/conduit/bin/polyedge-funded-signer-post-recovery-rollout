@@ -262,16 +262,17 @@ if [ -e "$rollout" ]; then
   rollout_sha=$(sha "$rollout")
   /usr/bin/jq -e --arg new "$new_image" --arg revision "$new_revision" --arg old "$old_image" \
     --arg recovery "sha256:$recovery_file_sha" --arg helper "sha256:$helper_sha" --arg deploy "sha256:$deploy_file_sha" \
-    --arg recovery_script "sha256:$expected_recovery_sha" \
+    --arg recovery_script "sha256:$expected_recovery_sha" --arg quadlet "sha256:$(sha "$quadlet")" \
     --argjson dlq "$dlq" '
       .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
       .oldImage == $old and .newImage == $new and .newRevision == $revision and
       .recoveryReceiptSha256 == $recovery and .helperSha256 == $helper and .deploySha256 == $deploy and
-      .recoveryScriptSha256 == $recovery_script and
+      .recoveryScriptSha256 == $recovery_script and .quadlet.afterSha256 == $quadlet and
       .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
         scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
       .producerRestored == true and .azureDeletionAllowed == false' "$rollout" >/dev/null
   test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$new_image")" = "linux/arm64|$new_revision"
+  test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
   wait_signer_safe true "$new_image"
   producer_safe
   ! "$systemctl" is-active --quiet polyedge-parity-hourly.timer
@@ -304,6 +305,8 @@ queue_snapshot "$dlq" >/dev/null
 wait_signer_safe false "$old_image"
 
 "$deploy" polyedge-funded-signer "$new_image"
+secure_file "$quadlet" 600 65536
+test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
 test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$new_image")" = "linux/arm64|$new_revision"
 wait_signer_safe true "$new_image"
 test "$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value)" = 0
