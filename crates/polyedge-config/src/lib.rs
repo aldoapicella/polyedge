@@ -15,6 +15,16 @@ const QSET_V3_CUTOVER_UTC: &str = "2026-08-23T00:00:00Z";
 const QSET_V3_INTENT_PREFIX: &str =
     "control/strategy-canary/intents/campaign-2026-08-23-qset-v3/intents";
 const QSET_V3_MARKET_TABLE: &str = "ShadowQsetV3MarketCatalog";
+const QSET_V4_APP_NAME: &str = "polyedge-shadow-qset-v4";
+const QSET_V4_RAW_CONTAINER: &str = "polyedge-shadow-qset-v4-events";
+const QSET_V4_EVENT_TABLE: &str = "ShadowQsetV4EventIndex";
+const QSET_V4_CHART_TABLE: &str = "ShadowQsetV4ChartSeries";
+const QSET_V4_PREFLIGHT_PREFIX: &str = "shadow-events/preflight/campaign-2026-08-24-qset-v4";
+const QSET_V4_EVENT_PREFIX: &str = "shadow-events/campaign-2026-08-24-qset-v4";
+const QSET_V4_CUTOVER_UTC: &str = "2026-08-24T00:00:00Z";
+const QSET_V4_INTENT_PREFIX: &str =
+    "control/strategy-canary/intents/campaign-2026-08-24-qset-v4/intents";
+const QSET_V4_MARKET_TABLE: &str = "ShadowQsetV4MarketCatalog";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -711,6 +721,7 @@ impl RuntimeSettings {
             reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
         }
         if self.azure.storage_container_name != QSET_V3_RAW_CONTAINER
+            && self.azure.storage_container_name != QSET_V4_RAW_CONTAINER
             && self.azure.strategy_intent_operator_direct
             && (!self.azure.funded_direct_service_bus_enabled
                 || self
@@ -778,9 +789,59 @@ impl RuntimeSettings {
                     .push("qset-v3 shadow evidence must use the exact pointer-only intent prefix");
             }
         }
+        if self.deploy.app_name == QSET_V4_APP_NAME
+            || self.azure.storage_container_name == QSET_V4_RAW_CONTAINER
+        {
+            if self.deploy.app_name != QSET_V4_APP_NAME
+                || self.azure.storage_container_name != QSET_V4_RAW_CONTAINER
+            {
+                reasons.push("qset-v4 shadow evidence must use the exact app and raw container");
+            }
+            if !self.azure.strategy_intent_operator_direct {
+                reasons.push("qset-v4 shadow evidence must use pointer-only intent preflight");
+            }
+            if self.azure.funded_direct_service_bus_enabled
+                || !self
+                    .azure
+                    .funded_direct_service_bus_namespace
+                    .trim()
+                    .is_empty()
+                || !self.azure.funded_direct_service_bus_queue.trim().is_empty()
+            {
+                reasons
+                    .push("qset-v4 shadow evidence must not configure funded Service Bus delivery");
+            }
+            if self.live.polymarket_funder.is_some() {
+                reasons.push("qset-v4 shadow evidence must not configure a Polymarket funder");
+            }
+            if self.azure.storage_table_name != QSET_V4_EVENT_TABLE
+                || self.azure.chart_table_name != QSET_V4_CHART_TABLE
+                || self.azure.market_table_name != QSET_V4_MARKET_TABLE
+            {
+                reasons.push("qset-v4 shadow evidence must use only the qset-v4 tables");
+            }
+            if self.azure.event_blob_prefix != QSET_V4_PREFLIGHT_PREFIX {
+                reasons.push("qset-v4 shadow evidence must use the exact preflight event prefix");
+            }
+            let qset_v4_cutover = DateTime::parse_from_rfc3339(QSET_V4_CUTOVER_UTC)
+                .expect("valid qset-v4 cutover UTC")
+                .with_timezone(&Utc);
+            if self.azure.event_blob_prefix_after_cutover.as_deref() != Some(QSET_V4_EVENT_PREFIX)
+                || self.azure.event_blob_prefix_cutover_utc.as_ref() != Some(&qset_v4_cutover)
+            {
+                reasons.push("qset-v4 shadow evidence must use the exact UTC event-prefix cutover");
+            }
+            if self.azure.strategy_canary_intent_prefix != QSET_V4_INTENT_PREFIX {
+                reasons
+                    .push("qset-v4 shadow evidence must use the exact pointer-only intent prefix");
+            }
+        }
         if !matches!(
             self.azure.storage_container_name.as_str(),
-            "polyedge-shadow-events" | "polyedge-shadow-qset-events" | QSET_V3_RAW_CONTAINER
+            "polyedge-shadow-events"
+                | "polyedge-shadow-qset-events"
+                | QSET_V3_RAW_CONTAINER
+                | QSET_V4_RAW_CONTAINER
         ) {
             reasons
                 .push("AZURE_STORAGE_CONTAINER_NAME must be an approved shadow evidence container");
@@ -1009,7 +1070,9 @@ mod tests {
         is_full_git_sha, ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings,
         QSET_V3_CHART_TABLE, QSET_V3_CUTOVER_UTC, QSET_V3_EVENT_PREFIX, QSET_V3_EVENT_TABLE,
         QSET_V3_INTENT_PREFIX, QSET_V3_MARKET_TABLE, QSET_V3_PREFLIGHT_PREFIX,
-        QSET_V3_RAW_CONTAINER,
+        QSET_V3_RAW_CONTAINER, QSET_V4_APP_NAME, QSET_V4_CHART_TABLE, QSET_V4_CUTOVER_UTC,
+        QSET_V4_EVENT_PREFIX, QSET_V4_EVENT_TABLE, QSET_V4_INTENT_PREFIX, QSET_V4_MARKET_TABLE,
+        QSET_V4_PREFLIGHT_PREFIX, QSET_V4_RAW_CONTAINER,
     };
     use chrono::{DateTime, Utc};
 
@@ -1122,6 +1185,71 @@ mod tests {
             .contains("exact pointer-only intent prefix"));
         settings.azure.strategy_canary_intent_prefix = QSET_V3_INTENT_PREFIX.to_owned();
     }
+
+    fn qset_v4_settings() -> RuntimeSettings {
+        let mut settings = safe_shadow_settings();
+        settings.deploy.app_name = QSET_V4_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V4_RAW_CONTAINER.to_owned();
+        settings.azure.storage_table_name = QSET_V4_EVENT_TABLE.to_owned();
+        settings.azure.chart_table_name = QSET_V4_CHART_TABLE.to_owned();
+        settings.azure.market_table_name = QSET_V4_MARKET_TABLE.to_owned();
+        settings.azure.event_blob_prefix = QSET_V4_PREFLIGHT_PREFIX.to_owned();
+        settings.azure.event_blob_prefix_after_cutover = Some(QSET_V4_EVENT_PREFIX.to_owned());
+        settings.azure.event_blob_prefix_cutover_utc = Some(
+            DateTime::parse_from_rfc3339(QSET_V4_CUTOVER_UTC)
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+        settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.strategy_canary_intent_prefix = QSET_V4_INTENT_PREFIX.to_owned();
+        settings
+    }
+
+    #[test]
+    fn qset_v4_requires_exact_campaign_binding() {
+        let settings = qset_v4_settings();
+        assert!(QSET_V4_INTENT_PREFIX.ends_with("/intents"));
+        assert!(settings.validate_runtime_role().is_ok());
+
+        let mut wrong_app = settings.clone();
+        wrong_app.deploy.app_name = "polyedge-shadow-qset-v3".to_owned();
+        assert!(wrong_app.validate_runtime_role().is_err());
+
+        let mut wrong_container = settings.clone();
+        wrong_container.azure.storage_container_name = QSET_V3_RAW_CONTAINER.to_owned();
+        assert!(wrong_container.validate_runtime_role().is_err());
+
+        let mut wrong_table = settings.clone();
+        wrong_table.azure.storage_table_name = QSET_V3_EVENT_TABLE.to_owned();
+        assert!(wrong_table.validate_runtime_role().is_err());
+
+        let mut wrong_campaign = settings;
+        wrong_campaign.azure.strategy_canary_intent_prefix = QSET_V3_INTENT_PREFIX.to_owned();
+        assert!(wrong_campaign.validate_runtime_role().is_err());
+    }
+
+    #[test]
+    fn qset_v4_rejects_every_funded_or_queue_binding() {
+        for mutate in [
+            |settings: &mut RuntimeSettings| {
+                settings.azure.funded_direct_service_bus_enabled = true;
+            },
+            |settings: &mut RuntimeSettings| {
+                settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
+            },
+            |settings: &mut RuntimeSettings| {
+                settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
+            },
+            |settings: &mut RuntimeSettings| {
+                settings.live.polymarket_funder = Some("funder".to_owned());
+            },
+        ] {
+            let mut settings = qset_v4_settings();
+            mutate(&mut settings);
+            assert!(settings.validate_runtime_role().is_err());
+        }
+    }
+
     #[test]
     fn qset_shadow_rejects_operator_direct_and_funded_service_bus_delivery() {
         for (operator_direct, service_bus_enabled, namespace, queue) in [

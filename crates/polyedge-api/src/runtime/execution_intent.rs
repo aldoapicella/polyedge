@@ -224,22 +224,24 @@ impl IntentPublisherConfig {
                 "qset shadow intent publisher must not use operator-direct delivery".to_owned(),
             );
         }
-        if settings.azure.storage_container_name == "polyedge-shadow-qset-v3-events"
-            && (!pointer_only_preflight
-                || settings.azure.funded_direct_service_bus_enabled
-                || !settings
-                    .azure
-                    .funded_direct_service_bus_namespace
-                    .trim()
-                    .is_empty()
-                || !settings
-                    .azure
-                    .funded_direct_service_bus_queue
-                    .trim()
-                    .is_empty()
-                || settings.live.polymarket_funder.is_some())
+        if matches!(
+            settings.azure.storage_container_name.as_str(),
+            "polyedge-shadow-qset-v3-events" | "polyedge-shadow-qset-v4-events"
+        ) && (!pointer_only_preflight
+            || settings.azure.funded_direct_service_bus_enabled
+            || !settings
+                .azure
+                .funded_direct_service_bus_namespace
+                .trim()
+                .is_empty()
+            || !settings
+                .azure
+                .funded_direct_service_bus_queue
+                .trim()
+                .is_empty()
+            || settings.live.polymarket_funder.is_some())
         {
-            return Err("qset-v3 intent publisher requires pointer-only preflight with no funded queue or credentials".to_owned());
+            return Err("qset-v3/v4 intent publisher requires pointer-only preflight with no funded queue or credentials".to_owned());
         }
         if pointer_only_preflight
             && (!settings.azure.strategy_intent_operator_direct
@@ -1247,6 +1249,7 @@ fn validated_conservative_prior(
             "static execution model is not the exact frozen conservative prior".to_owned()
         })?;
     let expected_container = match settings.azure.storage_container_name.as_str() {
+        "polyedge-shadow-qset-v4-events" => "polyedge-research-qset-v4",
         "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
         "polyedge-shadow-qset-events" => "polyedge-research-qset",
         "polyedge-shadow-events" => "polyedge-research",
@@ -1762,6 +1765,7 @@ mod tests {
         settings.azure.storage_account_name = Some("test-account".to_owned());
         settings.azure.storage_container_name = shadow_container.to_owned();
         let research_container = match shadow_container {
+            "polyedge-shadow-qset-v4-events" => "polyedge-research-qset-v4",
             "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
             "polyedge-shadow-qset-events" => "polyedge-research-qset",
             "polyedge-shadow-events" => "polyedge-research",
@@ -2323,6 +2327,34 @@ mod tests {
     }
 
     #[test]
+    fn qset_v4_publisher_requires_pointer_only_without_funded_binding() {
+        let mut settings = RuntimeSettings::default();
+        settings.azure.publish_strategy_canary_intents = true;
+        settings.azure.storage_account_name = Some("storage".to_owned());
+        settings.azure.storage_container_name = "polyedge-shadow-qset-v4-events".to_owned();
+        settings.azure.strategy_canary_intent_prefix =
+            "control/strategy-canary/intents/campaign-2026-08-24-qset-v4/intents".to_owned();
+        settings.azure.strategy_intent_operator_direct = true;
+
+        assert!(
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, false)
+                .unwrap_err()
+                .contains("requires pointer-only preflight")
+        );
+        assert!(
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, true)
+                .is_ok()
+        );
+
+        settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
+        assert!(
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, true)
+                .unwrap_err()
+                .contains("no funded queue or credentials")
+        );
+    }
+
+    #[test]
     fn operator_direct_publisher_uses_only_bounded_executable_lanes() {
         let mut settings = RuntimeSettings::default();
         settings.azure.publish_strategy_canary_intents = true;
@@ -2761,6 +2793,24 @@ mod tests {
             .azure
             .strategy_canary_execution_model_blob_uri
             .replace("polyedge-research-qset-v3", "polyedge-research-qset");
+        assert!(validated_conservative_prior(&settings).is_err());
+    }
+
+    #[test]
+    fn qset_v4_shadow_uses_only_the_isolated_frozen_prior() {
+        let (mut settings, ..) = fixture();
+        configure_validated_conservative_prior(&mut settings, "polyedge-shadow-qset-v4-events");
+        assert_eq!(
+            validated_conservative_prior(&settings).unwrap().blob_uri,
+            format!(
+                "azure://test-account/polyedge-research-qset-v4/reports/research/venue-probe/models/{CONSERVATIVE_PRIOR_VERSION}-{}.json",
+                &CONSERVATIVE_PRIOR_SHA256[7..]
+            )
+        );
+        settings.azure.strategy_canary_execution_model_blob_uri = settings
+            .azure
+            .strategy_canary_execution_model_blob_uri
+            .replace("polyedge-research-qset-v4", "polyedge-research-qset-v3");
         assert!(validated_conservative_prior(&settings).is_err());
     }
 

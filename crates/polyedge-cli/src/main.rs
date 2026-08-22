@@ -64,6 +64,48 @@ const QSET_V3_CONTAINER: &str = "polyedge-shadow-qset-v3-events";
 const QSET_V3_PREFIX: &str = "shadow-events/campaign-2026-08-23-qset-v3";
 const QSET_V3_DATES: [&str; 2] = ["2026-08-23", "2026-08-24"];
 const QSET_V3_FREEZE_CONTAINER: &str = "polyedge-qset-v3-control";
+const QSET_V4_CONTAINER: &str = "polyedge-shadow-qset-v4-events";
+const QSET_V4_PREFIX: &str = "shadow-events/campaign-2026-08-24-qset-v4";
+const QSET_V4_DATES: [&str; 2] = ["2026-08-24", "2026-08-25"];
+const QSET_V4_FREEZE_CONTAINER: &str = "polyedge-qset-v4-control";
+
+struct QsetSealConfig {
+    name: &'static str,
+    campaign_id: &'static str,
+    container: &'static str,
+    prefix: &'static str,
+    dates: &'static [&'static str; 2],
+    freeze_container: &'static str,
+    freeze_blob_prefix: &'static str,
+    validation_schema: &'static str,
+    seal_schema: &'static str,
+}
+
+const QSET_V3_SEAL_CONFIG: QsetSealConfig = QsetSealConfig {
+    name: "qset-v3",
+    campaign_id: "campaign-2026-08-23-qset-v3",
+    container: QSET_V3_CONTAINER,
+    prefix: QSET_V3_PREFIX,
+    dates: &QSET_V3_DATES,
+    freeze_container: QSET_V3_FREEZE_CONTAINER,
+    freeze_blob_prefix:
+        "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/control/code-freeze/source-",
+    validation_schema: "polyedge.qset_v3_closed_day_validation.v1",
+    seal_schema: "polyedge.qset_v3_closed_day_seal.v1",
+};
+
+const QSET_V4_SEAL_CONFIG: QsetSealConfig = QsetSealConfig {
+    name: "qset-v4",
+    campaign_id: "campaign-2026-08-24-qset-v4",
+    container: QSET_V4_CONTAINER,
+    prefix: QSET_V4_PREFIX,
+    dates: &QSET_V4_DATES,
+    freeze_container: QSET_V4_FREEZE_CONTAINER,
+    freeze_blob_prefix:
+        "reports/research/shadow/campaigns/campaign-2026-08-24-qset-v4/control/code-freeze/source-",
+    validation_schema: "polyedge.qset_v4_closed_day_validation.v1",
+    seal_schema: "polyedge.qset_v4_closed_day_seal.v1",
+};
 
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
@@ -179,6 +221,23 @@ enum Command {
         #[arg(long)]
         date: String,
         /// Exact reviewed source-freeze blob in polyedge-qset-v3-control.
+        #[arg(long)]
+        source_freeze_blob: String,
+        /// SHA-256 of --source-freeze-blob, prefixed with sha256:.
+        #[arg(long)]
+        source_freeze_sha256: String,
+        #[arg(long)]
+        validate_only: bool,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Seal one approved closed UTC day from the isolated qset-v4 campaign.
+    SealQsetV4Day {
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(long)]
+        date: String,
+        /// Exact reviewed source-freeze blob in polyedge-qset-v4-control.
         #[arg(long)]
         source_freeze_blob: String,
         /// SHA-256 of --source-freeze-blob, prefixed with sha256:.
@@ -894,7 +953,24 @@ async fn main() -> Result<()> {
             source_freeze_sha256,
             validate_only,
             client_id,
-        } => print_json(run_seal_qset_v3_day(
+        } => print_json(run_seal_qset_day(
+            &QSET_V3_SEAL_CONFIG,
+            account,
+            parse_date_arg(&date)?,
+            &source_freeze_blob,
+            &source_freeze_sha256,
+            validate_only,
+            client_id,
+        )?),
+        Command::SealQsetV4Day {
+            account,
+            date,
+            source_freeze_blob,
+            source_freeze_sha256,
+            validate_only,
+            client_id,
+        } => print_json(run_seal_qset_day(
+            &QSET_V4_SEAL_CONFIG,
             account,
             parse_date_arg(&date)?,
             &source_freeze_blob,
@@ -1798,7 +1874,8 @@ fn run_seal_qset_v2_day(
     }))
 }
 
-fn run_seal_qset_v3_day(
+fn run_seal_qset_day(
+    config: &QsetSealConfig,
     account: String,
     date: NaiveDate,
     source_freeze_blob: &str,
@@ -1806,27 +1883,19 @@ fn run_seal_qset_v3_day(
     validate_only: bool,
     client_id: Option<String>,
 ) -> Result<serde_json::Value> {
-    let date_value = date.format("%Y-%m-%d").to_string();
-    let today = Utc::now().date_naive();
-    if !QSET_V3_DATES.iter().any(|allowed| *allowed == date_value) || date >= today {
-        bail!(
-            "qset-v3 seal date must be exactly {} or {} and before {today}; received {date}",
-            QSET_V3_DATES[0],
-            QSET_V3_DATES[1]
-        );
-    }
-    if !valid_qset_v3_source_freeze_binding(source_freeze_blob, source_freeze_sha256) {
-        bail!("qset-v3 source-freeze binding is invalid");
+    validate_qset_seal_date(config, date, Utc::now().date_naive())?;
+    if !valid_qset_source_freeze_binding(config, source_freeze_blob, source_freeze_sha256) {
+        bail!("{} source-freeze binding is invalid", config.name);
     }
 
     let mut freeze_client = AzureBlobClient::with_managed_identity(
         account.clone(),
-        QSET_V3_FREEZE_CONTAINER,
+        config.freeze_container,
         client_id.clone(),
     );
     let freeze_items = freeze_client
         .list_blobs_unfiltered(source_freeze_blob, None, None)
-        .context("listing the qset-v3 source-freeze artifact")?;
+        .with_context(|| format!("listing the {} source-freeze artifact", config.name))?;
     let freeze_item = freeze_items
         .iter()
         .filter(|item| item.name == source_freeze_blob)
@@ -1836,7 +1905,10 @@ fn run_seal_qset_v3_day(
         || freeze_item[0].content_length == 0
         || freeze_item[0].content_length > QSET_V2_MAX_FREEZE_BYTES
     {
-        bail!("qset-v3 source-freeze artifact binding is not unique and bounded");
+        bail!(
+            "{} source-freeze artifact binding is not unique and bounded",
+            config.name
+        );
     }
     let freeze_bytes = freeze_client
         .download_blob_bytes_exact_bounded(
@@ -1844,92 +1916,131 @@ fn run_seal_qset_v3_day(
             freeze_item[0].content_length,
             QSET_V2_MAX_FREEZE_BYTES,
         )
-        .context("reading the qset-v3 source-freeze artifact")?;
+        .with_context(|| format!("reading the {} source-freeze artifact", config.name))?;
     if sha256_prefixed(&freeze_bytes) != source_freeze_sha256 {
-        bail!("qset-v3 source-freeze artifact hash disagrees with the approved binding");
+        bail!(
+            "{} source-freeze artifact hash disagrees with the approved binding",
+            config.name
+        );
     }
 
-    let prefix = format!("{QSET_V3_PREFIX}/{}/", date.format("%Y/%m/%d"));
+    let prefix = format!("{}/{}/", config.prefix, date.format("%Y/%m/%d"));
     let mut client =
-        AzureBlobClient::with_managed_identity(account.clone(), QSET_V3_CONTAINER, client_id);
-    let before = validate_qset_v3_inventory(
+        AzureBlobClient::with_managed_identity(account.clone(), config.container, client_id);
+    let before = validate_qset_inventory(
+        config,
         client
             .list_blobs_unfiltered(&prefix, None, None)
-            .context("listing the closed qset-v3 day before sealing")?,
+            .with_context(|| format!("listing the closed {} day before sealing", config.name))?,
         &prefix,
     )?;
     let source_inventory_sha256 = qset_v2_inventory_sha256(&before)?;
     if validate_only {
-        let total_bytes = before.iter().try_fold(0_u64, |total, blob| {
-            total
-                .checked_add(blob.content_length)
-                .context("qset-v3 day byte count overflow")
-        })?;
-        return Ok(json!({
-            "schema": "polyedge.qset_v3_closed_day_validation.v1",
-            "account": account,
-            "container": QSET_V3_CONTAINER,
-            "campaign_id": "campaign-2026-08-23-qset-v3",
-            "date": date,
-            "prefix": prefix,
-            "blob_count": before.len(),
-            "total_bytes": total_bytes,
-            "all_sealed": before.iter().all(|blob| blob.sealed == Some(true)),
-            "source_inventory_sha256": source_inventory_sha256,
-            "source_freeze": {
-                "container": QSET_V3_FREEZE_CONTAINER,
-                "blob": source_freeze_blob,
-                "sha256": source_freeze_sha256,
-                "verified": true
-            }
-        }));
+        return qset_closed_day_receipt(
+            config,
+            &account,
+            date,
+            &prefix,
+            &before,
+            &source_inventory_sha256,
+            source_freeze_blob,
+            source_freeze_sha256,
+            false,
+        );
     }
     for blob in before.iter().filter(|blob| blob.sealed == Some(false)) {
         client
             .seal_append_blob_if_match(&blob.name, &blob.etag)
-            .with_context(|| format!("sealing closed qset-v3 blob {}", blob.name))?;
+            .with_context(|| format!("sealing closed {} blob {}", config.name, blob.name))?;
     }
 
-    let after = validate_qset_v3_inventory(
+    let after = validate_qset_inventory(
+        config,
         client
             .list_blobs_unfiltered(&prefix, None, None)
-            .context("listing the closed qset-v3 day after sealing")?,
+            .with_context(|| format!("listing the closed {} day after sealing", config.name))?,
         &prefix,
     )?;
     if qset_v2_inventory_sha256(&after)? != source_inventory_sha256 {
-        bail!("qset-v3 source inventory changed while the day was sealed");
+        bail!(
+            "{} source inventory changed while the day was sealed",
+            config.name
+        );
     }
     if after.iter().any(|blob| blob.sealed != Some(true)) {
-        bail!("qset-v3 day still contains unsealed append blobs");
+        bail!("{} day still contains unsealed append blobs", config.name);
     }
-    let total_bytes = after.iter().try_fold(0_u64, |total, blob| {
+    qset_closed_day_receipt(
+        config,
+        &account,
+        date,
+        &prefix,
+        &after,
+        &source_inventory_sha256,
+        source_freeze_blob,
+        source_freeze_sha256,
+        true,
+    )
+}
+
+fn validate_qset_seal_date(
+    config: &QsetSealConfig,
+    date: NaiveDate,
+    today: NaiveDate,
+) -> Result<()> {
+    let date_value = date.format("%Y-%m-%d").to_string();
+    if config.dates.iter().any(|allowed| *allowed == date_value) && date < today {
+        return Ok(());
+    }
+    bail!(
+        "{} seal date must be exactly {} or {} and before {today}; received {date}",
+        config.name,
+        config.dates[0],
+        config.dates[1]
+    );
+}
+
+fn qset_closed_day_receipt(
+    config: &QsetSealConfig,
+    account: &str,
+    date: NaiveDate,
+    prefix: &str,
+    blobs: &[AzureBlobItem],
+    source_inventory_sha256: &str,
+    source_freeze_blob: &str,
+    source_freeze_sha256: &str,
+    sealed: bool,
+) -> Result<serde_json::Value> {
+    let total_bytes = blobs.iter().try_fold(0_u64, |total, blob| {
         total
             .checked_add(blob.content_length)
-            .context("qset-v3 day byte count overflow")
+            .with_context(|| format!("{} day byte count overflow", config.name))
     })?;
-
-    Ok(json!({
-        "schema": "polyedge.qset_v3_closed_day_seal.v1",
+    let mut receipt = json!({
+        "schema": if sealed { config.seal_schema } else { config.validation_schema },
         "account": account,
-        "container": QSET_V3_CONTAINER,
-        "campaign_id": "campaign-2026-08-23-qset-v3",
+        "container": config.container,
+        "campaign_id": config.campaign_id,
         "date": date,
         "prefix": prefix,
-        "blob_count": after.len(),
+        "blob_count": blobs.len(),
         "total_bytes": total_bytes,
-        "sealed_blob_count": after.len(),
-        "all_sealed": true,
+        "all_sealed": sealed || blobs.iter().all(|blob| blob.sealed == Some(true)),
         "source_inventory_sha256": source_inventory_sha256,
         "source_freeze": {
-            "container": QSET_V3_FREEZE_CONTAINER,
+            "container": config.freeze_container,
             "blob": source_freeze_blob,
             "sha256": source_freeze_sha256,
             "verified": true
         }
-    }))
+    });
+    if sealed {
+        receipt["sealed_blob_count"] = json!(blobs.len());
+    }
+    Ok(receipt)
 }
-
-fn valid_qset_v3_source_freeze_binding(
+fn valid_qset_source_freeze_binding(
+    config: &QsetSealConfig,
     source_freeze_blob: &str,
     source_freeze_sha256: &str,
 ) -> bool {
@@ -1937,9 +2048,7 @@ fn valid_qset_v3_source_freeze_binding(
         return false;
     };
     let Some(blob_digest) = source_freeze_blob
-        .strip_prefix(
-            "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/control/code-freeze/source-",
-        )
+        .strip_prefix(config.freeze_blob_prefix)
         .and_then(|name| name.strip_suffix(".json"))
     else {
         return false;
@@ -1951,12 +2060,13 @@ fn valid_qset_v3_source_freeze_binding(
         && blob_digest == digest
 }
 
-fn validate_qset_v3_inventory(
+fn validate_qset_inventory(
+    config: &QsetSealConfig,
     blobs: Vec<AzureBlobItem>,
     prefix: &str,
 ) -> Result<Vec<AzureBlobItem>> {
     validate_qset_v2_inventory(blobs, prefix)
-        .map_err(|error| anyhow::anyhow!("qset-v3 closed-day validation failed: {error:#}"))
+        .map_err(|error| anyhow::anyhow!("{} closed-day validation failed: {error:#}", config.name))
 }
 
 fn validate_qset_v2_inventory(
@@ -3796,7 +3906,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            super::validate_qset_v3_inventory(blobs.clone(), prefix)
+            super::validate_qset_inventory(&super::QSET_V3_SEAL_CONFIG, blobs.clone(), prefix)
                 .unwrap()
                 .len(),
             1_440
@@ -3806,22 +3916,28 @@ mod tests {
         sealed[0].etag.push_str("-sealed");
         sealed[0].sealed = Some(true);
         assert_eq!(qset_v2_inventory_sha256(&sealed).unwrap(), source_digest);
-        assert!(super::validate_qset_v3_inventory(blobs[..1_439].to_vec(), prefix).is_err());
+        assert!(super::validate_qset_inventory(
+            &super::QSET_V3_SEAL_CONFIG,
+            blobs[..1_439].to_vec(),
+            prefix
+        )
+        .is_err());
         assert_eq!(super::QSET_V3_DATES, ["2026-08-23", "2026-08-24"]);
 
         let freeze_sha256 =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let freeze_blob =
             "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
-        assert!(super::valid_qset_v3_source_freeze_binding(
+        assert!(super::valid_qset_source_freeze_binding(
+            &super::QSET_V3_SEAL_CONFIG,
             freeze_blob,
             freeze_sha256
         ));
-        assert!(!super::valid_qset_v3_source_freeze_binding(
+        assert!(!super::valid_qset_source_freeze_binding(&super::QSET_V3_SEAL_CONFIG,
             "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/control/code-freeze/source-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
             freeze_sha256
         ));
-        assert!(!super::valid_qset_v3_source_freeze_binding(
+        assert!(!super::valid_qset_source_freeze_binding(&super::QSET_V3_SEAL_CONFIG,
             "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json?x=1",
             freeze_sha256
         ));
@@ -3851,6 +3967,127 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn qset_v4_sealer_contract_is_exact() {
+        const SHA: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const V4_BLOB: &str =
+            "reports/research/shadow/campaigns/campaign-2026-08-24-qset-v4/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+        const V3_BLOB: &str =
+            "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+        const WRONG_HASH_BLOB: &str =
+            "reports/research/shadow/campaigns/campaign-2026-08-24-qset-v4/control/code-freeze/source-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json";
+
+        assert!(super::valid_qset_source_freeze_binding(
+            &super::QSET_V4_SEAL_CONFIG,
+            V4_BLOB,
+            SHA
+        ));
+        for (config, blob) in [
+            (&super::QSET_V4_SEAL_CONFIG, V3_BLOB),
+            (&super::QSET_V3_SEAL_CONFIG, V4_BLOB),
+            (&super::QSET_V4_SEAL_CONFIG, WRONG_HASH_BLOB),
+        ] {
+            assert!(!super::valid_qset_source_freeze_binding(config, blob, SHA));
+        }
+
+        let after_both = chrono::NaiveDate::from_ymd_opt(2026, 8, 26).unwrap();
+        for (day, valid) in [(23, false), (24, true), (25, true)] {
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 8, day).unwrap();
+            assert_eq!(
+                super::validate_qset_seal_date(&super::QSET_V4_SEAL_CONFIG, date, after_both)
+                    .is_ok(),
+                valid
+            );
+        }
+        let second_date = chrono::NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        assert!(super::validate_qset_seal_date(
+            &super::QSET_V4_SEAL_CONFIG,
+            second_date,
+            second_date
+        )
+        .is_err());
+
+        let cli = Cli::try_parse_from([
+            "polyedge-rs",
+            "seal-qset-v4-day",
+            "--account",
+            "storage",
+            "--date",
+            "2026-08-24",
+            "--source-freeze-blob",
+            V4_BLOB,
+            "--source-freeze-sha256",
+            SHA,
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::SealQsetV4Day { .. }));
+        assert!(Cli::try_parse_from([
+            "polyedge-rs",
+            "seal-qset-v4-day",
+            "--account",
+            "storage",
+            "--date",
+            "2026-08-24",
+        ])
+        .is_err());
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let prefix = "shadow-events/campaign-2026-08-24-qset-v4/2026/08/24/";
+        let blobs = [AzureBlobItem {
+            name: format!("{prefix}00/00.jsonl"),
+            etag: "\"etag\"".to_owned(),
+            version_id: None,
+            is_current_version: None,
+            content_md5: None,
+            blob_type: Some("AppendBlob".to_owned()),
+            sealed: Some(true),
+            content_length: 7,
+            last_modified: None,
+        }];
+        let receipt = |sealed| {
+            super::qset_closed_day_receipt(
+                &super::QSET_V4_SEAL_CONFIG,
+                "storage",
+                date,
+                prefix,
+                &blobs,
+                "sha256:inventory",
+                V4_BLOB,
+                SHA,
+                sealed,
+            )
+            .unwrap()
+        };
+        let validation = receipt(false);
+        assert_eq!(
+            validation["schema"],
+            "polyedge.qset_v4_closed_day_validation.v1"
+        );
+        assert_eq!(validation["campaign_id"], "campaign-2026-08-24-qset-v4");
+        assert_eq!(validation["container"], "polyedge-shadow-qset-v4-events");
+        assert_eq!(validation["prefix"], prefix);
+        assert_eq!(validation["blob_count"], 1);
+        assert_eq!(validation["total_bytes"], 7);
+        assert_eq!(validation["source_inventory_sha256"], "sha256:inventory");
+        assert_eq!(
+            validation["source_freeze"],
+            json!({
+                "container": "polyedge-qset-v4-control",
+                "blob": V4_BLOB,
+                "sha256": SHA,
+                "verified": true
+            })
+        );
+        assert!(validation.get("generated_ts").is_none());
+        assert!(validation.get("sealed_at").is_none());
+        assert!(validation.get("sealed_blob_count").is_none());
+
+        let seal = receipt(true);
+        assert_eq!(seal["schema"], "polyedge.qset_v4_closed_day_seal.v1");
+        assert_eq!(seal["sealed_blob_count"], 1);
+        assert!(seal.get("generated_ts").is_none());
+        assert!(seal.get("sealed_at").is_none());
+    }
     fn quarantine_fixture() -> (PathBuf, String) {
         let root = std::env::temp_dir().join(format!(
             "polyedge-ring-quarantine-{}-{}",
