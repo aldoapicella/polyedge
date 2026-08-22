@@ -81,6 +81,7 @@ sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-source-freeze /usr/local/l
 sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-rbac-handoff /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-boundary-guard /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-seal-days /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-retire-writer /usr/local/libexec/
 sudo install -D -m 0644 ops/conduit/systemd/polyedge-federated-token@shadow-qset-v4-writer.service.d/override.conf /etc/systemd/system/polyedge-federated-token@shadow-qset-v4-writer.service.d/override.conf
 sudo install -D -m 0644 ops/conduit/systemd/polyedge-federated-token@shadow-qset-v4-processor.service.d/override.conf /etc/systemd/system/polyedge-federated-token@shadow-qset-v4-processor.service.d/override.conf
 sudo install -m 0644 ops/conduit/quadlets/polyedge-shadow-qset-v4.container /etc/containers/systemd/
@@ -183,4 +184,12 @@ sudo systemctl start polyedge-qset-v4-processor.service
 
 Do not add recurrence. Require successful output hash/readback and the processor negative-access proof first.
 
-Before freezing a future qset campaign, require the maintained positive prepare-retirement/drain command to return nonzero on incomplete drain and a structured final receipt only after writer/processor quiescence, zero queued/unrecovered work, and durable readback. A missing positive receipt blocks retirement; absence of negative evidence is never sufficient.
+## Retire the qset-v4 writer
+
+Only after the campaign is complete and the local processor has independently proven successful output hash/readback and zero queued or unrecovered work, run the maintained host command:
+
+```sh
+sudo /usr/local/libexec/polyedge-qset-v4-retire-writer
+```
+
+It signals the current writer with `SIGUSR1`, accepts only the exact retirement receipt emitted after the recorder waterline is fully durable, and binds the captured journal message to the current systemd `InvocationID`, full container ID, pinned image digest, and immutable image revision. It atomically persists root:root mode 0640 evidence at `/srv/polyedge-ring/migration/qset-v4/retirement/campaign-2026-08-24-qset-v4-writer.json`, fsyncs the file and directory, rechecks the same live identity, and only then stops the service. If interrupted after evidence persistence, rerun the same command; it validates the existing evidence and stops the same writer without sending a second prepare signal. Any invocation, container, image, receipt, ownership, or durability mismatch fails closed and leaves the writer running.
