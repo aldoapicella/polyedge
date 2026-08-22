@@ -7,12 +7,13 @@ readonly v3_writer_service=polyedge-shadow-qset-v3.service
 readonly v3_seal_service=polyedge-qset-v3-seal-days.service
 readonly v3_processor_job=polyedge-shadow-qset-v3-neu-job
 readonly v4_writer_service=polyedge-shadow-qset-v4.service
+readonly v4_processor_job=polyedge-shadow-qset-v4-neu-job
 readonly token=/run/polyedge-federated-shadow-qset-v3-writer/azure-federated-token
 readonly receipt_root=/srv/polyedge-ring/migration/qset-v4/rbac-handoff
 readonly before_receipt=$receipt_root/v3-assignments-before.json
 readonly rollback_receipt=$receipt_root/rollback-result.json
 
-case "$mode" in check|apply) ;; *) echo "usage: ${0##*/} check|apply" >&2; exit 64 ;; esac
+case "$mode" in check|apply|rollback) ;; *) echo "usage: ${0##*/} check|apply|rollback" >&2; exit 64 ;; esac
 : "${AZURE_RESOURCE_GROUP:?AZURE_RESOURCE_GROUP is required}"
 : "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
 
@@ -51,12 +52,25 @@ require_retired_initiators() {
     jq -e '[.[] | select((.properties.status // .status // "") | test("Running|Provisioning|Processing"))] | length == 0' <<<"$executions" >/dev/null
   fi
 }
+require_v4_rollback_quiescent() {
+  v4_not_running_or_disabled "$v4_writer_service"
+  local jobs job executions
+  jobs=$(az containerapp job list --resource-group "$AZURE_RESOURCE_GROUP" -o json)
+  job=$(jq -ce --arg name "$v4_processor_job" '[.[] | select(.name == $name)]' <<<"$jobs")
+  jq -e 'length <= 1' <<<"$job" >/dev/null
+  if test "$(jq -r 'length' <<<"$job")" = 1; then
+    jq -e '.[0].properties.configuration.triggerType == "Manual"' <<<"$job" >/dev/null
+    executions=$(az containerapp job execution list --resource-group "$AZURE_RESOURCE_GROUP" --name "$v4_processor_job" -o json)
+    jq -e '[.[] | select((.properties.status // .status // "") | test("Running|Provisioning|Processing"))] | length == 0' <<<"$executions" >/dev/null
+  fi
+}
 resolve_ids() {
   subscription_id=$(az account show --query id -o tsv)
   storage_id=$(az storage account show --resource-group "$AZURE_RESOURCE_GROUP" --name "$AZURE_STORAGE_ACCOUNT_NAME" --query id -o tsv)
   writer_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name id-polyedge-conduit-shadow-qset-v3-writer --query principalId -o tsv)
   processor_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name id-polyedge-conduit-shadow-qset-v3-processor --query principalId -o tsv)
-  test -n "$subscription_id" && test -n "$storage_id" && test -n "$writer_principal" && test -n "$processor_principal"
+  api_principal=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name id-polyedge-conduit-api --query principalId -o tsv)
+  test -n "$subscription_id" && test -n "$storage_id" && test -n "$writer_principal" && test -n "$processor_principal" && test -n "$api_principal"
   blob_reader_role="/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleDefinitions/2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
   table_writer_role="/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleDefinitions/c8133837-ba14-4b6b-8f58-52ce675a33e4"
   blob_writer_role="/subscriptions/$subscription_id/providers/Microsoft.Authorization/roleDefinitions/44fd8b56-84f7-403c-a44a-7aabab1d28b1"
@@ -86,6 +100,17 @@ collect_assignments() {
   '
 }
 assert_exact_eight() {
+assert_no_unexpected_principal_assignments() {
+  local record=$1 writer_all processor_all
+  writer_all=$(az role assignment list --all --assignee-object-id "$writer_principal" -o json)
+  processor_all=$(az role assignment list --all --assignee-object-id "$processor_principal" -o json)
+  jq -n --slurpfile record "$record" --argjson writer "$writer_all" --argjson processor "$processor_all" '
+    def compact: [.[] | {id,scope,roleDefinitionId,principalId,condition,conditionVersion}] | sort_by(.id);
+    ($record[0].writer | sort_by(.id)) == ($writer | compact) and
+    ($record[0].processor | sort_by(.id)) == ($processor | compact) and
+    all(($writer + $processor)[]; (.scope | test("/resourceGroups/[^/]+$|/providers/Microsoft.Storage/storageAccounts/[^/]+$|^/subscriptions/[^/]+$|Microsoft.KeyVault|Microsoft.ServiceBus|funded"; "i") | not))
+  ' >/dev/null
+}
   local campaign=$1 record=$2 version writer_condition processor_condition
   campaign_values "$campaign"; version=${campaign#qset-v}
   writer_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals '$raw') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/preflight/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'control/strategy-canary/intents/$campaign_id/'))))"
@@ -104,6 +129,7 @@ assert_exact_eight() {
     (([.processor[] | select(.scope == $research)]) as $roles | ($roles | length) == 1 and $roles[0].roleDefinitionId == $blob_writer and ($roles[0] | matches_condition($processor_condition))) and
     all(.processor[] | select(.scope != $research); unconditional($blob_reader))
   ' "$record" >/dev/null
+  assert_no_unexpected_principal_assignments "$record"
 }
 require_apply_bindings() {
   : "${V4_ACCESS_PROBE_IMAGE:?V4_ACCESS_PROBE_IMAGE is required}"
@@ -168,6 +194,8 @@ delete_v4_assignments() {
   partial=$(mktemp)
   collect_assignments qset-v4 >"$partial"
   jq -r '.all[].id' "$partial" | while IFS= read -r assignment_id; do az role assignment delete --ids "$assignment_id"; done
+  api_scope="$storage_id/blobServices/default/containers/polyedge-research-qset-v4"
+  az role assignment list --all --assignee-object-id "$api_principal" --scope "$api_scope" -o json | jq -r '.[] | .id' | while IFS= read -r assignment_id; do az role assignment delete --ids "$assignment_id"; done
   rm -f "$partial"
 }
 restore_old_assignments() {
@@ -200,6 +228,17 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 require_retired_initiators
 resolve_ids
+if test "$mode" = rollback; then
+  require_v4_rollback_quiescent
+  test ! -L "$before_receipt" && test "$(stat -c %u:%g:%a:%h "$before_receipt")" = 0:0:640:1
+  cp "$before_receipt" "$before"
+  assert_exact_eight qset-v3 "$before"
+  handoff_started=true
+  reconcile_rollback
+  handoff_succeeded=true
+  printf '%s\n' 'qset-v4 RBAC rollback applied; exact v3 grants restored and v4 grants removed'
+  exit 0
+fi
 collect_assignments qset-v3 >"$before"
 assert_exact_eight qset-v3 "$before"
 if test "$mode" = check; then
