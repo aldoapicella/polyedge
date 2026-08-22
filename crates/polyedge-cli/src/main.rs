@@ -3821,6 +3821,23 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
+
+    // Clap builds the full nested command tree on the stack; use the same
+    // 8 MiB stack as the production Linux main thread, not a 2 MiB test worker.
+    fn try_parse_cli<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString>,
+    {
+        let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .name("cli-parse-test".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
     #[test]
     fn qset_v2_sealer_is_exact_closed_day_only() {
         let prefix = "shadow-events/campaign-2026-08-22-qset-v2/2026/08/22/";
@@ -3865,7 +3882,7 @@ mod tests {
         assert!(validate_qset_v2_inventory(invalid, prefix).is_err());
         assert!(validate_qset_v2_inventory(blobs[..1_439].to_vec(), prefix).is_err());
 
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "seal-qset-v2-day",
             "--account",
@@ -3875,7 +3892,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::SealQsetV2Day { .. }));
-        assert!(Cli::try_parse_from([
+        assert!(try_parse_cli([
             "polyedge-rs",
             "seal-qset-v2-day",
             "--account",
@@ -3942,7 +3959,7 @@ mod tests {
             freeze_sha256
         ));
 
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "seal-qset-v3-day",
             "--account",
@@ -3956,7 +3973,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::SealQsetV3Day { .. }));
-        assert!(Cli::try_parse_from([
+        assert!(try_parse_cli([
             "polyedge-rs",
             "seal-qset-v3-day",
             "--account",
@@ -4007,7 +4024,7 @@ mod tests {
         )
         .is_err());
 
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "seal-qset-v4-day",
             "--account",
@@ -4021,7 +4038,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::SealQsetV4Day { .. }));
-        assert!(Cli::try_parse_from([
+        assert!(try_parse_cli([
             "polyedge-rs",
             "seal-qset-v4-day",
             "--account",
@@ -4273,7 +4290,7 @@ mod tests {
 
     #[test]
     fn ring_quarantine_resolution_cli_requires_identity_boundary_and_approval() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "ring-quarantine-resolve",
             "--root",
@@ -4289,7 +4306,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::RingQuarantineResolve { .. }));
-        assert!(Cli::try_parse_from([
+        assert!(try_parse_cli([
             "polyedge-rs",
             "ring-quarantine-resolve",
             "--receipt-id",
@@ -4300,7 +4317,7 @@ mod tests {
             "storage",
         ])
         .is_err());
-        assert!(Cli::try_parse_from([
+        assert!(try_parse_cli([
             "polyedge-rs",
             "ring-quarantine-resolve",
             "--receipt-id",
@@ -4608,7 +4625,7 @@ mod tests {
 
     #[test]
     fn loss_diagnostics_cli_requires_explicit_snapshot_and_output_directory() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "research",
             "loss-diagnostics",
@@ -4626,12 +4643,12 @@ mod tests {
         };
         assert_eq!(input, PathBuf::from("immutable-v3-snapshot"));
         assert_eq!(out, PathBuf::from("loss-diagnostics-out"));
-        assert!(Cli::try_parse_from(["polyedge-rs", "research", "loss-diagnostics"]).is_err());
+        assert!(try_parse_cli(["polyedge-rs", "research", "loss-diagnostics"]).is_err());
     }
 
     #[test]
     fn loss_regime_oos_cli_requires_explicit_isolated_evidence_inputs() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "research",
             "loss-regime-oos",
@@ -4669,12 +4686,12 @@ mod tests {
         assert!(config.ends_with("loss-regime-oos-v2-2026-07-23.yaml"));
         assert!(out.starts_with("reports/research/experiments"));
         assert!(markdown.starts_with("reports/research/experiments"));
-        assert!(Cli::try_parse_from(["polyedge-rs", "research", "loss-regime-oos"]).is_err());
+        assert!(try_parse_cli(["polyedge-rs", "research", "loss-regime-oos"]).is_err());
     }
 
     #[test]
     fn publish_daily_bundle_cli_binds_explicit_shadow_runtime_role() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "research",
             "publish-daily-bundle",
@@ -4715,7 +4732,7 @@ mod tests {
 
     #[test]
     fn azure_lease_cli_preserves_the_exact_child_command() {
-        let cli = Cli::try_parse_from([
+        let cli = try_parse_cli([
             "polyedge-rs",
             "research",
             "with-azure-lease",
@@ -4757,7 +4774,7 @@ mod tests {
 
     #[test]
     fn normalized_snapshot_cli_requires_explicit_date_and_path() {
-        let publish = Cli::try_parse_from([
+        let publish = try_parse_cli([
             "polyedge-rs",
             "research",
             "publish-normalized-snapshot",
@@ -4787,7 +4804,7 @@ mod tests {
         assert_eq!(date, "2026-07-30");
         assert_eq!(prefix, "data/research/normalized/v1");
 
-        let restore = Cli::try_parse_from([
+        let restore = try_parse_cli([
             "polyedge-rs",
             "research",
             "restore-normalized-snapshot",
@@ -4810,7 +4827,7 @@ mod tests {
         assert_eq!(out, PathBuf::from("restored"));
         assert_eq!(date, "2026-07-30");
 
-        assert!(Cli::try_parse_from([
+        assert!(try_parse_cli([
             "polyedge-rs",
             "research",
             "publish-normalized-snapshot",

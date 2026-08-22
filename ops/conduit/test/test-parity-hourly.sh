@@ -1331,6 +1331,10 @@ if [ "${LAUNCH_MODE:-}" = hash ] && [ "${1##*/}" = audit.json ]; then
 fi
 exec /usr/bin/sha256sum "$@"
 EOF
+cat >"$launcher_root/bin/disk-guard" <<'EOF'
+#!/bin/sh
+[ "$*" = --assert-headroom ]
+EOF
 chmod 0755 "$launcher_root/bin"/*
 
 run_launcher() {
@@ -1339,6 +1343,7 @@ run_launcher() {
   mkdir -p "$launcher_root/calls"
   env PATH="$launcher_root/bin:$fake:$PATH" FAKE_MOUNTPOINT_OK=1 FAKE_DF_AVAILABLE=100000000000 \
     LAUNCH_MODE="$mode" LAUNCH_CALLS="$launcher_root/calls" LAUNCH_RING="$launcher_root/ring" \
+    POLYEDGE_BOOT_DISK_GUARD_BIN="$launcher_root/bin/disk-guard" \
     POLYEDGE_RESEARCH_IMAGE="$oci_image" POLYEDGE_LOCAL_RAW_ROOT=/input/events \
     POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH=true POLYEDGE_JOB_MIN_FREE_BYTES=1 \
     "$launcher_root/run-job" hourly
