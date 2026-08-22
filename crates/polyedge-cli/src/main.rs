@@ -2279,33 +2279,84 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
             "bind": bind
         })
     );
+    let qset_v4_writer = settings.deploy.app_name == "polyedge-shadow-qset-v4";
     let (app, shutdown) = app_with_shutdown(settings);
-    axum::serve(listener, app)
+    let (shutdown_result_tx, shutdown_result_rx) = tokio::sync::oneshot::channel();
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            if let Err(error) = shutdown.drain().await {
+            let result = shutdown_protocol(shutdown, qset_v4_writer).await;
+            if let Err(error) = &result {
                 eprintln!("Rust API shutdown did not fully drain: {error}");
             }
+            let _ = shutdown_result_tx.send(result);
         })
-        .await
-        .context("serving Rust API")
+        .await;
+    match shutdown_result_rx.await {
+        Ok(Ok(_)) => serve_result.context("serving Rust API"),
+        Ok(Err(error)) => Err(anyhow::anyhow!("Rust API retirement failed: {error}")),
+        Err(_) => serve_result.context("serving Rust API"),
+    }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_protocol(
+    shutdown: polyedge_api::ApiShutdown,
+    qset_v4_writer: bool,
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("installing SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+        if !qset_v4_writer {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return shutdown.drain().await;
+        }
+        let mut prepare =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("installing SIGUSR1 handler");
+        let mut prepared = false;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return require_qset_v4_prepared(prepared),
+                _ = terminate.recv() => return require_qset_v4_prepared(prepared),
+                _ = prepare.recv() => match shutdown.prepare_qset_v4_retirement().await {
+                    Ok(receipt) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&receipt)
+                                .map_err(|error| format!("serializing qset-v4 retirement receipt: {error}"))?
+                        );
+                        prepared = true;
+                    }
+                    Err(error) => {
+                        eprintln!("qset-v4 prepare-retirement failed; writer remains fenced: {error}");
+                    }
+                }
+            }
         }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c()
-        .await
-        .expect("installing Ctrl-C handler");
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("installing Ctrl-C handler");
+        if qset_v4_writer {
+            require_qset_v4_prepared(false)
+        } else {
+            shutdown.drain().await
+        }
+    }
+}
+
+fn require_qset_v4_prepared(prepared: bool) -> Result<(), String> {
+    if prepared {
+        Ok(())
+    } else {
+        Err("qset-v4 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM".to_owned())
+    }
 }
 
 fn bench_ingest(events: usize) -> serde_json::Value {
@@ -3808,12 +3859,13 @@ mod tests {
     use super::{
         accepted_ring_blob_prefix, prepare_ring_quarantine_resolution,
         profitability_authorization_flags, publish_local_ring_quarantine_resolution,
-        qset_v2_inventory_sha256, recover_ring_quarantine_staging, ring_blob_name,
-        ring_relative_path, ring_sha256, sha256_prefixed, terminate_lease_child_tree,
-        validate_local_ring_quarantine_resolution, validate_qset_v2_inventory,
-        validate_ring_identity, validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
-        validate_ring_quarantine_source_size, validate_ring_source_v3, validate_ring_source_v4,
-        validate_ring_upload_receipt, AzureBlobItem, Cli, Command, Path, PathBuf, ResearchCommand,
+        qset_v2_inventory_sha256, recover_ring_quarantine_staging, require_qset_v4_prepared,
+        ring_blob_name, ring_relative_path, ring_sha256, sha256_prefixed,
+        terminate_lease_child_tree, validate_local_ring_quarantine_resolution,
+        validate_qset_v2_inventory, validate_ring_identity, validate_ring_manifest_v3_sequence,
+        validate_ring_manifest_v4_runs, validate_ring_quarantine_source_size,
+        validate_ring_source_v3, validate_ring_source_v4, validate_ring_upload_receipt,
+        AzureBlobItem, Cli, Command, Path, PathBuf, ResearchCommand,
         MAX_RING_QUARANTINE_SOURCE_BYTES, RING_QUARANTINE_BLOB_PREFIX,
     };
     use clap::Parser;
@@ -3821,6 +3873,12 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn qset_v4_term_requires_a_successful_prepare_receipt() {
+        assert!(require_qset_v4_prepared(false).is_err());
+        assert!(require_qset_v4_prepared(true).is_ok());
+    }
 
     // Clap builds the full nested command tree on the stack; use the same
     // 8 MiB stack as the production Linux main thread, not a 2 MiB test worker.

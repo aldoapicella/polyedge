@@ -26,6 +26,7 @@ use history::{
     empty_chart, historical_detail, max_historical_markets, merge_chart_payloads,
     merge_market_lists, overlay_detail_market, MarketHistoryStore,
 };
+pub use runtime::QsetV4WriterRetirementReceipt;
 use runtime::RuntimeController;
 
 const RECENT_EVENTS_MAX: usize = 500;
@@ -61,8 +62,14 @@ pub struct ApiShutdown {
 }
 
 impl ApiShutdown {
-    pub async fn drain(self) -> Result<(), String> {
+    pub async fn drain(&self) -> Result<(), String> {
         self.runtime.shutdown().await
+    }
+
+    pub async fn prepare_qset_v4_retirement(
+        &self,
+    ) -> Result<QsetV4WriterRetirementReceipt, String> {
+        self.runtime.prepare_qset_v4_retirement().await
     }
 }
 

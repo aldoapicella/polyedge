@@ -65,6 +65,28 @@ const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
 const ESSENTIAL_FEED_MAX_AGE_SECONDS: i64 = 5 * 60;
+const QSET_V4_APP_NAME: &str = "polyedge-shadow-qset-v4";
+const QSET_V4_CAMPAIGN_ID: &str = "campaign-2026-08-24-qset-v4";
+const QSET_V4_RAW_CONTAINER: &str = "polyedge-shadow-qset-v4-events";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QsetV4WriterRetirementReceipt {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub retired_at: DateTime<Utc>,
+    pub campaign_id: &'static str,
+    pub app_name: String,
+    pub image_digest: String,
+    pub source_revision: String,
+    pub recorder_instance_id: String,
+    pub final_assigned_sequence: u64,
+    pub final_enqueued_sequence: u64,
+    pub final_enqueued_total: u64,
+    pub final_persisted_sequence: u64,
+    pub final_persisted_total: u64,
+    pub final_queued: usize,
+    pub flush_success: bool,
+}
 
 #[derive(Clone)]
 pub struct RuntimeController {
@@ -88,6 +110,8 @@ struct RuntimeInner {
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
     shutting_down: AtomicBool,
+    termination_audit_complete: AtomicBool,
+    shutdown_gate: Mutex<()>,
     feed_task: StdMutex<Option<JoinHandle<()>>>,
     background_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
@@ -96,6 +120,8 @@ struct RuntimeInner {
 struct RecorderMetrics {
     recorder_instance_id: String,
     last_assigned_sequence: AtomicU64,
+    last_enqueued_sequence: AtomicU64,
+    last_persisted_sequence: AtomicU64,
     queued: AtomicUsize,
     enqueued_total: AtomicU64,
     persisted_total: AtomicU64,
@@ -247,6 +273,8 @@ impl Default for RecorderMetrics {
         Self {
             recorder_instance_id: Uuid::new_v4().to_string(),
             last_assigned_sequence: AtomicU64::new(0),
+            last_enqueued_sequence: AtomicU64::new(0),
+            last_persisted_sequence: AtomicU64::new(0),
             queued: AtomicUsize::new(0),
             enqueued_total: AtomicU64::new(0),
             persisted_total: AtomicU64::new(0),
@@ -310,6 +338,8 @@ impl RecorderMetrics {
         json!({
             "recorder_instance_id": self.recorder_instance_id,
             "last_assigned_sequence": self.last_assigned_sequence.load(Ordering::Relaxed),
+            "last_enqueued_sequence": self.last_enqueued_sequence.load(Ordering::Relaxed),
+            "last_persisted_sequence": self.last_persisted_sequence.load(Ordering::Relaxed),
             "queued": self.queued.load(Ordering::Relaxed),
             "enqueued_total": self.enqueued_total.load(Ordering::Relaxed),
             "persisted_total": self.persisted_total.load(Ordering::Relaxed),
@@ -323,6 +353,18 @@ impl RecorderMetrics {
             "batches_total": self.batches_total.load(Ordering::Relaxed),
             "last_batch_size": self.last_batch_size.load(Ordering::Relaxed)
         })
+    }
+
+    fn mark_persisted(&self, event_count: usize, last_sequence: u64) {
+        self.persisted_total
+            .fetch_add(event_count as u64, Ordering::Release);
+        self.last_persisted_sequence
+            .store(last_sequence, Ordering::Release);
+    }
+
+    fn mark_enqueued(&self, last_sequence: u64) {
+        self.last_enqueued_sequence
+            .store(last_sequence, Ordering::Release);
     }
 
     fn mark_durable_batch_unrecovered(&self, events: &[RuntimeEvent]) {
@@ -591,6 +633,8 @@ impl RuntimeController {
                 broadcaster,
                 started: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
+                termination_audit_complete: AtomicBool::new(false),
+                shutdown_gate: Mutex::new(()),
                 feed_task: StdMutex::new(None),
                 background_tasks: StdMutex::new(Vec::new()),
             }),
@@ -697,18 +741,30 @@ impl RuntimeController {
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
+        let _shutdown_guard = self.inner.shutdown_gate.lock().await;
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
         self.inner.recorder_admission.close();
-        let mut shutdown_error = match tokio::time::timeout(
-            SHUTDOWN_TERMINATION_AUDIT_TIMEOUT,
-            self.terminate_all_clob_generations("runtime shutdown", true),
-        )
-        .await
+        let mut shutdown_error = if self
+            .inner
+            .termination_audit_complete
+            .load(Ordering::Acquire)
         {
-            Ok(()) => None,
-            Err(_) => Some("runtime shutdown CLOB termination audit timed out".to_owned()),
+            None
+        } else {
+            match tokio::time::timeout(
+                SHUTDOWN_TERMINATION_AUDIT_TIMEOUT,
+                self.terminate_all_clob_generations("runtime shutdown", true),
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.inner
+                        .termination_audit_complete
+                        .store(true, Ordering::Release);
+                    None
+                }
+                Err(_) => Some("runtime shutdown CLOB termination audit timed out".to_owned()),
+            }
         };
         let background_tasks = self
             .inner
@@ -752,12 +808,8 @@ impl RuntimeController {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let flush_result = if self.inner.recorder_metrics.queued.load(Ordering::Relaxed) == 0 {
-            self.inner
-                .recorder
-                .lock()
-                .map_err(|error| format!("runtime recorder lock poisoned: {error}"))?
-                .flush()
+        let flush_result = if self.inner.recorder_metrics.queued.load(Ordering::Acquire) == 0 {
+            recorder_flush_result(&self.inner.recorder, &self.inner.recorder_metrics, false)
         } else {
             Ok(())
         };
@@ -765,6 +817,63 @@ impl RuntimeController {
             return Err(error);
         }
         flush_result
+    }
+
+    pub async fn prepare_qset_v4_retirement(
+        &self,
+    ) -> Result<QsetV4WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V4_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V4_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v4 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v4_retirement_receipt(qset_v4_image_digest()?, qset_v4_source_revision()?)
+    }
+
+    fn qset_v4_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV4WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v4 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV4WriterRetirementReceipt {
+            schema: "polyedge.qset_v4_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V4_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
     }
 
     fn persist_startup_provenance(&self, payload: Value) -> Result<(), String> {
@@ -793,6 +902,9 @@ impl RuntimeController {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.inner.recorder_metrics.bind(event.clone())?
         };
+        self.inner
+            .recorder_metrics
+            .mark_enqueued(recorded_event.recorder_sequence());
         let mut staged = false;
         let mut last_error = None;
         let mut result = Err("startup provenance persistence was not attempted".to_owned());
@@ -831,8 +943,7 @@ impl RuntimeController {
             Ok(()) => {
                 self.inner
                     .recorder_metrics
-                    .persisted_total
-                    .fetch_add(1, Ordering::Relaxed);
+                    .mark_persisted(1, recorded_event.recorder_sequence());
                 if let Ok(mut state) = self.inner.data.try_write() {
                     state.runtime_events += 1;
                     state.recent_events.push_back(event.clone());
@@ -3145,6 +3256,10 @@ impl RuntimeController {
                 .into_iter()
                 .map(|event| self.inner.recorder_metrics.bind(event))
                 .collect::<Result<Vec<_>, _>>()?;
+            let last_sequence = events
+                .last()
+                .map(RecordedRuntimeEvent::recorder_sequence)
+                .unwrap_or_default();
             self.inner
                 .recorder_metrics
                 .queued
@@ -3158,7 +3273,10 @@ impl RuntimeController {
                 None => RecorderRequest::durable(events, ack_tx),
             };
             match self.inner.recorder_tx.send(request) {
-                Ok(()) => false,
+                Ok(()) => {
+                    self.inner.recorder_metrics.mark_enqueued(last_sequence);
+                    false
+                }
                 Err(error) => {
                     if !self
                         .inner
@@ -3242,6 +3360,7 @@ impl RuntimeController {
                     } else {
                         match self.inner.recorder_metrics.bind(event.clone()) {
                             Ok(event) => {
+                                let sequence = event.recorder_sequence();
                                 self.inner
                                     .recorder_metrics
                                     .queued
@@ -3255,7 +3374,10 @@ impl RuntimeController {
                                     .recorder_tx
                                     .send(RecorderRequest::admitted_best_effort(event, permit))
                                 {
-                                    Ok(()) => false,
+                                    Ok(()) => {
+                                        self.inner.recorder_metrics.mark_enqueued(sequence);
+                                        false
+                                    }
                                     Err(error) => {
                                         if !self
                                             .inner
@@ -3772,9 +3894,12 @@ fn spawn_recorder_worker(
                     match &result {
                         Ok(()) => {
                             saturating_sub_atomic(&metrics.queued, event_count);
-                            metrics
-                                .persisted_total
-                                .fetch_add(event_count as u64, Ordering::Relaxed);
+                            let last_sequence = requests
+                                .last()
+                                .and_then(|request| request.events.last())
+                                .map(RecordedRuntimeEvent::recorder_sequence)
+                                .unwrap_or_default();
+                            metrics.mark_persisted(event_count, last_sequence);
                             pending_best_effort = None;
                         }
                         Err(error) => {
@@ -3838,9 +3963,12 @@ fn spawn_recorder_worker(
                         saturating_sub_atomic(&metrics.queued, event_count);
                         match &result {
                             Ok(()) => {
-                                metrics
-                                    .persisted_total
-                                    .fetch_add(event_count as u64, Ordering::Relaxed);
+                                let last_sequence = request
+                                    .events
+                                    .last()
+                                    .map(RecordedRuntimeEvent::recorder_sequence)
+                                    .unwrap_or_default();
+                                metrics.mark_persisted(event_count, last_sequence);
                             }
                             Err(error) => {
                                 warn!("runtime recorder durable batch failed: {error}");
@@ -3901,9 +4029,11 @@ fn spawn_recorder_worker(
                 match &result {
                     Ok(()) => {
                         saturating_sub_atomic(&metrics.queued, event_count);
-                        metrics
-                            .persisted_total
-                            .fetch_add(event_count as u64, Ordering::Relaxed);
+                        let last_sequence = events
+                            .last()
+                            .map(RecordedRuntimeEvent::recorder_sequence)
+                            .unwrap_or_default();
+                        metrics.mark_persisted(event_count, last_sequence);
                     }
                     Err(error) => {
                         metrics
@@ -4032,6 +4162,41 @@ fn flush_runtime_recorder(
     if let Err(error) = recorder_flush_result(recorder, metrics, false) {
         warn!("runtime recorder flush failed: {error}");
     }
+}
+
+fn qset_v4_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V4_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V4_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v4_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V4_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v4_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v4_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V4_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V4_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v4_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v4_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V4_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v4 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
 }
 
 fn saturating_sub_atomic(value: &AtomicUsize, amount: usize) {
@@ -6368,14 +6533,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_closes_recorder_admission_and_bounds_pending_drain() {
+    async fn qset_v4_retirement_failure_stays_fenced_and_retryable() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
             best_effort_record_failures_remaining: 1,
             retry_flush_failures_remaining: usize::MAX,
             ..BufferedRecorderTestState::default()
         }));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V4_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V4_RAW_CONTAINER.to_owned();
         let controller = RuntimeController::new_with_recorder_and_capacity(
-            RuntimeSettings::default(),
+            settings,
             RuntimeRecorder::new_for_test_recorder(
                 Box::new(BufferedRecorderTestDouble {
                     state: Arc::clone(&state),
@@ -6405,7 +6573,7 @@ mod tests {
 
         let shutdown = tokio::time::timeout(
             RECORDER_SHUTDOWN_DRAIN_TIMEOUT + StdDuration::from_secs(1),
-            controller.shutdown(),
+            controller.prepare_qset_v4_retirement(),
         )
         .await
         .unwrap();
@@ -6423,6 +6591,12 @@ mod tests {
             }
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v4_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
     }
 
     #[tokio::test]
@@ -6448,6 +6622,79 @@ mod tests {
             state.lock().unwrap().committed_event_types,
             vec![vec!["book"]]
         );
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_persisted_sequence"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn qset_v4_retirement_receipt_proves_the_closed_durable_waterline() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V4_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V4_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v4_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+
+        assert_eq!(
+            receipt.schema,
+            "polyedge.qset_v4_writer_retirement_receipt.v1"
+        );
+        assert_eq!(receipt.status, "prepared_for_retirement");
+        assert_eq!(receipt.campaign_id, QSET_V4_CAMPAIGN_ID);
+        assert_eq!(receipt.app_name, QSET_V4_APP_NAME);
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_enqueued_sequence, 1);
+        assert_eq!(receipt.final_enqueued_total, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+        assert_eq!(receipt.final_persisted_total, 1);
+        assert_eq!(receipt.final_queued, 0);
+        assert!(receipt.flush_success);
+
+        controller
+            .record_event("book", json!({"sequence": 2}), None, None)
+            .await;
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+    }
+
+    #[test]
+    fn qset_v4_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v4_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v4_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v4_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v4_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v4_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v4_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v4_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
     }
 
     #[test]
