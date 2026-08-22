@@ -28,10 +28,15 @@ cp "$manifest" "$remote"
 
 cat >"$tmp/bin/git" <<'EOF'
 #!/bin/sh
-for last do :; done
-case "$last" in
-  HEAD) printf '%s\n' "$MOCK_COMMIT" ;;
-  'HEAD^{tree}') printf '%s\n' "$MOCK_TREE" ;;
+case "$*" in
+  *"rev-parse HEAD^{tree}") printf '%s\n' "$MOCK_TREE" ;;
+  *"rev-parse HEAD") printf '%s\n' "$MOCK_COMMIT" ;;
+  *"show HEAD:research/configs/campaign_freeze_2026-08-24_qset_v4.json")
+    printf '%s\n' '{"protected_files":["infra/test"]}'
+    ;;
+  *"show HEAD:") printf '%s\n' source ;;
+  *"cat-file -s HEAD:") printf '%s\n' 7 ;;
+  *"cat-file -e HEAD:"*|*"ls-files --error-unmatch "*) : ;;
   *) exit 64 ;;
 esac
 EOF
@@ -125,8 +130,17 @@ export MOCK_TREE=$tree
 export MOCK_DIGEST=$digest
 export MOCK_REMOTE=$remote
 export MOCK_DATE=2026-08-22T01:02:03Z
+export TMPDIR=$tmp
 
-"$freeze" lock-and-upload "$manifest" >"$tmp/first.out"
+built=$tmp/built-source-freeze.json
+FREEZE_RESEARCH_IMAGE=$image "$freeze" build "$built" >"$tmp/build.out" 2>"$tmp/build.err"
+test ! -s "$tmp/build.err"
+jq -e --arg image "$image" '.research_image==$image and (.critical_files|length)==1' "$built" >/dev/null
+! find "$tmp" -maxdepth 1 -type f \( -name 'tmp.*' -o -name '.qset-v4-freeze.*' \) | grep -q .
+
+"$freeze" lock-and-upload "$manifest" >"$tmp/first.out" 2>"$tmp/first.err"
+test ! -s "$tmp/first.err"
+! find "$tmp" -maxdepth 1 -type f -name 'tmp.*' | grep -q .
 ! grep -F 'storage blob upload' "$MOCK_AZ_LOG"
 receipt=$receipt_root/source-$digest.json
 test -f "$receipt"
@@ -137,7 +151,9 @@ jq -e --arg digest "sha256:$digest" --arg image "$image" --arg commit "$commit" 
 ' "$receipt" >/dev/null
 
 before=$(sha256sum "$receipt")
-MOCK_DATE=2026-08-22T02:03:04Z "$freeze" lock-and-upload "$manifest" >"$tmp/second.out"
+MOCK_DATE=2026-08-22T02:03:04Z "$freeze" lock-and-upload "$manifest" >"$tmp/second.out" 2>"$tmp/second.err"
+test ! -s "$tmp/second.err"
+! find "$tmp" -maxdepth 1 -type f -name 'tmp.*' | grep -q .
 test "$(sha256sum "$receipt")" = "$before"
 cmp -s "$tmp/first.out" "$tmp/second.out"
 

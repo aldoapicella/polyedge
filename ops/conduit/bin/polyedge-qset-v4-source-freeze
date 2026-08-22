@@ -32,6 +32,7 @@ build() {
   done <"$files" | jq -s --arg campaign_id "$campaign_id" --arg evidence_version "$evidence_version" --arg source_commit "$(git -C "$repo" rev-parse HEAD)" --arg git_tree "$(git -C "$repo" rev-parse 'HEAD^{tree}')" --arg research_image "$FREEZE_RESEARCH_IMAGE" --arg contract_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/profitability_gate_v3_2026-08-24_qset_v4.yaml|sha256sum|cut -d' ' -f1)" --arg policy_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-08-24_qset_v4.json|sha256sum|cut -d' ' -f1)" '{schema:"polyedge.shadow_source_freeze.v1",campaign_id:$campaign_id,evidence_version:$evidence_version,source_commit:$source_commit,git_tree:$git_tree,research_image:$research_image,campaign_contract_sha256:$contract_sha256,freeze_policy_sha256:$policy_sha256,critical_files:.}' >"$temporary"
   jq -e --arg id "$campaign_id" --arg version "$evidence_version" '.campaign_id==$id and .evidence_version==$version and (.critical_files|length>0)' "$temporary" >/dev/null
   chmod 0640 "$temporary"; mv "$temporary" "$output"
+  rm -f "$files" "$temporary"; trap - EXIT HUP INT TERM
 }
 
 lock_and_upload() {
@@ -73,6 +74,7 @@ lock_and_upload() {
     .manifest=={uri:$uri,sha256:$sha256,bytes:$bytes,etag:$etag} and .researchImage==$image and .sourceCommit==$commit and .gitTree==$tree and
     .immutabilityPolicy=={state:$policy.state,days:$policy.immutabilityPeriodSinceCreationInDays}
   ' "$receipt" >/dev/null
+  rm -f "$temporary" "$receipt_tmp"; trap - EXIT HUP INT TERM
   printf '%s\n%s\n' "$uri" "sha256:$digest"
 }
 
