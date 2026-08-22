@@ -101,7 +101,7 @@ jobs:
             .status == "applied-live-verified"
             and .proof == "identity-rbac-proof.json"
             and (.lanes | keys == ["api", "funded-intent-producer", "funded-signer", "research", "shadow-qset"])
-            and ([.lanes[].assignments[]] | length == 39)
+            and ([.lanes[].assignments[]] | length == 40)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
             and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
@@ -110,6 +110,10 @@ jobs:
             and .roles.acrPull == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
             and .scopePrefixes.keyVault == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/"
             and .scopePrefixes.containerRegistry == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/"
+            and any(.lanes.api.assignments[];
+              .role == "blobReader"
+              and .scope == "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3"
+            )
             and .lanes["funded-intent-producer"].identity == "id-polyedge-conduit-funded-intent-producer"
             and .lanes["funded-intent-producer"].subject == "spiffe://polyedge.local/conduit/funded-intent-producer"
             and (.lanes["funded-intent-producer"].assignments | length) == 8
@@ -175,13 +179,22 @@ jobs:
             and .secretsOrTokensCaptured == false
             and .issuer.validTls
             and .jwtSvid.perLaneOwnerOnlyFiles
+            and (.jwtSvid.crossLaneTokenFilesUnreadable | length) == 12
+            and (.jwtSvid.crossLaneTokenFilesUnreadable | unique | length) == 12
+            and .jwtSvid.federatedExchangeMatrix.matchingPairs == 4
+            and .jwtSvid.federatedExchangeMatrix.matchingStatusCode == 200
+            and .jwtSvid.federatedExchangeMatrix.crossedPairs == 12
+            and .jwtSvid.federatedExchangeMatrix.crossedStatusCode == 401
+            and .jwtSvid.federatedExchangeMatrix.crossedError == "invalid_client"
+            and .jwtSvid.federatedExchangeMatrix.crossedErrorCode == "AADSTS700213"
+            and (.jwtSvid.federatedExchangeMatrix.tokensOrResponseBodiesCaptured == false)
             and ([
               .lanes.api,
               .lanes.research,
               .lanes["shadow-qset"],
               .lanes["funded-signer"],
               .lanes["funded-intent-producer"]
-            ] | map(.assignmentCount) | add) == 39
+            ] | map(.assignmentCount) | add) == 40
             and all([
               .lanes.api,
               .lanes.research,
