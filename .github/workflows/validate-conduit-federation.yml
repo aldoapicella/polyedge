@@ -96,6 +96,12 @@ jobs:
           ops/conduit/test/test-parity-systemd-ordering.sh
           ops/conduit/test/test-funded-secret-bootstrap.sh
           ops/conduit/test/test-funded-signer-env-example.sh
+          ops/conduit/test/test-funded-post-recovery-rollout.sh
+          ops/conduit/test/test-qset-v4-ops.sh
+          ops/conduit/test/test-qset-v4-processor.sh
+          ops/conduit/test/test-qset-v4-rbac-proof.sh
+          ops/conduit/test/test-qset-v4-retire-writer.sh
+          ops/conduit/test/test-qset-v4-source-freeze-upload-interruption-recovery.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"
