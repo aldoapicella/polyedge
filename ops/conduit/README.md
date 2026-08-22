@@ -479,10 +479,23 @@ safe deletion savings remain $0. Workflow-change run `32417497482` completed
 successfully, including all three multi-architecture validations; docs-only run
 `32419800018` also succeeded with matrices skipped.
 
+The mapping distinguishes executable replacements from retire-only resources.
+Fourteen job entries bind to an OCI unit. The remaining five are historical or
+never-executed disabled jobs with `replacementRequired=false`; their evidence is
+retained and they must not be re-run merely to manufacture a local equivalent.
+`unresolvedJobMappingCount` must remain zero before deletion.
+
+At `2026-08-22T01:02:21Z`, the obsolete
+`polyedge-shadow-daily-neu-job` trigger was changed from its failing
+`15 2 * * *` schedule to `Manual`. The Azure resource and historical July
+campaign remain intact. Root-only rollback input is retained under
+`/srv/polyedge-ring/migration/azure-retirement/20260822T010221Z-shadow-daily-schedule/`.
+
 The canonical legacy correction `shadow-2026-07-23-through-2026-07-23` pointer
 and state hash match immutable state, but it remains `in_progress`: `completed_at`
-is absent and `daily/2026-07-23/latest.json` is absent. It must resume through
-the existing legacy shadow recovery gates, not be force-completed. Two exhaustive
+is absent and `daily/2026-07-23/latest.json` is absent. It is retained unchanged
+as historical and ineligible; it must not be resumed, force-completed, or used as
+promotion evidence. Two exhaustive
 stable listings found 1,440 blobs / 7,473,225,576 bytes on `2026-07-23` and 782
 blobs / 4,187,252,980 bytes on D+1 `2026-07-24`; all are unsealed Append Blobs.
 Recovery is NO-GO: no job was started and no source was sealed or changed. This is
@@ -836,7 +849,7 @@ sudo systemctl enable --now polyedge-qset-v2-first-seal.timer
 ## Digest deployment
 
 After the API/frontend are healthy, update one reviewed GHCR ARM64 digest at a
-time. The helper accepts only these four units, updates only their installed
+time. The helper accepts only these five units, updates only their installed
 `Image=` line, makes a timestamped rollback copy, pulls and checks
 `linux/arm64`, then restarts and verifies the running container's exact digest.
 Any restart or verification failure restores the prior Quadlet and restarts it.
@@ -848,13 +861,15 @@ sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-frontend \
   ghcr.io/OWNER/polyedge-frontend@sha256:LOWERCASE_64_HEX_DIGEST
 sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-shadow-qset \
   ghcr.io/OWNER/polyedge-rust-backend@sha256:LOWERCASE_64_HEX_DIGEST
+sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-funded-intent-producer \
+  ghcr.io/OWNER/polyedge-rust-backend@sha256:LOWERCASE_64_HEX_DIGEST
 sudo /usr/local/sbin/polyedge-quadlet-deploy polyedge-funded-signer \
   ghcr.io/OWNER/polyedge-venue-probe@sha256:LOWERCASE_64_HEX_DIGEST
 ```
 
 Rollback copies live in `/etc/polyedge/rollback/`. The helper never accepts a
 tag, a non-GHCR registry, a mismatched image repository, or any unit other than
-API, frontend, qset writer, or funded signer.
+API, frontend, qset writer, funded intent producer, or funded signer.
 
 Schedules are UTC: freshness every five minutes; hourly quality at `:12`;
 primary daily at 03:10; replay at 03:15; the disabled qset shadow timer remains

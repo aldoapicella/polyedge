@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "capturedAtUtc": "2026-08-21T16:30:00Z",
+  "capturedAtUtc": "2026-08-22T01:07:44Z",
   "azureJobCount": 19,
-  "liveOciEquivalentCount": 12,
+  "liveOciEquivalentCount": 14,
   "azureDeletionAllowed": false,
   "azureLiveInventory": {
     "containerAppCount": 4,
@@ -223,7 +223,15 @@
         "two_daily_cycles",
         "reboot_recovery",
         "rollback"
-      ]
+      ],
+      "replacementRequired": false,
+      "ociUnit": null,
+      "azureTrigger": "Manual",
+      "retiredAtUtc": "2026-08-22T01:02:21Z",
+      "priorSchedule": "15 2 * * *",
+      "azureResourceRetained": true,
+      "historicalEvidenceChanged": false,
+      "rollbackArtifact": "/srv/polyedge-ring/migration/azure-retirement/20260822T010221Z-shadow-daily-schedule/job-before.json"
     },
     {
       "azureJob": "polyedge-shadow-val-neu-job",
@@ -238,7 +246,9 @@
         "two_daily_cycles",
         "reboot_recovery",
         "rollback"
-      ]
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
     },
     {
       "azureJob": "polyedge-promotion-neu-job",
@@ -268,7 +278,9 @@
         "two_daily_cycles",
         "reboot_recovery",
         "rollback"
-      ]
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
     },
     {
       "azureJob": "polyedge-venue-probe-neu-job",
@@ -312,7 +324,9 @@
         "two_daily_cycles",
         "reboot_recovery",
         "rollback"
-      ]
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
     },
     {
       "azureJob": "polyedge-funded-ladder-neu-job",
@@ -326,14 +340,26 @@
         "two_daily_cycles",
         "reboot_recovery",
         "rollback"
-      ]
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
     },
     {
       "azureJob": "polyedge-funded-direct-cl-job",
       "classification": "retirement_candidate_after_funded_cutover",
-      "lane": null,
+      "lane": "funded-signer",
       "azureDeletionAllowed": false,
-      "requiredDecision": "Delete only after the continuous funded signer passes funded, settlement, queue, parity and rollback gates."
+      "replacementRequired": true,
+      "ociUnit": "polyedge-funded-signer.service",
+      "requiredProof": [
+        "funded_lifecycle",
+        "settlement",
+        "queue_and_dlq",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
     },
     {
       "azureJob": "polyedge-funded-warmup-cl",
@@ -347,7 +373,9 @@
         "queue_and_dlq",
         "reboot_recovery",
         "rollback"
-      ]
+      ],
+      "replacementRequired": true,
+      "ociUnit": "polyedge-funded-intent-producer.service"
     }
   ],
   "protectedTrustRules": {
@@ -484,5 +512,7 @@
         ]
       }
     ]
-  }
+  },
+  "retirementOnlyJobCount": 5,
+  "unresolvedJobMappingCount": 0
 }

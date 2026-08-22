@@ -12,6 +12,7 @@ on:
       - 'infra/conduit-funded-access.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
+      - '.github/workflows/deploy-conduit-oci.yml'
       - '.github/workflows/validate-conduit-federation.yml'
   push:
     branches: [main]
@@ -25,6 +26,7 @@ on:
       - 'infra/conduit-funded-access.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
+      - '.github/workflows/deploy-conduit-oci.yml'
       - '.github/workflows/validate-conduit-federation.yml'
   workflow_dispatch:
 
@@ -85,6 +87,7 @@ jobs:
           ops/conduit/test/test-federated-token-refresh.sh
           ops/conduit/test/test-boot-disk-guard.sh
           ops/conduit/test/test-quadlet-deploy.sh
+          ops/conduit/test/test-github-deploy.sh
           ops/conduit/test/test-run-job-mappings.sh
           ops/conduit/test/test-ring-sync.sh
           ops/conduit/test/test-parity-hourly.sh
