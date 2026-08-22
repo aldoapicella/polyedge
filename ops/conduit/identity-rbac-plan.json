@@ -117,6 +117,11 @@
           "id": "33d54aba-4eb3-4b9e-9d85-214580a08440"
         },
         {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control",
+          "id": "0458fb58-08c4-48dc-9ca3-492d33a61113"
+        },
+        {
           "role": "tableContributor",
           "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetEventIndex",
           "id": "42456de0-61e8-4229-8526-ce7e6f6b7f9e"
@@ -133,7 +138,7 @@
         }
       ],
       "negativeAssertions": [
-        "no primary, funded, control, non-qset table, Service Bus, storage-account, resource-group, or subscription role"
+        "no primary, funded, control writer, non-qset table, Service Bus, storage-account, resource-group, or subscription role; qset-control is exact-container reader only"
       ]
     },
     "funded-signer": {

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "capturedAtUtc": "2026-08-17T08:35:14Z",
+  "capturedAtUtc": "2026-08-22T03:14:00Z",
   "status": "live-verified",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -134,7 +134,7 @@
           "api://AzureADTokenExchange"
         ]
       },
-      "assignmentCount": 5,
+      "assignmentCount": 6,
       "exactPlanMatch": true,
       "workloadEnabled": false,
       "positiveChecks": [
@@ -174,6 +174,14 @@
           "target": "ShadowQsetMarketCatalog",
           "statusCode": 200,
           "result": "success"
+        },
+        {
+          "operation": "blob.get",
+          "target": "polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/control/code-freeze/source-8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1.json",
+          "statusCode": 200,
+          "sha256": "sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1",
+          "tokenCaptured": false,
+          "result": "success"
         }
       ],
       "negativeChecks": [
@@ -198,11 +206,11 @@
       ],
       "negativeAssertions": [
         {
-          "assertion": "no primary, funded, control, non-qset table, Service Bus, storage-account, resource-group, or subscription role",
+          "assertion": "no primary, funded, control writer, non-qset table, Service Bus, storage-account, resource-group, or subscription role; qset-control is exact-container reader only",
           "passed": true
         }
       ],
-      "capturedAtUtc": "2026-08-21T07:48:03Z",
+      "capturedAtUtc": "2026-08-22T03:14:00Z",
       "roleAssignments": [
         {
           "id": "d6a6e447-5da3-4d73-889a-a3b7a020df0f",
@@ -233,6 +241,12 @@
           "role": "Storage Table Data Contributor",
           "roleDefinitionId": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
           "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetMarketCatalog"
+        },
+        {
+          "id": "0458fb58-08c4-48dc-9ca3-492d33a61113",
+          "role": "Storage Blob Data Reader",
+          "roleDefinitionId": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control"
         }
       ]
     },

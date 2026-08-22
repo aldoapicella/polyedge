@@ -51,5 +51,19 @@ grep -F 'OnCalendar=*-*-* 03:10:00 UTC' "$bundle/systemd/polyedge-daily.timer" >
 grep -F 'OnCalendar=*-*-* 03:15:00 UTC' "$bundle/systemd/polyedge-replay.timer" >/dev/null
 grep -F 'OnCalendar=2026-08-24 02:15:00 UTC' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
 grep -F 'Persistent=true' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
-grep -F 'Unit=polyedge-job@shadow-qset.service' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+grep -F 'Unit=polyedge-qset-v2-seal-days.service' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
 ! grep -F 'OnCalendar=*-*-*' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+sealer="$bundle/bin/polyedge-qset-v2-seal-days"
+sh -n "$sealer"
+grep -F 'for date in 2026-08-22 2026-08-23' "$sealer" >/dev/null
+grep -F 'seal-qset-v2-day' "$sealer" >/dev/null
+grep -F 'sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd' "$sealer" >/dev/null
+grep -F '/usr/bin/flock -w 300 /run/polyedge/research.lock' "$bundle/systemd/polyedge-qset-v2-seal-days.service" >/dev/null
+preflight_line=$(grep -n 'run_sealer "$date" --validate-only' "$sealer" | cut -d: -f1)
+stop_line=$(grep -n 'systemctl stop "$writer"' "$sealer" | cut -d: -f1)
+seal_line=$(grep -n 'run_sealer "$date" >"$temporary"' "$sealer" | cut -d: -f1)
+[ "$preflight_line" -lt "$stop_line" ] && [ "$stop_line" -lt "$seal_line" ]
+test "$(grep -c 'run_sealer "$date" --validate-only' "$sealer")" -eq 1
+grep -F '.blob_count == 1440 and .sealed_blob_count == 1440' "$sealer" >/dev/null
+grep -F 'final="$receipt_root/$date.json"' "$sealer" >/dev/null
+! grep -F 'generated_ts' "$sealer" >/dev/null

@@ -2095,6 +2095,31 @@ impl AzureBlobClient {
         unreachable!("Azure Blob conditional upload retry loop always returns");
     }
 
+    /// Permanently seals the exact append-blob generation identified by a
+    /// prior authenticated list or HEAD response.
+    pub fn seal_append_blob_if_match(
+        &mut self,
+        name: &str,
+        expected_etag: &str,
+    ) -> Result<(), AzureBlobError> {
+        if expected_etag.trim().is_empty()
+            || expected_etag
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(AzureBlobError::Transport(
+                "conditional Azure append blob seal requires a valid ETag".to_owned(),
+            ));
+        }
+        let url = format!(
+            "https://{}.blob.core.windows.net/{}/{}",
+            self.account,
+            self.container,
+            encode_blob_path(name)
+        );
+        self.seal_append_blob_at_url(&url, expected_etag)
+    }
+
     /// Acquires a finite Azure lease on a dedicated block blob. The lock blob
     /// is created once if it does not yet exist. Finite leases expire after a
     /// crashed worker stops renewing, preventing a permanent campaign lock.
@@ -2200,6 +2225,106 @@ impl AzureBlobClient {
             }
         }
         unreachable!("Azure lease retry loop always returns");
+    }
+
+    fn seal_append_blob_at_url(
+        &mut self,
+        url: &str,
+        expected_etag: &str,
+    ) -> Result<(), AzureBlobError> {
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            match self.seal_append_blob_once(url, expected_etag) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("Azure append blob seal retry loop always returns");
+    }
+
+    fn seal_append_blob_once(
+        &mut self,
+        url: &str,
+        expected_etag: &str,
+    ) -> Result<(), AzureBlobError> {
+        let date = rfc1123_now();
+        let seal_url = format!("{url}?comp=seal");
+        let request = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self.agent.put(&append_sas(&seal_url, sas)),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .put(&seal_url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+            }
+        }
+        .set("x-ms-version", AZURE_BLOB_API_VERSION)
+        .set("x-ms-date", &date)
+        .set("if-match", expected_etag)
+        .set("content-length", "0");
+        match request.call() {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status, response)) => {
+                let error_code = safe_azure_response_header(&response, "x-ms-error-code");
+                let request_id = safe_azure_response_header(&response, "x-ms-request-id");
+                let detail =
+                    format!("seal PUT x-ms-error-code={error_code} x-ms-request-id={request_id}");
+                if status == 409 && error_code == "BlobAlreadySealed" {
+                    return match self.append_blob_is_sealed_if_match(url, expected_etag) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(AzureBlobError::HttpStatusDetail {
+                            status,
+                            detail: format!("{detail}; HEAD did not prove the listed sealed blob"),
+                        }),
+                        Err(error) => Err(error),
+                    };
+                }
+                Err(AzureBlobError::HttpStatusDetail { status, detail })
+            }
+            Err(ureq::Error::Transport(_)) => Err(AzureBlobError::Transport(
+                "Azure append blob seal request failed".to_owned(),
+            )),
+        }
+    }
+
+    fn append_blob_is_sealed_if_match(
+        &mut self,
+        url: &str,
+        expected_etag: &str,
+    ) -> Result<bool, AzureBlobError> {
+        let date = rfc1123_now();
+        let request = match &mut self.auth {
+            AzureBlobAuth::Sas(sas) => self.agent.head(&append_sas(url, sas)),
+            AzureBlobAuth::ManagedIdentity(token) => {
+                let access_token = token.access_token(&self.agent)?;
+                self.agent
+                    .head(url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+            }
+        }
+        .set("x-ms-version", AZURE_BLOB_API_VERSION)
+        .set("x-ms-date", &date)
+        .set("if-match", expected_etag);
+        match request.call() {
+            Ok(response) => Ok(response.header("etag") == Some(expected_etag)
+                && response.header("x-ms-blob-type") == Some("AppendBlob")
+                && response
+                    .header("x-ms-blob-sealed")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))),
+            Err(ureq::Error::Status(status, response)) => Err(AzureBlobError::HttpStatusDetail {
+                status,
+                detail: format!(
+                    "seal verification HEAD x-ms-error-code={} x-ms-request-id={}",
+                    safe_azure_response_header(&response, "x-ms-error-code"),
+                    safe_azure_response_header(&response, "x-ms-request-id")
+                ),
+            }),
+            Err(ureq::Error::Transport(_)) => Err(AzureBlobError::Transport(
+                "Azure append blob seal verification request failed".to_owned(),
+            )),
+        }
     }
 
     fn lease_request_once(
@@ -3703,6 +3828,84 @@ mod tests {
         .unwrap();
         assert!(already_committed);
         assert!(!starts.contains_key("events/minute.jsonl"));
+    }
+
+    #[test]
+    fn conditional_seal_is_authenticated_idempotent_only_after_head_and_redacts_failures() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            (0..4)
+                .map(|index| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_request(&stream);
+                    let lower = request.to_ascii_lowercase();
+                    let expected_method = if index == 2 { "HEAD " } else { "PUT " };
+                    let expected_etag = if matches!(index, 1 | 2) {
+                        "if-match: \"etag-sealed\""
+                    } else {
+                        "if-match: \"etag-open\""
+                    };
+                    let valid_request = request.starts_with(expected_method)
+                        && lower.contains(&format!("x-ms-version: {AZURE_BLOB_API_VERSION}"))
+                        && lower.contains("x-ms-date:")
+                        && lower.contains(expected_etag)
+                        && if index == 2 {
+                            request.starts_with("HEAD /minute.jsonl?sig=test-sas HTTP/1.1")
+                        } else {
+                            request.starts_with(
+                                "PUT /minute.jsonl?comp=seal&sig=test-sas HTTP/1.1",
+                            ) && lower.contains("content-length: 0")
+                        };
+                    let (status, headers, body) = match index {
+                        0 => ("200 OK", "", ""),
+                        1 => (
+                            "409 Conflict",
+                            "x-ms-error-code: BlobAlreadySealed\r\n",
+                            "",
+                        ),
+                        2 => (
+                            "200 OK",
+                            "etag: \"etag-sealed\"\r\nx-ms-blob-type: AppendBlob\r\nx-ms-blob-sealed: true\r\n",
+                            "",
+                        ),
+                        _ => (
+                            "403 Forbidden",
+                            "x-ms-error-code: AuthorizationPermissionMismatch\r\nx-ms-request-id: 11111111-2222-3333-4444-555555555555\r\n",
+                            "secret-body",
+                        ),
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                    valid_request
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let mut client = AzureBlobClient::new("unused", "unused", "sig=test-sas");
+        let url = format!("http://{address}/minute.jsonl");
+        client
+            .seal_append_blob_at_url(&url, "\"etag-open\"")
+            .unwrap();
+        client
+            .seal_append_blob_at_url(&url, "\"etag-sealed\"")
+            .unwrap();
+        let error = client
+            .seal_append_blob_at_url(&url, "\"etag-open\"")
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(server.join().unwrap().into_iter().all(|valid| valid));
+        assert!(message.contains("HTTP status 403"));
+        assert!(message.contains("x-ms-error-code=AuthorizationPermissionMismatch"));
+        assert!(message.contains("x-ms-request-id=11111111-2222-3333-4444-555555555555"));
+        assert!(!message.contains("secret-body"));
     }
 
     #[test]
