@@ -11,13 +11,13 @@ readonly writer_fic=fic-spire-conduit-shadow-qset-v4-writer
 readonly processor_fic=fic-spire-conduit-shadow-qset-v4-processor
 readonly writer_subject=spiffe://polyedge.local/conduit/shadow-qset-v4-writer
 readonly processor_subject=spiffe://polyedge.local/conduit/shadow-qset-v4-processor
-readonly writer_token=/run/polyedge-federated-shadow-qset-v4-writer/azure-federated-token
-readonly processor_token=/run/polyedge-federated-shadow-qset-v4-processor/azure-federated-token
+readonly writer_token=${QSET_V4_RBAC_WRITER_TOKEN_TEST_ONLY:-/run/polyedge-federated-shadow-qset-v4-writer/azure-federated-token}
+readonly processor_token=${QSET_V4_RBAC_PROCESSOR_TOKEN_TEST_ONLY:-/run/polyedge-federated-shadow-qset-v4-processor/azure-federated-token}
 readonly v3_writer_service=polyedge-shadow-qset-v3.service
 readonly v3_container=polyedge-shadow-qset-v3
 readonly v4_writer_service=polyedge-shadow-qset-v4.service
 readonly forbidden_azure_job=polyedge-shadow-qset-v4-neu-job
-readonly receipt_root=/srv/polyedge-ring/migration/qset-v4/rbac
+readonly receipt_root=${QSET_V4_RBAC_RECEIPT_ROOT_TEST_ONLY:-/srv/polyedge-ring/migration/qset-v4/rbac}
 readonly before_receipt=$receipt_root/before.json
 readonly after_receipt=$receipt_root/v4-assignments.json
 readonly apply_receipt=$receipt_root/apply-result.json
@@ -29,9 +29,9 @@ case "$mode" in check|apply|rollback) ;; *) echo "usage: ${0##*/} check|apply|ro
 : "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
 
 secure_file() {
-  local path=$1 mode=$2 max=$3
+  local path=$1 expected_mode=$2 max=$3
   test ! -L "$path" && test -f "$path"
-  test "$(stat -c '%u:%g:%a:%h' "$path")" = "0:0:$mode:1"
+  test "$(stat -c '%u:%g:%a:%h' "$path")" = "0:0:$expected_mode:1"
   test "$(stat -c '%s' "$path")" -gt 0 && test "$(stat -c '%s' "$path")" -le "$max"
 }
 
@@ -65,9 +65,9 @@ resolve_ids() {
 
 assert_fic() {
   local identity=$1 fic=$2 subject=$3 value
-  value=$(az identity federated-credential show --resource-group "$AZURE_RESOURCE_GROUP" --identity-name "$identity" --name "$fic" -o json)
-  jq -e --arg issuer "$issuer" --arg subject "$subject" --arg audience "$audience" \
-    '.issuer == $issuer and .subject == $subject and .audiences == [$audience]' <<<"$value" >/dev/null
+  value=$(az identity federated-credential list --resource-group "$AZURE_RESOURCE_GROUP" --identity-name "$identity" -o json)
+  jq -e --arg fic "$fic" --arg issuer "$issuer" --arg subject "$subject" --arg audience "$audience" \
+    'length == 1 and .[0].name == $fic and .[0].issuer == $issuer and .[0].subject == $subject and .[0].audiences == [$audience]' <<<"$value" >/dev/null
 }
 
 require_exact_federation() {
@@ -119,19 +119,26 @@ assert_campaign_assignments() {
 }
 
 assert_v4_subset() {
-  local record=$1
+  local record=$1 writer_condition processor_condition
   campaign_values 4
-  jq -e --arg raw "$raw" --arg research "$research" --arg control "$control" --arg event "$event_index" --arg chart "$chart_series" --arg market "$market_catalog" --arg blob_reader "$blob_reader_role" --arg table_writer "$table_writer_role" --arg blob_writer "$blob_writer_role" '
+  writer_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-shadow-qset-v4-events') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/preflight/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'control/strategy-canary/intents/$campaign_id/'))))"
+  processor_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-research-qset-v4') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'data/research/shadow/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'reports/research/shadow/campaigns/$campaign_id/'))))"
+  jq -e --arg writer "$writer_principal" --arg processor "$processor_principal" --arg raw "$raw" --arg research "$research" --arg control "$control" --arg event "$event_index" --arg chart "$chart_series" --arg market "$market_catalog" --arg blob_reader "$blob_reader_role" --arg table_writer "$table_writer_role" --arg blob_writer "$blob_writer_role" --arg writer_condition "$writer_condition" --arg processor_condition "$processor_condition" '
+    def normalized: gsub("[[:space:]]"; "");
+    def conditional($role;$condition): .roleDefinitionId==$role and .conditionVersion=="2.0" and ((.condition|normalized)==($condition|normalized));
+    def unconditional($role): .roleDefinitionId==$role and .condition==null and .conditionVersion==null;
     (.writer|length)<=5 and (.processor|length)<=3 and
     ([.writer[].scope]|length)==([.writer[].scope]|unique|length) and ([.processor[].scope]|length)==([.processor[].scope]|unique|length) and
     all(.writer[];
-      if .scope==$raw then .roleDefinitionId==$blob_writer and .conditionVersion=="2.0" and (.condition|type)=="string"
-      elif .scope==$control then .roleDefinitionId==$blob_reader and .condition==null and .conditionVersion==null
-      elif (.scope==$event or .scope==$chart or .scope==$market) then .roleDefinitionId==$table_writer and .condition==null and .conditionVersion==null
+      .principalId==$writer and
+      if .scope==$raw then conditional($blob_writer;$writer_condition)
+      elif .scope==$control then unconditional($blob_reader)
+      elif (.scope==$event or .scope==$chart or .scope==$market) then unconditional($table_writer)
       else false end) and
     all(.processor[];
-      if .scope==$research then .roleDefinitionId==$blob_writer and .conditionVersion=="2.0" and (.condition|type)=="string"
-      elif (.scope==$raw or .scope==$control) then .roleDefinitionId==$blob_reader and .condition==null and .conditionVersion==null
+      .principalId==$processor and
+      if .scope==$research then conditional($blob_writer;$processor_condition)
+      elif (.scope==$raw or .scope==$control) then unconditional($blob_reader)
       else false end)
   ' "$record" >/dev/null
 }
@@ -144,6 +151,28 @@ collect_api_v4() {
 assert_api_reader() {
   campaign_values 4
   jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length==1 and .[0].scope==$scope and .[0].principalId==$principal and .[0].roleDefinitionId==$role and .[0].condition==null and .[0].conditionVersion==null' "$1" >/dev/null
+}
+
+assert_api_subset() {
+  campaign_values 4
+  jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length<=1 and all(.[];.scope==$scope and .principalId==$principal and .roleDefinitionId==$role and .condition==null and .conditionVersion==null)' "$1" >/dev/null
+}
+
+assert_custom_roles() {
+  local blob table scope
+  scope=/subscriptions/$subscription_id
+  blob=$(az role definition list --name 44fd8b56-84f7-403c-a44a-7aabab1d28b1 --scope "$scope" -o json)
+  table=$(az role definition list --name c8133837-ba14-4b6b-8f58-52ce675a33e4 --scope "$scope" -o json)
+  jq -e --arg scope "$scope" --arg name 44fd8b56-84f7-403c-a44a-7aabab1d28b1 '
+    length==1 and .[0].name==$name and .[0].roleType=="CustomRole" and .[0].assignableScopes==[$scope] and (.[0].permissions|length)==1 and
+    .[0].permissions[0].actions==[] and .[0].permissions[0].notActions==[] and .[0].permissions[0].notDataActions==[] and
+    (.[0].permissions[0].dataActions|sort)==(["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]|sort)
+  ' <<<"$blob" >/dev/null
+  jq -e --arg scope "$scope" --arg name c8133837-ba14-4b6b-8f58-52ce675a33e4 '
+    length==1 and .[0].name==$name and .[0].roleType=="CustomRole" and .[0].assignableScopes==[$scope] and (.[0].permissions|length)==1 and
+    .[0].permissions[0].actions==[] and .[0].permissions[0].notActions==[] and .[0].permissions[0].notDataActions==[] and
+    (.[0].permissions[0].dataActions|sort)==(["Microsoft.Storage/storageAccounts/tableServices/tables/entities/read","Microsoft.Storage/storageAccounts/tableServices/tables/entities/write","Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action","Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action"]|sort)
+  ' <<<"$table" >/dev/null
 }
 
 capture_v3_state() {
@@ -162,7 +191,7 @@ capture_v3_state() {
 assert_v3_unchanged() {
   local after
   after=$(mktemp); capture_v3_state >"$after"
-  jq -e --slurpfile before "$1" --slurpfile after "$after" '$before[0]==$after[0]' >/dev/null
+  jq -ne --slurpfile before "$1" --slurpfile after "$after" '$before[0]==$after[0]' >/dev/null
   rm -f "$after"
 }
 
@@ -186,14 +215,66 @@ write_once() {
 }
 
 token_header() {
-  local token_file=$1 client_id=$2 scope=$3 response=$4 header=$5
-  curl --silent --show-error --fail-with-body -X POST "https://login.microsoftonline.com/${AZURE_TENANT_ID:?AZURE_TENANT_ID is required}/oauth2/v2.0/token" \
+  local token_file=$1 client_id=$2 scope=$3 response=$4 header=$5 code
+  chmod 0600 "$response" "$header"
+  code=$(curl --silent --show-error -o "$response" -w '%{http_code}' -X POST "https://login.microsoftonline.com/${AZURE_TENANT_ID:?AZURE_TENANT_ID is required}/oauth2/v2.0/token" \
     -H 'Content-Type: application/x-www-form-urlencoded' \
     --data-urlencode "client_id=$client_id" --data-urlencode 'grant_type=client_credentials' \
     --data-urlencode "scope=$scope" --data-urlencode 'client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer' \
-    --data-urlencode "client_assertion@$token_file" >"$response"
+    --data-urlencode "client_assertion@$token_file")
+  test "$code" = 200 || { echo "federated token exchange returned HTTP $code" >&2; return 1; }
   jq -er '.access_token|"Authorization: Bearer \(.)"' "$response" >"$header"
-  chmod 0600 "$header"
+}
+
+expect_http() {
+  test "$1" = "$2" || { echo "$3 returned HTTP $1, expected $2" >&2; return 1; }
+}
+
+proof_sha() {
+  printf '%s' "$1" | sha256sum | cut -d' ' -f1
+}
+
+probe_writer_allowed() {
+  local response header blob_body table_body code proof_id preflight campaign table resource
+  response=$(mktemp); header=$(mktemp); blob_body=$(mktemp); table_body=$(mktemp)
+  test ! -L "$writer_token" && test -f "$writer_token" && test "$(stat -c '%a:%h' "$writer_token")" = 600:1
+  token_header "$writer_token" "$writer_client_id" https://storage.azure.com/.default "$response" "$header" || { rm -f "$response" "$header" "$blob_body" "$table_body"; return 1; }
+  campaign_values 4; proof_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+  preflight="shadow-events/preflight/$campaign_id/rbac-proof/$proof_id.json"
+  campaign="shadow-events/$campaign_id/rbac-proof/$proof_id.json"
+  table=ShadowQsetV4EventIndex
+  jq -nc --arg proof "$proof_id" --arg lane writer '{schema:"polyedge.qset_v4_rbac_data_plane_proof.v1",lane:$lane,proof:$proof}' >"$blob_body"
+  for resource in "$preflight" "$campaign"; do
+    code=$(curl --silent --show-error -o "$response" -w '%{http_code}' -X PUT -H "@$header" -H 'x-ms-version: 2023-11-03' -H 'x-ms-blob-type: BlockBlob' -H 'Content-Type: application/json' --data-binary "@$blob_body" "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/polyedge-shadow-qset-v4-events/$resource") || { rm -f "$response" "$header" "$blob_body" "$table_body"; return 1; }
+    expect_http "$code" 201 "writer blob/$resource" || { rm -f "$response" "$header" "$blob_body" "$table_body"; return 1; }
+  done
+  jq -nc --arg partition rbac-proof --arg row "$proof_id" --arg proof "$proof_id" '{PartitionKey:$partition,RowKey:$row,Proof:$proof}' >"$table_body"
+  code=$(curl --silent --show-error -o "$response" -w '%{http_code}' -X POST -H "@$header" -H 'x-ms-version: 2023-11-03' -H 'Content-Type: application/json' -H 'Accept: application/json;odata=nometadata' -H 'Prefer: return-no-content' --data-binary "@$table_body" "https://$AZURE_STORAGE_ACCOUNT_NAME.table.core.windows.net/$table") || { rm -f "$response" "$header" "$blob_body" "$table_body"; return 1; }
+  expect_http "$code" 204 "writer table/$table" || { rm -f "$response" "$header" "$blob_body" "$table_body"; return 1; }
+  jq -nc --arg proof "sha256:$(proof_sha "$proof_id")" --arg preflight "sha256:$(proof_sha "$preflight")" --arg campaign "sha256:$(proof_sha "$campaign")" --arg blob "sha256:$(sha256sum "$blob_body"|cut -d' ' -f1)" --arg table "sha256:$(proof_sha "$table/rbac-proof/$proof_id")" --arg entity "sha256:$(sha256sum "$table_body"|cut -d' ' -f1)" '{lane:"writer",tokenSource:"federated",proofIdSha256:$proof,preflightBlob:{resourceSha256:$preflight,requestSha256:$blob,httpStatus:201},campaignBlob:{resourceSha256:$campaign,requestSha256:$blob,httpStatus:201},eventIndexEntity:{resourceSha256:$table,requestSha256:$entity,httpStatus:204}}'
+  rm -f "$response" "$header" "$blob_body" "$table_body"
+}
+
+probe_processor_allowed() {
+  local response header body read_body code proof_id research raw_hash control_hash resource container
+  response=$(mktemp); header=$(mktemp); body=$(mktemp); read_body=$(mktemp)
+  test ! -L "$processor_token" && test -f "$processor_token" && test "$(stat -c '%a:%h' "$processor_token")" = 600:1
+  token_header "$processor_token" "$processor_client_id" https://storage.azure.com/.default "$response" "$header" || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+  for container in polyedge-shadow-qset-v4-events polyedge-qset-v4-control; do
+    code=$(curl --silent --show-error -o "$response" -w '%{http_code}' -H "@$header" -H 'x-ms-version: 2023-11-03' "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/$container?restype=container&comp=list&maxresults=1") || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+    expect_http "$code" 200 "processor storage/$container read" || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+    case "$container" in *events) raw_hash=sha256:$(sha256sum "$response"|cut -d' ' -f1) ;; *) control_hash=sha256:$(sha256sum "$response"|cut -d' ' -f1) ;; esac
+  done
+  campaign_values 4; proof_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+  research="data/research/shadow/$campaign_id/rbac-proof/$proof_id.json"
+  jq -nc --arg proof "$proof_id" --arg lane processor '{schema:"polyedge.qset_v4_rbac_data_plane_proof.v1",lane:$lane,proof:$proof}' >"$body"
+  code=$(curl --silent --show-error -o "$response" -w '%{http_code}' -X PUT -H "@$header" -H 'x-ms-version: 2023-11-03' -H 'x-ms-blob-type: BlockBlob' -H 'Content-Type: application/json' --data-binary "@$body" "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/polyedge-research-qset-v4/$research") || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+  expect_http "$code" 201 "processor research write" || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+  code=$(curl --silent --show-error -o "$read_body" -w '%{http_code}' -H "@$header" -H 'x-ms-version: 2023-11-03' "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/polyedge-research-qset-v4/$research") || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+  expect_http "$code" 200 "processor research read" || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+  test "$(sha256sum "$body"|cut -d' ' -f1)" = "$(sha256sum "$read_body"|cut -d' ' -f1)" || { echo 'processor research read hash mismatch' >&2; rm -f "$response" "$header" "$body" "$read_body"; return 1; }
+  jq -nc --arg proof "sha256:$(proof_sha "$proof_id")" --arg research "sha256:$(proof_sha "$research")" --arg body "sha256:$(sha256sum "$body"|cut -d' ' -f1)" --arg raw "$raw_hash" --arg control "$control_hash" '{lane:"processor",tokenSource:"federated",proofIdSha256:$proof,rawRead:{responseSha256:$raw,httpStatus:200},controlRead:{responseSha256:$control,httpStatus:200},researchBlob:{resourceSha256:$research,requestAndResponseSha256:$body,writeHttpStatus:201,readHttpStatus:200}}'
+  rm -f "$response" "$header" "$body" "$read_body"
 }
 
 expect_denied() {
@@ -222,8 +303,9 @@ probe_denials() {
 
 resolve_ids
 require_exact_federation
+if test "$mode" != rollback; then assert_custom_roles; fi
 require_no_azure_processor_job
-v3_before=$(mktemp); trap 'rm -f "$v3_before" "${v4_current:-}" "${api_current:-}" "${probe_receipts:-}"' EXIT HUP INT TERM
+v3_before=$(mktemp); trap 'rm -f "$v3_before" "${v4_current:-}" "${api_current:-}" "${positive_receipts:-}" "${negative_receipts:-}" "${after_expected:-}" "${after_api:-}"' EXIT HUP INT TERM
 capture_v3_state >"$v3_before"
 
 if test "$mode" = check; then
@@ -240,11 +322,24 @@ require_v4_quiescent
 install -d -o root -g root -m 0750 "$receipt_root"
 
 if test "$mode" = rollback; then
-  secure_file "$after_receipt" 640 1048576
+  secure_file "$before_receipt" 640 1048576
+  jq -e --arg writer "$writer_principal" --arg processor "$processor_principal" '.schema=="polyedge.qset_v4_rbac_before.v1" and .writerPrincipal==$writer and .processorPrincipal==$processor and .v4PrincipalsHaveZeroAssignments==true and .apiV4ScopeHasZeroAssignments==true' "$before_receipt" >/dev/null
   v4_current=$(mktemp); api_current=$(mktemp)
   collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v4_current"
-  assert_campaign_assignments 4 "$v4_current" "$writer_principal" "$processor_principal"
-  collect_api_v4 >"$api_current"; assert_api_reader "$api_current"
+  collect_api_v4 >"$api_current"
+  assert_v4_subset "$v4_current"; assert_api_subset "$api_current"
+  if test -e "$after_receipt"; then
+    secure_file "$after_receipt" 640 1048576
+    after_expected=$(mktemp); after_api=$(mktemp)
+    jq -e '.schema=="polyedge.qset_v4_exact_assignments.v1"' "$after_receipt" >/dev/null
+    jq --slurpfile current "$v4_current" '{writer,processor,expected:$current[0].expected}' "$after_receipt" >"$after_expected"
+    jq '.apiResearchReader' "$after_receipt" >"$after_api"
+    assert_campaign_assignments 4 "$after_expected" "$writer_principal" "$processor_principal"
+    assert_api_reader "$after_api"
+    jq -e --slurpfile current "$v4_current" '(([$current[0].writer[].id]-[.writer[].id])|length)==0 and (([$current[0].processor[].id]-[.processor[].id])|length)==0' "$after_receipt" >/dev/null
+    jq -e --slurpfile current "$api_current" '(([$current[0][].id]-[.apiResearchReader[].id])|length)==0' "$after_receipt" >/dev/null
+  fi
+  remaining=$(jq '[.writer,.processor]|map(length)|add' "$v4_current"); remaining=$((remaining + $(jq 'length' "$api_current")))
   jq -r '.writer[].id,.processor[].id' "$v4_current" | while IFS= read -r id; do az role assignment delete --ids "$id"; done
   jq -r '.[].id' "$api_current" | while IFS= read -r id; do az role assignment delete --ids "$id"; done
   collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v4_current"; jq -e '.writer==[] and .processor==[]' "$v4_current" >/dev/null
@@ -252,10 +347,10 @@ if test "$mode" = rollback; then
   assert_v3_unchanged "$v3_before"; require_no_azure_processor_job
   if test ! -e "$rollback_receipt"; then
     temporary=$(mktemp "$receipt_root/.rollback.XXXXXX")
-    jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{schema:"polyedge.qset_v4_rbac_rollback.v1",generatedAtUtc:$generated,exactV4AssignmentsRemoved:9,v3AssignmentsRemoved:0,v3ServicesChanged:0,containersTablesAndEvidenceRetained:true,identitiesAndFederatedCredentialsRetained:true,azureProcessorJobAbsent:true}' >"$temporary"
+    jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson removed "$remaining" '{schema:"polyedge.qset_v4_rbac_rollback.v2",generatedAtUtc:$generated,exactAssignmentsRemovedThisRun:$removed,exactV4AndApiAssignmentsAbsent:9,v3AssignmentsRemoved:0,v3ServicesChanged:0,containersTablesAndEvidenceRetained:true,identitiesAndFederatedCredentialsRetained:true,azureProcessorJobAbsent:true}' >"$temporary"
     write_once "$temporary" "$rollback_receipt"
   fi
-  printf '%s\n' 'qset-v4 exact RBAC rollback complete; v3 and retained evidence are unchanged'
+  printf '%s\n' 'qset-v4 exact RBAC rollback complete; v2/v3 and retained evidence are unchanged'
   exit 0
 fi
 
@@ -266,7 +361,7 @@ collect_api_v4 >"$api_current"
 if test -e "$before_receipt"; then
   secure_file "$before_receipt" 640 1048576
   jq -e --arg writer "$writer_principal" --arg processor "$processor_principal" '.schema=="polyedge.qset_v4_rbac_before.v1" and .writerPrincipal==$writer and .processorPrincipal==$processor and .v4PrincipalsHaveZeroAssignments==true and .apiV4ScopeHasZeroAssignments==true' "$before_receipt" >/dev/null
-  assert_v4_subset "$v4_current"; jq -e 'length<=1' "$api_current" >/dev/null
+  assert_v4_subset "$v4_current"; assert_api_subset "$api_current"
 else
   jq -e '.writer==[] and .processor==[]' "$v4_current" >/dev/null
   jq -e 'length==0' "$api_current" >/dev/null
@@ -285,12 +380,18 @@ assert_campaign_assignments 4 "$v4_current" "$writer_principal" "$processor_prin
 assert_api_reader "$api_current"
 require_v4_quiescent; require_no_azure_processor_job; assert_v3_unchanged "$v3_before"
 
-probe_receipts=$(mktemp)
+positive_receipts=$(mktemp)
 for _ in 1 2 3 4 5 6; do
-  if { probe_denials writer "$writer_token" "$writer_client_id"; probe_denials processor "$processor_token" "$processor_client_id"; } >"$probe_receipts"; then break; fi
+  if { probe_writer_allowed; probe_processor_allowed; } >"$positive_receipts"; then break; fi
   sleep 10
 done
-jq -s -e 'length==2 and all(.[];.v1V2V3AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)' "$probe_receipts" >/dev/null
+jq -s -e 'length==2 and .[0].lane=="writer" and .[1].lane=="processor" and all(.[];.tokenSource=="federated")' "$positive_receipts" >/dev/null
+negative_receipts=$(mktemp)
+for _ in 1 2 3 4 5 6; do
+  if { probe_denials writer "$writer_token" "$writer_client_id"; probe_denials processor "$processor_token" "$processor_client_id"; } >"$negative_receipts"; then break; fi
+  sleep 10
+done
+jq -s -e 'length==2 and all(.[];.v1V2V3AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)' "$negative_receipts" >/dev/null
 
 if test ! -e "$after_receipt"; then
   temporary=$(mktemp "$receipt_root/.assignments.XXXXXX")
@@ -299,7 +400,7 @@ if test ! -e "$after_receipt"; then
 fi
 if test ! -e "$apply_receipt"; then
   temporary=$(mktemp "$receipt_root/.apply.XXXXXX")
-  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg before "sha256:$(sha256sum "$before_receipt"|cut -d' ' -f1)" --arg after "sha256:$(sha256sum "$after_receipt"|cut -d' ' -f1)" --slurpfile probes "$probe_receipts" '{schema:"polyedge.qset_v4_rbac_apply.v1",generatedAtUtc:$generated,beforeSha256:$before,assignmentsSha256:$after,resourcesDeployed:16,writerAssignments:5,processorAssignments:3,apiReaderAssignments:1,unexpectedPrincipalAssignments:0,negativeDataPlaneProbes:$probes,v3ActiveHealthyUnchanged:true,v3AssignmentsRemoved:0,v4WriterStarted:false,azureProcessorJobCreated:false}' >"$temporary"
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg before "sha256:$(sha256sum "$before_receipt"|cut -d' ' -f1)" --arg after "sha256:$(sha256sum "$after_receipt"|cut -d' ' -f1)" --slurpfile positive "$positive_receipts" --slurpfile negative "$negative_receipts" '{schema:"polyedge.qset_v4_rbac_apply.v2",generatedAtUtc:$generated,beforeSha256:$before,assignmentsSha256:$after,resourcesDeployed:16,writerAssignments:5,processorAssignments:3,apiReaderAssignments:1,unexpectedPrincipalAssignments:0,positiveDataPlaneProbes:$positive,negativeDataPlaneProbes:$negative,v3ActiveHealthyUnchanged:true,v3AssignmentsRemoved:0,v4WriterStarted:false,azureProcessorJobCreated:false}' >"$temporary"
   write_once "$temporary" "$apply_receipt"
 fi
 printf '%s\n' 'qset-v4 additive RBAC applied and denied outside v4; v3 is active, healthy, and unchanged'
