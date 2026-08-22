@@ -13,7 +13,7 @@ expected_gid=${POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID:-$(id -g)}
 
 case "$lane" in
   promotion) subject=spiffe://polyedge.local/conduit/promotion-controller ;;
-  api|research|shadow-qset|funded-signer|funded-intent-producer) subject=spiffe://polyedge.local/conduit/$lane ;;
+  api|research|shadow-qset|shadow-qset-v3-writer|funded-signer|funded-intent-producer) subject=spiffe://polyedge.local/conduit/$lane ;;
   *) echo 'unknown identity lane' >&2; exit 64 ;;
 esac
 expected_destination=$token_root/polyedge-federated-$lane/azure-federated-token

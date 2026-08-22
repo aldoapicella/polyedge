@@ -10,10 +10,13 @@ research_dir=$root/polyedge-federated-research
 research_token=$research_dir/azure-federated-token
 producer_dir=$root/polyedge-federated-funded-intent-producer
 producer_token=$producer_dir/azure-federated-token
+v3_dir=$root/polyedge-federated-shadow-qset-v3-writer
+v3_token=$v3_dir/azure-federated-token
 issuer=https://oidc.example.invalid
 mkdir -m 0700 "$token_dir"
 mkdir -m 0700 "$research_dir"
 mkdir -m 0700 "$producer_dir"
+mkdir -m 0700 "$v3_dir"
 python3 - "$socket" <<'PY' &
 import socket
 import sys
@@ -29,7 +32,7 @@ cleanup() {
   kill "$socket_pid" 2>/dev/null || true
   find "$root" -type f -exec unlink {} \;
   find "$root" -type s -exec unlink {} \;
-  rmdir "$token_dir" "$research_dir" "$producer_dir" "$root" 2>/dev/null || true
+  rmdir "$token_dir" "$research_dir" "$producer_dir" "$v3_dir" "$root" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 while [ ! -S "$socket" ]; do sleep 0.1; done
@@ -81,6 +84,12 @@ FAKE_EXPECTED_SUBJECT=spiffe://polyedge.local/conduit/funded-intent-producer \
   POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID=$(id -u) POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID=$(id -g) \
   ops/conduit/bin/polyedge-federated-token-refresh funded-intent-producer "$producer_token" "$issuer"
 [ "$(stat -c %a "$producer_token")" = 600 ]
+
+FAKE_EXPECTED_SUBJECT=spiffe://polyedge.local/conduit/shadow-qset-v3-writer \
+  POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPIRE_AGENT_BIN=$fake \
+  POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID=$(id -u) POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID=$(id -g) \
+  ops/conduit/bin/polyedge-federated-token-refresh shadow-qset-v3-writer "$v3_token" "$issuer"
+[ "$(stat -c %a "$v3_token")" = 600 ]
 
 POLYEDGE_FEDERATED_TOKEN_ROOT=$root SPIRE_AGENT_SOCKET=$socket SPIRE_AGENT_BIN=$fake \
   POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID=$(id -u) POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID=$(id -g) \

@@ -224,11 +224,29 @@ impl IntentPublisherConfig {
                 "qset shadow intent publisher must not use operator-direct delivery".to_owned(),
             );
         }
+        if settings.azure.storage_container_name == "polyedge-shadow-qset-v3-events"
+            && (!pointer_only_preflight
+                || settings.azure.funded_direct_service_bus_enabled
+                || !settings
+                    .azure
+                    .funded_direct_service_bus_namespace
+                    .trim()
+                    .is_empty()
+                || !settings
+                    .azure
+                    .funded_direct_service_bus_queue
+                    .trim()
+                    .is_empty()
+                || settings.live.polymarket_funder.is_some())
+        {
+            return Err("qset-v3 intent publisher requires pointer-only preflight with no funded queue or credentials".to_owned());
+        }
         if pointer_only_preflight
             && (!settings.azure.strategy_intent_operator_direct
                 || settings.live.execution_mode != ExecutionMode::Paper
                 || settings.live.allow_live
-                || settings.live.polymarket_private_key.is_some())
+                || settings.live.polymarket_private_key.is_some()
+                || settings.live.polymarket_funder.is_some())
         {
             return Err(
                 "pointer-only intent preflight requires an operator-direct, credential-free paper runtime"
@@ -1229,6 +1247,7 @@ fn validated_conservative_prior(
             "static execution model is not the exact frozen conservative prior".to_owned()
         })?;
     let expected_container = match settings.azure.storage_container_name.as_str() {
+        "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
         "polyedge-shadow-qset-events" => "polyedge-research-qset",
         "polyedge-shadow-events" => "polyedge-research",
         _ => {
@@ -1743,6 +1762,7 @@ mod tests {
         settings.azure.storage_account_name = Some("test-account".to_owned());
         settings.azure.storage_container_name = shadow_container.to_owned();
         let research_container = match shadow_container {
+            "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
             "polyedge-shadow-qset-events" => "polyedge-research-qset",
             "polyedge-shadow-events" => "polyedge-research",
             _ => unreachable!(),
@@ -2723,6 +2743,24 @@ mod tests {
         configure_validated_conservative_prior(&mut settings, "polyedge-shadow-qset-events");
         assert!(validated_conservative_prior(&settings).is_ok());
         settings.azure.storage_container_name = "bot-events".to_owned();
+        assert!(validated_conservative_prior(&settings).is_err());
+    }
+
+    #[test]
+    fn qset_v3_shadow_uses_only_the_isolated_frozen_prior() {
+        let (mut settings, ..) = fixture();
+        configure_validated_conservative_prior(&mut settings, "polyedge-shadow-qset-v3-events");
+        assert_eq!(
+            validated_conservative_prior(&settings).unwrap().blob_uri,
+            format!(
+                "azure://test-account/polyedge-research-qset-v3/reports/research/venue-probe/models/{CONSERVATIVE_PRIOR_VERSION}-{}.json",
+                &CONSERVATIVE_PRIOR_SHA256[7..]
+            )
+        );
+        settings.azure.strategy_canary_execution_model_blob_uri = settings
+            .azure
+            .strategy_canary_execution_model_blob_uri
+            .replace("polyedge-research-qset-v3", "polyedge-research-qset");
         assert!(validated_conservative_prior(&settings).is_err());
     }
 

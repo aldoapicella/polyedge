@@ -30,12 +30,15 @@ const REPORT_ROOT: &str = "reports/research";
 #[cfg(test)]
 const PRIMARY_DAILY_ROOT: &str = "reports/research/daily";
 const SHADOW_DAILY_ROOT: &str = "reports/research/shadow/daily";
-const ACTIVE_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-08-22-qset-v2";
+const ACTIVE_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-08-23-qset-v3";
 const RETIRED_QSET_CAMPAIGN_ID: &str = "campaign-2026-07-28-qset-v1";
 const ARCHIVED_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-23";
 const LEGACY_SHADOW_CAMPAIGN_ID: &str = "campaign-2026-07-12";
-const ACTIVE_SHADOW_CAMPAIGN_START: &str = "2026-08-22";
-const ACTIVE_SHADOW_CAMPAIGN_TERMINAL: &str = "2026-10-20";
+const ACTIVE_SHADOW_CAMPAIGN_START: &str = "2026-08-23";
+const ACTIVE_SHADOW_CAMPAIGN_TERMINAL: &str = "2026-10-21";
+const RETIRED_QSET_V2_CAMPAIGN_ID: &str = "campaign-2026-08-22-qset-v2";
+const RETIRED_QSET_V2_FIRST_DATE: &str = "2026-08-22";
+const RETIRED_QSET_V2_LAST_DATE: &str = "2026-08-22";
 const RETIRED_QSET_FIRST_DATE: &str = "2026-07-28";
 const RETIRED_QSET_LAST_DATE: &str = "2026-08-21";
 const ARCHIVED_SHADOW_FIRST_DATE: &str = "2026-07-23";
@@ -43,20 +46,24 @@ const ARCHIVED_SHADOW_LAST_DATE: &str = "2026-07-27";
 const LEGACY_SHADOW_FIRST_DATE: &str = "2026-07-13";
 const LEGACY_SHADOW_LAST_DATE: &str = "2026-07-20";
 const ACTIVE_SHADOW_DAILY_ROOT: &str =
+    "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/daily";
+const RETIRED_QSET_V2_DAILY_ROOT: &str =
     "reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/daily";
 const RETIRED_QSET_DAILY_ROOT: &str =
     "reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/daily";
 const ARCHIVED_SHADOW_DAILY_ROOT: &str =
     "reports/research/shadow/campaigns/campaign-2026-07-23/daily";
 const ACTIVE_SHADOW_PROSPECTIVE_PATH: &str =
-    "reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/prospective/prospective_validation.json";
+    "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/prospective/prospective_validation.json";
 const ACTIVE_SHADOW_PROFITABILITY_LATEST: &str =
-    "reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/profitability/latest.json";
+    "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/profitability/latest.json";
 const ACTIVE_SHADOW_CORRECTION_PATH: &str =
-    "reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/corrections/active.json";
+    "reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/corrections/active.json";
 const ACTIVE_SHADOW_CAMPAIGN_CONTRACT_PATH: &str =
-    "research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml";
-const ACTIVE_SHADOW_CONTAINER_ENV: &str = "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME";
+    "research/configs/profitability_gate_v3_2026-08-23_qset_v3.yaml";
+const RETIRED_QSET_CONTAINER_ENV: &str = "AZURE_SHADOW_RESEARCH_STORAGE_CONTAINER_NAME";
+const ACTIVE_SHADOW_CONTAINER: &str = "polyedge-research-qset-v3";
+const ACTIVE_SHADOW_CONTAINER_ENV: &str = "AZURE_QSET_V3_RESEARCH_STORAGE_CONTAINER_NAME";
 const FRESHNESS_LATEST: &str = "data_quality/freshness/latest.json";
 const PROFITABILITY_LATEST: &str = "reports/research/profitability/latest.json";
 const PROMOTION_MANIFEST_SCHEMA: &str = "promotion_manifest_v1";
@@ -1697,6 +1704,9 @@ fn resolve_verified_daily_bundle(
     let daily_root = match requested_date {
         None => ACTIVE_SHADOW_DAILY_ROOT,
         Some(date) if date >= ACTIVE_SHADOW_CAMPAIGN_START => ACTIVE_SHADOW_DAILY_ROOT,
+        Some(date) if (RETIRED_QSET_V2_FIRST_DATE..=RETIRED_QSET_V2_LAST_DATE).contains(&date) => {
+            RETIRED_QSET_V2_DAILY_ROOT
+        }
         Some(date) if (RETIRED_QSET_FIRST_DATE..=RETIRED_QSET_LAST_DATE).contains(&date) => {
             RETIRED_QSET_DAILY_ROOT
         }
@@ -1709,12 +1719,13 @@ fn resolve_verified_daily_bundle(
         Some(_) => return Ok(None),
     };
     let expected_runtime_role = polyedge_config::RuntimeRole::ProfitabilityShadow;
-    let container_env =
-        if daily_root == ACTIVE_SHADOW_DAILY_ROOT || daily_root == RETIRED_QSET_DAILY_ROOT {
-            ACTIVE_SHADOW_CONTAINER_ENV
-        } else {
-            "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
-        };
+    let container_env = if daily_root == ACTIVE_SHADOW_DAILY_ROOT {
+        ACTIVE_SHADOW_CONTAINER_ENV
+    } else if daily_root == RETIRED_QSET_V2_DAILY_ROOT || daily_root == RETIRED_QSET_DAILY_ROOT {
+        RETIRED_QSET_CONTAINER_ENV
+    } else {
+        "AZURE_RESEARCH_STORAGE_CONTAINER_NAME"
+    };
     if let Some(mut client) = artifact_blob_client(container_env) {
         if let Some(bundle) = resolve_azure_verified_daily_bundle(
             &mut client,
@@ -1984,6 +1995,8 @@ fn daily_payload_from_bundle(bundle: &VerifiedDailyBundle) -> Value {
     let historical = bundle.daily_root != ACTIVE_SHADOW_DAILY_ROOT;
     let campaign_id = if bundle.daily_root == RETIRED_QSET_DAILY_ROOT {
         RETIRED_QSET_CAMPAIGN_ID
+    } else if bundle.daily_root == RETIRED_QSET_V2_DAILY_ROOT {
+        RETIRED_QSET_V2_CAMPAIGN_ID
     } else if bundle.daily_root == ARCHIVED_SHADOW_DAILY_ROOT {
         ARCHIVED_SHADOW_CAMPAIGN_ID
     } else if bundle.daily_root == SHADOW_DAILY_ROOT {
@@ -2048,6 +2061,8 @@ pub(crate) fn daily_report_payload(date: &str) -> Value {
             "date": date,
             "campaign_id": if (RETIRED_QSET_FIRST_DATE..=RETIRED_QSET_LAST_DATE).contains(&date) {
                 RETIRED_QSET_CAMPAIGN_ID
+            } else if (RETIRED_QSET_V2_FIRST_DATE..=RETIRED_QSET_V2_LAST_DATE).contains(&date) {
+                RETIRED_QSET_V2_CAMPAIGN_ID
             } else if (ARCHIVED_SHADOW_FIRST_DATE..=ARCHIVED_SHADOW_LAST_DATE).contains(&date) {
                 ARCHIVED_SHADOW_CAMPAIGN_ID
             } else {
@@ -2060,6 +2075,7 @@ pub(crate) fn daily_report_payload(date: &str) -> Value {
                 "2026-07-21" => "July 21 is the original campaign reset boundary and is ineligible.",
                 "2026-07-22" => "July 22 contains three exact recorder-retry duplicates and is preserved as ineligible.",
                 "2026-07-23" | "2026-07-24" | "2026-07-25" | "2026-07-26" | "2026-07-27" => "This day belongs to the archived queue/settlement predecessor campaign and cannot count toward qset-v2.",
+                date if (RETIRED_QSET_V2_FIRST_DATE..=RETIRED_QSET_V2_LAST_DATE).contains(&date) => "Qset-v2 is historical/ineligible; qset-v3 is the active campaign.",
                 date if (RETIRED_QSET_FIRST_DATE..=RETIRED_QSET_LAST_DATE).contains(&date) => "Qset-v1 is retired unchanged as historical/ineligible because its required D+1 sealed inventory is incomplete.",
                 _ => "No eligible legacy shadow report exists for this historical date.",
             },
@@ -2493,6 +2509,7 @@ fn artifact_blob_client(container_env: &str) -> Option<AzureBlobClient> {
     {
         Some(value) => value,
         None if container_env == "AZURE_STORAGE_CONTAINER_NAME" => "bot-events".to_owned(),
+        None if container_env == ACTIVE_SHADOW_CONTAINER_ENV => ACTIVE_SHADOW_CONTAINER.to_owned(),
         None => return None,
     };
     let client_id = env::var("AZURE_CLIENT_ID")
@@ -2513,12 +2530,12 @@ fn artifact_container_env(blob_name: &str) -> &'static str {
         "AZURE_MODEL_STORAGE_CONTAINER_NAME"
     } else if blob_name.starts_with("reports/research/venue-probe/") {
         "AZURE_FUNDED_STORAGE_CONTAINER_NAME"
-    } else if blob_name.starts_with(
-        "reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/",
-    ) || blob_name.starts_with(
-        "reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/",
-    ) {
+    } else if blob_name.starts_with("reports/research/shadow/campaigns/campaign-2026-08-23-qset-v3/") {
         ACTIVE_SHADOW_CONTAINER_ENV
+    } else if blob_name.starts_with("reports/research/shadow/campaigns/campaign-2026-08-22-qset-v2/")
+        || blob_name.starts_with("reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/")
+    {
+        RETIRED_QSET_CONTAINER_ENV
     } else if blob_name.starts_with("reports/research/shadow/")
         || blob_name.starts_with("reports/research/profitability/")
     {
@@ -2616,12 +2633,14 @@ fn blob_artifacts_for_prefix(prefix: &str) -> Option<Vec<Value>> {
             "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
             ACTIVE_SHADOW_CONTAINER_ENV,
             "AZURE_MODEL_STORAGE_CONTAINER_NAME",
+            RETIRED_QSET_CONTAINER_ENV,
             "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
         ]
     } else if clean_prefix == "profitability" || clean_prefix.starts_with("profitability/") {
         &[
             "AZURE_RESEARCH_STORAGE_CONTAINER_NAME",
             ACTIVE_SHADOW_CONTAINER_ENV,
+            RETIRED_QSET_CONTAINER_ENV,
             "AZURE_FUNDED_STORAGE_CONTAINER_NAME",
         ]
     } else if clean_prefix == "venue-probe/models"
@@ -3516,7 +3535,7 @@ mod tests {
             .and_then(|artifact| artifact["artifact_id"].as_str())
             .expect("shadow artifact id");
         assert!(artifact_id.starts_with(
-            "shadow~campaigns~campaign-2026-08-22-qset-v2~daily~2099-12-29~runs~api-shadow-001~"
+            "shadow~campaigns~campaign-2026-08-23-qset-v3~daily~2099-12-29~runs~api-shadow-001~"
         ));
         let artifact_path = PathBuf::from(REPORT_ROOT).join(artifact_id.replace('~', "/"));
         let artifact = artifact_payload(&artifact_path)
@@ -3650,6 +3669,13 @@ mod tests {
         assert_eq!(retired["campaign_id"], RETIRED_QSET_CAMPAIGN_ID);
         assert_eq!(retired["active_campaign_id"], ACTIVE_SHADOW_CAMPAIGN_ID);
         assert_eq!(retired["bundle_status"], "complete");
+        assert_eq!(retired["evidence_eligibility"], "historical_ineligible");
+    }
+    #[test]
+    fn retired_qset_v2_campaign_remains_display_only() {
+        let retired = daily_report_payload(RETIRED_QSET_V2_FIRST_DATE);
+        assert_eq!(retired["status"], "historical_ineligible");
+        assert_eq!(retired["campaign_id"], RETIRED_QSET_V2_CAMPAIGN_ID);
         assert_eq!(retired["evidence_eligibility"], "historical_ineligible");
     }
     #[test]

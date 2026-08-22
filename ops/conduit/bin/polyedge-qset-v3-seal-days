@@ -1,0 +1,134 @@
+#!/bin/sh
+set -eu
+
+env_file=/etc/polyedge/qset-v3-sealer.env
+[ ! -L "$env_file" ] && [ -f "$env_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$env_file")" = 0:0:640:1 ] || {
+  echo 'qset-v3 sealer environment is missing or unsafe' >&2; exit 64;
+}
+set -a
+. "$env_file"
+set +a
+
+for name in POLYEDGE_QSET_V3_SEAL_IMAGE POLYEDGE_QSET_V3_SEAL_GIT_SHA POLYEDGE_QSET_V3_WRITER_IMAGE POLYEDGE_QSET_V3_WRITER_GIT_SHA EXECUTION_FREEZE_ARTIFACT_PATH EXECUTION_FREEZE_SHA256 AZURE_STORAGE_ACCOUNT_NAME AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_FEDERATED_TOKEN_FILE; do
+  eval "value=\${$name:-}"
+  [ -n "$value" ] || { echo "qset-v3 requires $name" >&2; exit 64; }
+done
+[ "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-08-23-qset-v3 ] || { echo 'qset-v3 campaign is inexact' >&2; exit 64; }
+[ "${SHADOW_CODE_FREEZE_FINALIZED:-}" = true ] || { echo 'qset-v3 source freeze is not finalized' >&2; exit 64; }
+printf '%s' "$EXECUTION_FREEZE_SHA256" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo 'qset-v3 execution freeze hash is invalid' >&2; exit 64; }
+case "$EXECUTION_FREEZE_ARTIFACT_PATH" in /*|.|..|*'//'|*/./*|*/../*) echo 'qset-v3 execution freeze blob is invalid' >&2; exit 64 ;; esac
+for image in "$POLYEDGE_QSET_V3_SEAL_IMAGE" "$POLYEDGE_QSET_V3_WRITER_IMAGE"; do
+  printf '%s' "$image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' || { echo 'qset-v3 image must be an immutable GHCR backend digest' >&2; exit 64; }
+done
+for revision in "$POLYEDGE_QSET_V3_SEAL_GIT_SHA" "$POLYEDGE_QSET_V3_WRITER_GIT_SHA"; do
+  printf '%s' "$revision" | grep -Eq '^[0-9a-f]{40}$' || { echo 'qset-v3 source revision must be a full Git SHA' >&2; exit 64; }
+done
+[ "$AZURE_FEDERATED_TOKEN_FILE" = /run/credentials/azure-federated-token ] || { echo 'qset-v3 federated token path is inexact' >&2; exit 64; }
+[ "${AZURE_STORAGE_CONTAINER_NAME:-}" = polyedge-shadow-qset-v3-events ] \
+  && [ "${AZURE_RESEARCH_STORAGE_CONTAINER_NAME:-}" = polyedge-research-qset-v3 ] \
+  && [ "${POLYEDGE_QSET_V3_CONTROL_CONTAINER_NAME:-}" = polyedge-qset-v3-control ] || {
+  echo 'qset-v3 raw, research, or control container is inexact' >&2; exit 64;
+}
+[ "${AZURE_STORAGE_TABLE_NAME:-}" = ShadowQsetV3EventIndex ] \
+  && [ "${AZURE_CHART_TABLE_NAME:-}" = ShadowQsetV3ChartSeries ] \
+  && [ "${AZURE_MARKET_TABLE_NAME:-}" = ShadowQsetV3MarketCatalog ] || {
+  echo 'qset-v3 table binding is inexact' >&2; exit 64;
+}
+
+credential_dir=/run/polyedge-federated-shadow-qset-v3-writer
+token_file=$credential_dir/azure-federated-token
+[ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$token_file")" = 983:979:600:1 ] || {
+  echo 'qset-v3 federated token is missing or unsafe' >&2; exit 1;
+}
+/usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
+mountpoint -q /srv/polyedge-ring || { echo '/srv/polyedge-ring is not a mount point' >&2; exit 1; }
+for image_revision in "$POLYEDGE_QSET_V3_SEAL_IMAGE:$POLYEDGE_QSET_V3_SEAL_GIT_SHA" "$POLYEDGE_QSET_V3_WRITER_IMAGE:$POLYEDGE_QSET_V3_WRITER_GIT_SHA"; do
+  image=${image_revision%:*}
+  revision=${image_revision##*:}
+  [ "$(podman image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/arm64 ] || { echo "qset-v3 image is not linux/arm64: $image" >&2; exit 1; }
+  [ "$(podman image inspect --format '{{ index .Labels \"org.opencontainers.image.revision\" }}' "$image")" = "$revision" ] || { echo "qset-v3 image revision mismatch: $image" >&2; exit 1; }
+done
+
+writer=polyedge-shadow-qset-v3.service
+container=polyedge-shadow-qset-v3
+systemctl is-active --quiet "$writer" || { echo 'qset-v3 writer must be active before closed-day sealing' >&2; exit 1; }
+[ "$(podman inspect --format '{{.Config.Image}}' "$container")" = "$POLYEDGE_QSET_V3_WRITER_IMAGE" ] || { echo 'qset-v3 writer image is not the reviewed immutable binding' >&2; exit 1; }
+podman healthcheck run "$container" >/dev/null
+
+receipt_root=/srv/polyedge-ring/migration/qset-v3-seal
+install -d -m 0750 "$receipt_root"
+run_sealer() {
+  date=$1
+  shift
+  podman run --rm --pull=never --log-driver=journald --name "polyedge-qset-v3-seal-$date" --network polyedge \
+    --user 983:979 --cpus 0.5 --memory 1g --pids-limit 256 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=32m --cap-drop=all \
+    --env-file "$env_file" -v "$credential_dir:/run/credentials:ro,Z" "$POLYEDGE_QSET_V3_SEAL_IMAGE" seal-qset-v3-day \
+    --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date "$date" \
+    --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" "$@"
+}
+validate_receipt() {
+  receipt=$1 date=$2 schema=$3
+  jq -e --arg date "$date" --arg schema "$schema" --arg freeze "$EXECUTION_FREEZE_SHA256" --arg freeze_blob "$EXECUTION_FREEZE_ARTIFACT_PATH" '
+    .schema == $schema and .campaign_id == "campaign-2026-08-23-qset-v3" and .date == $date
+    and .container == "polyedge-shadow-qset-v3-events" and .blob_count == 1440 and .total_bytes > 0
+    and .source_freeze == {container:"polyedge-qset-v3-control",blob:$freeze_blob,sha256:$freeze,verified:true}
+    and (has("generated_ts") | not) and (has("sealed_at") | not)
+  ' "$receipt" >/dev/null
+}
+
+# Validate both complete campaign days before fencing the continuously running writer.
+for date in 2026-08-23 2026-08-24; do
+  temporary=$(mktemp "$receipt_root/.validate-$date.XXXXXX")
+  run_sealer "$date" --validate-only >"$temporary"
+  validate_receipt "$temporary" "$date" polyedge.qset_v3_closed_day_validation.v1
+  rm -f "$temporary"
+done
+
+writer_stopped=false
+temporary=
+restore_writer() {
+  rm -f "${temporary:-}"
+  [ "$writer_stopped" = true ] && systemctl start "$writer" || true
+}
+trap restore_writer EXIT HUP INT TERM
+systemctl stop "$writer"
+writer_stopped=true
+if systemctl is-active --quiet "$writer" || podman inspect --format '{{.State.Running}}' "$container" 2>/dev/null | grep -qx true; then
+  echo 'qset-v3 writer did not fence cleanly' >&2; exit 1
+fi
+
+for date in 2026-08-23 2026-08-24; do
+  temporary=$(mktemp "$receipt_root/.seal-$date.XXXXXX")
+  run_sealer "$date" >"$temporary"
+  validate_receipt "$temporary" "$date" polyedge.qset_v3_closed_day_seal.v1
+  stable=$(mktemp "$receipt_root/.seal-$date.XXXXXX")
+  jq --arg image "$POLYEDGE_QSET_V3_SEAL_IMAGE" --arg git "$POLYEDGE_QSET_V3_SEAL_GIT_SHA" \
+    --arg writer_image "$POLYEDGE_QSET_V3_WRITER_IMAGE" --arg writer_git "$POLYEDGE_QSET_V3_WRITER_GIT_SHA" \
+    '. + {sealer_image:$image,sealer_git_sha:$git,writer_image:$writer_image,writer_git_sha:$writer_git}' "$temporary" >"$stable"
+  rm -f "$temporary"
+  temporary=$stable
+  chmod 0640 "$temporary"
+  chown 0:0 "$temporary"
+  final=$receipt_root/$date.json
+  if [ -e "$final" ]; then
+    cmp -s "$temporary" "$final" || { echo "qset-v3 date already has a conflicting deterministic receipt: $date" >&2; exit 1; }
+    rm -f "$temporary"
+  else
+    sync -f "$temporary"
+    mv "$temporary" "$final"
+  fi
+  temporary=
+  logger -p daemon.info -t polyedge-qset-v3-seal-days "sealed qset-v3 date=$date receipt=$final sha256=$(sha256sum "$final" | awk '{print $1}')"
+done
+
+systemctl start "$writer"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  if systemctl is-active --quiet "$writer" && podman healthcheck run "$container" >/dev/null 2>&1; then
+    writer_stopped=false
+    trap - EXIT HUP INT TERM
+    exit 0
+  fi
+  sleep 5
+done
+echo 'qset-v3 writer did not recover healthy after sealing' >&2
+exit 1
