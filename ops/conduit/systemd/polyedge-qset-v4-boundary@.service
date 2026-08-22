@@ -1,6 +1,6 @@
 [Unit]
 Description=Fail-closed qset-v4 UTC boundary guard (%i)
-Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service polyedge-shadow-qset-v4.service
+Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service
 Conflicts=polyedge-shadow-qset-v3.service
 After=network-online.target polyedge-shadow-qset-v4.service
 

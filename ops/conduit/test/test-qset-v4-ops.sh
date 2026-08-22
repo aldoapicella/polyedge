@@ -88,6 +88,8 @@ grep -F -- '--user 983:979' "$sealer" >/dev/null
 grep -F -- '--source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256"' "$sealer" >/dev/null
 grep -F 'source_freeze == {container:"polyedge-qset-v4-control",blob:$freeze_blob,sha256:$freeze,verified:true}' "$sealer" >/dev/null
 grep -Fx 'ExecStart=/usr/local/libexec/polyedge-qset-v4-boundary-guard %i' "$boundary_service" >/dev/null
+grep -Fx 'Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service' "$boundary_service" >/dev/null
+! grep -F 'Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service polyedge-shadow-qset-v4.service' "$boundary_service" >/dev/null
 grep -Fx 'OnCalendar=2026-08-23 23:59:30 UTC' "$boundary_pre" >/dev/null
 grep -Fx 'Unit=polyedge-qset-v4-boundary@pre.service' "$boundary_pre" >/dev/null
 grep -Fx 'OnCalendar=2026-08-24 00:01:30 UTC' "$boundary_post" >/dev/null
@@ -114,6 +116,15 @@ grep -F 'qset-v4 writer and sealer freeze hashes differ' "$sealer" >/dev/null
 grep -F 'qset-v4 refuses date after terminal 2026-10-22' "$sealer" >/dev/null
 grep -F 'assert_exact_eight' "$handoff" >/dev/null
 grep -F 'az role assignment delete --ids' "$handoff" >/dev/null
+grep -F 'restore_old_assignments' "$handoff" >/dev/null
+grep -F -- '--condition-version' "$handoff" >/dev/null
+grep -F -- '--parameters deployProcessorJob=false' "$handoff" >/dev/null
+! grep -F 'V4_PROCESSOR_IMAGE:?V4_PROCESSOR_IMAGE is required' "$handoff" >/dev/null
+grep -F 'V4_ACCESS_PROBE_GIT_SHA:?V4_ACCESS_PROBE_GIT_SHA is required' "$handoff" >/dev/null
+grep -F 'oldContainersDenied:true,v4WriterStarted:false' "$handoff" >/dev/null
 grep -F 'prove_old_containers_denied' "$handoff" >/dev/null
 grep -F 'lock-and-upload' "$freeze_builder" >/dev/null
 grep -F 'immutability-policy lock' "$freeze_builder" >/dev/null
+grep -F 'git -C "$repo" show "HEAD:$file"' "$freeze_builder" >/dev/null
+grep -F 'immutabilityPolicy:{state:$policy.state,days:$policy.immutabilityPeriodSinceCreationInDays}' "$freeze_builder" >/dev/null
+grep -F 'source-$digest.json' "$freeze_builder" >/dev/null

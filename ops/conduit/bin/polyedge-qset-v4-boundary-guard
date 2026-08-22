@@ -114,7 +114,11 @@ commit_receipt() {
   local temporary_receipt=$1 final_receipt=$2
   chown root:root "$temporary_receipt" && chmod 0640 "$temporary_receipt"
   test ! -e "$final_receipt"
+  sync -f "$temporary_receipt"
+  sync -d "$(dirname "$final_receipt")"
   ln "$temporary_receipt" "$final_receipt"
+  sync -f "$final_receipt"
+  sync -d "$(dirname "$final_receipt")"
 }
 
 if test "$mode" = check; then common_guard; printf '%s\n' 'qset-v4 boundary guard check passed; no state changed'; exit 0; fi
