@@ -1,0 +1,16 @@
+[Unit]
+Description=Manual-only OCI qset-v4 profitability processor
+Requires=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v4-processor.service
+After=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v4-processor.service
+RequiresMountsFor=/srv/polyedge-ring /run/polyedge-federated-shadow-qset-v4-processor
+ConditionPathExists=/etc/polyedge/ENABLE_QSET_V4_PROCESSOR_MANUAL
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/polyedge/jobs/qset-v4-processor.env
+ExecStart=/usr/local/libexec/polyedge-run-job qset-v4-processor
+TimeoutStartSec=5h
+CPUQuota=400%
+MemoryMax=8G
+TasksMax=1024
+UMask=0027

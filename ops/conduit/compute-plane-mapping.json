@@ -384,7 +384,8 @@
     "shadowQset": "Only qset event and research container access plus the three exact ShadowQset writer tables; no primary, funded, non-qset table, Service Bus, or control access.",
     "fundedSigner": "Only exact funded evidence dependencies and receiver direction; no qset, primary bot-events, table, broad scope, or sender role.",
     "arc": "Retain the existing no-delete bot-events ring uploader assignment only.",
-    "fundedIntentProducer": "Only exact model/funded reads, shadow event/table writes, ACR pull, and sender direction; no receiver, qset, Key Vault, wallet, broad scope, or live execution access."
+    "fundedIntentProducer": "Only exact model/funded reads, shadow event/table writes, ACR pull, and sender direction; no receiver, qset, Key Vault, wallet, broad scope, or live execution access.",
+    "shadowQsetV4Processor": "Only exact qset-v4 raw read plus qset-v4 research/control access through the shadow-qset-v4-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access."
   },
   "lastReadOnlyRecheck": {
     "capturedAtUtc": "2026-08-21T16:30:00Z",
@@ -514,5 +515,44 @@
     ]
   },
   "retirementOnlyJobCount": 5,
-  "unresolvedJobMappingCount": 0
+  "unresolvedJobMappingCount": 0,
+  "ociOnlyJobs": [
+    {
+      "name": "qset-v4-processor",
+      "classification": "configured_manual_only_not_executed",
+      "ociUnit": "polyedge-qset-v4-processor.service",
+      "identityLane": "shadow-qset-v4-processor",
+      "azureContainerAppsJob": null,
+      "azureProcessorJobDeploymentAllowed": false,
+      "manualFirstExecution": true,
+      "recurringEnabled": false,
+      "timerUnit": null,
+      "imagePullPolicy": "never",
+      "minimumDiskHeadroomBytes": 16106127360,
+      "resources": {
+        "cpu": 4,
+        "memory": "8GiB",
+        "pids": 1024
+      },
+      "requiredInputs": {
+        "sourceFreezeReceipt": "/srv/polyedge-ring/migration/qset-v4/source-freeze/source-<final-sha256>.json",
+        "sealedDayReceipts": [
+          "/srv/polyedge-ring/migration/qset-v4-seal/2026-08-24.json",
+          "/srv/polyedge-ring/migration/qset-v4-seal/2026-08-25.json"
+        ]
+      },
+      "requiredProofBeforeFirstExecution": [
+        "final_source_freeze_receipt_hash_image_revision_binding",
+        "two_exact_closed_day_receipt_and_inventory_hashes",
+        "local_linux_arm64_image_revision",
+        "dedicated_federated_token"
+      ],
+      "requiredProofBeforeRecurringEnablement": [
+        "manual_processor_success",
+        "verified_output_hash_and_readback",
+        "negative_access_probe",
+        "resource_and_disk_guard_evidence"
+      ]
+    }
+  ]
 }
