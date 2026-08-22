@@ -327,10 +327,10 @@ export async function runPersistentFundedDirectService({
     });
   };
   const failMessage = async (entry, error) => {
-    failedMessages += 1;
     const errorText = safeErrorMessage(error);
     const deterministic = /unsupported|schema|binding|TTL|stale|SHA-256|does not qualify|already has an authorization|latency|risk|reservation|cash.flow|equity|position|open order/i.test(errorText);
     if (deterministic || Number(entry.message.deliveryCount || 0) >= 2) {
+      failedMessages += 1;
       await receiver.deadLetterMessage(entry.message, {
         deadLetterReason: "FundedIntentFailedClosed",
         deadLetterErrorDescription: errorText.slice(0, 4_000)

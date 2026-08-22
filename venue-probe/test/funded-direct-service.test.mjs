@@ -431,6 +431,61 @@ test("persistent service warms a new market after the active intent finishes", a
   assert.equal(logs.some((value) => value.status === "market_warmed"), true);
 });
 
+test("persistent service counts only terminal warmup failures after a successful redelivery", async () => {
+  const body = {
+    schema: "polyedge.funded_market_warmup.v1",
+    market_id: "retry-market",
+    condition_id: "retry-condition",
+    token_id: "retry-token",
+    token_ids: ["retry-token", "other-token"],
+    market_end_ts: new Date(Date.now() + 600_000).toISOString()
+  };
+  const messages = [0, 1].map((deliveryCount) => ({
+    messageId: "retry-warmup",
+    deliveryCount,
+    body
+  }));
+  const abandoned = [];
+  const completed = [];
+  const deadLettered = [];
+  const receiver = {
+    async receiveMessages(maxMessages) { return messages.splice(0, maxMessages); },
+    async renewMessageLock() {},
+    async completeMessage(message) { completed.push(message.deliveryCount); },
+    async abandonMessage(message) { abandoned.push(message.deliveryCount); },
+    async deadLetterMessage(message) { deadLettered.push(message.deliveryCount); },
+    async close() {}
+  };
+  let attempts = 0;
+  const logs = [];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({
+      createReceiver: () => receiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("transient warmup disagreement");
+      },
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  });
+  assert.equal(attempts, 2);
+  assert.equal(result.processed_messages, 1);
+  assert.equal(result.failed_messages, 0);
+  assert.deepEqual(abandoned, [0]);
+  assert.deepEqual(completed, [1]);
+  assert.deepEqual(deadLettered, []);
+  assert.equal(logs.some((value) => value.status === "persistent_message_failed_closed"), true);
+  assert.equal(logs.some((value) => value.status === "market_warmed"), true);
+});
+
 test("persistent service redelivers idempotently after durable completion loses its broker lock", async () => {
   const decisionTs = new Date(Date.now() - 500).toISOString();
   const body = {
