@@ -31,6 +31,7 @@ grep -Fx 'AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER=shadow-events/campaign-2026-08-2
 grep -Fx 'AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC=2026-08-23T00:00:00Z' "$writer_env" >/dev/null
 grep -Fx 'STRATEGY_INTENT_OPERATOR_DIRECT=true' "$writer_env" >/dev/null
 grep -Fx 'STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT=true' "$writer_env" >/dev/null
+grep -Fx 'STRATEGY_CANARY_INTENT_PREFIX=control/strategy-canary/intents/campaign-2026-08-23-qset-v3/intents' "$writer_env" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_ENABLED=false' "$writer_env" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE=' "$writer_env" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_QUEUE=' "$writer_env" >/dev/null

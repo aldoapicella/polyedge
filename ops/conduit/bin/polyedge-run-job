@@ -19,6 +19,9 @@ case "$job:${POLYEDGE_UTILITY_LOCKED:-0}" in
     ;;
 esac
 
+disk_guard=${POLYEDGE_BOOT_DISK_GUARD_BIN:-/usr/local/libexec/polyedge-boot-disk-guard}
+"$disk_guard" --assert-headroom
+
 # This is intentionally separate from Azure-backed research jobs: it receives no
 # credentials or mounts, and must prove this OCI host is the expected CO origin.
 if [ "$job" = origin-check ]; then

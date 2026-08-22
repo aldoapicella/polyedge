@@ -26,7 +26,7 @@ grep -Fx 'CPUQuota=50%' "$parity"
 grep -Fx 'ExecStart=/usr/local/libexec/polyedge-reboot-attestation complete' "$reboot"
 grep -Fx 'ConditionPathExists=/srv/polyedge-ring/parity/reboot/pending.json' "$reboot"
 grep -Fx 'WantedBy=multi-user.target' "$reboot"
-grep -Fx 'Wants=network-online.target' "$reboot"
+grep -Fx 'Wants=network-online.target polyedge-funded-intent-producer.service polyedge-federated-token@funded-intent-producer.timer' "$reboot"
 grep -Fx 'Requires=polyedge-ring-health.service' "$reboot"
 grep -Fx 'Restart=on-failure' "$reboot"
 grep -Fx 'RestartSec=60s' "$reboot"
@@ -41,7 +41,8 @@ for dependency in \
   polyedge-freshness.timer polyedge-hourly.timer polyedge-daily.timer polyedge-replay.timer \
   polyedge-parity-hourly.timer polyedge-federated-token@api.timer \
   polyedge-federated-token@research.timer polyedge-funded-signer.service \
-  polyedge-federated-token@funded-signer.timer
+  polyedge-federated-token@funded-signer.timer polyedge-funded-intent-producer.service \
+  polyedge-federated-token@funded-intent-producer.timer
 do
   printf '%s\n' "$after" | grep -F "$dependency" >/dev/null
 done

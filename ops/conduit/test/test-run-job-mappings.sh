@@ -10,6 +10,8 @@ done
 grep -F 'if [ "$job" = origin-check ]; then' "$runner" >/dev/null
 grep -F 'freshness:0|hourly:0)' "$runner" >/dev/null
 grep -F 'exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock' "$runner" >/dev/null
+grep -F 'disk_guard=${POLYEDGE_BOOT_DISK_GUARD_BIN:-/usr/local/libexec/polyedge-boot-disk-guard}' "$runner" >/dev/null
+grep -F '"$disk_guard" --assert-headroom' "$runner" >/dev/null
 grep -F 'POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d' "$runner" >/dev/null
 grep -F 'audit_target=$POLYEDGE_AUDIT_TARGET' "$runner" >/dev/null
 target_line=$(grep -n 'POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d' "$runner" | cut -d: -f1)

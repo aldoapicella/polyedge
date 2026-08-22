@@ -12,7 +12,8 @@ const QSET_V3_CHART_TABLE: &str = "ShadowQsetV3ChartSeries";
 const QSET_V3_PREFLIGHT_PREFIX: &str = "shadow-events/preflight/campaign-2026-08-23-qset-v3";
 const QSET_V3_EVENT_PREFIX: &str = "shadow-events/campaign-2026-08-23-qset-v3";
 const QSET_V3_CUTOVER_UTC: &str = "2026-08-23T00:00:00Z";
-const QSET_V3_INTENT_PREFIX: &str = "control/strategy-canary/intents/campaign-2026-08-23-qset-v3";
+const QSET_V3_INTENT_PREFIX: &str =
+    "control/strategy-canary/intents/campaign-2026-08-23-qset-v3/intents";
 const QSET_V3_MARKET_TABLE: &str = "ShadowQsetV3MarketCatalog";
 
 #[derive(Debug, Error)]
@@ -1058,6 +1059,7 @@ mod tests {
         settings.azure.market_table_name = QSET_V3_MARKET_TABLE.to_owned();
         settings.azure.strategy_intent_operator_direct = true;
         settings.azure.strategy_canary_intent_prefix = QSET_V3_INTENT_PREFIX.to_owned();
+        assert!(QSET_V3_INTENT_PREFIX.ends_with("/intents"));
         assert!(settings.validate_runtime_role().is_ok());
 
         settings.azure.storage_table_name = "ShadowQsetEventIndex".to_owned();
