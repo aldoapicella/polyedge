@@ -24,6 +24,10 @@ Do not install or enable the bundle until all of these are true:
   `polyedge-shadow-qset-v3-events`, `polyedge-research-qset-v3`, and
   `polyedge-qset-v3-control`. No v1/v2 container or table is in the v3
   role assignment. The writer UAMI is custom no-delete on v3 raw only, read-only on v3 control, contributor only on the three v3 tables, and has no v3 research access.
+- The exact conservative prior exists in the v3 research container at the
+  hash-named reports/research/venue-probe/models path. Its source and
+  destination readback both hash to
+  sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.
 - `/srv/polyedge-ring` is its intended mount with at least 15 GiB free and the
   boot-disk guard passes. The writer is capped at 0.5 CPU/1 GiB and journals
   through the existing capped persistent journal.
@@ -32,7 +36,8 @@ Do not install or enable the bundle until all of these are true:
 
 Run this only after the gates above, with the existing SPIRE template and
 Podman network already installed. Use the final values in the installed files;
-the repository examples intentionally remain blank/zero-digest.
+the repository examples leave only campaign freeze, image, client, and account
+bindings blank. The conservative-prior URI and hash are exact.
 
 ```sh
 sudo groupadd --system --gid 979 polyedge-identity-shadow-qset-v3-writer
@@ -66,6 +71,25 @@ v3 Quadlet's zero image digest, pull that exact digest after the boot-disk pull
 gate, and verify `linux/arm64` and `org.opencontainers.image.revision`. The
 v3 bundle intentionally does not use the frozen shared digest-deploy helper.
 
+Before enabling the writer, copy the existing immutable conservative prior into
+the exact v3 research path. Use only a temporary source-container reader and
+destination-container custom no-delete writer for the signed-in operator, then
+remove those temporary assignments. Do not use account keys or SAS.
+
+    source_container=polyedge-research
+    destination_container=polyedge-research-qset-v3
+    model_blob=reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json
+    expected_model_sha=91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4
+    model_tmp=$(mktemp -d)
+    az storage blob download --auth-mode login --account-name stpolyedge6urdjr5nmwx7w --container-name "$source_container" --name "$model_blob" --file "$model_tmp/source.json"
+    test "$(sha256sum "$model_tmp/source.json" | cut -d' ' -f1)" = "$expected_model_sha"
+    az storage blob upload --auth-mode login --account-name stpolyedge6urdjr5nmwx7w --container-name "$destination_container" --name "$model_blob" --file "$model_tmp/source.json" --overwrite false
+    az storage blob download --auth-mode login --account-name stpolyedge6urdjr5nmwx7w --container-name "$destination_container" --name "$model_blob" --file "$model_tmp/readback.json"
+    test "$(sha256sum "$model_tmp/readback.json" | cut -d' ' -f1)" = "$expected_model_sha"
+
+Retain the source/destination ETags and hashes in the campaign control proof.
+The writer must remain stopped if the copy or readback proof fails.
+
 Before the boundary, enable only the new token timer and start the v3 writer
 alongside qset-v2. Its preflight remains paper-only and writes only
 `shadow-events/preflight/campaign-2026-08-23-qset-v3`.
@@ -95,5 +119,16 @@ sudo systemctl enable --now polyedge-qset-v3-first-seal.timer
 sudo systemctl list-timers polyedge-qset-v3-first-seal.timer
 ```
 
-No recurring daily qset-v3 job is enabled by this bundle. Add one only after
-the first two receipts and the separate research implementation are accepted.
+No recurring daily qset-v3 job is enabled by this bundle. After both seal
+receipts are accepted:
+
+1. Run an isolated Bicep what-if with deployProcessorJob=true, the exact
+   multi-architecture digest, its 40-character revision, both receipt inventory
+   hashes, and the final freeze path/hash. Require no delete and no unrelated
+   modify.
+2. Deploy the manual processor job, read back its processor UAMI and three
+   scoped no-delete/read grants, and prove its negative access to funded,
+   qset-v1/v2, Key Vault, Service Bus, and unrelated storage.
+3. Start exactly one execution. Require a successful terminal replica, hash
+   every v3 campaign output, and validate the atomic report bundle before
+   enabling any recurring schedule or considering Azure retirement.
