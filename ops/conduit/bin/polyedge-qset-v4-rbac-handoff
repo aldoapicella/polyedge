@@ -104,17 +104,18 @@ assert_campaign_assignments() {
   writer_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-shadow-qset-v${version}-events') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/preflight/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'control/strategy-canary/intents/$campaign_id/'))))"
   processor_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-research-qset-v${version}') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'data/research/shadow/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'reports/research/shadow/campaigns/$campaign_id/'))))"
   jq -e --arg writer "$writer" --arg processor "$processor" --arg raw "$raw" --arg research "$research" --arg control "$control" --arg blob_reader "$blob_reader_role" --arg table_writer "$table_writer_role" --arg blob_writer "$blob_writer_role" --arg writer_condition "$writer_condition" --arg processor_condition "$processor_condition" '
+    def resource_id: ascii_downcase;
     def normalized: gsub("[[:space:]]"; "");
-    def conditional($role;$condition): .roleDefinitionId == $role and .conditionVersion == "2.0" and ((.condition|normalized) == ($condition|normalized));
-    def unconditional($role): .roleDefinitionId == $role and .condition == null and .conditionVersion == null;
+    def conditional($role;$condition): (.roleDefinitionId|resource_id) == ($role|resource_id) and .conditionVersion == "2.0" and ((.condition|normalized) == ($condition|normalized));
+    def unconditional($role): (.roleDefinitionId|resource_id) == ($role|resource_id) and .condition == null and .conditionVersion == null;
     (.writer|length)==5 and (.processor|length)==3 and
-    ([.writer[].scope]|sort)==(.expected.writer|sort) and ([.processor[].scope]|sort)==(.expected.processor|sort) and
+    ([.writer[].scope|resource_id]|sort)==([.expected.writer[]|resource_id]|sort) and ([.processor[].scope|resource_id]|sort)==([.expected.processor[]|resource_id]|sort) and
     all(.writer[]; .principalId==$writer) and all(.processor[]; .principalId==$processor) and
-    (([.writer[]|select(.scope==$raw)]) as $x | ($x|length)==1 and ($x[0]|conditional($blob_writer;$writer_condition))) and
-    (([.writer[]|select(.scope==$control)]) as $x | ($x|length)==1 and ($x[0]|unconditional($blob_reader))) and
-    all(.writer[]|select(.scope!=$raw and .scope!=$control); unconditional($table_writer)) and
-    (([.processor[]|select(.scope==$research)]) as $x | ($x|length)==1 and ($x[0]|conditional($blob_writer;$processor_condition))) and
-    all(.processor[]|select(.scope!=$research); unconditional($blob_reader))
+    (([.writer[]|select((.scope|resource_id)==($raw|resource_id))]) as $x | ($x|length)==1 and ($x[0]|conditional($blob_writer;$writer_condition))) and
+    (([.writer[]|select((.scope|resource_id)==($control|resource_id))]) as $x | ($x|length)==1 and ($x[0]|unconditional($blob_reader))) and
+    all(.writer[]|select((.scope|resource_id)!=($raw|resource_id) and (.scope|resource_id)!=($control|resource_id)); unconditional($table_writer)) and
+    (([.processor[]|select((.scope|resource_id)==($research|resource_id))]) as $x | ($x|length)==1 and ($x[0]|conditional($blob_writer;$processor_condition))) and
+    all(.processor[]|select((.scope|resource_id)!=($research|resource_id)); unconditional($blob_reader))
   ' "$record" >/dev/null
 }
 
@@ -124,38 +125,39 @@ assert_v4_subset() {
   writer_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-shadow-qset-v4-events') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/preflight/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'control/strategy-canary/intents/$campaign_id/'))))"
   processor_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-research-qset-v4') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'data/research/shadow/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'reports/research/shadow/campaigns/$campaign_id/'))))"
   jq -e --arg writer "$writer_principal" --arg processor "$processor_principal" --arg raw "$raw" --arg research "$research" --arg control "$control" --arg event "$event_index" --arg chart "$chart_series" --arg market "$market_catalog" --arg blob_reader "$blob_reader_role" --arg table_writer "$table_writer_role" --arg blob_writer "$blob_writer_role" --arg writer_condition "$writer_condition" --arg processor_condition "$processor_condition" '
+    def resource_id: ascii_downcase;
     def normalized: gsub("[[:space:]]"; "");
-    def conditional($role;$condition): .roleDefinitionId==$role and .conditionVersion=="2.0" and ((.condition|normalized)==($condition|normalized));
-    def unconditional($role): .roleDefinitionId==$role and .condition==null and .conditionVersion==null;
+    def conditional($role;$condition): (.roleDefinitionId|resource_id)==($role|resource_id) and .conditionVersion=="2.0" and ((.condition|normalized)==($condition|normalized));
+    def unconditional($role): (.roleDefinitionId|resource_id)==($role|resource_id) and .condition==null and .conditionVersion==null;
     (.writer|length)<=5 and (.processor|length)<=3 and
-    ([.writer[].scope]|length)==([.writer[].scope]|unique|length) and ([.processor[].scope]|length)==([.processor[].scope]|unique|length) and
+    ([.writer[].scope|resource_id]|length)==([.writer[].scope|resource_id]|unique|length) and ([.processor[].scope|resource_id]|length)==([.processor[].scope|resource_id]|unique|length) and
     all(.writer[];
       .principalId==$writer and
-      if .scope==$raw then conditional($blob_writer;$writer_condition)
-      elif .scope==$control then unconditional($blob_reader)
-      elif (.scope==$event or .scope==$chart or .scope==$market) then unconditional($table_writer)
+      if (.scope|resource_id)==($raw|resource_id) then conditional($blob_writer;$writer_condition)
+      elif (.scope|resource_id)==($control|resource_id) then unconditional($blob_reader)
+      elif ((.scope|resource_id)==($event|resource_id) or (.scope|resource_id)==($chart|resource_id) or (.scope|resource_id)==($market|resource_id)) then unconditional($table_writer)
       else false end) and
     all(.processor[];
       .principalId==$processor and
-      if .scope==$research then conditional($blob_writer;$processor_condition)
-      elif (.scope==$raw or .scope==$control) then unconditional($blob_reader)
+      if (.scope|resource_id)==($research|resource_id) then conditional($blob_writer;$processor_condition)
+      elif ((.scope|resource_id)==($raw|resource_id) or (.scope|resource_id)==($control|resource_id)) then unconditional($blob_reader)
       else false end)
   ' "$record" >/dev/null
 }
 
 collect_api_v4() {
   campaign_values 4
-  az role assignment list --all --assignee-object-id "$api_principal" -o json | jq --arg scope "$research" '[.[]|select(.scope==$scope)|{id,scope,roleDefinitionId,principalId,condition,conditionVersion}]|sort_by(.id)'
+  az role assignment list --all --assignee-object-id "$api_principal" -o json | jq --arg scope "$research" '[.[]|select((.scope|ascii_downcase)==($scope|ascii_downcase))|{id,scope,roleDefinitionId,principalId,condition,conditionVersion}]|sort_by(.id)'
 }
 
 assert_api_reader() {
   campaign_values 4
-  jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length==1 and .[0].scope==$scope and .[0].principalId==$principal and .[0].roleDefinitionId==$role and .[0].condition==null and .[0].conditionVersion==null' "$1" >/dev/null
+  jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length==1 and (.[0].scope|ascii_downcase)==($scope|ascii_downcase) and .[0].principalId==$principal and (.[0].roleDefinitionId|ascii_downcase)==($role|ascii_downcase) and .[0].condition==null and .[0].conditionVersion==null' "$1" >/dev/null
 }
 
 assert_api_subset() {
   campaign_values 4
-  jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length<=1 and all(.[];.scope==$scope and .principalId==$principal and .roleDefinitionId==$role and .condition==null and .conditionVersion==null)' "$1" >/dev/null
+  jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length<=1 and all(.[];(.scope|ascii_downcase)==($scope|ascii_downcase) and .principalId==$principal and (.roleDefinitionId|ascii_downcase)==($role|ascii_downcase) and .condition==null and .conditionVersion==null)' "$1" >/dev/null
 }
 
 assert_custom_roles() {
@@ -164,12 +166,12 @@ assert_custom_roles() {
   blob=$(az role definition list --name 44fd8b56-84f7-403c-a44a-7aabab1d28b1 --scope "$scope" -o json)
   table=$(az role definition list --name c8133837-ba14-4b6b-8f58-52ce675a33e4 --scope "$scope" -o json)
   jq -e --arg scope "$scope" --arg name 44fd8b56-84f7-403c-a44a-7aabab1d28b1 '
-    length==1 and .[0].name==$name and .[0].roleType=="CustomRole" and .[0].assignableScopes==[$scope] and (.[0].permissions|length)==1 and
+    length==1 and .[0].name==$name and .[0].roleType=="CustomRole" and ([.[0].assignableScopes[]|ascii_downcase])==[($scope|ascii_downcase)] and (.[0].permissions|length)==1 and
     .[0].permissions[0].actions==[] and .[0].permissions[0].notActions==[] and .[0].permissions[0].notDataActions==[] and
     (.[0].permissions[0].dataActions|sort)==(["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write","Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action"]|sort)
   ' <<<"$blob" >/dev/null
   jq -e --arg scope "$scope" --arg name c8133837-ba14-4b6b-8f58-52ce675a33e4 '
-    length==1 and .[0].name==$name and .[0].roleType=="CustomRole" and .[0].assignableScopes==[$scope] and (.[0].permissions|length)==1 and
+    length==1 and .[0].name==$name and .[0].roleType=="CustomRole" and ([.[0].assignableScopes[]|ascii_downcase])==[($scope|ascii_downcase)] and (.[0].permissions|length)==1 and
     .[0].permissions[0].actions==[] and .[0].permissions[0].notActions==[] and .[0].permissions[0].notDataActions==[] and
     (.[0].permissions[0].dataActions|sort)==(["Microsoft.Storage/storageAccounts/tableServices/tables/entities/read","Microsoft.Storage/storageAccounts/tableServices/tables/entities/write","Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action","Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action"]|sort)
   ' <<<"$table" >/dev/null
@@ -336,8 +338,8 @@ if test "$mode" = rollback; then
     jq '.apiResearchReader' "$after_receipt" >"$after_api"
     assert_campaign_assignments 4 "$after_expected" "$writer_principal" "$processor_principal"
     assert_api_reader "$after_api"
-    jq -e --slurpfile current "$v4_current" '(([$current[0].writer[].id]-[.writer[].id])|length)==0 and (([$current[0].processor[].id]-[.processor[].id])|length)==0' "$after_receipt" >/dev/null
-    jq -e --slurpfile current "$api_current" '(([$current[0][].id]-[.apiResearchReader[].id])|length)==0' "$after_receipt" >/dev/null
+    jq -e --slurpfile current "$v4_current" '(([$current[0].writer[].id|ascii_downcase]-[.writer[].id|ascii_downcase])|length)==0 and (([$current[0].processor[].id|ascii_downcase]-[.processor[].id|ascii_downcase])|length)==0' "$after_receipt" >/dev/null
+    jq -e --slurpfile current "$api_current" '(([$current[0][].id|ascii_downcase]-[.apiResearchReader[].id|ascii_downcase])|length)==0' "$after_receipt" >/dev/null
   fi
   remaining=$(jq '[.writer,.processor]|map(length)|add' "$v4_current"); remaining=$((remaining + $(jq 'length' "$api_current")))
   jq -r '.writer[].id,.processor[].id' "$v4_current" | while IFS= read -r id; do az role assignment delete --ids "$id"; done

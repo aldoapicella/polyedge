@@ -140,8 +140,7 @@ case "$url" in
     if test "${DENY_POSITIVE:-}" = writer-preflight; then code=403; else code=201; fi ;;
   *polyedge-shadow-qset-v4-events/shadow-events/*) code=201 ;;
   *polyedge-research-qset-v4/data/research/*)
-    key=$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)
-    if test "$method" = PUT; then cp "$data" "$STATE/blob-$key"; code=201; else body=$(cat "$STATE/blob-$key"); code=200; fi ;;
+    if test "$method" = PUT; then cp "$data" "$STATE/research-blob"; code=201; else cp "$STATE/research-blob" "$output"; output=/dev/null; code=200; fi ;;
   *polyedge-shadow-qset-v4-events\?*|*polyedge-qset-v4-control\?*) code=200; body='<EnumerationResults />' ;;
   *.vault.azure.net/*|*.servicebus.windows.net/*) code=403 ;;
   *.blob.core.windows.net/*) code=403 ;;
@@ -171,6 +170,26 @@ run_handoff() {
     QSET_V4_RBAC_RECEIPT_ROOT_TEST_ONLY="$RECEIPTS" QSET_V4_RBAC_WRITER_TOKEN_TEST_ONLY="$WRITER_TOKEN" QSET_V4_RBAC_PROCESSOR_TOKEN_TEST_ONLY="$PROCESSOR_TOKEN" \
     EXTRA_FIC="${EXTRA_FIC:-}" DRIFT_ROLE="${DRIFT_ROLE:-}" DENY_POSITIVE="${DENY_POSITIVE:-}" "$handoff" "$1"
 }
+
+casefold_live_resource_ids() {
+  local file
+  for file in "$@"; do
+    jq 'map(.scope |= gsub("/resourceGroups/"; "/resourcegroups/") | .roleDefinitionId |= gsub("/Microsoft.Authorization/"; "/microsoft.authorization/"))' "$file" >"$file.tmp"
+    mv "$file.tmp" "$file"
+  done
+}
+
+setup_case mixed-case-live
+casefold_live_resource_ids "$STATE/assign-v3-writer-pid.json" "$STATE/assign-v3-processor-pid.json" \
+  "$STATE/full-writer.json" "$STATE/full-processor.json" "$STATE/full-api.json"
+run_handoff check >/dev/null
+run_handoff apply >/dev/null
+jq -e '.schema=="polyedge.qset_v4_rbac_apply.v2" and .writerAssignments==5 and .processorAssignments==3 and .apiReaderAssignments==1' "$RECEIPTS/apply-result.json" >/dev/null
+jq '(.writer[].id,.processor[].id,.apiResearchReader[].id) |= ascii_upcase' "$RECEIPTS/v4-assignments.json" >"$RECEIPTS/v4-assignments.json.tmp"
+mv "$RECEIPTS/v4-assignments.json.tmp" "$RECEIPTS/v4-assignments.json"
+run_handoff rollback >/dev/null
+test "$(wc -l <"$STATE/delete.log")" = 9
+jq -se 'all(.[];length==0)' "$STATE/assign-writer-pid.json" "$STATE/assign-processor-pid.json" "$STATE/assign-api-pid.json" >/dev/null
 
 setup_case partial-rollback
 jq '[.[0],.[2]]' "$STATE/full-writer.json" >"$STATE/assign-writer-pid.json"
