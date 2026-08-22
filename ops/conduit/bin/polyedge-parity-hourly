@@ -467,6 +467,14 @@ case "$POLYEDGE_PARITY_FUNDED_MODE" in
     ;;
   *) die 'formal funded mode must equal disabled or active' ;;
 esac
+collector_bin=${POLYEDGE_PARITY_COLLECTOR_BIN:-/usr/local/libexec/polyedge-parity-hourly}
+reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+if [ -n "$parity_collector_sha$reboot_validator_sha" ]; then
+  secure_file "$collector_bin" 755
+  secure_file "$reboot_validator" 755
+  [ "$(sha "$collector_bin")" = "$parity_collector_sha" ] || die 'installed parity collector hash differs from the formal binding'
+  [ "$(sha "$reboot_validator")" = "$reboot_validator_sha" ] || die 'installed reboot validator hash differs from the formal binding'
+fi
 producer_token=${POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE:-/run/polyedge-federated-funded-intent-producer/azure-federated-token}
 if [ "$funded_enabled" = true ]; then
   producer_token_dir=${producer_token%/*}
@@ -554,7 +562,6 @@ validate_ledger() {
       (.fundedIntentProducerImage? // null) == null and (.fundedIntentProducerUser? // null) == null and
       (.fundedIntentProducerConfigSha256? // null) == null end)
   ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
-  reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
   [ ! -L "$reboot_validator" ] && [ -x "$reboot_validator" ] || die 'reboot attestation validator is missing or unsafe'
   "$reboot_validator" validate-ledger || die 'reboot recovery evidence is invalid'
 }

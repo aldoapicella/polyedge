@@ -5,6 +5,8 @@ root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT HUP INT TERM
 collector=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-parity-hourly
 reboot_attestor=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-reboot-attestation
+collector_sha=sha256:$(sha256sum "$collector" | awk '{print $1}')
+validator_sha=sha256:$(sha256sum "$reboot_attestor" | awk '{print $1}')
 uid=$(id -u)
 gid=$(id -g)
 fake=$root/fake-bin
@@ -346,7 +348,8 @@ EOF
 cat >"$fake/az" <<'EOF'
 #!/bin/sh
 case "$*" in
-  "servicebus queue show --subscription 11111111-1111-1111-1111-111111111111 --resource-group rg-polyedge-dev --namespace-name sb-polyedge-funded-cl-6urdjr5nmwx7w --name funded-dynamic-quote-intents --only-show-errors -o json") ;;
+  "servicebus queue show --subscription 11111111-1111-1111-1111-111111111111 --resource-group rg-polyedge-dev --namespace-name sb-polyedge-funded-cl-6urdjr5nmwx7w --name funded-dynamic-quote-intents --only-show-errors -o json"|\
+  "servicebus queue show --subscription 73783c0c-5a53-4f9b-b244-6f64e813814c --resource-group rg-polyedge-dev --namespace-name sb-polyedge-funded-cl-6urdjr5nmwx7w --name funded-dynamic-quote-intents --only-show-errors -o json") ;;
   *) exit 2 ;;
 esac
 jq -nc --arg status "${FAKE_SERVICE_BUS_STATUS:-Active}" \
@@ -602,13 +605,13 @@ activate_funded_fixture() {
   chmod 0640 "$rollout"
   rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
   active_ledger=$case_root/ring/parity/20260809T141000Z-funded-active.json
-  jq --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
+  jq --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" \
+    --arg collector_sha "$collector_sha" --arg validator_sha "$validator_sha" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
     .fundedSignerImage="ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
     .fundedSignerRevision="7777777777777777777777777777777777777777" |
     .fundedRolloutReceiptPath=$rollout | .fundedRolloutReceiptSha256=$rollout_sha |
     .fundedServiceBusDlqBaseline=936 |
-    .parityCollectorSha256="sha256:1111111111111111111111111111111111111111111111111111111111111111" |
-    .rebootValidatorSha256="sha256:2222222222222222222222222222222222222222222222222222222222222222" |
+    .parityCollectorSha256=$collector_sha | .rebootValidatorSha256=$validator_sha |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
     .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999" |
@@ -633,8 +636,8 @@ POLYEDGE_PARITY_FUNDED_TOKEN_FILE=$case_root/token/funded-azure-federated-token
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
 POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=936
-POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=sha256:1111111111111111111111111111111111111111111111111111111111111111
-POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=sha256:2222222222222222222222222222222222222222222222222222222222222222
+POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=$collector_sha
+POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=$validator_sha
 POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE=$case_root/funded-intent-producer.env
 POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE=$case_root/token/funded-producer-azure-federated-token
 EOF
@@ -643,8 +646,8 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
 POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
 POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
 POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
-POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=sha256:1111111111111111111111111111111111111111111111111111111111111111
-POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=sha256:2222222222222222222222222222222222222222222222222222222222222222
+POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=$collector_sha
+POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=$validator_sha
 EOF
 }
 
@@ -674,8 +677,9 @@ run_collector() {
   case_root=$1
   env PATH="$fake:$PATH" \
     POLYEDGE_PARITY_UTILITY_LOCKED=1 \
+    POLYEDGE_RUNUSER_BIN="$fake/runuser" POLYEDGE_AZ_BIN="$fake/az" \
     POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
-    POLYEDGE_REBOOT_ATTESTATION_BIN="$reboot_attestor" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
+    POLYEDGE_PARITY_COLLECTOR_BIN="${TEST_COLLECTOR_BIN:-$collector}" POLYEDGE_REBOOT_ATTESTATION_BIN="${TEST_VALIDATOR_BIN:-$reboot_attestor}" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" \
     FAKE_CALLS="$case_root/calls" FAKE_DF_AVAILABLE="${FAKE_DF_AVAILABLE:-20000000000}" FAKE_MOUNTPOINT_OK="${FAKE_MOUNTPOINT_OK:-1}" \
     FAKE_AZURE_REPORT="$case_root/azure.json" FAKE_AZURE_ATTESTATION="$case_root/azure.json.attestation.json" \
@@ -1033,6 +1037,19 @@ jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled 
   (.services.fundedIntentProducerRuntime.configEnvBindingSha256 | test("^sha256:[0-9a-f]{64}$")) and
   (.services.fundedIntentProducerRuntime.tokenMountBindingSha256 | test("^sha256:[0-9a-f]{64}$"))' \
   "$active_funded/ring/parity/hourly/20260809T15/evidence.json" >/dev/null
+
+collector_drift=$root/collector-drift-bin
+cp "$collector" "$collector_drift"
+printf '\n' >>"$collector_drift"
+chmod 0755 "$collector_drift"
+helper_drift=$root/helper-drift
+fixture "$helper_drift"
+activate_funded_fixture "$helper_drift"
+if TEST_COLLECTOR_BIN="$collector_drift" FAKE_FUNDED_ACTIVE=1 run_collector "$helper_drift" >/dev/null 2>&1; then
+  echo 'drifted installed collector unexpectedly passed hourly parity' >&2
+  exit 1
+fi
+
 
 for producer_case in wrong-env rw-mount unprepared token-gap token-failure warmup-failure intent-failure journal-partial recorder-backlog recorder-unbound-null recorder-failure final-backlog; do
   case_root=$root/producer-$producer_case

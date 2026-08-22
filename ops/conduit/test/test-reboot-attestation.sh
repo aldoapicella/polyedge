@@ -4,6 +4,9 @@ set -eu
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT HUP INT TERM
 attestor=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-reboot-attestation
+collector=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-parity-hourly
+collector_sha=sha256:$(sha256sum "$collector" | awk '{print $1}')
+validator_sha=sha256:$(sha256sum "$attestor" | awk '{print $1}')
 uid=$(id -u)
 gid=$(id -g)
 fake=$root/fake-bin
@@ -178,6 +181,18 @@ else
   exec /usr/bin/sha256sum "$@"
 fi
 FAKE
+cat >"$fake/runuser" <<'FAKE'
+#!/bin/sh
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+FAKE
+cat >"$fake/az" <<'FAKE'
+#!/bin/sh
+jq -nc --arg status "${FAKE_SERVICE_BUS_STATUS:-Active}" --argjson active "${FAKE_SERVICE_BUS_ACTIVE:-0}" \
+  --argjson scheduled "${FAKE_SERVICE_BUS_SCHEDULED:-0}" --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-936}" \
+  '{status:$status,countDetails:{activeMessageCount:$active,scheduledMessageCount:$scheduled,deadLetterMessageCount:$dlq}}'
+FAKE
 chmod 0755 "$fake"/*
 
 case_root=$root/case
@@ -207,6 +222,7 @@ jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dl
 chmod 0640 "$rollout"
 rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
 jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" \
+  --arg collector_sha "$collector_sha" --arg validator_sha "$validator_sha" \
   '{schemaVersion:1,status:"in_progress",windowStartUtc:$start,
   azureAuthoritative:true,azureDeletionAllowed:false,acceptedCleanLiveHours:72,
   acceptedHourlyEvidence:[range(72) | {hourIndex:.}],completedDailyCycles:2,
@@ -216,8 +232,7 @@ jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$
   fundedSignerRevision:"7777777777777777777777777777777777777777",
   fundedRolloutReceiptPath:$rollout,fundedRolloutReceiptSha256:$rollout_sha,
   fundedServiceBusDlqBaseline:936,
-  parityCollectorSha256:"sha256:1111111111111111111111111111111111111111111111111111111111111111",
-  rebootValidatorSha256:"sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  parityCollectorSha256:$collector_sha,rebootValidatorSha256:$validator_sha,
   fundedSignerUser:$user,fundedSessionId:"fixture-funded-v3",
   fundedSessionManifestSha256:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   fundedConfigSha256:"sha256:9999999999999999999999999999999999999999999999999999999999999999",
@@ -246,8 +261,8 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
 POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
 POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
 POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
-POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=sha256:1111111111111111111111111111111111111111111111111111111111111111
-POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=sha256:2222222222222222222222222222222222222222222222222222222222222222
+POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=$collector_sha
+POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=$validator_sha
 POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=fixture-funded-v3
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -262,6 +277,10 @@ chmod 0640 "$case_root/run/ledger.lock"
 
 run_attestor() {
   env PATH="$fake:$PATH" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
+    POLYEDGE_REBOOT_ATTESTATION_BIN="${TEST_ATTESTOR_BIN:-$attestor}" POLYEDGE_PARITY_COLLECTOR_BIN="${TEST_COLLECTOR_BIN:-$collector}" \
+    POLYEDGE_RUNUSER_BIN="$fake/runuser" POLYEDGE_AZ_BIN="$fake/az" \
+    FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-936}" FAKE_SERVICE_BUS_STATUS="${FAKE_SERVICE_BUS_STATUS:-Active}" \
+    FAKE_SERVICE_BUS_ACTIVE="${FAKE_SERVICE_BUS_ACTIVE:-0}" FAKE_SERVICE_BUS_SCHEDULED="${FAKE_SERVICE_BUS_SCHEDULED:-0}" \
     POLYEDGE_PARITY_ENV_FILE="${ATTEST_ENV_FILE:-$case_root/parity.env}" POLYEDGE_REBOOT_RUNTIME_DIR="$case_root/run/reboot-attestation" \
     POLYEDGE_REBOOT_BOOT_ID_FILE="$case_root/boot-id" POLYEDGE_REBOOT_PROC_STAT="$case_root/proc-stat" \
     POLYEDGE_REBOOT_API_TOKEN_FILE="$case_root/tokens/api/azure-federated-token" \
@@ -376,6 +395,18 @@ if FAKE_PRODUCER_MOUNT_RW=true run_attestor prepare >/dev/null 2>&1; then
 fi
 if FAKE_PRODUCER_PREPARED=false run_attestor prepare >/dev/null 2>&1; then
   echo 'unprepared producer publisher unexpectedly passed prepare' >&2
+  exit 1
+fi
+if FAKE_SERVICE_BUS_DLQ=937 run_attestor prepare >/dev/null 2>&1; then
+  echo 'drifted Service Bus DLQ unexpectedly passed reboot prepare' >&2
+  exit 1
+fi
+attestor_drift=$root/attestor-drift-bin
+cp "$attestor" "$attestor_drift"
+printf '\n' >>"$attestor_drift"
+chmod 0755 "$attestor_drift"
+if TEST_ATTESTOR_BIN="$attestor_drift" run_attestor prepare >/dev/null 2>&1; then
+  echo 'drifted installed reboot attestor unexpectedly passed prepare' >&2
   exit 1
 fi
 run_attestor prepare >/dev/null

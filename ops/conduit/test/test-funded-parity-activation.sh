@@ -37,7 +37,7 @@ jq -n --arg image "$new_image" --arg revision "$revision" --arg recovery "$fixtu
 }' >"$fixture_rollout"
 
 (
-  POLYEDGE_TEST_SOURCE_ONLY=1 . "$stage"
+  POLYEDGE_TEST_UID=$(id -u) POLYEDGE_TEST_GID=$(id -g) POLYEDGE_TEST_SOURCE_ONLY=1 . "$stage"
   validate_recovery_receipt "$fixture_recovery"
   validate_rollout_receipt "$fixture_recovery" "$fixture_rollout"
   test "$signer_image" = "$new_image"
@@ -81,10 +81,43 @@ ENV
 
   jq '.producerRestored=false' "$fixture_rollout" >"$root/bad-rollout.json"
   if validate_rollout_receipt "$fixture_recovery" "$root/bad-rollout.json"; then exit 1; fi
+
+  tx_root=$root/transaction
+  mkdir -p "$tx_root"
+  printf '%s\n' before-formal >"$tx_root/before-formal"
+  printf '%s\n' before-hourly >"$tx_root/before-hourly"
+  printf '%s\n' candidate-formal >"$tx_root/candidate-formal"
+  printf '%s\n' candidate-hourly >"$tx_root/candidate-hourly"
+  cp "$tx_root/before-formal" "$tx_root/formal"
+  cp "$tx_root/before-hourly" "$tx_root/hourly"
+  cp "$tx_root/candidate-formal" "$tx_root/formal.tmp"
+  cp "$tx_root/candidate-hourly" "$tx_root/hourly.tmp"
+  chmod 0640 "$tx_root/before-formal" "$tx_root/candidate-formal" "$tx_root/formal" "$tx_root/formal.tmp"
+  chmod 0600 "$tx_root/before-hourly" "$tx_root/candidate-hourly" "$tx_root/hourly" "$tx_root/hourly.tmp"
+  set +e
+  (
+    POLYEDGE_TEST_KILL_BETWEEN_ENV_MOVES=1 commit_candidate_pair "$tx_root/marker.json" \
+      "$tx_root/formal" "$tx_root/hourly" "$tx_root/before-formal" "$tx_root/before-hourly" \
+      "$tx_root/candidate-formal" "$tx_root/candidate-hourly" "$tx_root/formal.tmp" "$tx_root/hourly.tmp"
+  ) >/dev/null 2>&1
+  killed_rc=$?
+  set -e
+  test "$killed_rc" = 137
+  cmp "$tx_root/formal" "$tx_root/candidate-formal"
+  cmp "$tx_root/hourly" "$tx_root/before-hourly"
+  jq -e '.phase == "formal_moved"' "$tx_root/marker.json" >/dev/null
+  recover_env_transaction "$tx_root/marker.json" "$tx_root/formal" "$tx_root/hourly" \
+    "$tx_root/before-formal" "$tx_root/before-hourly" "$tx_root/candidate-formal" "$tx_root/candidate-hourly" before
+  cmp "$tx_root/formal" "$tx_root/before-formal"
+  cmp "$tx_root/hourly" "$tx_root/before-hourly"
+  jq -e '.schema == "polyedge.parity_env_transaction.v1" and .phase == "recovered_before"' "$tx_root/marker.json" >/dev/null
+  printf '%s\n' ambiguous >"$tx_root/formal"
+  if recover_env_transaction "$tx_root/marker.json" "$tx_root/formal" "$tx_root/hourly" \
+    "$tx_root/before-formal" "$tx_root/before-hourly" "$tx_root/candidate-formal" "$tx_root/candidate-hourly" before; then exit 1; fi
 )
 
 (
-  POLYEDGE_TEST_SOURCE_ONLY=1 . "$first"
+  POLYEDGE_TEST_UID=$(id -u) POLYEDGE_TEST_GID=$(id -g) POLYEDGE_TEST_SOURCE_ONLY=1 . "$first"
   staged_fixture=$root/staged.json
   jq -n --arg window "$window" --arg ledger "$ledger" --arg recovery "$fixture_recovery" --arg recovery_sha "$fixture_recovery_sha" \
     --arg rollout "$fixture_rollout" --arg rollout_sha "sha256:$(sha256sum "$fixture_rollout" | cut -d' ' -f1)" \
@@ -99,6 +132,40 @@ ENV
   jq '.bindings.validatorSha256="sha256:0000000000000000000000000000000000000000000000000000000000000000"' \
     "$staged_fixture" >"$root/bad-staged.json"
   if validate_staged_receipt "$root/bad-staged.json" "$fixture_recovery" "$fixture_rollout"; then exit 1; fi
+
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$revision
+  export POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$fixture_rollout
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=sha256:$(sha256sum "$fixture_rollout" | cut -d' ' -f1)
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1037
+  evidence_fixture=$root/evidence.json
+  jq -n --arg window "$window" --arg ledger "$ledger" --arg revision "$revision" \
+    --arg rollout "$fixture_rollout" --arg rollout_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" \
+    --arg namespace "$namespace" --arg queue "$queue" --arg collector "$collector_sha" --arg validator "$validator_sha" '{
+      schemaVersion:1,status:"validated",acceptedForParityWindow:true,hourStartUtc:$window,ledgerPath:$ledger,
+      services:{fundedSignerEnabled:true,fundedSignerMode:"active",fundedSignerRevision:$revision,
+        fundedRolloutReceipt:{path:$rollout,sha256:$rollout_sha},fundedServiceBusDlqBaseline:1037,
+        parityCollectorSha256:$collector,rebootValidatorSha256:$validator,
+        fundedServiceBusRuntime:{namespace:$namespace,queue:$queue,status:"Active",activeMessageCount:0,
+          scheduledMessageCount:0,deadLetterMessageCount:1037,expectedDeadLetterMessageCount:1037},
+        fundedRuntime:{heartbeatCount:60,alertCount:0,failedClosedCount:0,restartCount:0},
+        fundedIntentProducerRuntime:{continuity:{restartCount:0}}},
+      sameInput:{deterministicResultExactMatch:true},azureAuthoritative:true,azureDeletionAllowed:false
+    }' >"$evidence_fixture"
+  validate_first_hour_evidence "$evidence_fixture"
+  for mutation in revision rollout-sha dlq collector validator; do
+    case "$mutation" in
+      revision) filter='.services.fundedSignerRevision = "0000000000000000000000000000000000000000"' ;;
+      rollout-sha) filter='.services.fundedRolloutReceipt.sha256 = "sha256:" + ("0" * 64)' ;;
+      dlq) filter='.services.fundedServiceBusRuntime.deadLetterMessageCount = 1038' ;;
+      collector) filter='.services.parityCollectorSha256 = "sha256:" + ("0" * 64)' ;;
+      validator) filter='.services.rebootValidatorSha256 = "sha256:" + ("0" * 64)' ;;
+    esac
+    jq "$filter" "$evidence_fixture" >"$root/evidence-$mutation.json"
+    if validate_first_hour_evidence "$root/evidence-$mutation.json"; then
+      echo "first-hour $mutation drift unexpectedly passed" >&2
+      exit 1
+    fi
+  done
 )
 
 printf 'funded parity activation fixture tests passed\n'

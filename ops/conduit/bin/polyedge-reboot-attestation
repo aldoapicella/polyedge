@@ -192,6 +192,32 @@ case "$funded_mode" in
     ;;
   *) die 'formal funded mode must equal disabled or active' ;;
 esac
+attestor_bin=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+collector_bin=${POLYEDGE_PARITY_COLLECTOR_BIN:-/usr/local/libexec/polyedge-parity-hourly}
+if [ -n "$parity_collector_sha$reboot_validator_sha" ]; then
+  secure_file "$attestor_bin" 755 262144
+  secure_file "$collector_bin" 755 262144
+  [ "$(sha "$attestor_bin")" = "$reboot_validator_sha" ] || die 'installed reboot validator hash differs from the formal binding'
+  [ "$(sha "$collector_bin")" = "$parity_collector_sha" ] || die 'installed parity collector hash differs from the formal binding'
+fi
+
+subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+resource_group=rg-polyedge-dev
+service_bus_namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+service_bus_queue=funded-dynamic-quote-intents
+runuser_bin=${POLYEDGE_RUNUSER_BIN:-/usr/sbin/runuser}
+az_bin=${POLYEDGE_AZ_BIN:-/usr/bin/az}
+validate_service_bus_snapshot() {
+  queue_json=$("$runuser_bin" -u ubuntu -- "$az_bin" servicebus queue show \
+    --subscription "$subscription" --resource-group "$resource_group" \
+    --namespace-name "$service_bus_namespace" --name "$service_bus_queue" --only-show-errors -o json) \
+    || die 'funded Service Bus queue snapshot is unreadable'
+  printf '%s' "$queue_json" | jq -e --argjson dlq "$funded_service_bus_dlq" '
+    .status == "Active" and .countDetails.activeMessageCount == 0 and
+    .countDetails.scheduledMessageCount == 0 and .countDetails.deadLetterMessageCount == $dlq
+  ' >/dev/null || die 'funded Service Bus queue differs from the immutable DLQ baseline'
+  unset queue_json
+}
 if [ "$funded_enabled" = true ]; then
   [ "$funded_rollout_receipt" = "$parity_root/activation/20260822T195013Z-funded-signer-rollout.json" ] \
     || die 'funded rollout receipt path differs from the approved activation receipt'
@@ -203,6 +229,7 @@ if [ "$funded_enabled" = true ]; then
     .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
       scheduledMessageCount:0,deadLetterMessageCount:$dlq}
   ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
+  validate_service_bus_snapshot
 fi
 
 protected_json() {

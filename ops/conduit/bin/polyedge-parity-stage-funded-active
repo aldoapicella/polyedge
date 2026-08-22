@@ -16,6 +16,7 @@ readonly recovery_script_sha=5d509a3dfdf09e39182ba369dff62821df3a31b5a8514988ba6
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260822T195013Z-acknowledged-evicted-no-fill.json
 readonly rollout=/srv/polyedge-ring/parity/activation/20260822T195013Z-funded-signer-rollout.json
 readonly rollback=/etc/polyedge/rollback/20260822T210000Z-funded-active
+readonly transaction=$rollback/env-transaction.json
 readonly activation_dir=/srv/polyedge-ring/parity/activation
 readonly receipt=$activation_dir/20260822T210000Z-staged.json
 readonly first_validated=$activation_dir/20260822T210000Z-first-hour-validated.json
@@ -37,9 +38,9 @@ readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:ef92718c49d6fa06c06271395f53b9c62ee0532d2492496e92337d31732eb50f
+readonly collector_sha=sha256:031a38be219fa23664bf3bae345453ad371ac7edb8ec34954e724abfb6000a50
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:3743e125dc5d791f7c002da205b017687998ab1c342e969a6c81bf8ed6f79eb2
+readonly validator_sha=sha256:739c420ba37e1287b84897908b2e4851249ea9f6775b71d8a6efa31d75d6faec
 
 formal_tmp=
 hourly_tmp=
@@ -108,6 +109,88 @@ validate_recovery_receipt() {
   test "$cutover_epoch" -ge 1787428213 && test "$cutover_epoch" -lt "$window_epoch"
 }
 
+transaction_uid=${POLYEDGE_TEST_UID:-0}
+transaction_gid=${POLYEDGE_TEST_GID:-0}
+
+write_env_transaction() {
+  local marker=$1 phase=$2 formal_path=$3 hourly_path=$4 before_formal=$5 before_hourly=$6 candidate_formal=$7 candidate_hourly=$8 tmp marker_dir
+  marker_dir=${marker%/*}
+  tmp=$(/usr/bin/mktemp "${marker}.XXXXXX") || return 1
+  /usr/bin/jq -n --arg phase "$phase" --arg formal "$formal_path" --arg hourly "$hourly_path" \
+    --arg before_formal "sha256:$(sha "$before_formal")" --arg before_hourly "sha256:$(sha "$before_hourly")" \
+    --arg candidate_formal "sha256:$(sha "$candidate_formal")" --arg candidate_hourly "sha256:$(sha "$candidate_hourly")" '
+    {schema:"polyedge.parity_env_transaction.v1",phase:$phase,
+     formal:{path:$formal,beforeSha256:$before_formal,candidateSha256:$candidate_formal},
+     hourly:{path:$hourly,beforeSha256:$before_hourly,candidateSha256:$candidate_hourly}}
+  ' >"$tmp" || { /usr/bin/rm -f "$tmp"; return 1; }
+  /usr/bin/chown "$transaction_uid:$transaction_gid" "$tmp" &&
+    /usr/bin/chmod 0600 "$tmp" && /usr/bin/sync -f "$tmp" &&
+    /usr/bin/mv -f "$tmp" "$marker" && /usr/bin/sync -f "$marker_dir"
+}
+
+validate_env_transaction() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7
+  test ! -L "$marker" && test -f "$marker" || return 1
+  test "$(/usr/bin/stat -c '%u:%g:%a:%h' "$marker")" = "$transaction_uid:$transaction_gid:600:1" || return 1
+  /usr/bin/jq -e --arg formal "$formal_path" --arg hourly "$hourly_path" \
+    --arg before_formal "sha256:$(sha "$before_formal")" --arg before_hourly "sha256:$(sha "$before_hourly")" \
+    --arg candidate_formal "sha256:$(sha "$candidate_formal")" --arg candidate_hourly "sha256:$(sha "$candidate_hourly")" '
+    .schema == "polyedge.parity_env_transaction.v1" and
+    (.phase | test("^(prepared|formal_moved|committed|recovering|formal_restored|recovered_before)$")) and
+    .formal == {path:$formal,beforeSha256:$before_formal,candidateSha256:$candidate_formal} and
+    .hourly == {path:$hourly,beforeSha256:$before_hourly,candidateSha256:$candidate_hourly}
+  ' "$marker" >/dev/null
+}
+
+restore_before_pair() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7 formal_restore hourly_restore
+  formal_restore=$(/usr/bin/mktemp "${formal_path}.XXXXXX") || return 1
+  hourly_restore=$(/usr/bin/mktemp "${hourly_path}.XXXXXX") || { /usr/bin/rm -f "$formal_restore"; return 1; }
+  /usr/bin/install -o "$transaction_uid" -g "$transaction_gid" -m 0640 "$before_formal" "$formal_restore" &&
+    /usr/bin/install -o "$transaction_uid" -g "$transaction_gid" -m 0600 "$before_hourly" "$hourly_restore" &&
+    /usr/bin/sync -f "$formal_restore" && /usr/bin/sync -f "$hourly_restore" &&
+    write_env_transaction "$marker" recovering "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" &&
+    /usr/bin/mv -f "$formal_restore" "$formal_path" &&
+    write_env_transaction "$marker" formal_restored "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" &&
+    /usr/bin/mv -f "$hourly_restore" "$hourly_path" &&
+    write_env_transaction "$marker" recovered_before "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+}
+
+recover_env_transaction() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7 prefer=$8 formal_sha hourly_sha before_formal_sha before_hourly_sha candidate_formal_sha candidate_hourly_sha
+  test -e "$marker" || return 0
+  validate_env_transaction "$marker" "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" || return 1
+  formal_sha="sha256:$(sha "$formal_path")"
+  hourly_sha="sha256:$(sha "$hourly_path")"
+  before_formal_sha="sha256:$(sha "$before_formal")"
+  before_hourly_sha="sha256:$(sha "$before_hourly")"
+  candidate_formal_sha="sha256:$(sha "$candidate_formal")"
+  candidate_hourly_sha="sha256:$(sha "$candidate_hourly")"
+  if test "$formal_sha" = "$before_formal_sha" && test "$hourly_sha" = "$before_hourly_sha"; then
+    write_env_transaction "$marker" recovered_before "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+  elif test "$formal_sha" = "$candidate_formal_sha" && test "$hourly_sha" = "$candidate_hourly_sha"; then
+    if test "$prefer" = before; then
+      restore_before_pair "$marker" "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+    else
+      write_env_transaction "$marker" committed "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+    fi
+  elif { test "$formal_sha" = "$candidate_formal_sha" && test "$hourly_sha" = "$before_hourly_sha"; } ||
+       { test "$formal_sha" = "$before_formal_sha" && test "$hourly_sha" = "$candidate_hourly_sha"; }; then
+    restore_before_pair "$marker" "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+  else
+    return 1
+  fi
+}
+
+commit_candidate_pair() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7 formal_source=$8 hourly_source=$9
+  write_env_transaction "$marker" prepared "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" &&
+    /usr/bin/mv -f "$formal_source" "$formal_path" &&
+    write_env_transaction "$marker" formal_moved "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" || return 1
+  if test "${POLYEDGE_TEST_KILL_BETWEEN_ENV_MOVES:-0}" = 1; then /usr/bin/kill -KILL "${BASHPID:-$$}"; fi
+  /usr/bin/mv -f "$hourly_source" "$hourly_path" &&
+    write_env_transaction "$marker" committed "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+}
 render_env() {
   local source=$1 target=$2 key count
   shift 2
@@ -158,13 +241,9 @@ restore_bindings() {
   /usr/bin/rm -f "$formal_tmp" "$hourly_tmp" "$ledger_tmp" "$journal_tmp" "$receipt_tmp"
   if [ "$complete" != true ] && [ "$mutations_started" = true ]; then
     /usr/bin/systemctl disable --now polyedge-parity-hourly.timer >/dev/null 2>&1 || true
-    if [ -f "$rollback/parity-hourly.env.before" ] &&
-       [ "$(sha "$rollback/parity-hourly.env.before")" = "$old_formal_sha" ]; then
-      /usr/bin/install -o root -g root -m 0640 "$rollback/parity-hourly.env.before" "$formal"
-    fi
-    if [ -f "$rollback/hourly.env.before" ] &&
-       [ "$(sha "$rollback/hourly.env.before")" = "$old_hourly_sha" ]; then
-      /usr/bin/install -o root -g root -m 0600 "$rollback/hourly.env.before" "$hourly"
+    if [ -f "$transaction" ] && [ -f "$rollback/parity-hourly.env.candidate" ] && [ -f "$rollback/hourly.env.candidate" ]; then
+      restore_before_pair "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+        "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" || true
     fi
     /usr/bin/logger -p daemon.err -t polyedge-parity-activation "stage failed closed rc=$rc; previous bindings restored"
   fi
@@ -257,15 +336,17 @@ if [ -e "$receipt" ]; then
   mutations_started=true
   /usr/bin/systemctl disable --now polyedge-parity-hourly.timer >/dev/null
   ! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
+  recover_env_transaction "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+    "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" candidate
   formal_tmp=$(/usr/bin/mktemp "${formal}.XXXXXX")
   hourly_tmp=$(/usr/bin/mktemp "${hourly}.XXXXXX")
   /usr/bin/install -o root -g root -m 0640 "$rollback/parity-hourly.env.candidate" "$formal_tmp"
   /usr/bin/install -o root -g root -m 0600 "$rollback/hourly.env.candidate" "$hourly_tmp"
   /usr/bin/sync -f "$formal_tmp"
   /usr/bin/sync -f "$hourly_tmp"
-  /usr/bin/mv -f "$formal_tmp" "$formal"
+  commit_candidate_pair "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+    "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" "$formal_tmp" "$hourly_tmp"
   formal_tmp=
-  /usr/bin/mv -f "$hourly_tmp" "$hourly"
   hourly_tmp=
   test "$(sha "$formal")" = "$(/usr/bin/jq -r '.bindings.formalSha256' "$receipt" | /usr/bin/cut -d: -f2)"
   test "$(sha "$hourly")" = "$(/usr/bin/jq -r '.bindings.hourlySha256' "$receipt" | /usr/bin/cut -d: -f2)"
@@ -277,6 +358,17 @@ if [ -e "$receipt" ]; then
 fi
 
 /usr/bin/mountpoint -q /srv/polyedge-ring
+if [ -e "$transaction" ]; then
+  secure_file "$rollback/parity-hourly.env.before" 640 1048576
+  secure_file "$rollback/hourly.env.before" 600 1048576
+  secure_file "$rollback/parity-hourly.env.candidate" 640 1048576
+  secure_file "$rollback/hourly.env.candidate" 600 1048576
+  mutations_started=true
+  /usr/bin/systemctl disable --now polyedge-parity-hourly.timer >/dev/null
+  ! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
+  recover_env_transaction "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+    "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" before
+fi
 
 /usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
 test ! -e /run/polyedge/image-pulls-paused
@@ -481,9 +573,9 @@ secure_file "$ledger" 640 1048576
 mutations_started=true
 /usr/bin/systemctl disable --now polyedge-parity-hourly.timer >/dev/null
 ! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
-/usr/bin/mv -f "$formal_tmp" "$formal"
+commit_candidate_pair "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+  "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" "$formal_tmp" "$hourly_tmp"
 formal_tmp=
-/usr/bin/mv -f "$hourly_tmp" "$hourly"
 hourly_tmp=
 secure_file "$formal" 640 1048576
 secure_file "$hourly" 600 1048576

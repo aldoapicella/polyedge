@@ -4,7 +4,10 @@ set -eu
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT HUP INT TERM
 recorder=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-parity-record-daily
+collector=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-parity-hourly
 reboot_attestor=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)/bin/polyedge-reboot-attestation
+collector_sha=sha256:$(sha256sum "$collector" | awk '{print $1}')
+validator_sha=sha256:$(sha256sum "$reboot_attestor" | awk '{print $1}')
 uid=$(id -u)
 gid=$(id -g)
 fake=$root/fake-bin
@@ -17,6 +20,19 @@ cat >"$fake/df" <<'EOF'
 #!/bin/sh
 printf '%s\n' 'Filesystem 1-blocks Used Available Capacity Mounted on'
 printf '%s\n' 'fixture 100000000000 1 50000000000 1% /'
+EOF
+cat >"$fake/runuser" <<'EOF'
+#!/bin/sh
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+EOF
+cat >"$fake/az" <<'EOF'
+#!/bin/sh
+jq -nc --arg status "${FAKE_SERVICE_BUS_STATUS:-Active}" \
+  --argjson active "${FAKE_SERVICE_BUS_ACTIVE:-0}" --argjson scheduled "${FAKE_SERVICE_BUS_SCHEDULED:-0}" \
+  --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-936}" \
+  '{status:$status,countDetails:{activeMessageCount:$active,scheduledMessageCount:$scheduled,deadLetterMessageCount:$dlq}}'
 EOF
 chmod 0755 "$fake"/*
 
@@ -94,13 +110,13 @@ activate_funded_fixture() {
   chmod 0640 "$rollout"
   rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
   active_ledger=$case_root/ring/parity/20260811T000000Z-funded-active.json
-  jq --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
+  jq --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" \
+    --arg collector_sha "$collector_sha" --arg validator_sha "$validator_sha" '.fundedSignerEnabled=true | .fundedSignerMode="active" |
     .fundedSignerImage="ghcr.io/fixture/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
     .fundedSignerRevision="7777777777777777777777777777777777777777" |
     .fundedRolloutReceiptPath=$rollout | .fundedRolloutReceiptSha256=$rollout_sha |
     .fundedServiceBusDlqBaseline=936 |
-    .parityCollectorSha256="sha256:1111111111111111111111111111111111111111111111111111111111111111" |
-    .rebootValidatorSha256="sha256:2222222222222222222222222222222222222222222222222222222222222222" |
+    .parityCollectorSha256=$collector_sha | .rebootValidatorSha256=$validator_sha |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
     .fundedConfigSha256="sha256:9999999999999999999999999999999999999999999999999999999999999999" |
@@ -118,8 +134,8 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
 POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
 POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
 POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
-POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=sha256:1111111111111111111111111111111111111111111111111111111111111111
-POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=sha256:2222222222222222222222222222222222222222222222222222222222222222
+POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=$collector_sha
+POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=$validator_sha
 POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=dynamic-quote-funded-2026-08-13-v10
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -132,7 +148,10 @@ EOF
 run_recorder() {
   case_root=$1 date=$2
   env PATH="$fake:$PATH" POLYEDGE_PARITY_EXPECTED_UID="$uid" POLYEDGE_PARITY_EXPECTED_GID="$gid" \
-    POLYEDGE_REBOOT_ATTESTATION_BIN="$reboot_attestor" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
+    POLYEDGE_PARITY_COLLECTOR_BIN="${TEST_COLLECTOR_BIN:-$collector}" POLYEDGE_REBOOT_ATTESTATION_BIN="${TEST_VALIDATOR_BIN:-$reboot_attestor}" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
+    POLYEDGE_RUNUSER_BIN="$fake/runuser" POLYEDGE_AZ_BIN="$fake/az" \
+    FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-936}" FAKE_SERVICE_BUS_STATUS="${FAKE_SERVICE_BUS_STATUS:-Active}" \
+    FAKE_SERVICE_BUS_ACTIVE="${FAKE_SERVICE_BUS_ACTIVE:-0}" FAKE_SERVICE_BUS_SCHEDULED="${FAKE_SERVICE_BUS_SCHEDULED:-0}" \
     POLYEDGE_RESEARCH_IMAGE=ghcr.io/fixture/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     POLYEDGE_PARITY_ENV_FILE="$case_root/parity.env" "$recorder" "$date"
 }
@@ -221,6 +240,29 @@ jq -e '.fundedSignerMode == "active" and .fundedSignerEnabled == true and
   .fundedIntentProducerEnabled == true and .fundedIntentProducerUser == "984:980" and
   .fundedIntentProducerConfigSha256 == "sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b"' \
   "$active_funded/ring/parity/daily/2026-08-11/evidence.json" >/dev/null
+
+queue_drift=$root/queue-drift
+fixture "$queue_drift"
+activate_funded_fixture "$queue_drift"
+make_bundle "$queue_drift" 2026-08-11 2026-08-12T08:00:00Z
+if FAKE_SERVICE_BUS_DLQ=937 run_recorder "$queue_drift" 2026-08-11 >/dev/null 2>&1; then
+  echo 'drifted Service Bus DLQ unexpectedly passed daily parity' >&2
+  exit 1
+fi
+
+validator_drift_bin=$root/validator-drift-bin
+cp "$reboot_attestor" "$validator_drift_bin"
+printf '\n' >>"$validator_drift_bin"
+chmod 0755 "$validator_drift_bin"
+validator_drift=$root/validator-drift
+fixture "$validator_drift"
+activate_funded_fixture "$validator_drift"
+make_bundle "$validator_drift" 2026-08-11 2026-08-12T08:00:00Z
+if TEST_VALIDATOR_BIN="$validator_drift_bin" run_recorder "$validator_drift" 2026-08-11 >/dev/null 2>&1; then
+  echo 'drifted installed reboot validator unexpectedly passed daily parity' >&2
+  exit 1
+fi
+
 
 producer_drift=$root/producer-drift
 fixture "$producer_drift"
