@@ -141,6 +141,12 @@ case "$funded_mode" in
     funded_user= funded_session= funded_session_sha= funded_config_sha=
     funded_producer_image= funded_producer_user= funded_producer_config_sha=
     funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:-}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:-}
+    [ -z "$parity_collector_sha$reboot_validator_sha" ] || {
+      [ -n "$parity_collector_sha" ] && [ -n "$reboot_validator_sha" ] || die 'disabled parity helper hashes must be supplied together'
+      for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'; done
+    }
     ;;
   active)
     funded_enabled=true
@@ -149,6 +155,8 @@ case "$funded_mode" in
     funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:?missing funded rollout receipt}
     funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:?missing funded rollout receipt hash}
     funded_service_bus_dlq=${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:?missing funded DLQ baseline}
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:?missing approved parity collector hash}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:?missing approved reboot validator hash}
     funded_user=${POLYEDGE_PARITY_FUNDED_UID:?missing funded UID}:${POLYEDGE_PARITY_FUNDED_GID:?missing funded GID}
     funded_session=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:?missing funded session}
     funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:?missing funded session hash}
@@ -158,6 +166,9 @@ case "$funded_mode" in
     printf '%s' "$funded_revision" | grep -Eq '^[0-9a-f]{40}$' || die 'funded revision is malformed'
     printf '%s' "$funded_rollout_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded rollout receipt hash is malformed'
     printf '%s' "$funded_service_bus_dlq" | grep -Eq '^[0-9]+$' || die 'funded DLQ baseline is malformed'
+    for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do
+      printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'
+    done
     printf '%s' "$funded_user" | grep -Eq '^[0-9]+:[0-9]+$' || die 'funded user is malformed'
     printf '%s' "$funded_session" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' || die 'funded session is malformed'
     for hash in "$funded_session_sha" "$funded_config_sha"; do
@@ -200,7 +211,8 @@ protected_json() {
     --arg oci "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
     --arg mode "$funded_mode" --arg image "$funded_image" --arg user "$funded_user" \
     --arg revision "$funded_revision" --arg rollout "$funded_rollout_receipt" --arg rollout_sha "$funded_rollout_sha" \
-    --argjson dlq "$funded_service_bus_dlq" \
+    --argjson dlq "$funded_service_bus_dlq" --arg collector_sha "$parity_collector_sha" \
+    --arg validator_sha "$reboot_validator_sha" \
     --arg session "$funded_session" --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
     --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
     --arg producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
@@ -210,6 +222,7 @@ protected_json() {
        fundedSignerRevision:(.fundedSignerRevision // null),fundedRolloutReceiptPath:(.fundedRolloutReceiptPath // null),
        fundedRolloutReceiptSha256:(.fundedRolloutReceiptSha256 // null),
        fundedServiceBusDlqBaseline:(.fundedServiceBusDlqBaseline // null),
+       parityCollectorSha256:(.parityCollectorSha256 // null),rebootValidatorSha256:(.rebootValidatorSha256 // null),
        fundedSessionId:(.fundedSessionId // null),fundedSessionManifestSha256:(.fundedSessionManifestSha256 // null),
        fundedConfigSha256:(.fundedConfigSha256 // null),fundedIntentProducerEnabled:(.fundedIntentProducerEnabled // false),
        fundedIntentProducerImage:(.fundedIntentProducerImage // null),fundedIntentProducerUser:(.fundedIntentProducerUser // null),
@@ -221,6 +234,7 @@ protected_json() {
          (if $funded then $p.fundedSignerMode == $mode and $p.fundedSignerImage == $image and
            $p.fundedSignerRevision == $revision and $p.fundedRolloutReceiptPath == $rollout and
            $p.fundedRolloutReceiptSha256 == $rollout_sha and $p.fundedServiceBusDlqBaseline == $dlq and
+           $p.parityCollectorSha256 == $collector_sha and $p.rebootValidatorSha256 == $validator_sha and
            $p.fundedSignerUser == $user and $p.fundedSessionId == $session and
            $p.fundedSessionManifestSha256 == $session_sha and $p.fundedConfigSha256 == $config_sha and
            $p.fundedIntentProducerEnabled == true and $p.fundedIntentProducerImage == $producer_image and
@@ -228,6 +242,8 @@ protected_json() {
           else $p.fundedSignerMode == "disabled" and $p.fundedSignerImage == null and
            $p.fundedSignerRevision == null and $p.fundedRolloutReceiptPath == null and
            $p.fundedRolloutReceiptSha256 == null and $p.fundedServiceBusDlqBaseline == null and
+           (($collector_sha == "" and $p.parityCollectorSha256 == null and $p.rebootValidatorSha256 == null) or
+            ($collector_sha != "" and $p.parityCollectorSha256 == $collector_sha and $p.rebootValidatorSha256 == $validator_sha)) and
            $p.fundedSignerUser == null and
            $p.fundedSessionId == null and $p.fundedSessionManifestSha256 == null and $p.fundedConfigSha256 == null and
            $p.fundedIntentProducerEnabled == false and $p.fundedIntentProducerImage == null and
@@ -243,7 +259,9 @@ evidence_protected_json() {
       .fundedSignerRevision = (.fundedSignerRevision // null) |
       .fundedRolloutReceiptPath = (.fundedRolloutReceiptPath // null) |
       .fundedRolloutReceiptSha256 = (.fundedRolloutReceiptSha256 // null) |
-      .fundedServiceBusDlqBaseline = (.fundedServiceBusDlqBaseline // null)
+      .fundedServiceBusDlqBaseline = (.fundedServiceBusDlqBaseline // null) |
+      .parityCollectorSha256 = (.parityCollectorSha256 // null) |
+      .rebootValidatorSha256 = (.rebootValidatorSha256 // null)
     else . end
   ' "$1"
 }

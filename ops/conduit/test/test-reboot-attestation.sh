@@ -216,6 +216,8 @@ jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$
   fundedSignerRevision:"7777777777777777777777777777777777777777",
   fundedRolloutReceiptPath:$rollout,fundedRolloutReceiptSha256:$rollout_sha,
   fundedServiceBusDlqBaseline:936,
+  parityCollectorSha256:"sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  rebootValidatorSha256:"sha256:2222222222222222222222222222222222222222222222222222222222222222",
   fundedSignerUser:$user,fundedSessionId:"fixture-funded-v3",
   fundedSessionManifestSha256:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   fundedConfigSha256:"sha256:9999999999999999999999999999999999999999999999999999999999999999",
@@ -244,6 +246,8 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$funded_revision
 POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$rollout
 POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$rollout_sha
 POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$funded_dlq
+POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=sha256:1111111111111111111111111111111111111111111111111111111111111111
+POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=sha256:2222222222222222222222222222222222222222222222222222222222222222
 POLYEDGE_PARITY_FUNDED_GID=$gid
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=fixture-funded-v3
 POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
@@ -323,6 +327,17 @@ awk -v ledger="$disabled_ledger" '
   {print}
 ' "$case_root/parity.env" >"$disabled_env"
 chmod 0640 "$disabled_env"
+legacy_disabled_ledger=$case_root/ring/parity/legacy-disabled-ledger.json
+jq 'del(.parityCollectorSha256,.rebootValidatorSha256)' "$disabled_ledger" >"$legacy_disabled_ledger"
+chmod 0640 "$legacy_disabled_ledger"
+legacy_disabled_env=$case_root/legacy-disabled-parity.env
+awk -v ledger="$legacy_disabled_ledger" '
+  /^POLYEDGE_PARITY_LEDGER=/ {print "POLYEDGE_PARITY_LEDGER=" ledger; next}
+  /^POLYEDGE_PARITY_EXPECTED_(COLLECTOR|REBOOT_VALIDATOR)_SHA256=/ {next}
+  {print}
+' "$disabled_env" >"$legacy_disabled_env"
+chmod 0640 "$legacy_disabled_env"
+ATTEST_ENV_FILE="$legacy_disabled_env" FAKE_FUNDED_ACTIVE=0 run_attestor validate-ledger
 if ATTEST_ENV_FILE="$disabled_env" FAKE_FUNDED_ACTIVE=1 run_attestor prepare >/dev/null 2>&1; then
   echo 'active funded signer unexpectedly passed disabled-mode prepare' >&2
   exit 1
