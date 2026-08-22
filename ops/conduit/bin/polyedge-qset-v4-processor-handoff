@@ -193,6 +193,7 @@ write_started() {
   write_marker "$started" --arg attempt "$attempt_sha" --arg dispatched "$dispatched_sha" --arg invocation "$1" \
     '{schema:"polyedge.qset_v4_processor_started.v2",attemptSha256:$attempt,dispatchedSha256:$dispatched,invocationId:$invocation}'
   validate_started
+  remove_gate || fail 'qset-v4 processor could not consume manual gate after durable start'
 }
 finalize() {
   current=$(show InvocationID)
@@ -200,6 +201,9 @@ finalize() {
   [ "$(show ActiveState)" = inactive ] || fail 'qset-v4 processor invocation is still active'
   [ "$(show Result)" = success ] || fail 'qset-v4 processor invocation did not succeed'
   remove_gate || fail 'qset-v4 processor could not remove manual gate'
+  [ "$(show InvocationID)" = "$started_invocation" ] || fail 'qset-v4 processor invocation changed after gate removal'
+  [ "$(show ActiveState)" = inactive ] || fail 'qset-v4 processor invocation restarted after gate removal'
+  [ "$(show Result)" = success ] || fail 'qset-v4 processor result changed after gate removal'
   "$disk_guard" --assert-headroom
   if [ ! -e "$completed" ] && [ ! -L "$completed" ]; then
     write_marker "$completed" --arg attempt "$attempt_sha" --arg started "$started_sha" --arg invocation "$started_invocation" \

@@ -57,6 +57,8 @@ done
 
 grep -Fx 'Requires=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v4-processor.service' "$service" >/dev/null
 grep -Fx 'ConditionPathExists=/etc/polyedge/ENABLE_QSET_V4_PROCESSOR_MANUAL' "$service" >/dev/null
+grep -Fx 'ExecStartPre=/usr/bin/rm -f /etc/polyedge/ENABLE_QSET_V4_PROCESSOR_MANUAL' "$service" >/dev/null
+grep -Fx 'ExecStartPre=/usr/bin/sync -f /etc/polyedge' "$service" >/dev/null
 grep -Fx 'CPUQuota=400%' "$service" >/dev/null
 grep -Fx 'MemoryMax=8G' "$service" >/dev/null
 grep -Fx 'TasksMax=1024' "$service" >/dev/null

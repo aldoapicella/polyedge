@@ -66,6 +66,7 @@ printf '%s\n' '{"schema":"polyedge.qset_v4_rbac_verify_live.v1"}'
 EOF
   cat >"$systemctl" <<'EOF'
 #!/bin/sh
+set -eu
 state=$HANDOFF_STATE
 case "$1" in
   is-enabled) printf '%s\n' static ;;
@@ -85,7 +86,14 @@ case "$1" in
         cat "$state/invocation"
         ;;
       --property=ActiveState) cat "$state/active" ;;
-      --property=Result) cat "$state/result" ;;
+      --property=Result)
+        if test -f "$state/inject-second-start"; then
+          rm -f "$state/inject-second-start"
+          if "$0" start --no-block polyedge-qset-v4-processor.service >/dev/null 2>&1; then exit 70; fi
+          : >"$state/second-start-denied"
+        fi
+        cat "$state/result"
+        ;;
       *) exit 64 ;;
     esac
     ;;
@@ -95,6 +103,9 @@ case "$1" in
     test -f "$HANDOFF_ATTEMPT"
     test -f "$HANDOFF_DISPATCHED"
     test -f "$HANDOFF_GATE"
+    rm -f "$HANDOFF_GATE"
+    /usr/bin/sync -f "$(dirname "$HANDOFF_GATE")"
+    : >"$state/gate-directory-synced"
     printf '%s\n' attempt-before-gate >>"$state/order"
     count=$(($(cat "$state/starts") + 1))
     printf '%s\n' "$count" >"$state/starts"
@@ -135,8 +146,11 @@ grep -F 'start_attempts=60' "$handoff" >/dev/null
 grep -F 'wait_attempts=18030' "$handoff" >/dev/null
 
 setup_case completed
+touch "$state/inject-second-start"
 run_handoff >/dev/null
 test "$(cat "$state/starts")" = 1
+test -f "$state/second-start-denied"
+test -f "$state/gate-directory-synced"
 test "$(cat "$state/order")" = attempt-before-gate
 test ! -e "$gate"
 test -f "$rollback/attempt.json"
