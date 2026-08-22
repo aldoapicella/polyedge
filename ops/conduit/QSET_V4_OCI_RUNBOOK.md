@@ -40,7 +40,7 @@ az deployment group create --resource-group rg-polyedge-dev \
   --parameters lane=shadow-qset-v4-processor issuer=https://oidc.jupiterlabs.dev
 ```
 
-Provision two dedicated local service identities: writer UID/GID `982:978` and processor UID/GID `981:977`. Before creating them, prove all four numeric IDs are still unallocated; after creation, prove each name resolves to its exact pair and that the pairs are distinct from every existing lane. Never reuse the v3 writer (`983:979`) or promotion (`985:981`) identity. Register the writer as `unix:uid:982` and processor as `unix:uid:981`. Fetching explicitly by SPIFFE ID keeps the two SVIDs distinct.
+Provision two dedicated local service identities: writer UID/GID `982:978` and processor UID/GID `981:977`. Before creating them, prove all four numeric IDs are still unallocated; after creation, prove each name resolves to its exact pair and that the pairs are distinct from every existing lane. Never reuse the v3 writer (`983:979`) or promotion (`985:981`) identity. Register each lane with the exact SPIRE agent path plus its dedicated username. Fetching explicitly by SPIFFE ID keeps the two SVIDs distinct.
 
 ```bash
 ! getent passwd 982
@@ -59,11 +59,15 @@ test "$(id -u polyedge-qset-v4-processor):$(id -g polyedge-qset-v4-processor)" =
 sudo /opt/spire/bin/spire-server entry create -socketPath /run/spire-server/api.sock \
   -parentID spiffe://polyedge.local/conduit-dev \
   -spiffeID spiffe://polyedge.local/conduit/shadow-qset-v4-writer \
-  -selector unix:uid:982
+  -selector unix:path:/opt/spire/bin/spire-agent \
+  -selector unix:user:polyedge-qset-v4-writer \
+  -jwtSVIDTTL 300
 sudo /opt/spire/bin/spire-server entry create -socketPath /run/spire-server/api.sock \
   -parentID spiffe://polyedge.local/conduit-dev \
   -spiffeID spiffe://polyedge.local/conduit/shadow-qset-v4-processor \
-  -selector unix:uid:981
+  -selector unix:path:/opt/spire/bin/spire-agent \
+  -selector unix:user:polyedge-qset-v4-processor \
+  -jwtSVIDTTL 300
 ```
 
 ## Install the two token lanes and writer bundle
