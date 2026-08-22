@@ -196,6 +196,7 @@ export async function runPersistentFundedDirectService({
   });
   let processedMessages = 0;
   let failedMessages = 0;
+  let failedAttempts = 0;
   let consecutiveLatencyBreaches = 0;
   let redemptionChecks = 0;
   let redemptionResults = 0;
@@ -272,6 +273,7 @@ export async function runPersistentFundedDirectService({
       status: "persistent_service_heartbeat",
       processed_messages: processedMessages,
       failed_messages: failedMessages,
+      failed_attempts: failedAttempts,
       consecutive_latency_breaches: consecutiveLatencyBreaches,
       redemption_checks: redemptionChecks,
       redemption_results: redemptionResults,
@@ -312,39 +314,81 @@ export async function runPersistentFundedDirectService({
     entry.renewal.unref?.();
     return entry;
   };
+  const settleFailure = async (entry, { terminal, reason, description }) => {
+    failedAttempts += 1;
+    try {
+      if (terminal) {
+        await receiver.deadLetterMessage(entry.message, {
+          deadLetterReason: reason,
+          deadLetterErrorDescription: description
+        });
+        failedMessages += 1;
+        return { terminal_failure: true, settlement_action: "dead_lettered", settlement_succeeded: true };
+      }
+      await receiver.abandonMessage(entry.message);
+      return { terminal_failure: false, settlement_action: "abandoned_for_retry", settlement_succeeded: true };
+    } catch (settlementError) {
+      if (terminal) {
+        try {
+          await receiver.abandonMessage(entry.message);
+          return {
+            terminal_failure: false,
+            settlement_action: "abandoned_for_retry",
+            settlement_succeeded: true,
+            settlement_fallback_from: "dead_lettered",
+            settlement_error: safeErrorProjection(settlementError)
+          };
+        } catch (fallbackError) {
+          return {
+            terminal_failure: false,
+            settlement_action: "settlement_failed",
+            settlement_succeeded: false,
+            settlement_error: safeErrorProjection(fallbackError),
+            dead_letter_error: safeErrorProjection(settlementError)
+          };
+        }
+      }
+      return {
+        terminal_failure: false,
+        settlement_action: "settlement_failed",
+        settlement_succeeded: false,
+        settlement_error: safeErrorProjection(settlementError)
+      };
+    }
+  };
   const settleStoppedMessage = async (entry) => {
     clearInterval(entry.renewal);
-    failedMessages += 1;
-    await receiver.deadLetterMessage(entry.message, {
-      deadLetterReason: "FundedServiceStopping",
-      deadLetterErrorDescription: "Funded service stopped before this locked message could be processed."
-    }).catch(() => receiver.abandonMessage(entry.message).catch(() => null));
+    const settlement = await settleFailure(entry, {
+      terminal: true,
+      reason: "FundedServiceStopping",
+      description: "Funded service stopped before this locked message could be processed."
+    });
     logger({
       schema: "polyedge.funded_direct_service.v2",
       status: "persistent_message_stopped_fail_closed",
       message_id: entry.message.messageId || null,
-      delivery_count: entry.message.deliveryCount || 0
+      delivery_count: entry.message.deliveryCount || 0,
+      ...settlement,
+      broker_redelivery_expected: settlement.terminal_failure !== true
     });
   };
   const failMessage = async (entry, error) => {
     const errorText = safeErrorMessage(error);
     const deterministic = /unsupported|schema|binding|TTL|stale|SHA-256|does not qualify|already has an authorization|latency|risk|reservation|cash.flow|equity|position|open order/i.test(errorText);
-    if (deterministic || Number(entry.message.deliveryCount || 0) >= 2) {
-      failedMessages += 1;
-      await receiver.deadLetterMessage(entry.message, {
-        deadLetterReason: "FundedIntentFailedClosed",
-        deadLetterErrorDescription: errorText.slice(0, 4_000)
-      }).catch(() => null);
-    } else {
-      await receiver.abandonMessage(entry.message).catch(() => null);
-    }
+    const settlement = await settleFailure(entry, {
+      terminal: deterministic || Number(entry.message.deliveryCount || 0) >= 2,
+      reason: "FundedIntentFailedClosed",
+      description: errorText.slice(0, 4_000)
+    });
     logger({
       schema: "polyedge.funded_direct_service.v2",
       status: "persistent_message_failed_closed",
       message_id: entry.message.messageId || null,
       delivery_count: entry.message.deliveryCount || 0,
       error: errorText,
-      error_detail: safeErrorProjection(error)
+      error_detail: safeErrorProjection(error),
+      ...settlement,
+      broker_redelivery_expected: settlement.terminal_failure !== true
     });
   };
   const recordDurableSettlementLoss = (entry, result, error) => {
@@ -499,12 +543,12 @@ export async function runPersistentFundedDirectService({
   try {
     while (!stopping) {
       if (activeWorkflow) await new Promise((resolve) => setImmediate(resolve));
-      if (config.maxMessages > 0 && processedMessages + failedMessages >= config.maxMessages) {
+      if (config.maxMessages > 0 && processedMessages + failedAttempts >= config.maxMessages) {
         stopping = true;
         break;
       }
       if (busyValidations.size >= FUNDED_BUSY_VALIDATION_LIMIT ||
-          (config.maxMessages > 0 && processedMessages + failedMessages + busyValidations.size + (activeWorkflowKind === "intent" ? 1 : 0) >= config.maxMessages)) {
+          (config.maxMessages > 0 && processedMessages + failedAttempts + busyValidations.size + (activeWorkflowKind === "intent" ? 1 : 0) >= config.maxMessages)) {
         await Promise.race([activeWorkflow, ...busyValidations].filter(Boolean));
         continue;
       }
@@ -561,6 +605,7 @@ export async function runPersistentFundedDirectService({
       status: "persistent_service_stopped",
       processed_messages: processedMessages,
       failed_messages: failedMessages,
+      failed_attempts: failedAttempts,
       redemption_checks: redemptionChecks,
       redemption_results: redemptionResults,
       redemption_failures: redemptionFailures,

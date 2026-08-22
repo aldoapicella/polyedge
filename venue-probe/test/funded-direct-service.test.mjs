@@ -459,7 +459,7 @@ test("persistent service counts only terminal warmup failures after a successful
   let attempts = 0;
   const logs = [];
   const result = await runPersistentFundedDirectService({
-    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
     createBusClient: () => ({
       createReceiver: () => receiver,
       async close() {}
@@ -479,11 +479,130 @@ test("persistent service counts only terminal warmup failures after a successful
   assert.equal(attempts, 2);
   assert.equal(result.processed_messages, 1);
   assert.equal(result.failed_messages, 0);
+  assert.equal(result.failed_attempts, 1);
   assert.deepEqual(abandoned, [0]);
   assert.deepEqual(completed, [1]);
   assert.deepEqual(deadLettered, []);
-  assert.equal(logs.some((value) => value.status === "persistent_message_failed_closed"), true);
+  const failure = logs.find((value) => value.status === "persistent_message_failed_closed");
+  assert.equal(failure.terminal_failure, false);
+  assert.equal(failure.settlement_action, "abandoned_for_retry");
+  assert.equal(failure.settlement_succeeded, true);
   assert.equal(logs.some((value) => value.status === "market_warmed"), true);
+});
+
+test("persistent service counts a terminal failure only after dead-letter settlement succeeds", async () => {
+  const logs = [];
+  const deadLettered = [];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({
+      createReceiver: () => ({
+        receiveMessages: async () => [{
+          messageId: "terminal-warmup",
+          deliveryCount: 2,
+          body: { schema: "polyedge.funded_market_warmup.v1" }
+        }],
+        renewMessageLock: async () => {},
+        completeMessage: async () => {},
+        abandonMessage: async () => {},
+        deadLetterMessage: async (message) => { deadLettered.push(message.deliveryCount); },
+        close: async () => {}
+      }),
+      close: async () => {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => { throw new Error("transient warmup disagreement"); },
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  });
+  assert.equal(result.failed_attempts, 1);
+  assert.equal(result.failed_messages, 1);
+  assert.deepEqual(deadLettered, [2]);
+  const failure = logs.find((value) => value.status === "persistent_message_failed_closed");
+  assert.equal(failure.terminal_failure, true);
+  assert.equal(failure.settlement_action, "dead_lettered");
+  assert.equal(failure.settlement_succeeded, true);
+});
+
+test("persistent service falls back to retry when dead-letter settlement fails", async () => {
+  const logs = [];
+  const abandoned = [];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({
+      createReceiver: () => ({
+        receiveMessages: async () => [{
+          messageId: "terminal-settlement-failed",
+          deliveryCount: 2,
+          body: { schema: "polyedge.funded_market_warmup.v1" }
+        }],
+        renewMessageLock: async () => {},
+        completeMessage: async () => {},
+        abandonMessage: async (message) => { abandoned.push(message.deliveryCount); },
+        deadLetterMessage: async () => { throw new Error("dead-letter lock lost"); },
+        close: async () => {}
+      }),
+      close: async () => {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => { throw new Error("transient warmup disagreement"); },
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: (value) => logs.push(value)
+  });
+  assert.equal(result.failed_attempts, 1);
+  assert.equal(result.failed_messages, 0);
+  assert.deepEqual(abandoned, [2]);
+  const failure = logs.find((value) => value.status === "persistent_message_failed_closed");
+  assert.equal(failure.terminal_failure, false);
+  assert.equal(failure.settlement_action, "abandoned_for_retry");
+  assert.equal(failure.settlement_fallback_from, "dead_lettered");
+  assert.equal(failure.settlement_succeeded, true);
+  assert.equal(failure.broker_redelivery_expected, true);
+});
+
+test("persistent service bounds transient failed attempts with max messages", async () => {
+  const messages = [0, 1, 1].map((deliveryCount, index) => ({
+    messageId: `bounded-retry-${index}`,
+    deliveryCount,
+    body: { schema: "polyedge.funded_market_warmup.v1" }
+  }));
+  const abandoned = [];
+  let attempts = 0;
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
+    createBusClient: () => ({
+      createReceiver: () => ({
+        receiveMessages: async (maxMessages) => messages.splice(0, maxMessages),
+        renewMessageLock: async () => {},
+        completeMessage: async () => {},
+        abandonMessage: async (message) => { abandoned.push(message.messageId); },
+        deadLetterMessage: async () => {},
+        close: async () => {}
+      }),
+      close: async () => {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => { attempts += 1; throw new Error("transient warmup disagreement"); },
+      execute: async () => {},
+      status: () => ({ ready: true }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    logger: () => {}
+  });
+  assert.equal(attempts, 2);
+  assert.equal(result.failed_attempts, 2);
+  assert.equal(result.failed_messages, 0);
+  assert.deepEqual(abandoned, ["bounded-retry-0", "bounded-retry-1"]);
+  assert.equal(messages.length, 1);
 });
 
 test("persistent service redelivers idempotently after durable completion loses its broker lock", async () => {
