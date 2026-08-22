@@ -97,6 +97,7 @@ jobs:
           ops/conduit/test/test-funded-secret-bootstrap.sh
           ops/conduit/test/test-funded-signer-env-example.sh
           ops/conduit/test/test-funded-post-recovery-rollout.sh
+          ops/conduit/test/test-funded-parity-activation.sh
           ops/conduit/test/test-qset-v4-ops.sh
           ops/conduit/test/test-qset-v4-processor.sh
           ops/conduit/test/test-qset-v4-rbac-proof.sh
