@@ -2320,8 +2320,8 @@ async fn shutdown_protocol(
         let mut prepared = false;
         loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => return require_qset_v4_prepared(prepared),
-                _ = terminate.recv() => return require_qset_v4_prepared(prepared),
+                _ = tokio::signal::ctrl_c() => return terminate_qset_v4_writer(&shutdown, prepared).await,
+                _ = terminate.recv() => return terminate_qset_v4_writer(&shutdown, prepared).await,
                 _ = prepare.recv() => match shutdown.prepare_qset_v4_retirement().await {
                     Ok(receipt) => {
                         println!(
@@ -2344,18 +2344,27 @@ async fn shutdown_protocol(
             .await
             .expect("installing Ctrl-C handler");
         if qset_v4_writer {
-            require_qset_v4_prepared(false)
+            terminate_qset_v4_writer(&shutdown, false).await
         } else {
             shutdown.drain().await
         }
     }
 }
 
-fn require_qset_v4_prepared(prepared: bool) -> Result<(), String> {
+async fn terminate_qset_v4_writer(
+    shutdown: &polyedge_api::ApiShutdown,
+    prepared: bool,
+) -> Result<(), String> {
     if prepared {
-        Ok(())
-    } else {
-        Err("qset-v4 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM".to_owned())
+        return Ok(());
+    }
+
+    let not_prepared = "qset-v4 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM";
+    match shutdown.drain().await {
+        Ok(()) => Err(format!(
+            "{not_prepared}; recorder drained without issuing a retirement receipt"
+        )),
+        Err(error) => Err(format!("{not_prepared}; lossless drain failed: {error}")),
     }
 }
 
@@ -3859,9 +3868,9 @@ mod tests {
     use super::{
         accepted_ring_blob_prefix, prepare_ring_quarantine_resolution,
         profitability_authorization_flags, publish_local_ring_quarantine_resolution,
-        qset_v2_inventory_sha256, recover_ring_quarantine_staging, require_qset_v4_prepared,
-        ring_blob_name, ring_relative_path, ring_sha256, sha256_prefixed,
-        terminate_lease_child_tree, validate_local_ring_quarantine_resolution,
+        qset_v2_inventory_sha256, recover_ring_quarantine_staging, ring_blob_name,
+        ring_relative_path, ring_sha256, sha256_prefixed, terminate_lease_child_tree,
+        terminate_qset_v4_writer, validate_local_ring_quarantine_resolution,
         validate_qset_v2_inventory, validate_ring_identity, validate_ring_manifest_v3_sequence,
         validate_ring_manifest_v4_runs, validate_ring_quarantine_source_size,
         validate_ring_source_v3, validate_ring_source_v4, validate_ring_upload_receipt,
@@ -3874,10 +3883,27 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn qset_v4_term_requires_a_successful_prepare_receipt() {
-        assert!(require_qset_v4_prepared(false).is_err());
-        assert!(require_qset_v4_prepared(true).is_ok());
+    #[tokio::test]
+    async fn qset_v4_unprepared_term_drains_but_still_fails() {
+        let (_app, shutdown) =
+            polyedge_api::app_with_shutdown(polyedge_config::RuntimeSettings::default());
+
+        let error = terminate_qset_v4_writer(&shutdown, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("not prepared for retirement"));
+        assert!(error.contains("recorder drained without issuing a retirement receipt"));
+        assert!(shutdown.drain().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn qset_v4_prepared_term_exits_cleanly() {
+        let (_app, shutdown) =
+            polyedge_api::app_with_shutdown(polyedge_config::RuntimeSettings::default());
+
+        assert!(terminate_qset_v4_writer(&shutdown, true).await.is_ok());
+        assert!(shutdown.drain().await.is_ok());
     }
 
     // Clap builds the full nested command tree on the stack; use the same
