@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+REPO="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:?SHADOW_CAMPAIGN_ID is required}"
+
+case "$CAMPAIGN_ID" in
+  campaign-2026-07-28-qset-v1|campaign-2026-08-22-qset-v2|campaign-2026-08-23-qset-v3)
+    echo "$CAMPAIGN_ID is historical and cannot produce new evidence" >&2
+    exit 1
+    ;;
+  campaign-2026-08-24-qset-v4) ;;
+  *)
+    echo "shadow daily v4 accepts only campaign-2026-08-24-qset-v4" >&2
+    exit 1
+    ;;
+esac
+
+test "${SHADOW_CAMPAIGN_START:?SHADOW_CAMPAIGN_START is required}" = "2026-08-24" \
+  && test "${SHADOW_CAMPAIGN_PREFIX:-shadow-events/$CAMPAIGN_ID}" = "shadow-events/$CAMPAIGN_ID" \
+  && test "${SHADOW_CAMPAIGN_REPORT_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID}" = "reports/research/shadow/campaigns/$CAMPAIGN_ID" \
+  && test "${SHADOW_CORRECTION_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID/corrections}" = "reports/research/shadow/campaigns/$CAMPAIGN_ID/corrections" \
+  && test "${SHADOW_CAMPAIGN_CONTRACT:?SHADOW_CAMPAIGN_CONTRACT is required}" = "research/configs/profitability_gate_v3_2026-08-24_qset_v4.yaml" \
+  && test "${SHADOW_EVIDENCE_VERSION:-}" = "protocol-v3-qset-v4" \
+  && test "${SHADOW_SOURCE_CONTAINER_NAME:-}" = "polyedge-shadow-qset-v4-events" \
+  && test "${AZURE_STORAGE_CONTAINER_NAME:-}" = "polyedge-research-qset-v4" \
+  && test "${QSET_V4_CONTROL_CONTAINER_NAME:?QSET_V4_CONTROL_CONTAINER_NAME is required}" = "polyedge-qset-v4-control" \
+  && test "${POLYEDGE_CAMPAIGN_LEASE_BLOB:-}" = "data/research/shadow/$CAMPAIGN_ID/control/replay.lock" || {
+    echo "qset-v4 campaign binding is inexact" >&2
+    exit 1
+  }
+
+printf '%s\n' "${SHADOW_CODE_FREEZE_SHA256:-}" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+  echo "SHADOW_CODE_FREEZE_SHA256 must bind qset-v4 to an immutable source manifest" >&2
+  exit 1
+}
+test "${SHADOW_CODE_FREEZE_FINALIZED:-false}" = "true" || {
+  echo "qset-v4 requires a finalized source-freeze binding" >&2
+  exit 1
+}
+case "${SHADOW_CODE_FREEZE_MANIFEST:-}" in
+  azure://"${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"/polyedge-qset-v4-control/reports/research/shadow/campaigns/"$CAMPAIGN_ID"/control/code-freeze/source-*.json) ;;
+  *) echo "SHADOW_CODE_FREEZE_MANIFEST must stay in the isolated qset-v4 freeze-control path" >&2; exit 1 ;;
+esac
+FREEZE_DIGEST="${SHADOW_CODE_FREEZE_SHA256#sha256:}"
+test "$(basename "$SHADOW_CODE_FREEZE_MANIFEST")" = "source-$FREEZE_DIGEST.json" || { echo "SHADOW_CODE_FREEZE_MANIFEST filename must bind SHADOW_CODE_FREEZE_SHA256" >&2; exit 1; }
+case "${SHADOW_PROJECTED_CACHE_ROOT:-}" in
+  ""|azure://"$AZURE_STORAGE_ACCOUNT_NAME"/polyedge-research-qset-v4/data/research/shadow/"$CAMPAIGN_ID"/projected-cache) ;;
+  *) echo "SHADOW_PROJECTED_CACHE_ROOT must stay in the isolated qset-v4 research path" >&2; exit 1 ;;
+esac
+
+exec sh "$REPO/research/run_shadow_daily.sh"
