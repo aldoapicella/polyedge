@@ -13,44 +13,22 @@ expected_gid=${POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID:-$(id -g)}
 
 case "$lane" in
   promotion) subject=spiffe://polyedge.local/conduit/promotion-controller ;;
-  api|research|shadow-qset|shadow-qset-v3-writer|funded-signer|funded-intent-producer) subject=spiffe://polyedge.local/conduit/$lane ;;
+  api|research|shadow-qset|shadow-qset-v3-writer|shadow-qset-v4-writer|shadow-qset-v4-processor|funded-signer|funded-intent-producer) subject=spiffe://polyedge.local/conduit/$lane ;;
   *) echo 'unknown identity lane' >&2; exit 64 ;;
 esac
 expected_destination=$token_root/polyedge-federated-$lane/azure-federated-token
-[ "$destination" = "$expected_destination" ] || {
-  echo 'token destination does not match the identity lane' >&2
-  exit 64
-}
-[ -d "$(dirname "$destination")" ] && [ ! -L "$(dirname "$destination")" ] || {
-  echo 'token directory is missing or unsafe' >&2
-  exit 64
-}
+[ "$destination" = "$expected_destination" ] || { echo 'token destination does not match the identity lane' >&2; exit 64; }
+[ -d "$(dirname "$destination")" ] && [ ! -L "$(dirname "$destination")" ] || { echo 'token directory is missing or unsafe' >&2; exit 64; }
 set -- $(stat -c '%u %g %a' "$(dirname "$destination")")
-[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || {
-  echo 'token directory has wrong owner or mode' >&2
-  exit 64
-}
-case "$issuer" in
-  https://*) ;;
-  *) echo 'OIDC issuer must use HTTPS' >&2; exit 64 ;;
-esac
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || { echo 'token directory has wrong owner or mode' >&2; exit 64; }
+case "$issuer" in https://*) ;; *) echo 'OIDC issuer must use HTTPS' >&2; exit 64 ;; esac
 test -S "$socket" || { echo 'SPIRE Workload API socket is unavailable' >&2; exit 1; }
 test -x "$spire_agent" || { echo 'SPIRE Agent binary is unavailable' >&2; exit 1; }
 
 temporary=$(mktemp "$destination.XXXXXX")
 trap 'unlink "$temporary" 2>/dev/null || true' EXIT HUP INT TERM
-"$spire_agent" api fetch jwt \
-  -socketPath "$socket" \
-  -spiffeID "$subject" \
-  -audience "$audience" \
-  -output json \
-  | jq -erj --arg subject "$subject" \
-      '[(if type == "array" then .[] else . end)
-        | .svids[]?
-        | select((.spiffeId // .spiffe_id) == $subject)
-        | .svid]
-       | if length == 1 then .[0] else error("expected one JWT-SVID") end' \
-      > "$temporary"
+"$spire_agent" api fetch jwt -socketPath "$socket" -spiffeID "$subject" -audience "$audience" -output json \
+  | jq -erj --arg subject "$subject" '[(if type == "array" then .[] else . end)|.svids[]?|select((.spiffeId//.spiffe_id)==$subject)|.svid]|if length==1 then .[0] else error("expected one JWT-SVID") end' >"$temporary"
 chmod 0600 "$temporary"
 
 python3 - "$temporary" "$issuer" "$subject" "$audience" <<'PY'
@@ -79,12 +57,11 @@ except Exception:
 now = int(time.time())
 issued = claims.get("iat")
 expires = claims.get("exp")
-valid_audience = claims.get("aud") in (audience, [audience])
 if (
     header.get("alg") != "RS256"
     or claims.get("iss") != issuer
     or claims.get("sub") != subject
-    or not valid_audience
+    or claims.get("aud") not in (audience, [audience])
     or not isinstance(issued, int)
     or not isinstance(expires, int)
     or issued > now + 30
@@ -95,13 +72,7 @@ if (
 PY
 
 mv "$temporary" "$destination"
-[ ! -L "$destination" ] && [ -f "$destination" ] || {
-  echo 'token file is unsafe after write' >&2
-  exit 1
-}
+[ ! -L "$destination" ] && [ -f "$destination" ] || { echo 'token file is unsafe after write' >&2; exit 1; }
 set -- $(stat -c '%u %g %a' "$destination")
-[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 600 ] || {
-  echo 'token file has wrong owner or mode after write' >&2
-  exit 1
-}
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 600 ] || { echo 'token file has wrong owner or mode after write' >&2; exit 1; }
 trap - EXIT HUP INT TERM

@@ -14,65 +14,50 @@ verify_image_binding() {
   local image=$1 source_commit=$2
   printf '%s' "$image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$'
   test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$image")" = "linux/arm64|$source_commit"
-  podman manifest inspect "$image" | jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | index("linux/amd64") and index("linux/arm64")' >/dev/null
+  podman manifest inspect "$image" | jq -e '[.manifests[].platform|"\(.os)/\(.architecture)"]|sort|index("linux/amd64") and index("linux/arm64")' >/dev/null
 }
-
 
 build() {
   local output=$1 temporary files
-  test ! -e "$output"
-  test -d "$(dirname "$output")"
+  test ! -e "$output" && test -d "$(dirname "$output")"
   : "${FREEZE_RESEARCH_IMAGE:?FREEZE_RESEARCH_IMAGE is required}"
   verify_image_binding "$FREEZE_RESEARCH_IMAGE" "$(git -C "$repo" rev-parse HEAD)"
   files=$(mktemp); temporary=$(mktemp "$(dirname "$output")/.qset-v4-freeze.XXXXXX")
   trap 'rm -f "$files" "$temporary"' EXIT HUP INT TERM
   git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-08-24_qset_v4.json | jq -r '.protected_files[]' | LC_ALL=C sort -u >"$files"
   test "$(wc -l <"$files")" -gt 0
+  while IFS= read -r file; do git -C "$repo" cat-file -e "HEAD:$file"; git -C "$repo" ls-files --error-unmatch -- "$file" >/dev/null; done <"$files"
   while IFS= read -r file; do
-    git -C "$repo" cat-file -e "HEAD:$file"
-    git -C "$repo" ls-files --error-unmatch -- "$file" >/dev/null
-  done <"$files"
-  while IFS= read -r file; do
-    jq -nc --arg path "$file" --arg sha256 "sha256:$(git -C "$repo" show "HEAD:$file" | sha256sum | cut -d' ' -f1)" --argjson bytes "$(git -C "$repo" cat-file -s "HEAD:$file")" '{path:$path,sha256:$sha256,bytes:$bytes}'
-  done <"$files" | jq -s --arg campaign_id "$campaign_id" --arg evidence_version "$evidence_version" --arg source_commit "$(git -C "$repo" rev-parse HEAD)" --arg git_tree "$(git -C "$repo" rev-parse 'HEAD^{tree}')" --arg research_image "$FREEZE_RESEARCH_IMAGE" --arg contract_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/profitability_gate_v3_2026-08-24_qset_v4.yaml | sha256sum | cut -d' ' -f1)" --arg policy_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-08-24_qset_v4.json | sha256sum | cut -d' ' -f1)" '{schema:"polyedge.shadow_source_freeze.v1",campaign_id:$campaign_id,evidence_version:$evidence_version,source_commit:$source_commit,git_tree:$git_tree,research_image:$research_image,campaign_contract_sha256:$contract_sha256,freeze_policy_sha256:$policy_sha256,critical_files:.}' >"$temporary"
-  jq -e --arg id "$campaign_id" --arg version "$evidence_version" '.campaign_id == $id and .evidence_version == $version and (.critical_files | length > 0)' "$temporary" >/dev/null
+    jq -nc --arg path "$file" --arg sha256 "sha256:$(git -C "$repo" show "HEAD:$file"|sha256sum|cut -d' ' -f1)" --argjson bytes "$(git -C "$repo" cat-file -s "HEAD:$file")" '{path:$path,sha256:$sha256,bytes:$bytes}'
+  done <"$files" | jq -s --arg campaign_id "$campaign_id" --arg evidence_version "$evidence_version" --arg source_commit "$(git -C "$repo" rev-parse HEAD)" --arg git_tree "$(git -C "$repo" rev-parse 'HEAD^{tree}')" --arg research_image "$FREEZE_RESEARCH_IMAGE" --arg contract_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/profitability_gate_v3_2026-08-24_qset_v4.yaml|sha256sum|cut -d' ' -f1)" --arg policy_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-08-24_qset_v4.json|sha256sum|cut -d' ' -f1)" '{schema:"polyedge.shadow_source_freeze.v1",campaign_id:$campaign_id,evidence_version:$evidence_version,source_commit:$source_commit,git_tree:$git_tree,research_image:$research_image,campaign_contract_sha256:$contract_sha256,freeze_policy_sha256:$policy_sha256,critical_files:.}' >"$temporary"
+  jq -e --arg id "$campaign_id" --arg version "$evidence_version" '.campaign_id==$id and .evidence_version==$version and (.critical_files|length>0)' "$temporary" >/dev/null
   chmod 0640 "$temporary"; mv "$temporary" "$output"
 }
 
 lock_and_upload() {
-  local manifest=$1 digest blob temporary policy_json state etag remote receipt_root receipt_tmp receipt current_commit current_tree manifest_image
+  local manifest=$1 digest blob temporary policy_json state etag remote receipt_root receipt_tmp receipt current_commit current_tree manifest_image uri
   : "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
   secure_manifest "$manifest"
-  current_commit=$(git -C "$repo" rev-parse HEAD)
-  current_tree=$(git -C "$repo" rev-parse 'HEAD^{tree}')
-  manifest_image=$(jq -er '.research_image' "$manifest")
-  jq -e --arg id "$campaign_id" --arg version "$evidence_version" --arg commit "$current_commit" --arg tree "$current_tree" --arg image "$manifest_image" '.campaign_id == $id and .evidence_version == $version and .source_commit == $commit and .git_tree == $tree and .research_image == $image' "$manifest" >/dev/null
+  current_commit=$(git -C "$repo" rev-parse HEAD); current_tree=$(git -C "$repo" rev-parse 'HEAD^{tree}'); manifest_image=$(jq -er .research_image "$manifest")
+  jq -e --arg id "$campaign_id" --arg version "$evidence_version" --arg commit "$current_commit" --arg tree "$current_tree" --arg image "$manifest_image" '.campaign_id==$id and .evidence_version==$version and .source_commit==$commit and .git_tree==$tree and .research_image==$image' "$manifest" >/dev/null
   verify_image_binding "$manifest_image" "$current_commit"
-  digest=$(sha256sum "$manifest" | cut -d' ' -f1)
-  blob="reports/research/shadow/campaigns/$campaign_id/control/code-freeze/source-$digest.json"
-  jq -e --arg id "$campaign_id" --arg version "$evidence_version" '.campaign_id == $id and .evidence_version == $version' "$manifest" >/dev/null
+  digest=$(sha256sum "$manifest"|cut -d' ' -f1); blob="reports/research/shadow/campaigns/$campaign_id/control/code-freeze/source-$digest.json"; uri="azure://$AZURE_STORAGE_ACCOUNT_NAME/$control_container/$blob"
   policy_json=$(az storage container immutability-policy show --resource-group "${AZURE_RESOURCE_GROUP:?AZURE_RESOURCE_GROUP is required}" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" -o json)
   state=$(jq -r .state <<<"$policy_json")
-  if test "$state" != Locked; then
-    etag=$(jq -er .etag <<<"$policy_json")
-    az storage container immutability-policy lock --resource-group "$AZURE_RESOURCE_GROUP" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --if-match "$etag" >/dev/null
-  fi
+  if test "$state" != Locked; then etag=$(jq -er .etag <<<"$policy_json"); az storage container immutability-policy lock --resource-group "$AZURE_RESOURCE_GROUP" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --if-match "$etag" >/dev/null; fi
   policy_json=$(az storage container immutability-policy show --resource-group "$AZURE_RESOURCE_GROUP" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" -o json)
-  jq -e '.state == "Locked" and (.immutabilityPeriodSinceCreationInDays | type == "number" and . >= 90)' <<<"$policy_json" >/dev/null
+  jq -e '.state=="Locked" and (.immutabilityPeriodSinceCreationInDays|type=="number" and .>=90)' <<<"$policy_json" >/dev/null
   az storage blob upload --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" --file "$manifest" --overwrite false >/dev/null
   temporary=$(mktemp); trap 'rm -f "$temporary"' EXIT HUP INT TERM
   az storage blob download --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" --file "$temporary" >/dev/null
-  test "$(sha256sum "$temporary" | cut -d' ' -f1)" = "$digest"
+  test "$(sha256sum "$temporary"|cut -d' ' -f1)" = "$digest"
   remote=$(az storage blob show --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" -o json)
-  receipt_root=/srv/polyedge-ring/migration/qset-v4/source-freeze
-  install -d -o root -g root -m 0750 "$receipt_root"
-  receipt=$receipt_root/source-$digest.json
-  test ! -e "$receipt"
+  receipt_root=/srv/polyedge-ring/migration/qset-v4/source-freeze; install -d -o root -g root -m 0750 "$receipt_root"; receipt=$receipt_root/source-$digest.json; test ! -e "$receipt"
   receipt_tmp=$(mktemp "$receipt_root/.upload.XXXXXX")
-  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg uri "azure://$AZURE_STORAGE_ACCOUNT_NAME/$control_container/$blob" --arg sha256 "sha256:$digest" --arg etag "$(jq -er '.properties.etag // .etag' <<<"$remote")" --argjson bytes "$(stat -c '%s' "$manifest")" --argjson policy "$policy_json" '{schema:"polyedge.qset_v4_source_freeze_upload_receipt.v1",generatedAtUtc:$generated,uri:$uri,sha256:$sha256,bytes:$bytes,etag:$etag,immutabilityPolicy:{state:$policy.state,days:$policy.immutabilityPeriodSinceCreationInDays}}' >"$receipt_tmp"
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg uri "$uri" --arg sha256 "sha256:$digest" --arg etag "$(jq -er '.properties.etag//.etag' <<<"$remote")" --argjson bytes "$(stat -c '%s' "$manifest")" --arg image "$manifest_image" --arg commit "$current_commit" --arg tree "$current_tree" --argjson policy "$policy_json" '{schema:"polyedge.qset_v4_source_freeze_upload_receipt.v2",generatedAtUtc:$generated,manifest:{uri:$uri,sha256:$sha256,bytes:$bytes,etag:$etag},researchImage:$image,sourceCommit:$commit,gitTree:$tree,immutabilityPolicy:{state:$policy.state,days:$policy.immutabilityPeriodSinceCreationInDays}}' >"$receipt_tmp"
   chown root:root "$receipt_tmp" && chmod 0640 "$receipt_tmp"
   sync -f "$receipt_tmp" && mv "$receipt_tmp" "$receipt" && sync -f "$receipt" && sync -d "$receipt_root"
-  printf 'azure://%s/%s/%s\nsha256:%s\n' "$AZURE_STORAGE_ACCOUNT_NAME" "$control_container" "$blob" "$digest"
+  printf '%s\n%s\n' "$uri" "sha256:$digest"
 }
 
 case "${1:-}" in build) test "$#" = 2 || usage; build "$2" ;; lock-and-upload) test "$#" = 2 || usage; lock_and_upload "$2" ;; *) usage ;; esac

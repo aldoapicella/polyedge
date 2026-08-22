@@ -1,127 +1,186 @@
 # qset-v4 OCI operations runbook
 
-This is an additive, isolated bundle for `campaign-2026-08-24-qset-v4`.
-It does not replace or alter qset-v1/v2/v3. The writer is paper-only and starts
-on the pointer-only preflight prefix; the runtime configuration switches its
-write prefix exactly at `2026-08-24T00:00:00Z` without a restart.
+This bundle is additive. It never stops, reconfigures, or removes RBAC from qset-v1/v2/v3 or funded lanes. Qset-v3 stays active and healthy on its frozen identity. Qset-v4 has two new zero-cost identities and two distinct SPIFFE/token lanes:
+
+- writer: `id-polyedge-conduit-shadow-qset-v4-writer`, `spiffe://polyedge.local/conduit/shadow-qset-v4-writer`
+- processor: `id-polyedge-conduit-shadow-qset-v4-processor`, `spiffe://polyedge.local/conduit/shadow-qset-v4-processor`
+- issuer: `https://oidc.jupiterlabs.dev`
+- audience: `api://AzureADTokenExchange`
+
+There is no Azure Container Apps qset-v4 job. The initial profitability template contains only seven Storage resources and nine exact role assignments (16 resources total). Processing runs later on OCI under the processor lane.
 
 ## Hard gates
 
-Do not install or enable the bundle until all of these are true:
+- Qset-v3 is active and healthy with its five writer and three processor assignments unchanged. Its old boundary and first-seal timers remain disabled.
+- Qset-v2 is active and healthy; `polyedge-qset-v2-first-seal.timer` is already disabled/inactive. The v4 boundary guard never changes either workload or any timer.
+- Both v4 UAMIs/FICs exist with the exact issuer, subject, and sole audience above, and both v4 principals have zero role assignments before initial apply.
+- The final source-freeze manifest binds `research_image`, `source_commit`, and `git_tree`. Its hash-selected upload receipt is root-owned mode 0640 under `/srv/polyedge-ring/migration/qset-v4/source-freeze/source-HASH.json` and binds `manifest`, `researchImage`, `sourceCommit`, and `gitTree`.
+- Writer, sealer, and later processor use the receipt's same immutable `researchImage`; every OCI revision label equals `sourceCommit`.
+- The writer remains paper-only. Funded execution and Service Bus remain disabled.
 
-- A final (not draft) freeze manifest supplies the full source SHA-256,
-  immutable manifest location, immutable ARM64 writer/sealer image digests,
-  and their matching full OCI revision labels. Set
-  `SHADOW_CODE_FREEZE_FINALIZED=true` only after that artifact is final.
-- The qset-v4 image implements `seal-qset-v4-day`; the current repository
-  bundle deliberately does not substitute an older seal command.
-- The existing qset-v3 writer and processor UAMIs are reused sequentially only after the v3 writer is stopped. Keep their existing `spiffe://polyedge.local/conduit/shadow-qset-v3-writer` federated credential and token lane; do not create a v4 UAMI, FIC, or SPIFFE subject. Before applying v4 scopes, remove their old v3 raw, research, control, and table assignments. The v4 scopes cover only the new raw, research, and control containers plus `ShadowQsetV4EventIndex`, `ShadowQsetV4ChartSeries`, and `ShadowQsetV4MarketCatalog`.
-- The Azure data plane has these new containers before startup:
-  `polyedge-shadow-qset-v4-events`, `polyedge-research-qset-v4`, and
-  `polyedge-qset-v4-control`. No v1/v2/v3 container or table is in the v4
-  role assignment. The writer UAMI is custom no-delete on v4 raw only, read-only on v4 control, contributor only on the three v4 tables, and has no v4 research access.
-- The exact conservative prior exists in the v4 research container at the
-  hash-named reports/research/venue-probe/models path. Its source and
-  destination readback both hash to
-  sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.
-- `/srv/polyedge-ring` is its intended mount with at least 15 GiB free and the
-  boot-disk guard passes. The writer is capped at 0.5 CPU/1 GiB and journals
-  through the existing capped persistent journal.
+## Provision the two independent identities
 
-## Installation and cutover
+An authorized operator deploys each lane once. These deployments create only one UAMI and one FIC each; they create no RBAC or compute.
 
-Run this only after the gates above, with the existing SPIRE template and
-Podman network already installed. Use the final values in the installed files;
-the repository examples leave only campaign freeze, image, client, and account
-bindings blank. The conservative-prior URI and hash are exact.
+```sh
+az deployment group what-if --resource-group rg-polyedge-dev \
+  --template-file infra/conduit-federated-identity.bicep \
+  --parameters lane=shadow-qset-v4-writer issuer=https://oidc.jupiterlabs.dev
+az deployment group create --resource-group rg-polyedge-dev \
+  --name conduit-shadow-qset-v4-writer-identity \
+  --template-file infra/conduit-federated-identity.bicep \
+  --parameters lane=shadow-qset-v4-writer issuer=https://oidc.jupiterlabs.dev
+
+az deployment group what-if --resource-group rg-polyedge-dev \
+  --template-file infra/conduit-federated-identity.bicep \
+  --parameters lane=shadow-qset-v4-processor issuer=https://oidc.jupiterlabs.dev
+az deployment group create --resource-group rg-polyedge-dev \
+  --name conduit-shadow-qset-v4-processor-identity \
+  --template-file infra/conduit-federated-identity.bicep \
+  --parameters lane=shadow-qset-v4-processor issuer=https://oidc.jupiterlabs.dev
+```
+
+Provision two dedicated local service identities: writer UID/GID `982:978` and processor UID/GID `981:977`. Before creating them, prove all four numeric IDs are still unallocated; after creation, prove each name resolves to its exact pair and that the pairs are distinct from every existing lane. Never reuse the v3 writer (`983:979`) or promotion (`985:981`) identity. Register the writer as `unix:uid:982` and processor as `unix:uid:981`. Fetching explicitly by SPIFFE ID keeps the two SVIDs distinct.
+
+```bash
+! getent passwd 982
+! getent group 978
+! getent passwd 981
+! getent group 977
+sudo groupadd --system --gid 978 polyedge-qset-v4-writer
+sudo useradd --system --uid 982 --gid 978 --home-dir /nonexistent --shell /usr/sbin/nologin polyedge-qset-v4-writer
+sudo groupadd --system --gid 977 polyedge-qset-v4-processor
+sudo useradd --system --uid 981 --gid 977 --home-dir /nonexistent --shell /usr/sbin/nologin polyedge-qset-v4-processor
+test "$(id -u polyedge-qset-v4-writer):$(id -g polyedge-qset-v4-writer)" = 982:978
+test "$(id -u polyedge-qset-v4-processor):$(id -g polyedge-qset-v4-processor)" = 981:977
+```
+
+```sh
+sudo /opt/spire/bin/spire-server entry create -socketPath /run/spire-server/api.sock \
+  -parentID spiffe://polyedge.local/conduit-dev \
+  -spiffeID spiffe://polyedge.local/conduit/shadow-qset-v4-writer \
+  -selector unix:uid:982
+sudo /opt/spire/bin/spire-server entry create -socketPath /run/spire-server/api.sock \
+  -parentID spiffe://polyedge.local/conduit-dev \
+  -spiffeID spiffe://polyedge.local/conduit/shadow-qset-v4-processor \
+  -selector unix:uid:981
+```
+
+## Install the two token lanes and writer bundle
+
+The template unit creates separate directories and files:
+
+- `/run/polyedge-federated-shadow-qset-v4-writer/azure-federated-token`
+- `/run/polyedge-federated-shadow-qset-v4-processor/azure-federated-token`
+
+The writer Quadlet and sealer bind only the writer directory. The OCI processor must later bind only the processor directory.
 
 ```sh
 sudo install -m 0755 ops/conduit/bin/polyedge-federated-token-refresh /usr/local/libexec/
-sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-seal-days /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-source-freeze /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-rbac-handoff /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-boundary-guard /usr/local/libexec/
+sudo install -m 0755 ops/conduit/bin/polyedge-qset-v4-seal-days /usr/local/libexec/
+sudo install -D -m 0644 ops/conduit/systemd/polyedge-federated-token@shadow-qset-v4-writer.service.d/override.conf /etc/systemd/system/polyedge-federated-token@shadow-qset-v4-writer.service.d/override.conf
+sudo install -D -m 0644 ops/conduit/systemd/polyedge-federated-token@shadow-qset-v4-processor.service.d/override.conf /etc/systemd/system/polyedge-federated-token@shadow-qset-v4-processor.service.d/override.conf
 sudo install -m 0644 ops/conduit/quadlets/polyedge-shadow-qset-v4.container /etc/containers/systemd/
 sudo install -m 0644 ops/conduit/systemd/polyedge-qset-v4-seal-days.service ops/conduit/systemd/polyedge-qset-v4-first-seal.timer /etc/systemd/system/
 sudo install -m 0644 ops/conduit/systemd/polyedge-qset-v4-boundary@.service ops/conduit/systemd/polyedge-qset-v4-boundary-pre.timer ops/conduit/systemd/polyedge-qset-v4-boundary-post.timer /etc/systemd/system/
 sudo install -m 0600 ops/conduit/env/shadow-qset-v4.env.example /etc/polyedge/shadow-qset-v4.env
 sudo install -m 0640 ops/conduit/env/qset-v4-sealer.env.example /etc/polyedge/qset-v4-sealer.env
-sudo chown root:root /etc/polyedge/qset-v4-sealer.env
+sudo chown root:root /etc/polyedge/shadow-qset-v4.env /etc/polyedge/qset-v4-sealer.env
 sudo systemctl daemon-reload
+sudo systemctl enable --now polyedge-federated-token@shadow-qset-v4-writer.timer polyedge-federated-token@shadow-qset-v4-processor.timer
 ```
 
-Reuse the existing qset-v3 SPIRE workload entry and Azure federated credential only after the v3 writer is stopped, then confirm the decoded token claims locally without printing the token. They must be RS256, the configured HTTPS issuer, subject `spiffe://polyedge.local/conduit/shadow-qset-v3-writer`, the sole Azure Token Exchange audience, and at most six minutes long. Do not create a v4 FIC or SPIFFE subject, and do not reuse `shadow-qset`'s token, account, FIC, or role assignment.
+Decode and verify each token locally without printing it. Require RS256, its exact v4 subject, the issuer above, the sole Azure Token Exchange audience, and a lifetime no longer than six minutes. Confirm the two files have different paths and inodes.
 
-Edit the two installed environment files with the final freeze bindings and
-the same immutable writer image/revision values. Set `EXECUTION_FREEZE_ARTIFACT_PATH`
-to the reviewed relative blob path, set `EXECUTION_FREEZE_SHA256` equal to
-`SHADOW_CODE_FREEZE_SHA256`, and set `SHADOW_CODE_FREEZE_MANIFEST` exactly to
-`azure://ACCOUNT/polyedge-qset-v4-control/RELATIVE_PATH`. The sealer passes only
-`RELATIVE_PATH` and its hash to `seal-qset-v4-day`; it never passes the Azure URI. Replace only the installed
-v4 Quadlet's zero image digest, pull that exact digest after the boot-disk pull
-gate, and verify `linux/arm64` and `org.opencontainers.image.revision`. The
-v4 bundle intentionally does not use the frozen shared digest-deploy helper. Set `POLYEDGE_QSET_V4_WRITER_IMAGE` to that exact immutable digest and `POLYEDGE_QSET_V4_WRITER_GIT_SHA` to its matching full OCI revision; the boundary guard rejects a container whose image, revision, campaign resources, or final freeze binding differs.
+## Additive Storage/RBAC apply
 
-Before enabling the writer, copy the existing immutable conservative prior into
-the exact v4 research path. Use only a temporary source-container reader and
-destination-container custom no-delete writer for the signed-in operator, then
-remove those temporary assignments. Do not use account keys or SAS.
-
-    source_container=polyedge-research
-    destination_container=polyedge-research-qset-v4
-    model_blob=reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json
-    expected_model_sha=91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4
-    model_tmp=$(mktemp -d)
-    az storage blob download --auth-mode login --account-name stpolyedge6urdjr5nmwx7w --container-name "$source_container" --name "$model_blob" --file "$model_tmp/source.json"
-    test "$(sha256sum "$model_tmp/source.json" | cut -d' ' -f1)" = "$expected_model_sha"
-    az storage blob upload --auth-mode login --account-name stpolyedge6urdjr5nmwx7w --container-name "$destination_container" --name "$model_blob" --file "$model_tmp/source.json" --overwrite false
-    az storage blob download --auth-mode login --account-name stpolyedge6urdjr5nmwx7w --container-name "$destination_container" --name "$model_blob" --file "$model_tmp/readback.json"
-    test "$(sha256sum "$model_tmp/readback.json" | cut -d' ' -f1)" = "$expected_model_sha"
-
-Retain the source/destination ETags and hashes in the campaign control proof.
-The writer must remain stopped if the copy or readback proof fails.
-
-Before the boundary, enable the existing v3 token timer and start the v4 writer.
-Keep qset-v3 stopped; the v4 service never reads or writes its containers. Its preflight remains paper-only and writes only
-`shadow-events/preflight/campaign-2026-08-24-qset-v4`.
+The check is read-only. It requires v3 active/healthy/unchanged, old v3 timers disabled, both v4 principals at zero assignments, exact FICs, no Azure processor job, and a compiled template of exactly 16 resources/9 assignments/zero compute.
 
 ```sh
-sudo systemctl enable --now polyedge-federated-token@shadow-qset-v3-writer.timer
+export AZURE_RESOURCE_GROUP=rg-polyedge-dev
+export AZURE_STORAGE_ACCOUNT_NAME=stpolyedge6urdjr5nmwx7w
+export AZURE_TENANT_ID=9767f0dc-e83f-4cc1-94e1-0d5f9d287d32
+ops/conduit/bin/polyedge-qset-v4-rbac-handoff check
+az deployment group what-if --resource-group "$AZURE_RESOURCE_GROUP" \
+  --template-file infra/shadow-profitability-qset-v4.bicep
+```
+
+Accept only 16 creates: three containers, one immutability policy, three tables, and nine role assignments. Reject every modify/delete and every `Microsoft.App` or compute resource. Then run `apply`. It is additive and interruption-safe: a root-owned before receipt proves the initial zero-assignment state; rerunning reconciles only an expected partial v4 assignment set. It never starts the writer.
+
+```sh
+ops/conduit/bin/polyedge-qset-v4-rbac-handoff apply
+```
+
+Apply proves exactly five writer assignments, three processor assignments, and one API research reader. It rejects every unexpected full-principal assignment and performs negative data-plane probes against v1/v2/v3/funded Storage, Key Vault, and Service Bus with both v4 tokens.
+
+Rollback requires the v4 writer and local processor units quiescent. It removes only the exact nine v4 assignments. It leaves both UAMIs/FICs, all containers/tables/evidence, and every v3 role/service untouched.
+
+```sh
+ops/conduit/bin/polyedge-qset-v4-rbac-handoff rollback
+```
+
+## Final freeze and boundary
+
+From a clean committed checkout, build with `FREEZE_RESEARCH_IMAGE` set to the reviewed multi-architecture digest. An explicitly authorized operator may then lock/upload. The upload receipt is root:root 0640 and includes the exact manifest URI/hash/ETag/bytes plus `researchImage`, `sourceCommit`, and `gitTree`.
+
+```sh
+FREEZE_RESEARCH_IMAGE=ghcr.io/OWNER/polyedge-rust-backend@sha256:DIGEST \
+  ops/conduit/bin/polyedge-qset-v4-source-freeze build /secure/path/qset-v4-source-freeze.json
+sudo -E ops/conduit/bin/polyedge-qset-v4-source-freeze lock-and-upload /secure/path/qset-v4-source-freeze.json
+```
+
+Populate both installed env files from that exact receipt. Writer and sealer image values must equal `researchImage`; all writer/sealer revision values must equal `sourceCommit`; `EXECUTION_FREEZE_SHA256` selects the local receipt filename and exact immutable Azure manifest.
+
+Start qset-v4 without stopping qset-v3. The v4 Quadlet has no `Conflicts=` edge to v3.
+
+```sh
 sudo systemctl start polyedge-shadow-qset-v4.service
 sudo podman healthcheck run polyedge-shadow-qset-v4
-sudo systemctl show -p MainPID -p ActiveEnterTimestamp polyedge-shadow-qset-v4.service
-sudo systemctl disable --now polyedge-shadow-qset-v3.service polyedge-qset-v3-boundary-pre.timer polyedge-qset-v3-boundary-post.timer polyedge-qset-v3-first-seal.timer
 sudo systemctl enable --now polyedge-qset-v4-boundary-pre.timer polyedge-qset-v4-boundary-post.timer
 ```
 
-Immediately before and after `2026-08-24T00:00:00Z`, verify the service remains
-active with the same `MainPID`. Do not restart it at the boundary. The runtime
-switches from the preflight prefix to
-`shadow-events/campaign-2026-08-24-qset-v4` from the configured UTC clock.
-The pre/post timers invoke the local-only guard at `2026-08-23 23:59:30 UTC` and `2026-08-24 00:01:30 UTC`. It fails closed unless the v4 recorder is clean and its intent publisher is exactly configured, prepared, and pointer-only preflight; the v3 writer and all v3 boundary/first-seal timers are stopped and disabled; and v2 remains healthy. It writes root-owned, no-overwrite receipts under `/srv/polyedge-ring/migration/qset-v4/boundary/` without mutating Azure evidence. After committing the post receipt, it disables only v2's unsafe first-seal timer. Check its journal and retain both receipts.
+The boundary guard is read-only except for its local root-owned receipts. It requires v2 and v3 active/healthy, v2's unsafe first-seal timer disabled, all old v3 timers disabled, and the same v3 PID/invocation/container across pre/post. It performs no `start`, `stop`, `disable`, or Azure evidence mutation.
 
-Before any authorized rollout, use `ops/conduit/bin/polyedge-qset-v4-source-freeze build OUTPUT` from a clean committed checkout with `FREEZE_RESEARCH_IMAGE` set to the reviewed immutable digest. Only an explicitly authorized operator may run `lock-and-upload` to lock the v4 control-container policy, upload with overwrite disabled, and hash-readback the exact manifest. Then run `ops/conduit/bin/polyedge-qset-v4-rbac-handoff check` to prove the eight exact v3 writer/processor assignments and all retired initiators. Its `apply` mode is the only handoff path: it deletes those captured assignments, verifies zero old scopes, deploys v4-only scopes, proves old v3 containers deny the reused writer identity, and never starts v4. Do not run either mutating mode during review.
+## Closed-day seal
 
-The first seal is one-shot and disabled until the two complete UTC days exist.
-At `2026-08-26 02:15 UTC`, it validates exactly August 24 and August 25 while
-the writer is healthy, then takes the existing `/run/polyedge/research.lock`,
-fences the v4 writer, seals both days, writes deterministic receipts under
-`/srv/polyedge-ring/migration/qset-v4-seal/`, and restarts/health-checks only
-the v4 writer. It fails closed on any mismatch or a conflicting receipt.
+Keep `polyedge-qset-v4-first-seal.timer` disabled until both complete UTC days exist. At 2026-08-26 02:15 UTC it validates August 24 and 25 before fencing only the v4 writer, seals both days under the writer identity, writes deterministic root-owned receipts under `/srv/polyedge-ring/migration/qset-v4-seal/`, and restarts/health-checks only v4. Qset-v2 and qset-v3 are never stopped. Enable the one-shot timer only after the final freeze and boundary receipts pass.
 
 ```sh
 sudo systemctl enable --now polyedge-qset-v4-first-seal.timer
 sudo systemctl list-timers polyedge-qset-v4-first-seal.timer
 ```
 
-No recurring daily qset-v4 job is enabled by this bundle. After both seal
-receipts are accepted:
+## OCI-local processor binding
 
-1. Run an isolated Bicep what-if with deployProcessorJob=true, the exact
-   multi-architecture digest, its 40-character revision, both receipt inventory
-   hashes, and the final freeze path/hash. Require no delete and no unrelated
-   modify.
-2. Deploy the manual processor job, read back its processor UAMI and three
-   scoped no-delete/read grants, and prove its negative access to funded,
-   qset-v1/v2/v3, Key Vault, Service Bus, and unrelated storage.
-3. Start exactly one execution. Require a successful terminal replica, hash
-   every v4 campaign output, and validate the atomic report bundle before
-   enabling any recurring schedule or considering Azure retirement.
+Do not deploy an Azure job. After both sealed-day receipts exist, the separately managed OCI local processor must use:
+
+- client ID from `id-polyedge-conduit-shadow-qset-v4-processor`
+- only `/run/polyedge-federated-shadow-qset-v4-processor/azure-federated-token`
+- raw `polyedge-shadow-qset-v4-events` (reader)
+- control `polyedge-qset-v4-control` (reader)
+- research `polyedge-research-qset-v4` (custom no-delete writer)
+- exact `researchImage`, `sourceCommit`, `gitTree`, manifest URI/path, and hash from the selected root:root 0640 freeze receipt
+
+The local deployment guard must reject any image other than `researchImage`, any OCI revision other than `sourceCommit`, any different receipt hash/path, any Azure Container Apps qset-v4 job, and any funded/v1/v2/v3/KV/Service Bus access. Install the maintained local processor components without a timer or enablement:
+
+```sh
+sudo install -m 0755 ops/conduit/bin/polyedge-run-job ops/conduit/bin/polyedge-qset-v4-processor-preflight /usr/local/libexec/
+sudo install -D -m 0640 ops/conduit/env/qset-v4-processor.env.example /etc/polyedge/jobs/qset-v4-processor.env
+sudo chown root:root /etc/polyedge/jobs/qset-v4-processor.env
+sudo install -m 0644 ops/conduit/systemd/polyedge-qset-v4-processor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+Leave the service disabled. Only after the exact source-freeze receipt v2 and both 2026-08-24/2026-08-25 sealed receipts and inventory hashes pass preflight may the operator create the explicit manual gate and start one execution:
+
+```sh
+sudo install -o root -g root -m 0640 /dev/null /etc/polyedge/ENABLE_QSET_V4_PROCESSOR_MANUAL
+sudo systemctl start polyedge-qset-v4-processor.service
+```
+
+Do not add recurrence. Require successful output hash/readback and the processor negative-access proof first.
+
+Before freezing a future qset campaign, require the maintained positive prepare-retirement/drain command to return nonzero on incomplete drain and a structured final receipt only after writer/processor quiescence, zero queued/unrecovered work, and durable readback. A missing positive receipt blocks retirement; absence of negative evidence is never sufficient.

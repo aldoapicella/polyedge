@@ -410,8 +410,18 @@ jobs:
           jq -e '
             .variables.audience == "api://AzureADTokenExchange"
             and .parameters.lane.allowedValues == [
-              "api", "research", "shadow-qset", "funded-signer", "funded-intent-producer"
+              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "funded-signer", "funded-intent-producer"
             ]
+            and .variables.lanes["shadow-qset-v4-writer"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v4-writer",
+              ficName: "fic-spire-conduit-shadow-qset-v4-writer",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v4-writer"
+            }
+            and .variables.lanes["shadow-qset-v4-processor"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v4-processor",
+              ficName: "fic-spire-conduit-shadow-qset-v4-processor",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v4-processor"
+            }
             and .variables.lanes["funded-intent-producer"] == {
               identityName: "id-polyedge-conduit-funded-intent-producer",
               ficName: "fic-spire-conduit-funded-intent-producer",

@@ -1,8 +1,7 @@
 [Unit]
 Description=PolyEdge isolated qset-v4 shadow writer
-Requires=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service
-Conflicts=polyedge-shadow-qset-v3.service
-After=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v3-writer.service
+Requires=network-online.target polyedge-federated-token@shadow-qset-v4-writer.service
+After=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v4-writer.service
 Requires=polyedge-network.service
 
 [Container]
@@ -10,9 +9,9 @@ Requires=polyedge-network.service
 Image=registry.example.invalid/polyedge-rust-backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
 ContainerName=polyedge-shadow-qset-v4
 Network=polyedge.network
-User=983:979
+User=982:978
 EnvironmentFile=/etc/polyedge/shadow-qset-v4.env
-Volume=/run/polyedge-federated-shadow-qset-v3-writer:/run/credentials:ro,Z
+Volume=/run/polyedge-federated-shadow-qset-v4-writer:/run/credentials:ro,Z
 HealthCmd=/usr/bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8081; printf "GET /api/v1/health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3; head -n 1 <&3 | grep -q " 200 "'
 HealthInterval=30s
 HealthTimeout=5s

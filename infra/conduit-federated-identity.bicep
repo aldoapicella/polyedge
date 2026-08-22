@@ -5,6 +5,8 @@ targetScope = 'resourceGroup'
   'api'
   'research'
   'shadow-qset'
+  'shadow-qset-v4-writer'
+  'shadow-qset-v4-processor'
   'funded-signer'
   'funded-intent-producer'
 ])
@@ -37,6 +39,16 @@ var lanes = {
     identityName: 'id-polyedge-conduit-shadow-qset'
     ficName: 'fic-spire-conduit-shadow-qset'
     subject: 'spiffe://polyedge.local/conduit/shadow-qset'
+  }
+  'shadow-qset-v4-writer': {
+    identityName: 'id-polyedge-conduit-shadow-qset-v4-writer'
+    ficName: 'fic-spire-conduit-shadow-qset-v4-writer'
+    subject: 'spiffe://polyedge.local/conduit/shadow-qset-v4-writer'
+  }
+  'shadow-qset-v4-processor': {
+    identityName: 'id-polyedge-conduit-shadow-qset-v4-processor'
+    ficName: 'fic-spire-conduit-shadow-qset-v4-processor'
+    subject: 'spiffe://polyedge.local/conduit/shadow-qset-v4-processor'
   }
   'funded-signer': {
     identityName: 'id-polyedge-conduit-funded-signer'
