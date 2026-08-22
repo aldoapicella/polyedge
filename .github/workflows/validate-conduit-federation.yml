@@ -101,7 +101,7 @@ jobs:
             .status == "applied-live-verified"
             and .proof == "identity-rbac-proof.json"
             and (.lanes | keys == ["api", "funded-intent-producer", "funded-signer", "research", "shadow-qset"])
-            and ([.lanes[].assignments[]] | length == 38)
+            and ([.lanes[].assignments[]] | length == 39)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
             and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
@@ -159,6 +159,12 @@ jobs:
               and .id == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
               and .scope == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job"
             ))
+            and (.lanes["shadow-qset"].assignments | length) == 6
+            and (.lanes["shadow-qset"].assignments[] | select(
+              .role == "blobReader"
+              and .id == "0458fb58-08c4-48dc-9ca3-492d33a61113"
+              and .scope == "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control"
+            ))
             and .githubDeployment.assignment.role == "blobReader"
             and (.githubDeployment.negativeAssertions | length) == 3
             and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
@@ -175,7 +181,7 @@ jobs:
               .lanes["shadow-qset"],
               .lanes["funded-signer"],
               .lanes["funded-intent-producer"]
-            ] | map(.assignmentCount) | add) == 38
+            ] | map(.assignmentCount) | add) == 39
             and all([
               .lanes.api,
               .lanes.research,
@@ -324,6 +330,13 @@ jobs:
               {target:"kvpolyedge6urdjr5nmwx7w/secrets/dashboard-auth-password", operation:"secretGet", statusCode:403, result:"denied"},
               {target:"rootful funded signer Podman secret store", operation:"nonRootRead", result:"denied"}
             ]
+            and .lanes["shadow-qset"].assignmentCount == 6
+            and (.lanes["shadow-qset"].roleAssignments | length) == 6
+            and any(.lanes["shadow-qset"].roleAssignments[];
+              .id == "0458fb58-08c4-48dc-9ca3-492d33a61113"
+              and .role == "Storage Blob Data Reader"
+              and .roleDefinitionId == "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
+              and .scope == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control")
             and (.lanes.research.positiveChecks[] | select(
               .operation == "Microsoft.App/jobs/executions/read"
               and .assignmentId == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
