@@ -285,11 +285,36 @@ case "$*" in
       timestamp=$((second * 1000000))
       invocation=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       [ "${FAKE_FUNDED_RESTART:-0}" != 1 ] || [ "$i" -ne 30 ] || invocation=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-      message=$(jq -nc '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",
+      busy=false
+      snapshot_age=100
+      open_orders=0
+      unresolved_positions=0
+      unresolved_reservations=0
+      if [ "$i" -eq 30 ] && [ "${FAKE_FUNDED_MID_HOUR_ACTIVE:-0}" = 1 ]; then
+        busy=true
+        open_orders=1
+        unresolved_positions=1
+        unresolved_reservations=1
+      fi
+      if [ "$i" -eq 59 ]; then
+        [ "${FAKE_FUNDED_BUSY:-0}" != 1 ] || busy=true
+        [ "${FAKE_FUNDED_STALE_SNAPSHOT:-0}" != 1 ] || snapshot_age=651
+        [ "${FAKE_FUNDED_OPEN_ORDER:-0}" != 1 ] || open_orders=1
+        [ "${FAKE_FUNDED_UNRESOLVED_POSITION:-0}" != 1 ] || unresolved_positions=1
+        [ "${FAKE_FUNDED_UNRESOLVED_RESERVATION:-0}" != 1 ] || unresolved_reservations=1
+      fi
+      message=$(jq -nc --argjson busy "$busy" --argjson snapshot_age "$snapshot_age" \
+        --argjson open_orders "$open_orders" --argjson unresolved_positions "$unresolved_positions" \
+        --argjson unresolved_reservations "$unresolved_reservations" '
+        {schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",
         processed_messages:1,failed_messages:0,consecutive_latency_breaches:0,redemption_failures:0,
         executor:{user_channel_ready:true,market_channel_ready:true,user_channel_gaps:0,market_channel_gaps:0,
-          user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,
-          safety_snapshot_cache_ready:true,safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
+          user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,busy:$busy,
+          safety_snapshot_cache_ready:true,safety_snapshot_cache_age_ms:$snapshot_age,
+          safety_snapshot_open_order_count:$open_orders,
+          safety_snapshot_unresolved_position_count:$unresolved_positions,
+          safety_snapshot_unresolved_risk_reservation_count:$unresolved_reservations,
+          safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
       jq -nc --arg timestamp "$timestamp" --arg invocation "$invocation" \
         --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --arg message "$message" \
         '{__REALTIME_TIMESTAMP:$timestamp,_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
@@ -309,6 +334,25 @@ case "$*" in
     fi
     ;;
 esac
+EOF
+
+cat >"$fake/runuser" <<'EOF'
+#!/bin/sh
+[ "$1" = -u ] && [ "$2" = ubuntu ] && [ "$3" = -- ] || exit 2
+shift 3
+exec "$@"
+EOF
+
+cat >"$fake/az" <<'EOF'
+#!/bin/sh
+case "$*" in
+  "servicebus queue show --subscription 11111111-1111-1111-1111-111111111111 --resource-group rg-polyedge-dev --namespace-name sb-polyedge-funded-cl-6urdjr5nmwx7w --name funded-dynamic-quote-intents --only-show-errors -o json") ;;
+  *) exit 2 ;;
+esac
+jq -nc --arg status "${FAKE_SERVICE_BUS_STATUS:-Active}" \
+  --argjson active "${FAKE_SERVICE_BUS_ACTIVE:-0}" --argjson scheduled "${FAKE_SERVICE_BUS_SCHEDULED:-0}" \
+  --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-936}" \
+  '{status:$status,countDetails:{activeMessageCount:$active,scheduledMessageCount:$scheduled,deadLetterMessageCount:$dlq}}'
 EOF
 
 cat >"$fake/mountpoint" <<'EOF'
@@ -569,9 +613,11 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:999999999999999999999999999
 POLYEDGE_PARITY_FUNDED_TOKEN_FILE=$case_root/token/funded-azure-federated-token
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=936
 POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE=$case_root/funded-intent-producer.env
 POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE=$case_root/token/funded-producer-azure-federated-token
 EOF
+  printf '%s\n' 'POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=936' >>"$case_root/hourly.env"
 }
 
 refresh_segment() {
@@ -616,6 +662,13 @@ run_collector() {
     FAKE_FUNDED_BURST="${FAKE_FUNDED_BURST:-0}" FAKE_FUNDED_GAP="${FAKE_FUNDED_GAP:-0}" \
     FAKE_FUNDED_RESTART="${FAKE_FUNDED_RESTART:-0}" FAKE_FUNDED_TOKEN_GAP="${FAKE_FUNDED_TOKEN_GAP:-0}" \
     FAKE_FUNDED_TOKEN_FAILURE="${FAKE_FUNDED_TOKEN_FAILURE:-0}" \
+    FAKE_FUNDED_MID_HOUR_ACTIVE="${FAKE_FUNDED_MID_HOUR_ACTIVE:-0}" \
+    FAKE_FUNDED_BUSY="${FAKE_FUNDED_BUSY:-0}" FAKE_FUNDED_STALE_SNAPSHOT="${FAKE_FUNDED_STALE_SNAPSHOT:-0}" \
+    FAKE_FUNDED_OPEN_ORDER="${FAKE_FUNDED_OPEN_ORDER:-0}" \
+    FAKE_FUNDED_UNRESOLVED_POSITION="${FAKE_FUNDED_UNRESOLVED_POSITION:-0}" \
+    FAKE_FUNDED_UNRESOLVED_RESERVATION="${FAKE_FUNDED_UNRESOLVED_RESERVATION:-0}" \
+    FAKE_SERVICE_BUS_STATUS="${FAKE_SERVICE_BUS_STATUS:-Active}" FAKE_SERVICE_BUS_ACTIVE="${FAKE_SERVICE_BUS_ACTIVE:-0}" \
+    FAKE_SERVICE_BUS_SCHEDULED="${FAKE_SERVICE_BUS_SCHEDULED:-0}" FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-936}" \
     FAKE_PRODUCER_RUN_BOT="${FAKE_PRODUCER_RUN_BOT:-true}" \
     FAKE_PRODUCER_MOUNT_SOURCE="${FAKE_PRODUCER_MOUNT_SOURCE:-$case_root/token}" \
     FAKE_PRODUCER_MOUNT_RW="${FAKE_PRODUCER_MOUNT_RW:-false}" \
@@ -921,7 +974,7 @@ fi
 active_funded=$root/active-funded
 fixture "$active_funded"
 activate_funded_fixture "$active_funded"
-FAKE_FUNDED_ACTIVE=1 run_collector "$active_funded" >/dev/null
+FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_MID_HOUR_ACTIVE=1 run_collector "$active_funded" >/dev/null
 jq -e '.acceptedCleanLiveHours == 1 and .fundedSignerEnabled == true and
   (.acceptedHourlyEvidence | length) == 1' "$active_funded/ring/parity/20260809T141000Z-funded-active.json" >/dev/null
 jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled == true and
@@ -930,6 +983,14 @@ jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled 
   .services.fundedRuntime.heartbeatCount == 60 and .services.fundedRuntime.alertCount == 0 and
   .services.fundedRuntime.maxHeartbeatGapSeconds == 60 and .services.fundedRuntime.tokenRefreshCount == 30 and
   .services.fundedRuntime.maxTokenRefreshGapSeconds == 120 and
+  .services.fundedRuntime.executor.busy == false and
+  .services.fundedRuntime.executor.safetySnapshotCacheAgeMs == 100 and
+  .services.fundedRuntime.executor.openOrderCount == 0 and
+  .services.fundedRuntime.executor.unresolvedPositionCount == 0 and
+  .services.fundedRuntime.executor.unresolvedRiskReservationCount == 0 and
+  .services.fundedServiceBusRuntime == {namespace:"sb-polyedge-funded-cl-6urdjr5nmwx7w",
+    queue:"funded-dynamic-quote-intents",status:"Active",activeMessageCount:0,scheduledMessageCount:0,
+    deadLetterMessageCount:936,expectedDeadLetterMessageCount:936} and
   .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshCount == 30 and
   .services.fundedIntentProducerRuntime.tokenContinuity.maxTokenRefreshGapSeconds == 120 and
   .services.fundedIntentProducerRuntime.continuity.publisher.successCount == 1 and
@@ -1034,7 +1095,7 @@ if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_ALERT=1 run_collector "$funded_alert" >/dev/
   exit 1
 fi
 
-for funded_case in burst gap restart failed-closed token-gap token-failure wrong-user wrong-config; do
+for funded_case in burst gap restart failed-closed token-gap token-failure wrong-user wrong-config busy stale-snapshot open-order unresolved-position unresolved-reservation; do
   case_root=$root/funded-$funded_case
   fixture "$case_root"
   activate_funded_fixture "$case_root"
@@ -1047,9 +1108,30 @@ for funded_case in burst gap restart failed-closed token-gap token-failure wrong
     token-failure) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_TOKEN_FAILURE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
     wrong-user) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_UID=999 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
     wrong-config) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_CONFIG_SHA=sha256:8888888888888888888888888888888888888888888888888888888888888888 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    busy) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_BUSY=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    stale-snapshot) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_STALE_SNAPSHOT=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    open-order) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_OPEN_ORDER=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    unresolved-position) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_UNRESOLVED_POSITION=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    unresolved-reservation) if FAKE_FUNDED_ACTIVE=1 FAKE_FUNDED_UNRESOLVED_RESERVATION=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
   esac
   if [ "$passed" -eq 1 ]; then
     echo "invalid funded runtime unexpectedly passed: $funded_case" >&2
+    exit 1
+  fi
+done
+
+for broker_case in inactive active-message scheduled-message dlq-drift; do
+  case_root=$root/broker-$broker_case
+  fixture "$case_root"
+  activate_funded_fixture "$case_root"
+  case "$broker_case" in
+    inactive) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_STATUS=Disabled run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    active-message) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_ACTIVE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    scheduled-message) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_SCHEDULED=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    dlq-drift) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_DLQ=937 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+  esac
+  if [ "$passed" -eq 1 ]; then
+    echo "unsafe funded Service Bus runtime unexpectedly passed: $broker_case" >&2
     exit 1
   fi
 done

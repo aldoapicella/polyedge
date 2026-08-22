@@ -836,6 +836,21 @@ export async function waitForSafetySnapshotIdle(
   }
 }
 
+export function cachedSafetySnapshotStatus(resources, nowMs = Date.now()) {
+  const runtime = resources.safetyCache?.latest?.runtime;
+  const completedWallMs = Number(runtime?.capturedCompletedWallMs);
+  const count = (value) => Number.isInteger(value) && value >= 0 ? value : null;
+  return {
+    safety_snapshot_cache_ready: Number.isFinite(completedWallMs),
+    safety_snapshot_cache_age_ms: Number.isFinite(completedWallMs)
+      ? Math.max(0, nowMs - completedWallMs)
+      : null,
+    safety_snapshot_open_order_count: count(runtime?.openOrderCount),
+    safety_snapshot_unresolved_position_count: count(runtime?.riskBasis?.unresolvedPositionCount),
+    safety_snapshot_unresolved_risk_reservation_count: count(runtime?.riskBasis?.unresolvedReservationCount)
+  };
+}
+
 export async function createPersistentCanaryExecutor({
   env = process.env,
   readOnly = false
@@ -965,9 +980,7 @@ export async function createPersistentCanaryExecutor({
       );
     },
     status() {
-      const safetySnapshotCompletedWallMs = Number(
-        resources.safetyCache?.latest?.runtime?.capturedCompletedWallMs
-      );
+      const safetySnapshotStatus = cachedSafetySnapshotStatus(resources);
       const userChannelHistory = resources.userChannel?.historyStats?.();
       const marketChannelHistory = resources.marketChannel?.historyStats?.();
       return {
@@ -987,10 +1000,7 @@ export async function createPersistentCanaryExecutor({
           resources.userChannel?.requiresReconciliation() === true ||
           resources.marketChannel?.requiresReconciliation() === true,
         warmed_market: resources.warmedMarket,
-        safety_snapshot_cache_ready: Number.isFinite(safetySnapshotCompletedWallMs),
-        safety_snapshot_cache_age_ms: Number.isFinite(safetySnapshotCompletedWallMs)
-          ? Math.max(0, Date.now() - safetySnapshotCompletedWallMs)
-          : null,
+        ...safetySnapshotStatus,
         safety_snapshot_component_durations_ms:
           resources.safetyCache?.latest?.runtime?.preflightComponentDurationsMs || null,
         safety_snapshot_cache_in_flight: resources.safetyCache?.inFlight || 0,

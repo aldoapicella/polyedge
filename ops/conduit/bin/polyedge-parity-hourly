@@ -162,7 +162,9 @@ producer_env_binding_expected() {
 validate_producer_evidence() {
   jq -e --arg image "$funded_producer_image" --arg user "$funded_producer_user" \
     --arg config_sha "$funded_producer_config_sha" --arg env_binding_sha "$funded_producer_env_binding_sha" \
-    --arg mount_binding_sha "$funded_producer_mount_binding_sha" --argjson funded "$funded_enabled" '
+    --arg mount_binding_sha "$funded_producer_mount_binding_sha" --argjson funded "$funded_enabled" \
+    --arg service_bus_namespace "$funded_service_bus_namespace" --arg service_bus_queue "$funded_service_bus_queue" \
+    --arg expected_service_bus_dlq "$funded_service_bus_dlq" '
     def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
     (.hourStartUtc | epoch) as $start |
     (.hourEndUtc | epoch) as $end |
@@ -220,7 +222,12 @@ validate_producer_evidence() {
       .services.fundedIntentProducerRuntime.status.recorder.unrecoveredDurableEvents == 0 and
       .services.fundedIntentProducerRuntime.status.recorder.flushUnrecovered == false and
       .services.fundedIntentProducerRuntime.status.recorder.errorCount == 0 and
-      .services.fundedIntentProducerRuntime.status.recorder.droppedCount == 0
+      .services.fundedIntentProducerRuntime.status.recorder.droppedCount == 0 and
+      .services.fundedServiceBusRuntime == {
+        namespace:$service_bus_namespace,queue:$service_bus_queue,status:"Active",
+        activeMessageCount:0,scheduledMessageCount:0,
+        deadLetterMessageCount:($expected_service_bus_dlq | tonumber),
+        expectedDeadLetterMessageCount:($expected_service_bus_dlq | tonumber)}
      else .services.fundedIntentProducerActive == false and
       (.services.fundedIntentProducerEnablement == "disabled" or
        .services.fundedIntentProducerEnablement == "masked") and
@@ -228,7 +235,8 @@ validate_producer_evidence() {
       (.services.fundedIntentProducerTokenTimerEnablement == "disabled" or
        .services.fundedIntentProducerTokenTimerEnablement == "masked") and
       .services.fundedIntentProducerImage == null and .services.fundedIntentProducerUser == null and
-      .services.fundedIntentProducerConfigSha256 == null and .services.fundedIntentProducerRuntime == null end)
+      .services.fundedIntentProducerConfigSha256 == null and .services.fundedIntentProducerRuntime == null and
+      .services.fundedServiceBusRuntime == null end)
   ' "$1" >/dev/null
 }
 
@@ -303,6 +311,7 @@ formal_expected_funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA
 formal_expected_funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}
 formal_expected_funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:-}
 formal_expected_funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:-}
+formal_expected_funded_service_bus_dlq=${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:-}
 formal_window_start=${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}
 formal_ledger=${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}
 formal_subscription=${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}
@@ -341,6 +350,7 @@ set +a
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}" = "$formal_expected_funded_config_sha" ] || die 'hourly environment overrides the formal funded config hash'
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:-}" = "$formal_expected_funded_producer_image" ] || die 'hourly environment overrides the formal funded producer image'
 [ "${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:-}" = "$formal_expected_funded_producer_config_sha" ] || die 'hourly environment overrides the formal funded producer config hash'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:-}" = "$formal_expected_funded_service_bus_dlq" ] || die 'hourly environment overrides the formal funded Service Bus DLQ baseline'
 [ "${POLYEDGE_PARITY_WINDOW_START_UTC:-}" = "$formal_window_start" ] || die 'hourly environment overrides the formal window start'
 [ "${POLYEDGE_PARITY_LEDGER:-}" = "$formal_ledger" ] || die 'hourly environment overrides the formal ledger path'
 [ "${AZURE_SUBSCRIPTION_ID:-}" = "$formal_subscription" ] || die 'hourly environment overrides the Azure subscription'
@@ -358,6 +368,7 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=$formal_expected_funded_session_s
 POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=$formal_expected_funded_config_sha
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=$formal_expected_funded_producer_image
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=$formal_expected_funded_producer_config_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$formal_expected_funded_service_bus_dlq
 POLYEDGE_PARITY_WINDOW_START_UTC=$formal_window_start
 POLYEDGE_PARITY_LEDGER=$formal_ledger
 AZURE_SUBSCRIPTION_ID=$formal_subscription
@@ -389,6 +400,7 @@ case "$POLYEDGE_PARITY_FUNDED_MODE" in
     funded_image= funded_user= funded_session= funded_session_sha= funded_config_sha=
     funded_producer_image= funded_producer_user= funded_producer_config_sha=
     funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
+    funded_service_bus_namespace= funded_service_bus_queue= funded_service_bus_dlq=
     ;;
   active)
     funded_enabled=true
@@ -416,6 +428,11 @@ case "$POLYEDGE_PARITY_FUNDED_MODE" in
     printf '%s' "$funded_producer_config_sha" | grep -Ex 'sha256:[0-9a-f]{64}' \
       || die 'expected funded producer config hash is malformed'
     funded_producer_env_binding_sha=$(text_sha "$(producer_env_binding_expected)")
+    printf '%s' "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" | grep -Eq '^[0-9]+$' \
+      || die 'expected funded Service Bus DLQ baseline is malformed'
+    funded_service_bus_namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+    funded_service_bus_queue=funded-dynamic-quote-intents
+    funded_service_bus_dlq=$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ
     ;;
   *) die 'formal funded mode must equal disabled or active' ;;
 esac
@@ -591,7 +608,13 @@ collect_refs() {
            .services.fundedRuntime.heartbeatCount >= 50 and .services.fundedRuntime.alertCount == 0 and
            .services.fundedRuntime.failedClosedCount == 0 and .services.fundedRuntime.restartCount == 0 and
            .services.fundedRuntime.maxHeartbeatGapSeconds <= 75 and .services.fundedRuntime.tokenRefreshCount >= 20 and
-           .services.fundedRuntime.maxTokenRefreshGapSeconds <= 180
+           .services.fundedRuntime.maxTokenRefreshGapSeconds <= 180 and
+           .services.fundedRuntime.executor.busy == false and
+           .services.fundedRuntime.executor.safetySnapshotCacheReady == true and
+           (.services.fundedRuntime.executor.safetySnapshotCacheAgeMs | type == "number" and . >= 0 and . <= 650) and
+           .services.fundedRuntime.executor.openOrderCount == 0 and
+           .services.fundedRuntime.executor.unresolvedPositionCount == 0 and
+           .services.fundedRuntime.executor.unresolvedRiskReservationCount == 0
           else .services.fundedSignerActive == false and .services.fundedSignerMasked == true and
            .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
            .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null and .services.fundedRuntime == null end)' \
@@ -719,6 +742,7 @@ case "$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)" in
 if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
 funded_runtime=null
 funded_producer_runtime=null
+funded_service_bus_runtime=null
 funded_journal_file=
 funded_token_journal_file=
 producer_journal_file=
@@ -903,7 +927,13 @@ else
           .executor.user_channel_unparsed == 0 and .executor.market_channel_unparsed == 0 and
           .executor.reconnect_reconciliation_required == false and
           .executor.safety_snapshot_cache_ready == true and .executor.safety_snapshot_cache_error == null and
-          .executor.risk_reservation_index_ready == true)
+          .executor.risk_reservation_index_ready == true) and
+        ($heartbeats[-1].event.executor |
+          .busy == false and
+          (.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+          .safety_snapshot_open_order_count == 0 and
+          .safety_snapshot_unresolved_position_count == 0 and
+          .safety_snapshot_unresolved_risk_reservation_count == 0)
       then ($heartbeats[-1].event | {
         invocationId:$invocation,containerId:$container,heartbeatCount:($heartbeats | length),
         firstHeartbeatUtc:($times[0] | todateiso8601),lastHeartbeatUtc:($times[-1] | todateiso8601),
@@ -914,8 +944,13 @@ else
         executor:{userChannelReady:.executor.user_channel_ready,marketChannelReady:.executor.market_channel_ready,
           userChannelGaps:.executor.user_channel_gaps,marketChannelGaps:.executor.market_channel_gaps,
           userChannelUnparsed:.executor.user_channel_unparsed,marketChannelUnparsed:.executor.market_channel_unparsed,
-          reconnectReconciliationRequired:.executor.reconnect_reconciliation_required,
-          safetySnapshotCacheReady:.executor.safety_snapshot_cache_ready,safetySnapshotCacheError:.executor.safety_snapshot_cache_error,
+          reconnectReconciliationRequired:.executor.reconnect_reconciliation_required,busy:.executor.busy,
+          safetySnapshotCacheReady:.executor.safety_snapshot_cache_ready,
+          safetySnapshotCacheAgeMs:.executor.safety_snapshot_cache_age_ms,
+          openOrderCount:.executor.safety_snapshot_open_order_count,
+          unresolvedPositionCount:.executor.safety_snapshot_unresolved_position_count,
+          unresolvedRiskReservationCount:.executor.safety_snapshot_unresolved_risk_reservation_count,
+          safetySnapshotCacheError:.executor.safety_snapshot_cache_error,
           riskReservationIndexReady:.executor.risk_reservation_index_ready}})
       else error("funded signer lacks continuous bound heartbeat evidence") end
     ' "$funded_journal_file") || die 'funded signer lacks continuous healthy heartbeat evidence'
@@ -1626,6 +1661,25 @@ rm -f "$azure_execution_tmp"
 azure_execution_tmp=
 trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
 
+if [ "$funded_enabled" = true ]; then
+  funded_service_bus_runtime=$(runuser -u ubuntu -- az servicebus queue show \
+    --subscription "$AZURE_SUBSCRIPTION_ID" --resource-group "$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP" \
+    --namespace-name "$funded_service_bus_namespace" --name "$funded_service_bus_queue" \
+    --only-show-errors -o json | jq -ce \
+    --arg namespace "$funded_service_bus_namespace" --arg queue "$funded_service_bus_queue" \
+    --argjson expected_dlq "$funded_service_bus_dlq" '
+      if .status == "Active" and .countDetails.activeMessageCount == 0 and
+        .countDetails.scheduledMessageCount == 0 and
+        .countDetails.deadLetterMessageCount == $expected_dlq
+      then {namespace:$namespace,queue:$queue,status:.status,
+        activeMessageCount:.countDetails.activeMessageCount,
+        scheduledMessageCount:.countDetails.scheduledMessageCount,
+        deadLetterMessageCount:.countDetails.deadLetterMessageCount,
+        expectedDeadLetterMessageCount:$expected_dlq}
+      else error("funded Service Bus runtime properties differ from the formal baseline") end
+    ') || die 'funded Service Bus end-state is unsafe or unreadable'
+fi
+
 evidence=$hour_dir/evidence.json
 [ ! -e "$evidence" ] || die 'evidence appeared during collection'
 tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
@@ -1642,7 +1696,7 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
   --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" --arg producer_config_sha "$funded_producer_config_sha" \
   --arg producer_enablement "$producer_enablement" --arg producer_token_enablement "$producer_token_enablement" \
   --argjson funded "$funded_enabled" --argjson funded_runtime "$funded_runtime" --argjson funded_producer_runtime "$funded_producer_runtime" \
-  --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
+  --argjson funded_service_bus_runtime "$funded_service_bus_runtime" --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
   --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
   --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
   '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,
@@ -1667,7 +1721,8 @@ jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_P
       fundedIntentProducerImage:(if $funded then $producer_image else null end),
       fundedIntentProducerUser:(if $funded then $producer_user else null end),
       fundedIntentProducerConfigSha256:(if $funded then $producer_config_sha else null end),
-      fundedIntentProducerRuntime:$funded_producer_runtime},
+      fundedIntentProducerRuntime:$funded_producer_runtime,
+      fundedServiceBusRuntime:$funded_service_bus_runtime},
     ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
   .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
 chmod 0640 "$tmp"

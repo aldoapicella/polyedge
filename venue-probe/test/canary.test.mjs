@@ -33,7 +33,8 @@ import {
   startSafetySnapshotCache,
   streamBookEvidence,
   createAndPostFundedOrderWithinSignalToSendDeadline,
-  waitForSafetySnapshotIdle
+  waitForSafetySnapshotIdle,
+  cachedSafetySnapshotStatus
 } from "../src/canary.mjs";
 import { automaticSettlementReceiptEvidence } from "../src/redeem.mjs";
 import { internalSettlementBlobName } from "../src/compounding-risk.mjs";
@@ -576,6 +577,28 @@ test("Polygon receipt decoder preserves the exact CTF-to-pUSD adapter chain", ()
     block_number: "77",
     confirmations: 2,
     ...decoded
+  });
+});
+
+test("persistent executor reports cached safety snapshot counts and age", () => {
+  const runtime = {
+    capturedCompletedWallMs: 102,
+    openOrderCount: 0,
+    riskBasis: { unresolvedPositionCount: 0, unresolvedReservationCount: 0 }
+  };
+  assert.deepEqual(cachedSafetySnapshotStatus({ safetyCache: { latest: { runtime } } }, 202), {
+    safety_snapshot_cache_ready: true,
+    safety_snapshot_cache_age_ms: 100,
+    safety_snapshot_open_order_count: 0,
+    safety_snapshot_unresolved_position_count: 0,
+    safety_snapshot_unresolved_risk_reservation_count: 0
+  });
+  assert.deepEqual(cachedSafetySnapshotStatus({}, 202), {
+    safety_snapshot_cache_ready: false,
+    safety_snapshot_cache_age_ms: null,
+    safety_snapshot_open_order_count: null,
+    safety_snapshot_unresolved_position_count: null,
+    safety_snapshot_unresolved_risk_reservation_count: null
   });
 });
 
