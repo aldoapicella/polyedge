@@ -76,11 +76,15 @@
         {
           "role": "tableContributor",
           "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeJobStatus"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3"
         }
       ],
       "negativeAssertions": [
         "no subscription, resource-group, storage-account, Key Vault, or Service Bus role",
-        "no qset container or ShadowQset table role",
+        "no qset raw/control writer or ShadowQset table role; qset-v3 research output is exact-container reader only",
         "no funded-evidence write role"
       ]
     },

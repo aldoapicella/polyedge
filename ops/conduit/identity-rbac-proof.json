@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "capturedAtUtc": "2026-08-22T03:14:00Z",
+  "capturedAtUtc": "2026-08-22T06:15:53Z",
   "status": "live-verified",
   "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
   "resourceGroup": "rg-polyedge-dev",
@@ -19,11 +19,31 @@
     "audience": "api://AzureADTokenExchange",
     "lifetimeSeconds": 300,
     "perLaneOwnerOnlyFiles": true,
-    "crossLaneResearchFileUnreadable": [
-      "api",
-      "shadow-qset",
-      "funded-signer"
-    ]
+    "crossLaneTokenFilesUnreadable": [
+      "api->research",
+      "api->shadow-qset",
+      "api->funded-signer",
+      "research->api",
+      "research->shadow-qset",
+      "research->funded-signer",
+      "shadow-qset->api",
+      "shadow-qset->research",
+      "shadow-qset->funded-signer",
+      "funded-signer->api",
+      "funded-signer->research",
+      "funded-signer->shadow-qset"
+    ],
+    "federatedExchangeMatrix": {
+      "receipt": "/srv/polyedge-ring/migration/identity/20260822T061441Z-fic-exchange-matrix.tsv",
+      "sha256": "sha256:222124aa22f0813ebaf8d078464c5d08003a8fff465fed4db12cb9cdd5999201",
+      "matchingPairs": 4,
+      "matchingStatusCode": 200,
+      "crossedPairs": 12,
+      "crossedStatusCode": 401,
+      "crossedError": "invalid_client",
+      "crossedErrorCode": "AADSTS700213",
+      "tokensOrResponseBodiesCaptured": false
+    }
   },
   "rbacPlan": "identity-rbac-plan.json",
   "lanes": {
@@ -41,7 +61,7 @@
           "api://AzureADTokenExchange"
         ]
       },
-      "assignmentCount": 13,
+      "assignmentCount": 14,
       "exactPlanMatch": true,
       "positiveChecks": [
         {
@@ -63,7 +83,7 @@
           "passed": true
         },
         {
-          "assertion": "no qset container or ShadowQset table role",
+          "assertion": "no qset raw/control writer or ShadowQset table role; qset-v3 research output is exact-container reader only",
           "passed": true
         },
         {
@@ -136,7 +156,7 @@
       },
       "assignmentCount": 6,
       "exactPlanMatch": true,
-      "workloadEnabled": false,
+      "workloadEnabled": true,
       "positiveChecks": [
         {
           "operation": "workloadIdentityTokenExchange",
@@ -266,7 +286,7 @@
       },
       "assignmentCount": 10,
       "exactPlanMatch": true,
-      "workloadEnabled": false,
+      "workloadEnabled": true,
       "roleAssignments": [
         {
           "id": "5d3e8e9b-2d87-4455-9751-b2f5e76f46dc",
@@ -873,5 +893,13 @@
         "outsideFiveWorkloadUamiProof": true
       }
     ]
+  },
+  "workloadState": {
+    "capturedAtUtc": "2026-08-22T06:15:53Z",
+    "api": "active/running",
+    "researchTimers": "active/waiting",
+    "shadowQset": "active/running",
+    "fundedSigner": "active/running",
+    "allFourTokenTimers": "active/waiting"
   }
 }
