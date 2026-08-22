@@ -12,6 +12,7 @@ processor_override=$root/systemd/polyedge-federated-token@shadow-qset-v4-process
 policy=$repo/research/configs/campaign_freeze_2026-08-24_qset_v4.json
 
 bash -n "$guard" "$handoff" "$freeze"; sh -n "$sealer" "$token"
+grep -F 'local path=$1 expected_mode=$2 max=$3' "$guard" >/dev/null
 grep -Fx "var writerIdentityName = 'id-polyedge-conduit-shadow-qset-v4-writer'" "$infra" >/dev/null
 grep -Fx "var processorIdentityName = 'id-polyedge-conduit-shadow-qset-v4-processor'" "$infra" >/dev/null
 grep -Fx "resource writerIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {" "$infra" >/dev/null
