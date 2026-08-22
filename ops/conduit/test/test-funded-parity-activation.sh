@@ -137,28 +137,58 @@ ENV
   export POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$fixture_rollout
   export POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=sha256:$(sha256sum "$fixture_rollout" | cut -d' ' -f1)
   export POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1037
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=$new_image
+  export POLYEDGE_PARITY_FUNDED_UID=986 POLYEDGE_PARITY_FUNDED_GID=982
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=fixture-session
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:9999999999999999999999999999999999999999999999999999999999999999
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
   evidence_fixture=$root/evidence.json
   jq -n --arg window "$window" --arg ledger "$ledger" --arg revision "$revision" \
     --arg rollout "$fixture_rollout" --arg rollout_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" \
-    --arg namespace "$namespace" --arg queue "$queue" --arg collector "$collector_sha" --arg validator "$validator_sha" '{
+    --arg namespace "$namespace" --arg queue "$queue" --arg collector "$collector_sha" --arg validator "$validator_sha" \
+    --arg funded_image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg funded_user "986:982" \
+    --arg funded_session "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID" \
+    --arg funded_session_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256" \
+    --arg funded_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256" \
+    --arg producer_image "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE" \
+    --arg producer_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256" \
+    --arg producer_env_sha "$producer_env_binding_sha" --arg producer_mount_sha "$producer_mount_binding_sha" '{
       schemaVersion:1,status:"validated",acceptedForParityWindow:true,hourStartUtc:$window,ledgerPath:$ledger,
       services:{fundedSignerEnabled:true,fundedSignerMode:"active",fundedSignerRevision:$revision,
+        fundedSignerImage:$funded_image,fundedSignerUser:$funded_user,fundedSessionId:$funded_session,
+        fundedSessionManifestSha256:$funded_session_sha,fundedConfigSha256:$funded_config_sha,
         fundedRolloutReceipt:{path:$rollout,sha256:$rollout_sha},fundedServiceBusDlqBaseline:1037,
         parityCollectorSha256:$collector,rebootValidatorSha256:$validator,
         fundedServiceBusRuntime:{namespace:$namespace,queue:$queue,status:"Active",activeMessageCount:0,
           scheduledMessageCount:0,deadLetterMessageCount:1037,expectedDeadLetterMessageCount:1037},
         fundedRuntime:{heartbeatCount:60,alertCount:0,failedClosedCount:0,restartCount:0},
-        fundedIntentProducerRuntime:{continuity:{restartCount:0}}},
+        fundedIntentProducerEnabled:true,fundedIntentProducerImage:$producer_image,
+        fundedIntentProducerUser:"984:980",fundedIntentProducerConfigSha256:$producer_config_sha,
+        fundedIntentProducerRuntime:{configEnvBindingSha256:$producer_env_sha,
+          tokenMountBindingSha256:$producer_mount_sha,continuity:{restartCount:0}}},
       sameInput:{deterministicResultExactMatch:true},azureAuthoritative:true,azureDeletionAllowed:false
     }' >"$evidence_fixture"
   validate_first_hour_evidence "$evidence_fixture"
-  for mutation in revision rollout-sha dlq collector validator; do
+  for mutation in revision rollout-sha dlq collector validator signer-image signer-user signer-session \
+    signer-session-sha signer-config producer-image producer-user producer-config producer-env producer-mount; do
     case "$mutation" in
       revision) filter='.services.fundedSignerRevision = "0000000000000000000000000000000000000000"' ;;
       rollout-sha) filter='.services.fundedRolloutReceipt.sha256 = "sha256:" + ("0" * 64)' ;;
       dlq) filter='.services.fundedServiceBusRuntime.deadLetterMessageCount = 1038' ;;
       collector) filter='.services.parityCollectorSha256 = "sha256:" + ("0" * 64)' ;;
       validator) filter='.services.rebootValidatorSha256 = "sha256:" + ("0" * 64)' ;;
+      signer-image) filter='.services.fundedSignerImage = "ghcr.io/fixture/polyedge-venue-probe@sha256:" + ("0" * 64)' ;;
+      signer-user) filter='.services.fundedSignerUser = "0:0"' ;;
+      signer-session) filter='.services.fundedSessionId = "wrong-session"' ;;
+      signer-session-sha) filter='.services.fundedSessionManifestSha256 = "sha256:" + ("0" * 64)' ;;
+      signer-config) filter='.services.fundedConfigSha256 = "sha256:" + ("0" * 64)' ;;
+      producer-image) filter='.services.fundedIntentProducerImage = "ghcr.io/fixture/polyedge-rust-backend@sha256:" + ("0" * 64)' ;;
+      producer-user) filter='.services.fundedIntentProducerUser = "0:0"' ;;
+      producer-config) filter='.services.fundedIntentProducerConfigSha256 = "sha256:" + ("0" * 64)' ;;
+      producer-env) filter='.services.fundedIntentProducerRuntime.configEnvBindingSha256 = "sha256:" + ("0" * 64)' ;;
+      producer-mount) filter='.services.fundedIntentProducerRuntime.tokenMountBindingSha256 = "sha256:" + ("0" * 64)' ;;
     esac
     jq "$filter" "$evidence_fixture" >"$root/evidence-$mutation.json"
     if validate_first_hour_evidence "$root/evidence-$mutation.json"; then

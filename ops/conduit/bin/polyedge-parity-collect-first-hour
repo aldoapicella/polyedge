@@ -23,6 +23,8 @@ readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
 readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
+readonly producer_env_binding_sha=sha256:8faa07c90246486bcd9e609924d85368a1e69ad85ca6961bb45af22ee46bbb9b
+readonly producer_mount_binding_sha=sha256:8f5f4dcf132460eed131e7a0d096d54d1cb1f972b8bd5b279700021ac1bc698e
 readonly old_formal_sha=41b0cbbd22adcb872a8005a1b9f5502733ad7c7bcf11ad160eb1d1e1d25cb8c8
 readonly old_hourly_sha=5a6b85b8ae29a62603e902e3da10e184c4d9c71a78cc8790b6426f79dd61059b
 
@@ -141,18 +143,36 @@ commit_candidate_pair() {
 
 validate_first_hour_evidence() {
   local evidence_path=${1:-$evidence}
+  local funded_user="$POLYEDGE_PARITY_FUNDED_UID:$POLYEDGE_PARITY_FUNDED_GID"
   /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" \
     --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
     --arg rollout "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT" \
     --arg rollout_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" \
     --arg namespace "$namespace" --arg queue "$queue" \
     --arg collector "$collector_sha" --arg validator "$validator_sha" \
+    --arg funded_image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg funded_user "$funded_user" \
+    --arg funded_session "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID" \
+    --arg funded_session_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256" \
+    --arg funded_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256" \
+    --arg producer_image "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE" --arg producer_user "984:980" \
+    --arg producer_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256" \
+    --arg producer_env_sha "$producer_env_binding_sha" --arg producer_mount_sha "$producer_mount_binding_sha" \
     --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .hourStartUtc == $window and .ledgerPath == $ledger and
     .services.fundedSignerEnabled == true and .services.fundedSignerMode == "active" and
     .services.fundedSignerRevision == $revision and
     .services.fundedRolloutReceipt == {path:$rollout,sha256:$rollout_sha} and
+    .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+    .services.fundedSessionId == $funded_session and
+    .services.fundedSessionManifestSha256 == $funded_session_sha and
+    .services.fundedConfigSha256 == $funded_config_sha and
+    .services.fundedIntentProducerEnabled == true and
+    .services.fundedIntentProducerImage == $producer_image and
+    .services.fundedIntentProducerUser == $producer_user and
+    .services.fundedIntentProducerConfigSha256 == $producer_config_sha and
+    .services.fundedIntentProducerRuntime.configEnvBindingSha256 == $producer_env_sha and
+    .services.fundedIntentProducerRuntime.tokenMountBindingSha256 == $producer_mount_sha and
     .services.fundedServiceBusDlqBaseline == $dlq and
     .services.parityCollectorSha256 == $collector and .services.rebootValidatorSha256 == $validator and
     .services.fundedServiceBusRuntime == {namespace:$namespace,queue:$queue,status:"Active",
