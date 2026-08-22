@@ -40,6 +40,7 @@ test "$new_image" != "$old_image"
 recovery=/srv/polyedge-ring/parity/funded-recovery/20260822T195013Z-acknowledged-evicted-no-fill.json
 rollout=/srv/polyedge-ring/parity/activation/20260822T195013Z-funded-signer-rollout.json
 activation=${rollout%/*}
+pending_rollout=$activation/20260822T195013Z-funded-signer-rollout.pending.json
 recovery_script=/usr/local/libexec/polyedge-funded-reservation-recovery-cutover
 quadlet=/etc/containers/systemd/polyedge-funded-signer.container
 deploy=/usr/local/sbin/polyedge-quadlet-deploy
@@ -59,6 +60,7 @@ if [ "${POLYEDGE_TEST_ALLOW_UNPRIVILEGED:-}" = 1 ]; then
   recovery=${POLYEDGE_TEST_RECOVERY:?}
   rollout=${POLYEDGE_TEST_ROLLOUT:?}
   activation=${rollout%/*}
+  pending_rollout=$activation/20260822T195013Z-funded-signer-rollout.pending.json
   recovery_script=${POLYEDGE_TEST_RECOVERY_SCRIPT:?}
   quadlet=${POLYEDGE_TEST_QUADLET:?}
   deploy=${POLYEDGE_TEST_DEPLOY:?}
@@ -198,6 +200,24 @@ new_signer_safe() {
     test "$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value 2>/dev/null || true)" = 0 &&
     wait_signer_safe true "$new_image"
 }
+validate_pending_rollout() {
+  secure_file "$pending_rollout" 640 65536
+  /usr/bin/jq -e --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
+    --arg recovery "sha256:$recovery_file_sha" --arg helper "sha256:$helper_sha" --arg deploy "sha256:$deploy_file_sha" \
+    --arg recovery_script "sha256:$expected_recovery_sha" --arg quadlet_before "sha256:$expected_quadlet_sha" \
+    --argjson dlq "$dlq" '
+      .schema == "polyedge.funded_signer_post_recovery_rollout_pending.v1" and
+      .status == "deployment_pending_receipt" and
+      .oldImage == $old and .newImage == $new and .newRevision == $revision and
+      .recoveryReceiptSha256 == $recovery and .helperSha256 == $helper and .deploySha256 == $deploy and
+      .recoveryScriptSha256 == $recovery_script and .quadlet.beforeSha256 == $quadlet_before and
+      (.quadlet.afterSha256 | test("^sha256:[0-9a-f]{64}$")) and
+      (.runtime.oldInvocationId | test("^[0-9a-f]{32}$")) and
+      (.runtime.oldContainerId | test("^[0-9a-f]{64}$")) and
+      .producerWasActive == true and .unresolvedReservationsBefore == 0 and
+      .queue == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+      .azureDeletionAllowed == false' "$pending_rollout" >/dev/null
+}
 
 
 restore_on_failure() {
@@ -206,9 +226,26 @@ restore_on_failure() {
   /usr/bin/rm -f "$temporary"
   if [ "$complete" != true ] && [ "$producer_was_active" = true ]; then
     current_identity=$(signer_identity 2>/dev/null || true)
-    if { [ "$current_identity" = "$new_image|986:982|running" ] && wait_signer_safe false "$new_image"; } ||
-       { [ "$current_identity" = "$old_image|986:982|running" ] && wait_signer_safe false "$old_image"; }; then
+    if [ "$current_identity" = "$old_image|986:982|running" ] &&
+       [ -e "$pending_rollout" ] && validate_pending_rollout &&
+       [ "$(sha "$quadlet" 2>/dev/null || true)" = "$expected_quadlet_sha" ] &&
+       [ "$(/usr/bin/grep -c "^Image=$old_image$" "$quadlet" 2>/dev/null || true)" -eq 1 ] &&
+       [ "$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value 2>/dev/null || true)" = \
+         "$(/usr/bin/jq -er '.runtime.oldInvocationId' "$pending_rollout" 2>/dev/null || true)" ] &&
+       [ "$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer 2>/dev/null || true)" = \
+         "$(/usr/bin/jq -er '.runtime.oldContainerId' "$pending_rollout" 2>/dev/null || true)" ] &&
+       wait_signer_safe false "$old_image"; then
       start_producer || "$systemctl" stop polyedge-funded-intent-producer.service || true
+    elif [ "$current_identity" = "$new_image|986:982|running" ] && [ -e "$pending_rollout" ] &&
+         validate_pending_rollout; then
+      pending_quadlet_sha=$(/usr/bin/jq -er '.quadlet.afterSha256 | ltrimstr("sha256:")' "$pending_rollout")
+      if [ "$(sha "$quadlet" 2>/dev/null || true)" = "$pending_quadlet_sha" ] &&
+         [ "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet" 2>/dev/null || true)" -eq 1 ] &&
+         new_signer_safe && queue_snapshot "$dlq" >/dev/null 2>&1; then
+        start_producer || "$systemctl" stop polyedge-funded-intent-producer.service || true
+      else
+        "$systemctl" stop polyedge-funded-intent-producer.service || true
+      fi
     else
       "$systemctl" stop polyedge-funded-intent-producer.service || true
     fi
@@ -259,15 +296,19 @@ queue_snapshot "$dlq" >/dev/null
 
 if [ -e "$rollout" ]; then
   secure_file "$rollout" 640 65536
+  validate_pending_rollout
   rollout_sha=$(sha "$rollout")
+  pending_rollout_sha=$(sha "$pending_rollout")
   /usr/bin/jq -e --arg new "$new_image" --arg revision "$new_revision" --arg old "$old_image" \
     --arg recovery "sha256:$recovery_file_sha" --arg helper "sha256:$helper_sha" --arg deploy "sha256:$deploy_file_sha" \
     --arg recovery_script "sha256:$expected_recovery_sha" --arg quadlet "sha256:$(sha "$quadlet")" \
+    --arg pending_path "$pending_rollout" --arg pending_sha "sha256:$pending_rollout_sha" \
     --argjson dlq "$dlq" '
       .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
       .oldImage == $old and .newImage == $new and .newRevision == $revision and
       .recoveryReceiptSha256 == $recovery and .helperSha256 == $helper and .deploySha256 == $deploy and
       .recoveryScriptSha256 == $recovery_script and .quadlet.afterSha256 == $quadlet and
+      .pendingRollout == {path:$pending_path,sha256:$pending_sha} and
       .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
         scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
       .producerRestored == true and .azureDeletionAllowed == false' "$rollout" >/dev/null
@@ -284,15 +325,84 @@ if [ -e "$rollout" ]; then
   exit 0
 fi
 
+if [ -e "$pending_rollout" ]; then
+  validate_pending_rollout
+  producer_was_active=true
+  old_invocation=$(/usr/bin/jq -er '.runtime.oldInvocationId' "$pending_rollout")
+  old_container=$(/usr/bin/jq -er '.runtime.oldContainerId' "$pending_rollout")
+  old_quadlet_file_sha=$(/usr/bin/jq -er '.quadlet.beforeSha256 | ltrimstr("sha256:")' "$pending_rollout")
+  expected_new_quadlet_sha=$(/usr/bin/jq -er '.quadlet.afterSha256 | ltrimstr("sha256:")' "$pending_rollout")
+  if [ "$(sha "$quadlet")" = "$expected_quadlet_sha" ] &&
+     [ "$(/usr/bin/grep -c "^Image=$old_image$" "$quadlet")" -eq 1 ]; then
+    test "$(signer_identity)" = "$old_image|986:982|running"
+    test "$(binding)" = '0|||'
+    test "$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)" = "$old_invocation"
+    test "$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)" = "$old_container"
+    wait_signer_safe false "$old_image"
+    if producer_safe; then
+      "$systemctl" stop polyedge-funded-intent-producer.service
+    else
+      ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+      ! "$podman" container exists polyedge-funded-intent-producer
+    fi
+    queue_snapshot "$dlq" >/dev/null
+    "$deploy" polyedge-funded-signer "$new_image"
+  fi
+  secure_file "$quadlet" 600 65536
+  test "$(sha "$quadlet")" = "$expected_new_quadlet_sha"
+  test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
+  new_signer_safe
+  new_invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)
+  new_container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)
+  test "$new_invocation" != "$old_invocation"
+  test "$new_container" != "$old_container"
+  new_quadlet_file_sha=$(sha "$quadlet")
+  queue_snapshot "$dlq" >/dev/null
+  test "$(binding)" = '0|||'
+  "$disk_guard" --assert-headroom
+  test ! -e /run/polyedge/image-pulls-paused
+  if producer_safe; then
+    :
+  else
+    ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+    ! "$podman" container exists polyedge-funded-intent-producer
+    start_producer
+  fi
+else
 test "$(sha "$quadlet")" = "$expected_quadlet_sha"
 test "$(/usr/bin/grep -c "^Image=$old_image$" "$quadlet")" -eq 1
 test "$(signer_identity)" = "$old_image|986:982|running"
 test "$(binding)" = '0|||'
 producer_safe
-producer_was_active=true
 old_invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)
 old_container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)
 old_quadlet_file_sha=$(sha "$quadlet")
+expected_new_quadlet_sha=$(/usr/bin/awk -v image="$new_image" '/^Image=/ {print "Image=" image; next} {print}' "$quadlet" | /usr/bin/sha256sum | /usr/bin/cut -d' ' -f1)
+queue_before=$(queue_snapshot "$dlq")
+/usr/bin/install -d -o "$expected_uid" -g "$expected_gid" -m 0750 "$activation"
+temporary=$(/usr/bin/mktemp "$activation/.20260822T195013Z-funded-signer-rollout.pending.XXXXXX")
+/usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
+  --arg recovery_sha "sha256:$recovery_file_sha" --arg helper_sha "sha256:$helper_sha" \
+  --arg deploy_sha "sha256:$deploy_file_sha" --arg recovery_script_sha "sha256:$expected_recovery_sha" \
+  --arg quadlet_before "sha256:$old_quadlet_file_sha" --arg quadlet_after "sha256:$expected_new_quadlet_sha" \
+  --arg old_invocation "$old_invocation" --arg old_container "$old_container" --argjson queue "$queue_before" '
+    {schema:"polyedge.funded_signer_post_recovery_rollout_pending.v1",status:"deployment_pending_receipt",
+     createdAtUtc:$created,oldImage:$old,newImage:$new,newRevision:$revision,
+     recoveryReceiptSha256:$recovery_sha,helperSha256:$helper_sha,deploySha256:$deploy_sha,
+     recoveryScriptSha256:$recovery_script_sha,
+     quadlet:{beforeSha256:$quadlet_before,afterSha256:$quadlet_after},
+     runtime:{oldInvocationId:$old_invocation,oldContainerId:$old_container},
+     producerWasActive:true,unresolvedReservationsBefore:0,queue:$queue,azureDeletionAllowed:false}' >"$temporary"
+/usr/bin/chown "$expected_uid:$expected_gid" "$temporary"
+/usr/bin/chmod 0640 "$temporary"
+/usr/bin/sync -f "$temporary"
+/usr/bin/mv -n "$temporary" "$pending_rollout"
+test ! -e "$temporary"
+temporary=
+/usr/bin/sync -f "$activation"
+validate_pending_rollout
+producer_was_active=true
 
 "$systemctl" stop polyedge-funded-intent-producer.service
 ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
@@ -306,6 +416,7 @@ wait_signer_safe false "$old_image"
 
 "$deploy" polyedge-funded-signer "$new_image"
 secure_file "$quadlet" 600 65536
+test "$(sha "$quadlet")" = "$expected_new_quadlet_sha"
 test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
 test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$new_image")" = "linux/arm64|$new_revision"
 wait_signer_safe true "$new_image"
@@ -321,6 +432,7 @@ test "$(binding)" = '0|||'
 test ! -e /run/polyedge/image-pulls-paused
 
 start_producer
+fi
 producer_invocation=$("$systemctl" show polyedge-funded-intent-producer.service -p InvocationID --value)
 queue_final=$(queue_snapshot "$dlq")
 test "$(binding)" = '0|||'
@@ -337,6 +449,8 @@ printf '%s' "$available" | /usr/bin/grep -Eq '^[0-9]+$'
 test "$available" -ge 16106127360
 
 /usr/bin/install -d -o "$expected_uid" -g "$expected_gid" -m 0750 "$activation"
+validate_pending_rollout
+pending_rollout_sha=$(sha "$pending_rollout")
 temporary=$(/usr/bin/mktemp "$activation/.20260822T195013Z-funded-signer-rollout.XXXXXX")
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
@@ -344,6 +458,7 @@ temporary=$(/usr/bin/mktemp "$activation/.20260822T195013Z-funded-signer-rollout
   --arg helper_sha "sha256:$helper_sha" --arg deploy_sha "sha256:$deploy_file_sha" \
   --arg recovery_script_sha "sha256:$expected_recovery_sha" \
   --arg quadlet_before "sha256:$old_quadlet_file_sha" --arg quadlet_after "sha256:$new_quadlet_file_sha" \
+  --arg pending_path "$pending_rollout" --arg pending_sha "sha256:$pending_rollout_sha" \
   --arg old_invocation "$old_invocation" --arg old_container "$old_container" \
   --arg new_invocation "$new_invocation" --arg new_container "$new_container" \
   --arg producer_invocation "$producer_invocation" --argjson queue "$queue_final" --argjson available "$available" '
@@ -352,6 +467,7 @@ temporary=$(/usr/bin/mktemp "$activation/.20260822T195013Z-funded-signer-rollout
      recoveryReceipt:{path:$recovery,sha256:$recovery_sha},recoveryReceiptSha256:$recovery_sha,
      helperSha256:$helper_sha,deploySha256:$deploy_sha,recoveryScriptSha256:$recovery_script_sha,
      quadlet:{beforeSha256:$quadlet_before,afterSha256:$quadlet_after},
+     pendingRollout:{path:$pending_path,sha256:$pending_sha},
      runtime:{oldInvocationId:$old_invocation,oldContainerId:$old_container,
        newInvocationId:$new_invocation,newContainerId:$new_container,
        producerInvocationId:$producer_invocation},
@@ -364,6 +480,7 @@ temporary=$(/usr/bin/mktemp "$activation/.20260822T195013Z-funded-signer-rollout
 /usr/bin/ln "$temporary" "$rollout"
 /usr/bin/sync -f "$activation"
 /usr/bin/rm -f "$temporary"
+/usr/bin/sync -f "$activation"
 temporary=
 complete=true
 trap - EXIT HUP INT TERM

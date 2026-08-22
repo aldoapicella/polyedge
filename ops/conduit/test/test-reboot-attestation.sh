@@ -446,4 +446,57 @@ chmod 0640 "$case_root/post.saved"
 mv "$case_root/post.saved" "$post"
 run_attestor validate-ledger
 
+cp "$post" "$case_root/active-post.saved"
+cp "$ledger" "$case_root/active-ledger.saved"
+jq 'del(.protectedBindings.fundedSignerRevision)' "$post" >"$case_root/post.tmp"
+chmod 0640 "$case_root/post.tmp"
+mv "$case_root/post.tmp" "$post"
+active_post_sha=sha256:$(sha256sum "$post" | awk '{print $1}')
+jq --arg sha "$active_post_sha" '.rebootRecovery.postboot.sha256 = $sha' "$ledger" >"$raw"
+chmod 0640 "$raw"
+mv "$raw" "$ledger"
+if run_attestor validate-ledger >/dev/null 2>&1; then
+  echo 'active evidence missing an exact funded binding unexpectedly passed' >&2
+  exit 1
+fi
+chmod 0640 "$case_root/active-post.saved" "$case_root/active-ledger.saved"
+mv "$case_root/active-post.saved" "$post"
+mv "$case_root/active-ledger.saved" "$ledger"
+run_attestor validate-ledger
+
+printf '%s\n' '33333333-3333-4333-8333-333333333333' >"$case_root/boot-id"
+printf '%s\n' 'cpu 1 1 1 1' 'btime 3000' >"$case_root/proc-stat"
+ATTEST_ENV_FILE="$disabled_env" FAKE_FUNDED_ACTIVE=0 run_attestor prepare >/dev/null
+disabled_pending=$case_root/ring/parity/reboot/pending.json
+disabled_pre=$(jq -r '.preboot.path' "$disabled_pending")
+printf '%s\n' '44444444-4444-4444-8444-444444444444' >"$case_root/boot-id"
+printf '%s\n' 'cpu 1 1 1 1' 'btime 4000' >"$case_root/proc-stat"
+ATTEST_ENV_FILE="$disabled_env" FAKE_FUNDED_ACTIVE=0 run_attestor complete >/dev/null
+disabled_post=$(jq -r '.rebootRecovery.postboot.path' "$disabled_ledger")
+
+jq 'del(.protectedBindings.fundedSignerRevision,
+  .protectedBindings.fundedRolloutReceiptPath,
+  .protectedBindings.fundedRolloutReceiptSha256,
+  .protectedBindings.fundedServiceBusDlqBaseline)' "$disabled_pre" >"$case_root/legacy-pre.tmp"
+chmod 0640 "$case_root/legacy-pre.tmp"
+mv "$case_root/legacy-pre.tmp" "$disabled_pre"
+disabled_pre_sha=sha256:$(sha256sum "$disabled_pre" | awk '{print $1}')
+jq --arg pre_sha "$disabled_pre_sha" '
+  del(.protectedBindings.fundedSignerRevision,
+    .protectedBindings.fundedRolloutReceiptPath,
+    .protectedBindings.fundedRolloutReceiptSha256,
+    .protectedBindings.fundedServiceBusDlqBaseline) |
+  .preboot.sha256 = $pre_sha
+' "$disabled_post" >"$case_root/legacy-post.tmp"
+chmod 0640 "$case_root/legacy-post.tmp"
+mv "$case_root/legacy-post.tmp" "$disabled_post"
+disabled_post_sha=sha256:$(sha256sum "$disabled_post" | awk '{print $1}')
+jq --arg pre_sha "$disabled_pre_sha" --arg post_sha "$disabled_post_sha" '
+  .rebootRecovery.preboot.sha256 = $pre_sha |
+  .rebootRecovery.postboot.sha256 = $post_sha
+' "$disabled_ledger" >"$raw"
+chmod 0640 "$raw"
+mv "$raw" "$disabled_ledger"
+ATTEST_ENV_FILE="$disabled_env" FAKE_FUNDED_ACTIVE=0 run_attestor validate-ledger
+
 echo 'reboot attestation self-test passed'

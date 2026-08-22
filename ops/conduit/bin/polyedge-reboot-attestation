@@ -236,6 +236,18 @@ protected_json() {
     ' "$ledger_read"
 }
 
+evidence_protected_json() {
+  jq -cS '
+    .protectedBindings |
+    if .fundedSignerEnabled == false then
+      .fundedSignerRevision = (.fundedSignerRevision // null) |
+      .fundedRolloutReceiptPath = (.fundedRolloutReceiptPath // null) |
+      .fundedRolloutReceiptSha256 = (.fundedRolloutReceiptSha256 // null) |
+      .fundedServiceBusDlqBaseline = (.fundedServiceBusDlqBaseline // null)
+    else . end
+  ' "$1"
+}
+
 validate_base_ledger() {
   jq -e '
     . as $ledger |
@@ -408,8 +420,8 @@ validate_gate() {
   validate_evidence_file "$pre" preboot
   validate_evidence_file "$post" postboot
   current_protected=$(protected_json)
-  [ "$(jq -cS '.protectedBindings' "$pre")" = "$current_protected" ] \
-    && [ "$(jq -cS '.protectedBindings' "$post")" = "$current_protected" ] \
+  [ "$(evidence_protected_json "$pre")" = "$current_protected" ] \
+    && [ "$(evidence_protected_json "$post")" = "$current_protected" ] \
     || die 'reboot evidence protected bindings differ from the ledger'
   [ "$(jq -r '.boot.id' "$pre")" = "$pre_id" ] && [ "$(jq -r '.boot.id' "$post")" = "$post_id" ] \
     || die 'reboot evidence path and boot ID disagree'
@@ -845,7 +857,7 @@ secure_dir "$reboot_root/$pre_id" 750
 validate_evidence_file "$pre" preboot
 [ "$boot_id" != "$pre_id" ] || die 'complete requires a different boot ID'
 [ "$btime" -gt "$(jq -r '.boot.btime' "$pre")" ] || die 'complete requires a later boot time'
-[ "$(jq -cS '.protectedBindings' "$pre")" = "$protected" ] || die 'protected bindings changed across reboot'
+[ "$(evidence_protected_json "$pre")" = "$protected" ] || die 'protected bindings changed across reboot'
 [ "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$pre")" = \
   "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$system_tmp")" ] \
   || die 'container image, user, or health binding changed across reboot'

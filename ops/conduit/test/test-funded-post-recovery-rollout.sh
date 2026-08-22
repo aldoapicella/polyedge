@@ -41,6 +41,7 @@ make_fixture() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"$case_root/bin/recovery"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$case_root/bin/disk-guard"
   printf '[Container]\nImage=%s\n' "$old_image" >"$case_root/signer.container"
+  sha256sum "$case_root/signer.container" | cut -d' ' -f1 >"$case_root/state/old-quadlet-sha"
 
   cat >"$case_root/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -125,6 +126,9 @@ if [ "${FAKE_DEPLOY_FAIL:-0}" = 1 ]; then exit 1; fi
 printf '%s\n' "$FAKE_NEW_IMAGE" >"$FAKE_STATE/signer-image"
 printf '%032d\n' 4 >"$FAKE_STATE/signer-invocation"
 printf '%064d\n' 5 >"$FAKE_STATE/signer-container"
+if [ "${FAKE_DEPLOY_INTERRUPT:-0}" = 1 ]; then
+  kill -KILL "$PPID"
+fi
 EOF
 
   chmod 0700 "$case_root/bin/recovery"
@@ -147,7 +151,7 @@ run_helper() {
     POLYEDGE_TEST_JOURNALCTL="$case_root/bin/journalctl" POLYEDGE_TEST_RUNUSER="$case_root/bin/runuser" \
     POLYEDGE_TEST_AZ="$case_root/bin/az" POLYEDGE_TEST_UID="$(id -u)" POLYEDGE_TEST_GID="$(id -g)" \
     POLYEDGE_TEST_RECOVERY_SHA="$(sha256sum "$case_root/bin/recovery" | cut -d' ' -f1)" \
-    POLYEDGE_TEST_QUADLET_SHA="$(sha256sum "$case_root/signer.container" | cut -d' ' -f1)" \
+    POLYEDGE_TEST_QUADLET_SHA="$(cat "$case_root/state/old-quadlet-sha")" \
     POLYEDGE_TEST_DEPLOY_SHA="$(sha256sum "$case_root/bin/deploy" | cut -d' ' -f1)" \
     POLYEDGE_TEST_LOCK_FILE="$case_root/utility.lock" POLYEDGE_TEST_WAIT_ATTEMPTS=2 POLYEDGE_TEST_WAIT_SECONDS=0 \
     "$helper" "$new_image" "$revision"
@@ -161,9 +165,13 @@ run_helper "$success"
 test "$(cat "$success/state/producer-active")" = 1
 test "$(cat "$success/state/deploy-count")" = 1
 test "$(stat -c %a "$success/ring/activation/rollout.json")" = 640
-/usr/bin/jq -e --arg image "$new_image" --arg revision "$revision" '
+pending=$success/ring/activation/20260822T195013Z-funded-signer-rollout.pending.json
+test "$(stat -c %a "$pending")" = 640
+/usr/bin/jq -e --arg image "$new_image" --arg revision "$revision" \
+  --arg pending "$pending" --arg pending_sha "sha256:$(sha256sum "$pending" | cut -d' ' -f1)" '
   .status == "validated" and .newImage == $image and .newRevision == $revision and
   .producerRestored == true and .unresolvedReservationsAfter == 0 and
+  .pendingRollout == {path:$pending,sha256:$pending_sha} and
   (.recoveryScriptSha256 | test("^sha256:[0-9a-f]{64}$"))' "$success/ring/activation/rollout.json" >/dev/null
 run_helper "$success"
 test "$(cat "$success/state/deploy-count")" = 1
@@ -187,5 +195,34 @@ make_fixture "$unsafe"
 if run_helper "$unsafe" FAKE_DEPLOY_FAIL=1 FAKE_DEPLOY_UNSAFE=1; then exit 1; fi
 test "$(cat "$unsafe/state/producer-active")" = 0
 test ! -e "$unsafe/ring/activation/rollout.json"
+
+interrupted=$root/interrupted-resume
+make_fixture "$interrupted"
+if run_helper "$interrupted" FAKE_DEPLOY_INTERRUPT=1; then exit 1; fi
+interrupted_pending=$interrupted/ring/activation/20260822T195013Z-funded-signer-rollout.pending.json
+test "$(cat "$interrupted/state/producer-active")" = 0
+test "$(cat "$interrupted/state/deploy-count")" = 1
+test "$(cat "$interrupted/state/signer-image")" = "$new_image"
+test -e "$interrupted_pending"
+test ! -e "$interrupted/ring/activation/rollout.json"
+run_helper "$interrupted"
+test "$(cat "$interrupted/state/producer-active")" = 1
+test "$(cat "$interrupted/state/deploy-count")" = 1
+test -e "$interrupted_pending"
+test -e "$interrupted/ring/activation/rollout.json"
+/usr/bin/jq -e --arg path "$interrupted_pending" \
+  --arg sha "sha256:$(sha256sum "$interrupted_pending" | cut -d' ' -f1)" \
+  '.pendingRollout == {path:$path,sha256:$sha} and .producerRestored == true' \
+  "$interrupted/ring/activation/rollout.json" >/dev/null
+
+drift=$root/interrupted-drift
+make_fixture "$drift"
+if run_helper "$drift" FAKE_DEPLOY_INTERRUPT=1; then exit 1; fi
+printf '# drift\n' >>"$drift/signer.container"
+if run_helper "$drift"; then exit 1; fi
+test "$(cat "$drift/state/producer-active")" = 0
+test "$(cat "$drift/state/deploy-count")" = 1
+test -e "$drift/ring/activation/20260822T195013Z-funded-signer-rollout.pending.json"
+test ! -e "$drift/ring/activation/rollout.json"
 
 printf 'funded post-recovery rollout tests passed\n'
