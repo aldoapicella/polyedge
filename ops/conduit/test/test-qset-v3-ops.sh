@@ -52,8 +52,8 @@ grep -Fx 'OnCalendar=2026-08-25 02:15:00 UTC' "$timer" >/dev/null
 grep -Fx 'Persistent=true' "$timer" >/dev/null
 grep -Fx 'Unit=polyedge-qset-v3-seal-days.service' "$timer" >/dev/null
 grep -Fx 'ExecStart=/usr/bin/flock -w 300 /run/polyedge/research.lock /usr/local/libexec/polyedge-qset-v3-seal-days' "$service" >/dev/null
-grep -Fx 'User=polyedge-identity-shadow-qset-v3-writer' "$override" >/dev/null
-grep -Fx 'Group=polyedge-identity-shadow-qset-v3-writer' "$override" >/dev/null
+grep -Fx 'User=polyedge-qset-v3-writer' "$override" >/dev/null
+grep -Fx 'Group=polyedge-qset-v3-writer' "$override" >/dev/null
 grep -F 'shadow-qset-v3-writer' "$token" >/dev/null
 grep -F 'for date in 2026-08-23 2026-08-24' "$sealer" >/dev/null
 grep -F 'seal-qset-v3-day' "$sealer" >/dev/null

@@ -40,9 +40,9 @@ the repository examples leave only campaign freeze, image, client, and account
 bindings blank. The conservative-prior URI and hash are exact.
 
 ```sh
-sudo groupadd --system --gid 979 polyedge-identity-shadow-qset-v3-writer
-sudo useradd --system --uid 983 --no-create-home --gid polyedge-identity-shadow-qset-v3-writer --shell /usr/sbin/nologin polyedge-identity-shadow-qset-v3-writer
-sudo install -d -m 0700 -o polyedge-identity-shadow-qset-v3-writer -g polyedge-identity-shadow-qset-v3-writer /run/polyedge-federated-shadow-qset-v3-writer
+sudo groupadd --system --gid 979 polyedge-qset-v3-writer
+sudo useradd --system --uid 983 --no-create-home --gid polyedge-qset-v3-writer --shell /usr/sbin/nologin polyedge-qset-v3-writer
+sudo install -d -m 0700 -o polyedge-qset-v3-writer -g polyedge-qset-v3-writer /run/polyedge-federated-shadow-qset-v3-writer
 sudo install -m 0755 ops/conduit/bin/polyedge-federated-token-refresh /usr/local/libexec/
 sudo install -m 0755 ops/conduit/bin/polyedge-qset-v3-seal-days /usr/local/libexec/
 sudo install -m 0644 ops/conduit/quadlets/polyedge-shadow-qset-v3.container /etc/containers/systemd/
