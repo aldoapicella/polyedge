@@ -68,6 +68,10 @@ const QSET_V4_CONTAINER: &str = "polyedge-shadow-qset-v4-events";
 const QSET_V4_PREFIX: &str = "shadow-events/campaign-2026-08-24-qset-v4";
 const QSET_V4_DATES: [&str; 2] = ["2026-08-24", "2026-08-25"];
 const QSET_V4_FREEZE_CONTAINER: &str = "polyedge-qset-v4-control";
+const QSET_V5_CONTAINER: &str = "polyedge-shadow-qset-v5-events";
+const QSET_V5_PREFIX: &str = "shadow-events/campaign-2026-08-26-qset-v5";
+const QSET_V5_DATES: [&str; 2] = ["2026-08-26", "2026-08-27"];
+const QSET_V5_FREEZE_CONTAINER: &str = "polyedge-qset-v5-control";
 
 struct QsetSealConfig {
     name: &'static str,
@@ -105,6 +109,19 @@ const QSET_V4_SEAL_CONFIG: QsetSealConfig = QsetSealConfig {
         "reports/research/shadow/campaigns/campaign-2026-08-24-qset-v4/control/code-freeze/source-",
     validation_schema: "polyedge.qset_v4_closed_day_validation.v1",
     seal_schema: "polyedge.qset_v4_closed_day_seal.v1",
+};
+
+const QSET_V5_SEAL_CONFIG: QsetSealConfig = QsetSealConfig {
+    name: "qset-v5",
+    campaign_id: "campaign-2026-08-26-qset-v5",
+    container: QSET_V5_CONTAINER,
+    prefix: QSET_V5_PREFIX,
+    dates: &QSET_V5_DATES,
+    freeze_container: QSET_V5_FREEZE_CONTAINER,
+    freeze_blob_prefix:
+        "reports/research/shadow/campaigns/campaign-2026-08-26-qset-v5/control/code-freeze/source-",
+    validation_schema: "polyedge.qset_v5_closed_day_validation.v1",
+    seal_schema: "polyedge.qset_v5_closed_day_seal.v1",
 };
 
 #[derive(Parser)]
@@ -238,6 +255,23 @@ enum Command {
         #[arg(long)]
         date: String,
         /// Exact reviewed source-freeze blob in polyedge-qset-v4-control.
+        #[arg(long)]
+        source_freeze_blob: String,
+        /// SHA-256 of --source-freeze-blob, prefixed with sha256:.
+        #[arg(long)]
+        source_freeze_sha256: String,
+        #[arg(long)]
+        validate_only: bool,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    // Seal one approved closed UTC day from the isolated qset-v5 campaign.
+    SealQsetV5Day {
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(long)]
+        date: String,
+        /// Exact reviewed source-freeze blob in polyedge-qset-v5-control.
         #[arg(long)]
         source_freeze_blob: String,
         /// SHA-256 of --source-freeze-blob, prefixed with sha256:.
@@ -971,6 +1005,22 @@ async fn main() -> Result<()> {
             client_id,
         } => print_json(run_seal_qset_day(
             &QSET_V4_SEAL_CONFIG,
+            account,
+            parse_date_arg(&date)?,
+            &source_freeze_blob,
+            &source_freeze_sha256,
+            validate_only,
+            client_id,
+        )?),
+        Command::SealQsetV5Day {
+            account,
+            date,
+            source_freeze_blob,
+            source_freeze_sha256,
+            validate_only,
+            client_id,
+        } => print_json(run_seal_qset_day(
+            &QSET_V5_SEAL_CONFIG,
             account,
             parse_date_arg(&date)?,
             &source_freeze_blob,
@@ -2280,11 +2330,16 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
         })
     );
     let qset_v4_writer = settings.deploy.app_name == "polyedge-shadow-qset-v4";
+    let qset_v5_writer = settings.deploy.app_name == "polyedge-shadow-qset-v5";
     let (app, shutdown) = app_with_shutdown(settings);
     let (shutdown_result_tx, shutdown_result_rx) = tokio::sync::oneshot::channel();
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let result = shutdown_protocol(shutdown, qset_v4_writer).await;
+            let result = if qset_v5_writer {
+                shutdown_protocol_qset_v5(shutdown).await
+            } else {
+                shutdown_protocol(shutdown, qset_v4_writer).await
+            };
             if let Err(error) = &result {
                 eprintln!("Rust API shutdown did not fully drain: {error}");
             }
@@ -2351,6 +2406,37 @@ async fn shutdown_protocol(
     }
 }
 
+async fn shutdown_protocol_qset_v5(shutdown: polyedge_api::ApiShutdown) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
+        let mut prepare =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("installing SIGUSR1 handler");
+        let mut prepared = false;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return terminate_qset_v5_writer(&shutdown, prepared).await,
+                _ = terminate.recv() => return terminate_qset_v5_writer(&shutdown, prepared).await,
+                _ = prepare.recv() => match shutdown.prepare_qset_v5_retirement().await {
+                    Ok(receipt) => {
+                        println!("{}", serde_json::to_string(&receipt)
+                            .map_err(|error| format!("serializing qset-v5 retirement receipt: {error}"))?);
+                        prepared = true;
+                    }
+                    Err(error) => eprintln!("qset-v5 prepare-retirement failed; writer remains fenced: {error}"),
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        terminate_qset_v5_writer(&shutdown, false).await
+    }
+}
+
 async fn terminate_qset_v4_writer(
     shutdown: &polyedge_api::ApiShutdown,
     prepared: bool,
@@ -2360,6 +2446,23 @@ async fn terminate_qset_v4_writer(
     }
 
     let not_prepared = "qset-v4 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM";
+    match shutdown.drain().await {
+        Ok(()) => Err(format!(
+            "{not_prepared}; recorder drained without issuing a retirement receipt"
+        )),
+        Err(error) => Err(format!("{not_prepared}; lossless drain failed: {error}")),
+    }
+}
+
+async fn terminate_qset_v5_writer(
+    shutdown: &polyedge_api::ApiShutdown,
+    prepared: bool,
+) -> Result<(), String> {
+    if prepared {
+        return Ok(());
+    }
+
+    let not_prepared = "qset-v5 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM";
     match shutdown.drain().await {
         Ok(()) => Err(format!(
             "{not_prepared}; recorder drained without issuing a retirement receipt"
@@ -3870,11 +3973,11 @@ mod tests {
         profitability_authorization_flags, publish_local_ring_quarantine_resolution,
         qset_v2_inventory_sha256, recover_ring_quarantine_staging, ring_blob_name,
         ring_relative_path, ring_sha256, sha256_prefixed, terminate_lease_child_tree,
-        terminate_qset_v4_writer, validate_local_ring_quarantine_resolution,
-        validate_qset_v2_inventory, validate_ring_identity, validate_ring_manifest_v3_sequence,
-        validate_ring_manifest_v4_runs, validate_ring_quarantine_source_size,
-        validate_ring_source_v3, validate_ring_source_v4, validate_ring_upload_receipt,
-        AzureBlobItem, Cli, Command, Path, PathBuf, ResearchCommand,
+        terminate_qset_v4_writer, terminate_qset_v5_writer,
+        validate_local_ring_quarantine_resolution, validate_qset_v2_inventory,
+        validate_ring_identity, validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
+        validate_ring_quarantine_source_size, validate_ring_source_v3, validate_ring_source_v4,
+        validate_ring_upload_receipt, AzureBlobItem, Cli, Command, Path, PathBuf, ResearchCommand,
         MAX_RING_QUARANTINE_SOURCE_BYTES, RING_QUARANTINE_BLOB_PREFIX,
     };
     use clap::Parser;
@@ -3922,6 +4025,29 @@ mod tests {
             .join()
             .unwrap()
     }
+    #[tokio::test]
+    async fn qset_v5_unprepared_term_drains_but_still_fails() {
+        let (_app, shutdown) =
+            polyedge_api::app_with_shutdown(polyedge_config::RuntimeSettings::default());
+
+        let error = terminate_qset_v5_writer(&shutdown, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("not prepared for retirement"));
+        assert!(error.contains("recorder drained without issuing a retirement receipt"));
+        assert!(shutdown.drain().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn qset_v5_prepared_term_exits_cleanly() {
+        let (_app, shutdown) =
+            polyedge_api::app_with_shutdown(polyedge_config::RuntimeSettings::default());
+
+        assert!(terminate_qset_v5_writer(&shutdown, true).await.is_ok());
+        assert!(shutdown.drain().await.is_ok());
+    }
+
     #[test]
     fn qset_v2_sealer_is_exact_closed_day_only() {
         let prefix = "shadow-events/campaign-2026-08-22-qset-v2/2026/08/22/";

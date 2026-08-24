@@ -68,9 +68,31 @@ const ESSENTIAL_FEED_MAX_AGE_SECONDS: i64 = 5 * 60;
 const QSET_V4_APP_NAME: &str = "polyedge-shadow-qset-v4";
 const QSET_V4_CAMPAIGN_ID: &str = "campaign-2026-08-24-qset-v4";
 const QSET_V4_RAW_CONTAINER: &str = "polyedge-shadow-qset-v4-events";
+const QSET_V5_APP_NAME: &str = "polyedge-shadow-qset-v5";
+const QSET_V5_CAMPAIGN_ID: &str = "campaign-2026-08-26-qset-v5";
+const QSET_V5_RAW_CONTAINER: &str = "polyedge-shadow-qset-v5-events";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct QsetV4WriterRetirementReceipt {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub retired_at: DateTime<Utc>,
+    pub campaign_id: &'static str,
+    pub app_name: String,
+    pub image_digest: String,
+    pub source_revision: String,
+    pub recorder_instance_id: String,
+    pub final_assigned_sequence: u64,
+    pub final_enqueued_sequence: u64,
+    pub final_enqueued_total: u64,
+    pub final_persisted_sequence: u64,
+    pub final_persisted_total: u64,
+    pub final_queued: usize,
+    pub flush_success: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QsetV5WriterRetirementReceipt {
     pub schema: &'static str,
     pub status: &'static str,
     pub retired_at: DateTime<Utc>,
@@ -862,6 +884,63 @@ impl RuntimeController {
             status: "prepared_for_retirement",
             retired_at: Utc::now(),
             campaign_id: QSET_V4_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
+    }
+
+    pub async fn prepare_qset_v5_retirement(
+        &self,
+    ) -> Result<QsetV5WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V5_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V5_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v5 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v5_retirement_receipt(qset_v5_image_digest()?, qset_v5_source_revision()?)
+    }
+
+    fn qset_v5_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV5WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v5 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV5WriterRetirementReceipt {
+            schema: "polyedge.qset_v5_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V5_CAMPAIGN_ID,
             app_name: self.inner.settings.deploy.app_name.clone(),
             image_digest,
             source_revision,
@@ -4199,6 +4278,41 @@ fn qset_v4_source_revision_from(
     Ok(configured.to_owned())
 }
 
+fn qset_v5_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V5_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V5_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v5_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V5_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v5_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v5_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V5_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V5_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v5_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v5_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V5_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v5 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
+}
+
 fn saturating_sub_atomic(value: &AtomicUsize, amount: usize) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
@@ -6600,6 +6714,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qset_v5_retirement_failure_stays_fenced_and_retryable() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V5_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V5_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+
+        let shutdown = tokio::time::timeout(
+            RECORDER_SHUTDOWN_DRAIN_TIMEOUT + StdDuration::from_secs(1),
+            controller.prepare_qset_v5_retirement(),
+        )
+        .await
+        .unwrap();
+        assert!(shutdown.is_err());
+        waiting.await.unwrap();
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v5_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+    }
+
+    #[tokio::test]
     async fn shutdown_drains_and_flushes_the_recorder_queue() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
         let controller = RuntimeController::new_with_recorder(
@@ -6676,6 +6857,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn qset_v5_retirement_receipt_proves_the_closed_durable_waterline() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V5_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V5_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v5_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+
+        assert_eq!(
+            receipt.schema,
+            "polyedge.qset_v5_writer_retirement_receipt.v1"
+        );
+        assert_eq!(receipt.status, "prepared_for_retirement");
+        assert_eq!(receipt.campaign_id, QSET_V5_CAMPAIGN_ID);
+        assert_eq!(receipt.app_name, QSET_V5_APP_NAME);
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_enqueued_sequence, 1);
+        assert_eq!(receipt.final_enqueued_total, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+        assert_eq!(receipt.final_persisted_total, 1);
+        assert_eq!(receipt.final_queued, 0);
+        assert!(receipt.flush_success);
+
+        controller
+            .record_event("book", json!({"sequence": 2}), None, None)
+            .await;
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+    }
+
     #[test]
     fn qset_v4_receipt_requires_exact_frozen_identity() {
         assert_eq!(
@@ -6695,6 +6924,27 @@ mod tests {
         );
         assert!(qset_v4_source_revision_from(&"A".repeat(40), None).is_err());
         assert!(qset_v4_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
+    }
+
+    #[test]
+    fn qset_v5_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v5_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v5_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v5_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v5_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v5_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v5_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v5_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
     }
 
     #[test]

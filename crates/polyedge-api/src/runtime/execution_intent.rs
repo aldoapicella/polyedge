@@ -226,7 +226,9 @@ impl IntentPublisherConfig {
         }
         if matches!(
             settings.azure.storage_container_name.as_str(),
-            "polyedge-shadow-qset-v3-events" | "polyedge-shadow-qset-v4-events"
+            "polyedge-shadow-qset-v3-events"
+                | "polyedge-shadow-qset-v4-events"
+                | "polyedge-shadow-qset-v5-events"
         ) && (!pointer_only_preflight
             || settings.azure.funded_direct_service_bus_enabled
             || !settings
@@ -241,7 +243,7 @@ impl IntentPublisherConfig {
                 .is_empty()
             || settings.live.polymarket_funder.is_some())
         {
-            return Err("qset-v3/v4 intent publisher requires pointer-only preflight with no funded queue or credentials".to_owned());
+            return Err("qset-v3/v4/v5 intent publisher requires pointer-only preflight with no funded queue or credentials".to_owned());
         }
         if pointer_only_preflight
             && (!settings.azure.strategy_intent_operator_direct
@@ -1249,6 +1251,7 @@ fn validated_conservative_prior(
             "static execution model is not the exact frozen conservative prior".to_owned()
         })?;
     let expected_container = match settings.azure.storage_container_name.as_str() {
+        "polyedge-shadow-qset-v5-events" => "polyedge-research-qset-v5",
         "polyedge-shadow-qset-v4-events" => "polyedge-research-qset-v4",
         "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
         "polyedge-shadow-qset-events" => "polyedge-research-qset",
@@ -1765,6 +1768,7 @@ mod tests {
         settings.azure.storage_account_name = Some("test-account".to_owned());
         settings.azure.storage_container_name = shadow_container.to_owned();
         let research_container = match shadow_container {
+            "polyedge-shadow-qset-v5-events" => "polyedge-research-qset-v5",
             "polyedge-shadow-qset-v4-events" => "polyedge-research-qset-v4",
             "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
             "polyedge-shadow-qset-events" => "polyedge-research-qset",

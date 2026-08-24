@@ -45,8 +45,9 @@ grep -F 'data/research/shadow/campaign-2026-08-22-qset-v2/control/replay.lock' "
 grep -F 'credential_dir=/run/polyedge-federated-$credential' "$runner" >/dev/null
 grep -F 'credential_dir=/etc/polyedge/credentials/$credential' "$runner" >/dev/null
 grep -F -- '-v "$credential_dir:/run/credentials:ro,Z"' "$runner" >/dev/null
-grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor)' "$runner" >/dev/null
-grep -F 'set -- /usr/bin/flock -w 129600 /run/polyedge/research.lock "$@"' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor)' "$runner" >/dev/null
+grep -F 'seal-qset-v5-day' "$runner" >/dev/null
+grep -F 'shadow-qset-v5-processor' "$runner" >/dev/null
 test "$(grep -c '/usr/bin/flock -w 129600 /run/polyedge/research.lock' "$runner")" -eq 1
 test "$(grep -c -- '--pull=never --log-driver=journald' "$runner")" -eq 2
 grep -F 'OnCalendar=*-*-* 03:10:00 UTC' "$bundle/systemd/polyedge-daily.timer" >/dev/null

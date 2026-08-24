@@ -103,6 +103,11 @@ jobs:
           ops/conduit/test/test-qset-v4-rbac-proof.sh
           ops/conduit/test/test-qset-v4-retire-writer.sh
           ops/conduit/test/test-qset-v4-source-freeze-upload-interruption-recovery.sh
+          ops/conduit/test/test-qset-v5-ops.sh
+          ops/conduit/test/test-qset-v5-processor.sh
+          ops/conduit/test/test-qset-v5-rbac-proof.sh
+          ops/conduit/test/test-qset-v5-retire-writer.sh
+          ops/conduit/test/test-qset-v5-source-freeze-upload-interruption-recovery.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
           jq -e '
             .status == "applied-live-verified"
@@ -417,7 +422,7 @@ jobs:
           jq -e '
             .variables.audience == "api://AzureADTokenExchange"
             and .parameters.lane.allowedValues == [
-              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "funded-signer", "funded-intent-producer"
+              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "shadow-qset-v5-writer", "shadow-qset-v5-processor", "funded-signer", "funded-intent-producer"
             ]
             and .variables.lanes["shadow-qset-v4-writer"] == {
               identityName: "id-polyedge-conduit-shadow-qset-v4-writer",

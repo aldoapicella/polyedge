@@ -113,6 +113,12 @@ case "$job" in
     export POLYEDGE_RESEARCH_IMAGE
     command='polyedge-rs seal-qset-v4-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date 2026-08-24 --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" --validate-only | jq -e --arg inventory "$POLYEDGE_QSET_V4_DAY1_INVENTORY_SHA256" '\'' .schema == "polyedge.qset_v4_closed_day_validation.v1" and .source_inventory_sha256 == $inventory '\'' >/dev/null; polyedge-rs seal-qset-v4-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date 2026-08-25 --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" --validate-only | jq -e --arg inventory "$POLYEDGE_QSET_V4_DAY2_INVENTORY_SHA256" '\'' .schema == "polyedge.qset_v4_closed_day_validation.v1" and .source_inventory_sha256 == $inventory '\'' >/dev/null; exec polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "polyedge-research-qset-v4" --blob "data/research/shadow/campaign-2026-08-24-qset-v4/control/replay.lock" -- /bin/sh /app/research/run_shadow_daily_v4.sh'
     ;;
+  qset-v5-processor)
+    cpus=4 memory=8g limit=16800
+    POLYEDGE_RESEARCH_IMAGE=${POLYEDGE_QSET_V5_PROCESSOR_IMAGE:-}
+    export POLYEDGE_RESEARCH_IMAGE
+    command='polyedge-rs seal-qset-v5-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date 2026-08-26 --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" --validate-only | jq -e --arg inventory "$POLYEDGE_QSET_V5_DAY1_INVENTORY_SHA256" '\'' .schema == "polyedge.qset_v5_closed_day_validation.v1" and .source_inventory_sha256 == $inventory '\'' >/dev/null; polyedge-rs seal-qset-v5-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date 2026-08-27 --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" --validate-only | jq -e --arg inventory "$POLYEDGE_QSET_V5_DAY2_INVENTORY_SHA256" '\'' .schema == "polyedge.qset_v5_closed_day_validation.v1" and .source_inventory_sha256 == $inventory '\'' >/dev/null; exec polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "polyedge-research-qset-v5" --blob "data/research/shadow/campaign-2026-08-26-qset-v5/control/replay.lock" -- /bin/sh /app/research/run_shadow_daily_v5.sh'
+    ;;
   *)
     echo "unknown PolyEdge job: $job" >&2
     exit 64
@@ -147,7 +153,7 @@ if [ "$job" = daily ]; then
   export POLYEDGE_RESEARCH_IMAGE POLYEDGE_PARITY_BINDINGS_FROZEN
 fi
 
-if [ "$job" != shadow-qset ] && [ "$job" != qset-v4-processor ]; then
+if [ "$job" != shadow-qset ] && [ "$job" != qset-v4-processor ] && [ "$job" != qset-v5-processor ]; then
   test "${POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH:-}" = true || {
     echo 'POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH must equal true for primary OCI jobs' >&2
     exit 64
@@ -166,22 +172,23 @@ available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
   echo "insufficient free ring space: $available bytes available, $minimum_free required" >&2
   exit 1
 }
-[ "$job" != qset-v4-processor ] || /usr/local/libexec/polyedge-qset-v4-processor-preflight
+case "$job" in qset-v4-processor) /usr/local/libexec/polyedge-qset-v4-processor-preflight ;; qset-v5-processor) /usr/local/libexec/polyedge-qset-v5-processor-preflight ;; esac
 case "$job" in
   qset-v4-processor) work=$ring/jobs/qset-v4-processor credential=shadow-qset-v4-processor ;;
+  qset-v5-processor) work=$ring/jobs/qset-v5-processor credential=shadow-qset-v5-processor ;;
   shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;
   *) work=$ring/jobs/research credential=research ;;
 esac
 install -d -m 0750 "$work/data" "$work/reports" "$work/freshness"
 
 credential_dir=/run/polyedge-federated-$credential
-if [ "$job" = qset-v4-processor ]; then
+if [ "$job" = qset-v4-processor ] || [ "$job" = qset-v5-processor ]; then
   token_file=$credential_dir/azure-federated-token
   [ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%a:%h' "$token_file")" = 600:1 ] || {
-    echo 'qset-v4 processor federated token is missing or unsafe' >&2; exit 1;
+    echo 'qset processor federated token is missing or unsafe' >&2; exit 1;
   }
   token_uid=$(stat -c %u "$token_file") token_gid=$(stat -c %g "$token_file")
-  [ "$token_uid" -gt 0 ] && [ "$token_gid" -gt 0 ] || { echo 'qset-v4 processor token must use its dedicated non-root identity' >&2; exit 1; }
+  [ "$token_uid" -gt 0 ] && [ "$token_gid" -gt 0 ] || { echo 'qset processor token must use its dedicated non-root identity' >&2; exit 1; }
   install -d -o "$token_uid" -g "$token_gid" -m 0750 "$work/data" "$work/reports" "$work/freshness"
 elif [ ! -r "$credential_dir/azure-federated-token" ]; then
   # Preserve the reviewed client-secret-file rollback path.
@@ -235,7 +242,7 @@ case "$job" in
     }
     set -- --volume "$ring/segments:/input/events:ro,Z"
     ;;
-  qset-v4-processor)
+  qset-v4-processor|qset-v5-processor)
     set -- --user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges
     ;;
   *) set -- ;;
@@ -320,7 +327,7 @@ if [ "$job" = hourly ]; then
 fi
 
 case "$job" in
-  daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor)
+  daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor)
     set -- /usr/bin/flock -w 129600 /run/polyedge/research.lock "$@"
     ;;
 esac
