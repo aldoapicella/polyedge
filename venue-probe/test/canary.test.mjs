@@ -12,6 +12,7 @@ import {
   assertFundedSignalToSendDeadline,
   loadHashedJson,
   sha256,
+  validateCanaryPreflight,
   validateDeterministicNoOrderReconciliation
 } from "../src/canary-lib.mjs";
 import {
@@ -1735,6 +1736,34 @@ test("loss-resizing protected capital submits only the current-equity size bound
   controls.executeLifecycle = async (value) => {
     controls.calls.execute += 1;
     submittedIntent = value.intent;
+    assert.equal(value.documents.intent, value.intent);
+    const refreshedRuntime = {
+      ...input.runtime,
+      executionSizing: {
+        ...input.runtime.executionSizing,
+        source_shares: 17.25,
+        source_notional: 3.45
+      }
+    };
+    const validation = {
+      config: input.config,
+      ...value.documents,
+      runtime: refreshedRuntime,
+      now
+    };
+    assert.equal(validateCanaryPreflight(validation).shares, 17.25);
+    for (const executionSizing of [
+      { ...refreshedRuntime.executionSizing, source_shares: 17.24 },
+      { ...refreshedRuntime.executionSizing, source_notional: 3.44 }
+    ]) {
+      assert.throws(
+        () => validateCanaryPreflight({
+          ...validation,
+          runtime: { ...refreshedRuntime, executionSizing }
+        }),
+        /protected compounding or current-funds sizing reconciliation failed/
+      );
+    }
     return { order_id: "order-1" };
   };
   const result = await executeStrategyCanary({ ...input, ...controls });

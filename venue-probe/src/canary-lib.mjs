@@ -714,7 +714,7 @@ export async function executeStrategyCanary({ config, documents, runtime, runId,
   };
   const lifecycle = await executeLifecycle({
     intent: executionIntent,
-    documents,
+    documents: { ...documents, intent: executionIntent },
     runtime,
     reservation,
     consumption,
