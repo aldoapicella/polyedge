@@ -35,7 +35,7 @@ jq -e --arg uri "$SHADOW_CODE_FREEZE_MANIFEST" --arg hash "$EXECUTION_FREEZE_SHA
 
 credential_dir=/run/polyedge-federated-shadow-qset-v5-writer
 token_file=$credential_dir/azure-federated-token
-[ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$token_file")" = 982:978:600:1 ] || { echo 'qset-v5 writer federated token is missing or unsafe' >&2; exit 1; }
+[ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$token_file")" = 976:976:600:1 ] || { echo 'qset-v5 writer federated token is missing or unsafe' >&2; exit 1; }
 /usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
 mountpoint -q /srv/polyedge-ring || { echo '/srv/polyedge-ring is not a mount point' >&2; exit 1; }
 for image_revision in "$POLYEDGE_QSET_V5_SEAL_IMAGE:$POLYEDGE_QSET_V5_SEAL_GIT_SHA" "$POLYEDGE_QSET_V5_WRITER_IMAGE:$POLYEDGE_QSET_V5_WRITER_GIT_SHA"; do
@@ -53,7 +53,7 @@ container_freeze_is "SHADOW_CODE_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; cont
 receipt_root=/srv/polyedge-ring/migration/qset-v5-seal; install -d -m 0750 "$receipt_root"
 run_sealer() {
   date=$1; validate_campaign_date "$date"; shift
-  podman run --rm --pull=never --log-driver=journald --name "polyedge-qset-v5-seal-$date" --network polyedge --user 982:978 --cpus 0.5 --memory 1g --pids-limit 256 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=32m --cap-drop=all --env-file "$env_file" -v "$credential_dir:/run/credentials:ro,Z" "$POLYEDGE_QSET_V5_SEAL_IMAGE" seal-qset-v5-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date "$date" --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" "$@"
+  podman run --rm --pull=never --log-driver=journald --name "polyedge-qset-v5-seal-$date" --network polyedge --user 976:976 --cpus 0.5 --memory 1g --pids-limit 256 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=32m --cap-drop=all --env-file "$env_file" -v "$credential_dir:/run/credentials:ro,Z" "$POLYEDGE_QSET_V5_SEAL_IMAGE" seal-qset-v5-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date "$date" --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" "$@"
 }
 validate_receipt() {
   jq -e --arg date "$2" --arg schema "$3" --arg freeze "$EXECUTION_FREEZE_SHA256" --arg freeze_blob "$EXECUTION_FREEZE_ARTIFACT_PATH" '.schema==$schema and .campaign_id=="campaign-2026-08-26-qset-v5" and .date==$date and .container=="polyedge-shadow-qset-v5-events" and .blob_count==1440 and .total_bytes>0 and .source_freeze=={container:"polyedge-qset-v5-control",blob:$freeze_blob,sha256:$freeze,verified:true} and (has("generated_ts")|not) and (has("sealed_at")|not)' "$1" >/dev/null

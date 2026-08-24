@@ -89,7 +89,7 @@ common_guard() {
   load_final_v5_binding
   v3_state=$(capture_v3); validate_v2
   systemctl is-active --quiet "$v5_service"
-  test "$(podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}|{{.State.Health.Status}}' "$v5_container")" = "$POLYEDGE_QSET_V5_WRITER_IMAGE|982:978|running|healthy"
+  test "$(podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}|{{.State.Health.Status}}' "$v5_container")" = "$POLYEDGE_QSET_V5_WRITER_IMAGE|976:976|running|healthy"
   test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$POLYEDGE_QSET_V5_WRITER_IMAGE")" = "linux/arm64|$POLYEDGE_QSET_V5_WRITER_GIT_SHA"
   container_env_is 'SHADOW_CAMPAIGN_ID=campaign-2026-08-26-qset-v5'; container_env_is 'SHADOW_EVIDENCE_VERSION=protocol-v3-qset-v5'; container_env_is 'SHADOW_CODE_FREEZE_FINALIZED=true'
   container_env_is "SHADOW_CODE_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; container_env_is "EXECUTION_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; container_env_is "EXECUTION_FREEZE_ARTIFACT_PATH=$EXECUTION_FREEZE_ARTIFACT_PATH"

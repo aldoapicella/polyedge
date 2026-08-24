@@ -40,19 +40,19 @@ az deployment group create --resource-group rg-polyedge-dev \
   --parameters lane=shadow-qset-v5-processor issuer=https://oidc.jupiterlabs.dev
 ```
 
-Provision two dedicated local service identities: writer UID/GID `982:978` and processor UID/GID `981:977`. Before creating them, prove all four numeric IDs are still unallocated; after creation, prove each name resolves to its exact pair and that the pairs are distinct from every existing lane. Never reuse the v3 writer (`983:979`) or promotion (`985:981`) identity. Register each lane with the exact SPIRE agent path plus its dedicated username. Fetching explicitly by SPIFFE ID keeps the two SVIDs distinct.
+Provision two dedicated local service identities: writer UID/GID `976:976` and processor UID/GID `975:975`. Before creating them, prove both numeric IDs are still unallocated; after creation, prove each name resolves to its exact pair and that the pairs are distinct from every existing lane. Never reuse the v3 writer (`983:979`) or promotion (`985:981`) identity. Register each lane with the exact SPIRE agent path plus its dedicated username. Fetching explicitly by SPIFFE ID keeps the two SVIDs distinct.
 
 ```bash
-! getent passwd 982
-! getent group 978
-! getent passwd 981
-! getent group 977
-sudo groupadd --system --gid 978 polyedge-qset-v5-writer
-sudo useradd --system --uid 982 --gid 978 --home-dir /nonexistent --shell /usr/sbin/nologin polyedge-qset-v5-writer
-sudo groupadd --system --gid 977 polyedge-qset-v5-processor
-sudo useradd --system --uid 981 --gid 977 --home-dir /nonexistent --shell /usr/sbin/nologin polyedge-qset-v5-processor
-test "$(id -u polyedge-qset-v5-writer):$(id -g polyedge-qset-v5-writer)" = 982:978
-test "$(id -u polyedge-qset-v5-processor):$(id -g polyedge-qset-v5-processor)" = 981:977
+! getent passwd 976
+! getent group 976
+! getent passwd 975
+! getent group 975
+sudo groupadd --system --gid 976 polyedge-qset-v5-writer
+sudo useradd --system --uid 976 --gid 976 --home-dir /nonexistent --shell /usr/sbin/nologin polyedge-qset-v5-writer
+sudo groupadd --system --gid 975 polyedge-qset-v5-processor
+sudo useradd --system --uid 975 --gid 975 --home-dir /nonexistent --shell /usr/sbin/nologin polyedge-qset-v5-processor
+test "$(id -u polyedge-qset-v5-writer):$(id -g polyedge-qset-v5-writer)" = 976:976
+test "$(id -u polyedge-qset-v5-processor):$(id -g polyedge-qset-v5-processor)" = 975:975
 ```
 
 ```sh

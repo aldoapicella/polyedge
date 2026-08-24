@@ -29,8 +29,12 @@ for lane in writer processor; do
   grep -F "spiffe://polyedge.local/conduit/shadow-qset-v5-$lane" "$identity" >/dev/null
   grep -F "shadow-qset-v5-$lane" "$token" >/dev/null
 done
-grep -Fx 'User=982' "$writer_override" >/dev/null; grep -Fx 'Group=978' "$writer_override" >/dev/null
-grep -Fx 'User=981' "$processor_override" >/dev/null; grep -Fx 'Group=977' "$processor_override" >/dev/null
+grep -Fx 'User=976' "$writer_override" >/dev/null; grep -Fx 'Group=976' "$writer_override" >/dev/null
+grep -Fx 'User=975' "$processor_override" >/dev/null; grep -Fx 'Group=975' "$processor_override" >/dev/null
+grep -Fx 'User=976:976' "$writer" >/dev/null
+grep -F -- '--user 976:976 --cpus' "$sealer" >/dev/null
+grep -F '$POLYEDGE_QSET_V5_WRITER_IMAGE|976:976|running|healthy' "$guard" >/dev/null
+grep -F -- '-socketPath /run/spire-server/api.sock' "$root/QSET_V5_OCI_RUNBOOK.md" >/dev/null
 grep -Fx 'Volume=/run/polyedge-federated-shadow-qset-v5-writer:/run/credentials:ro,Z' "$writer" >/dev/null
 grep -Fx 'Requires=network-online.target polyedge-federated-token@shadow-qset-v5-writer.service' "$writer" >/dev/null
 ! grep -F 'shadow-qset-v3-writer' "$writer"; ! grep -F 'Conflicts=polyedge-shadow-qset-v3.service' "$writer"
@@ -44,7 +48,7 @@ grep -F 'id-polyedge-conduit-shadow-qset-v5-writer' "$handoff" >/dev/null
 grep -F 'id-polyedge-conduit-shadow-qset-v5-processor' "$handoff" >/dev/null
 grep -F 'v5PrincipalsHaveZeroAssignments:true' "$handoff" >/dev/null
 grep -F 'resources:16,roleAssignments:9,computeResources:0' "$handoff" >/dev/null
-grep -F 'assert_campaign_assignments 4' "$handoff" >/dev/null
+grep -F 'assert_campaign_assignments 5' "$handoff" >/dev/null
 grep -F 'assert_api_reader' "$handoff" >/dev/null
 grep -F 'polyedge-shadow-events polyedge-shadow-qset-events' "$handoff" >/dev/null
 grep -F 'polyedge-shadow-qset-v3-events' "$handoff" >/dev/null

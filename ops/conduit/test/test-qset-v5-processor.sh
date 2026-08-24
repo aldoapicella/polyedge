@@ -19,10 +19,10 @@ grep -F '  qset-v5-processor)' "$runner" >/dev/null
 grep -F 'cpus=4 memory=8g limit=16800' "$runner" >/dev/null
 grep -F '/usr/local/libexec/polyedge-qset-v5-processor-preflight' "$runner" >/dev/null
 grep -F 'credential=shadow-qset-v5-processor' "$runner" >/dev/null
-grep -F 'qset-v5 processor federated token is missing or unsafe' "$runner" >/dev/null
+grep -F 'qset processor federated token is missing or unsafe' "$runner" >/dev/null
 grep -F -- '--user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges' "$runner" >/dev/null
 grep -F -- '--pull=never --log-driver=journald' "$runner" >/dev/null
-grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v5-processor)' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor)' "$runner" >/dev/null
 grep -F '2026-08-26 --source-freeze-blob' "$runner" >/dev/null
 grep -F '2026-08-27 --source-freeze-blob' "$runner" >/dev/null
 grep -F '/app/research/run_shadow_daily_v5.sh' "$runner" >/dev/null
