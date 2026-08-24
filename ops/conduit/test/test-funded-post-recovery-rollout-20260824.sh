@@ -48,7 +48,7 @@ make_fixture() {
       queueBefore:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},
       queueAfter:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},
       brokerOperations:["peekMessages"],mutationOperations:[],remoteStateMutationPerformed:false,
-      safety:{openOrders:0,unresolvedPositions:0,unresolvedRiskReservations:0,durableRiskIndexUnresolvedReservations:0},
+      safety:{heartbeatCapturedAtEpoch:1,openOrders:0,unresolvedPositions:0,unresolvedRiskReservations:0,durableRiskIndexUnresolvedReservations:0},
       duplicateExecutionEvidence:{matchingDlqMessages:3,immutableAuthorizations:3,immutableCompletions:3,terminalReservations:3,orderLifecycles:3,distinctOrderIds:3},
       parityTimerRemainsPaused:true,azureDeletionAllowed:false,
       durableEvidence:[range(0;3) as $i | {
