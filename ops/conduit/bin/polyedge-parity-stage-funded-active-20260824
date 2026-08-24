@@ -286,7 +286,7 @@ test "sha256:$(sha "$settlement")" = "$settlement_receipt_sha"
 validate_recovery_receipt
 validate_rollout_receipt
 test "$(/usr/bin/podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer)" = "$signer_image|986:982|running"
-test "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels \"org.opencontainers.image.revision\" }}' "$signer_image")" = "linux/arm64|$signer_revision"
+test "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$signer_image")" = "linux/arm64|$signer_revision"
 queue_json=$(/usr/sbin/runuser -u ubuntu -- /usr/bin/az servicebus queue show --subscription "$subscription" --resource-group "$resource_group" --namespace-name "$namespace" --name "$queue" --only-show-errors -o json)
 /usr/bin/jq -e --argjson dlq "$service_bus_dlq" '.status == "Active" and
   .countDetails.activeMessageCount == 0 and .countDetails.scheduledMessageCount == 0 and

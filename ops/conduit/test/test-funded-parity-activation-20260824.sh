@@ -9,6 +9,8 @@ grep -Fq 'persistent_message_failed_closed' "$stage"
 grep -Fq '.failed_attempts == 0' "$stage"
 grep -Fq '$warmed | length) >= 1' "$stage"
 grep -Fq 'processed_messages > $heartbeats[0].event.processed_messages' "$stage"
+grep -Fq '{{ index .Labels "org.opencontainers.image.revision" }}' "$stage"
+! grep -Fq '{{ index .Labels \"org.opencontainers.image.revision\" }}' "$stage"
 stage_jq=$(sed -n '476,500p' "$stage")
 printf '%s' '' | jq -Rs --arg invocation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --argjson now 0 "$stage_jq" >/dev/null
 ! grep -Fq 'recovery_dlq=' "$stage"
