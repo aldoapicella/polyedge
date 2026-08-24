@@ -128,6 +128,9 @@ SCRIPT
 set -euo pipefail
 if [ "$(cat "$FAKE_STATE/signer-image")" = "$FAKE_NEW_IMAGE" ]; then
   : >"$FAKE_STATE/new-signer-proof"
+else
+  alert=$(/usr/bin/jq -nc '{schema:"polyedge.funded_direct_alert.v1",status:"historical_attested_failure"}')
+  /usr/bin/jq -nc --arg ts "$(( $(/usr/bin/date -u +%s) - 120 ))000000" --arg inv "$(cat "$FAKE_STATE/signer-invocation")" --arg container "$(cat "$FAKE_STATE/signer-container")" --arg message "$alert" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 fi
 message=$(/usr/bin/jq -nc '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",failed_messages:0,executor:{busy:false,user_channel_ready:true,market_channel_ready:true,user_channel_gaps:0,market_channel_gaps:0,user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,safety_snapshot_cache_ready:true,safety_snapshot_cache_age_ms:1,safety_snapshot_open_order_count:0,safety_snapshot_unresolved_position_count:0,safety_snapshot_unresolved_risk_reservation_count:0,safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
 /usr/bin/jq -nc --arg ts "$(/usr/bin/date -u +%s)000000" --arg inv "$(cat "$FAKE_STATE/signer-invocation")" --arg container "$(cat "$FAKE_STATE/signer-container")" --arg message "$message" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
@@ -170,7 +173,7 @@ SCRIPT
 run_helper() {
   case_root=$1
   shift
-  env FAKE_STATE="$case_root/state" FAKE_NEW_IMAGE="$new_image" FAKE_REVISION="$revision" \
+  env FAKE_STATE="$case_root/state" FAKE_NEW_IMAGE="$new_image" FAKE_OLD_IMAGE="$old_image" FAKE_REVISION="$revision" \
     FAKE_PRODUCER_IMAGE="$producer_image" FAKE_QUADLET="$case_root/signer.container" \
     POLYEDGE_TEST_ALLOW_UNPRIVILEGED=1 \
     POLYEDGE_TEST_RECOVERY="$case_root/ring/funded-recovery/recovery.json" \

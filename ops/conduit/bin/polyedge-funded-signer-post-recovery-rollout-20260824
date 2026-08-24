@@ -168,29 +168,27 @@ heartbeat_safe() {
       [$events[] | select(.invocation == $invocation and .container == $container and
         .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")]
         | sort_by(.timestamp) | last as $heartbeat |
+      $heartbeat != null and $heartbeat.timestamp <= $now and $heartbeat.timestamp >= ($now - 75) and
       ([ $events[] | select(.invocation == $invocation and .container == $container and
         ((.event.schema == "polyedge.funded_direct_alert.v1") or
          (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")) and
-        ($clean or .timestamp > $settlement_cutoff)) ] | length) == 0 and
-      $heartbeat != null and $heartbeat.timestamp <= $now and $heartbeat.timestamp >= ($now - 75) and
+        (if $clean then true else .timestamp > $heartbeat.timestamp end)) ] | length) == 0 and
       $heartbeat.event.executor.busy == false and
-      (if $clean then
-        $heartbeat.event.failed_messages == 0 and
-        $heartbeat.event.executor.user_channel_ready == true and
-        $heartbeat.event.executor.market_channel_ready == true and
-        $heartbeat.event.executor.user_channel_gaps == 0 and
-        $heartbeat.event.executor.market_channel_gaps == 0 and
-        $heartbeat.event.executor.user_channel_unparsed == 0 and
-        $heartbeat.event.executor.market_channel_unparsed == 0 and
-        $heartbeat.event.executor.reconnect_reconciliation_required == false and
-        $heartbeat.event.executor.safety_snapshot_cache_ready == true and
-        ($heartbeat.event.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
-        $heartbeat.event.executor.safety_snapshot_open_order_count == 0 and
-        $heartbeat.event.executor.safety_snapshot_unresolved_position_count == 0 and
-        $heartbeat.event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
-        $heartbeat.event.executor.safety_snapshot_cache_error == null and
-        $heartbeat.event.executor.risk_reservation_index_ready == true
-       else true end)'
+      $heartbeat.event.executor.user_channel_ready == true and
+      $heartbeat.event.executor.market_channel_ready == true and
+      $heartbeat.event.executor.user_channel_gaps == 0 and
+      $heartbeat.event.executor.market_channel_gaps == 0 and
+      $heartbeat.event.executor.user_channel_unparsed == 0 and
+      $heartbeat.event.executor.market_channel_unparsed == 0 and
+      $heartbeat.event.executor.reconnect_reconciliation_required == false and
+      $heartbeat.event.executor.safety_snapshot_cache_ready == true and
+      ($heartbeat.event.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+      $heartbeat.event.executor.safety_snapshot_open_order_count == 0 and
+      $heartbeat.event.executor.safety_snapshot_unresolved_position_count == 0 and
+      $heartbeat.event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+      $heartbeat.event.executor.safety_snapshot_cache_error == null and
+      $heartbeat.event.executor.risk_reservation_index_ready == true and
+      (if $clean then $heartbeat.event.failed_messages == 0 else $heartbeat.timestamp >= $settlement_cutoff end)'
 }
 
 wait_signer_safe() {
