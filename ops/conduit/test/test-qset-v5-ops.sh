@@ -67,6 +67,10 @@ grep -F 'polyedge.qset_v5_source_freeze_upload_receipt.v2' "$guard" >/dev/null
 grep -F '.researchImage==$writerImage' "$guard" >/dev/null; grep -F '.sourceCommit==$writerCommit' "$guard" >/dev/null
 grep -F 'polyedge.qset_v5_source_freeze_upload_receipt.v2' "$sealer" >/dev/null
 grep -F '.researchImage==$sealImage' "$sealer" >/dev/null; grep -F '.sourceCommit==$sealCommit' "$sealer" >/dev/null
+grep -Fx 'readonly boundary=2026-08-26T00:00:00Z' "$guard" >/dev/null
+grep -Fx 'readonly boundary_epoch=1787702400' "$guard" >/dev/null
+grep -Fx 'readonly pre_receipt=$receipt_root/20260826T000000Z-pre.json' "$guard" >/dev/null
+grep -Fx 'readonly post_receipt=$receipt_root/20260826T000000Z-post.json' "$guard" >/dev/null
 
 grep -F 'systemctl is-active --quiet "$v3_service"' "$guard" >/dev/null
 grep -F 'polyedge-qset-v3-first-seal.timer' "$guard" >/dev/null

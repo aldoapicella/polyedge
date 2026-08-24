@@ -4,7 +4,7 @@ umask 027
 
 readonly mode=${1:-}
 readonly boundary=2026-08-26T00:00:00Z
-readonly boundary_epoch=1787529600
+readonly boundary_epoch=1787702400
 readonly v5_service=polyedge-shadow-qset-v5.service
 readonly v5_container=polyedge-shadow-qset-v5
 readonly v3_service=polyedge-shadow-qset-v3.service
@@ -16,8 +16,8 @@ readonly v5_env=/etc/polyedge/shadow-qset-v5.env
 readonly v5_sealer_env=/etc/polyedge/qset-v5-sealer.env
 readonly freeze_receipt_root=/srv/polyedge-ring/migration/qset-v5/source-freeze
 readonly receipt_root=/srv/polyedge-ring/migration/qset-v5/boundary
-readonly pre_receipt=$receipt_root/20260824T000000Z-pre.json
-readonly post_receipt=$receipt_root/20260824T000000Z-post.json
+readonly pre_receipt=$receipt_root/20260826T000000Z-pre.json
+readonly post_receipt=$receipt_root/20260826T000000Z-post.json
 
 case "$mode" in check|pre|post) ;; *) echo "usage: ${0##*/} check|pre|post" >&2; exit 64 ;; esac
 

@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+readonly old_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:976492b39921417ec8db01bcc38b09cc42c97afd4bb573047d4284db0a9ceeb8
+readonly recovery_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3
+readonly producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8
+readonly recovery_receipt_sha=925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
+readonly settlement_receipt_sha=f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
+readonly recovery_script_sha=8ec3b59df15f3d6b2c8e55687f1b064bbf8af793231486063ec8a073b0bed8b4
+readonly authorized_dlq=1311
+readonly old_quadlet_sha=8d323a3aa7f502836e31c207235d74093d5684dc130cd63a4084af188a3dd2fb
+readonly deploy_sha=f3bab7f8a53fedb1daa9a4b6843b4d87e3eec6362e7df6be83fdfda712f45396
+readonly decision=65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7
+readonly run=funded-direct-20260822235002541-68c5aaa9
+readonly order=0xd9b1491affbcc71b3876763af5583411b05e08ef8b46a74a88d983dbea1a9319
+readonly reservation_blob=reports/research/venue-probe/risk-reservations/2026-08-22/funded-direct-65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7.json
+readonly reservation_sha=sha256:e32a1ec82254c5490f0c25a25d2fed99fe3ab129002610234c704ef688a24a9d
+readonly completion_blob=reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/completed/65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7.json
+readonly completion_sha=sha256:fcc2f5861c5364202bd171b4b229e883472980f1db752ab7588bdba1d2f3bed9
+readonly summary_blob=reports/research/venue-probe/runs/2026-08-22/funded-direct-20260822235002541-68c5aaa9/summary.json
+readonly summary_sha=sha256:a5ea76b54d8b3b9b3fa4ae5d549de6466d0eae1c22d4ca4074b362ec0c725d57
+readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+readonly resource_group=rg-polyedge-dev
+readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+readonly queue=funded-dynamic-quote-intents
+
+test "$#" -eq 2 || {
+  echo 'usage: polyedge-funded-signer-scaled-intent-rollout-20260824 NEW_DIGEST NEW_REVISION' >&2
+  exit 64
+}
+new_image=$1
+new_revision=$2
+printf '%s' "$new_image" | /usr/bin/grep -Eq '^ghcr\.io/aldoapicella/polyedge-venue-probe@sha256:[0-9a-f]{64}$' || {
+  echo 'usage: polyedge-funded-signer-scaled-intent-rollout-20260824 NEW_DIGEST NEW_REVISION' >&2
+  exit 64
+}
+printf '%s' "$new_revision" | /usr/bin/grep -Eq '^[0-9a-f]{40}$' || {
+  echo 'new image revision must be a full 40-character Git SHA' >&2
+  exit 64
+}
+test "$new_image" != "$old_image"
+
+recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
+settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
+rollout=/srv/polyedge-ring/parity/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json
+activation=${rollout%/*}
+pending_rollout=$activation/20260824T083626Z-funded-signer-scaled-intent-rollout.pending.json
+recovery_script=/usr/local/libexec/polyedge-funded-reservation-recovery-20260824
+quadlet=/etc/containers/systemd/polyedge-funded-signer.container
+deploy=/usr/local/sbin/polyedge-quadlet-deploy
+disk_guard=/usr/local/libexec/polyedge-boot-disk-guard
+systemctl=/usr/bin/systemctl
+podman=/usr/bin/podman
+journalctl=/usr/bin/journalctl
+runuser=/usr/sbin/runuser
+az=/usr/bin/az
+expected_uid=0
+expected_gid=0
+lock_file=/run/polyedge/utility.lock
+wait_attempts=36
+wait_seconds=5
+
+if [ "${POLYEDGE_TEST_ALLOW_UNPRIVILEGED:-}" = 1 ]; then
+  recovery=${POLYEDGE_TEST_RECOVERY:?}
+  settlement=${POLYEDGE_TEST_SETTLEMENT:?}
+  rollout=${POLYEDGE_TEST_ROLLOUT:?}
+  activation=${rollout%/*}
+  pending_rollout=$activation/20260824T083626Z-funded-signer-scaled-intent-rollout.pending.json
+  recovery_script=${POLYEDGE_TEST_RECOVERY_SCRIPT:?}
+  quadlet=${POLYEDGE_TEST_QUADLET:?}
+  deploy=${POLYEDGE_TEST_DEPLOY:?}
+  disk_guard=${POLYEDGE_TEST_DISK_GUARD:?}
+  systemctl=${POLYEDGE_TEST_SYSTEMCTL:?}
+  podman=${POLYEDGE_TEST_PODMAN:?}
+  journalctl=${POLYEDGE_TEST_JOURNALCTL:?}
+  runuser=${POLYEDGE_TEST_RUNUSER:?}
+  az=${POLYEDGE_TEST_AZ:?}
+  expected_uid=${POLYEDGE_TEST_UID:?}
+  expected_gid=${POLYEDGE_TEST_GID:?}
+  expected_recovery_receipt_sha=${POLYEDGE_TEST_RECOVERY_RECEIPT_SHA:?}
+  expected_settlement_receipt_sha=${POLYEDGE_TEST_SETTLEMENT_RECEIPT_SHA:?}
+  expected_recovery_script_sha=${POLYEDGE_TEST_RECOVERY_SCRIPT_SHA:?}
+  expected_quadlet_sha=${POLYEDGE_TEST_QUADLET_SHA:?}
+  expected_deploy_sha=${POLYEDGE_TEST_DEPLOY_SHA:?}
+  lock_file=${POLYEDGE_TEST_LOCK_FILE:?}
+  wait_attempts=${POLYEDGE_TEST_WAIT_ATTEMPTS:-36}
+  wait_seconds=${POLYEDGE_TEST_WAIT_SECONDS:-5}
+else
+  test "$(/usr/bin/id -u)" -eq 0
+  expected_recovery_receipt_sha=$recovery_receipt_sha
+  expected_settlement_receipt_sha=$settlement_receipt_sha
+  expected_recovery_script_sha=$recovery_script_sha
+  expected_quadlet_sha=$old_quadlet_sha
+  expected_deploy_sha=$deploy_sha
+fi
+
+temporary=
+complete=false
+producer_was_active=false
+
+sha() { /usr/bin/sha256sum "$1" | /usr/bin/cut -d' ' -f1; }
+
+secure_file() {
+  local path=$1 mode=$2 max=$3 uid gid actual links size
+  test ! -L "$path" && test -f "$path"
+  read -r uid gid actual links size < <(/usr/bin/stat -c '%u %g %a %h %s' "$path")
+  test "$uid:$gid:$actual:$links" = "$expected_uid:$expected_gid:$mode:1"
+  test "$size" -gt 0 && test "$size" -le "$max"
+}
+
+queue_json() {
+  "$runuser" -u ubuntu -- "$az" servicebus queue show --subscription "$subscription" \
+    --resource-group "$resource_group" --namespace-name "$namespace" --name "$queue" \
+    --only-show-errors -o json
+}
+
+queue_snapshot() {
+  queue_json | /usr/bin/jq -ce --argjson expected "$authorized_dlq" '
+    if .status == "Active" and .countDetails.activeMessageCount == 0 and
+       .countDetails.scheduledMessageCount == 0 and .countDetails.deadLetterMessageCount == $expected
+    then {status:.status,activeMessageCount:.countDetails.activeMessageCount,
+      scheduledMessageCount:.countDetails.scheduledMessageCount,
+      deadLetterMessageCount:.countDetails.deadLetterMessageCount}
+    else error("queue differs from the immutable settlement baseline") end'
+}
+
+binding() {
+  "$podman" exec polyedge-funded-signer node --input-type=module -e '
+    import {loadCampaignUnresolvedRiskReservationRecords} from "./src/lib.mjs";
+    const config={campaignId:process.env.VENUE_PROBE_FUNDED_CAMPAIGN_ID,operatorDirect:true,dryRun:false,
+      storageAccount:process.env.AZURE_STORAGE_ACCOUNT_NAME,storageContainer:process.env.AZURE_STORAGE_CONTAINER_NAME,
+      azureClientId:process.env.AZURE_CLIENT_ID};
+    const records=await loadCampaignUnresolvedRiskReservationRecords(config); const record=records[0]||{};
+    console.log([records.length,record.blob_name||"",record.reservation?.run_id||"",record.reservation?.order_id||""].join("|"));'
+}
+
+signer_identity() {
+  "$podman" inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer
+}
+
+producer_safe() {
+  "$systemctl" is-active --quiet polyedge-funded-intent-producer.service &&
+    test "$("$podman" inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}|{{.State.Health.Status}}' polyedge-funded-intent-producer 2>/dev/null || true)" = \
+      "$producer_image|984:980|running|healthy"
+}
+
+start_producer() {
+  "$systemctl" start polyedge-funded-intent-producer.service || return 1
+  for _ in $(/usr/bin/seq 1 "$wait_attempts"); do
+    if producer_safe; then return 0; fi
+    /usr/bin/sleep "$wait_seconds"
+  done
+  return 1
+}
+
+heartbeat_safe() {
+  local clean=$1 invocation container now
+  invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value) || return 1
+  container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer) || return 1
+  now=$(/usr/bin/date -u +%s)
+  "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager | /usr/bin/jq -Rse \
+    --arg invocation "$invocation" --arg container "$container" --argjson now "$now" \
+    --argjson clean "$clean" --argjson settlement_cutoff "$settlement_cutoff" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
+        {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
+         invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] as $events |
+      [$events[] | select(.invocation == $invocation and .container == $container and
+        .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")]
+        | sort_by(.timestamp) | last as $heartbeat |
+      $heartbeat != null and $heartbeat.timestamp <= $now and $heartbeat.timestamp >= ($now - 75) and
+      ([ $events[] | select(.invocation == $invocation and .container == $container and
+        ((.event.schema == "polyedge.funded_direct_alert.v1") or
+         (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")) and
+        (if $clean then true else .timestamp > $heartbeat.timestamp end)) ] | length) == 0 and
+      $heartbeat.event.executor.busy == false and
+      $heartbeat.event.executor.user_channel_ready == true and
+      $heartbeat.event.executor.market_channel_ready == true and
+      $heartbeat.event.executor.user_channel_gaps == 0 and
+      $heartbeat.event.executor.market_channel_gaps == 0 and
+      $heartbeat.event.executor.user_channel_unparsed == 0 and
+      $heartbeat.event.executor.market_channel_unparsed == 0 and
+      $heartbeat.event.executor.reconnect_reconciliation_required == false and
+      $heartbeat.event.executor.safety_snapshot_cache_ready == true and
+      ($heartbeat.event.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+      $heartbeat.event.executor.safety_snapshot_open_order_count == 0 and
+      $heartbeat.event.executor.safety_snapshot_unresolved_position_count == 0 and
+      $heartbeat.event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+      $heartbeat.event.executor.safety_snapshot_cache_error == null and
+      $heartbeat.event.executor.risk_reservation_index_ready == true and
+      (if $clean then $heartbeat.event.failed_messages == 0 else $heartbeat.timestamp >= $settlement_cutoff end)'
+}
+
+wait_signer_safe() {
+  local clean=$1 image=$2
+  for _ in $(/usr/bin/seq 1 "$wait_attempts"); do
+    if "$systemctl" is-active --quiet polyedge-funded-signer.service &&
+       test "$(signer_identity 2>/dev/null || true)" = "$image|986:982|running" &&
+       test "$(binding 2>/dev/null || true)" = '0|||' && heartbeat_safe "$clean"; then
+      return 0
+    fi
+    /usr/bin/sleep "$wait_seconds"
+  done
+  return 1
+}
+new_signer_safe() {
+  test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$new_image" 2>/dev/null || true)" = "linux/arm64|$new_revision" &&
+    test "$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value 2>/dev/null || true)" = 0 &&
+    wait_signer_safe true "$new_image"
+}
+
+validate_settlement_receipt() {
+  /usr/bin/jq -e --argjson decisions '["5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759"]' \
+    --argjson orders '["0xbcdf3a4bd0e6c1d8cf61aca501c86ca0ed8d557547929bdb87326c6133ad99d9","0xc655d44197be86d5013939e9366c223076915c80b5df10b3982be77632ecef68","0x8a022015f95b2ec94f09865feaa05d7e95c34176e76299c8208f216d8c0ba5da"]' '
+      .schema == "polyedge.funded_dlq_settlement_reconciliation.v1" and
+      .status == "attested_durable_completion_no_duplicate_execution" and
+      .authorizedDeadLetterBaseline == 1311 and
+      .queueBefore == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311} and
+      .queueAfter == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311} and
+      .brokerOperations == ["peekMessages"] and .mutationOperations == [] and
+      .remoteStateMutationPerformed == false and
+      (.safety.heartbeatCapturedAtEpoch | type == "number" and . > 0) and
+      .safety.openOrders == 0 and .safety.unresolvedPositions == 0 and
+      .safety.unresolvedRiskReservations == 0 and .safety.durableRiskIndexUnresolvedReservations == 0 and
+      .duplicateExecutionEvidence == {matchingDlqMessages:3,immutableAuthorizations:3,
+        immutableCompletions:3,terminalReservations:3,orderLifecycles:3,distinctOrderIds:3} and
+      .parityTimerRemainsPaused == true and .azureDeletionAllowed == false and
+      (.durableEvidence | length) == 3 and
+      ([.durableEvidence[].message.decisionId] == $decisions) and
+      ([.durableEvidence[].reservation.orderId] == $orders) and
+      ([.durableEvidence[].message.decisionId] | unique | length) == 3 and
+      ([.durableEvidence[].reservation.orderId] | unique | length) == 3 and
+      . as $root | all(range(0;3); . as $i | $root.durableEvidence[$i] as $e |
+        $e.message.messageId == $decisions[$i] and $e.message.decisionId == $decisions[$i] and
+        $e.authorization.decisionId == $decisions[$i] and $e.completion.decisionId == $decisions[$i] and
+        $e.summary.decisionId == $decisions[$i] and
+        $e.authorization.childRunId == $e.completion.childRunId and
+        $e.completion.childRunId == $e.reservation.runId and $e.reservation.runId == $e.summary.runId and
+        $e.reservation.orderId == $orders[$i] and $e.summary.orderId == $orders[$i] and
+        $e.reservation.state == "finalized_no_fill" and $e.reservation.reconciliationComplete == true and
+        $e.reservation.zeroOpenOrdersConfirmed == true and $e.reservation.matchedNotional == 0 and
+        $e.summary.reconciliationComplete == true and $e.summary.zeroOpenOrdersConfirmed == true)
+    ' "$settlement" >/dev/null
+}
+
+validate_pending_rollout() {
+  secure_file "$pending_rollout" 640 65536
+  /usr/bin/jq -e --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
+    --arg recovery_path "$recovery" --arg recovery_sha "sha256:$recovery_file_sha" \
+    --arg settlement_path "$settlement" --arg settlement_sha "sha256:$settlement_file_sha" \
+    --arg helper "sha256:$helper_sha" --arg deploy "sha256:$deploy_file_sha" \
+    --arg recovery_script "sha256:$expected_recovery_script_sha" --arg quadlet_before "sha256:$expected_quadlet_sha" '
+      .schema == "polyedge.funded_signer_scaled_intent_rollout_pending.v1" and
+      .status == "deployment_pending_receipt" and
+      .oldImage == $old and .newImage == $new and .newRevision == $revision and
+      .recoveryReceipt == {path:$recovery_path,sha256:$recovery_sha} and
+      .settlementReceipt == {path:$settlement_path,sha256:$settlement_sha} and
+      .authorizedDeadLetterBaseline == 1311 and
+      .helperSha256 == $helper and .deploySha256 == $deploy and
+      .recoveryScriptSha256 == $recovery_script and .quadlet.beforeSha256 == $quadlet_before and
+      (.quadlet.afterSha256 | test("^sha256:[0-9a-f]{64}$")) and
+      (.runtime.oldInvocationId | test("^[0-9a-f]{32}$")) and
+      (.runtime.oldContainerId | test("^[0-9a-f]{64}$")) and
+      (.producerWasActive | type) == "boolean" and .unresolvedReservationsBefore == 0 and
+      .queue == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311} and
+      .parityTimerRemainsPaused == true and .azureDeletionAllowed == false' "$pending_rollout" >/dev/null
+}
+
+restore_on_failure() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  /usr/bin/rm -f "$temporary"
+  if [ "$complete" != true ]; then
+    "$systemctl" stop polyedge-funded-intent-producer.service >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+}
+trap restore_on_failure EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+exec 9>"$lock_file"
+/usr/bin/flock -n 9 || { echo 'another PolyEdge utility is active' >&2; exit 75; }
+
+secure_file "$0" 755 65536
+secure_file "$recovery" 640 65536
+secure_file "$settlement" 640 65536
+secure_file "$recovery_script" 700 65536
+secure_file "$deploy" 755 65536
+secure_file "$quadlet" 600 65536
+test "$(sha "$recovery")" = "$expected_recovery_receipt_sha"
+test "$(sha "$settlement")" = "$expected_settlement_receipt_sha"
+test "$(sha "$recovery_script")" = "$expected_recovery_script_sha"
+test "$(sha "$deploy")" = "$expected_deploy_sha"
+helper_sha=$(sha "$0")
+deploy_file_sha=$(sha "$deploy")
+recovery_file_sha=$(sha "$recovery")
+settlement_file_sha=$(sha "$settlement")
+/usr/bin/jq -e --arg decision "$decision" --arg run "$run" --arg order "$order" \
+  --arg recovery_image "$recovery_image" --arg producer "$producer_image" --arg reservation "$reservation_blob" \
+  --arg reservation_sha "$reservation_sha" --arg completion "$completion_blob" \
+  --arg completion_sha "$completion_sha" --arg summary "$summary_blob" --arg summary_sha "$summary_sha" '
+    .schema == "polyedge.acknowledged_no_fill_reconciliation.v1" and .status == "finalized_no_fill" and
+    (.cutoverCompletedAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    .decision_id == $decision and .run_id == $run and .order_id == $order and
+    .order_submission_attempted == true and .recovery_order_submission_attempted == false and
+    .recovery_grant_consumed == false and .recovery_risk_reservation_created == false and
+    .reconciliation_reason == "acknowledged_evicted_order_no_fill" and .evidence.observation_ms >= 10000 and
+    .recoveryImage == $recovery_image and .signerImageUnchanged == $recovery_image and .producerImageUnchanged == $producer and
+    .reservationEvidence == {blob:$reservation,sha256:$reservation_sha} and
+    .completionEvidence == {blob:$completion,sha256:$completion_sha} and
+    .summaryEvidence == {blob:$summary,sha256:$summary_sha} and
+    .unresolvedReservationsAfter == 0 and .queueActiveMessages == 0 and .queueScheduledMessages == 0 and
+    .queueDeadLetterMessages == 1308 and
+    .parityTimerRemainsPaused == true and .azureDeletionAllowed == false' "$recovery" >/dev/null
+validate_settlement_receipt
+settlement_cutoff=$(/usr/bin/jq -er '.safety.heartbeatCapturedAtEpoch | select(type == "number" and . > 0)' "$settlement")
+
+"$disk_guard" --assert-headroom
+test ! -e /run/polyedge/image-pulls-paused
+! "$systemctl" is-active --quiet polyedge-parity-hourly.timer
+queue_snapshot >/dev/null
+
+if [ -e "$rollout" ]; then
+  secure_file "$rollout" 640 65536
+  validate_pending_rollout
+  rollout_sha=$(sha "$rollout")
+  pending_rollout_sha=$(sha "$pending_rollout")
+  /usr/bin/jq -e --arg new "$new_image" --arg revision "$new_revision" --arg old "$old_image" \
+    --arg recovery_path "$recovery" --arg recovery_sha "sha256:$recovery_file_sha" \
+    --arg settlement_path "$settlement" --arg settlement_sha "sha256:$settlement_file_sha" \
+    --arg helper "sha256:$helper_sha" --arg deploy "sha256:$deploy_file_sha" \
+    --arg recovery_script "sha256:$expected_recovery_script_sha" --arg quadlet "sha256:$(sha "$quadlet")" \
+    --arg pending_path "$pending_rollout" --arg pending_sha "sha256:$pending_rollout_sha" '
+      .schema == "polyedge.funded_signer_scaled_intent_rollout.v1" and .status == "validated" and
+      .oldImage == $old and .newImage == $new and .newRevision == $revision and
+      .recoveryReceipt == {path:$recovery_path,sha256:$recovery_sha} and
+      .settlementReceipt == {path:$settlement_path,sha256:$settlement_sha} and
+      .authorizedDeadLetterBaseline == 1311 and .helperSha256 == $helper and .deploySha256 == $deploy and
+      .recoveryScriptSha256 == $recovery_script and .quadlet.afterSha256 == $quadlet and
+      .pendingRollout == {path:$pending_path,sha256:$pending_sha} and
+      (.producerWasActive | type) == "boolean" and .producerStoppedForDeployment == .producerWasActive and
+      .producerStartedAfterSignerProof == true and .producerRestored == true and
+      .unresolvedReservationsAfter == 0 and
+      .queue == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311} and
+      .parityTimerRemainsPaused == true and .azureDeletionAllowed == false' "$rollout" >/dev/null
+  test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
+  new_signer_safe
+  queue_snapshot >/dev/null
+  test "$(binding)" = '0|||'
+  if ! producer_safe; then
+    ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+    ! "$podman" container exists polyedge-funded-intent-producer
+    start_producer
+  fi
+  ! "$systemctl" is-active --quiet polyedge-parity-hourly.timer
+  complete=true
+  trap - EXIT HUP INT TERM
+  printf 'scaled-intent signer rollout already validated sha256:%s\n' "$rollout_sha"
+  exit 0
+fi
+
+if [ -e "$pending_rollout" ]; then
+  validate_pending_rollout
+  producer_was_active=$(/usr/bin/jq -er '.producerWasActive | if type == "boolean" then tostring else error("producerWasActive") end' "$pending_rollout")
+  old_invocation=$(/usr/bin/jq -er '.runtime.oldInvocationId' "$pending_rollout")
+  old_container=$(/usr/bin/jq -er '.runtime.oldContainerId' "$pending_rollout")
+  old_quadlet_file_sha=$(/usr/bin/jq -er '.quadlet.beforeSha256 | ltrimstr("sha256:")' "$pending_rollout")
+  expected_new_quadlet_sha=$(/usr/bin/jq -er '.quadlet.afterSha256 | ltrimstr("sha256:")' "$pending_rollout")
+  if producer_safe; then
+    "$systemctl" stop polyedge-funded-intent-producer.service
+  else
+    ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+    ! "$podman" container exists polyedge-funded-intent-producer
+  fi
+  ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+  ! "$podman" container exists polyedge-funded-intent-producer
+  if [ "$(sha "$quadlet")" = "$expected_quadlet_sha" ] &&
+     [ "$(/usr/bin/grep -c "^Image=$old_image$" "$quadlet")" -eq 1 ]; then
+    test "$(signer_identity)" = "$old_image|986:982|running"
+    test "$(binding)" = '0|||'
+    test "$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)" = "$old_invocation"
+    test "$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)" = "$old_container"
+    wait_signer_safe false "$old_image"
+    queue_snapshot >/dev/null
+    "$deploy" polyedge-funded-signer "$new_image"
+  fi
+else
+  test "$(sha "$quadlet")" = "$expected_quadlet_sha"
+  test "$(/usr/bin/grep -c "^Image=$old_image$" "$quadlet")" -eq 1
+  test "$(signer_identity)" = "$old_image|986:982|running"
+  test "$(binding)" = '0|||'
+  wait_signer_safe false "$old_image"
+  if producer_safe; then
+    producer_was_active=true
+  else
+    ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+    ! "$podman" container exists polyedge-funded-intent-producer
+    producer_was_active=false
+  fi
+  old_invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)
+  old_container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)
+  old_quadlet_file_sha=$(sha "$quadlet")
+  expected_new_quadlet_sha=$(/usr/bin/awk -v image="$new_image" '/^Image=/ {print "Image=" image; next} {print}' "$quadlet" | /usr/bin/sha256sum | /usr/bin/cut -d' ' -f1)
+  queue_before=$(queue_snapshot)
+  /usr/bin/install -d -o "$expected_uid" -g "$expected_gid" -m 0750 "$activation"
+  temporary=$(/usr/bin/mktemp "$activation/.20260824T083626Z-funded-signer-scaled-intent-rollout.pending.XXXXXX")
+  /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
+    --arg recovery_path "$recovery" --arg recovery_sha "sha256:$recovery_file_sha" \
+    --arg settlement_path "$settlement" --arg settlement_sha "sha256:$settlement_file_sha" \
+    --arg helper_sha "sha256:$helper_sha" --arg deploy_sha "sha256:$deploy_file_sha" \
+    --arg recovery_script_sha "sha256:$expected_recovery_script_sha" \
+    --arg quadlet_before "sha256:$old_quadlet_file_sha" --arg quadlet_after "sha256:$expected_new_quadlet_sha" \
+    --arg old_invocation "$old_invocation" --arg old_container "$old_container" \
+    --argjson producer_was_active "$producer_was_active" --argjson queue "$queue_before" '
+      {schema:"polyedge.funded_signer_scaled_intent_rollout_pending.v1",status:"deployment_pending_receipt",
+       createdAtUtc:$created,oldImage:$old,newImage:$new,newRevision:$revision,
+       recoveryReceipt:{path:$recovery_path,sha256:$recovery_sha},
+       settlementReceipt:{path:$settlement_path,sha256:$settlement_sha},authorizedDeadLetterBaseline:1311,
+       helperSha256:$helper_sha,deploySha256:$deploy_sha,recoveryScriptSha256:$recovery_script_sha,
+       quadlet:{beforeSha256:$quadlet_before,afterSha256:$quadlet_after},
+       runtime:{oldInvocationId:$old_invocation,oldContainerId:$old_container},
+       producerWasActive:$producer_was_active,unresolvedReservationsBefore:0,queue:$queue,
+       parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$temporary"
+  /usr/bin/chown "$expected_uid:$expected_gid" "$temporary"
+  /usr/bin/chmod 0640 "$temporary"
+  /usr/bin/sync -f "$temporary"
+  /usr/bin/mv -n "$temporary" "$pending_rollout"
+  test ! -e "$temporary"
+  temporary=
+  /usr/bin/sync -f "$activation"
+  validate_pending_rollout
+  if [ "$producer_was_active" = true ]; then
+    "$systemctl" stop polyedge-funded-intent-producer.service
+  fi
+  ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service
+  ! "$podman" container exists polyedge-funded-intent-producer
+  queue_snapshot >/dev/null
+  wait_signer_safe false "$old_image"
+  "$deploy" polyedge-funded-signer "$new_image"
+fi
+
+secure_file "$quadlet" 600 65536
+test "$(sha "$quadlet")" = "$expected_new_quadlet_sha"
+test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
+new_signer_safe
+new_invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)
+new_container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)
+test "$new_invocation" != "$old_invocation"
+test "$new_container" != "$old_container"
+new_quadlet_file_sha=$(sha "$quadlet")
+queue_snapshot >/dev/null
+test "$(binding)" = '0|||'
+"$disk_guard" --assert-headroom
+test ! -e /run/polyedge/image-pulls-paused
+! "$systemctl" is-active --quiet polyedge-parity-hourly.timer
+start_producer
+producer_invocation=$("$systemctl" show polyedge-funded-intent-producer.service -p InvocationID --value)
+queue_final=$(queue_snapshot)
+test "$(binding)" = '0|||'
+new_signer_safe
+for identifier in "$old_invocation" "$new_invocation" "$producer_invocation"; do
+  printf '%s' "$identifier" | /usr/bin/grep -Eq '^[0-9a-f]{32}$'
+done
+for identifier in "$old_container" "$new_container"; do
+  printf '%s' "$identifier" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+done
+available=$(/usr/bin/df -P -B1 / | /usr/bin/awk 'NR == 2 {print $4}')
+printf '%s' "$available" | /usr/bin/grep -Eq '^[0-9]+$'
+test "$available" -ge 16106127360
+
+/usr/bin/install -d -o "$expected_uid" -g "$expected_gid" -m 0750 "$activation"
+validate_pending_rollout
+pending_rollout_sha=$(sha "$pending_rollout")
+temporary=$(/usr/bin/mktemp "$activation/.20260824T083626Z-funded-signer-scaled-intent-rollout.XXXXXX")
+/usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
+  --arg recovery_path "$recovery" --arg recovery_sha "sha256:$recovery_file_sha" \
+  --arg settlement_path "$settlement" --arg settlement_sha "sha256:$settlement_file_sha" \
+  --arg helper_sha "sha256:$helper_sha" --arg deploy_sha "sha256:$deploy_file_sha" \
+  --arg recovery_script_sha "sha256:$expected_recovery_script_sha" \
+  --arg quadlet_before "sha256:$old_quadlet_file_sha" --arg quadlet_after "sha256:$new_quadlet_file_sha" \
+  --arg pending_path "$pending_rollout" --arg pending_sha "sha256:$pending_rollout_sha" \
+  --arg old_invocation "$old_invocation" --arg old_container "$old_container" \
+  --arg new_invocation "$new_invocation" --arg new_container "$new_container" \
+  --arg producer_invocation "$producer_invocation" --argjson queue "$queue_final" \
+  --argjson available "$available" --argjson producer_was_active "$producer_was_active" '
+    {schema:"polyedge.funded_signer_scaled_intent_rollout.v1",status:"validated",createdAtUtc:$created,
+     oldImage:$old,newImage:$new,newRevision:$revision,
+     recoveryReceipt:{path:$recovery_path,sha256:$recovery_sha},
+     settlementReceipt:{path:$settlement_path,sha256:$settlement_sha},authorizedDeadLetterBaseline:1311,
+     helperSha256:$helper_sha,deploySha256:$deploy_sha,recoveryScriptSha256:$recovery_script_sha,
+     quadlet:{beforeSha256:$quadlet_before,afterSha256:$quadlet_after},
+     pendingRollout:{path:$pending_path,sha256:$pending_sha},
+     runtime:{oldInvocationId:$old_invocation,oldContainerId:$old_container,
+       newInvocationId:$new_invocation,newContainerId:$new_container,producerInvocationId:$producer_invocation},
+     producerWasActive:$producer_was_active,producerStoppedForDeployment:$producer_was_active,
+     producerStartedAfterSignerProof:true,producerRestored:true,unresolvedReservationsAfter:0,
+     queue:$queue,disk:{availableBytes:$available,minimumAvailableBytes:16106127360},
+     parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$temporary"
+/usr/bin/chown "$expected_uid:$expected_gid" "$temporary"
+/usr/bin/chmod 0640 "$temporary"
+/usr/bin/sync -f "$temporary"
+/usr/bin/ln "$temporary" "$rollout"
+/usr/bin/sync -f "$activation"
+/usr/bin/rm -f "$temporary"
+/usr/bin/sync -f "$activation"
+temporary=
+complete=true
+trap - EXIT HUP INT TERM
+/usr/bin/logger -p daemon.info -t polyedge-funded-recovery "deployed validated scaled-intent funded signer revision=$new_revision" || true
+printf 'validated scaled-intent funded signer rollout: %s\n' "$rollout"
