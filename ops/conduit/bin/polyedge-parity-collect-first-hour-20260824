@@ -14,11 +14,15 @@ readonly transaction=$rollback/env-transaction.json
 readonly staged=/srv/polyedge-ring/parity/activation/20260824T080000Z-staged.json
 readonly validated=/srv/polyedge-ring/parity/activation/20260824T080000Z-first-hour-validated.json
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260824T052321Z-funded-signer-rollout.json
+readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
+readonly rollout=/srv/polyedge-ring/parity/activation/20260824T060435Z-funded-signer-rollout.json
+readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
+readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
+readonly authorized_dlq=1311
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:2de07dc77ec2b529616f8df96735400c1ad1fc28185c0504bf4d16ac7aac54f8
+readonly collector_sha=sha256:6af251be658005fd9a9803f4193d2e489ac46cadd7e14299649b3627948d3ed3
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:0ef4557fd4f5231cd6e4063ea263b444bd3e5458d4efe33e06810603c503af3a
+readonly validator_sha=sha256:06afbf3330085179a90bfd6b16c448f618389f0e77f5516028ec4d22c3a69bfe
 readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
 readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
@@ -45,12 +49,14 @@ secure_file() {
 }
 
 validate_staged_receipt() {
-  local staged_path=${1:-$staged} recovery_path=${2:-$recovery} rollout_path=${3:-$rollout}
+  local staged_path=${1:-$staged} recovery_path=${2:-$recovery} rollout_path=${3:-$rollout} settlement_path=${4:-$settlement}
   /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" --arg recovery "$recovery_path" \
-    --arg recovery_sha "sha256:$(sha "$recovery_path")" --arg rollout "$rollout_path" --arg rollout_sha "sha256:$(sha "$rollout_path")" \
+    --arg recovery_sha "sha256:$(sha "$recovery_path")" --arg settlement "$settlement_path" --arg settlement_sha "sha256:$(sha "$settlement_path")" \
+    --argjson dlq "$authorized_dlq" --arg rollout "$rollout_path" --arg rollout_sha "sha256:$(sha "$rollout_path")" \
     --arg collector "$collector_sha" --arg validator "$validator_sha" '
       .schemaVersion == 1 and .status == "staged" and .windowStartUtc == $window and
       .ledger.path == $ledger and .recovery.path == $recovery and .recovery.sha256 == $recovery_sha and
+      .settlement == {path:$settlement,sha256:$settlement_sha} and .authorizedDeadLetterBaseline == $dlq and
       .rollout == {path:$rollout,sha256:$rollout_sha} and
       .bindings.collectorSha256 == $collector and .bindings.validatorSha256 == $validator and
       .acceptedCleanLiveHours == 0 and .completedDailyCycles == 0 and .rebootRecoveryPassed == false and
@@ -225,6 +231,7 @@ secure_file "$validator" 755 262144
 test "sha256:$(sha "$collector")" = "$collector_sha"
 test "sha256:$(sha "$validator")" = "$validator_sha"
 secure_file "$recovery" 640 65536
+secure_file "$settlement" 640 65536
 secure_file "$rollout" 640 65536
 secure_file "$staged" 640 65536
 secure_file "$rollback/parity-hourly.env.before" 640 1048576
@@ -236,6 +243,8 @@ secure_file "$formal" 640 1048576
 secure_file "$hourly" 600 1048576
 test "$(sha "$rollback/parity-hourly.env.before")" = "$old_formal_sha"
 test "$(sha "$rollback/hourly.env.before")" = "$old_hourly_sha"
+test "sha256:$(sha "$recovery")" = "$recovery_receipt_sha"
+test "sha256:$(sha "$settlement")" = "$settlement_receipt_sha"
 validate_staged_receipt
 set -a
 . "$formal"
@@ -243,21 +252,24 @@ set +a
 test "$POLYEDGE_PARITY_FUNDED_MODE" = active
 test "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT" = "$rollout"
 test "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" = "sha256:$(sha "$rollout")"
+test "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" = "$authorized_dlq"
 test "$POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256" = "$collector_sha"
 test "$POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256" = "$validator_sha"
 /usr/bin/jq -e --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
   .schema == "polyedge.acknowledged_no_fill_reconciliation.v1" and .status == "finalized_no_fill" and
   .unresolvedReservationsAfter == 0 and .queueActiveMessages == 0 and .queueScheduledMessages == 0 and
-  .queueDeadLetterMessages == $dlq and .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
+  .queueDeadLetterMessages == 1308 and .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
 ' "$recovery" >/dev/null
 /usr/bin/jq -e --arg image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
-  --arg recovery "$recovery" --arg recovery_sha "sha256:$(sha "$recovery")" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
+  --arg recovery "$recovery" --arg recovery_sha "$recovery_receipt_sha" --arg settlement "$settlement" --arg settlement_sha "$settlement_receipt_sha" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
     .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
     .newImage == $image and .newRevision == $revision and (.newRevision | test("^[0-9a-f]{40}$")) and
     (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
     (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
     (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and
-    .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and .producerRestored == true and
+    .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
+    .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and
+    .authorizedDeadLetterBaseline == $dlq and .producerRestored == true and
     .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
       scheduledMessageCount:0,deadLetterMessageCount:$dlq} and .parityTimerRemainsPaused == true and
     .azureDeletionAllowed == false

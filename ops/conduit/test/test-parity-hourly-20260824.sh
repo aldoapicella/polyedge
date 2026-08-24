@@ -368,7 +368,7 @@ case "$*" in
 esac
 jq -nc --arg status "${FAKE_SERVICE_BUS_STATUS:-Active}" \
   --argjson active "${FAKE_SERVICE_BUS_ACTIVE:-0}" --argjson scheduled "${FAKE_SERVICE_BUS_SCHEDULED:-0}" \
-  --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-936}" \
+  --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-1311}" \
   '{status:$status,countDetails:{activeMessageCount:$active,scheduledMessageCount:$scheduled,deadLetterMessageCount:$dlq}}'
 EOF
 
@@ -609,14 +609,19 @@ activate_funded_fixture() {
   case_root=$1
   funded_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
   funded_revision=7777777777777777777777777777777777777777
-  funded_dlq=936
+  funded_dlq=1311
   activation=$case_root/ring/parity/activation
-  rollout=$activation/20260824T052321Z-funded-signer-rollout.json
+  recovery=$case_root/ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
+  settlement=$case_root/ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
+  rollout=$activation/20260824T060435Z-funded-signer-rollout.json
   install -d -m 0750 "$activation"
   jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
+    --arg recovery "$recovery" --arg settlement "$settlement" \
     '{schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
       runtime:{newInvocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",newContainerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",producerInvocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-      producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
+      recoveryReceipt:{path:$recovery,sha256:"sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0"},
+      settlementReceipt:{path:$settlement,sha256:"sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee"},
+      authorizedDeadLetterBaseline:1311,producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
   chmod 0640 "$rollout"
   rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
   active_ledger=$case_root/ring/parity/20260809T141000Z-funded-active.json
@@ -625,7 +630,7 @@ activate_funded_fixture() {
     .fundedSignerImage="ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" |
     .fundedSignerRevision="7777777777777777777777777777777777777777" |
     .fundedRolloutReceiptPath=$rollout | .fundedRolloutReceiptSha256=$rollout_sha |
-    .fundedServiceBusDlqBaseline=936 |
+    .fundedServiceBusDlqBaseline=1311 |
     .parityCollectorSha256=$collector_sha | .rebootValidatorSha256=$validator_sha |
     .fundedSignerUser=$user | .fundedSessionId="dynamic-quote-funded-2026-08-13-v10" |
     .fundedSessionManifestSha256="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" |
@@ -650,7 +655,7 @@ POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:999999999999999999999999999
 POLYEDGE_PARITY_FUNDED_TOKEN_FILE=$case_root/token/funded-azure-federated-token
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
 POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
-POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=936
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1311
 POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=$collector_sha
 POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=$validator_sha
 POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE=$case_root/funded-intent-producer.env
@@ -716,7 +721,7 @@ run_collector() {
     FAKE_FUNDED_UNRESOLVED_POSITION="${FAKE_FUNDED_UNRESOLVED_POSITION:-0}" \
     FAKE_FUNDED_UNRESOLVED_RESERVATION="${FAKE_FUNDED_UNRESOLVED_RESERVATION:-0}" \
     FAKE_SERVICE_BUS_STATUS="${FAKE_SERVICE_BUS_STATUS:-Active}" FAKE_SERVICE_BUS_ACTIVE="${FAKE_SERVICE_BUS_ACTIVE:-0}" \
-    FAKE_SERVICE_BUS_SCHEDULED="${FAKE_SERVICE_BUS_SCHEDULED:-0}" FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-936}" \
+    FAKE_SERVICE_BUS_SCHEDULED="${FAKE_SERVICE_BUS_SCHEDULED:-0}" FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-1311}" \
     FAKE_PRODUCER_RUN_BOT="${FAKE_PRODUCER_RUN_BOT:-true}" \
     FAKE_PRODUCER_MOUNT_SOURCE="${FAKE_PRODUCER_MOUNT_SOURCE:-$case_root/token}" \
     FAKE_PRODUCER_MOUNT_RW="${FAKE_PRODUCER_MOUNT_RW:-false}" \
@@ -1028,9 +1033,9 @@ jq -e '.acceptedCleanLiveHours == 1 and .fundedSignerEnabled == true and
 jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled == true and
   .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
   .services.fundedSignerRevision == "7777777777777777777777777777777777777777" and
-  (.services.fundedRolloutReceipt.path | endswith("/activation/20260824T052321Z-funded-signer-rollout.json")) and
+  (.services.fundedRolloutReceipt.path | endswith("/activation/20260824T060435Z-funded-signer-rollout.json")) and
   (.services.fundedRolloutReceipt.sha256 | test("^sha256:[0-9a-f]{64}$")) and
-  .services.fundedServiceBusDlqBaseline == 936 and
+  .services.fundedServiceBusDlqBaseline == 1311 and
   .services.fundedSignerUser == "'"$uid:$gid"'" and .services.fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and
   .services.fundedRuntime.heartbeatCount == 60 and .services.fundedRuntime.alertCount == 0 and
   .services.fundedRuntime.maxHeartbeatGapSeconds == 60 and .services.fundedRuntime.tokenRefreshCount == 30 and
@@ -1042,7 +1047,7 @@ jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled 
   .services.fundedRuntime.executor.unresolvedRiskReservationCount == 0 and
   .services.fundedServiceBusRuntime == {namespace:"sb-polyedge-funded-cl-6urdjr5nmwx7w",
     queue:"funded-dynamic-quote-intents",status:"Active",activeMessageCount:0,scheduledMessageCount:0,
-    deadLetterMessageCount:936,expectedDeadLetterMessageCount:936} and
+    deadLetterMessageCount:1311,expectedDeadLetterMessageCount:1311} and
   .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshCount == 30 and
   .services.fundedIntentProducerRuntime.tokenContinuity.maxTokenRefreshGapSeconds == 120 and
   .services.fundedIntentProducerRuntime.continuity.publisher.successCount == 1 and
@@ -1198,7 +1203,7 @@ for broker_case in inactive active-message scheduled-message dlq-drift; do
     inactive) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_STATUS=Disabled run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
     active-message) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_ACTIVE=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
     scheduled-message) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_SCHEDULED=1 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
-    dlq-drift) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_DLQ=937 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
+    dlq-drift) if FAKE_FUNDED_ACTIVE=1 FAKE_SERVICE_BUS_DLQ=1312 run_collector "$case_root" >/dev/null 2>&1; then passed=1; else passed=0; fi ;;
   esac
   if [ "$passed" -eq 1 ]; then
     echo "unsafe funded Service Bus runtime unexpectedly passed: $broker_case" >&2

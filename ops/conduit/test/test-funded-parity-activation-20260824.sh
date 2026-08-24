@@ -9,12 +9,13 @@ grep -Fq 'persistent_message_failed_closed' "$stage"
 grep -Fq '.failed_attempts == 0' "$stage"
 grep -Fq '$warmed | length) >= 1' "$stage"
 grep -Fq 'processed_messages > $heartbeats[0].event.processed_messages' "$stage"
-stage_jq=$(sed -n '466,490p' "$stage")
+stage_jq=$(sed -n '476,500p' "$stage")
 printf '%s' '' | jq -Rs --arg invocation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --argjson now 0 "$stage_jq" >/dev/null
 ! grep -Fq 'recovery_dlq=' "$stage"
 trap 'rm -rf "$root"' EXIT
 
 fixture_recovery=$root/recovery.json
+fixture_settlement=$root/settlement.json
 fixture_rollout=$root/rollout.json
 jq -n '{
   schema:"polyedge.acknowledged_no_fill_reconciliation.v1",status:"finalized_no_fill",
@@ -30,29 +31,33 @@ jq -n '{
   reservationEvidence:{blob:"reports/research/venue-probe/risk-reservations/2026-08-22/funded-direct-65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7.json",sha256:"sha256:e32a1ec82254c5490f0c25a25d2fed99fe3ab129002610234c704ef688a24a9d"},
   completionEvidence:{blob:"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/completed/65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7.json",sha256:"sha256:fcc2f5861c5364202bd171b4b229e883472980f1db752ab7588bdba1d2f3bed9"},
   summaryEvidence:{blob:"reports/research/venue-probe/runs/2026-08-22/funded-direct-20260822235002541-68c5aaa9/summary.json",sha256:"sha256:a5ea76b54d8b3b9b3fa4ae5d549de6466d0eae1c22d4ca4074b362ec0c725d57"},
-  unresolvedReservationsAfter:0,queueActiveMessages:0,queueScheduledMessages:0,queueDeadLetterMessages:1037,
+  unresolvedReservationsAfter:0,queueActiveMessages:0,queueScheduledMessages:0,queueDeadLetterMessages:1308,
   parityTimerRemainsPaused:true,azureDeletionAllowed:false,cutoverCompletedAtUtc:"2026-08-24T05:23:21Z"
 }' >"$fixture_recovery"
 fixture_recovery_sha=sha256:$(sha256sum "$fixture_recovery" | cut -d' ' -f1)
+jq -n '{schema:"polyedge.funded_settlement_loss_reconciliation.v1",status:"finalized",authorizedDeadLetterBaseline:1311}' >"$fixture_settlement"
+fixture_settlement_sha=sha256:$(sha256sum "$fixture_settlement" | cut -d' ' -f1)
 new_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-jq -n --arg image "$new_image" --arg revision "$revision" --arg recovery "$fixture_recovery" --arg recovery_sha "$fixture_recovery_sha" '{
+jq -n --arg image "$new_image" --arg revision "$revision" --arg recovery "$fixture_recovery" --arg recovery_sha "$fixture_recovery_sha" \
+  --arg settlement "$fixture_settlement" --arg settlement_sha "$fixture_settlement_sha" '{
   schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",
   oldImage:"ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3",
   runtime:{newInvocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",newContainerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",producerInvocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
   newImage:$image,newRevision:$revision,recoveryReceipt:{path:$recovery,sha256:$recovery_sha},
+  settlementReceipt:{path:$settlement,sha256:$settlement_sha},authorizedDeadLetterBaseline:1311,
   producerRestored:true,unresolvedReservationsAfter:0,
-  queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1037},
+  queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},
   parityTimerRemainsPaused:true,azureDeletionAllowed:false
 }' >"$fixture_rollout"
 
 (
   POLYEDGE_TEST_UID=$(id -u) POLYEDGE_TEST_GID=$(id -g) POLYEDGE_TEST_SOURCE_ONLY=1 . "$stage"
   validate_recovery_receipt "$fixture_recovery"
-  validate_rollout_receipt "$fixture_recovery" "$fixture_rollout"
+  validate_rollout_receipt "$fixture_recovery" "$fixture_rollout" "$fixture_settlement"
   test "$signer_image" = "$new_image"
   test "$signer_revision" = "$revision"
-  test "$service_bus_dlq" = 1037
+  test "$service_bus_dlq" = 1311
 
   source_env=$root/source.env
   rendered=$root/rendered.env
@@ -85,12 +90,12 @@ ENV
   render_env "$source_env" "$rendered" "${keys[@]}"
   for key in "${keys[@]}"; do test "$(grep -c "^${key}=" "$rendered")" = 1; done
   grep -qx "POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$revision" "$rendered"
-  grep -qx 'POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1037' "$rendered"
+  grep -qx 'POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1311' "$rendered"
   printf '%s\n' 'POLYEDGE_PARITY_FUNDED_MODE=active' >>"$source_env"
   if render_env "$source_env" "$root/duplicate.env" "${keys[@]}"; then exit 1; fi
 
   jq '.producerRestored=false' "$fixture_rollout" >"$root/bad-rollout.json"
-  if validate_rollout_receipt "$fixture_recovery" "$root/bad-rollout.json"; then exit 1; fi
+  if validate_rollout_receipt "$fixture_recovery" "$root/bad-rollout.json" "$fixture_settlement"; then exit 1; fi
 
   tx_root=$root/transaction
   mkdir -p "$tx_root"
@@ -131,22 +136,24 @@ ENV
   staged_fixture=$root/staged.json
   jq -n --arg window "$window" --arg ledger "$ledger" --arg recovery "$fixture_recovery" --arg recovery_sha "$fixture_recovery_sha" \
     --arg rollout "$fixture_rollout" --arg rollout_sha "sha256:$(sha256sum "$fixture_rollout" | cut -d' ' -f1)" \
+    --arg settlement "$fixture_settlement" --arg settlement_sha "$fixture_settlement_sha" \
     --arg collector "$collector_sha" --arg validator "$validator_sha" '{
       schemaVersion:1,status:"staged",windowStartUtc:$window,ledger:{path:$ledger},
-      recovery:{path:$recovery,sha256:$recovery_sha},rollout:{path:$rollout,sha256:$rollout_sha},
+      recovery:{path:$recovery,sha256:$recovery_sha},settlement:{path:$settlement,sha256:$settlement_sha},
+      authorizedDeadLetterBaseline:1311,rollout:{path:$rollout,sha256:$rollout_sha},
       bindings:{collectorSha256:$collector,validatorSha256:$validator},acceptedCleanLiveHours:0,
       completedDailyCycles:0,rebootRecoveryPassed:false,recurrenceEnabled:false,
       azureAuthoritative:true,azureDeletionAllowed:false
     }' >"$staged_fixture"
-  validate_staged_receipt "$staged_fixture" "$fixture_recovery" "$fixture_rollout"
+  validate_staged_receipt "$staged_fixture" "$fixture_recovery" "$fixture_rollout" "$fixture_settlement"
   jq '.bindings.validatorSha256="sha256:0000000000000000000000000000000000000000000000000000000000000000"' \
     "$staged_fixture" >"$root/bad-staged.json"
-  if validate_staged_receipt "$root/bad-staged.json" "$fixture_recovery" "$fixture_rollout"; then exit 1; fi
+  if validate_staged_receipt "$root/bad-staged.json" "$fixture_recovery" "$fixture_rollout" "$fixture_settlement"; then exit 1; fi
 
   export POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$revision
   export POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$fixture_rollout
   export POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=sha256:$(sha256sum "$fixture_rollout" | cut -d' ' -f1)
-  export POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1037
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=1311
   export POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=$new_image
   export POLYEDGE_PARITY_FUNDED_UID=986 POLYEDGE_PARITY_FUNDED_GID=982
   export POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=fixture-session
@@ -169,10 +176,10 @@ ENV
       services:{fundedSignerEnabled:true,fundedSignerMode:"active",fundedSignerRevision:$revision,
         fundedSignerImage:$funded_image,fundedSignerUser:$funded_user,fundedSessionId:$funded_session,
         fundedSessionManifestSha256:$funded_session_sha,fundedConfigSha256:$funded_config_sha,
-        fundedRolloutReceipt:{path:$rollout,sha256:$rollout_sha},fundedServiceBusDlqBaseline:1037,
+        fundedRolloutReceipt:{path:$rollout,sha256:$rollout_sha},fundedServiceBusDlqBaseline:1311,
         parityCollectorSha256:$collector,rebootValidatorSha256:$validator,
         fundedServiceBusRuntime:{namespace:$namespace,queue:$queue,status:"Active",activeMessageCount:0,
-          scheduledMessageCount:0,deadLetterMessageCount:1037,expectedDeadLetterMessageCount:1037},
+          scheduledMessageCount:0,deadLetterMessageCount:1311,expectedDeadLetterMessageCount:1311},
         fundedRuntime:{invocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",containerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",heartbeatCount:60,alertCount:0,failedClosedCount:0,failedAttempts:0,marketWarmedCount:1,processedMessagesDelta:1,restartCount:0},
         fundedIntentProducerEnabled:true,fundedIntentProducerImage:$producer_image,
         fundedIntentProducerUser:"984:980",fundedIntentProducerConfigSha256:$producer_config_sha,
@@ -186,7 +193,7 @@ ENV
     case "$mutation" in
       revision) filter='.services.fundedSignerRevision = "0000000000000000000000000000000000000000"' ;;
       rollout-sha) filter='.services.fundedRolloutReceipt.sha256 = "sha256:" + ("0" * 64)' ;;
-      dlq) filter='.services.fundedServiceBusRuntime.deadLetterMessageCount = 1038' ;;
+      dlq) filter='.services.fundedServiceBusRuntime.deadLetterMessageCount = 1312' ;;
       collector) filter='.services.parityCollectorSha256 = "sha256:" + ("0" * 64)' ;;
       validator) filter='.services.rebootValidatorSha256 = "sha256:" + ("0" * 64)' ;;
       signer-image) filter='.services.fundedSignerImage = "ghcr.io/fixture/polyedge-venue-probe@sha256:" + ("0" * 64)' ;;

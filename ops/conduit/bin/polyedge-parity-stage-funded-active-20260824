@@ -14,7 +14,11 @@ readonly old_ledger_sha=2e2930f4d4665f9ed9c73dba32f22c8bcd368605d9726bf5f46b7801
 readonly recovery_script=/usr/local/libexec/polyedge-funded-reservation-recovery-20260824
 readonly recovery_script_sha=8ec3b59df15f3d6b2c8e55687f1b064bbf8af793231486063ec8a073b0bed8b4
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260824T052321Z-funded-signer-rollout.json
+readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
+readonly rollout=/srv/polyedge-ring/parity/activation/20260824T060435Z-funded-signer-rollout.json
+readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
+readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
+readonly authorized_dlq=1311
 readonly rollback=/etc/polyedge/rollback/20260824T080000Z-funded-active
 readonly transaction=$rollback/env-transaction.json
 readonly activation_dir=/srv/polyedge-ring/parity/activation
@@ -38,9 +42,9 @@ readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:2de07dc77ec2b529616f8df96735400c1ad1fc28185c0504bf4d16ac7aac54f8
+readonly collector_sha=sha256:6af251be658005fd9a9803f4193d2e489ac46cadd7e14299649b3627948d3ed3
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:0ef4557fd4f5231cd6e4063ea263b444bd3e5458d4efe33e06810603c503af3a
+readonly validator_sha=sha256:06afbf3330085179a90bfd6b16c448f618389f0e77f5516028ec4d22c3a69bfe
 
 formal_tmp=
 hourly_tmp=
@@ -68,21 +72,24 @@ env_value() {
 }
 
 validate_rollout_receipt() {
-  local recovery_path=${1:-$recovery} rollout_path=${2:-$rollout} receipt_sha recovery_sha
+  local recovery_path=${1:-$recovery} rollout_path=${2:-$rollout} settlement_path=${3:-$settlement} receipt_sha recovery_sha settlement_sha
   receipt_sha="sha256:$(sha "$rollout_path")"
   recovery_sha="sha256:$(sha "$recovery_path")"
-  /usr/bin/jq -e --arg old "$old_signer_image" --arg recovery "$recovery_path" --arg recovery_sha "$recovery_sha" '
+  settlement_sha="sha256:$(sha "$settlement_path")"
+  /usr/bin/jq -e --arg old "$old_signer_image" --arg recovery "$recovery_path" --arg recovery_sha "$recovery_sha" \
+    --arg settlement "$settlement_path" --arg settlement_sha "$settlement_sha" --argjson dlq "$authorized_dlq" '
       .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
       .oldImage == $old and .newImage != $old and
       (.newImage | test("^ghcr\\.io/aldoapicella/polyedge-venue-probe@sha256:[0-9a-f]{64}$")) and
       (.newRevision | test("^[0-9a-f]{40}$")) and
       .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
+      .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and
+      .authorizedDeadLetterBaseline == $dlq and
       (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
       (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
       (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and
       .producerRestored == true and .unresolvedReservationsAfter == 0 and
-      .queue.status == "Active" and .queue.activeMessageCount == 0 and .queue.scheduledMessageCount == 0 and
-      (.queue.deadLetterMessageCount | type == "number" and floor == . and . >= 0) and
+      .queue == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
       .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
     ' "$rollout_path" >/dev/null || return 1
   signer_image=$(/usr/bin/jq -r '.newImage' "$rollout_path")
@@ -91,7 +98,7 @@ validate_rollout_receipt() {
   rollout_signer_container=$(/usr/bin/jq -r '.runtime.newContainerId' "$rollout_path")
   rollout_producer_invocation=$(/usr/bin/jq -r '.runtime.producerInvocationId' "$rollout_path")
   rollout_sha=$receipt_sha
-  service_bus_dlq=$(/usr/bin/jq -r '.queue.deadLetterMessageCount' "$rollout_path")
+  service_bus_dlq=$authorized_dlq
 }
 
 validate_recovery_receipt() {
@@ -268,11 +275,14 @@ exec 9>/run/polyedge/utility.lock
 secure_file "$collector" 755 262144
 secure_file "$validator" 755 262144
 secure_file "$recovery" 640 65536
+secure_file "$settlement" 640 65536
 secure_file "$rollout" 640 65536
 secure_file "$recovery_script" 700 65536
 test "sha256:$(sha "$collector")" = "$collector_sha"
 test "sha256:$(sha "$validator")" = "$validator_sha"
 test "$(sha "$recovery_script")" = "$recovery_script_sha"
+test "sha256:$(sha "$recovery")" = "$recovery_receipt_sha"
+test "sha256:$(sha "$settlement")" = "$settlement_receipt_sha"
 validate_recovery_receipt
 validate_rollout_receipt
 test "$(/usr/bin/podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer)" = "$signer_image|986:982|running"
@@ -601,12 +611,13 @@ test "$(sha "$old_ledger")" = "$old_ledger_sha"
 receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260824T080000Z-staged.XXXXXX")
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
   --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" \
-  --arg recovery "$recovery" --arg recoverySha "sha256:$(sha "$recovery")" --arg recoveryScriptSha "sha256:$recovery_script_sha" \
+  --arg recovery "$recovery" --arg recoverySha "$recovery_receipt_sha" --arg recoveryScriptSha "sha256:$recovery_script_sha" \
+  --arg settlement "$settlement" --arg settlementSha "$settlement_receipt_sha" --argjson authorizedDlq "$authorized_dlq" \
   --arg rollout "$rollout" --arg rolloutSha "$rollout_sha" --arg formalSha "sha256:$(sha "$formal")" \
   --arg hourlySha "sha256:$(sha "$hourly")" --arg collectorSha "$collector_sha" --arg validatorSha "$validator_sha" '
   {schemaVersion:1,status:"staged",createdAtUtc:$created,windowStartUtc:$window,
    ledger:{path:$ledger,sha256:$ledgerSha},recovery:{path:$recovery,sha256:$recoverySha,scriptSha256:$recoveryScriptSha},
-   rollout:{path:$rollout,sha256:$rolloutSha},
+   settlement:{path:$settlement,sha256:$settlementSha},authorizedDeadLetterBaseline:$authorizedDlq,rollout:{path:$rollout,sha256:$rolloutSha},
    bindings:{formalSha256:$formalSha,hourlySha256:$hourlySha,collectorSha256:$collectorSha,validatorSha256:$validatorSha},
    acceptedCleanLiveHours:0,completedDailyCycles:0,rebootRecoveryPassed:false,shadowQsetEnabled:false,
    recurrenceEnabled:false,azureAuthoritative:true,azureDeletionAllowed:false}

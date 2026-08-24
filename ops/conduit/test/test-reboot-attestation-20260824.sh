@@ -190,7 +190,7 @@ FAKE
 cat >"$fake/az" <<'FAKE'
 #!/bin/sh
 jq -nc --arg status "${FAKE_SERVICE_BUS_STATUS:-Active}" --argjson active "${FAKE_SERVICE_BUS_ACTIVE:-0}" \
-  --argjson scheduled "${FAKE_SERVICE_BUS_SCHEDULED:-0}" --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-936}" \
+  --argjson scheduled "${FAKE_SERVICE_BUS_SCHEDULED:-0}" --argjson dlq "${FAKE_SERVICE_BUS_DLQ:-1311}" \
   '{status:$status,countDetails:{activeMessageCount:$active,scheduledMessageCount:$scheduled,deadLetterMessageCount:$dlq}}'
 FAKE
 chmod 0755 "$fake"/*
@@ -212,13 +212,18 @@ printf '%s\n' '11111111-1111-4111-8111-111111111111' >"$case_root/boot-id"
 printf '%s\n' 'cpu 1 1 1 1' 'btime 1000' >"$case_root/proc-stat"
 funded_image=ghcr.io/fixture/polyedge-venue-probe@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 funded_revision=7777777777777777777777777777777777777777
-funded_dlq=936
+funded_dlq=1311
 activation=$case_root/ring/parity/activation
-rollout=$activation/20260824T052321Z-funded-signer-rollout.json
+recovery=$case_root/ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
+settlement=$case_root/ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
+rollout=$activation/20260824T060435Z-funded-signer-rollout.json
 install -d -m 0750 "$activation"
 jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
+  --arg recovery "$recovery" --arg settlement "$settlement" \
   '{schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
-    producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
+    recoveryReceipt:{path:$recovery,sha256:"sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0"},
+    settlementReceipt:{path:$settlement,sha256:"sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee"},
+    authorizedDeadLetterBaseline:1311,producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
 chmod 0640 "$rollout"
 rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
 jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" \
@@ -231,7 +236,7 @@ jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$
   fundedSignerImage:"ghcr.io/fixture/polyedge-venue-probe@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
   fundedSignerRevision:"7777777777777777777777777777777777777777",
   fundedRolloutReceiptPath:$rollout,fundedRolloutReceiptSha256:$rollout_sha,
-  fundedServiceBusDlqBaseline:936,
+  fundedServiceBusDlqBaseline:1311,
   parityCollectorSha256:$collector_sha,rebootValidatorSha256:$validator_sha,
   fundedSignerUser:$user,fundedSessionId:"fixture-funded-v3",
   fundedSessionManifestSha256:"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -279,7 +284,7 @@ run_attestor() {
   env PATH="$fake:$PATH" POLYEDGE_REBOOT_EXPECTED_UID="$uid" POLYEDGE_REBOOT_EXPECTED_GID="$gid" \
     POLYEDGE_REBOOT_ATTESTATION_BIN="${TEST_ATTESTOR_BIN:-$attestor}" POLYEDGE_PARITY_COLLECTOR_BIN="${TEST_COLLECTOR_BIN:-$collector}" \
     POLYEDGE_RUNUSER_BIN="$fake/runuser" POLYEDGE_AZ_BIN="$fake/az" \
-    FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-936}" FAKE_SERVICE_BUS_STATUS="${FAKE_SERVICE_BUS_STATUS:-Active}" \
+    FAKE_SERVICE_BUS_DLQ="${FAKE_SERVICE_BUS_DLQ:-1311}" FAKE_SERVICE_BUS_STATUS="${FAKE_SERVICE_BUS_STATUS:-Active}" \
     FAKE_SERVICE_BUS_ACTIVE="${FAKE_SERVICE_BUS_ACTIVE:-0}" FAKE_SERVICE_BUS_SCHEDULED="${FAKE_SERVICE_BUS_SCHEDULED:-0}" \
     POLYEDGE_PARITY_ENV_FILE="${ATTEST_ENV_FILE:-$case_root/parity.env}" POLYEDGE_REBOOT_RUNTIME_DIR="$case_root/run/reboot-attestation" \
     POLYEDGE_REBOOT_BOOT_ID_FILE="$case_root/boot-id" POLYEDGE_REBOOT_PROC_STAT="$case_root/proc-stat" \
@@ -397,7 +402,7 @@ if FAKE_PRODUCER_PREPARED=false run_attestor prepare >/dev/null 2>&1; then
   echo 'unprepared producer publisher unexpectedly passed prepare' >&2
   exit 1
 fi
-if FAKE_SERVICE_BUS_DLQ=937 run_attestor prepare >/dev/null 2>&1; then
+if FAKE_SERVICE_BUS_DLQ=1312 run_attestor prepare >/dev/null 2>&1; then
   echo 'drifted Service Bus DLQ unexpectedly passed reboot prepare' >&2
   exit 1
 fi
