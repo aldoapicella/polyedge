@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import {
   assertEligibleOrigin,
@@ -1059,6 +1060,33 @@ test("funded unresolved index makes preflight O(unresolved), not O(history)", as
   assert.equal(records[0].blob_name, unresolvedName);
   assert.deepEqual(container.downloads.sort(), [riskIndexBlobName, unresolvedName].sort());
   assert.deepEqual(container.listCalls, []);
+});
+
+test("funded dry-run unresolved scan binds each reservation to its exact bytes", async () => {
+  const unresolvedName =
+    "reports/research/venue-probe/risk-reservations/2026-08-24/funded-direct-dry-run.json";
+  const unresolved = {
+    schema_version: 1,
+    campaign_id: fundedRiskIndexConfig.campaignId,
+    probe_id: "funded-direct-dry-run",
+    state: "position_unresolved",
+    matched_notional: 0.01564794
+  };
+  const container = new RiskIndexContainer(new Map([[unresolvedName, unresolved]]));
+  const bytes = container.values.get(unresolvedName);
+
+  const records = await loadCampaignUnresolvedRiskReservationRecords({
+    ...fundedRiskIndexConfig,
+    dryRun: true
+  }, { container });
+
+  assert.equal(records.length, 1);
+  assert.equal(records[0].blob_name, unresolvedName);
+  assert.equal(records[0].etag, container.etags.get(unresolvedName));
+  assert.match(records[0].reservation_sha256, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(records[0].reservation_sha256,
+    `sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+  assert.deepEqual(records[0].reservation, unresolved);
 });
 
 test("funded unresolved index follows reserve, unresolved finalize, and settlement", async () => {

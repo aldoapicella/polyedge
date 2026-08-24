@@ -1753,12 +1753,13 @@ async function loadCampaignRiskReservationRecordsFromContainer(config, container
     prefix: RISK_RESERVATION_PREFIX
   })) {
     if (!item.name.endsWith(".json")) continue;
-    const response = await container.getBlobClient(item.name).download();
-    const reservation = JSON.parse(await streamToString(response.readableStreamBody));
+    const document = await downloadBlobDocument(container.getBlobClient(item.name));
+    const reservation = document.value;
     if (config.operatorDirect === true && reservation?.campaign_id !== config.campaignId) continue;
     records.push({
       blob_name: item.name,
-      etag: response.etag || null,
+      etag: document.etag,
+      reservation_sha256: digest(document.bytes),
       reservation
     });
   }
