@@ -1170,6 +1170,112 @@ test("persistent handoff verifies the immutable hash and executes exactly once a
   assert.equal(executions, 1);
 });
 
+test("expired persistent redelivery recognizes only an exactly bound immutable completion", async (t) => {
+  const now = new Date("2026-07-27T12:00:00Z");
+
+  await t.test("exact completion is read-only and idempotent", async () => {
+    const value = intent(now, "a".repeat(64));
+    const bytes = Buffer.from(JSON.stringify(value));
+    const control = new Container();
+    let observed = now;
+    let executions = 0;
+    const processor = await createFundedDirectProcessor({
+      env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+      containers: {
+        control,
+        intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+      },
+      clock: () => observed,
+      executeCanary: async () => {
+        executions += 1;
+        return { order_submission_attempted: true };
+      }
+    });
+    await processor.process(handoff(value));
+    observed = new Date(Date.parse(value.valid_until) + 1);
+    const before = containerSnapshot(control);
+    const uploadCalls = control.uploadCalls;
+
+    const duplicate = await processor.process(handoff(value));
+
+    assert.equal(duplicate.status, "already_completed_idempotent");
+    assert.equal(executions, 1);
+    assert.equal(control.uploadCalls, uploadCalls);
+    assert.deepEqual(containerSnapshot(control), before);
+  });
+
+  await t.test("missing completion fails before authorization or execution", async () => {
+    const value = intent(now, "b".repeat(64));
+    const bytes = Buffer.from(JSON.stringify(value));
+    const control = new Container();
+    let executions = 0;
+    const processor = await createFundedDirectProcessor({
+      env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+      containers: {
+        control,
+        intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+      },
+      clock: () => new Date(Date.parse(value.valid_until) + 1),
+      executeCanary: async () => { executions += 1; }
+    });
+    const before = containerSnapshot(control);
+    const uploadCalls = control.uploadCalls;
+
+    await assert.rejects(processor.process(handoff(value)), /insufficient remaining TTL/);
+
+    assert.equal(executions, 0);
+    assert.equal(control.uploadCalls, uploadCalls);
+    assert.deepEqual(containerSnapshot(control), before);
+    assert.deepEqual(mutationKeysets(control, env().FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME).authorizations, []);
+  });
+
+  for (const tamper of ["completion_hash", "authorization_binding"]) {
+    await t.test(`${tamper} fails closed without a second execution`, async () => {
+      const value = intent(now, tamper === "completion_hash" ? "c".repeat(64) : "d".repeat(64));
+      const bytes = Buffer.from(JSON.stringify(value));
+      const control = new Container();
+      let observed = now;
+      let executions = 0;
+      const processor = await createFundedDirectProcessor({
+        env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+        containers: {
+          control,
+          intents: new Container({ [`intents/${value.decision_id}.json`]: bytes })
+        },
+        clock: () => observed,
+        executeCanary: async () => {
+          executions += 1;
+          return { order_submission_attempted: true };
+        }
+      });
+      await processor.process(handoff(value));
+      const completionName = [...control.values.keys()].find((name) => name.includes("/completed/"));
+      const authorizationName = [...control.values.keys()].find((name) => name.includes("/authorizations/"));
+      if (tamper === "completion_hash") {
+        const completion = JSON.parse(control.values.get(completionName).toString("utf8"));
+        completion.authorization_sha256 = `sha256:${"0".repeat(64)}`;
+        control.values.set(completionName, Buffer.from(JSON.stringify(completion)));
+      } else {
+        const authorization = JSON.parse(control.values.get(authorizationName).toString("utf8"));
+        authorization.intent_sha256 = `sha256:${"0".repeat(64)}`;
+        control.values.set(authorizationName, Buffer.from(JSON.stringify(authorization)));
+      }
+      observed = new Date(Date.parse(value.valid_until) + 1);
+      const before = containerSnapshot(control);
+      const uploadCalls = control.uploadCalls;
+
+      await assert.rejects(
+        processor.process(handoff(value)),
+        tamper === "completion_hash" ? /completion is not exactly bound/ : /authorization that is not exactly bound/
+      );
+
+      assert.equal(executions, 1);
+      assert.equal(control.uploadCalls, uploadCalls);
+      assert.deepEqual(containerSnapshot(control), before);
+    });
+  }
+});
+
 test("persistent handoff seals a post-submit evidence failure only from exact terminal no-fill risk", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "7".repeat(64));

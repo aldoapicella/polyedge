@@ -16,6 +16,8 @@ import {
 } from "../src/canary-lib.mjs";
 import {
   putOperatorSessionManifest,
+  ensurePersistentMarket,
+  capturePostReservationFinalGate,
   requireExecutionModelArtifact,
   assertPersistentIntentRemainingTtl,
   decodePayoutRedemptions,
@@ -1148,6 +1150,92 @@ test("funded maintenance gives bounded preflights room to quiesce", async () => 
     clearTimeout(completion);
   }
   assert.equal(resources.safetyCache.inFlight, 0);
+});
+
+test("persistent market warmup accepts fresh exact-token top-of-book stream frames", async () => {
+  const updates = [];
+  const resources = {
+    warmedMarket: {
+      market_id: "market-1",
+      condition_id: "condition-1",
+      token_id: "token-old",
+      token_ids: ["token-old"],
+      market_end_ts: "2026-08-25T00:00:00Z"
+    },
+    marketChannel: {
+      messages: [],
+      updateSubscription: async (value) => { updates.push(value); },
+      waitForMessage: async (predicate, timeoutMs) => {
+        const freshWallMs = Date.now() + 100;
+        assert.equal(timeoutMs, 2_000);
+        assert.equal(Boolean(predicate({
+          event_type: "price_change",
+          price_changes: [{ asset_id: "token-up", best_ask: "0.53" }],
+          _received_wall_ms: 0
+        })), false);
+        assert.equal(Boolean(predicate({
+          event_type: "best_bid_ask",
+          asset_id: "token-down",
+          best_ask: "0.61",
+          _received_wall_ms: freshWallMs
+        })), false);
+        assert.ok(predicate({
+          event_type: "price_change",
+          price_changes: [{ asset_id: "token-up", best_ask: "0.53" }],
+          _received_wall_ms: freshWallMs
+        }));
+      }
+    }
+  };
+  const market = await ensurePersistentMarket(resources, {
+    market_id: "market-1",
+    condition_id: "condition-1",
+    token_id: "token-up",
+    token_ids: ["token-up"],
+    market_end_ts: "2026-08-25T00:00:00Z"
+  });
+  assert.deepEqual(updates, [{ operation: "subscribe", assets_ids: ["token-up"] }]);
+  assert.equal(market.token_id, "token-up");
+});
+
+test("post-reservation safety capture excludes only its reservation and covers fresh risk", async () => {
+  const client = {};
+  const intent = { price: "0.5", shares: "2", notional: "1" };
+  const manifest = {};
+  const reservation = { probe_id: "probe-new", reserved_notional: 1.2 };
+  const freshRuntime = {
+    capturedCompletedWallMs: 123,
+    feeRate: 0.1,
+    feeExponent: 0,
+    executionSizing: { shares: 2, notional: 1, reserved_notional: 1.2 }
+  };
+  const result = await capturePostReservationFinalGate({
+    client,
+    intent,
+    manifest,
+    reservation,
+    capture: async (...args) => {
+      assert.deepEqual(args, [client, intent, manifest, "probe-new"]);
+      return freshRuntime;
+    },
+    finalGate: async (actualClient, actualIntent, runtime) => {
+      assert.equal(actualClient, client);
+      assert.equal(actualIntent, intent);
+      assert.equal(runtime, freshRuntime);
+      return { ...runtime, finalGateCompletedWallMs: 124 };
+    }
+  });
+  assert.equal(result.capturedCompletedWallMs, 123);
+  assert.equal(result.finalGateCompletedWallMs, 124);
+
+  await assert.rejects(capturePostReservationFinalGate({
+    client,
+    intent,
+    manifest,
+    reservation: { ...reservation, reserved_notional: 1.19 },
+    capture: async () => ({ feeRate: 0.1, feeExponent: 0 }),
+    finalGate: async () => assert.fail("under-covered risk must not reach the final gate")
+  }), /principal and fee risk exceed the durable reservation/);
 });
 
 test("final stream evidence follows the newest token-specific top-of-book update", () => {

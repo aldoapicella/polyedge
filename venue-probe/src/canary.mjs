@@ -615,7 +615,7 @@ function validatePersistentBinding(resources) {
   }
 }
 
-async function ensurePersistentMarket(resources, { market_id, condition_id, token_id, token_ids, market_end_ts }) {
+export async function ensurePersistentMarket(resources, { market_id, condition_id, token_id, token_ids, market_end_ts }) {
   const requestedTokens = [...new Set(
     (Array.isArray(token_ids) ? token_ids : [token_id]).map(String).filter(Boolean)
   )];
@@ -657,8 +657,7 @@ async function ensurePersistentMarket(resources, { market_id, condition_id, toke
     }
   } else {
     const latest = [...resources.marketChannel.messages].reverse().find((message) =>
-      String(message?.event_type || message?.type || "").toLowerCase() === "book" &&
-      String(message?.asset_id || message?.token_id || message?.tokenId || "") === next.token_id
+      streamBookEvidence([message], next.token_id)
     );
     if (!latest) {
       needsFreshBook = true;
@@ -679,8 +678,7 @@ async function ensurePersistentMarket(resources, { market_id, condition_id, toke
   if (needsFreshBook) {
     await resources.marketChannel.waitForMessage((message) =>
       Number(message?._received_wall_ms) >= subscriptionStartedWallMs &&
-      String(message?.event_type || message?.type || "").toLowerCase() === "book" &&
-      String(message?.asset_id || message?.token_id || message?.tokenId || "") === next.token_id
+      streamBookEvidence([message], next.token_id)
     , 2_000);
   }
   resources.warmedMarket = next;
@@ -1756,7 +1754,12 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       userChannelPromise,
       marketChannelPromise,
       activeResources?.persistent
-        ? captureFinalGate(client, intent, runtime)
+        ? capturePostReservationFinalGate({
+            client,
+            intent,
+            manifest: documents.manifest,
+            reservation
+          })
         : capturePreflight(
             client,
             documents.intent,
@@ -1783,7 +1786,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       if (userChannelHistory?.evicted_count > 0 || marketChannelHistory?.evicted_count > 0) {
         throw new Error("fail closed: websocket evidence history was truncated before submission");
       }
-      const snapshotAgeMs = Date.now() - Number(runtime.capturedCompletedWallMs);
+      const snapshotAgeMs = Date.now() - Number(refreshed.capturedCompletedWallMs);
       const finalGateAgeMs = Date.now() - Number(refreshed.finalGateCompletedWallMs);
       if (!Number.isFinite(snapshotAgeMs) || snapshotAgeMs > 1_500) {
         throw new Error(`fail closed: full safety snapshot exceeded 1500ms at signing (${snapshotAgeMs}ms)`);
@@ -2267,6 +2270,35 @@ async function captureFinalGate(client, intent, runtime) {
     finalGateCompletedWallMs,
     finalGateDurationMs
   };
+}
+
+export async function capturePostReservationFinalGate({
+  client,
+  intent,
+  manifest,
+  reservation,
+  capture = capturePreflight,
+  finalGate = captureFinalGate
+}) {
+  const runtime = await capture(client, intent, manifest, reservation?.probe_id);
+  const freshPrincipal = Number(runtime?.executionSizing?.notional ?? intent?.notional);
+  const freshShares = Number(runtime?.executionSizing?.shares ?? intent?.shares);
+  const freshFeeRisk = freshShares * polymarketV2FeePerShare(
+    intent?.price,
+    runtime?.feeRate,
+    runtime?.feeExponent
+  );
+  const freshRisk = freshPrincipal + freshFeeRisk;
+  const reservedRisk = Number(reservation?.reserved_notional);
+  if (!Number.isFinite(freshPrincipal) || freshPrincipal < 0 ||
+      !Number.isFinite(freshShares) || freshShares < 0 ||
+      !Number.isFinite(freshFeeRisk) || freshFeeRisk < 0 ||
+      !Number.isFinite(freshRisk) || freshRisk < 0 ||
+      !Number.isFinite(reservedRisk) || reservedRisk < 0 ||
+      freshRisk > reservedRisk + 1e-9) {
+    throw new Error("fail closed: post-reservation principal and fee risk exceed the durable reservation");
+  }
+  return finalGate(client, intent, runtime);
 }
 
 export function streamBookEvidence(messages, tokenId) {

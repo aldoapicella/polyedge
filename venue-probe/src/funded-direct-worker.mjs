@@ -510,7 +510,7 @@ async function selectedFromHandoff(
     throw new Error("fail closed: funded intent handoff decision time is invalid");
   }
   const initialRemainingTtlMs = Date.parse(handoff.valid_until) - now.getTime();
-  if (!Number.isFinite(initialRemainingTtlMs) || initialRemainingTtlMs < config.minRemainingTtlMs) {
+  if (!Number.isFinite(initialRemainingTtlMs)) {
     throw fundedHandoffRejection(
       "remaining_ttl",
       "fail closed: funded intent handoff has insufficient remaining TTL",
@@ -521,7 +521,7 @@ async function selectedFromHandoff(
   const bytes = await streamToBuffer(response.readableStreamBody);
   const downloadedAt = clock();
   const remainingTtlMs = Date.parse(handoff.valid_until) - downloadedAt.getTime();
-  if (!Number.isFinite(remainingTtlMs) || remainingTtlMs < config.childMinRemainingTtlMs) {
+  if (!Number.isFinite(remainingTtlMs)) {
     throw fundedHandoffRejection(
       "remaining_ttl",
       "fail closed: funded intent handoff has insufficient child TTL after immutable intent download",
@@ -533,18 +533,19 @@ async function selectedFromHandoff(
   let value;
   try { value = JSON.parse(bytes.toString("utf8")); }
   catch { throw new Error("fail closed: funded intent handoff blob is not valid JSON"); }
+  const qualification = qualificationRejection(
+    value,
+    blobName,
+    actualHash,
+    config,
+    session,
+    downloadedAt,
+    config.childMinRemainingTtlMs
+  );
   if (value.decision_id !== decisionId ||
       value.decision_ts !== handoff.decision_ts ||
       value.valid_until !== handoff.valid_until ||
-      !qualifies(
-        value,
-        blobName,
-        actualHash,
-        config,
-        session,
-        downloadedAt,
-        config.childMinRemainingTtlMs
-      )) {
+      (qualification && qualification !== "remaining_ttl")) {
     throw new Error("fail closed: funded intent handoff does not qualify for execution");
   }
   const authorizationName = authorizationBlobName(config, session, value);
@@ -554,6 +555,7 @@ async function selectedFromHandoff(
     clients.control.getBlobClient(completionName).exists()
   ]);
   if (readOnly) {
+    assertRemainingHandoffTtl(initialRemainingTtlMs, remainingTtlMs, config);
     if (authorizationExists || completionExists) {
       throw new Error("fail closed: preflight handoff already has durable execution state");
     }
@@ -566,7 +568,8 @@ async function selectedFromHandoff(
   }
   if (completionExists) {
     const completion = await readJsonBlob(clients.control, completionName);
-    const busyCompletion = completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
+    const busyCompletion = !authorizationExists &&
+      completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
       completion.session_id === session.session_id &&
       completion.decision_id === value.decision_id &&
       completion.intent_blob_name === blobName &&
@@ -577,7 +580,8 @@ async function selectedFromHandoff(
       completion.order_submission_attempted === false &&
       completion.authorization_consumed === false &&
       completion.risk_reservation_created === false;
-    const authorizedCompletion = authorizationExists &&
+    let authorizedCompletion = false;
+    if (authorizationExists &&
       completion?.schema === "polyedge.operator_funded_intent_completion.v1" &&
       completion.session_id === session.session_id &&
       completion.decision_id === value.decision_id &&
@@ -587,7 +591,16 @@ async function selectedFromHandoff(
         "expired_before_child_launch",
         "child_failed_closed_pre_submission",
         "child_failed_closed_post_submission_unresolved"
-      ].includes(completion.status);
+      ].includes(completion.status)) {
+      const authorization = await readJsonBlobDocument(clients.control, authorizationName);
+      assertExistingAuthorizationBinding(authorization, config, session, {
+        value,
+        blobName,
+        hash: actualHash
+      });
+      authorizedCompletion = hash(completion.authorization_sha256) === authorization.hash &&
+        completion.child_run_id === authorization.value.child_run_id;
+    }
     if (busyCompletion || authorizedCompletion) {
       return {
         value,
@@ -605,6 +618,7 @@ async function selectedFromHandoff(
     }
     throw new Error("fail closed: funded intent completion is not exactly bound");
   }
+  assertRemainingHandoffTtl(initialRemainingTtlMs, remainingTtlMs, config);
   if (authorizationExists) {
     const authorization = await readJsonBlobDocument(clients.control, authorizationName);
     assertExistingAuthorizationBinding(authorization, config, session, {
@@ -864,6 +878,23 @@ function fundedHandoffRejection(code, message, remainingTtlMs = null) {
   error.code = code;
   error.remainingTtlMs = remainingTtlMs;
   return error;
+}
+
+function assertRemainingHandoffTtl(initialRemainingTtlMs, remainingTtlMs, config) {
+  if (initialRemainingTtlMs < config.minRemainingTtlMs) {
+    throw fundedHandoffRejection(
+      "remaining_ttl",
+      "fail closed: funded intent handoff has insufficient remaining TTL",
+      initialRemainingTtlMs
+    );
+  }
+  if (remainingTtlMs < config.childMinRemainingTtlMs) {
+    throw fundedHandoffRejection(
+      "remaining_ttl",
+      "fail closed: funded intent handoff has insufficient child TTL after immutable intent download",
+      remainingTtlMs
+    );
+  }
 }
 
 function qualificationRejection(
