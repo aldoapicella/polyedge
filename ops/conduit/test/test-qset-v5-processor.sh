@@ -67,7 +67,7 @@ grep -Fx 'TasksMax=1024' "$service" >/dev/null
 
 jq -e '
   .azureJobCount == (.jobs | length)
-  and .ociOnlyJobs == [{
+  and ([.ociOnlyJobs[] | select(.name == "qset-v5-processor")] == [{
     name:"qset-v5-processor",classification:"configured_manual_only_not_executed",
     ociUnit:"polyedge-qset-v5-processor.service",identityLane:"shadow-qset-v5-processor",
     azureContainerAppsJob:null,azureProcessorJobDeploymentAllowed:false,
@@ -77,7 +77,7 @@ jq -e '
     requiredInputs:{sourceFreezeReceipt:"/srv/polyedge-ring/migration/qset-v5/source-freeze/source-<final-sha256>.json",sealedDayReceipts:["/srv/polyedge-ring/migration/qset-v5-seal/2026-08-26.json","/srv/polyedge-ring/migration/qset-v5-seal/2026-08-27.json"]},
     requiredProofBeforeFirstExecution:["final_source_freeze_receipt_hash_image_revision_binding","two_exact_closed_day_receipt_and_inventory_hashes","local_linux_arm64_image_revision","dedicated_federated_token"],
     requiredProofBeforeRecurringEnablement:["manual_processor_success","verified_output_hash_and_readback","negative_access_probe","resource_and_disk_guard_evidence"]
-  }]
+  }])
   and (.protectedTrustRules.shadowQsetV5Processor | contains("no funded, qset-v1/v2/v3, Key Vault, Service Bus"))
 ' "$mapping" >/dev/null
 "$root/test/test-qset-v5-processor-handoff.sh"

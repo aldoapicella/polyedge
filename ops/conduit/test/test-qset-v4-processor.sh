@@ -19,10 +19,10 @@ grep -F '  qset-v4-processor)' "$runner" >/dev/null
 grep -F 'cpus=4 memory=8g limit=16800' "$runner" >/dev/null
 grep -F '/usr/local/libexec/polyedge-qset-v4-processor-preflight' "$runner" >/dev/null
 grep -F 'credential=shadow-qset-v4-processor' "$runner" >/dev/null
-grep -F 'qset-v4 processor federated token is missing or unsafe' "$runner" >/dev/null
+grep -F 'qset processor federated token is missing or unsafe' "$runner" >/dev/null
 grep -F -- '--user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges' "$runner" >/dev/null
 grep -F -- '--pull=never --log-driver=journald' "$runner" >/dev/null
-grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor)' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor)' "$runner" >/dev/null
 grep -F '2026-08-24 --source-freeze-blob' "$runner" >/dev/null
 grep -F '2026-08-25 --source-freeze-blob' "$runner" >/dev/null
 grep -F '/app/research/run_shadow_daily_v4.sh' "$runner" >/dev/null
@@ -67,7 +67,7 @@ grep -Fx 'TasksMax=1024' "$service" >/dev/null
 
 jq -e '
   .azureJobCount == (.jobs | length)
-  and .ociOnlyJobs == [{
+  and ([.ociOnlyJobs[] | select(.name == "qset-v4-processor")] == [{
     name:"qset-v4-processor",classification:"configured_manual_only_not_executed",
     ociUnit:"polyedge-qset-v4-processor.service",identityLane:"shadow-qset-v4-processor",
     azureContainerAppsJob:null,azureProcessorJobDeploymentAllowed:false,
@@ -77,7 +77,7 @@ jq -e '
     requiredInputs:{sourceFreezeReceipt:"/srv/polyedge-ring/migration/qset-v4/source-freeze/source-<final-sha256>.json",sealedDayReceipts:["/srv/polyedge-ring/migration/qset-v4-seal/2026-08-24.json","/srv/polyedge-ring/migration/qset-v4-seal/2026-08-25.json"]},
     requiredProofBeforeFirstExecution:["final_source_freeze_receipt_hash_image_revision_binding","two_exact_closed_day_receipt_and_inventory_hashes","local_linux_arm64_image_revision","dedicated_federated_token"],
     requiredProofBeforeRecurringEnablement:["manual_processor_success","verified_output_hash_and_readback","negative_access_probe","resource_and_disk_guard_evidence"]
-  }]
+  }])
   and (.protectedTrustRules.shadowQsetV4Processor | contains("no funded, qset-v1/v2/v3, Key Vault, Service Bus"))
 ' "$mapping" >/dev/null
 "$root/test/test-qset-v4-processor-handoff.sh"

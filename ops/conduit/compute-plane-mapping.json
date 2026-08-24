@@ -385,7 +385,8 @@
     "fundedSigner": "Only exact funded evidence dependencies and receiver direction; no qset, primary bot-events, table, broad scope, or sender role.",
     "arc": "Retain the existing no-delete bot-events ring uploader assignment only.",
     "fundedIntentProducer": "Only exact model/funded reads, shadow event/table writes, ACR pull, and sender direction; no receiver, qset, Key Vault, wallet, broad scope, or live execution access.",
-    "shadowQsetV4Processor": "Only exact qset-v4 raw read plus qset-v4 research/control access through the shadow-qset-v4-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access."
+    "shadowQsetV4Processor": "Only exact qset-v4 raw read plus qset-v4 research/control access through the shadow-qset-v4-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access.",
+    "shadowQsetV5Processor": "Only exact qset-v5 raw read plus qset-v5 research/control access through the shadow-qset-v5-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access."
   },
   "lastReadOnlyRecheck": {
     "capturedAtUtc": "2026-08-21T16:30:00Z",
