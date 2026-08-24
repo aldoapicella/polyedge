@@ -19,6 +19,7 @@ import {
   acquireCampaignLease,
   assertEligibleOrigin,
   loadCampaignRiskReservationRecords,
+  loadCampaignUnresolvedRiskReservationRecords,
   sanitize,
   settleProbeRiskReservations,
   storageContainer,
@@ -172,11 +173,14 @@ async function run() {
   if (!Array.isArray(openOrders)) throw new Error("fail closed: CLOB open-order response is not an array");
   if (openOrders.length) throw new Error(`fail closed: account has ${openOrders.length} open order(s)`);
 
-  const [positions, balance, activity, initialRedemptionControl] = await Promise.all([
+  const [positions, balance, activity, initialRedemptionControl, unresolvedReservations] = await Promise.all([
     fetchPositions(),
     clob.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetchActivity(),
-    readRedemptionControl()
+    readRedemptionControl(),
+    config.dustRedemptionEnabled
+      ? loadCampaignUnresolvedRiskReservationRecords(config)
+      : []
   ]);
   const liquidBefore = Number(formatUnits(BigInt(balance.balance || "0"), 6));
   const onchainLiquidBefore = await readPusdBalance(publicClient);
@@ -206,7 +210,12 @@ async function run() {
     canonicalRecoveryOwnsEvidence = recoveryEvidenceOwnershipAfterResume(resumed);
     if (resumed) return resumed;
   }
-  const selection = await discoverOnchainRedeemableConditions(publicClient, positions);
+  const candidates = await augmentRedeemableCandidatesFromRiskReservations(
+    positions,
+    unresolvedReservations,
+    { enabled: config.dustRedemptionEnabled }
+  );
+  const selection = await discoverOnchainRedeemableConditions(publicClient, candidates);
   const redemptionControl = await reconcilePriorRejectedSubmission(
     initialRedemptionControl,
     selection
@@ -259,13 +268,17 @@ async function run() {
   await checkOrigin("pre_submit");
   const finalOrders = await clob.getOpenOrders(undefined, true);
   if (!Array.isArray(finalOrders) || finalOrders.length) throw new Error("fail closed: open-order state changed before redemption");
-  const finalSelection = await discoverOnchainRedeemableConditions(
-    publicClient,
-    await fetchPositions()
-  );
-  if (JSON.stringify(finalSelection.selected) !== JSON.stringify(selection.selected)) {
-    throw new Error("fail closed: redeemable position set changed after preflight");
-  }
+  const [finalPositions, finalReservations] = await Promise.all([
+    fetchPositions(),
+    config.dustRedemptionEnabled
+      ? loadCampaignUnresolvedRiskReservationRecords(config)
+      : []
+  ]);
+  const finalSelection = await discoverOnchainRedeemableConditions(publicClient,
+    await augmentRedeemableCandidatesFromRiskReservations(finalPositions, finalReservations, {
+      enabled: config.dustRedemptionEnabled
+    }));
+  assertStableRedemptionSelection(selection, finalSelection);
 
   const control = {
     schema_version: 1,
@@ -945,11 +958,121 @@ export async function discoverOnchainRedeemableConditions(
     null,
     Number.MAX_SAFE_INTEGER
   );
-  return validateOnchainSelection(publicClient, discovered, {
+  const validated = await validateOnchainSelection(publicClient, discovered, {
     funderAddress,
     maxPayout,
     maxConditions
   });
+  return {
+    ...validated,
+    selected: validated.selected.map((row) => {
+      const bindings = positions.flatMap((position) =>
+        String(position?.conditionId || "").toLowerCase() === row.condition_id.toLowerCase()
+          ? position.riskReservationBindings || []
+          : []);
+      return bindings.length ? {
+        ...row,
+        candidate_source: "durable_unresolved_reservation_plus_resolved_gamma",
+        risk_reservation_bindings: bindings
+      } : row;
+    })
+  };
+}
+
+export async function augmentRedeemableCandidatesFromRiskReservations(
+  positions,
+  records,
+  { enabled = false, fetchMarket = fetchGammaMarket } = {}
+) {
+  if (!Array.isArray(positions) || !Array.isArray(records)) {
+    throw new Error("fail closed: redemption candidate inputs are unavailable");
+  }
+  if (!enabled) return [...positions];
+  const candidates = [...positions];
+  for (const record of records) {
+    const reservation = record?.reservation;
+    if (reservation?.state !== "position_unresolved") continue;
+    if (reservation?.schema_version !== 1 || reservation?.evidence_protocol_version !== 3 ||
+        !(Number(reservation?.matched_notional) > 0) || reservation?.reconciliation_complete !== true ||
+        reservation?.zero_open_orders_confirmed !== true ||
+        !/^0x[0-9a-f]{64}$/i.test(String(reservation?.condition_id || "")) ||
+        !/^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || "")) ||
+        !/^[1-9]\d{0,77}$/.test(String(reservation?.token_id || "")) ||
+        !String(reservation?.market_id || "") || !String(reservation?.run_id || "") ||
+        !String(reservation?.probe_id || "") ||
+        !/^sha256:[0-9a-f]{64}$/.test(String(record?.reservation_sha256 || "")) ||
+        !String(record?.blob_name || "").endsWith(`/${reservation.probe_id}.json`)) {
+      throw new Error("fail closed: unresolved redemption reservation binding is invalid");
+    }
+    const exact = candidates.filter((row) =>
+      String(row?.conditionId || "").toLowerCase() === reservation.condition_id.toLowerCase() &&
+      String(row?.asset || "") === String(reservation.token_id));
+    if (exact.length > 1) throw new Error("fail closed: Data API returned duplicate exact redemption positions");
+    if (exact.length === 1) continue;
+
+    const market = await fetchMarket(String(reservation.market_id));
+    const tokenIds = jsonArray(market?.clobTokenIds).map(String);
+    const outcomes = jsonArray(market?.outcomes).map(String);
+    const prices = jsonArray(market?.outcomePrices).map(Number);
+    const outcomeIndex = tokenIds.indexOf(String(reservation.token_id));
+    if (String(market?.id || "") !== String(reservation.market_id) ||
+        String(market?.conditionId || "").toLowerCase() !== reservation.condition_id.toLowerCase() ||
+        market?.closed !== true || market?.acceptingOrders !== false ||
+        typeof market?.negRisk !== "boolean" || tokenIds.length !== 2 || outcomes.length !== 2 ||
+        prices.length !== 2 || new Set(tokenIds).size !== 2 || outcomeIndex < 0 ||
+        prices[outcomeIndex] !== 1 || prices[1 - outcomeIndex] !== 0) {
+      throw new Error("fail closed: resolved Gamma market does not bind the winning unresolved token");
+    }
+    // ponytail: currentValue only admits the candidate; chain balance and payout vector remain authoritative.
+    candidates.push({
+      conditionId: reservation.condition_id,
+      redeemable: true,
+      currentValue: 1,
+      initialValue: Number(reservation.matched_notional),
+      negativeRisk: market.negRisk,
+      title: market.question || market.title || null,
+      asset: reservation.token_id,
+      oppositeAsset: tokenIds[1 - outcomeIndex],
+      outcomeIndex,
+      riskReservationBindings: [{
+        blob_name: record.blob_name,
+        sha256: record.reservation_sha256,
+        run_id: reservation.run_id,
+        probe_id: reservation.probe_id,
+        order_id: reservation.order_id,
+        matched_notional: Number(reservation.matched_notional)
+      }]
+    });
+  }
+  return candidates;
+}
+
+export function assertStableRedemptionSelection(initial, final) {
+  if (JSON.stringify(final?.selected) !== JSON.stringify(initial?.selected)) {
+    throw new Error("fail closed: redeemable position set changed after preflight");
+  }
+}
+
+async function fetchGammaMarket(marketId) {
+  const response = await fetch(`https://gamma-api.polymarket.com/markets?id=${encodeURIComponent(marketId)}`, {
+    signal: AbortSignal.timeout(10_000)
+  });
+  if (!response.ok) throw new Error(`fail closed: Gamma market lookup failed (${response.status})`);
+  const rows = await response.json();
+  if (!Array.isArray(rows) || rows.length !== 1) {
+    throw new Error("fail closed: Gamma market lookup was not exact");
+  }
+  return rows[0];
+}
+
+function jsonArray(value) {
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 async function validateOnchainSelection(publicClient, selection, {

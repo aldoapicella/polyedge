@@ -9,6 +9,8 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import {
   RELAYER_DEADLINE_BUFFER_SECONDS,
+  assertStableRedemptionSelection,
+  augmentRedeemableCandidatesFromRiskReservations,
   confirmedRedemptionControlMatches,
   commitCanonicalRecoveryJournal,
   discoverOnchainRedeemableConditions,
@@ -706,9 +708,27 @@ test("funded-service redemption is bound to an approved static-egress protected-
     VENUE_REDEMPTION_MAX_CONDITIONS: "1"
   });
   assert.equal(funded.fundedServiceManaged, true);
+  assert.equal(funded.dustRedemptionEnabled, false);
+  assert.equal(loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_DUST_REDEMPTION_ENABLED: "false"
+  }).dustRedemptionEnabled, false);
   assert.equal(funded.executionOrigin, "azure_chile_central_static_egress");
   assert.equal(funded.maxOrderNotional, 10.5);
   assert.equal(funded.maxPayout, null);
+  assert.equal(loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_DUST_REDEMPTION_ENABLED: "true",
+    FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(session),
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: session.session_id,
+    VENUE_PROBE_EXECUTION_ORIGIN: "azure_chile_central_static_egress",
+    VENUE_REDEMPTION_MAX_CONDITIONS: "1"
+  }).dustRedemptionEnabled, true);
+  assert.throws(() => loadRedemptionConfig({
+    ...safeEnv,
+    FUNDED_DIRECT_DUST_REDEMPTION_ENABLED: "true"
+  }), /requires funded-service redemption/);
   assert.equal(loadRedemptionConfig({
     ...safeEnv,
     FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED: "true",
@@ -818,6 +838,92 @@ test("onchain discovery skips stale candidates and uses authoritative payout", a
   assert.equal(selection.selected[0].gross_payout, 7);
   assert.equal(selection.selected_gross_payout, 7);
   assert.equal(selection.payout_source, "onchain_balances_and_payout_vector");
+});
+
+test("dust candidate augmentation is explicit and remains bound to durable, Gamma, chain, and repeat evidence", async () => {
+  const decisionId = "a".repeat(64);
+  const probeId = `funded-direct-${decisionId}`;
+  const orderId = `0x${"ab".repeat(32)}`;
+  const record = {
+    blob_name: `reports/research/venue-probe/risk-reservations/2026-08-24/${probeId}.json`,
+    reservation_sha256: `sha256:${"c".repeat(64)}`,
+    reservation: {
+      schema_version: 1,
+      evidence_protocol_version: 3,
+      state: "position_unresolved",
+      market_id: "3801022",
+      condition_id: conditionA,
+      token_id: "101",
+      run_id: "funded-direct-20260824095256162-6ad533f2",
+      probe_id: probeId,
+      order_id: orderId,
+      matched_notional: 0.01564794,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true
+    }
+  };
+  const market = {
+    id: "3801022",
+    conditionId: conditionA,
+    closed: true,
+    acceptingOrders: false,
+    negRisk: false,
+    question: "BTC Up or Down",
+    clobTokenIds: JSON.stringify(["101", "102"]),
+    outcomes: JSON.stringify(["Up", "Down"]),
+    outcomePrices: JSON.stringify(["1", "0"])
+  };
+  let marketCalls = 0;
+  const disabled = await augmentRedeemableCandidatesFromRiskReservations([], [record], {
+    fetchMarket: async () => { marketCalls += 1; return market; }
+  });
+  assert.deepEqual(disabled, []);
+  assert.equal(marketCalls, 0);
+
+  const candidates = await augmentRedeemableCandidatesFromRiskReservations([], [record], {
+    enabled: true,
+    fetchMarket: async () => { marketCalls += 1; return market; }
+  });
+  assert.equal(candidates.length, 1);
+  assert.equal(marketCalls, 1);
+  const publicClient = {
+    async readContract({ functionName, args }) {
+      if (functionName === "getCollectionId") return args[2] === 1n ? "up" : "down";
+      if (functionName === "getPositionId") return args[1] === "up" ? 101n : 102n;
+      if (functionName === "payoutDenominator") return 1n;
+      if (functionName === "payoutNumerators") return args[1] === 0n ? 1n : 0n;
+      if (functionName === "balanceOf") return args[1] === 101n ? 20_000n : 0n;
+      throw new Error(`unexpected contract call: ${functionName}`);
+    }
+  };
+  const selection = await discoverOnchainRedeemableConditions(publicClient, candidates, {
+    funderAddress: funder,
+    maxPayout: null,
+    maxConditions: 1
+  });
+  assert.equal(selection.selected[0].gross_payout, 0.02);
+  assert.equal(selection.selected[0].candidate_source,
+    "durable_unresolved_reservation_plus_resolved_gamma");
+  assert.equal(selection.selected[0].risk_reservation_bindings[0].sha256,
+    record.reservation_sha256);
+  assert.doesNotThrow(() => assertStableRedemptionSelection(selection, structuredClone(selection)));
+  const changed = structuredClone(selection);
+  changed.selected[0].onchain_balances_base_units[0] = "0";
+  assert.throws(() => assertStableRedemptionSelection(selection, changed), /changed after preflight/);
+
+  for (const mutate of [
+    (value) => { value.record.reservation_sha256 = "invalid"; },
+    (value) => { value.market.closed = false; },
+    (value) => { value.market.outcomePrices = JSON.stringify(["0", "1"]); },
+    (value) => { value.market.clobTokenIds = JSON.stringify(["201", "202"]); }
+  ]) {
+    const value = { record: structuredClone(record), market: structuredClone(market) };
+    mutate(value);
+    await assert.rejects(augmentRedeemableCandidatesFromRiskReservations([], [value.record], {
+      enabled: true,
+      fetchMarket: async () => value.market
+    }), /fail closed/);
+  }
 });
 
 test("recent redemption activity is attributed only to a matching durable worker control record", () => {

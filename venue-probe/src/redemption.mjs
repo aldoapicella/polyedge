@@ -89,6 +89,8 @@ export function loadRedemptionConfig(env = process.env) {
     campaignId: String(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID || "funded-campaign-2026-07-12"),
     executionOrigin: String(env.VENUE_PROBE_EXECUTION_ORIGIN || "azure_north_europe_static_egress"),
     fundedServiceManaged,
+    dustRedemptionEnabled:
+      env.FUNDED_DIRECT_DUST_REDEMPTION_ENABLED === "true",
     operatorDirect: fundedServiceManaged,
     fundedSessionManifestJson,
     campaignBaselineEquity: finiteNumber(env.VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY, 5.030521),
@@ -182,6 +184,8 @@ export function validateRedemptionConfig(config) {
     if (config.maxConditions !== 1) {
       errors.push("funded-service redemption must cap each run at one condition");
     }
+  } else if (config.dustRedemptionEnabled) {
+    errors.push("FUNDED_DIRECT_DUST_REDEMPTION_ENABLED requires funded-service redemption");
   }
   for (const [name, value] of [
     ["POLYMARKET_PRIVATE_KEY", config.privateKey],
