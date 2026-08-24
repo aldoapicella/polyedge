@@ -484,10 +484,15 @@ now=$(/usr/bin/date -u +%s)
   [$events[] | select(.invocation == $invocation and .container == $container and
     .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "market_warmed")] as $warmed |
   [$events[] | select(.invocation == $invocation and .container == $container and
-    .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")] | sort_by(.timestamp) as $heartbeats |
+    .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")] | sort_by(.timestamp) as $all_heartbeats |
+  ([$all_heartbeats[] | select(.event.executor.user_channel_ready == true and
+    .event.executor.market_channel_ready == true and .event.executor.safety_snapshot_cache_ready == true)] |
+    first | .timestamp) as $ready_start |
+  (if $ready_start == null then [] else [$all_heartbeats[] | select(.timestamp >= $ready_start)] end) as $heartbeats |
   [$heartbeats[].timestamp] as $times |
   ([range(1; ($times | length)) as $i | $times[$i] - $times[$i-1]] | max // 0) as $max_gap |
-  ($alerts | length) == 0 and ($failed | length) == 0 and ($warmed | length) >= 1 and ($heartbeats | length) >= 3 and
+  $ready_start != null and ($alerts | length) == 0 and ($failed | length) == 0 and
+  ($warmed | length) >= 1 and ($heartbeats | length) >= 3 and
   $times[-1] <= $now and $times[-1] >= ($now - 75) and $max_gap <= 75 and
   $heartbeats[-1].event.processed_messages > $heartbeats[0].event.processed_messages and
   all($heartbeats[].event;
