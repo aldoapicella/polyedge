@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+die() { echo "polyedge-parity-generate-boundary-bindings-20260824: $*" >&2; exit 1; }
+sha() { /usr/bin/sha256sum "$1" | /usr/bin/awk '{print "sha256:" $1}'; }
+
+secure_input() {
+  local path=$1 max=$2 links size
+  test ! -L "$path" && test -f "$path" || die "unsafe or missing input: $path"
+  read -r links size < <(/usr/bin/stat -c '%h %s' "$path")
+  test "$links" = 1 && test "$size" -gt 0 && test "$size" -le "$max" \
+    || die "unsafe input link count or size: $path"
+}
+
+env_value() {
+  local key=$1 path=$2 count
+  count=$(/usr/bin/grep -c "^${key}=" "$path" || true)
+  test "$count" = 1 || die "expected exactly one $key in $path"
+  /usr/bin/awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print}' "$path"
+}
+
+test "$#" -eq 2 || die 'usage: polyedge-parity-generate-boundary-bindings-20260824 WINDOW_START_UTC POST_REDEMPTION_ATTESTATION'
+window=$1
+attestation=$2
+printf '%s' "$window" | /usr/bin/grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z$' \
+  || die 'window must be a canonical UTC hour'
+window_epoch=$(/usr/bin/date -u -d "$window" +%s) || die 'window is invalid'
+test "$(/usr/bin/date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$window" \
+  || die 'window is not canonical UTC'
+test "$(/usr/bin/date -u +%s)" -lt "$window_epoch" || die 'window must still be untouched and in the future'
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+activation_root=$parity_root/activation
+rollback_root=${POLYEDGE_PARITY_ROLLBACK_ROOT:-/etc/polyedge/rollback}
+formal=${POLYEDGE_PARITY_FORMAL_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+hourly_env=${POLYEDGE_PARITY_HOURLY_ENV_FILE:-/etc/polyedge/jobs/hourly.env}
+bin_dir=$(cd "$(dirname "$0")" && pwd)
+first=$bin_dir/polyedge-parity-collect-first-hour-20260824
+hourly=$bin_dir/polyedge-parity-hourly-20260824
+daily=$bin_dir/polyedge-parity-record-daily-20260824
+reboot=$bin_dir/polyedge-reboot-attestation-20260824
+stage=$bin_dir/polyedge-parity-stage-funded-active-20260824
+
+case "$attestation" in "$activation_root"/*.json) ;; *) die 'attestation must be a direct activation receipt' ;; esac
+for input in "$attestation" "$formal" "$hourly_env" "$stage" "$first" "$hourly" "$daily" "$reboot"; do
+  secure_input "$input" 2097152
+done
+
+old_ledger=$(env_value POLYEDGE_PARITY_LEDGER "$formal")
+case "$old_ledger" in "$parity_root"/*.json) ;; *) die 'current ledger must be a direct parity-root JSON file' ;; esac
+secure_input "$old_ledger" 1048576
+
+/usr/bin/jq -e '
+  .schema == "polyedge.funded_signer_post_redemption_attestation.v1" and .status == "attested" and
+  (.createdAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+  (.helperSha256 | test("^sha256:[0-9a-f]{64}$")) and
+  (.redemption.transactionHash | test("^0x[0-9a-f]{64}$")) and
+  (.redemption.settlementBlob | type == "string" and length > 0) and
+  all(.evidence.liveSummary,.evidence.followUpDryRun,.evidence.internalSettlement;
+    (.path | type == "string" and length > 0) and (.sha256 | test("^sha256:[0-9a-f]{64}$"))) and
+  (.runtime.signer.invocationId | test("^[0-9a-f]{32}$")) and
+  (.runtime.signer.containerId | test("^[0-9a-f]{64}$")) and .runtime.signer.restartCount == 0 and
+  (.runtime.signer.image | test("^ghcr\\.io/[a-z0-9][a-z0-9._/-]*polyedge-venue-probe@sha256:[0-9a-f]{64}$")) and
+  (.runtime.signer.revision | test("^[0-9a-f]{40}$")) and
+  .runtime.signer.user == "986:982" and
+  (.runtime.producer.invocationId | test("^[0-9a-f]{32}$")) and
+  (.runtime.producer.containerId | test("^[0-9a-f]{64}$")) and .runtime.producer.restartCount == 0 and
+  (.runtime.producer.image | test("^ghcr\\.io/[a-z0-9][a-z0-9._/-]*polyedge-rust-backend@sha256:[0-9a-f]{64}$")) and
+  (.runtime.producer.revision | test("^[0-9a-f]{40}$")) and
+  .runtime.producer.user == "984:980" and .runtime.producer.status == "running" and .runtime.producer.health == "healthy" and
+  (.heartbeat.capturedAtEpoch | type == "number" and . > 0) and
+  (.heartbeat.processedMessages | type == "number" and . > 0) and
+  .heartbeat.failedMessages == 0 and .heartbeat.failedAttempts == 0 and
+  .heartbeat.executor.busy == false and .heartbeat.executor.user_channel_ready == true and
+  .heartbeat.executor.market_channel_ready == true and .heartbeat.executor.user_channel_gaps == 0 and
+  .heartbeat.executor.market_channel_gaps == 0 and .heartbeat.executor.user_channel_unparsed == 0 and
+  .heartbeat.executor.market_channel_unparsed == 0 and
+  .heartbeat.executor.reconnect_reconciliation_required == false and
+  .heartbeat.executor.safety_snapshot_cache_ready == true and
+  (.heartbeat.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+  .heartbeat.executor.safety_snapshot_open_order_count == 0 and
+  .heartbeat.executor.safety_snapshot_unresolved_position_count == 0 and
+  .heartbeat.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+  .heartbeat.executor.safety_snapshot_cache_error == null and .heartbeat.executor.risk_reservation_index_ready == true and
+  (.authorizedDeadLetterBaseline | type == "number" and floor == . and . >= 0) and
+  .queue.before.status == "Active" and .queue.before.activeMessageCount == 0 and .queue.before.scheduledMessageCount == 0 and
+  .queue.after == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,
+    deadLetterMessageCount:.authorizedDeadLetterBaseline} and
+  .queue.before.deadLetterMessageCount >= .queue.after.deadLetterMessageCount and .queue.deadLetterNonGrowth == true and
+  .servicesMutated == false and .staleRecoveryReceiptsAccepted == false and
+  .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
+' "$attestation" >/dev/null || die 'post-redemption attestation is not safe for boundary preparation'
+
+created=$(/usr/bin/jq -er '.createdAtUtc' "$attestation")
+created_epoch=$(/usr/bin/date -u -d "$created" +%s) || die 'attestation creation time is invalid'
+test "$(/usr/bin/date -u -d "@$created_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$created" \
+  || die 'attestation creation time is not canonical UTC'
+test "$created_epoch" -lt "$window_epoch" || die 'attestation must be finalized before the untouched boundary'
+heartbeat_epoch=$(/usr/bin/jq -er '.heartbeat.capturedAtEpoch | floor' "$attestation")
+test "$heartbeat_epoch" -le "$created_epoch" && test $((created_epoch - heartbeat_epoch)) -le 75 \
+  || die 'attested heartbeat is not fresh at receipt creation'
+
+live=$(/usr/bin/jq -er '.evidence.liveSummary.path' "$attestation")
+live_sha=$(/usr/bin/jq -er '.evidence.liveSummary.sha256' "$attestation")
+dry=$(/usr/bin/jq -er '.evidence.followUpDryRun.path' "$attestation")
+dry_sha=$(/usr/bin/jq -er '.evidence.followUpDryRun.sha256' "$attestation")
+settlement=$(/usr/bin/jq -er '.evidence.internalSettlement.path' "$attestation")
+settlement_sha=$(/usr/bin/jq -er '.evidence.internalSettlement.sha256' "$attestation")
+case "$live:$dry:$settlement" in *'/funded-recovery/'*) die 'stale funded-recovery evidence is prohibited' ;; esac
+for input in "$live" "$dry" "$settlement"; do secure_input "$input" 1048576; done
+test "$(sha "$live")" = "$live_sha" || die 'live redemption summary hash mismatch'
+test "$(sha "$dry")" = "$dry_sha" || die 'follow-up dry-run summary hash mismatch'
+test "$(sha "$settlement")" = "$settlement_sha" || die 'internal settlement hash mismatch'
+
+transaction=$(/usr/bin/jq -er '.redemption.transactionHash | ascii_downcase' "$attestation")
+settlement_blob=$(/usr/bin/jq -er '.redemption.settlementBlob' "$attestation")
+/usr/bin/jq -e --arg transaction "$transaction" --arg settlement_blob "$settlement_blob" '
+  .schema_version == 1 and .status == "redeemed_and_verified" and .dry_run == false and
+  (.run_id | type == "string" and length > 0) and
+  (.transaction_hash | ascii_downcase) == $transaction and .redemption_submitted == true and
+  (.liquid_collateral_before | type == "number") and (.liquid_collateral_after | type == "number") and
+  .liquid_collateral_after > .liquid_collateral_before and (.realized_payout | type == "number" and . > 0) and
+  .zero_open_orders_confirmed == true and .internal_settlement_blobs == [$settlement_blob] and
+  (.finished_ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+' "$live" >/dev/null || die 'live redemption source evidence is invalid'
+/usr/bin/jq -e '
+  .schema_version == 1 and .status == "nothing_to_redeem" and .dry_run == true and
+  .zero_open_orders_confirmed == true and .selection.selected == [] and .redemption_submitted == false and
+  (.finished_ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
+' "$dry" >/dev/null || die 'follow-up dry-run source evidence is invalid'
+/usr/bin/jq -e --arg transaction "$transaction" --argjson payout "$(/usr/bin/jq -er '.realized_payout' "$live")" '
+  .schema == "polyedge.verified_internal_settlement.v1" and
+  (.transaction_hash | ascii_downcase) == $transaction and .payout == $payout and (.receipt_confirmations | tonumber) >= 2
+' "$settlement" >/dev/null || die 'internal settlement source evidence is invalid'
+live_finished=$(/usr/bin/date -u -d "$(/usr/bin/jq -er '.finished_ts' "$live")" +%s%3N) || die 'live evidence time is invalid'
+dry_finished=$(/usr/bin/date -u -d "$(/usr/bin/jq -er '.finished_ts' "$dry")" +%s%3N) || die 'dry-run evidence time is invalid'
+test "$live_finished" -le "$dry_finished" && test "$dry_finished" -le $((created_epoch * 1000)) \
+  || die 'source evidence ordering is invalid'
+
+window_tag=$(/usr/bin/date -u -d "@$window_epoch" +%Y%m%dT%H%M%SZ)
+hour_tag=$(/usr/bin/date -u -d "@$window_epoch" +%Y%m%dT%H)
+ledger=$parity_root/${window_tag}-funded-active.json
+test "$ledger" != "$old_ledger" || die 'candidate ledger would reuse the current ledger'
+rollback=$rollback_root/${window_tag}-funded-active
+dlq=$(/usr/bin/jq -er '.authorizedDeadLetterBaseline' "$attestation")
+
+/usr/bin/jq -n \
+  --arg generated "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
+  --argjson window_epoch "$window_epoch" --arg window_tag "$window_tag" \
+  --arg ledger "$ledger" --arg old_ledger "$old_ledger" --arg old_ledger_sha "$(sha "$old_ledger")" \
+  --arg formal "$formal" --arg formal_sha "$(sha "$formal")" --arg hourly_env "$hourly_env" --arg hourly_env_sha "$(sha "$hourly_env")" \
+  --arg rollback "$rollback" --arg staged "$activation_root/${window_tag}-staged.json" \
+  --arg first_validated "$activation_root/${window_tag}-first-hour-validated.json" \
+  --arg first_evidence "$parity_root/hourly/$hour_tag/evidence.json" \
+  --arg attestation "$attestation" --arg attestation_sha "$(sha "$attestation")" \
+  --arg helper_sha "$(/usr/bin/jq -er '.helperSha256' "$attestation")" \
+  --arg transaction "$transaction" --arg settlement_blob "$settlement_blob" \
+  --arg live "$live" --arg live_sha "$live_sha" --arg dry "$dry" --arg dry_sha "$dry_sha" \
+  --arg settlement "$settlement" --arg settlement_sha "$settlement_sha" --argjson dlq "$dlq" \
+  --arg signer_image "$(/usr/bin/jq -er '.runtime.signer.image' "$attestation")" \
+  --arg signer_revision "$(/usr/bin/jq -er '.runtime.signer.revision' "$attestation")" \
+  --arg signer_invocation "$(/usr/bin/jq -er '.runtime.signer.invocationId' "$attestation")" \
+  --arg signer_container "$(/usr/bin/jq -er '.runtime.signer.containerId' "$attestation")" \
+  --arg producer_image "$(/usr/bin/jq -er '.runtime.producer.image' "$attestation")" \
+  --arg producer_revision "$(/usr/bin/jq -er '.runtime.producer.revision' "$attestation")" \
+  --arg producer_invocation "$(/usr/bin/jq -er '.runtime.producer.invocationId' "$attestation")" \
+  --arg producer_container "$(/usr/bin/jq -er '.runtime.producer.containerId' "$attestation")" \
+  --argjson heartbeat_epoch "$heartbeat_epoch" \
+  --arg stage "$stage" --arg stage_sha "$(sha "$stage")" --arg first "$first" --arg first_sha "$(sha "$first")" \
+  --arg hourly "$hourly" --arg hourly_sha "$(sha "$hourly")" --arg daily "$daily" --arg daily_sha "$(sha "$daily")" \
+  --arg reboot "$reboot" --arg reboot_sha "$(sha "$reboot")" '
+  {schema:"polyedge.parity_boundary_binding_review.v1",generatedAtUtc:$generated,
+   activationAllowed:false,reviewRequired:true,windowStartUtc:$window,windowStartEpoch:$window_epoch,
+   collectNotBeforeEpoch:($window_epoch + 4680),enableDeadlineEpoch:($window_epoch + 7200),
+   paths:{ledger:$ledger,rollback:$rollback,stagedReceipt:$staged,
+     firstHourValidatedReceipt:$first_validated,firstHourEvidence:$first_evidence},
+   rollbackSource:{ledger:{path:$old_ledger,sha256:$old_ledger_sha},
+     formalEnv:{path:$formal,sha256:$formal_sha},hourlyEnv:{path:$hourly_env,sha256:$hourly_env_sha}},
+   evidence:{postRedemptionAttestation:{path:$attestation,sha256:$attestation_sha,helperSha256:$helper_sha},
+     redemption:{transactionHash:$transaction,settlementBlob:$settlement_blob},
+     liveSummary:{path:$live,sha256:$live_sha},followUpDryRun:{path:$dry,sha256:$dry_sha},
+     internalSettlement:{path:$settlement,sha256:$settlement_sha},authorizedDeadLetterBaseline:$dlq},
+   runtime:{signer:{image:$signer_image,revision:$signer_revision,invocationId:$signer_invocation,
+       containerId:$signer_container,restartCount:0,user:"986:982"},
+     producer:{image:$producer_image,revision:$producer_revision,invocationId:$producer_invocation,containerId:$producer_container,
+       restartCount:0,user:"984:980",status:"running",health:"healthy"},
+     heartbeatCapturedAtEpoch:$heartbeat_epoch},
+   sourceBasis:{stage:{path:$stage,sha256:$stage_sha},firstHour:{path:$first,sha256:$first_sha},
+     hourly:{path:$hourly,sha256:$hourly_sha},daily:{path:$daily,sha256:$daily_sha},
+     reboot:{path:$reboot,sha256:$reboot_sha}},
+   operatorNote:"review and bind these exact values into versioned scripts; this output cannot stage or enable parity"}
+'
