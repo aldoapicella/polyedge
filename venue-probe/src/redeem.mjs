@@ -998,7 +998,7 @@ export async function augmentRedeemableCandidatesFromRiskReservations(
         !/^0x[0-9a-f]{64}$/i.test(String(reservation?.condition_id || "")) ||
         !/^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || "")) ||
         !/^[1-9]\d{0,77}$/.test(String(reservation?.token_id || "")) ||
-        !String(reservation?.market_id || "") || !String(reservation?.run_id || "") ||
+        !/^[1-9]\d*$/.test(String(reservation?.market_id || "")) || !String(reservation?.run_id || "") ||
         !String(reservation?.probe_id || "") ||
         !/^sha256:[0-9a-f]{64}$/.test(String(record?.reservation_sha256 || "")) ||
         !String(record?.blob_name || "").endsWith(`/${reservation.probe_id}.json`)) {
@@ -1016,12 +1016,17 @@ export async function augmentRedeemableCandidatesFromRiskReservations(
     const prices = jsonArray(market?.outcomePrices).map(Number);
     const outcomeIndex = tokenIds.indexOf(String(reservation.token_id));
     if (String(market?.id || "") !== String(reservation.market_id) ||
-        String(market?.conditionId || "").toLowerCase() !== reservation.condition_id.toLowerCase() ||
-        market?.closed !== true || market?.acceptingOrders !== false ||
+        String(market?.conditionId || "").toLowerCase() !== reservation.condition_id.toLowerCase()) {
+      throw new Error("fail closed: Gamma market ID or condition does not match the unresolved reservation");
+    }
+    if (market?.closed !== true || market?.acceptingOrders !== false ||
+        market?.umaResolutionStatus !== "resolved" ||
         typeof market?.negRisk !== "boolean" || tokenIds.length !== 2 || outcomes.length !== 2 ||
-        prices.length !== 2 || new Set(tokenIds).size !== 2 || outcomeIndex < 0 ||
-        prices[outcomeIndex] !== 1 || prices[1 - outcomeIndex] !== 0) {
-      throw new Error("fail closed: resolved Gamma market does not bind the winning unresolved token");
+        prices.length !== 2 || new Set(tokenIds).size !== 2) {
+      throw new Error("fail closed: Gamma market is not an exact resolved binary market");
+    }
+    if (outcomeIndex < 0 || prices[outcomeIndex] !== 1 || prices[1 - outcomeIndex] !== 0) {
+      throw new Error("fail closed: Gamma market does not bind the unresolved reservation to the winning token");
     }
     // ponytail: currentValue only admits the candidate; chain balance and payout vector remain authoritative.
     candidates.push({
@@ -1053,16 +1058,19 @@ export function assertStableRedemptionSelection(initial, final) {
   }
 }
 
-async function fetchGammaMarket(marketId) {
-  const response = await fetch(`https://gamma-api.polymarket.com/markets?id=${encodeURIComponent(marketId)}`, {
+export async function fetchGammaMarket(marketId, { fetchImpl = fetch } = {}) {
+  if (!/^[1-9]\d*$/.test(String(marketId || ""))) {
+    throw new Error("fail closed: Gamma market ID is invalid");
+  }
+  const response = await fetchImpl(`https://gamma-api.polymarket.com/markets/${marketId}`, {
     signal: AbortSignal.timeout(10_000)
   });
   if (!response.ok) throw new Error(`fail closed: Gamma market lookup failed (${response.status})`);
-  const rows = await response.json();
-  if (!Array.isArray(rows) || rows.length !== 1) {
-    throw new Error("fail closed: Gamma market lookup was not exact");
+  const market = await response.json();
+  if (!market || typeof market !== "object" || Array.isArray(market)) {
+    throw new Error("fail closed: Gamma exact-market response is invalid");
   }
-  return rows[0];
+  return market;
 }
 
 function jsonArray(value) {

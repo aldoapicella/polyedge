@@ -15,6 +15,7 @@ import {
   commitCanonicalRecoveryJournal,
   discoverOnchainRedeemableConditions,
   expectedRecoveredAdapterApprovals,
+  fetchGammaMarket,
   persistCanonicalRecoveryJournal,
   putCanonicalRecoveryJournal,
   recoveryEvidenceOwnershipAfterResume,
@@ -867,6 +868,7 @@ test("dust candidate augmentation is explicit and remains bound to durable, Gamm
     conditionId: conditionA,
     closed: true,
     acceptingOrders: false,
+    umaResolutionStatus: "resolved",
     negRisk: false,
     question: "BTC Up or Down",
     clobTokenIds: JSON.stringify(["101", "102"]),
@@ -924,6 +926,24 @@ test("dust candidate augmentation is explicit and remains bound to durable, Gamm
       fetchMarket: async () => value.market
     }), /fail closed/);
   }
+});
+
+test("Gamma exact-market lookup uses the path endpoint and requires one object", async () => {
+  let requested;
+  const market = await fetchGammaMarket("3801022", {
+    fetchImpl: async (url) => {
+      requested = url;
+      return { ok: true, json: async () => ({ id: "3801022" }) };
+    }
+  });
+  assert.equal(requested, "https://gamma-api.polymarket.com/markets/3801022");
+  assert.equal(market.id, "3801022");
+  await assert.rejects(fetchGammaMarket("3801022", {
+    fetchImpl: async () => ({ ok: true, json: async () => [{ id: "3801022" }] })
+  }), /exact-market response is invalid/);
+  await assert.rejects(fetchGammaMarket("3801022?limit=1", {
+    fetchImpl: async () => assert.fail("invalid ID must not reach Gamma")
+  }), /market ID is invalid/);
 });
 
 test("recent redemption activity is attributed only to a matching durable worker control record", () => {
