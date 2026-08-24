@@ -1,0 +1,1853 @@
+#!/bin/sh
+set -eu
+
+die() { echo "polyedge-parity-hourly: $*" >&2; exit 1; }
+immutable_hour_rejection() { echo "polyedge-parity-hourly: $*" >&2; exit 78; }
+sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
+
+if [ "${POLYEDGE_PARITY_UTILITY_LOCKED:-0}" != 1 ]; then
+  POLYEDGE_PARITY_TARGET_HOUR_UTC=${POLYEDGE_PARITY_TARGET_HOUR_UTC:-$(date -u -d '1 hour ago' +%Y-%m-%dT%H:00:00Z)}
+  export POLYEDGE_PARITY_TARGET_HOUR_UTC
+  exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock \
+    /usr/bin/env POLYEDGE_PARITY_UTILITY_LOCKED=1 "$0" "$@"
+fi
+
+expected_uid=${POLYEDGE_PARITY_EXPECTED_UID:-0}
+expected_gid=${POLYEDGE_PARITY_EXPECTED_GID:-0}
+secure_file() {
+  file=$1 mode=$2
+  [ ! -L "$file" ] && [ -f "$file" ] || die "unsafe or missing file: $file"
+  set -- $(stat -c '%u %g %a %h' "$file")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] && [ "$4" = 1 ] \
+    || die "wrong owner, mode, or link count: $file"
+}
+secure_dir() {
+  dir=$1 mode=$2
+  [ ! -L "$dir" ] && [ -d "$dir" ] || die "unsafe or missing directory: $dir"
+  set -- $(stat -c '%u %g %a' "$dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] || die "wrong owner or mode: $dir"
+}
+
+validate_attestation() (
+  report=$1 attestation=$2 platform=$3 image=$4 job_name=${5:-}
+  [ ! -L "$report" ] && [ -f "$report" ] && [ "$(stat -c %h "$report")" = 1 ] || die "unsafe or missing report: $report"
+  secure_file "$attestation" 640
+  report_sha=$(sha "$report")
+  case "$platform" in
+    azure_container_apps_job)
+      jq -e --arg sha "$report_sha" --arg image "$image" --arg job "$job_name" '
+        .schema_version == 1 and .report_sha256 == $sha and
+        .platform == "azure_container_apps_job" and .image == $image and .job_name == $job and
+        (.execution_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))
+      ' "$attestation" >/dev/null || die "invalid Azure execution attestation: $attestation"
+      jq -e --arg image "$image" --arg job "$job_name" --arg execution "$(jq -r '.execution_id' "$attestation")" '
+        .generator_provenance == {schema_version:1,platform:"azure_container_apps_job",
+          image:$image,execution_id:$execution,job_name:$job}
+      ' "$report" >/dev/null || die "Azure report provenance does not match its attestation: $report"
+      ;;
+    oci_podman)
+      jq -e --arg sha "$report_sha" --arg image "$image" '
+        .schema_version == 1 and .report_sha256 == $sha and .platform == "oci_podman" and
+        .image == $image and
+        (.execution_id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")) and
+        (.image_digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+        (.container_id | type == "string" and test("^[0-9a-f]{64}$"))
+      ' "$attestation" >/dev/null || die "invalid OCI execution attestation: $attestation"
+      jq -e --arg image "$image" --arg execution "$(jq -r '.execution_id' "$attestation")" '
+        .generator_provenance == {schema_version:1,platform:"oci_podman",
+          image:$image,execution_id:$execution,job_name:null}
+      ' "$report" >/dev/null || die "OCI report provenance does not match its attestation: $report"
+      ;;
+    *) die "unsupported attestation platform: $platform" ;;
+  esac
+)
+
+sequence_evidence() {
+  jq -ce '
+    def valid_run:
+      type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_first_sequence | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence | type == "number" and floor == .) and
+      (.recorder_last_sequence >= .recorder_first_sequence) and
+      (.recorder_event_count | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence - .recorder_first_sequence + 1 == .recorder_event_count);
+    def valid_runs:
+      . as $runs |
+      ($runs | length) >= 1 and all($runs[]; valid_run) and
+      all(range(1; ($runs | length)); . as $index |
+        if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+          $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+        else
+          $runs[$index].recorder_first_sequence == 1 and
+          ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+        end);
+    if .recorderSequence? != null then
+      if .recorderRuns? == null and (.recorderSequence | valid_run) then [.recorderSequence] else error("invalid recorder sequence evidence") end
+    elif (.recorderRuns | type) == "array" then .recorderRuns
+    else error("invalid recorder sequence evidence")
+    end | if valid_runs then . else error("invalid recorder sequence evidence") end
+  ' "$1"
+}
+
+feed_evidence() {
+  jq -e '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def current_feed_ok($name; $sampled):
+      .recorderStatus.feedStatus[$name] as $feed |
+      (($feed | type) == "object") and $feed.status == "ok" and
+      (($feed.updated_at | type) == "string") and
+      (($feed.updated_at | epoch) as $updated |
+        $updated <= $sampled and $updated >= ($sampled - 300));
+    (.recorderStatus.sampledAtUtc | epoch) as $sampled |
+    (.hourStartUtc | epoch) as $start |
+    (.hourEndUtc | epoch) as $end |
+    current_feed_ok("Discovery"; $sampled) and
+    current_feed_ok("PolymarketClobMarket"; $sampled) and
+    current_feed_ok("PolymarketRtdsChainlink"; $sampled) and
+    current_feed_ok("PolymarketRtdsBinance"; $sampled) and
+    ((.continuousFeedHealth.observations | type) == "number") and
+    (.continuousFeedHealth.observations | floor == . and . >= 60) and
+    .continuousFeedHealth.unhealthyObservations == 0 and
+    .continuousFeedHealth.essentialFeedErrors == 0 and
+    ((.continuousFeedHealth.maxGapSeconds | type) == "number") and
+    (.continuousFeedHealth.maxGapSeconds >= 0 and .continuousFeedHealth.maxGapSeconds <= 75) and
+    ((.continuousFeedHealth.firstObservationUtc | epoch) as $first |
+      $first >= $start and $first <= ($start + 60)) and
+    ((.continuousFeedHealth.lastObservationUtc | epoch) as $last |
+      $last >= ($end - 60) and $last < $end)
+  ' "$1" >/dev/null
+}
+
+
+text_sha() { printf '%s\n' "$1" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
+
+producer_env_binding_expected() {
+  jq -cS -n '{
+    APP_NAME:"polyedge-funded-intent-producer",
+    RUNTIME_ROLE:"profitability_shadow",
+    EXECUTION_MODE:"paper",
+    ALLOW_LIVE:"false",
+    RUN_BOT_ON_STARTUP:"true",
+    STRATEGY_INTENT_OPERATOR_DIRECT:"true",
+    PUBLISH_STRATEGY_CANARY_INTENTS:"true",
+    STRATEGY_CANARY_INTENT_PREFIX:"reports/research/venue-probe/control/strategy-canary/intents",
+    STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:"conservative-execution-prior-v1",
+    STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:"azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    STRATEGY_CANARY_EXECUTION_MODEL_SHA256:"sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4",
+    STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MAX_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:"360",
+    STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:"900",
+    TARGET_ASSET:"BTC",TARGET_ASSET_NAME:"Bitcoin",TARGET_HORIZON:"15m",
+    TARGET_BINANCE_SYMBOL:"btcusdt",TARGET_CHAINLINK_SYMBOL:"btc/usd",TARGET_COINBASE_PRODUCT_ID:"BTC-USD",
+    AZURE_TENANT_ID:"9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
+    AZURE_CLIENT_ID:"54f0136b-5e72-4ad1-b23e-cb1269d356c1",
+    AZURE_FEDERATED_TOKEN_FILE:"/run/credentials/azure-federated-token",
+    AZURE_TOKEN_CREDENTIALS:"WorkloadIdentityCredential",
+    AZURE_STORAGE_ACCOUNT_NAME:"stpolyedge6urdjr5nmwx7w",
+    AZURE_STORAGE_CONTAINER_NAME:"polyedge-shadow-events",
+    AZURE_STORAGE_TABLE_NAME:"ShadowBotEventIndex",
+    AZURE_CHART_TABLE_NAME:"ShadowBotChartSeries",
+    AZURE_MARKET_TABLE_NAME:"ShadowBotMarketCatalog",
+    AZURE_FUNDED_STORAGE_CONTAINER_NAME:"polyedge-funded-evidence",
+    AZURE_MODEL_STORAGE_CONTAINER_NAME:"polyedge-models",
+    FUNDED_DIRECT_SERVICE_BUS_ENABLED:"true",
+    FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:"sb-polyedge-funded-cl-6urdjr5nmwx7w",
+    FUNDED_DIRECT_SERVICE_BUS_QUEUE:"funded-dynamic-quote-intents"
+  }'
+}
+
+
+validate_producer_evidence() {
+  jq -e --arg image "$funded_producer_image" --arg user "$funded_producer_user" \
+    --arg config_sha "$funded_producer_config_sha" --arg env_binding_sha "$funded_producer_env_binding_sha" \
+    --arg mount_binding_sha "$funded_producer_mount_binding_sha" --argjson funded "$funded_enabled" \
+    --arg service_bus_namespace "$funded_service_bus_namespace" --arg service_bus_queue "$funded_service_bus_queue" \
+    --arg expected_service_bus_dlq "$funded_service_bus_dlq" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    (.hourStartUtc | epoch) as $start |
+    (.hourEndUtc | epoch) as $end |
+    .services.fundedIntentProducerEnabled == $funded and
+    (if $funded then
+      .services.fundedIntentProducerActive == true and
+      (.services.fundedIntentProducerEnablement == "enabled" or .services.fundedIntentProducerEnablement == "generated") and
+      .services.fundedIntentProducerTokenTimerEnablement == "enabled" and
+      .services.fundedIntentProducerTokenTimerActive == true and
+      .services.fundedIntentProducerImage == $image and .services.fundedIntentProducerUser == $user and
+      .services.fundedIntentProducerConfigSha256 == $config_sha and
+      (.services.fundedIntentProducerRuntime.containerId | test("^[0-9a-f]{64}$")) and
+      (.services.fundedIntentProducerRuntime.invocationId | test("^[0-9a-f]{32}$")) and
+      .services.fundedIntentProducerRuntime.configEnvBindingSha256 == $env_binding_sha and
+      .services.fundedIntentProducerRuntime.tokenMountBindingSha256 == $mount_binding_sha and
+      .services.fundedIntentProducerRuntime.continuity.invocationId == .services.fundedIntentProducerRuntime.invocationId and
+      .services.fundedIntentProducerRuntime.continuity.containerId == .services.fundedIntentProducerRuntime.containerId and
+      .services.fundedIntentProducerRuntime.continuity.observationCount >= 50 and
+      .services.fundedIntentProducerRuntime.continuity.maxGapSeconds <= 75 and
+      .services.fundedIntentProducerRuntime.continuity.foreignObservationCount == 0 and
+      .services.fundedIntentProducerRuntime.continuity.restartCount == 0 and
+      ((.services.fundedIntentProducerRuntime.continuity.firstObservationUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.continuity.firstObservationUtc | epoch) <= ($start + 75)) and
+      ((.services.fundedIntentProducerRuntime.continuity.lastObservationUtc | epoch) >= ($end - 75)) and
+      ((.services.fundedIntentProducerRuntime.continuity.lastObservationUtc | epoch) < $end) and
+      .services.fundedIntentProducerRuntime.continuity.publisher.successCount >= 1 and
+      .services.fundedIntentProducerRuntime.continuity.publisher.successCount ==
+        (.services.fundedIntentProducerRuntime.continuity.publisher.warmupSentCount +
+         .services.fundedIntentProducerRuntime.continuity.publisher.intentPublishedCount) and
+      .services.fundedIntentProducerRuntime.continuity.publisher.infrastructureFailureCount == 0 and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.firstSuccessUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.firstSuccessUtc | epoch) < $end) and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.lastSuccessUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.continuity.publisher.lastSuccessUtc | epoch) < $end) and
+      .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshCount >= 20 and
+      .services.fundedIntentProducerRuntime.tokenContinuity.tokenRefreshFailureCount == 0 and
+      .services.fundedIntentProducerRuntime.tokenContinuity.maxTokenRefreshGapSeconds <= 180 and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.firstTokenRefreshUtc | epoch) >= $start) and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.firstTokenRefreshUtc | epoch) <= ($start + 180)) and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.lastTokenRefreshUtc | epoch) >= ($end - 180)) and
+      ((.services.fundedIntentProducerRuntime.tokenContinuity.lastTokenRefreshUtc | epoch) < $end) and
+      .services.fundedIntentProducerRuntime.health == {
+        ok:true,backendImpl:"rust",runtimeRole:"profitability_shadow",shadowOnly:true,
+        runtimeActive:true,executionMode:"paper",killSwitch:false} and
+      .services.fundedIntentProducerRuntime.status.app == "polyedge-funded-intent-producer" and
+      .services.fundedIntentProducerRuntime.status.runtimeRole == "profitability_shadow" and
+      .services.fundedIntentProducerRuntime.status.executionMode == "paper" and
+      .services.fundedIntentProducerRuntime.status.intentPublisher == {
+        configured:true,prepared:true,pointerOnlyPreflight:false} and
+      .services.fundedIntentProducerRuntime.status.taskHealth == {api:"ok",runtimeLoop:"running",feeds:"running"} and
+      all(.services.fundedIntentProducerRuntime.status.feedStatus[]; .status == "ok") and
+      .services.fundedIntentProducerRuntime.status.recorder.queued == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.enqueuedTotal == .services.fundedIntentProducerRuntime.status.recorder.persistedTotal and
+      .services.fundedIntentProducerRuntime.status.recorder.failedTotal == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.unrecoveredDurableEvents == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.flushUnrecovered == false and
+      .services.fundedIntentProducerRuntime.status.recorder.errorCount == 0 and
+      .services.fundedIntentProducerRuntime.status.recorder.droppedCount == 0 and
+      .services.fundedServiceBusRuntime == {
+        namespace:$service_bus_namespace,queue:$service_bus_queue,status:"Active",
+        activeMessageCount:0,scheduledMessageCount:0,
+        deadLetterMessageCount:($expected_service_bus_dlq | tonumber),
+        expectedDeadLetterMessageCount:($expected_service_bus_dlq | tonumber)}
+     else .services.fundedIntentProducerActive == false and
+      (.services.fundedIntentProducerEnablement == "disabled" or
+       .services.fundedIntentProducerEnablement == "masked") and
+      .services.fundedIntentProducerTokenTimerActive == false and
+      (.services.fundedIntentProducerTokenTimerEnablement == "disabled" or
+       .services.fundedIntentProducerTokenTimerEnablement == "masked") and
+      .services.fundedIntentProducerImage == null and .services.fundedIntentProducerUser == null and
+      .services.fundedIntentProducerConfigSha256 == null and .services.fundedIntentProducerRuntime == null and
+      .services.fundedServiceBusRuntime == null end)
+  ' "$1" >/dev/null
+}
+
+validate_evidence_artifacts() (
+  file=$1
+  start=$(jq -er '.hourStartUtc | select(type == "string")' "$file") || die "evidence hour is missing: $file"
+  epoch=$(date -u -d "$start" +%s) || die "invalid evidence hour: $file"
+  stamp=$(date -u -d "@$epoch" +%Y%m%dT%H)
+  day=$(date -u -d "@$epoch" +%Y/%m/%d)
+  hour=$(date -u -d "@$epoch" +%H)
+  check_artifact() {
+    path=$1
+    declared_sha=$2
+    case "$path" in */../*|*/..|../*|..) die "unsafe evidence artifact path: $path" ;; esac
+    [ ! -L "$path" ] && [ -f "$path" ] && [ "$(stat -c %h "$path")" = 1 ] || die "unsafe evidence artifact: $path"
+    [ "$declared_sha" = "$(sha "$path")" ] || die "evidence artifact hash mismatch: $path"
+  }
+  azure_path=$(jq -er '.scheduledAudits.azure.path' "$file") || die "Azure artifact reference is missing: $file"
+  oci_path=$(jq -er '.scheduledAudits.oci.path' "$file") || die "OCI artifact reference is missing: $file"
+  same_path=$(jq -er '.sameInput.path' "$file") || die "same-input artifact reference is missing: $file"
+  azure_attestation=$(jq -er '.scheduledAudits.azure.attestation.path' "$file") || die "Azure attestation reference is missing: $file"
+  oci_attestation=$(jq -er '.scheduledAudits.oci.attestation.path' "$file") || die "OCI attestation reference is missing: $file"
+  same_attestation=$(jq -er '.sameInput.attestation.path' "$file") || die "same-input attestation reference is missing: $file"
+  [ "$azure_path" = "$hourly_root/$stamp/azure-scheduled-audit.json" ] || die "Azure artifact path is not bound to its hour: $file"
+  [ "$oci_path" = "$report_root/$day/$hour/audit.json" ] || die "OCI artifact path is not bound to its hour: $file"
+  [ "$same_path" = "$hourly_root/$stamp/same-input-audit.json" ] || die "same-input artifact path is not bound to its hour: $file"
+  [ "$azure_attestation" = "$azure_path.attestation.json" ] || die "Azure attestation path is not bound to its report: $file"
+  [ "$oci_attestation" = "$oci_path.attestation.json" ] || die "OCI attestation path is not bound to its report: $file"
+  [ "$same_attestation" = "$same_path.attestation.json" ] || die "same-input attestation path is not bound to its report: $file"
+  check_artifact "$azure_path" "$(jq -er '.scheduledAudits.azure.sha256' "$file")"
+  check_artifact "$oci_path" "$(jq -er '.scheduledAudits.oci.sha256' "$file")"
+  check_artifact "$same_path" "$(jq -er '.sameInput.sha256' "$file")"
+  check_artifact "$azure_attestation" "$(jq -er '.scheduledAudits.azure.attestation.sha256' "$file")"
+  check_artifact "$oci_attestation" "$(jq -er '.scheduledAudits.oci.attestation.sha256' "$file")"
+  check_artifact "$same_attestation" "$(jq -er '.sameInput.attestation.sha256' "$file")"
+  validate_attestation "$azure_path" "$azure_attestation" azure_container_apps_job "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_AZURE_JOB_NAME"
+  validate_attestation "$oci_path" "$oci_attestation" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+  validate_attestation "$same_path" "$same_attestation" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+  segment_count=$(jq -er '.segments | type == "array" and length == 6' "$file") || die "evidence segments are incomplete: $file"
+  i=0
+  while [ "$i" -lt 6 ]; do
+    source_path=$(jq -er ".segments[$i].source.path" "$file")
+    gzip_path=$(jq -er ".segments[$i].gzip.path" "$file")
+    manifest_path=$(jq -er ".segments[$i].manifest.path" "$file")
+    receipt_path=$(jq -er ".segments[$i].receipt.path" "$file")
+    case "$source_path" in "$segments_root/$day/$hour/"*) ;; *) die "segment source path is not bound to its hour: $file" ;; esac
+    case "$gzip_path" in "$archive_root/$day/$hour/"*) ;; *) die "segment archive path is not bound to its hour: $file" ;; esac
+    case "$manifest_path" in "$archive_root/$day/$hour/"*) ;; *) die "segment manifest path is not bound to its hour: $file" ;; esac
+    case "$receipt_path" in "$archive_root/$day/$hour/"*) ;; *) die "segment receipt path is not bound to its hour: $file" ;; esac
+    check_artifact "$source_path" "$(jq -er ".segments[$i].source.sha256" "$file")"
+    check_artifact "$gzip_path" "$(jq -er ".segments[$i].gzip.sha256" "$file")"
+    check_artifact "$manifest_path" "$(jq -er ".segments[$i].manifest.sha256" "$file")"
+    check_artifact "$receipt_path" "$(jq -er ".segments[$i].receipt.sha256" "$file")"
+    i=$((i + 1))
+  done
+)
+
+env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+secure_file "$env_file" 640
+set -a
+. "$env_file"
+set +a
+formal_expected_git_sha=${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}
+formal_expected_azure_image=${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?set the approved Azure image digest}
+formal_expected_oci_image=${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?set the approved OCI multiarch image digest}
+formal_funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
+formal_expected_funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:-}
+formal_expected_funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:-}
+formal_funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:-}
+formal_expected_funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:-}
+formal_funded_uid=${POLYEDGE_PARITY_FUNDED_UID:-986}
+formal_funded_gid=${POLYEDGE_PARITY_FUNDED_GID:-982}
+formal_expected_funded_session_id=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}
+formal_expected_funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:-}
+formal_expected_funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}
+formal_expected_funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:-}
+formal_expected_funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:-}
+formal_expected_funded_service_bus_dlq=${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:-}
+formal_expected_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:-}
+formal_expected_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:-}
+formal_window_start=${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}
+formal_ledger=${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}
+formal_subscription=${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}
+formal_azure_resource_group=${POLYEDGE_PARITY_AZURE_RESOURCE_GROUP:?missing Azure resource group}
+formal_azure_job_name=${POLYEDGE_PARITY_AZURE_JOB_NAME:?missing Azure hourly job name}
+
+lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
+lock_ledger() {
+  lock_dir=${lock_file%/*}
+  [ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] || die 'unsafe parity lock directory'
+  set -- $(stat -c '%u %g %a' "$lock_dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die 'wrong parity lock directory owner'
+  case "$3" in 700|750|755) ;; *) die 'unsafe parity lock directory mode' ;; esac
+  if [ ! -e "$lock_file" ]; then
+    (umask 027; : >"$lock_file")
+  fi
+  secure_file "$lock_file" 640
+  exec 9<>"$lock_file"
+  /usr/bin/flock -w 300 9 || die 'timed out waiting for the parity ledger lock'
+}
+
+hourly_env=${POLYEDGE_PARITY_HOURLY_ENV:-/etc/polyedge/jobs/hourly.env}
+secure_file "$hourly_env" 600
+set -a
+. "$hourly_env"
+set +a
+[ "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:-}" = "$formal_expected_git_sha" ] || die 'hourly environment overrides the formal source commit'
+[ "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:-}" = "$formal_expected_azure_image" ] || die 'hourly environment overrides the formal Azure image'
+[ "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:-}" = "$formal_expected_oci_image" ] || die 'hourly environment overrides the formal OCI image'
+[ "${POLYEDGE_PARITY_FUNDED_MODE:-disabled}" = "$formal_funded_mode" ] || die 'hourly environment overrides the formal funded mode'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:-}" = "$formal_expected_funded_image" ] || die 'hourly environment overrides the formal funded image'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:-}" = "$formal_expected_funded_revision" ] || die 'hourly environment overrides the formal funded revision'
+[ "${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:-}" = "$formal_funded_rollout_receipt" ] || die 'hourly environment overrides the funded rollout receipt'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:-}" = "$formal_expected_funded_rollout_sha" ] || die 'hourly environment overrides the funded rollout receipt hash'
+[ "${POLYEDGE_PARITY_FUNDED_UID:-986}" = "$formal_funded_uid" ] || die 'hourly environment overrides the formal funded UID'
+[ "${POLYEDGE_PARITY_FUNDED_GID:-982}" = "$formal_funded_gid" ] || die 'hourly environment overrides the formal funded GID'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:-}" = "$formal_expected_funded_session_id" ] || die 'hourly environment overrides the formal funded session'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:-}" = "$formal_expected_funded_session_sha" ] || die 'hourly environment overrides the formal funded session hash'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:-}" = "$formal_expected_funded_config_sha" ] || die 'hourly environment overrides the formal funded config hash'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:-}" = "$formal_expected_funded_producer_image" ] || die 'hourly environment overrides the formal funded producer image'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:-}" = "$formal_expected_funded_producer_config_sha" ] || die 'hourly environment overrides the formal funded producer config hash'
+[ "${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:-}" = "$formal_expected_funded_service_bus_dlq" ] || die 'hourly environment overrides the formal funded Service Bus DLQ baseline'
+[ "${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:-}" = "$formal_expected_collector_sha" ] || die 'hourly environment overrides the formal parity collector hash'
+[ "${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:-}" = "$formal_expected_validator_sha" ] || die 'hourly environment overrides the formal reboot validator hash'
+[ "${POLYEDGE_PARITY_WINDOW_START_UTC:-}" = "$formal_window_start" ] || die 'hourly environment overrides the formal window start'
+[ "${POLYEDGE_PARITY_LEDGER:-}" = "$formal_ledger" ] || die 'hourly environment overrides the formal ledger path'
+[ "${AZURE_SUBSCRIPTION_ID:-}" = "$formal_subscription" ] || die 'hourly environment overrides the Azure subscription'
+[ "${POLYEDGE_PARITY_AZURE_RESOURCE_GROUP:-}" = "$formal_azure_resource_group" ] || die 'hourly environment overrides the Azure resource group'
+[ "${POLYEDGE_PARITY_AZURE_JOB_NAME:-}" = "$formal_azure_job_name" ] || die 'hourly environment overrides the Azure job name'
+POLYEDGE_PARITY_EXPECTED_GIT_SHA=$formal_expected_git_sha
+POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE=$formal_expected_azure_image
+POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE=$formal_expected_oci_image
+POLYEDGE_PARITY_FUNDED_MODE=$formal_funded_mode
+POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE=$formal_expected_funded_image
+POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION=$formal_expected_funded_revision
+POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT=$formal_funded_rollout_receipt
+POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256=$formal_expected_funded_rollout_sha
+POLYEDGE_PARITY_FUNDED_UID=$formal_funded_uid
+POLYEDGE_PARITY_FUNDED_GID=$formal_funded_gid
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=$formal_expected_funded_session_id
+POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=$formal_expected_funded_session_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=$formal_expected_funded_config_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=$formal_expected_funded_producer_image
+POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=$formal_expected_funded_producer_config_sha
+POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ=$formal_expected_funded_service_bus_dlq
+POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256=$formal_expected_collector_sha
+POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256=$formal_expected_validator_sha
+POLYEDGE_PARITY_WINDOW_START_UTC=$formal_window_start
+POLYEDGE_PARITY_LEDGER=$formal_ledger
+AZURE_SUBSCRIPTION_ID=$formal_subscription
+POLYEDGE_PARITY_AZURE_RESOURCE_GROUP=$formal_azure_resource_group
+POLYEDGE_PARITY_AZURE_JOB_NAME=$formal_azure_job_name
+
+: "${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}"
+: "${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}"
+: "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}"
+: "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?set the approved Azure image digest}"
+: "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?set the approved OCI multiarch image digest}"
+: "${POLYEDGE_RESEARCH_IMAGE:?missing pinned research image}"
+: "${AZURE_TENANT_ID:?missing research tenant ID}"
+: "${AZURE_CLIENT_ID:?missing research client ID}"
+: "${AZURE_SUBSCRIPTION_ID:?missing Azure subscription ID}"
+: "${POLYEDGE_PARITY_AZURE_RESOURCE_GROUP:?missing Azure resource group}"
+: "${POLYEDGE_PARITY_AZURE_JOB_NAME:?missing Azure hourly job name}"
+[ "${AZURE_STORAGE_ACCOUNT_NAME:-}" = stpolyedge6urdjr5nmwx7w ] || die 'unexpected Azure storage account'
+[ "${AZURE_STORAGE_CONTAINER_NAME:-}" = bot-events ] || die 'unexpected Azure storage container'
+[ "${POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH:-}" = true ] || die 'artifact publication must remain disabled'
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'expected source commit is malformed'
+for image in "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"; do
+  printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+    || die 'expected research image is not an immutable registry digest'
+done
+case "$POLYEDGE_PARITY_FUNDED_MODE" in
+  disabled)
+    funded_enabled=false
+    funded_image= funded_revision= funded_rollout_receipt= funded_rollout_sha= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_producer_image= funded_producer_user= funded_producer_config_sha=
+    funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
+    funded_service_bus_namespace= funded_service_bus_queue= funded_service_bus_dlq=null
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:-}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:-}
+    [ -z "$parity_collector_sha$reboot_validator_sha" ] || {
+      [ -n "$parity_collector_sha" ] && [ -n "$reboot_validator_sha" ] || die 'disabled parity helper hashes must be supplied together'
+      for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'; done
+    }
+    ;;
+  active)
+    funded_enabled=true
+    printf '%s' "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" \
+      | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' \
+      || die 'expected funded image is not an immutable venue-probe digest'
+    printf '%s:%s' "$POLYEDGE_PARITY_FUNDED_UID" "$POLYEDGE_PARITY_FUNDED_GID" | grep -Eq '^[0-9]+:[0-9]+$' \
+      || die 'expected funded user is malformed'
+    printf '%s' "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' \
+      || die 'expected funded session is malformed'
+    for funded_hash in "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256" "$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256"; do
+      printf '%s' "$funded_hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded binding hash is malformed'
+    done
+    funded_image=$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE
+    funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:?set the approved funded revision}
+    funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:?set the funded rollout receipt}
+    funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:?set the funded rollout receipt hash}
+    printf '%s' "$funded_revision" | grep -Eq '^[0-9a-f]{40}$' || die 'expected funded revision is malformed'
+    printf '%s' "$funded_rollout_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded rollout receipt hash is malformed'
+    funded_user=$POLYEDGE_PARITY_FUNDED_UID:$POLYEDGE_PARITY_FUNDED_GID
+    funded_session=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID
+    funded_session_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256
+    funded_config_sha=$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256
+    funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:?set the approved funded producer image}
+    funded_producer_user=984:980
+    funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:?set the funded producer config hash}
+    printf '%s' "$funded_producer_image" \
+      | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+      || die 'expected funded producer image is not an immutable rust-backend digest'
+    printf '%s' "$funded_producer_config_sha" | grep -Ex 'sha256:[0-9a-f]{64}' \
+      || die 'expected funded producer config hash is malformed'
+    funded_producer_env_binding_sha=$(text_sha "$(producer_env_binding_expected)")
+    printf '%s' "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" | grep -Eq '^[0-9]+$' \
+      || die 'expected funded Service Bus DLQ baseline is malformed'
+    funded_service_bus_namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+    funded_service_bus_queue=funded-dynamic-quote-intents
+    funded_service_bus_dlq=$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:?set the approved parity collector hash}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:?set the approved reboot validator hash}
+    for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do
+      printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'
+    done
+    ;;
+  *) die 'formal funded mode must equal disabled or active' ;;
+esac
+collector_bin=${POLYEDGE_PARITY_COLLECTOR_BIN:-/usr/local/libexec/polyedge-parity-hourly}
+reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+if [ -n "$parity_collector_sha$reboot_validator_sha" ]; then
+  secure_file "$collector_bin" 755
+  secure_file "$reboot_validator" 755
+  [ "$(sha "$collector_bin")" = "$parity_collector_sha" ] || die 'installed parity collector hash differs from the formal binding'
+  [ "$(sha "$reboot_validator")" = "$reboot_validator_sha" ] || die 'installed reboot validator hash differs from the formal binding'
+fi
+producer_token=${POLYEDGE_PARITY_FUNDED_PRODUCER_TOKEN_FILE:-/run/polyedge-federated-funded-intent-producer/azure-federated-token}
+if [ "$funded_enabled" = true ]; then
+  producer_token_dir=${producer_token%/*}
+  funded_producer_mount_binding_sha=$(text_sha "$(jq -cS -n --arg source "$producer_token_dir" \
+    '{source:$source,destination:"/run/credentials",readOnly:true}')")
+fi
+[ "$POLYEDGE_RESEARCH_IMAGE" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] || die 'hourly OCI job image differs from the formal multiarch image'
+printf '%s' "$AZURE_SUBSCRIPTION_ID" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || die 'Azure subscription ID is malformed'
+printf '%s/%s' "$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP" "$POLYEDGE_PARITY_AZURE_JOB_NAME" | grep -Eq '^[A-Za-z0-9._()-]+/[A-Za-z0-9._()-]+$' || die 'Azure job resource identity is malformed'
+printf '%s' "$POLYEDGE_PARITY_WINDOW_START_UTC" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+  || die 'formal window start is malformed'
+window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
+[ "$(date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$POLYEDGE_PARITY_WINDOW_START_UTC" ] \
+  || die 'formal window start is not canonical UTC'
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+hourly_root=$parity_root/hourly
+segments_root=${POLYEDGE_PARITY_SEGMENTS_ROOT:-$ring/segments}
+archive_root=${POLYEDGE_PARITY_ARCHIVE_ROOT:-$ring/archive}
+report_root=${POLYEDGE_PARITY_REPORT_ROOT:-$ring/jobs/research/reports/research/hourly}
+ring_status=${POLYEDGE_PARITY_RING_STATUS:-$ring/status.json}
+boot_root=${POLYEDGE_PARITY_BOOT_ROOT:-/}
+boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
+pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
+token_file=${POLYEDGE_PARITY_TOKEN_FILE:-/run/polyedge-federated-research/azure-federated-token}
+runtime_dir=${POLYEDGE_PARITY_RUNTIME_DIR:-/run/polyedge/parity-hourly}
+
+mountpoint -q "$ring" || die 'ring root is not a mount point'
+ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
+ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
+[ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
+  || die 'formal ledger must be a direct .json child of the parity root'
+if [ "$POLYEDGE_PARITY_FUNDED_MODE" = active ]; then
+  printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
+    || die 'active funded parity requires a distinct funded-active ledger'
+fi
+
+secure_file "$POLYEDGE_PARITY_LEDGER" 640
+rollout_signer_invocation= rollout_signer_container= rollout_producer_invocation=
+if [ "$funded_enabled" = true ]; then
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260824T052321Z-funded-signer-rollout.json" ] \
+    || die 'funded rollout receipt path differs from the approved activation receipt'
+  secure_file "$funded_rollout_receipt" 640
+  [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
+  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_service_bus_dlq" '
+    .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+    .newImage == $image and .newRevision == $revision and
+    (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
+    (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
+    (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and .producerRestored == true and
+    .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
+      scheduledMessageCount:0,deadLetterMessageCount:$dlq}
+  ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
+  rollout_signer_invocation=$(jq -er '.runtime.newInvocationId' "$funded_rollout_receipt")
+  rollout_signer_container=$(jq -er '.runtime.newContainerId' "$funded_rollout_receipt")
+  rollout_producer_invocation=$(jq -er '.runtime.producerInvocationId' "$funded_rollout_receipt")
+fi
+
+validate_ledger() {
+  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$POLYEDGE_PARITY_FUNDED_MODE" \
+    --arg image "$funded_image" --arg user "$funded_user" --arg session "$funded_session" \
+    --arg revision "$funded_revision" --arg rollout "$funded_rollout_receipt" --arg rollout_sha "$funded_rollout_sha" \
+    --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" --argjson dlq "$funded_service_bus_dlq" \
+    --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
+    --arg producer_config_sha "$funded_producer_config_sha" --arg collector_sha "$parity_collector_sha" \
+    --arg validator_sha "$reboot_validator_sha" --argjson funded "$funded_enabled" '
+    .schemaVersion == 1 and .status == "in_progress" and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .windowStartUtc == $start and
+    (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedHourlyEvidence? // []) | type == "array") and
+    ((.completedDailyCycles? // 0) | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedDailyEvidence? // []) | type == "array") and
+    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
+    (if $funded then
+      .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
+      .fundedSignerRevision == $revision and .fundedRolloutReceiptPath == $rollout and
+      .fundedRolloutReceiptSha256 == $rollout_sha and .fundedServiceBusDlqBaseline == $dlq and
+      .parityCollectorSha256 == $collector_sha and .rebootValidatorSha256 == $validator_sha and
+      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha and
+      .fundedIntentProducerEnabled == true and .fundedIntentProducerImage == $producer_image and
+      .fundedIntentProducerUser == $producer_user and .fundedIntentProducerConfigSha256 == $producer_config_sha
+     else (.fundedSignerMode? // "disabled") == "disabled" and
+      (.fundedSignerImage? // null) == null and (.fundedSignerUser? // null) == null and
+      (.fundedSignerRevision? // null) == null and (.fundedRolloutReceiptPath? // null) == null and
+      (.fundedRolloutReceiptSha256? // null) == null and (.fundedServiceBusDlqBaseline? // null) == null and
+      (($collector_sha == "" and (.parityCollectorSha256? // null) == null and (.rebootValidatorSha256? // null) == null) or
+       ($collector_sha != "" and .parityCollectorSha256 == $collector_sha and .rebootValidatorSha256 == $validator_sha)) and
+      (.fundedSessionId? // null) == null and (.fundedSessionManifestSha256? // null) == null and
+      (.fundedConfigSha256? // null) == null and (.fundedIntentProducerEnabled? // false) == false and
+      (.fundedIntentProducerImage? // null) == null and (.fundedIntentProducerUser? // null) == null and
+      (.fundedIntentProducerConfigSha256? // null) == null end)
+  ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+  [ ! -L "$reboot_validator" ] && [ -x "$reboot_validator" ] || die 'reboot attestation validator is missing or unsafe'
+  "$reboot_validator" validate-ledger || die 'reboot recovery evidence is invalid'
+}
+validate_ledger
+
+if [ -n "${POLYEDGE_PARITY_TARGET_HOUR_UTC:-}" ]; then
+  target=$POLYEDGE_PARITY_TARGET_HOUR_UTC
+else
+  target=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:00:00Z)
+fi
+printf '%s' "$target" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z$' || die 'target hour is malformed'
+target_epoch=$(date -u -d "$target" +%s) || die 'target hour is invalid'
+[ "$(date -u -d "@$target_epoch" +%Y-%m-%dT%H:00:00Z)" = "$target" ] || die 'target hour is not canonical UTC'
+end_epoch=$((target_epoch + 3600))
+now_epoch=${POLYEDGE_PARITY_NOW_EPOCH:-$(date -u +%s)}
+printf '%s' "$now_epoch" | grep -Eq '^[0-9]+$' || die 'current time is invalid'
+hour_end=$(date -u -d "@$end_epoch" +%Y-%m-%dT%H:%M:%SZ)
+[ "$end_epoch" -le "$now_epoch" ] || die 'target hour has not ended'
+stamp=$(date -u -d "@$target_epoch" +%Y%m%dT%H)
+day=$(date -u -d "@$target_epoch" +%Y/%m/%d)
+hour=$(date -u -d "@$target_epoch" +%H)
+hour_dir=$hourly_root/$stamp
+evidence=$hour_dir/evidence.json
+
+secure_dir "$parity_root" 750
+install -d -m 0750 "$hourly_root"
+secure_dir "$hourly_root" 750
+install -d -m 0750 "$hour_dir"
+secure_dir "$hour_dir" 750
+
+if [ "$target_epoch" -lt "$window_epoch" ]; then
+  if [ -e "$evidence" ]; then
+    secure_file "$evidence" 640
+    jq -e --arg hour "$target" '.schemaVersion == 1 and .hourStartUtc == $hour and .acceptedForParityWindow == false' "$evidence" >/dev/null \
+      || die 'existing excluded evidence is invalid'
+    exit 0
+  fi
+  tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+    --arg hour "$target" --arg end "$hour_end" \
+    '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$start,hourStartUtc:$hour,hourEndUtc:$end,status:"excluded_pre_window",acceptedForParityWindow:false,azureAuthoritative:true,azureDeletionAllowed:false}' >"$tmp"
+  chmod 0640 "$tmp"
+  sync -f "$tmp"
+  mv "$tmp" "$evidence"
+  trap - EXIT HUP INT TERM
+  exit 0
+fi
+
+first_epoch=$(( (window_epoch + 3599) / 3600 * 3600 ))
+[ "$target_epoch" -ge "$first_epoch" ] || die 'mixed window hour cannot be accepted'
+
+install -d -m 0700 "$runtime_dir"
+[ ! -L "$runtime_dir" ] && [ -d "$runtime_dir" ] || die 'unsafe runtime directory'
+set -- $(stat -c '%u %g %a' "$runtime_dir")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || die 'unsafe runtime directory ownership or mode'
+refs_tmp=$(mktemp "$runtime_dir/refs.XXXXXX")
+segments_tmp=$(mktemp "$runtime_dir/segments.XXXXXX")
+feed_tmp=$(mktemp "$runtime_dir/feeds.XXXXXX")
+oauth_response=$(mktemp "$runtime_dir/oauth.XXXXXX")
+auth_header=$(mktemp "$runtime_dir/header.XXXXXX")
+sequence_tmp=
+api_status=
+producer_health_file=
+producer_status_file=
+funded_journal_file=
+funded_token_journal_file=
+producer_journal_file=
+producer_token_journal_file=
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$sequence_tmp" "$api_status" "$producer_health_file" "$producer_status_file" "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file"' EXIT HUP INT TERM
+chmod 0600 "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"
+
+validate_funded_evidence_binding() {
+  jq -e --arg revision "$funded_revision" --arg receipt "$funded_rollout_receipt" \
+    --arg receipt_sha "$funded_rollout_sha" --arg collector_sha "$parity_collector_sha" \
+    --arg validator_sha "$reboot_validator_sha" --argjson dlq "$funded_service_bus_dlq" \
+    --arg signer_invocation "$rollout_signer_invocation" --arg signer_container "$rollout_signer_container" \
+    --arg producer_invocation "$rollout_producer_invocation" --argjson funded "$funded_enabled" '
+    if $funded then
+      .services.fundedSignerRevision == $revision and
+      .services.fundedRolloutReceipt == {path:$receipt,sha256:$receipt_sha} and
+      .services.fundedServiceBusDlqBaseline == $dlq and
+      .services.fundedRuntime.invocationId == $signer_invocation and
+      .services.fundedRuntime.containerId == $signer_container and
+      .services.fundedIntentProducerRuntime.invocationId == $producer_invocation and
+      .services.fundedRuntime.failedAttempts == 0 and
+      .services.fundedRuntime.marketWarmedCount >= 1 and
+      .services.fundedRuntime.processedMessagesDelta > 0 and
+      .services.parityCollectorSha256 == $collector_sha and .services.rebootValidatorSha256 == $validator_sha and
+      .services.fundedServiceBusRuntime.deadLetterMessageCount == $dlq and
+      .services.fundedServiceBusRuntime.expectedDeadLetterMessageCount == $dlq
+    else
+      .services.fundedSignerRevision == null and .services.fundedRolloutReceipt == null and
+      .services.fundedServiceBusDlqBaseline == null and
+      (.services.parityCollectorSha256 // null) == (if $collector_sha == "" then null else $collector_sha end) and
+      (.services.rebootValidatorSha256 // null) == (if $validator_sha == "" then null else $validator_sha end)
+    end
+  ' "$1" >/dev/null
+}
+
+collect_refs() {
+  : >"$refs_tmp"
+  find "$hourly_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | while IFS= read -r file; do
+    secure_file "$file" 640
+    jq -e '.schemaVersion == 1 and (.acceptedForParityWindow | type == "boolean")' "$file" >/dev/null || die "malformed evidence: $file"
+    if [ "$(jq -r '.acceptedForParityWindow' "$file")" = true ]; then
+      evidence_window=$(jq -r '.windowStartUtc // ""' "$file")
+      evidence_ledger=$(jq -r '.ledgerPath // ""' "$file")
+      if [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] || [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ]; then
+        [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] && [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ] \
+          || die "accepted evidence has mixed parity provenance: $file"
+        continue
+      fi
+      start=$(jq -r '.hourStartUtc' "$file")
+      epoch=$(date -u -d "$start" +%s) || die "invalid accepted hour: $file"
+      [ "$((epoch % 3600))" -eq 0 ] && [ "$(date -u -d "@$epoch" +%Y-%m-%dT%H:00:00Z)" = "$start" ] || die "non-canonical accepted hour: $file"
+      expected_file="$hourly_root/$(date -u -d "@$epoch" +%Y%m%dT%H)/evidence.json"
+      [ "$file" = "$expected_file" ] || die "accepted evidence is stored under the wrong hour: $file"
+      jq -e --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+        --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+        --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+        --argjson funded "$funded_enabled" '
+        .status == "validated" and .azureAuthoritative == true and .azureDeletionAllowed == false and .sameInput.deterministicResultExactMatch == true and
+         .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image and
+         .services.fundedSignerMode == $funded_mode and .services.fundedSignerEnabled == $funded and
+         (if $funded then .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
+           .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+           .services.fundedSessionId == $funded_session and .services.fundedSessionManifestSha256 == $funded_session_sha and
+           .services.fundedConfigSha256 == $funded_config_sha and
+           (.services.fundedRuntime.invocationId | test("^[0-9a-f]{32}$")) and
+           (.services.fundedRuntime.containerId | test("^[0-9a-f]{64}$")) and
+           .services.fundedRuntime.heartbeatCount >= 50 and .services.fundedRuntime.alertCount == 0 and
+           .services.fundedRuntime.failedClosedCount == 0 and .services.fundedRuntime.restartCount == 0 and
+           .services.fundedRuntime.maxHeartbeatGapSeconds <= 75 and .services.fundedRuntime.tokenRefreshCount >= 20 and
+           .services.fundedRuntime.maxTokenRefreshGapSeconds <= 180 and
+           .services.fundedRuntime.executor.busy == false and
+           .services.fundedRuntime.executor.safetySnapshotCacheReady == true and
+           (.services.fundedRuntime.executor.safetySnapshotCacheAgeMs | type == "number" and . >= 0 and . <= 650) and
+           .services.fundedRuntime.executor.openOrderCount == 0 and
+           .services.fundedRuntime.executor.unresolvedPositionCount == 0 and
+           .services.fundedRuntime.executor.unresolvedRiskReservationCount == 0
+          else .services.fundedSignerActive == false and .services.fundedSignerMasked == true and
+           .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
+           .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null and .services.fundedRuntime == null end)' \
+        "$file" >/dev/null || die "accepted evidence failed its invariant: $file"
+      validate_funded_evidence_binding "$file" || die "accepted evidence lacks funded rollout binding: $file"
+      validate_evidence_artifacts "$file"
+      sequence=$(sequence_evidence "$file") || die "accepted evidence lacks recorder sequence proof: $file"
+      feed_evidence "$file" || die "accepted evidence lacks continuous essential feed proof: $file"
+      validate_producer_evidence "$file" || die "accepted evidence lacks funded producer proof: $file"
+      file_sha=$(sha "$file")
+      funded_invocation=$(jq -r '.services.fundedRuntime.invocationId // ""' "$file")
+      funded_container=$(jq -r '.services.fundedRuntime.containerId // ""' "$file")
+      funded_producer_invocation=$(jq -r '.services.fundedIntentProducerRuntime.invocationId // ""' "$file")
+      funded_producer_container=$(jq -r '.services.fundedIntentProducerRuntime.containerId // ""' "$file")
+      jq -nc --argjson epoch "$epoch" --arg start "$start" --arg path "$file" --arg sha "$file_sha" --argjson runs "$sequence" \
+        --arg funded_invocation "$funded_invocation" --arg funded_container "$funded_container" \
+        --arg funded_producer_invocation "$funded_producer_invocation" --arg funded_producer_container "$funded_producer_container" \
+        '{hourStartEpoch:$epoch,hourStartUtc:$start,path:$path,sha256:$sha} +
+         (if ($runs | length) == 1 then {recorderSequence:$runs[0]} else {recorderRuns:$runs} end) +
+         (if $funded_invocation == "" then {} else {fundedInvocationId:$funded_invocation,fundedContainerId:$funded_container,
+           fundedProducerInvocationId:$funded_producer_invocation,fundedProducerContainerId:$funded_producer_container} end)' >>"$refs_tmp"
+    fi
+  done
+  refs=$(jq -sc 'sort_by(.hourStartEpoch)' "$refs_tmp")
+  count=$(printf '%s' "$refs" | jq 'length')
+  [ "$count" -eq $(( (target_epoch - first_epoch) / 3600 + 1 )) ] || die 'accepted evidence has a gap'
+  printf '%s' "$refs" | jq -e --argjson first "$first_epoch" --argjson funded "$funded_enabled" '
+    def runs: if .recorderSequence? != null then [.recorderSequence] else .recorderRuns end;
+    . as $refs |
+    ([$refs[] | runs[]]) as $runs |
+    ($refs | to_entries | all(.value.hourStartEpoch == ($first + (.key * 3600)))) and
+    ([$refs[].hourStartEpoch] | length == (unique | length)) and
+    (if $funded then ([$refs[].fundedInvocationId] | unique | length) == 1 and
+      ([$refs[].fundedContainerId] | unique | length) == 1 and
+      ([$refs[].fundedProducerInvocationId] | unique | length) == 1 and
+      ([$refs[].fundedProducerContainerId] | unique | length) == 1
+     else all($refs[]; has("fundedInvocationId") | not) and
+      all($refs[]; has("fundedProducerInvocationId") | not) end) and
+    all(range(1; ($runs | length)); . as $index |
+      if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+        $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+      else
+        $runs[$index].recorder_first_sequence == 1 and
+        ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+      end)
+  ' >/dev/null || die 'accepted evidence is duplicate or non-sequential'
+}
+
+update_ledger() {
+  old_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+  [ "$old_count" -eq $((count - 1)) ] || die 'ledger was not at the strictly previous count'
+  old_refs=$(jq -c '.acceptedHourlyEvidence // []' "$POLYEDGE_PARITY_LEDGER")
+  expected_old_refs=$(printf '%s' "$refs" | jq -c '.[0:-1]')
+  [ "$old_refs" = "$expected_old_refs" ] || die 'ledger evidence references are incomplete or divergent'
+
+  protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerRevision,fundedRolloutReceiptPath,fundedRolloutReceiptSha256,fundedServiceBusDlqBaseline,parityCollectorSha256,rebootValidatorSha256,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$POLYEDGE_PARITY_LEDGER")
+  ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$ledger_tmp"' EXIT HUP INT TERM
+  jq --argjson count "$count" --argjson refs "$refs" '.acceptedCleanLiveHours = $count | .acceptedHourlyEvidence = $refs' \
+    "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+  chmod 0640 "$ledger_tmp"
+  [ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerRevision,fundedRolloutReceiptPath,fundedRolloutReceiptSha256,fundedServiceBusDlqBaseline,parityCollectorSha256,rebootValidatorSha256,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,completedDailyCycles:(.completedDailyCycles // 0),acceptedDailyEvidence:(.acceptedDailyEvidence // [])}' "$ledger_tmp")" = "$protected_before" ] \
+    || die 'protected ledger fields changed'
+  sync -f "$ledger_tmp"
+  mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
+  trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+}
+
+if [ -e "$evidence" ]; then
+  secure_file "$evidence" 640
+  jq -e --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+    --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
+    .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
+    .hourStartUtc == $hour and .hourEndUtc == $end and .ledgerPath == $ledger and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .sameInput.deterministicResultExactMatch == true and
+    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image and
+    .services.fundedSignerMode == $funded_mode and .services.fundedSignerEnabled == $funded and
+    (if $funded then .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+      .services.fundedSessionId == $funded_session and .services.fundedSessionManifestSha256 == $funded_session_sha and
+      .services.fundedConfigSha256 == $funded_config_sha
+     else .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
+      .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null end)
+  ' "$evidence" >/dev/null || die 'existing accepted evidence is invalid'
+  validate_evidence_artifacts "$evidence"
+  sequence_evidence "$evidence" >/dev/null || die 'existing accepted evidence lacks recorder sequence proof'
+  feed_evidence "$evidence" || die 'existing accepted evidence lacks continuous essential feed proof'
+  validate_producer_evidence "$evidence" || die 'existing accepted evidence lacks funded producer proof'
+  lock_ledger
+  validate_ledger
+  collect_refs
+  ledger_count=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+  if [ "$ledger_count" -eq "$count" ]; then
+    jq -e --argjson refs "$refs" '(.acceptedHourlyEvidence // []) == $refs' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+      || die 'ledger references disagree with accepted evidence'
+    exit 0
+  fi
+  [ "$ledger_count" -eq $((count - 1)) ] || die 'ledger count disagrees with accepted evidence'
+  update_ledger
+  echo "validated parity hour $target; acceptedCleanLiveHours=$count"
+  exit 0
+else
+  evidence=
+fi
+
+[ ! -e "$pause_file" ] || die 'image pulls are paused'
+available=$(df -P -B1 "$boot_root" | awk 'NR == 2 {print $4}')
+printf '%s' "$available" | grep -Eq '^[0-9]+$' || die 'boot free space is unreadable'
+[ "$available" -ge "$boot_floor" ] || die 'boot disk is below the parity floor'
+secure_file "$ring_status" 640
+jq -e '
+  .capacity_ok == true and .free_ok == true and .upload_fresh == true and
+  .unsealed_closed_count == 0 and .unuploaded_count == 0
+' "$ring_status" >/dev/null || die 'ring is unhealthy'
+ring_age=$((now_epoch - $(stat -c %Y "$ring_status")))
+[ "$ring_age" -ge 0 ] && [ "$ring_age" -le 600 ] || die 'ring health status is stale'
+
+systemctl is-active --quiet polyedge-api.service || die 'API service is inactive'
+systemctl is-active --quiet polyedge-frontend.service || die 'frontend service is inactive'
+[ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-api)" = healthy ] || die 'API container is unhealthy'
+[ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-frontend)" = healthy ] || die 'frontend container is unhealthy'
+case "$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
+if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
+funded_runtime=null
+funded_producer_runtime=null
+funded_service_bus_runtime=null
+funded_journal_file=
+funded_token_journal_file=
+producer_journal_file=
+producer_token_journal_file=
+if [ "$POLYEDGE_PARITY_FUNDED_MODE" = disabled ]; then
+  [ "$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)" = masked ] || die 'funded signer is not masked'
+  if systemctl is-active --quiet polyedge-funded-signer.service; then die 'funded signer is active'; fi
+  producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  case "$producer_enablement" in disabled|masked) ;; *) die 'funded intent producer is enabled or absent' ;; esac
+  if systemctl is-active --quiet polyedge-funded-intent-producer.service; then die 'funded intent producer is active'; fi
+  producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  case "$producer_token_enablement" in disabled|masked) ;; *) die 'funded producer token timer is enabled or absent' ;; esac
+  if systemctl is-active --quiet polyedge-federated-token@funded-intent-producer.timer; then
+    die 'funded producer token timer is active'
+  fi
+else
+  producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  case "$producer_enablement" in
+    enabled) ;;
+    generated)
+      systemctl show multi-user.target --property=Wants --value | tr ' ' '\n' \
+        | grep -Fx polyedge-funded-intent-producer.service >/dev/null \
+        || die 'generated funded intent producer is not wanted by the reboot target'
+      ;;
+    *) die 'funded intent producer is not enabled for reboot recovery' ;;
+  esac
+  producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  [ "$producer_token_enablement" = enabled ] || die 'funded producer token rotation timer is not enabled for reboot recovery'
+  systemctl is-active --quiet polyedge-funded-intent-producer.service || die 'funded intent producer is inactive'
+  systemctl is-active --quiet polyedge-federated-token@funded-intent-producer.timer || die 'funded producer token rotation timer is inactive'
+  [ "$(podman inspect --format '{{.State.Status}}' polyedge-funded-intent-producer)" = running ] || die 'funded intent producer container is not running'
+  [ "$(podman inspect --format '{{.State.Health.Status}}' polyedge-funded-intent-producer)" = healthy ] || die 'funded intent producer container is unhealthy'
+  [ "$(podman inspect --format '{{.Config.Image}}' polyedge-funded-intent-producer)" = "$funded_producer_image" ] \
+    || die 'funded intent producer image differs from the formal digest'
+  [ "$(podman inspect --format '{{.Config.User}}' polyedge-funded-intent-producer)" = "$funded_producer_user" ] \
+    || die 'funded intent producer container user is not 984:980'
+  funded_producer_container=$(podman inspect --format '{{.Id}}' polyedge-funded-intent-producer)
+  printf '%s' "$funded_producer_container" | grep -Eq '^[0-9a-f]{64}$' || die 'funded intent producer container ID is malformed'
+  funded_producer_invocation=$(systemctl show polyedge-funded-intent-producer.service --property=InvocationID --value)
+  printf '%s' "$funded_producer_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'funded intent producer invocation ID is malformed'
+  [ "$funded_producer_invocation" = "$rollout_producer_invocation" ] || die 'funded intent producer invocation differs from the rollout receipt'
+  producer_config_file=${POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE:-/etc/polyedge/funded-intent-producer.env}
+  secure_file "$producer_config_file" 600
+  [ "$(sha "$producer_config_file")" = "$funded_producer_config_sha" ] \
+    || die 'funded intent producer environment hash differs from the formal config'
+  [ ! -L "$producer_token" ] && [ -f "$producer_token" ] || die 'funded producer JWT-SVID is missing or unsafe'
+  set -- $(stat -c '%u %g %a %h %s %Y' "$producer_token")
+  [ "$1:$2" = "$funded_producer_user" ] && [ "$3" = 600 ] && [ "$4" = 1 ] && [ "$5" -gt 0 ] && [ "$5" -le 65536 ] \
+    || die 'funded producer JWT-SVID has unsafe metadata'
+  funded_producer_token_age=$((now_epoch - $6))
+  [ "$funded_producer_token_age" -ge 0 ] && [ "$funded_producer_token_age" -le 240 ] || die 'funded producer JWT-SVID rotation is stale'
+
+  producer_env_raw=$(podman inspect --format '{{json .Config.Env}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer environment is unreadable'
+  producer_env_binding=$(printf '%s\n' "$producer_env_raw" | jq -cSe '
+    def one($name):
+      ($name + "=") as $prefix |
+      [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+      if length == 1 then .[0] else error("critical producer environment binding is absent or duplicate") end;
+    {
+      APP_NAME:one("APP_NAME"),RUNTIME_ROLE:one("RUNTIME_ROLE"),EXECUTION_MODE:one("EXECUTION_MODE"),
+      ALLOW_LIVE:one("ALLOW_LIVE"),RUN_BOT_ON_STARTUP:one("RUN_BOT_ON_STARTUP"),
+      STRATEGY_INTENT_OPERATOR_DIRECT:one("STRATEGY_INTENT_OPERATOR_DIRECT"),
+      PUBLISH_STRATEGY_CANARY_INTENTS:one("PUBLISH_STRATEGY_CANARY_INTENTS"),
+      STRATEGY_CANARY_INTENT_PREFIX:one("STRATEGY_CANARY_INTENT_PREFIX"),
+      STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:one("STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION"),
+      STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:one("STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI"),
+      STRATEGY_CANARY_EXECUTION_MODEL_SHA256:one("STRATEGY_CANARY_EXECUTION_MODEL_SHA256"),
+      STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:one("STRATEGY_INTENT_TARGET_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MAX_ORDER_NOTIONAL:one("STRATEGY_INTENT_MAX_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY"),
+      STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY"),
+      TARGET_ASSET:one("TARGET_ASSET"),TARGET_ASSET_NAME:one("TARGET_ASSET_NAME"),TARGET_HORIZON:one("TARGET_HORIZON"),
+      TARGET_BINANCE_SYMBOL:one("TARGET_BINANCE_SYMBOL"),TARGET_CHAINLINK_SYMBOL:one("TARGET_CHAINLINK_SYMBOL"),
+      TARGET_COINBASE_PRODUCT_ID:one("TARGET_COINBASE_PRODUCT_ID"),
+      AZURE_TENANT_ID:one("AZURE_TENANT_ID"),AZURE_CLIENT_ID:one("AZURE_CLIENT_ID"),
+      AZURE_FEDERATED_TOKEN_FILE:one("AZURE_FEDERATED_TOKEN_FILE"),
+      AZURE_TOKEN_CREDENTIALS:one("AZURE_TOKEN_CREDENTIALS"),
+      AZURE_STORAGE_ACCOUNT_NAME:one("AZURE_STORAGE_ACCOUNT_NAME"),
+      AZURE_STORAGE_CONTAINER_NAME:one("AZURE_STORAGE_CONTAINER_NAME"),
+      AZURE_STORAGE_TABLE_NAME:one("AZURE_STORAGE_TABLE_NAME"),
+      AZURE_CHART_TABLE_NAME:one("AZURE_CHART_TABLE_NAME"),
+      AZURE_MARKET_TABLE_NAME:one("AZURE_MARKET_TABLE_NAME"),
+      AZURE_FUNDED_STORAGE_CONTAINER_NAME:one("AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+      AZURE_MODEL_STORAGE_CONTAINER_NAME:one("AZURE_MODEL_STORAGE_CONTAINER_NAME"),
+      FUNDED_DIRECT_SERVICE_BUS_ENABLED:one("FUNDED_DIRECT_SERVICE_BUS_ENABLED"),
+      FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:one("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE"),
+      FUNDED_DIRECT_SERVICE_BUS_QUEUE:one("FUNDED_DIRECT_SERVICE_BUS_QUEUE")
+    }
+  ') || die 'funded intent producer critical environment binding is unsafe'
+  unset producer_env_raw
+  [ "$(text_sha "$producer_env_binding")" = "$funded_producer_env_binding_sha" ] \
+    || die 'funded intent producer critical environment differs from the approved binding'
+  unset producer_env_binding
+
+  producer_mount_raw=$(podman inspect --format '{{json .Mounts}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer mounts are unreadable'
+  producer_mount_binding=$(printf '%s\n' "$producer_mount_raw" | jq -cSe --arg source "$producer_token_dir" '
+    [.[] | select(.Destination == "/run/credentials")] as $mounts |
+    if ($mounts | length) == 1 and $mounts[0].Source == $source and $mounts[0].RW == false
+    then {source:$mounts[0].Source,destination:$mounts[0].Destination,readOnly:true}
+    else error("producer token mount is not exact and read-only") end
+  ') || die 'funded intent producer token mount is not exact and read-only'
+  unset producer_mount_raw
+  [ "$(text_sha "$producer_mount_binding")" = "$funded_producer_mount_binding_sha" ] \
+    || die 'funded intent producer token mount differs from the approved binding'
+  unset producer_mount_binding
+
+  funded_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
+  case "$funded_enablement" in
+    enabled) ;;
+    generated)
+      systemctl show multi-user.target --property=Wants --value | tr ' ' '\n' \
+        | grep -Fx polyedge-funded-signer.service >/dev/null \
+        || die 'generated funded signer is not wanted by the reboot target'
+      ;;
+    *) die 'funded signer is not enabled for reboot recovery' ;;
+  esac
+  [ "$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)" = enabled ] \
+    || die 'funded token rotation timer is not enabled for reboot recovery'
+  systemctl is-active --quiet polyedge-funded-signer.service || die 'funded signer is inactive'
+  systemctl is-active --quiet polyedge-federated-token@funded-signer.timer || die 'funded token rotation timer is inactive'
+  [ "$(podman inspect --format '{{.State.Status}}' polyedge-funded-signer)" = running ] || die 'funded signer container is not running'
+  [ "$(podman inspect --format '{{.Config.Image}}' polyedge-funded-signer)" = "$funded_image" ] || die 'funded signer image differs from the formal digest'
+  [ "$(podman inspect --format '{{.Config.User}}' polyedge-funded-signer)" = "$funded_user" ] || die 'funded signer container user is not the isolated lane identity'
+  funded_container=$(podman inspect --format '{{.Id}}' polyedge-funded-signer)
+  printf '%s' "$funded_container" | grep -Eq '^[0-9a-f]{64}$' || die 'funded signer container ID is malformed'
+  funded_invocation=$(systemctl show polyedge-funded-signer.service --property=InvocationID --value)
+  printf '%s' "$funded_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'funded signer invocation ID is malformed'
+  [ "$funded_invocation" = "$rollout_signer_invocation" ] || die 'funded signer invocation differs from the rollout receipt'
+  [ "$funded_container" = "$rollout_signer_container" ] || die 'funded signer container differs from the rollout receipt'
+  funded_env_value() {
+    raw=$(podman inspect --format '{{json .Config.Env}}' polyedge-funded-signer) || die 'funded signer environment is unreadable'
+    printf '%s\n' "$raw" | jq -er --arg name "$1" '($name + "=") as $prefix |
+      [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+      if length == 1 then .[0] else error("funded runtime binding is absent or duplicate") end'
+    unset raw
+  }
+  [ "$(funded_env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = "$funded_session" ] || die 'funded signer campaign differs from the formal session'
+  [ "$(funded_env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = "$funded_session_sha" ] || die 'funded signer manifest hash differs from the formal session'
+  [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] || die 'funded signer config hash differs from the formal config'
+  funded_token=${POLYEDGE_PARITY_FUNDED_TOKEN_FILE:-/run/polyedge-federated-funded-signer/azure-federated-token}
+  [ ! -L "$funded_token" ] && [ -f "$funded_token" ] || die 'funded JWT-SVID is missing or unsafe'
+  set -- $(stat -c '%u %g %a %h %Y' "$funded_token")
+  [ "$1:$2" = "$funded_user" ] && [ "$3" = 600 ] && [ "$4" = 1 ] || die 'funded JWT-SVID has wrong owner, mode, or link count'
+  funded_token_age=$((now_epoch - $5))
+  [ "$funded_token_age" -ge 0 ] && [ "$funded_token_age" -le 240 ] || die 'funded JWT-SVID rotation is stale'
+
+  funded_journal_file=$(mktemp "$runtime_dir/funded-journal.XXXXXX")
+  funded_token_journal_file=$(mktemp "$runtime_dir/funded-token-journal.XXXXXX")
+  producer_journal_file=$(mktemp "$runtime_dir/producer-journal.XXXXXX")
+  producer_token_journal_file=$(mktemp "$runtime_dir/producer-token-journal.XXXXXX")
+  chmod 0600 "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file"
+  journalctl -u polyedge-funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager >"$funded_journal_file" \
+    || die 'funded signer journal capture failed'
+  journalctl -u polyedge-federated-token@funded-signer.service --since "$target" --until "$hour_end" -o json --no-pager >"$funded_token_journal_file" \
+    || die 'funded signer token journal capture failed'
+  journalctl -u polyedge-funded-intent-producer.service --since "$target" --until "$hour_end" -o json --no-pager >"$producer_journal_file" \
+    || die 'funded intent producer journal capture failed'
+  journalctl -u polyedge-federated-token@funded-intent-producer.service --since "$target" --until "$hour_end" -o json --no-pager >"$producer_token_journal_file" \
+    || die 'funded producer token journal capture failed'
+
+  funded_runtime=$(jq -Rsc --arg invocation "$funded_invocation" --arg container "$funded_container" \
+    --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
+        {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
+         invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] as $events |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_alert.v1")] as $alerts |
+      [$events[] | select((.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed") or
+        (.event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_message_failed_closed"))] as $failed |
+      [$events[] | select(.invocation == $invocation and .container == $container and
+        .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "market_warmed")] as $warmed |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_service.v2" and
+        (.event.status == "persistent_service_started" or .event.status == "persistent_service_stopped"))] as $restarts |
+      [$events[] | select(.event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")] as $all_heartbeats |
+      [$all_heartbeats[] | select(.invocation == $invocation and .container == $container)] | sort_by(.timestamp) as $heartbeats |
+      ([$all_heartbeats[] | select(.invocation != $invocation or .container != $container)] | length) as $foreign |
+      [$heartbeats[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($alerts | length) == 0 and ($failed | length) == 0 and ($warmed | length) >= 1 and
+        ($restarts | length) == 0 and $foreign == 0 and
+        ($heartbeats | length) >= 50 and $times[0] >= $start and $times[0] <= ($start + 60) and
+        $times[-1] >= ($end - 60) and $times[-1] < $end and $max_gap <= 75 and
+        $heartbeats[-1].event.processed_messages > $heartbeats[0].event.processed_messages and
+        all($heartbeats[].event;
+          (.processed_messages | type == "number" and floor == . and . >= 0) and
+          .failed_messages == 0 and .failed_attempts == 0 and .consecutive_latency_breaches == 0 and .redemption_failures == 0 and
+          .executor.user_channel_ready == true and .executor.market_channel_ready == true and
+          .executor.user_channel_gaps == 0 and .executor.market_channel_gaps == 0 and
+          .executor.user_channel_unparsed == 0 and .executor.market_channel_unparsed == 0 and
+          .executor.reconnect_reconciliation_required == false and
+          .executor.safety_snapshot_cache_ready == true and .executor.safety_snapshot_cache_error == null and
+          .executor.risk_reservation_index_ready == true) and
+        ($heartbeats[-1].event.executor |
+          .busy == false and
+          (.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+          .safety_snapshot_open_order_count == 0 and
+          .safety_snapshot_unresolved_position_count == 0 and
+          .safety_snapshot_unresolved_risk_reservation_count == 0)
+      then ($heartbeats[-1].event | {
+        invocationId:$invocation,containerId:$container,heartbeatCount:($heartbeats | length),
+        firstHeartbeatUtc:($times[0] | todateiso8601),lastHeartbeatUtc:($times[-1] | todateiso8601),
+        maxHeartbeatGapSeconds:$max_gap,alertCount:($alerts | length),failedClosedCount:($failed | length),
+        failedAttempts:.failed_attempts,marketWarmedCount:($warmed | length),
+        processedMessagesDelta:(.processed_messages - $heartbeats[0].event.processed_messages),
+        restartCount:(($restarts | length) + $foreign),processedMessages:.processed_messages,
+        failedMessages:.failed_messages,consecutiveLatencyBreaches:.consecutive_latency_breaches,
+        redemptionFailures:.redemption_failures,
+        executor:{userChannelReady:.executor.user_channel_ready,marketChannelReady:.executor.market_channel_ready,
+          userChannelGaps:.executor.user_channel_gaps,marketChannelGaps:.executor.market_channel_gaps,
+          userChannelUnparsed:.executor.user_channel_unparsed,marketChannelUnparsed:.executor.market_channel_unparsed,
+          reconnectReconciliationRequired:.executor.reconnect_reconciliation_required,busy:.executor.busy,
+          safetySnapshotCacheReady:.executor.safety_snapshot_cache_ready,
+          safetySnapshotCacheAgeMs:.executor.safety_snapshot_cache_age_ms,
+          openOrderCount:.executor.safety_snapshot_open_order_count,
+          unresolvedPositionCount:.executor.safety_snapshot_unresolved_position_count,
+          unresolvedRiskReservationCount:.executor.safety_snapshot_unresolved_risk_reservation_count,
+          safetySnapshotCacheError:.executor.safety_snapshot_cache_error,
+          riskReservationIndexReady:.executor.risk_reservation_index_ready}})
+      else error("funded signer lacks continuous bound heartbeat evidence") end
+    ' "$funded_journal_file") || die 'funded signer lacks continuous healthy heartbeat evidence'
+  token_runtime=$(jq -Rsc --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") |
+        {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),message:(.MESSAGE // "")}] as $events |
+      [$events[] | select(.message | startswith("Finished polyedge-federated-token@funded-signer.service"))] | sort_by(.timestamp) as $refreshes |
+      [$events[] | select(.message | test("failed|failure|status=[1-9]"; "i"))] as $failures |
+      [$refreshes[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($refreshes | length) >= 20 and ($failures | length) == 0 and
+        $times[0] >= $start and $times[0] <= ($start + 180) and
+        $times[-1] >= ($end - 180) and $times[-1] < $end and $max_gap <= 180
+      then {tokenRefreshCount:($refreshes | length),firstTokenRefreshUtc:($times[0] | todateiso8601),
+        lastTokenRefreshUtc:($times[-1] | todateiso8601),maxTokenRefreshGapSeconds:$max_gap,tokenRefreshFailureCount:0}
+      else error("funded token rotation was not continuous") end
+    ' "$funded_token_journal_file") || die 'funded token rotation lacks continuous success evidence'
+  funded_runtime=$(jq -nc --argjson signer "$funded_runtime" --argjson token "$token_runtime" '$signer + $token')
+
+  producer_continuity=$(jq -Rsc --arg invocation "$funded_producer_invocation" --arg container "$funded_producer_container" \
+    --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | if type == "array" then implode else . end |
+          capture("(?<json>\\{.*\\})").json | fromjson?) as $event | select($event.event == "runtime_health") |
+        {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
+         invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] as $all |
+      [$all[] | select(.invocation == $invocation and .container == $container)] | sort_by(.timestamp) as $events |
+      ([$all[] | select(.invocation != $invocation or .container != $container)] | length) as $foreign |
+      [$events[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($events | length) >= 50 and $foreign == 0 and
+        $times[0] >= $start and $times[0] <= ($start + 75) and
+        $times[-1] >= ($end - 75) and $times[-1] < $end and $max_gap <= 75 and
+        any($events[].event; .recorder_queued == 0 and .recorder_dropped_count == 0 and .recorder_error_count == 0) and
+        all($events[].event; .execution_mode == "paper" and .runtime_loop == "running" and .feeds == "running" and
+          (.recorder_queued == 0 or .recorder_queued == 1) and
+          .recorder_failed_total == 0 and .recorder_unrecovered_durable_events == 0 and
+          .recorder_flush_unrecovered == false and
+          ((.recorder_dropped_count == 0 and .recorder_error_count == 0) or
+           (.recorder_queued == 1 and .recorder_dropped_count == null and .recorder_error_count == null)))
+      then {invocationId:$invocation,containerId:$container,observationCount:($events | length),
+        firstObservationUtc:($times[0] | todateiso8601),lastObservationUtc:($times[-1] | todateiso8601),
+        maxGapSeconds:$max_gap,foreignObservationCount:$foreign,restartCount:0,
+        maxRecorderQueueDepth:([$events[].event.recorder_queued] | max),
+        recorderBusyObservationCount:([$events[].event | select(.recorder_dropped_count == null and .recorder_error_count == null)] | length)}
+      else error("funded intent producer lacks continuous bound runtime health evidence") end
+    ' "$producer_journal_file") || die 'funded intent producer lacks continuous healthy runtime evidence'
+  publisher_outcomes=$(jq -Rsc --arg invocation "$funded_producer_invocation" --arg container "$funded_producer_container" \
+    --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") |
+        {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),invocation:(._SYSTEMD_INVOCATION_ID // ""),
+         container:(.CONTAINER_ID_FULL // ""),message:(.MESSAGE | if type == "array" then implode else (. // "") end)} |
+        select(.invocation == $invocation and .container == $container and .timestamp >= $start and .timestamp < $end)] as $events |
+      [$events[] | select(.message | contains("funded market warmup sent") or contains("execution intent published"))] | sort_by(.timestamp) as $successes |
+      [$events[] | select(.message | contains("funded market warmup not sent") or contains("execution intent publication failed"))] as $failures |
+      if ($successes | length) >= 1 and ($failures | length) == 0
+      then {successCount:($successes | length),
+        warmupSentCount:([$successes[] | select(.message | contains("funded market warmup sent"))] | length),
+        intentPublishedCount:([$successes[] | select(.message | contains("execution intent published"))] | length),
+        firstSuccessUtc:($successes[0].timestamp | todateiso8601),lastSuccessUtc:($successes[-1].timestamp | todateiso8601),
+        infrastructureFailureCount:0}
+      else error("publisher lacks successful hour-local executable output or has infrastructure failures") end
+    ' "$producer_journal_file") || die 'funded intent producer lacks successful hour-local publisher evidence'
+  producer_continuity=$(jq -nc --argjson continuity "$producer_continuity" --argjson publisher "$publisher_outcomes" \
+    '$continuity + {publisher:$publisher}')
+  producer_token_continuity=$(jq -Rsc --argjson start "$target_epoch" --argjson end "$end_epoch" '
+      [split("\n")[] | fromjson? | select(type == "object") |
+        {timestamp:((.__REALTIME_TIMESTAMP | tonumber) / 1000000),message:(.MESSAGE // "")}] as $events |
+      [$events[] | select(.message | startswith("Finished polyedge-federated-token@funded-intent-producer.service"))] | sort_by(.timestamp) as $refreshes |
+      [$events[] | select(.message | test("failed|failure|status=[1-9]"; "i"))] as $failures |
+      [$refreshes[].timestamp] as $times |
+      ([range(1; ($times | length)) as $index | $times[$index] - $times[$index - 1]] | max // 0) as $max_gap |
+      if ($refreshes | length) >= 20 and ($failures | length) == 0 and
+        $times[0] >= $start and $times[0] <= ($start + 180) and
+        $times[-1] >= ($end - 180) and $times[-1] < $end and $max_gap <= 180
+      then {tokenRefreshCount:($refreshes | length),firstTokenRefreshUtc:($times[0] | todateiso8601),
+        lastTokenRefreshUtc:($times[-1] | todateiso8601),maxTokenRefreshGapSeconds:$max_gap,tokenRefreshFailureCount:0}
+      else error("funded producer token rotation was not continuous") end
+    ' "$producer_token_journal_file") || die 'funded producer token rotation lacks continuous success evidence'
+
+  producer_health_file=$(mktemp "$runtime_dir/producer-health.XXXXXX")
+  producer_status_file=$(mktemp "$runtime_dir/producer-status.XXXXXX")
+  chmod 0600 "$producer_health_file" "$producer_status_file"
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_health_file" || die 'funded intent producer private health request failed'
+  producer_health=$(tr -d '\r' <"$producer_health_file" | sed '1,/^$/d' | jq -ce '
+    if .ok == true and .backend_impl == "rust" and .runtime_role == "profitability_shadow" and
+      .shadow_only == true and .runtime_active == true and .execution_mode == "paper" and .kill_switch == false
+    then {ok,backendImpl:.backend_impl,runtimeRole:.runtime_role,shadowOnly:.shadow_only,
+      runtimeActive:.runtime_active,executionMode:.execution_mode,killSwitch:.kill_switch}
+    else error("funded intent producer native health is unsafe") end
+  ') || die 'funded intent producer native health is unsafe'
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_status_file" || die 'funded intent producer private status request failed'
+  producer_status=$(tr -d '\r' <"$producer_status_file" | sed '1,/^$/d' | jq -ce --argjson now "$now_epoch" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def feed_ok($name):
+      .feed_status[$name] as $feed | ($feed | type) == "object" and $feed.status == "ok" and
+      ($feed.updated_at | type) == "string" and (($feed.updated_at | epoch) as $updated |
+        $updated <= $now and $updated >= ($now - 300));
+    if .app == "polyedge-funded-intent-producer" and .backend_impl == "rust" and
+      .runtime_role == "profitability_shadow" and .shadow_only == true and .execution_mode == "paper" and
+      .intent_publisher == {configured:true,prepared:true,pointer_only_preflight:false} and
+      .task_health.api == "ok" and .task_health.runtime_loop == "running" and .task_health.feeds == "running" and
+      feed_ok("Discovery") and feed_ok("PolymarketClobMarket") and
+      feed_ok("PolymarketRtdsChainlink") and feed_ok("PolymarketRtdsBinance") and
+      (.drop_counts | type == "object" and length == 0) and
+      .recorder_status.error_count == 0 and .recorder_status.dropped_count == 0 and
+      .recorder_metrics.queued == 0 and .recorder_metrics.failed_total == 0 and
+      .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and
+      .recorder_metrics.enqueued_total == .recorder_metrics.persisted_total and
+      .recorder_metrics.last_assigned_sequence == .recorder_metrics.enqueued_total and
+      (.recorder_metrics.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_metrics.last_assigned_sequence | type == "number" and floor == . and . >= 1)
+    then {sampledAtUtc:($now | todateiso8601),app,runtimeRole:.runtime_role,executionMode:.execution_mode,
+      intentPublisher:{configured:.intent_publisher.configured,prepared:.intent_publisher.prepared,
+        pointerOnlyPreflight:.intent_publisher.pointer_only_preflight},
+      taskHealth:{api:.task_health.api,runtimeLoop:.task_health.runtime_loop,feeds:.task_health.feeds},
+      feedStatus:{Discovery:(.feed_status.Discovery | {status,updated_at}),
+        PolymarketClobMarket:(.feed_status.PolymarketClobMarket | {status,updated_at}),
+        PolymarketRtdsChainlink:(.feed_status.PolymarketRtdsChainlink | {status,updated_at}),
+        PolymarketRtdsBinance:(.feed_status.PolymarketRtdsBinance | {status,updated_at})},
+      recorder:{instanceId:.recorder_metrics.recorder_instance_id,lastAssignedSequence:.recorder_metrics.last_assigned_sequence,
+        queued:.recorder_metrics.queued,enqueuedTotal:.recorder_metrics.enqueued_total,persistedTotal:.recorder_metrics.persisted_total,
+        failedTotal:.recorder_metrics.failed_total,unrecoveredDurableEvents:.recorder_metrics.unrecovered_durable_events,
+        flushUnrecovered:.recorder_metrics.flush_unrecovered,errorCount:.recorder_status.error_count,droppedCount:.recorder_status.dropped_count}}
+    else error("funded intent producer native status is unsafe") end
+  ') || die 'funded intent producer native status is unsafe'
+  funded_producer_runtime=$(jq -nc --arg container "$funded_producer_container" --arg invocation "$funded_producer_invocation" \
+    --arg enablement "$producer_enablement" --arg token_enablement "$producer_token_enablement" \
+    --arg env_binding_sha "$funded_producer_env_binding_sha" --arg mount_binding_sha "$funded_producer_mount_binding_sha" \
+    --argjson continuity "$producer_continuity" --argjson token_continuity "$producer_token_continuity" \
+    --argjson health "$producer_health" --argjson status "$producer_status" \
+    '{containerId:$container,invocationId:$invocation,serviceEnablement:$enablement,serviceActive:true,
+      tokenTimerEnablement:$token_enablement,tokenTimerActive:true,
+      configEnvBindingSha256:$env_binding_sha,tokenMountBindingSha256:$mount_binding_sha,
+      continuity:$continuity,tokenContinuity:$token_continuity,health:$health,status:$status}')
+
+  rm -f "$funded_journal_file" "$funded_token_journal_file" "$producer_journal_file" "$producer_token_journal_file" \
+    "$producer_health_file" "$producer_status_file"
+  funded_journal_file=
+  funded_token_journal_file=
+  producer_journal_file=
+  producer_token_journal_file=
+  producer_health_file=
+  producer_status_file=
+fi
+
+source_dir=$segments_root/$day/$hour
+: >"$feed_tmp"
+sequence_summary() {
+  segment=$1
+  sequence_tmp=$(mktemp "$segment.sequence.XXXXXX") || return 1
+  trap 'rm -f "$sequence_tmp"' EXIT HUP INT TERM
+  chmod 0600 "$sequence_tmp"
+  if ! jq -cer '
+    if type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_sequence | type == "number" and floor == . and . >= 1)
+    then "\(.recorder_instance_id)\t\(.recorder_sequence)"
+    else error("invalid recorder sequence fields")
+    end
+  ' "$segment" >"$sequence_tmp"; then
+    rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
+  fi
+  if ! recorder=$(awk -F '\t' '
+    function emit() {
+      out = out comma "{\"recorder_instance_id\":\"" instance "\",\"recorder_first_sequence\":" first ",\"recorder_last_sequence\":" previous ",\"recorder_event_count\":" count "}"
+      comma=","
+    }
+    NR == 1 { instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next }
+    $1 != instance {
+      if ($2 != 1 || seen[$1]) exit 1
+      emit(); instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next
+    }
+    $2 != previous + 1 { exit 1 }
+    { previous=$2; count++ }
+    END { if (NR == 0) exit 1; emit(); print "{\"recorder_runs\":[" out "]}" }
+  ' "$sequence_tmp"); then
+    rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
+  fi
+  rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM
+  printf '%s\n' "$recorder"
+}
+[ ! -L "$source_dir" ] && [ -d "$source_dir" ] || die 'hour segment directory is missing or unsafe'
+[ "$(find "$source_dir" -maxdepth 1 -name '*.jsonl' | wc -l)" -eq 6 ] || die 'target hour does not contain exactly six source segments'
+: >"$segments_tmp"
+i=0
+while [ "$i" -lt 6 ]; do
+  start=$((target_epoch + i * 600))
+  source=$source_dir/$start.jsonl
+  relative=$day/$hour/$start.jsonl
+  gzip_file=$archive_root/$relative.gz
+  manifest=$gzip_file.manifest.json
+  receipt=$manifest.uploaded.json
+  for file in "$source" "$gzip_file" "$manifest" "$receipt"; do
+    [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c %h "$file")" = 1 ] || die "unsafe segment evidence: $file"
+  done
+  source_recorder=$(sequence_summary "$source") || die "invalid recorder sequence proof: $source"
+  source_runs=$(printf '%s' "$source_recorder" | jq -ce '.recorder_runs')
+  gzip -t "$gzip_file" || die "invalid gzip: $gzip_file"
+  source_sha=$(sha "$source")
+  [ "sha256:$(gzip -dc "$gzip_file" | sha256sum | awk '{print $1}')" = "$source_sha" ] || die "gzip source mismatch: $gzip_file"
+  gzip_sha=$(sha "$gzip_file")
+  manifest_sha=$(sha "$manifest")
+  expected_blob="events-oci-hot7-v1/$day/$hour/$start.jsonl.gz"
+  [ "$(jq -r '.blob_name' "$manifest")" = "$expected_blob" ] || die "manifest blob mismatch: $manifest"
+  source_lines=$(wc -l < "$source")
+  manifest_runs=$(jq -ce --arg segment "segments/$relative" --arg archive "archive/$relative.gz" --arg source_sha "$source_sha" \
+    --arg gzip_sha "$gzip_sha" --argjson start "$start" --argjson end "$((start + 600))" --argjson source_lines "$source_lines" '
+    def valid_run:
+      type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_first_sequence | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence | type == "number" and floor == .) and
+      (.recorder_last_sequence >= .recorder_first_sequence) and
+      (.recorder_event_count | type == "number" and floor == . and . >= 1) and
+      (.recorder_last_sequence - .recorder_first_sequence + 1 == .recorder_event_count);
+    def valid_runs:
+      . as $runs |
+      ($runs | length) >= 1 and all($runs[]; valid_run) and
+      all(range(1; ($runs | length)); . as $index |
+        if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+          $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+        else
+          $runs[$index].recorder_first_sequence == 1 and
+          ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+        end);
+    . as $manifest |
+    if (.segment_path == $segment and .archive_path == $archive and .compression == "gzip" and
+        .source_sha256 == $source_sha and .sha256 == $gzip_sha and .segment_start_epoch == $start and
+        .segment_end_epoch == $end and .lines == $source_lines) then
+      (if .schema_version == 3 and (has("recorder_runs") | not) then
+         [{recorder_instance_id,recorder_first_sequence,recorder_last_sequence,recorder_event_count}]
+       elif .schema_version == 4 and
+         (["recorder_instance_id","recorder_first_sequence","recorder_last_sequence","recorder_event_count"] | all(.[]; $manifest[.] == null)) then
+         .recorder_runs
+       else error("unsupported recorder manifest") end) as $runs |
+      if ($runs | type) == "array" and ($runs | valid_runs) and
+         ([$runs[].recorder_event_count] | add) == $source_lines
+      then $runs else error("manifest recorder runs are invalid") end
+    else error("manifest identity is invalid") end
+  ' "$manifest") || die "manifest mismatch: $manifest"
+  printf '%s' "$manifest_runs" | jq -e --argjson source_runs "$source_runs" '. == $source_runs' >/dev/null \
+    || die "manifest recorder sequence differs from source: $manifest"
+  jq -e --arg manifest_sha "$manifest_sha" --arg blob "$expected_blob" --arg manifest_blob "$expected_blob.manifest.json" '
+    .schema_version == 1 and .manifest_sha256 == $manifest_sha and .blob_name == $blob and
+    .manifest_blob_name == $manifest_blob and
+    (.verified_ts | type == "string" and length > 0)
+  ' "$receipt" >/dev/null || die "receipt mismatch: $receipt"
+  jq -nc --argjson start "$start" --arg source "$source" --arg source_sha "$source_sha" \
+    --arg gzip "$gzip_file" --arg gzip_sha "$gzip_sha" --arg manifest "$manifest" --arg manifest_sha "$manifest_sha" \
+    --arg receipt "$receipt" --arg receipt_sha "$(sha "$receipt")" --argjson runs "$manifest_runs" \
+    '{segmentStartEpoch:$start,source:{path:$source,sha256:$source_sha},gzip:{path:$gzip,sha256:$gzip_sha},manifest:{path:$manifest,sha256:$manifest_sha},receipt:{path:$receipt,sha256:$receipt_sha},recorderRuns:$runs}' >>"$segments_tmp"
+  jq -cr --argjson hour_start "$target_epoch" --argjson hour_end "$end_epoch" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def essential($name):
+      $name == "Discovery" or $name == "PolymarketClobMarket" or
+      $name == "PolymarketRtdsChainlink" or $name == "PolymarketRtdsBinance";
+    def feed_ok($name; $recorded):
+      .payload.essential_feed_health.feed_status[$name] as $feed |
+      (($feed | type) == "object") and $feed.status == "ok" and
+      (($feed.updated_at | type) == "string") and
+      (($feed.updated_at | epoch) as $updated |
+        $updated <= $recorded and $updated >= ($recorded - 300));
+    if .event_type == "feed_error" and essential(.payload.feed) then
+      {kind:"error"}
+    elif .event_type == "runtime_provenance" and (.recorded_ts | type) == "string" then
+      . as $event | ($event.recorded_ts | epoch) as $recorded |
+      if $recorded >= $hour_start and $recorded < $hour_end then
+        {kind:"health",epoch:$recorded,recordedAt:$event.recorded_ts,
+         healthy:(.payload.essential_feed_health.summary == "running" and
+           feed_ok("Discovery"; $recorded) and feed_ok("PolymarketClobMarket"; $recorded) and
+           feed_ok("PolymarketRtdsChainlink"; $recorded) and feed_ok("PolymarketRtdsBinance"; $recorded))}
+      else empty end
+    else empty end
+  ' "$source" >>"$feed_tmp" || die "invalid continuous feed proof: $source"
+  i=$((i + 1))
+done
+segments=$(jq -sc '.' "$segments_tmp")
+continuous_feed=$(jq -sce --argjson start "$target_epoch" --argjson end "$end_epoch" '
+  . as $events |
+  ([$events[] | select(.kind == "health")] | sort_by(.epoch)) as $health |
+  ([$events[] | select(.kind == "error")] | length) as $errors |
+  if ($health | length) >= 60 then
+    ([$health[].epoch]) as $epochs |
+    ([range(1; $epochs | length) as $index | $epochs[$index] - $epochs[$index - 1]] | max // 0) as $gap |
+    ([$health[] | select(.healthy != true)] | length) as $unhealthy |
+    if $errors == 0 and $unhealthy == 0 and $epochs[0] >= $start and $epochs[0] <= ($start + 60) and
+      $epochs[-1] >= ($end - 60) and $epochs[-1] < $end and $gap <= 75
+    then {observations:($health | length),unhealthyObservations:$unhealthy,essentialFeedErrors:$errors,
+      firstObservationUtc:$health[0].recordedAt,lastObservationUtc:$health[-1].recordedAt,maxGapSeconds:$gap}
+    else error("essential feed health was not continuous") end
+  else error("essential feed health observations are incomplete") end
+' "$feed_tmp") || immutable_hour_rejection 'target hour lacks continuous essential feed health proof'
+hour_runs=$(printf '%s' "$segments" | jq -ce '
+  . as $segments |
+  ([$segments[].recorderRuns[]]) as $runs |
+  if length == 6 and ($runs | length) >= 1 and
+    all(range(1; ($runs | length)); . as $index |
+      if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+        $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+      else
+        $runs[$index].recorder_first_sequence == 1 and
+        ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+      end)
+  then reduce $runs[] as $run
+    ([]; if length > 0 and .[-1].recorder_instance_id == $run.recorder_instance_id then
+      .[-1].recorder_last_sequence = $run.recorder_last_sequence |
+      .[-1].recorder_event_count += $run.recorder_event_count
+    else . + [$run] end)
+  else error("invalid hourly recorder runs") end
+') || die 'hourly recorder sequence proof is not contiguous'
+hour_sequence=$(printf '%s' "$hour_runs" | jq -ce '
+  if length == 1 then {recorderSequence:.[0]} else {recorderRuns:.} end
+')
+
+if [ "$target_epoch" -gt "$first_epoch" ]; then
+  prior_epoch=$((target_epoch - 3600))
+  prior=$hourly_root/$(date -u -d "@$prior_epoch" +%Y%m%dT%H)/evidence.json
+  secure_file "$prior" 640
+  jq -e --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" --argjson epoch "$prior_epoch" \
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+    --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
+    .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
+    .windowStartUtc == $window and .ledgerPath == $ledger and
+    .hourStartUtc == ($epoch | strftime("%Y-%m-%dT%H:00:00Z")) and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .sameInput.deterministicResultExactMatch == true and
+    .gitSha == $expected_git and .azureResearchImage == $azure_image and .ociResearchImage == $oci_image and
+    .services.fundedSignerMode == $funded_mode and .services.fundedSignerEnabled == $funded and
+    (if $funded then .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+      .services.fundedSessionId == $funded_session and .services.fundedSessionManifestSha256 == $funded_session_sha and
+      .services.fundedConfigSha256 == $funded_config_sha
+     else .services.fundedSignerImage == null and .services.fundedSignerUser == null and .services.fundedSessionId == null and
+      .services.fundedSessionManifestSha256 == null and .services.fundedConfigSha256 == null end)
+  ' "$prior" >/dev/null || die 'prior accepted evidence is invalid'
+  validate_evidence_artifacts "$prior"
+  validate_producer_evidence "$prior" || die 'prior accepted evidence lacks funded producer proof'
+  prior_runs=$(sequence_evidence "$prior") || die 'prior accepted evidence lacks recorder sequence proof'
+  feed_evidence "$prior" || die 'prior accepted evidence lacks continuous essential feed proof'
+  printf '%s\n%s\n' "$prior_runs" "$hour_runs" | jq -se '
+    (.[0] + .[1]) as $runs |
+    all(range(1; ($runs | length)); . as $index |
+      if $runs[$index].recorder_instance_id == $runs[$index - 1].recorder_instance_id then
+        $runs[$index].recorder_first_sequence == ($runs[$index - 1].recorder_last_sequence + 1)
+      else
+        $runs[$index].recorder_first_sequence == 1 and
+        ([$runs[0:$index][].recorder_instance_id] | index($runs[$index].recorder_instance_id) | not)
+      end)
+  ' >/dev/null || die 'prior recorder runs are not adjacent'
+fi
+
+api_status=$(mktemp "$runtime_dir/api-status.XXXXXX")
+chmod 0600 "$api_status"
+attempt=0
+while :; do
+  status_now_epoch=${POLYEDGE_PARITY_STATUS_NOW_EPOCH:-$(date -u +%s)}
+  printf '%s' "$status_now_epoch" | grep -Eq '^[0-9]+$' || die 'API status sample time is invalid'
+  if podman exec polyedge-api /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/status HTTP/1.0\r\nHost: localhost\r\nAuthorization: Bearer %s\r\n\r\n" "$API_BEARER_TOKEN" >&3
+    cat <&3
+  ' >"$api_status" && api_summary=$(tr -d '\r' <"$api_status" | sed '1,/^$/d' | jq -ce --argjson now "$status_now_epoch" '
+    def canonical_epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def essential_feed_ok($name):
+      .feed_status[$name] as $feed |
+      (($feed | type) == "object") and $feed.status == "ok" and
+      (($feed.updated_at | type) == "string") and
+      (($feed.updated_at | canonical_epoch) as $updated |
+        $updated <= $now and $updated >= ($now - 300));
+    if .task_health.api == "ok" and .task_health.runtime_loop == "running" and .task_health.feeds == "running" and
+      essential_feed_ok("Discovery") and essential_feed_ok("PolymarketClobMarket") and
+      essential_feed_ok("PolymarketRtdsChainlink") and essential_feed_ok("PolymarketRtdsBinance") and
+      (.drop_counts | type == "object" and length == 0) and
+      .recorder_status.error_count == 0 and .recorder_status.dropped_count == 0 and
+      .recorder_metrics.queued == 0 and .recorder_metrics.failed_total == 0 and
+      .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and
+      .recorder_metrics.enqueued_total == .recorder_metrics.persisted_total and .recorder_metrics.last_assigned_sequence == .recorder_metrics.enqueued_total and
+      (.recorder_metrics.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_metrics.last_assigned_sequence | type == "number" and floor == . and . >= 1)
+    then {
+      sampledAtUtc:($now | todateiso8601),
+      taskHealth:{api:.task_health.api,runtime_loop:.task_health.runtime_loop,feeds:.task_health.feeds},
+      feedStatus:{
+        Discovery:(.feed_status.Discovery | {status,updated_at}),
+        PolymarketClobMarket:(.feed_status.PolymarketClobMarket | {status,updated_at}),
+        PolymarketRtdsChainlink:(.feed_status.PolymarketRtdsChainlink | {status,updated_at}),
+        PolymarketRtdsBinance:(.feed_status.PolymarketRtdsBinance | {status,updated_at})
+      },dropCounts:.drop_counts,
+      recorder:{recorder_instance_id:.recorder_metrics.recorder_instance_id,last_assigned_sequence:.recorder_metrics.last_assigned_sequence,
+        queued:.recorder_metrics.queued,enqueued_total:.recorder_metrics.enqueued_total,persisted_total:.recorder_metrics.persisted_total,
+        failed_total:.recorder_metrics.failed_total,unrecovered_durable_events:.recorder_metrics.unrecovered_durable_events,
+        flush_unrecovered:.recorder_metrics.flush_unrecovered,error_count:.recorder_status.error_count,dropped_count:.recorder_status.dropped_count}
+    }
+    else error("unhealthy recorder status")
+    end
+  '); then
+    break
+  fi
+  attempt=$((attempt + 1))
+  [ "$attempt" -lt 6 ] || { rm -f "$api_status"; api_status=; die 'protected API recorder or essential feed status is unhealthy'; }
+  sleep 1
+done
+rm -f "$api_status"
+api_status=
+last_run=$(printf '%s' "$hour_runs" | jq -ce 'last')
+[ "$(printf '%s' "$api_summary" | jq -r '.recorder.recorder_instance_id')" = "$(printf '%s' "$last_run" | jq -r '.recorder_instance_id')" ] || die 'API recorder instance does not match the final hour run'
+[ "$(printf '%s' "$api_summary" | jq -r '.recorder.last_assigned_sequence')" -ge "$(printf '%s' "$last_run" | jq -r '.recorder_last_sequence')" ] || die 'API recorder sequence is behind the final hour run'
+
+oci_scheduled=$report_root/$day/$hour/audit.json
+[ ! -L "$oci_scheduled" ] && [ -f "$oci_scheduled" ] && [ "$(stat -c %h "$oci_scheduled")" = 1 ] || die 'OCI scheduled audit is missing or unsafe'
+oci_attestation=$oci_scheduled.attestation.json
+validate_attestation "$oci_scheduled" "$oci_attestation" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+
+azure_report=$hour_dir/azure-scheduled-audit.json
+azure_attestation=$azure_report.attestation.json
+same_report=$hour_dir/same-input-audit.json
+same_attestation=$same_report.attestation.json
+azure_input="azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$day/$hour/?prefetch_blobs=8"
+azure_tmp=
+azure_attestation_tmp=
+azure_execution_tmp=
+same_tmp=
+same_attestation_tmp=
+same_markdown=
+same_work_dir=
+same_container=
+if [ -e "$azure_report" ] || [ -e "$azure_attestation" ]; then
+  secure_file "$azure_report" 640
+  secure_file "$azure_attestation" 640
+  azure_candidate=$azure_report
+  azure_attestation_candidate=$azure_attestation
+else
+  azure_candidate=
+  azure_attestation_candidate=
+fi
+if [ -e "$same_report" ] || [ -e "$same_attestation" ]; then
+  secure_file "$same_report" 640
+  secure_file "$same_attestation" 640
+  same_candidate=$same_report
+  same_attestation_candidate=$same_attestation
+else
+  same_candidate=
+  same_attestation_candidate=
+fi
+
+# The exact Azure execution is checked even when both local artifacts were recovered.
+  [ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%a %h' "$token_file")" = '600 1' ] \
+    || die 'research workload token is missing or unsafe'
+  token_dir=${token_file%/*}
+  [ ! -L "$token_dir" ] && [ -d "$token_dir" ] && [ "$(stat -c %a "$token_dir")" = 700 ] \
+    || die 'research workload token directory is unsafe'
+  [ "$(stat -c '%u:%g' "$token_file")" = "$(stat -c '%u:%g' "$token_dir")" ] \
+    || die 'research workload token owner is unexpected'
+  token_uid=${POLYEDGE_PARITY_TOKEN_UID:-$(id -u polyedge-identity-research)}
+  token_gid=${POLYEDGE_PARITY_TOKEN_GID:-$(id -g polyedge-identity-research)}
+  [ "$(stat -c '%u:%g' "$token_file")" = "$token_uid:$token_gid" ] || die 'research workload token is not owned by the research identity'
+
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$azure_tmp" "$azure_attestation_tmp" "$azure_execution_tmp" "$same_tmp" "$same_attestation_tmp" "$same_markdown"; [ -z "$same_container" ] || podman rm -f "$same_container" >/dev/null 2>&1 || true; [ -z "$same_work_dir" ] || rmdir "$same_work_dir" 2>/dev/null || true' EXIT HUP INT TERM
+if [ -z "$azure_candidate" ]; then
+  curl --silent --show-error --fail --output "$oauth_response" \
+    --request POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+    --data-urlencode grant_type=client_credentials \
+    --data-urlencode "client_id=$AZURE_CLIENT_ID" \
+    --data-urlencode scope=https://storage.azure.com/.default \
+    --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+    --data-urlencode "client_assertion@$token_file" || die 'research UAMI token exchange failed'
+  access_token=$(jq -er '.access_token | select(type == "string" and length > 0)' "$oauth_response") || die 'OAuth response is malformed'
+  printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header"
+  unset access_token
+  azure_tmp=$(mktemp "$hour_dir/.azure-scheduled-audit.XXXXXX")
+  curl --silent --show-error --fail --output "$azure_tmp" --header @"$auth_header" --header 'x-ms-version: 2023-11-03' \
+    "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/$AZURE_STORAGE_CONTAINER_NAME/reports/research/hourly/$day/$hour/audit.json" \
+    || die 'Azure scheduled audit download failed'
+  azure_attestation_tmp=$(mktemp "$hour_dir/.azure-scheduled-attestation.XXXXXX")
+  curl --silent --show-error --fail --output "$azure_attestation_tmp" --header @"$auth_header" --header 'x-ms-version: 2023-11-03' \
+    "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/$AZURE_STORAGE_CONTAINER_NAME/reports/research/hourly/$day/$hour/audit.json.attestation.json" \
+    || die 'Azure scheduled audit attestation download failed'
+  chmod 0640 "$azure_tmp"
+  chmod 0640 "$azure_attestation_tmp"
+  azure_candidate=$azure_tmp
+  azure_attestation_candidate=$azure_attestation_tmp
+fi
+
+if [ -z "$same_candidate" ]; then
+  same_work_dir=$(mktemp -d "$runtime_dir/same-input.XXXXXX")
+  chown "$token_uid:$token_gid" "$same_work_dir"
+  chmod 0700 "$same_work_dir"
+  [ "$(stat -c '%u:%g:%a' "$same_work_dir")" = "$token_uid:$token_gid:700" ] \
+    || die 'same-input work directory is unsafe'
+  same_tmp=$same_work_dir/audit.json
+  same_markdown=$same_work_dir/audit.md
+  same_attestation_tmp=$same_work_dir/audit.json.attestation.json
+  POLYEDGE_GENERATOR_EXECUTION_ID=$(cat /proc/sys/kernel/random/uuid)
+  POLYEDGE_GENERATOR_PLATFORM=oci_podman
+  POLYEDGE_GENERATOR_IMAGE=$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE
+  export POLYEDGE_GENERATOR_EXECUTION_ID POLYEDGE_GENERATOR_PLATFORM POLYEDGE_GENERATOR_IMAGE
+  same_container="polyedge-parity-$stamp-$POLYEDGE_GENERATOR_EXECUTION_ID"
+  # ponytail: Podman NNP breaks DNS on this host; the dedicated UID, read-only root, and zero capabilities contain this one-shot audit. Restore NNP after the runtime resolver is fixed.
+  timeout --preserve-status 1800 podman run --pull=never --log-driver=journald --name "$same_container" --network polyedge \
+    --cpus 0.5 --memory 1g --pids-limit 1024 --read-only --cap-drop=all \
+    --user "$token_uid:$token_gid" --tmpfs /tmp:rw,noexec,nosuid,size=128m \
+    --env-file "$hourly_env" -v "$same_work_dir:/evidence:rw,Z" \
+    -v "$token_file:/run/credentials/azure-federated-token:ro,Z" \
+    --env POLYEDGE_GENERATOR_EXECUTION_ID --env POLYEDGE_GENERATOR_PLATFORM --env POLYEDGE_GENERATOR_IMAGE \
+    "$POLYEDGE_RESEARCH_IMAGE" polyedge-rs research audit \
+    --input "$azure_input" \
+    --out /evidence/audit.json --markdown /evidence/audit.md --exclude-file /app/data_quality/exclusion_windows.yaml \
+    || die 'same-input OCI audit failed'
+  same_configured_image=$(podman inspect --format '{{.Config.Image}}' "$same_container")
+  same_image_digest=$(podman inspect --format '{{.ImageDigest}}' "$same_container")
+  same_container_id=$(podman inspect --format '{{.Id}}' "$same_container")
+  [ "$same_configured_image" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] || die 'same-input container image differs from the approved OCI image'
+  printf '%s' "$same_image_digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'same-input container image digest is invalid'
+  printf '%s' "$same_container_id" | grep -Eq '^[0-9a-f]{64}$' || die 'same-input container ID is invalid'
+  for same_output in "$same_tmp" "$same_markdown"; do
+    [ ! -L "$same_output" ] && [ -f "$same_output" ] && [ "$(stat -c %h "$same_output")" = 1 ] \
+      || die 'same-input report output is missing or unsafe'
+  done
+  chmod 0640 "$same_tmp" "$same_markdown"
+  chown "$expected_uid:$expected_gid" "$same_tmp" "$same_markdown"
+  secure_file "$same_tmp" 640
+  secure_file "$same_markdown" 640
+  jq -e --arg image "$same_configured_image" --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" '
+    .generator_provenance == {schema_version:1,platform:"oci_podman",
+      image:$image,execution_id:$execution,job_name:null}
+  ' "$same_tmp" >/dev/null || die 'same-input report generator provenance is invalid'
+  jq -n --arg report_sha256 "$(sha "$same_tmp")" --arg image "$same_configured_image" \
+    --arg image_digest "$same_image_digest" --arg execution "$POLYEDGE_GENERATOR_EXECUTION_ID" \
+    --arg container_id "$same_container_id" \
+    '{schema_version:1,report_sha256:$report_sha256,platform:"oci_podman",image:$image,
+      image_digest:$image_digest,execution_id:$execution,container_id:$container_id}' >"$same_attestation_tmp"
+  chmod 0640 "$same_attestation_tmp"
+  chown "$expected_uid:$expected_gid" "$same_attestation_tmp"
+  sync -f "$same_attestation_tmp"
+  podman rm "$same_container" >/dev/null || die 'same-input container removal failed'
+  same_container=
+  same_candidate=$same_tmp
+  same_attestation_candidate=$same_attestation_tmp
+fi
+
+validate_report() {
+  jq -e --arg start "$target" --arg end "$hour_end" --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" '
+    type == "object" and (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and .git_sha == $expected_git and
+    (.generated_at | type == "string") and (.result | type == "object") and
+    (.result.total_events | type == "number" and . >= 0) and
+    (.result.fatal_data_quality_issues | type == "array" and length == 0) and
+    .result.runtime_provenance.observations == 60 and
+    .result.runtime_provenance.valid_observations == 60 and
+    .result.runtime_provenance.invalid_observations == 0 and
+    (.result.runtime_provenance.distinct_identity_count |
+      type == "number" and . >= 1 and . <= 60 and floor == .) and
+    (.result.runtime_provenance.identities | type == "array") and
+    (.result.runtime_provenance.identities | length) ==
+      .result.runtime_provenance.distinct_identity_count and
+    (.result.runtime_provenance.identities | all(.[];
+      .app_name == "polyedge" and .runtime_role == "primary" and .execution_mode == "paper" and
+      .allow_live == false and .enable_taker_orders == false and
+      .allow_emergency_account_cancel == false and .research_only == true and
+      .shadow_only == false and .backend_impl == "rust" and
+      .storage_container == "bot-events" and .event_blob_prefix == "events" and
+      .adaptive_regime_enabled == false and .adaptive_regime_mode == "paper_only" and
+      .paper_maker_fill_policy == "touch_after_quote_was_live" and
+      .publish_strategy_canary_intents == false and .candidate == null and
+      .decision_config_schema == "polyedge.decision_config.v1" and
+      (.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and .git_sha == $expected_git and
+      (.runtime_config_hash | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.decision_config_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      .decision_pipeline_schema == "polyedge.strategy_decision_batch.v4" and
+      .decision_pipeline_parity_scope == "full_decision_pipeline_recomputation"
+    )) and
+    ([.result.runtime_provenance.identities[].git_sha] | unique | length == 1) and
+    ([.result.runtime_provenance.identities[].runtime_config_hash] | unique | length == 1) and
+    ([.result.runtime_provenance.identities[].decision_config_sha256] | unique | length == 1) and
+    ((.result.runtime_provenance.first_timestamp | fromdateiso8601) >=
+      ($start | fromdateiso8601)) and
+    ((.result.runtime_provenance.first_timestamp | fromdateiso8601) <=
+      (($start | fromdateiso8601) + 300)) and
+    ((.result.runtime_provenance.last_timestamp | fromdateiso8601) >=
+      (($end | fromdateiso8601) - 300)) and
+    ((.result.runtime_provenance.last_timestamp | fromdateiso8601) <
+      ($end | fromdateiso8601)) and
+    (.result.runtime_provenance.max_gap_ms | type == "number" and . >= 0 and . <= 300000) and
+    (.result.strategy_batches | type == "number" and . > 0 and floor == .) and
+    .result.strategy_batch_replayed == .result.strategy_batches and
+    .result.strategy_batch_matches == .result.strategy_batches and
+    .result.strategy_batch_invalid == 0 and
+    .result.strategy_batch_contract_invalid == 0 and
+    .result.strategy_batch_contract_invalid_reasons == {} and
+    .result.strategy_batch_missing_independent_start == 0 and
+    .result.strategy_batch_ineligible == 0 and
+    .result.strategy_batch_conflicts == 0 and
+    .result.strategy_binding_ineligible == 0 and
+    .result.strategy_binding_conflicts == 0 and
+    .result.unbound_strategy_decisions == 0 and
+    .result.decision_application_invalid == 0 and
+    .result.decision_application_conflicts == 0 and
+    .result.orphan_decision_applications == 0 and
+    .result.decision_pipeline_replay_rate == 1 and
+    .result.decision_output_binding_rate == 1 and
+    .result.decision_parity_rate == 1
+  ' "$1" >/dev/null || die "invalid or unhealthy audit report: $1"
+}
+validate_report "$azure_candidate"
+validate_report "$oci_scheduled"
+validate_report "$same_candidate"
+validate_attestation "$azure_candidate" "$azure_attestation_candidate" azure_container_apps_job "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_AZURE_JOB_NAME"
+validate_attestation "$same_candidate" "$same_attestation_candidate" oci_podman "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"
+azure_execution_id=$(jq -r '.execution_id' "$azure_attestation_candidate")
+curl --silent --show-error --fail --output "$oauth_response" \
+  --request POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode "client_id=$AZURE_CLIENT_ID" \
+  --data-urlencode scope=https://management.azure.com/.default \
+  --data-urlencode client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+  --data-urlencode "client_assertion@$token_file" || die 'research UAMI ARM token exchange failed'
+access_token=$(jq -er '.access_token | select(type == "string" and length > 0)' "$oauth_response") || die 'ARM OAuth response is malformed'
+printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header"
+unset access_token
+azure_execution_tmp=$(mktemp "$runtime_dir/azure-execution.XXXXXX")
+chmod 0600 "$azure_execution_tmp"
+# The exact execution GET requires Microsoft.App/jobs/executions/read on this job.
+curl --silent --show-error --fail --output "$azure_execution_tmp" --header @"$auth_header" \
+  "https://management.azure.com/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP/providers/Microsoft.App/jobs/$POLYEDGE_PARITY_AZURE_JOB_NAME/executions/$azure_execution_id?api-version=2025-07-01" \
+  || die 'exact Azure job execution read failed'
+expected_azure_args='TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H); DAY=${TARGET%/*}; HOUR=${TARGET##*/}; OUT="reports/research/hourly/$DAY/$HOUR/audit.json"; /bin/sh /app/research/run_compact_report_job.sh polyedge_hourly_quality "$OUT" polyedge-rs research audit --input "azure://$AZURE_STORAGE_ACCOUNT_NAME/$AZURE_STORAGE_CONTAINER_NAME/events/$DAY/$HOUR/?prefetch_blobs=8" --out "$OUT" --markdown "reports/research/hourly/$DAY/$HOUR/audit.md" --exclude-file "data_quality/exclusion_windows.yaml"'
+azure_generated_at=$(jq -er '.generated_at | select(type == "string")' "$azure_candidate") || die 'Azure report generation time is missing'
+azure_execution_start=$(jq -er '.properties.startTime | select(type == "string")' "$azure_execution_tmp") || die 'Azure execution start time is missing'
+azure_execution_end=$(jq -er '.properties.endTime | select(type == "string")' "$azure_execution_tmp") || die 'Azure execution end time is missing'
+azure_start_epoch=$(date -u -d "$azure_execution_start" +%s) || die 'Azure execution start time is invalid RFC3339'
+azure_end_epoch=$(date -u -d "$azure_execution_end" +%s) || die 'Azure execution end time is invalid RFC3339'
+azure_generated_epoch=$(date -u -d "$azure_generated_at" +%s) || die 'Azure report generation time is invalid RFC3339'
+jq -e --arg execution "$azure_execution_id" --arg image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" \
+  --argjson hour_end_epoch "$end_epoch" --argjson started "$azure_start_epoch" \
+  --argjson ended "$azure_end_epoch" --argjson produced "$azure_generated_epoch" \
+  --arg expected_args "$expected_azure_args" '
+  def one_value($name; $value):
+    ([.properties.template.containers[0].env[]? | select(.name == $name)] | length == 1 and .[0].value == $value);
+  def one_safe_bearer_secret:
+    ([.properties.template.containers[0].env[]? | select(.name == "API_BEARER_TOKEN")] |
+      length == 1 and (.[0].secretRef == "api-bearer-token" or
+        .[0].secretRef == "cappjob-polyedge-hourly-quality-job") and
+      (.[0] | has("value") | not));
+  .name == $execution and .properties.status == "Succeeded" and
+  (.properties.startTime | type == "string") and (.properties.endTime | type == "string") and
+  $started >= $hour_end_epoch and $started <= ($hour_end_epoch + 1200) and
+  $ended >= $started and $ended <= ($hour_end_epoch + 1800) and
+  $produced >= $started and $produced <= $ended and
+  (.properties.template.containers | type == "array" and length == 1) and
+  .properties.template.containers[0].name == "research-job" and
+  .properties.template.containers[0].image == $image and
+  .properties.template.containers[0].command == ["/bin/sh", "-lc"] and
+  .properties.template.containers[0].args == [$expected_args] and
+  one_value("ALLOW_LIVE"; "false") and one_value("EXECUTION_MODE"; "paper") and
+  one_value("RUN_BOT_ON_STARTUP"; "false") and one_value("ENABLE_TAKER_ORDERS"; "false") and
+  one_value("ALLOW_EMERGENCY_ACCOUNT_CANCEL"; "false") and one_value("REQUIRE_API_AUTH"; "true") and
+  one_safe_bearer_secret and
+  one_value("POLYEDGE_GENERATOR_PLATFORM"; "azure_container_apps_job") and
+  one_value("POLYEDGE_GENERATOR_IMAGE"; $image) and
+  ([.properties.template.containers[0].env[]?.name |
+    select(. == "CONTAINER_APP_JOB_NAME" or . == "CONTAINER_APP_JOB_EXECUTION_NAME")] | length == 0)
+' "$azure_execution_tmp" >/dev/null || die 'Azure execution identity, time, command, environment, or immutable image does not match the report attestation'
+local_input="/input/events/$day/$hour/"
+for binding in "$azure_candidate:$azure_input" "$same_candidate:$azure_input" "$oci_scheduled:$local_input"; do
+  report_file=${binding%%:*}
+  expected_input=${binding#*:}
+  jq -e --arg input "$expected_input" '.input_path == $input' "$report_file" >/dev/null || die "audit input mismatch: $report_file"
+done
+azure_result=$(jq -cS '.result' "$azure_candidate" | sha256sum | awk '{print "sha256:"$1}')
+same_result=$(jq -cS '.result' "$same_candidate" | sha256sum | awk '{print "sha256:"$1}')
+[ "$azure_result" = "$same_result" ] || die 'same-input deterministic result mismatch'
+azure_decision_config=$(jq -er '[.result.runtime_provenance.identities[].decision_config_sha256] | unique | if length == 1 then .[0] else error("mixed decision config") end' "$azure_candidate")
+oci_decision_config=$(jq -er '[.result.runtime_provenance.identities[].decision_config_sha256] | unique | if length == 1 then .[0] else error("mixed decision config") end' "$oci_scheduled")
+same_decision_config=$(jq -er '[.result.runtime_provenance.identities[].decision_config_sha256] | unique | if length == 1 then .[0] else error("mixed decision config") end' "$same_candidate")
+[ "$azure_decision_config" = "$oci_decision_config" ] && [ "$azure_decision_config" = "$same_decision_config" ] || die 'cross-report decision config mismatch'
+
+if [ -n "$azure_tmp" ]; then
+  sync -f "$azure_tmp"
+  sync -f "$azure_attestation_tmp"
+  mv "$azure_tmp" "$azure_report"
+  mv "$azure_attestation_tmp" "$azure_attestation"
+  azure_tmp=
+  azure_attestation_tmp=
+fi
+if [ -n "$same_tmp" ]; then
+  sync -f "$same_tmp"
+  sync -f "$same_attestation_tmp"
+  chown "$expected_uid:$expected_gid" "$same_tmp"
+  mv "$same_tmp" "$same_report"
+  mv "$same_attestation_tmp" "$same_attestation"
+  same_tmp=
+  same_attestation_tmp=
+  rm -f "$same_markdown"
+  same_markdown=
+  rmdir "$same_work_dir"
+  same_work_dir=
+fi
+rm -f "$azure_execution_tmp"
+azure_execution_tmp=
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+
+if [ "$funded_enabled" = true ]; then
+  funded_service_bus_runtime=$(runuser -u ubuntu -- az servicebus queue show \
+    --subscription "$AZURE_SUBSCRIPTION_ID" --resource-group "$POLYEDGE_PARITY_AZURE_RESOURCE_GROUP" \
+    --namespace-name "$funded_service_bus_namespace" --name "$funded_service_bus_queue" \
+    --only-show-errors -o json | jq -ce \
+    --arg namespace "$funded_service_bus_namespace" --arg queue "$funded_service_bus_queue" \
+    --argjson expected_dlq "$funded_service_bus_dlq" '
+      if .status == "Active" and .countDetails.activeMessageCount == 0 and
+        .countDetails.scheduledMessageCount == 0 and
+        .countDetails.deadLetterMessageCount == $expected_dlq
+      then {namespace:$namespace,queue:$queue,status:.status,
+        activeMessageCount:.countDetails.activeMessageCount,
+        scheduledMessageCount:.countDetails.scheduledMessageCount,
+        deadLetterMessageCount:.countDetails.deadLetterMessageCount,
+        expectedDeadLetterMessageCount:$expected_dlq}
+      else error("funded Service Bus runtime properties differ from the formal baseline") end
+    ') || die 'funded Service Bus end-state is unsafe or unreadable'
+fi
+
+evidence=$hour_dir/evidence.json
+[ ! -e "$evidence" ] || die 'evidence appeared during collection'
+tmp=$(mktemp "$hour_dir/.evidence.XXXXXX")
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header" "$tmp"' EXIT HUP INT TERM
+jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+  --arg hour "$target" --arg end "$hour_end" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg azure_image "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" --arg oci_image "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" \
+  --arg azure_path "$azure_report" --arg azure_sha "$(sha "$azure_report")" --arg oci_path "$oci_scheduled" --arg oci_sha "$(sha "$oci_scheduled")" \
+  --arg azure_attestation "$azure_attestation" --arg azure_attestation_sha "$(sha "$azure_attestation")" \
+  --arg oci_attestation "$oci_attestation" --arg oci_attestation_sha "$(sha "$oci_attestation")" \
+  --arg same_path "$same_report" --arg same_sha "$(sha "$same_report")" --arg result_sha "$azure_result" --arg decision_config_sha256 "$azure_decision_config" \
+  --arg same_attestation "$same_attestation" --arg same_attestation_sha "$(sha "$same_attestation")" \
+  --arg funded_mode "$POLYEDGE_PARITY_FUNDED_MODE" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+  --arg funded_revision "$funded_revision" --arg funded_rollout "$funded_rollout_receipt" \
+  --arg funded_rollout_sha "$funded_rollout_sha" --arg collector_sha "$parity_collector_sha" \
+  --arg validator_sha "$reboot_validator_sha" --argjson funded_dlq "$funded_service_bus_dlq" \
+  --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+  --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" --arg producer_config_sha "$funded_producer_config_sha" \
+  --arg producer_enablement "$producer_enablement" --arg producer_token_enablement "$producer_token_enablement" \
+  --argjson funded "$funded_enabled" --argjson funded_runtime "$funded_runtime" --argjson funded_producer_runtime "$funded_producer_runtime" \
+  --argjson funded_service_bus_runtime "$funded_service_bus_runtime" --argjson boot_available "$available" --argjson boot_floor "$boot_floor" --argjson segments "$segments" \
+  --argjson azure_total "$(jq '.result.total_events' "$azure_report")" --argjson oci_total "$(jq '.result.total_events' "$oci_scheduled")" \
+  --argjson recorder_sequence "$hour_sequence" --argjson recorder_status "$api_summary" --argjson continuous_feed "$continuous_feed" \
+  '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,hourStartUtc:$hour,hourEndUtc:$end,
+    status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,
+    ledgerPath:$ledger,gitSha:$expected_git,azureResearchImage:$azure_image,ociResearchImage:$oci_image,
+    segments:$segments,recorderStatus:$recorder_status,continuousFeedHealth:$continuous_feed,
+    decisionConfigSha256:$decision_config_sha256,
+    scheduledAudits:{azure:{path:$azure_path,sha256:$azure_sha,totalEvents:null,attestation:{path:$azure_attestation,sha256:$azure_attestation_sha}},
+      oci:{path:$oci_path,sha256:$oci_sha,totalEvents:null,attestation:{path:$oci_attestation,sha256:$oci_attestation_sha}}},
+    sameInput:{path:$same_path,sha256:$same_sha,attestation:{path:$same_attestation,sha256:$same_attestation_sha},azureResultSha256:$result_sha,ociResultSha256:$result_sha,deterministicResultExactMatch:true},
+    disk:{bootAvailableBytes:$boot_available,bootMinimumFreeBytes:$boot_floor,imagePullsPaused:false},
+    services:{apiHealthy:true,frontendHealthy:true,qsetDisabled:true,fundedSignerMode:$funded_mode,
+      fundedSignerEnabled:$funded,fundedSignerMasked:($funded | not),fundedSignerActive:$funded,
+      fundedSignerImage:(if $funded then $funded_image else null end),
+      fundedSignerRevision:(if $funded then $funded_revision else null end),
+      fundedRolloutReceipt:(if $funded then {path:$funded_rollout,sha256:$funded_rollout_sha} else null end),
+      fundedServiceBusDlqBaseline:(if $funded then $funded_dlq else null end),
+      parityCollectorSha256:(if $collector_sha != "" then $collector_sha else null end),
+      rebootValidatorSha256:(if $validator_sha != "" then $validator_sha else null end),
+      fundedSignerUser:(if $funded then $funded_user else null end),
+      fundedSessionId:(if $funded then $funded_session else null end),
+      fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),
+      fundedConfigSha256:(if $funded then $funded_config_sha else null end),fundedRuntime:$funded_runtime,
+      fundedIntentProducerEnabled:$funded,fundedIntentProducerActive:$funded,
+      fundedIntentProducerEnablement:$producer_enablement,fundedIntentProducerTokenTimerEnablement:$producer_token_enablement,
+      fundedIntentProducerTokenTimerActive:$funded,
+      fundedIntentProducerImage:(if $funded then $producer_image else null end),
+      fundedIntentProducerUser:(if $funded then $producer_user else null end),
+      fundedIntentProducerConfigSha256:(if $funded then $producer_config_sha else null end),
+      fundedIntentProducerRuntime:$funded_producer_runtime,
+      fundedServiceBusRuntime:$funded_service_bus_runtime},
+    ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}} + $recorder_sequence |
+  .scheduledAudits.azure.totalEvents = $azure_total | .scheduledAudits.oci.totalEvents = $oci_total' >"$tmp"
+chmod 0640 "$tmp"
+sync -f "$tmp"
+mv "$tmp" "$evidence"
+trap 'rm -f "$refs_tmp" "$segments_tmp" "$feed_tmp" "$oauth_response" "$auth_header"' EXIT HUP INT TERM
+
+lock_ledger
+validate_ledger
+collect_refs
+update_ledger
+
+echo "validated parity hour $target; acceptedCleanLiveHours=$count"
