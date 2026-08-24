@@ -15,7 +15,9 @@ readonly recovery_script=/usr/local/libexec/polyedge-funded-reservation-recovery
 readonly recovery_script_sha=8ec3b59df15f3d6b2c8e55687f1b064bbf8af793231486063ec8a073b0bed8b4
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260824T060435Z-funded-signer-rollout.json
+readonly rollout=/srv/polyedge-ring/parity/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json
+readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010
+readonly rollout_helper_sha=sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
 readonly authorized_dlq=1311
@@ -25,7 +27,7 @@ readonly activation_dir=/srv/polyedge-ring/parity/activation
 readonly receipt=$activation_dir/20260824T080000Z-staged.json
 readonly first_validated=$activation_dir/20260824T080000Z-first-hour-validated.json
 readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260824T08/evidence.json
-readonly old_signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3
+readonly old_signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:976492b39921417ec8db01bcc38b09cc42c97afd4bb573047d4284db0a9ceeb8
 readonly producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8
 readonly recovery_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3
 readonly decision=65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7
@@ -42,9 +44,9 @@ readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:6af251be658005fd9a9803f4193d2e489ac46cadd7e14299649b3627948d3ed3
+readonly collector_sha=sha256:7a9dde3953c614b18b4781e78201ed310db6498dc4d35d22ff598fce2c843d29
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:06afbf3330085179a90bfd6b16c448f618389f0e77f5516028ec4d22c3a69bfe
+readonly validator_sha=sha256:3f01cbf660523ab574bf434d065ba7b270de112ba08a6f39eb8f318339547eec
 
 formal_tmp=
 hourly_tmp=
@@ -77,18 +79,18 @@ validate_rollout_receipt() {
   recovery_sha="sha256:$(sha "$recovery_path")"
   settlement_sha="sha256:$(sha "$settlement_path")"
   /usr/bin/jq -e --arg old "$old_signer_image" --arg recovery "$recovery_path" --arg recovery_sha "$recovery_sha" \
-    --arg settlement "$settlement_path" --arg settlement_sha "$settlement_sha" --argjson dlq "$authorized_dlq" '
-      .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+    --arg settlement "$settlement_path" --arg settlement_sha "$settlement_sha" --arg helper "$rollout_helper_sha" --argjson dlq "$authorized_dlq" '
+      .schema == "polyedge.funded_signer_scaled_intent_rollout.v1" and .status == "validated" and
       .oldImage == $old and .newImage != $old and
       (.newImage | test("^ghcr\\.io/aldoapicella/polyedge-venue-probe@sha256:[0-9a-f]{64}$")) and
       (.newRevision | test("^[0-9a-f]{40}$")) and
       .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
       .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and
-      .authorizedDeadLetterBaseline == $dlq and
+      .authorizedDeadLetterBaseline == $dlq and .helperSha256 == $helper and
       (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
       (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
       (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and
-      .producerRestored == true and .unresolvedReservationsAfter == 0 and
+      .producerStartedAfterSignerProof == true and .producerRestored == true and .unresolvedReservationsAfter == 0 and
       .queue == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
       .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
     ' "$rollout_path" >/dev/null || return 1
@@ -283,6 +285,7 @@ test "sha256:$(sha "$validator")" = "$validator_sha"
 test "$(sha "$recovery_script")" = "$recovery_script_sha"
 test "sha256:$(sha "$recovery")" = "$recovery_receipt_sha"
 test "sha256:$(sha "$settlement")" = "$settlement_receipt_sha"
+test "sha256:$(sha "$rollout")" = "$rollout_receipt_sha"
 validate_recovery_receipt
 validate_rollout_receipt
 test "$(/usr/bin/podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer)" = "$signer_image|986:982|running"

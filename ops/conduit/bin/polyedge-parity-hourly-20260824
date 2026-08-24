@@ -516,8 +516,12 @@ fi
 secure_file "$POLYEDGE_PARITY_LEDGER" 640
 rollout_signer_invocation= rollout_signer_container= rollout_producer_invocation=
 if [ "$funded_enabled" = true ]; then
-  [ "$funded_rollout_receipt" = "$parity_root/activation/20260824T060435Z-funded-signer-rollout.json" ] \
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json" ] \
     || die 'funded rollout receipt path differs from the approved activation receipt'
+  if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
+    [ "$funded_rollout_sha" = sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010 ] \
+      || die 'funded rollout receipt hash differs from the approved scaled-intent receipt'
+  fi
   secure_file "$funded_rollout_receipt" 640
   [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
   [ "$funded_service_bus_dlq" = 1311 ] || die 'funded Service Bus baseline differs from the authorized settlement baseline'
@@ -525,16 +529,19 @@ if [ "$funded_enabled" = true ]; then
     --arg recovery "$parity_root/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json" \
     --arg recovery_sha "sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0" \
     --arg settlement "$parity_root/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json" \
-    --arg settlement_sha "sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee" '
-    .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+    --arg settlement_sha "sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee" \
+    --arg helper "sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead" '
+    .schema == "polyedge.funded_signer_scaled_intent_rollout.v1" and .status == "validated" and
     .newImage == $image and .newRevision == $revision and
     .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
     .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and .authorizedDeadLetterBaseline == $dlq and
+    .helperSha256 == $helper and
     (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
     (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
-    (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and .producerRestored == true and
+    (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and .producerStartedAfterSignerProof == true and .producerRestored == true and
     .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
-      scheduledMessageCount:0,deadLetterMessageCount:$dlq}
+      scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+    .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
   ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
   rollout_signer_invocation=$(jq -er '.runtime.newInvocationId' "$funded_rollout_receipt")
   rollout_signer_container=$(jq -er '.runtime.newContainerId' "$funded_rollout_receipt")

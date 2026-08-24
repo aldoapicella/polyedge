@@ -216,14 +216,16 @@ funded_dlq=1311
 activation=$case_root/ring/parity/activation
 recovery=$case_root/ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 settlement=$case_root/ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-rollout=$activation/20260824T060435Z-funded-signer-rollout.json
+rollout=$activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json
 install -d -m 0750 "$activation"
 jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
   --arg recovery "$recovery" --arg settlement "$settlement" \
-  '{schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
+  '{schema:"polyedge.funded_signer_scaled_intent_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
     recoveryReceipt:{path:$recovery,sha256:"sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0"},
     settlementReceipt:{path:$settlement,sha256:"sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee"},
-    authorizedDeadLetterBaseline:1311,producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq}}' >"$rollout"
+    authorizedDeadLetterBaseline:1311,helperSha256:"sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead",
+      producerStartedAfterSignerProof:true,producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq},
+      parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$rollout"
 chmod 0640 "$rollout"
 rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
 jq -n --arg start '2026-08-20T22:00:00Z' --arg user "$uid:$gid" --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" \

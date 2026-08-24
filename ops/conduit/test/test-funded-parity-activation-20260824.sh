@@ -5,6 +5,10 @@ repo=$(cd "$(dirname "$0")/../../.." && pwd)
 stage=$repo/ops/conduit/bin/polyedge-parity-stage-funded-active-20260824
 first=$repo/ops/conduit/bin/polyedge-parity-collect-first-hour-20260824
 root=$(mktemp -d)
+grep -Fq 'readonly rollout=/srv/polyedge-ring/parity/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json' "$stage"
+grep -Fq 'readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010' "$stage"
+grep -Fq 'readonly rollout_helper_sha=sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead' "$stage"
+grep -Fq 'readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010' "$first"
 grep -Fq 'persistent_message_failed_closed' "$stage"
 grep -Fq '.failed_attempts == 0' "$stage"
 grep -Fq '$warmed | length) >= 1' "$stage"
@@ -14,7 +18,7 @@ grep -Fq '{{ index .Labels "org.opencontainers.image.revision" }}' "$stage"
 grep -Fq 'as $all_heartbeats' "$stage"
 grep -Fq 'as $ready_start' "$stage"
 grep -Fq '$ready_start != null' "$stage"
-stage_jq=$(sed -n '476,505p' "$stage")
+stage_jq=$(sed -n '479,508p' "$stage")
 printf '%s' '' | jq -Rs --arg invocation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --argjson now 0 "$stage_jq" >/dev/null
 ! grep -Fq 'recovery_dlq=' "$stage"
 trap 'rm -rf "$root"' EXIT
@@ -46,12 +50,13 @@ new_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:ccccccccccccccccccccc
 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 jq -n --arg image "$new_image" --arg revision "$revision" --arg recovery "$fixture_recovery" --arg recovery_sha "$fixture_recovery_sha" \
   --arg settlement "$fixture_settlement" --arg settlement_sha "$fixture_settlement_sha" '{
-  schema:"polyedge.funded_signer_post_recovery_rollout.v1",status:"validated",
-  oldImage:"ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3",
+  schema:"polyedge.funded_signer_scaled_intent_rollout.v1",status:"validated",
+  oldImage:"ghcr.io/aldoapicella/polyedge-venue-probe@sha256:976492b39921417ec8db01bcc38b09cc42c97afd4bb573047d4284db0a9ceeb8",
   runtime:{newInvocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",newContainerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",producerInvocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
   newImage:$image,newRevision:$revision,recoveryReceipt:{path:$recovery,sha256:$recovery_sha},
   settlementReceipt:{path:$settlement,sha256:$settlement_sha},authorizedDeadLetterBaseline:1311,
-  producerRestored:true,unresolvedReservationsAfter:0,
+  helperSha256:"sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead",
+  producerStartedAfterSignerProof:true,producerRestored:true,unresolvedReservationsAfter:0,
   queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},
   parityTimerRemainsPaused:true,azureDeletionAllowed:false
 }' >"$fixture_rollout"

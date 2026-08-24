@@ -15,14 +15,16 @@ readonly staged=/srv/polyedge-ring/parity/activation/20260824T080000Z-staged.jso
 readonly validated=/srv/polyedge-ring/parity/activation/20260824T080000Z-first-hour-validated.json
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260824T060435Z-funded-signer-rollout.json
+readonly rollout=/srv/polyedge-ring/parity/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json
+readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010
+readonly rollout_helper_sha=sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
 readonly authorized_dlq=1311
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:6af251be658005fd9a9803f4193d2e489ac46cadd7e14299649b3627948d3ed3
+readonly collector_sha=sha256:7a9dde3953c614b18b4781e78201ed310db6498dc4d35d22ff598fce2c843d29
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:06afbf3330085179a90bfd6b16c448f618389f0e77f5516028ec4d22c3a69bfe
+readonly validator_sha=sha256:3f01cbf660523ab574bf434d065ba7b270de112ba08a6f39eb8f318339547eec
 readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
 readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
@@ -251,7 +253,8 @@ set -a
 set +a
 test "$POLYEDGE_PARITY_FUNDED_MODE" = active
 test "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT" = "$rollout"
-test "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" = "sha256:$(sha "$rollout")"
+test "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" = "$rollout_receipt_sha"
+test "sha256:$(sha "$rollout")" = "$rollout_receipt_sha"
 test "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" = "$authorized_dlq"
 test "$POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256" = "$collector_sha"
 test "$POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256" = "$validator_sha"
@@ -261,15 +264,16 @@ test "$POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256" = "$validator_sha"
   .queueDeadLetterMessages == 1308 and .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
 ' "$recovery" >/dev/null
 /usr/bin/jq -e --arg image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
-  --arg recovery "$recovery" --arg recovery_sha "$recovery_receipt_sha" --arg settlement "$settlement" --arg settlement_sha "$settlement_receipt_sha" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
-    .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+  --arg recovery "$recovery" --arg recovery_sha "$recovery_receipt_sha" --arg settlement "$settlement" --arg settlement_sha "$settlement_receipt_sha" --arg helper "$rollout_helper_sha" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
+    .schema == "polyedge.funded_signer_scaled_intent_rollout.v1" and .status == "validated" and
     .newImage == $image and .newRevision == $revision and (.newRevision | test("^[0-9a-f]{40}$")) and
     (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
     (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
     (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and
     .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
     .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and
-    .authorizedDeadLetterBaseline == $dlq and .producerRestored == true and
+    .authorizedDeadLetterBaseline == $dlq and .helperSha256 == $helper and
+    .producerStartedAfterSignerProof == true and .producerRestored == true and
     .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
       scheduledMessageCount:0,deadLetterMessageCount:$dlq} and .parityTimerRemainsPaused == true and
     .azureDeletionAllowed == false
