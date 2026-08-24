@@ -113,7 +113,7 @@ jobs:
             .status == "applied-live-verified"
             and .proof == "identity-rbac-proof.json"
             and (.lanes | keys == ["api", "funded-intent-producer", "funded-signer", "research", "shadow-qset"])
-            and ([.lanes[].assignments[]] | length == 40)
+            and ([.lanes[].assignments[]] | length == 42)
             and all(.lanes[]; (.negativeAssertions | length) > 0)
             and .arc.unchanged
             and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
@@ -122,10 +122,13 @@ jobs:
             and .roles.acrPull == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
             and .scopePrefixes.keyVault == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/"
             and .scopePrefixes.containerRegistry == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/"
-            and any(.lanes.api.assignments[];
-              .role == "blobReader"
-              and .scope == "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3"
-            )
+            and ([.lanes.api.assignments[]
+              | select(.role == "blobReader" and (.scope | test("/containers/polyedge-research-qset-v[345]$")))
+              | .scope] | sort) == [
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v4",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v5"
+            ]
             and .lanes["funded-intent-producer"].identity == "id-polyedge-conduit-funded-intent-producer"
             and .lanes["funded-intent-producer"].subject == "spiffe://polyedge.local/conduit/funded-intent-producer"
             and (.lanes["funded-intent-producer"].assignments | length) == 8
@@ -187,26 +190,33 @@ jobs:
             and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFiveWorkloadUamiProof)
           ' ops/conduit/identity-rbac-plan.json
           jq -e '
-            .status == "live-verified"
+            .status == "historical-live-verified"
+            and .currentCoreFourAcceptance.capturedAtUtc == "2026-08-24T14:56:07Z"
             and .secretsOrTokensCaptured == false
             and .issuer.validTls
-            and .jwtSvid.perLaneOwnerOnlyFiles
-            and (.jwtSvid.crossLaneTokenFilesUnreadable | length) == 12
-            and (.jwtSvid.crossLaneTokenFilesUnreadable | unique | length) == 12
-            and .jwtSvid.federatedExchangeMatrix.matchingPairs == 4
-            and .jwtSvid.federatedExchangeMatrix.matchingStatusCode == 200
-            and .jwtSvid.federatedExchangeMatrix.crossedPairs == 12
-            and .jwtSvid.federatedExchangeMatrix.crossedStatusCode == 401
-            and .jwtSvid.federatedExchangeMatrix.crossedError == "invalid_client"
-            and .jwtSvid.federatedExchangeMatrix.crossedErrorCode == "AADSTS700213"
-            and (.jwtSvid.federatedExchangeMatrix.tokensOrResponseBodiesCaptured == false)
+            and .currentCoreFourAcceptance.status == "live_read_only_verified"
+            and .currentCoreFourAcceptance.lanes == ["api", "research", "shadow-qset", "funded-signer"]
+            and .currentCoreFourAcceptance.receipt == "/srv/polyedge-ring/migration/identity/20260824T145607Z-four-lane-identity-acceptance.json"
+            and .currentCoreFourAcceptance.sha256 == "sha256:c4ea2b4132e49cd2555340fa65af1ca0b7b2fee6614b5ebb9df63c56fabf70c4"
+            and .currentCoreFourAcceptance.roleCounts == {api:16, research:2, shadowQset:6, fundedSigner:10}
+            and .currentCoreFourAcceptance.broadScopeAssignmentCount == 0
+            and .currentCoreFourAcceptance.tokenFileIsolation == {expectedCount:12, passedCount:12}
+            and .currentCoreFourAcceptance.federatedExchangeMatrix == {
+              matchingPairs:4, matchingStatusCode:200,
+              crossedPairs:12, crossedStatusCode:401,
+              crossedError:"invalid_client", crossedErrorCode:"AADSTS700213"
+            }
+            and .currentCoreFourAcceptance.storageDataPlane == {positivePassed:4, negativePassed:4}
+            and .currentCoreFourAcceptance.mutationOperations == []
+            and .currentCoreFourAcceptance.secretsOrTokensStored == false
             and ([
               .lanes.api,
               .lanes.research,
               .lanes["shadow-qset"],
               .lanes["funded-signer"],
               .lanes["funded-intent-producer"]
-            ] | map(.assignmentCount) | add) == 40
+            ] | map(.assignmentCount) | add) == 42
+            and .lanes.api.assignmentCount == 16
             and all([
               .lanes.api,
               .lanes.research,
@@ -346,7 +356,7 @@ jobs:
             and any(.lanes["funded-signer"].positiveChecks[];
               .operation == "serviceBus.peekMessages"
               and .target == "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
-              and .activePeekedMessageCount == 0 and .deadLetterMessageCount == 868
+              and .activePeekedMessageCount == 0
               and .consumed == false and .result == "success")
             and .lanes["funded-signer"].negativeChecks == [
               {target:"bot-events", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},

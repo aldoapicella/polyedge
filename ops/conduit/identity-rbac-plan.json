@@ -80,11 +80,19 @@
         {
           "role": "blobReader",
           "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v4"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v5"
         }
       ],
       "negativeAssertions": [
         "no subscription, resource-group, storage-account, Key Vault, or Service Bus role",
-        "no qset raw/control writer or ShadowQset table role; qset-v3 research output is exact-container reader only",
+        "no qset raw/control writer or ShadowQset table role; qset-v3/v4/v5 research outputs are exact-container readers only",
         "no funded-evidence write role"
       ]
     },

@@ -728,10 +728,22 @@ az deployment group create --resource-group rg-polyedge-dev \
 The research UAMI first received only a temporary Blob Data Reader role on the
 `bot-events` container. Its bounded workload-federation `getProperties` proof
 passed, after which the temporary role was replaced with the reviewed exact
-container Contributor role. The remaining FICs were created sequentially and
-only the positive scopes in `identity-rbac-plan.json` were assigned. Live IDs,
-role counts, positive reads, and cross-lane 403 checks are captured without
-credentials in `identity-rbac-proof.json`.
+The remaining FICs were created sequentially and only the positive scopes in
+`identity-rbac-plan.json` were assigned. The API lane has only reader access to
+the three research-output containers `polyedge-research-qset-v3`, `-v4`, and
+`-v5`; it has no qset raw/control writer or ShadowQset table role.
+
+The current four-lane read-only acceptance is the root-only receipt
+`/srv/polyedge-ring/migration/identity/20260824T145607Z-four-lane-identity-acceptance.json`
+(`sha256:c4ea2b4132e49cd2555340fa65af1ca0b7b2fee6614b5ebb9df63c56fabf70c4`).
+It records 16/2/6/10 exact assignments for API/research/shadow-qset/funded
+signer, zero broad assignments, 12/12 cross-lane token-file denials, four
+matching Entra exchanges, 12 crossed-exchange denials, and four positive plus
+four negative Storage reads, without storing credentials or performing
+mutations. `identity-rbac-proof.json` contains a compact non-secret index to
+that current receipt; its producer, promotion-controller, Arc, and deployment
+details remain historical, scope-specific evidence rather than a claim that
+they were all re-probed with this four-lane receipt.
 
 The isolated promotion controller is a fifth UAMI,
 `id-polyedge-conduit-promotion-controller`, with only the custom `PolyEdge OCI
