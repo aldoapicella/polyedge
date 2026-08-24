@@ -307,7 +307,7 @@ test "$POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256" = "$validator_sha"
     .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
   ' "$rollout" >/dev/null
 test "$(/usr/bin/podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer)" = "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE|986:982|running"
-test "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels \"org.opencontainers.image.revision\" }}' "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE")" = "linux/arm64|$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION"
+test "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE")" = "linux/arm64|$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION"
 rollout_signer_invocation=$(/usr/bin/jq -er '.runtime.signer.invocationId' "$rollout")
 rollout_signer_container=$(/usr/bin/jq -er '.runtime.signer.containerId' "$rollout")
 rollout_producer_invocation=$(/usr/bin/jq -er '.runtime.producer.invocationId' "$rollout")
@@ -316,7 +316,7 @@ test "$(/usr/bin/systemctl show polyedge-funded-signer.service -p InvocationID -
 test "$(/usr/bin/podman inspect --format '{{.Id}}' polyedge-funded-signer)" = "$rollout_signer_container"
 test "$(/usr/bin/systemctl show polyedge-funded-intent-producer.service -p InvocationID --value)" = "$rollout_producer_invocation"
 test "$(/usr/bin/podman inspect --format '{{.Id}}' polyedge-funded-intent-producer)" = "$rollout_producer_container"
-test "$(/usr/bin/podman image inspect --format '{{ index .Labels \"org.opencontainers.image.revision\" }}' "$producer_image_expected")" = "$producer_revision_expected"
+test "$(/usr/bin/podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$producer_image_expected")" = "$producer_revision_expected"
 queue_json=$(/usr/sbin/runuser -u ubuntu -- /usr/bin/az servicebus queue show --subscription "$subscription" --resource-group "$resource_group" --namespace-name "$namespace" --name "$queue" --only-show-errors -o json)
 /usr/bin/jq -e --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '.status == "Active" and
   .countDetails.activeMessageCount == 0 and .countDetails.scheduledMessageCount == 0 and
