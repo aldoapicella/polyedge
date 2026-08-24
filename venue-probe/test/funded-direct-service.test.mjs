@@ -250,7 +250,7 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   assert.ok(bus.receiveCalls.every(({ maxMessages, options }) =>
     maxMessages === 1 && options?.maxWaitTimeInMs === 1_000
   ));
-  assert.deepEqual(bus.renewed.sort(), ["decision", "warmup"]);
+  assert.deepEqual(bus.renewed, []);
   assert.equal(logs.find((value) => value.schema === "polyedge.funded_direct_latency.v1")?.order_submitted, true);
 });
 
@@ -315,7 +315,7 @@ test("persistent service coalesces only duplicate market-token warmups", async (
   assert.equal(result.processed_messages, 4);
   assert.deepEqual(order, ["warmup", "warmup", "intent"]);
   assert.deepEqual(bus.completed.sort(), ["intent-first", "warmup-duplicate", "warmup-first", "warmup-other-token"]);
-  assert.deepEqual(bus.renewed.sort(), ["intent-first", "warmup-duplicate", "warmup-first", "warmup-other-token"]);
+  assert.deepEqual(bus.renewed, []);
 });
 
 test("persistent service seals a fresh intent busy while the first child is delayed", async () => {
@@ -359,7 +359,7 @@ test("persistent service seals a fresh intent busy while the first child is dela
   await firstStartedPromise;
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(bus.received, ["first", "fresh"]);
-  assert.deepEqual(bus.renewed.sort(), ["first", "fresh"]);
+  assert.deepEqual(bus.renewed, []);
   releaseFirst();
   const result = await resultPromise;
   assert.equal(result.processed_messages, 2, JSON.stringify(logs));
@@ -620,22 +620,21 @@ test("persistent service redelivers idempotently after durable completion loses 
   const completed = [];
   const abandoned = [];
   const deadLettered = [];
-  let failRenewal;
+  let receiverOptions;
+  let manualRenewals = 0;
   const receiver = {
     async receiveMessages(maxMessages) { return messages.splice(0, maxMessages); },
-    renewMessageLock(message) {
-      if (message.deliveryCount > 0) return Promise.resolve();
-      return new Promise((_, reject) => {
-        failRenewal = () => {
-          const error = new Error("");
-          error.name = "ServiceBusError";
-          error.code = "GeneralError";
-          error.reason = "MessageLockLost";
-          reject(error);
-        };
-      });
+    async renewMessageLock() { manualRenewals += 1; },
+    async completeMessage(message) {
+      if (message.deliveryCount === 0) {
+        const error = new Error("");
+        error.name = "ServiceBusError";
+        error.code = "GeneralError";
+        error.reason = "MessageLockLost";
+        throw error;
+      }
+      completed.push(message.deliveryCount);
     },
-    async completeMessage(message) { completed.push(message.deliveryCount); },
     async abandonMessage(message) { abandoned.push(message.deliveryCount); },
     async deadLetterMessage(message) { deadLettered.push(message.deliveryCount); },
     async close() {}
@@ -647,8 +646,6 @@ test("persistent service redelivers idempotently after durable completion loses 
     processingCalls += 1;
     if (processingCalls === 1) {
       executions += 1;
-      failRenewal();
-      await new Promise((resolve) => setImmediate(resolve));
       return {
         status: "persistent_intent_completed",
         execution: {
@@ -673,7 +670,10 @@ test("persistent service redelivers idempotently after durable completion loses 
   const result = await runPersistentFundedDirectService({
     env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
     createBusClient: () => ({
-      createReceiver: () => receiver,
+      createReceiver: (_queue, options) => {
+        receiverOptions = options;
+        return receiver;
+      },
       async close() {}
     }),
     createExecutor: async () => ({
@@ -690,6 +690,11 @@ test("persistent service redelivers idempotently after durable completion loses 
   assert.deepEqual(completed, [1]);
   assert.deepEqual(abandoned, []);
   assert.deepEqual(deadLettered, []);
+  assert.deepEqual(receiverOptions, {
+    receiveMode: "peekLock",
+    maxAutoLockRenewalDurationInMs: 300_000
+  });
+  assert.equal(manualRenewals, 0);
   const lost = logs.find((value) =>
     value.status === "persistent_message_settlement_lost_after_durable_completion"
   );

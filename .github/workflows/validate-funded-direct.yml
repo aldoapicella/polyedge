@@ -928,7 +928,7 @@ jobs:
           assert.equal(queue.properties.requiresDuplicateDetection, true);
           assert.equal(queue.properties.duplicateDetectionHistoryTimeWindow, "PT10M");
           assert.equal(queue.properties.defaultMessageTimeToLive, "PT1H");
-          assert.equal(queue.properties.lockDuration, "PT30S");
+          assert.equal(queue.properties.lockDuration, "PT2M");
           assert.equal(queue.properties.deadLetteringOnMessageExpiration, true);
           assert.equal(queue.properties.maxDeliveryCount, 3);
           const deadLetterAlert = resources("Microsoft.Insights/metricAlerts").find((resource) =>

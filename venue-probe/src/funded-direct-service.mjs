@@ -10,7 +10,6 @@ import {
 import { sanitize } from "./lib.mjs";
 
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
-const FUNDED_LOCK_RENEWAL_MS = 10_000;
 const FUNDED_BUSY_VALIDATION_LIMIT = 4;
 
 export function loadFundedDirectServiceConfig(env = process.env) {
@@ -172,7 +171,10 @@ export async function runPersistentFundedDirectService({
   if (config.engine !== "persistent_v1") throw new Error("persistent funded service requires FUNDED_DIRECT_ENGINE=persistent_v1");
   const credential = new DefaultAzureCredential({ managedIdentityClientId: env.AZURE_CLIENT_ID });
   const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
-  const receiver = bus.createReceiver(config.serviceBusQueue, { receiveMode: "peekLock" });
+  const receiver = bus.createReceiver(config.serviceBusQueue, {
+    receiveMode: "peekLock",
+    maxAutoLockRenewalDurationInMs: 300_000
+  });
   let executor = null;
   let leaseHandoffAttempts = 0;
   while (!executor) {
@@ -294,26 +296,6 @@ export async function runPersistentFundedDirectService({
   }, config.heartbeatMs);
   heartbeat.unref?.();
   const warmedMarketTokens = new Set();
-  const startLockRenewal = (message) => {
-    const entry = {
-      message,
-      body: null,
-      renewalError: null,
-      renewal: null,
-      queueReceiveMonotonicMs: performance.now()
-    };
-    const renew = async () => {
-      try {
-        await receiver.renewMessageLock(message);
-      } catch (error) {
-        entry.renewalError = error;
-      }
-    };
-    void renew();
-    entry.renewal = setInterval(renew, FUNDED_LOCK_RENEWAL_MS);
-    entry.renewal.unref?.();
-    return entry;
-  };
   const settleFailure = async (entry, { terminal, reason, description }) => {
     failedAttempts += 1;
     try {
@@ -357,7 +339,6 @@ export async function runPersistentFundedDirectService({
     }
   };
   const settleStoppedMessage = async (entry) => {
-    clearInterval(entry.renewal);
     const settlement = await settleFailure(entry, {
       terminal: true,
       reason: "FundedServiceStopping",
@@ -407,11 +388,6 @@ export async function runPersistentFundedDirectService({
   };
   const processIntent = async (entry, busy) => {
     const { message, body, queueReceiveMonotonicMs } = entry;
-    try {
-      if (entry.renewalError) {
-        await failMessage(entry, entry.renewalError);
-        return;
-      }
       const receivedWallMs = Date.now();
       let result;
       try {
@@ -421,7 +397,6 @@ export async function runPersistentFundedDirectService({
         return;
       }
       try {
-        if (entry.renewalError) throw entry.renewalError;
         await receiver.completeMessage(message);
       } catch (error) {
         if (hasDurableCompletion(result)) {
@@ -484,15 +459,11 @@ export async function runPersistentFundedDirectService({
         stopping = true;
         logger({ schema: "polyedge.funded_direct_alert.v1", status: "engine_paused_by_consecutive_latency_breaches", decision_id: body.decision_id, consecutive_transitions_above_slo: consecutiveLatencyBreaches, signal_to_send_slo_ms: config.signalToSendSloMs, account_risk_pause: true });
       }
-    } finally {
-      clearInterval(entry.renewal);
-    }
   };
   const processWarmup = async (entry) => {
     const { message, body } = entry;
     const key = body.market_id && body.token_id ? `${body.market_id}:${body.token_id}` : null;
     try {
-      if (entry.renewalError) throw entry.renewalError;
       if (key && warmedMarketTokens.has(key)) {
         await receiver.completeMessage(message);
         processedMessages += 1;
@@ -500,15 +471,12 @@ export async function runPersistentFundedDirectService({
         return;
       }
       await executor.warmMarket(body);
-      if (entry.renewalError) throw entry.renewalError;
       await receiver.completeMessage(message);
       processedMessages += 1;
       if (key) warmedMarketTokens.add(key);
       logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmed", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
     } catch (error) {
       await failMessage(entry, error);
-    } finally {
-      clearInterval(entry.renewal);
     }
   };
   let activeWorkflow = null;
@@ -559,11 +527,16 @@ export async function runPersistentFundedDirectService({
         continue;
       }
       const message = messages[0];
-      const entry = startLockRenewal(message);
+      const entry = {
+        message,
+        body: null,
+        bodyError: null,
+        queueReceiveMonotonicMs: performance.now()
+      };
       try {
         entry.body = parseMessageBody(message.body);
       } catch (error) {
-        entry.renewalError = error;
+        entry.bodyError = error;
       }
       const { body } = entry;
       if (stopping) {
@@ -595,8 +568,7 @@ export async function runPersistentFundedDirectService({
         }
         continue;
       }
-      await failMessage(entry, entry.renewalError || new Error("fail closed: unsupported funded intent handoff schema"));
-      clearInterval(entry.renewal);
+      await failMessage(entry, entry.bodyError || new Error("fail closed: unsupported funded intent handoff schema"));
       continue;
     }
     await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
