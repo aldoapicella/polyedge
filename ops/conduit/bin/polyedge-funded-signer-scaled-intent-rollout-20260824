@@ -11,6 +11,7 @@ readonly recovery_script_sha=8ec3b59df15f3d6b2c8e55687f1b064bbf8af793231486063ec
 readonly authorized_dlq=1311
 readonly old_quadlet_sha=8d323a3aa7f502836e31c207235d74093d5684dc130cd63a4084af188a3dd2fb
 readonly deploy_sha=f3bab7f8a53fedb1daa9a4b6843b4d87e3eec6362e7df6be83fdfda712f45396
+readonly resume_helper_sha=93b4478ca43e9faf176b293f1d88e943587c575523921c470b5be0ee8da3e4bd
 readonly decision=65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7
 readonly run=funded-direct-20260822235002541-68c5aaa9
 readonly order=0xd9b1491affbcc71b3876763af5583411b05e08ef8b46a74a88d983dbea1a9319
@@ -155,13 +156,29 @@ start_producer() {
 }
 
 heartbeat_safe() {
-  local clean=$1 invocation container now
+  local clean=$1 readiness=${2:-ready} invocation container now
   invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value) || return 1
   container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer) || return 1
   now=$(/usr/bin/date -u +%s)
   "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager | /usr/bin/jq -Rse \
     --arg invocation "$invocation" --arg container "$container" --argjson now "$now" \
-    --argjson clean "$clean" --argjson settlement_cutoff "$settlement_cutoff" '
+    --argjson clean "$clean" --arg readiness "$readiness" --argjson settlement_cutoff "$settlement_cutoff" '
+      def ready($heartbeat):
+        $heartbeat.event.executor.market_channel_ready == true and
+        $heartbeat.event.executor.safety_snapshot_cache_ready == true and
+        ($heartbeat.event.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+        $heartbeat.event.executor.safety_snapshot_open_order_count == 0 and
+        $heartbeat.event.executor.safety_snapshot_unresolved_position_count == 0 and
+        $heartbeat.event.executor.safety_snapshot_unresolved_risk_reservation_count == 0;
+      def cold($heartbeat):
+        $heartbeat.event.processed_messages == 0 and $heartbeat.event.failed_attempts == 0 and
+        $heartbeat.event.executor.market_channel_ready == false and
+        $heartbeat.event.executor.warmed_market == null and
+        $heartbeat.event.executor.safety_snapshot_cache_ready == false and
+        $heartbeat.event.executor.safety_snapshot_cache_age_ms == null and
+        $heartbeat.event.executor.safety_snapshot_open_order_count == null and
+        $heartbeat.event.executor.safety_snapshot_unresolved_position_count == null and
+        $heartbeat.event.executor.safety_snapshot_unresolved_risk_reservation_count == null;
       [split("\n")[] | fromjson? | select(type == "object") | . as $record |
         ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
         {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
@@ -176,38 +193,37 @@ heartbeat_safe() {
         (if $clean then true else .timestamp > $heartbeat.timestamp end)) ] | length) == 0 and
       $heartbeat.event.executor.busy == false and
       $heartbeat.event.executor.user_channel_ready == true and
-      $heartbeat.event.executor.market_channel_ready == true and
       $heartbeat.event.executor.user_channel_gaps == 0 and
       $heartbeat.event.executor.market_channel_gaps == 0 and
       $heartbeat.event.executor.user_channel_unparsed == 0 and
       $heartbeat.event.executor.market_channel_unparsed == 0 and
       $heartbeat.event.executor.reconnect_reconciliation_required == false and
-      $heartbeat.event.executor.safety_snapshot_cache_ready == true and
-      ($heartbeat.event.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
-      $heartbeat.event.executor.safety_snapshot_open_order_count == 0 and
-      $heartbeat.event.executor.safety_snapshot_unresolved_position_count == 0 and
-      $heartbeat.event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
       $heartbeat.event.executor.safety_snapshot_cache_error == null and
       $heartbeat.event.executor.risk_reservation_index_ready == true and
+      (if $readiness == "ready" then ready($heartbeat)
+       elif $readiness == "prestart" then (ready($heartbeat) or cold($heartbeat))
+       else false end) and
       (if $clean then $heartbeat.event.failed_messages == 0 else $heartbeat.timestamp >= $settlement_cutoff end)'
 }
 
 wait_signer_safe() {
-  local clean=$1 image=$2
+  local clean=$1 image=$2 readiness=${3:-ready}
   for _ in $(/usr/bin/seq 1 "$wait_attempts"); do
     if "$systemctl" is-active --quiet polyedge-funded-signer.service &&
        test "$(signer_identity 2>/dev/null || true)" = "$image|986:982|running" &&
-       test "$(binding 2>/dev/null || true)" = '0|||' && heartbeat_safe "$clean"; then
+       test "$(binding 2>/dev/null || true)" = '0|||' && heartbeat_safe "$clean" "$readiness"; then
       return 0
     fi
     /usr/bin/sleep "$wait_seconds"
   done
   return 1
 }
+
 new_signer_safe() {
+  local readiness=${1:-ready}
   test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$new_image" 2>/dev/null || true)" = "linux/arm64|$new_revision" &&
     test "$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value 2>/dev/null || true)" = 0 &&
-    wait_signer_safe true "$new_image"
+    wait_signer_safe true "$new_image" "$readiness"
 }
 
 validate_settlement_receipt() {
@@ -249,7 +265,7 @@ validate_pending_rollout() {
   /usr/bin/jq -e --arg old "$old_image" --arg new "$new_image" --arg revision "$new_revision" \
     --arg recovery_path "$recovery" --arg recovery_sha "sha256:$recovery_file_sha" \
     --arg settlement_path "$settlement" --arg settlement_sha "sha256:$settlement_file_sha" \
-    --arg helper "sha256:$helper_sha" --arg deploy "sha256:$deploy_file_sha" \
+    --arg helper "sha256:$helper_sha" --arg resume_helper "sha256:$resume_helper_sha" --arg deploy "sha256:$deploy_file_sha" \
     --arg recovery_script "sha256:$expected_recovery_script_sha" --arg quadlet_before "sha256:$expected_quadlet_sha" '
       .schema == "polyedge.funded_signer_scaled_intent_rollout_pending.v1" and
       .status == "deployment_pending_receipt" and
@@ -257,7 +273,7 @@ validate_pending_rollout() {
       .recoveryReceipt == {path:$recovery_path,sha256:$recovery_sha} and
       .settlementReceipt == {path:$settlement_path,sha256:$settlement_sha} and
       .authorizedDeadLetterBaseline == 1311 and
-      .helperSha256 == $helper and .deploySha256 == $deploy and
+      (.helperSha256 == $helper or .helperSha256 == $resume_helper) and .deploySha256 == $deploy and
       .recoveryScriptSha256 == $recovery_script and .quadlet.beforeSha256 == $quadlet_before and
       (.quadlet.afterSha256 | test("^sha256:[0-9a-f]{64}$")) and
       (.runtime.oldInvocationId | test("^[0-9a-f]{32}$")) and
@@ -347,7 +363,7 @@ if [ -e "$rollout" ]; then
       .queue == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311} and
       .parityTimerRemainsPaused == true and .azureDeletionAllowed == false' "$rollout" >/dev/null
   test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
-  new_signer_safe
+  new_signer_safe prestart
   queue_snapshot >/dev/null
   test "$(binding)" = '0|||'
   if ! producer_safe; then
@@ -355,6 +371,7 @@ if [ -e "$rollout" ]; then
     ! "$podman" container exists polyedge-funded-intent-producer
     start_producer
   fi
+  new_signer_safe
   ! "$systemctl" is-active --quiet polyedge-parity-hourly.timer
   complete=true
   trap - EXIT HUP INT TERM
@@ -446,7 +463,7 @@ fi
 secure_file "$quadlet" 600 65536
 test "$(sha "$quadlet")" = "$expected_new_quadlet_sha"
 test "$(/usr/bin/grep -c "^Image=$new_image$" "$quadlet")" -eq 1
-new_signer_safe
+new_signer_safe prestart
 new_invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)
 new_container=$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)
 test "$new_invocation" != "$old_invocation"

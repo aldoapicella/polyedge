@@ -8,6 +8,7 @@ recovery_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74
 new_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8
+authorized_resume_helper_sha=93b4478ca43e9faf176b293f1d88e943587c575523921c470b5be0ee8da3e4bd
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 
@@ -83,7 +84,6 @@ case "$1" in
     test "$2" = polyedge-funded-intent-producer.service
     test "$(cat "$FAKE_STATE/signer-image")" = "$FAKE_NEW_IMAGE"
     test "$(cat "$FAKE_STATE/binding")" = '0|||'
-    test -e "$FAKE_STATE/new-signer-proof"
     count=$(cat "$FAKE_STATE/start-count")
     printf '%s\n' "$((count + 1))" >"$FAKE_STATE/start-count"
     printf '1\n' >"$FAKE_STATE/producer-active" ;;
@@ -127,13 +127,18 @@ SCRIPT
   node -e "require('fs').writeFileSync(process.argv[1], require('fs').readFileSync(0, 'utf8'))" "$case_root/bin/journalctl" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "$(cat "$FAKE_STATE/signer-image")" = "$FAKE_NEW_IMAGE" ]; then
-  : >"$FAKE_STATE/new-signer-proof"
-else
+if [ "$(cat "$FAKE_STATE/signer-image")" != "$FAKE_NEW_IMAGE" ]; then
   alert=$(/usr/bin/jq -nc '{schema:"polyedge.funded_direct_alert.v1",status:"historical_attested_failure"}')
   /usr/bin/jq -nc --arg ts "$(( $(/usr/bin/date -u +%s) - 120 ))000000" --arg inv "$(cat "$FAKE_STATE/signer-invocation")" --arg container "$(cat "$FAKE_STATE/signer-container")" --arg message "$alert" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 fi
-message=$(/usr/bin/jq -nc '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",failed_messages:0,executor:{busy:false,user_channel_ready:true,market_channel_ready:true,user_channel_gaps:0,market_channel_gaps:0,user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,safety_snapshot_cache_ready:true,safety_snapshot_cache_age_ms:1,safety_snapshot_open_order_count:0,safety_snapshot_unresolved_position_count:0,safety_snapshot_unresolved_risk_reservation_count:0,safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
+ready=true
+if [ "$(cat "$FAKE_STATE/signer-image")" = "$FAKE_NEW_IMAGE" ] &&
+   { [ "$(cat "$FAKE_STATE/producer-active")" != 1 ] || [ "${FAKE_STAY_COLD_AFTER_PRODUCER:-0}" = 1 ]; }; then
+  ready=false
+fi
+market_gaps=0
+if [ "$ready" = false ] && [ "${FAKE_COLD_MARKET_GAP:-0}" = 1 ]; then market_gaps=1; fi
+message=$(/usr/bin/jq -nc --argjson ready "$ready" --argjson market_gaps "$market_gaps" '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",processed_messages:(if $ready then 1 else 0 end),failed_attempts:0,failed_messages:0,executor:{busy:false,user_channel_ready:true,market_channel_ready:$ready,warmed_market:(if $ready then {market_id:"test"} else null end),user_channel_gaps:0,market_channel_gaps:$market_gaps,user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,safety_snapshot_cache_ready:$ready,safety_snapshot_cache_age_ms:(if $ready then 1 else null end),safety_snapshot_open_order_count:(if $ready then 0 else null end),safety_snapshot_unresolved_position_count:(if $ready then 0 else null end),safety_snapshot_unresolved_risk_reservation_count:(if $ready then 0 else null end),safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
 /usr/bin/jq -nc --arg ts "$(/usr/bin/date -u +%s)000000" --arg inv "$(cat "$FAKE_STATE/signer-invocation")" --arg container "$(cat "$FAKE_STATE/signer-container")" --arg message "$message" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 SCRIPT
 
@@ -246,6 +251,20 @@ make_fixture "$unsafe"
 if run_helper "$unsafe" FAKE_DEPLOY_FAIL=1 FAKE_DEPLOY_UNSAFE=1; then exit 1; fi
 assert_fail_closed "$unsafe"
 
+cold_gap=$root/cold-gap
+make_fixture "$cold_gap"
+if run_helper "$cold_gap" FAKE_COLD_MARKET_GAP=1; then exit 1; fi
+assert_fail_closed "$cold_gap"
+test "$(cat "$cold_gap/state/deploy-count")" = 1
+
+stuck_cold=$root/stuck-cold
+make_fixture "$stuck_cold"
+if run_helper "$stuck_cold" FAKE_STAY_COLD_AFTER_PRODUCER=1; then exit 1; fi
+test "$(cat "$stuck_cold/state/producer-active")" = 0
+test "$(cat "$stuck_cold/state/start-count")" = 1
+test "$(cat "$stuck_cold/state/deploy-count")" = 1
+test ! -e "$stuck_cold/ring/activation/rollout.json"
+
 interrupted=$root/interrupted-resume
 make_fixture "$interrupted"
 if run_helper "$interrupted" FAKE_DEPLOY_INTERRUPT=1; then exit 1; fi
@@ -253,6 +272,9 @@ interrupted_pending=$interrupted/ring/activation/20260824T083626Z-funded-signer-
 assert_fail_closed "$interrupted"
 test "$(cat "$interrupted/state/deploy-count")" = 1
 test -e "$interrupted_pending"
+/usr/bin/jq --arg helper "sha256:$authorized_resume_helper_sha" '.helperSha256=$helper' "$interrupted_pending" >"$interrupted_pending.tmp"
+mv "$interrupted_pending.tmp" "$interrupted_pending"
+chmod 0640 "$interrupted_pending"
 run_helper "$interrupted"
 test "$(cat "$interrupted/state/producer-active")" = 1
 test "$(cat "$interrupted/state/deploy-count")" = 1
@@ -287,6 +309,16 @@ tamper_case wrong-baseline '.authorizedDeadLetterBaseline=1312'
 tamper_case receipt-queue-drift '.queueBefore.deadLetterMessageCount=1312'
 tamper_case duplicate-decision '.durableEvidence[1].message.decisionId=.durableEvidence[0].message.decisionId'
 tamper_case duplicate-order '.durableEvidence[1].reservation.orderId=.durableEvidence[0].reservation.orderId'
+
+unauthorized_resume=$root/unauthorized-resume
+make_fixture "$unauthorized_resume"
+if run_helper "$unauthorized_resume" FAKE_DEPLOY_INTERRUPT=1; then exit 1; fi
+unauthorized_pending=$unauthorized_resume/ring/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.pending.json
+/usr/bin/jq '.helperSha256="sha256:0000000000000000000000000000000000000000000000000000000000000000"' "$unauthorized_pending" >"$unauthorized_pending.tmp"
+mv "$unauthorized_pending.tmp" "$unauthorized_pending"
+chmod 0640 "$unauthorized_pending"
+if run_helper "$unauthorized_resume"; then exit 1; fi
+assert_fail_closed "$unauthorized_resume"
 
 wrong_digest=$root/wrong-digest
 make_fixture "$wrong_digest"
