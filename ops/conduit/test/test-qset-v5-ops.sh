@@ -7,6 +7,7 @@ writer=$root/quadlets/polyedge-shadow-qset-v5.container; sealer=$root/bin/polyed
 token=$root/bin/polyedge-federated-token-refresh; guard=$root/bin/polyedge-qset-v5-boundary-guard
 handoff=$root/bin/polyedge-qset-v5-rbac-handoff; freeze=$root/bin/polyedge-qset-v5-source-freeze
 service=$root/systemd/polyedge-qset-v5-seal-days.service; boundary_service=$root/systemd/polyedge-qset-v5-boundary@.service
+boundary_pre=$root/systemd/polyedge-qset-v5-boundary-pre.timer; boundary_post=$root/systemd/polyedge-qset-v5-boundary-post.timer
 writer_override=$root/systemd/polyedge-federated-token@shadow-qset-v5-writer.service.d/override.conf
 processor_override=$root/systemd/polyedge-federated-token@shadow-qset-v5-processor.service.d/override.conf
 policy=$repo/research/configs/campaign_freeze_2026-08-26_qset_v5.json
@@ -73,6 +74,8 @@ grep -F 'disabled "$v2_seal_timer"' "$guard" >/dev/null
 grep -F 'systemctl is-active --quiet "$v2_service"' "$guard" >/dev/null
 ! grep -Eq 'systemctl (start|stop|restart|enable|disable) ' "$guard"
 ! grep -F 'Requires=' "$boundary_service"; ! grep -F 'Conflicts=' "$boundary_service"
+grep -Fx 'OnCalendar=2026-08-25 23:59:30 UTC' "$boundary_pre" >/dev/null
+grep -Fx 'OnCalendar=2026-08-26 00:01:30 UTC' "$boundary_post" >/dev/null
 grep -F 'stateMutationPerformed:false' "$guard" >/dev/null
 
 receipt_dir=$(mktemp -d); printf '{"schema":"polyedge.qset_v5_boundary_pre.v2"}\n' >"$receipt_dir/pre.json"; sha="sha256:$(sha256sum "$receipt_dir/pre.json"|cut -d' ' -f1)"
