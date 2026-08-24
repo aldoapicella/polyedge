@@ -14,7 +14,7 @@ table_writer=$subscription/providers/Microsoft.Authorization/roleDefinitions/c81
 
 make_campaign() {
   local version=$1 writer=$2 processor=$3 output_writer=$4 output_processor=$5 date raw research control event chart market campaign writer_condition processor_condition
-  case "$version" in 3) date=2026-08-23 ;; 4) date=2026-08-26 ;; esac
+  case "$version" in 3) date=2026-08-23 ;; 5) date=2026-08-26 ;; esac
   raw=$storage/blobServices/default/containers/polyedge-shadow-qset-v${version}-events
   research=$storage/blobServices/default/containers/polyedge-research-qset-v${version}
   control=$storage/blobServices/default/containers/polyedge-qset-v${version}-control
@@ -157,7 +157,7 @@ setup_case() {
   mkdir -p "$STATE" "$RECEIPTS"
   make_stubs "$FAKE"
   make_campaign 3 v3-writer-pid v3-processor-pid "$STATE/assign-v3-writer-pid.json" "$STATE/assign-v3-processor-pid.json"
-  make_campaign 4 writer-pid processor-pid "$STATE/full-writer.json" "$STATE/full-processor.json"
+  make_campaign 5 writer-pid processor-pid "$STATE/full-writer.json" "$STATE/full-processor.json"
   jq -n --arg scope "$storage/blobServices/default/containers/polyedge-research-qset-v5" --arg role "$blob_reader" '[{id:"/assign/api-research",scope:$scope,roleDefinitionId:$role,principalId:"api-pid",condition:null,conditionVersion:null}]' >"$STATE/full-api.json"
   printf '[]\n' >"$STATE/assign-writer-pid.json"; printf '[]\n' >"$STATE/assign-processor-pid.json"; printf '[]\n' >"$STATE/assign-api-pid.json"
   WRITER_TOKEN=$CASE/writer-token; PROCESSOR_TOKEN=$CASE/processor-token

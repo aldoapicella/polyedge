@@ -151,7 +151,7 @@ The boundary guard is read-only except for its local root-owned receipts. It req
 
 ## Closed-day seal
 
-Keep `polyedge-qset-v5-first-seal.timer` disabled until both complete UTC days exist. At 2026-08-28 02:15 UTC it validates August 24 and 25 before fencing only the v5 writer, seals both days under the writer identity, writes deterministic root-owned receipts under `/srv/polyedge-ring/migration/qset-v5-seal/`, and restarts/health-checks only v5. Qset-v2 and qset-v3 are never stopped. Enable the one-shot timer only after the final freeze and boundary receipts pass.
+Keep `polyedge-qset-v5-first-seal.timer` disabled until both complete UTC days exist. At 2026-08-28 02:15 UTC it validates August 26 and 27 before fencing only the v5 writer, seals both days under the writer identity, writes deterministic root-owned receipts under `/srv/polyedge-ring/migration/qset-v5-seal/`, and restarts/health-checks only v5. Qset-v2 and qset-v3 are never stopped. Enable the one-shot timer only after the final freeze and boundary receipts pass.
 
 ```sh
 sudo systemctl enable --now polyedge-qset-v5-first-seal.timer

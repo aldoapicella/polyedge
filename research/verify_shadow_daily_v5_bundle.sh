@@ -8,7 +8,7 @@ test "$#" -ge 1 || {
 }
 validate_qset_v5_bundle_date() {
   value=$1
-  case "$value" in 2026-08-2[4-9]|2026-08-3[01]|2026-09-0[1-9]|2026-09-[12][0-9]|2026-09-30|2026-10-0[1-9]|2026-10-1[0-9]|2026-10-2[0-2]) ;; *) echo "qset-v5 verifier rejects date outside 2026-08-26 through 2026-10-24: $value" >&2; exit 2 ;; esac
+  case "$value" in 2026-08-2[6-9]|2026-08-3[01]|2026-09-0[1-9]|2026-09-[12][0-9]|2026-09-30|2026-10-0[1-9]|2026-10-1[0-9]|2026-10-2[0-4]) ;; *) echo "qset-v5 verifier rejects date outside 2026-08-26 through 2026-10-24: $value" >&2; exit 2 ;; esac
 }
 for requested_date in "$@"; do validate_qset_v5_bundle_date "$requested_date"; done
 

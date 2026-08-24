@@ -301,8 +301,8 @@ safe_file "$day1_receipt" 1048576 || fail "qset-v5 sealed-day receipt is missing
 safe_file "$day2_receipt" 1048576 || fail "qset-v5 sealed-day receipt is missing or unsafe: $day2_receipt"
 day1_receipt_sha=$(sha256_file "$day1_receipt")
 day2_receipt_sha=$(sha256_file "$day2_receipt")
-day1_inventory_sha=$(receipt_inventory "$day1_receipt" 2026-08-26) || fail 'qset-v5 August 24 sealed receipt is invalid'
-day2_inventory_sha=$(receipt_inventory "$day2_receipt" 2026-08-27) || fail 'qset-v5 August 25 sealed receipt is invalid'
+day1_inventory_sha=$(receipt_inventory "$day1_receipt" 2026-08-26) || fail 'qset-v5 August 26 sealed receipt is invalid'
+day2_inventory_sha=$(receipt_inventory "$day2_receipt" 2026-08-27) || fail 'qset-v5 August 27 sealed receipt is invalid'
 env_dir=$(dirname "$env_file")
 install -d -o "$expected_uid" -g "$expected_gid" -m 0700 "$rollback_root"
 [ ! -L "$rollback_root" ] && [ "$(stat -c '%u:%g:%a' "$rollback_root")" = "$expected_uid:$expected_gid:700" ] \

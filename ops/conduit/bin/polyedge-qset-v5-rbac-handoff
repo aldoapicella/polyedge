@@ -87,7 +87,7 @@ require_exact_federation() {
 
 campaign_values() {
   local version=$1
-  case "$version" in 3) campaign_date=2026-08-23 ;; 4) campaign_date=2026-08-26 ;; *) return 64 ;; esac
+  case "$version" in 3) campaign_date=2026-08-23 ;; 5) campaign_date=2026-08-26 ;; *) return 64 ;; esac
   raw="$storage_id/blobServices/default/containers/polyedge-shadow-qset-v${version}-events"
   research="$storage_id/blobServices/default/containers/polyedge-research-qset-v${version}"
   control="$storage_id/blobServices/default/containers/polyedge-qset-v${version}-control"
@@ -131,7 +131,7 @@ assert_campaign_assignments() {
 
 assert_v5_subset() {
   local record=$1 writer_condition processor_condition
-  campaign_values 4
+  campaign_values 5
   writer_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-shadow-qset-v5-events') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/preflight/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'shadow-events/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'control/strategy-canary/intents/$campaign_id/'))))"
   processor_condition="((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'}) AND !(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'})) OR ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers:name] StringEquals 'polyedge-research-qset-v5') AND ((@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'data/research/shadow/$campaign_id/') OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringStartsWith 'reports/research/shadow/campaigns/$campaign_id/'))))"
   jq -e --arg writer "$writer_principal" --arg processor "$processor_principal" --arg raw "$raw" --arg research "$research" --arg control "$control" --arg event "$event_index" --arg chart "$chart_series" --arg market "$market_catalog" --arg blob_reader "$blob_reader_role" --arg table_writer "$table_writer_role" --arg blob_writer "$blob_writer_role" --arg writer_condition "$writer_condition" --arg processor_condition "$processor_condition" '
@@ -156,17 +156,17 @@ assert_v5_subset() {
 }
 
 collect_api_v5() {
-  campaign_values 4
+  campaign_values 5
   az role assignment list --all --assignee-object-id "$api_principal" -o json | jq --arg scope "$research" '[.[]|select((.scope|ascii_downcase)==($scope|ascii_downcase))|{id,scope,roleDefinitionId,principalId,condition,conditionVersion}]|sort_by(.id)'
 }
 
 assert_api_reader() {
-  campaign_values 4
+  campaign_values 5
   jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length==1 and (.[0].scope|ascii_downcase)==($scope|ascii_downcase) and .[0].principalId==$principal and (.[0].roleDefinitionId|ascii_downcase)==($role|ascii_downcase) and .[0].condition==null and .[0].conditionVersion==null' "$1" >/dev/null
 }
 
 assert_api_subset() {
-  campaign_values 4
+  campaign_values 5
   jq -e --arg scope "$research" --arg principal "$api_principal" --arg role "$blob_reader_role" 'length<=1 and all(.[];(.scope|ascii_downcase)==($scope|ascii_downcase) and .principalId==$principal and (.roleDefinitionId|ascii_downcase)==($role|ascii_downcase) and .condition==null and .conditionVersion==null)' "$1" >/dev/null
 }
 
@@ -251,7 +251,7 @@ probe_writer_allowed() {
   response=$(mktemp); header=$(mktemp); blob_body=$(mktemp); table_body=$(mktemp)
   test ! -L "$writer_token" && test -f "$writer_token" && test "$(stat -c '%a:%h' "$writer_token")" = 600:1
   token_header "$writer_token" "$writer_client_id" https://storage.azure.com/.default "$response" "$header" || { rm -f "$response" "$header" "$blob_body" "$table_body"; return 1; }
-  campaign_values 4; proof_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+  campaign_values 5; proof_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
   preflight="shadow-events/preflight/$campaign_id/rbac-proof/$proof_id.json"
   campaign="shadow-events/$campaign_id/rbac-proof/$proof_id.json"
   table=ShadowQsetV5EventIndex
@@ -277,7 +277,7 @@ probe_processor_allowed() {
     expect_http "$code" 200 "processor storage/$container read" || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
     case "$container" in *events) raw_hash=sha256:$(sha256sum "$response"|cut -d' ' -f1) ;; *) control_hash=sha256:$(sha256sum "$response"|cut -d' ' -f1) ;; esac
   done
-  campaign_values 4; proof_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
+  campaign_values 5; proof_id=$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM
   research="data/research/shadow/$campaign_id/rbac-proof/$proof_id.json"
   jq -nc --arg proof "$proof_id" --arg lane processor '{schema:"polyedge.qset_v5_rbac_data_plane_proof.v1",lane:$lane,proof:$proof}' >"$body"
   code=$(curl --silent --show-error -o "$response" -w '%{http_code}' -X PUT -H "@$header" -H 'x-ms-version: 2023-11-03' -H 'x-ms-blob-type: BlockBlob' -H 'Content-Type: application/json' --data-binary "@$body" "https://$AZURE_STORAGE_ACCOUNT_NAME.blob.core.windows.net/polyedge-research-qset-v5/$research") || { rm -f "$response" "$header" "$body" "$read_body"; return 1; }
@@ -322,7 +322,7 @@ capture_v3_state >"$v3_before"
 
 if test "$mode" = check; then
   v5_current=$(mktemp); api_current=$(mktemp)
-  collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v5_current"
+  collect_campaign_assignments 5 "$writer_principal" "$processor_principal" >"$v5_current"
   jq -e '.writer==[] and .processor==[]' "$v5_current" >/dev/null
   collect_api_v5 >"$api_current"; jq -e 'length==0' "$api_current" >/dev/null
   validate_template; assert_v3_unchanged "$v3_before"
@@ -332,9 +332,9 @@ fi
 
 if test "$mode" = verify-live; then
   v5_current=$(mktemp); api_current=$(mktemp)
-  collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v5_current"
+  collect_campaign_assignments 5 "$writer_principal" "$processor_principal" >"$v5_current"
   collect_api_v5 >"$api_current"
-  assert_campaign_assignments 4 "$v5_current" "$writer_principal" "$processor_principal"
+  assert_campaign_assignments 5 "$v5_current" "$writer_principal" "$processor_principal"
   assert_api_reader "$api_current"
   negative_receipts=$(mktemp)
   for _ in 1 2 3 4 5 6; do
@@ -355,7 +355,7 @@ if test "$mode" = rollback; then
   secure_file "$before_receipt" 640 1048576
   jq -e --arg writer "$writer_principal" --arg processor "$processor_principal" '.schema=="polyedge.qset_v5_rbac_before.v1" and .writerPrincipal==$writer and .processorPrincipal==$processor and .v5PrincipalsHaveZeroAssignments==true and .apiV5ScopeHasZeroAssignments==true' "$before_receipt" >/dev/null
   v5_current=$(mktemp); api_current=$(mktemp)
-  collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v5_current"
+  collect_campaign_assignments 5 "$writer_principal" "$processor_principal" >"$v5_current"
   collect_api_v5 >"$api_current"
   assert_v5_subset "$v5_current"; assert_api_subset "$api_current"
   if test -e "$after_receipt"; then
@@ -364,7 +364,7 @@ if test "$mode" = rollback; then
     jq -e '.schema=="polyedge.qset_v5_exact_assignments.v1"' "$after_receipt" >/dev/null
     jq --slurpfile current "$v5_current" '{writer,processor,expected:$current[0].expected}' "$after_receipt" >"$after_expected"
     jq '.apiResearchReader' "$after_receipt" >"$after_api"
-    assert_campaign_assignments 4 "$after_expected" "$writer_principal" "$processor_principal"
+    assert_campaign_assignments 5 "$after_expected" "$writer_principal" "$processor_principal"
     assert_api_reader "$after_api"
     jq -e --slurpfile current "$v5_current" '(([$current[0].writer[].id|ascii_downcase]-[.writer[].id|ascii_downcase])|length)==0 and (([$current[0].processor[].id|ascii_downcase]-[.processor[].id|ascii_downcase])|length)==0' "$after_receipt" >/dev/null
     jq -e --slurpfile current "$api_current" '(([$current[0][].id|ascii_downcase]-[.apiResearchReader[].id|ascii_downcase])|length)==0' "$after_receipt" >/dev/null
@@ -372,7 +372,7 @@ if test "$mode" = rollback; then
   remaining=$(jq '[.writer,.processor]|map(length)|add' "$v5_current"); remaining=$((remaining + $(jq 'length' "$api_current")))
   jq -r '.writer[].id,.processor[].id' "$v5_current" | while IFS= read -r id; do az role assignment delete --ids "$id"; done
   jq -r '.[].id' "$api_current" | while IFS= read -r id; do az role assignment delete --ids "$id"; done
-  collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v5_current"; jq -e '.writer==[] and .processor==[]' "$v5_current" >/dev/null
+  collect_campaign_assignments 5 "$writer_principal" "$processor_principal" >"$v5_current"; jq -e '.writer==[] and .processor==[]' "$v5_current" >/dev/null
   collect_api_v5 >"$api_current"; jq -e 'length==0' "$api_current" >/dev/null
   assert_v3_unchanged "$v3_before"; require_no_azure_processor_job
   if test ! -e "$rollback_receipt"; then
@@ -386,7 +386,7 @@ fi
 
 validate_template
 v5_current=$(mktemp); api_current=$(mktemp)
-collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v5_current"
+collect_campaign_assignments 5 "$writer_principal" "$processor_principal" >"$v5_current"
 collect_api_v5 >"$api_current"
 if test -e "$before_receipt"; then
   secure_file "$before_receipt" 640 1048576
@@ -402,11 +402,11 @@ fi
 
 az deployment group create --resource-group "$AZURE_RESOURCE_GROUP" --name qset-v5-additive-rbac --template-file "$template" >/dev/null
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  collect_campaign_assignments 4 "$writer_principal" "$processor_principal" >"$v5_current"; collect_api_v5 >"$api_current"
-  if assert_campaign_assignments 4 "$v5_current" "$writer_principal" "$processor_principal" && assert_api_reader "$api_current"; then break; fi
+  collect_campaign_assignments 5 "$writer_principal" "$processor_principal" >"$v5_current"; collect_api_v5 >"$api_current"
+  if assert_campaign_assignments 5 "$v5_current" "$writer_principal" "$processor_principal" && assert_api_reader "$api_current"; then break; fi
   sleep 10
 done
-assert_campaign_assignments 4 "$v5_current" "$writer_principal" "$processor_principal"
+assert_campaign_assignments 5 "$v5_current" "$writer_principal" "$processor_principal"
 assert_api_reader "$api_current"
 require_v5_quiescent; require_no_azure_processor_job; assert_v3_unchanged "$v3_before"
 
