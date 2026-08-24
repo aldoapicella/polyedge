@@ -514,38 +514,63 @@ if [ "$POLYEDGE_PARITY_FUNDED_MODE" = active ]; then
 fi
 
 secure_file "$POLYEDGE_PARITY_LEDGER" 640
-rollout_signer_invocation= rollout_signer_container= rollout_producer_invocation=
+rollout_signer_invocation= rollout_signer_container= rollout_producer_invocation= rollout_producer_container= rollout_producer_revision=
 if [ "$funded_enabled" = true ]; then
-  [ "$funded_rollout_receipt" = "$parity_root/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json" ] \
+  [ "$funded_rollout_receipt" = "$parity_root/activation/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json" ] \
     || die 'funded rollout receipt path differs from the approved activation receipt'
   if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
-    [ "$funded_rollout_sha" = sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010 ] \
-      || die 'funded rollout receipt hash differs from the approved scaled-intent receipt'
+    [ "$funded_rollout_sha" = sha256:2d14048427e9bf81f83f357c57ae97c335278198e3ee5c05bbdf6191183ae928 ] \
+      || die 'funded rollout receipt hash differs from the approved post-redemption attestation'
+    [ "$funded_service_bus_dlq" = 1338 ] || die 'funded Service Bus baseline differs from the live attestation'
   fi
   secure_file "$funded_rollout_receipt" 640
   [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
-  [ "$funded_service_bus_dlq" = 1311 ] || die 'funded Service Bus baseline differs from the authorized settlement baseline'
-  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_service_bus_dlq" \
-    --arg recovery "$parity_root/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json" \
-    --arg recovery_sha "sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0" \
-    --arg settlement "$parity_root/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json" \
-    --arg settlement_sha "sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee" \
-    --arg helper "sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead" '
-    .schema == "polyedge.funded_signer_scaled_intent_rollout.v1" and .status == "validated" and
-    .newImage == $image and .newRevision == $revision and
-    .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
-    .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and .authorizedDeadLetterBaseline == $dlq and
-    .helperSha256 == $helper and
-    (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
-    (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
-    (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and .producerStartedAfterSignerProof == true and .producerRestored == true and
-    .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
-      scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --arg producer_image "$funded_producer_image" \
+    --argjson dlq "$funded_service_bus_dlq" '
+    .schema == "polyedge.funded_signer_post_redemption_attestation.v1" and .status == "attested" and
+    (.createdAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.helperSha256 | test("^sha256:[0-9a-f]{64}$")) and .authorizedDeadLetterBaseline == $dlq and
+    .runtime.signer.image == $image and .runtime.signer.revision == $revision and
+    (.runtime.signer.invocationId | test("^[0-9a-f]{32}$")) and (.runtime.signer.containerId | test("^[0-9a-f]{64}$")) and
+    .runtime.signer.restartCount == 0 and .runtime.signer.user == "986:982" and
+    .runtime.producer.image == $producer_image and (.runtime.producer.revision | test("^[0-9a-f]{40}$")) and
+    (.runtime.producer.invocationId | test("^[0-9a-f]{32}$")) and (.runtime.producer.containerId | test("^[0-9a-f]{64}$")) and
+    .runtime.producer.restartCount == 0 and .runtime.producer.user == "984:980" and
+    .runtime.producer.status == "running" and .runtime.producer.health == "healthy" and
+    (.redemption.transactionHash | test("^0x[0-9a-f]{64}$")) and (.redemption.settlementBlob | type == "string" and length > 0) and
+    all(.evidence.liveSummary,.evidence.followUpDryRun,.evidence.internalSettlement;
+      (.path | type == "string" and length > 0) and (.sha256 | test("^sha256:[0-9a-f]{64}$"))) and
+    .heartbeat.failedMessages == 0 and .heartbeat.failedAttempts == 0 and
+    .heartbeat.executor.busy == false and .heartbeat.executor.user_channel_ready == true and
+    .heartbeat.executor.market_channel_ready == true and .heartbeat.executor.user_channel_gaps == 0 and
+    .heartbeat.executor.market_channel_gaps == 0 and .heartbeat.executor.user_channel_unparsed == 0 and
+    .heartbeat.executor.market_channel_unparsed == 0 and .heartbeat.executor.reconnect_reconciliation_required == false and
+    .heartbeat.executor.safety_snapshot_cache_ready == true and .heartbeat.executor.safety_snapshot_open_order_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_position_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+    .heartbeat.executor.safety_snapshot_cache_error == null and .heartbeat.executor.risk_reservation_index_ready == true and
+    .queue.after == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+    .queue.deadLetterNonGrowth == true and .servicesMutated == false and .staleRecoveryReceiptsAccepted == false and
     .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
   ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
-  rollout_signer_invocation=$(jq -er '.runtime.newInvocationId' "$funded_rollout_receipt")
-  rollout_signer_container=$(jq -er '.runtime.newContainerId' "$funded_rollout_receipt")
-  rollout_producer_invocation=$(jq -er '.runtime.producerInvocationId' "$funded_rollout_receipt")
+  rollout_signer_invocation=$(jq -er '.runtime.signer.invocationId' "$funded_rollout_receipt")
+  rollout_signer_container=$(jq -er '.runtime.signer.containerId' "$funded_rollout_receipt")
+  rollout_producer_invocation=$(jq -er '.runtime.producer.invocationId' "$funded_rollout_receipt")
+  rollout_producer_container=$(jq -er '.runtime.producer.containerId' "$funded_rollout_receipt")
+  rollout_producer_revision=$(jq -er '.runtime.producer.revision' "$funded_rollout_receipt")
+  if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
+    jq -e '
+      .helperSha256 == "sha256:b0588df04a92eb58d1e8727d61ef9a0b2ab8935336327f612ac89e7f455c27ab" and
+      .runtime.signer.image == "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:9506512f5cb96f8b5e593629838bf64c5acf920afad18689a0ef2a9b076aebb3" and
+      .runtime.signer.revision == "7d34f36d70c8dd4f90fbcde3cedbaac1c857da1b" and
+      .runtime.signer.invocationId == "1521d4e1402f4bd5aa66ae87648ac34b" and
+      .runtime.signer.containerId == "8c6f40223ae383fcbf4e6eeb7b075188e12ca0eb43b73c81be033af8972b40af" and
+      .runtime.producer.image == "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8" and
+      .runtime.producer.revision == "72224c12d0790c02d98be7ece8fbcb781b6412e4" and
+      .runtime.producer.invocationId == "3571ebce1cef4f80aae3d220f138b030" and
+      .runtime.producer.containerId == "f15f80000c562d2b6428454a071b8c7c0d401d5099bfb2c1b31be6242695c1e2"
+    ' "$funded_rollout_receipt" >/dev/null || die 'live attestation runtime identity differs from the approved values'
+  fi
 fi
 
 validate_ledger() {
@@ -660,7 +685,7 @@ validate_funded_evidence_binding() {
     --arg receipt_sha "$funded_rollout_sha" --arg collector_sha "$parity_collector_sha" \
     --arg validator_sha "$reboot_validator_sha" --argjson dlq "$funded_service_bus_dlq" \
     --arg signer_invocation "$rollout_signer_invocation" --arg signer_container "$rollout_signer_container" \
-    --arg producer_invocation "$rollout_producer_invocation" --argjson funded "$funded_enabled" '
+    --arg producer_invocation "$rollout_producer_invocation" --arg producer_container "$rollout_producer_container" --argjson funded "$funded_enabled" '
     if $funded then
       .services.fundedSignerRevision == $revision and
       .services.fundedRolloutReceipt == {path:$receipt,sha256:$receipt_sha} and
@@ -668,6 +693,7 @@ validate_funded_evidence_binding() {
       .services.fundedRuntime.invocationId == $signer_invocation and
       .services.fundedRuntime.containerId == $signer_container and
       .services.fundedIntentProducerRuntime.invocationId == $producer_invocation and
+      .services.fundedIntentProducerRuntime.containerId == $producer_container and
       .services.fundedRuntime.failedAttempts == 0 and
       .services.fundedRuntime.marketWarmedCount >= 1 and
       .services.fundedRuntime.processedMessagesDelta > 0 and
@@ -891,9 +917,12 @@ else
     || die 'funded intent producer container user is not 984:980'
   funded_producer_container=$(podman inspect --format '{{.Id}}' polyedge-funded-intent-producer)
   printf '%s' "$funded_producer_container" | grep -Eq '^[0-9a-f]{64}$' || die 'funded intent producer container ID is malformed'
+  [ "$funded_producer_container" = "$rollout_producer_container" ] || die 'funded intent producer container differs from the post-redemption attestation'
   funded_producer_invocation=$(systemctl show polyedge-funded-intent-producer.service --property=InvocationID --value)
   printf '%s' "$funded_producer_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'funded intent producer invocation ID is malformed'
   [ "$funded_producer_invocation" = "$rollout_producer_invocation" ] || die 'funded intent producer invocation differs from the rollout receipt'
+  [ "$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$funded_producer_image")" = "$rollout_producer_revision" ] \
+    || die 'funded intent producer revision differs from the post-redemption attestation'
   producer_config_file=${POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE:-/etc/polyedge/funded-intent-producer.env}
   secure_file "$producer_config_file" 600
   [ "$(sha "$producer_config_file")" = "$funded_producer_config_sha" ] \

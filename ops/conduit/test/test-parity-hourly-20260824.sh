@@ -100,6 +100,10 @@ case "$1" in
       *) exit 2 ;;
     esac
     ;;
+  image)
+    [ "$2" = inspect ] || exit 2
+    case "$*" in *org.opencontainers.image.revision*) printf '%s\n' 6666666666666666666666666666666666666666 ;; *) exit 2 ;; esac
+    ;;
   exec)
     printf 'HTTP/1.0 200 OK\r\n\r\n'
     case "$*" in
@@ -613,17 +617,28 @@ activate_funded_fixture() {
   activation=$case_root/ring/parity/activation
   recovery=$case_root/ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
   settlement=$case_root/ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-  rollout=$activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json
+  rollout=$activation/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json
   install -d -m 0750 "$activation"
   jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
-    --arg recovery "$recovery" --arg settlement "$settlement" \
-    '{schema:"polyedge.funded_signer_scaled_intent_rollout.v1",status:"validated",newImage:$image,newRevision:$revision,
-      runtime:{newInvocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",newContainerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",producerInvocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-      recoveryReceipt:{path:$recovery,sha256:"sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0"},
-      settlementReceipt:{path:$settlement,sha256:"sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee"},
-      authorizedDeadLetterBaseline:1311,helperSha256:"sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead",
-      producerStartedAfterSignerProof:true,producerRestored:true,unresolvedReservationsAfter:0,queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq},
-      parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$rollout"
+    --arg producer_image "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc" '{
+      schema:"polyedge.funded_signer_post_redemption_attestation.v1",status:"attested",createdAtUtc:"2026-08-24T18:30:00Z",
+      helperSha256:("sha256:" + ("1" * 64)),authorizedDeadLetterBaseline:$dlq,
+      redemption:{transactionHash:("0x" + ("2" * 64)),settlementBlob:"fixture-settlement"},
+      evidence:{liveSummary:{path:"fixture-live",sha256:("sha256:" + ("3" * 64))},
+        followUpDryRun:{path:"fixture-dry",sha256:("sha256:" + ("4" * 64))},
+        internalSettlement:{path:"fixture-settlement",sha256:("sha256:" + ("5" * 64))}},
+      runtime:{signer:{invocationId:("a" * 32),containerId:("e" * 64),restartCount:0,image:$image,revision:$revision,user:"986:982"},
+        producer:{invocationId:("b" * 32),containerId:(("0" * 63) + "4"),restartCount:0,image:$producer_image,
+          revision:("6" * 40),user:"984:980",status:"running",health:"healthy"}},
+      heartbeat:{capturedAtEpoch:1787596150,processedMessages:1,failedMessages:0,failedAttempts:0,
+        executor:{busy:false,user_channel_ready:true,market_channel_ready:true,user_channel_gaps:0,market_channel_gaps:0,
+          user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,
+          safety_snapshot_cache_ready:true,safety_snapshot_cache_age_ms:100,safety_snapshot_open_order_count:0,
+          safety_snapshot_unresolved_position_count:0,safety_snapshot_unresolved_risk_reservation_count:0,
+          safety_snapshot_cache_error:null,risk_reservation_index_ready:true}},
+      queue:{before:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq},
+        after:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq},deadLetterNonGrowth:true},
+      servicesMutated:false,staleRecoveryReceiptsAccepted:false,parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$rollout"
   chmod 0640 "$rollout"
   rollout_sha=sha256:$(sha256sum "$rollout" | awk '{print $1}')
   active_ledger=$case_root/ring/parity/20260809T141000Z-funded-active.json
@@ -1035,7 +1050,7 @@ jq -e '.acceptedCleanLiveHours == 1 and .fundedSignerEnabled == true and
 jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled == true and
   .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
   .services.fundedSignerRevision == "7777777777777777777777777777777777777777" and
-  (.services.fundedRolloutReceipt.path | endswith("/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json")) and
+  (.services.fundedRolloutReceipt.path | endswith("/activation/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json")) and
   (.services.fundedRolloutReceipt.sha256 | test("^sha256:[0-9a-f]{64}$")) and
   .services.fundedServiceBusDlqBaseline == 1311 and
   .services.fundedSignerUser == "'"$uid:$gid"'" and .services.fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and

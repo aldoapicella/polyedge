@@ -5,10 +5,12 @@ repo=$(cd "$(dirname "$0")/../../.." && pwd)
 stage=$repo/ops/conduit/bin/polyedge-parity-stage-funded-active-20260824
 first=$repo/ops/conduit/bin/polyedge-parity-collect-first-hour-20260824
 root=$(mktemp -d)
-grep -Fq 'readonly rollout=/srv/polyedge-ring/parity/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json' "$stage"
-grep -Fq 'readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010' "$stage"
-grep -Fq 'readonly rollout_helper_sha=sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead' "$stage"
-grep -Fq 'readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010' "$first"
+grep -Fq 'readonly window=2026-08-24T21:00:00Z' "$stage"
+grep -Fq 'readonly rollout=/srv/polyedge-ring/parity/activation/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json' "$stage"
+grep -Fq 'readonly rollout_receipt_sha=sha256:2d14048427e9bf81f83f357c57ae97c335278198e3ee5c05bbdf6191183ae928' "$stage"
+grep -Fq 'readonly rollout_helper_sha=sha256:b0588df04a92eb58d1e8727d61ef9a0b2ab8935336327f612ac89e7f455c27ab' "$stage"
+grep -Fq 'readonly authorized_dlq=1338' "$stage"
+grep -Fq 'readonly rollout_receipt_sha=sha256:2d14048427e9bf81f83f357c57ae97c335278198e3ee5c05bbdf6191183ae928' "$first"
 grep -Fq 'persistent_message_failed_closed' "$stage"
 grep -Fq '.failed_attempts == 0' "$stage"
 grep -Fq '$warmed | length) >= 1' "$stage"
@@ -18,14 +20,14 @@ grep -Fq '{{ index .Labels "org.opencontainers.image.revision" }}' "$stage"
 grep -Fq 'as $all_heartbeats' "$stage"
 grep -Fq 'as $ready_start' "$stage"
 grep -Fq '$ready_start != null' "$stage"
-stage_jq=$(sed -n '479,508p' "$stage")
+stage_jq=$(sed -n '524,553p' "$stage")
 printf '%s' '' | jq -Rs --arg invocation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --arg container eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --argjson now 0 "$stage_jq" >/dev/null
 ! grep -Fq 'recovery_dlq=' "$stage"
 trap 'rm -rf "$root"' EXIT
 
 fixture_recovery=$root/recovery.json
 fixture_settlement=$root/settlement.json
-fixture_rollout=$root/rollout.json
+fixture_rollout=$root/post-redemption-fixture-attestation.json
 jq -n '{
   schema:"polyedge.acknowledged_no_fill_reconciliation.v1",status:"finalized_no_fill",
   decision_id:"65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7",
@@ -48,23 +50,35 @@ jq -n '{schema:"polyedge.funded_settlement_loss_reconciliation.v1",status:"final
 fixture_settlement_sha=sha256:$(sha256sum "$fixture_settlement" | cut -d' ' -f1)
 new_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 revision=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-jq -n --arg image "$new_image" --arg revision "$revision" --arg recovery "$fixture_recovery" --arg recovery_sha "$fixture_recovery_sha" \
-  --arg settlement "$fixture_settlement" --arg settlement_sha "$fixture_settlement_sha" '{
-  schema:"polyedge.funded_signer_scaled_intent_rollout.v1",status:"validated",
-  oldImage:"ghcr.io/aldoapicella/polyedge-venue-probe@sha256:976492b39921417ec8db01bcc38b09cc42c97afd4bb573047d4284db0a9ceeb8",
-  runtime:{newInvocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",newContainerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",producerInvocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
-  newImage:$image,newRevision:$revision,recoveryReceipt:{path:$recovery,sha256:$recovery_sha},
-  settlementReceipt:{path:$settlement,sha256:$settlement_sha},authorizedDeadLetterBaseline:1311,
-  helperSha256:"sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead",
-  producerStartedAfterSignerProof:true,producerRestored:true,unresolvedReservationsAfter:0,
-  queue:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},
-  parityTimerRemainsPaused:true,azureDeletionAllowed:false
+producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
+jq -n --arg image "$new_image" --arg revision "$revision" --arg producer_image "$producer_image" '{
+  schema:"polyedge.funded_signer_post_redemption_attestation.v1",status:"attested",createdAtUtc:"2026-08-24T18:30:00Z",
+  helperSha256:"sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  authorizedDeadLetterBaseline:1311,
+  redemption:{transactionHash:("0x" + ("2" * 64)),settlementBlob:"fixture-settlement"},
+  evidence:{
+    liveSummary:{path:"fixture-live",sha256:("sha256:" + ("3" * 64))},
+    followUpDryRun:{path:"fixture-dry",sha256:("sha256:" + ("4" * 64))},
+    internalSettlement:{path:"fixture-settlement",sha256:("sha256:" + ("5" * 64))}},
+  runtime:{
+    signer:{invocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",containerId:("e" * 64),restartCount:0,image:$image,revision:$revision,user:"986:982"},
+    producer:{invocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",containerId:("f" * 64),restartCount:0,image:$producer_image,
+      revision:"6666666666666666666666666666666666666666",user:"984:980",status:"running",health:"healthy"}},
+  heartbeat:{capturedAtEpoch:1787596150,processedMessages:1,failedMessages:0,failedAttempts:0,executor:{
+    busy:false,user_channel_ready:true,market_channel_ready:true,user_channel_gaps:0,market_channel_gaps:0,
+    user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,
+    safety_snapshot_cache_ready:true,safety_snapshot_cache_age_ms:100,safety_snapshot_open_order_count:0,
+    safety_snapshot_unresolved_position_count:0,safety_snapshot_unresolved_risk_reservation_count:0,
+    safety_snapshot_cache_error:null,risk_reservation_index_ready:true}},
+  queue:{before:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},
+    after:{status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:1311},deadLetterNonGrowth:true},
+  servicesMutated:false,staleRecoveryReceiptsAccepted:false,parityTimerRemainsPaused:true,azureDeletionAllowed:false
 }' >"$fixture_rollout"
 
 (
   POLYEDGE_TEST_UID=$(id -u) POLYEDGE_TEST_GID=$(id -g) POLYEDGE_TEST_SOURCE_ONLY=1 . "$stage"
   validate_recovery_receipt "$fixture_recovery"
-  validate_rollout_receipt "$fixture_recovery" "$fixture_rollout" "$fixture_settlement"
+  validate_rollout_receipt "$fixture_rollout"
   test "$signer_image" = "$new_image"
   test "$signer_revision" = "$revision"
   test "$service_bus_dlq" = 1311
@@ -104,8 +118,8 @@ ENV
   printf '%s\n' 'POLYEDGE_PARITY_FUNDED_MODE=active' >>"$source_env"
   if render_env "$source_env" "$root/duplicate.env" "${keys[@]}"; then exit 1; fi
 
-  jq '.producerRestored=false' "$fixture_rollout" >"$root/bad-rollout.json"
-  if validate_rollout_receipt "$fixture_recovery" "$root/bad-rollout.json" "$fixture_settlement"; then exit 1; fi
+  jq '.staleRecoveryReceiptsAccepted=true' "$fixture_rollout" >"$root/bad-rollout.json"
+  if validate_rollout_receipt "$root/bad-rollout.json"; then exit 1; fi
 
   tx_root=$root/transaction
   mkdir -p "$tx_root"
@@ -169,7 +183,7 @@ ENV
   export POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID=fixture-session
   export POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
   export POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256=sha256:9999999999999999999999999999999999999999999999999999999999999999
-  export POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
+  export POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE=$producer_image
   export POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256=sha256:56d8d0573ffbc2f50354100921355244ceedb71e1b28bbf32dea9f0a18b0c87b
   evidence_fixture=$root/evidence.json
   jq -n --arg window "$window" --arg ledger "$ledger" --arg revision "$revision" \
@@ -193,13 +207,13 @@ ENV
         fundedRuntime:{invocationId:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",containerId:"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",heartbeatCount:60,alertCount:0,failedClosedCount:0,failedAttempts:0,marketWarmedCount:1,processedMessagesDelta:1,restartCount:0},
         fundedIntentProducerEnabled:true,fundedIntentProducerImage:$producer_image,
         fundedIntentProducerUser:"984:980",fundedIntentProducerConfigSha256:$producer_config_sha,
-        fundedIntentProducerRuntime:{invocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",configEnvBindingSha256:$producer_env_sha,
+        fundedIntentProducerRuntime:{invocationId:"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",containerId:("f" * 64),configEnvBindingSha256:$producer_env_sha,
           tokenMountBindingSha256:$producer_mount_sha,continuity:{restartCount:0}}},
       sameInput:{deterministicResultExactMatch:true},azureAuthoritative:true,azureDeletionAllowed:false
     }' >"$evidence_fixture"
   validate_first_hour_evidence "$evidence_fixture"
   for mutation in revision rollout-sha dlq collector validator signer-image signer-user signer-session \
-    signer-session-sha signer-config producer-image producer-user producer-config producer-env producer-mount signer-invocation signer-container producer-invocation failed-attempts market-warmed processed-delta; do
+    signer-session-sha signer-config producer-image producer-user producer-config producer-env producer-mount signer-invocation signer-container producer-invocation producer-container failed-attempts market-warmed processed-delta; do
     case "$mutation" in
       revision) filter='.services.fundedSignerRevision = "0000000000000000000000000000000000000000"' ;;
       rollout-sha) filter='.services.fundedRolloutReceipt.sha256 = "sha256:" + ("0" * 64)' ;;
@@ -219,6 +233,7 @@ ENV
       signer-invocation) filter='.services.fundedRuntime.invocationId = "cccccccccccccccccccccccccccccccc"' ;;
       signer-container) filter='.services.fundedRuntime.containerId = ("d" * 64)' ;;
       producer-invocation) filter='.services.fundedIntentProducerRuntime.invocationId = "cccccccccccccccccccccccccccccccc"' ;;
+      producer-container) filter='.services.fundedIntentProducerRuntime.containerId = ("c" * 64)' ;;
       failed-attempts) filter='.services.fundedRuntime.failedAttempts = 1' ;;
       market-warmed) filter='.services.fundedRuntime.marketWarmedCount = 0' ;;
       processed-delta) filter='.services.fundedRuntime.processedMessagesDelta = 0' ;;

@@ -38,6 +38,9 @@ subscription=${POLYEDGE_GUARDED_RESTART_SUBSCRIPTION:-73783c0c-5a53-4f9b-b244-6f
 resource_group=${POLYEDGE_GUARDED_RESTART_RESOURCE_GROUP:-rg-polyedge-dev}
 namespace=${POLYEDGE_GUARDED_RESTART_NAMESPACE:-sb-polyedge-funded-cl-6urdjr5nmwx7w}
 queue=${POLYEDGE_GUARDED_RESTART_QUEUE:-funded-dynamic-quote-intents}
+allow_stopped=${POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED:-false}
+stopped_preflight=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT:-}
+stopped_preflight_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256:-}
 
 printf '%s\n' "$signer_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' || { echo 'signer image must be immutable' >&2; exit 64; }
 printf '%s\n' "$producer_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' || { echo 'producer image must be immutable' >&2; exit 64; }
@@ -48,6 +51,7 @@ complete=false
 producer_stopped=false
 restart_attempted=false
 producer_was_active=false
+stopped_restore=false
 queue_before=
 old_invocation=
 old_container=
@@ -88,6 +92,13 @@ producer_safe() {
     [ "$("$podman" inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}|{{.State.Health.Status}}' polyedge-funded-intent-producer 2>/dev/null || true)" = "$producer_image|$producer_user|running|healthy" ] &&
     [ "$(nrestarts polyedge-funded-intent-producer 2>/dev/null || true)" = 0 ]
 }
+wait_producer() {
+  for _ in $(seq 1 "$wait_attempts"); do
+    if producer_safe; then return 0; fi
+    sleep "$wait_seconds"
+  done
+  return 1
+}
 
 heartbeat_safe() {
   local readiness=$1 invocation_id container now
@@ -97,7 +108,7 @@ heartbeat_safe() {
   "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager | jq -Rse \
     --arg invocation "$invocation_id" --arg container "$container" --argjson now "$now" --arg readiness "$readiness" '
       def ready:
-        .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.executor.busy == false and
+        .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.redemption_failures == 0 and .event.executor.busy == false and
         .event.executor.user_channel_ready == true and .event.executor.market_channel_ready == true and
         .event.executor.user_channel_gaps == 0 and .event.executor.market_channel_gaps == 0 and
         .event.executor.user_channel_unparsed == 0 and .event.executor.market_channel_unparsed == 0 and
@@ -109,15 +120,19 @@ heartbeat_safe() {
         .event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
         .event.executor.safety_snapshot_cache_error == null and .event.executor.risk_reservation_index_ready == true;
       def cold:
-        .event.processed_messages == 0 and .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.executor.busy == false and
-        .event.executor.user_channel_ready == false and .event.executor.market_channel_ready == false and
+        .event.processed_messages == 0 and .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.redemption_failures == 0 and .event.executor.busy == false and
+        (.event.executor.user_channel_ready | type == "boolean") and (.event.executor.market_channel_ready | type == "boolean") and
         .event.executor.user_channel_gaps == 0 and .event.executor.market_channel_gaps == 0 and .event.executor.user_channel_unparsed == 0 and .event.executor.market_channel_unparsed == 0 and
-        .event.executor.reconnect_reconciliation_required == false and .event.executor.risk_reservation_index_ready == true and .event.executor.safety_snapshot_cache_age_ms == null and .event.executor.safety_snapshot_open_order_count == null and .event.executor.safety_snapshot_unresolved_position_count == null and .event.executor.safety_snapshot_unresolved_risk_reservation_count == null;
+        .event.executor.reconnect_reconciliation_required == false and .event.executor.risk_reservation_index_ready == true and
+        .event.executor.safety_snapshot_cache_ready == false and .event.executor.safety_snapshot_cache_age_ms == null and
+        .event.executor.safety_snapshot_open_order_count == null and .event.executor.safety_snapshot_unresolved_position_count == null and
+        .event.executor.safety_snapshot_unresolved_risk_reservation_count == null and .event.executor.safety_snapshot_cache_error == null;
       [split("\n")[] | fromjson? | select(type == "object") | . as $r | ($r.MESSAGE | fromjson?) as $e |
        select($e | type == "object") | {timestamp:(($r.__REALTIME_TIMESTAMP | tonumber) / 1000000),invocation:($r._SYSTEMD_INVOCATION_ID // ""),container:($r.CONTAINER_ID_FULL // ""),event:$e}] as $events |
       [$events[] | select(.invocation == $invocation and .container == $container and .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")] |
       sort_by(.timestamp) | last as $h |
-      ([ $events[] | select(.invocation == $invocation and .container == $container and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")))] | length) == 0 and
+      ([$events[] | select(.invocation == $invocation and .container == $container and .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_started" and .event.automatic_redemption_enabled == true)] | length) == 1 and
+      ([$events[] | select(.invocation == $invocation and .container == $container and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")))] | length) == 0 and
       $h != null and $h.timestamp <= $now and $h.timestamp >= ($now - 75) and
       (if $readiness == "ready" then ($h | ready) elif $readiness == "prestart" then ($h | ready or cold) else false end)'
 }
@@ -137,19 +152,35 @@ validate_evidence() {
     secure_file "$lifecycle_evidence" 640 65536 && [ "$(sha "$lifecycle_evidence")" = "$lifecycle_evidence_sha" ] &&
     jq -e '(.status == "validated" or .status == "succeeded") and (.azureDeletionAllowed? == false or .azureDeletionAuthorized? == false)' "$lifecycle_evidence" >/dev/null
 }
+validate_stopped_preflight() {
+  local now
+  now=$(date -u +%s)
+  secure_file "$stopped_preflight" 640 1048576 && [ "$(sha "$stopped_preflight")" = "$stopped_preflight_sha" ] &&
+    jq -e --argjson now "$now" '
+      .schema_version == 1 and .status == "nothing_to_redeem" and .dry_run == true and
+      .redemption_submitted == false and .zero_open_orders_confirmed == true and
+      .portfolio.redeemable_winner_count == 0 and .selection.selected_gross_payout == 0 and
+      (.selection.selected | type == "array" and length == 0) and
+      ((.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= ($now - 1800)) and
+      ((.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $now)
+    ' "$stopped_preflight" >/dev/null
+}
 restore_or_stop() {
   local rc=$?
   trap - EXIT HUP INT TERM
   rm -f "$tmp"
   if [ "$restart_attempted" = true ]; then
     "$systemctl" stop polyedge-funded-intent-producer.service >/dev/null 2>&1 || true
+    if [ "$stopped_restore" = true ]; then
+      "$systemctl" stop polyedge-funded-signer.service >/dev/null 2>&1 || true
+    fi
   elif [ "$producer_stopped" = true ]; then
     if [ "$producer_was_active" = true ] && [ "$restart_attempted" = false ] &&
       [ "$(identity polyedge-funded-signer 2>/dev/null || true)" = "$signer_image|$signer_user|running" ] &&
       [ "$(invocation polyedge-funded-signer 2>/dev/null || true)" = "$old_invocation" ] &&
       [ "$(container_id polyedge-funded-signer 2>/dev/null || true)" = "$old_container" ] &&
       binding_safe && [ "$(queue_snapshot 2>/dev/null || true)" = "$queue_before" ] && heartbeat_safe ready &&
-      "$systemctl" start polyedge-funded-intent-producer.service && producer_safe; then :
+      "$systemctl" start polyedge-funded-intent-producer.service && wait_producer; then :
     else "$systemctl" stop polyedge-funded-intent-producer.service >/dev/null 2>&1 || true; fi
   fi
   exit "$rc"
@@ -162,35 +193,50 @@ trap 'exit 143' TERM
 exec 9>"$lock_file"
 flock -n 9 || { echo 'another PolyEdge utility is active' >&2; exit 75; }
 secure_file "$0" 755 65536 || die 'guarded restart helper is unsafe'
+case "$allow_stopped" in true|false) :;; *) die 'POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED must be true or false';; esac
+if [ "$allow_stopped" = true ]; then
+  [ -n "$stopped_preflight" ] && printf '%s\n' "$stopped_preflight_sha" | grep -Eq '^[0-9a-f]{64}$' ||
+    die 'stopped restore requires an immutable preflight and SHA-256'
+fi
 validate_evidence || die 'prior rollout or lifecycle evidence is not the approved immutable success evidence'
 "$disk_guard" --assert-headroom
 [ ! -e "$pause_file" ] || die 'image pulls are paused'
 ! "$systemctl" is-active --quiet polyedge-parity-hourly.timer || die 'parity timer is active'
 token_safe || die 'funded signer token file is unsafe'
-producer_safe || die 'funded producer is not exactly healthy and configured'
-wait_signer ready || die 'funded signer is not exactly healthy and configured'
 queue_before=$(queue_snapshot) || die 'funded queue is unsafe'
-binding_safe || die 'funded binding is unresolved'
-old_invocation=$(invocation polyedge-funded-signer)
-old_container=$(container_id polyedge-funded-signer)
-printf '%s\n' "$old_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'invalid prior signer InvocationID'
-printf '%s\n' "$old_container" | grep -Eq '^[0-9a-f]{64}$' || die 'invalid prior signer container ID'
-producer_was_active=true
-
-"$systemctl" stop polyedge-funded-intent-producer.service
-producer_stopped=true
-! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'producer did not stop'
-[ "$(queue_snapshot)" = "$queue_before" ] || die 'queue changed after producer stop'
-binding_safe || die 'binding changed after producer stop'
-restart_attempted=true
-"$systemctl" restart polyedge-funded-signer.service
+if [ "$allow_stopped" = true ]; then
+  ! "$systemctl" is-active --quiet polyedge-funded-signer.service || die 'stopped restore requires an inactive signer'
+  ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'stopped restore requires an inactive producer'
+  validate_stopped_preflight || die 'stopped restore preflight is unsafe, stale, or incomplete'
+  stopped_restore=true
+  restart_attempted=true
+  "$systemctl" start polyedge-funded-signer.service
+else
+  producer_safe || die 'funded producer is not exactly healthy and configured'
+  wait_signer ready || die 'funded signer is not exactly healthy and configured'
+  binding_safe || die 'funded binding is unresolved'
+  old_invocation=$(invocation polyedge-funded-signer)
+  old_container=$(container_id polyedge-funded-signer)
+  printf '%s\n' "$old_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'invalid prior signer InvocationID'
+  printf '%s\n' "$old_container" | grep -Eq '^[0-9a-f]{64}$' || die 'invalid prior signer container ID'
+  producer_was_active=true
+  "$systemctl" stop polyedge-funded-intent-producer.service
+  producer_stopped=true
+  ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'producer did not stop'
+  [ "$(queue_snapshot)" = "$queue_before" ] || die 'queue changed after producer stop'
+  binding_safe || die 'binding changed after producer stop'
+  restart_attempted=true
+  "$systemctl" restart polyedge-funded-signer.service
+fi
 wait_signer prestart || die 'restarted signer is unsafe before producer restoration'
 new_invocation=$(invocation polyedge-funded-signer)
 new_container=$(container_id polyedge-funded-signer)
-[ "$new_invocation" != "$old_invocation" ] && [ "$new_container" != "$old_container" ] || die 'signer restart did not create a new runtime'
+if [ "$stopped_restore" = false ]; then
+  [ "$new_invocation" != "$old_invocation" ] && [ "$new_container" != "$old_container" ] || die 'signer restart did not create a new runtime'
+fi
 "$systemctl" start polyedge-funded-intent-producer.service
 producer_stopped=false
-producer_safe || die 'producer did not restore safely'
+wait_producer || die 'producer did not restore safely'
 producer_invocation=$(invocation polyedge-funded-intent-producer)
 printf '%s\n' "$producer_invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'invalid producer InvocationID'
 wait_signer ready || die 'signer did not become fully safe after producer restoration'
@@ -207,14 +253,17 @@ install -d -o "$expected_uid" -g "$expected_gid" -m 0750 "$activation"
 available=$(df -P -B1 / | awk 'NR == 2 {print $4}')
 [ "$available" -ge 16106127360 ] || die 'boot disk is below the guarded restart floor'
 tmp=$(mktemp "$activation/.guarded-restart.XXXXXX")
+start_mode=restart; [ "$stopped_restore" = false ] || start_mode=stopped_restore
 jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt" --arg prior_sha "sha256:$prior_receipt_sha" \
   --arg lifecycle "$lifecycle_evidence" --arg lifecycle_sha "sha256:$lifecycle_evidence_sha" --arg helper_sha "sha256:$(sha "$0")" \
   --arg old_invocation "$old_invocation" --arg old_container "$old_container" --arg new_invocation "$new_invocation" --arg new_container "$new_container" \
   --arg signer_image "$signer_image" --arg signer_user "$signer_user" --arg producer_image "$producer_image" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" \
+  --arg start_mode "$start_mode" --arg stopped_preflight "$stopped_preflight" --arg stopped_preflight_sha "$stopped_preflight_sha" \
   --argjson queue_before "$queue_before" --argjson queue_after "$queue_after" --argjson disk_available "$available" \
   '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:{path:$prior,sha256:$prior_sha},lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
-    signer:{image:$signer_image,user:$signer_user,oldInvocationId:$old_invocation,oldContainerId:$old_container,newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0},
-    producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:true,restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
+    startMode:$start_mode,stoppedPreflight:(if $start_mode == "stopped_restore" then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
+    signer:{image:$signer_image,user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0},
+    producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode == "restart"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
     unresolvedBindingRecords:0,disk:{availableBytes:$disk_available,minAvailableBytes:16106127360},parityTimerPaused:true,azureDeletionAuthorized:false}' >"$tmp"
 chown "$expected_uid:$expected_gid" "$tmp"
 chmod 0640 "$tmp"

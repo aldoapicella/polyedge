@@ -2,37 +2,43 @@
 set -euo pipefail
 umask 027
 
-readonly window=2026-08-24T08:00:00Z
-readonly collect_not_before=1787563080
-readonly enable_deadline=1787565600
-readonly ledger=/srv/polyedge-ring/parity/20260824T080000Z-funded-active.json
-readonly evidence=/srv/polyedge-ring/parity/hourly/20260824T08/evidence.json
+readonly window=2026-08-24T21:00:00Z
+readonly collect_not_before=1787609880
+readonly enable_deadline=1787612400
+readonly ledger=/srv/polyedge-ring/parity/20260824T210000Z-funded-active.json
+readonly evidence=/srv/polyedge-ring/parity/hourly/20260824T21/evidence.json
 readonly formal=/etc/polyedge/parity-hourly.env
 readonly hourly=/etc/polyedge/jobs/hourly.env
-readonly rollback=/etc/polyedge/rollback/20260824T080000Z-funded-active
+readonly rollback=/etc/polyedge/rollback/20260824T210000Z-funded-active
 readonly transaction=$rollback/env-transaction.json
-readonly staged=/srv/polyedge-ring/parity/activation/20260824T080000Z-staged.json
-readonly validated=/srv/polyedge-ring/parity/activation/20260824T080000Z-first-hour-validated.json
+readonly staged=/srv/polyedge-ring/parity/activation/20260824T210000Z-staged.json
+readonly validated=/srv/polyedge-ring/parity/activation/20260824T210000Z-first-hour-validated.json
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260824T083626Z-funded-signer-scaled-intent-rollout.json
-readonly rollout_receipt_sha=sha256:ed3db8e8911a352f0085e35f2c7445cb7d166e885431c359f710e72470313010
-readonly rollout_helper_sha=sha256:6ab340c63318c2cf40e481c06f89008c4adbe50fd0f49be5e0157d7a868b8ead
+readonly rollout=/srv/polyedge-ring/parity/activation/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json
+readonly rollout_receipt_sha=sha256:2d14048427e9bf81f83f357c57ae97c335278198e3ee5c05bbdf6191183ae928
+readonly rollout_helper_sha=sha256:b0588df04a92eb58d1e8727d61ef9a0b2ab8935336327f612ac89e7f455c27ab
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
-readonly authorized_dlq=1311
+readonly authorized_dlq=1338
+readonly signer_invocation_expected=1521d4e1402f4bd5aa66ae87648ac34b
+readonly signer_container_expected=8c6f40223ae383fcbf4e6eeb7b075188e12ca0eb43b73c81be033af8972b40af
+readonly producer_image_expected=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8
+readonly producer_revision_expected=72224c12d0790c02d98be7ece8fbcb781b6412e4
+readonly producer_invocation_expected=3571ebce1cef4f80aae3d220f138b030
+readonly producer_container_expected=f15f80000c562d2b6428454a071b8c7c0d401d5099bfb2c1b31be6242695c1e2
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:7a9dde3953c614b18b4781e78201ed310db6498dc4d35d22ff598fce2c843d29
+readonly collector_sha=sha256:c52a031ada01475b73a8f44678c11edcb70bfc7882a39d705f3925d09df7c20a
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:3f01cbf660523ab574bf434d065ba7b270de112ba08a6f39eb8f318339547eec
+readonly validator_sha=sha256:5c8fdf63369c1f31e8d13e37c8a175caa68a9295ba597b24d01ee926f102bd42
 readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
 readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
 readonly producer_env_binding_sha=sha256:8faa07c90246486bcd9e609924d85368a1e69ad85ca6961bb45af22ee46bbb9b
 readonly producer_mount_binding_sha=sha256:8f5f4dcf132460eed131e7a0d096d54d1cb1f972b8bd5b279700021ac1bc698e
-readonly old_formal_sha=41b0cbbd22adcb872a8005a1b9f5502733ad7c7bcf11ad160eb1d1e1d25cb8c8
-readonly old_hourly_sha=5a6b85b8ae29a62603e902e3da10e184c4d9c71a78cc8790b6426f79dd61059b
+readonly old_formal_sha=d67873339d719b1221b9e3de7057dc78ca9cda2d483a512e41ac02dbfa2574e9
+readonly old_hourly_sha=05fc245bb3225ff37f31a85b8935959019af63cc75c890bde57ae3f21daf607a
 
 formal_tmp=
 hourly_tmp=
@@ -52,9 +58,12 @@ secure_file() {
 
 validate_staged_receipt() {
   local staged_path=${1:-$staged} recovery_path=${2:-$recovery} rollout_path=${3:-$rollout} settlement_path=${4:-$settlement}
+  local staged_dlq
+  staged_dlq=$(/usr/bin/jq -er '.authorizedDeadLetterBaseline' "$rollout_path")
+  if test "$rollout_path" = "$rollout"; then test "$staged_dlq" = "$authorized_dlq"; fi
   /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" --arg recovery "$recovery_path" \
     --arg recovery_sha "sha256:$(sha "$recovery_path")" --arg settlement "$settlement_path" --arg settlement_sha "sha256:$(sha "$settlement_path")" \
-    --argjson dlq "$authorized_dlq" --arg rollout "$rollout_path" --arg rollout_sha "sha256:$(sha "$rollout_path")" \
+    --argjson dlq "$staged_dlq" --arg rollout "$rollout_path" --arg rollout_sha "sha256:$(sha "$rollout_path")" \
     --arg collector "$collector_sha" --arg validator "$validator_sha" '
       .schemaVersion == 1 and .status == "staged" and .windowStartUtc == $window and
       .ledger.path == $ledger and .recovery.path == $recovery and .recovery.sha256 == $recovery_sha and
@@ -152,10 +161,11 @@ commit_candidate_pair() {
 validate_first_hour_evidence() {
   local evidence_path=${1:-$evidence}
   local funded_user="$POLYEDGE_PARITY_FUNDED_UID:$POLYEDGE_PARITY_FUNDED_GID"
-  local signer_invocation signer_container producer_invocation
-  signer_invocation=$(/usr/bin/jq -er '.runtime.newInvocationId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
-  signer_container=$(/usr/bin/jq -er '.runtime.newContainerId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
-  producer_invocation=$(/usr/bin/jq -er '.runtime.producerInvocationId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
+  local signer_invocation signer_container producer_invocation producer_container
+  signer_invocation=$(/usr/bin/jq -er '.runtime.signer.invocationId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
+  signer_container=$(/usr/bin/jq -er '.runtime.signer.containerId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
+  producer_invocation=$(/usr/bin/jq -er '.runtime.producer.invocationId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
+  producer_container=$(/usr/bin/jq -er '.runtime.producer.containerId' "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT")
   /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" \
     --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
     --arg rollout "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT" \
@@ -170,7 +180,7 @@ validate_first_hour_evidence() {
     --arg producer_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256" \
     --arg producer_env_sha "$producer_env_binding_sha" --arg producer_mount_sha "$producer_mount_binding_sha" \
     --arg signer_invocation "$signer_invocation" --arg signer_container "$signer_container" \
-    --arg producer_invocation "$producer_invocation" \
+    --arg producer_invocation "$producer_invocation" --arg producer_container "$producer_container" \
     --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
     .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
     .hourStartUtc == $window and .ledgerPath == $ledger and
@@ -198,6 +208,7 @@ validate_first_hour_evidence() {
     .services.fundedRuntime.marketWarmedCount >= 1 and .services.fundedRuntime.processedMessagesDelta > 0 and
     .services.fundedRuntime.restartCount == 0 and
     .services.fundedIntentProducerRuntime.invocationId == $producer_invocation and
+    .services.fundedIntentProducerRuntime.containerId == $producer_container and
     .services.fundedIntentProducerRuntime.continuity.restartCount == 0 and
     .sameInput.deterministicResultExactMatch == true and
     .azureAuthoritative == true and .azureDeletionAllowed == false
@@ -264,28 +275,48 @@ test "$POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256" = "$validator_sha"
   .queueDeadLetterMessages == 1308 and .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
 ' "$recovery" >/dev/null
 /usr/bin/jq -e --arg image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
-  --arg recovery "$recovery" --arg recovery_sha "$recovery_receipt_sha" --arg settlement "$settlement" --arg settlement_sha "$settlement_receipt_sha" --arg helper "$rollout_helper_sha" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
-    .schema == "polyedge.funded_signer_scaled_intent_rollout.v1" and .status == "validated" and
-    .newImage == $image and .newRevision == $revision and (.newRevision | test("^[0-9a-f]{40}$")) and
-    (.runtime.newInvocationId | test("^[0-9a-f]{32}$")) and
-    (.runtime.newContainerId | test("^[0-9a-f]{64}$")) and
-    (.runtime.producerInvocationId | test("^[0-9a-f]{32}$")) and
-    .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and
-    .settlementReceipt == {path:$settlement,sha256:$settlement_sha} and
-    .authorizedDeadLetterBaseline == $dlq and .helperSha256 == $helper and
-    .producerStartedAfterSignerProof == true and .producerRestored == true and
-    .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
-      scheduledMessageCount:0,deadLetterMessageCount:$dlq} and .parityTimerRemainsPaused == true and
-    .azureDeletionAllowed == false
+  --arg producer_image "$producer_image_expected" --arg producer_revision "$producer_revision_expected" \
+  --arg helper "$rollout_helper_sha" --arg signer_invocation "$signer_invocation_expected" \
+  --arg signer_container "$signer_container_expected" --arg producer_invocation "$producer_invocation_expected" \
+  --arg producer_container "$producer_container_expected" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
+    .schema == "polyedge.funded_signer_post_redemption_attestation.v1" and .status == "attested" and
+    .helperSha256 == $helper and .authorizedDeadLetterBaseline == $dlq and
+    .runtime.signer.invocationId == $signer_invocation and .runtime.signer.containerId == $signer_container and
+    .runtime.signer.restartCount == 0 and .runtime.signer.image == $image and .runtime.signer.revision == $revision and
+    .runtime.signer.user == "986:982" and
+    .runtime.producer.invocationId == $producer_invocation and .runtime.producer.containerId == $producer_container and
+    .runtime.producer.restartCount == 0 and .runtime.producer.image == $producer_image and
+    .runtime.producer.revision == $producer_revision and .runtime.producer.user == "984:980" and
+    .runtime.producer.status == "running" and .runtime.producer.health == "healthy" and
+    (.redemption.transactionHash | test("^0x[0-9a-f]{64}$")) and
+    (.redemption.settlementBlob | type == "string" and length > 0) and
+    all(.evidence.liveSummary,.evidence.followUpDryRun,.evidence.internalSettlement;
+      (.path | type == "string" and length > 0) and (.sha256 | test("^sha256:[0-9a-f]{64}$"))) and
+    .heartbeat.failedMessages == 0 and .heartbeat.failedAttempts == 0 and
+    .heartbeat.executor.busy == false and .heartbeat.executor.user_channel_ready == true and
+    .heartbeat.executor.market_channel_ready == true and .heartbeat.executor.user_channel_gaps == 0 and
+    .heartbeat.executor.market_channel_gaps == 0 and .heartbeat.executor.user_channel_unparsed == 0 and
+    .heartbeat.executor.market_channel_unparsed == 0 and .heartbeat.executor.reconnect_reconciliation_required == false and
+    .heartbeat.executor.safety_snapshot_cache_ready == true and
+    .heartbeat.executor.safety_snapshot_open_order_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_position_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+    .heartbeat.executor.safety_snapshot_cache_error == null and .heartbeat.executor.risk_reservation_index_ready == true and
+    .queue.after == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+    .queue.deadLetterNonGrowth == true and .servicesMutated == false and .staleRecoveryReceiptsAccepted == false and
+    .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
   ' "$rollout" >/dev/null
 test "$(/usr/bin/podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer)" = "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE|986:982|running"
 test "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels \"org.opencontainers.image.revision\" }}' "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE")" = "linux/arm64|$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION"
-rollout_signer_invocation=$(/usr/bin/jq -er '.runtime.newInvocationId' "$rollout")
-rollout_signer_container=$(/usr/bin/jq -er '.runtime.newContainerId' "$rollout")
-rollout_producer_invocation=$(/usr/bin/jq -er '.runtime.producerInvocationId' "$rollout")
+rollout_signer_invocation=$(/usr/bin/jq -er '.runtime.signer.invocationId' "$rollout")
+rollout_signer_container=$(/usr/bin/jq -er '.runtime.signer.containerId' "$rollout")
+rollout_producer_invocation=$(/usr/bin/jq -er '.runtime.producer.invocationId' "$rollout")
+rollout_producer_container=$(/usr/bin/jq -er '.runtime.producer.containerId' "$rollout")
 test "$(/usr/bin/systemctl show polyedge-funded-signer.service -p InvocationID --value)" = "$rollout_signer_invocation"
 test "$(/usr/bin/podman inspect --format '{{.Id}}' polyedge-funded-signer)" = "$rollout_signer_container"
 test "$(/usr/bin/systemctl show polyedge-funded-intent-producer.service -p InvocationID --value)" = "$rollout_producer_invocation"
+test "$(/usr/bin/podman inspect --format '{{.Id}}' polyedge-funded-intent-producer)" = "$rollout_producer_container"
+test "$(/usr/bin/podman image inspect --format '{{ index .Labels \"org.opencontainers.image.revision\" }}' "$producer_image_expected")" = "$producer_revision_expected"
 queue_json=$(/usr/sbin/runuser -u ubuntu -- /usr/bin/az servicebus queue show --subscription "$subscription" --resource-group "$resource_group" --namespace-name "$namespace" --name "$queue" --only-show-errors -o json)
 /usr/bin/jq -e --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '.status == "Active" and
   .countDetails.activeMessageCount == 0 and .countDetails.scheduledMessageCount == 0 and
@@ -394,7 +425,7 @@ test "$(/usr/bin/date -u +%s)" -lt "$enable_deadline"
 ! /usr/bin/systemctl is-enabled --quiet polyedge-parity-hourly.timer
 ! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
 
-receipt_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/activation/.20260824T080000Z-first-hour.XXXXXX)
+receipt_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/activation/.20260824T210000Z-first-hour.XXXXXX)
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
   --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" --arg evidence "$evidence" \
   --arg evidenceSha "sha256:$(sha "$evidence")" --arg collectorSha "$collector_sha" --arg validatorSha "$validator_sha" '
