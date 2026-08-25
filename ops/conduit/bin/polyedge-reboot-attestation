@@ -797,7 +797,8 @@ token_state() {
   set -- $(stat -c '%u %g %a %h %s %Y' "$path")
   [ "$1" = "$uid" ] && [ "$2" = "$gid" ] && [ "$3" = 600 ] && [ "$4" = 1 ] \
     && [ "$5" -gt 0 ] && [ "$5" -le 65536 ] || die "token metadata is unsafe: $name"
-  age=$((now_epoch - $6))
+  token_now=$(date -u +%s)
+  age=$((token_now - $6))
   [ "$age" -ge 0 ] && [ "$age" -le 240 ] || die "token rotation is stale: $name"
   jq -nc --arg name "$name" --arg path "$path" --argjson uid "$1" --argjson gid "$2" \
     --argjson size "$5" --argjson modified "$6" --argjson age "$age" \

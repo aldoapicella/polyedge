@@ -168,6 +168,7 @@ done
 case "$path:$format" in
   "${FAKE_PRODUCER_TOKEN_DIR}:%u %g %a") printf '%s\n' '984 980 700' ;;
   "${FAKE_PRODUCER_TOKEN_PATH}:%u %g %a %h %s %Y")
+    sleep "${FAKE_PRODUCER_TOKEN_STAT_DELAY:-0}"
     printf '984 980 600 1 21 %s\n' "$(date -u +%s)"
     ;;
   *) exec /usr/bin/stat -c "$format" "$path" ;;
@@ -299,6 +300,7 @@ run_attestor() {
     FAKE_FRONTEND_IMAGE="${FAKE_FRONTEND_IMAGE:-}" FAKE_PRODUCER_IMAGE="${FAKE_PRODUCER_IMAGE:-}" \
     FAKE_PRODUCER_QUEUED="${FAKE_PRODUCER_QUEUED:-0}" FAKE_PRODUCER_PREPARED="${FAKE_PRODUCER_PREPARED:-true}" \
     FAKE_PRODUCER_STATUS_DELAY="${FAKE_PRODUCER_STATUS_DELAY:-0}" \
+    FAKE_PRODUCER_TOKEN_STAT_DELAY="${FAKE_PRODUCER_TOKEN_STAT_DELAY:-0}" \
     FAKE_PRODUCER_RUN_BOT="${FAKE_PRODUCER_RUN_BOT:-true}" FAKE_PRODUCER_MOUNT_RW="${FAKE_PRODUCER_MOUNT_RW:-false}" \
     "$attestor" "$1"
 }
@@ -315,7 +317,7 @@ fi
 jq '.rebootRecoveryPassed = false | del(.rebootRecovery)' "$ledger" >"$raw"
 chmod 0640 "$raw"
 mv "$raw" "$ledger"
-FAKE_PRODUCER_STATUS_DELAY=1 run_attestor validate-ledger
+FAKE_PRODUCER_STATUS_DELAY=1 FAKE_PRODUCER_TOKEN_STAT_DELAY=1 run_attestor validate-ledger
 cp "$rollout" "$rollout.valid"
 jq '.queue.deadLetterMessageCount += 1' "$rollout" >"$rollout.drift"
 chmod 0640 "$rollout.drift"
