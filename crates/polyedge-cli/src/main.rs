@@ -46,6 +46,7 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 const LEGACY_RING_BLOB_PREFIX: &str = "events-oci-dual";
+const AZURE_LEASE_RENEWAL_SAFETY_MARGIN_SECONDS: u64 = 10;
 const RING_QUARANTINE_BLOB_PREFIX: &str =
     "events-oci-quarantine-v1/invalid-recorder-sequence-proof";
 const MAX_RING_QUARANTINE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
@@ -1643,9 +1644,7 @@ fn run_with_azure_lease(
     if !(15..=60).contains(&lease_seconds) {
         bail!("lease-seconds must be between 15 and 60");
     }
-    if renew_seconds == 0 || renew_seconds >= u64::from(lease_seconds) {
-        bail!("renew-seconds must be positive and shorter than lease-seconds");
-    }
+    let renewal_deadline = lease_renewal_deadline(lease_seconds, renew_seconds)?;
     let executable = command
         .first()
         .filter(|value| !value.trim().is_empty())
@@ -1721,11 +1720,6 @@ fn run_with_azure_lease(
             thread::spawn(move || {
                 let _ = renew_tx.send(renew_client.renew_blob_lease(&renew_blob, &renew_lease_id));
             });
-            let renewal_deadline = StdDuration::from_secs(
-                u64::from(lease_seconds)
-                    .saturating_sub(renew_seconds)
-                    .min(10),
-            );
             let renewal = renew_rx.recv_timeout(renewal_deadline);
             match renewal {
                 Ok(Ok(true)) => last_renewed = Instant::now(),
@@ -1779,6 +1773,16 @@ fn run_with_azure_lease(
         "blob": blob,
         "child_status": child_status.code()
     }))
+}
+
+fn lease_renewal_deadline(lease_seconds: u32, renew_seconds: u64) -> Result<StdDuration> {
+    let renewal_budget = u64::from(lease_seconds)
+        .saturating_sub(renew_seconds)
+        .saturating_sub(AZURE_LEASE_RENEWAL_SAFETY_MARGIN_SECONDS);
+    if renew_seconds == 0 || renewal_budget == 0 {
+        bail!("renew-seconds must be positive and leave a 10-second lease-expiry margin");
+    }
+    Ok(StdDuration::from_secs(renewal_budget))
 }
 
 fn terminate_lease_child_tree(child: &mut Child) {
@@ -3969,7 +3973,7 @@ fn profitability_authorization_flags(
 #[cfg(test)]
 mod tests {
     use super::{
-        accepted_ring_blob_prefix, prepare_ring_quarantine_resolution,
+        accepted_ring_blob_prefix, lease_renewal_deadline, prepare_ring_quarantine_resolution,
         profitability_authorization_flags, publish_local_ring_quarantine_resolution,
         qset_v2_inventory_sha256, recover_ring_quarantine_staging, ring_blob_name,
         ring_relative_path, ring_sha256, sha256_prefixed, terminate_lease_child_tree,
@@ -4980,6 +4984,20 @@ mod tests {
                 "--test-child-argument"
             ]
         );
+    }
+
+    #[test]
+    fn azure_lease_renewal_deadline_reserves_expiry_margin() {
+        assert_eq!(
+            lease_renewal_deadline(60, 20).expect("production defaults are valid"),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            lease_renewal_deadline(15, 4).expect("minimum bounded lease is valid"),
+            std::time::Duration::from_secs(1)
+        );
+        assert!(lease_renewal_deadline(15, 5).is_err());
+        assert!(lease_renewal_deadline(60, 0).is_err());
     }
 
     #[test]
