@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../../.." && pwd); script="$root/ops/conduit/bin/polyedge-funded-signer-post-redemption-rollout-20260824"
-bash -n "$script"; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; mkdir -p "$tmp/bin" "$tmp/out" "$tmp/out-gap" "$tmp/out-bad" "$tmp/out-alert"
+bash -n "$script"; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT; mkdir -p "$tmp/bin" "$tmp/out" "$tmp/out-live-noop" "$tmp/out-gap" "$tmp/out-bad" "$tmp/out-alert"
 for n in systemctl podman journalctl runuser az guard; do : >"$tmp/bin/$n"; chmod 755 "$tmp/bin/$n"; done
 cat >"$tmp/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -40,6 +40,9 @@ EOF
 run(){ env POLYEDGE_TEST_ALLOW_UNPRIVILEGED=1 POLYEDGE_TEST_SYSTEMCTL="$tmp/bin/systemctl" POLYEDGE_TEST_PODMAN="$tmp/bin/podman" POLYEDGE_TEST_JOURNALCTL="$tmp/bin/journalctl" POLYEDGE_TEST_RUNUSER="$tmp/bin/runuser" POLYEDGE_TEST_AZ="$tmp/bin/az" POLYEDGE_TEST_DISK_GUARD="$tmp/bin/guard" POLYEDGE_TEST_UID="$(id -u)" POLYEDGE_TEST_GID="$(id -g)" POLYEDGE_TEST_LOCK_FILE="$tmp/lock" POLYEDGE_POST_REDEMPTION_RUN_ID=venue-redemption-20260824182234412-7ef7b79f POLYEDGE_POST_REDEMPTION_TRANSACTION_HASH=0x676417d72ea63cb7346569caf8d1b2585332a5be97506919aba5e9ed4b51ded1 POLYEDGE_POST_REDEMPTION_CONDITION_ID=0xe79defc301b116f6f911912194a98e4d88be1d37dd37d5ff27be85dc4795600b POLYEDGE_POST_REDEMPTION_SETTLEMENT_BLOB=reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/internal-settlements/ef2057fff0b51ea73541efdd05bf378c18249c51b4bc9f72bcb774d5b9008e37.json POLYEDGE_POST_REDEMPTION_FRESH_AFTER=2026-08-24T18:22:34Z POLYEDGE_POST_REDEMPTION_HEALTH_AFTER="$(date -u -d '60 seconds ago' +%Y-%m-%dT%H:%M:%SZ)" POLYEDGE_POST_REDEMPTION_LIQUID_BEFORE=26.171637 POLYEDGE_POST_REDEMPTION_LIQUID_AFTER=31.171637 POLYEDGE_POST_REDEMPTION_PAYOUT=5 POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY="$tmp/live" POLYEDGE_POST_REDEMPTION_DRY_RUN="$tmp/dry" POLYEDGE_POST_REDEMPTION_SETTLEMENT="$tmp/settlement" POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR="$1" "$script"; }
 run "$tmp/out" >/dev/null
 receipt="$tmp/out/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json"; /usr/bin/jq -e '.status=="attested" and (.helperSha256|test("^sha256:[0-9a-f]{64}$")) and .authorizedDeadLetterBaseline==7 and .runtime.signer.restartCount==0 and .runtime.producer.revision=="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and .runtime.producer.status=="running" and .heartbeat.automaticRedemptionEnabled==true and (.heartbeat.healthBaselineAtEpoch|type=="number") and .heartbeat.redemptionFailures==0 and .evidence.liveSummary.path != null and .servicesMutated==false' "$receipt" >/dev/null
+sed -i 's/"dry_run":true/"dry_run":false,"redemption_enabled":true/' "$tmp/dry"
+run "$tmp/out-live-noop" >/dev/null
+sed -i 's/"dry_run":false,"redemption_enabled":true/"dry_run":true/' "$tmp/dry"
 sed -i 's/"market_channel_gaps":0/"market_channel_gaps":1/' "$tmp/bin/journalctl"
 if run "$tmp/out-gap" >/dev/null 2>&1; then echo "websocket gap unexpectedly attested" >&2; exit 1; fi
 sed -i 's/"market_channel_gaps":1/"market_channel_gaps":0/' "$tmp/bin/journalctl"
