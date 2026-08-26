@@ -1082,3 +1082,51 @@ test("persistent service pauses after three consecutive transitions above the re
   assert.deepEqual(bus.received, ["decision-0", "decision-1", "decision-2", "decision-3"]);
   assert.deepEqual(bus.deadLettered, ["decision-3"]);
 });
+
+test("persistent service uses the streaming receiver without SDK batch-drain polling", async () => {
+  const message = {
+    messageId: "streaming-intent",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: "f".repeat(64),
+      decision_ts: new Date(Date.now() - 500).toISOString()
+    }
+  };
+  let subscribeOptions;
+  let subscriptionClosed = false;
+  let completed = false;
+  let handlerPromise;
+  const receiver = {
+    subscribe(handlers, options) {
+      subscribeOptions = options;
+      queueMicrotask(() => { handlerPromise = handlers.processMessage(message); });
+      return { async close() { subscriptionClosed = true; } };
+    },
+    async receiveMessages() { throw new Error("batch receiver must not be used"); },
+    async completeMessage() { completed = true; },
+    async abandonMessage() {},
+    async deadLetterMessage() {},
+    async close() { await handlerPromise; }
+  };
+  const logs = [];
+  const result = await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    createBusClient: () => ({ createReceiver: () => receiver, async close() {} }),
+    createExecutor: async () => ({
+      warmMarket: async () => {}, execute: async () => {}, status: () => ({ ready: true }), close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => ({ status: "child_failed_closed_pre_submission" }),
+      rejectBusy: async () => ({ status: "one_workflow_busy" })
+    }),
+    logger: (value) => logs.push(value)
+  });
+
+  assert.equal(result.processed_messages, 1);
+  assert.equal(completed, true);
+  assert.equal(subscriptionClosed, true);
+  assert.deepEqual(subscribeOptions, { autoCompleteMessages: false, maxConcurrentCalls: 5 });
+  assert.equal(logs.find((value) => value.status === "persistent_service_started")?.handoff,
+    "azure_service_bus_streaming_peek_lock");
+});

@@ -12,6 +12,48 @@ import { sanitize } from "./lib.mjs";
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
 const FUNDED_BUSY_VALIDATION_LIMIT = 4;
 
+function createStreamingInbox(receiver, processError) {
+  const pending = [];
+  const waiters = [];
+  const deliver = (entry) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(entry);
+    else pending.push(entry);
+  };
+  const subscription = receiver.subscribe({
+    processMessage: (message) => new Promise((release) => deliver({ message, release })),
+    processError
+  }, {
+    autoCompleteMessages: false,
+    maxConcurrentCalls: FUNDED_BUSY_VALIDATION_LIMIT + 1
+  });
+  return {
+    receive(maxWaitTimeInMs) {
+      if (pending.length) return Promise.resolve(pending.shift());
+      return new Promise((resolve) => {
+        let timer;
+        const waiter = (entry) => {
+          clearTimeout(timer);
+          resolve(entry);
+        };
+        waiters.push(waiter);
+        timer = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          resolve(null);
+        }, maxWaitTimeInMs);
+      });
+    },
+    async stop() {
+      await subscription.close();
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    drain() {
+      return pending.splice(0);
+    }
+  };
+}
+
 export function loadFundedDirectServiceConfig(env = process.env) {
   const config = {
     enabled: env.FUNDED_DIRECT_SERVICE_ENABLED === "true",
@@ -210,11 +252,21 @@ export async function runPersistentFundedDirectService({
   const stop = () => { stopping = true; };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
+  const streaming = typeof receiver.subscribe === "function"
+    ? createStreamingInbox(receiver, async (args) => logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "service_bus_receiver_error",
+        account_risk_pause: true,
+        error_source: args?.errorSource || null,
+        error: safeErrorMessage(args?.error),
+        error_detail: safeErrorProjection(args?.error)
+      }))
+    : null;
   logger({
     schema: "polyedge.funded_direct_service.v2",
     status: "persistent_service_started",
     engine: config.engine,
-    handoff: "azure_service_bus_peek_lock",
+    handoff: streaming ? "azure_service_bus_streaming_peek_lock" : "azure_service_bus_peek_lock",
     queue: config.serviceBusQueue,
     poll_interval_ms: config.pollIntervalMs,
     signal_to_send_slo_ms: config.signalToSendSloMs,
@@ -339,19 +391,23 @@ export async function runPersistentFundedDirectService({
     }
   };
   const settleStoppedMessage = async (entry) => {
-    const settlement = await settleFailure(entry, {
-      terminal: true,
-      reason: "FundedServiceStopping",
-      description: "Funded service stopped before this locked message could be processed."
-    });
-    logger({
-      schema: "polyedge.funded_direct_service.v2",
-      status: "persistent_message_stopped_fail_closed",
-      message_id: entry.message.messageId || null,
-      delivery_count: entry.message.deliveryCount || 0,
-      ...settlement,
-      broker_redelivery_expected: settlement.terminal_failure !== true
-    });
+    try {
+      const settlement = await settleFailure(entry, {
+        terminal: true,
+        reason: "FundedServiceStopping",
+        description: "Funded service stopped before this locked message could be processed."
+      });
+      logger({
+        schema: "polyedge.funded_direct_service.v2",
+        status: "persistent_message_stopped_fail_closed",
+        message_id: entry.message.messageId || null,
+        delivery_count: entry.message.deliveryCount || 0,
+        ...settlement,
+        broker_redelivery_expected: settlement.terminal_failure !== true
+      });
+    } finally {
+      entry.release?.();
+    }
   };
   const failMessage = async (entry, error) => {
     const errorText = safeErrorMessage(error);
@@ -387,7 +443,8 @@ export async function runPersistentFundedDirectService({
     });
   };
   const processIntent = async (entry, busy) => {
-    const { message, body, queueReceiveMonotonicMs } = entry;
+    try {
+      const { message, body, queueReceiveMonotonicMs } = entry;
       const receivedWallMs = Date.now();
       let result;
       try {
@@ -459,6 +516,9 @@ export async function runPersistentFundedDirectService({
         stopping = true;
         logger({ schema: "polyedge.funded_direct_alert.v1", status: "engine_paused_by_consecutive_latency_breaches", decision_id: body.decision_id, consecutive_transitions_above_slo: consecutiveLatencyBreaches, signal_to_send_slo_ms: config.signalToSendSloMs, account_risk_pause: true });
       }
+    } finally {
+      entry.release?.();
+    }
   };
   const processWarmup = async (entry) => {
     const { message, body } = entry;
@@ -477,6 +537,8 @@ export async function runPersistentFundedDirectService({
       logger({ schema: "polyedge.funded_direct_service.v2", status: "market_warmed", message_id: message.messageId || null, market_id: body.market_id, token_id: body.token_id });
     } catch (error) {
       await failMessage(entry, error);
+    } finally {
+      entry.release?.();
     }
   };
   let activeWorkflow = null;
@@ -520,18 +582,21 @@ export async function runPersistentFundedDirectService({
         await Promise.race([activeWorkflow, ...busyValidations].filter(Boolean));
         continue;
       }
-      const messages = await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs });
-      if (!messages.length) {
+      const incoming = streaming
+        ? await streaming.receive(config.pollIntervalMs)
+        : (await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs }))[0] || null;
+      if (!incoming) {
         maybeStartAutomaticRedemption();
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
-      const message = messages[0];
+      const message = incoming.message || incoming;
       const entry = {
         message,
         body: null,
         bodyError: null,
-        queueReceiveMonotonicMs: performance.now()
+        queueReceiveMonotonicMs: performance.now(),
+        release: incoming.release || null
       };
       try {
         entry.body = parseMessageBody(message.body);
@@ -569,6 +634,7 @@ export async function runPersistentFundedDirectService({
         continue;
       }
       await failMessage(entry, entry.bodyError || new Error("fail closed: unsupported funded intent handoff schema"));
+      entry.release?.();
       continue;
     }
     await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
@@ -585,6 +651,10 @@ export async function runPersistentFundedDirectService({
     };
   } finally {
     stopping = true;
+    if (streaming) {
+      await streaming.stop().catch(() => null);
+      for (const entry of streaming.drain()) await settleStoppedMessage(entry);
+    }
     await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
     clearInterval(heartbeat);
     process.removeListener("SIGTERM", stop);
