@@ -245,6 +245,9 @@ async function run() {
     }))
   });
 
+  if (selection.selected.length && hasUnselectedUnresolvedRiskReservations(unresolvedReservations, selection)) {
+    return baseSummary("redemption_deferred_unrelated_unresolved_reservation", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
+  }
   if (!selection.selected.length) {
     return baseSummary("nothing_to_redeem", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
   }
@@ -279,6 +282,9 @@ async function run() {
       enabled: config.dustRedemptionEnabled
     }));
   assertStableRedemptionSelection(selection, finalSelection);
+  if (hasUnselectedUnresolvedRiskReservations(finalReservations, finalSelection)) {
+    return baseSummary("redemption_deferred_unrelated_unresolved_reservation", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
+  }
 
   const control = {
     schema_version: 1,
@@ -1056,6 +1062,12 @@ export function assertStableRedemptionSelection(initial, final) {
   if (JSON.stringify(final?.selected) !== JSON.stringify(initial?.selected)) {
     throw new Error("fail closed: redeemable position set changed after preflight");
   }
+}
+
+export function hasUnselectedUnresolvedRiskReservations(records, selection) {
+  const selected = new Set((selection?.selected || []).map((row) => String(row.condition_id || "").toLowerCase()));
+  return (records || []).some((record) =>
+    !selected.has(String(record?.reservation?.condition_id || "").toLowerCase()));
 }
 
 export async function fetchGammaMarket(marketId, { fetchImpl = fetch } = {}) {

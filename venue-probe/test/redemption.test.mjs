@@ -16,6 +16,7 @@ import {
   discoverOnchainRedeemableConditions,
   expectedRecoveredAdapterApprovals,
   fetchGammaMarket,
+  hasUnselectedUnresolvedRiskReservations,
   persistCanonicalRecoveryJournal,
   putCanonicalRecoveryJournal,
   recoveryEvidenceOwnershipAfterResume,
@@ -457,6 +458,17 @@ test("redemption uses the current Polymarket collateral adapters", () => {
 
 test("redemption uses the documented ten-minute relayer deadline buffer", () => {
   assert.equal(RELAYER_DEADLINE_BUFFER_SECONDS, 600);
+});
+
+test("redemption defers while an unrelated reservation remains unresolved", () => {
+  const selection = { selected: [{ condition_id: conditionA }] };
+  assert.equal(hasUnselectedUnresolvedRiskReservations([
+    { reservation: { condition_id: conditionA } }
+  ], selection), false);
+  assert.equal(hasUnselectedUnresolvedRiskReservations([
+    { reservation: { condition_id: conditionA } },
+    { reservation: { condition_id: conditionB } }
+  ], selection), true);
 });
 
 const safeEnv = {
