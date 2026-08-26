@@ -10,6 +10,7 @@ old=ghcr.io/example/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 new=ghcr.io/example/polyedge-rust-backend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 next=ghcr.io/example/polyedge-rust-backend@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 signer=ghcr.io/example/polyedge-venue-probe@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+signer_next=ghcr.io/example/polyedge-venue-probe@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 printf '[Container]\nImage=%s\nContainerName=polyedge-api\n' "$old" >"$tmp/quadlets/polyedge-api.container"
 printf '[Container]\nImage=%s\nContainerName=polyedge-shadow-qset\n' "$old" >"$tmp/quadlets/polyedge-shadow-qset.container"
 printf '[Container]\nImage=%s\nContainerName=polyedge-funded-intent-producer\n' "$old" >"$tmp/quadlets/polyedge-funded-intent-producer.container"
@@ -19,6 +20,7 @@ printf '%s\n' '#!/bin/sh' 'set -eu' 'printf "%s\\n" "$*" >>"$TEST_LOG"' \
   'case "$1 $2" in' "  'image inspect') printf 'linux/arm64\\n' ;;" \
   "  'inspect --type') printf 'true %s %s\\n' \"\$TEST_IMAGE_ID\" \"\$TEST_IMAGE\" ;;" 'esac' >"$tmp/bin/podman"
 printf '%s\n' '#!/bin/sh' 'set -eu' 'printf "%s\\n" "$*" >>"$TEST_LOG"' >"$tmp/bin/systemctl"
+printf '%s\n' '[ "$1" != is-active ] || exit 3' >>"$tmp/bin/systemctl"
 printf '%s\n' '#!/bin/sh' 'set -eu' 'printf "disk %s\\n" "$*" >>"$TEST_LOG"' >"$tmp/bin/disk-guard"
 chmod +x "$tmp/bin/podman" "$tmp/bin/systemctl" "$tmp/bin/disk-guard"
 
@@ -27,6 +29,7 @@ run() {
   running_image=$2
   timestamp=$3
   unit=${4:-polyedge-api}
+  leave_stopped=${5:-false}
   TEST_LOG="$tmp/log" TEST_IMAGE_ID=linux/arm64 TEST_IMAGE="$running_image" \
     POLYEDGE_TEST_ALLOW_UNPRIVILEGED=1 \
     POLYEDGE_QUADLET_DIR="$tmp/quadlets" \
@@ -35,6 +38,7 @@ run() {
     POLYEDGE_SYSTEMCTL="$tmp/bin/systemctl" \
     POLYEDGE_DISK_GUARD="$tmp/bin/disk-guard" \
     POLYEDGE_DEPLOY_TIMESTAMP="$timestamp" \
+    POLYEDGE_DEPLOY_LEAVE_STOPPED="$leave_stopped" \
     "$root/bin/polyedge-quadlet-deploy" "$unit" "$image"
 }
 
@@ -48,6 +52,12 @@ grep -Fx 'restart polyedge-api.service' "$tmp/log" >/dev/null
 
 run "$signer" "$signer" 20260805T000002Z polyedge-funded-signer
 grep -Fx "Image=$signer" "$tmp/quadlets/polyedge-funded-signer.container" >/dev/null
+
+run "$signer_next" "$signer_next" 20260805T000003Z polyedge-funded-signer true
+grep -Fx "Image=$signer_next" "$tmp/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fx "Image=$signer" "$tmp/rollback/20260805T000003Z-polyedge-funded-signer.container" >/dev/null
+grep -Fx 'is-active --quiet polyedge-funded-signer.service' "$tmp/log" >/dev/null
+test "$(grep -c '^restart polyedge-funded-signer.service$' "$tmp/log")" -eq 1
 
 run "$next" "$next" 20260805T000004Z polyedge-shadow-qset
 grep -Fx "Image=$next" "$tmp/quadlets/polyedge-shadow-qset.container" >/dev/null

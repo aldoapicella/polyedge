@@ -49,6 +49,8 @@ repair_failed_messages=${POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_MESSAGES:-0}
 repair_failed_attempts=${POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_ATTEMPTS:-0}
 stopped_preflight=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT:-}
 stopped_preflight_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256:-}
+stopped_binding=${POLYEDGE_GUARDED_RESTART_STOPPED_BINDING:-}
+stopped_binding_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256:-}
 
 printf '%s\n' "$signer_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' || { echo 'signer image must be immutable' >&2; exit 64; }
 printf "%s\n" "$prior_signer_image" | grep -Eq "^.+@sha256:[0-9a-f]{64}$" || { echo "prior signer image must be immutable" >&2; exit 64; }
@@ -188,6 +190,19 @@ validate_repair_evidence() {
     jq -e --arg invocation "$old_invocation" --arg container "$old_container" --arg image "$prior_signer_image" ".schema == \"polyedge.funded_signer_post_redemption_attestation.v1\" and .status == \"attested\" and .runtime.signer.invocationId == \$invocation and .runtime.signer.containerId == \$container and .runtime.signer.image == \$image" "$lifecycle_evidence" >/dev/null
 }
 
+validate_stopped_repair_evidence() {
+  jq -se --arg image "$prior_signer_image" '
+    .[0] as $prior | .[1] as $lifecycle |
+    $prior.status == "validated" and $prior.signer.image == $image and
+    ($prior.signer.newInvocationId | test("^[0-9a-f]{32}$")) and
+    ($prior.signer.newContainerId | test("^[0-9a-f]{64}$")) and
+    $lifecycle.schema == "polyedge.funded_signer_post_redemption_attestation.v1" and
+    $lifecycle.status == "attested" and $lifecycle.runtime.signer.image == $image and
+    $lifecycle.runtime.signer.invocationId == $prior.signer.newInvocationId and
+    $lifecycle.runtime.signer.containerId == $prior.signer.newContainerId
+  ' "$prior_receipt" "$lifecycle_evidence" >/dev/null
+}
+
 validate_stopped_preflight() {
   local now
   now=$(date -u +%s)
@@ -200,6 +215,17 @@ validate_stopped_preflight() {
       ((.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= ($now - 1800)) and
       ((.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $now)
     ' "$stopped_preflight" >/dev/null
+}
+validate_stopped_binding() {
+  local now
+  now=$(date -u +%s)
+  secure_file "$stopped_binding" 640 65536 && [ "$(sha "$stopped_binding")" = "$stopped_binding_sha" ] &&
+    jq -e --argjson now "$now" '
+      .schema == "polyedge.funded_stopped_binding.v1" and .status == "verified_zero" and
+      .readOnly == true and .unresolvedRiskReservationCount == 0 and .records == [] and
+      ((.createdAtUtc | fromdateiso8601) >= ($now - 1800)) and
+      ((.createdAtUtc | fromdateiso8601) <= $now)
+    ' "$stopped_binding" >/dev/null
 }
 restore_or_stop() {
   local rc=$?
@@ -239,13 +265,14 @@ case "$repair_failed_messages" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REP
 case "$repair_failed_attempts" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_ATTEMPTS must be a non-negative integer';; esac
 [ "$prior_signer_image" = "$signer_image" ] || [ "$repair_mode" = true ] || die "signer image changes require explicit repair mode"
 if [ "$repair_mode" = true ]; then
-  [ "$allow_stopped" = false ] && [ "$prior_signer_image" != "$signer_image" ] || die "repair mode requires a running prior signer and a new image"
+  [ "$prior_signer_image" != "$signer_image" ] || die "repair mode requires a new image"
   image_changed=true
-  preflight_readiness=repair
+  [ "$allow_stopped" = true ] || preflight_readiness=repair
 fi
 if [ "$allow_stopped" = true ]; then
-  [ -n "$stopped_preflight" ] && printf '%s\n' "$stopped_preflight_sha" | grep -Eq '^[0-9a-f]{64}$' ||
-    die 'stopped restore requires an immutable preflight and SHA-256'
+  [ -n "$stopped_preflight" ] && [ -n "$stopped_binding" ] &&
+    printf '%s\n' "$stopped_preflight_sha$stopped_binding_sha" | grep -Eq '^[0-9a-f]{128}$' ||
+    die 'stopped restore requires immutable redemption and binding preflights with SHA-256 values'
 fi
 validate_evidence || die 'prior rollout or lifecycle evidence is not the approved immutable success evidence'
 "$disk_guard" --assert-headroom
@@ -264,8 +291,21 @@ if [ "$allow_stopped" = true ]; then
   ! "$systemctl" is-active --quiet polyedge-funded-signer.service || die 'stopped restore requires an inactive signer'
   ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'stopped restore requires an inactive producer'
   validate_stopped_preflight || die 'stopped restore preflight is unsafe, stale, or incomplete'
+  validate_stopped_binding || die 'stopped restore binding proof is unsafe, stale, or incomplete'
+  if [ "$image_changed" = true ]; then
+    validate_stopped_repair_evidence || die 'stopped repair evidence does not bind the exact last signer runtime'
+    old_invocation=$(jq -er '.signer.newInvocationId' "$prior_receipt")
+    old_container=$(jq -er '.signer.newContainerId' "$prior_receipt")
+  fi
   stopped_restore=true
   restart_attempted=true
+  if [ "$image_changed" = true ]; then
+    deploy_output=$(POLYEDGE_DEPLOY_LEAVE_STOPPED=true POLYEDGE_ROLLBACK_DIR="$rollback_dir" "$deploy" polyedge-funded-signer "$signer_image")
+    candidate_rollback=${deploy_output##*rollback copy: }
+    case "$candidate_rollback" in "$rollback_dir"/*) :;; *) die 'deploy did not return the expected rollback copy';; esac
+    secure_file "$candidate_rollback" 600 65536 || die 'signer rollback copy is unsafe'
+    rollback_copy=$candidate_rollback
+  fi
   "$systemctl" start polyedge-funded-signer.service
 else
   producer_safe || die 'funded producer is not exactly healthy and configured'
@@ -298,7 +338,7 @@ wait_signer prestart "$signer_image" || die 'restarted signer is unsafe before p
 [ "$(image_metadata "$signer_image" 2>/dev/null || true)" = "linux/arm64|$signer_revision" ] || die "running signer image metadata is wrong"
 new_invocation=$(invocation polyedge-funded-signer)
 new_container=$(container_id polyedge-funded-signer)
-if [ "$stopped_restore" = false ]; then
+if [ "$stopped_restore" = false ] || [ "$image_changed" = true ]; then
   [ "$new_invocation" != "$old_invocation" ] && [ "$new_container" != "$old_container" ] || die 'signer restart did not create a new runtime'
 fi
 "$systemctl" start polyedge-funded-intent-producer.service
@@ -320,18 +360,25 @@ install -d -o "$expected_uid" -g "$expected_gid" -m 0750 "$activation"
 available=$(df -P -B1 / | awk 'NR == 2 {print $4}')
 [ "$available" -ge 16106127360 ] || die 'boot disk is below the guarded restart floor'
 tmp=$(mktemp "$activation/.guarded-restart.XXXXXX")
-start_mode=restart; [ "$image_changed" = false ] || start_mode=repair_rollout; [ "$stopped_restore" = false ] || start_mode=stopped_restore
+start_mode=restart
+if [ "$stopped_restore" = true ] && [ "$image_changed" = true ]; then start_mode=stopped_repair_rollout
+elif [ "$stopped_restore" = true ]; then start_mode=stopped_restore
+elif [ "$image_changed" = true ]; then start_mode=repair_rollout
+fi
 jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt" --arg prior_sha "sha256:$prior_receipt_sha" \
   --arg lifecycle "$lifecycle_evidence" --arg lifecycle_sha "sha256:$lifecycle_evidence_sha" --arg helper_sha "sha256:$(sha "$0")" \
   --arg old_invocation "$old_invocation" --arg old_container "$old_container" --arg new_invocation "$new_invocation" --arg new_container "$new_container" \
   --arg signer_image "$signer_image" --arg prior_signer_image "$prior_signer_image" --arg signer_revision "$signer_revision" --arg rollback_copy "$rollback_copy" --arg signer_user "$signer_user" --arg producer_image "$producer_image" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" \
   --arg start_mode "$start_mode" --arg stopped_preflight "$stopped_preflight" --arg stopped_preflight_sha "$stopped_preflight_sha" \
+  --arg stopped_binding "$stopped_binding" --arg stopped_binding_sha "$stopped_binding_sha" \
   --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" \
   --argjson queue_before "$queue_before" --argjson queue_after "$queue_after" --argjson disk_available "$available" \
   '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:{path:$prior,sha256:$prior_sha},lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
-    startMode:$start_mode,stoppedPreflight:(if $start_mode == "stopped_restore" then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
-    signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode == "repair_rollout"),priorFailedMessages:(if $start_mode == "repair_rollout" then $repair_failed_messages else null end),priorFailedAttempts:(if $start_mode == "repair_rollout" then $repair_failed_attempts else null end),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
-    producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode != "stopped_restore"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
+    startMode:$start_mode,
+    stoppedPreflight:(if ($start_mode | startswith("stopped_")) then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
+    stoppedBinding:(if ($start_mode | startswith("stopped_")) then {path:$stopped_binding,sha256:("sha256:" + $stopped_binding_sha)} else null end),
+    signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode | endswith("repair_rollout")),priorFailedMessages:(if $start_mode == "repair_rollout" then $repair_failed_messages else null end),priorFailedAttempts:(if $start_mode == "repair_rollout" then $repair_failed_attempts else null end),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
+    producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode == "restart" or $start_mode == "repair_rollout"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
     unresolvedBindingRecords:0,disk:{availableBytes:$disk_available,minAvailableBytes:16106127360},parityTimerPaused:true,azureDeletionAuthorized:false}' >"$tmp"
 chown "$expected_uid:$expected_gid" "$tmp"
 chmod 0640 "$tmp"
