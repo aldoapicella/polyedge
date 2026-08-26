@@ -2,10 +2,10 @@
 set -euo pipefail
 umask 027
 
-readonly window=2026-08-26T17:00:00Z
-readonly window_epoch=1787763600
+readonly window=2026-08-26T18:00:00Z
+readonly window_epoch=1787767200
 readonly old_ledger=/srv/polyedge-ring/parity/20260826T090000Z-funded-active.json
-readonly ledger=/srv/polyedge-ring/parity/20260826T170000Z-funded-active.json
+readonly ledger=/srv/polyedge-ring/parity/20260826T180000Z-funded-active.json
 readonly formal=/etc/polyedge/parity-hourly.env
 readonly hourly=/etc/polyedge/jobs/hourly.env
 readonly old_formal_sha=5555af8aff320be18cd1e17e2c9652507a11a0f7a2f3b6fa1379983b61ab405b
@@ -21,12 +21,12 @@ readonly rollout_helper_sha=sha256:71ef46c684d9347dcea51fa24457d7dae933bcf97eb64
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
 readonly authorized_dlq=1344
-readonly rollback=/etc/polyedge/rollback/20260826T170000Z-funded-active
+readonly rollback=/etc/polyedge/rollback/20260826T180000Z-funded-active
 readonly transaction=$rollback/env-transaction.json
 readonly activation_dir=/srv/polyedge-ring/parity/activation
-readonly receipt=$activation_dir/20260826T170000Z-staged.json
-readonly first_validated=$activation_dir/20260826T170000Z-first-hour-validated.json
-readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260826T17/evidence.json
+readonly receipt=$activation_dir/20260826T180000Z-staged.json
+readonly first_validated=$activation_dir/20260826T180000Z-first-hour-validated.json
+readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260826T18/evidence.json
 readonly signer_image_expected=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:6c016dd582ca7c514c99b299c88a2fa815388eb0c14ad272df9ede746c93c0eb
 readonly signer_revision_expected=9c587b06764abf66395cc0ad494fffadaf0ea2a0
 readonly signer_invocation_expected=b9d1387814fa4c02b3aa9883df487a17
@@ -618,7 +618,7 @@ else
   /usr/bin/install -o root -g root -m 0600 "$hourly_tmp" "$rollback/hourly.env.candidate"
 fi
 
-ledger_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/.20260826T170000Z-funded-active.XXXXXX)
+ledger_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/.20260826T180000Z-funded-active.XXXXXX)
 /usr/bin/jq --arg window "$window" --arg signer_image "$signer_image" --arg revision "$signer_revision" \
   --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" --argjson dlq "$service_bus_dlq" \
   --arg collector "$collector_sha" --arg validator "$validator_sha" '
@@ -661,7 +661,7 @@ POLYEDGE_PARITY_ENV_FILE="$formal" "$validator" validate-ledger
 test "$(sha "$old_ledger")" = "$old_ledger_sha"
 
 /usr/bin/install -d -o root -g root -m 0750 "$activation_dir"
-receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260826T170000Z-staged.XXXXXX")
+receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260826T180000Z-staged.XXXXXX")
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
   --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" \
   --arg recovery "$recovery" --arg recoverySha "$recovery_receipt_sha" --arg recoveryScriptSha "sha256:$recovery_script_sha" \
