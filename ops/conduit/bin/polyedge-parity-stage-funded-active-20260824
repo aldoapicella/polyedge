@@ -2,10 +2,10 @@
 set -euo pipefail
 umask 027
 
-readonly window=2026-08-26T15:00:00Z
-readonly window_epoch=1787756400
+readonly window=2026-08-26T16:00:00Z
+readonly window_epoch=1787760000
 readonly old_ledger=/srv/polyedge-ring/parity/20260826T090000Z-funded-active.json
-readonly ledger=/srv/polyedge-ring/parity/20260826T150000Z-funded-active.json
+readonly ledger=/srv/polyedge-ring/parity/20260826T160000Z-funded-active.json
 readonly formal=/etc/polyedge/parity-hourly.env
 readonly hourly=/etc/polyedge/jobs/hourly.env
 readonly old_formal_sha=5555af8aff320be18cd1e17e2c9652507a11a0f7a2f3b6fa1379983b61ab405b
@@ -16,17 +16,17 @@ readonly recovery_script_sha=8ec3b59df15f3d6b2c8e55687f1b064bbf8af793231486063ec
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
 readonly rollout=/srv/polyedge-ring/parity/activation/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json
-readonly rollout_receipt_sha=sha256:4695a55d4a546d3d40f697fc90c1f391038da3f01842cd39e96447ea7593d81f
+readonly rollout_receipt_sha=sha256:2e69707ed24d9da69d24cfaa3372b341c62852bd9c2833caa35a0eefcf7c16c2
 readonly rollout_helper_sha=sha256:71ef46c684d9347dcea51fa24457d7dae933bcf97eb64cac8b7bf0e92d97ab8b
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
 readonly authorized_dlq=1343
-readonly rollback=/etc/polyedge/rollback/20260826T150000Z-funded-active
+readonly rollback=/etc/polyedge/rollback/20260826T160000Z-funded-active
 readonly transaction=$rollback/env-transaction.json
 readonly activation_dir=/srv/polyedge-ring/parity/activation
-readonly receipt=$activation_dir/20260826T150000Z-staged.json
-readonly first_validated=$activation_dir/20260826T150000Z-first-hour-validated.json
-readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260826T15/evidence.json
+readonly receipt=$activation_dir/20260826T160000Z-staged.json
+readonly first_validated=$activation_dir/20260826T160000Z-first-hour-validated.json
+readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260826T16/evidence.json
 readonly signer_image_expected=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:a091d45396230177c20ce77646c45afbeffd1ffa4caf9c1f8279029b4c5b8276
 readonly signer_revision_expected=8797ad69a95b7fa0ee04dc5a13c250faf79990d2
 readonly signer_invocation_expected=294f4dc10177430b931088f202325b8b
@@ -50,9 +50,9 @@ readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:aedc35834b6437597073f05c97f949b61778e79b9b30023c89072aa02b196526
+readonly collector_sha=sha256:8a64deab2a6934f07c7b2b17958f63af2f10134b5eab97070661f39347e6d447
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:8b24b32f607624727ca2ff4c57663fec31248ac8b4251b7fa9f82b53ba859b51
+readonly validator_sha=sha256:86d936a55b478288a6a3138bb9f2d4d1405a2c62635d9b954ed2917da8704706
 
 formal_tmp=
 hourly_tmp=
@@ -618,7 +618,7 @@ else
   /usr/bin/install -o root -g root -m 0600 "$hourly_tmp" "$rollback/hourly.env.candidate"
 fi
 
-ledger_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/.20260826T150000Z-funded-active.XXXXXX)
+ledger_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/.20260826T160000Z-funded-active.XXXXXX)
 /usr/bin/jq --arg window "$window" --arg signer_image "$signer_image" --arg revision "$signer_revision" \
   --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" --argjson dlq "$service_bus_dlq" \
   --arg collector "$collector_sha" --arg validator "$validator_sha" '
@@ -661,7 +661,7 @@ POLYEDGE_PARITY_ENV_FILE="$formal" "$validator" validate-ledger
 test "$(sha "$old_ledger")" = "$old_ledger_sha"
 
 /usr/bin/install -d -o root -g root -m 0750 "$activation_dir"
-receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260826T150000Z-staged.XXXXXX")
+receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260826T160000Z-staged.XXXXXX")
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
   --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" \
   --arg recovery "$recovery" --arg recoverySha "$recovery_receipt_sha" --arg recoveryScriptSha "sha256:$recovery_script_sha" \

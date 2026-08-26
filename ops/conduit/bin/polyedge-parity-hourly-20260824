@@ -519,7 +519,7 @@ if [ "$funded_enabled" = true ]; then
   [ "$funded_rollout_receipt" = "$parity_root/activation/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json" ] \
     || die 'funded rollout receipt path differs from the approved activation receipt'
   if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
-    [ "$funded_rollout_sha" = sha256:4695a55d4a546d3d40f697fc90c1f391038da3f01842cd39e96447ea7593d81f ] \
+    [ "$funded_rollout_sha" = sha256:2e69707ed24d9da69d24cfaa3372b341c62852bd9c2833caa35a0eefcf7c16c2 ] \
       || die 'funded rollout receipt hash differs from the approved post-redemption attestation'
     [ "$funded_service_bus_dlq" = 1343 ] || die 'funded Service Bus baseline differs from the live attestation'
   fi
