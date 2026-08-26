@@ -945,6 +945,11 @@ export async function createPersistentCanaryExecutor({
         validatePersistentBinding(resources);
         resources.lease?.assertHealthy();
         await waitForSafetySnapshotIdle(resources);
+        const openOrders = await getOpenOrdersStrict(resources.client);
+        if (openOrders.length !== 0) {
+          throw new Error("fail closed: funded maintenance found an open order");
+        }
+        const result = await task({ lease: resources.lease });
         if (resources.userChannel?.requiresReconciliation() === true ||
             resources.marketChannel?.requiresReconciliation() === true) {
           if (!resources.warmedMarket) {
@@ -952,11 +957,6 @@ export async function createPersistentCanaryExecutor({
           }
           await reconcilePersistentChannels(resources, resources.warmedMarket);
         }
-        const openOrders = await getOpenOrdersStrict(resources.client);
-        if (openOrders.length !== 0) {
-          throw new Error("fail closed: funded maintenance found an open order");
-        }
-        const result = await task({ lease: resources.lease });
         resources.lease?.assertHealthy();
         return result;
       } finally {

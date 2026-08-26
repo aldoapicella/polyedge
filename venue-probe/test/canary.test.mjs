@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { encodeAbiParameters, encodeEventTopics } from "viem";
 import {
@@ -1151,6 +1152,14 @@ test("funded maintenance gives bounded preflights room to quiesce", async () => 
     clearTimeout(completion);
   }
   assert.equal(resources.safetyCache.inFlight, 0);
+});
+
+test("funded maintenance redeems before reconciling websocket gaps", () => {
+  const source = readFileSync(new URL("../src/canary.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async runMaintenance(task)");
+  const block = source.slice(start, source.indexOf("async close()", start));
+  assert.ok(block.indexOf("getOpenOrdersStrict") < block.indexOf("await task"));
+  assert.ok(block.indexOf("await task") < block.indexOf("reconcilePersistentChannels"));
 });
 
 test("persistent market rollover replaces the expiring socket and accepts fresh exact-token frames", async () => {
