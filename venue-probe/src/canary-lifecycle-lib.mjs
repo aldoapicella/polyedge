@@ -41,7 +41,7 @@ export async function connectLifecycleChannel({
   evidenceBaselineBytes = DEFAULT_EVIDENCE_BASELINE_BYTES,
   WebSocketImpl = WebSocket,
   reconnectAttempts = 5,
-  heartbeatIntervalMs = 10_000,
+  heartbeatIntervalMs = 8_000,
   heartbeatTimeoutMs = 5_000,
   openTimeoutMs = 8_000,
   settleMs = 250,

@@ -599,7 +599,7 @@ test("persistent channels record lifecycle frames only while the execution ledge
   channel.close();
 });
 
-test("each socket sends one non-overlapping heartbeat at least every ten seconds and close clears it", async () => {
+test("the default heartbeat leaves a two-second server margin and close clears it", async () => {
   const scheduler = new ManualScheduler();
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;
@@ -632,7 +632,6 @@ test("each socket sends one non-overlapping heartbeat at least every ten seconds
     subscription: { type: "user" },
     eventType: "test_user_channel",
     WebSocketImpl: FakeWebSocket,
-    heartbeatIntervalMs: 20_000,
     heartbeatTimeoutMs: 100,
     openTimeoutMs: 100,
     settleMs: 0,
@@ -646,14 +645,14 @@ test("each socket sends one non-overlapping heartbeat at least every ten seconds
   assert.equal(socket.sent.filter((value) => value === "PING").length, 1);
   assert.equal(scheduler.pendingCount(), 1, "only the next heartbeat timer may remain armed");
 
-  scheduler.advance(9_999);
+  scheduler.advance(7_999);
   assert.equal(socket.sent.filter((value) => value === "PING").length, 1);
   scheduler.advance(1);
   await flushMicrotasks();
   assert.equal(socket.sent.filter((value) => value === "PING").length, 2);
   assert.equal(scheduler.pendingCount(), 1, "a successful heartbeat must schedule exactly one successor");
 
-  scheduler.advance(10_000);
+  scheduler.advance(8_000);
   await flushMicrotasks();
   assert.equal(socket.sent.filter((value) => value === "PING").length, 3);
   assert.equal(scheduler.pendingCount(), 1);
