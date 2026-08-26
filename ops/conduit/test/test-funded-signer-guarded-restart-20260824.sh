@@ -9,6 +9,7 @@ signer_revision=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
+grep -F '"$journalctl" -u polyedge-funded-signer.service -n 5000 -o json --no-pager' "$helper" >/dev/null
 
 fixture() {
   local d=$1

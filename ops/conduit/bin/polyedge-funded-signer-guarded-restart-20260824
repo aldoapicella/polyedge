@@ -119,7 +119,7 @@ heartbeat_safe() {
   invocation_id=$(invocation polyedge-funded-signer) || return 1
   container=$(container_id polyedge-funded-signer) || return 1
   now=$(date -u +%s)
-  "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager | jq -Rse \
+  "$journalctl" -u polyedge-funded-signer.service -n 5000 -o json --no-pager | jq -Rse \
     --arg invocation "$invocation_id" --arg container "$container" --argjson now "$now" --arg readiness "$readiness" \
     --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" '
       def ready:
