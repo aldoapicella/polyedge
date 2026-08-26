@@ -1153,49 +1153,63 @@ test("funded maintenance gives bounded preflights room to quiesce", async () => 
   assert.equal(resources.safetyCache.inFlight, 0);
 });
 
-test("persistent market warmup accepts fresh exact-token top-of-book stream frames", async () => {
-  const updates = [];
+test("persistent market rollover replaces the expiring socket and accepts fresh exact-token frames", async () => {
+  let closed = 0;
+  const connections = [];
+  const replacement = {
+    messages: [],
+    waitForMessage: async (predicate, timeoutMs) => {
+      const freshWallMs = Date.now() + 100;
+      assert.equal(timeoutMs, 2_000);
+      assert.equal(Boolean(predicate({
+        event_type: "price_change",
+        price_changes: [{ asset_id: "token-up", best_ask: "0.53" }],
+        _received_wall_ms: 0
+      })), false);
+      assert.equal(Boolean(predicate({
+        event_type: "best_bid_ask",
+        asset_id: "token-down",
+        best_ask: "0.61",
+        _received_wall_ms: freshWallMs
+      })), false);
+      assert.ok(predicate({
+        event_type: "price_change",
+        price_changes: [{ asset_id: "token-up", best_ask: "0.53" }],
+        _received_wall_ms: freshWallMs
+      }));
+    }
+  };
   const resources = {
     warmedMarket: {
-      market_id: "market-1",
-      condition_id: "condition-1",
+      market_id: "market-old",
+      condition_id: "condition-old",
       token_id: "token-old",
       token_ids: ["token-old"],
       market_end_ts: "2026-08-25T00:00:00Z"
     },
     marketChannel: {
       messages: [],
-      updateSubscription: async (value) => { updates.push(value); },
-      waitForMessage: async (predicate, timeoutMs) => {
-        const freshWallMs = Date.now() + 100;
-        assert.equal(timeoutMs, 2_000);
-        assert.equal(Boolean(predicate({
-          event_type: "price_change",
-          price_changes: [{ asset_id: "token-up", best_ask: "0.53" }],
-          _received_wall_ms: 0
-        })), false);
-        assert.equal(Boolean(predicate({
-          event_type: "best_bid_ask",
-          asset_id: "token-down",
-          best_ask: "0.61",
-          _received_wall_ms: freshWallMs
-        })), false);
-        assert.ok(predicate({
-          event_type: "price_change",
-          price_changes: [{ asset_id: "token-up", best_ask: "0.53" }],
-          _received_wall_ms: freshWallMs
-        }));
-      }
-    }
+      close: () => { closed += 1; }
+    },
+    ledgerMultiplexer: {}
   };
   const market = await ensurePersistentMarket(resources, {
-    market_id: "market-1",
-    condition_id: "condition-1",
+    market_id: "market-next",
+    condition_id: "condition-next",
     token_id: "token-up",
     token_ids: ["token-up"],
-    market_end_ts: "2026-08-25T00:00:00Z"
-  });
-  assert.deepEqual(updates, [{ operation: "subscribe", assets_ids: ["token-up"] }]);
+    market_end_ts: "2026-08-25T00:15:00Z"
+  }, async (options) => {
+    connections.push(options);
+    return replacement;
+  }, "wss://market.example");
+  assert.equal(closed, 1);
+  assert.deepEqual(connections.map(({ subscription }) => subscription), [{
+    assets_ids: ["token-up"],
+    type: "market",
+    custom_feature_enabled: true
+  }]);
+  assert.equal(resources.marketChannel, replacement);
   assert.equal(market.token_id, "token-up");
 });
 

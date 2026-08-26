@@ -615,7 +615,12 @@ function validatePersistentBinding(resources) {
   }
 }
 
-export async function ensurePersistentMarket(resources, { market_id, condition_id, token_id, token_ids, market_end_ts }) {
+export async function ensurePersistentMarket(
+  resources,
+  { market_id, condition_id, token_id, token_ids, market_end_ts },
+  connectChannel = connectLifecycleChannel,
+  marketWsUrl = config.marketWsUrl
+) {
   const requestedTokens = [...new Set(
     (Array.isArray(token_ids) ? token_ids : [token_id]).map(String).filter(Boolean)
   )];
@@ -633,8 +638,8 @@ export async function ensurePersistentMarket(resources, { market_id, condition_i
   let needsFreshBook = false;
   if (!resources.marketChannel) {
     needsFreshBook = true;
-    resources.marketChannel = await connectLifecycleChannel({
-      url: config.marketWsUrl,
+    resources.marketChannel = await connectChannel({
+      url: marketWsUrl,
       subscription: {
         assets_ids: next.token_ids,
         type: "market",
@@ -643,18 +648,22 @@ export async function ensurePersistentMarket(resources, { market_id, condition_i
       ledger: resources.ledgerMultiplexer,
       eventType: "venue_market_channel"
     });
-  } else if (!resources.warmedMarket ||
-      resources.warmedMarket.condition_id !== next.condition_id ||
-      !next.token_ids.every((value) => resources.warmedMarket.token_ids.includes(value))) {
+  } else if (resources.warmedMarket?.condition_id !== next.condition_id) {
+    needsFreshBook = true;
+    resources.marketChannel.close();
+    resources.marketChannel = await connectChannel({
+      url: marketWsUrl,
+      subscription: {
+        assets_ids: next.token_ids,
+        type: "market",
+        custom_feature_enabled: true
+      },
+      ledger: resources.ledgerMultiplexer,
+      eventType: "venue_market_channel"
+    });
+  } else if (!next.token_ids.every((value) => resources.warmedMarket.token_ids.includes(value))) {
     needsFreshBook = true;
     await resources.marketChannel.updateSubscription({ operation: "subscribe", assets_ids: next.token_ids });
-    if (resources.warmedMarket?.token_ids?.length &&
-        resources.warmedMarket.condition_id !== next.condition_id) {
-      await resources.marketChannel.updateSubscription({
-        operation: "unsubscribe",
-        assets_ids: resources.warmedMarket.token_ids
-      });
-    }
   } else {
     const latest = [...resources.marketChannel.messages].reverse().find((message) =>
       streamBookEvidence([message], next.token_id)
@@ -663,8 +672,8 @@ export async function ensurePersistentMarket(resources, { market_id, condition_i
       needsFreshBook = true;
       const retainedTokens = resources.marketChannel.subscription().assets_ids || [];
       resources.marketChannel.close();
-      resources.marketChannel = await connectLifecycleChannel({
-        url: config.marketWsUrl,
+      resources.marketChannel = await connectChannel({
+        url: marketWsUrl,
         subscription: {
           assets_ids: [...new Set([...retainedTokens, ...next.token_ids])],
           type: "market",
