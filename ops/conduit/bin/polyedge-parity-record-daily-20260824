@@ -167,12 +167,12 @@ if [ "$funded_mode" = active ]; then
     || die 'active funded parity requires a distinct funded-active ledger'
 fi
 if [ "$funded_enabled" = true ]; then
-  [ "$funded_rollout_receipt" = "$parity_root/activation/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json" ] \
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260826T164152Z-funded-signer-repair-post-redemption/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json" ] \
     || die 'funded rollout receipt path differs from the approved activation receipt'
   if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
-    [ "$funded_rollout_sha" = sha256:2e69707ed24d9da69d24cfaa3372b341c62852bd9c2833caa35a0eefcf7c16c2 ] \
+    [ "$funded_rollout_sha" = sha256:77023a92e03c2fd502b3f20c256e520d3cde8be37e4d3853174b5de8a0606f20 ] \
       || die 'funded rollout receipt hash differs from the approved post-redemption attestation'
-    [ "$funded_service_bus_dlq" = 1343 ] || die 'funded Service Bus baseline differs from the live attestation'
+    [ "$funded_service_bus_dlq" = 1344 ] || die 'funded Service Bus baseline differs from the live attestation'
   fi
   secure_owned_file "$funded_rollout_receipt" 640
   [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
@@ -204,10 +204,10 @@ if [ "$funded_enabled" = true ]; then
   ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
   if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
     jq -e '.helperSha256 == "sha256:71ef46c684d9347dcea51fa24457d7dae933bcf97eb64cac8b7bf0e92d97ab8b" and
-      .runtime.signer.image == "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:a091d45396230177c20ce77646c45afbeffd1ffa4caf9c1f8279029b4c5b8276" and .runtime.signer.revision == "8797ad69a95b7fa0ee04dc5a13c250faf79990d2" and
-      .runtime.signer.invocationId == "294f4dc10177430b931088f202325b8b" and .runtime.signer.containerId == "e490a49c573ed58d0a31227b40e6bfd5077945f830ad1035567b5b0108669766" and
+      .runtime.signer.image == "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:6c016dd582ca7c514c99b299c88a2fa815388eb0c14ad272df9ede746c93c0eb" and .runtime.signer.revision == "9c587b06764abf66395cc0ad494fffadaf0ea2a0" and
+      .runtime.signer.invocationId == "b9d1387814fa4c02b3aa9883df487a17" and .runtime.signer.containerId == "d075d0efdacac665ca4ecb1e0357cf094b970e975330bbe80c709e18f01c5816" and
       .runtime.producer.image == "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8" and .runtime.producer.revision == "72224c12d0790c02d98be7ece8fbcb781b6412e4" and
-      .runtime.producer.invocationId == "5e2ff9b380bf478d853f71c61cfc81fd" and .runtime.producer.containerId == "269df9ee11a76e4398d9bd09e1eb06e0ac5486c42cff10d053886524c167654f"' "$funded_rollout_receipt" >/dev/null \
+      .runtime.producer.invocationId == "3b8a4c13e57a4494989b757c5089461e" and .runtime.producer.containerId == "d7b224230cada65dd89110a8cce27d7cdde45aa2ef55901148ea1fd2ad2327b4"' "$funded_rollout_receipt" >/dev/null \
       || die 'live attestation runtime identity differs from the approved values'
   fi
   validate_service_bus_snapshot

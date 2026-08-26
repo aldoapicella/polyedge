@@ -216,8 +216,8 @@ funded_dlq=1311
 producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
 producer_revision=6666666666666666666666666666666666666666
 activation=$case_root/ring/parity/activation
-rollout=$activation/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json
-install -d -m 0750 "$activation"
+rollout=$activation/20260826T164152Z-funded-signer-repair-post-redemption/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json
+install -d -m 0750 "$activation" "$(dirname "$rollout")"
 jq -n --arg image "$funded_image" --arg revision "$funded_revision" --arg producer_image "$producer_image" \
   --arg producer_revision "$producer_revision" --argjson dlq "$funded_dlq" \
   '{schema:"polyedge.funded_signer_post_redemption_attestation.v1",status:"attested",createdAtUtc:"2026-08-24T18:30:00Z",
