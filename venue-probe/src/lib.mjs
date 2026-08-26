@@ -476,6 +476,15 @@ export class EventLedger {
   jsonl() {
     return `${this.events.map((event) => JSON.stringify(event)).join("\n")}\n`;
   }
+
+  async jsonlAsync() {
+    const lines = [];
+    for (let index = 0; index < this.events.length; index += 1) {
+      lines.push(JSON.stringify(this.events[index]));
+      if ((index + 1) % 256 === 0) await new Promise((resolve) => setImmediate(resolve));
+    }
+    return lines.join("\n") + "\n";
+  }
 }
 
 export function selectMakerOrder(book, maxNotional, minNotional = 1, minPrice = 0.05) {
@@ -1557,7 +1566,7 @@ export async function uploadEvidence(config, runId, summary, ledger) {
   const date = new Date().toISOString().slice(0, 10);
   const prefix = `reports/research/venue-probe/runs/${date}/${runId}`;
   const safeSummary = sanitize(summary);
-  const safeEventsJsonl = ledger.jsonl();
+  const safeEventsJsonl = await ledger.jsonlAsync();
   if (config.outputDir) {
     const { mkdir, writeFile } = await import("node:fs/promises");
     await mkdir(config.outputDir, { recursive: true, mode: 0o700 });

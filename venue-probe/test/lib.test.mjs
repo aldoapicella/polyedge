@@ -9,6 +9,7 @@ import {
   createCampaignLeaseRenewalGuard,
   evaluateCampaignRiskGate,
   evaluateDailyRiskGate,
+  EventLedger,
   fitEffectiveQueueModel,
   isEvidenceProtocolVersionEligible,
   isRiskReservationResolved,
@@ -32,6 +33,18 @@ import {
   validateFillMarkouts,
   summarizePortfolio
 } from "../src/lib.mjs";
+
+test("async event-ledger serialization preserves bytes and yields to heartbeats", async () => {
+  const ledger = new EventLedger("serialization-test");
+  for (let index = 0; index < 257; index += 1) ledger.record("market", { index });
+  let yielded = false;
+  setImmediate(() => { yielded = true; });
+
+  const serialized = await ledger.jsonlAsync();
+
+  assert.equal(yielded, true);
+  assert.equal(serialized, ledger.jsonl());
+});
 
 const safeEnv = {
   EXECUTION_MODE: "venue_probe",
