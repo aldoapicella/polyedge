@@ -23,8 +23,8 @@ fixture() {
   printf token >"$d/tokens/token"; chmod 600 "$d/tokens/token"
   printf '%s\n' '{"status":"validated","azureDeletionAuthorized":false}' >"$d/prior.json"
   printf '%s\n' '{"status":"succeeded","azureDeletionAuthorized":false}' >"$d/lifecycle.json"
-  /usr/bin/jq -n --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{schema_version:1,status:"nothing_to_redeem",dry_run:true,redemption_submitted:false,zero_open_orders_confirmed:true,finished_ts:$finished,portfolio:{redeemable_winner_count:0},selection:{selected_gross_payout:0,selected:[]}}' >"$d/preflight.json"
-  /usr/bin/jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{schema:"polyedge.funded_stopped_binding.v1",status:"verified_zero",createdAtUtc:$created,readOnly:true,unresolvedRiskReservationCount:0,records:[]}' >"$d/binding-proof.json"
+  /usr/bin/jq -n --arg finished "$(date -u +%Y-%m-%dT%H:%M:%S).399Z" '{schema_version:1,status:"nothing_to_redeem",dry_run:true,redemption_submitted:false,zero_open_orders_confirmed:true,finished_ts:$finished,portfolio:{redeemable_winner_count:0},selection:{selected_gross_payout:0,selected:[]}}' >"$d/preflight.json"
+  /usr/bin/jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%S).399Z" '{schema:"polyedge.funded_stopped_binding.v1",status:"verified_zero",createdAtUtc:$created,readOnly:true,unresolvedRiskReservationCount:0,records:[]}' >"$d/binding-proof.json"
   chmod 640 "$d/prior.json" "$d/lifecycle.json" "$d/preflight.json" "$d/binding-proof.json"
   cat >"$d/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -112,7 +112,7 @@ bind_repair_evidence() {
 
 automatic_preflight() {
   local d=$1 condition=$2
-  /usr/bin/jq -n --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg condition "$condition" '{schema_version:1,status:"redemption_ready_no_transaction",dry_run:true,redemption_submitted:false,zero_open_orders_confirmed:true,finished_ts:$finished,portfolio:{redeemable_winner_count:1},selection:{available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,selected:[{condition_id:$condition,gross_payout:5}]}}' >"$d/preflight.json"
+  /usr/bin/jq -n --arg finished "$(date -u +%Y-%m-%dT%H:%M:%S).399Z" --arg condition "$condition" '{schema_version:1,status:"redemption_ready_no_transaction",dry_run:true,redemption_submitted:false,zero_open_orders_confirmed:true,finished_ts:$finished,portfolio:{redeemable_winner_count:1},selection:{available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,selected:[{condition_id:$condition,gross_payout:5}]}}' >"$d/preflight.json"
   chmod 640 "$d/preflight.json"
 }
 run() {

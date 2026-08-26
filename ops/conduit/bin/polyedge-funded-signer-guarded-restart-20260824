@@ -271,8 +271,8 @@ validate_stopped_binding() {
     jq -e --argjson now "$now" '
       .schema == "polyedge.funded_stopped_binding.v1" and .status == "verified_zero" and
       .readOnly == true and .unresolvedRiskReservationCount == 0 and .records == [] and
-      ((.createdAtUtc | fromdateiso8601) >= ($now - 1800)) and
-      ((.createdAtUtc | fromdateiso8601) <= $now)
+      ((.createdAtUtc | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= ($now - 1800)) and
+      ((.createdAtUtc | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $now)
     ' "$stopped_binding" >/dev/null
 }
 restore_or_stop() {
