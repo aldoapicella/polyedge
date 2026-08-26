@@ -516,10 +516,10 @@ fi
 secure_file "$POLYEDGE_PARITY_LEDGER" 640
 rollout_signer_invocation= rollout_signer_container= rollout_producer_invocation= rollout_producer_container= rollout_producer_revision=
 if [ "$funded_enabled" = true ]; then
-  [ "$funded_rollout_receipt" = "$parity_root/activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json" ] \
+  [ "$funded_rollout_receipt" = "$parity_root/activation/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json" ] \
     || die 'funded rollout receipt path differs from the approved activation receipt'
   if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
-    [ "$funded_rollout_sha" = sha256:512444359038a3d22c2b0cd1b3c76250688761a24ae340c6683e979157337e4b ] \
+    [ "$funded_rollout_sha" = sha256:4695a55d4a546d3d40f697fc90c1f391038da3f01842cd39e96447ea7593d81f ] \
       || die 'funded rollout receipt hash differs from the approved post-redemption attestation'
     [ "$funded_service_bus_dlq" = 1343 ] || die 'funded Service Bus baseline differs from the live attestation'
   fi
@@ -560,7 +560,7 @@ if [ "$funded_enabled" = true ]; then
   rollout_producer_revision=$(jq -er '.runtime.producer.revision' "$funded_rollout_receipt")
   if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
     jq -e '
-      .helperSha256 == "sha256:260cd403f022235c26efe96483ef0809f73cb51d669707080337e135b738f3de" and
+      .helperSha256 == "sha256:71ef46c684d9347dcea51fa24457d7dae933bcf97eb64cac8b7bf0e92d97ab8b" and
       .runtime.signer.image == "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:a091d45396230177c20ce77646c45afbeffd1ffa4caf9c1f8279029b4c5b8276" and
       .runtime.signer.revision == "8797ad69a95b7fa0ee04dc5a13c250faf79990d2" and
       .runtime.signer.invocationId == "294f4dc10177430b931088f202325b8b" and

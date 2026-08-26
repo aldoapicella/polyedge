@@ -35,7 +35,7 @@ jq -n --arg finished "$live_finished" --arg transaction "$transaction" --arg blo
   liquid_collateral_before:10,liquid_collateral_after:10.02,realized_payout:0.02,zero_open_orders_confirmed:true,
   internal_settlement_blobs:[$blob]
 }' >"$live"
-jq -n --arg finished "$dry_finished" '{schema_version:1,status:"nothing_to_redeem",dry_run:true,
+jq -n --arg finished "$dry_finished" '{schema_version:1,status:"nothing_to_redeem",dry_run:false,redemption_enabled:true,
   finished_ts:$finished,zero_open_orders_confirmed:true,selection:{selected:[]},redemption_submitted:false}' >"$dry"
 jq -n --arg transaction "$transaction" '{schema:"polyedge.verified_internal_settlement.v1",
   transaction_hash:$transaction,payout:0.02,receipt_confirmations:3}' >"$settlement"

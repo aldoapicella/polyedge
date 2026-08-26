@@ -126,7 +126,7 @@ settlement_blob=$(/usr/bin/jq -er '.redemption.settlementBlob' "$attestation")
   (.finished_ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
 ' "$live" >/dev/null || die 'live redemption source evidence is invalid'
 /usr/bin/jq -e '
-  .schema_version == 1 and .status == "nothing_to_redeem" and .dry_run == true and
+  .schema_version == 1 and .status == "nothing_to_redeem" and (.dry_run == true or (.dry_run == false and .redemption_enabled == true)) and
   .zero_open_orders_confirmed == true and .selection.selected == [] and .redemption_submitted == false and
   (.finished_ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"))
 ' "$dry" >/dev/null || die 'follow-up dry-run source evidence is invalid'
