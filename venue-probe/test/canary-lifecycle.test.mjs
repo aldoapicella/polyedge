@@ -663,7 +663,7 @@ test("the default heartbeat leaves a two-second server margin and close clears i
   assert.equal(socket.sent.filter((value) => value === "PING").length, 3);
 });
 
-test("a slow fresh PONG does not move the next PING beyond the ten-second cadence", async () => {
+test("the default heartbeat tolerates a slow fresh PONG and keeps its eight-second cadence", async () => {
   const scheduler = new ManualScheduler();
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;
@@ -683,7 +683,7 @@ test("a slow fresh PONG does not move the next PING beyond the ten-second cadenc
       this.pingCount += 1;
       if (this.pingCount === 1) queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
       else if (this.pingCount === 2) {
-        scheduler.setTimer(() => this.emit("message", Buffer.from("PONG")), 4_000);
+        scheduler.setTimer(() => this.emit("message", Buffer.from("PONG")), 6_000);
       } else queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
     }
 
@@ -698,8 +698,6 @@ test("a slow fresh PONG does not move the next PING beyond the ten-second cadenc
     subscription: { type: "user" },
     eventType: "test_user_channel",
     WebSocketImpl: FakeWebSocket,
-    heartbeatIntervalMs: 10_000,
-    heartbeatTimeoutMs: 5_000,
     openTimeoutMs: 100,
     settleMs: 0,
     sleep: async () => {},
@@ -708,12 +706,16 @@ test("a slow fresh PONG does not move the next PING beyond the ten-second cadenc
     clearTimer: scheduler.clearTimer
   });
 
-  scheduler.advance(10_000);
-  await flushMicrotasks();
-  scheduler.advance(4_000);
+  scheduler.advance(8_000);
   await flushMicrotasks();
   scheduler.advance(5_999);
   assert.equal(channel.isOpen(), true);
+  scheduler.advance(1);
+  await flushMicrotasks();
+  assert.equal(channel.isOpen(), true);
+  assert.equal(channel.messages.filter((message) => message._pong).length, 2);
+  scheduler.advance(1_999);
+  assert.equal(channel.messages.filter((message) => message._pong).length, 2);
   scheduler.advance(1);
   await flushMicrotasks();
   assert.equal(channel.messages.filter((message) => message._pong).length, 3);

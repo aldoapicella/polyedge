@@ -42,7 +42,7 @@ export async function connectLifecycleChannel({
   WebSocketImpl = WebSocket,
   reconnectAttempts = 5,
   heartbeatIntervalMs = 8_000,
-  heartbeatTimeoutMs = 5_000,
+  heartbeatTimeoutMs = 8_000,
   openTimeoutMs = 8_000,
   settleMs = 250,
   sleep = defaultSleep,
