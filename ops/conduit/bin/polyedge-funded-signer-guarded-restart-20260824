@@ -45,6 +45,8 @@ namespace=${POLYEDGE_GUARDED_RESTART_NAMESPACE:-sb-polyedge-funded-cl-6urdjr5nmw
 queue=${POLYEDGE_GUARDED_RESTART_QUEUE:-funded-dynamic-quote-intents}
 allow_stopped=${POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED:-false}
 repair_mode=${POLYEDGE_GUARDED_RESTART_REPAIR_MODE:-false}
+repair_failed_messages=${POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_MESSAGES:-0}
+repair_failed_attempts=${POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_ATTEMPTS:-0}
 stopped_preflight=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT:-}
 stopped_preflight_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256:-}
 
@@ -118,7 +120,8 @@ heartbeat_safe() {
   container=$(container_id polyedge-funded-signer) || return 1
   now=$(date -u +%s)
   "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager | jq -Rse \
-    --arg invocation "$invocation_id" --arg container "$container" --argjson now "$now" --arg readiness "$readiness" '
+    --arg invocation "$invocation_id" --arg container "$container" --argjson now "$now" --arg readiness "$readiness" \
+    --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" '
       def ready:
         .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.redemption_failures == 0 and .event.executor.busy == false and
         .event.executor.user_channel_ready == true and .event.executor.market_channel_ready == true and
@@ -132,7 +135,7 @@ heartbeat_safe() {
         .event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
         .event.executor.safety_snapshot_cache_error == null and .event.executor.risk_reservation_index_ready == true;
       def repair:
-        .event.failed_attempts == 0 and .event.failed_messages == 0 and (.event.redemption_failures | type == "number" and . >= 1) and .event.executor.busy == false and
+        .event.failed_attempts == $repair_failed_attempts and .event.failed_messages == $repair_failed_messages and (.event.redemption_failures | type == "number" and . >= 1) and .event.executor.busy == false and
         .event.executor.user_channel_ready == true and .event.executor.market_channel_ready == true and
         .event.executor.user_channel_gaps == 0 and .event.executor.market_channel_gaps == 0 and
         .event.executor.user_channel_unparsed == 0 and .event.executor.market_channel_unparsed == 0 and
@@ -157,9 +160,9 @@ heartbeat_safe() {
       sort_by(.timestamp) | last as $h |
       ([$events[] | select(.invocation == $invocation and .container == $container and .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_started" and .event.automatic_redemption_enabled == true)] | length) == 1 and
       (if $readiness == "repair" then
-         ([$events[] | select(.invocation == $invocation and .container == $container and .timestamp > $h.timestamp and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")))] | length) == 0
+         ([$events[] | select(.invocation == $invocation and .container == $container and .timestamp > $h.timestamp and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed") or (.event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_message_failed_closed")))] | length) == 0
        else
-         ([$events[] | select(.invocation == $invocation and .container == $container and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed")))] | length) == 0
+         ([$events[] | select(.invocation == $invocation and .container == $container and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed") or (.event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_message_failed_closed")))] | length) == 0
        end) and
       $h != null and $h.timestamp <= $now and $h.timestamp >= ($now - 75) and
       (if $readiness == "ready" then ($h | ready) elif $readiness == "prestart" then ($h | ready or cold) elif $readiness == "repair" then ($h | repair) else false end)'
@@ -232,6 +235,8 @@ flock -n 9 || { echo 'another PolyEdge utility is active' >&2; exit 75; }
 secure_file "$0" 755 65536 || die 'guarded restart helper is unsafe'
 case "$allow_stopped" in true|false) :;; *) die 'POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED must be true or false';; esac
 case "$repair_mode" in true|false) :;; *) die "POLYEDGE_GUARDED_RESTART_REPAIR_MODE must be true or false";; esac
+case "$repair_failed_messages" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_MESSAGES must be a non-negative integer';; esac
+case "$repair_failed_attempts" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_ATTEMPTS must be a non-negative integer';; esac
 [ "$prior_signer_image" = "$signer_image" ] || [ "$repair_mode" = true ] || die "signer image changes require explicit repair mode"
 if [ "$repair_mode" = true ]; then
   [ "$allow_stopped" = false ] && [ "$prior_signer_image" != "$signer_image" ] || die "repair mode requires a running prior signer and a new image"
@@ -321,10 +326,11 @@ jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt
   --arg old_invocation "$old_invocation" --arg old_container "$old_container" --arg new_invocation "$new_invocation" --arg new_container "$new_container" \
   --arg signer_image "$signer_image" --arg prior_signer_image "$prior_signer_image" --arg signer_revision "$signer_revision" --arg rollback_copy "$rollback_copy" --arg signer_user "$signer_user" --arg producer_image "$producer_image" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" \
   --arg start_mode "$start_mode" --arg stopped_preflight "$stopped_preflight" --arg stopped_preflight_sha "$stopped_preflight_sha" \
+  --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" \
   --argjson queue_before "$queue_before" --argjson queue_after "$queue_after" --argjson disk_available "$available" \
   '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:{path:$prior,sha256:$prior_sha},lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
     startMode:$start_mode,stoppedPreflight:(if $start_mode == "stopped_restore" then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
-    signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode == "repair_rollout"),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
+    signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode == "repair_rollout"),priorFailedMessages:(if $start_mode == "repair_rollout" then $repair_failed_messages else null end),priorFailedAttempts:(if $start_mode == "repair_rollout" then $repair_failed_attempts else null end),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
     producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode != "stopped_restore"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
     unresolvedBindingRecords:0,disk:{availableBytes:$disk_available,minAvailableBytes:16106127360},parityTimerPaused:true,azureDeletionAuthorized:false}' >"$tmp"
 chown "$expected_uid:$expected_gid" "$tmp"
