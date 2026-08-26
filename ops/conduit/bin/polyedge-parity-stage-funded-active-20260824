@@ -2,39 +2,39 @@
 set -euo pipefail
 umask 027
 
-readonly window=2026-08-24T21:00:00Z
-readonly window_epoch=1787605200
-readonly old_ledger=/srv/polyedge-ring/parity/20260824T080000Z-funded-active.json
-readonly ledger=/srv/polyedge-ring/parity/20260824T210000Z-funded-active.json
+readonly window=2026-08-26T14:00:00Z
+readonly window_epoch=1787752800
+readonly old_ledger=/srv/polyedge-ring/parity/20260826T090000Z-funded-active.json
+readonly ledger=/srv/polyedge-ring/parity/20260826T140000Z-funded-active.json
 readonly formal=/etc/polyedge/parity-hourly.env
 readonly hourly=/etc/polyedge/jobs/hourly.env
-readonly old_formal_sha=d67873339d719b1221b9e3de7057dc78ca9cda2d483a512e41ac02dbfa2574e9
-readonly old_hourly_sha=05fc245bb3225ff37f31a85b8935959019af63cc75c890bde57ae3f21daf607a
-readonly old_ledger_sha=2b5f758c93ace28da9401ef48c782ec54a997d7fb790ac4faf0f94ad1fbb7a4f
+readonly old_formal_sha=5555af8aff320be18cd1e17e2c9652507a11a0f7a2f3b6fa1379983b61ab405b
+readonly old_hourly_sha=9835ecf0a48056fbff4ebcd0d0f22cfeb9e907c60ad29a33180e19d9592d83ad
+readonly old_ledger_sha=6c68b64513716868ca30ec0eb8a8d8d142178b70ea31f4192451b3ddb01c5115
 readonly recovery_script=/usr/local/libexec/polyedge-funded-reservation-recovery-20260824
 readonly recovery_script_sha=8ec3b59df15f3d6b2c8e55687f1b064bbf8af793231486063ec8a073b0bed8b4
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260824T203004Z-post-restart-redemption-attestation.json
-readonly rollout_receipt_sha=sha256:6a5e7660460f13f86288107bdadc3fef1df15d6431e9f3eea408e0c20b943380
-readonly rollout_helper_sha=sha256:b0588df04a92eb58d1e8727d61ef9a0b2ab8935336327f612ac89e7f455c27ab
+readonly rollout=/srv/polyedge-ring/parity/activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json
+readonly rollout_receipt_sha=sha256:512444359038a3d22c2b0cd1b3c76250688761a24ae340c6683e979157337e4b
+readonly rollout_helper_sha=sha256:260cd403f022235c26efe96483ef0809f73cb51d669707080337e135b738f3de
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
-readonly authorized_dlq=1339
-readonly rollback=/etc/polyedge/rollback/20260824T210000Z-funded-active
+readonly authorized_dlq=1343
+readonly rollback=/etc/polyedge/rollback/20260826T140000Z-funded-active
 readonly transaction=$rollback/env-transaction.json
 readonly activation_dir=/srv/polyedge-ring/parity/activation
-readonly receipt=$activation_dir/20260824T210000Z-staged.json
-readonly first_validated=$activation_dir/20260824T210000Z-first-hour-validated.json
-readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260824T21/evidence.json
-readonly signer_image_expected=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:9506512f5cb96f8b5e593629838bf64c5acf920afad18689a0ef2a9b076aebb3
-readonly signer_revision_expected=7d34f36d70c8dd4f90fbcde3cedbaac1c857da1b
-readonly signer_invocation_expected=36f0fc2fae7c43e4a7a234f2a4f546c7
-readonly signer_container_expected=fde5a0ded60daa5fec75dd6e6407b660cd211ab83c081896ce56575fa192d805
+readonly receipt=$activation_dir/20260826T140000Z-staged.json
+readonly first_validated=$activation_dir/20260826T140000Z-first-hour-validated.json
+readonly first_evidence=/srv/polyedge-ring/parity/hourly/20260826T14/evidence.json
+readonly signer_image_expected=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:a091d45396230177c20ce77646c45afbeffd1ffa4caf9c1f8279029b4c5b8276
+readonly signer_revision_expected=8797ad69a95b7fa0ee04dc5a13c250faf79990d2
+readonly signer_invocation_expected=294f4dc10177430b931088f202325b8b
+readonly signer_container_expected=e490a49c573ed58d0a31227b40e6bfd5077945f830ad1035567b5b0108669766
 readonly producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8
 readonly producer_revision_expected=72224c12d0790c02d98be7ece8fbcb781b6412e4
-readonly producer_invocation_expected=2d2b45a9f25a4ee58a9938f75c6d1710
-readonly producer_container_expected=052fb251a198aa88510b084692cd7c1e8260b08035e091ba08f4366757ccb2a7
+readonly producer_invocation_expected=5e2ff9b380bf478d853f71c61cfc81fd
+readonly producer_container_expected=269df9ee11a76e4398d9bd09e1eb06e0ac5486c42cff10d053886524c167654f
 readonly recovery_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3
 readonly decision=65b559290100796ef9137179176bf053c8ab5421a1ef3c80bd8fd81676611de7
 readonly run=funded-direct-20260822235002541-68c5aaa9
@@ -50,9 +50,9 @@ readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
 readonly queue=funded-dynamic-quote-intents
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:ac0bdebb8ed312e3b75419e437b432e88389dc7f150522ec10ec5bdd860b682f
+readonly collector_sha=sha256:d0b74fdf25e58efad7f8eb9585781f7cdff44cab9368ffcd5c8764b235c76681
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:313725793e3b261c760acf3ecb300f5a5c96c51473cd8e94383731049ea2f099
+readonly validator_sha=sha256:b3ba0e4948f23b9266a85f65bfa0e4ef57f5eea72ed7f76c3d81185de23d89dd
 
 formal_tmp=
 hourly_tmp=
@@ -618,7 +618,7 @@ else
   /usr/bin/install -o root -g root -m 0600 "$hourly_tmp" "$rollback/hourly.env.candidate"
 fi
 
-ledger_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/.20260824T210000Z-funded-active.XXXXXX)
+ledger_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/.20260826T140000Z-funded-active.XXXXXX)
 /usr/bin/jq --arg window "$window" --arg signer_image "$signer_image" --arg revision "$signer_revision" \
   --arg rollout "$rollout" --arg rollout_sha "$rollout_sha" --argjson dlq "$service_bus_dlq" \
   --arg collector "$collector_sha" --arg validator "$validator_sha" '
@@ -661,7 +661,7 @@ POLYEDGE_PARITY_ENV_FILE="$formal" "$validator" validate-ledger
 test "$(sha "$old_ledger")" = "$old_ledger_sha"
 
 /usr/bin/install -d -o root -g root -m 0750 "$activation_dir"
-receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260824T210000Z-staged.XXXXXX")
+receipt_tmp=$(/usr/bin/mktemp "$activation_dir/.20260826T140000Z-staged.XXXXXX")
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
   --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" \
   --arg recovery "$recovery" --arg recoverySha "$recovery_receipt_sha" --arg recoveryScriptSha "sha256:$recovery_script_sha" \

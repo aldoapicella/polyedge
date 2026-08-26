@@ -617,7 +617,7 @@ activate_funded_fixture() {
   activation=$case_root/ring/parity/activation
   recovery=$case_root/ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
   settlement=$case_root/ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-  rollout=$activation/20260824T203004Z-post-restart-redemption-attestation.json
+  rollout=$activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json
   install -d -m 0750 "$activation"
   jq -n --arg image "$funded_image" --arg revision "$funded_revision" --argjson dlq "$funded_dlq" \
     --arg producer_image "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc" '{
@@ -1050,7 +1050,7 @@ jq -e '.acceptedCleanLiveHours == 1 and .fundedSignerEnabled == true and
 jq -e '.services.fundedSignerMode == "active" and .services.fundedSignerEnabled == true and
   .services.fundedSignerActive == true and .services.fundedSignerMasked == false and
   .services.fundedSignerRevision == "7777777777777777777777777777777777777777" and
-  (.services.fundedRolloutReceipt.path | endswith("/activation/20260824T203004Z-post-restart-redemption-attestation.json")) and
+  (.services.fundedRolloutReceipt.path | endswith("/activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json")) and
   (.services.fundedRolloutReceipt.sha256 | test("^sha256:[0-9a-f]{64}$")) and
   .services.fundedServiceBusDlqBaseline == 1311 and
   .services.fundedSignerUser == "'"$uid:$gid"'" and .services.fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and

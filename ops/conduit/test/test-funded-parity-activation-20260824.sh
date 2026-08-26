@@ -5,12 +5,12 @@ repo=$(cd "$(dirname "$0")/../../.." && pwd)
 stage=$repo/ops/conduit/bin/polyedge-parity-stage-funded-active-20260824
 first=$repo/ops/conduit/bin/polyedge-parity-collect-first-hour-20260824
 root=$(mktemp -d)
-grep -Fq 'readonly window=2026-08-24T21:00:00Z' "$stage"
-grep -Fq 'readonly rollout=/srv/polyedge-ring/parity/activation/20260824T203004Z-post-restart-redemption-attestation.json' "$stage"
-grep -Fq 'readonly rollout_receipt_sha=sha256:6a5e7660460f13f86288107bdadc3fef1df15d6431e9f3eea408e0c20b943380' "$stage"
-grep -Fq 'readonly rollout_helper_sha=sha256:b0588df04a92eb58d1e8727d61ef9a0b2ab8935336327f612ac89e7f455c27ab' "$stage"
-grep -Fq 'readonly authorized_dlq=1339' "$stage"
-grep -Fq 'readonly rollout_receipt_sha=sha256:6a5e7660460f13f86288107bdadc3fef1df15d6431e9f3eea408e0c20b943380' "$first"
+grep -Fq 'readonly window=2026-08-26T14:00:00Z' "$stage"
+grep -Fq 'readonly rollout=/srv/polyedge-ring/parity/activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json' "$stage"
+grep -Fq 'readonly rollout_receipt_sha=sha256:512444359038a3d22c2b0cd1b3c76250688761a24ae340c6683e979157337e4b' "$stage"
+grep -Fq 'readonly rollout_helper_sha=sha256:260cd403f022235c26efe96483ef0809f73cb51d669707080337e135b738f3de' "$stage"
+grep -Fq 'readonly authorized_dlq=1343' "$stage"
+grep -Fq 'readonly rollout_receipt_sha=sha256:512444359038a3d22c2b0cd1b3c76250688761a24ae340c6683e979157337e4b' "$first"
 grep -Fq 'persistent_message_failed_closed' "$stage"
 grep -Fq '.failed_attempts == 0' "$stage"
 grep -Fq '$warmed | length) >= 1' "$stage"

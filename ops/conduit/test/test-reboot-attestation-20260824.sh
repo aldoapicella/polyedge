@@ -216,7 +216,7 @@ funded_dlq=1311
 producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
 producer_revision=6666666666666666666666666666666666666666
 activation=$case_root/ring/parity/activation
-rollout=$activation/20260824T203004Z-post-restart-redemption-attestation.json
+rollout=$activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json
 install -d -m 0750 "$activation"
 jq -n --arg image "$funded_image" --arg revision "$funded_revision" --arg producer_image "$producer_image" \
   --arg producer_revision "$producer_revision" --argjson dlq "$funded_dlq" \

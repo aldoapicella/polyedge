@@ -104,7 +104,7 @@ activate_funded_fixture() {
   producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc
   producer_revision=6666666666666666666666666666666666666666
   activation=$case_root/ring/parity/activation
-  rollout=$activation/20260824T203004Z-post-restart-redemption-attestation.json
+  rollout=$activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json
   install -d -m 0750 "$activation"
   jq -n --arg image "$funded_image" --arg revision "$funded_revision" --arg producer_image "$producer_image" \
     --arg producer_revision "$producer_revision" --argjson dlq "$funded_dlq" \
@@ -255,7 +255,7 @@ jq -e '.fundedSignerEnabled == true and .completedDailyCycles == 1 and
   (.acceptedDailyEvidence | length) == 1' "$active_funded/ring/parity/20260811T000000Z-funded-active.json" >/dev/null
 jq -e '.fundedSignerMode == "active" and .fundedSignerEnabled == true and
   .fundedSignerRevision == "7777777777777777777777777777777777777777" and
-  (.fundedRolloutReceipt.path | endswith("/activation/20260824T203004Z-post-restart-redemption-attestation.json")) and
+  (.fundedRolloutReceipt.path | endswith("/activation/post-redemption-venue-redemption-20260826124254663-9c84ed65-attestation.json")) and
   (.fundedRolloutReceipt.sha256 | test("^sha256:[0-9a-f]{64}$")) and
   .fundedServiceBusDlqBaseline == 1311 and
   .fundedSessionId == "dynamic-quote-funded-2026-08-13-v10" and .fundedSignerUser == "'"$uid:$gid"'" and
