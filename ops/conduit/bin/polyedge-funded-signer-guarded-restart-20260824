@@ -187,29 +187,43 @@ automatic_redemption_summary() {
   invocation_id=$(invocation polyedge-funded-signer) || return 1
   container=$(container_id polyedge-funded-signer) || return 1
   now=$(date -u +%s)
-  "$journalctl" -u polyedge-funded-signer.service -n 5000 -o json --no-pager | jq -Rcse \
-    --arg invocation "$invocation_id" --arg container "$container" --arg condition "$approved_automatic_redemption_condition" --argjson now "$now" '
-      [split("\n")[] | fromjson? | select(type == "object") | . as $r | ($r.MESSAGE | fromjson?) as $e |
-       select($e | type == "object") | {timestamp:(($r.__REALTIME_TIMESTAMP | tonumber) / 1000000),invocation:($r._SYSTEMD_INVOCATION_ID // ""),container:($r.CONTAINER_ID_FULL // ""),event:$e}] as $events |
-      [$events[] | select(.invocation == $invocation and .container == $container and
-        .event.schema == "polyedge.funded_redemption_service.v1" and .event.status == "redemption_worker_summary" and
-        .event.redemption.status == "redeemed_and_verified" and .event.redemption.redemption_submitted == true and
-        .event.redemption.zero_open_orders_confirmed == true and
-        (.event.redemption.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$")) and
-        (.event.redemption.transaction_hash | test("^0x[0-9a-f]{64}$")) and
-        (.event.redemption.transaction_id | type == "string" and length > 0) and
-        (.event.redemption.selection.selected | type == "array" and length == 1) and
-        .event.redemption.selection.selected[0].condition_id == $condition and
-        (.event.redemption.selection.selected_gross_payout | type == "number" and . > 0) and
-        (.event.redemption.internal_settlement_blobs | type == "array" and length == 1 and (.[0] | type == "string" and length > 0)))] |
-      sort_by(.timestamp) | last as $summary |
-      ([$events[] | select(.invocation == $invocation and .container == $container and
-        .event.schema == "polyedge.funded_redemption_service.v1" and .event.status == "automatic_redemption_cycle_completed" and
-        .event.redemption_status == "redeemed_and_verified" and .event.redemption_submitted == true)] | length) as $cycles |
-      if $summary != null and $cycles >= 1 and $summary.timestamp <= $now and $summary.timestamp >= ($now - 900) then
-        {conditionId:$condition,runId:$summary.event.redemption.run_id,transactionId:$summary.event.redemption.transaction_id,
-         transactionHash:$summary.event.redemption.transaction_hash,grossPayout:$summary.event.redemption.selection.selected_gross_payout,
-         internalSettlementBlob:$summary.event.redemption.internal_settlement_blobs[0],automatic:true,verified:true}
+  "$journalctl" -u polyedge-funded-signer.service "_SYSTEMD_INVOCATION_ID=$invocation_id" \
+    "CONTAINER_ID_FULL=$container" -n 5000 -o verbose --no-pager | jq -Rcse \
+    --arg condition "$approved_automatic_redemption_condition" --argjson now "$now" '
+      [split("\n")[] |
+        if startswith("    MESSAGE=") then ltrimstr("    MESSAGE=")
+        else (try fromjson catch null) as $record |
+          select(($record | type) == "object" and ($record.MESSAGE | type) == "string") | $record.MESSAGE
+        end] as $messages |
+      reduce $messages[] as $message ({buffer:null,events:[]};
+        if .buffer != null then
+          .buffer += $message | (try (.buffer | fromjson) catch null) as $event |
+          if ($event | type) == "object" then .events += [$event] | .buffer = null else . end
+        else (try ($message | fromjson) catch null) as $event |
+          if ($event | type) == "object" then .events += [$event]
+          elif ($message | startswith("{\"schema\":\"polyedge.funded_redemption_service.v1\",\"status\":\"redemption_worker_summary\""))
+          then .buffer = $message else . end
+        end) | .events as $events |
+      [$events[] | select(
+        .schema == "polyedge.funded_redemption_service.v1" and .status == "redemption_worker_summary" and
+        .redemption.status == "redeemed_and_verified" and .redemption.redemption_submitted == true and
+        .redemption.zero_open_orders_confirmed == true and
+        (.redemption.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$")) and
+        (.redemption.transaction_hash | test("^0x[0-9a-f]{64}$")) and
+        (.redemption.transaction_id | type == "string" and length > 0) and
+        (.redemption.selection.selected | type == "array" and length == 1) and
+        .redemption.selection.selected[0].condition_id == $condition and
+        (.redemption.selection.selected_gross_payout | type == "number" and . > 0) and
+        (.redemption.internal_settlement_blobs | type == "array" and length == 1 and (.[0] | type == "string" and length > 0)))] |
+      last as $summary |
+      ([$events[] | select(
+        .schema == "polyedge.funded_redemption_service.v1" and .status == "automatic_redemption_cycle_completed" and
+        .redemption_status == "redeemed_and_verified" and .redemption_submitted == true)] | length) as $cycles |
+      ($summary.redemption.finished_ts | sub("\\.[0-9]+Z$";"Z") | fromdateiso8601) as $finished |
+      if $summary != null and $cycles >= 1 and $finished <= $now and $finished >= ($now - 900) then
+        {conditionId:$condition,runId:$summary.redemption.run_id,transactionId:$summary.redemption.transaction_id,
+         transactionHash:$summary.redemption.transaction_hash,grossPayout:$summary.redemption.selection.selected_gross_payout,
+         internalSettlementBlob:$summary.redemption.internal_settlement_blobs[0],automatic:true,verified:true}
       else empty end'
 }
 wait_automatic_redemption() {
