@@ -51,6 +51,7 @@ stopped_preflight=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT:-}
 stopped_preflight_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256:-}
 stopped_binding=${POLYEDGE_GUARDED_RESTART_STOPPED_BINDING:-}
 stopped_binding_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256:-}
+approved_automatic_redemption_condition=${POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION:-}
 
 printf '%s\n' "$signer_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' || { echo 'signer image must be immutable' >&2; exit 64; }
 printf "%s\n" "$prior_signer_image" | grep -Eq "^.+@sha256:[0-9a-f]{64}$" || { echo "prior signer image must be immutable" >&2; exit 64; }
@@ -70,6 +71,7 @@ preflight_readiness=ready
 queue_before=
 old_invocation=
 old_container=
+automatic_redemption=null
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 die() { echo "$*" >&2; exit 1; }
@@ -179,6 +181,45 @@ wait_signer() {
   done
   return 1
 }
+
+automatic_redemption_summary() {
+  local invocation_id container now
+  invocation_id=$(invocation polyedge-funded-signer) || return 1
+  container=$(container_id polyedge-funded-signer) || return 1
+  now=$(date -u +%s)
+  "$journalctl" -u polyedge-funded-signer.service -n 5000 -o json --no-pager | jq -Rcse \
+    --arg invocation "$invocation_id" --arg container "$container" --arg condition "$approved_automatic_redemption_condition" --argjson now "$now" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $r | ($r.MESSAGE | fromjson?) as $e |
+       select($e | type == "object") | {timestamp:(($r.__REALTIME_TIMESTAMP | tonumber) / 1000000),invocation:($r._SYSTEMD_INVOCATION_ID // ""),container:($r.CONTAINER_ID_FULL // ""),event:$e}] as $events |
+      [$events[] | select(.invocation == $invocation and .container == $container and
+        .event.schema == "polyedge.funded_redemption_service.v1" and .event.status == "redemption_worker_summary" and
+        .event.redemption.status == "redeemed_and_verified" and .event.redemption.redemption_submitted == true and
+        .event.redemption.zero_open_orders_confirmed == true and
+        (.event.redemption.run_id | test("^venue-redemption-[0-9]{17}-[0-9a-f]{8}$")) and
+        (.event.redemption.transaction_hash | test("^0x[0-9a-f]{64}$")) and
+        (.event.redemption.transaction_id | type == "string" and length > 0) and
+        (.event.redemption.selection.selected | type == "array" and length == 1) and
+        .event.redemption.selection.selected[0].condition_id == $condition and
+        (.event.redemption.selection.selected_gross_payout | type == "number" and . > 0) and
+        (.event.redemption.internal_settlement_blobs | type == "array" and length == 1 and (.[0] | type == "string" and length > 0)))] |
+      sort_by(.timestamp) | last as $summary |
+      ([$events[] | select(.invocation == $invocation and .container == $container and
+        .event.schema == "polyedge.funded_redemption_service.v1" and .event.status == "automatic_redemption_cycle_completed" and
+        .event.redemption_status == "redeemed_and_verified" and .event.redemption_submitted == true)] | length) as $cycles |
+      if $summary != null and $cycles >= 1 and $summary.timestamp <= $now and $summary.timestamp >= ($now - 900) then
+        {conditionId:$condition,runId:$summary.event.redemption.run_id,transactionId:$summary.event.redemption.transaction_id,
+         transactionHash:$summary.event.redemption.transaction_hash,grossPayout:$summary.event.redemption.selection.selected_gross_payout,
+         internalSettlementBlob:$summary.event.redemption.internal_settlement_blobs[0],automatic:true,verified:true}
+      else empty end'
+}
+wait_automatic_redemption() {
+  for _ in $(seq 1 "$wait_attempts"); do
+    automatic_redemption=$(automatic_redemption_summary 2>/dev/null || true)
+    if [ -n "$automatic_redemption" ] && wait_signer ready; then return 0; fi
+    sleep "$wait_seconds"
+  done
+  return 1
+}
 validate_evidence() {
   secure_file "$prior_receipt" 640 65536 && [ "$(sha "$prior_receipt")" = "$prior_receipt_sha" ] &&
     jq -e '.status == "validated" and (.azureDeletionAllowed? == false or .azureDeletionAuthorized? == false)' "$prior_receipt" >/dev/null &&
@@ -207,11 +248,18 @@ validate_stopped_preflight() {
   local now
   now=$(date -u +%s)
   secure_file "$stopped_preflight" 640 1048576 && [ "$(sha "$stopped_preflight")" = "$stopped_preflight_sha" ] &&
-    jq -e --argjson now "$now" '
-      .schema_version == 1 and .status == "nothing_to_redeem" and .dry_run == true and
-      .redemption_submitted == false and .zero_open_orders_confirmed == true and
-      .portfolio.redeemable_winner_count == 0 and .selection.selected_gross_payout == 0 and
-      (.selection.selected | type == "array" and length == 0) and
+    jq -e --argjson now "$now" --arg condition "$approved_automatic_redemption_condition" '
+      .schema_version == 1 and .dry_run == true and .redemption_submitted == false and .zero_open_orders_confirmed == true and
+      (if $condition == "" then
+         .status == "nothing_to_redeem" and .portfolio.redeemable_winner_count == 0 and .selection.selected_gross_payout == 0 and
+         (.selection.selected | type == "array" and length == 0)
+       else
+         .status == "redemption_ready_no_transaction" and .portfolio.redeemable_winner_count == 1 and
+         .selection.available_winner_conditions == 1 and .selection.skipped_winner_conditions == 0 and
+         (.selection.selected | type == "array" and length == 1) and .selection.selected[0].condition_id == $condition and
+         (.selection.selected[0].gross_payout | type == "number" and . > 0) and
+         .selection.selected_gross_payout == .selection.selected[0].gross_payout
+       end) and
       ((.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= ($now - 1800)) and
       ((.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) <= $now)
     ' "$stopped_preflight" >/dev/null
@@ -268,6 +316,10 @@ if [ "$repair_mode" = true ]; then
   [ "$prior_signer_image" != "$signer_image" ] || die "repair mode requires a new image"
   image_changed=true
   [ "$allow_stopped" = true ] || preflight_readiness=repair
+fi
+if [ -n "$approved_automatic_redemption_condition" ]; then
+  printf '%s\n' "$approved_automatic_redemption_condition" | grep -Eq '^0x[0-9a-f]{64}$' || die 'approved automatic redemption condition must be one lowercase condition ID'
+  [ "$allow_stopped" = true ] && [ "$image_changed" = true ] || die 'approved automatic redemption requires a stopped image repair'
 fi
 if [ "$allow_stopped" = true ]; then
   [ -n "$stopped_preflight" ] && [ -n "$stopped_binding" ] &&
@@ -334,7 +386,11 @@ else
     "$systemctl" restart polyedge-funded-signer.service
   fi
 fi
-wait_signer prestart "$signer_image" || die 'restarted signer is unsafe before producer restoration'
+if [ -n "$approved_automatic_redemption_condition" ]; then
+  wait_automatic_redemption || die 'approved automatic redemption did not complete safely before producer restoration'
+else
+  wait_signer prestart "$signer_image" || die 'restarted signer is unsafe before producer restoration'
+fi
 [ "$(image_metadata "$signer_image" 2>/dev/null || true)" = "linux/arm64|$signer_revision" ] || die "running signer image metadata is wrong"
 new_invocation=$(invocation polyedge-funded-signer)
 new_container=$(container_id polyedge-funded-signer)
@@ -371,12 +427,14 @@ jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt
   --arg signer_image "$signer_image" --arg prior_signer_image "$prior_signer_image" --arg signer_revision "$signer_revision" --arg rollback_copy "$rollback_copy" --arg signer_user "$signer_user" --arg producer_image "$producer_image" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" \
   --arg start_mode "$start_mode" --arg stopped_preflight "$stopped_preflight" --arg stopped_preflight_sha "$stopped_preflight_sha" \
   --arg stopped_binding "$stopped_binding" --arg stopped_binding_sha "$stopped_binding_sha" \
+  --arg approved_automatic_redemption_condition "$approved_automatic_redemption_condition" --argjson automatic_redemption "$automatic_redemption" \
   --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" \
   --argjson queue_before "$queue_before" --argjson queue_after "$queue_after" --argjson disk_available "$available" \
   '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:{path:$prior,sha256:$prior_sha},lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
     startMode:$start_mode,
     stoppedPreflight:(if ($start_mode | startswith("stopped_")) then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
     stoppedBinding:(if ($start_mode | startswith("stopped_")) then {path:$stopped_binding,sha256:("sha256:" + $stopped_binding_sha)} else null end),
+    approvedAutomaticRedemptionCondition:(if $approved_automatic_redemption_condition == "" then null else $approved_automatic_redemption_condition end),automaticRedemption:$automatic_redemption,
     signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode | endswith("repair_rollout")),priorFailedMessages:(if $start_mode == "repair_rollout" then $repair_failed_messages else null end),priorFailedAttempts:(if $start_mode == "repair_rollout" then $repair_failed_attempts else null end),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
     producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode == "restart" or $start_mode == "repair_rollout"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
     unresolvedBindingRecords:0,disk:{availableBytes:$disk_available,minAvailableBytes:16106127360},parityTimerPaused:true,azureDeletionAuthorized:false}' >"$tmp"

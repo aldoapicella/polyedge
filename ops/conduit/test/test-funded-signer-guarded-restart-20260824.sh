@@ -7,6 +7,7 @@ signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:cccccccccccccccccc
 prior_signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 signer_revision=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+approved_condition=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 grep -F '"$journalctl" -u polyedge-funded-signer.service -n 5000 -o json --no-pager' "$helper" >/dev/null
@@ -70,6 +71,12 @@ if [ "${FAKE_REPAIR_PRE:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = before ];
 fi
 /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$started" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$message" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+if [ "${FAKE_AUTOMATIC_REDEMPTION:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = after ]; then
+  summary=$(/usr/bin/jq -nc --arg condition "$FAKE_APPROVED_CONDITION" '{schema:"polyedge.funded_redemption_service.v1",status:"redemption_worker_summary",redemption:{schema_version:1,run_id:"venue-redemption-20260826190000000-abcdef12",status:"redeemed_and_verified",redemption_submitted:true,transaction_id:"automatic-test",transaction_hash:("0x" + ("f" * 64)),zero_open_orders_confirmed:true,selection:{selected_gross_payout:5,selected:[{condition_id:$condition,gross_payout:5}]},internal_settlement_blobs:["reports/funded/internal-settlement.json"]}}')
+  cycle=$(/usr/bin/jq -nc '{schema:"polyedge.funded_redemption_service.v1",status:"automatic_redemption_cycle_completed",redemption_status:"redeemed_and_verified",redemption_submitted:true}')
+  /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$summary" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+  /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$cycle" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+fi
 EOF
   cat >"$d/bin/runuser" <<'EOF'
 #!/usr/bin/env bash
@@ -102,6 +109,12 @@ bind_repair_evidence() {
   printf "Image=%s\n" "$prior_signer_image" >"$d/quadlet"; chmod 600 "$d/quadlet"
 }
 
+
+automatic_preflight() {
+  local d=$1 condition=$2
+  /usr/bin/jq -n --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg condition "$condition" '{schema_version:1,status:"redemption_ready_no_transaction",dry_run:true,redemption_submitted:false,zero_open_orders_confirmed:true,finished_ts:$finished,portfolio:{redeemable_winner_count:1},selection:{available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,selected:[{condition_id:$condition,gross_payout:5}]}}' >"$d/preflight.json"
+  chmod 640 "$d/preflight.json"
+}
 run() {
   local d=$1; shift
   env FAKE="$d" FAKE_SIGNER_IMAGE="$signer_image" FAKE_SIGNER_REVISION="$signer_revision" FAKE_USER="$(id -u):$(id -g)" FAKE_PRODUCER_IMAGE="$producer_image" \
@@ -144,10 +157,10 @@ stopped=$root/stopped; fixture "$stopped"; printf '0\n' >"$stopped/state/signer-
 run "$stopped" FAKE_PRESTART_PARTIAL=1 FAKE_PRODUCER_HEALTH_FIRST=starting POLYEDGE_GUARDED_RESTART_WAIT_ATTEMPTS=2 POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED=true POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT="$stopped/preflight.json" POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256="$(sha256sum "$stopped/preflight.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING="$stopped/binding-proof.json" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256="$(sha256sum "$stopped/binding-proof.json" | cut -d' ' -f1)"
 test "$(cat "$stopped/state/signer-active")" = 1; test "$(cat "$stopped/state/producer-active")" = 1
 jq -e '.status == "validated" and .startMode == "stopped_restore" and .signer.oldInvocationId == null and .producer.stoppedForRestart == false and (.stoppedPreflight.sha256 | startswith("sha256:")) and (.stoppedBinding.sha256 | startswith("sha256:"))' "$stopped/ring/activation/receipt.json" >/dev/null
-stopped_repair=$root/stopped-repair; fixture "$stopped_repair"; bind_repair_evidence "$stopped_repair"; printf '0\n' >"$stopped_repair/state/signer-active"; printf '0\n' >"$stopped_repair/state/producer-active"
-run "$stopped_repair" FAKE_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_REPAIR_MODE=true POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED=true POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT="$stopped_repair/preflight.json" POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256="$(sha256sum "$stopped_repair/preflight.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING="$stopped_repair/binding-proof.json" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256="$(sha256sum "$stopped_repair/binding-proof.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_DEPLOY="$stopped_repair/bin/deploy" POLYEDGE_GUARDED_RESTART_QUADLET="$stopped_repair/quadlet" POLYEDGE_GUARDED_RESTART_ROLLBACK_DIR="$stopped_repair/rollback"
+stopped_repair=$root/stopped-repair; fixture "$stopped_repair"; bind_repair_evidence "$stopped_repair"; automatic_preflight "$stopped_repair" "$approved_condition"; printf '0\n' >"$stopped_repair/state/signer-active"; printf '0\n' >"$stopped_repair/state/producer-active"
+run "$stopped_repair" FAKE_PRIOR_SIGNER_IMAGE="$prior_signer_image" FAKE_AUTOMATIC_REDEMPTION=1 FAKE_APPROVED_CONDITION="$approved_condition" POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION="$approved_condition" POLYEDGE_GUARDED_RESTART_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_REPAIR_MODE=true POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED=true POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT="$stopped_repair/preflight.json" POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256="$(sha256sum "$stopped_repair/preflight.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING="$stopped_repair/binding-proof.json" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256="$(sha256sum "$stopped_repair/binding-proof.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_DEPLOY="$stopped_repair/bin/deploy" POLYEDGE_GUARDED_RESTART_QUADLET="$stopped_repair/quadlet" POLYEDGE_GUARDED_RESTART_ROLLBACK_DIR="$stopped_repair/rollback"
 test "$(cat "$stopped_repair/state/signer-active")" = 1; test "$(cat "$stopped_repair/state/producer-active")" = 1; grep -Fx "Image=$signer_image" "$stopped_repair/quadlet" >/dev/null
-jq -e --arg prior "$prior_signer_image" --arg image "$signer_image" '.status == "validated" and .startMode == "stopped_repair_rollout" and .signer.repairMode == true and .signer.priorImage == $prior and .signer.image == $image and .signer.oldInvocationId != null and .producer.stoppedForRestart == false and (.signer.rollbackCopy | endswith("fixture-polyedge-funded-signer.container"))' "$stopped_repair/ring/activation/receipt.json" >/dev/null
+jq -e --arg prior "$prior_signer_image" --arg image "$signer_image" --arg condition "$approved_condition" '.status == "validated" and .startMode == "stopped_repair_rollout" and .signer.repairMode == true and .signer.priorImage == $prior and .signer.image == $image and .signer.oldInvocationId != null and .producer.stoppedForRestart == false and .approvedAutomaticRedemptionCondition == $condition and .automaticRedemption.conditionId == $condition and .automaticRedemption.automatic == true and .automaticRedemption.verified == true and (.automaticRedemption.transactionHash | test("^0x[0-9a-f]{64}$")) and (.signer.rollbackCopy | endswith("fixture-polyedge-funded-signer.container"))' "$stopped_repair/ring/activation/receipt.json" >/dev/null
 stopped_repair_bad=$root/stopped-repair-bad; fixture "$stopped_repair_bad"; bind_repair_evidence "$stopped_repair_bad"; printf '0\n' >"$stopped_repair_bad/state/signer-active"; printf '0\n' >"$stopped_repair_bad/state/producer-active"
 if run "$stopped_repair_bad" FAKE_BAD_POST=1 FAKE_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_REPAIR_MODE=true POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED=true POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT="$stopped_repair_bad/preflight.json" POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256="$(sha256sum "$stopped_repair_bad/preflight.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING="$stopped_repair_bad/binding-proof.json" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256="$(sha256sum "$stopped_repair_bad/binding-proof.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_DEPLOY="$stopped_repair_bad/bin/deploy" POLYEDGE_GUARDED_RESTART_QUADLET="$stopped_repair_bad/quadlet" POLYEDGE_GUARDED_RESTART_ROLLBACK_DIR="$stopped_repair_bad/rollback"; then exit 1; fi
 test "$(cat "$stopped_repair_bad/state/signer-active")" = 0; test "$(cat "$stopped_repair_bad/state/producer-active")" = 0; grep -Fx "Image=$prior_signer_image" "$stopped_repair_bad/quadlet" >/dev/null; test ! -e "$stopped_repair_bad/ring/activation/receipt.json"
