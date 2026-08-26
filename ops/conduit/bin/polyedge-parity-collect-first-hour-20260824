@@ -2,35 +2,35 @@
 set -euo pipefail
 umask 027
 
-readonly window=2026-08-26T18:00:00Z
-readonly collect_not_before=1787771880
-readonly enable_deadline=1787774400
-readonly ledger=/srv/polyedge-ring/parity/20260826T180000Z-funded-active.json
-readonly evidence=/srv/polyedge-ring/parity/hourly/20260826T18/evidence.json
+readonly window=2026-08-26T20:00:00Z
+readonly collect_not_before=1787779080
+readonly enable_deadline=1787781600
+readonly ledger=/srv/polyedge-ring/parity/20260826T200000Z-funded-active.json
+readonly evidence=/srv/polyedge-ring/parity/hourly/20260826T20/evidence.json
 readonly formal=/etc/polyedge/parity-hourly.env
 readonly hourly=/etc/polyedge/jobs/hourly.env
-readonly rollback=/etc/polyedge/rollback/20260826T180000Z-funded-active
+readonly rollback=/etc/polyedge/rollback/20260826T200000Z-funded-active
 readonly transaction=$rollback/env-transaction.json
-readonly staged=/srv/polyedge-ring/parity/activation/20260826T180000Z-staged.json
-readonly validated=/srv/polyedge-ring/parity/activation/20260826T180000Z-first-hour-validated.json
+readonly staged=/srv/polyedge-ring/parity/activation/20260826T200000Z-staged.json
+readonly validated=/srv/polyedge-ring/parity/activation/20260826T200000Z-first-hour-validated.json
 readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260824T052321Z-acknowledged-evicted-no-fill.json
 readonly settlement=/srv/polyedge-ring/parity/funded-recovery/20260824T060435Z-settlement-loss-dlq-1311.json
-readonly rollout=/srv/polyedge-ring/parity/activation/20260826T164152Z-funded-signer-repair-post-redemption/post-redemption-venue-redemption-20260826141030359-43ebed36-attestation.json
-readonly rollout_receipt_sha=sha256:77023a92e03c2fd502b3f20c256e520d3cde8be37e4d3853174b5de8a0606f20
-readonly rollout_helper_sha=sha256:71ef46c684d9347dcea51fa24457d7dae933bcf97eb64cac8b7bf0e92d97ab8b
+readonly rollout=/srv/polyedge-ring/parity/activation/20260826T185115Z-approved-automatic-redemption-restore/post-redemption-venue-redemption-20260826185822229-5506e167-attestation.json
+readonly rollout_receipt_sha=sha256:b36e20b5aef7463f539c4dd613d6f85748f9bb3e872121767bbd164a6c962faf
+readonly rollout_helper_sha=sha256:9014e37eb1c731233789521648368fad0219b2b569aa75eeabebd7d739ccf51b
 readonly recovery_receipt_sha=sha256:925dbb659f4f2da877d3321b8165e2f6d8157d1d2d81e9fc2a62e7bc72bccee0
 readonly settlement_receipt_sha=sha256:f4cfa78ff7dbb63f401ef1f4f427fb6a2d9a1d9b2d96e96476b69264313570ee
-readonly authorized_dlq=1344
-readonly signer_invocation_expected=b9d1387814fa4c02b3aa9883df487a17
-readonly signer_container_expected=d075d0efdacac665ca4ecb1e0357cf094b970e975330bbe80c709e18f01c5816
+readonly authorized_dlq=1346
+readonly signer_invocation_expected=767d7aa472744206975680575cb94527
+readonly signer_container_expected=95f6fa69fc0827e2e6db3c505d40944b400425c64625aabb6d7cebc973f284ec
 readonly producer_image_expected=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8
 readonly producer_revision_expected=72224c12d0790c02d98be7ece8fbcb781b6412e4
-readonly producer_invocation_expected=3b8a4c13e57a4494989b757c5089461e
-readonly producer_container_expected=d7b224230cada65dd89110a8cce27d7cdde45aa2ef55901148ea1fd2ad2327b4
+readonly producer_invocation_expected=44dc5970872d4811977c20a030fc0a68
+readonly producer_container_expected=331908a3afdfc213970928516cd90e7d2973ee790fb2e6d9e8c3271b14d3da6c
 readonly collector=/usr/local/libexec/polyedge-parity-hourly
-readonly collector_sha=sha256:480e29316533ea0cb4f463e17ac283e7053b4b7113943ff7acf11d55099e4d67
+readonly collector_sha=sha256:2895cb2caebd982db28ab36f63c3d538c1022769887b29d697b4076a6bcdb854
 readonly validator=/usr/local/libexec/polyedge-reboot-attestation
-readonly validator_sha=sha256:d8dcaea4b1c0a3bda0e247d586a464ce07f9bfdfc5395dbe8dea4ee5f5fdba17
+readonly validator_sha=sha256:a89b46a74062dee5b9e8e6fac4b38d56bef68abf64f18d41018d14ebab1b65fa
 readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
 readonly resource_group=rg-polyedge-dev
 readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
@@ -425,7 +425,7 @@ test "$(/usr/bin/date -u +%s)" -lt "$enable_deadline"
 ! /usr/bin/systemctl is-enabled --quiet polyedge-parity-hourly.timer
 ! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
 
-receipt_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/activation/.20260826T180000Z-first-hour.XXXXXX)
+receipt_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/activation/.20260826T200000Z-first-hour.XXXXXX)
 /usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
   --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" --arg evidence "$evidence" \
   --arg evidenceSha "sha256:$(sha "$evidence")" --arg collectorSha "$collector_sha" --arg validatorSha "$validator_sha" '
