@@ -132,7 +132,7 @@ heartbeat_safe() {
         .event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
         .event.executor.safety_snapshot_cache_error == null and .event.executor.risk_reservation_index_ready == true;
       def repair:
-        .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.redemption_failures == 1 and .event.executor.busy == false and
+        .event.failed_attempts == 0 and .event.failed_messages == 0 and (.event.redemption_failures | type == "number" and . >= 1) and .event.executor.busy == false and
         .event.executor.user_channel_ready == true and .event.executor.market_channel_ready == true and
         .event.executor.user_channel_gaps == 0 and .event.executor.market_channel_gaps == 0 and
         .event.executor.user_channel_unparsed == 0 and .event.executor.market_channel_unparsed == 0 and
