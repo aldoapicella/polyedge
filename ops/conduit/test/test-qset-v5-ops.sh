@@ -34,6 +34,7 @@ grep -Fx 'User=976' "$writer_override" >/dev/null; grep -Fx 'Group=976' "$writer
 grep -Fx 'User=975' "$processor_override" >/dev/null; grep -Fx 'Group=975' "$processor_override" >/dev/null
 grep -Fx 'User=976:976' "$writer" >/dev/null
 grep -F -- '--user 976:976 --cpus' "$sealer" >/dev/null
+grep -F '"$POLYEDGE_QSET_V5_SEAL_IMAGE" polyedge-rs seal-qset-v5-day' "$sealer" >/dev/null
 grep -F '$POLYEDGE_QSET_V5_WRITER_IMAGE|976:976|running|healthy' "$guard" >/dev/null
 grep -F -- '-socketPath /run/spire-server/api.sock' "$root/QSET_V5_OCI_RUNBOOK.md" >/dev/null
 grep -Fx 'Volume=/run/polyedge-federated-shadow-qset-v5-writer:/run/credentials:ro,Z' "$writer" >/dev/null
