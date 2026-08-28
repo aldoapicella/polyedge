@@ -243,7 +243,7 @@ case "$job" in
     set -- --volume "$ring/segments:/input/events:ro,Z"
     ;;
   qset-v4-processor|qset-v5-processor)
-    set -- --user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges
+    set -- --user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --security-opt=no-new-privileges --unsetenv AZURE_CLIENT_SECRET_FILE
     ;;
   *) set -- ;;
 esac
