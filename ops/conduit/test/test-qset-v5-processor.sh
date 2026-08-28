@@ -54,6 +54,7 @@ for exact in \
   'AZURE_CLIENT_SECRET='; do
   grep -Fx "$exact" "$env_file" >/dev/null
 done
+! grep -F 'AZURE_CLIENT_SECRET_FILE=' "$env_file" >/dev/null
 
 grep -Fx 'Requires=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v5-processor.service' "$service" >/dev/null
 grep -Fx 'ConditionPathExists=/etc/polyedge/ENABLE_QSET_V5_PROCESSOR_MANUAL' "$service" >/dev/null
