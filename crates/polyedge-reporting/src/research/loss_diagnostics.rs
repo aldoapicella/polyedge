@@ -2251,6 +2251,9 @@ fn summarize_stable_runtime_identity(observations: &[(DateTime<Utc>, Value)]) ->
         .filter_map(|(_, payload)| {
             let mut normalized = payload.clone();
             normalized
+                .as_object_mut()
+                .map(|identity| identity.remove("essential_feed_health"));
+            normalized
                 .get_mut("event_blob_prefix_routing")
                 .and_then(Value::as_object_mut)
                 .map(|routing| routing.remove("evaluated_event_ts"));
@@ -2259,7 +2262,7 @@ fn summarize_stable_runtime_identity(observations: &[(DateTime<Utc>, Value)]) ->
         .collect::<BTreeSet<_>>();
     json!({
         "schema_version": 1,
-        "normalization": "event_blob_prefix_routing.evaluated_event_ts excluded after raw provenance validation",
+        "normalization": "essential_feed_health and event_blob_prefix_routing.evaluated_event_ts excluded after raw provenance validation",
         "observations": observations.len(),
         "distinct_identity_count": identities.len(),
         "identity_sha256s": identities
@@ -4228,9 +4231,11 @@ mod tests {
             "evaluated_event_ts": decision_ts - Duration::milliseconds(2),
             "selected_prefix": "shadow-events/test-campaign"
         });
+        runtime_one["essential_feed_health"] = json!({"summary": "running"});
         let mut runtime_two = runtime_one.clone();
         runtime_two["event_blob_prefix_routing"]["evaluated_event_ts"] =
             json!(decision_ts - Duration::milliseconds(1));
+        runtime_two["essential_feed_health"] = json!({"summary": "recovering"});
         let mut events = vec![
             event(
                 "market_start_price",
