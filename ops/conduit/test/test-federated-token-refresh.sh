@@ -2,7 +2,7 @@
 set -eu
 
 root=$(mktemp -d); socket=$root/agent.sock; fake=$root/spire-agent; issuer=https://oidc.example.invalid
-lanes='promotion research funded-intent-producer shadow-qset-v3-writer shadow-qset-v4-writer shadow-qset-v4-processor shadow-qset-v5-writer shadow-qset-v5-processor'
+lanes='promotion research funded-intent-producer shadow-qset-v3-writer shadow-qset-v4-writer shadow-qset-v4-processor shadow-qset-v5-writer shadow-qset-v5-processor shadow-qset-v6-writer shadow-qset-v6-processor'
 for lane in $lanes; do mkdir -m 0700 "$root/polyedge-federated-$lane"; done
 python3 - "$socket" <<'PY' &
 import socket, sys, time

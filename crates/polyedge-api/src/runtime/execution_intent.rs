@@ -229,6 +229,7 @@ impl IntentPublisherConfig {
             "polyedge-shadow-qset-v3-events"
                 | "polyedge-shadow-qset-v4-events"
                 | "polyedge-shadow-qset-v5-events"
+                | "polyedge-shadow-qset-v6-events"
         ) && (!pointer_only_preflight
             || settings.azure.funded_direct_service_bus_enabled
             || !settings
@@ -1251,6 +1252,7 @@ fn validated_conservative_prior(
             "static execution model is not the exact frozen conservative prior".to_owned()
         })?;
     let expected_container = match settings.azure.storage_container_name.as_str() {
+        "polyedge-shadow-qset-v6-events" => "polyedge-research-qset-v6",
         "polyedge-shadow-qset-v5-events" => "polyedge-research-qset-v5",
         "polyedge-shadow-qset-v4-events" => "polyedge-research-qset-v4",
         "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
@@ -1768,6 +1770,7 @@ mod tests {
         settings.azure.storage_account_name = Some("test-account".to_owned());
         settings.azure.storage_container_name = shadow_container.to_owned();
         let research_container = match shadow_container {
+            "polyedge-shadow-qset-v6-events" => "polyedge-research-qset-v6",
             "polyedge-shadow-qset-v5-events" => "polyedge-research-qset-v5",
             "polyedge-shadow-qset-v4-events" => "polyedge-research-qset-v4",
             "polyedge-shadow-qset-v3-events" => "polyedge-research-qset-v3",
