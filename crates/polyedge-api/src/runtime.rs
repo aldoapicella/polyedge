@@ -74,6 +74,9 @@ const QSET_V5_RAW_CONTAINER: &str = "polyedge-shadow-qset-v5-events";
 const QSET_V6_APP_NAME: &str = "polyedge-shadow-qset-v6";
 const QSET_V6_CAMPAIGN_ID: &str = "campaign-2026-09-01-qset-v6";
 const QSET_V6_RAW_CONTAINER: &str = "polyedge-shadow-qset-v6-events";
+const QSET_V7_APP_NAME: &str = "polyedge-shadow-qset-v7";
+const QSET_V7_CAMPAIGN_ID: &str = "campaign-2026-09-02-qset-v7";
+const QSET_V7_RAW_CONTAINER: &str = "polyedge-shadow-qset-v7-events";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct QsetV4WriterRetirementReceipt {
@@ -131,6 +134,8 @@ pub struct QsetV6WriterRetirementReceipt {
     pub final_queued: usize,
     pub flush_success: bool,
 }
+pub type QsetV7WriterRetirementReceipt = QsetV6WriterRetirementReceipt;
+
 #[derive(Clone)]
 pub struct RuntimeController {
     inner: Arc<RuntimeInner>,
@@ -1019,6 +1024,63 @@ impl RuntimeController {
             status: "prepared_for_retirement",
             retired_at: Utc::now(),
             campaign_id: QSET_V6_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
+    }
+
+    pub async fn prepare_qset_v7_retirement(
+        &self,
+    ) -> Result<QsetV7WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V7_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V7_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v7 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v7_retirement_receipt(qset_v7_image_digest()?, qset_v7_source_revision()?)
+    }
+
+    fn qset_v7_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV7WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v7 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV7WriterRetirementReceipt {
+            schema: "polyedge.qset_v7_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V7_CAMPAIGN_ID,
             app_name: self.inner.settings.deploy.app_name.clone(),
             image_digest,
             source_revision,
@@ -4426,6 +4488,41 @@ fn qset_v6_source_revision_from(
     Ok(configured.to_owned())
 }
 
+fn qset_v7_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V7_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V7_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v7_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V7_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v7_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v7_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V7_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V7_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v7_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v7_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V7_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v7 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
+}
+
 fn saturating_sub_atomic(value: &AtomicUsize, amount: usize) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
@@ -7194,6 +7291,27 @@ mod tests {
         );
         assert!(qset_v6_source_revision_from(&"A".repeat(40), None).is_err());
         assert!(qset_v6_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
+    }
+
+    #[test]
+    fn qset_v7_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v7_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v7_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v7_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v7_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v7_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v7_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v7_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
     }
 
     #[test]

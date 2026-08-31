@@ -11,6 +11,8 @@ targetScope = 'resourceGroup'
   'shadow-qset-v5-processor'
   'shadow-qset-v6-writer'
   'shadow-qset-v6-processor'
+  'shadow-qset-v7-writer'
+  'shadow-qset-v7-processor'
   'funded-signer'
   'funded-intent-producer'
 ])
@@ -73,6 +75,16 @@ var lanes = {
     identityName: 'id-polyedge-conduit-shadow-qset-v6-processor'
     ficName: 'fic-spire-conduit-shadow-qset-v6-processor'
     subject: 'spiffe://polyedge.local/conduit/shadow-qset-v6-processor'
+  }
+  'shadow-qset-v7-writer': {
+    identityName: 'id-polyedge-conduit-shadow-qset-v7-writer'
+    ficName: 'fic-spire-conduit-shadow-qset-v7-writer'
+    subject: 'spiffe://polyedge.local/conduit/shadow-qset-v7-writer'
+  }
+  'shadow-qset-v7-processor': {
+    identityName: 'id-polyedge-conduit-shadow-qset-v7-processor'
+    ficName: 'fic-spire-conduit-shadow-qset-v7-processor'
+    subject: 'spiffe://polyedge.local/conduit/shadow-qset-v7-processor'
   }
   'funded-signer': {
     identityName: 'id-polyedge-conduit-funded-signer'

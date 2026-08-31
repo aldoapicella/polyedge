@@ -114,6 +114,14 @@ jobs:
           ops/conduit/test/test-qset-v6-rbac-proof.sh
           ops/conduit/test/test-qset-v6-retire-writer.sh
           ops/conduit/test/test-qset-v6-source-freeze-upload-interruption-recovery.sh
+          ops/conduit/test/test-qset-v7-ops.sh
+          ops/conduit/test/test-qset-v7-processor.sh
+          ops/conduit/test/test-qset-v7-processor-handoff.sh
+          ops/conduit/test/test-qset-v7-rbac-proof.sh
+          ops/conduit/test/test-qset-v7-retire-writer.sh
+          ops/conduit/test/test-qset-v7-source-freeze-upload-interruption-recovery.sh
+          bash research/test_run_shadow_daily_v7.sh
+          bash research/test_verify_shadow_daily_v7_bundle.sh
           bash research/test_run_shadow_daily_v6.sh
           bash research/test_verify_shadow_daily_v6_bundle.sh
           node --test venue-probe/test/workload-identity-smoke.test.mjs
@@ -440,7 +448,7 @@ jobs:
           jq -e '
             .variables.audience == "api://AzureADTokenExchange"
             and .parameters.lane.allowedValues == [
-              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "shadow-qset-v5-writer", "shadow-qset-v5-processor", "shadow-qset-v6-writer", "shadow-qset-v6-processor", "funded-signer", "funded-intent-producer"
+              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "shadow-qset-v5-writer", "shadow-qset-v5-processor", "shadow-qset-v6-writer", "shadow-qset-v6-processor", "shadow-qset-v7-writer", "shadow-qset-v7-processor", "funded-signer", "funded-intent-producer"
             ]
             and .variables.lanes["shadow-qset-v4-writer"] == {
               identityName: "id-polyedge-conduit-shadow-qset-v4-writer",
@@ -461,6 +469,16 @@ jobs:
               identityName: "id-polyedge-conduit-shadow-qset-v6-processor",
               ficName: "fic-spire-conduit-shadow-qset-v6-processor",
               subject: "spiffe://polyedge.local/conduit/shadow-qset-v6-processor"
+            }
+            and .variables.lanes["shadow-qset-v7-writer"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v7-writer",
+              ficName: "fic-spire-conduit-shadow-qset-v7-writer",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v7-writer"
+            }
+            and .variables.lanes["shadow-qset-v7-processor"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v7-processor",
+              ficName: "fic-spire-conduit-shadow-qset-v7-processor",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v7-processor"
             }
             and .variables.lanes["funded-intent-producer"] == {
               identityName: "id-polyedge-conduit-funded-intent-producer",

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run qset-v7 pre-boundary guard at the exact UTC handoff window
+
+[Timer]
+OnCalendar=2026-09-01 23:59:30 UTC
+AccuracySec=1s
+Persistent=false
+Unit=polyedge-qset-v7-boundary@pre.service
+
+[Install]
+WantedBy=timers.target

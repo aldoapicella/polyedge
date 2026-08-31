@@ -29,6 +29,7 @@ use history::{
 use runtime::RuntimeController;
 pub use runtime::{
     QsetV4WriterRetirementReceipt, QsetV5WriterRetirementReceipt, QsetV6WriterRetirementReceipt,
+    QsetV7WriterRetirementReceipt,
 };
 
 const RECENT_EVENTS_MAX: usize = 500;
@@ -84,6 +85,12 @@ impl ApiShutdown {
         &self,
     ) -> Result<QsetV6WriterRetirementReceipt, String> {
         self.runtime.prepare_qset_v6_retirement().await
+    }
+
+    pub async fn prepare_qset_v7_retirement(
+        &self,
+    ) -> Result<QsetV7WriterRetirementReceipt, String> {
+        self.runtime.prepare_qset_v7_retirement().await
     }
 }
 

@@ -387,7 +387,8 @@
     "fundedIntentProducer": "Only exact model/funded reads, shadow event/table writes, ACR pull, and sender direction; no receiver, qset, Key Vault, wallet, broad scope, or live execution access.",
     "shadowQsetV4Processor": "Only exact qset-v4 raw read plus qset-v4 research/control access through the shadow-qset-v4-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access.",
     "shadowQsetV5Processor": "Only exact qset-v5 raw read plus qset-v5 research/control access through the shadow-qset-v5-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access.",
-    "shadowQsetV6Processor": "Only exact qset-v6 raw read plus qset-v6 research/control access through the shadow-qset-v6-processor federated lane; no funded, qset-v1/v2/v3/v4/v5, Key Vault, Service Bus, wallet, or client-secret access."
+    "shadowQsetV6Processor": "Only exact qset-v6 raw read plus qset-v6 research/control access through the shadow-qset-v6-processor federated lane; no funded, qset-v1/v2/v3/v4/v5, Key Vault, Service Bus, wallet, or client-secret access.",
+    "shadowQsetV7Processor": "Only exact qset-v7 raw read plus qset-v7 research/control access through the shadow-qset-v7-processor federated lane; no funded, qset-v1/v2/v3/v4/v5/v6, Key Vault, Service Bus, wallet, or client-secret access."
   },
   "lastReadOnlyRecheck": {
     "capturedAtUtc": "2026-08-21T16:30:00Z",
@@ -615,6 +616,43 @@
         "sealedDayReceipts": [
           "/srv/polyedge-ring/migration/qset-v6-seal/2026-09-01.json",
           "/srv/polyedge-ring/migration/qset-v6-seal/2026-09-02.json"
+        ]
+      },
+      "requiredProofBeforeFirstExecution": [
+        "final_source_freeze_receipt_hash_image_revision_binding",
+        "two_exact_closed_day_receipt_and_inventory_hashes",
+        "local_linux_arm64_image_revision",
+        "dedicated_federated_token"
+      ],
+      "requiredProofBeforeRecurringEnablement": [
+        "manual_processor_success",
+        "verified_output_hash_and_readback",
+        "negative_access_probe",
+        "resource_and_disk_guard_evidence"
+      ]
+    },
+    {
+      "name": "qset-v7-processor",
+      "classification": "configured_manual_only_not_executed",
+      "ociUnit": "polyedge-qset-v7-processor.service",
+      "identityLane": "shadow-qset-v7-processor",
+      "azureContainerAppsJob": null,
+      "azureProcessorJobDeploymentAllowed": false,
+      "manualFirstExecution": true,
+      "recurringEnabled": false,
+      "timerUnit": null,
+      "imagePullPolicy": "never",
+      "minimumDiskHeadroomBytes": 16106127360,
+      "resources": {
+        "cpu": 4,
+        "memory": "8GiB",
+        "pids": 1024
+      },
+      "requiredInputs": {
+        "sourceFreezeReceipt": "/srv/polyedge-ring/migration/qset-v7/source-freeze/source-<final-sha256>.json",
+        "sealedDayReceipts": [
+          "/srv/polyedge-ring/migration/qset-v7-seal/2026-09-02.json",
+          "/srv/polyedge-ring/migration/qset-v7-seal/2026-09-03.json"
         ]
       },
       "requiredProofBeforeFirstExecution": [
