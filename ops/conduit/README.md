@@ -634,6 +634,10 @@ TLS, and inbound TCP/80 and TCP/443 in OCI and UFW. Do not use an ephemeral
 platform hostname. Keep the same exact issuer in the three SPIRE configs,
 `spire.env`, Caddy, and the Bicep `issuer` parameter.
 
+The dashboard uses the separate HTTPS name
+`https://polyedge.149.130.186.60.nip.io`; Caddy proxies it to the loopback-only
+frontend on port 3000. It must never share the OIDC issuer's catch-all handler.
+
 Use the verified SPIRE 1.15.2 ARM64 musl artifacts. Their SHA-256 values are
 `92e782b285c50c62cdf37fdfa8917ea68fa57685b3bf99d03db36da4095678fa`
 for SPIRE and

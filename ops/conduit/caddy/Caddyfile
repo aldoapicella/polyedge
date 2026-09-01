@@ -11,3 +11,7 @@ oidc.jupiterlabs.dev {
 		respond 404
 	}
 }
+
+polyedge.149.130.186.60.nip.io {
+	reverse_proxy 127.0.0.1:3000
+}
