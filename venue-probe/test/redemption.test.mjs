@@ -853,6 +853,42 @@ test("onchain discovery skips stale candidates and uses authoritative payout", a
   assert.equal(selection.payout_source, "onchain_balances_and_payout_vector");
 });
 
+test("onchain discovery validates independent conditions concurrently", async () => {
+  const collections = new Map([
+    [`${conditionA}:1`, "a1"], [`${conditionA}:2`, "a2"],
+    [`${conditionB}:1`, "b1"], [`${conditionB}:2`, "b2"]
+  ]);
+  const assets = new Map([
+    ["a1", 101n], ["a2", 102n], ["b1", 201n], ["b2", 202n]
+  ]);
+  let activeDenominators = 0;
+  let maxActiveDenominators = 0;
+  const publicClient = {
+    async readContract({ functionName, args }) {
+      if (functionName === "getCollectionId") return collections.get(`${args[1]}:${args[2]}`);
+      if (functionName === "getPositionId") return assets.get(args[1]);
+      if (functionName === "payoutDenominator") {
+        activeDenominators += 1;
+        maxActiveDenominators = Math.max(maxActiveDenominators, activeDenominators);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        activeDenominators -= 1;
+        return 1n;
+      }
+      if (functionName === "payoutNumerators") return args[1] === 0n ? 1n : 0n;
+      if (functionName === "balanceOf") return [101n, 201n].includes(args[1]) ? 1_000_000n : 0n;
+      throw new Error(`unexpected contract call: ${functionName}`);
+    }
+  };
+
+  const selection = await discoverOnchainRedeemableConditions(publicClient, [
+    { conditionId: conditionA, redeemable: true, currentValue: 1, negativeRisk: false, asset: "101", oppositeAsset: "102", outcomeIndex: 0 },
+    { conditionId: conditionB, redeemable: true, currentValue: 1, negativeRisk: false, asset: "201", oppositeAsset: "202", outcomeIndex: 0 }
+  ], { funderAddress: funder, maxPayout: null, maxConditions: 2 });
+
+  assert.equal(maxActiveDenominators, 2);
+  assert.deepEqual(selection.selected.map((row) => row.condition_id), [conditionA, conditionB]);
+});
+
 test("dust candidate augmentation is explicit and remains bound to durable, Gamma, chain, and repeat evidence", async () => {
   const decisionId = "a".repeat(64);
   const probeId = `funded-direct-${decisionId}`;

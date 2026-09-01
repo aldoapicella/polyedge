@@ -1137,9 +1137,7 @@ async function validateOnchainSelection(publicClient, selection, {
         functionName: "WRAPPED_COLLATERAL"
       })
     : null;
-  const rows = [];
-  let totalPayout = 0;
-  for (const row of selection.selected) {
+  const rows = (await Promise.all(selection.selected.map(async (row) => {
     if (!Array.isArray(row.assets) || row.assets.length !== 2 ||
         row.assets.some((asset, index) => asset.outcome_index !== index || !/^\d+$/.test(asset.asset))) {
       throw new Error(`fail closed: complete two-outcome asset metadata is required for ${row.condition_id}`);
@@ -1169,14 +1167,14 @@ async function validateOnchainSelection(publicClient, selection, {
         address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "balanceOf", args: [funderAddress, asset]
       })))
     ]);
-    if (denominator === 0n) continue;
+    if (denominator === 0n) return null;
     const payoutBaseUnits = balances.reduce(
       (sum, balance, index) => sum + (balance * numerators[index]) / denominator,
       0n
     );
     const expectedPayout = Number(formatUnits(payoutBaseUnits, 6));
-    if (!(expectedPayout > 0)) continue;
-    rows.push({
+    if (!(expectedPayout > 0)) return null;
+    return {
       ...row,
       gross_payout: expectedPayout,
       adapter: row.negative_risk ? NEG_RISK_CTF_COLLATERAL_ADAPTER : CTF_COLLATERAL_ADAPTER,
@@ -1186,9 +1184,10 @@ async function validateOnchainSelection(publicClient, selection, {
       payout_numerators: numerators.map(String),
       payout_denominator: String(denominator),
       onchain_expected_payout: expectedPayout
-    });
-  }
+    };
+  }))).filter(Boolean);
   const selected = [];
+  let totalPayout = 0;
   for (const row of rows) {
     if (selected.length >= Number(maxConditions)) break;
     if (hasPayoutCap(maxPayout) && totalPayout + row.gross_payout > Number(maxPayout) + 1e-9) {
