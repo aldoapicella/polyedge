@@ -1,0 +1,989 @@
+#!/bin/sh
+set -eu
+
+die() { echo "polyedge-reboot-attestation: $*" >&2; exit 1; }
+sha() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
+json_sha() { jq -cS "$1" "$2" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
+
+text_sha() { printf '%s\n' "$1" | sha256sum | awk '{printf "sha256:%s\n", $1}'; }
+
+producer_env_binding_expected() {
+  jq -cS -n '{
+    APP_NAME:"polyedge-funded-intent-producer",
+    RUNTIME_ROLE:"profitability_shadow",
+    EXECUTION_MODE:"paper",
+    ALLOW_LIVE:"false",
+    RUN_BOT_ON_STARTUP:"true",
+    STRATEGY_INTENT_OPERATOR_DIRECT:"true",
+    PUBLISH_STRATEGY_CANARY_INTENTS:"true",
+    STRATEGY_CANARY_INTENT_PREFIX:"reports/research/venue-probe/control/strategy-canary/intents",
+    STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:"conservative-execution-prior-v1",
+    STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:"azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    STRATEGY_CANARY_EXECUTION_MODEL_SHA256:"sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4",
+    STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MAX_ORDER_NOTIONAL:"10.5",
+    STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:"360",
+    STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:"900",
+    TARGET_ASSET:"BTC",TARGET_ASSET_NAME:"Bitcoin",TARGET_HORIZON:"15m",
+    TARGET_BINANCE_SYMBOL:"btcusdt",TARGET_CHAINLINK_SYMBOL:"btc/usd",TARGET_COINBASE_PRODUCT_ID:"BTC-USD",
+    AZURE_TENANT_ID:"9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
+    AZURE_CLIENT_ID:"54f0136b-5e72-4ad1-b23e-cb1269d356c1",
+    AZURE_FEDERATED_TOKEN_FILE:"/run/credentials/azure-federated-token",
+    AZURE_TOKEN_CREDENTIALS:"WorkloadIdentityCredential",
+    AZURE_STORAGE_ACCOUNT_NAME:"stpolyedge6urdjr5nmwx7w",
+    AZURE_STORAGE_CONTAINER_NAME:"polyedge-shadow-events",
+    AZURE_STORAGE_TABLE_NAME:"ShadowBotEventIndex",
+    AZURE_CHART_TABLE_NAME:"ShadowBotChartSeries",
+    AZURE_MARKET_TABLE_NAME:"ShadowBotMarketCatalog",
+    AZURE_FUNDED_STORAGE_CONTAINER_NAME:"polyedge-funded-evidence",
+    AZURE_MODEL_STORAGE_CONTAINER_NAME:"polyedge-models",
+    FUNDED_DIRECT_SERVICE_BUS_ENABLED:"true",
+    FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:"sb-polyedge-funded-cl-6urdjr5nmwx7w",
+    FUNDED_DIRECT_SERVICE_BUS_QUEUE:"funded-dynamic-quote-intents"
+  }'
+}
+
+[ "$#" -eq 1 ] || die 'usage: polyedge-reboot-attestation prepare|complete|validate-ledger'
+command=$1
+case "$command" in prepare|complete|validate-ledger) ;; *) die 'unsupported command' ;; esac
+
+expected_uid=${POLYEDGE_REBOOT_EXPECTED_UID:-0}
+expected_gid=${POLYEDGE_REBOOT_EXPECTED_GID:-0}
+[ "$(id -u)" = "$expected_uid" ] || die 'must run as the configured root identity'
+
+secure_dir() (
+  path=$1 required_mode=$2
+  [ ! -L "$path" ] && [ -d "$path" ] || die "unsafe or missing directory: $path"
+  set -- $(stat -c '%u %g %a' "$path")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$required_mode" ] \
+    || die "wrong owner or mode: $path"
+)
+
+secure_file() (
+  path=$1 required_mode=$2 size_limit=$3
+  [ ! -L "$path" ] && [ -f "$path" ] || die "unsafe or missing file: $path"
+  set -- $(stat -c '%u %g %a %h %s' "$path")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$required_mode" ] && [ "$4" = 1 ] \
+    && [ "$5" -gt 0 ] && [ "$5" -le "$size_limit" ] || die "wrong owner, mode, link count, or size: $path"
+)
+
+make_dir() {
+  md_path=$1 md_parent=$2
+  if [ -e "$md_path" ]; then
+    secure_dir "$md_path" 750
+  else
+    secure_dir "$md_parent" 750
+    install -d -m 0750 "$md_path"
+    secure_dir "$md_path" 750
+  fi
+}
+
+env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+if [ "${POLYEDGE_PARITY_BINDINGS_FROZEN:-}" != 1 ]; then
+  secure_file "$env_file" 640 1048576
+  set -a
+  . "$env_file"
+  set +a
+fi
+
+: "${POLYEDGE_PARITY_WINDOW_START_UTC:?missing formal window start}"
+: "${POLYEDGE_PARITY_LEDGER:?missing formal ledger path}"
+: "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?missing formal source commit}"
+: "${POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE:?missing formal Azure image}"
+: "${POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE:?missing formal OCI image}"
+
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'formal source commit is malformed'
+for image in "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE"; do
+  printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+    || die 'formal image is not an immutable registry digest'
+done
+
+window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
+[ "$(date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$POLYEDGE_PARITY_WINDOW_START_UTC" ] \
+  || die 'formal window start is not canonical UTC'
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+reboot_root=$parity_root/reboot
+pending=$reboot_root/pending.json
+runtime_dir=${POLYEDGE_REBOOT_RUNTIME_DIR:-/run/polyedge/reboot-attestation}
+lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
+boot_id_file=${POLYEDGE_REBOOT_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}
+proc_stat=${POLYEDGE_REBOOT_PROC_STAT:-/proc/stat}
+ring_status=${POLYEDGE_PARITY_RING_STATUS:-$ring/status.json}
+boot_root=${POLYEDGE_PARITY_BOOT_ROOT:-/}
+boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
+ring_floor=${POLYEDGE_JOB_MIN_FREE_BYTES:-42949672960}
+pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
+api_token=${POLYEDGE_REBOOT_API_TOKEN_FILE:-/run/polyedge-federated-api/azure-federated-token}
+research_token=${POLYEDGE_REBOOT_RESEARCH_TOKEN_FILE:-/run/polyedge-federated-research/azure-federated-token}
+funded_token=${POLYEDGE_REBOOT_FUNDED_TOKEN_FILE:-/run/polyedge-federated-funded-signer/azure-federated-token}
+funded_producer_token=${POLYEDGE_REBOOT_FUNDED_PRODUCER_TOKEN_FILE:-/run/polyedge-federated-funded-intent-producer/azure-federated-token}
+funded_producer_config=${POLYEDGE_PARITY_FUNDED_PRODUCER_ENV_FILE:-/etc/polyedge/funded-intent-producer.env}
+
+case "$ring:$parity_root:$POLYEDGE_PARITY_LEDGER" in *'/../'*|*'/..:'*|../*|*':../'*) die 'unsafe parity path' ;; esac
+[ "${ring#/}" != "$ring" ] || die 'ring root must be absolute'
+mountpoint -q "$ring" || die 'ring root is not a mount point'
+secure_dir "$parity_root" 750
+ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
+ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
+[ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
+  || die 'formal ledger must be a direct .json child of the parity root'
+secure_file "$POLYEDGE_PARITY_LEDGER" 640 1048576
+ledger_read=$POLYEDGE_PARITY_LEDGER
+
+funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
+case "$funded_mode" in
+  disabled)
+    funded_enabled=false
+    funded_image= funded_revision= funded_rollout_receipt= funded_rollout_sha=
+    funded_service_bus_dlq=null
+    funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_producer_image= funded_producer_user= funded_producer_config_sha=
+    funded_producer_env_binding_sha= funded_producer_mount_binding_sha=
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:-}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:-}
+    [ -z "$parity_collector_sha$reboot_validator_sha" ] || {
+      [ -n "$parity_collector_sha" ] && [ -n "$reboot_validator_sha" ] || die 'disabled parity helper hashes must be supplied together'
+      for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'; done
+    }
+    ;;
+  active)
+    funded_enabled=true
+    funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:?missing funded image}
+    funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:?missing funded revision}
+    funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:?missing funded rollout receipt}
+    funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:?missing funded rollout receipt hash}
+    funded_service_bus_dlq=${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:?missing funded DLQ baseline}
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:?missing approved parity collector hash}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:?missing approved reboot validator hash}
+    funded_user=${POLYEDGE_PARITY_FUNDED_UID:?missing funded UID}:${POLYEDGE_PARITY_FUNDED_GID:?missing funded GID}
+    funded_session=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:?missing funded session}
+    funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:?missing funded session hash}
+    funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:?missing funded config hash}
+    printf '%s' "$funded_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' \
+      || die 'funded image is malformed'
+    printf '%s' "$funded_revision" | grep -Eq '^[0-9a-f]{40}$' || die 'funded revision is malformed'
+    printf '%s' "$funded_rollout_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded rollout receipt hash is malformed'
+    printf '%s' "$funded_service_bus_dlq" | grep -Eq '^[0-9]+$' || die 'funded DLQ baseline is malformed'
+    for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do
+      printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'
+    done
+    printf '%s' "$funded_user" | grep -Eq '^[0-9]+:[0-9]+$' || die 'funded user is malformed'
+    printf '%s' "$funded_session" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' || die 'funded session is malformed'
+    for hash in "$funded_session_sha" "$funded_config_sha"; do
+      printf '%s' "$hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded binding hash is malformed'
+    done
+    funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:?missing funded producer image}
+    funded_producer_user=984:980
+    funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:?missing funded producer config hash}
+    printf '%s' "$funded_producer_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+      || die 'funded producer image is malformed'
+    printf '%s' "$funded_producer_config_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'funded producer config hash is malformed'
+    producer_env_binding_json=$(producer_env_binding_expected)
+    funded_producer_env_binding_sha=$(text_sha "$producer_env_binding_json")
+    unset producer_env_binding_json
+    producer_mount_binding_json=$(jq -cS -n --arg source "${funded_producer_token%/*}" \
+      '{source:$source,destination:"/run/credentials",readOnly:true}')
+    funded_producer_mount_binding_sha=$(text_sha "$producer_mount_binding_json")
+    unset producer_mount_binding_json
+    printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
+      || die 'active funded parity requires a funded-active ledger'
+    ;;
+  *) die 'formal funded mode must equal disabled or active' ;;
+esac
+attestor_bin=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+collector_bin=${POLYEDGE_PARITY_COLLECTOR_BIN:-/usr/local/libexec/polyedge-parity-hourly}
+if [ -n "$parity_collector_sha$reboot_validator_sha" ]; then
+  secure_file "$attestor_bin" 755 262144
+  secure_file "$collector_bin" 755 262144
+  [ "$(sha "$attestor_bin")" = "$reboot_validator_sha" ] || die 'installed reboot validator hash differs from the formal binding'
+  [ "$(sha "$collector_bin")" = "$parity_collector_sha" ] || die 'installed parity collector hash differs from the formal binding'
+fi
+
+subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+resource_group=rg-polyedge-dev
+service_bus_namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+service_bus_queue=funded-dynamic-quote-intents
+runuser_bin=${POLYEDGE_RUNUSER_BIN:-/usr/sbin/runuser}
+az_bin=${POLYEDGE_AZ_BIN:-/usr/bin/az}
+validate_service_bus_snapshot() {
+  queue_json=$("$runuser_bin" -u ubuntu -- "$az_bin" servicebus queue show \
+    --subscription "$subscription" --resource-group "$resource_group" \
+    --namespace-name "$service_bus_namespace" --name "$service_bus_queue" --only-show-errors -o json) \
+    || die 'funded Service Bus queue snapshot is unreadable'
+  printf '%s' "$queue_json" | jq -e --argjson dlq "$funded_service_bus_dlq" '
+    .status == "Active" and .countDetails.activeMessageCount == 0 and
+    .countDetails.scheduledMessageCount == 0 and .countDetails.deadLetterMessageCount == $dlq
+  ' >/dev/null || die 'funded Service Bus queue differs from the immutable DLQ baseline'
+  unset queue_json
+}
+if [ "$funded_enabled" = true ]; then
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260831T185544Z-funded-signer-resume/post-redemption-venue-redemption-20260826185822229-5506e167-attestation.json" ] \
+    || die 'funded rollout receipt path differs from the approved activation receipt'
+  if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
+    [ "$funded_rollout_sha" = sha256:3be3281bb491cc52f864c463471b9b373ffba72c180118ef8729c563052736c3 ] \
+      || die 'funded rollout receipt hash differs from the approved post-redemption attestation'
+    [ "$funded_service_bus_dlq" = 1346 ] || die 'funded Service Bus baseline differs from the live attestation'
+  fi
+  secure_file "$funded_rollout_receipt" 640 1048576
+  [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
+  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --arg producer_image "$funded_producer_image" \
+    --argjson dlq "$funded_service_bus_dlq" '
+    .schema == "polyedge.funded_signer_post_redemption_attestation.v1" and .status == "attested" and
+    (.createdAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.helperSha256 | test("^sha256:[0-9a-f]{64}$")) and .authorizedDeadLetterBaseline == $dlq and
+    .runtime.signer.image == $image and .runtime.signer.revision == $revision and
+    (.runtime.signer.invocationId | test("^[0-9a-f]{32}$")) and (.runtime.signer.containerId | test("^[0-9a-f]{64}$")) and
+    .runtime.signer.restartCount == 0 and .runtime.signer.user == "986:982" and
+    .runtime.producer.image == $producer_image and (.runtime.producer.revision | test("^[0-9a-f]{40}$")) and
+    (.runtime.producer.invocationId | test("^[0-9a-f]{32}$")) and (.runtime.producer.containerId | test("^[0-9a-f]{64}$")) and
+    .runtime.producer.restartCount == 0 and .runtime.producer.user == "984:980" and
+    .runtime.producer.status == "running" and .runtime.producer.health == "healthy" and
+    (.redemption.transactionHash | test("^0x[0-9a-f]{64}$")) and (.redemption.settlementBlob | type == "string" and length > 0) and
+    .heartbeat.failedMessages == 0 and .heartbeat.failedAttempts == 0 and
+    .heartbeat.executor.busy == false and .heartbeat.executor.user_channel_ready == true and
+    .heartbeat.executor.market_channel_ready == true and .heartbeat.executor.user_channel_gaps == 0 and
+    .heartbeat.executor.market_channel_gaps == 0 and .heartbeat.executor.user_channel_unparsed == 0 and
+    .heartbeat.executor.market_channel_unparsed == 0 and .heartbeat.executor.reconnect_reconciliation_required == false and
+    .heartbeat.executor.safety_snapshot_cache_ready == true and .heartbeat.executor.safety_snapshot_open_order_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_position_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+    .heartbeat.executor.safety_snapshot_cache_error == null and .heartbeat.executor.risk_reservation_index_ready == true and
+    .queue.after == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+    .queue.deadLetterNonGrowth == true and .servicesMutated == false and .staleRecoveryReceiptsAccepted == false and
+    .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
+  ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
+  if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
+    jq -e '.helperSha256 == "sha256:9014e37eb1c731233789521648368fad0219b2b569aa75eeabebd7d739ccf51b" and
+      .runtime.signer.image == "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:6fa635f016811b7a0506ddcc40a6b273435c8e619de09b6b7aae116b21544ea4" and .runtime.signer.revision == "c37ab84c3abb49be024e8489fa078eeaef0bbf42" and
+      .runtime.signer.invocationId == "1a0fe3ee8b00497ab0242f23a9dcbd10" and .runtime.signer.containerId == "de1f301c0acacba98445ecd13a62dae9e6f4563b6b7db344caf7c5efee5886a4" and
+      .runtime.producer.image == "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8" and .runtime.producer.revision == "72224c12d0790c02d98be7ece8fbcb781b6412e4" and
+      .runtime.producer.invocationId == "1063610618f64580b67b98782e5328a0" and .runtime.producer.containerId == "b2a281fc7a3b4530db8e25c3f7d4d9c64634fe8dafdfd68c8574dadad00a250e"' "$funded_rollout_receipt" >/dev/null \
+      || die 'live attestation runtime identity differs from the approved values'
+  fi
+  validate_service_bus_snapshot
+fi
+
+protected_json() {
+  jq -cS --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" \
+    --arg azure "$POLYEDGE_PARITY_EXPECTED_AZURE_RESEARCH_IMAGE" \
+    --arg oci "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" \
+    --arg mode "$funded_mode" --arg image "$funded_image" --arg user "$funded_user" \
+    --arg revision "$funded_revision" --arg rollout "$funded_rollout_receipt" --arg rollout_sha "$funded_rollout_sha" \
+    --argjson dlq "$funded_service_bus_dlq" --arg collector_sha "$parity_collector_sha" \
+    --arg validator_sha "$reboot_validator_sha" \
+    --arg session "$funded_session" --arg session_sha "$funded_session_sha" --arg config_sha "$funded_config_sha" \
+    --arg producer_image "$funded_producer_image" --arg producer_user "$funded_producer_user" \
+    --arg producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
+      {schemaVersion,status,windowStartUtc,azureAuthoritative,azureDeletionAllowed,shadowQsetEnabled,
+       fundedSignerEnabled,fundedSignerMode:(.fundedSignerMode // "disabled"),
+       fundedSignerImage:(.fundedSignerImage // null),fundedSignerUser:(.fundedSignerUser // null),
+       fundedSignerRevision:(.fundedSignerRevision // null),fundedRolloutReceiptPath:(.fundedRolloutReceiptPath // null),
+       fundedRolloutReceiptSha256:(.fundedRolloutReceiptSha256 // null),
+       fundedServiceBusDlqBaseline:(.fundedServiceBusDlqBaseline // null),
+       parityCollectorSha256:(.parityCollectorSha256 // null),rebootValidatorSha256:(.rebootValidatorSha256 // null),
+       fundedSessionId:(.fundedSessionId // null),fundedSessionManifestSha256:(.fundedSessionManifestSha256 // null),
+       fundedConfigSha256:(.fundedConfigSha256 // null),fundedIntentProducerEnabled:(.fundedIntentProducerEnabled // false),
+       fundedIntentProducerImage:(.fundedIntentProducerImage // null),fundedIntentProducerUser:(.fundedIntentProducerUser // null),
+       fundedIntentProducerConfigSha256:(.fundedIntentProducerConfigSha256 // null),gitSha:$git,azureResearchImage:$azure,ociResearchImage:$oci} as $p |
+      if $p.schemaVersion == 1 and $p.status == "in_progress" and
+         $p.windowStartUtc == $start and
+         $p.azureAuthoritative == true and $p.azureDeletionAllowed == false and $p.shadowQsetEnabled == false and
+         $p.fundedSignerEnabled == $funded and
+         (if $funded then $p.fundedSignerMode == $mode and $p.fundedSignerImage == $image and
+           $p.fundedSignerRevision == $revision and $p.fundedRolloutReceiptPath == $rollout and
+           $p.fundedRolloutReceiptSha256 == $rollout_sha and $p.fundedServiceBusDlqBaseline == $dlq and
+           $p.parityCollectorSha256 == $collector_sha and $p.rebootValidatorSha256 == $validator_sha and
+           $p.fundedSignerUser == $user and $p.fundedSessionId == $session and
+           $p.fundedSessionManifestSha256 == $session_sha and $p.fundedConfigSha256 == $config_sha and
+           $p.fundedIntentProducerEnabled == true and $p.fundedIntentProducerImage == $producer_image and
+           $p.fundedIntentProducerUser == $producer_user and $p.fundedIntentProducerConfigSha256 == $producer_config_sha
+          else $p.fundedSignerMode == "disabled" and $p.fundedSignerImage == null and
+           $p.fundedSignerRevision == null and $p.fundedRolloutReceiptPath == null and
+           $p.fundedRolloutReceiptSha256 == null and $p.fundedServiceBusDlqBaseline == null and
+           (($collector_sha == "" and $p.parityCollectorSha256 == null and $p.rebootValidatorSha256 == null) or
+            ($collector_sha != "" and $p.parityCollectorSha256 == $collector_sha and $p.rebootValidatorSha256 == $validator_sha)) and
+           $p.fundedSignerUser == null and
+           $p.fundedSessionId == null and $p.fundedSessionManifestSha256 == null and $p.fundedConfigSha256 == null and
+           $p.fundedIntentProducerEnabled == false and $p.fundedIntentProducerImage == null and
+           $p.fundedIntentProducerUser == null and $p.fundedIntentProducerConfigSha256 == null end)
+      then $p else error("protected ledger binding changed") end
+    ' "$ledger_read"
+}
+
+evidence_protected_json() {
+  jq -cS '
+    .protectedBindings |
+    if .fundedSignerEnabled == false then
+      .fundedSignerRevision = (.fundedSignerRevision // null) |
+      .fundedRolloutReceiptPath = (.fundedRolloutReceiptPath // null) |
+      .fundedRolloutReceiptSha256 = (.fundedRolloutReceiptSha256 // null) |
+      .fundedServiceBusDlqBaseline = (.fundedServiceBusDlqBaseline // null) |
+      .parityCollectorSha256 = (.parityCollectorSha256 // null) |
+      .rebootValidatorSha256 = (.rebootValidatorSha256 // null)
+    else . end
+  ' "$1"
+}
+
+validate_base_ledger() {
+  jq -e '
+    . as $ledger |
+    (($ledger.acceptedCleanLiveHours | type) == "number" and $ledger.acceptedCleanLiveHours >= 0 and ($ledger.acceptedCleanLiveHours | floor) == $ledger.acceptedCleanLiveHours) and
+    ((($ledger.completedDailyCycles // 0) | type) == "number" and ($ledger.completedDailyCycles // 0) >= 0 and (($ledger.completedDailyCycles // 0) | floor) == ($ledger.completedDailyCycles // 0)) and
+    (($ledger.acceptedHourlyEvidence | type) == "array" and ($ledger.acceptedHourlyEvidence | length) == $ledger.acceptedCleanLiveHours) and
+    ((($ledger.acceptedDailyEvidence // []) | type) == "array" and (($ledger.acceptedDailyEvidence // []) | length) == ($ledger.completedDailyCycles // 0)) and
+    ($ledger.rebootRecoveryPassed | type == "boolean")
+  ' "$ledger_read" >/dev/null || die 'formal ledger evidence counters are malformed'
+  protected_json >/dev/null || die 'formal ledger protected bindings are invalid'
+}
+
+lock_ledger() {
+  lock_dir=${lock_file%/*}
+  [ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] || die 'unsafe parity lock directory'
+  set -- $(stat -c '%u %g %a' "$lock_dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die 'wrong parity lock directory owner'
+  case "$3" in 700|750|755) ;; *) die 'unsafe parity lock directory mode' ;; esac
+  if [ ! -e "$lock_file" ]; then (umask 027; : >"$lock_file"); fi
+  [ ! -L "$lock_file" ] && [ -f "$lock_file" ] || die 'unsafe parity lock file'
+  set -- $(stat -c '%u %g %a %h %s' "$lock_file")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 640 ] && [ "$4" = 1 ] && [ "$5" -le 4096 ] \
+    || die 'wrong owner, mode, link count, or size for parity lock file'
+  exec 9<>"$lock_file"
+  /usr/bin/flock -w 300 9 || die 'timed out waiting for the parity ledger lock'
+}
+
+valid_boot_id() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; }
+
+validate_system_evidence() {
+  file=$1 funded=$2
+  jq -e --argjson funded "$funded" \
+    --arg api_token "$api_token" --arg research_token "$research_token" --arg funded_token "$funded_token" \
+    --arg producer_token "$funded_producer_token" \
+    --arg producer_env_binding_sha "$funded_producer_env_binding_sha" \
+    --arg producer_mount_binding_sha "$funded_producer_mount_binding_sha" '
+    .healthy == true and
+    (.units | type == "array" and length == (if $funded then 20 else 16 end)) and
+    ([.units[].name] | length == (unique | length)) and
+    ([.units[].name] | sort) == (([
+      "spire-server.service","spire-agent.service","spire-oidc-discovery-provider.service","caddy.service",
+      "polyedge-api.service","polyedge-frontend.service","polyedge-ring-sync.timer","polyedge-ring-health.timer",
+      "polyedge-boot-disk-guard.timer","polyedge-freshness.timer","polyedge-hourly.timer","polyedge-daily.timer",
+      "polyedge-replay.timer","polyedge-parity-hourly.timer","polyedge-federated-token@api.timer",
+      "polyedge-federated-token@research.timer"] +
+      (if $funded then ["polyedge-funded-signer.service","polyedge-federated-token@funded-signer.timer",
+        "polyedge-funded-intent-producer.service","polyedge-federated-token@funded-intent-producer.timer"] else [] end)) | sort) and
+    all(.units[]; (.name | type == "string") and (.enablement == "enabled" or .enablement == "generated") and .active == true) and
+    (.containers | type == "array" and length == (if $funded then 4 else 2 end)) and
+    ([.containers[].name] | length == (unique | length)) and
+    ([.containers[].name] | sort) == ((["polyedge-api","polyedge-frontend"] +
+      (if $funded then ["polyedge-funded-signer","polyedge-funded-intent-producer"] else [] end)) | sort) and
+    all(.containers[]; (.id | test("^[0-9a-f]{64}$")) and
+      (.image | test("^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$")) and
+      (.user | type == "string") and .state == "running" and
+      (if .name == "polyedge-funded-signer" then .health == "not_configured" else .health == "healthy" end)) and
+    (.tokens | type == "array" and length == (if $funded then 4 else 2 end)) and
+    ([.tokens[].name] | length == (unique | length)) and
+    ([.tokens[] | [.name,.path]] | sort) == (([["api",$api_token],["research",$research_token]] +
+      (if $funded then [["funded-signer",$funded_token],["funded-intent-producer",$producer_token]] else [] end)) | sort) and
+    all(.tokens[]; (.path | type == "string") and
+      (.uid | type == "number") and (.gid | type == "number") and .mode == 600 and .linkCount == 1 and
+      (.sizeBytes | type == "number" and . > 0 and . <= 65536) and
+      (.modifiedEpoch | type == "number" and . > 0) and (.ageSeconds | type == "number" and . >= 0 and . <= 240)) and
+    (.qset.timerEnablement == "disabled" or .qset.timerEnablement == "masked" or .qset.timerEnablement == "not-found") and
+    .qset.timerActive == false and .qset.jobActive == false and
+    .funded.mode == (if $funded then "active" else "disabled" end) and
+    (if $funded then
+      (.funded.signerEnablement == "enabled" or .funded.signerEnablement == "generated") and
+      .funded.signerActive == true and .funded.tokenTimerEnablement == "enabled" and
+      .funded.tokenTimerActive == true and
+      (.funded.producerEnablement == "enabled" or .funded.producerEnablement == "generated") and
+      .funded.producerActive == true and .funded.producerTokenTimerEnablement == "enabled" and
+      .funded.producerTokenTimerActive == true and
+      .funded.producerConfigEnvBindingSha256 == $producer_env_binding_sha and
+      .funded.producerTokenMountBindingSha256 == $producer_mount_binding_sha and
+      .funded.producerNative.health == {ok:true,backendImpl:"rust",runtimeRole:"profitability_shadow",
+        shadowOnly:true,runtimeActive:true,executionMode:"paper",killSwitch:false} and
+      .funded.producerNative.status.app == "polyedge-funded-intent-producer" and
+      .funded.producerNative.status.runtimeRole == "profitability_shadow" and
+      .funded.producerNative.status.executionMode == "paper" and
+      .funded.producerNative.status.intentPublisher == {configured:true,prepared:true,pointerOnlyPreflight:false} and
+      .funded.producerNative.status.taskHealth == {api:"ok",runtimeLoop:"running",feeds:"running"} and
+      ([.funded.producerNative.status.feedStatus | keys[]] | sort) ==
+        (["Discovery","PolymarketClobMarket","PolymarketRtdsBinance","PolymarketRtdsChainlink"] | sort) and
+      all(.funded.producerNative.status.feedStatus[]; .status == "ok" and
+        (.updated_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z"))) and
+      (.funded.producerNative.status.sampledAtUtc | type == "string" and length == 20 and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")) and
+      (.funded.producerNative.status.recorder.instanceId | type == "string" and length == 36 and
+        test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")) and
+      (.funded.producerNative.status.recorder.lastAssignedSequence | type == "number" and floor == . and . >= 1) and
+      .funded.producerNative.status.recorder.enqueuedTotal == .funded.producerNative.status.recorder.persistedTotal and
+      .funded.producerNative.status.recorder.lastAssignedSequence == .funded.producerNative.status.recorder.enqueuedTotal and
+      .funded.producerNative.status.recorder.queued == 0 and
+      .funded.producerNative.status.recorder.failedTotal == 0 and
+      .funded.producerNative.status.recorder.unrecoveredDurableEvents == 0 and
+      .funded.producerNative.status.recorder.flushUnrecovered == false and
+      .funded.producerNative.status.recorder.errorCount == 0 and .funded.producerNative.status.recorder.droppedCount == 0
+    else
+      .funded.signerEnablement == "masked" and .funded.signerActive == false and
+      (.funded.tokenTimerEnablement == "disabled" or .funded.tokenTimerEnablement == "masked") and
+      .funded.tokenTimerActive == false and
+      (.funded.producerEnablement == "disabled" or .funded.producerEnablement == "masked") and
+      .funded.producerActive == false and
+      (.funded.producerTokenTimerEnablement == "disabled" or .funded.producerTokenTimerEnablement == "masked") and
+      .funded.producerTokenTimerActive == false and .funded.producerConfigEnvBindingSha256 == null and
+      .funded.producerTokenMountBindingSha256 == null and .funded.producerNative == null
+    end) and
+    .ring.capacityOk == true and .ring.freeOk == true and .ring.uploadFresh == true and
+    .ring.unsealedClosedCount == 0 and .ring.unuploadedCount == 0 and
+    (.ring.statusModifiedEpoch | type == "number" and . > 0) and (.ring.statusAgeSeconds | type == "number" and . >= 0 and . <= 600) and
+    .disk.imagePullsPaused == false and .disk.bootAvailableBytes >= .disk.bootMinimumFreeBytes and
+    .disk.ringAvailableBytes >= .disk.ringMinimumFreeBytes
+  ' "$file" >/dev/null
+}
+
+validate_evidence_file() {
+  file=$1 phase=$2
+  secure_file "$file" 640 1048576
+  jq -e --arg phase "$phase" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+    .schemaVersion == 1 and .phase == $phase and .status == "validated" and
+    .ledger.path == $ledger and (.ledger.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+    .protectedBindings.windowStartUtc == $window and
+    (.boot.id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) and
+    (.boot.btime | type == "number" and floor == . and . > 0) and
+    (.boot.observedAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.acceptedEvidence.cleanLiveHours | type == "number" and floor == . and . >= 72) and
+    (.acceptedEvidence.completedDailyCycles | type == "number" and floor == . and . >= 2) and
+    (.acceptedEvidence.hourlyPrefixSha256 | test("^sha256:[0-9a-f]{64}$")) and
+    (.acceptedEvidence.dailyPrefixSha256 | test("^sha256:[0-9a-f]{64}$"))
+  ' "$file" >/dev/null || die "invalid $phase evidence"
+  validate_system_evidence "$file" "$funded_enabled" || die "invalid $phase system evidence"
+}
+
+validate_gate() {
+  validate_base_ledger
+  passed=$(jq -r '.rebootRecoveryPassed' "$ledger_read")
+  if [ "$passed" = false ]; then
+    jq -e 'has("rebootRecovery") | not' "$ledger_read" >/dev/null \
+      || die 'false reboot gate has a rebootRecovery object'
+    return 0
+  fi
+  jq -e '
+    .rebootRecovery == {
+      schemaVersion:1,status:"validated",completedAtUtc:.rebootRecovery.completedAtUtc,
+      preboot:.rebootRecovery.preboot,postboot:.rebootRecovery.postboot
+    } and
+    (.rebootRecovery.completedAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.rebootRecovery.preboot.path | type == "string") and
+    (.rebootRecovery.preboot.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+    (.rebootRecovery.postboot.path | type == "string") and
+    (.rebootRecovery.postboot.sha256 | test("^sha256:[0-9a-f]{64}$"))
+  ' "$ledger_read" >/dev/null || die 'validated reboot gate lacks its exact evidence references'
+  pre=$(jq -r '.rebootRecovery.preboot.path' "$ledger_read")
+  post=$(jq -r '.rebootRecovery.postboot.path' "$ledger_read")
+  pre_id=${pre%/preboot.json}; pre_id=${pre_id##*/}
+  post_id=${post%/postboot.json}; post_id=${post_id##*/}
+  valid_boot_id "$pre_id" && valid_boot_id "$post_id" && [ "$pre_id" != "$post_id" ] \
+    || die 'reboot evidence boot IDs are invalid or equal'
+  [ "$pre" = "$reboot_root/$pre_id/preboot.json" ] && [ "$post" = "$reboot_root/$post_id/postboot.json" ] \
+    || die 'reboot evidence is outside its canonical parity path'
+  secure_dir "$reboot_root" 750
+  secure_dir "$reboot_root/$pre_id" 750
+  secure_dir "$reboot_root/$post_id" 750
+  [ "$(sha "$pre")" = "$(jq -r '.rebootRecovery.preboot.sha256' "$ledger_read")" ] \
+    || die 'preboot evidence hash mismatch'
+  [ "$(sha "$post")" = "$(jq -r '.rebootRecovery.postboot.sha256' "$ledger_read")" ] \
+    || die 'postboot evidence hash mismatch'
+  validate_evidence_file "$pre" preboot
+  validate_evidence_file "$post" postboot
+  current_protected=$(protected_json)
+  [ "$(evidence_protected_json "$pre")" = "$current_protected" ] \
+    && [ "$(evidence_protected_json "$post")" = "$current_protected" ] \
+    || die 'reboot evidence protected bindings differ from the ledger'
+  [ "$(jq -r '.boot.id' "$pre")" = "$pre_id" ] && [ "$(jq -r '.boot.id' "$post")" = "$post_id" ] \
+    || die 'reboot evidence path and boot ID disagree'
+  pre_btime=$(jq -r '.boot.btime' "$pre")
+  post_btime=$(jq -r '.boot.btime' "$post")
+  [ "$post_btime" -gt "$pre_btime" ] || die 'postboot evidence does not prove a later boot'
+  jq -e --arg path "$pre" --arg hash "$(sha "$pre")" \
+    '.preboot == {path:$path,sha256:$hash}' "$post" >/dev/null || die 'postboot evidence does not bind preboot evidence'
+  [ "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$post")" ] \
+    || die 'preboot and postboot container bindings differ'
+  [ "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$post")" ] \
+    || die 'preboot and postboot unit bindings differ'
+  [ "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$post")" ] \
+    || die 'preboot and postboot token bindings differ'
+  [ "$(jq -cS '.funded | del(.producerNative)' "$pre")" = "$(jq -cS '.funded | del(.producerNative)' "$post")" ] \
+    || die 'preboot and postboot funded service binding differs'
+  for phase_file in "$pre" "$post"; do
+    hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$phase_file")
+    days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$phase_file")
+    [ "$(json_sha ".acceptedHourlyEvidence[0:$hours]" "$ledger_read")" = "$(jq -r '.acceptedEvidence.hourlyPrefixSha256' "$phase_file")" ] \
+      || die 'hourly evidence prefix regressed after reboot'
+    [ "$(json_sha ".acceptedDailyEvidence[0:$days]" "$ledger_read")" = "$(jq -r '.acceptedEvidence.dailyPrefixSha256' "$phase_file")" ] \
+      || die 'daily evidence prefix regressed after reboot'
+  done
+  pre_hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$pre")
+  post_hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$post")
+  pre_days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$pre")
+  post_days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$post")
+  current_hours=$(jq -r '.acceptedCleanLiveHours' "$ledger_read")
+  current_days=$(jq -r '.completedDailyCycles' "$ledger_read")
+  [ "$post_hours" -ge "$pre_hours" ] && [ "$current_hours" -ge "$post_hours" ] \
+    && [ "$post_days" -ge "$pre_days" ] && [ "$current_days" -ge "$post_days" ] \
+    || die 'accepted evidence counts regressed after reboot'
+}
+
+if [ "$command" = validate-ledger ]; then
+  validate_gate
+  exit 0
+fi
+
+lock_ledger
+secure_file "$POLYEDGE_PARITY_LEDGER" 640 1048576
+validate_base_ledger
+
+if [ "$command" = prepare ]; then
+  jq -e '.rebootRecoveryPassed == false and (has("rebootRecovery") | not) and
+    .acceptedCleanLiveHours >= 72 and .completedDailyCycles >= 2' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+    || die 'prepare requires 72 clean hours, two daily cycles, and an unpassed reboot gate'
+else
+  [ -e "$pending" ] || die 'no reboot attestation is pending'
+  secure_file "$pending" 640 65536
+  jq -e --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" '
+    .schemaVersion == 1 and .status == "pending" and .ledgerPath == $ledger and .windowStartUtc == $window and
+    (.preboot.path | type == "string") and (.preboot.sha256 | test("^sha256:[0-9a-f]{64}$"))
+  ' "$pending" >/dev/null || die 'pending reboot marker is invalid'
+fi
+
+if [ ! -e "$runtime_dir" ]; then
+  runtime_parent=${runtime_dir%/*}
+  [ ! -L "$runtime_parent" ] && [ -d "$runtime_parent" ] || die 'unsafe runtime parent'
+  set -- $(stat -c '%u %g %a' "$runtime_parent")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die 'wrong runtime parent owner'
+  case "$3" in 700|750|755) ;; *) die 'unsafe runtime parent mode' ;; esac
+  install -d -m 0700 "$runtime_dir"
+fi
+[ ! -L "$runtime_dir" ] && [ -d "$runtime_dir" ] || die 'unsafe runtime directory'
+set -- $(stat -c '%u %g %a' "$runtime_dir")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] \
+  || die 'unsafe runtime directory ownership or mode'
+
+units_tmp=$(mktemp "$runtime_dir/units.XXXXXX")
+containers_tmp=$(mktemp "$runtime_dir/containers.XXXXXX")
+tokens_tmp=$(mktemp "$runtime_dir/tokens.XXXXXX")
+system_tmp=$(mktemp "$runtime_dir/system.XXXXXX")
+evidence_tmp=
+ledger_tmp=
+pending_tmp=
+producer_health_tmp=
+producer_status_tmp=
+trap 'rm -f "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp" "$evidence_tmp" "$ledger_tmp" "$pending_tmp" "$producer_health_tmp" "$producer_status_tmp"' EXIT HUP INT TERM
+chmod 0600 "$units_tmp" "$containers_tmp" "$tokens_tmp" "$system_tmp"
+: >"$units_tmp"; : >"$containers_tmp"; : >"$tokens_tmp"
+
+unit_state() {
+  unit=$1
+  enablement=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+  case "$enablement" in
+    enabled) ;;
+    generated)
+      systemctl show multi-user.target --property=Wants --value | tr ' ' '\n' | grep -Fx "$unit" >/dev/null \
+        || die "generated unit is not wanted at boot: $unit"
+      ;;
+    *) die "unit is not enabled for reboot recovery: $unit" ;;
+  esac
+  systemctl is-active --quiet "$unit" || die "unit is inactive: $unit"
+  jq -nc --arg name "$unit" --arg enablement "$enablement" '{name:$name,enablement:$enablement,active:true}' >>"$units_tmp"
+}
+
+for unit in \
+  spire-server.service spire-agent.service spire-oidc-discovery-provider.service caddy.service \
+  polyedge-api.service polyedge-frontend.service \
+  polyedge-ring-sync.timer polyedge-ring-health.timer polyedge-boot-disk-guard.timer \
+  polyedge-freshness.timer polyedge-hourly.timer polyedge-daily.timer polyedge-replay.timer \
+  polyedge-parity-hourly.timer polyedge-federated-token@api.timer polyedge-federated-token@research.timer
+do unit_state "$unit"; done
+if [ "$funded_enabled" = true ]; then
+  unit_state polyedge-funded-signer.service
+  unit_state polyedge-federated-token@funded-signer.timer
+  unit_state polyedge-funded-intent-producer.service
+  unit_state polyedge-federated-token@funded-intent-producer.timer
+  funded_signer_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
+  funded_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)
+  funded_producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  funded_producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  funded_state=$(jq -nc --arg signer "$funded_signer_enablement" --arg token "$funded_token_enablement" \
+    --arg producer "$funded_producer_enablement" --arg producer_token "$funded_producer_token_enablement" \
+    '{mode:"active",signerEnablement:$signer,signerActive:true,
+      tokenTimerEnablement:$token,tokenTimerActive:true,producerEnablement:$producer,producerActive:true,
+      producerTokenTimerEnablement:$producer_token,producerTokenTimerActive:true,producerNative:null}')
+else
+  funded_signer_enablement=$(systemctl is-enabled polyedge-funded-signer.service 2>/dev/null || true)
+  [ "$funded_signer_enablement" = masked ] || die 'disabled funded signer is not masked'
+  if systemctl is-active --quiet polyedge-funded-signer.service; then die 'disabled funded signer is active'; fi
+  funded_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-signer.timer 2>/dev/null || true)
+  case "$funded_token_enablement" in disabled|masked) ;; *) die 'disabled funded token timer is enabled' ;; esac
+  if systemctl is-active --quiet polyedge-federated-token@funded-signer.timer; then
+    die 'disabled funded token timer is active'
+  fi
+  funded_producer_enablement=$(systemctl is-enabled polyedge-funded-intent-producer.service 2>/dev/null || true)
+  case "$funded_producer_enablement" in disabled|masked) ;; *) die 'disabled funded producer service is enabled or absent' ;; esac
+  if systemctl is-active --quiet polyedge-funded-intent-producer.service; then die 'disabled funded producer is active'; fi
+  funded_producer_token_enablement=$(systemctl is-enabled polyedge-federated-token@funded-intent-producer.timer 2>/dev/null || true)
+  case "$funded_producer_token_enablement" in disabled|masked) ;; *) die 'disabled funded producer token timer is enabled' ;; esac
+  if systemctl is-active --quiet polyedge-federated-token@funded-intent-producer.timer; then
+    die 'disabled funded producer token timer is active'
+  fi
+  funded_state=$(jq -nc --arg signer "$funded_signer_enablement" --arg token "$funded_token_enablement" \
+    --arg producer "$funded_producer_enablement" --arg producer_token "$funded_producer_token_enablement" \
+    '{mode:"disabled",signerEnablement:$signer,signerActive:false,
+      tokenTimerEnablement:$token,tokenTimerActive:false,producerEnablement:$producer,producerActive:false,
+      producerTokenTimerEnablement:$producer_token,producerTokenTimerActive:false,
+      producerConfigEnvBindingSha256:null,producerTokenMountBindingSha256:null,producerNative:null}')
+fi
+qset_enablement=$(systemctl is-enabled polyedge-shadow-qset.timer 2>/dev/null || true)
+case "$qset_enablement" in disabled|masked|not-found) ;; *) die 'qset timer is enabled' ;; esac
+if systemctl is-active --quiet polyedge-shadow-qset.timer; then die 'qset timer is active'; fi
+if systemctl is-active --quiet polyedge-job@shadow-qset.service; then die 'qset job is active'; fi
+
+
+container_state() {
+  name=$1
+  id=$(podman inspect --format '{{.Id}}' "$name") || die "container is missing: $name"
+  image=$(podman inspect --format '{{.Config.Image}}' "$name") || die "container image is unreadable: $name"
+  user=$(podman inspect --format '{{.Config.User}}' "$name") || die "container user is unreadable: $name"
+  state=$(podman inspect --format '{{.State.Status}}' "$name") || die "container state is unreadable: $name"
+  health=$(podman inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}not_configured{{end}}' "$name") \
+    || die "container health is unreadable: $name"
+  [ -n "$health" ] || health=not_configured
+  printf '%s' "$id" | grep -Eq '^[0-9a-f]{64}$' || die "container ID is malformed: $name"
+  printf '%s' "$image" | grep -Eq '^[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+    || die "container image is not immutable: $name"
+  [ "$state" = running ] || die "container is not running: $name"
+  case "$name:$health" in polyedge-funded-signer:not_configured|polyedge-funded-intent-producer:healthy|polyedge-api:healthy|polyedge-frontend:healthy) ;; *) die "container is unhealthy: $name" ;; esac
+  jq -nc --arg name "$name" --arg id "$id" --arg image "$image" --arg user "$user" --arg state "$state" --arg health "$health" \
+    '{name:$name,id:$id,image:$image,user:$user,state:$state,health:$health}' >>"$containers_tmp"
+}
+
+container_state polyedge-api
+container_state polyedge-frontend
+[ "$(jq -r 'select(.name == "polyedge-api") | .image' "$containers_tmp")" = "$POLYEDGE_PARITY_EXPECTED_OCI_RESEARCH_IMAGE" ] \
+  || die 'API container differs from the formal OCI image'
+if [ "$funded_enabled" = true ]; then
+  container_state polyedge-funded-signer
+  [ "$(jq -r 'select(.name == "polyedge-funded-signer") | .image' "$containers_tmp")" = "$funded_image" ] \
+    && [ "$(jq -r 'select(.name == "polyedge-funded-signer") | .user' "$containers_tmp")" = "$funded_user" ] \
+    || die 'funded container differs from its formal binding'
+  funded_env_value() {
+    podman inspect --format '{{json .Config.Env}}' polyedge-funded-signer \
+      | jq -er --arg name "$1" '($name + "=") as $prefix |
+          [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+          if length == 1 then .[0] else error("funded runtime binding is absent or duplicate") end'
+  }
+  [ "$(funded_env_value VENUE_PROBE_FUNDED_CAMPAIGN_ID)" = "$funded_session" ] \
+    || die 'funded container campaign differs from the formal session'
+  [ "$(funded_env_value FUNDED_DIRECT_SESSION_MANIFEST_SHA256)" = "$funded_session_sha" ] \
+    || die 'funded container manifest hash differs from the formal session'
+  [ "$(funded_env_value STRATEGY_CANARY_CANDIDATE_CONFIG_HASH)" = "$funded_config_sha" ] \
+    || die 'funded container config hash differs from the formal config'
+  container_state polyedge-funded-intent-producer
+  [ "$(jq -r 'select(.name == "polyedge-funded-intent-producer") | .image' "$containers_tmp")" = "$funded_producer_image" ] \
+    && [ "$(jq -r 'select(.name == "polyedge-funded-intent-producer") | .user' "$containers_tmp")" = "$funded_producer_user" ] \
+    || die 'funded intent producer container differs from its formal binding'
+  secure_file "$funded_producer_config" 600 1048576
+  [ "$(sha "$funded_producer_config")" = "$funded_producer_config_sha" ] \
+    || die 'funded intent producer environment hash differs from the formal config'
+  producer_env_raw=$(podman inspect --format '{{json .Config.Env}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer environment is unreadable'
+  producer_env_binding=$(printf '%s\n' "$producer_env_raw" | jq -cSe '
+    def one($name):
+      ($name + "=") as $prefix |
+      [.[] | select(startswith($prefix)) | ltrimstr($prefix)] |
+      if length == 1 then .[0] else error("critical producer environment binding is absent or duplicate") end;
+    {
+      APP_NAME:one("APP_NAME"),RUNTIME_ROLE:one("RUNTIME_ROLE"),EXECUTION_MODE:one("EXECUTION_MODE"),
+      ALLOW_LIVE:one("ALLOW_LIVE"),RUN_BOT_ON_STARTUP:one("RUN_BOT_ON_STARTUP"),
+      STRATEGY_INTENT_OPERATOR_DIRECT:one("STRATEGY_INTENT_OPERATOR_DIRECT"),
+      PUBLISH_STRATEGY_CANARY_INTENTS:one("PUBLISH_STRATEGY_CANARY_INTENTS"),
+      STRATEGY_CANARY_INTENT_PREFIX:one("STRATEGY_CANARY_INTENT_PREFIX"),
+      STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION:one("STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION"),
+      STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI:one("STRATEGY_CANARY_EXECUTION_MODEL_BLOB_URI"),
+      STRATEGY_CANARY_EXECUTION_MODEL_SHA256:one("STRATEGY_CANARY_EXECUTION_MODEL_SHA256"),
+      STRATEGY_INTENT_TARGET_ORDER_NOTIONAL:one("STRATEGY_INTENT_TARGET_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MAX_ORDER_NOTIONAL:one("STRATEGY_INTENT_MAX_ORDER_NOTIONAL"),
+      STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY"),
+      STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY:one("STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY"),
+      TARGET_ASSET:one("TARGET_ASSET"),TARGET_ASSET_NAME:one("TARGET_ASSET_NAME"),TARGET_HORIZON:one("TARGET_HORIZON"),
+      TARGET_BINANCE_SYMBOL:one("TARGET_BINANCE_SYMBOL"),TARGET_CHAINLINK_SYMBOL:one("TARGET_CHAINLINK_SYMBOL"),
+      TARGET_COINBASE_PRODUCT_ID:one("TARGET_COINBASE_PRODUCT_ID"),
+      AZURE_TENANT_ID:one("AZURE_TENANT_ID"),AZURE_CLIENT_ID:one("AZURE_CLIENT_ID"),
+      AZURE_FEDERATED_TOKEN_FILE:one("AZURE_FEDERATED_TOKEN_FILE"),
+      AZURE_TOKEN_CREDENTIALS:one("AZURE_TOKEN_CREDENTIALS"),
+      AZURE_STORAGE_ACCOUNT_NAME:one("AZURE_STORAGE_ACCOUNT_NAME"),
+      AZURE_STORAGE_CONTAINER_NAME:one("AZURE_STORAGE_CONTAINER_NAME"),
+      AZURE_STORAGE_TABLE_NAME:one("AZURE_STORAGE_TABLE_NAME"),
+      AZURE_CHART_TABLE_NAME:one("AZURE_CHART_TABLE_NAME"),
+      AZURE_MARKET_TABLE_NAME:one("AZURE_MARKET_TABLE_NAME"),
+      AZURE_FUNDED_STORAGE_CONTAINER_NAME:one("AZURE_FUNDED_STORAGE_CONTAINER_NAME"),
+      AZURE_MODEL_STORAGE_CONTAINER_NAME:one("AZURE_MODEL_STORAGE_CONTAINER_NAME"),
+      FUNDED_DIRECT_SERVICE_BUS_ENABLED:one("FUNDED_DIRECT_SERVICE_BUS_ENABLED"),
+      FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:one("FUNDED_DIRECT_SERVICE_BUS_NAMESPACE"),
+      FUNDED_DIRECT_SERVICE_BUS_QUEUE:one("FUNDED_DIRECT_SERVICE_BUS_QUEUE")
+    }
+  ') || die 'funded intent producer critical environment binding is unsafe'
+  unset producer_env_raw
+  producer_env_binding_sha=$(text_sha "$producer_env_binding")
+  [ "$producer_env_binding_sha" = "$funded_producer_env_binding_sha" ] \
+    || die 'funded intent producer critical environment differs from the approved binding'
+  unset producer_env_binding
+
+  producer_mount_raw=$(podman inspect --format '{{json .Mounts}}' polyedge-funded-intent-producer) \
+    || die 'funded intent producer mounts are unreadable'
+  producer_mount_binding=$(printf '%s\n' "$producer_mount_raw" | jq -cSe --arg source "${funded_producer_token%/*}" '
+    [.[] | select(.Destination == "/run/credentials")] as $mounts |
+    if ($mounts | length) == 1 and $mounts[0].Source == $source and $mounts[0].RW == false
+    then {source:$mounts[0].Source,destination:$mounts[0].Destination,readOnly:true}
+    else error("producer token mount is not exact and read-only") end
+  ') || die 'funded intent producer token mount is not exact and read-only'
+  unset producer_mount_raw
+  producer_mount_binding_sha=$(text_sha "$producer_mount_binding")
+  [ "$producer_mount_binding_sha" = "$funded_producer_mount_binding_sha" ] \
+    || die 'funded intent producer token mount differs from the approved binding'
+  unset producer_mount_binding
+fi
+
+now_epoch=$(date -u +%s)
+if [ "$funded_enabled" = true ]; then
+  producer_health_tmp=$(mktemp "$runtime_dir/producer-health.XXXXXX")
+  producer_status_tmp=$(mktemp "$runtime_dir/producer-status.XXXXXX")
+  chmod 0600 "$producer_health_tmp" "$producer_status_tmp"
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_health_tmp" || die 'funded intent producer private health request failed'
+  producer_health=$(tr -d '\r' <"$producer_health_tmp" | sed '1,/^$/d' | jq -ce '
+    if .ok == true and .backend_impl == "rust" and .runtime_role == "profitability_shadow" and
+      .shadow_only == true and .runtime_active == true and .execution_mode == "paper" and .kill_switch == false
+    then {ok,backendImpl:.backend_impl,runtimeRole:.runtime_role,shadowOnly:.shadow_only,
+      runtimeActive:.runtime_active,executionMode:.execution_mode,killSwitch:.kill_switch}
+    else error("funded intent producer native health is unsafe") end
+  ') || die 'funded intent producer native health is unsafe'
+  podman exec polyedge-funded-intent-producer /usr/bin/bash -ec '
+    exec 3<>/dev/tcp/127.0.0.1/8081
+    printf "GET /api/v1/status HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n" >&3
+    cat <&3
+  ' >"$producer_status_tmp" || die 'funded intent producer private status request failed'
+  now_epoch=$(date -u +%s)
+  producer_status=$(tr -d '\r' <"$producer_status_tmp" | sed '1,/^$/d' | jq -ce --argjson now "$now_epoch" '
+    def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    def feed_ok($name):
+      .feed_status[$name] as $feed | ($feed | type) == "object" and $feed.status == "ok" and
+      ($feed.updated_at | type) == "string" and (($feed.updated_at | epoch) as $updated |
+        $updated <= $now and $updated >= ($now - 300));
+    if .app == "polyedge-funded-intent-producer" and .backend_impl == "rust" and
+      .runtime_role == "profitability_shadow" and .shadow_only == true and .execution_mode == "paper" and
+      .intent_publisher == {configured:true,prepared:true,pointer_only_preflight:false} and
+      .task_health.api == "ok" and .task_health.runtime_loop == "running" and .task_health.feeds == "running" and
+      feed_ok("Discovery") and feed_ok("PolymarketClobMarket") and
+      feed_ok("PolymarketRtdsChainlink") and feed_ok("PolymarketRtdsBinance") and
+      (.drop_counts | type == "object" and length == 0) and
+      .recorder_status.error_count == 0 and .recorder_status.dropped_count == 0 and
+      .recorder_metrics.queued == 0 and .recorder_metrics.failed_total == 0 and
+      .recorder_metrics.unrecovered_durable_events == 0 and .recorder_metrics.flush_unrecovered == false and
+      .recorder_metrics.enqueued_total == .recorder_metrics.persisted_total and
+      .recorder_metrics.last_assigned_sequence == .recorder_metrics.enqueued_total and
+      (.recorder_metrics.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_metrics.last_assigned_sequence | type == "number" and floor == . and . >= 1)
+    then {sampledAtUtc:($now | todateiso8601),app,runtimeRole:.runtime_role,executionMode:.execution_mode,
+      intentPublisher:{configured:.intent_publisher.configured,prepared:.intent_publisher.prepared,
+        pointerOnlyPreflight:.intent_publisher.pointer_only_preflight},
+      taskHealth:{api:.task_health.api,runtimeLoop:.task_health.runtime_loop,feeds:.task_health.feeds},
+      feedStatus:{Discovery:(.feed_status.Discovery | {status,updated_at}),
+        PolymarketClobMarket:(.feed_status.PolymarketClobMarket | {status,updated_at}),
+        PolymarketRtdsChainlink:(.feed_status.PolymarketRtdsChainlink | {status,updated_at}),
+        PolymarketRtdsBinance:(.feed_status.PolymarketRtdsBinance | {status,updated_at})},
+      recorder:{instanceId:.recorder_metrics.recorder_instance_id,lastAssignedSequence:.recorder_metrics.last_assigned_sequence,
+        queued:.recorder_metrics.queued,enqueuedTotal:.recorder_metrics.enqueued_total,persistedTotal:.recorder_metrics.persisted_total,
+        failedTotal:.recorder_metrics.failed_total,unrecoveredDurableEvents:.recorder_metrics.unrecovered_durable_events,
+        flushUnrecovered:.recorder_metrics.flush_unrecovered,errorCount:.recorder_status.error_count,droppedCount:.recorder_status.dropped_count}}
+    else error("funded intent producer native status is unsafe") end
+  ') || die 'funded intent producer native status is unsafe'
+  funded_state=$(jq -nc --argjson state "$funded_state" --arg env_binding_sha "$producer_env_binding_sha" \
+    --arg mount_binding_sha "$producer_mount_binding_sha" --argjson health "$producer_health" --argjson status "$producer_status" \
+    '$state + {producerConfigEnvBindingSha256:$env_binding_sha,producerTokenMountBindingSha256:$mount_binding_sha,
+      producerNative:{health:$health,status:$status}}')
+  rm -f "$producer_health_tmp" "$producer_status_tmp"
+  producer_health_tmp=
+  producer_status_tmp=
+fi
+
+token_state() {
+  name=$1 path=$2 uid=$3 gid=$4
+  token_dir=${path%/*}
+  [ ! -L "$token_dir" ] && [ -d "$token_dir" ] || die "token directory is missing or unsafe: $name"
+  set -- $(stat -c '%u %g %a' "$token_dir")
+  [ "$1" = "$uid" ] && [ "$2" = "$gid" ] && [ "$3" = 700 ] || die "token directory metadata is unsafe: $name"
+  [ ! -L "$path" ] && [ -f "$path" ] || die "token is missing or unsafe: $name"
+  set -- $(stat -c '%u %g %a %h %s %Y' "$path")
+  [ "$1" = "$uid" ] && [ "$2" = "$gid" ] && [ "$3" = 600 ] && [ "$4" = 1 ] \
+    && [ "$5" -gt 0 ] && [ "$5" -le 65536 ] || die "token metadata is unsafe: $name"
+  age=$((now_epoch - $6))
+  [ "$age" -ge 0 ] && [ "$age" -le 240 ] || die "token rotation is stale: $name"
+  jq -nc --arg name "$name" --arg path "$path" --argjson uid "$1" --argjson gid "$2" \
+    --argjson size "$5" --argjson modified "$6" --argjson age "$age" \
+    '{name:$name,path:$path,uid:$uid,gid:$gid,mode:600,linkCount:1,sizeBytes:$size,modifiedEpoch:$modified,ageSeconds:$age}' >>"$tokens_tmp"
+}
+
+api_uid=${POLYEDGE_REBOOT_API_UID:-$(id -u polyedge-identity-api)}
+api_gid=${POLYEDGE_REBOOT_API_GID:-$(id -g polyedge-identity-api)}
+research_uid=${POLYEDGE_REBOOT_RESEARCH_UID:-$(id -u polyedge-identity-research)}
+research_gid=${POLYEDGE_REBOOT_RESEARCH_GID:-$(id -g polyedge-identity-research)}
+token_state api "$api_token" "$api_uid" "$api_gid"
+token_state research "$research_token" "$research_uid" "$research_gid"
+if [ "$funded_enabled" = true ]; then
+  token_state funded-signer "$funded_token" \
+    "${POLYEDGE_PARITY_FUNDED_UID}" "${POLYEDGE_PARITY_FUNDED_GID}"
+  token_state funded-intent-producer "$funded_producer_token" 984 980
+fi
+
+[ ! -e "$pause_file" ] || die 'image pulls are paused'
+boot_available=$(df -P -B1 "$boot_root" | awk 'NR == 2 {print $4}')
+ring_available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
+printf '%s:%s:%s:%s' "$boot_available" "$boot_floor" "$ring_available" "$ring_floor" | grep -Eq '^[0-9]+:[0-9]+:[0-9]+:[0-9]+$' \
+  || die 'disk capacity is unreadable'
+[ "$boot_available" -ge "$boot_floor" ] && [ "$ring_available" -ge "$ring_floor" ] || die 'disk floor is not satisfied'
+secure_file "$ring_status" 640 1048576
+ring_mtime=$(stat -c %Y "$ring_status")
+ring_age=$((now_epoch - ring_mtime))
+[ "$ring_age" -ge 0 ] && [ "$ring_age" -le 600 ] || die 'ring status is stale'
+ring_json=$(jq -ce '
+  if .capacity_ok == true and .free_ok == true and .upload_fresh == true and
+     .unsealed_closed_count == 0 and .unuploaded_count == 0
+  then {capacityOk:.capacity_ok,freeOk:.free_ok,uploadFresh:.upload_fresh,
+    unsealedClosedCount:.unsealed_closed_count,unuploadedCount:.unuploaded_count}
+  else error("ring is unhealthy") end
+' "$ring_status") || die 'ring is unhealthy'
+units=$(jq -sc '.' "$units_tmp")
+containers=$(jq -sc '.' "$containers_tmp")
+tokens=$(jq -sc '.' "$tokens_tmp")
+jq -n --argjson units "$units" --argjson containers "$containers" --argjson tokens "$tokens" \
+  --argjson funded_state "$funded_state" \
+  --argjson ring "$ring_json" --argjson ring_mtime "$ring_mtime" --argjson ring_age "$ring_age" \
+  --argjson boot "$boot_available" --argjson boot_floor "$boot_floor" \
+  --argjson ring_free "$ring_available" --argjson ring_floor "$ring_floor" --arg qset_enablement "$qset_enablement" \
+  '{healthy:true,units:$units,containers:$containers,tokens:$tokens,
+    qset:{timerEnablement:$qset_enablement,timerActive:false,jobActive:false},
+    funded:$funded_state,
+    ring:($ring + {statusModifiedEpoch:$ring_mtime,statusAgeSeconds:$ring_age}),
+    disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring_free,
+      ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false}}' >"$system_tmp"
+validate_system_evidence "$system_tmp" "$funded_enabled" || die 'captured system evidence is invalid'
+
+boot_id=$(tr -d '\n' <"$boot_id_file")
+valid_boot_id "$boot_id" || die 'boot ID is malformed'
+btime=$(awk '$1 == "btime" {print $2; found=1} END {if (!found) exit 1}' "$proc_stat") || die 'boot time is missing'
+printf '%s' "$btime" | grep -Eq '^[0-9]+$' && [ "$btime" -gt 0 ] || die 'boot time is malformed'
+observed=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+protected=$(protected_json)
+hours=$(jq -r '.acceptedCleanLiveHours' "$POLYEDGE_PARITY_LEDGER")
+days=$(jq -r '.completedDailyCycles' "$POLYEDGE_PARITY_LEDGER")
+[ "$hours" -ge 72 ] && [ "$days" -ge 2 ] || die 'reboot proof requires 72 clean hours and two daily cycles'
+hourly_sha=$(json_sha '.acceptedHourlyEvidence' "$POLYEDGE_PARITY_LEDGER")
+daily_sha=$(json_sha '.acceptedDailyEvidence' "$POLYEDGE_PARITY_LEDGER")
+ledger_sha=$(sha "$POLYEDGE_PARITY_LEDGER")
+
+if [ "$command" = prepare ]; then
+  [ ! -e "$pending" ] || die 'a reboot attestation is already pending'
+  make_dir "$reboot_root" "$parity_root"
+  boot_dir=$reboot_root/$boot_id
+  make_dir "$boot_dir" "$reboot_root"
+  pre=$boot_dir/preboot.json
+  [ ! -e "$pre" ] || die 'preboot evidence already exists for this boot'
+  evidence_tmp=$(mktemp "$boot_dir/.preboot.XXXXXX")
+  jq -n --arg observed "$observed" --arg boot "$boot_id" --argjson btime "$btime" \
+    --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg ledger_sha "$ledger_sha" --argjson protected "$protected" \
+    --argjson hours "$hours" --argjson days "$days" --arg hourly_sha "$hourly_sha" --arg daily_sha "$daily_sha" \
+    --slurpfile system "$system_tmp" \
+    '{schemaVersion:1,phase:"preboot",status:"validated",generatedAtUtc:$observed,
+      boot:{id:$boot,btime:$btime,observedAtUtc:$observed},ledger:{path:$ledger,sha256:$ledger_sha},
+      protectedBindings:$protected,acceptedEvidence:{cleanLiveHours:$hours,completedDailyCycles:$days,
+        hourlyPrefixSha256:$hourly_sha,dailyPrefixSha256:$daily_sha}} + $system[0]' >"$evidence_tmp"
+  chmod 0640 "$evidence_tmp"; sync -f "$evidence_tmp"; mv -n "$evidence_tmp" "$pre"; evidence_tmp=
+  secure_file "$pre" 640 1048576
+  pre_sha=$(sha "$pre")
+  pending_tmp=$(mktemp "$reboot_root/.pending.XXXXXX")
+  jq -n --arg created "$observed" --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+    --arg pre "$pre" --arg pre_sha "$pre_sha" \
+    '{schemaVersion:1,status:"pending",createdAtUtc:$created,ledgerPath:$ledger,windowStartUtc:$window,
+      preboot:{path:$pre,sha256:$pre_sha}}' >"$pending_tmp"
+  chmod 0640 "$pending_tmp"; sync -f "$pending_tmp"; mv -n "$pending_tmp" "$pending"; pending_tmp=
+  secure_file "$pending" 640 65536
+  echo "reboot attestation prepared for boot $boot_id"
+  exit 0
+fi
+
+pre=$(jq -r '.preboot.path' "$pending")
+pre_sha=$(jq -r '.preboot.sha256' "$pending")
+pre_id=${pre%/preboot.json}; pre_id=${pre_id##*/}
+valid_boot_id "$pre_id" && [ "$pre" = "$reboot_root/$pre_id/preboot.json" ] || die 'pending preboot path is not canonical'
+secure_dir "$reboot_root" 750
+secure_dir "$reboot_root/$pre_id" 750
+[ "$(sha "$pre")" = "$pre_sha" ] || die 'pending preboot hash mismatch'
+validate_evidence_file "$pre" preboot
+[ "$boot_id" != "$pre_id" ] || die 'complete requires a different boot ID'
+[ "$btime" -gt "$(jq -r '.boot.btime' "$pre")" ] || die 'complete requires a later boot time'
+[ "$(evidence_protected_json "$pre")" = "$protected" ] || die 'protected bindings changed across reboot'
+[ "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$pre")" = \
+  "$(jq -cS '[.containers[] | {name,image,user,health}] | sort_by(.name)' "$system_tmp")" ] \
+  || die 'container image, user, or health binding changed across reboot'
+[ "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.units[] | {name,enablement,active}] | sort_by(.name)' "$system_tmp")" ] || die 'unit enablement changed across reboot'
+[ "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$pre")" = "$(jq -cS '[.tokens[] | {name,path,uid,gid,mode,linkCount}] | sort_by(.name)' "$system_tmp")" ] || die 'token ownership or path binding changed across reboot'
+pre_hours=$(jq -r '.acceptedEvidence.cleanLiveHours' "$pre")
+pre_days=$(jq -r '.acceptedEvidence.completedDailyCycles' "$pre")
+[ "$hours" -ge "$pre_hours" ] && [ "$days" -ge "$pre_days" ] || die 'accepted evidence counts regressed across reboot'
+[ "$(json_sha ".acceptedHourlyEvidence[0:$pre_hours]" "$POLYEDGE_PARITY_LEDGER")" = "$(jq -r '.acceptedEvidence.hourlyPrefixSha256' "$pre")" ] \
+  || die 'accepted hourly evidence changed across reboot'
+[ "$(json_sha ".acceptedDailyEvidence[0:$pre_days]" "$POLYEDGE_PARITY_LEDGER")" = "$(jq -r '.acceptedEvidence.dailyPrefixSha256' "$pre")" ] \
+  || die 'accepted daily evidence changed across reboot'
+
+post_dir=$reboot_root/$boot_id
+make_dir "$post_dir" "$reboot_root"
+post=$post_dir/postboot.json
+if [ ! -e "$post" ]; then
+  evidence_tmp=$(mktemp "$post_dir/.postboot.XXXXXX")
+  jq -n --arg observed "$observed" --arg boot "$boot_id" --argjson btime "$btime" \
+    --arg ledger "$POLYEDGE_PARITY_LEDGER" --arg ledger_sha "$ledger_sha" --argjson protected "$protected" \
+    --argjson hours "$hours" --argjson days "$days" --arg hourly_sha "$hourly_sha" --arg daily_sha "$daily_sha" \
+    --arg pre "$pre" --arg pre_sha "$pre_sha" --slurpfile system "$system_tmp" \
+    '{schemaVersion:1,phase:"postboot",status:"validated",generatedAtUtc:$observed,
+      boot:{id:$boot,btime:$btime,observedAtUtc:$observed},ledger:{path:$ledger,sha256:$ledger_sha},
+      preboot:{path:$pre,sha256:$pre_sha},protectedBindings:$protected,
+      acceptedEvidence:{cleanLiveHours:$hours,completedDailyCycles:$days,
+        hourlyPrefixSha256:$hourly_sha,dailyPrefixSha256:$daily_sha}} + $system[0]' >"$evidence_tmp"
+  chmod 0640 "$evidence_tmp"; sync -f "$evidence_tmp"; mv -n "$evidence_tmp" "$post"; evidence_tmp=
+fi
+secure_file "$post" 640 1048576
+validate_evidence_file "$post" postboot
+jq -e --arg pre "$pre" --arg pre_sha "$pre_sha" '.preboot == {path:$pre,sha256:$pre_sha}' "$post" >/dev/null \
+  || die 'postboot evidence does not bind the pending preboot evidence'
+post_sha=$(sha "$post")
+
+protected_before=$(jq -cS 'del(.rebootRecoveryPassed,.rebootRecovery)' "$POLYEDGE_PARITY_LEDGER")
+ledger_tmp=$(mktemp "$parity_root/.ledger.XXXXXX")
+jq --arg completed "$observed" --arg pre "$pre" --arg pre_sha "$pre_sha" --arg post "$post" --arg post_sha "$post_sha" '
+  .rebootRecoveryPassed = true |
+  .rebootRecovery = {schemaVersion:1,status:"validated",completedAtUtc:$completed,
+    preboot:{path:$pre,sha256:$pre_sha},postboot:{path:$post,sha256:$post_sha}}
+' "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+chmod 0640 "$ledger_tmp"
+[ "$(jq -cS 'del(.rebootRecoveryPassed,.rebootRecovery)' "$ledger_tmp")" = "$protected_before" ] \
+  || die 'reboot commit changed a non-reboot ledger field'
+ledger_read=$ledger_tmp
+validate_gate
+ledger_read=$POLYEDGE_PARITY_LEDGER
+sync -f "$ledger_tmp"; mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"; ledger_tmp=
+rm -f "$pending"
+echo "reboot recovery validated for boot $boot_id"
