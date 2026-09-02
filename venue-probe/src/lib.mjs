@@ -1398,6 +1398,7 @@ export async function finalizeProbeRisk(config, reservation, result, {
 
 export async function settleProbeRiskReservations(config, settlement, {
   reservationRecords = null,
+  matchedNotionalRecoveries = [],
   container = storageContainer(config)
 } = {}) {
   const conditionIds = new Set((settlement?.condition_ids || []).map((value) => String(value).toLowerCase()));
@@ -1414,10 +1415,71 @@ export async function settleProbeRiskReservations(config, settlement, {
   const indexTransitions = [];
   const records = reservationRecords ||
     await loadCampaignRiskReservationRecordsFromContainer(config, container);
+  if (!Array.isArray(matchedNotionalRecoveries)) {
+    throw new Error("fail closed: automatic matched-risk recoveries are invalid");
+  }
+  const recoveries = matchedNotionalRecoveries;
+  if (recoveries.length && (
+    settlement?.trust_boundary_ready !== true ||
+    settlement?.evidence_source !== "polymarket_data_api_plus_onchain_redemption" ||
+    settlement?.zero_open_orders_confirmed !== true ||
+    Number(settlement?.polygon_chain_id) !== 137 ||
+    settlement?.transaction_receipt_status !== "success" ||
+    !/^\d+$/.test(String(settlement?.transaction_block_number || "")) ||
+    BigInt(settlement.transaction_block_number) <= 0n ||
+    Number(settlement?.transaction_receipt_confirmations) < 2 ||
+    !/^0x[0-9a-f]{64}$/i.test(String(settlement?.transaction_hash || "")) ||
+    !/^0x[0-9a-f]{40}$/i.test(String(settlement?.settlement_wallet || "")) ||
+    !/^0x[0-9a-f]{40}$/i.test(String(settlement?.settlement_signer || "")))) {
+    throw new Error("fail closed: automatic matched-risk recovery lacks exact verified redemption controls");
+  }
+  const recoveryByOrderId = new Map();
+  for (const recovery of recoveries) {
+    const orderId = String(recovery?.order_id || "");
+    const conditionId = String(recovery?.condition_id || "").toLowerCase();
+    const tokenId = String(recovery?.token_id || "");
+    const matchedNotional = number(recovery?.matched_notional, 0);
+    if (!/^0x[0-9a-f]{64}$/i.test(orderId) ||
+        !/^0x[0-9a-f]{64}$/.test(conditionId) ||
+        !/^[1-9]\d{0,77}$/.test(tokenId) ||
+        !String(recovery?.run_id || "") || !String(recovery?.probe_id || "") ||
+        Number(recovery?.prior_matched_notional) !== 0 || !(matchedNotional > 0) ||
+        recoveryByOrderId.has(orderId) || !conditionIds.has(conditionId)) {
+      throw new Error("fail closed: automatic matched-risk recovery binding is invalid");
+    }
+    const exact = records.filter((record) => {
+      const reservation = record?.reservation;
+      return reservation?.campaign_id === config.campaignId &&
+        reservation?.run_id === recovery.run_id &&
+        reservation?.probe_id === recovery.probe_id &&
+        reservation?.order_id === orderId &&
+        String(reservation?.condition_id || "").toLowerCase() === conditionId &&
+        String(reservation?.token_id || "") === tokenId;
+    });
+    const reservation = exact[0]?.reservation;
+    const principal = number(reservation?.principal_notional, 0);
+    const feeRisk = number(reservation?.fee_risk_upper_bound, 0);
+    const reserved = number(reservation?.reserved_notional, 0);
+    const pending = reservation?.state === "unresolved_reconciliation" &&
+      number(reservation?.matched_notional, 0) === 0 &&
+      reservation?.reconciliation_complete === false &&
+      reservation?.zero_open_orders_confirmed === true;
+    const applied = reservation?.state === "position_settled" &&
+      Math.abs(number(reservation?.matched_notional, 0) - matchedNotional) <= 0.000001 &&
+      String(reservation?.settlement_transaction_hash || "").toLowerCase() ===
+        String(settlement.transaction_hash).toLowerCase();
+    if (exact.length !== 1 || !(principal > 0) || feeRisk < 0 ||
+        Math.abs(reserved - principal - feeRisk) > 0.000001 ||
+        Math.abs(matchedNotional - reserved) > 0.000001 || (!pending && !applied)) {
+      throw new Error("fail closed: automatic matched-risk recovery does not bind one full reservation");
+    }
+    recoveryByOrderId.set(orderId, { ...recovery, matched_notional: matchedNotional });
+  }
   for (const record of records) {
     const reservation = record?.reservation;
+    const recovery = recoveryByOrderId.get(String(reservation?.order_id || ""));
     if ((config.operatorDirect === true && reservation?.campaign_id !== config.campaignId)
-        || number(reservation?.matched_notional, 0) <= 0
+        || (number(reservation?.matched_notional, 0) <= 0 && !recovery)
         || !conditionIds.has(String(reservation?.condition_id || "").toLowerCase())) continue;
     // A previous redemption pass may already have moved the reservation to
     // position_settled before terminal portfolio evidence was available.  Do
@@ -1427,6 +1489,19 @@ export async function settleProbeRiskReservations(config, settlement, {
     const payload = {
       ...reservation,
       state: "position_settled",
+      matched_notional: recovery?.matched_notional ?? reservation.matched_notional,
+      reconciliation_complete: recovery ? true : reservation.reconciliation_complete,
+      zero_open_orders_confirmed: recovery ? true : reservation.zero_open_orders_confirmed,
+      reconciliation_reason: recovery
+        ? "authenticated_full_fill_and_verified_redemption"
+        : reservation.reconciliation_reason,
+      reconciliation_evidence: recovery
+        ? {
+            source: "authenticated_clob_full_fill_plus_verified_redemption",
+            transaction_hash: String(settlement.transaction_hash).toLowerCase(),
+            matched_notional: recovery.matched_notional
+          }
+        : reservation.reconciliation_evidence,
       settlement_verified: true,
       settlement_evidence_source: redemptionVerified ? "verified_onchain_redemption" : settlement.evidence_source,
       settlement_transaction_hash: settlement.transaction_hash ? String(settlement.transaction_hash) : null,

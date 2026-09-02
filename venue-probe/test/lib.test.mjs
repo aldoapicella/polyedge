@@ -1152,6 +1152,75 @@ test("funded unresolved index follows reserve, unresolved finalize, and settleme
   )).length, 0);
 });
 
+test("verified redemption atomically settles an exact zero-matched full fill", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const conditionId = `0x${"b".repeat(64)}`;
+  const orderId = `0x${"c".repeat(64)}`;
+  const tokenId = "123456789";
+  const reservation = await reserveProbeRisk(fundedRiskIndexConfig, {
+    date: "2026-09-02",
+    run_id: "run-recovered-full-fill",
+    probe_id: "probe-recovered-full-fill",
+    reserved_notional: 2.1,
+    principal_notional: 2,
+    fee_risk_upper_bound: 0.1,
+    condition_id: conditionId,
+    token_id: tokenId
+  }, { container });
+  await finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "unresolved_reconciliation",
+    order_submitted: true,
+    order_id: orderId,
+    matched_notional: 0,
+    reconciliation_complete: false,
+    zero_open_orders_confirmed: true
+  }, { container });
+  const records = await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  );
+  const transactionHash = `0x${"d".repeat(64)}`;
+  assert.equal(await settleProbeRiskReservations(fundedRiskIndexConfig, {
+    condition_ids: [conditionId],
+    settlement_verified: true,
+    trust_boundary_ready: true,
+    transaction_hash: transactionHash,
+    polygon_chain_id: 137,
+    transaction_receipt_status: "success",
+    transaction_block_number: "12345678",
+    transaction_receipt_confirmations: 2,
+    settlement_wallet: `0x${"e".repeat(40)}`,
+    settlement_signer: `0x${"f".repeat(40)}`,
+    run_id: "settlement-recovered-full-fill",
+    zero_open_orders_confirmed: true,
+    evidence_source: "polymarket_data_api_plus_onchain_redemption"
+  }, {
+    container,
+    reservationRecords: records,
+    matchedNotionalRecoveries: [{
+      run_id: "run-recovered-full-fill",
+      probe_id: "probe-recovered-full-fill",
+      order_id: orderId,
+      condition_id: conditionId,
+      token_id: tokenId,
+      prior_matched_notional: 0,
+      matched_notional: 2.1
+    }]
+  }), 1);
+  const settled = container.json(
+    "reports/research/venue-probe/risk-reservations/2026-09-02/probe-recovered-full-fill.json"
+  );
+  assert.equal(settled.state, "position_settled");
+  assert.equal(settled.matched_notional, 2.1);
+  assert.equal(settled.reconciliation_complete, true);
+  assert.equal(settled.settlement_transaction_hash, transactionHash);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 0);
+});
+
 test("funded risk finalization honors an exact reservation ETag", async () => {
   const container = new RiskIndexContainer();
   await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });

@@ -412,7 +412,9 @@ async function run() {
       zero_open_orders_confirmed: verified.zero_open_orders_confirmed,
       evidence_source: "polymarket_data_api_plus_onchain_redemption"
     }, {
-      reservationRecords
+      reservationRecords,
+      matchedNotionalRecoveries: settlementValues.flatMap((row) =>
+        row.reservation_risk_recoveries || [])
     });
     await writeRedemptionControl(control);
     ledger.record("venue_redemption_verified", verified);
@@ -569,7 +571,9 @@ async function recoverConfirmedRedemption({
     zero_open_orders_confirmed: true,
     evidence_source: "polymarket_data_api_plus_onchain_redemption"
   }, {
-    reservationRecords
+    reservationRecords,
+    matchedNotionalRecoveries: settlementValues.flatMap((row) =>
+      row.reservation_risk_recoveries || [])
   });
 
   const finishedTs = new Date().toISOString();

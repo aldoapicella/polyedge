@@ -1106,6 +1106,44 @@ test("automatic settlement binds exact reservation, CLOB, Data API, wallet, and 
   assert.equal(state.protected_reserve, 5.729586);
 });
 
+test("automatic settlement backfills an exact zero-matched full fill", async () => {
+  const reservation = automaticReservation({
+    schema_version: 1,
+    state: "unresolved_reconciliation",
+    matched_notional: 0,
+    principal_notional: 2,
+    fee_risk_upper_bound: 0.1,
+    reserved_notional: 2.1,
+    reconciliation_complete: false,
+    zero_open_orders_confirmed: true
+  });
+  const [settlement] = await discoverVerifiedAutomaticInternalSettlements({
+    manifest: manifest(),
+    reservations: [reservation],
+    activity: [tradeActivity(), redeemActivity()],
+    expectedWallet,
+    getOrderFills: async () => [automaticFill()],
+    getTransactionReceipt: async () => confirmedReceipt()
+  });
+
+  assert.equal(settlement.reservation_matched_notional, 2.1);
+  assert.deepEqual(settlement.reservation_risk_recoveries, [{
+    run_id: "run-funded-1",
+    probe_id: "probe-funded-1",
+    order_id: "order-funded-1",
+    condition_id: automaticCondition,
+    token_id: automaticToken,
+    prior_matched_notional: 0,
+    matched_notional: 2.1
+  }]);
+  const container = new Container();
+  await putVerifiedInternalSettlement(container, settlement);
+  assert.equal((await loadDurableInternalSettlements(
+    container,
+    "dynamic-quote-funded-test-v5"
+  ))[0].reservation_risk_recoveries[0].matched_notional, 2.1);
+});
+
 test("automatic settlement accepts a flat maker row only with the exact reservation asset", () => {
   const fixture = verifyFixture();
   Object.assign(fixture.orderFills[0], {

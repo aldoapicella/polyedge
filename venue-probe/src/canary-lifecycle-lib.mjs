@@ -575,17 +575,27 @@ export async function waitForStablePostCancelReconciliation({
     await userChannel.ensureOpen();
     let finalOrder;
     let trades;
-    try {
-      [finalOrder, trades] = await Promise.all([
-        client.getOrder(orderId),
-        client.getTrades({ market: conditionId })
-      ]);
-    } catch (error) {
-      ledger?.record("venue_post_cancel_reconciliation_query_failed", { order_id: orderId, message: error.message });
+    const [orderResult, tradesResult] = await Promise.allSettled([
+      client.getOrder(orderId),
+      client.getTrades({ market: conditionId })
+    ]);
+    if (tradesResult.status === "rejected") {
+      ledger?.record("venue_post_cancel_reconciliation_query_failed", {
+        order_id: orderId,
+        message: tradesResult.reason?.message || "authenticated trade history query failed"
+      });
       previousFingerprint = null;
       stableSince = null;
       await sleep(pollMs);
       continue;
+    }
+    finalOrder = orderResult.status === "fulfilled" ? orderResult.value : null;
+    trades = tradesResult.value;
+    if (orderResult.status === "rejected") {
+      ledger?.record("venue_post_cancel_order_query_failed", {
+        order_id: orderId,
+        message: orderResult.reason?.message || "order query failed"
+      });
     }
     const relatedTrades = uniqueTrades((trades || []).filter((trade) => orderIds(trade).includes(String(orderId))));
     const userEvents = relevantUserEvents(userChannel.messages, orderId);

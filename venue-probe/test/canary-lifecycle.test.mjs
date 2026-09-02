@@ -861,3 +861,42 @@ test("non-terminal status containing MATCHED is never accepted as terminal", asy
   assert.equal(result.stableFinality, false);
   assert.equal(result.terminalConfirmed, false);
 });
+
+test("missing terminal order still preserves authenticated fills for fail-closed recovery", async () => {
+  let now = 0;
+  const trade = {
+    id: "trade-1",
+    status: "CONFIRMED",
+    market: "condition-1",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    maker_orders: [{
+      order_id: "order-1",
+      matched_amount: "5",
+      price: "0.82",
+      asset_id: "token-1",
+      side: "BUY"
+    }]
+  };
+  const result = await waitForStablePostCancelReconciliation({
+    client: {
+      async getOrder() { throw new Error("order was evicted"); },
+      async getTrades() { return [trade]; },
+      async getOpenOrders() { return []; }
+    },
+    conditionId: "condition-1",
+    orderId: "order-1",
+    userChannel: { messages: [], ensureOpen: async () => true },
+    options: {
+      nowMs: () => now,
+      sleep: async (ms) => { now += ms; },
+      minimumObservationMs: 100,
+      requiredStableMs: 50,
+      timeoutMs: 200,
+      pollMs: 25
+    }
+  });
+
+  assert.equal(result.stableFinality, false);
+  assert.equal(result.finalOrder, null);
+  assert.equal(result.relatedTrades.length, 1);
+});

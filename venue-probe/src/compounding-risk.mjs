@@ -211,6 +211,21 @@ export async function verifyConfiguredInternalSettlements({
   return verified;
 }
 
+function recoverableZeroMatchedReservation(reservation) {
+  const principal = Number(reservation?.principal_notional);
+  const feeRisk = Number(reservation?.fee_risk_upper_bound);
+  const reserved = Number(reservation?.reserved_notional);
+  return reservation?.schema_version === 1
+    && reservation?.state === "unresolved_reconciliation"
+    && Number(reservation?.matched_notional) === 0
+    && reservation?.reconciliation_complete === false
+    && reservation?.zero_open_orders_confirmed === true
+    && principal > 0
+    && feeRisk >= 0
+    && reserved > 0
+    && moneyEqual(reserved, principal + feeRisk);
+}
+
 export async function discoverVerifiedAutomaticInternalSettlements({
   manifest,
   reservations,
@@ -275,7 +290,8 @@ export async function discoverVerifiedAutomaticInternalSettlements({
         && reservation.probe_id.length > 0
         && typeof reservation?.run_id === "string"
         && reservation.run_id.length > 0
-        && Number(reservation?.matched_notional) > 0
+        && (Number(reservation?.matched_notional) > 0 ||
+          recoverableZeroMatchedReservation(reservation))
     );
     if (!matchingReservations.length) {
       throw new Error("fail closed: automatic settlement redemption does not bind funded reservations");
@@ -336,7 +352,8 @@ export function verifyAutomaticSettlementEvidence({
           || !normalizedAsset(reservation?.token_id)
           || reservation?.order_submission_intended !== true
           || reservation?.order_submitted !== true
-          || !(Number(reservation?.matched_notional) > 0)
+          || !(Number(reservation?.matched_notional) > 0 ||
+            recoverableZeroMatchedReservation(reservation))
           || !reservation?.run_id
           || !reservation?.probe_id
           || !reservation?.order_id
@@ -429,10 +446,30 @@ export function verifyAutomaticSettlementEvidence({
     (total, fill) => total + Number(fill.size) * Number(fill.price),
     0
   ));
-  const matchedRisk = money(boundReservations.reduce(
-    (total, row) => total + Number(row.matched_notional),
-    0
-  ));
+  const reservationRiskRecoveries = [];
+  const matchedRisk = money(boundReservations.reduce((total, reservation) => {
+    const durableMatchedRisk = Number(reservation.matched_notional);
+    if (durableMatchedRisk > 0) return total + durableMatchedRisk;
+    const orderPrincipal = money(fills
+      .filter((fill) => fill.order_id === reservation.order_id)
+      .reduce((sum, fill) => sum + fill.size * fill.price, 0));
+    if (!moneyEqual(orderPrincipal, reservation.principal_notional)) {
+      // ponytail: automatic backfill is full-fill only; add exact partial-fee
+      // reconstruction if a confirmed partial-fill incident proves it is needed.
+      throw new Error("fail closed: zero-matched reservation is not an exact authenticated full fill");
+    }
+    const recoveredMatchedRisk = money(reservation.reserved_notional);
+    reservationRiskRecoveries.push({
+      run_id: reservation.run_id,
+      probe_id: reservation.probe_id,
+      order_id: reservation.order_id,
+      condition_id: normalizedHash(reservation.condition_id),
+      token_id: normalizedAsset(reservation.token_id),
+      prior_matched_notional: 0,
+      matched_notional: recoveredMatchedRisk
+    });
+    return total + recoveredMatchedRisk;
+  }, 0));
   const feeRiskUpperBound = money(boundReservations.reduce(
     (total, row) => total + Math.max(0, Number(row.fee_risk_upper_bound) || 0),
     0
@@ -564,6 +601,10 @@ export function verifyAutomaticSettlementEvidence({
     authenticated_clob_fill_ids: fills.map((fill) => fill.id).sort(),
     reservation_matched_notional: matchedRisk,
     reservation_fee_risk_upper_bound: feeRiskUpperBound,
+    ...(reservationRiskRecoveries.length
+      ? { reservation_risk_recoveries: reservationRiskRecoveries.sort((left, right) =>
+          left.order_id.localeCompare(right.order_id)) }
+      : {}),
     evidence_source: "polymarket_data_api_plus_onchain_redemption",
     redemption_evidence_decoded: true,
     redemption_adapter_address: adapter,
@@ -1518,6 +1559,24 @@ function validInternalSettlement(value) {
         && value.fill_transaction_hashes.every((hash) => /^0x[0-9a-fA-F]{64}$/.test(String(hash)))));
 }
 
+function validAutomaticReservationRiskRecoveries(value) {
+  if (value.reservation_risk_recoveries === undefined) return true;
+  const recoveries = value.reservation_risk_recoveries;
+  return Array.isArray(recoveries)
+    && recoveries.length > 0
+    && new Set(recoveries.map((row) => row?.order_id)).size === recoveries.length
+    && recoveries.every((row) =>
+      typeof row?.run_id === "string" && value.run_ids.includes(row.run_id)
+      && typeof row?.probe_id === "string" && value.probe_ids.includes(row.probe_id)
+      && typeof row?.order_id === "string" && value.order_ids.includes(row.order_id)
+      && normalizedHash(row?.condition_id) === normalizedHash(value.condition_id)
+      && normalizedAsset(row?.token_id) === value.token_ids[0]
+      && Number(row?.prior_matched_notional) === 0
+      && Number(row?.matched_notional) > 0)
+    && money(recoveries.reduce((total, row) => total + Number(row.matched_notional), 0)) <=
+      Number(value.reservation_matched_notional) + 1 / MONEY_SCALE;
+}
+
 function validDurableInternalSettlement(value) {
   if (!validInternalSettlement(value)
       || typeof value.session_id !== "string"
@@ -1566,6 +1625,7 @@ function validDurableInternalSettlement(value) {
           String(Math.round(Number(value.payout) * MONEY_SCALE))
         || value.redemption_transfer_chain_verified !== true
         || normalizedAsset(value.redemption_token_id) !== value.token_ids[0]
+        || !validAutomaticReservationRiskRecoveries(value)
         || !Number.isFinite(Number(value.reservation_matched_notional))
         || !Number.isFinite(Number(value.reservation_fee_risk_upper_bound))
         || Number(value.reservation_fee_risk_upper_bound) < 0
