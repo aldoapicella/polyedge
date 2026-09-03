@@ -4290,10 +4290,12 @@ fn persist_durable_recorder_request(
         }
     }
 
-    // Best-effort events may still be buffered. Flush them before assigning
-    // the recorder's pending buffer to this durable batch so unrelated bytes
-    // can never determine the journal's acknowledgment.
-    recorder_flush_result(recorder, metrics, false)?;
+    // A failed best-effort flush must recover before this journal is staged.
+    // Healthy buffered bytes can share the journal's atomic flush: the durable
+    // acknowledgment still waits for every byte in that flush to persist.
+    if metrics.flush_unrecovered.load(Ordering::Acquire) {
+        recorder_flush_result(recorder, metrics, false)?;
+    }
     durability.pending_batch_key = Some(batch_key.to_owned());
     let result = match recorder.lock() {
         Ok(mut recorder) => match recorder.record_recorded_batch(events) {
@@ -7398,7 +7400,7 @@ mod tests {
         assert_eq!(metrics.snapshot()["flush_recovered_total"], 1);
         assert_eq!(metrics.snapshot()["persisted_total"], 3);
         let state = state.lock().unwrap();
-        assert_eq!(state.committed_sequences, vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(state.committed_sequences, vec![vec![1], vec![2, 3]]);
         assert_eq!(
             state
                 .record_batch_calls
@@ -7411,8 +7413,7 @@ mod tests {
             state.committed_event_types,
             vec![
                 vec!["book".to_owned()],
-                vec!["book".to_owned()],
-                vec!["required_evidence".to_owned()]
+                vec!["book".to_owned(), "required_evidence".to_owned()]
             ]
         );
     }
@@ -7459,7 +7460,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_requests_flush_best_effort_before_staging_the_journal() {
+    fn durable_requests_commit_buffered_best_effort_with_the_journal() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
         let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
             Box::new(BufferedRecorderTestDouble {
@@ -7508,11 +7509,65 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(
             state.committed_event_types,
+            vec![vec!["book".to_owned(), "required_evidence".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn durable_request_recovers_a_failed_best_effort_flush_first() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            retry_flush_failures_remaining: 1,
+            ..BufferedRecorderTestState::default()
+        }));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
+        let metrics = Arc::new(RecorderMetrics::default());
+        let book = metrics
+            .bind(RuntimeEvent {
+                event_type: "book".to_owned(),
+                ts: Utc::now(),
+                data: json!({"sequence": 1}),
+            })
+            .unwrap();
+        recorder
+            .lock()
+            .unwrap()
+            .record_recorded_batch(std::slice::from_ref(&book))
+            .unwrap();
+        assert!(recorder_flush_result(&recorder, &metrics, false).is_err());
+
+        let durable = metrics
+            .bind(RuntimeEvent {
+                event_type: "required_evidence".to_owned(),
+                ts: Utc::now(),
+                data: json!({"journal_id": "after-failed-book-flush"}),
+            })
+            .unwrap();
+        let mut durability = RecorderDurabilityState::default();
+        assert_eq!(
+            persist_durable_recorder_request(
+                &recorder,
+                &metrics,
+                &mut durability,
+                "after-failed-book-flush",
+                std::slice::from_ref(&durable),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
             vec![
                 vec!["book".to_owned()],
                 vec!["required_evidence".to_owned()]
             ]
         );
+        assert_eq!(metrics.snapshot()["flush_unrecovered"], false);
+        assert_eq!(metrics.snapshot()["flush_recovered_total"], 1);
     }
 
     #[test]
