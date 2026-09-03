@@ -790,8 +790,6 @@ impl RuntimeController {
 
     pub async fn shutdown(&self) -> Result<(), String> {
         let _shutdown_guard = self.inner.shutdown_gate.lock().await;
-        self.inner.shutting_down.store(true, Ordering::SeqCst);
-        self.inner.recorder_admission.close();
         let mut shutdown_error = if self
             .inner
             .termination_audit_complete
@@ -848,6 +846,8 @@ impl RuntimeController {
             }
         }
 
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        self.inner.recorder_admission.close();
         let deadline = Instant::now() + RECORDER_SHUTDOWN_DRAIN_TIMEOUT;
         while self.inner.recorder_metrics.queued.load(Ordering::Relaxed) != 0 {
             if Instant::now() >= deadline {
@@ -7079,6 +7079,39 @@ mod tests {
             controller.inner.recorder_metrics.snapshot()["last_persisted_sequence"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_feed_events_before_closing_recorder_admission() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(FeedEvent::Error {
+                source: FeedName::PolymarketClobMarket,
+                message: "shutdown tail".to_owned(),
+                ts: Utc::now(),
+            })
+            .unwrap();
+        drop(sender);
+        *controller.inner.feed_task.lock().unwrap() =
+            Some(controller.spawn_feed_event_loop(receiver));
+
+        controller.shutdown().await.unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
+            vec![vec!["feed_error"]]
+        );
+        assert_eq!(controller.inner.recorder_metrics.snapshot()["queued"], 0);
     }
 
     #[tokio::test]
