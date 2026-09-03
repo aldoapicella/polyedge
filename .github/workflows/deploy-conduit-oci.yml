@@ -1,6 +1,14 @@
 name: Deploy OCI image to conduit
 
 on:
+  workflow_call:
+    inputs:
+      quadlet_unit:
+        required: true
+        type: string
+      image_digest:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       quadlet_unit:
@@ -58,13 +66,24 @@ jobs:
         env:
           CONDUIT_KNOWN_HOSTS: ${{ secrets.CONDUIT_KNOWN_HOSTS }}
           CONDUIT_SSH_DEPLOY_KEY: ${{ secrets.CONDUIT_SSH_DEPLOY_KEY }}
+          CONDUIT_SSH_TARGET: ${{ vars.CONDUIT_SSH_TARGET }}
         run: |
           set -euo pipefail
           test -n "$CONDUIT_KNOWN_HOSTS"
           test -n "$CONDUIT_SSH_DEPLOY_KEY"
+          [[ "$CONDUIT_SSH_TARGET" =~ ^[a-z_][a-z0-9_-]*@[a-zA-Z0-9.-]+$ ]]
+          host=${CONDUIT_SSH_TARGET#*@}
           install -d -m 700 "$HOME/.ssh"
           umask 077
-          printf '%s\n' "$CONDUIT_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          trusted=$(mktemp)
+          scanned=$(mktemp)
+          matched=$(mktemp)
+          trap 'rm -f "$trusted" "$scanned" "$matched"' EXIT
+          printf '%s\n' "$CONDUIT_KNOWN_HOSTS" | awk 'NF >= 3 { print $2, $3 }' | sort -u > "$trusted"
+          ssh-keyscan -T 10 "$host" 2>/dev/null | awk 'NF >= 3 { print $2, $3 }' | sort -u > "$scanned"
+          comm -12 "$trusted" "$scanned" > "$matched"
+          test -s "$matched"
+          awk -v host="$host" '{ print host, $1, $2 }' "$matched" > "$HOME/.ssh/known_hosts"
           printf '%s\n' "$CONDUIT_SSH_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/known_hosts" "$HOME/.ssh/id_ed25519"
 

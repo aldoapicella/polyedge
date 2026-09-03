@@ -35,6 +35,15 @@ on:
       - 'venue-probe/**'
       - '.github/workflows/build-oci-images.yml'
   workflow_dispatch:
+    inputs:
+      deploy_unit:
+        description: Existing PolyEdge Quadlet unit name on conduit
+        required: false
+        type: string
+      deploy_image_digest:
+        description: Existing immutable GHCR image reference to deploy without rebuilding
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -178,7 +187,7 @@ jobs:
           PY
 
   publish:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.deploy_image_digest == '')
     name: ${{ matrix.name }} (publish)
     runs-on: ubuntu-latest
     permissions:
@@ -250,7 +259,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish-research-validation:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.deploy_image_digest == '')
     needs: publish
     runs-on: ubuntu-latest
     permissions:
@@ -291,3 +300,14 @@ jobs:
             | sort == ["amd64", "arm64"]
           ' manifest.json
           printf '### research-validation\n\n- `%s@%s`\n' "${IMAGE%:*}" "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_image_digest != ''
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/deploy-conduit-oci.yml
+    with:
+      quadlet_unit: ${{ inputs.deploy_unit }}
+      image_digest: ${{ inputs.deploy_image_digest }}
+    secrets: inherit
