@@ -143,7 +143,7 @@ jq -e '
 oci_calls=$(wc -l <"$oci_log")
 PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
   POLYEDGE_TEST_OCI_MODE=fail POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
-  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync"
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload POLYEDGE_TEST_FORBIDDEN_HASH=$archive_fixture "$sync"
 [ "$(wc -l <"$oci_log")" = "$oci_calls" ]
 rm -f "$oci_receipt"
 PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \

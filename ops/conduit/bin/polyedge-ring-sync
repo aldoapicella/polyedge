@@ -551,10 +551,6 @@ oci_sync() {
       ) | .blob_name
     ' "$_oci_manifest") || { echo "invalid OCI ring manifest: $_oci_manifest" >&2; return 1; }
     _oci_payload_sha=$(jq -r '.sha256' "$_oci_manifest")
-    [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
-      echo "OCI ring payload changed: $_oci_payload" >&2
-      return 1
-    }
     _oci_manifest_sha=sha256:$(sha256sum "$_oci_manifest" | awk '{print $1}')
     _oci_manifest_blob=$_oci_blob.manifest.json
     if [ -e "$_oci_receipt" ] || [ -L "$_oci_receipt" ]; then
@@ -581,6 +577,10 @@ oci_sync() {
       }
       continue
     fi
+    [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
+      echo "OCI ring payload changed: $_oci_payload" >&2
+      return 1
+    }
     _oci_blob_etag=$(oci_put_immutable "$_oci_payload" "$_oci_blob" "$_oci_payload_sha" application/gzip) || return 1
     _oci_manifest_etag=$(oci_put_immutable "$_oci_manifest" "$_oci_manifest_blob" "$_oci_manifest_sha" application/json) || return 1
     _oci_temporary=$(mktemp "$_oci_receipt.XXXXXX") || return 1
