@@ -8,6 +8,7 @@ import {
   marketMessagesThrough,
   maximumMatchedSize,
   postCancelFillStats,
+  reconciledOrderRisk,
   tradeFillsFromRest,
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
@@ -833,6 +834,17 @@ test("terminal no-fill reconciliation waits for the full stable-finality window"
   assert.ok(result.observationMs >= 10_000);
   assert.ok(snapshots >= 21, "the first terminal/zero-open snapshot must not be accepted immediately");
   assert.equal(result.relatedTrades.length, 0);
+  assert.deepEqual(reconciledOrderRisk({
+    ...result,
+    finalOrder: { ...result.finalOrder, id: "order-1" }
+  }, "order-1"), {
+    restFills: [],
+    userFills: [],
+    matchedShares: 0,
+    matchedSizeSourceAgreement: true,
+    tradeIdSourceAgreement: true,
+    reconciliationComplete: true
+  });
 });
 
 test("non-terminal status containing MATCHED is never accepted as terminal", async () => {
@@ -899,4 +911,5 @@ test("missing terminal order still preserves authenticated fills for fail-closed
   assert.equal(result.stableFinality, false);
   assert.equal(result.finalOrder, null);
   assert.equal(result.relatedTrades.length, 1);
+  assert.equal(reconciledOrderRisk(result, "order-1").reconciliationComplete, false);
 });

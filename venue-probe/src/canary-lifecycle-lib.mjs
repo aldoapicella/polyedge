@@ -640,6 +640,34 @@ export async function waitForStablePostCancelReconciliation({
   return { ...latest, stableFinality: false, observationMs: nowMs() - started };
 }
 
+export function reconciledOrderRisk(reconciliation, orderId) {
+  const restFills = tradeFillsFromRest(reconciliation?.relatedTrades, orderId);
+  const userFills = tradeFillsFromUserEvents(reconciliation?.userEvents, orderId);
+  const matchedSizes = [
+    Number(reconciliation?.finalOrder?.size_matched || 0),
+    maximumMatchedSize(reconciliation?.userEvents),
+    sum(restFills.map((fill) => fill.size)),
+    sum(userFills.map((fill) => fill.size))
+  ];
+  const matchedShares = Math.max(...matchedSizes);
+  const matchedSizeSourceAgreement = matchedSizes.every((value) => nearlyEqualSize(value, matchedShares));
+  const tradeIdSourceAgreement = sameStringSet(
+    restFills.map((fill) => fill.id),
+    userFills.map((fill) => fill.id)
+  );
+  const reconciliationComplete = reconciliation?.zeroOpenOrders === true &&
+    reconciliation?.stableFinality === true && reconciliation?.terminalConfirmed === true &&
+    Boolean(reconciliation?.finalOrder) && matchedSizeSourceAgreement && tradeIdSourceAgreement;
+  return {
+    restFills,
+    userFills,
+    matchedShares,
+    matchedSizeSourceAgreement,
+    tradeIdSourceAgreement,
+    reconciliationComplete
+  };
+}
+
 export function relevantUserEvents(messages, orderId) {
   return (messages || []).filter((message) => orderIds(message).includes(String(orderId)));
 }

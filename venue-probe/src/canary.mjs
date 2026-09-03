@@ -49,10 +49,9 @@ import {
   marketMessagesThrough,
   maximumMatchedSize,
   mergeTradeFills,
-  nearlyEqualSize,
   postCancelFillStats,
   publicTradeThroughStats,
-  sameStringSet,
+  reconciledOrderRisk,
   sum,
   tradeFillsFromRest,
   tradeFillsFromUserEvents,
@@ -1986,12 +1985,13 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       assertHealthy: () => lease.assertHealthy()
     });
     await Promise.all([userChannel.ensureOpen(), marketChannel.ensureOpen()]);
+    const risk = reconciledOrderRisk(reconciliation, orderId);
     const userFills = normalizeFillClock(
-      tradeFillsFromUserEvents(reconciliation.userEvents, orderId),
+      risk.userFills,
       refreshed.clockServerMinusLocalMs
     );
     const restFills = normalizeFillClock(
-      tradeFillsFromRest(reconciliation.relatedTrades, orderId),
+      risk.restFills,
       refreshed.clockServerMinusLocalMs
     );
     const fills = mergeTradeFills(userFills, restFills);
@@ -2000,13 +2000,11 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     const userOrderMatched = maximumMatchedSize(reconciliation.userEvents);
     const restTradesMatched = sum(restFills.map((fill) => fill.size));
     const userTradesMatched = sum(userFills.map((fill) => fill.size));
-    const matchedShares = Math.max(restOrderMatched, userOrderMatched, restTradesMatched, userTradesMatched);
-    const matchedSizeSourceAgreement = [restOrderMatched, userOrderMatched, restTradesMatched, userTradesMatched]
-      .every((value) => nearlyEqualSize(value, matchedShares));
-    const tradeIdSourceAgreement = sameStringSet(restFills.map((fill) => fill.id), userFills.map((fill) => fill.id));
+    const matchedShares = risk.matchedShares;
+    const matchedSizeSourceAgreement = risk.matchedSizeSourceAgreement;
+    const tradeIdSourceAgreement = risk.tradeIdSourceAgreement;
     const restOrderReturned = Boolean(reconciliation.finalOrder);
-    const reconciliationComplete = reconciliation.zeroOpenOrders && reconciliation.stableFinality &&
-      reconciliation.terminalConfirmed && restOrderReturned && matchedSizeSourceAgreement && tradeIdSourceAgreement;
+    const reconciliationComplete = risk.reconciliationComplete;
     ledger.record("funded_terminal_reconciliation_completed", {
       wall_ms: Date.now(),
       monotonic_ms: performance.now(),
@@ -2168,11 +2166,13 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     let reservationPersistenceError = null;
     try {
       await finalizeProbeRisk(config, reservation, {
-        state: "unresolved_reconciliation",
+        state: emergency.reconciliationComplete
+          ? (emergency.matchedShares > 0 ? "position_unresolved" : "finalized_no_fill")
+          : "unresolved_reconciliation",
         order_submitted: true,
         order_id: orderId,
         matched_notional: matchedRisk,
-        reconciliation_complete: false,
+        reconciliation_complete: emergency.reconciliationComplete,
         zero_open_orders_confirmed: emergency.zeroOpenOrders
       });
     } catch (persistenceError) {
@@ -2201,7 +2201,9 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     });
     const failure = reservationPersistenceError
       ? new Error(`fail closed: post-ack error and unresolved reservation persistence failed; prior durable reservation remains blocking (${error.message}; ${reservationPersistenceError.message})`)
-      : !emergency.zeroOpenOrders
+      : emergency.reconciliationComplete
+        ? new Error(`fail closed: post-ack evidence degraded after emergency terminal reconciliation (${error.message})`)
+        : !emergency.zeroOpenOrders
         ? new Error(`fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved (${error.message})`)
         : new Error(`fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (${error.message})`);
     failure.executionEvidence = {
@@ -2214,7 +2216,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
         ack_wall_ms: acknowledgedAt.getTime(),
         client_to_http_ack_ms: acknowledgementLatencyMs,
         matched_notional: matchedRisk,
-        reconciliation_complete: false,
+        reconciliation_complete: emergency.reconciliationComplete,
         zero_open_orders_confirmed: emergency.zeroOpenOrders
       }
     };
@@ -2428,13 +2430,13 @@ async function uploadFailedPostAckEvidence({ intent, runtime, reservation, order
     live_duration_ms: Math.max(0, finishedAt.getTime() - acknowledgedAt.getTime()),
     first_fill_after_ack_ms: null,
     actual_matched_size: emergency.matchedShares,
-    related_trade_ids: [],
+    related_trade_ids: emergency.relatedTradeIds || [],
     venue_fee_model: runtime.feeModel,
     venue_fee_rate: runtime.feeRate,
     venue_fee_rate_bps: Number(runtime.feeRateBps || 0),
     venue_fee_exponent: runtime.feeExponent,
     venue_fee_taker_only: runtime.feeTakerOnly,
-    reconciliation_complete: false,
+    reconciliation_complete: emergency.reconciliationComplete,
     zero_open_orders_confirmed: emergency.zeroOpenOrders,
     data_gap_detected: true,
     cancellation_failure: !emergency.zeroOpenOrders
@@ -2528,13 +2530,15 @@ async function emergencyReconcileAfterAck(client, conditionId, orderId) {
     ledger
   }).catch(() => null);
   const openOrders = await getOpenOrdersStrict(client).catch(() => null);
-  const zeroOpenOrders = Array.isArray(openOrders) && openOrders.length === 0;
-  const restFills = reconciliation ? tradeFillsFromRest(reconciliation.relatedTrades, orderId) : [];
-  const matchedShares = Math.max(
-    Number(reconciliation?.finalOrder?.size_matched || 0),
-    restFills.reduce((sum, fill) => sum + fill.size, 0)
-  );
-  return { zeroOpenOrders, matchedShares };
+  const risk = reconciledOrderRisk(reconciliation, orderId);
+  const zeroOpenOrders = reconciliation?.zeroOpenOrders === true &&
+    Array.isArray(openOrders) && openOrders.length === 0;
+  return {
+    zeroOpenOrders,
+    matchedShares: risk.matchedShares,
+    reconciliationComplete: risk.reconciliationComplete && zeroOpenOrders,
+    relatedTradeIds: risk.restFills.map((fill) => fill.id)
+  };
 }
 
 async function loadExactMarket(intent) {
