@@ -1377,20 +1377,21 @@ impl RuntimeController {
                 generation = generation.wrapping_add(1);
                 let lease = runtime.begin_clob_generation(generation, &token_ids).await;
                 let subscribed_tokens = token_ids.clone();
-                let mut feed = tokio::spawn(polyedge_feeds::run_market_feed_generation_with_lease(
+                let feed = polyedge_feeds::run_market_feed_generation_with_lease(
                     runtime.inner.settings.clone(),
                     token_ids,
                     generation,
                     lease,
                     sender.clone(),
-                ));
+                );
+                tokio::pin!(feed);
                 let mut refresh = tokio::time::interval(Duration::from_secs(2));
                 loop {
                     tokio::select! {
                         result = &mut feed => {
                             runtime.terminate_clob_generation(generation, "market feed generation ended").await;
                             match result {
-                                Ok(Ok(())) => {
+                                Ok(()) => {
                                     runtime
                                         .record_feed_disconnect(
                                             &[FeedName::PolymarketClobMarket],
@@ -1398,25 +1399,17 @@ impl RuntimeController {
                                         )
                                         .await;
                                 }
-                                Ok(Err(error)) => {
+                                Err(error) => {
                                     runtime
                                         .feed_error(FeedName::PolymarketClobMarket, error.to_string())
                                         .await;
                                 }
-                                Err(error) if !error.is_cancelled() => {
-                                    runtime
-                                        .feed_error(FeedName::PolymarketClobMarket, error.to_string())
-                                        .await;
-                                }
-                                Err(_) => {}
                             }
                             break;
                         }
                         _ = refresh.tick() => {
                             if runtime.market_token_ids().await != subscribed_tokens {
                                 runtime.terminate_clob_generation(generation, "market token set changed").await;
-                                feed.abort();
-                                let _ = feed.await;
                                 break;
                             }
                         }
