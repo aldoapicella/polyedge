@@ -13,10 +13,10 @@ fi
 unit=${1:-}
 image=${2:-}
 case "$unit" in
-  polyedge-api|polyedge-shadow-qset|polyedge-funded-intent-producer) repository=polyedge-rust-backend ;;
+  polyedge-api|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer) repository=polyedge-rust-backend ;;
   polyedge-frontend) repository=polyedge-frontend ;;
   polyedge-funded-signer) repository=polyedge-venue-probe ;;
-  *) die 'usage: polyedge-quadlet-deploy {polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-funded-intent-producer|polyedge-funded-signer} ghcr.io/OWNER/IMAGE@sha256:<64-lowercase-hex>' ;;
+  *) die 'usage: polyedge-quadlet-deploy {polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer|polyedge-funded-signer} ghcr.io/OWNER/IMAGE@sha256:<64-lowercase-hex>' ;;
 esac
 
 printf '%s' "$image" | grep -Eq "^ghcr\\.io/[a-z0-9][a-z0-9._-]*/$repository@sha256:[0-9a-f]{64}$" || \

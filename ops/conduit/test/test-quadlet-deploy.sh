@@ -13,6 +13,8 @@ signer=ghcr.io/example/polyedge-venue-probe@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 signer_next=ghcr.io/example/polyedge-venue-probe@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 printf '[Container]\nImage=%s\nContainerName=polyedge-api\n' "$old" >"$tmp/quadlets/polyedge-api.container"
 printf '[Container]\nImage=%s\nContainerName=polyedge-shadow-qset\n' "$old" >"$tmp/quadlets/polyedge-shadow-qset.container"
+printf '[Container]\nImage=%s\nContainerName=polyedge-shadow-qset-v5\n' "$old" >"$tmp/quadlets/polyedge-shadow-qset-v5.container"
+printf '[Container]\nImage=%s\nContainerName=polyedge-shadow-qset-v7\n' "$old" >"$tmp/quadlets/polyedge-shadow-qset-v7.container"
 printf '[Container]\nImage=%s\nContainerName=polyedge-funded-intent-producer\n' "$old" >"$tmp/quadlets/polyedge-funded-intent-producer.container"
 printf '[Container]\nImage=%s\nContainerName=polyedge-funded-signer\n' "$old" >"$tmp/quadlets/polyedge-funded-signer.container"
 
@@ -64,6 +66,12 @@ grep -Fx "Image=$next" "$tmp/quadlets/polyedge-shadow-qset.container" >/dev/null
 
 run "$next" "$next" 20260805T000005Z polyedge-funded-intent-producer
 grep -Fx "Image=$next" "$tmp/quadlets/polyedge-funded-intent-producer.container" >/dev/null
+
+run "$next" "$next" 20260805T000006Z polyedge-shadow-qset-v5
+grep -Fx "Image=$next" "$tmp/quadlets/polyedge-shadow-qset-v5.container" >/dev/null
+
+run "$next" "$next" 20260805T000007Z polyedge-shadow-qset-v7
+grep -Fx "Image=$next" "$tmp/quadlets/polyedge-shadow-qset-v7.container" >/dev/null
 
 if run "$new" "$new" 20260805T000003Z polyedge-funded-signer; then
   echo 'wrong repository was accepted for funded signer' >&2

@@ -42,10 +42,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$QUADLET_UNIT" =~ ^(polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-funded-intent-producer|polyedge-funded-signer)$ ]]
+          [[ "$QUADLET_UNIT" =~ ^(polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer|polyedge-funded-signer)$ ]]
           [[ "$IMAGE_DIGEST" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
           case "$QUADLET_UNIT" in
-            polyedge-api|polyedge-shadow-qset|polyedge-funded-intent-producer)
+            polyedge-api|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer)
               [[ "$IMAGE_DIGEST" =~ /polyedge-rust-backend@sha256:[0-9a-f]{64}$ ]]
               ;;
             polyedge-frontend)

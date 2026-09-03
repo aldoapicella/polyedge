@@ -9,7 +9,7 @@ die() {
 command=${SSH_ORIGINAL_COMMAND:-}
 single_line=$(printf '%s' "$command" | tr -d '\n\r\t')
 [ "$single_line" = "$command" ] || die 'invalid deployment command'
-printf '%s' "$command" | grep -Eq '^sudo -n /usr/local/sbin/polyedge-quadlet-deploy (polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-funded-intent-producer|polyedge-funded-signer) ghcr\.io/[a-z0-9][a-z0-9._-]*/(polyedge-rust-backend|polyedge-frontend|polyedge-venue-probe)@sha256:[0-9a-f]{64}$' || die 'invalid deployment command'
+printf '%s' "$command" | grep -Eq '^sudo -n /usr/local/sbin/polyedge-quadlet-deploy (polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer|polyedge-funded-signer) ghcr\.io/[a-z0-9][a-z0-9._-]*/(polyedge-rust-backend|polyedge-frontend|polyedge-venue-probe)@sha256:[0-9a-f]{64}$' || die 'invalid deployment command'
 
 set -f
 old_ifs=$IFS
@@ -19,7 +19,7 @@ IFS=$old_ifs
 [ "$#" -eq 5 ] || die 'invalid deployment command'
 
 case "$4" in
-  polyedge-api|polyedge-shadow-qset|polyedge-funded-intent-producer) repository=polyedge-rust-backend ;;
+  polyedge-api|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer) repository=polyedge-rust-backend ;;
   polyedge-frontend) repository=polyedge-frontend ;;
   polyedge-funded-signer) repository=polyedge-venue-probe ;;
   *) die 'invalid deployment command' ;;
