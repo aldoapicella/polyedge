@@ -17,7 +17,10 @@ pub(super) struct RuntimeRecorder {
 impl RuntimeRecorder {
     pub(super) fn new(settings: &RuntimeSettings) -> Self {
         let mut recorders: Vec<Box<dyn EventRecorder + Send>> = Vec::new();
-        let authoritative_remote = settings.azure.storage_account_name.is_some();
+        let azure_recorder_enabled =
+            configured_enabled(env::var("AZURE_EVENT_RECORDER_ENABLED").ok().as_deref());
+        let authoritative_remote =
+            azure_recorder_enabled && settings.azure.storage_account_name.is_some();
         let local_jsonl_enabled = local_jsonl_recorder_enabled(
             authoritative_remote,
             env::var("LOCAL_JSONL_RECORDER_ENABLED").ok().as_deref(),
@@ -41,16 +44,18 @@ impl RuntimeRecorder {
             };
             recorders.push(Box::new(recorder));
         }
-        if let Some(account) = settings.azure.storage_account_name.as_deref() {
-            let client_id = env::var("AZURE_CLIENT_ID").ok();
-            recorders.push(Box::new(AzureAppendBlobRecorder::new_with_prefix_cutover(
-                account,
-                settings.azure.storage_container_name.clone(),
-                client_id,
-                settings.azure.event_blob_prefix.clone(),
-                settings.azure.event_blob_prefix_after_cutover.clone(),
-                settings.azure.event_blob_prefix_cutover_utc,
-            )));
+        if azure_recorder_enabled {
+            if let Some(account) = settings.azure.storage_account_name.as_deref() {
+                let client_id = env::var("AZURE_CLIENT_ID").ok();
+                recorders.push(Box::new(AzureAppendBlobRecorder::new_with_prefix_cutover(
+                    account,
+                    settings.azure.storage_container_name.clone(),
+                    client_id,
+                    settings.azure.event_blob_prefix.clone(),
+                    settings.azure.event_blob_prefix_after_cutover.clone(),
+                    settings.azure.event_blob_prefix_cutover_utc,
+                )));
+            }
         }
         Self {
             recorders,
@@ -155,9 +160,10 @@ impl RuntimeRecorder {
 }
 
 fn local_jsonl_recorder_enabled(authoritative_remote: bool, configured: Option<&str>) -> bool {
-    if !authoritative_remote {
-        return true;
-    }
+    !authoritative_remote || configured_enabled(configured)
+}
+
+fn configured_enabled(configured: Option<&str>) -> bool {
     !matches!(
         configured
             .map(str::trim)
@@ -169,7 +175,7 @@ fn local_jsonl_recorder_enabled(authoritative_remote: bool, configured: Option<&
 
 #[cfg(test)]
 mod tests {
-    use super::local_jsonl_recorder_enabled;
+    use super::{configured_enabled, local_jsonl_recorder_enabled};
 
     #[test]
     fn local_jsonl_can_only_be_disabled_when_remote_storage_is_authoritative() {
@@ -178,5 +184,14 @@ mod tests {
         assert!(local_jsonl_recorder_enabled(true, None));
         assert!(local_jsonl_recorder_enabled(true, Some("true")));
         assert!(local_jsonl_recorder_enabled(false, Some("false")));
+    }
+
+    #[test]
+    fn recorder_switches_default_on_and_accept_explicit_false_values() {
+        assert!(configured_enabled(None));
+        assert!(configured_enabled(Some("true")));
+        assert!(!configured_enabled(Some("false")));
+        assert!(!configured_enabled(Some(" 0 ")));
+        assert!(!configured_enabled(Some("NO")));
     }
 }

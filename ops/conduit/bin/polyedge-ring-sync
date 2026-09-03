@@ -16,7 +16,13 @@ root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
 root_requested=$root
 root=$(realpath -e -- "$root") || exit 1
 [ "$root_requested" = "$root" ] || { echo "ring root path contains a symlink or is non-canonical: $root_requested" >&2; exit 1; }
-mountpoint -q "$root" || { echo "$root is not a mount point" >&2; exit 1; }
+mount_root=${POLYEDGE_RING_MOUNT_ROOT:-$root}
+[ ! -L "$mount_root" ] && [ -d "$mount_root" ] || { echo "ring mount root is not a regular directory: $mount_root" >&2; exit 1; }
+mount_root_requested=$mount_root
+mount_root=$(realpath -e -- "$mount_root") || exit 1
+[ "$mount_root_requested" = "$mount_root" ] || { echo "ring mount root path contains a symlink or is non-canonical: $mount_root_requested" >&2; exit 1; }
+mountpoint -q "$mount_root" || { echo "$mount_root is not a mount point" >&2; exit 1; }
+case "$root" in "$mount_root"|"$mount_root"/*) ;; *) echo "$root is outside ring mount $mount_root" >&2; exit 1 ;; esac
 segments=$root/segments
 archive=$root/archive
 quarantine_parent=$root/quarantine
@@ -461,6 +467,149 @@ if [ "${POLYEDGE_RING_SEAL_ONLY:-}" = 1 ]; then
   exit 0
 fi
 
+oci_put_immutable() {
+  _oci_file=$1
+  _oci_name=$2
+  _oci_sha256=$3
+  _oci_content_type=$4
+  _oci_checksum=$(printf '%s' "${_oci_sha256#sha256:}" | xxd -r -p | base64 -w0)
+  _oci_response=$(mktemp "$root/.oci-response.XXXXXX") || return 1
+  trap 'rm -f "$_oci_response"' EXIT HUP INT TERM
+  if ! "$oci_cli" os object put \
+      --auth instance_principal \
+      --region "$oci_region" \
+      --namespace-name "$oci_namespace" \
+      --bucket-name "$oci_bucket" \
+      --name "$_oci_name" \
+      --file "$_oci_file" \
+      --content-type "$_oci_content_type" \
+      --no-overwrite \
+      --no-multipart \
+      --opc-checksum-algorithm SHA256 \
+      --opc-content-sha256 "$_oci_checksum" \
+      --verify-checksum \
+      --output json >"$_oci_response"; then
+    "$oci_cli" os object head \
+      --auth instance_principal \
+      --region "$oci_region" \
+      --namespace-name "$oci_namespace" \
+      --bucket-name "$oci_bucket" \
+      --name "$_oci_name" \
+      --output json >"$_oci_response" || {
+        rm -f "$_oci_response"
+        trap - EXIT HUP INT TERM
+        return 1
+      }
+  fi
+  jq -er --arg checksum "$_oci_checksum" '
+    select(.["opc-content-sha256"] == $checksum) |
+    .etag | select(type == "string" and length > 0)
+  ' "$_oci_response" || {
+    echo "OCI object checksum disagrees: $_oci_name" >&2
+    rm -f "$_oci_response"
+    trap - EXIT HUP INT TERM
+    return 1
+  }
+  rm -f "$_oci_response"
+  trap - EXIT HUP INT TERM
+}
+
+oci_sync() {
+  : "${OCI_OBJECT_STORAGE_NAMESPACE:?set OCI_OBJECT_STORAGE_NAMESPACE}"
+  : "${OCI_OBJECT_STORAGE_BUCKET:?set OCI_OBJECT_STORAGE_BUCKET}"
+  : "${OCI_OBJECT_STORAGE_REGION:?set OCI_OBJECT_STORAGE_REGION}"
+  oci_cli=${POLYEDGE_OCI_CLI:-/home/ubuntu/.local/bin/oci}
+  oci_namespace=$OCI_OBJECT_STORAGE_NAMESPACE
+  oci_bucket=$OCI_OBJECT_STORAGE_BUCKET
+  oci_region=$OCI_OBJECT_STORAGE_REGION
+  case "$oci_cli" in /*) ;; *) echo 'POLYEDGE_OCI_CLI must be absolute' >&2; return 64 ;; esac
+  [ -x "$oci_cli" ] || { echo "OCI CLI is not executable: $oci_cli" >&2; return 1; }
+  command -v xxd >/dev/null && command -v base64 >/dev/null || { echo 'xxd and base64 are required' >&2; return 1; }
+  printf '%s' "$oci_namespace" | grep -Eq '^[A-Za-z0-9_-]+$' || { echo 'invalid OCI namespace' >&2; return 64; }
+  printf '%s' "$oci_bucket" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo 'invalid OCI bucket' >&2; return 64; }
+  printf '%s' "$oci_region" | grep -Eq '^[a-z0-9-]+$' || { echo 'invalid OCI region' >&2; return 64; }
+
+  _oci_manifest_list=$(mktemp "$root/.oci-manifests.XXXXXX") || return 1
+  trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
+  find "$archive" -type f -name '*.jsonl.gz.manifest.json' -print | LC_ALL=C sort >"$_oci_manifest_list"
+  while IFS= read -r _oci_manifest; do
+    _oci_payload=${_oci_manifest%.manifest.json}
+    _oci_receipt=$_oci_manifest.oci-uploaded.json
+    [ ! -L "$_oci_manifest" ] && [ -f "$_oci_manifest" ] &&
+      [ ! -L "$_oci_payload" ] && [ -f "$_oci_payload" ] || {
+      echo "invalid OCI ring upload input: $_oci_manifest" >&2
+      return 1
+    }
+    _oci_archive_path=${_oci_payload#"$root"/}
+    _oci_blob=$(jq -er --arg archive_path "$_oci_archive_path" --arg prefix "$prefix/" '
+      select(
+        (.schema_version == 2 or .schema_version == 3 or .schema_version == 4) and
+        .compression == "gzip" and
+        .archive_path == $archive_path and
+        (.blob_name | type == "string" and startswith($prefix) and endswith(".jsonl.gz")) and
+        (.sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+      ) | .blob_name
+    ' "$_oci_manifest") || { echo "invalid OCI ring manifest: $_oci_manifest" >&2; return 1; }
+    _oci_payload_sha=$(jq -r '.sha256' "$_oci_manifest")
+    [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
+      echo "OCI ring payload changed: $_oci_payload" >&2
+      return 1
+    }
+    _oci_manifest_sha=sha256:$(sha256sum "$_oci_manifest" | awk '{print $1}')
+    _oci_manifest_blob=$_oci_blob.manifest.json
+    if [ -e "$_oci_receipt" ] || [ -L "$_oci_receipt" ]; then
+      [ ! -L "$_oci_receipt" ] && [ -f "$_oci_receipt" ] && jq -e \
+        --arg namespace "$oci_namespace" \
+        --arg bucket "$oci_bucket" \
+        --arg region "$oci_region" \
+        --arg blob "$_oci_blob" \
+        --arg blob_sha "$_oci_payload_sha" \
+        --arg manifest_blob "$_oci_manifest_blob" \
+        --arg manifest_sha "$_oci_manifest_sha" '
+          type == "object" and
+          keys == ["blob_etag","blob_name","blob_sha256","bucket_name","manifest_blob_etag","manifest_blob_name","manifest_sha256","namespace","region","schema","verified_ts"] and
+          .schema == "polyedge_oci_ring_upload.v1" and
+          .namespace == $namespace and .bucket_name == $bucket and .region == $region and
+          .blob_name == $blob and .blob_sha256 == $blob_sha and
+          .manifest_blob_name == $manifest_blob and .manifest_sha256 == $manifest_sha and
+          (.blob_etag | type == "string" and length > 0) and
+          (.manifest_blob_etag | type == "string" and length > 0) and
+          (.verified_ts | type == "string" and length > 0)
+        ' "$_oci_receipt" >/dev/null || {
+        echo "invalid OCI ring upload receipt: $_oci_receipt" >&2
+        return 1
+      }
+      continue
+    fi
+    _oci_blob_etag=$(oci_put_immutable "$_oci_payload" "$_oci_blob" "$_oci_payload_sha" application/gzip) || return 1
+    _oci_manifest_etag=$(oci_put_immutable "$_oci_manifest" "$_oci_manifest_blob" "$_oci_manifest_sha" application/json) || return 1
+    _oci_temporary=$(mktemp "$_oci_receipt.XXXXXX") || return 1
+    trap 'rm -f "$_oci_temporary" "$_oci_manifest_list"' EXIT HUP INT TERM
+    jq -n \
+      --arg namespace "$oci_namespace" \
+      --arg bucket "$oci_bucket" \
+      --arg region "$oci_region" \
+      --arg blob "$_oci_blob" \
+      --arg blob_sha "$_oci_payload_sha" \
+      --arg blob_etag "$_oci_blob_etag" \
+      --arg manifest_blob "$_oci_manifest_blob" \
+      --arg manifest_sha "$_oci_manifest_sha" \
+      --arg manifest_etag "$_oci_manifest_etag" \
+      --arg verified_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{schema:"polyedge_oci_ring_upload.v1",namespace:$namespace,bucket_name:$bucket,region:$region,blob_name:$blob,blob_sha256:$blob_sha,blob_etag:$blob_etag,manifest_blob_name:$manifest_blob,manifest_sha256:$manifest_sha,manifest_blob_etag:$manifest_etag,verified_ts:$verified_ts}' \
+      >"$_oci_temporary"
+    chmod 0640 "$_oci_temporary"
+    sync -f "$_oci_temporary"
+    mv "$_oci_temporary" "$_oci_receipt"
+    sync -f "$_oci_receipt"
+    trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
+  done <"$_oci_manifest_list"
+  rm -f "$_oci_manifest_list"
+  trap - EXIT HUP INT TERM
+}
+
+case "${POLYEDGE_AZURE_RING_UPLOAD_ENABLED:-1}" in
+1)
 : "${POLYEDGE_RING_IMAGE:?set an immutable POLYEDGE_RING_IMAGE}"
 : "${AZURE_STORAGE_ACCOUNT_NAME:?set AZURE_STORAGE_ACCOUNT_NAME}"
 : "${AZURE_STORAGE_CONTAINER_NAME:?set AZURE_STORAGE_CONTAINER_NAME}"
@@ -514,5 +663,20 @@ esac
     --root /srv/polyedge-ring \
     --blob-prefix "$prefix" \
     --retention-hours "${POLYEDGE_RING_RETENTION_HOURS:-48}"
+;;
+0)
+  [ "${POLYEDGE_OCI_OBJECT_STORAGE_ENABLED:-0}" = 1 ] || {
+    echo 'OCI Object Storage must be enabled when Azure ring upload is disabled' >&2
+    exit 64
+  }
+;;
+*) echo 'POLYEDGE_AZURE_RING_UPLOAD_ENABLED must equal 0 or 1' >&2; exit 64 ;;
+esac
+
+case "${POLYEDGE_OCI_OBJECT_STORAGE_ENABLED:-0}" in
+  1) oci_sync ;;
+  0) ;;
+  *) echo 'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED must equal 0 or 1' >&2; exit 64 ;;
+esac
 
 POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$0"

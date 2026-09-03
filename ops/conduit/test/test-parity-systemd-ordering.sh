@@ -4,6 +4,8 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 timer=$root/ops/conduit/systemd/polyedge-ring-sync.timer
 sync_service=$root/ops/conduit/systemd/polyedge-ring-sync.service
+domain_timer=$root/ops/conduit/systemd/polyedge-ring-sync@.timer
+domain_service=$root/ops/conduit/systemd/polyedge-ring-sync@.service
 health=$root/ops/conduit/systemd/polyedge-ring-health.service
 parity=$root/ops/conduit/systemd/polyedge-parity-hourly.service
 collector=$root/ops/conduit/bin/polyedge-parity-hourly
@@ -16,6 +18,20 @@ grep -Fx 'RandomizedDelaySec=0' "$timer"
 grep -Fx 'MemoryMax=10G' "$sync_service"
 grep -Fx 'TimeoutStartSec=3h' "$sync_service"
 grep -Fx 'ExecStart=/usr/bin/flock -n /run/polyedge-ring-sync.lock /usr/bin/flock -w 3600 /run/polyedge/utility.lock /usr/local/libexec/polyedge-ring-sync' "$sync_service"
+grep -Fx 'Unit=polyedge-ring-sync@%i.service' "$domain_timer"
+grep -Fx 'ExecStart=/usr/bin/flock -n /run/polyedge-ring-sync-%i.lock /usr/bin/flock -w 3600 /run/polyedge/utility.lock /usr/bin/env POLYEDGE_RING_ENV_FILE=/etc/polyedge/ring-%i.env /usr/local/libexec/polyedge-ring-sync' "$domain_service"
+for mapping in \
+  'funded-intent-producer polyedge-shadow-events' \
+  'shadow-qset-v5 polyedge-shadow-qset-v5-events' \
+  'shadow-qset-v7 polyedge-shadow-qset-v7-events'
+do
+  set -- $mapping
+  domain_env=$root/ops/conduit/env/ring-$1.env.example
+  grep -Fx "POLYEDGE_RING_ROOT=/srv/polyedge-ring/domains/$1" "$domain_env"
+  grep -Fx "OCI_OBJECT_STORAGE_BUCKET=$2" "$domain_env"
+  grep -Fx 'POLYEDGE_AZURE_RING_UPLOAD_ENABLED=0' "$domain_env"
+  grep -Fx "Volume=/srv/polyedge-ring/domains/$1:/srv/polyedge-ring:Z" "$root/ops/conduit/quadlets/polyedge-$1.container"
+done
 grep -Fx 'After=local-fs.target polyedge-ring-sync.service' "$health"
 grep -Fx 'Requires=polyedge-ring-health.service' "$parity"
 grep -Fx 'After=network-online.target polyedge-job@hourly.service polyedge-ring-sync.service polyedge-ring-health.service' "$parity"

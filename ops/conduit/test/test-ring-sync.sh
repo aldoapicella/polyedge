@@ -24,6 +24,7 @@ quarantined_post_archive=$archive_dir/1785963600.jsonl.gz
 quarantined_post_manifest=$quarantined_post_archive.manifest.json
 env_file=$root/ring.env
 quarantine=$root/quarantine/recorder-sequence-proof-v1
+oci_log=$root/oci.log
 cleanup() { rm -rf "$root"; }
 trap cleanup EXIT HUP INT TERM
 
@@ -46,17 +47,30 @@ printf '%s\n' \
   '[ "$POLYEDGE_TEST_UPLOAD_MODE" = fail ] && exit 1' \
   'exit 0' >"$fake/podman"
 chmod 0755 "$fake/podman"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'action=$3; shift 3; name= checksum=' \
+  'while [ "$#" -gt 0 ]; do case "$1" in --name) name=$2; shift 2 ;; --opc-content-sha256) checksum=$2; shift 2 ;; *) shift ;; esac; done' \
+  'printf "%s %s\n" "$action" "$name" >> "$POLYEDGE_TEST_OCI_LOG"' \
+  'state=$POLYEDGE_TEST_OCI_STATE/$(printf %s "$name" | sha256sum | awk "{print \$1}")' \
+  '[ "$action" = put ] && printf %s "$checksum" >"$state"' \
+  '[ "$action" = head ] && checksum=$(cat "$state")' \
+  'case "${POLYEDGE_TEST_OCI_MODE:-success}:$action" in exists:put|bad-head:put) exit 1 ;; fail:*) exit 1 ;; bad-head:head) checksum=bad ;; esac' \
+  'printf "{\"etag\":\"test-etag\",\"opc-content-sha256\":\"%s\"}\n" "$checksum"' \
+  >"$fake/oci"
+chmod 0755 "$fake/oci"
 sync=$root/polyedge-ring-sync
 sed "s|/usr/bin/podman|$fake/podman|" "$(pwd)/ops/conduit/bin/polyedge-ring-sync" > "$sync"
 chmod 0755 "$sync"
 printf '%s\n' \
   '{"test":1,"recorder_instance_id":"123e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}' \
   '{"test":2,"recorder_instance_id":"223e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}' > "$fixture"
-printf 'POLYEDGE_RING_ROOT=%s\n' "$root" > "$env_file"
+printf 'POLYEDGE_RING_ROOT=%s\nPOLYEDGE_RING_MOUNT_ROOT=%s\n' "$root" "${root%/*}" > "$env_file"
 printf '%s\n' \
   'POLYEDGE_RING_IMAGE=ghcr.io/test/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'POLYEDGE_RING_BLOB_PREFIX=events-oci-test' \
   'RECORDER_SEGMENT_SECONDS=600' \
+  'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=0' \
   'POLYEDGE_RING_SEAL_ONLY=0' \
   'POLYEDGE_RING_LEGACY_CUTOFF_EPOCH=1785960600' \
   'AZURE_STORAGE_ACCOUNT_NAME=test' \
@@ -105,6 +119,63 @@ PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
 [ -e "$post_upload_manifest" ]
 [ "$(wc -l < "$upload_log")" = 2 ]
 [ "$(gzip -dc "$archive_fixture" | jq -s 'length')" = 2 ]
+install -d "$root/oci-state"
+printf '%s\n' \
+  'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=1' \
+  "POLYEDGE_OCI_CLI=$fake/oci" \
+  'OCI_OBJECT_STORAGE_NAMESPACE=testnamespace' \
+  'OCI_OBJECT_STORAGE_BUCKET=bot-events' \
+  'OCI_OBJECT_STORAGE_REGION=sa-bogota-1' \
+  "POLYEDGE_TEST_OCI_LOG=$oci_log" \
+  "POLYEDGE_TEST_OCI_STATE=$root/oci-state" >>"$env_file"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync"
+oci_receipt=$manifest.oci-uploaded.json
+jq -e '
+  .schema == "polyedge_oci_ring_upload.v1" and
+  .namespace == "testnamespace" and .bucket_name == "bot-events" and .region == "sa-bogota-1" and
+  .blob_name == "events-oci-test/2026/08/05/20/1785960600.jsonl.gz" and
+  (.blob_sha256 | startswith("sha256:")) and
+  .manifest_blob_name == (.blob_name + ".manifest.json") and
+  (.manifest_sha256 | startswith("sha256:"))
+' "$oci_receipt" >/dev/null
+oci_calls=$(wc -l <"$oci_log")
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_OCI_MODE=fail POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync"
+[ "$(wc -l <"$oci_log")" = "$oci_calls" ]
+rm -f "$oci_receipt"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_OCI_MODE=exists POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync"
+[ -e "$oci_receipt" ]
+[ "$(tail -4 "$oci_log" | cut -d' ' -f1 | paste -sd, -)" = 'put,head,put,head' ]
+rm -f "$oci_receipt"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_OCI_MODE=bad-head POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync" >/dev/null 2>&1; then
+  echo 'mismatched OCI checksum unexpectedly passed' >&2
+  exit 1
+fi
+[ ! -e "$oci_receipt" ]
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_TEST_UPLOAD_MODE=success POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync"
+upload_count=$(wc -l <"$upload_log")
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file POLYEDGE_AZURE_RING_UPLOAD_ENABLED=0 \
+  POLYEDGE_TEST_UPLOAD_MODE=fail POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync"
+[ "$(wc -l <"$upload_log")" = "$upload_count" ]
+printf '%s\n' 'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=0' >>"$env_file"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$env_file \
+  POLYEDGE_AZURE_RING_UPLOAD_ENABLED=0 \
+  POLYEDGE_TEST_UPLOAD_MODE=fail POLYEDGE_TEST_UPLOAD_LOG=$upload_log \
+  POLYEDGE_TEST_POST_UPLOAD_SEGMENT=$post_upload "$sync" >/dev/null 2>&1; then
+  echo 'disabled remote uploads unexpectedly passed' >&2
+  exit 1
+fi
+printf '%s\n' 'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=1' >>"$env_file"
 printf '%s\n' \
   '{"test":"bad-1","recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":1}' \
   '{"test":"bad-3","recorder_instance_id":"523e4567-e89b-42d3-a456-826614174000","recorder_sequence":3}' > "$bad"
