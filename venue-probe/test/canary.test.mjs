@@ -1939,10 +1939,18 @@ test("only exact venue rejection messages are classified as deterministic no-ord
       message: "invalid post-only order: order crosses book"
     }
   );
+  assert.deepEqual(
+    deterministicNoOrderRejection(new Error("trading is disabled")),
+    {
+      code: "trading_disabled",
+      message: "trading is disabled"
+    }
+  );
   assert.equal(
     deterministicNoOrderRejection(new Error("invalid post-only order: order crosses book after submission")),
     null
   );
+  assert.equal(deterministicNoOrderRejection(new Error("trading is disabled after submission")), null);
   assert.equal(deterministicNoOrderRejection(new Error("request timed out after signing")), null);
   assert.equal(deterministicNoOrderRejection({ response: { data: { error: "gateway unavailable" } } }), null);
 });

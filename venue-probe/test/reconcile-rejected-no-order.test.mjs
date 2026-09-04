@@ -49,14 +49,14 @@ test("rejected-order recovery preserves risk for every ambiguous or exposed stat
   }
 });
 
-test("post-only rejection recovery updates the exact campaign-scoped reservation index", async () => {
+test("deterministic rejection recovery updates the exact campaign-scoped reservation index", async () => {
   const value = fixture();
   let unresolved = [value.reservation];
   const result = await runRejectedNoOrderReconciliation({
     env: {
       FUNDED_DIRECT_RECONCILIATION_ENABLED: "true",
       FUNDED_DIRECT_RECONCILE_RUN_ID: value.expectedRunId,
-      FUNDED_DIRECT_RECONCILE_REJECTION_CODE: "post_only_crosses_book",
+      FUNDED_DIRECT_RECONCILE_REJECTION_CODE: "trading_disabled",
       VENUE_PROBE_FUNDED_CAMPAIGN_ID: "dynamic-quote-funded-2026-08-03-v7",
       AZURE_STORAGE_ACCOUNT_NAME: "storage",
       AZURE_STORAGE_CONTAINER_NAME: "funded",
@@ -79,13 +79,13 @@ test("post-only rejection recovery updates the exact campaign-scoped reservation
       assert.equal(config.campaignId, "dynamic-quote-funded-2026-08-03-v7");
       assert.equal(reservation.run_id, value.expectedRunId);
       assert.equal(settlement.state, "released_no_order");
-      assert.equal(settlement.reconciliation_reason, "post_only_crosses_book");
+      assert.equal(settlement.reconciliation_reason, "trading_disabled");
       unresolved = [];
       return reservation;
     }
   });
   assert.equal(result.status, "released_no_order");
-  assert.equal(result.rejection_code, "post_only_crosses_book");
+  assert.equal(result.rejection_code, "trading_disabled");
   assert.equal(result.run_id, value.expectedRunId);
 });
 

@@ -11,7 +11,8 @@ import {
 
 const EXPECTED_REJECTION_CODES = new Set([
   "invalid_gtd_expiration",
-  "post_only_crosses_book"
+  "post_only_crosses_book",
+  "trading_disabled"
 ]);
 
 export function validateRejectedReservationRecovery({

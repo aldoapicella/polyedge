@@ -619,6 +619,9 @@ export function deterministicNoOrderRejection(error) {
   if (/^invalid post-only order: order crosses book$/i.test(message)) {
     return { code: "post_only_crosses_book", message };
   }
+  if (/^trading is disabled$/i.test(message)) {
+    return { code: "trading_disabled", message };
+  }
   return null;
 }
 
