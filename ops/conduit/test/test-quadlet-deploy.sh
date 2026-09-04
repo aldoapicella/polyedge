@@ -124,6 +124,7 @@ grep -Fx 'User=984:980' "$root/quadlets/polyedge-funded-intent-producer.containe
 grep -Fx 'Network=polyedge.network' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'IP=10.89.0.248' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'EnvironmentFile=/etc/polyedge/funded-intent-producer.env' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
+grep -Fx 'EnvironmentFile=/etc/polyedge/ring-funded-intent-producer.env' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'Volume=/run/polyedge-federated-funded-intent-producer:/run/credentials:ro,Z' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'Wants=network-online.target polyedge-federated-token@funded-intent-producer.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'After=network-online.target polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-federated-token@funded-intent-producer.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
@@ -153,6 +154,10 @@ grep -Fx 'AZURE_MODEL_STORAGE_CONTAINER_NAME=polyedge-models' "$root/env/funded-
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_ENABLED=true' "$root/env/funded-intent-producer.env.example" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE=sb-polyedge-funded-cl-6urdjr5nmwx7w' "$root/env/funded-intent-producer.env.example" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_QUEUE=funded-dynamic-quote-intents' "$root/env/funded-intent-producer.env.example" >/dev/null
+grep -Fx 'LOCAL_JSONL_RECORDER_ENABLED=true' "$root/env/ring-funded-intent-producer.env.example" >/dev/null
+grep -Fx 'RECORDER_PATH=/srv/polyedge-ring/segments' "$root/env/ring-funded-intent-producer.env.example" >/dev/null
+grep -Fx 'AZURE_EVENT_RECORDER_ENABLED=false' "$root/env/ring-funded-intent-producer.env.example" >/dev/null
+grep -Fx 'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=1' "$root/env/ring-funded-intent-producer.env.example" >/dev/null
 if grep -Eiq 'qset|bot-events|key.?vault|wallet|receiver|secret|private.?key|api.?key|passphrase' "$root/env/funded-intent-producer.env.example"; then
   echo 'funded intent producer environment includes a forbidden lane or credential surface' >&2
   exit 1
