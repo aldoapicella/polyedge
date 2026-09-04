@@ -123,7 +123,12 @@ test("OCI queue bridge is exclusive and preserves receive settlement semantics",
 
   const calls = [];
   const receiver = createOciQueueBridgeReceiver(OCI_QUEUE_BRIDGE_URL, async (url, options = {}) => {
-    calls.push({ url: String(url), method: options.method || "GET", body: options.body && JSON.parse(options.body) });
+    calls.push({
+      url: String(url),
+      method: options.method || "GET",
+      body: options.body && JSON.parse(options.body),
+      signal: options.signal
+    });
     if (String(url).includes("/messages?")) {
       return new Response(JSON.stringify({ messages: [{
         message_id: "decision-1",
@@ -151,6 +156,7 @@ test("OCI queue bridge is exclusive and preserves receive settlement semantics",
   ]);
   assert.equal(calls[3].body.receipt, "receipt-1");
   assert.equal(calls[3].body.reason, "terminal");
+  assert.equal(calls.every(({ signal }) => signal instanceof AbortSignal), true);
 });
 
 test("automatic redemption remains strictly inside the final no-trade window", () => {

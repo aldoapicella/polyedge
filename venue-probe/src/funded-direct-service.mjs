@@ -57,10 +57,11 @@ function createStreamingInbox(receiver, processError) {
 
 export function createOciQueueBridgeReceiver(messagesUrl, fetchImpl = fetch) {
   const endpoint = (path = "") => new URL(path, `${messagesUrl.slice(0, messagesUrl.lastIndexOf("/") + 1)}`);
-  const request = async (path, options = {}) => {
+  const request = async (path, options = {}, timeoutMs = 10_000) => {
     const response = await fetchImpl(endpoint(path), {
       ...options,
-      headers: options.body ? { "content-type": "application/json", ...options.headers } : options.headers
+      headers: options.body ? { "content-type": "application/json", ...options.headers } : options.headers,
+      signal: options.signal || AbortSignal.timeout(timeoutMs)
     });
     if (!response.ok) throw new Error(`OCI queue bridge ${path || "receive"} failed: HTTP ${response.status}`);
     return response.status === 204 ? null : response.json();
@@ -77,7 +78,8 @@ export function createOciQueueBridgeReceiver(messagesUrl, fetchImpl = fetch) {
   });
   return {
     async receiveMessages(maxMessages, { maxWaitTimeInMs } = {}) {
-      const result = await request(`messages?timeout_ms=${Math.max(1_000, Number(maxWaitTimeInMs) || 1_000)}`);
+      const waitMs = Math.max(1_000, Number(maxWaitTimeInMs) || 1_000);
+      const result = await request(`messages?timeout_ms=${waitMs}`, {}, waitMs + 5_000);
       return (result?.messages || []).slice(0, maxMessages).map((message) => ({
         messageId: message.message_id || null,
         deliveryCount: message.delivery_count || 0,
