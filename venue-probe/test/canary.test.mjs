@@ -684,6 +684,9 @@ test("persistent executor selects only a fresh exact-market safety snapshot", ()
     selectFreshCachedSafetySnapshot(resources, { ...intent, token_id: "token-down" }, 10_600),
     null
   );
+  resources.campaignRiskSnapshot = { reservationRecords: [] };
+  runtime.riskBasis = { unresolvedReservationCount: 1 };
+  assert.equal(selectFreshCachedSafetySnapshot(resources, intent, 10_600), null);
 });
 
 test("campaign risk snapshot avoids duplicate list loaders and does not cross runs", async () => {
@@ -1941,6 +1944,13 @@ test("only exact venue rejection messages are classified as deterministic no-ord
   );
   assert.deepEqual(
     deterministicNoOrderRejection(new Error("trading is disabled")),
+    {
+      code: "trading_disabled",
+      message: "trading is disabled"
+    }
+  );
+  assert.deepEqual(
+    deterministicNoOrderRejection({ success: false, errorMsg: "trading is disabled" }),
     {
       code: "trading_disabled",
       message: "trading is disabled"

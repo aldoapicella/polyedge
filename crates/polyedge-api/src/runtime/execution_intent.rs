@@ -365,7 +365,7 @@ impl IntentPublisherConfig {
             None
         };
         Ok(IntentPublisherLane {
-            blob_client: Box::new(AzureBlobClient::with_managed_identity(
+            blob_client: Box::new(AzureBlobClient::with_managed_identity_for_funded_intent(
                 self.account.clone(),
                 self.container.clone(),
                 self.client_id.clone(),
@@ -385,11 +385,13 @@ impl IntentPublisherConfig {
             .collect::<Result<Vec<_>, _>>()?;
         let current_intent_lane: Option<StdMutex<Box<dyn CurrentFundedIntentStore>>> =
             self.operator_direct.then(|| {
-                StdMutex::new(Box::new(AzureBlobClient::with_managed_identity(
-                    self.account.clone(),
-                    self.container.clone(),
-                    self.client_id.clone(),
-                )) as Box<dyn CurrentFundedIntentStore>)
+                StdMutex::new(
+                    Box::new(AzureBlobClient::with_managed_identity_for_funded_intent(
+                        self.account.clone(),
+                        self.container.clone(),
+                        self.client_id.clone(),
+                    )) as Box<dyn CurrentFundedIntentStore>,
+                )
             });
         Ok(IntentPublisher {
             intent_lanes,

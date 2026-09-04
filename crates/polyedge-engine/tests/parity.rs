@@ -7,8 +7,9 @@ use polyedge_domain::{
 use polyedge_engine::{
     evaluate_decision_pipeline_v3, final_decision_evidence_v1, DecisionPipelineInputV3,
     DecisionPipelineOutputV3, FrozenStrategyMode, LogReturnFairValueModel, MakerFirstStrategy,
-    MarketStartEvidenceV1, OrderManager, PaperFillEngine, RegimeBookSnapshot, RegimeClassifier,
-    RegimeFeatureInput, RegimeReferencePoint, RestingMakerOrder, RiskManager,
+    ManagedQuoteSnapshot, MarketStartEvidenceV1, OrderManager, OrderManagerSnapshot,
+    PaperFillEngine, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
+    RegimeReferencePoint, RestingMakerOrder, RiskManager,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,6 +87,77 @@ fn order_manager_matches_fixture_golden_master() {
         );
         assert_eq!(serde_json::to_value(actual).unwrap(), case["expected"]);
     }
+}
+
+#[test]
+fn expired_quote_from_prior_market_is_cancelled_before_current_market_actions() {
+    let placed_ts = parse_ts("2026-09-04T15:16:49Z");
+    let expired_market_id = MarketId::new("expired-market");
+    let resting: TradeDecision = serde_json::from_value(serde_json::json!({
+        "action": "place",
+        "market_id": expired_market_id,
+        "condition_id": "expired-condition",
+        "token_id": "expired-token",
+        "outcome": "down",
+        "side": "buy",
+        "price": "0.37",
+        "size": "1",
+        "quote_amount": null,
+        "order_kind": "post_only_gtc",
+        "reason": "maker edge exceeds threshold",
+        "ttl_ms": 10000,
+        "expected_edge": "0.039783",
+        "post_only": true,
+        "tick_size": "0.01",
+        "neg_risk": false
+    }))
+    .unwrap();
+    let manager = OrderManager::from_snapshot(OrderManagerSnapshot {
+        quotes: vec![ManagedQuoteSnapshot {
+            market_id: expired_market_id.clone(),
+            token_id: TokenId::new("expired-token"),
+            side: polyedge_domain::Side::Buy,
+            decision: resting,
+            placed_ts,
+            expires_at: Some(placed_ts + chrono::Duration::seconds(10)),
+            order_id: Some(OrderId::new("paper-expired")),
+        }],
+    });
+    let current_market_id = MarketId::new("current-market");
+    let risk_cancel: TradeDecision = serde_json::from_value(serde_json::json!({
+        "action": "cancel_all",
+        "market_id": current_market_id,
+        "condition_id": "current-condition",
+        "token_id": null,
+        "outcome": null,
+        "side": null,
+        "price": null,
+        "size": null,
+        "quote_amount": null,
+        "order_kind": null,
+        "reason": "max open orders reached",
+        "ttl_ms": null,
+        "expected_edge": null,
+        "post_only": false,
+        "tick_size": null,
+        "neg_risk": false
+    }))
+    .unwrap();
+
+    let actions = manager.reconcile(
+        &current_market_id,
+        &[risk_cancel],
+        None,
+        placed_ts + chrono::Duration::seconds(11),
+    );
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        actions[0].action,
+        polyedge_domain::DecisionAction::CancelAll
+    );
+    assert_eq!(actions[0].market_id, expired_market_id);
+    assert_eq!(actions[0].reason, "expired maker quote from a prior market");
 }
 
 #[test]

@@ -1703,6 +1703,11 @@ export function selectFreshCachedSafetySnapshot(resources, intent, nowMs = Date.
       nowMs - completedWallMs > SAFETY_CACHE_MAX_SELECTION_AGE_MS) {
     return null;
   }
+  if (Array.isArray(resources?.campaignRiskSnapshot?.reservationRecords) &&
+      Number(cached.runtime?.riskBasis?.unresolvedReservationCount) !==
+        resources.campaignRiskSnapshot.reservationRecords.length) {
+    return null;
+  }
   // The warm snapshot is captured with a deliberately non-executable
   // synthetic intent. Rebind only the immutable resolution provenance from
   // the verified executable intent; all volatile venue/account evidence
@@ -1906,6 +1911,17 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
     }
     await cancelAllAndConfirm(client);
     throw new Error(`fail closed: ambiguous strategy-canary submission; authorization is consumed and risk remains reserved (${error.message})`);
+  }
+  const rejection = deterministicNoOrderRejection(response);
+  if (rejection) {
+    await releaseDeterministicRejectedOrder(client, {
+      intent,
+      manifest: documents.manifest,
+      reservation,
+      sentAt,
+      rejection
+    });
+    throw new Error(`fail closed: venue rejected the order without acknowledgement; no-order risk was reconciled and released (${rejection.code}: ${rejection.message})`);
   }
   if (!response?.success || !response.orderID || !["live", "matched"].includes(String(response.status).toLowerCase())) {
     await cancelAllAndConfirm(client);

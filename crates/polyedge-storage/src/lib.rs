@@ -1838,6 +1838,7 @@ pub struct AzureBlobClient {
     container: String,
     auth: AzureBlobAuth,
     agent: ureq::Agent,
+    max_attempts: usize,
 }
 
 #[derive(Clone)]
@@ -1861,6 +1862,7 @@ impl AzureBlobClient {
                 .timeout_read(Duration::from_secs(120))
                 .timeout_write(Duration::from_secs(30))
                 .build(),
+            max_attempts: AZURE_BLOB_MAX_ATTEMPTS,
         }
     }
 
@@ -1878,6 +1880,25 @@ impl AzureBlobClient {
                 .timeout_read(Duration::from_secs(120))
                 .timeout_write(Duration::from_secs(30))
                 .build(),
+            max_attempts: AZURE_BLOB_MAX_ATTEMPTS,
+        }
+    }
+
+    pub fn with_managed_identity_for_funded_intent(
+        account: impl Into<String>,
+        container: impl Into<String>,
+        client_id: Option<String>,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            container: container.into(),
+            auth: AzureBlobAuth::ManagedIdentity(ManagedIdentityToken::new(client_id)),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(2))
+                .timeout_read(Duration::from_secs(2))
+                .timeout_write(Duration::from_secs(2))
+                .build(),
+            max_attempts: 1,
         }
     }
 
@@ -1897,6 +1918,7 @@ impl AzureBlobClient {
                 .timeout_read(Duration::from_secs(7200))
                 .timeout_write(Duration::from_secs(7200))
                 .build(),
+            max_attempts: AZURE_BLOB_MAX_ATTEMPTS,
         }
     }
 
@@ -1917,6 +1939,7 @@ impl AzureBlobClient {
                 .timeout_read(AZURE_LEASE_READ_TIMEOUT)
                 .timeout_write(AZURE_LEASE_WRITE_TIMEOUT)
                 .build(),
+            max_attempts: AZURE_BLOB_MAX_ATTEMPTS,
         }
     }
 
@@ -2061,13 +2084,13 @@ impl AzureBlobClient {
             self.container,
             encode_blob_path(name)
         );
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let result = self
                 .get_response_if_match(&url, expected_etag)
                 .and_then(read_versioned_blob_response);
             match result {
                 Ok(versioned) => return Ok(versioned),
-                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                Err(error) if error.is_retryable() && attempt + 1 < self.max_attempts => {
                     thread::sleep(retry_delay(attempt));
                 }
                 Err(error) => return Err(error),
@@ -2149,10 +2172,10 @@ impl AzureBlobClient {
             self.container,
             encode_blob_path(name)
         );
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             match self.put_block_blob_if_match(&url, bytes, content_type, expected_etag) {
                 Ok(updated) => return Ok(updated),
-                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                Err(error) if error.is_retryable() && attempt + 1 < self.max_attempts => {
                     thread::sleep(retry_delay(attempt));
                 }
                 Err(error) => return Err(error),
@@ -2270,18 +2293,18 @@ impl AzureBlobClient {
         lease_id: Option<&str>,
         duration_seconds: Option<u32>,
     ) -> Result<ureq::Response, AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             match self.lease_request_once(url, action, lease_id, duration_seconds) {
                 Ok(response) => return Ok(response),
                 Err(AzureBlobError::HttpStatus(status)) => {
-                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                    if is_retryable_azure_status(status) && attempt + 1 < self.max_attempts {
                         thread::sleep(retry_delay(attempt));
                         continue;
                     }
                     return Err(AzureBlobError::HttpStatus(status));
                 }
                 Err(AzureBlobError::Transport(message)) => {
-                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                    if attempt + 1 < self.max_attempts {
                         thread::sleep(retry_delay(attempt));
                         continue;
                     }
@@ -2298,10 +2321,10 @@ impl AzureBlobClient {
         url: &str,
         expected_etag: &str,
     ) -> Result<(), AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             match self.seal_append_blob_once(url, expected_etag) {
                 Ok(()) => return Ok(()),
-                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                Err(error) if error.is_retryable() && attempt + 1 < self.max_attempts => {
                     thread::sleep(retry_delay(attempt));
                 }
                 Err(error) => return Err(error),
@@ -2429,11 +2452,11 @@ impl AzureBlobClient {
     }
 
     fn get_bytes_with_retry(&mut self, url: &str) -> Result<Vec<u8>, AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let result = self.read_response_bytes(url);
             match result {
                 Ok(bytes) => return Ok(bytes),
-                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                Err(error) if error.is_retryable() && attempt + 1 < self.max_attempts => {
                     thread::sleep(retry_delay(attempt));
                 }
                 Err(error) => return Err(error),
@@ -2487,7 +2510,7 @@ impl AzureBlobClient {
     }
 
     fn get_response(&mut self, url: &str) -> Result<ureq::Response, AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let date = rfc1123_now();
             let response = match &mut self.auth {
                 AzureBlobAuth::Sas(sas) => self
@@ -2508,7 +2531,7 @@ impl AzureBlobClient {
             match response {
                 Ok(response) => return Ok(response),
                 Err(ureq::Error::Status(status, response)) => {
-                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                    if is_retryable_azure_status(status) && attempt + 1 < self.max_attempts {
                         thread::sleep(retry_delay(attempt));
                         continue;
                     }
@@ -2526,7 +2549,7 @@ impl AzureBlobClient {
                 }
                 Err(ureq::Error::Transport(error)) => {
                     let message = error.to_string();
-                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                    if attempt + 1 < self.max_attempts {
                         thread::sleep(retry_delay(attempt));
                         continue;
                     }
@@ -2542,7 +2565,7 @@ impl AzureBlobClient {
         url: &str,
         expected_etag: &str,
     ) -> Result<ureq::Response, AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let date = rfc1123_now();
             let response = match &mut self.auth {
                 AzureBlobAuth::Sas(sas) => self
@@ -2565,7 +2588,7 @@ impl AzureBlobClient {
             match response {
                 Ok(response) => return Ok(response),
                 Err(ureq::Error::Status(status, _)) => {
-                    if is_retryable_azure_status(status) && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                    if is_retryable_azure_status(status) && attempt + 1 < self.max_attempts {
                         thread::sleep(retry_delay(attempt));
                         continue;
                     }
@@ -2573,7 +2596,7 @@ impl AzureBlobClient {
                 }
                 Err(ureq::Error::Transport(error)) => {
                     let message = error.to_string();
-                    if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS {
+                    if attempt + 1 < self.max_attempts {
                         thread::sleep(retry_delay(attempt));
                         continue;
                     }
@@ -2590,11 +2613,11 @@ impl AzureBlobClient {
         bytes: &[u8],
         content_type: &str,
     ) -> Result<(), AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             let result = self.put_block_blob(url, bytes, content_type);
             match result {
                 Ok(()) => return Ok(()),
-                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                Err(error) if error.is_retryable() && attempt + 1 < self.max_attempts => {
                     thread::sleep(retry_delay(attempt));
                 }
                 Err(error) => return Err(error),
@@ -2645,10 +2668,10 @@ impl AzureBlobClient {
         content_type: &str,
         access_tier: Option<&str>,
     ) -> Result<ImmutableBlobWrite, AzureBlobError> {
-        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+        for attempt in 0..self.max_attempts {
             match self.put_block_blob_if_absent_once(url, bytes, content_type, access_tier) {
                 Ok(result) => return Ok(result),
-                Err(error) if error.is_retryable() && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                Err(error) if error.is_retryable() && attempt + 1 < self.max_attempts => {
                     thread::sleep(retry_delay(attempt));
                 }
                 Err(error) => return Err(error),
@@ -3308,6 +3331,17 @@ mod tests {
         assert_eq!(client.account, "account");
         assert_eq!(client.container, "container");
         assert!(matches!(client.auth, AzureBlobAuth::ManagedIdentity(_)));
+        assert_eq!(client.max_attempts, AZURE_BLOB_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn funded_intent_client_does_not_retry_past_the_live_handoff_window() {
+        let client = AzureBlobClient::with_managed_identity_for_funded_intent(
+            "account",
+            "container",
+            Some(TEST_CLIENT_ID.to_owned()),
+        );
+        assert_eq!(client.max_attempts, 1);
     }
 
     #[test]
