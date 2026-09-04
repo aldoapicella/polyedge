@@ -1,8 +1,8 @@
 [Unit]
 Description=PolyEdge isolated funded intent producer
 Wants=network-online.target polyedge-federated-token@funded-intent-producer.service
-After=network-online.target polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-federated-token@funded-intent-producer.service
-Requires=polyedge-network.service polyedge-funded-intent-producer-egress.service
+After=network-online.target polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-federated-token@funded-intent-producer.service polyedge-oci-queue-bridge.service
+Requires=polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-oci-queue-bridge.service
 
 [Container]
 # Replace the all-zero digest with the reviewed ARM64 image digest.

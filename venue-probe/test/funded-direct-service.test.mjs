@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  createOciQueueBridgeReceiver,
   fundedRedemptionMaintenanceWindow,
   loadFundedDirectServiceConfig,
   runFundedDirectService,
   runPersistentFundedDirectService
 } from "../src/funded-direct-service.mjs";
+
+const OCI_QUEUE_BRIDGE_URL = "http://10.89.0.1:8182/v1/messages";
 
 function env(overrides = {}) {
   return {
@@ -102,6 +105,53 @@ function automaticRedemptionEnv(overrides = {}) {
     ...overrides
   });
 }
+
+test("OCI queue bridge is exclusive and preserves receive settlement semantics", async () => {
+  const bridgeEnv = persistentEnv({
+    FUNDED_DIRECT_SERVICE_BUS_NAMESPACE: "",
+    FUNDED_DIRECT_SERVICE_BUS_QUEUE: "",
+    FUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL: OCI_QUEUE_BRIDGE_URL
+  });
+  assert.equal(loadFundedDirectServiceConfig(bridgeEnv).ociQueueBridgeUrl, OCI_QUEUE_BRIDGE_URL);
+  assert.throws(
+    () => loadFundedDirectServiceConfig({
+      ...bridgeEnv,
+      FUNDED_DIRECT_SERVICE_BUS_QUEUE: "stale-azure-queue"
+    }),
+    /must not retain a Service Bus binding/
+  );
+
+  const calls = [];
+  const receiver = createOciQueueBridgeReceiver(OCI_QUEUE_BRIDGE_URL, async (url, options = {}) => {
+    calls.push({ url: String(url), method: options.method || "GET", body: options.body && JSON.parse(options.body) });
+    if (String(url).includes("/messages?")) {
+      return new Response(JSON.stringify({ messages: [{
+        message_id: "decision-1",
+        delivery_count: 2,
+        receipt: "receipt-1",
+        body: { schema: "polyedge.funded_intent_handoff.v1", decision_id: "decision-1" }
+      }] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(null, { status: 204 });
+  });
+  const [message] = await receiver.receiveMessages(1, { maxWaitTimeInMs: 1_000 });
+  assert.equal(message.messageId, "decision-1");
+  assert.equal(message.deliveryCount, 2);
+  await receiver.completeMessage(message);
+  await receiver.abandonMessage(message);
+  await receiver.deadLetterMessage(message, {
+    deadLetterReason: "terminal",
+    deadLetterErrorDescription: "failed closed"
+  });
+  assert.deepEqual(calls.map(({ url, method }) => [new URL(url).pathname, method]), [
+    ["/v1/messages", "GET"],
+    ["/v1/complete", "POST"],
+    ["/v1/abandon", "POST"],
+    ["/v1/dead-letter", "POST"]
+  ]);
+  assert.equal(calls[3].body.receipt, "receipt-1");
+  assert.equal(calls[3].body.reason, "terminal");
+});
 
 test("automatic redemption remains strictly inside the final no-trade window", () => {
   const config = loadFundedDirectServiceConfig(automaticRedemptionEnv());

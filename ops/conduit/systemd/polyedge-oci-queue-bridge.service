@@ -1,0 +1,29 @@
+[Unit]
+Description=PolyEdge OCI Queue bridge for isolated funded containers
+Wants=network-online.target
+After=network-online.target polyedge-network.service polyedge-oci-queue-bridge-firewall.service
+Requires=polyedge-network.service polyedge-oci-queue-bridge-firewall.service
+Before=polyedge-funded-intent-producer.service polyedge-funded-signer.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+EnvironmentFile=/etc/polyedge/oci-queue-bridge.env
+ExecStart=/home/ubuntu/.local/share/oci-cli/bin/python3 /usr/local/libexec/polyedge-oci-queue-bridge
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

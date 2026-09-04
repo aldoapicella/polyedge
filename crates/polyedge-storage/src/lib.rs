@@ -1746,6 +1746,72 @@ impl AzureServiceBusSender {
     }
 }
 
+#[derive(Clone)]
+pub struct HttpJsonQueueSender {
+    url: String,
+    agent: ureq::Agent,
+}
+
+impl HttpJsonQueueSender {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(5))
+                .timeout_read(Duration::from_secs(10))
+                .timeout_write(Duration::from_secs(10))
+                .build(),
+        }
+    }
+
+    pub fn send_json(
+        &self,
+        message_id: &str,
+        ttl_seconds: u64,
+        value: &Value,
+    ) -> Result<(), AzureBlobError> {
+        if self.url.trim().is_empty() || message_id.trim().is_empty() || ttl_seconds == 0 {
+            return Err(AzureBlobError::Transport(
+                "HTTP queue sender binding is incomplete".to_owned(),
+            ));
+        }
+        let body = serde_json::to_vec(value)?;
+        for attempt in 0..AZURE_BLOB_MAX_ATTEMPTS {
+            let response = self
+                .agent
+                .post(self.url.trim())
+                .set("content-type", "application/json; charset=utf-8")
+                .set("x-polyedge-message-id", message_id)
+                .set("x-polyedge-ttl-seconds", &ttl_seconds.to_string())
+                .send_bytes(&body);
+            match response {
+                Ok(_) => return Ok(()),
+                Err(ureq::Error::Status(status, _))
+                    if is_retryable_azure_status(status)
+                        && attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS =>
+                {
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(ureq::Error::Status(status, _)) => {
+                    return Err(AzureBlobError::HttpStatus(status));
+                }
+                Err(ureq::Error::Transport(error)) if attempt + 1 < AZURE_BLOB_MAX_ATTEMPTS => {
+                    thread::sleep(retry_delay(attempt));
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %error,
+                        "retrying OCI queue bridge send"
+                    );
+                }
+                Err(ureq::Error::Transport(error)) => {
+                    return Err(AzureBlobError::Transport(error.to_string()));
+                }
+            }
+        }
+        unreachable!("HTTP queue retry loop always returns");
+    }
+}
+
 fn rfc1123_now() -> String {
     Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
@@ -3282,6 +3348,35 @@ mod tests {
             assert!(message.contains("bounded Azure Blob download"));
             assert!(!message.contains("secret-body"));
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_queue_sender_preserves_message_binding() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&stream);
+            assert!(request.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-polyedge-message-id: decision-1\r\n"));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-polyedge-ttl-seconds: 3600\r\n"));
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        HttpJsonQueueSender::new(format!("http://{address}/v1/messages"))
+            .send_json("decision-1", 3600, &json!({"decision_id": "decision-1"}))
+            .unwrap();
         server.join().unwrap();
     }
 

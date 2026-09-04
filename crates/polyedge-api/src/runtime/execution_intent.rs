@@ -7,7 +7,7 @@ use polyedge_domain::{
 use polyedge_engine::{crypto_taker_fee_per_share, FrozenStrategyMode, StrategyDecisionMetadata};
 use polyedge_reporting::research::{parse_azure_artifact_uri, PromotionManifestV1, PromotionPhase};
 use polyedge_storage::{
-    AzureBlobClient, AzureBlobError, AzureServiceBusSender, ImmutableBlobWrite,
+    AzureBlobClient, AzureBlobError, AzureServiceBusSender, HttpJsonQueueSender, ImmutableBlobWrite,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
@@ -32,6 +32,7 @@ const FUNDED_INTENT_TRANSPORT_TTL_SECONDS: u64 = 3_600;
 const OPERATOR_DIRECT_INTENT_PUBLISH_LANES: usize = 4;
 const CURRENT_FUNDED_INTENT_CAS_ATTEMPTS: usize = 4;
 const POINTER_ONLY_PREFLIGHT_ENV: &str = "STRATEGY_INTENT_POINTER_ONLY_PREFLIGHT";
+const FUNDED_OCI_QUEUE_BRIDGE_URL: &str = "http://10.89.0.1:8182/v1/messages";
 // Keep the signed venue expiry well beyond the documented minimum. Live V2
 // rejected a correctly serialized order 107 seconds before its expiry, so the
 // immutable intent carries a five-minute fail-safe while the lifecycle still
@@ -50,8 +51,10 @@ pub(super) struct IntentPublisherConfig {
     prefix: String,
     operator_direct: bool,
     pointer_only_preflight: bool,
+    service_bus_enabled: bool,
     service_bus_namespace: String,
     service_bus_queue: String,
+    oci_queue_bridge_url: String,
 }
 
 pub(super) struct IntentPublisher {
@@ -66,7 +69,26 @@ pub(super) struct IntentPublisher {
 
 struct IntentPublisherLane {
     blob_client: Box<dyn IntentBlobStore>,
-    service_bus_sender: Option<AzureServiceBusSender>,
+    service_bus_sender: Option<FundedQueueSender>,
+}
+
+enum FundedQueueSender {
+    AzureServiceBus(AzureServiceBusSender),
+    OciBridge(HttpJsonQueueSender),
+}
+
+impl FundedQueueSender {
+    fn send_json(
+        &mut self,
+        message_id: &str,
+        ttl_seconds: u64,
+        value: &Value,
+    ) -> Result<(), AzureBlobError> {
+        match self {
+            Self::AzureServiceBus(sender) => sender.send_json(message_id, ttl_seconds, value),
+            Self::OciBridge(sender) => sender.send_json(message_id, ttl_seconds, value),
+        }
+    }
 }
 
 trait CurrentFundedIntentStore: Send {
@@ -243,6 +265,11 @@ impl IntentPublisherConfig {
                 .funded_direct_service_bus_queue
                 .trim()
                 .is_empty()
+            || !settings
+                .azure
+                .funded_direct_oci_queue_bridge_url
+                .trim()
+                .is_empty()
             || settings.live.polymarket_funder.is_some())
         {
             return Err("qset-v3/v4/v5 intent publisher requires pointer-only preflight with no funded queue or credentials".to_owned());
@@ -281,6 +308,7 @@ impl IntentPublisherConfig {
             prefix,
             operator_direct: settings.azure.strategy_intent_operator_direct,
             pointer_only_preflight,
+            service_bus_enabled: settings.azure.funded_direct_service_bus_enabled,
             service_bus_namespace: settings
                 .azure
                 .funded_direct_service_bus_namespace
@@ -291,22 +319,48 @@ impl IntentPublisherConfig {
                 .funded_direct_service_bus_queue
                 .trim()
                 .to_owned(),
+            oci_queue_bridge_url: settings
+                .azure
+                .funded_direct_oci_queue_bridge_url
+                .trim()
+                .to_owned(),
         })
     }
 
     fn connect_lane(&self) -> Result<IntentPublisherLane, String> {
         let service_bus_sender = if self.operator_direct && !self.pointer_only_preflight {
-            if self.service_bus_namespace.is_empty() || self.service_bus_queue.is_empty() {
-                return Err(
-                    "operator-direct intent publisher requires an exact Service Bus binding"
-                        .to_owned(),
-                );
+            if !self.oci_queue_bridge_url.is_empty() {
+                if self.oci_queue_bridge_url != FUNDED_OCI_QUEUE_BRIDGE_URL
+                    || self.service_bus_enabled
+                    || !self.service_bus_namespace.is_empty()
+                    || !self.service_bus_queue.is_empty()
+                {
+                    return Err(
+                        "operator-direct intent publisher requires the exact isolated OCI queue bridge binding"
+                            .to_owned(),
+                    );
+                }
+                Some(FundedQueueSender::OciBridge(HttpJsonQueueSender::new(
+                    self.oci_queue_bridge_url.clone(),
+                )))
+            } else {
+                if !self.service_bus_enabled
+                    || self.service_bus_namespace.is_empty()
+                    || self.service_bus_queue.is_empty()
+                {
+                    return Err(
+                        "operator-direct intent publisher requires exactly one funded queue binding"
+                            .to_owned(),
+                    );
+                }
+                Some(FundedQueueSender::AzureServiceBus(
+                    AzureServiceBusSender::with_managed_identity(
+                        self.service_bus_namespace.clone(),
+                        self.service_bus_queue.clone(),
+                        self.client_id.clone(),
+                    ),
+                ))
             }
-            Some(AzureServiceBusSender::with_managed_identity(
-                self.service_bus_namespace.clone(),
-                self.service_bus_queue.clone(),
-                self.client_id.clone(),
-            ))
         } else {
             None
         };
@@ -2302,7 +2356,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_direct_publisher_requires_exact_service_bus_binding() {
+    fn operator_direct_publisher_requires_exact_queue_binding() {
         let mut settings = RuntimeSettings::default();
         settings.azure.publish_strategy_canary_intents = true;
         settings.azure.storage_account_name = Some("storage".to_owned());
@@ -2314,8 +2368,30 @@ mod tests {
                 .unwrap()
                 .connect()
                 .err()
-                .expect("missing Service Bus binding must fail");
-        assert!(error.contains("exact Service Bus binding"));
+                .expect("missing queue binding must fail");
+        assert!(error.contains("exactly one funded queue binding"));
+
+        settings.azure.funded_direct_oci_queue_bridge_url = FUNDED_OCI_QUEUE_BRIDGE_URL.to_owned();
+        assert!(
+            IntentPublisherConfig::from_settings_with_pointer_only_preflight(&settings, false)
+                .unwrap()
+                .connect()
+                .is_ok()
+        );
+
+        settings.azure.funded_direct_service_bus_enabled = true;
+        settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
+        settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
+        let error = match IntentPublisherConfig::from_settings_with_pointer_only_preflight(
+            &settings, false,
+        )
+        .unwrap()
+        .connect()
+        {
+            Ok(_) => panic!("mixed Azure and OCI queue bindings were accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("exact isolated OCI queue bridge binding"));
     }
 
     #[test]
@@ -2326,6 +2402,7 @@ mod tests {
         settings.azure.storage_container_name = "polyedge-shadow-qset-events".to_owned();
         settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
         settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.funded_direct_service_bus_enabled = true;
         settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
         settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
 
@@ -2372,6 +2449,7 @@ mod tests {
         settings.azure.storage_container_name = "polyedge-shadow-events".to_owned();
         settings.azure.strategy_canary_intent_prefix = "intents".to_owned();
         settings.azure.strategy_intent_operator_direct = true;
+        settings.azure.funded_direct_service_bus_enabled = true;
         settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
         settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
 

@@ -45,6 +45,7 @@ const QSET_V7_CUTOVER_UTC: &str = "2026-09-02T00:00:00Z";
 const QSET_V7_INTENT_PREFIX: &str =
     "control/strategy-canary/intents/campaign-2026-09-02-qset-v7/intents";
 const QSET_V7_MARKET_TABLE: &str = "ShadowQsetV7MarketCatalog";
+const FUNDED_OCI_QUEUE_BRIDGE_URL: &str = "http://10.89.0.1:8182/v1/messages";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -331,6 +332,7 @@ pub struct AzureConfig {
     pub funded_direct_service_bus_enabled: bool,
     pub funded_direct_service_bus_namespace: String,
     pub funded_direct_service_bus_queue: String,
+    pub funded_direct_oci_queue_bridge_url: String,
     pub strategy_intent_operator_direct: bool,
     pub strategy_intent_target_order_notional: Decimal,
     pub strategy_intent_max_order_notional: Decimal,
@@ -361,6 +363,7 @@ impl Default for AzureConfig {
             funded_direct_service_bus_enabled: false,
             funded_direct_service_bus_namespace: String::new(),
             funded_direct_service_bus_queue: String::new(),
+            funded_direct_oci_queue_bridge_url: String::new(),
             strategy_intent_operator_direct: false,
             strategy_intent_target_order_notional: Decimal::ZERO,
             strategy_intent_max_order_notional: Decimal::ONE,
@@ -587,6 +590,10 @@ impl RuntimeSettings {
             "FUNDED_DIRECT_SERVICE_BUS_QUEUE",
             settings.azure.funded_direct_service_bus_queue,
         );
+        settings.azure.funded_direct_oci_queue_bridge_url = env_string(
+            "FUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL",
+            settings.azure.funded_direct_oci_queue_bridge_url,
+        );
         settings.azure.strategy_intent_operator_direct = env_bool(
             "STRATEGY_INTENT_OPERATOR_DIRECT",
             settings.azure.strategy_intent_operator_direct,
@@ -740,21 +747,33 @@ impl RuntimeSettings {
         if !self.azure.publish_strategy_canary_intents {
             reasons.push("PUBLISH_STRATEGY_CANARY_INTENTS must be true");
         }
+        let service_bus_configured = self.azure.funded_direct_service_bus_enabled
+            || !self
+                .azure
+                .funded_direct_service_bus_namespace
+                .trim()
+                .is_empty()
+            || !self.azure.funded_direct_service_bus_queue.trim().is_empty();
+        let service_bus_valid = self.azure.funded_direct_service_bus_enabled
+            && !self
+                .azure
+                .funded_direct_service_bus_namespace
+                .trim()
+                .is_empty()
+            && !self.azure.funded_direct_service_bus_queue.trim().is_empty();
+        let oci_queue_bridge_url = self.azure.funded_direct_oci_queue_bridge_url.trim();
+        let oci_queue_configured = !oci_queue_bridge_url.is_empty();
+        let oci_queue_valid = oci_queue_bridge_url == FUNDED_OCI_QUEUE_BRIDGE_URL;
         if self.azure.storage_container_name != QSET_V3_RAW_CONTAINER
             && self.azure.storage_container_name != QSET_V4_RAW_CONTAINER
             && self.azure.storage_container_name != QSET_V5_RAW_CONTAINER
             && self.azure.storage_container_name != QSET_V7_RAW_CONTAINER
             && self.azure.strategy_intent_operator_direct
-            && (!self.azure.funded_direct_service_bus_enabled
-                || self
-                    .azure
-                    .funded_direct_service_bus_namespace
-                    .trim()
-                    .is_empty()
-                || self.azure.funded_direct_service_bus_queue.trim().is_empty())
+            && !((service_bus_valid && !oci_queue_configured)
+                || (oci_queue_valid && !service_bus_configured))
         {
             reasons.push(
-                "operator-direct intent publication requires the managed-identity Service Bus handoff",
+                "operator-direct intent publication requires exactly one funded queue handoff",
             );
         }
         if self.azure.storage_container_name == "polyedge-shadow-qset-events"
@@ -765,7 +784,12 @@ impl RuntimeSettings {
                     .funded_direct_service_bus_namespace
                     .trim()
                     .is_empty()
-                || !self.azure.funded_direct_service_bus_queue.trim().is_empty())
+                || !self.azure.funded_direct_service_bus_queue.trim().is_empty()
+                || !self
+                    .azure
+                    .funded_direct_oci_queue_bridge_url
+                    .trim()
+                    .is_empty())
         {
             reasons.push(
                 "qset shadow evidence must not configure operator-direct or funded Service Bus delivery",
@@ -782,6 +806,11 @@ impl RuntimeSettings {
                     .trim()
                     .is_empty()
                 || !self.azure.funded_direct_service_bus_queue.trim().is_empty()
+                || !self
+                    .azure
+                    .funded_direct_oci_queue_bridge_url
+                    .trim()
+                    .is_empty()
             {
                 reasons
                     .push("qset-v3 shadow evidence must not configure funded Service Bus delivery");
@@ -829,6 +858,11 @@ impl RuntimeSettings {
                     .trim()
                     .is_empty()
                 || !self.azure.funded_direct_service_bus_queue.trim().is_empty()
+                || !self
+                    .azure
+                    .funded_direct_oci_queue_bridge_url
+                    .trim()
+                    .is_empty()
             {
                 reasons
                     .push("qset-v4 shadow evidence must not configure funded Service Bus delivery");
@@ -876,6 +910,11 @@ impl RuntimeSettings {
                     .trim()
                     .is_empty()
                 || !self.azure.funded_direct_service_bus_queue.trim().is_empty()
+                || !self
+                    .azure
+                    .funded_direct_oci_queue_bridge_url
+                    .trim()
+                    .is_empty()
             {
                 reasons
                     .push("qset-v5 shadow evidence must not configure funded Service Bus delivery");
@@ -923,6 +962,11 @@ impl RuntimeSettings {
                     .trim()
                     .is_empty()
                 || !self.azure.funded_direct_service_bus_queue.trim().is_empty()
+                || !self
+                    .azure
+                    .funded_direct_oci_queue_bridge_url
+                    .trim()
+                    .is_empty()
             {
                 reasons
                     .push("qset-v7 shadow evidence must not configure funded Service Bus delivery");
@@ -1076,6 +1120,7 @@ impl RuntimeSettings {
                 "funded_direct_service_bus_enabled": self.azure.funded_direct_service_bus_enabled,
                 "funded_direct_service_bus_namespace": self.azure.funded_direct_service_bus_namespace,
                 "funded_direct_service_bus_queue": self.azure.funded_direct_service_bus_queue,
+                "funded_direct_oci_queue_bridge_url": self.azure.funded_direct_oci_queue_bridge_url,
                 "strategy_intent_operator_direct": self.azure.strategy_intent_operator_direct,
                 "strategy_intent_target_order_notional": self.azure.strategy_intent_target_order_notional.to_string(),
                 "strategy_intent_max_order_notional": self.azure.strategy_intent_max_order_notional.to_string(),
@@ -1186,13 +1231,14 @@ fn env_decimal(name: &str, default: Decimal) -> Result<Decimal, ConfigError> {
 mod tests {
     use super::{
         is_full_git_sha, ConfigError, ExecutionMode, RuntimeRole, RuntimeSettings,
-        QSET_V3_CHART_TABLE, QSET_V3_CUTOVER_UTC, QSET_V3_EVENT_PREFIX, QSET_V3_EVENT_TABLE,
-        QSET_V3_INTENT_PREFIX, QSET_V3_MARKET_TABLE, QSET_V3_PREFLIGHT_PREFIX,
-        QSET_V3_RAW_CONTAINER, QSET_V4_APP_NAME, QSET_V4_CHART_TABLE, QSET_V4_CUTOVER_UTC,
-        QSET_V4_EVENT_PREFIX, QSET_V4_EVENT_TABLE, QSET_V4_INTENT_PREFIX, QSET_V4_MARKET_TABLE,
-        QSET_V4_PREFLIGHT_PREFIX, QSET_V4_RAW_CONTAINER, QSET_V7_APP_NAME, QSET_V7_CHART_TABLE,
-        QSET_V7_CUTOVER_UTC, QSET_V7_EVENT_PREFIX, QSET_V7_EVENT_TABLE, QSET_V7_INTENT_PREFIX,
-        QSET_V7_MARKET_TABLE, QSET_V7_PREFLIGHT_PREFIX, QSET_V7_RAW_CONTAINER,
+        FUNDED_OCI_QUEUE_BRIDGE_URL, QSET_V3_CHART_TABLE, QSET_V3_CUTOVER_UTC,
+        QSET_V3_EVENT_PREFIX, QSET_V3_EVENT_TABLE, QSET_V3_INTENT_PREFIX, QSET_V3_MARKET_TABLE,
+        QSET_V3_PREFLIGHT_PREFIX, QSET_V3_RAW_CONTAINER, QSET_V4_APP_NAME, QSET_V4_CHART_TABLE,
+        QSET_V4_CUTOVER_UTC, QSET_V4_EVENT_PREFIX, QSET_V4_EVENT_TABLE, QSET_V4_INTENT_PREFIX,
+        QSET_V4_MARKET_TABLE, QSET_V4_PREFLIGHT_PREFIX, QSET_V4_RAW_CONTAINER, QSET_V7_APP_NAME,
+        QSET_V7_CHART_TABLE, QSET_V7_CUTOVER_UTC, QSET_V7_EVENT_PREFIX, QSET_V7_EVENT_TABLE,
+        QSET_V7_INTENT_PREFIX, QSET_V7_MARKET_TABLE, QSET_V7_PREFLIGHT_PREFIX,
+        QSET_V7_RAW_CONTAINER,
     };
     use chrono::{DateTime, Utc};
 
@@ -1361,6 +1407,10 @@ mod tests {
                 settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
             },
             |settings: &mut RuntimeSettings| {
+                settings.azure.funded_direct_oci_queue_bridge_url =
+                    FUNDED_OCI_QUEUE_BRIDGE_URL.to_owned();
+            },
+            |settings: &mut RuntimeSettings| {
                 settings.live.polymarket_funder = Some("funder".to_owned());
             },
         ] {
@@ -1428,6 +1478,15 @@ mod tests {
         settings.azure.funded_direct_service_bus_namespace = "namespace".to_owned();
         settings.azure.funded_direct_service_bus_queue = "queue".to_owned();
         assert!(settings.validate_runtime_role().is_ok());
+
+        settings.azure.funded_direct_service_bus_enabled = false;
+        settings.azure.funded_direct_service_bus_namespace.clear();
+        settings.azure.funded_direct_service_bus_queue.clear();
+        settings.azure.funded_direct_oci_queue_bridge_url = FUNDED_OCI_QUEUE_BRIDGE_URL.to_owned();
+        assert!(settings.validate_runtime_role().is_ok());
+
+        settings.azure.funded_direct_service_bus_queue = "stale".to_owned();
+        assert!(settings.validate_runtime_role().is_err());
     }
 
     #[test]

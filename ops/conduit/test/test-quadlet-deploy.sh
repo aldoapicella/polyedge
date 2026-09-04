@@ -99,8 +99,8 @@ grep -Fx 'User=986:982' "$root/quadlets/polyedge-funded-signer.container" >/dev/
 grep -Fx 'IP=10.89.0.250' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
 grep -Fx 'WantedBy=multi-user.target' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
 grep -Fx 'Wants=network-online.target polyedge-federated-token@funded-signer.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
-grep -Fx 'After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
-grep -Fx 'Requires=polyedge-network.service polyedge-funded-egress.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fx 'After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service polyedge-oci-queue-bridge.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
+grep -Fx 'Requires=polyedge-network.service polyedge-funded-egress.service polyedge-oci-queue-bridge.service' "$root/quadlets/polyedge-funded-signer.container" >/dev/null
 grep -Fq '10.89.0.250/32 ! -d 10.89.0.0/24' "$root/systemd/polyedge-funded-egress.service"
 grep -Fq -- '--to-source 10.0.0.81' "$root/systemd/polyedge-funded-egress.service"
 grep -Fq 'ExecStartPre=/usr/bin/bash -ec' "$root/quadlets/polyedge-funded-signer.container"
@@ -127,8 +127,8 @@ grep -Fx 'EnvironmentFile=/etc/polyedge/funded-intent-producer.env' "$root/quadl
 grep -Fx 'EnvironmentFile=/etc/polyedge/ring-funded-intent-producer.env' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'Volume=/run/polyedge-federated-funded-intent-producer:/run/credentials:ro,Z' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fx 'Wants=network-online.target polyedge-federated-token@funded-intent-producer.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
-grep -Fx 'After=network-online.target polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-federated-token@funded-intent-producer.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
-grep -Fx 'Requires=polyedge-network.service polyedge-funded-intent-producer-egress.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
+grep -Fx 'After=network-online.target polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-federated-token@funded-intent-producer.service polyedge-oci-queue-bridge.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
+grep -Fx 'Requires=polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-oci-queue-bridge.service' "$root/quadlets/polyedge-funded-intent-producer.container" >/dev/null
 grep -Fq -- '--read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --pull=never' "$root/quadlets/polyedge-funded-intent-producer.container"
 if grep -Eq '^PublishPort=|funded-signer' "$root/quadlets/polyedge-funded-intent-producer.container"; then
   echo 'funded intent producer must not expose a port or link the signer' >&2
@@ -154,6 +154,13 @@ grep -Fx 'AZURE_MODEL_STORAGE_CONTAINER_NAME=polyedge-models' "$root/env/funded-
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_ENABLED=true' "$root/env/funded-intent-producer.env.example" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE=sb-polyedge-funded-cl-6urdjr5nmwx7w' "$root/env/funded-intent-producer.env.example" >/dev/null
 grep -Fx 'FUNDED_DIRECT_SERVICE_BUS_QUEUE=funded-dynamic-quote-intents' "$root/env/funded-intent-producer.env.example" >/dev/null
+grep -Fx 'FUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL=' "$root/env/funded-intent-producer.env.example" >/dev/null
+POLYEDGE_OCI_QUEUE_BRIDGE_SELF_TEST=1 python3 "$root/bin/polyedge-oci-queue-bridge" >/dev/null
+grep -Fx 'User=ubuntu' "$root/systemd/polyedge-oci-queue-bridge.service" >/dev/null
+grep -Fx 'EnvironmentFile=/etc/polyedge/oci-queue-bridge.env' "$root/systemd/polyedge-oci-queue-bridge.service" >/dev/null
+test "$(grep -Fc -- '--dport 8182' "$root/systemd/polyedge-oci-queue-bridge-firewall.service")" -eq 6
+grep -Fq '10.89.0.248/32 -d 10.89.0.1/32' "$root/systemd/polyedge-oci-queue-bridge-firewall.service"
+grep -Fq '10.89.0.250/32 -d 10.89.0.1/32' "$root/systemd/polyedge-oci-queue-bridge-firewall.service"
 grep -Fx 'LOCAL_JSONL_RECORDER_ENABLED=true' "$root/env/ring-funded-intent-producer.env.example" >/dev/null
 grep -Fx 'RECORDER_PATH=/srv/polyedge-ring/segments' "$root/env/ring-funded-intent-producer.env.example" >/dev/null
 grep -Fx 'AZURE_EVENT_RECORDER_ENABLED=false' "$root/env/ring-funded-intent-producer.env.example" >/dev/null

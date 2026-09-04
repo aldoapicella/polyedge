@@ -1,8 +1,8 @@
 [Unit]
 Description=PolyEdge isolated funded signer
 Wants=network-online.target polyedge-federated-token@funded-signer.service
-After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service
-Requires=polyedge-network.service polyedge-funded-egress.service
+After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service polyedge-oci-queue-bridge.service
+Requires=polyedge-network.service polyedge-funded-egress.service polyedge-oci-queue-bridge.service
 
 [Container]
 # Replace the all-zero digest with the reviewed ARM64 venue-probe image digest.

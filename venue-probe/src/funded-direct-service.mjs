@@ -11,6 +11,7 @@ import { sanitize } from "./lib.mjs";
 
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
 const FUNDED_BUSY_VALIDATION_LIMIT = 4;
+const FUNDED_OCI_QUEUE_BRIDGE_URL = "http://10.89.0.1:8182/v1/messages";
 
 function createStreamingInbox(receiver, processError) {
   const pending = [];
@@ -54,6 +55,46 @@ function createStreamingInbox(receiver, processError) {
   };
 }
 
+export function createOciQueueBridgeReceiver(messagesUrl, fetchImpl = fetch) {
+  const endpoint = (path = "") => new URL(path, `${messagesUrl.slice(0, messagesUrl.lastIndexOf("/") + 1)}`);
+  const request = async (path, options = {}) => {
+    const response = await fetchImpl(endpoint(path), {
+      ...options,
+      headers: options.body ? { "content-type": "application/json", ...options.headers } : options.headers
+    });
+    if (!response.ok) throw new Error(`OCI queue bridge ${path || "receive"} failed: HTTP ${response.status}`);
+    return response.status === 204 ? null : response.json();
+  };
+  const settle = (path, message, extra = {}) => request(path, {
+    method: "POST",
+    body: JSON.stringify({
+      receipt: message.receipt,
+      message_id: message.messageId || null,
+      delivery_count: message.deliveryCount || 0,
+      body: message.body,
+      ...extra
+    })
+  });
+  return {
+    async receiveMessages(maxMessages, { maxWaitTimeInMs } = {}) {
+      const result = await request(`messages?timeout_ms=${Math.max(1_000, Number(maxWaitTimeInMs) || 1_000)}`);
+      return (result?.messages || []).slice(0, maxMessages).map((message) => ({
+        messageId: message.message_id || null,
+        deliveryCount: message.delivery_count || 0,
+        body: message.body,
+        receipt: message.receipt
+      }));
+    },
+    completeMessage: (message) => settle("complete", message),
+    abandonMessage: (message) => settle("abandon", message),
+    deadLetterMessage: (message, details = {}) => settle("dead-letter", message, {
+      reason: details.deadLetterReason || "FundedIntentFailedClosed",
+      description: details.deadLetterErrorDescription || ""
+    }),
+    async close() {}
+  };
+}
+
 export function loadFundedDirectServiceConfig(env = process.env) {
   const config = {
     enabled: env.FUNDED_DIRECT_SERVICE_ENABLED === "true",
@@ -65,6 +106,7 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     engine: String(env.FUNDED_DIRECT_ENGINE || "legacy_spawn").trim(),
     serviceBusNamespace: String(env.FUNDED_DIRECT_SERVICE_BUS_NAMESPACE || "").trim(),
     serviceBusQueue: String(env.FUNDED_DIRECT_SERVICE_BUS_QUEUE || "").trim(),
+    ociQueueBridgeUrl: String(env.FUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL || "").trim(),
     signalToSendSloMs: integer(env.FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS, 7_000),
     maxMessages: integer(env.FUNDED_DIRECT_SERVICE_MAX_MESSAGES, 0),
     autoRedemptionEnabled: env.FUNDED_DIRECT_AUTO_REDEMPTION_ENABLED === "true",
@@ -92,8 +134,17 @@ export function loadFundedDirectServiceConfig(env = process.env) {
   if (!["legacy_spawn", "persistent_v1"].includes(config.engine)) {
     errors.push("FUNDED_DIRECT_ENGINE must equal legacy_spawn or persistent_v1");
   }
-  if (config.engine === "persistent_v1" && (!config.serviceBusNamespace || !config.serviceBusQueue)) {
-    errors.push("persistent_v1 requires the exact Service Bus namespace and queue");
+  if (config.engine === "persistent_v1") {
+    if (config.ociQueueBridgeUrl) {
+      if (config.ociQueueBridgeUrl !== FUNDED_OCI_QUEUE_BRIDGE_URL) {
+        errors.push("persistent_v1 requires the exact isolated OCI queue bridge URL");
+      }
+      if (config.serviceBusNamespace || config.serviceBusQueue) {
+        errors.push("OCI queue bridge transport must not retain a Service Bus binding");
+      }
+    } else if (!config.serviceBusNamespace || !config.serviceBusQueue) {
+      errors.push("persistent_v1 requires exactly one funded queue binding");
+    }
   }
   if (!(config.signalToSendSloMs >= 500 && config.signalToSendSloMs <= 7_000)) {
     errors.push("FUNDED_DIRECT_SIGNAL_TO_SEND_SLO_MS must be in [500, 7000]");
@@ -206,17 +257,22 @@ export async function runPersistentFundedDirectService({
   runRedemption = runVenueRedemption,
   now = Date.now,
   sleep = delay,
+  createBridgeReceiver = createOciQueueBridgeReceiver,
   createBusClient = ({ namespace, credential }) =>
     new ServiceBusClient(`${namespace}.servicebus.windows.net`, credential)
 } = {}) {
   const config = loadFundedDirectServiceConfig(env);
   if (config.engine !== "persistent_v1") throw new Error("persistent funded service requires FUNDED_DIRECT_ENGINE=persistent_v1");
-  const credential = new DefaultAzureCredential({ managedIdentityClientId: env.AZURE_CLIENT_ID });
-  const bus = createBusClient({ namespace: config.serviceBusNamespace, credential });
-  const receiver = bus.createReceiver(config.serviceBusQueue, {
-    receiveMode: "peekLock",
-    maxAutoLockRenewalDurationInMs: 300_000
+  const bus = config.ociQueueBridgeUrl ? null : createBusClient({
+    namespace: config.serviceBusNamespace,
+    credential: new DefaultAzureCredential({ managedIdentityClientId: env.AZURE_CLIENT_ID })
   });
+  const receiver = config.ociQueueBridgeUrl
+    ? createBridgeReceiver(config.ociQueueBridgeUrl)
+    : bus.createReceiver(config.serviceBusQueue, {
+        receiveMode: "peekLock",
+        maxAutoLockRenewalDurationInMs: 300_000
+      });
   let executor = null;
   let leaseHandoffAttempts = 0;
   while (!executor) {
@@ -266,8 +322,10 @@ export async function runPersistentFundedDirectService({
     schema: "polyedge.funded_direct_service.v2",
     status: "persistent_service_started",
     engine: config.engine,
-    handoff: streaming ? "azure_service_bus_streaming_peek_lock" : "azure_service_bus_peek_lock",
-    queue: config.serviceBusQueue,
+    handoff: config.ociQueueBridgeUrl
+      ? "oci_queue_bridge_visibility_lock"
+      : (streaming ? "azure_service_bus_streaming_peek_lock" : "azure_service_bus_peek_lock"),
+    queue: config.ociQueueBridgeUrl ? "funded-dynamic-quote-intents" : config.serviceBusQueue,
     poll_interval_ms: config.pollIntervalMs,
     signal_to_send_slo_ms: config.signalToSendSloMs,
     automatic_redemption_enabled: config.autoRedemptionEnabled,
@@ -661,7 +719,7 @@ export async function runPersistentFundedDirectService({
     process.removeListener("SIGINT", stop);
     await executor.close().catch(() => null);
     await receiver.close().catch(() => null);
-    await bus.close().catch(() => null);
+    await bus?.close().catch(() => null);
   }
 }
 
