@@ -1898,7 +1898,7 @@ impl AzureBlobClient {
                 .timeout_read(Duration::from_secs(2))
                 .timeout_write(Duration::from_secs(2))
                 .build(),
-            max_attempts: 1,
+            max_attempts: 2,
         }
     }
 
@@ -3335,13 +3335,13 @@ mod tests {
     }
 
     #[test]
-    fn funded_intent_client_does_not_retry_past_the_live_handoff_window() {
+    fn funded_intent_client_retries_once_within_the_live_handoff_window() {
         let client = AzureBlobClient::with_managed_identity_for_funded_intent(
             "account",
             "container",
             Some(TEST_CLIENT_ID.to_owned()),
         );
-        assert_eq!(client.max_attempts, 1);
+        assert_eq!(client.max_attempts, 2);
     }
 
     #[test]
