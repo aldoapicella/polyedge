@@ -1578,7 +1578,13 @@ export async function publishTerminalRiskPortfolioEvidence(container, { reservat
   if (![baseline, cashFlows].every(Number.isFinite)) throw new Error("fail closed: terminal evidence requires immutable campaign baseline and cash-flow ledger");
   const adjustedStart = baseline + cashFlows;
   const observedAt = settlement.settled_ts || new Date().toISOString();
-  const unresolvedRiskReservations = await countUnresolvedRiskReservations(container);
+  const campaignId = String(campaign?.campaign_id || "").trim();
+  if (!campaignId) throw new Error("fail closed: terminal evidence requires an exact campaign binding");
+  const unresolvedRiskReservations = (await loadCampaignUnresolvedRiskReservationRecords({
+    campaignId,
+    operatorDirect: true,
+    dryRun: false
+  }, { container })).length;
   if (unresolvedRiskReservations !== 0) {
     throw new Error(`fail closed: terminal evidence requires zero durable unresolved risk reservations (observed ${unresolvedRiskReservations})`);
   }
@@ -1622,19 +1628,6 @@ export async function publishTerminalRiskPortfolioEvidence(container, { reservat
   const sha256 = `sha256:${createHash("sha256").update(content).digest("hex")}`;
   await uploadImmutable(container, blobName, content, "application/json");
   return { blob_name: blobName, sha256, evidence };
-}
-
-async function countUnresolvedRiskReservations(container) {
-  let count = 0;
-  for await (const item of container.listBlobsFlat({ prefix: "reports/research/venue-probe/risk-reservations/" })) {
-    if (!item.name.endsWith(".json")) continue;
-    const blob = typeof container.getBlobClient === "function"
-      ? container.getBlobClient(item.name)
-      : container.getBlockBlobClient(item.name);
-    const reservation = await downloadJson(blob);
-    if (!isRiskReservationResolved(reservation)) count += 1;
-  }
-  return count;
 }
 
 export async function uploadEvidence(config, runId, summary, ledger) {

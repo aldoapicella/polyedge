@@ -963,6 +963,7 @@ class RiskIndexContainer {
     this.downloads = [];
     this.listCalls = [];
     this.uploads = [];
+    this.uploadOptions = [];
     this.failUploads = new Set();
   }
 
@@ -989,6 +990,7 @@ class RiskIndexContainer {
       },
       uploadData: async (bytes, options = {}) => {
         this.uploads.push(name);
+        this.uploadOptions.push(options);
         if (this.failUploads.has(name)) throw new Error(`injected upload failure ${name}`);
         const conditions = options.conditions || {};
         if (conditions.ifNoneMatch === "*" && this.values.has(name)) {
@@ -1411,46 +1413,37 @@ test("startup rebuild repairs a crash after blob-first terminal finalization", a
   )).length, 0);
 });
 
-function recordingContainer(reservations = []) {
-  const uploads = [];
-  const reservationBlobs = new Map(reservations.map((reservation, index) => [
-    `reports/research/venue-probe/risk-reservations/2026-07-13/reservation-${index}.json`,
-    reservation
-  ]));
-  const blobClient = (name) => ({
-    async uploadData(bytes, options) {
-      uploads.push({ name, bytes: Buffer.from(bytes), options });
-    },
-    async download() {
-      const value = reservationBlobs.get(name);
-      if (value === undefined) throw new Error(`missing test blob ${name}`);
-      return {
-        readableStreamBody: (async function* stream() {
-          yield Buffer.from(JSON.stringify(value));
-        }())
-      };
-    }
-  });
-  return {
-    uploads,
-    async *listBlobsFlat({ prefix }) {
-      for (const name of reservationBlobs.keys()) {
-        if (name.startsWith(prefix)) yield { name };
-      }
-    },
-    getBlobClient: blobClient,
-    getBlockBlobClient: blobClient
-  };
-}
-
 const terminalCampaign = {
+  campaign_id: "dynamic-quote-funded-terminal-test",
   baseline_equity: 5.030521,
   net_external_cash_flow: 0,
   cash_flow_ids: []
 };
 
+async function recordingContainer(reservations = []) {
+  const values = new Map(reservations.map((reservation, index) => [
+    `reports/research/venue-probe/risk-reservations/2026-07-13/reservation-${index}.json`,
+    {
+      schema_version: 1,
+      campaign_id: terminalCampaign.campaign_id,
+      probe_id: `reservation-${index}`,
+      ...reservation
+    }
+  ]));
+  const container = new RiskIndexContainer(values);
+  await rebuildCampaignRiskReservationIndex({
+    campaignId: terminalCampaign.campaign_id,
+    operatorDirect: true,
+    dryRun: false
+  }, { container });
+  container.uploads.length = 0;
+  container.uploadOptions.length = 0;
+  container.listCalls.length = 0;
+  return container;
+}
+
 test("terminal producer publishes immutable no-fill evidence with an exact SHA", async () => {
-  const container = recordingContainer();
+  const container = await recordingContainer();
   const result = await publishTerminalRiskPortfolioEvidence(container, {
     reservation: {
       run_id: "run-1",
@@ -1477,15 +1470,16 @@ test("terminal producer publishes immutable no-fill evidence with an exact SHA",
   assert.equal(result.blob_name, "reports/research/venue-probe/terminal-risk-portfolio/2026-07-13/probe-1.json");
   assert.match(result.sha256, /^sha256:[0-9a-f]{64}$/);
   assert.equal(container.uploads.length, 1);
-  assert.deepEqual(container.uploads[0].options.conditions, { ifNoneMatch: "*" });
-  const stored = JSON.parse(container.uploads[0].bytes);
+  assert.deepEqual(container.uploadOptions[0].conditions, { ifNoneMatch: "*" });
+  const stored = container.json(result.blob_name);
   assert.equal(stored.source, "authenticated_no_fill");
   assert.equal(stored.unresolved_risk_reservations, 0);
+  assert.deepEqual(container.listCalls, []);
 });
 
 test("terminal producer derives durable zero-unresolved proof and fails closed otherwise", async () => {
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer([{
+    publishTerminalRiskPortfolioEvidence(await recordingContainer([{
       state: "submitted_pending_reconciliation",
       matched_notional: 0,
       reserved_notional: 1
@@ -1517,7 +1511,7 @@ test("terminal producer derives durable zero-unresolved proof and fails closed o
 });
 
 test("terminal producer accepts an already-settled fill only with on-chain proof", async () => {
-  const container = recordingContainer();
+  const container = await recordingContainer();
   const input = {
     reservation: {
       run_id: "run-2",
@@ -1555,21 +1549,21 @@ test("terminal producer accepts an already-settled fill only with on-chain proof
   assert.equal(result.evidence.transaction_receipt_status, "success");
   assert.equal(result.evidence.transaction_block_number, "12345678");
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, transaction_hash: null }
     }),
     /fills also require a transaction hash/
   );
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, transaction_receipt_confirmations: undefined }
     }),
     /confirmed Polygon receipt/
   );
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, condition_ids: ["condition-other"] }
     }),
@@ -1579,7 +1573,7 @@ test("terminal producer accepts an already-settled fill only with on-chain proof
 
 test("terminal producer rejects portfolio discrepancies above one cent", async () => {
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       reservation: {
         run_id: "run-3", probe_id: "probe-3", order_id: "order-3",
         state: "finalized_no_fill", matched_notional: 0
