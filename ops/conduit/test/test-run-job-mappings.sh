@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+bundle=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+runner=$bundle/bin/polyedge-run-job
+sh -n "$runner"
+for job in prospective chart-backfill backfill; do
+  grep -F "  $job)" "$runner" >/dev/null
+done
+grep -F 'if [ "$job" = origin-check ]; then' "$runner" >/dev/null
+grep -F 'freshness:0|hourly:0)' "$runner" >/dev/null
+grep -F 'exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock' "$runner" >/dev/null
+grep -F 'disk_guard=${POLYEDGE_BOOT_DISK_GUARD_BIN:-/usr/local/libexec/polyedge-boot-disk-guard}' "$runner" >/dev/null
+grep -F '"$disk_guard" --assert-headroom' "$runner" >/dev/null
+grep -F 'POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d' "$runner" >/dev/null
+grep -F 'audit_target=$POLYEDGE_AUDIT_TARGET' "$runner" >/dev/null
+target_line=$(grep -n 'POLYEDGE_AUDIT_TARGET=${POLYEDGE_AUDIT_TARGET:-$(date -u -d' "$runner" | cut -d: -f1)
+lock_line=$(grep -n 'exec /usr/bin/flock -w 3600 /run/polyedge/utility.lock' "$runner" | cut -d: -f1)
+use_line=$(grep -n 'audit_target=$POLYEDGE_AUDIT_TARGET' "$runner" | cut -d: -f1)
+[ "$target_line" -lt "$lock_line" ] && [ "$lock_line" -lt "$use_line" ]
+grep -F 'POLYEDGE_ORIGIN_EXPECTED_COUNTRY must equal CO' "$runner" >/dev/null
+grep -F 'getent ahostsv4 polymarket.com' "$runner" >/dev/null
+grep -F -- '--network polyedge' "$runner" >/dev/null
+grep -F 'origin.country !== "CO" || origin.ip !== expectedIp' "$runner" >/dev/null
+grep -F 'POLYEDGE_RAW_EVENT_PREFIX%/}/' "$runner" >/dev/null
+grep -F 'set POLYEDGE_RAW_EVENT_PREFIX for Azure upload freshness' "$runner" >/dev/null
+grep -F -- '--max-age-seconds 900 --expected-interval-seconds 600' "$runner" >/dev/null
+grep -F 'POLYEDGE_LOCAL_RAW_ROOT%/}/$POLYEDGE_AUDIT_DAY/$POLYEDGE_AUDIT_HOUR/' "$runner" >/dev/null
+grep -F 'POLYEDGE_LOCAL_RAW_ROOT must equal /input/events' "$runner" >/dev/null
+grep -F 'POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH must equal true for primary OCI jobs' "$runner" >/dev/null
+grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z"' "$runner" >/dev/null
+grep -F 'POLYEDGE_RESEARCH_DATE=${POLYEDGE_RESEARCH_DATE:-$(date -u -d yesterday +%Y-%m-%d)}' "$runner" >/dev/null
+grep -F "grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'" "$runner" >/dev/null
+grep -F 'date -u -d "$POLYEDGE_RESEARCH_DATE 00:00:00Z" +%s' "$runner" >/dev/null
+grep -F 'date -u -d "@$research_date_epoch" +%Y-%m-%d' "$runner" >/dev/null
+grep -F 'set -- --volume "$ring/segments:/input/events:ro,Z" --env POLYEDGE_RESEARCH_DATE' "$runner" >/dev/null
+grep -F 'exec /usr/local/libexec/polyedge-parity-record-daily "$POLYEDGE_RESEARCH_DATE"' "$runner" >/dev/null
+test "$(grep -c 'cpus=1.5 memory=' "$runner")" -eq 3
+grep -F '*) work=$ring/jobs/research credential=research ;;' "$runner" >/dev/null
+grep -F 'shadow-qset) work=$ring/jobs/shadow-qset credential=shadow-qset ;;' "$runner" >/dev/null
+grep -F 'campaign-2026-08-22-qset-v2' "$runner" >/dev/null
+grep -F 'protocol-v3-qset-v2' "$runner" >/dev/null
+grep -F 'data/research/shadow/campaign-2026-08-22-qset-v2/control/replay.lock' "$runner" >/dev/null
+! grep -F 'only permits campaign-2026-07-28-qset-v1' "$runner" >/dev/null
+grep -F 'credential_dir=/run/polyedge-federated-$credential' "$runner" >/dev/null
+grep -F 'credential_dir=/etc/polyedge/credentials/$credential' "$runner" >/dev/null
+grep -F -- '-v "$credential_dir:/run/credentials:ro,Z"' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor|qset-v6-processor|qset-v7-processor)' "$runner" >/dev/null
+grep -F 'seal-qset-v5-day' "$runner" >/dev/null
+grep -F 'shadow-qset-v5-processor' "$runner" >/dev/null
+grep -F 'seal-qset-v6-day' "$runner" >/dev/null
+grep -F 'shadow-qset-v6-processor' "$runner" >/dev/null
+grep -F 'campaign-2026-09-01-qset-v6' "$runner" >/dev/null
+grep -F 'run_shadow_daily_v6.sh' "$runner" >/dev/null
+grep -F 'seal-qset-v7-day' "$runner" >/dev/null
+grep -F 'shadow-qset-v7-processor' "$runner" >/dev/null
+grep -F 'campaign-2026-09-02-qset-v7' "$runner" >/dev/null
+grep -F 'run_shadow_daily_v7.sh' "$runner" >/dev/null
+test "$(grep -c '/app/research/run_shadow_daily_v6.sh' "$runner")" -eq 1
+test "$(grep -c '/app/research/run_shadow_daily_v7.sh' "$runner")" -eq 1
+grep -F -- '--unsetenv AZURE_CLIENT_SECRET_FILE' "$runner" >/dev/null
+test "$(grep -c '/usr/bin/flock -w 129600 /run/polyedge/research.lock' "$runner")" -eq 1
+test "$(grep -c -- '--pull=never --log-driver=journald' "$runner")" -eq 2
+grep -F 'OnCalendar=*-*-* 03:10:00 UTC' "$bundle/systemd/polyedge-daily.timer" >/dev/null
+grep -F 'OnCalendar=*-*-* 03:15:00 UTC' "$bundle/systemd/polyedge-replay.timer" >/dev/null
+grep -F 'OnCalendar=2026-08-24 02:15:00 UTC' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+grep -F 'Persistent=true' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+grep -F 'Unit=polyedge-qset-v2-seal-days.service' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+! grep -F 'OnCalendar=*-*-*' "$bundle/systemd/polyedge-qset-v2-first-seal.timer" >/dev/null
+sealer="$bundle/bin/polyedge-qset-v2-seal-days"
+sh -n "$sealer"
+grep -F 'for date in 2026-08-22 2026-08-23' "$sealer" >/dev/null
+grep -F 'seal-qset-v2-day' "$sealer" >/dev/null
+grep -F 'sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd' "$sealer" >/dev/null
+grep -F '/usr/bin/flock -w 300 /run/polyedge/research.lock' "$bundle/systemd/polyedge-qset-v2-seal-days.service" >/dev/null
+preflight_line=$(grep -n 'run_sealer "$date" --validate-only' "$sealer" | cut -d: -f1)
+stop_line=$(grep -n 'systemctl stop "$writer"' "$sealer" | cut -d: -f1)
+seal_line=$(grep -n 'run_sealer "$date" >"$temporary"' "$sealer" | cut -d: -f1)
+[ "$preflight_line" -lt "$stop_line" ] && [ "$stop_line" -lt "$seal_line" ]
+test "$(grep -c 'run_sealer "$date" --validate-only' "$sealer")" -eq 1
+grep -F '.blob_count == 1440 and .sealed_blob_count == 1440' "$sealer" >/dev/null
+grep -F 'final="$receipt_root/$date.json"' "$sealer" >/dev/null
+! grep -F 'generated_ts' "$sealer" >/dev/null

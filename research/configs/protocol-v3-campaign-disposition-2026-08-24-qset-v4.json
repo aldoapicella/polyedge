@@ -1,0 +1,72 @@
+{
+  "schema": "polyedge.shadow_campaign_disposition.v1",
+  "generated_at": "2026-08-22T00:00:00Z",
+  "active_campaign": {
+    "campaign_id": "campaign-2026-08-24-qset-v4",
+    "contract": "research/configs/profitability_gate_v3_2026-08-24_qset_v4.yaml",
+    "evidence_version": "protocol-v3-qset-v4",
+    "start_date": "2026-08-24",
+    "first_eligible_date": "2026-08-24",
+    "first_possible_seal_utc": "2026-08-26T02:15:00Z",
+    "terminal_date": "2026-10-22",
+    "raw_container": "polyedge-shadow-qset-v4-events",
+    "research_container": "polyedge-research-qset-v4",
+    "freeze_control_container": "polyedge-qset-v4-control",
+    "activation_status": "planned_draft_not_effective",
+    "effective_at_utc": "2026-08-24T00:00:00Z",
+    "code_frozen": false,
+    "freeze_manifest_status": "not_created_requires_final_commit_and_published_image"
+  },
+  "archived_campaigns": [
+    {
+      "campaign_id": "campaign-2026-08-23-qset-v3",
+      "date_range": {
+        "from": "2026-08-23",
+        "through": "2026-08-23"
+      },
+      "disposition": "historical_preflight_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "The finalized qset-v3 source freeze is immutable. qset-v4 starts a separate policy boundary and qset-v3 supplies no qset-v4 promotion evidence."
+    },
+    {
+      "campaign_id": "campaign-2026-08-22-qset-v2",
+      "date_range": {
+        "from": "2026-08-22",
+        "through": "2026-08-22"
+      },
+      "disposition": "historical_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Retired before a clean container, control-plane, and table isolation boundary existed. It supplies no qset-v4 promotion evidence."
+    },
+    {
+      "campaign_id": "campaign-2026-07-28-qset-v1",
+      "date_range": {
+        "from": "2026-07-28",
+        "through": "2026-08-21"
+      },
+      "disposition": "historical_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Retired without retro-sealing or forced completion. It supplies no qset-v4 promotion evidence."
+    },
+    {
+      "campaign_id": "campaign-2026-07-23",
+      "date_range": {
+        "from": "2026-07-23",
+        "through": "2026-07-27"
+      },
+      "disposition": "historical_diagnostic_only",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "This evidence predates the isolated qset-v4 boundary."
+    }
+  ],
+  "carry_forward": {
+    "historical_pnl": "diagnostic_only",
+    "historical_hypotheses": "allowed_for_rejection_and_design_only",
+    "promotion_evidence": "none",
+    "formal_gate_counters_reset": true
+  }
+}

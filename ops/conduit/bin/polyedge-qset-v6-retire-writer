@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+service=polyedge-shadow-qset-v6.service
+container=polyedge-shadow-qset-v6
+receipt_root=/srv/polyedge-ring/migration/qset-v6/retirement
+receipt=$receipt_root/campaign-2026-09-01-qset-v6-writer.json
+lock_file=/run/polyedge/qset-v6-writer-retirement.lock
+wait_seconds=120
+temporary=
+
+die() { echo "$*" >&2; exit 1; }
+cleanup() { trap - EXIT HUP INT TERM; test -z "$temporary" || rm -f -- "$temporary"; }
+
+secure_file() {
+  test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a:%h' "$1")" = 0:0:640:1 \
+    && test "$(stat -c '%s' "$1")" -gt 0 && test "$(stat -c '%s' "$1")" -le 1048576
+}
+
+capture_identity() {
+  local invocation pid inspect id image digest revision
+  systemctl is-active --quiet "$service" || die "$service is not active"
+  invocation=$(systemctl show "$service" --property=InvocationID --value)
+  pid=$(systemctl show "$service" --property=MainPID --value)
+  printf '%s' "$invocation" | grep -Eq '^[0-9a-f]{32}$' || die 'qset-v6 systemd invocation ID is malformed'
+  printf '%s' "$pid" | grep -Eq '^[1-9][0-9]*$' || die 'qset-v6 systemd main PID is malformed'
+
+  inspect=$(podman inspect "$container")
+  id=$(jq -er '.[0].Id' <<<"$inspect")
+  image=$(jq -er '.[0].Config.Image' <<<"$inspect")
+  digest=$(jq -er '.[0].ImageDigest' <<<"$inspect")
+  jq -e '.[0].State.Status=="running"' <<<"$inspect" >/dev/null
+  printf '%s' "$id" | grep -Eq '^[0-9a-f]{64}$' || die 'qset-v6 container ID is malformed'
+  printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'qset-v6 image digest is malformed'
+  case "$image" in *@"$digest") ;; *) die 'qset-v6 container image is not pinned to its running digest' ;; esac
+  revision=$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$image")
+  printf '%s' "$revision" | grep -Eq '^[0-9a-f]{40}$' || die 'qset-v6 immutable image revision is malformed'
+
+  jq -nc --arg service "$service" --arg invocation "$invocation" --argjson pid "$pid" \
+    --arg container "$container" --arg id "$id" --arg image "$image" --arg digest "$digest" --arg revision "$revision" \
+    '{service:{name:$service,invocationId:$invocation,mainPid:$pid},container:{name:$container,id:$id,image:$image,imageDigest:$digest,imageRevision:$revision}}'
+}
+
+validate_retirement_receipt() {
+  jq -e --arg digest "$2" --arg revision "$3" '
+    type=="object" and keys==["app_name","campaign_id","final_assigned_sequence","final_enqueued_sequence","final_enqueued_total","final_persisted_sequence","final_persisted_total","final_queued","flush_success","image_digest","recorder_instance_id","retired_at","schema","source_revision","status"] and
+    .schema=="polyedge.qset_v6_writer_retirement_receipt.v1" and .status=="prepared_for_retirement" and
+    .campaign_id=="campaign-2026-09-01-qset-v6" and .app_name=="polyedge-shadow-qset-v6" and
+    .image_digest==$digest and .source_revision==$revision and .flush_success==true and .final_queued==0 and
+    (.retired_at|type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")) and
+    (.recorder_instance_id|type=="string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) and
+    ([.final_assigned_sequence,.final_enqueued_sequence,.final_enqueued_total,.final_persisted_sequence,.final_persisted_total] | all(type=="number" and .>=0 and floor==.)) and
+    .final_assigned_sequence==.final_enqueued_sequence and .final_assigned_sequence==.final_enqueued_total and
+    .final_assigned_sequence==.final_persisted_sequence and .final_assigned_sequence==.final_persisted_total
+  ' "$1" >/dev/null
+}
+
+validate_evidence() {
+  local file=$1 current=${2:-} digest revision message expected_hash actual_hash
+  jq -e '
+    . as $evidence | type=="object" and keys==["capturedAtUtc","container","journal","receipt","schema","service"] and
+    .schema=="polyedge.qset_v6_writer_retirement_evidence.v1" and
+    (.capturedAtUtc|type=="string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    .service.name=="polyedge-shadow-qset-v6.service" and (.service.invocationId|test("^[0-9a-f]{32}$")) and (.service.mainPid|type=="number" and .>0 and floor==.) and
+    .container.name=="polyedge-shadow-qset-v6" and (.container.id|test("^[0-9a-f]{64}$")) and
+    (.container.imageDigest|test("^sha256:[0-9a-f]{64}$")) and (.container.image|endswith("@"+$evidence.container.imageDigest)) and
+    (.container.imageRevision|test("^[0-9a-f]{40}$")) and
+    .journal.invocationId==.service.invocationId and .journal.containerId==.container.id and
+    (.journal.message|fromjson)==.receipt and (.journal.messageSha256|test("^sha256:[0-9a-f]{64}$"))
+  ' "$file" >/dev/null
+  digest=$(jq -er '.container.imageDigest' "$file"); revision=$(jq -er '.container.imageRevision' "$file")
+  jq -c '.receipt' "$file" | validate_retirement_receipt /dev/stdin "$digest" "$revision"
+  message=$(jq -er '.journal.message' "$file"); expected_hash=$(jq -er '.journal.messageSha256' "$file")
+  actual_hash="sha256:$(printf '%s' "$message" | sha256sum | cut -d' ' -f1)"
+  test "$actual_hash" = "$expected_hash"
+  test -z "$current" || jq -e --argjson current "$current" '.service==$current.service and .container==$current.container' "$file" >/dev/null
+}
+
+stop_from_evidence() {
+  local identity
+  secure_file "$receipt" || die "qset-v6 retirement evidence is not root-owned mode 0640: $receipt"
+  validate_evidence "$receipt" || die 'qset-v6 retirement evidence is invalid'
+  if ! systemctl is-active --quiet "$service"; then printf '%s\n' "$receipt"; return; fi
+  identity=$(capture_identity)
+  validate_evidence "$receipt" "$identity" || die 'qset-v6 invocation, container, or immutable image changed after retirement receipt capture'
+  systemctl stop "$service"
+  ! systemctl is-active --quiet "$service" || die "$service remained active after stop"
+  printf '%s\n' "$receipt"
+}
+
+main() {
+  local identity after cursor records candidate digest revision message_hash deadline
+  trap cleanup EXIT HUP INT TERM
+  exec 9>"$lock_file"
+  flock -n 9 || die 'qset-v6 writer retirement is already running'
+  if test -e "$receipt"; then stop_from_evidence; return; fi
+
+  install -d -o root -g root -m 0750 "$receipt_root"
+  identity=$(capture_identity)
+  journalctl --sync
+  cursor=$(journalctl -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p' | tail -n 1)
+  test -n "$cursor" || die 'could not capture the journald cursor before qset-v6 retirement'
+  podman kill --signal SIGUSR1 "$container" >/dev/null
+
+  deadline=$((SECONDS+wait_seconds)); candidate=
+  while test "$SECONDS" -lt "$deadline"; do
+    records=$(journalctl --after-cursor "$cursor" --no-pager -o json \
+      "_SYSTEMD_INVOCATION_ID=$(jq -r '.service.invocationId' <<<"$identity")" \
+      "CONTAINER_ID_FULL=$(jq -r '.container.id' <<<"$identity")")
+    candidate=$(jq -r '
+      select(._SYSTEMD_INVOCATION_ID==$invocation and .CONTAINER_ID_FULL==$container) |
+      select(try (.MESSAGE|fromjson|.schema=="polyedge.qset_v6_writer_retirement_receipt.v1") catch false) | .MESSAGE
+    ' --arg invocation "$(jq -r '.service.invocationId' <<<"$identity")" --arg container "$(jq -r '.container.id' <<<"$identity")" <<<"$records" | tail -n 1)
+    test -z "$candidate" || break
+    sleep 1
+  done
+  test -n "$candidate" || die 'timed out waiting for the current qset-v6 invocation retirement receipt'
+
+  digest=$(jq -r '.container.imageDigest' <<<"$identity"); revision=$(jq -r '.container.imageRevision' <<<"$identity")
+  validate_retirement_receipt <(printf '%s\n' "$candidate") "$digest" "$revision" || die 'qset-v6 retirement receipt failed validation'
+  after=$(capture_identity)
+  test "$after" = "$identity" || die 'qset-v6 invocation, container, or immutable image changed during retirement capture'
+
+  message_hash="sha256:$(printf '%s' "$candidate" | sha256sum | cut -d' ' -f1)"
+  temporary=$(mktemp "$receipt_root/.writer-retirement.XXXXXX")
+  jq -n --arg captured "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson identity "$identity" \
+    --arg message "$candidate" --arg message_hash "$message_hash" --argjson retirement "$candidate" '
+    {schema:"polyedge.qset_v6_writer_retirement_evidence.v1",capturedAtUtc:$captured,service:$identity.service,container:$identity.container,
+     journal:{invocationId:$identity.service.invocationId,containerId:$identity.container.id,message:$message,messageSha256:$message_hash},receipt:$retirement}
+  ' >"$temporary"
+  chown root:root "$temporary"; chmod 0640 "$temporary"
+  validate_evidence "$temporary" "$identity" || die 'generated qset-v6 retirement evidence failed validation'
+  sync -f "$temporary"
+  test ! -e "$receipt" || die "qset-v6 retirement evidence appeared concurrently: $receipt"
+  mv -T "$temporary" "$receipt"; temporary=
+  sync -f "$receipt"; sync -d "$receipt_root"
+
+  stop_from_evidence
+}
+
+if test "${BASH_SOURCE[0]}" = "$0"; then main "$@"; fi

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check PolyEdge ring health every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:04/5:00 UTC
+Persistent=true
+RandomizedDelaySec=30
+Unit=polyedge-ring-health.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,111 @@
+name: Deploy OCI image to conduit
+
+on:
+  workflow_call:
+    inputs:
+      quadlet_unit:
+        required: true
+        type: string
+      image_digest:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      quadlet_unit:
+        description: Existing PolyEdge Quadlet unit name on conduit
+        required: true
+        type: string
+      image_digest:
+        description: Fully qualified GHCR image reference pinned with @sha256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: conduit-oci-deploy-${{ inputs.quadlet_unit }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: conduit
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Validate immutable ARM64 image input
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          QUADLET_UNIT: ${{ inputs.quadlet_unit }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$QUADLET_UNIT" =~ ^(polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer|polyedge-funded-signer)$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
+          case "$QUADLET_UNIT" in
+            polyedge-api|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer)
+              [[ "$IMAGE_DIGEST" =~ /polyedge-rust-backend@sha256:[0-9a-f]{64}$ ]]
+              ;;
+            polyedge-frontend)
+              [[ "$IMAGE_DIGEST" =~ /polyedge-frontend@sha256:[0-9a-f]{64}$ ]]
+              ;;
+            polyedge-funded-signer)
+              [[ "$IMAGE_DIGEST" =~ /polyedge-venue-probe@sha256:[0-9a-f]{64}$ ]]
+              ;;
+          esac
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools inspect --raw "$IMAGE_DIGEST" > manifest.json
+          jq -e '
+            .manifests
+            | any(.platform.os == "linux" and .platform.architecture == "arm64")
+          ' manifest.json
+
+      - name: Configure pinned SSH host key
+        env:
+          CONDUIT_KNOWN_HOSTS: ${{ secrets.CONDUIT_KNOWN_HOSTS }}
+          CONDUIT_SSH_DEPLOY_KEY: ${{ secrets.CONDUIT_SSH_DEPLOY_KEY }}
+          CONDUIT_SSH_TARGET: ${{ vars.CONDUIT_SSH_TARGET }}
+        run: |
+          set -euo pipefail
+          test -n "$CONDUIT_KNOWN_HOSTS"
+          test -n "$CONDUIT_SSH_DEPLOY_KEY"
+          [[ "$CONDUIT_SSH_TARGET" =~ ^[a-z_][a-z0-9_-]*@[a-zA-Z0-9.-]+$ ]]
+          host=${CONDUIT_SSH_TARGET#*@}
+          install -d -m 700 "$HOME/.ssh"
+          umask 077
+          trusted=$(mktemp)
+          scanned=$(mktemp)
+          matched=$(mktemp)
+          trap 'rm -f "$trusted" "$scanned" "$matched"' EXIT
+          printf '%s\n' "$CONDUIT_KNOWN_HOSTS" | awk 'NF >= 3 { print $2, $3 }' | sort -u > "$trusted"
+          ssh-keyscan -T 10 "$host" 2>/dev/null | awk 'NF >= 3 { print $2, $3 }' | sort -u > "$scanned"
+          comm -12 "$trusted" "$scanned" > "$matched"
+          test -s "$matched"
+          awk -v host="$host" '{ print host, $1, $2 }' "$matched" > "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$CONDUIT_SSH_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/known_hosts" "$HOME/.ssh/id_ed25519"
+
+      - name: Deploy pinned image through the remote Quadlet controller
+        env:
+          CONDUIT_SSH_TARGET: ${{ vars.CONDUIT_SSH_TARGET }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          QUADLET_UNIT: ${{ inputs.quadlet_unit }}
+        run: |
+          set -euo pipefail
+          [[ "$CONDUIT_SSH_TARGET" =~ ^[a-z_][a-z0-9_-]*@[a-zA-Z0-9.-]+$ ]]
+          trap 'rm -f "$HOME/.ssh/id_ed25519"' EXIT
+          receipt=$(ssh \
+            -i "$HOME/.ssh/id_ed25519" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "$CONDUIT_SSH_TARGET" \
+            sudo -n /usr/local/sbin/polyedge-quadlet-deploy \
+              "$QUADLET_UNIT" \
+              "$IMAGE_DIGEST")
+          printf '%s\n' "$receipt"
+          expected_digest="sha256:${IMAGE_DIGEST##*@sha256:}"
+          printf '%s\n' "$receipt" | grep -Ex \
+            "deployed $QUADLET_UNIT with $expected_digest; rollback copy: /etc/polyedge/rollback/[0-9]{8}T[0-9]{6}Z-$QUADLET_UNIT\.container"

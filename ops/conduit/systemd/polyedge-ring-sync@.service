@@ -1,0 +1,15 @@
+[Unit]
+Description=Seal and upload PolyEdge recorder segments for %i
+After=network-online.target polyedge-network.service
+Wants=network-online.target
+Requires=polyedge-network.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /run/polyedge-ring-sync-%i.lock /usr/bin/flock -w 3600 /run/polyedge/utility.lock /usr/bin/env POLYEDGE_RING_ENV_FILE=/etc/polyedge/ring-%i.env /usr/local/libexec/polyedge-ring-sync
+CPUQuota=50%
+MemoryMax=2G
+TimeoutStartSec=3h
+
+[Install]
+WantedBy=multi-user.target

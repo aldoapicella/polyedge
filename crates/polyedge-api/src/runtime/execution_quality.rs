@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 const MARKOUT_HORIZONS_SECONDS: [i64; 3] = [1, 5, 30];
+const MAX_MARKOUT_OBSERVATION_DELAY_MS: i64 = 2_000;
 const REGISTRATION_QUEUE_POSITION_SCHEMA: &str = "polyedge.paper_registration_queue_position.v1";
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -268,30 +269,53 @@ impl ExecutionQualityTracker {
             (None, Some(ask)) => Some(ask.price),
             (None, None) => book.last_trade_price,
         };
-        let Some(mark_price) = mark_price else {
-            return Vec::new();
-        };
         let mut pending = Vec::with_capacity(self.pending_markouts.len());
         for markout in self.pending_markouts.drain(..) {
-            if markout.token_id == book.token_id
-                && observed_ts >= markout.fill_ts + Duration::seconds(markout.horizon_seconds)
+            let horizon_ts = markout.fill_ts + Duration::seconds(markout.horizon_seconds);
+            if markout.token_id != book.token_id || observed_ts < horizon_ts {
+                pending.push(markout);
+            } else if observed_ts
+                > horizon_ts + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS)
             {
+                due.push(QualityEvent {
+                    event_type: "paper_fill_markout_missing",
+                    payload: json!({
+                        "fill_id": markout.fill_id,
+                        "fill_source": markout.source,
+                        "order_id": markout.order_id,
+                        "market_id": markout.market_id,
+                        "token_id": markout.token_id,
+                        "side": markout.side,
+                        "fill_price": markout.fill_price.to_string(),
+                        "fill_size": markout.fill_size.to_string(),
+                        "fee_per_share": markout.fee_per_share.to_string(),
+                        "fill_ts": markout.fill_ts,
+                        "horizon_seconds": markout.horizon_seconds,
+                        "reason": "markout_observation_deadline_exceeded",
+                        "research_only": true
+                    }),
+                });
+            } else {
+                let executable_mark_price = match markout.side {
+                    Side::Buy => book.best_bid().map(|level| level.price),
+                    Side::Sell => book.best_ask().map(|level| level.price),
+                };
+                let (Some(mark_price), Some(executable_mark_price)) =
+                    (mark_price, executable_mark_price)
+                else {
+                    pending.push(markout);
+                    continue;
+                };
                 let per_share = match markout.side {
                     Side::Buy => mark_price - markout.fill_price,
                     Side::Sell => markout.fill_price - mark_price,
                 };
                 let net_per_share = per_share - markout.fee_per_share;
-                let executable_mark_price = match markout.side {
-                    Side::Buy => book.best_bid().map(|level| level.price),
-                    Side::Sell => book.best_ask().map(|level| level.price),
+                let executable_per_share = match markout.side {
+                    Side::Buy => executable_mark_price - markout.fill_price,
+                    Side::Sell => markout.fill_price - executable_mark_price,
                 };
-                let executable_per_share =
-                    executable_mark_price.map(|executable| match markout.side {
-                        Side::Buy => executable - markout.fill_price,
-                        Side::Sell => markout.fill_price - executable,
-                    });
-                let net_executable_per_share =
-                    executable_per_share.map(|gross| gross - markout.fee_per_share);
+                let net_executable_per_share = executable_per_share - markout.fee_per_share;
                 due.push(QualityEvent {
                     event_type: "paper_fill_markout",
                     payload: json!({
@@ -311,11 +335,11 @@ impl ExecutionQualityTracker {
                         "markout_pnl": (per_share * markout.fill_size).to_string(),
                         "net_markout_per_share": net_per_share.to_string(),
                         "net_markout_pnl": (net_per_share * markout.fill_size).to_string(),
-                        "executable_mark_price": executable_mark_price.map(|value| value.to_string()),
-                        "executable_markout_per_share": executable_per_share.map(|value| value.to_string()),
-                        "executable_markout_pnl": executable_per_share.map(|value| (value * markout.fill_size).to_string()),
-                        "net_executable_markout_per_share": net_executable_per_share.map(|value| value.to_string()),
-                        "net_executable_markout_pnl": net_executable_per_share.map(|value| (value * markout.fill_size).to_string()),
+                        "executable_mark_price": executable_mark_price.to_string(),
+                        "executable_markout_per_share": executable_per_share.to_string(),
+                        "executable_markout_pnl": (executable_per_share * markout.fill_size).to_string(),
+                        "net_executable_markout_per_share": net_executable_per_share.to_string(),
+                        "net_executable_markout_pnl": (net_executable_per_share * markout.fill_size).to_string(),
                         "best_bid": book.best_bid().map(|level| level.price.to_string()),
                         "best_ask": book.best_ask().map(|level| level.price.to_string()),
                         "observed_ts": observed_ts,
@@ -325,8 +349,6 @@ impl ExecutionQualityTracker {
                         "research_only": true
                     }),
                 });
-            } else {
-                pending.push(markout);
             }
         }
         self.pending_markouts = pending;
@@ -1199,6 +1221,76 @@ mod tests {
         assert_eq!(thirty.payload["fee_per_share"], "0.01");
         assert_eq!(thirty.payload["net_executable_markout_per_share"], "0.01");
         assert_eq!(thirty.payload["net_executable_markout_pnl"], "0.05");
+    }
+
+    #[test]
+    fn markout_waits_for_executable_side_before_deadline() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+
+        let mut one_sided = book("0.51", "4", "0.52", "4", ts(1));
+        one_sided.bids.clear();
+        assert!(tracker.observe_book(&one_sided).is_empty());
+
+        let recovered = tracker.observe_book(&book("0.51", "4", "0.52", "4", ts(2)));
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].event_type, "paper_fill_markout");
+        assert_eq!(recovered[0].payload["horizon_seconds"], 1);
+        assert_eq!(recovered[0].payload["executable_mark_price"], "0.51");
+        assert_eq!(recovered[0].payload["observation_delay_ms"], 1_000);
+    }
+
+    #[test]
+    fn markout_accepts_executable_side_at_deadline_and_ignores_other_tokens() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+
+        let mut unrelated = book("0.51", "4", "0.52", "4", ts(4));
+        unrelated.token_id = TokenId::new("other-token");
+        assert!(tracker.observe_book(&unrelated).is_empty());
+
+        let at_deadline = tracker.observe_book(&book("0.51", "4", "0.52", "4", ts(3)));
+        assert_eq!(at_deadline.len(), 1);
+        assert_eq!(at_deadline[0].event_type, "paper_fill_markout");
+        assert_eq!(at_deadline[0].payload["horizon_seconds"], 1);
+        assert_eq!(at_deadline[0].payload["observation_delay_ms"], 2_000);
+    }
+
+    #[test]
+    fn markout_deadline_expiry_emits_one_missing_row() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+
+        let mut one_sided = book("0.51", "4", "0.52", "4", ts(1));
+        one_sided.bids.clear();
+        assert!(tracker.observe_book(&one_sided).is_empty());
+
+        let expired = tracker.observe_book(&book("0.51", "4", "0.52", "4", ts(4)));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].event_type, "paper_fill_markout_missing");
+        assert_eq!(expired[0].payload["horizon_seconds"], 1);
+        assert_eq!(
+            expired[0].payload["reason"],
+            "markout_observation_deadline_exceeded"
+        );
+        assert!(tracker
+            .observe_book(&book("0.51", "4", "0.52", "4", ts(4)))
+            .is_empty());
     }
 
     #[test]

@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+die() {
+  echo "polyedge-quadlet-deploy: $*" >&2
+  exit 64
+}
+
+if [ "${POLYEDGE_TEST_ALLOW_UNPRIVILEGED:-}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  die 'must run as root'
+fi
+
+unit=${1:-}
+image=${2:-}
+case "$unit" in
+  polyedge-api|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer) repository=polyedge-rust-backend ;;
+  polyedge-frontend) repository=polyedge-frontend ;;
+  polyedge-funded-signer) repository=polyedge-venue-probe ;;
+  *) die 'usage: polyedge-quadlet-deploy {polyedge-api|polyedge-frontend|polyedge-shadow-qset|polyedge-shadow-qset-v5|polyedge-shadow-qset-v7|polyedge-funded-intent-producer|polyedge-funded-signer} ghcr.io/OWNER/IMAGE@sha256:<64-lowercase-hex>' ;;
+esac
+
+printf '%s' "$image" | grep -Eq "^ghcr\\.io/[a-z0-9][a-z0-9._-]*/$repository@sha256:[0-9a-f]{64}$" || \
+  die "image must be the $repository GHCR repository with an exact lowercase sha256 digest"
+
+quadlet_dir=${POLYEDGE_QUADLET_DIR:-/etc/containers/systemd}
+rollback_dir=${POLYEDGE_ROLLBACK_DIR:-/etc/polyedge/rollback}
+podman=${POLYEDGE_PODMAN:-/usr/bin/podman}
+systemctl=${POLYEDGE_SYSTEMCTL:-/usr/bin/systemctl}
+disk_guard=${POLYEDGE_DISK_GUARD:-/usr/local/libexec/polyedge-boot-disk-guard}
+leave_stopped=${POLYEDGE_DEPLOY_LEAVE_STOPPED:-false}
+quadlet=$quadlet_dir/$unit.container
+case "$leave_stopped" in true|false) :;; *) die 'POLYEDGE_DEPLOY_LEAVE_STOPPED must be true or false';; esac
+test -f "$quadlet" || die "missing installed Quadlet: $quadlet"
+test "$(grep -c '^Image=' "$quadlet")" -eq 1 || die "expected exactly one Image= line in $quadlet"
+test -x "$disk_guard" || die "missing boot-disk guard: $disk_guard"
+[ "$leave_stopped" = false ] || ! "$systemctl" is-active --quiet "$unit.service" || die 'leave-stopped deployment requires an inactive service'
+
+# Confirm the exact ARM64 manifest before changing the installed definition.
+"$disk_guard" --pull-gate || die 'boot-disk headroom blocks image pulls'
+"$podman" pull "$image"
+test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}' "$image")" = linux/arm64 || \
+  die "image is not linux/arm64: $image"
+image_id=$("$podman" image inspect --format '{{.Id}}' "$image")
+test -n "$image_id" || die "image has no local content ID: $image"
+
+timestamp=${POLYEDGE_DEPLOY_TIMESTAMP:-$(date -u +%Y%m%dT%H%M%SZ)}
+printf '%s' "$timestamp" | grep -Eq '^[0-9]{8}T[0-9]{6}Z$' || die 'invalid deployment timestamp'
+install -d -m 0750 "$rollback_dir"
+backup=$rollback_dir/$timestamp-$unit.container
+test ! -e "$backup" || die "rollback copy already exists: $backup"
+cp -p "$quadlet" "$backup"
+
+replacement=$(mktemp "$quadlet.XXXXXX")
+trap 'rm -f "$replacement"' EXIT HUP INT TERM
+awk -v image="$image" '/^Image=/ { print "Image=" image; next } { print }' "$quadlet" >"$replacement"
+test "$(grep -c "^Image=$image$" "$replacement")" -eq 1 || die 'failed to construct replacement Quadlet'
+mv "$replacement" "$quadlet"
+
+if [ "$leave_stopped" = true ]; then
+  if ! "$systemctl" daemon-reload || ! "$disk_guard" --assert-headroom; then
+    cp -p "$backup" "$replacement"
+    mv "$replacement" "$quadlet"
+    "$systemctl" daemon-reload || die 'daemon reload failed and the prior stopped Quadlet could not be restored'
+    die 'stopped deployment failed; restored the prior stopped Quadlet'
+  fi
+  echo "installed $unit with sha256:${image##*@sha256:}; rollback copy: $backup"
+  exit 0
+fi
+
+restore() {
+  cp -p "$backup" "$replacement"
+  mv "$replacement" "$quadlet"
+  "$systemctl" daemon-reload
+  "$systemctl" restart "$unit.service"
+}
+
+if ! "$systemctl" daemon-reload || ! "$systemctl" restart "$unit.service"; then
+  echo 'restart failed; restoring previous Quadlet' >&2
+  restore || die 'restart failed and rollback restart failed'
+  exit 1
+fi
+
+digest=sha256:${image##*@sha256:}
+running=$("$podman" inspect --type container --format '{{.State.Running}} {{.Image}} {{.ImageName}}' "$unit" 2>/dev/null || true)
+if [ "$running" != "true $image_id $image" ]; then
+  echo "running container did not resolve $digest; restoring previous Quadlet" >&2
+  restore || die 'verification failed and rollback restart failed'
+  exit 1
+fi
+if ! "$disk_guard" --assert-headroom; then
+  echo 'deployment consumed reserved boot-disk headroom; restoring previous Quadlet' >&2
+  restore || die 'headroom check failed and rollback restart failed'
+  exit 1
+fi
+
+echo "deployed $unit with $digest; rollback copy: $backup"

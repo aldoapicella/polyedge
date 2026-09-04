@@ -18,6 +18,28 @@ param funderAddress string = '0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8'
 param relayerApiKeyAddress string = '0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921'
 @description('Set true only after polymarket-relayer-api-key exists in Key Vault.')
 param relayerApiKeySecretConfigured bool = false
+@description('Explicit operator switch for the scheduled funded Dynamic Quote lane.')
+param fundedDirectEnabled bool = false
+param fundedDirectSessionManifestJson string = ''
+param fundedDirectSessionManifestBlobName string = ''
+param fundedDirectSessionManifestSha256 string = ''
+param fundedDirectShadowValidationSealJson string = ''
+param fundedDirectShadowValidationSealBlobName string = ''
+param fundedDirectShadowValidationSealSha256 string = ''
+param fundedDirectCampaignId string = 'dynamic-quote-funded-disabled'
+param fundedDirectStartingCollateral string = '11.09862'
+param fundedDirectMaxAccountLoss string = '11.09862'
+param fundedDirectTargetOrderNotional string = '10.5'
+param fundedDirectMaxOrderNotional string = '10.5'
+param fundedDirectMinSecondsToExpiry string = '360'
+param fundedDirectMaxSecondsToExpiry string = '900'
+param fundedDirectServiceBusNamespace string = 'sb-polyedge-funded-cl-6urdjr5nmwx7w'
+param fundedDirectServiceBusQueue string = 'funded-dynamic-quote-intents'
+
+var fundedDirectValidationProvided = (!empty(fundedDirectShadowValidationSealJson) && !empty(fundedDirectShadowValidationSealBlobName) && !empty(fundedDirectShadowValidationSealSha256))
+var fundedDirectReleaseReady = fundedDirectEnabled && fundedDirectValidationProvided
+@description('Static public IP resource used by the authenticated North Europe NAT egress.')
+param publicIpName string = 'pip-polyedge-venue-neu-egress-2'
 
 var environmentName = 'polyedge-venue-neu-env'
 var identityName = 'polyedge-venue-neu-id'
@@ -38,7 +60,6 @@ var shadowCampaignReportRoot = 'reports/research/shadow/campaigns/${shadowCampai
 var shadowCampaignLeaseBlobName = 'data/research/shadow/${shadowCampaignId}/control/replay.lock'
 var vnetName = 'vnet-polyedge-venue-neu'
 var natName = 'nat-polyedge-venue-neu'
-var publicIpName = 'pip-polyedge-venue-neu-egress'
 var tags = {
   app: 'polyedge'
   environment: 'dev'
@@ -246,6 +267,11 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' = {
           natGateway: {
             id: natGateway.id
           }
+          serviceEndpoints: [
+            {
+              service: 'Microsoft.Storage.Global'
+            }
+          ]
           delegations: [
             {
               name: 'Microsoft.App.environments'
@@ -581,6 +607,14 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'MAX_TOTAL_POSITION', value: '1' }
             { name: 'MAX_DAILY_LOSS', value: '1' }
             { name: 'MAX_OPEN_ORDERS', value: '1' }
+            { name: 'STRATEGY_INTENT_OPERATOR_DIRECT', value: fundedDirectReleaseReady ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_ENABLED', value: fundedDirectReleaseReady ? 'true' : 'false' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_NAMESPACE', value: fundedDirectReleaseReady ? fundedDirectServiceBusNamespace : '' }
+            { name: 'FUNDED_DIRECT_SERVICE_BUS_QUEUE', value: fundedDirectReleaseReady ? fundedDirectServiceBusQueue : '' }
+            { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectReleaseReady ? fundedDirectTargetOrderNotional : '0' }
+            { name: 'STRATEGY_INTENT_MAX_ORDER_NOTIONAL', value: fundedDirectReleaseReady ? fundedDirectMaxOrderNotional : '1' }
+            { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectReleaseReady ? fundedDirectMinSecondsToExpiry : '0' }
+            { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: fundedDirectReleaseReady ? fundedDirectMaxSecondsToExpiry : '86400' }
             { name: 'TARGET_ASSET', value: 'BTC' }
             { name: 'TARGET_ASSET_NAME', value: 'Bitcoin' }
             { name: 'TARGET_HORIZON', value: '15m' }
@@ -599,6 +633,7 @@ resource shadowApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AZURE_EVENT_BLOB_PREFIX', value: 'shadow-events/campaign-2026-07-22' }
             { name: 'AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER', value: shadowCampaignEventPrefix }
             { name: 'AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC', value: '${shadowCampaignStart}T00:00:00Z' }
+            { name: 'LOCAL_JSONL_RECORDER_ENABLED', value: 'false' }
             { name: 'COMPACT_SHADOW_RECORDING', value: 'true' }
             { name: 'SHADOW_BOOK_SAMPLE_MS', value: '1000' }
             { name: 'PUBLISH_STRATEGY_CANARY_INTENTS', value: 'true' }
@@ -942,7 +977,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
   location: location
   tags: union(tags, {
     trigger: 'manual-only'
-    operation: 'funded-ladder-5-25-100-200'
+    operation: 'funded-dynamic-quote-operator-direct'
     fundedExecution: 'disabled'
     dryRun: 'true'
   })
@@ -955,8 +990,7 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
     configuration: {
       triggerType: 'Manual'
       replicaRetryLimit: 0
-      replicaTimeout: 3600
-      manualTriggerConfig: { parallelism: 1, replicaCompletionCount: 1 }
+      replicaTimeout: 290
       registries: [{ server: registry.properties.loginServer, identity: identity.id }]
       secrets: [
         { name: 'polymarket-private-key', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-private-key', identity: identity.id }
@@ -964,13 +998,32 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
         { name: 'polymarket-api-secret', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-secret', identity: identity.id }
         { name: 'polymarket-api-passphrase', keyVaultUrl: '${keyVault.properties.vaultUri}secrets/polymarket-api-passphrase', identity: identity.id }
       ]
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
     }
     template: {
       containers: [{
         name: 'funded-ladder'
         image: venueProbeImage
-        command: ['node', 'src/funded-ladder-controller.mjs']
+        command: ['node', 'src/funded-direct-worker.mjs']
         env: [
+          { name: 'FUNDED_DIRECT_WORKER_ENABLED', value: 'false' }
+          { name: 'ALLOW_FUNDED_DIRECT', value: 'false' }
+          { name: 'FUNDED_DIRECT_DRY_RUN', value: 'true' }
+          { name: 'FUNDED_DIRECT_MAX_ITERATIONS', value: '200' }
+          { name: 'FUNDED_DIRECT_POLL_INTERVAL_MS', value: '1000' }
+          { name: 'FUNDED_DIRECT_MAX_IDLE_MS', value: '240000' }
+          { name: 'FUNDED_DIRECT_CONTROL_PREFIX', value: 'reports/funded/dynamic-quote' }
+          { name: 'FUNDED_DIRECT_SESSION_MANIFEST_JSON', value: fundedDirectSessionManifestJson }
+          { name: 'FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME', value: fundedDirectSessionManifestBlobName }
+          { name: 'FUNDED_DIRECT_SESSION_MANIFEST_SHA256', value: fundedDirectSessionManifestSha256 }
+          { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_JSON', value: fundedDirectShadowValidationSealJson }
+          { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_BLOB_NAME', value: fundedDirectShadowValidationSealBlobName }
+          { name: 'FUNDED_DIRECT_SHADOW_VALIDATION_SEAL_SHA256', value: fundedDirectShadowValidationSealSha256 }
+          { name: 'FUNDED_DIRECT_MIN_REMAINING_TTL_MS', value: '7000' }
+          { name: 'FUNDED_DIRECT_CHILD_MIN_REMAINING_TTL_MS', value: '2000' }
           { name: 'FUNDED_LADDER_CONTROLLER_ENABLED', value: 'false' }
           { name: 'ALLOW_FUNDED_LADDER', value: 'false' }
           { name: 'FUNDED_LADDER_DRY_RUN', value: 'true' }
@@ -995,16 +1048,20 @@ resource fundedLadderJob 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'STRATEGY_CANARY_CANDIDATE_CONFIG_HASH', value: 'sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c' }
           { name: 'STRATEGY_CANARY_REQUIRED_FILL_MODEL_VERSION', value: 'conservative-execution-prior-v1' }
           { name: 'STRATEGY_CANARY_REQUIRED_RESOLUTION_SOURCE', value: 'chainlink_reference' }
-          { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: '1' }
+          { name: 'STRATEGY_INTENT_TARGET_ORDER_NOTIONAL', value: fundedDirectTargetOrderNotional }
+          { name: 'STRATEGY_CANARY_MAX_ORDER_NOTIONAL', value: fundedDirectMaxOrderNotional }
+          { name: 'STRATEGY_INTENT_MIN_SECONDS_TO_EXPIRY', value: fundedDirectMinSecondsToExpiry }
+          { name: 'STRATEGY_INTENT_MAX_SECONDS_TO_EXPIRY', value: fundedDirectMaxSecondsToExpiry }
           { name: 'STRATEGY_CANARY_MAX_REFERENCE_AGE_MS', value: '2000' }
           { name: 'STRATEGY_CANARY_MAX_BOOK_AGE_MS', value: '1000' }
           { name: 'STRATEGY_CANARY_REST_SECONDS', value: '30' }
           { name: 'MAX_OPEN_ORDERS', value: '1' }
-          { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: 'funded-campaign-2026-07-12' }
-          { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: '5.030521' }
-          { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '4.03' }
-          { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: '1' }
+          { name: 'VENUE_PROBE_FUNDED_CAMPAIGN_ID', value: fundedDirectCampaignId }
+          { name: 'VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY', value: fundedDirectStartingCollateral }
+          { name: 'VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR', value: '0' }
+          { name: 'VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN', value: fundedDirectMaxAccountLoss }
           { name: 'VENUE_PROBE_MAX_RECONCILIATION_DISCREPANCY', value: '0.01' }
+          { name: 'VENUE_PROBE_CAMPAIGN_CASH_FLOWS', value: '[]' }
           { name: 'VENUE_PROBE_MAX_CLOCK_DRIFT_MS', value: '5000' }
           { name: 'VENUE_PROBE_MAX_CLOCK_UNCERTAINTY_MS', value: '750' }
           { name: 'VENUE_PROBE_EXPECTED_COUNTRY', value: 'IE' }

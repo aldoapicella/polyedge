@@ -1,0 +1,58 @@
+{
+  "schema": "polyedge.shadow_campaign_disposition.v1",
+  "generated_at": "2026-08-21T00:00:00Z",
+  "active_campaign": {
+    "campaign_id": "campaign-2026-08-22-qset-v2",
+    "contract": "research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml",
+    "evidence_version": "protocol-v3-qset-v2",
+    "start_date": "2026-08-22",
+    "first_eligible_date": "2026-08-22",
+    "first_possible_seal_utc": "2026-08-24T02:15:00Z",
+    "terminal_date": "2026-10-20",
+    "raw_container": "polyedge-shadow-qset-events",
+    "research_container": "polyedge-research-qset",
+    "freeze_control_container": "polyedge-qset-control",
+    "code_frozen": false
+  },
+  "archived_campaigns": [
+    {
+      "campaign_id": "campaign-2026-07-28-qset-v1",
+      "date_range": {
+        "from": "2026-07-28",
+        "through": "2026-08-21"
+      },
+      "disposition": "historical_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Retired without retro-sealing or forced completion because its exhaustive sealed D+1 inventory is incomplete."
+    },
+    {
+      "campaign_id": "campaign-2026-07-23",
+      "date_range": {
+        "from": "2026-07-23",
+        "through": "2026-07-27"
+      },
+      "disposition": "historical_diagnostic_only",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Queue registration and settlement carry semantics changed. This evidence cannot be mixed with qset-v2."
+    },
+    {
+      "campaign_id": "campaign-2026-07-12",
+      "date_range": {
+        "from": "2026-07-13",
+        "through": "2026-07-22"
+      },
+      "disposition": "historical_diagnostic_only",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "These days predate the qset-v2 frozen evidence boundary."
+    }
+  ],
+  "carry_forward": {
+    "historical_pnl": "diagnostic_only",
+    "historical_hypotheses": "allowed_for_rejection_and_design_only",
+    "promotion_evidence": "none",
+    "formal_gate_counters_reset": true
+  }
+}

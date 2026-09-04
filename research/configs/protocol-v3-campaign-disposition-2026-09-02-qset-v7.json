@@ -1,0 +1,113 @@
+{
+  "schema": "polyedge.shadow_campaign_disposition.v1",
+  "generated_at": "2026-08-31T23:00:48Z",
+  "active_campaign": {
+    "campaign_id": "campaign-2026-09-02-qset-v7",
+    "contract": "research/configs/profitability_gate_v3_2026-09-02_qset_v7.yaml",
+    "evidence_version": "protocol-v3-qset-v7",
+    "start_date": "2026-09-02",
+    "first_eligible_date": "2026-09-02",
+    "first_possible_seal_utc": "2026-09-04T02:15:00Z",
+    "terminal_date": "2026-10-31",
+    "raw_container": "polyedge-shadow-qset-v7-events",
+    "research_container": "polyedge-research-qset-v7",
+    "freeze_control_container": "polyedge-qset-v7-control",
+    "activation_status": "planned_draft_not_effective",
+    "effective_at_utc": "2026-09-02T00:00:00Z",
+    "code_frozen": false,
+    "freeze_manifest_status": "not_created_requires_final_commit_and_published_image"
+  },
+  "archived_campaigns": [
+    {
+      "campaign_id": "campaign-2026-09-01-qset-v6",
+      "date_range": {
+        "from": "2026-09-01",
+        "through": "2026-09-01"
+      },
+      "disposition": "historical_prestart_diagnostic_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "terminal_receipt": {
+        "path": "/srv/polyedge-ring/migration/qset-v6/prestart-ineligible-20260831T223627Z-runtime-validator/ineligibility.json",
+        "sha256": "sha256:597646ac88df5b82845ac74fbd538274b0c0975ea7dd9d0922787aeb373f7ea5"
+      },
+      "reason": "Qset-v6 failed runtime admission before its recorder or boundary started. Its source freeze and RBAC evidence remain immutable, its writer remains inactive, and it supplies no qset-v7 promotion evidence or counters."
+    },
+    {
+      "campaign_id": "campaign-2026-08-26-qset-v5",
+      "date_range": {
+        "from": "2026-08-26",
+        "through": "2026-08-27"
+      },
+      "disposition": "historical_diagnostic_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "terminal_receipt": {
+        "path": "/srv/polyedge-ring/migration/qset-v5/processor-handoff-ineligible-20260828T155929Z-74d816e962994b139423cb410b1529ff/ineligibility.json",
+        "sha256": "sha256:d8b270dcc317d84792290d09b2fbb172e8e43f993b0c5c24464253316dc811da"
+      },
+      "reason": "Terminal qset-v5 diagnostics require fresh campaign evidence after the code fix; no qset-v5 result, counter, seal, or artifact is carried into qset-v7."
+    },
+    {
+      "campaign_id": "campaign-2026-08-24-qset-v4",
+      "date_range": {
+        "from": "2026-08-24",
+        "through": "2026-08-25"
+      },
+      "disposition": "historical_non_promotable_diagnostic_only",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Qset-v4 remains retained and supplies no qset-v7 promotion evidence or formal gate counters."
+    },
+    {
+      "campaign_id": "campaign-2026-08-23-qset-v3",
+      "date_range": {
+        "from": "2026-08-23",
+        "through": "2026-08-23"
+      },
+      "disposition": "historical_preflight_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "The finalized qset-v3 source freeze is immutable. qset-v7 starts a separate policy boundary and qset-v3 supplies no qset-v7 promotion evidence."
+    },
+    {
+      "campaign_id": "campaign-2026-08-22-qset-v2",
+      "date_range": {
+        "from": "2026-08-22",
+        "through": "2026-08-22"
+      },
+      "disposition": "historical_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Retired before a clean container, control-plane, and table isolation boundary existed. It supplies no qset-v7 promotion evidence."
+    },
+    {
+      "campaign_id": "campaign-2026-07-28-qset-v1",
+      "date_range": {
+        "from": "2026-07-28",
+        "through": "2026-08-21"
+      },
+      "disposition": "historical_ineligible",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "Retired without retro-sealing or forced completion. It supplies no qset-v7 promotion evidence."
+    },
+    {
+      "campaign_id": "campaign-2026-07-23",
+      "date_range": {
+        "from": "2026-07-23",
+        "through": "2026-07-27"
+      },
+      "disposition": "historical_diagnostic_only",
+      "promotion_eligible": false,
+      "artifacts_mutable": false,
+      "reason": "This evidence predates the isolated qset-v7 boundary."
+    }
+  ],
+  "carry_forward": {
+    "historical_pnl": "diagnostic_only",
+    "historical_hypotheses": "allowed_for_rejection_and_design_only",
+    "promotion_evidence": "none",
+    "formal_gate_counters_reset": true
+  }
+}

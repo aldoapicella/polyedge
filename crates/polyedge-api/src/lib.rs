@@ -27,6 +27,10 @@ use history::{
     merge_market_lists, overlay_detail_market, MarketHistoryStore,
 };
 use runtime::RuntimeController;
+pub use runtime::{
+    QsetV4WriterRetirementReceipt, QsetV5WriterRetirementReceipt, QsetV6WriterRetirementReceipt,
+    QsetV7WriterRetirementReceipt,
+};
 
 const RECENT_EVENTS_MAX: usize = 500;
 
@@ -56,9 +60,50 @@ impl ApiState {
     }
 }
 
+pub struct ApiShutdown {
+    runtime: RuntimeController,
+}
+
+impl ApiShutdown {
+    pub async fn drain(&self) -> Result<(), String> {
+        self.runtime.shutdown().await
+    }
+
+    pub async fn prepare_qset_v4_retirement(
+        &self,
+    ) -> Result<QsetV4WriterRetirementReceipt, String> {
+        self.runtime.prepare_qset_v4_retirement().await
+    }
+
+    pub async fn prepare_qset_v5_retirement(
+        &self,
+    ) -> Result<QsetV5WriterRetirementReceipt, String> {
+        self.runtime.prepare_qset_v5_retirement().await
+    }
+
+    pub async fn prepare_qset_v6_retirement(
+        &self,
+    ) -> Result<QsetV6WriterRetirementReceipt, String> {
+        self.runtime.prepare_qset_v6_retirement().await
+    }
+
+    pub async fn prepare_qset_v7_retirement(
+        &self,
+    ) -> Result<QsetV7WriterRetirementReceipt, String> {
+        self.runtime.prepare_qset_v7_retirement().await
+    }
+}
+
 pub fn app(settings: RuntimeSettings) -> Router {
+    app_with_shutdown(settings).0
+}
+
+pub fn app_with_shutdown(settings: RuntimeSettings) -> (Router, ApiShutdown) {
     let state = ApiState::new(settings);
-    Router::new()
+    let shutdown = ApiShutdown {
+        runtime: state.runtime.clone(),
+    };
+    let router = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/snapshot", get(snapshot))
@@ -114,7 +159,8 @@ pub fn app(settings: RuntimeSettings) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(state)
+        .with_state(state);
+    (router, shutdown)
 }
 
 async fn require_auth(
@@ -158,8 +204,14 @@ async fn require_auth(
         .into_response()
 }
 
-async fn health(State(state): State<ApiState>) -> Json<Value> {
-    Json(state.runtime.health().await)
+async fn health(State(state): State<ApiState>) -> impl IntoResponse {
+    let payload = state.runtime.health().await;
+    let status = if payload["ok"] == true {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(payload))
 }
 
 async fn status(State(state): State<ApiState>) -> Json<Value> {

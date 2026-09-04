@@ -10,7 +10,8 @@ use chart::chart_sample_from_data;
 use chart_history::{point_bucket_ms, should_persist, spawn_persist, ChartPersistenceSample};
 use chrono::{DateTime, Utc};
 use execution_intent::{
-    build_execution_intent_with_model, resolve_execution_model, IntentPublisherConfig,
+    build_execution_intent_with_model, resolve_execution_model, resolve_local_execution_model,
+    IntentExecutionModel, IntentPublisher, IntentPublisherConfig, IntentPublisherPreparation,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
 use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
@@ -25,8 +26,8 @@ use polyedge_engine::{
     RegimeReferencePoint, RestingMakerOrder, RiskManager, StrategyDecisionMetadata,
 };
 use polyedge_execution::{ExecutionClient, PaperExecutionClient};
-use polyedge_feeds::{self, FeedEvent, FeedName};
-use polyedge_storage::{canonical_json_sha256, wire_normalized_json};
+use polyedge_feeds::{self, ClobGenerationLease, ClobResyncBarrier, FeedEvent, FeedName};
+use polyedge_storage::{canonical_json_sha256, wire_normalized_json, RecordedRuntimeEvent};
 use recorder::RuntimeRecorder;
 use reference::ReferenceAggregator;
 use rust_decimal::Decimal;
@@ -38,21 +39,102 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{
+    broadcast, mpsc, oneshot, Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 const RECENT_LIMIT: usize = 1_000;
 const HISTORY_LIMIT: usize = 500;
 const CHART_HISTORY_LIMIT: usize = 2_000;
 const RECORDER_BATCH_LIMIT: usize = 500;
+const RECORDER_QUEUE_CAPACITY: usize = 1_000;
 const RECORDER_FLUSH_INTERVAL: Duration = Duration::from_secs(10);
+const RECORDER_RETRY_DELAY: Duration = Duration::from_millis(250);
+const SHUTDOWN_TERMINATION_AUDIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const RECORDER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const RECORDER_COMPLETED_DURABLE_BATCH_LIMIT: usize = 10_000;
 const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
 const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
 const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
+const ESSENTIAL_FEED_MAX_AGE_SECONDS: i64 = 5 * 60;
+const QSET_V4_APP_NAME: &str = "polyedge-shadow-qset-v4";
+const QSET_V4_CAMPAIGN_ID: &str = "campaign-2026-08-24-qset-v4";
+const QSET_V4_RAW_CONTAINER: &str = "polyedge-shadow-qset-v4-events";
+const QSET_V5_APP_NAME: &str = "polyedge-shadow-qset-v5";
+const QSET_V5_CAMPAIGN_ID: &str = "campaign-2026-08-26-qset-v5";
+const QSET_V5_RAW_CONTAINER: &str = "polyedge-shadow-qset-v5-events";
+const QSET_V6_APP_NAME: &str = "polyedge-shadow-qset-v6";
+const QSET_V6_CAMPAIGN_ID: &str = "campaign-2026-09-01-qset-v6";
+const QSET_V6_RAW_CONTAINER: &str = "polyedge-shadow-qset-v6-events";
+const QSET_V7_APP_NAME: &str = "polyedge-shadow-qset-v7";
+const QSET_V7_CAMPAIGN_ID: &str = "campaign-2026-09-02-qset-v7";
+const QSET_V7_RAW_CONTAINER: &str = "polyedge-shadow-qset-v7-events";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QsetV4WriterRetirementReceipt {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub retired_at: DateTime<Utc>,
+    pub campaign_id: &'static str,
+    pub app_name: String,
+    pub image_digest: String,
+    pub source_revision: String,
+    pub recorder_instance_id: String,
+    pub final_assigned_sequence: u64,
+    pub final_enqueued_sequence: u64,
+    pub final_enqueued_total: u64,
+    pub final_persisted_sequence: u64,
+    pub final_persisted_total: u64,
+    pub final_queued: usize,
+    pub flush_success: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QsetV5WriterRetirementReceipt {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub retired_at: DateTime<Utc>,
+    pub campaign_id: &'static str,
+    pub app_name: String,
+    pub image_digest: String,
+    pub source_revision: String,
+    pub recorder_instance_id: String,
+    pub final_assigned_sequence: u64,
+    pub final_enqueued_sequence: u64,
+    pub final_enqueued_total: u64,
+    pub final_persisted_sequence: u64,
+    pub final_persisted_total: u64,
+    pub final_queued: usize,
+    pub flush_success: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QsetV6WriterRetirementReceipt {
+    pub schema: &'static str,
+    pub status: &'static str,
+    pub retired_at: DateTime<Utc>,
+    pub campaign_id: &'static str,
+    pub app_name: String,
+    pub image_digest: String,
+    pub source_revision: String,
+    pub recorder_instance_id: String,
+    pub final_assigned_sequence: u64,
+    pub final_enqueued_sequence: u64,
+    pub final_enqueued_total: u64,
+    pub final_persisted_sequence: u64,
+    pub final_persisted_total: u64,
+    pub final_queued: usize,
+    pub flush_success: bool,
+}
+pub type QsetV7WriterRetirementReceipt = QsetV6WriterRetirementReceipt;
 
 #[derive(Clone)]
 pub struct RuntimeController {
@@ -65,17 +147,29 @@ struct RuntimeInner {
     engine: Mutex<RuntimeEngine>,
     /// Serializes every mutation that can invalidate a decision snapshot with
     /// the final durable compare-and-apply section.
-    decision_gate: Mutex<()>,
+    decision_gate: Arc<Mutex<()>>,
     recorder: Arc<StdMutex<RuntimeRecorder>>,
+    recorder_enqueue_gate: StdMutex<()>,
     recorder_tx: std_mpsc::Sender<RecorderRequest>,
+    recorder_admission: Arc<Semaphore>,
     recorder_metrics: Arc<RecorderMetrics>,
     persistence_filter: StdMutex<PersistenceFilter>,
+    intent_publisher: Option<IntentPublisher>,
     broadcaster: broadcast::Sender<RuntimeEvent>,
     started: AtomicBool,
+    shutting_down: AtomicBool,
+    termination_audit_complete: AtomicBool,
+    shutdown_gate: Mutex<()>,
+    feed_task: StdMutex<Option<JoinHandle<()>>>,
+    background_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RecorderMetrics {
+    recorder_instance_id: String,
+    last_assigned_sequence: AtomicU64,
+    last_enqueued_sequence: AtomicU64,
+    last_persisted_sequence: AtomicU64,
     queued: AtomicUsize,
     enqueued_total: AtomicU64,
     persisted_total: AtomicU64,
@@ -147,34 +241,58 @@ enum PendingSettlementRetry {
 }
 
 struct RecorderRequest {
-    events: Vec<RuntimeEvent>,
+    events: Vec<RecordedRuntimeEvent>,
     durable_batch_key: Option<String>,
     logical_event_count: usize,
     durable_ack: Option<oneshot::Sender<Result<(), String>>>,
+    _admission_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl RecorderRequest {
-    fn best_effort(event: RuntimeEvent) -> Self {
+    fn best_effort(event: RecordedRuntimeEvent) -> Self {
         Self {
             events: vec![event],
             durable_batch_key: None,
             logical_event_count: 1,
             durable_ack: None,
+            _admission_permit: None,
         }
     }
 
+    fn admitted_best_effort(event: RecordedRuntimeEvent, permit: OwnedSemaphorePermit) -> Self {
+        let mut request = Self::best_effort(event);
+        request._admission_permit = Some(permit);
+        request
+    }
+
     fn durable(
-        events: Vec<RuntimeEvent>,
+        events: Vec<RecordedRuntimeEvent>,
         durable_ack: oneshot::Sender<Result<(), String>>,
     ) -> Self {
         let logical_event_count = events.len();
-        let durable_batch_key = required_recorder_batch_key(&events);
+        let durable_batch_key = required_recorder_batch_key(
+            &events
+                .iter()
+                .map(|event| event.event().clone())
+                .collect::<Vec<_>>(),
+        );
         Self {
             events,
             durable_batch_key: Some(durable_batch_key),
             logical_event_count,
             durable_ack: Some(durable_ack),
+            _admission_permit: None,
         }
+    }
+
+    fn admitted_durable(
+        events: Vec<RecordedRuntimeEvent>,
+        durable_ack: oneshot::Sender<Result<(), String>>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let mut request = Self::durable(events, durable_ack);
+        request._admission_permit = Some(permit);
+        request
     }
 }
 
@@ -198,9 +316,78 @@ impl RecorderDurabilityState {
     }
 }
 
+impl Default for RecorderMetrics {
+    fn default() -> Self {
+        Self {
+            recorder_instance_id: Uuid::new_v4().to_string(),
+            last_assigned_sequence: AtomicU64::new(0),
+            last_enqueued_sequence: AtomicU64::new(0),
+            last_persisted_sequence: AtomicU64::new(0),
+            queued: AtomicUsize::new(0),
+            enqueued_total: AtomicU64::new(0),
+            persisted_total: AtomicU64::new(0),
+            filtered_total: AtomicU64::new(0),
+            failed_total: AtomicU64::new(0),
+            recovered_total: AtomicU64::new(0),
+            unrecovered_durable_events: AtomicUsize::new(0),
+            flush_failed_total: AtomicU64::new(0),
+            flush_recovered_total: AtomicU64::new(0),
+            flush_unrecovered: AtomicBool::new(false),
+            unrecovered_batches: StdMutex::new(BTreeMap::new()),
+            batches_total: AtomicU64::new(0),
+            last_batch_size: AtomicUsize::new(0),
+        }
+    }
+}
+
 impl RecorderMetrics {
+    fn bind(&self, event: RuntimeEvent) -> Result<RecordedRuntimeEvent, String> {
+        let previous = self
+            .last_assigned_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| "runtime recorder sequence exhausted".to_owned())?;
+        Ok(RecordedRuntimeEvent::bound(
+            event,
+            self.recorder_instance_id.clone(),
+            previous + 1,
+        ))
+    }
+
+    fn rollback_bound_tail(&self, events: &[RecordedRuntimeEvent]) -> bool {
+        let Some(last_sequence) = events.last().map(RecordedRuntimeEvent::recorder_sequence) else {
+            return true;
+        };
+        let Ok(event_count) = u64::try_from(events.len()) else {
+            return false;
+        };
+        let Some(previous_sequence) = last_sequence.checked_sub(event_count) else {
+            return false;
+        };
+        if events
+            .iter()
+            .enumerate()
+            .any(|(index, event)| event.recorder_sequence() != previous_sequence + index as u64 + 1)
+        {
+            return false;
+        }
+        self.last_assigned_sequence
+            .compare_exchange(
+                last_sequence,
+                previous_sequence,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     fn snapshot(&self) -> Value {
         json!({
+            "recorder_instance_id": self.recorder_instance_id,
+            "last_assigned_sequence": self.last_assigned_sequence.load(Ordering::Relaxed),
+            "last_enqueued_sequence": self.last_enqueued_sequence.load(Ordering::Relaxed),
+            "last_persisted_sequence": self.last_persisted_sequence.load(Ordering::Relaxed),
             "queued": self.queued.load(Ordering::Relaxed),
             "enqueued_total": self.enqueued_total.load(Ordering::Relaxed),
             "persisted_total": self.persisted_total.load(Ordering::Relaxed),
@@ -214,6 +401,18 @@ impl RecorderMetrics {
             "batches_total": self.batches_total.load(Ordering::Relaxed),
             "last_batch_size": self.last_batch_size.load(Ordering::Relaxed)
         })
+    }
+
+    fn mark_persisted(&self, event_count: usize, last_sequence: u64) {
+        self.persisted_total
+            .fetch_add(event_count as u64, Ordering::Release);
+        self.last_persisted_sequence
+            .store(last_sequence, Ordering::Release);
+    }
+
+    fn mark_enqueued(&self, last_sequence: u64) {
+        self.last_enqueued_sequence
+            .store(last_sequence, Ordering::Release);
     }
 
     fn mark_durable_batch_unrecovered(&self, events: &[RuntimeEvent]) {
@@ -324,6 +523,13 @@ struct RuntimeData {
     pause_reason: Option<String>,
     paused_at: Option<DateTime<Utc>>,
     kill_switch: bool,
+    clob_generation: Option<u64>,
+    clob_pending_generation: Option<u64>,
+    clob_terminal_generation: u64,
+    clob_lease: Option<ClobGenerationLease>,
+    clob_last_sequence: u64,
+    clob_tokens: BTreeSet<TokenId>,
+    clob_pending_tokens: BTreeSet<TokenId>,
     markets: BTreeMap<MarketId, MarketSpec>,
     books: BTreeMap<TokenId, BookState>,
     reference: Option<ReferencePrice>,
@@ -338,6 +544,7 @@ struct RuntimeData {
     execution_reports: VecDeque<ExecutionReport>,
     recent_events: VecDeque<RuntimeEvent>,
     settled_markets: Vec<MarketId>,
+    funded_warmup_market_id: Option<MarketId>,
     feed_status: BTreeMap<String, Value>,
     feed_events: usize,
     runtime_events: usize,
@@ -359,6 +566,17 @@ struct RuntimeEngine {
     pending_decision_application: Option<PendingDecisionApplication>,
 }
 
+fn select_funded_warmup_market<'a>(
+    markets: impl Iterator<Item = &'a MarketSpec>,
+    now: DateTime<Utc>,
+    minimum_seconds_to_expiry: i64,
+) -> Option<&'a MarketSpec> {
+    let minimum_seconds_to_expiry = minimum_seconds_to_expiry.max(0);
+    markets
+        .filter(|market| (market.end_ts - now).num_seconds() >= minimum_seconds_to_expiry)
+        .min_by_key(|market| market.end_ts)
+}
+
 impl RuntimeController {
     pub fn new(settings: RuntimeSettings) -> Self {
         let recorder = RuntimeRecorder::new(&settings);
@@ -366,7 +584,30 @@ impl RuntimeController {
     }
 
     fn new_with_recorder(settings: RuntimeSettings, recorder: RuntimeRecorder) -> Self {
+        Self::new_with_recorder_capacity(settings, recorder, RECORDER_QUEUE_CAPACITY)
+    }
+
+    #[cfg(test)]
+    fn new_with_recorder_and_capacity(
+        settings: RuntimeSettings,
+        recorder: RuntimeRecorder,
+        capacity: usize,
+    ) -> Self {
+        Self::new_with_recorder_capacity(settings, recorder, capacity)
+    }
+
+    fn new_with_recorder_capacity(
+        settings: RuntimeSettings,
+        recorder: RuntimeRecorder,
+        recorder_queue_capacity: usize,
+    ) -> Self {
         let (broadcaster, _) = broadcast::channel(1_000);
+        let intent_publisher =
+            IntentPublisherConfig::optional_connect(&settings).unwrap_or_else(|error| {
+                panic!(
+                    "refusing runtime startup with invalid pointer-only intent preflight: {error}"
+                )
+            });
         let data = RuntimeData {
             decision_generation: 0,
             started_at: Utc::now(),
@@ -374,6 +615,13 @@ impl RuntimeController {
             pause_reason: None,
             paused_at: None,
             kill_switch: false,
+            clob_generation: None,
+            clob_pending_generation: None,
+            clob_terminal_generation: 0,
+            clob_lease: None,
+            clob_last_sequence: 0,
+            clob_tokens: BTreeSet::new(),
+            clob_pending_tokens: BTreeSet::new(),
             markets: BTreeMap::new(),
             books: BTreeMap::new(),
             reference: None,
@@ -388,6 +636,7 @@ impl RuntimeController {
             execution_reports: VecDeque::new(),
             recent_events: VecDeque::new(),
             settled_markets: Vec::new(),
+            funded_warmup_market_id: None,
             feed_status: BTreeMap::new(),
             feed_events: 0,
             runtime_events: 0,
@@ -410,6 +659,7 @@ impl RuntimeController {
         let recorder = Arc::new(StdMutex::new(recorder));
         let recorder_metrics = Arc::new(RecorderMetrics::default());
         let (recorder_tx, recorder_rx) = std_mpsc::channel();
+        let recorder_admission = Arc::new(Semaphore::new(recorder_queue_capacity));
         spawn_recorder_worker(
             Arc::clone(&recorder),
             recorder_rx,
@@ -420,13 +670,21 @@ impl RuntimeController {
                 settings,
                 data: RwLock::new(data),
                 engine: Mutex::new(engine),
-                decision_gate: Mutex::new(()),
+                decision_gate: Arc::new(Mutex::new(())),
                 recorder,
+                recorder_enqueue_gate: StdMutex::new(()),
                 recorder_tx,
+                recorder_admission,
                 recorder_metrics,
                 persistence_filter: StdMutex::new(PersistenceFilter::default()),
+                intent_publisher,
                 broadcaster,
                 started: AtomicBool::new(false),
+                shutting_down: AtomicBool::new(false),
+                termination_audit_complete: AtomicBool::new(false),
+                shutdown_gate: Mutex::new(()),
+                feed_task: StdMutex::new(None),
+                background_tasks: StdMutex::new(Vec::new()),
             }),
         }
     }
@@ -468,20 +726,373 @@ impl RuntimeController {
                 panic!("refusing runtime startup because provenance was not persisted: {error}")
             });
         let (sender, receiver) = mpsc::channel(10_000);
-        self.spawn_feed_event_loop(receiver);
-        self.spawn_discovery_loop();
-        self.spawn_strategy_loop();
-        self.spawn_runtime_telemetry_loop();
-        self.spawn_runtime_provenance_loop();
-        self.spawn_market_feed_loop(sender.clone());
-        self.spawn_rtds_loop(sender.clone());
-        self.spawn_chainlink_http_loop(sender.clone());
+        let feed_task = self.spawn_feed_event_loop(receiver);
+        let mut background_tasks = vec![
+            self.spawn_discovery_loop(),
+            self.spawn_strategy_loop(),
+            self.spawn_runtime_telemetry_loop(),
+            self.spawn_runtime_provenance_loop(),
+            self.spawn_market_feed_loop(sender.clone()),
+            self.spawn_chainlink_http_loop(sender.clone()),
+        ];
+        if self.inner.settings.target.enable_polymarket_rtds_chainlink {
+            background_tasks
+                .push(self.spawn_rtds_loop(sender.clone(), FeedName::PolymarketRtdsChainlink));
+        }
+        if self.inner.settings.target.enable_polymarket_rtds_binance {
+            background_tasks
+                .push(self.spawn_rtds_loop(sender.clone(), FeedName::PolymarketRtdsBinance));
+        }
         if self.inner.settings.target.enable_direct_binance_book_ticker {
-            self.spawn_binance_loop(sender);
+            background_tasks.push(self.spawn_binance_loop(sender));
         } else {
             info!("Direct Binance bookTicker feed disabled by configuration");
         }
+        *self
+            .inner
+            .feed_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(feed_task);
+        self.inner
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(background_tasks);
         info!("Rust PolyEdge runtime started in paper mode");
+    }
+
+    fn runtime_tasks_running(&self) -> bool {
+        let Ok(feed_task) = self.inner.feed_task.lock() else {
+            return false;
+        };
+        let Ok(background_tasks) = self.inner.background_tasks.lock() else {
+            return false;
+        };
+        feed_task.as_ref().is_some_and(|task| !task.is_finished())
+            && !background_tasks.is_empty()
+            && background_tasks.iter().all(|task| !task.is_finished())
+    }
+
+    async fn acquire_recorder_admission(&self) -> Result<OwnedSemaphorePermit, String> {
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err("runtime recorder is shutting down".to_owned());
+        }
+        let permit = Arc::clone(&self.inner.recorder_admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| "runtime recorder is shutting down".to_owned())?;
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            drop(permit);
+            return Err("runtime recorder is shutting down".to_owned());
+        }
+        Ok(permit)
+    }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let _shutdown_guard = self.inner.shutdown_gate.lock().await;
+        let mut shutdown_error = if self
+            .inner
+            .termination_audit_complete
+            .load(Ordering::Acquire)
+        {
+            None
+        } else {
+            match tokio::time::timeout(
+                SHUTDOWN_TERMINATION_AUDIT_TIMEOUT,
+                self.terminate_all_clob_generations("runtime shutdown", true),
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.inner
+                        .termination_audit_complete
+                        .store(true, Ordering::Release);
+                    None
+                }
+                Err(_) => Some("runtime shutdown CLOB termination audit timed out".to_owned()),
+            }
+        };
+        let background_tasks = self
+            .inner
+            .background_tasks
+            .lock()
+            .map_err(|error| format!("runtime background task lock poisoned: {error}"))?
+            .drain(..)
+            .collect::<Vec<_>>();
+        for task in &background_tasks {
+            task.abort();
+        }
+        for task in background_tasks {
+            let _ = task.await;
+        }
+
+        let feed_task = self
+            .inner
+            .feed_task
+            .lock()
+            .map_err(|error| format!("runtime feed task lock poisoned: {error}"))?
+            .take();
+        if let Some(mut feed_task) = feed_task {
+            match tokio::time::timeout(Duration::from_secs(10), &mut feed_task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    shutdown_error.get_or_insert(format!("runtime feed drain failed: {error}"));
+                }
+                Err(_) => {
+                    feed_task.abort();
+                    let _ = feed_task.await;
+                    shutdown_error.get_or_insert_with(|| "runtime feed drain timed out".to_owned());
+                }
+            }
+        }
+
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        self.inner.recorder_admission.close();
+        let deadline = Instant::now() + RECORDER_SHUTDOWN_DRAIN_TIMEOUT;
+        while self.inner.recorder_metrics.queued.load(Ordering::Relaxed) != 0 {
+            if Instant::now() >= deadline {
+                shutdown_error.get_or_insert_with(|| "runtime recorder drain timed out".to_owned());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let flush_result = if self.inner.recorder_metrics.queued.load(Ordering::Acquire) == 0 {
+            recorder_flush_result(&self.inner.recorder, &self.inner.recorder_metrics, false)
+        } else {
+            Ok(())
+        };
+        if let Some(error) = shutdown_error {
+            return Err(error);
+        }
+        flush_result
+    }
+
+    pub async fn prepare_qset_v4_retirement(
+        &self,
+    ) -> Result<QsetV4WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V4_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V4_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v4 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v4_retirement_receipt(qset_v4_image_digest()?, qset_v4_source_revision()?)
+    }
+
+    fn qset_v4_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV4WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v4 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV4WriterRetirementReceipt {
+            schema: "polyedge.qset_v4_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V4_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
+    }
+
+    pub async fn prepare_qset_v5_retirement(
+        &self,
+    ) -> Result<QsetV5WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V5_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V5_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v5 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v5_retirement_receipt(qset_v5_image_digest()?, qset_v5_source_revision()?)
+    }
+
+    fn qset_v5_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV5WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v5 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV5WriterRetirementReceipt {
+            schema: "polyedge.qset_v5_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V5_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
+    }
+
+    pub async fn prepare_qset_v6_retirement(
+        &self,
+    ) -> Result<QsetV6WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V6_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V6_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v6 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v6_retirement_receipt(qset_v6_image_digest()?, qset_v6_source_revision()?)
+    }
+
+    fn qset_v6_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV6WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v6 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV6WriterRetirementReceipt {
+            schema: "polyedge.qset_v6_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V6_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
+    }
+
+    pub async fn prepare_qset_v7_retirement(
+        &self,
+    ) -> Result<QsetV7WriterRetirementReceipt, String> {
+        if self.inner.settings.deploy.app_name != QSET_V7_APP_NAME
+            || self.inner.settings.azure.storage_container_name != QSET_V7_RAW_CONTAINER
+        {
+            return Err(
+                "qset-v7 writer retirement requires the exact app and raw container".to_owned(),
+            );
+        }
+        self.shutdown().await?;
+        self.qset_v7_retirement_receipt(qset_v7_image_digest()?, qset_v7_source_revision()?)
+    }
+
+    fn qset_v7_retirement_receipt(
+        &self,
+        image_digest: String,
+        source_revision: String,
+    ) -> Result<QsetV7WriterRetirementReceipt, String> {
+        let metrics = &self.inner.recorder_metrics;
+        let final_assigned_sequence = metrics.last_assigned_sequence.load(Ordering::Acquire);
+        let final_enqueued_sequence = metrics.last_enqueued_sequence.load(Ordering::Acquire);
+        let final_enqueued_total = metrics.enqueued_total.load(Ordering::Acquire);
+        let final_persisted_sequence = metrics.last_persisted_sequence.load(Ordering::Acquire);
+        let final_persisted_total = metrics.persisted_total.load(Ordering::Acquire);
+        let final_queued = metrics.queued.load(Ordering::Acquire);
+        if final_queued != 0
+            || final_assigned_sequence != final_persisted_sequence
+            || final_assigned_sequence != final_enqueued_sequence
+            || final_assigned_sequence != final_enqueued_total
+            || final_enqueued_total != final_persisted_total
+            || metrics.unrecovered_durable_events.load(Ordering::Acquire) != 0
+            || metrics.flush_unrecovered.load(Ordering::Acquire)
+        {
+            return Err(
+                "qset-v7 writer retirement recorder waterline is not fully durable".to_owned(),
+            );
+        }
+        Ok(QsetV7WriterRetirementReceipt {
+            schema: "polyedge.qset_v7_writer_retirement_receipt.v1",
+            status: "prepared_for_retirement",
+            retired_at: Utc::now(),
+            campaign_id: QSET_V7_CAMPAIGN_ID,
+            app_name: self.inner.settings.deploy.app_name.clone(),
+            image_digest,
+            source_revision,
+            recorder_instance_id: metrics.recorder_instance_id.clone(),
+            final_assigned_sequence,
+            final_enqueued_sequence,
+            final_enqueued_total,
+            final_persisted_sequence,
+            final_persisted_total,
+            final_queued,
+            flush_success: true,
+        })
     }
 
     fn persist_startup_provenance(&self, payload: Value) -> Result<(), String> {
@@ -502,7 +1113,18 @@ impl RuntimeController {
             .recorder_metrics
             .last_batch_size
             .store(1, Ordering::Relaxed);
-        let mut authoritative_staged = false;
+        let recorded_event = {
+            let _enqueue_gate = self
+                .inner
+                .recorder_enqueue_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner.recorder_metrics.bind(event.clone())?
+        };
+        self.inner
+            .recorder_metrics
+            .mark_enqueued(recorded_event.recorder_sequence());
+        let mut staged = false;
         let mut last_error = None;
         let mut result = Err("startup provenance persistence was not attempted".to_owned());
         for attempt in 1..=STARTUP_PROVENANCE_ATTEMPTS {
@@ -512,15 +1134,11 @@ impl RuntimeController {
                 .lock()
                 .map_err(|error| format!("runtime recorder lock poisoned: {error}"))
                 .and_then(|mut recorder| {
-                    if authoritative_staged {
+                    if staged {
                         return recorder.retry_pending();
                     }
-                    let authoritative_remote = recorder.has_authoritative_remote();
-                    let staged = recorder.record_batch(std::slice::from_ref(&event));
-                    if authoritative_remote {
-                        authoritative_staged = true;
-                    }
-                    staged?;
+                    staged = true;
+                    recorder.record_recorded_batch(std::slice::from_ref(&recorded_event))?;
                     recorder.flush()
                 });
             if result.is_ok() {
@@ -544,8 +1162,7 @@ impl RuntimeController {
             Ok(()) => {
                 self.inner
                     .recorder_metrics
-                    .persisted_total
-                    .fetch_add(1, Ordering::Relaxed);
+                    .mark_persisted(1, recorded_event.recorder_sequence());
                 if let Ok(mut state) = self.inner.data.try_write() {
                     state.runtime_events += 1;
                     state.recent_events.push_back(event.clone());
@@ -637,8 +1254,8 @@ impl RuntimeController {
     fn spawn_discovery_loop(&self) -> JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
+            runtime.set_feed_status("Discovery", "starting", None).await;
             loop {
-                runtime.set_feed_status("discovery", "running", None).await;
                 let settings = runtime.inner.settings.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     polyedge_feeds::discover_markets(&settings)
@@ -647,7 +1264,7 @@ impl RuntimeController {
                 match result {
                     Ok(Ok(markets)) => {
                         runtime.replace_markets(markets).await;
-                        runtime.set_feed_status("discovery", "ok", None).await;
+                        runtime.set_feed_status("Discovery", "ok", None).await;
                     }
                     Ok(Err(error)) => {
                         runtime
@@ -723,8 +1340,19 @@ impl RuntimeController {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let provenance = runtime_provenance(&runtime.inner.settings)
+                let mut provenance = runtime_provenance(&runtime.inner.settings)
                     .expect("startup already validated exact runtime provenance");
+                let data = runtime.inner.data.read().await;
+                provenance["essential_feed_health"] = json!({
+                    "summary": feed_summary(&data, &runtime.inner.settings),
+                    "feed_status": {
+                        "Discovery": data.feed_status.get("Discovery").cloned().unwrap_or(Value::Null),
+                        "PolymarketClobMarket": data.feed_status.get("PolymarketClobMarket").cloned().unwrap_or(Value::Null),
+                        "PolymarketRtdsChainlink": data.feed_status.get("PolymarketRtdsChainlink").cloned().unwrap_or(Value::Null),
+                        "PolymarketRtdsBinance": data.feed_status.get("PolymarketRtdsBinance").cloned().unwrap_or(Value::Null)
+                    }
+                });
+                drop(data);
                 runtime
                     .record_event("runtime_provenance", provenance, None, None)
                     .await;
@@ -735,59 +1363,53 @@ impl RuntimeController {
     fn spawn_market_feed_loop(&self, sender: mpsc::Sender<FeedEvent>) -> JoinHandle<()> {
         let runtime = self.clone();
         tokio::spawn(async move {
+            let mut generation = 0_u64;
             loop {
                 let token_ids = runtime.market_token_ids().await;
                 if token_ids.is_empty() {
                     runtime
-                        .set_feed_status("polymarket_clob_market", "waiting_for_markets", None)
+                        .set_feed_status("PolymarketClobMarket", "waiting_for_markets", None)
                         .await;
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
-                runtime
-                    .set_feed_status("polymarket_clob_market", "connecting", None)
-                    .await;
+                runtime.mark_market_feed_connecting().await;
+                generation = generation.wrapping_add(1);
+                let lease = runtime.begin_clob_generation(generation, &token_ids).await;
                 let subscribed_tokens = token_ids.clone();
-                let mut feed = tokio::spawn(polyedge_feeds::run_market_feed(
+                let feed = polyedge_feeds::run_market_feed_generation_with_lease(
                     runtime.inner.settings.clone(),
                     token_ids,
+                    generation,
+                    lease,
                     sender.clone(),
-                ));
+                );
+                tokio::pin!(feed);
                 let mut refresh = tokio::time::interval(Duration::from_secs(2));
                 loop {
                     tokio::select! {
                         result = &mut feed => {
+                            runtime.terminate_clob_generation(generation, "market feed generation ended").await;
                             match result {
-                                Ok(Ok(())) => {
+                                Ok(()) => {
                                     runtime
-                                        .set_feed_status("polymarket_clob_market", "disconnected", None)
+                                        .record_feed_disconnect(
+                                            &[FeedName::PolymarketClobMarket],
+                                            "market feed ended without a close error",
+                                        )
                                         .await;
                                 }
-                                Ok(Err(error)) => {
-                                    runtime
-                                        .feed_error(FeedName::PolymarketClobMarket, error.to_string())
-                                        .await;
-                                }
-                                Err(error) if !error.is_cancelled() => {
+                                Err(error) => {
                                     runtime
                                         .feed_error(FeedName::PolymarketClobMarket, error.to_string())
                                         .await;
                                 }
-                                Err(_) => {}
                             }
                             break;
                         }
                         _ = refresh.tick() => {
                             if runtime.market_token_ids().await != subscribed_tokens {
-                                feed.abort();
-                                let _ = feed.await;
-                                runtime
-                                    .set_feed_status(
-                                        "polymarket_clob_market",
-                                        "resubscribing_token_set_changed",
-                                        None,
-                                    )
-                                    .await;
+                                runtime.terminate_clob_generation(generation, "market token set changed").await;
                                 break;
                             }
                         }
@@ -798,25 +1420,25 @@ impl RuntimeController {
         })
     }
 
-    fn spawn_rtds_loop(&self, sender: mpsc::Sender<FeedEvent>) -> JoinHandle<()> {
+    fn spawn_rtds_loop(&self, sender: mpsc::Sender<FeedEvent>, source: FeedName) -> JoinHandle<()> {
         let runtime = self.clone();
+        let settings = rtds_source_settings(&self.inner.settings, &source);
         tokio::spawn(async move {
             loop {
                 runtime
-                    .set_feed_status("polymarket_rtds", "connecting", None)
+                    .set_feed_status(&format!("{source:?}"), "connecting", None)
                     .await;
-                match polyedge_feeds::run_rtds_feed(runtime.inner.settings.clone(), sender.clone())
-                    .await
-                {
+                match polyedge_feeds::run_rtds_feed(settings.clone(), sender.clone()).await {
                     Ok(()) => {
                         runtime
-                            .set_feed_status("polymarket_rtds", "disconnected", None)
+                            .record_feed_disconnect(
+                                &[source.clone()],
+                                "RTDS feed ended without a close error",
+                            )
                             .await;
                     }
                     Err(error) => {
-                        runtime
-                            .feed_error(FeedName::PolymarketRtdsChainlink, error.to_string())
-                            .await;
+                        runtime.feed_error(source.clone(), error.to_string()).await;
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -902,23 +1524,93 @@ impl RuntimeController {
         }
         match event {
             FeedEvent::Reference(reference) => self.handle_reference(reference).await,
-            FeedEvent::RawMarketEvent(event) => self.handle_raw_market_event(event).await,
-            FeedEvent::Book(book) => self.handle_book(book).await,
+            FeedEvent::RawMarketEvent(event) => {
+                self.set_feed_status_at("PolymarketClobMarket", "ok", None, event.recorded_ts)
+                    .await;
+                self.handle_raw_market_event(event, None).await;
+            }
+            FeedEvent::Book(book) => {
+                self.set_feed_status_at("PolymarketClobMarket", "ok", None, book.local_ts)
+                    .await;
+                self.handle_book(book, None).await;
+            }
+            FeedEvent::BookInvalidated(token_id) => self.invalidate_book(token_id, None).await,
+            FeedEvent::ClobResyncBarrier(barrier) => self.handle_clob_resync_barrier(barrier).await,
+            FeedEvent::ClobRawMarketEvent {
+                generation,
+                sequence,
+                event,
+            } => {
+                self.handle_raw_market_event(event, Some((generation, sequence)))
+                    .await
+            }
+            FeedEvent::ClobBook {
+                generation,
+                sequence,
+                book,
+            } => self.handle_book(book, Some((generation, sequence))).await,
+            FeedEvent::ClobBookInvalidated {
+                generation,
+                sequence,
+                token_id,
+            } => {
+                self.invalidate_book(token_id, Some((generation, sequence)))
+                    .await
+            }
             FeedEvent::Error {
-                source, message, ..
-            } => self.feed_error(source, message).await,
-            FeedEvent::Heartbeat { source, .. } => {
-                self.set_feed_status(&format!("{source:?}"), "ok", None)
+                source,
+                message,
+                ts,
+            } => self.feed_error_at(source, message, ts).await,
+            FeedEvent::Heartbeat { source, ts } => {
+                self.set_feed_status_at(&format!("{source:?}"), "ok", None, ts)
                     .await;
             }
         }
     }
 
     async fn replace_markets(&self, markets: Vec<MarketSpec>) {
+        let next_tokens = markets
+            .iter()
+            .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
+            .collect::<BTreeSet<_>>();
         let _decision_guard = self.inner.decision_gate.lock().await;
         let mut data = self.inner.data.write().await;
         let existing = data.markets.clone();
         let now = Utc::now();
+        let mut final_tokens = existing
+            .values()
+            .filter(|market| {
+                !data.settled_markets.contains(&market.market_id)
+                    && now.signed_duration_since(market.end_ts).num_seconds()
+                        <= PENDING_SETTLEMENT_RETENTION_SECONDS
+            })
+            .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
+            .collect::<BTreeSet<_>>();
+        final_tokens.extend(next_tokens);
+        let current_tokens = if data.clob_pending_generation.is_some() {
+            &data.clob_pending_tokens
+        } else {
+            &data.clob_tokens
+        };
+        let revoked_generation = (current_tokens != &final_tokens)
+            .then(|| Self::revoke_clob_generation_locked(&mut data))
+            .flatten();
+        if let Some(generation) = revoked_generation {
+            drop(data);
+            let _ = self
+                .record_required_events(vec![(
+                    "clob_resync_aborted".to_owned(),
+                    json!({
+                        "generation": generation,
+                        "reason": "market token set changed",
+                        "fail_closed": true,
+                        "ready": false
+                    }),
+                )])
+                .await;
+            data = self.inner.data.write().await;
+        }
         let settled = data.settled_markets.clone();
         data.markets = existing
             .values()
@@ -997,10 +1689,96 @@ impl RuntimeController {
             }
             data = self.inner.data.write().await;
         }
+        let warmup_market = select_funded_warmup_market(
+            data.markets.values(),
+            now,
+            self.inner
+                .settings
+                .azure
+                .strategy_intent_min_seconds_to_expiry,
+        )
+        .filter(|market| data.funded_warmup_market_id.as_ref() != Some(&market.market_id))
+        .cloned();
         data.decision_generation = data.decision_generation.wrapping_add(1);
         drop(data);
         drop(_decision_guard);
         self.retry_pending_market_start_events().await;
+        if let Some(market) = warmup_market {
+            if self.maybe_publish_market_warmup(market.clone()).await {
+                self.inner.data.write().await.funded_warmup_market_id = Some(market.market_id);
+            }
+        }
+    }
+
+    async fn maybe_publish_market_warmup(&self, market: MarketSpec) -> bool {
+        if !self.inner.settings.azure.strategy_intent_operator_direct {
+            return false;
+        }
+        let pointer_only_preflight = self
+            .inner
+            .intent_publisher
+            .as_ref()
+            .is_some_and(IntentPublisher::is_pointer_only_preflight);
+        let publisher_runtime = self.clone();
+        let publish_market = market.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let publisher = publisher_runtime
+                .inner
+                .intent_publisher
+                .as_ref()
+                .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
+            publisher.warm_market(&publish_market)
+        })
+        .await
+        .map_err(|error| format!("market warmup task failed: {error}"))
+        .and_then(|result| result);
+        match result {
+            Ok(IntentPublisherPreparation::PointerOnly) if pointer_only_preflight => true,
+            Ok(IntentPublisherPreparation::WarmupSent) => {
+                info!(
+                    market_id = %market.market_id,
+                    condition_id = %market.condition_id,
+                    "funded market warmup sent"
+                );
+                self.record_event(
+                    "funded_market_warmup_sent",
+                    json!({
+                        "market_id": market.market_id,
+                        "condition_id": market.condition_id,
+                        "token_ids": [market.up_token_id, market.down_token_id],
+                        "market_end_ts": market.end_ts,
+                        "executable": false
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+                true
+            }
+            Ok(IntentPublisherPreparation::NotRequired) => false,
+            Ok(IntentPublisherPreparation::PointerOnly) => false,
+            Err(reason) => {
+                warn!(
+                    market_id = %market.market_id,
+                    reason = %reason,
+                    "funded market warmup not sent"
+                );
+                self.record_event(
+                    "funded_market_warmup_not_sent",
+                    json!({
+                        "market_id": market.market_id,
+                        "condition_id": market.condition_id,
+                        "reason": reason,
+                        "fail_closed": true,
+                        "executable": false
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+                false
+            }
+        }
     }
 
     async fn handle_reference(&self, reference: ReferencePrice) {
@@ -1048,13 +1826,16 @@ impl RuntimeController {
             .await;
     }
 
-    async fn handle_book(&self, book: BookState) {
+    async fn handle_book(&self, book: BookState, clob_sequence: Option<(u64, u64)>) {
         if self.retry_pending_decision_application().await == PendingApplicationRetry::Retained {
             return;
         }
         let (market, quality_events) = {
             let _decision_guard = self.inner.decision_gate.lock().await;
             let mut data = self.inner.data.write().await;
+            if !self.accept_clob_sequence(&mut data, clob_sequence, book.local_ts) {
+                return;
+            }
             data.books.insert(book.token_id.clone(), book.clone());
             data.decision_generation = data.decision_generation.wrapping_add(1);
             let market = markets_by_token_from_data(&data)
@@ -1085,15 +1866,39 @@ impl RuntimeController {
             self.record_event(event.event_type, event.payload, None, None)
                 .await;
         }
-        self.handle_paper_fills(&book).await;
+        self.handle_paper_fills(&book, clob_sequence.map(|(generation, _)| generation))
+            .await;
     }
 
-    async fn handle_raw_market_event(&self, event: polyedge_feeds::MarketChannelEvent) {
+    async fn invalidate_book(&self, token_id: TokenId, clob_sequence: Option<(u64, u64)>) {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let mut data = self.inner.data.write().await;
+        if !self.accept_clob_sequence(&mut data, clob_sequence, Utc::now()) {
+            return;
+        }
+        data.books.remove(&token_id);
+        data.decision_generation = data.decision_generation.wrapping_add(1);
+        drop(data);
+        let mut engine = self.inner.engine.lock().await;
+        engine.decision_generation = engine.decision_generation.wrapping_add(1);
+    }
+
+    async fn handle_raw_market_event(
+        &self,
+        event: polyedge_feeds::MarketChannelEvent,
+        clob_sequence: Option<(u64, u64)>,
+    ) {
         if self.retry_pending_decision_application().await == PendingApplicationRetry::Retained {
             return;
         }
         let quality_events = {
             let _decision_guard = self.inner.decision_gate.lock().await;
+            {
+                let mut data = self.inner.data.write().await;
+                if !self.accept_clob_sequence(&mut data, clob_sequence, event.recorded_ts) {
+                    return;
+                }
+            }
             let mut engine = self.inner.engine.lock().await;
             let events = engine.execution_quality.observe_market_event(&event);
             engine.decision_generation = engine.decision_generation.wrapping_add(1);
@@ -1129,13 +1934,24 @@ impl RuntimeController {
         }
     }
 
-    async fn handle_paper_fills(&self, book: &BookState) {
+    async fn handle_paper_fills(&self, book: &BookState, clob_generation: Option<u64>) {
         let markets_by_token = {
             let data = self.inner.data.read().await;
             markets_by_token_from_data(&data)
         };
         let reports = {
             let _decision_guard = self.inner.decision_gate.lock().await;
+            if let Some(generation) = clob_generation {
+                let data = self.inner.data.read().await;
+                if data.clob_generation != Some(generation)
+                    || data
+                        .clob_lease
+                        .as_ref()
+                        .is_none_or(ClobGenerationLease::is_terminal)
+                {
+                    return;
+                }
+            }
             let mut engine = self.inner.engine.lock().await;
             let resting: Vec<_> = engine
                 .execution
@@ -1264,9 +2080,26 @@ impl RuntimeController {
         if self.retry_pending_decision_application().await == PendingApplicationRetry::Retained {
             return;
         }
-        let (reference, references, markets, books, paused, kill_switch, data_generation) = {
+        let (
+            reference,
+            references,
+            markets,
+            books,
+            paused,
+            kill_switch,
+            data_generation,
+            clob_generation,
+        ) = {
             let _decision_guard = self.inner.decision_gate.lock().await;
             let data = self.inner.data.read().await;
+            if data.clob_generation.is_none()
+                || data
+                    .clob_lease
+                    .as_ref()
+                    .is_none_or(ClobGenerationLease::is_terminal)
+            {
+                return;
+            }
             (
                 data.reference.clone(),
                 data.exact_references.clone(),
@@ -1290,6 +2123,7 @@ impl RuntimeController {
                 data.paused,
                 data.kill_switch,
                 data.decision_generation,
+                data.clob_generation.expect("checked above"),
             )
         };
         let Some(reference) = reference else {
@@ -1548,7 +2382,18 @@ impl RuntimeController {
                     .iter()
                     .map(|prepared| ("decision".to_owned(), prepared.payload.clone())),
             );
-            let _decision_guard = self.inner.decision_gate.lock().await;
+            let decision_guard = Arc::clone(&self.inner.decision_gate).lock_owned().await;
+            {
+                let data = self.inner.data.read().await;
+                if data.clob_generation != Some(clob_generation)
+                    || data
+                        .clob_lease
+                        .as_ref()
+                        .is_none_or(ClobGenerationLease::is_terminal)
+                {
+                    continue;
+                }
+            }
             let observed_data_generation = {
                 let data = self.inner.data.read().await;
                 data.decision_generation
@@ -1560,7 +2405,7 @@ impl RuntimeController {
                 decision_state_generation,
             ) {
                 drop(apply_engine);
-                drop(_decision_guard);
+                drop(decision_guard);
                 self.record_event(
                     "strategy_decision_batch_stale",
                     json!({
@@ -1581,7 +2426,7 @@ impl RuntimeController {
             }
             if !self.record_required_events(required_events).await {
                 drop(apply_engine);
-                drop(_decision_guard);
+                drop(decision_guard);
                 self.record_event(
                     "strategy_decision_batch_rejected",
                     json!({
@@ -1670,25 +2515,39 @@ impl RuntimeController {
                         .flat_map(|applied| applied.reports.iter().cloned())
                         .collect(),
                 });
-            let application_evidence_durable =
-                self.record_required_runtime_events(applied_events).await;
+            let application_evidence_durable = self
+                .record_required_runtime_events(applied_events, false)
+                .await;
             if !application_evidence_durable {
                 if let Some(pending) = pending_application {
                     let mut engine = self.inner.engine.lock().await;
                     engine.pending_decision_application = Some(pending);
                 }
             }
-            drop(_decision_guard);
+            let local_execution_model = self
+                .inner
+                .settings
+                .azure
+                .publish_strategy_canary_intents
+                .then(|| resolve_local_execution_model(&self.inner.settings))
+                .flatten();
+            let publication_guard = match local_execution_model {
+                Some(_) => Some(Arc::new(decision_guard)),
+                None => {
+                    drop(decision_guard);
+                    None
+                }
+            };
 
+            let mut persisted_reports = Vec::new();
             for (prepared, applied) in prepared_decisions.into_iter().zip(applied_outputs) {
                 let decision = prepared.decision;
                 let metadata = prepared.metadata;
                 self.accept_durable_decision(decision.clone()).await;
-                let actionable = matches!(
-                    decision.action,
-                    DecisionAction::Place | DecisionAction::CancelAll
-                );
-                if !actionable || (application_evidence_durable && applied.is_some()) {
+                if decision.action == DecisionAction::Place
+                    && application_evidence_durable
+                    && applied.is_some()
+                {
                     self.maybe_publish_execution_intent(
                         &market,
                         &fair_value,
@@ -1697,16 +2556,23 @@ impl RuntimeController {
                         &decision,
                         metadata.as_ref(),
                         decision_ts,
+                        clob_generation,
+                        local_execution_model
+                            .as_ref()
+                            .zip(publication_guard.as_ref())
+                            .map(|(model, guard)| (model.clone(), Arc::clone(guard))),
                     )
                     .await;
                 }
                 if application_evidence_durable {
                     if let Some(applied) = applied {
-                        for report in applied.reports {
-                            self.accept_persisted_execution_report(report, false).await;
-                        }
+                        persisted_reports.extend(applied.reports);
                     }
                 }
+            }
+            drop(publication_guard);
+            for report in persisted_reports {
+                self.accept_persisted_execution_report(report, false).await;
             }
         }
     }
@@ -1725,6 +2591,11 @@ impl RuntimeController {
         decision: &TradeDecision,
         metadata: Option<&StrategyDecisionMetadata>,
         decision_ts: DateTime<Utc>,
+        clob_generation: u64,
+        local_publication: Option<(
+            Result<IntentExecutionModel, String>,
+            Arc<OwnedMutexGuard<()>>,
+        )>,
     ) {
         if !self.inner.settings.azure.publish_strategy_canary_intents {
             return;
@@ -1777,16 +2648,28 @@ impl RuntimeController {
         // Azure's credential and blob clients are synchronous. Keep canonical
         // model control reads off the runtime/feed task so a transient storage
         // delay cannot stall recording or market-data processing.
-        let model_settings = self.inner.settings.clone();
-        let execution_model = match tokio::task::spawn_blocking(move || {
-            resolve_execution_model(&model_settings, decision_ts)
-        })
-        .await
-        .map_err(|error| format!("execution-model control task failed: {error}"))
-        .and_then(|result| result)
-        {
+        let (execution_model_result, decision_guard) = match local_publication {
+            Some((model, guard)) => (model, Some(guard)),
+            None => {
+                let model_settings = self.inner.settings.clone();
+                let model = tokio::task::spawn_blocking(move || {
+                    resolve_execution_model(&model_settings, decision_ts)
+                })
+                .await
+                .map_err(|error| format!("execution-model control task failed: {error}"))
+                .and_then(|result| result);
+                (model, None)
+            }
+        };
+        let execution_model = match execution_model_result {
             Ok(model) => model,
             Err(reason) => {
+                warn!(
+                    market_id = %market.market_id,
+                    candidate_version = %metadata.candidate.version,
+                    reason = %reason,
+                    "execution intent not published"
+                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1817,6 +2700,12 @@ impl RuntimeController {
         ) {
             Ok(intent) => intent,
             Err(reason) => {
+                warn!(
+                    market_id = %market.market_id,
+                    candidate_version = %metadata.candidate.version,
+                    reason = %reason,
+                    "execution intent not published"
+                );
                 self.record_event(
                     "execution_intent_not_published",
                     json!({
@@ -1834,31 +2723,71 @@ impl RuntimeController {
                 return;
             }
         };
-        let publisher = match IntentPublisherConfig::from_settings(&self.inner.settings) {
-            Ok(publisher) => publisher,
-            Err(reason) => {
-                self.record_event(
-                    "execution_intent_not_published",
-                    json!({
-                        "decision_id": intent.decision_id,
-                        "market_id": intent.market_id,
-                        "reason": reason,
-                        "fail_closed": true
-                    }),
-                    None,
-                    None,
-                )
-                .await;
-                return;
-            }
-        };
         let runtime = self.clone();
-        tokio::spawn(async move {
+        let publication_token_id = token_id.clone();
+        let publication_book = book.clone();
+        let wait_for_local_publication = decision_guard.is_some();
+        let join_decision_id = intent.decision_id.clone();
+        let join_market_id = intent.market_id.clone();
+        let publication = tokio::spawn(async move {
             let publish_intent = intent.clone();
-            let result =
-                tokio::task::spawn_blocking(move || publisher.publish(&publish_intent)).await;
+            let publisher_runtime = runtime.clone();
+            let publish = move || {
+                let publisher = publisher_runtime
+                    .inner
+                    .intent_publisher
+                    .as_ref()
+                    .ok_or_else(|| "persistent intent publisher is unavailable".to_owned())?;
+                publisher.publish(&publish_intent)
+            };
+            let result = if let Some(_decision_guard) = decision_guard {
+                runtime
+                    .execute_live_clob_publication_while_gated(
+                        clob_generation,
+                        &publication_token_id,
+                        &publication_book,
+                        publish,
+                    )
+                    .await
+            } else {
+                runtime
+                    .execute_live_clob_publication(
+                        clob_generation,
+                        &publication_token_id,
+                        &publication_book,
+                        publish,
+                    )
+                    .await
+            };
             match result {
-                Ok(Ok(published)) => {
+                Ok(None) => {
+                    runtime
+                        .record_event(
+                            "execution_intent_not_published",
+                            json!({
+                                "decision_id": intent.decision_id,
+                                "market_id": intent.market_id,
+                                "reason": "CLOB generation changed or is not ready",
+                                "fail_closed": true,
+                                "order_submission_attempted": false
+                            }),
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                Ok(Some(published)) => {
+                    info!(
+                        decision_id = %intent.decision_id,
+                        market_id = %intent.market_id,
+                        market_end_ts = ?intent.market_end_ts,
+                        notional = %intent.notional,
+                        blob_name = %published.blob_name,
+                        blob_commit_elapsed_ms = published.blob_commit_elapsed_ms,
+                        queue_send_elapsed_ms = ?published.queue_send_elapsed_ms,
+                        pointer_only_preflight = published.pointer_only_preflight,
+                        "execution intent published"
+                    );
                     runtime
                         .record_event(
                             "execution_intent_published",
@@ -1870,6 +2799,13 @@ impl RuntimeController {
                                 "candidate_version": intent.candidate_version,
                                 "blob_name": published.blob_name,
                                 "artifact_sha256": published.artifact_sha256,
+                                "queue_handoff_sent": published.queue_handoff_sent,
+                                "pointer_only_preflight": published.pointer_only_preflight,
+                                "intent_created_wall_ts": intent.decision_ts,
+                                "blob_commit_wall_ts": published.blob_commit_wall_ts,
+                                "blob_commit_elapsed_ms": published.blob_commit_elapsed_ms,
+                                "queue_send_wall_ts": published.queue_send_wall_ts,
+                                "queue_send_elapsed_ms": published.queue_send_elapsed_ms,
                                 "valid_until": intent.valid_until,
                                 "order_submission_attempted": false,
                                 "credential_free": true
@@ -1879,7 +2815,13 @@ impl RuntimeController {
                         )
                         .await;
                 }
-                Ok(Err(reason)) => {
+                Err(reason) => {
+                    warn!(
+                        decision_id = %intent.decision_id,
+                        market_id = %intent.market_id,
+                        reason = %reason,
+                        "execution intent publication failed"
+                    );
                     runtime
                         .record_event(
                             "execution_intent_not_published",
@@ -1895,24 +2837,80 @@ impl RuntimeController {
                         )
                         .await;
                 }
-                Err(error) => {
-                    runtime
-                        .record_event(
-                            "execution_intent_not_published",
-                            json!({
-                                "decision_id": intent.decision_id,
-                                "market_id": intent.market_id,
-                                "reason": format!("publisher task failed: {error}"),
-                                "fail_closed": true,
-                                "order_submission_attempted": false
-                            }),
-                            None,
-                            None,
-                        )
-                        .await;
-                }
             }
         });
+        if wait_for_local_publication {
+            if let Err(error) = publication.await {
+                self.record_event(
+                    "execution_intent_not_published",
+                    json!({
+                        "decision_id": join_decision_id,
+                        "market_id": join_market_id,
+                        "reason": format!("local publication task failed: {error}"),
+                        "fail_closed": true,
+                        "order_submission_attempted": false
+                    }),
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    // The decision gate is the linearization point for every external intent
+    // commit.  Tests inject a blocking closure here; production supplies the
+    // real persistent publisher from maybe_publish_execution_intent above.
+    async fn execute_live_clob_publication<T, F>(
+        &self,
+        clob_generation: u64,
+        token_id: &TokenId,
+        expected_book: &BookState,
+        publish: F,
+    ) -> Result<Option<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        let decision_guard = self.inner.decision_gate.lock().await;
+        let result = self
+            .execute_live_clob_publication_while_gated(
+                clob_generation,
+                token_id,
+                expected_book,
+                publish,
+            )
+            .await;
+        drop(decision_guard);
+        result
+    }
+
+    async fn execute_live_clob_publication_while_gated<T, F>(
+        &self,
+        clob_generation: u64,
+        token_id: &TokenId,
+        expected_book: &BookState,
+        publish: F,
+    ) -> Result<Option<T>, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        let data = self.inner.data.read().await;
+        let live = data.clob_generation == Some(clob_generation)
+            && data
+                .clob_lease
+                .as_ref()
+                .is_some_and(|lease| !lease.is_terminal())
+            && data.books.get(token_id) == Some(expected_book);
+        drop(data);
+        if !live {
+            return Ok(None);
+        }
+        let result = tokio::task::spawn_blocking(publish)
+            .await
+            .map_err(|error| format!("publisher task failed: {error}"))?;
+        result.map(Some)
     }
 
     async fn push_decision_with_metadata(
@@ -2017,6 +3015,7 @@ impl RuntimeController {
                     if should_persist(
                         data.chart_last_persisted_ms.get(market_id).copied(),
                         bucket_ms,
+                        self.inner.settings.azure.chart_persist_interval_ms as i64,
                     ) =>
                 {
                     data.chart_last_persisted_ms
@@ -2110,7 +3109,7 @@ impl RuntimeController {
         };
         for (market_id, event) in pending {
             if !self
-                .record_required_runtime_events(vec![event.clone()])
+                .record_required_runtime_events(vec![event.clone()], false)
                 .await
             {
                 continue;
@@ -2136,7 +3135,7 @@ impl RuntimeController {
             pending
         };
         if !self
-            .record_required_runtime_events(pending.events.clone())
+            .record_required_runtime_events(pending.events.clone(), false)
             .await
         {
             warn!(
@@ -2186,7 +3185,7 @@ impl RuntimeController {
             pending
         };
         if !self
-            .record_required_runtime_events(pending.events.clone())
+            .record_required_runtime_events(pending.events.clone(), false)
             .await
         {
             warn!(
@@ -2389,76 +3388,120 @@ impl RuntimeController {
     }
 
     async fn record_required_events(&self, entries: Vec<(String, Value)>) -> bool {
-        self.record_required_runtime_events(required_runtime_events(entries, Utc::now()))
+        self.record_required_runtime_events(required_runtime_events(entries, Utc::now()), false)
             .await
     }
 
-    async fn record_required_runtime_events(&self, events: Vec<RuntimeEvent>) -> bool {
+    async fn record_required_events_during_shutdown(&self, entries: Vec<(String, Value)>) -> bool {
+        self.record_required_runtime_events(required_runtime_events(entries, Utc::now()), true)
+            .await
+    }
+
+    async fn record_required_runtime_events(
+        &self,
+        events: Vec<RuntimeEvent>,
+        allow_during_shutdown: bool,
+    ) -> bool {
         if events.is_empty() {
             return true;
         }
-        let mut last_error = None;
-        for attempt in 1..=REQUIRED_RECORDER_ATTEMPTS {
-            match self.persist_required_batch(events.clone()).await {
-                Ok(()) => {
-                    if self
-                        .inner
-                        .recorder_metrics
-                        .mark_durable_batch_recovered(&events)
-                    {
-                        info!(
-                            event_count = events.len(),
-                            recovered_on_attempt = attempt,
-                            "required runtime evidence recovered after recorder retry"
-                        );
-                    }
-                    self.accept_durable_events(&events).await;
-                    return true;
-                }
-                Err(error) => {
-                    self.inner
-                        .recorder_metrics
-                        .mark_durable_batch_unrecovered(&events);
-                    warn!(
-                        attempt,
-                        max_attempts = REQUIRED_RECORDER_ATTEMPTS,
+        match self
+            .persist_required_batch(events.clone(), allow_during_shutdown)
+            .await
+        {
+            Ok(()) => {
+                if self
+                    .inner
+                    .recorder_metrics
+                    .mark_durable_batch_recovered(&events)
+                {
+                    info!(
                         event_count = events.len(),
-                        "required runtime evidence was not durably persisted: {error}"
+                        "required runtime evidence recovered after recorder retry"
                     );
-                    last_error = Some(error);
                 }
+                self.accept_durable_events(&events).await;
+                true
+            }
+            Err(error) => {
+                self.inner
+                    .recorder_metrics
+                    .mark_durable_batch_unrecovered(&events);
+                let mut state = self.inner.data.write().await;
+                *state
+                    .drop_counts
+                    .entry("required_recorder_write_error".to_owned())
+                    .or_insert(0) += events.len();
+                warn!(
+                    event_count = events.len(),
+                    error, "required runtime evidence exhausted durable recorder retries"
+                );
+                false
             }
         }
-        let mut state = self.inner.data.write().await;
-        *state
-            .drop_counts
-            .entry("required_recorder_write_error".to_owned())
-            .or_insert(0) += events.len();
-        warn!(
-            event_count = events.len(),
-            error = last_error.as_deref().unwrap_or("unknown recorder error"),
-            "required runtime evidence exhausted durable recorder retries"
-        );
-        false
     }
 
-    async fn persist_required_batch(&self, events: Vec<RuntimeEvent>) -> Result<(), String> {
+    async fn persist_required_batch(
+        &self,
+        events: Vec<RuntimeEvent>,
+        allow_during_shutdown: bool,
+    ) -> Result<(), String> {
         let event_count = events.len();
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.inner
-            .recorder_metrics
-            .queued
-            .fetch_add(event_count, Ordering::Relaxed);
-        self.inner
-            .recorder_metrics
-            .enqueued_total
-            .fetch_add(event_count as u64, Ordering::Relaxed);
-        if self
-            .inner
-            .recorder_tx
-            .send(RecorderRequest::durable(events, ack_tx))
-            .is_err()
-        {
+        let permit = if allow_during_shutdown {
+            None
+        } else {
+            Some(self.acquire_recorder_admission().await?)
+        };
+        // Keep sequence allocation and FIFO queue admission inseparable: a
+        // later caller must not send N+1 before this caller sends N.
+        let queue_failed = {
+            let _enqueue_gate = self
+                .inner
+                .recorder_enqueue_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !allow_during_shutdown && self.inner.shutting_down.load(Ordering::SeqCst) {
+                return Err("runtime recorder is shutting down".to_owned());
+            }
+            let events = events
+                .into_iter()
+                .map(|event| self.inner.recorder_metrics.bind(event))
+                .collect::<Result<Vec<_>, _>>()?;
+            let last_sequence = events
+                .last()
+                .map(RecordedRuntimeEvent::recorder_sequence)
+                .unwrap_or_default();
+            self.inner
+                .recorder_metrics
+                .queued
+                .fetch_add(event_count, Ordering::Relaxed);
+            self.inner
+                .recorder_metrics
+                .enqueued_total
+                .fetch_add(event_count as u64, Ordering::Relaxed);
+            let request = match permit {
+                Some(permit) => RecorderRequest::admitted_durable(events, ack_tx, permit),
+                None => RecorderRequest::durable(events, ack_tx),
+            };
+            match self.inner.recorder_tx.send(request) {
+                Ok(()) => {
+                    self.inner.recorder_metrics.mark_enqueued(last_sequence);
+                    false
+                }
+                Err(error) => {
+                    if !self
+                        .inner
+                        .recorder_metrics
+                        .rollback_bound_tail(&error.0.events)
+                    {
+                        warn!("runtime recorder rejected durable tail could not be rolled back");
+                    }
+                    true
+                }
+            }
+        };
+        if queue_failed {
             saturating_sub_atomic(&self.inner.recorder_metrics.queued, event_count);
             self.inner
                 .recorder_metrics
@@ -2516,28 +3559,73 @@ impl RuntimeController {
                 event.ts,
                 force_persistence,
             );
-        let recorder_queue_failed = if persist {
-            self.inner
-                .recorder_metrics
-                .queued
-                .fetch_add(1, Ordering::Relaxed);
-            self.inner
-                .recorder_metrics
-                .enqueued_total
-                .fetch_add(1, Ordering::Relaxed);
-            self.inner
-                .recorder_tx
-                .send(RecorderRequest::best_effort(event.clone()))
-                .is_err()
+        let (recorder_queue_failed, recorder_queue_incremented) = if persist {
+            match self.acquire_recorder_admission().await {
+                Ok(permit) => {
+                    let _enqueue_gate = self
+                        .inner
+                        .recorder_enqueue_gate
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if self.inner.shutting_down.load(Ordering::SeqCst) {
+                        (true, false)
+                    } else {
+                        match self.inner.recorder_metrics.bind(event.clone()) {
+                            Ok(event) => {
+                                let sequence = event.recorder_sequence();
+                                self.inner
+                                    .recorder_metrics
+                                    .queued
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.inner
+                                    .recorder_metrics
+                                    .enqueued_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let queue_failed = match self
+                                    .inner
+                                    .recorder_tx
+                                    .send(RecorderRequest::admitted_best_effort(event, permit))
+                                {
+                                    Ok(()) => {
+                                        self.inner.recorder_metrics.mark_enqueued(sequence);
+                                        false
+                                    }
+                                    Err(error) => {
+                                        if !self
+                                            .inner
+                                            .recorder_metrics
+                                            .rollback_bound_tail(&error.0.events)
+                                        {
+                                            warn!("runtime recorder rejected best-effort tail could not be rolled back");
+                                        }
+                                        true
+                                    }
+                                };
+                                (queue_failed, true)
+                            }
+                            Err(error) => {
+                                warn!("runtime recorder sequence allocation failed: {error}");
+                                (true, false)
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!("runtime recorder admission failed: {error}");
+                    (true, false)
+                }
+            }
         } else {
             self.inner
                 .recorder_metrics
                 .filtered_total
                 .fetch_add(1, Ordering::Relaxed);
-            false
+            (false, false)
         };
         if recorder_queue_failed {
-            saturating_sub_atomic(&self.inner.recorder_metrics.queued, 1);
+            if recorder_queue_incremented {
+                saturating_sub_atomic(&self.inner.recorder_metrics.queued, 1);
+            }
             self.inner
                 .recorder_metrics
                 .failed_total
@@ -2607,20 +3695,342 @@ impl RuntimeController {
     }
 
     async fn set_feed_status(&self, name: &str, status: &str, message: Option<String>) {
+        self.set_feed_status_at(name, status, message, Utc::now())
+            .await;
+    }
+
+    async fn set_feed_status_at(
+        &self,
+        name: &str,
+        status: &str,
+        message: Option<String>,
+        observed_at: DateTime<Utc>,
+    ) {
         let mut data = self.inner.data.write().await;
+        Self::set_feed_status_at_locked(&mut data, name, status, message, observed_at);
+    }
+
+    fn set_feed_status_at_locked(
+        data: &mut RuntimeData,
+        name: &str,
+        status: &str,
+        message: Option<String>,
+        observed_at: DateTime<Utc>,
+    ) {
+        if data.feed_status.get(name).and_then(|value| {
+            value["updated_at"]
+                .as_str()
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc) > observed_at)
+        }) == Some(true)
+        {
+            return;
+        }
         data.feed_status.insert(
             name.to_owned(),
             json!({
                 "status": status,
                 "message": message,
-                "updated_at": Utc::now()
+                "updated_at": observed_at
             }),
         );
     }
 
     async fn feed_error(&self, source: FeedName, message: String) {
+        self.feed_error_at(source, message, Utc::now()).await;
+    }
+
+    fn accept_clob_sequence(
+        &self,
+        data: &mut RuntimeData,
+        sequence: Option<(u64, u64)>,
+        observed_at: DateTime<Utc>,
+    ) -> bool {
+        let Some((generation, sequence)) = sequence else {
+            return true;
+        };
+        if data.clob_generation != Some(generation)
+            || data
+                .clob_lease
+                .as_ref()
+                .is_none_or(ClobGenerationLease::is_terminal)
+            || sequence <= data.clob_last_sequence
+        {
+            return false;
+        }
+        data.clob_last_sequence = sequence;
+        Self::set_feed_status_at_locked(data, "PolymarketClobMarket", "ok", None, observed_at);
+        true
+    }
+
+    async fn begin_clob_generation(
+        &self,
+        generation: u64,
+        token_ids: &[TokenId],
+    ) -> ClobGenerationLease {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let mut data = self.inner.data.write().await;
+        let replaced_generation = Self::revoke_clob_generation_locked(&mut data);
+        let lease = ClobGenerationLease::new();
+        data.clob_pending_generation = Some(generation);
+        data.clob_pending_tokens = token_ids.iter().cloned().collect();
+        data.clob_lease = Some(lease.clone());
+        data.decision_generation = data.decision_generation.wrapping_add(1);
+        drop(data);
+        if let Some(replaced_generation) = replaced_generation {
+            let _ = self
+                .record_required_events(vec![(
+                    "clob_resync_aborted".to_owned(),
+                    json!({
+                        "generation": replaced_generation,
+                        "reason": "replaced by a newer CLOB generation",
+                        "fail_closed": true,
+                        "ready": false
+                    }),
+                )])
+                .await;
+        }
+        lease
+    }
+
+    // Must be called while decision_gate and the RuntimeData write lock are
+    // held.  It is deliberately idempotent: exactly one caller wins the
+    // terminal transition and is therefore responsible for its abort audit.
+    fn revoke_clob_generation_locked(data: &mut RuntimeData) -> Option<u64> {
+        let generation = data.clob_generation.or(data.clob_pending_generation)?;
+        if let Some(lease) = &data.clob_lease {
+            lease.terminate();
+        }
+        data.clob_generation = None;
+        data.clob_pending_generation = None;
+        data.clob_tokens.clear();
+        data.clob_pending_tokens.clear();
+        data.clob_last_sequence = 0;
+        data.clob_terminal_generation = data.clob_terminal_generation.max(generation);
+        data.decision_generation = data.decision_generation.wrapping_add(1);
+        Some(generation)
+    }
+
+    async fn abort_clob_generation_while_gated(&self, generation: u64, reason: &str) -> bool {
+        let revoked = {
+            let mut data = self.inner.data.write().await;
+            (data.clob_generation == Some(generation)
+                || data.clob_pending_generation == Some(generation))
+            .then(|| Self::revoke_clob_generation_locked(&mut data))
+            .flatten()
+        };
+        let Some(generation) = revoked else {
+            return false;
+        };
+        if !self
+            .record_required_events(vec![(
+                "clob_resync_aborted".to_owned(),
+                json!({
+                    "generation": generation,
+                    "reason": reason,
+                    "fail_closed": true,
+                    "ready": false
+                }),
+            )])
+            .await
+        {
+            warn!(
+                generation,
+                "CLOB resync abort audit was not durable; canonical feed error remains required"
+            );
+        }
+        true
+    }
+
+    async fn handle_clob_resync_barrier(&self, barrier: ClobResyncBarrier) {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let (expected, pending_generation, terminal_generation) = {
+            let data = self.inner.data.read().await;
+            (
+                data.clob_pending_tokens.clone(),
+                data.clob_pending_generation,
+                data.clob_terminal_generation,
+            )
+        };
+        let anchored = barrier.token_ids().cloned().collect::<BTreeSet<_>>();
+        let valid = !barrier.lease.is_terminal()
+            && pending_generation == Some(barrier.generation)
+            && terminal_generation < barrier.generation
+            && !expected.is_empty()
+            && !anchored.is_empty()
+            && anchored.is_subset(&expected)
+            && expected.len() == barrier.token_count
+            && clob_token_set_digest(&expected) == barrier.token_set_digest;
+        if !valid {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "barrier token set no longer matches the pending generation",
+            )
+            .await;
+            let _ = barrier.ready_ack.send(Err(
+                "barrier token set no longer matches the pending generation".to_owned(),
+            ));
+            return;
+        }
+        let pre_ready_evidence = barrier
+            .pre_ready_events
+            .iter()
+            .map(|event| {
+                (
+                    "raw_market_event".to_owned(),
+                    serde_json::to_value(event).unwrap_or(Value::Null),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !self.record_required_events(pre_ready_evidence).await {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "durable pre-ready market evidence failed",
+            )
+            .await;
+            let _ = barrier
+                .ready_ack
+                .send(Err("durable pre-ready market evidence failed".to_owned()));
+            return;
+        }
+        let authorization_event = json!({
+            "generation": barrier.generation,
+            "sequence": barrier.sequence,
+            "token_count": barrier.token_count,
+            "token_set_digest": barrier.token_set_digest,
+            "authorization": "single_transport_snapshot_barrier",
+            "ready": false,
+            "authorized": true
+        });
+        if !self
+            .record_required_events(vec![(
+                "clob_resync_authorized".to_owned(),
+                authorization_event,
+            )])
+            .await
+        {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "durable readiness authorization failed",
+            )
+            .await;
+            let _ = barrier
+                .ready_ack
+                .send(Err("durable readiness authorization failed".to_owned()));
+            return;
+        }
+        {
+            let mut data = self.inner.data.write().await;
+            // The producer is blocked on ready_ack.  This transition therefore
+            // follows the only possible final drain boundary with no await.
+            if barrier.lease.is_terminal()
+                || data.clob_pending_generation != Some(barrier.generation)
+                || data.clob_terminal_generation >= barrier.generation
+            {
+                drop(data);
+                self.abort_clob_generation_while_gated(
+                    barrier.generation,
+                    "generation terminated before readiness install",
+                )
+                .await;
+                let _ = barrier.ready_ack.send(Err(
+                    "generation terminated before readiness install".to_owned(),
+                ));
+                return;
+            }
+            data.books.retain(|token, _| !expected.contains(token));
+            for book in barrier.anchors {
+                data.books.insert(book.token_id.clone(), book);
+            }
+            data.clob_generation = Some(barrier.generation);
+            data.clob_pending_generation = None;
+            data.clob_pending_tokens.clear();
+            data.clob_lease = Some(barrier.lease.clone());
+            data.clob_last_sequence = barrier.sequence;
+            data.clob_tokens = expected;
+            data.decision_generation = data.decision_generation.wrapping_add(1);
+            data.feed_status.insert(
+                "PolymarketClobMarket".to_owned(),
+                json!({"status": "ok", "message": Value::Null, "updated_at": Utc::now()}),
+            );
+        }
+        if barrier.ready_ack.send(Ok(())).is_err() {
+            self.abort_clob_generation_while_gated(
+                barrier.generation,
+                "CLOB readiness receiver dropped",
+            )
+            .await;
+        }
+    }
+
+    async fn terminate_clob_generation(&self, generation: u64, reason: &str) {
+        self.terminate_clob_generation_inner(generation, reason, false)
+            .await;
+    }
+
+    async fn terminate_clob_generation_inner(
+        &self,
+        generation: u64,
+        reason: &str,
+        allow_during_shutdown: bool,
+    ) {
+        let _decision_guard = self.inner.decision_gate.lock().await;
+        let revoked = {
+            let mut data = self.inner.data.write().await;
+            (data.clob_generation == Some(generation)
+                || data.clob_pending_generation == Some(generation))
+            .then(|| Self::revoke_clob_generation_locked(&mut data))
+            .flatten()
+        };
+        if let Some(generation) = revoked {
+            let event = json!({
+                "generation": generation,
+                "reason": reason,
+                "fail_closed": true,
+                "ready": false
+            });
+            let recorded = if allow_during_shutdown {
+                self.record_required_events_during_shutdown(vec![(
+                    "clob_resync_aborted".to_owned(),
+                    event,
+                )])
+                .await
+            } else {
+                self.record_required_events(vec![("clob_resync_aborted".to_owned(), event)])
+                    .await
+            };
+            if !recorded {
+                warn!(generation, "CLOB resync abort audit was not durable; canonical feed error remains required");
+            }
+        }
+    }
+
+    async fn terminate_all_clob_generations(&self, reason: &str, allow_during_shutdown: bool) {
+        let generation = {
+            let data = self.inner.data.read().await;
+            data.clob_generation.or(data.clob_pending_generation)
+        };
+        if let Some(generation) = generation {
+            self.terminate_clob_generation_inner(generation, reason, allow_during_shutdown)
+                .await;
+        }
+    }
+
+    async fn mark_market_feed_connecting(&self) {
+        let now = Utc::now();
+        let fresh = {
+            let data = self.inner.data.read().await;
+            fresh_market_feed_ok(data.feed_status.get("PolymarketClobMarket"), now)
+        };
+        if !fresh {
+            self.set_feed_status_at("PolymarketClobMarket", "connecting", None, now)
+                .await;
+        }
+    }
+
+    async fn feed_error_at(&self, source: FeedName, message: String, observed_at: DateTime<Utc>) {
         let source_text = format!("{source:?}");
-        self.set_feed_status(&source_text, "error", Some(message.clone()))
+        self.set_feed_status_at(&source_text, "error", Some(message.clone()), observed_at)
             .await;
         self.record_event(
             "feed_error",
@@ -2634,6 +4044,12 @@ impl RuntimeController {
         .await;
     }
 
+    async fn record_feed_disconnect(&self, sources: &[FeedName], message: &str) {
+        for source in sources {
+            self.feed_error(source.clone(), message.to_owned()).await;
+        }
+    }
+
     async fn market_token_ids(&self) -> Vec<TokenId> {
         let data = self.inner.data.read().await;
         data.markets
@@ -2641,6 +4057,26 @@ impl RuntimeController {
             .flat_map(|market| [market.up_token_id.clone(), market.down_token_id.clone()])
             .collect()
     }
+}
+
+fn clob_token_set_digest(tokens: &BTreeSet<TokenId>) -> String {
+    let mut hasher = 0xcbf2_9ce4_8422_2325_u64;
+    for token in tokens {
+        for byte in token.as_ref().bytes().chain(std::iter::once(0)) {
+            hasher ^= u64::from(byte);
+            hasher = hasher.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{hasher:016x}")
+}
+
+fn rtds_source_settings(settings: &RuntimeSettings, source: &FeedName) -> RuntimeSettings {
+    let mut scoped = settings.clone();
+    scoped.target.enable_polymarket_rtds_chainlink =
+        matches!(source, FeedName::PolymarketRtdsChainlink);
+    scoped.target.enable_polymarket_rtds_binance =
+        matches!(source, FeedName::PolymarketRtdsBinance);
+    scoped
 }
 
 fn spawn_recorder_worker(
@@ -2653,78 +4089,137 @@ fn spawn_recorder_worker(
         .spawn(move || {
             let mut last_flush = Instant::now();
             let mut deferred_request = None;
+            let mut pending_best_effort: Option<Vec<RecorderRequest>> = None;
             let mut durability = RecorderDurabilityState::default();
             loop {
-                let request = match deferred_request.take() {
-                    Some(request) => request,
-                    None => match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
-                        Ok(request) => request,
-                        Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                            flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
-                            last_flush = Instant::now();
-                            continue;
-                        }
-                        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                            flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
-                            break;
-                        }
-                    },
-                };
-                if let Some(batch_key) = request.durable_batch_key.as_deref() {
-                    let event_count = request.logical_event_count;
-                    metrics.batches_total.fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .last_batch_size
-                        .store(event_count, Ordering::Relaxed);
-                    let result = persist_durable_recorder_request(
-                        &recorder,
-                        &metrics,
-                        &mut durability,
-                        batch_key,
-                        &request.events,
-                    );
-                    saturating_sub_atomic(&metrics.queued, event_count);
+                if let Some(requests) = pending_best_effort.as_ref() {
+                    std::thread::sleep(RECORDER_RETRY_DELAY);
+                    let event_count = requests
+                        .iter()
+                        .map(|request| request.logical_event_count)
+                        .sum::<usize>();
+                    let result = match recorder.lock() {
+                        Ok(mut recorder) => recorder.retry_pending(),
+                        Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
+                    };
+                    update_recorder_flush_health(&metrics, &result);
                     match &result {
                         Ok(()) => {
-                            metrics
-                                .persisted_total
-                                .fetch_add(event_count as u64, Ordering::Relaxed);
+                            saturating_sub_atomic(&metrics.queued, event_count);
+                            let last_sequence = requests
+                                .last()
+                                .and_then(|request| request.events.last())
+                                .map(RecordedRuntimeEvent::recorder_sequence)
+                                .unwrap_or_default();
+                            metrics.mark_persisted(event_count, last_sequence);
+                            pending_best_effort = None;
                         }
                         Err(error) => {
                             metrics
                                 .failed_total
                                 .fetch_add(event_count as u64, Ordering::Relaxed);
-                            warn!("runtime recorder durable batch failed: {error}");
+                            warn!("runtime recorder retry failed: {error}");
                         }
                     }
-                    if let Some(ack) = request.durable_ack {
-                        let _ = ack.send(result);
-                    }
                     continue;
                 }
-                if durability.pending_batch_key.is_some()
-                    && resume_pending_durable(&recorder, &metrics, &mut durability).is_err()
-                {
-                    deferred_request = Some(request);
-                    std::thread::sleep(Duration::from_millis(250));
-                    continue;
-                }
-                let mut requests = vec![request];
-                let mut event_count = requests[0].logical_event_count;
-                while event_count < RECORDER_BATCH_LIMIT {
-                    match receiver.try_recv() {
-                        Ok(request) => {
-                            if request.durable_batch_key.is_some() {
-                                deferred_request = Some(request);
+                let requests = loop {
+                    let request = match deferred_request.take() {
+                        Some(request) => request,
+                        None => match receiver.recv_timeout(RECORDER_FLUSH_INTERVAL) {
+                            Ok(request) => request,
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                                flush_or_resume_runtime_recorder(
+                                    &recorder,
+                                    &metrics,
+                                    &mut durability,
+                                );
+                                last_flush = Instant::now();
+                                continue;
+                            }
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                                flush_or_resume_runtime_recorder(
+                                    &recorder,
+                                    &metrics,
+                                    &mut durability,
+                                );
+                                return;
+                            }
+                        },
+                    };
+                    if let Some(batch_key) = request.durable_batch_key.as_deref() {
+                        let event_count = request.logical_event_count;
+                        metrics.batches_total.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .last_batch_size
+                            .store(event_count, Ordering::Relaxed);
+                        let mut result = Err("durable recorder retry was not attempted".to_owned());
+                        for attempt in 1..=REQUIRED_RECORDER_ATTEMPTS {
+                            result = persist_durable_recorder_request(
+                                &recorder,
+                                &metrics,
+                                &mut durability,
+                                batch_key,
+                                &request.events,
+                            );
+                            if result.is_ok() {
                                 break;
                             }
-                            event_count += request.logical_event_count;
-                            requests.push(request);
+                            metrics
+                                .failed_total
+                                .fetch_add(event_count as u64, Ordering::Relaxed);
+                            if attempt < REQUIRED_RECORDER_ATTEMPTS {
+                                std::thread::sleep(RECORDER_RETRY_DELAY);
+                            }
                         }
-                        Err(std_mpsc::TryRecvError::Empty) => break,
-                        Err(std_mpsc::TryRecvError::Disconnected) => break,
+                        saturating_sub_atomic(&metrics.queued, event_count);
+                        match &result {
+                            Ok(()) => {
+                                let last_sequence = request
+                                    .events
+                                    .last()
+                                    .map(RecordedRuntimeEvent::recorder_sequence)
+                                    .unwrap_or_default();
+                                metrics.mark_persisted(event_count, last_sequence);
+                            }
+                            Err(error) => {
+                                warn!("runtime recorder durable batch failed: {error}");
+                            }
+                        }
+                        if let Some(ack) = request.durable_ack {
+                            let _ = ack.send(result);
+                        }
+                        continue;
                     }
-                }
+                    if durability.pending_batch_key.is_some()
+                        && resume_pending_durable(&recorder, &metrics, &mut durability).is_err()
+                    {
+                        deferred_request = Some(request);
+                        std::thread::sleep(RECORDER_RETRY_DELAY);
+                        continue;
+                    }
+                    let mut requests = vec![request];
+                    let mut event_count = requests[0].logical_event_count;
+                    while event_count < RECORDER_BATCH_LIMIT {
+                        match receiver.try_recv() {
+                            Ok(request) => {
+                                if request.durable_batch_key.is_some() {
+                                    deferred_request = Some(request);
+                                    break;
+                                }
+                                event_count += request.logical_event_count;
+                                requests.push(request);
+                            }
+                            Err(std_mpsc::TryRecvError::Empty) => break,
+                            Err(std_mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    break requests;
+                };
+                let event_count = requests
+                    .iter()
+                    .map(|request| request.logical_event_count)
+                    .sum::<usize>();
                 metrics.batches_total.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .last_batch_size
@@ -2734,7 +4229,7 @@ fn spawn_recorder_worker(
                     .flat_map(|request| request.events.iter().cloned())
                     .collect::<Vec<_>>();
                 let result = match recorder.lock() {
-                    Ok(mut recorder) => recorder.record_batch(&events),
+                    Ok(mut recorder) => recorder.record_recorded_batch(&events),
                     Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
                 };
                 // `record_batch` can attempt a previously frozen Azure block.
@@ -2742,22 +4237,25 @@ fn spawn_recorder_worker(
                 // the recorder's immutable retry queue, even though these
                 // best-effort requests do not wait for a durable ack.
                 update_recorder_flush_health(&metrics, &result);
-                saturating_sub_atomic(&metrics.queued, event_count);
+                debug_assert!(requests.iter().all(|request| request.durable_ack.is_none()));
                 match &result {
                     Ok(()) => {
-                        metrics
-                            .persisted_total
-                            .fetch_add(event_count as u64, Ordering::Relaxed);
+                        saturating_sub_atomic(&metrics.queued, event_count);
+                        let last_sequence = events
+                            .last()
+                            .map(RecordedRuntimeEvent::recorder_sequence)
+                            .unwrap_or_default();
+                        metrics.mark_persisted(event_count, last_sequence);
                     }
                     Err(error) => {
                         metrics
                             .failed_total
                             .fetch_add(event_count as u64, Ordering::Relaxed);
                         warn!("runtime recorder failed: {error}");
+                        pending_best_effort = Some(requests);
                     }
                 }
-                debug_assert!(requests.iter().all(|request| request.durable_ack.is_none()));
-                if last_flush.elapsed() >= RECORDER_FLUSH_INTERVAL {
+                if result.is_ok() && last_flush.elapsed() >= RECORDER_FLUSH_INTERVAL {
                     flush_or_resume_runtime_recorder(&recorder, &metrics, &mut durability);
                     last_flush = Instant::now();
                 }
@@ -2773,7 +4271,7 @@ fn persist_durable_recorder_request(
     metrics: &Arc<RecorderMetrics>,
     durability: &mut RecorderDurabilityState,
     batch_key: &str,
-    events: &[RuntimeEvent],
+    events: &[RecordedRuntimeEvent],
 ) -> Result<(), String> {
     if durability.completed_batch_keys.contains(batch_key) {
         return Ok(());
@@ -2785,40 +4283,28 @@ fn persist_durable_recorder_request(
         }
     }
 
-    // Best-effort events may still be buffered. Flush them before assigning
-    // the recorder's pending buffer to this durable batch so unrelated bytes
-    // can never determine the journal's acknowledgment.
-    recorder_flush_result(recorder, metrics, false)?;
-    durability.pending_batch_key = Some(batch_key.to_owned());
-    let (authoritative_remote, result, flush_attempted) = match recorder.lock() {
-        Ok(mut recorder) => {
-            let authoritative_remote = recorder.has_authoritative_remote();
-            match recorder.record_batch(events) {
-                Ok(()) => (authoritative_remote, recorder.flush(), true),
-                Err(error) => (authoritative_remote, Err(error), false),
-            }
-        }
-        Err(error) => (
-            false,
-            Err(format!("runtime recorder lock poisoned: {error}")),
-            false,
-        ),
-    };
-    if flush_attempted {
-        update_recorder_flush_health(metrics, &result);
+    // A failed best-effort flush must recover before this journal is staged.
+    // Healthy buffered bytes can share the journal's atomic flush: the durable
+    // acknowledgment still waits for every byte in that flush to persist.
+    if metrics.flush_unrecovered.load(Ordering::Acquire) {
+        recorder_flush_result(recorder, metrics, false)?;
     }
+    durability.pending_batch_key = Some(batch_key.to_owned());
+    let result = match recorder.lock() {
+        Ok(mut recorder) => match recorder.record_recorded_batch(events) {
+            Ok(()) => recorder.flush(),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(format!("runtime recorder lock poisoned: {error}")),
+    };
+    update_recorder_flush_health(metrics, &result);
     match result {
         Ok(()) => {
             durability.pending_batch_key = None;
             durability.remember_completed(batch_key.to_owned());
             Ok(())
         }
-        Err(error) => {
-            if !authoritative_remote {
-                durability.pending_batch_key = None;
-            }
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2890,6 +4376,146 @@ fn flush_runtime_recorder(
     if let Err(error) = recorder_flush_result(recorder, metrics, false) {
         warn!("runtime recorder flush failed: {error}");
     }
+}
+
+fn qset_v4_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V4_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V4_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v4_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V4_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v4_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v4_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V4_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V4_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v4_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v4_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V4_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v4 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
+}
+
+fn qset_v5_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V5_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V5_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v5_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V5_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v5_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v5_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V5_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V5_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v5_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v5_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V5_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v5 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
+}
+
+fn qset_v6_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V6_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V6_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v6_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V6_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v6_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v6_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V6_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V6_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v6_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v6_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V6_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v6 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
+}
+
+fn qset_v7_image_digest() -> Result<String, String> {
+    let image = std::env::var("POLYEDGE_QSET_V7_WRITER_IMAGE")
+        .map_err(|_| "POLYEDGE_QSET_V7_WRITER_IMAGE is required for retirement".to_owned())?;
+    qset_v7_image_digest_from(&image)
+        .ok_or_else(|| "POLYEDGE_QSET_V7_WRITER_IMAGE must be pinned by SHA-256 digest".to_owned())
+}
+
+fn qset_v7_image_digest_from(image: &str) -> Option<String> {
+    let (_, digest) = image.rsplit_once("@sha256:")?;
+    (digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| format!("sha256:{digest}"))
+}
+
+fn qset_v7_source_revision() -> Result<String, String> {
+    let configured = std::env::var("POLYEDGE_QSET_V7_WRITER_GIT_SHA")
+        .map_err(|_| "POLYEDGE_QSET_V7_WRITER_GIT_SHA is required for retirement".to_owned())?;
+    qset_v7_source_revision_from(&configured, embedded_git_sha())
+}
+
+fn qset_v7_source_revision_from(
+    configured: &str,
+    embedded: Option<&str>,
+) -> Result<String, String> {
+    if !polyedge_config::is_full_git_sha(configured) {
+        return Err("POLYEDGE_QSET_V7_WRITER_GIT_SHA must be an exact lowercase commit".to_owned());
+    }
+    if embedded.is_some_and(|embedded| embedded != configured) {
+        return Err("qset-v7 frozen source revision does not match the running binary".to_owned());
+    }
+    Ok(configured.to_owned())
 }
 
 fn saturating_sub_atomic(value: &AtomicUsize, amount: usize) {
@@ -3088,17 +4714,55 @@ fn compact_recorded_book(book: &BookState) -> BookState {
     }
 }
 
-fn feed_summary(data: &RuntimeData) -> &'static str {
-    if data.feed_status.values().any(|status| {
+fn feed_summary(data: &RuntimeData, settings: &RuntimeSettings) -> &'static str {
+    let now = Utc::now();
+    let healthy = |name: &str| {
+        data.feed_status
+            .get(name)
+            .and_then(|status| status.get("status"))
+            .and_then(Value::as_str)
+            == Some("ok")
+    };
+    let fresh = |name: &str| fresh_market_feed_ok(data.feed_status.get(name), now);
+    if healthy("Discovery")
+        && fresh("PolymarketClobMarket")
+        && (!settings.target.enable_polymarket_rtds_chainlink || fresh("PolymarketRtdsChainlink"))
+        && (!settings.target.enable_polymarket_rtds_binance || fresh("PolymarketRtdsBinance"))
+    {
+        "running"
+    } else if data.feed_status.values().any(|status| {
         status
             .get("status")
             .and_then(Value::as_str)
-            .is_some_and(|status| status == "ok" || status == "running" || status == "connecting")
-    }) {
-        "running"
+            .is_some_and(|status| status == "error" || status == "disconnected")
+    }) || (settings.target.enable_polymarket_rtds_chainlink
+        && healthy("PolymarketRtdsChainlink")
+        && !fresh("PolymarketRtdsChainlink"))
+        || (settings.target.enable_polymarket_rtds_binance
+            && healthy("PolymarketRtdsBinance")
+            && !fresh("PolymarketRtdsBinance"))
+    {
+        "degraded"
     } else {
         "starting"
     }
+}
+
+fn fresh_market_feed_ok(status: Option<&Value>, now: DateTime<Utc>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    let Some(updated_at) = status["updated_at"]
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+    else {
+        return false;
+    };
+    status["status"] == "ok"
+        && updated_at <= now
+        && now.signed_duration_since(updated_at)
+            <= chrono::Duration::seconds(ESSENTIAL_FEED_MAX_AGE_SECONDS)
 }
 
 fn report_status(shadow_only: bool) -> Value {
@@ -3165,6 +4829,11 @@ fn runtime_provenance_with_git_sha_at(
         "decision_config_schema": "polyedge.decision_config.v1",
         "decision_config_sha256": decision_config_sha256,
         "candidate": candidate,
+        "authoritative_recorder_backend": if settings.azure.storage_account_name.is_some() {
+            "azure_append_blob"
+        } else {
+            "local_jsonl"
+        },
         "storage_account": settings.azure.storage_account_name,
         "storage_container": settings.azure.storage_container_name,
         "event_blob_prefix": settings.azure.event_blob_prefix_at(event_ts),
@@ -3508,12 +5177,858 @@ mod tests {
     use std::thread;
     use std::time::Duration as StdDuration;
 
+    fn clob_test_book(token: &str) -> BookState {
+        BookState {
+            token_id: TokenId::new(token),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            last_trade_price: None,
+            exchange_ts: None,
+            local_ts: Utc::now(),
+            book_hash: None,
+        }
+    }
+
+    fn clob_test_event(token: &str) -> polyedge_feeds::MarketChannelEvent {
+        polyedge_feeds::MarketChannelEvent {
+            event_type: "price_change".to_owned(),
+            recorded_ts: Utc::now(),
+            source_ts: None,
+            market_id: None,
+            condition_id: None,
+            token_id: Some(token.to_owned()),
+            asset_id: Some(token.to_owned()),
+            side: Some("BUY".to_owned()),
+            price: Some("0.5".to_owned()),
+            size: Some("1".to_owned()),
+            best_bid: None,
+            best_ask: None,
+            book_hash: None,
+            raw_payload: json!({"event_type": "price_change", "asset_id": token}),
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_runtime_task_marks_runtime_unhealthy() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        controller.inner.started.store(true, Ordering::SeqCst);
+        *controller.inner.feed_task.lock().unwrap() = Some(tokio::spawn(async {}));
+        controller
+            .inner
+            .background_tasks
+            .lock()
+            .unwrap()
+            .push(tokio::spawn(std::future::pending()));
+        tokio::task::yield_now().await;
+
+        assert!(!controller.runtime_tasks_running());
+        assert_eq!(controller.health().await["ok"], false);
+        assert_eq!(
+            controller.status().await["task_health"]["runtime_loop"],
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn clob_generation_rejects_pre_ready_and_stale_frames() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let mut data = controller.inner.data.write().await;
+        let observed_at = Utc::now();
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1)), observed_at));
+        data.clob_generation = Some(7);
+        data.clob_lease = Some(ClobGenerationLease::new());
+        assert!(controller.accept_clob_sequence(&mut data, Some((7, 1)), observed_at));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 1)), observed_at));
+        assert!(!controller.accept_clob_sequence(&mut data, Some((6, 2)), observed_at));
+        assert!(controller.accept_clob_sequence(&mut data, Some((7, 2)), observed_at));
+        data.clob_lease.as_ref().unwrap().terminate();
+        assert!(!controller.accept_clob_sequence(&mut data, Some((7, 3)), observed_at));
+    }
+
+    #[tokio::test]
+    async fn accepted_clob_events_refresh_feed_status_but_rejected_events_do_not() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(7);
+            data.clob_lease = Some(ClobGenerationLease::new());
+        }
+
+        let book_ts = Utc::now() - chrono::Duration::seconds(2);
+        let mut book = clob_test_book("test-token");
+        book.local_ts = book_ts;
+        controller
+            .handle_feed_event(FeedEvent::ClobBook {
+                generation: 7,
+                sequence: 1,
+                book,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"]["updated_at"],
+            json!(book_ts)
+        );
+
+        let raw_ts = book_ts + chrono::Duration::seconds(1);
+        let mut event = clob_test_event("test-token");
+        event.recorded_ts = raw_ts;
+        controller
+            .handle_feed_event(FeedEvent::ClobRawMarketEvent {
+                generation: 7,
+                sequence: 2,
+                event,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"]["updated_at"],
+            json!(raw_ts)
+        );
+
+        let invalidated_after = Utc::now();
+        controller
+            .handle_feed_event(FeedEvent::ClobBookInvalidated {
+                generation: 7,
+                sequence: 3,
+                token_id: TokenId::new("test-token"),
+            })
+            .await;
+        let accepted_status =
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"].clone();
+        let invalidated_at = accepted_status["updated_at"]
+            .as_str()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .expect("invalidation freshness timestamp");
+        assert!(invalidated_at >= invalidated_after);
+
+        let mut stale_book = clob_test_book("test-token");
+        stale_book.local_ts = Utc::now() + chrono::Duration::hours(1);
+        controller
+            .handle_feed_event(FeedEvent::ClobBook {
+                generation: 7,
+                sequence: 3,
+                book: stale_book,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            accepted_status
+        );
+
+        let mut rejected_event = clob_test_event("test-token");
+        rejected_event.recorded_ts = Utc::now() + chrono::Duration::hours(1);
+        controller
+            .handle_feed_event(FeedEvent::ClobRawMarketEvent {
+                generation: 6,
+                sequence: 4,
+                event: rejected_event,
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            accepted_status
+        );
+
+        controller
+            .inner
+            .data
+            .write()
+            .await
+            .clob_lease
+            .as_ref()
+            .unwrap()
+            .terminate();
+        controller
+            .handle_feed_event(FeedEvent::ClobBookInvalidated {
+                generation: 7,
+                sequence: 4,
+                token_id: TokenId::new("test-token"),
+            })
+            .await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            accepted_status
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_tombstone_precedes_an_unpolled_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(42, &[TokenId::new("test-token")])
+            .await;
+        assert!(!lease.is_terminal());
+        controller
+            .terminate_clob_generation(42, "test pre-install cancellation")
+            .await;
+        let data = controller.inner.data.read().await;
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_terminal_generation, 42);
+    }
+
+    #[tokio::test]
+    async fn same_token_pending_replacement_tombstones_the_prior_lease() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let first = controller
+            .begin_clob_generation(421, &[TokenId::new("same-token")])
+            .await;
+        let second = controller
+            .begin_clob_generation(422, &[TokenId::new("same-token")])
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(first.is_terminal());
+        assert!(!second.is_terminal());
+        assert_eq!(data.clob_pending_generation, Some(422));
+        assert_eq!(data.clob_terminal_generation, 421);
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_signals_emit_one_abort_for_the_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(423, &[TokenId::new("terminal-token")])
+            .await;
+        let left = controller.terminate_clob_generation(423, "concurrent left");
+        let right = controller.terminate_clob_generation(423, "concurrent right");
+        tokio::join!(left, right);
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "clob_resync_aborted")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_first_prevents_the_real_live_publication_helper_from_calling_publisher() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("publish-token");
+        let book = clob_test_book(token.as_ref());
+        let lease = controller
+            .begin_clob_generation(424, std::slice::from_ref(&token))
+            .await;
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(424);
+            data.clob_pending_generation = None;
+            data.books.insert(token.clone(), book.clone());
+        }
+        controller
+            .terminate_clob_generation(424, "terminal before external publish")
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publisher_calls = Arc::clone(&calls);
+        assert_eq!(
+            controller
+                .execute_live_clob_publication(424, &token, &book, move || {
+                    publisher_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(lease.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn publish_first_makes_terminal_wait_for_the_real_live_publication_helper() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("publish-token");
+        let book = clob_test_book(token.as_ref());
+        let lease = controller
+            .begin_clob_generation(425, std::slice::from_ref(&token))
+            .await;
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(425);
+            data.clob_pending_generation = None;
+            data.books.insert(token.clone(), book.clone());
+        }
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let published = Arc::new(AtomicUsize::new(0));
+        let publication = {
+            let controller = controller.clone();
+            let published = Arc::clone(&published);
+            tokio::spawn(async move {
+                controller
+                    .execute_live_clob_publication(425, &token, &book, move || {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        published.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(StdDuration::from_secs(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        let terminator = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .terminate_clob_generation(425, "terminal after external publish start")
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!lease.is_terminal());
+        release_tx.send(()).unwrap();
+        assert_eq!(publication.await.unwrap().unwrap(), Some(()));
+        terminator.await.unwrap();
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert!(lease.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn transferred_decision_gate_publishes_before_a_queued_book_update() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("publish-token");
+        let book = clob_test_book(token.as_ref());
+        controller
+            .begin_clob_generation(426, std::slice::from_ref(&token))
+            .await;
+        {
+            let mut data = controller.inner.data.write().await;
+            data.clob_generation = Some(426);
+            data.clob_pending_generation = None;
+            data.books.insert(token.clone(), book.clone());
+        }
+
+        let decision_guard = Arc::clone(&controller.inner.decision_gate)
+            .lock_owned()
+            .await;
+        let mut updated_book = book.clone();
+        updated_book.local_ts += chrono::Duration::seconds(1);
+        let update = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .handle_feed_event(FeedEvent::ClobBook {
+                        generation: 426,
+                        sequence: 1,
+                        book: updated_book,
+                    })
+                    .await;
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+        assert_eq!(
+            controller
+                .execute_live_clob_publication_while_gated(426, &token, &book, move || {
+                    publish_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(controller.inner.data.read().await.books[&token], book);
+
+        drop(decision_guard);
+        update.await.unwrap();
+        assert_ne!(controller.inner.data.read().await.books[&token], book);
+    }
+
+    #[tokio::test]
+    async fn rejected_clob_barrier_atomically_tombstones_its_pending_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(43, &[TokenId::new("expected-token")])
+            .await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 43,
+                sequence: 0,
+                token_set_digest: "not-the-pending-set".to_owned(),
+                token_count: 0,
+                anchors: Vec::new(),
+                pre_ready_events: Vec::new(),
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_err());
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_terminal_generation, 43);
+    }
+
+    #[tokio::test]
+    async fn partial_clob_barrier_clears_unanchored_stale_book_before_authorization() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let expected = BTreeSet::from([TokenId::new("yes"), TokenId::new("no")]);
+        {
+            let mut data = controller.inner.data.write().await;
+            data.books.insert(TokenId::new("no"), clob_test_book("no"));
+        }
+        let tokens = expected.iter().cloned().collect::<Vec<_>>();
+        let lease = controller.begin_clob_generation(431, &tokens).await;
+        let authorized_book = clob_test_book("yes");
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 431,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&expected),
+                token_count: expected.len(),
+                anchors: vec![authorized_book.clone()],
+                pre_ready_events: Vec::new(),
+                lease,
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_ok());
+        {
+            let data = controller.inner.data.read().await;
+            assert_eq!(data.clob_generation, Some(431));
+            assert_eq!(data.clob_tokens, expected);
+            assert!(data.books.contains_key(&TokenId::new("yes")));
+            assert!(!data.books.contains_key(&TokenId::new("no")));
+            assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
+        }
+
+        let yes = TokenId::new("yes");
+        controller
+            .handle_feed_event(FeedEvent::ClobBookInvalidated {
+                generation: 431,
+                sequence: 1,
+                token_id: yes.clone(),
+            })
+            .await;
+        assert!(!controller.inner.data.read().await.books.contains_key(&yes));
+        controller
+            .handle_feed_event(FeedEvent::ClobBook {
+                generation: 431,
+                sequence: 2,
+                book: clob_test_book("yes"),
+            })
+            .await;
+        assert!(controller.inner.data.read().await.books.contains_key(&yes));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::clone(&calls);
+        assert_eq!(
+            controller
+                .execute_live_clob_publication(431, &yes, &authorized_book, move || {
+                    publish_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn clob_pre_ready_evidence_recorder_failure_rejects_the_barrier() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let token = TokenId::new("pre-ready-token");
+        let lease = controller.begin_clob_generation(44, &[token.clone()]).await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 44,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&BTreeSet::from([token])),
+                token_count: 1,
+                anchors: vec![clob_test_book("pre-ready-token")],
+                pre_ready_events: vec![clob_test_event("pre-ready-token")],
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_err());
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+    }
+
+    #[tokio::test]
+    async fn clob_authorization_recorder_failure_rejects_the_barrier() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let token = TokenId::new("authorization-token");
+        let lease = controller.begin_clob_generation(45, &[token.clone()]).await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 45,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&BTreeSet::from([token])),
+                token_count: 1,
+                anchors: vec![clob_test_book("authorization-token")],
+                pre_ready_events: Vec::new(),
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        assert!(ready_result.await.unwrap().is_err());
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_generation, None);
+    }
+
+    #[tokio::test]
+    async fn dropped_clob_ready_ack_revokes_the_generation() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let token = TokenId::new("ack-token");
+        let lease = controller.begin_clob_generation(46, &[token.clone()]).await;
+        let (ready_ack, ready_result) = oneshot::channel();
+        drop(ready_result);
+        controller
+            .handle_clob_resync_barrier(ClobResyncBarrier {
+                generation: 46,
+                sequence: 0,
+                token_set_digest: clob_token_set_digest(&BTreeSet::from([token])),
+                token_count: 1,
+                anchors: vec![clob_test_book("ack-token")],
+                pre_ready_events: Vec::new(),
+                lease: lease.clone(),
+                ready_ack,
+            })
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_terminal_generation, 46);
+    }
+
+    #[tokio::test]
+    async fn token_refresh_and_repeated_terminal_signal_abort_once() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let lease = controller
+            .begin_clob_generation(47, &[TokenId::new("old-token")])
+            .await;
+        controller.replace_markets(Vec::new()).await;
+        controller
+            .terminate_clob_generation(47, "duplicate terminal signal")
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_terminal_generation, 47);
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "clob_resync_aborted")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn clob_abort_recorder_failure_keeps_the_generation_terminal() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let lease = controller
+            .begin_clob_generation(48, &[TokenId::new("abort-audit-token")])
+            .await;
+        controller
+            .terminate_clob_generation(48, "injected abort audit failure")
+            .await;
+        let data = controller.inner.data.read().await;
+        assert!(lease.is_terminal());
+        assert_eq!(data.clob_generation, None);
+        assert_eq!(data.clob_pending_generation, None);
+        assert_eq!(data.clob_terminal_generation, 48);
+    }
+
+    #[tokio::test]
+    async fn feed_health_requires_every_enabled_source_and_market_data_clears_clob_error() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let base = Utc::now() - chrono::Duration::seconds(20);
+        controller.set_feed_status("Discovery", "ok", None).await;
+        controller
+            .set_feed_status("PolymarketRtdsChainlink", "ok", None)
+            .await;
+        controller
+            .set_feed_status("PolymarketRtdsBinance", "ok", None)
+            .await;
+        controller
+            .feed_error_at(
+                FeedName::PolymarketClobMarket,
+                "injected disconnect".to_owned(),
+                base + chrono::Duration::seconds(10),
+            )
+            .await;
+        {
+            let data = controller.inner.data.read().await;
+            assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        }
+
+        controller
+            .handle_feed_event(FeedEvent::Book(BookState {
+                token_id: TokenId::new("recovered-token"),
+                bids: Vec::new(),
+                asks: Vec::new(),
+                last_trade_price: None,
+                exchange_ts: None,
+                local_ts: base,
+                book_hash: None,
+            }))
+            .await;
+        {
+            let data = controller.inner.data.read().await;
+            assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "error");
+            assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        }
+
+        controller
+            .handle_feed_event(FeedEvent::Book(BookState {
+                token_id: TokenId::new("recovered-token"),
+                bids: Vec::new(),
+                asks: Vec::new(),
+                last_trade_price: None,
+                exchange_ts: None,
+                local_ts: base + chrono::Duration::seconds(11),
+                book_hash: None,
+            }))
+            .await;
+
+        let data = controller.inner.data.read().await;
+        assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
+        assert_eq!(feed_summary(&data, &controller.inner.settings), "running");
+        drop(data);
+
+        for source in [
+            FeedName::PolymarketRtdsChainlink,
+            FeedName::PolymarketRtdsBinance,
+        ] {
+            let name = format!("{source:?}");
+            {
+                let mut data = controller.inner.data.write().await;
+                data.feed_status.get_mut(&name).unwrap()["updated_at"] =
+                    json!(Utc::now() - chrono::Duration::minutes(6));
+            }
+            {
+                let data = controller.inner.data.read().await;
+                assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+            }
+            controller
+                .handle_feed_event(FeedEvent::Heartbeat {
+                    source,
+                    ts: Utc::now(),
+                })
+                .await;
+            let data = controller.inner.data.read().await;
+            assert_eq!(feed_summary(&data, &controller.inner.settings), "running");
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_market_resubscription_preserves_only_fresh_ok_status() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        controller.mark_market_feed_connecting().await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"]["status"],
+            "connecting"
+        );
+
+        controller
+            .set_feed_status("PolymarketClobMarket", "ok", None)
+            .await;
+        let before = controller.inner.data.read().await.feed_status["PolymarketClobMarket"].clone();
+        controller.mark_market_feed_connecting().await;
+        assert_eq!(
+            controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
+            before
+        );
+
+        let now = Utc::now();
+        for (name, status, expected) in [
+            (
+                "exact boundary",
+                json!({"status":"ok","updated_at":now - chrono::Duration::seconds(300)}),
+                true,
+            ),
+            (
+                "past boundary",
+                json!({"status":"ok","updated_at":now - chrono::Duration::seconds(301)}),
+                false,
+            ),
+            (
+                "future",
+                json!({"status":"ok","updated_at":now + chrono::Duration::seconds(1)}),
+                false,
+            ),
+            (
+                "malformed",
+                json!({"status":"ok","updated_at":"invalid"}),
+                false,
+            ),
+            (
+                "not ok",
+                json!({"status":"connecting","updated_at":now}),
+                false,
+            ),
+        ] {
+            assert_eq!(fresh_market_feed_ok(Some(&status), now), expected, "{name}");
+        }
+
+        let stale_controller = RuntimeController::new(RuntimeSettings::default());
+        for name in [
+            "Discovery",
+            "PolymarketRtdsChainlink",
+            "PolymarketRtdsBinance",
+        ] {
+            stale_controller.set_feed_status(name, "ok", None).await;
+        }
+        stale_controller
+            .set_feed_status_at(
+                "PolymarketClobMarket",
+                "ok",
+                None,
+                Utc::now() - chrono::Duration::minutes(6),
+            )
+            .await;
+        let data = stale_controller.inner.data.read().await;
+        assert_eq!(
+            feed_summary(&data, &stale_controller.inner.settings),
+            "starting"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_disconnects_are_durable_canonical_feed_errors() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        controller
+            .record_feed_disconnect(
+                &[
+                    FeedName::PolymarketClobMarket,
+                    FeedName::PolymarketRtdsChainlink,
+                    FeedName::PolymarketRtdsBinance,
+                ],
+                "injected clean disconnect",
+            )
+            .await;
+
+        let data = controller.inner.data.read().await;
+        for source in [
+            "PolymarketClobMarket",
+            "PolymarketRtdsChainlink",
+            "PolymarketRtdsBinance",
+        ] {
+            assert_eq!(data.feed_status[source]["status"], "error");
+        }
+        assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "feed_error")
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn rtds_source_settings_enable_only_the_requested_subscription() {
+        let settings = RuntimeSettings::default();
+        let chainlink = rtds_source_settings(&settings, &FeedName::PolymarketRtdsChainlink);
+        assert!(chainlink.target.enable_polymarket_rtds_chainlink);
+        assert!(!chainlink.target.enable_polymarket_rtds_binance);
+
+        let binance = rtds_source_settings(&settings, &FeedName::PolymarketRtdsBinance);
+        assert!(!binance.target.enable_polymarket_rtds_chainlink);
+        assert!(binance.target.enable_polymarket_rtds_binance);
+    }
+
+    #[tokio::test]
+    async fn rtds_disconnect_is_scoped_to_the_failed_source() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        for source in [
+            "Discovery",
+            "PolymarketClobMarket",
+            "PolymarketRtdsChainlink",
+            "PolymarketRtdsBinance",
+        ] {
+            controller.set_feed_status(source, "ok", None).await;
+        }
+
+        controller
+            .record_feed_disconnect(
+                &[FeedName::PolymarketRtdsChainlink],
+                "injected Chainlink disconnect",
+            )
+            .await;
+
+        let data = controller.inner.data.read().await;
+        assert_eq!(
+            data.feed_status["PolymarketRtdsChainlink"]["status"],
+            "error"
+        );
+        assert_eq!(data.feed_status["PolymarketRtdsBinance"]["status"], "ok");
+        assert_eq!(feed_summary(&data, &controller.inner.settings), "degraded");
+        assert_eq!(
+            data.recent_events
+                .iter()
+                .filter(|event| event.event_type == "feed_error")
+                .count(),
+            1
+        );
+    }
+
     #[derive(Default)]
     struct BufferedRecorderTestState {
         pending: Vec<RuntimeEvent>,
+        pending_sequences: Vec<u64>,
+        retry_pending: Vec<RuntimeEvent>,
+        retry_sequences: Vec<u64>,
         committed_event_types: Vec<Vec<String>>,
+        committed_sequences: Vec<Vec<u64>>,
         record_batch_calls: Vec<Vec<String>>,
         best_effort_record_failures_remaining: usize,
+        retry_flush_failures_remaining: usize,
         durable_flush_failures_remaining: usize,
     }
 
@@ -3534,19 +6049,65 @@ mod tests {
                     .map(|event| event.event_type.clone())
                     .collect(),
             );
-            state.pending.extend_from_slice(events);
             let best_effort_only = events.iter().all(|event| event.event_type == "book");
             if best_effort_only && state.best_effort_record_failures_remaining > 0 {
                 state.best_effort_record_failures_remaining -= 1;
+                state.retry_pending.extend_from_slice(events);
                 return Err(StorageError::Io(std::io::Error::other(
                     "injected best-effort record failure",
                 )));
             }
+            state.pending.extend_from_slice(events);
+            Ok(())
+        }
+
+        fn record_recorded_batch(
+            &mut self,
+            events: &[RecordedRuntimeEvent],
+        ) -> Result<(), StorageError> {
+            let mut state = self.state.lock().unwrap();
+            state.record_batch_calls.push(
+                events
+                    .iter()
+                    .map(|event| event.event().event_type.clone())
+                    .collect(),
+            );
+            let best_effort_only = events
+                .iter()
+                .all(|event| event.event().event_type == "book");
+            if best_effort_only && state.best_effort_record_failures_remaining > 0 {
+                state.best_effort_record_failures_remaining -= 1;
+                state
+                    .retry_pending
+                    .extend(events.iter().map(|event| event.event().clone()));
+                state
+                    .retry_sequences
+                    .extend(events.iter().map(RecordedRuntimeEvent::recorder_sequence));
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected best-effort record failure",
+                )));
+            }
+            state
+                .pending
+                .extend(events.iter().map(|event| event.event().clone()));
+            state
+                .pending_sequences
+                .extend(events.iter().map(RecordedRuntimeEvent::recorder_sequence));
             Ok(())
         }
 
         fn flush(&mut self) -> Result<(), StorageError> {
             let mut state = self.state.lock().unwrap();
+            let mut retry_pending = std::mem::take(&mut state.retry_pending);
+            let mut retry_sequences = std::mem::take(&mut state.retry_sequences);
+            state.pending.append(&mut retry_pending);
+            state.pending_sequences.append(&mut retry_sequences);
+            if state.retry_flush_failures_remaining > 0 {
+                state.retry_flush_failures_remaining -= 1;
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected retry flush failure",
+                )));
+            }
             let durable_pending = state.pending.iter().any(|event| event.event_type != "book");
             if durable_pending && state.durable_flush_failures_remaining > 0 {
                 state.durable_flush_failures_remaining -= 1;
@@ -3560,7 +6121,9 @@ mod tests {
                     .iter()
                     .map(|event| event.event_type.clone())
                     .collect();
+                let sequences = std::mem::take(&mut state.pending_sequences);
                 state.committed_event_types.push(event_types);
+                state.committed_sequences.push(sequences);
                 state.pending.clear();
             }
             Ok(())
@@ -3590,6 +6153,8 @@ mod tests {
         assert_eq!(payload["candidate"]["name"], "dynamic_quote_style");
         assert_eq!(payload["compact_shadow_recording"], true);
         assert_eq!(payload["shadow_book_sample_ms"], 1_000);
+        assert_eq!(payload["authoritative_recorder_backend"], "local_jsonl");
+        assert!(payload["storage_account"].is_null());
         assert_eq!(
             payload["decision_pipeline_schema"],
             "polyedge.strategy_decision_batch.v4"
@@ -3793,6 +6358,58 @@ mod tests {
             vec!["a-down-token".to_owned(), "z-up-token".to_owned()]
         );
         assert!(!scoped.contains_key(&TokenId::new("unrelated-token")));
+    }
+
+    #[test]
+    fn funded_warmup_tracks_the_nearest_market_outside_the_final_six_minutes() {
+        let now = Utc::now();
+        let market = |id: &str, seconds_to_expiry: i64| MarketSpec {
+            asset: "BTC".to_owned(),
+            horizon: "15m".to_owned(),
+            event_id: None,
+            event_slug: None,
+            market_id: MarketId::new(id),
+            market_slug: None,
+            condition_id: ConditionId::new(format!("{id}-condition")),
+            question: "BTC up?".to_owned(),
+            description: None,
+            up_token_id: TokenId::new(format!("{id}-up")),
+            down_token_id: TokenId::new(format!("{id}-down")),
+            start_ts: now,
+            end_ts: now + chrono::Duration::seconds(seconds_to_expiry),
+            start_price: Some(Decimal::from(100)),
+            resolution_source: "chainlink_reference".to_owned(),
+            tick_size: Decimal::new(1, 2),
+            minimum_order_size: Decimal::from(5),
+            neg_risk: false,
+            fees_enabled: true,
+            accepting_orders: true,
+            status: MarketStatus::Tradeable,
+            raw: BTreeMap::new(),
+        };
+        let markets = [
+            market("final-six", 300),
+            market("active-window", 840),
+            market("future", 1_740),
+        ]
+        .into_iter()
+        .map(|market| (market.market_id.clone(), market))
+        .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            select_funded_warmup_market(markets.values(), now, 360)
+                .map(|market| market.market_id.to_string()),
+            Some("active-window".to_owned())
+        );
+        assert_eq!(
+            select_funded_warmup_market(
+                markets.values(),
+                now + chrono::Duration::seconds(500),
+                360,
+            )
+            .map(|market| market.market_id.to_string()),
+            Some("future".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -4084,29 +6701,44 @@ mod tests {
             metrics.queued.fetch_add(1, Ordering::Relaxed);
             metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
             sender
-                .send(RecorderRequest::best_effort(RuntimeEvent {
-                    event_type: "book".to_owned(),
-                    ts: Utc::now(),
-                    data: json!({ "index": index }),
-                }))
+                .send(RecorderRequest::best_effort(
+                    metrics
+                        .bind(RuntimeEvent {
+                            event_type: "book".to_owned(),
+                            ts: Utc::now(),
+                            data: json!({ "index": index }),
+                        })
+                        .unwrap(),
+                ))
                 .unwrap();
         }
         drop(sender);
 
         for _ in 0..100 {
-            let lines = fs::read_to_string(&path)
-                .map(|text| text.lines().count())
-                .unwrap_or_default();
-            if lines == 100 {
+            if metrics.queued.load(Ordering::Relaxed) == 0 {
                 break;
             }
             thread::sleep(StdDuration::from_millis(10));
         }
+        assert_eq!(metrics.queued.load(Ordering::Relaxed), 0);
 
         let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 100);
+        let recorded = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 100);
+        assert!(recorded.iter().all(|event| {
+            event["recorder_instance_id"] == metrics.snapshot()["recorder_instance_id"]
+        }));
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|event| event["recorder_sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            (1..=100).collect::<Vec<_>>()
+        );
         assert_eq!(recorder.lock().unwrap().status(false)["error_count"], 0);
-        assert_eq!(metrics.snapshot()["queued"], 0);
         assert_eq!(metrics.snapshot()["enqueued_total"], 100);
         assert_eq!(metrics.snapshot()["persisted_total"], 100);
         assert_eq!(metrics.snapshot()["failed_total"], 0);
@@ -4114,7 +6746,604 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_failure_stays_unrecovered_until_retry_flush_succeeds() {
+    fn recorder_queue_rejection_rolls_back_an_unentered_tail() {
+        let metrics = RecorderMetrics::default();
+        let event = || RuntimeEvent {
+            event_type: "book".to_owned(),
+            ts: Utc::now(),
+            data: json!({}),
+        };
+        let first = metrics.bind(event()).unwrap();
+        let (sender, receiver) = std_mpsc::channel();
+        drop(receiver);
+        let rejected = match sender.send(RecorderRequest::best_effort(first)) {
+            Ok(()) => panic!("recorder queue unexpectedly accepted a request"),
+            Err(error) => error.0,
+        };
+        assert!(metrics.rollback_bound_tail(&rejected.events));
+        let second = metrics.bind(event()).unwrap();
+        assert_eq!(second.recorder_sequence(), 1);
+        let status = metrics.snapshot();
+        assert!(uuid::Uuid::parse_str(status["recorder_instance_id"].as_str().unwrap()).is_ok());
+        assert_eq!(status["last_assigned_sequence"], 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_recorder_enqueues_preserve_sequence_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "polyedge-recorder-order-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        let path = dir.join("events.jsonl");
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_path(path.clone()),
+        );
+        let first = controller.record_event("book", json!({"index": 1}), None, None);
+        let second = controller.record_event("book", json!({"index": 2}), None, None);
+        tokio::join!(first, second);
+        controller.shutdown().await.unwrap();
+        let sequences = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["recorder_sequence"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recorder_admission_yields_while_capacity_is_held() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        let heartbeat = tokio::time::timeout(
+            StdDuration::from_millis(100),
+            tokio::time::sleep(StdDuration::from_millis(1)),
+        )
+        .await;
+        assert!(heartbeat.is_ok());
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        tokio::time::timeout(StdDuration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        controller.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn qset_v4_retirement_failure_stays_fenced_and_retryable() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V4_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V4_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+
+        let shutdown = tokio::time::timeout(
+            RECORDER_SHUTDOWN_DRAIN_TIMEOUT + StdDuration::from_secs(1),
+            controller.prepare_qset_v4_retirement(),
+        )
+        .await
+        .unwrap();
+        assert!(shutdown.is_err());
+        waiting.await.unwrap();
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v4_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn qset_v5_retirement_failure_stays_fenced_and_retryable() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V5_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V5_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+
+        let shutdown = tokio::time::timeout(
+            RECORDER_SHUTDOWN_DRAIN_TIMEOUT + StdDuration::from_secs(1),
+            controller.prepare_qset_v5_retirement(),
+        )
+        .await
+        .unwrap();
+        assert!(shutdown.is_err());
+        waiting.await.unwrap();
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v5_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn qset_v6_retirement_failure_stays_fenced_and_retryable() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            best_effort_record_failures_remaining: 1,
+            retry_flush_failures_remaining: usize::MAX,
+            ..BufferedRecorderTestState::default()
+        }));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V6_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V6_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder_and_capacity(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+            1,
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["failed_total"] == 1 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiting_controller = controller.clone();
+        let waiting = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            waiting_controller
+                .record_event("book", json!({"sequence": 2}), None, None)
+                .await;
+        });
+        started_rx.await.unwrap();
+
+        let shutdown = tokio::time::timeout(
+            RECORDER_SHUTDOWN_DRAIN_TIMEOUT + StdDuration::from_secs(1),
+            controller.prepare_qset_v6_retirement(),
+        )
+        .await
+        .unwrap();
+        assert!(shutdown.is_err());
+        waiting.await.unwrap();
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+
+        state.lock().unwrap().retry_flush_failures_remaining = 0;
+        for _ in 0..100 {
+            if controller.inner.recorder_metrics.snapshot()["queued"] == 0 {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v6_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_and_flushes_the_recorder_queue() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+
+        assert_eq!(controller.inner.recorder_metrics.snapshot()["queued"], 0);
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
+            vec![vec!["book"]]
+        );
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_persisted_sequence"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_feed_events_before_closing_recorder_admission() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let controller = RuntimeController::new_with_recorder(
+            RuntimeSettings::default(),
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .try_send(FeedEvent::Error {
+                source: FeedName::PolymarketClobMarket,
+                message: "shutdown tail".to_owned(),
+                ts: Utc::now(),
+            })
+            .unwrap();
+        drop(sender);
+        *controller.inner.feed_task.lock().unwrap() =
+            Some(controller.spawn_feed_event_loop(receiver));
+
+        controller.shutdown().await.unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
+            vec![vec!["feed_error"]]
+        );
+        assert_eq!(controller.inner.recorder_metrics.snapshot()["queued"], 0);
+    }
+
+    #[tokio::test]
+    async fn qset_v4_retirement_receipt_proves_the_closed_durable_waterline() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V4_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V4_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v4_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+
+        assert_eq!(
+            receipt.schema,
+            "polyedge.qset_v4_writer_retirement_receipt.v1"
+        );
+        assert_eq!(receipt.status, "prepared_for_retirement");
+        assert_eq!(receipt.campaign_id, QSET_V4_CAMPAIGN_ID);
+        assert_eq!(receipt.app_name, QSET_V4_APP_NAME);
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_enqueued_sequence, 1);
+        assert_eq!(receipt.final_enqueued_total, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+        assert_eq!(receipt.final_persisted_total, 1);
+        assert_eq!(receipt.final_queued, 0);
+        assert!(receipt.flush_success);
+
+        controller
+            .record_event("book", json!({"sequence": 2}), None, None)
+            .await;
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn qset_v5_retirement_receipt_proves_the_closed_durable_waterline() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V5_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V5_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v5_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+
+        assert_eq!(
+            receipt.schema,
+            "polyedge.qset_v5_writer_retirement_receipt.v1"
+        );
+        assert_eq!(receipt.status, "prepared_for_retirement");
+        assert_eq!(receipt.campaign_id, QSET_V5_CAMPAIGN_ID);
+        assert_eq!(receipt.app_name, QSET_V5_APP_NAME);
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_enqueued_sequence, 1);
+        assert_eq!(receipt.final_enqueued_total, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+        assert_eq!(receipt.final_persisted_total, 1);
+        assert_eq!(receipt.final_queued, 0);
+        assert!(receipt.flush_success);
+
+        controller
+            .record_event("book", json!({"sequence": 2}), None, None)
+            .await;
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn qset_v6_retirement_receipt_proves_the_closed_durable_waterline() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
+        let mut settings = RuntimeSettings::default();
+        settings.deploy.app_name = QSET_V6_APP_NAME.to_owned();
+        settings.azure.storage_container_name = QSET_V6_RAW_CONTAINER.to_owned();
+        let controller = RuntimeController::new_with_recorder(
+            settings,
+            RuntimeRecorder::new_for_test_recorder(
+                Box::new(BufferedRecorderTestDouble {
+                    state: Arc::clone(&state),
+                }),
+                true,
+            ),
+        );
+        controller
+            .record_event("book", json!({"sequence": 1}), None, None)
+            .await;
+
+        controller.shutdown().await.unwrap();
+        let receipt = controller
+            .qset_v6_retirement_receipt(format!("sha256:{}", "b".repeat(64)), "a".repeat(40))
+            .unwrap();
+
+        assert_eq!(
+            receipt.schema,
+            "polyedge.qset_v6_writer_retirement_receipt.v1"
+        );
+        assert_eq!(receipt.status, "prepared_for_retirement");
+        assert_eq!(receipt.campaign_id, QSET_V6_CAMPAIGN_ID);
+        assert_eq!(receipt.app_name, QSET_V6_APP_NAME);
+        assert_eq!(receipt.final_assigned_sequence, 1);
+        assert_eq!(receipt.final_enqueued_sequence, 1);
+        assert_eq!(receipt.final_enqueued_total, 1);
+        assert_eq!(receipt.final_persisted_sequence, 1);
+        assert_eq!(receipt.final_persisted_total, 1);
+        assert_eq!(receipt.final_queued, 0);
+        assert!(receipt.flush_success);
+
+        controller
+            .record_event("book", json!({"sequence": 2}), None, None)
+            .await;
+        assert_eq!(
+            controller.inner.recorder_metrics.snapshot()["last_assigned_sequence"],
+            1
+        );
+    }
+
+    #[test]
+    fn qset_v4_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v4_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v4_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v4_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v4_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v4_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v4_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v4_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
+    }
+
+    #[test]
+    fn qset_v5_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v5_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v5_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v5_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v5_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v5_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v5_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v5_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
+    }
+
+    #[test]
+    fn qset_v6_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v6_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v6_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v6_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v6_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v6_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v6_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v6_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
+    }
+
+    #[test]
+    fn qset_v7_receipt_requires_exact_frozen_identity() {
+        assert_eq!(
+            qset_v7_image_digest_from(&format!("registry/polyedge@sha256:{}", "a".repeat(64))),
+            Some(format!("sha256:{}", "a".repeat(64)))
+        );
+        assert!(
+            qset_v7_image_digest_from(&format!("registry/polyedge@sha256:{}", "A".repeat(64)))
+                .is_none()
+        );
+        assert!(qset_v7_image_digest_from("user:secret@registry/polyedge:latest").is_none());
+        assert!(qset_v7_image_digest_from("registry/polyedge@sha256:not-a-digest").is_none());
+        let revision = "a".repeat(40);
+        assert_eq!(
+            qset_v7_source_revision_from(&revision, Some(&revision)).unwrap(),
+            revision
+        );
+        assert!(qset_v7_source_revision_from(&"A".repeat(40), None).is_err());
+        assert!(qset_v7_source_revision_from(&"a".repeat(40), Some(&"b".repeat(40))).is_err());
+    }
+
+    #[test]
+    fn best_effort_failure_retries_before_later_requests_and_durable() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
             best_effort_record_failures_remaining: 1,
             ..BufferedRecorderTestState::default()
@@ -4131,11 +7360,15 @@ mod tests {
         metrics.queued.fetch_add(1, Ordering::Relaxed);
         metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
         sender
-            .send(RecorderRequest::best_effort(RuntimeEvent {
-                event_type: "book".to_owned(),
-                ts: Utc::now(),
-                data: json!({"sequence": 1}),
-            }))
+            .send(RecorderRequest::best_effort(
+                metrics
+                    .bind(RuntimeEvent {
+                        event_type: "book".to_owned(),
+                        ts: Utc::now(),
+                        data: json!({"sequence": 1}),
+                    })
+                    .unwrap(),
+            ))
             .unwrap();
 
         for _ in 0..100 {
@@ -4144,35 +7377,85 @@ mod tests {
             }
             thread::sleep(StdDuration::from_millis(10));
         }
-        assert_eq!(metrics.snapshot()["queued"], 0);
+        assert_eq!(metrics.snapshot()["failed_total"], 1);
+        assert_eq!(metrics.snapshot()["queued"], 1);
+        assert_eq!(metrics.snapshot()["persisted_total"], 0);
         assert_eq!(metrics.snapshot()["flush_unrecovered"], true);
         assert_eq!(metrics.snapshot()["flush_failed_total"], 1);
+        assert!(state.lock().unwrap().pending.is_empty());
 
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::best_effort(
+                metrics
+                    .bind(RuntimeEvent {
+                        event_type: "book".to_owned(),
+                        ts: Utc::now(),
+                        data: json!({"sequence": 2}),
+                    })
+                    .unwrap(),
+            ))
+            .unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        metrics.queued.fetch_add(1, Ordering::Relaxed);
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(RecorderRequest::durable(
+                vec![metrics
+                    .bind(RuntimeEvent {
+                        event_type: "required_evidence".to_owned(),
+                        ts: Utc::now(),
+                        data: json!({"journal_id": "after-recovered-books"}),
+                    })
+                    .unwrap()],
+                ack_tx,
+            ))
+            .unwrap();
+
+        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
         drop(sender);
         for _ in 0..100 {
-            if metrics.snapshot()["flush_unrecovered"] == false {
+            if metrics.snapshot()["queued"] == 0 {
                 break;
             }
             thread::sleep(StdDuration::from_millis(10));
         }
+        assert_eq!(metrics.snapshot()["queued"], 0);
         assert_eq!(metrics.snapshot()["flush_unrecovered"], false);
         assert_eq!(metrics.snapshot()["flush_recovered_total"], 1);
+        assert_eq!(metrics.snapshot()["persisted_total"], 3);
+        let state = state.lock().unwrap();
+        assert_eq!(state.committed_sequences, vec![vec![1], vec![2, 3]]);
         assert_eq!(
-            state.lock().unwrap().committed_event_types,
-            vec![vec!["book"]]
+            state
+                .record_batch_calls
+                .iter()
+                .filter(|events| events.as_slice() == ["book"])
+                .count(),
+            2
+        );
+        assert_eq!(
+            state.committed_event_types,
+            vec![
+                vec!["book".to_owned()],
+                vec!["book".to_owned(), "required_evidence".to_owned()]
+            ]
         );
     }
 
     #[test]
-    fn durable_recorder_ack_fails_then_retries_the_same_journal() {
-        let dir = std::env::temp_dir().join(format!(
-            "polyedge-recorder-ack-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let path = dir.join("events.jsonl");
-        fs::create_dir_all(&path).unwrap();
-        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_path(path.clone())));
+    fn durable_recorder_retries_the_same_bound_request_without_restaging() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            durable_flush_failures_remaining: 1,
+            ..BufferedRecorderTestState::default()
+        }));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
         let metrics = Arc::new(RecorderMetrics::default());
         let (sender, receiver) = std_mpsc::channel();
         spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
@@ -4182,34 +7465,28 @@ mod tests {
             data: json!({"journal_id": "stable-journal-1"}),
         };
 
-        let (failed_ack_tx, failed_ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         metrics.queued.fetch_add(1, Ordering::Relaxed);
         metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
         sender
-            .send(RecorderRequest::durable(vec![event.clone()], failed_ack_tx))
+            .send(RecorderRequest::durable(
+                vec![metrics.bind(event).unwrap()],
+                ack_tx,
+            ))
             .unwrap();
-        assert!(failed_ack_rx.blocking_recv().unwrap().is_err());
-
-        fs::remove_dir_all(&path).unwrap();
-        let (success_ack_tx, success_ack_rx) = oneshot::channel();
-        metrics.queued.fetch_add(1, Ordering::Relaxed);
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        sender
-            .send(RecorderRequest::durable(vec![event], success_ack_tx))
-            .unwrap();
-        assert_eq!(success_ack_rx.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
         drop(sender);
 
-        let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.lines().count(), 1);
-        assert!(text.contains("stable-journal-1"));
+        let state = state.lock().unwrap();
+        assert_eq!(state.committed_sequences, vec![vec![1]]);
+        assert_eq!(state.record_batch_calls, vec![vec!["required_evidence"]]);
         assert_eq!(metrics.snapshot()["persisted_total"], 1);
         assert_eq!(metrics.snapshot()["failed_total"], 1);
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(metrics.snapshot()["last_assigned_sequence"], 1);
     }
 
     #[test]
-    fn durable_requests_flush_best_effort_before_staging_the_journal() {
+    fn durable_requests_commit_buffered_best_effort_with_the_journal() {
         let state = Arc::new(StdMutex::new(BufferedRecorderTestState::default()));
         let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
             Box::new(BufferedRecorderTestDouble {
@@ -4232,11 +7509,16 @@ mod tests {
         metrics.queued.fetch_add(2, Ordering::Relaxed);
         metrics.enqueued_total.fetch_add(2, Ordering::Relaxed);
         sender
-            .send(RecorderRequest::best_effort(best_effort))
+            .send(RecorderRequest::best_effort(
+                metrics.bind(best_effort).unwrap(),
+            ))
             .unwrap();
         let (ack_tx, ack_rx) = oneshot::channel();
         sender
-            .send(RecorderRequest::durable(vec![durable], ack_tx))
+            .send(RecorderRequest::durable(
+                vec![metrics.bind(durable).unwrap()],
+                ack_tx,
+            ))
             .unwrap();
         spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
 
@@ -4253,11 +7535,65 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(
             state.committed_event_types,
+            vec![vec!["book".to_owned(), "required_evidence".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn durable_request_recovers_a_failed_best_effort_flush_first() {
+        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
+            retry_flush_failures_remaining: 1,
+            ..BufferedRecorderTestState::default()
+        }));
+        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
+            Box::new(BufferedRecorderTestDouble {
+                state: Arc::clone(&state),
+            }),
+            true,
+        )));
+        let metrics = Arc::new(RecorderMetrics::default());
+        let book = metrics
+            .bind(RuntimeEvent {
+                event_type: "book".to_owned(),
+                ts: Utc::now(),
+                data: json!({"sequence": 1}),
+            })
+            .unwrap();
+        recorder
+            .lock()
+            .unwrap()
+            .record_recorded_batch(std::slice::from_ref(&book))
+            .unwrap();
+        assert!(recorder_flush_result(&recorder, &metrics, false).is_err());
+
+        let durable = metrics
+            .bind(RuntimeEvent {
+                event_type: "required_evidence".to_owned(),
+                ts: Utc::now(),
+                data: json!({"journal_id": "after-failed-book-flush"}),
+            })
+            .unwrap();
+        let mut durability = RecorderDurabilityState::default();
+        assert_eq!(
+            persist_durable_recorder_request(
+                &recorder,
+                &metrics,
+                &mut durability,
+                "after-failed-book-flush",
+                std::slice::from_ref(&durable),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            state.lock().unwrap().committed_event_types,
             vec![
                 vec!["book".to_owned()],
                 vec!["required_evidence".to_owned()]
             ]
         );
+        assert_eq!(metrics.snapshot()["flush_unrecovered"], false);
+        assert_eq!(metrics.snapshot()["flush_recovered_total"], 1);
     }
 
     #[test]
@@ -4282,12 +7618,15 @@ mod tests {
         metrics.enqueued_total.fetch_add(2, Ordering::Relaxed);
         sender
             .send(RecorderRequest::durable(
-                vec![durable.clone()],
+                vec![metrics.bind(durable.clone()).unwrap()],
                 first_ack_tx,
             ))
             .unwrap();
         sender
-            .send(RecorderRequest::durable(vec![durable], second_ack_tx))
+            .send(RecorderRequest::durable(
+                vec![metrics.bind(durable).unwrap()],
+                second_ack_tx,
+            ))
             .unwrap();
         spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
 
@@ -4358,81 +7697,6 @@ mod tests {
         );
         assert_eq!(
             controller.inner.recorder_metrics.snapshot()["persisted_total"],
-            1
-        );
-    }
-
-    #[test]
-    fn completed_durable_batch_is_acknowledged_without_resubmission() {
-        let state = Arc::new(StdMutex::new(BufferedRecorderTestState {
-            durable_flush_failures_remaining: REQUIRED_RECORDER_ATTEMPTS,
-            ..BufferedRecorderTestState::default()
-        }));
-        let recorder = Arc::new(StdMutex::new(RuntimeRecorder::new_for_test_recorder(
-            Box::new(BufferedRecorderTestDouble {
-                state: Arc::clone(&state),
-            }),
-            true,
-        )));
-        let metrics = Arc::new(RecorderMetrics::default());
-        let (sender, receiver) = std_mpsc::channel();
-        spawn_recorder_worker(Arc::clone(&recorder), receiver, Arc::clone(&metrics));
-        let durable = RuntimeEvent {
-            event_type: "required_evidence".to_owned(),
-            ts: Utc::now(),
-            data: json!({"journal_id": "delayed-commit-journal-1"}),
-        };
-
-        for _ in 0..REQUIRED_RECORDER_ATTEMPTS {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            metrics.queued.fetch_add(1, Ordering::Relaxed);
-            metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-            sender
-                .send(RecorderRequest::durable(vec![durable.clone()], ack_tx))
-                .unwrap();
-            assert!(ack_rx.blocking_recv().unwrap().is_err());
-        }
-
-        metrics.queued.fetch_add(1, Ordering::Relaxed);
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        sender
-            .send(RecorderRequest::best_effort(RuntimeEvent {
-                event_type: "book".to_owned(),
-                ts: Utc::now(),
-                data: json!({"sequence": 1}),
-            }))
-            .unwrap();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        metrics.queued.fetch_add(1, Ordering::Relaxed);
-        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
-        sender
-            .send(RecorderRequest::durable(vec![durable], ack_tx))
-            .unwrap();
-        assert_eq!(ack_rx.blocking_recv().unwrap(), Ok(()));
-        drop(sender);
-
-        for _ in 0..100 {
-            if metrics.snapshot()["queued"] == 0 {
-                break;
-            }
-            thread::sleep(StdDuration::from_millis(10));
-        }
-        let state = state.lock().unwrap();
-        assert_eq!(
-            state
-                .record_batch_calls
-                .iter()
-                .filter(|events| events.as_slice() == ["required_evidence"])
-                .count(),
-            1
-        );
-        assert_eq!(
-            state
-                .committed_event_types
-                .iter()
-                .flatten()
-                .filter(|event_type| event_type.as_str() == "required_evidence")
-                .count(),
             1
         );
     }

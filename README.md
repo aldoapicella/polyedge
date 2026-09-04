@@ -41,10 +41,13 @@ cargo run --release -p polyedge-cli -- bench-azure-replay \
 
 ## Deployment
 
-Deploy through GitHub Actions with `.github/workflows/deploy-polyedge-active.yml`. The workflow runs Rust and frontend validations, builds `Dockerfile.rust` and `Dockerfile.frontend`, pushes images to ACR, and applies `infra/main.bicep` to `polyedge-dev`.
+Build the ARM64 images with `.github/workflows/build-oci-images.yml`, then deploy an immutable GHCR digest to `conduit-dev` with `.github/workflows/deploy-conduit-oci.yml`.
 
 ```bash
-gh workflow run deploy-polyedge-active.yml --ref <branch-or-sha>
+gh workflow run build-oci-images.yml --ref <branch-or-sha>
+gh workflow run deploy-conduit-oci.yml --ref <branch-or-sha> \
+  -f quadlet_unit=polyedge-api \
+  -f image_digest=ghcr.io/OWNER/polyedge-rust-backend@sha256:DIGEST
 ```
 
 ## Frontend
@@ -52,9 +55,9 @@ gh workflow run deploy-polyedge-active.yml --ref <branch-or-sha>
 The Next.js frontend remains the public control plane. Browser calls use `/api/backend/*`; the server-side proxy forwards them to the Rust backend `/api/v1/*` with the bearer token kept server-side.
 
 ```text
-Public frontend/API: https://polyedge-dev.graypond-7f5d8417.eastus.azurecontainerapps.io
-Backend sidecar:     http://127.0.0.1:8081/api/v1
-WebSocket sidecar:   ws://127.0.0.1:8081/api/v1/ws/live
+Public frontend/API: https://polyedge.149.130.186.60.nip.io
+Private backend:     http://polyedge-api:8081/api/v1
+Private WebSocket:   ws://polyedge-api:8081/api/v1/ws/live
 ```
 
 ## Live Trading Gates

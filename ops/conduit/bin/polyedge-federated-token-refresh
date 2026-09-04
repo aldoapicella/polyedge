@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+lane=${1:?usage: polyedge-federated-token-refresh LANE DESTINATION ISSUER}
+destination=${2:?usage: polyedge-federated-token-refresh LANE DESTINATION ISSUER}
+issuer=${3:?usage: polyedge-federated-token-refresh LANE DESTINATION ISSUER}
+audience=api://AzureADTokenExchange
+socket=${SPIRE_AGENT_SOCKET:-/run/spire/agent.sock}
+spire_agent=${SPIRE_AGENT_BIN:-/opt/spire/bin/spire-agent}
+token_root=${POLYEDGE_FEDERATED_TOKEN_ROOT:-/run}
+expected_uid=${POLYEDGE_FEDERATED_TOKEN_EXPECTED_UID:-$(id -u)}
+expected_gid=${POLYEDGE_FEDERATED_TOKEN_EXPECTED_GID:-$(id -g)}
+
+case "$lane" in
+  promotion) subject=spiffe://polyedge.local/conduit/promotion-controller ;;
+  api|research|shadow-qset|shadow-qset-v3-writer|shadow-qset-v4-writer|shadow-qset-v4-processor|shadow-qset-v5-writer|shadow-qset-v5-processor|shadow-qset-v6-writer|shadow-qset-v6-processor|shadow-qset-v7-writer|shadow-qset-v7-processor|funded-signer|funded-intent-producer) subject=spiffe://polyedge.local/conduit/$lane ;;
+  *) echo 'unknown identity lane' >&2; exit 64 ;;
+esac
+expected_destination=$token_root/polyedge-federated-$lane/azure-federated-token
+[ "$destination" = "$expected_destination" ] || { echo 'token destination does not match the identity lane' >&2; exit 64; }
+[ -d "$(dirname "$destination")" ] && [ ! -L "$(dirname "$destination")" ] || { echo 'token directory is missing or unsafe' >&2; exit 64; }
+set -- $(stat -c '%u %g %a' "$(dirname "$destination")")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 700 ] || { echo 'token directory has wrong owner or mode' >&2; exit 64; }
+case "$issuer" in https://*) ;; *) echo 'OIDC issuer must use HTTPS' >&2; exit 64 ;; esac
+test -S "$socket" || { echo 'SPIRE Workload API socket is unavailable' >&2; exit 1; }
+test -x "$spire_agent" || { echo 'SPIRE Agent binary is unavailable' >&2; exit 1; }
+
+temporary=$(mktemp "$destination.XXXXXX")
+trap 'unlink "$temporary" 2>/dev/null || true' EXIT HUP INT TERM
+"$spire_agent" api fetch jwt -socketPath "$socket" -spiffeID "$subject" -audience "$audience" -output json \
+  | jq -erj --arg subject "$subject" '[(if type == "array" then .[] else . end)|.svids[]?|select((.spiffeId//.spiffe_id)==$subject)|.svid]|if length==1 then .[0] else error("expected one JWT-SVID") end' >"$temporary"
+chmod 0600 "$temporary"
+
+python3 - "$temporary" "$issuer" "$subject" "$audience" <<'PY'
+import base64
+import json
+import sys
+import time
+
+path, issuer, subject, audience = sys.argv[1:]
+with open(path, "rb") as token_file:
+    token = token_file.read()
+if not 0 < len(token) <= 16 * 1024 or b"\x00" in token:
+    raise SystemExit("JWT-SVID size is invalid")
+parts = token.rstrip(b"\r\n").split(b".")
+if len(parts) != 3 or any(not part for part in parts):
+    raise SystemExit("JWT-SVID shape is invalid")
+
+def decode(part):
+    return json.loads(base64.urlsafe_b64decode(part + b"=" * (-len(part) % 4)))
+
+try:
+    header = decode(parts[0])
+    claims = decode(parts[1])
+except Exception:
+    raise SystemExit("JWT-SVID claims are invalid") from None
+now = int(time.time())
+issued = claims.get("iat")
+expires = claims.get("exp")
+if (
+    header.get("alg") != "RS256"
+    or claims.get("iss") != issuer
+    or claims.get("sub") != subject
+    or claims.get("aud") not in (audience, [audience])
+    or not isinstance(issued, int)
+    or not isinstance(expires, int)
+    or issued > now + 30
+    or expires <= now
+    or not 0 < expires - issued <= 360
+):
+    raise SystemExit("JWT-SVID trust claims are invalid")
+PY
+
+mv "$temporary" "$destination"
+[ ! -L "$destination" ] && [ -f "$destination" ] || { echo 'token file is unsafe after write' >&2; exit 1; }
+set -- $(stat -c '%u %g %a' "$destination")
+[ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = 600 ] || { echo 'token file has wrong owner or mode after write' >&2; exit 1; }
+trap - EXIT HUP INT TERM

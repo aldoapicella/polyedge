@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+readonly repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+readonly policy=$repo/research/configs/campaign_freeze_2026-09-01_qset_v6.json
+readonly campaign_id=campaign-2026-09-01-qset-v6
+readonly evidence_version=protocol-v3-qset-v6
+readonly control_container=polyedge-qset-v6-control
+
+usage() { echo "usage: ${0##*/} build OUTPUT | lock-and-upload MANIFEST" >&2; exit 64; }
+secure_manifest() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%s' "$1")" -gt 0 && test "$(stat -c '%s' "$1")" -le 1048576; }
+verify_image_binding() {
+  local image=$1 source_commit=$2
+  printf '%s' "$image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$'
+  test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$image")" = "linux/arm64|$source_commit"
+  podman manifest inspect "$image" | jq -e '[.manifests[].platform|"\(.os)/\(.architecture)"]|sort|index("linux/amd64") and index("linux/arm64")' >/dev/null
+}
+
+build() {
+  local output=$1 temporary files
+  test ! -e "$output" && test -d "$(dirname "$output")"
+  : "${FREEZE_RESEARCH_IMAGE:?FREEZE_RESEARCH_IMAGE is required}"
+  verify_image_binding "$FREEZE_RESEARCH_IMAGE" "$(git -C "$repo" rev-parse HEAD)"
+  files=$(mktemp); temporary=$(mktemp "$(dirname "$output")/.qset-v6-freeze.XXXXXX")
+  trap 'rm -f "$files" "$temporary"' EXIT HUP INT TERM
+  git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-09-01_qset_v6.json | jq -r '.protected_files[]' | LC_ALL=C sort -u >"$files"
+  test "$(wc -l <"$files")" -gt 0
+  while IFS= read -r file; do git -C "$repo" cat-file -e "HEAD:$file"; git -C "$repo" ls-files --error-unmatch -- "$file" >/dev/null; done <"$files"
+  while IFS= read -r file; do
+    jq -nc --arg path "$file" --arg sha256 "sha256:$(git -C "$repo" show "HEAD:$file"|sha256sum|cut -d' ' -f1)" --argjson bytes "$(git -C "$repo" cat-file -s "HEAD:$file")" '{path:$path,sha256:$sha256,bytes:$bytes}'
+  done <"$files" | jq -s --arg campaign_id "$campaign_id" --arg evidence_version "$evidence_version" --arg source_commit "$(git -C "$repo" rev-parse HEAD)" --arg git_tree "$(git -C "$repo" rev-parse 'HEAD^{tree}')" --arg research_image "$FREEZE_RESEARCH_IMAGE" --arg contract_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/profitability_gate_v3_2026-09-01_qset_v6.yaml|sha256sum|cut -d' ' -f1)" --arg policy_sha256 "sha256:$(git -C "$repo" show HEAD:research/configs/campaign_freeze_2026-09-01_qset_v6.json|sha256sum|cut -d' ' -f1)" '{schema:"polyedge.shadow_source_freeze.v1",campaign_id:$campaign_id,evidence_version:$evidence_version,source_commit:$source_commit,git_tree:$git_tree,research_image:$research_image,campaign_contract_sha256:$contract_sha256,freeze_policy_sha256:$policy_sha256,critical_files:.}' >"$temporary"
+  jq -e --arg id "$campaign_id" --arg version "$evidence_version" '.campaign_id==$id and .evidence_version==$version and (.critical_files|length>0)' "$temporary" >/dev/null
+  chmod 0640 "$temporary"; mv "$temporary" "$output"
+  rm -f "$files" "$temporary"; trap - EXIT HUP INT TERM
+}
+
+lock_and_upload() {
+  local manifest=$1 digest blob temporary= policy_json state etag remote remote_exists receipt_root receipt_tmp= receipt current_commit current_tree manifest_image uri bytes
+  : "${AZURE_STORAGE_ACCOUNT_NAME:?AZURE_STORAGE_ACCOUNT_NAME is required}"
+  secure_manifest "$manifest"
+  current_commit=$(git -C "$repo" rev-parse HEAD); current_tree=$(git -C "$repo" rev-parse 'HEAD^{tree}'); manifest_image=$(jq -er .research_image "$manifest")
+  jq -e --arg id "$campaign_id" --arg version "$evidence_version" --arg commit "$current_commit" --arg tree "$current_tree" --arg image "$manifest_image" '.campaign_id==$id and .evidence_version==$version and .source_commit==$commit and .git_tree==$tree and .research_image==$image' "$manifest" >/dev/null
+  verify_image_binding "$manifest_image" "$current_commit"
+  digest=$(sha256sum "$manifest"|cut -d' ' -f1); bytes=$(stat -c '%s' "$manifest"); blob="reports/research/shadow/campaigns/$campaign_id/control/code-freeze/source-$digest.json"; uri="azure://$AZURE_STORAGE_ACCOUNT_NAME/$control_container/$blob"
+  policy_json=$(az storage container immutability-policy show --resource-group "${AZURE_RESOURCE_GROUP:?AZURE_RESOURCE_GROUP is required}" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" -o json)
+  state=$(jq -r .state <<<"$policy_json")
+  if test "$state" != Locked; then etag=$(jq -er .etag <<<"$policy_json"); az storage container immutability-policy lock --resource-group "$AZURE_RESOURCE_GROUP" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --if-match "$etag" >/dev/null; fi
+  policy_json=$(az storage container immutability-policy show --resource-group "$AZURE_RESOURCE_GROUP" --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" -o json)
+  jq -e '.state=="Locked" and (.immutabilityPeriodSinceCreationInDays|type=="number" and .>=90)' <<<"$policy_json" >/dev/null
+  remote_exists=$(az storage blob exists --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" -o json)
+  if ! jq -e '.exists==true' <<<"$remote_exists" >/dev/null; then
+    az storage blob upload --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" --file "$manifest" --overwrite false >/dev/null
+  fi
+  temporary=$(mktemp); trap 'test -z "${temporary:-}" || rm -f "$temporary"; test -z "${receipt_tmp:-}" || rm -f "$receipt_tmp"' EXIT HUP INT TERM
+  az storage blob download --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" --file "$temporary" >/dev/null
+  test "$(sha256sum "$temporary"|cut -d' ' -f1)" = "$digest" && cmp -s "$manifest" "$temporary"
+  remote=$(az storage blob show --auth-mode login --account-name "$AZURE_STORAGE_ACCOUNT_NAME" --container-name "$control_container" --name "$blob" -o json)
+  jq -e --arg container "$control_container" --arg blob "$blob" --argjson bytes "$bytes" '
+    .container==$container and .name==$blob and .metadata=={} and .properties.blobType=="BlockBlob" and .properties.contentLength==$bytes
+  ' <<<"$remote" >/dev/null
+  etag=$(jq -er '.properties.etag//.etag' <<<"$remote")
+  receipt_root=/srv/polyedge-ring/migration/qset-v6/source-freeze; install -d -o root -g root -m 0750 "$receipt_root"; receipt=$receipt_root/source-$digest.json
+  if test ! -e "$receipt"; then
+    receipt_tmp=$(mktemp "$receipt_root/.upload.XXXXXX")
+    jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg uri "$uri" --arg sha256 "sha256:$digest" --arg etag "$etag" --argjson bytes "$bytes" --arg image "$manifest_image" --arg commit "$current_commit" --arg tree "$current_tree" --argjson policy "$policy_json" '{schema:"polyedge.qset_v6_source_freeze_upload_receipt.v2",generatedAtUtc:$generated,manifest:{uri:$uri,sha256:$sha256,bytes:$bytes,etag:$etag},researchImage:$image,sourceCommit:$commit,gitTree:$tree,immutabilityPolicy:{state:$policy.state,days:$policy.immutabilityPeriodSinceCreationInDays}}' >"$receipt_tmp"
+    chown root:root "$receipt_tmp" && chmod 0640 "$receipt_tmp"
+    sync -f "$receipt_tmp" && mv -n "$receipt_tmp" "$receipt" && sync -f "$receipt" && sync -d "$receipt_root"
+  fi
+  test ! -L "$receipt" && test -f "$receipt"
+  jq -e --arg uri "$uri" --arg sha256 "sha256:$digest" --arg etag "$etag" --argjson bytes "$bytes" --arg image "$manifest_image" --arg commit "$current_commit" --arg tree "$current_tree" --argjson policy "$policy_json" '
+    .schema=="polyedge.qset_v6_source_freeze_upload_receipt.v2" and (.generatedAtUtc|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    .manifest=={uri:$uri,sha256:$sha256,bytes:$bytes,etag:$etag} and .researchImage==$image and .sourceCommit==$commit and .gitTree==$tree and
+    .immutabilityPolicy=={state:$policy.state,days:$policy.immutabilityPeriodSinceCreationInDays}
+  ' "$receipt" >/dev/null
+  rm -f "$temporary" "$receipt_tmp"; trap - EXIT HUP INT TERM
+  printf '%s\n%s\n' "$uri" "sha256:$digest"
+}
+
+case "${1:-}" in build) test "$#" = 2 || usage; build "$2" ;; lock-and-upload) test "$#" = 2 || usage; lock_and_upload "$2" ;; *) usage ;; esac

@@ -1,0 +1,25 @@
+[Unit]
+Description=Collect fail-closed PolyEdge OCI hourly parity evidence
+Wants=network-online.target
+Requires=polyedge-ring-health.service
+After=network-online.target polyedge-job@hourly.service polyedge-ring-sync.service polyedge-ring-health.service
+ConditionPathExists=/etc/polyedge/parity-hourly.env
+StartLimitIntervalSec=15min
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0027
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/usr/local/libexec/polyedge-parity-hourly
+TimeoutStartSec=2h
+CPUQuota=50%
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=60s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full

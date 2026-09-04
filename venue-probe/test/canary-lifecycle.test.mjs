@@ -8,6 +8,8 @@ import {
   marketMessagesThrough,
   maximumMatchedSize,
   postCancelFillStats,
+  reconciledOrderRisk,
+  tradeFillsFromRest,
   tradeFillsFromUserEvents,
   waitForStablePostCancelReconciliation
 } from "../src/canary-lifecycle-lib.mjs";
@@ -80,6 +82,115 @@ test("nested maker_orders user trades produce authenticated maker fills", () => 
       builder_fee: null
     }
   }]);
+});
+
+test("empty maker fee field falls back to the authenticated trade fee", () => {
+  const fills = tradeFillsFromUserEvents([{
+    event_type: "trade",
+    id: "trade-empty-maker-fee",
+    match_time: "2026-07-13T12:00:01.000Z",
+    trader_side: "MAKER",
+    fee_rate_bps: "0",
+    maker_orders: [{
+      order_id: "maker-order-empty-fee",
+      matched_amount: "13.42",
+      price: "0.77",
+      fee_rate_bps: ""
+    }]
+  }], "maker-order-empty-fee");
+
+  assert.equal(fills[0].authenticatedFeeRateBps, 0);
+  assert.equal(fills[0].authenticatedFeeRaw.fee_rate_bps, "0");
+  assert.equal(fills[0].traderSide, "MAKER");
+  assert.equal(fills[0].orderRole, "MAKER");
+});
+
+test("authenticated REST fills retain exact settlement binding fields", () => {
+  const transactionHash = `0x${"a".repeat(64)}`;
+  const conditionId = `0x${"b".repeat(64)}`;
+  const fills = tradeFillsFromRest([{
+    id: "trade-rest-1",
+    taker_order_id: "taker-order-1",
+    market: conditionId,
+    asset_id: "trade-asset",
+    side: "SELL",
+    size: "2.5",
+    price: "0.40",
+    status: "CONFIRMED",
+    match_time: "2026-07-13T12:00:01.000Z",
+    owner: "trade-owner",
+    maker_address: "0x1111111111111111111111111111111111111111",
+    transaction_hash: transactionHash,
+    trader_side: "MAKER",
+    maker_orders: [{
+      order_id: "maker-order-1",
+      owner: "maker-owner",
+      maker_address: "0x2222222222222222222222222222222222222222",
+      matched_amount: "2.5",
+      price: "0.40",
+      asset_id: "maker-asset",
+      side: "BUY"
+    }]
+  }], "maker-order-1");
+
+  assert.equal(fills.length, 1);
+  assert.deepEqual({
+    transactionHash: fills[0].transactionHash,
+    market: fills[0].market,
+    assetId: fills[0].assetId,
+    tradeAssetId: fills[0].tradeAssetId,
+    makerAssetId: fills[0].makerAssetId,
+    status: fills[0].status,
+    orderId: fills[0].orderId,
+    makerOrderId: fills[0].makerOrderId,
+    nestedMakerOrderMatchCount: fills[0].nestedMakerOrderMatchCount,
+    directMakerOrder: fills[0].directMakerOrder,
+    takerOrderId: fills[0].takerOrderId,
+    owner: fills[0].owner,
+    makerAddress: fills[0].makerAddress,
+    orderSide: fills[0].orderSide
+  }, {
+    transactionHash,
+    market: conditionId,
+    assetId: "maker-asset",
+    tradeAssetId: "trade-asset",
+    makerAssetId: "maker-asset",
+    status: "CONFIRMED",
+    orderId: "maker-order-1",
+    makerOrderId: "maker-order-1",
+    nestedMakerOrderMatchCount: 1,
+    directMakerOrder: false,
+    takerOrderId: "taker-order-1",
+    owner: "maker-owner",
+    makerAddress: "0x2222222222222222222222222222222222222222",
+    orderSide: "BUY"
+  });
+});
+
+test("authenticated REST fills expose duplicate nested maker-order matches", () => {
+  const makerOrder = {
+    order_id: "maker-order-duplicate",
+    owner: "maker-owner",
+    maker_address: "0x2222222222222222222222222222222222222222",
+    matched_amount: "2.5",
+    price: "0.40",
+    asset_id: "maker-asset",
+    side: "BUY"
+  };
+  const fills = tradeFillsFromRest([{
+    id: "trade-rest-duplicate",
+    market: `0x${"b".repeat(64)}`,
+    asset_id: "trade-asset",
+    status: "CONFIRMED",
+    match_time: "2026-07-13T12:00:01.000Z",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    trader_side: "MAKER",
+    maker_orders: [makerOrder, { ...makerOrder }]
+  }], makerOrder.order_id);
+
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].nestedMakerOrderMatchCount, 2);
+  assert.equal(fills[0].directMakerOrder, false);
 });
 
 test("a later partial fill after cancel is classified as a cancellation race", () => {
@@ -186,10 +297,310 @@ test("channel disconnect is counted as a gap and reconnects before reuse", async
   assert.equal(channel.gapCount(), 1);
   assert.equal(channel.reconnectCount(), 1);
   assert.equal(channel.isOpen(), true);
+  assert.equal(channel.requiresReconciliation(), true);
+  channel.markReconciled();
+  assert.equal(channel.gapCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
   channel.close();
 });
 
-test("each socket sends one non-overlapping heartbeat at least every ten seconds and close clears it", async () => {
+test("subscription update retries after the automatic reconnect batch is exhausted", async () => {
+  const ledgerEvents = [];
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static accepting = true;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        if (!FakeWebSocket.accepting) {
+          this.emit("error", new Error("temporary outage"));
+          return;
+        }
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    forceClose() {
+      this.readyState = 3;
+      this.emit("close", 1006, Buffer.from("network gap"));
+    }
+
+    close() {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { assets_ids: ["old-token"], type: "market" },
+    eventType: "test_market_channel",
+    ledger: { record: (event, fields) => ledgerEvents.push({ event, fields }) },
+    WebSocketImpl: FakeWebSocket,
+    reconnectAttempts: 2,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 1)))
+  });
+
+  FakeWebSocket.accepting = false;
+  FakeWebSocket.instances[0].forceClose();
+  while (ledgerEvents.filter(({ event }) => event === "test_market_channel_reconnect_failed").length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  await flushMicrotasks();
+  FakeWebSocket.accepting = true;
+
+  await channel.updateSubscription({ operation: "subscribe", assets_ids: ["new-token"] });
+
+  assert.equal(FakeWebSocket.instances.length, 4);
+  assert.equal(channel.isOpen(), true);
+  assert.deepEqual(channel.subscription().assets_ids, ["old-token", "new-token"]);
+  channel.close();
+});
+
+test("unparsed frame metadata survives reconciliation without retaining payloads", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  let wallMs = 1_722_470_400_000;
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { type: "user" },
+    eventType: "test_user_channel",
+    WebSocketImpl: FakeWebSocket,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: async () => {},
+    nowMs: () => wallMs
+  });
+
+  assert.equal(channel.latestUnparsedFrameMetadata(), null);
+  FakeWebSocket.instances[0].emit("message", Buffer.from("NO NEW ASSETS"), false);
+  assert.equal(channel.unparsedCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
+  wallMs += 100;
+  FakeWebSocket.instances[0].emit("message", Buffer.from("not-json"), false);
+
+  assert.equal(channel.gapCount(), 0);
+  assert.equal(channel.unparsedCount(), 1);
+  assert.equal(channel.requiresReconciliation(), true);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), {
+    received_wall_ms: 1_722_470_400_100,
+    byte_length: 8,
+    sha256: "sha256:0c21a879c732a67910d80988df4919d794f6a070aab610ef865032a28046b021",
+    classification: "text"
+  });
+
+  wallMs += 100;
+  FakeWebSocket.instances[0].emit("message", Buffer.from([0xff, 0x00]), true);
+  const latestMetadata = {
+    received_wall_ms: 1_722_470_400_200,
+    byte_length: 2,
+    sha256: "sha256:ea5dbf9596d187e9500f23e9a680109475341cf4e81f7e043f7d97152c10772f",
+    classification: "binary"
+  };
+  assert.equal(channel.unparsedCount(), 2);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), latestMetadata);
+
+  channel.markReconciled();
+  assert.equal(channel.unparsedCount(), 0);
+  assert.equal(channel.requiresReconciliation(), false);
+  assert.deepEqual(channel.latestUnparsedFrameMetadata(), latestMetadata);
+  channel.close();
+});
+
+test("persistent channel bounds frame and dedupe retention across repeated warm safety refreshes", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const ledgerEvents = [];
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { type: "market" },
+    eventType: "test_market_channel",
+    ledger: { record: (event, fields) => ledgerEvents.push({ event, fields }) },
+    recordMessages: false,
+    maxMessageHistory: 8,
+    maxMessageHistoryBytes: 1_024,
+    evidenceBaselineMessages: 4,
+    evidenceBaselineBytes: 512,
+    WebSocketImpl: FakeWebSocket,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: async () => {}
+  });
+  const socket = FakeWebSocket.instances[0];
+  const emit = (value) => socket.emit("message", Buffer.from(JSON.stringify(value)));
+
+  channel.clearHistory();
+  const reusable = { event_type: "book", asset_id: "token", sequence: "reusable", payload: "x".repeat(128) };
+  emit(reusable);
+  for (let cycle = 0; cycle < 100; cycle += 1) {
+    for (let update = 0; update < 10; update += 1) {
+      emit({
+        event_type: "price_change",
+        asset_id: "token",
+        sequence: `${cycle}-${update}`,
+        payload: "x".repeat(128)
+      });
+    }
+    const stats = channel.historyStats();
+    assert.ok(stats.message_count <= 8);
+    assert.ok(stats.fingerprint_count <= 8);
+    assert.ok(stats.approximate_bytes <= 1_024);
+    assert.ok(stats.evicted_count > 0);
+  }
+  emit(reusable);
+
+  assert.equal(channel.messages.at(-1)?.sequence, "reusable", "evicting a frame must also evict its dedupe key");
+  assert.equal(channel.duplicateCount(), 0);
+  assert.equal(ledgerEvents.some(({ event }) => event === "test_market_channel"), false);
+
+  channel.beginEvidenceWindow();
+  assert.ok(channel.messages.length <= 4, "a new evidence window must leave headroom for the active lifecycle");
+  assert.equal(channel.messages.at(-1)?.sequence, "reusable", "recent warm book context must be retained");
+  assert.ok(channel.historyStats().approximate_bytes <= 512);
+  assert.equal(channel.historyStats().evicted_count, 0);
+
+  for (let update = 0; update < 10; update += 1) {
+    emit({
+      event_type: "price_change",
+      asset_id: "token",
+      sequence: `active-${update}`,
+      payload: "x".repeat(128)
+    });
+  }
+  assert.ok(channel.historyStats().evicted_count > 0, "active-window overflow must remain fail-closed");
+
+  channel.clearHistory();
+  emit(reusable);
+  assert.equal(channel.messages.length, 1, "a new warm window must accept frames from the prior window");
+  assert.equal(channel.historyStats().fingerprint_count, 1);
+  channel.close();
+  assert.deepEqual(channel.historyStats(), {
+    message_count: 0,
+    fingerprint_count: 0,
+    approximate_bytes: 0,
+    evicted_count: 0
+  });
+});
+
+test("persistent channels record lifecycle frames only while the execution ledger is attached", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit("open");
+      });
+    }
+
+    send(value) {
+      if (value === "PING") queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
+    }
+
+    close() {
+      this.readyState = 3;
+      this.emit("close", 1000, Buffer.alloc(0));
+    }
+  }
+
+  const events = [];
+  const ledgerMultiplexer = {
+    current: null,
+    record(event, fields) {
+      this.current?.record(event, fields);
+    }
+  };
+  const channel = await connectLifecycleChannel({
+    url: "wss://example.invalid",
+    subscription: { type: "market" },
+    eventType: "test_market_channel",
+    ledger: ledgerMultiplexer,
+    WebSocketImpl: FakeWebSocket,
+    settleMs: 0,
+    openTimeoutMs: 100,
+    heartbeatTimeoutMs: 100,
+    sleep: async () => {}
+  });
+  const socket = FakeWebSocket.instances[0];
+  ledgerMultiplexer.current = { record: (event, fields) => events.push({ event, fields }) };
+  socket.emit("message", Buffer.from(JSON.stringify({ event_type: "book", asset_id: "active-token" })));
+  await flushMicrotasks();
+  const activeFrame = events.find(({ event }) => event === "test_market_channel");
+  assert.equal(activeFrame?.fields?.event_type, "book");
+  assert.equal(activeFrame?.fields?.asset_id, "active-token");
+  assert.ok(Number.isFinite(activeFrame?.fields?._received_wall_ms));
+
+  ledgerMultiplexer.current = null;
+  socket.emit("message", Buffer.from(JSON.stringify({ event_type: "book", asset_id: "idle-token" })));
+  await flushMicrotasks();
+  assert.equal(events.filter(({ event }) => event === "test_market_channel").length, 1);
+  channel.close();
+});
+
+test("the default heartbeat leaves a two-second server margin and close clears it", async () => {
   const scheduler = new ManualScheduler();
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;
@@ -222,7 +633,6 @@ test("each socket sends one non-overlapping heartbeat at least every ten seconds
     subscription: { type: "user" },
     eventType: "test_user_channel",
     WebSocketImpl: FakeWebSocket,
-    heartbeatIntervalMs: 20_000,
     heartbeatTimeoutMs: 100,
     openTimeoutMs: 100,
     settleMs: 0,
@@ -236,14 +646,14 @@ test("each socket sends one non-overlapping heartbeat at least every ten seconds
   assert.equal(socket.sent.filter((value) => value === "PING").length, 1);
   assert.equal(scheduler.pendingCount(), 1, "only the next heartbeat timer may remain armed");
 
-  scheduler.advance(9_999);
+  scheduler.advance(7_999);
   assert.equal(socket.sent.filter((value) => value === "PING").length, 1);
   scheduler.advance(1);
   await flushMicrotasks();
   assert.equal(socket.sent.filter((value) => value === "PING").length, 2);
   assert.equal(scheduler.pendingCount(), 1, "a successful heartbeat must schedule exactly one successor");
 
-  scheduler.advance(10_000);
+  scheduler.advance(8_000);
   await flushMicrotasks();
   assert.equal(socket.sent.filter((value) => value === "PING").length, 3);
   assert.equal(scheduler.pendingCount(), 1);
@@ -254,7 +664,7 @@ test("each socket sends one non-overlapping heartbeat at least every ten seconds
   assert.equal(socket.sent.filter((value) => value === "PING").length, 3);
 });
 
-test("a slow fresh PONG does not move the next PING beyond the ten-second cadence", async () => {
+test("the default heartbeat tolerates a slow fresh PONG and keeps its eight-second cadence", async () => {
   const scheduler = new ManualScheduler();
   class FakeWebSocket extends EventEmitter {
     static OPEN = 1;
@@ -274,7 +684,7 @@ test("a slow fresh PONG does not move the next PING beyond the ten-second cadenc
       this.pingCount += 1;
       if (this.pingCount === 1) queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
       else if (this.pingCount === 2) {
-        scheduler.setTimer(() => this.emit("message", Buffer.from("PONG")), 4_000);
+        scheduler.setTimer(() => this.emit("message", Buffer.from("PONG")), 6_000);
       } else queueMicrotask(() => this.emit("message", Buffer.from("PONG")));
     }
 
@@ -289,8 +699,6 @@ test("a slow fresh PONG does not move the next PING beyond the ten-second cadenc
     subscription: { type: "user" },
     eventType: "test_user_channel",
     WebSocketImpl: FakeWebSocket,
-    heartbeatIntervalMs: 10_000,
-    heartbeatTimeoutMs: 5_000,
     openTimeoutMs: 100,
     settleMs: 0,
     sleep: async () => {},
@@ -299,12 +707,16 @@ test("a slow fresh PONG does not move the next PING beyond the ten-second cadenc
     clearTimer: scheduler.clearTimer
   });
 
-  scheduler.advance(10_000);
-  await flushMicrotasks();
-  scheduler.advance(4_000);
+  scheduler.advance(8_000);
   await flushMicrotasks();
   scheduler.advance(5_999);
   assert.equal(channel.isOpen(), true);
+  scheduler.advance(1);
+  await flushMicrotasks();
+  assert.equal(channel.isOpen(), true);
+  assert.equal(channel.messages.filter((message) => message._pong).length, 2);
+  scheduler.advance(1_999);
+  assert.equal(channel.messages.filter((message) => message._pong).length, 2);
   scheduler.advance(1);
   await flushMicrotasks();
   assert.equal(channel.messages.filter((message) => message._pong).length, 3);
@@ -422,6 +834,17 @@ test("terminal no-fill reconciliation waits for the full stable-finality window"
   assert.ok(result.observationMs >= 10_000);
   assert.ok(snapshots >= 21, "the first terminal/zero-open snapshot must not be accepted immediately");
   assert.equal(result.relatedTrades.length, 0);
+  assert.deepEqual(reconciledOrderRisk({
+    ...result,
+    finalOrder: { ...result.finalOrder, id: "order-1" }
+  }, "order-1"), {
+    restFills: [],
+    userFills: [],
+    matchedShares: 0,
+    matchedSizeSourceAgreement: true,
+    tradeIdSourceAgreement: true,
+    reconciliationComplete: true
+  });
 });
 
 test("non-terminal status containing MATCHED is never accepted as terminal", async () => {
@@ -449,4 +872,44 @@ test("non-terminal status containing MATCHED is never accepted as terminal", asy
 
   assert.equal(result.stableFinality, false);
   assert.equal(result.terminalConfirmed, false);
+});
+
+test("missing terminal order still preserves authenticated fills for fail-closed recovery", async () => {
+  let now = 0;
+  const trade = {
+    id: "trade-1",
+    status: "CONFIRMED",
+    market: "condition-1",
+    transaction_hash: `0x${"a".repeat(64)}`,
+    maker_orders: [{
+      order_id: "order-1",
+      matched_amount: "5",
+      price: "0.82",
+      asset_id: "token-1",
+      side: "BUY"
+    }]
+  };
+  const result = await waitForStablePostCancelReconciliation({
+    client: {
+      async getOrder() { throw new Error("order was evicted"); },
+      async getTrades() { return [trade]; },
+      async getOpenOrders() { return []; }
+    },
+    conditionId: "condition-1",
+    orderId: "order-1",
+    userChannel: { messages: [], ensureOpen: async () => true },
+    options: {
+      nowMs: () => now,
+      sleep: async (ms) => { now += ms; },
+      minimumObservationMs: 100,
+      requiredStableMs: 50,
+      timeoutMs: 200,
+      pollMs: 25
+    }
+  });
+
+  assert.equal(result.stableFinality, false);
+  assert.equal(result.finalOrder, null);
+  assert.equal(result.relatedTrades.length, 1);
+  assert.equal(reconciledOrderRisk(result, "order-1").reconciliationComplete, false);
 });

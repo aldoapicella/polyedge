@@ -1,0 +1,531 @@
+name: Validate conduit workload federation
+
+on:
+  pull_request:
+    paths:
+      - 'crates/polyedge-storage/**'
+      - 'crates/polyedge-api/**'
+      - 'crates/polyedge-cli/**'
+      - 'crates/polyedge-reporting/**'
+      - 'infra/conduit-federated-identity.bicep'
+      - 'infra/conduit-data-roles.bicep'
+      - 'infra/conduit-funded-access.bicep'
+      - 'infra/main.bicep'
+      - 'ops/conduit/**'
+      - '.github/workflows/deploy-conduit-oci.yml'
+      - '.github/workflows/validate-conduit-federation.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/polyedge-storage/**'
+      - 'crates/polyedge-api/**'
+      - 'crates/polyedge-cli/**'
+      - 'crates/polyedge-reporting/**'
+      - 'infra/conduit-federated-identity.bicep'
+      - 'infra/conduit-data-roles.bicep'
+      - 'infra/conduit-funded-access.bicep'
+      - 'infra/main.bicep'
+      - 'ops/conduit/**'
+      - '.github/workflows/deploy-conduit-oci.yml'
+      - '.github/workflows/validate-conduit-federation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-conduit-federation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify public OIDC discovery and JWKS
+        env:
+          OIDC_ISSUER: https://oidc.jupiterlabs.dev
+        run: |
+          set -euo pipefail
+          discovery=$(mktemp)
+          jwks=$(mktemp)
+          trap 'rm -f "$discovery" "$jwks"' EXIT
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 \
+            --retry 2 --retry-all-errors --retry-delay 2 \
+            "$OIDC_ISSUER/.well-known/openid-configuration" --output "$discovery"
+          jq -e --arg issuer "$OIDC_ISSUER" '
+            .issuer == $issuer
+            and .jwks_uri == ($issuer + "/keys")
+            and (.id_token_signing_alg_values_supported | index("RS256") != null)
+          ' "$discovery" >/dev/null
+          curl --fail --silent --show-error --proto '=https' --tlsv1.2 --max-time 20 \
+            --retry 2 --retry-all-errors --retry-delay 2 \
+            "$OIDC_ISSUER/keys" --output "$jwks"
+          jq -e '
+            (.keys | type == "array" and length > 0)
+            and all(.keys[];
+              .kty == "RSA" and .alg == "RS256"
+              and (.kid | type == "string" and length > 0)
+              and (.n | type == "string" and length > 0)
+              and (.e | type == "string" and length > 0))
+          ' "$jwks" >/dev/null
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test shared Azure token authentication
+        run: |
+          cargo test -p polyedge-storage
+          cargo test -p polyedge-api recorder
+          cargo test -p polyedge-cli ring_manifest
+          cargo test -p polyedge-reporting audit_recomputes_primary_paper_batch
+          cargo test -p polyedge-reporting expected_daily_scan_is_inclusive_and_bounded
+          cargo test -p polyedge-reporting local_daily_scan_stops_at_expected_date
+
+      - name: Test token rotation and bounded Node smoke
+        run: |
+          ops/conduit/test/test-federated-token-refresh.sh
+          ops/conduit/test/test-boot-disk-guard.sh
+          ops/conduit/test/test-quadlet-deploy.sh
+          ops/conduit/test/test-github-deploy.sh
+          ops/conduit/test/test-run-job-mappings.sh
+          ops/conduit/test/test-ring-sync.sh
+          ops/conduit/test/test-parity-hourly.sh
+          ops/conduit/test/test-parity-daily.sh
+          ops/conduit/test/test-reboot-attestation.sh
+          ops/conduit/test/test-parity-systemd-ordering.sh
+          ops/conduit/test/test-funded-secret-bootstrap.sh
+          ops/conduit/test/test-funded-signer-env-example.sh
+          ops/conduit/test/test-funded-post-recovery-rollout.sh
+          ops/conduit/test/test-funded-parity-activation.sh
+          ops/conduit/test/test-qset-v4-ops.sh
+          ops/conduit/test/test-qset-v4-processor.sh
+          ops/conduit/test/test-qset-v4-rbac-proof.sh
+          ops/conduit/test/test-qset-v4-retire-writer.sh
+          ops/conduit/test/test-qset-v4-source-freeze-upload-interruption-recovery.sh
+          ops/conduit/test/test-qset-v5-ops.sh
+          ops/conduit/test/test-qset-v5-processor.sh
+          ops/conduit/test/test-qset-v5-rbac-proof.sh
+          ops/conduit/test/test-qset-v5-retire-writer.sh
+          ops/conduit/test/test-qset-v5-source-freeze-upload-interruption-recovery.sh
+          ops/conduit/test/test-qset-v6-ops.sh
+          ops/conduit/test/test-qset-v6-processor.sh
+          ops/conduit/test/test-qset-v6-processor-handoff.sh
+          ops/conduit/test/test-qset-v6-rbac-proof.sh
+          ops/conduit/test/test-qset-v6-retire-writer.sh
+          ops/conduit/test/test-qset-v6-source-freeze-upload-interruption-recovery.sh
+          ops/conduit/test/test-qset-v7-ops.sh
+          ops/conduit/test/test-qset-v7-processor.sh
+          ops/conduit/test/test-qset-v7-processor-handoff.sh
+          ops/conduit/test/test-qset-v7-rbac-proof.sh
+          ops/conduit/test/test-qset-v7-retire-writer.sh
+          ops/conduit/test/test-qset-v7-source-freeze-upload-interruption-recovery.sh
+          bash research/test_run_shadow_daily_v7.sh
+          bash research/test_verify_shadow_daily_v7_bundle.sh
+          bash research/test_run_shadow_daily_v6.sh
+          bash research/test_verify_shadow_daily_v6_bundle.sh
+          node --test venue-probe/test/workload-identity-smoke.test.mjs
+          jq -e '
+            .status == "applied-live-verified"
+            and .proof == "identity-rbac-proof.json"
+            and (.lanes | keys == ["api", "funded-intent-producer", "funded-signer", "research", "shadow-qset"])
+            and ([.lanes[].assignments[]] | length == 42)
+            and all(.lanes[]; (.negativeAssertions | length) > 0)
+            and .arc.unchanged
+            and .roles.acaJobExecutionReader == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+            and .roles.keyVaultSecretsUser == "4633458b-17de-408a-b874-0445c86b69e6"
+            and .roles.serviceBusSender == "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39"
+            and .roles.acrPull == "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+            and .scopePrefixes.keyVault == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/"
+            and .scopePrefixes.containerRegistry == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/"
+            and ([.lanes.api.assignments[]
+              | select(.role == "blobReader" and (.scope | test("/containers/polyedge-research-qset-v[345]$")))
+              | .scope] | sort) == [
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v4",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v5"
+            ]
+            and .lanes["funded-intent-producer"].identity == "id-polyedge-conduit-funded-intent-producer"
+            and .lanes["funded-intent-producer"].subject == "spiffe://polyedge.local/conduit/funded-intent-producer"
+            and (.lanes["funded-intent-producer"].assignments | length) == 8
+            and ([.lanes["funded-intent-producer"].assignments[].role] | sort) == [
+              "acrPull",
+              "blobContributor",
+              "blobReader", "blobReader",
+              "serviceBusSender",
+              "tableContributor", "tableContributor", "tableContributor"
+            ]
+            and ([.lanes["funded-intent-producer"].assignments[].scope] | sort) == [
+              "containerRegistry/crpolyedge6urdjr5nmwx7w",
+              "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models",
+              "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events",
+              "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotChartSeries",
+              "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotEventIndex",
+              "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotMarketCatalog"
+            ]
+            and (.lanes["funded-signer"].assignments | length) == 10
+            and ([.lanes["funded-signer"].assignments[].role] | sort) == [
+              "blobContributor",
+              "blobReader", "blobReader", "blobReader",
+              "keyVaultSecretsUser", "keyVaultSecretsUser", "keyVaultSecretsUser",
+              "keyVaultSecretsUser", "keyVaultSecretsUser",
+              "serviceBusReceiver"
+            ]
+            and ([.lanes["funded-signer"].assignments[]
+              | select(.role == "keyVaultSecretsUser") | .id] | sort) == [
+              "0965ea81-a451-5029-8070-6e319b3c233d",
+              "0fc8d996-6b8e-5b19-98e8-b9ba72f0108a",
+              "7e0c070f-beda-5845-a895-2b3efcef5063",
+              "8ae6d49a-402d-5431-a82d-e95c64c9d61a",
+              "eb9e7b65-1391-5237-95d4-ffc77078b42d"
+            ]
+            and ([.lanes["funded-signer"].assignments[]
+              | select(.role == "keyVaultSecretsUser") | .scope] | sort) == [
+              "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-key",
+              "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-passphrase",
+              "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-secret",
+              "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-private-key",
+              "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-relayer-api-key"
+            ]
+            and (.lanes.research.assignments[] | select(
+              .role == "acaJobExecutionReader"
+              and .id == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
+              and .scope == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job"
+            ))
+            and (.lanes["shadow-qset"].assignments | length) == 6
+            and (.lanes["shadow-qset"].assignments[] | select(
+              .role == "blobReader"
+              and .id == "0458fb58-08c4-48dc-9ca3-492d33a61113"
+              and .scope == "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control"
+            ))
+            and .githubDeployment.assignment.role == "blobReader"
+            and (.githubDeployment.negativeAssertions | length) == 3
+            and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
+            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFiveWorkloadUamiProof)
+          ' ops/conduit/identity-rbac-plan.json
+          jq -e '
+            .status == "historical-live-verified"
+            and .currentCoreFourAcceptance.capturedAtUtc == "2026-08-24T14:56:07Z"
+            and .secretsOrTokensCaptured == false
+            and .issuer.validTls
+            and .currentCoreFourAcceptance.status == "live_read_only_verified"
+            and .currentCoreFourAcceptance.lanes == ["api", "research", "shadow-qset", "funded-signer"]
+            and .currentCoreFourAcceptance.receipt == "/srv/polyedge-ring/migration/identity/20260824T145607Z-four-lane-identity-acceptance.json"
+            and .currentCoreFourAcceptance.sha256 == "sha256:c4ea2b4132e49cd2555340fa65af1ca0b7b2fee6614b5ebb9df63c56fabf70c4"
+            and .currentCoreFourAcceptance.roleCounts == {api:16, research:2, shadowQset:6, fundedSigner:10}
+            and .currentCoreFourAcceptance.broadScopeAssignmentCount == 0
+            and .currentCoreFourAcceptance.tokenFileIsolation == {expectedCount:12, passedCount:12}
+            and .currentCoreFourAcceptance.federatedExchangeMatrix == {
+              matchingPairs:4, matchingStatusCode:200,
+              crossedPairs:12, crossedStatusCode:401,
+              crossedError:"invalid_client", crossedErrorCode:"AADSTS700213"
+            }
+            and .currentCoreFourAcceptance.storageDataPlane == {positivePassed:4, negativePassed:4}
+            and .currentCoreFourAcceptance.mutationOperations == []
+            and .currentCoreFourAcceptance.secretsOrTokensStored == false
+            and ([
+              .lanes.api,
+              .lanes.research,
+              .lanes["shadow-qset"],
+              .lanes["funded-signer"],
+              .lanes["funded-intent-producer"]
+            ] | map(.assignmentCount) | add) == 42
+            and .lanes.api.assignmentCount == 16
+            and all([
+              .lanes.api,
+              .lanes.research,
+              .lanes["shadow-qset"],
+              .lanes["funded-signer"],
+              .lanes["funded-intent-producer"]
+            ][]; .exactPlanMatch)
+            and all(.lanes[]; all(.negativeAssertions[]; .passed))
+            and .lanes["promotion-controller"].assignmentCount == 2
+            and .lanes["promotion-controller"].exactDeploymentTemplateMatch
+            and (.lanes["promotion-controller"].workloadEnabled == false)
+            and .arc.unchanged
+            and .roleDefinitions.acaJobExecutionReader.id == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+            and .roleDefinitions.acaJobExecutionReader.actions == ["Microsoft.App/jobs/executions/read"]
+            and .roleDefinitions.acaJobExecutionReader.dataActions == []
+            and .roleDefinitions.acaJobExecutionReader.exactDefinitionMatch
+            and .roleDefinitions.promotionController.dataActions == []
+            and .roleDefinitions.promotionController.exactDefinitionMatch
+            and .lanes["funded-intent-producer"].identity.resourceId == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-polyedge-conduit-funded-intent-producer"
+            and .lanes["funded-intent-producer"].identity.clientId == "54f0136b-5e72-4ad1-b23e-cb1269d356c1"
+            and .lanes["funded-intent-producer"].identity.principalId == "cb986c69-8a3c-424e-8461-f6953cd4d3f7"
+            and .lanes["funded-intent-producer"].federatedCredential.name == "fic-spire-conduit-funded-intent-producer"
+            and .lanes["funded-intent-producer"].federatedCredential.issuer == "https://oidc.jupiterlabs.dev"
+            and .lanes["funded-intent-producer"].federatedCredential.subject == "spiffe://polyedge.local/conduit/funded-intent-producer"
+            and .lanes["funded-intent-producer"].federatedCredential.audiences == ["api://AzureADTokenExchange"]
+            and .lanes["funded-intent-producer"].assignmentCount == 8
+            and (.lanes["funded-intent-producer"].roleAssignments | length) == 8
+            and ([.lanes["funded-intent-producer"].roleAssignments[].id] | length) ==
+              ([.lanes["funded-intent-producer"].roleAssignments[].id] | unique | length)
+            and ([.lanes["funded-intent-producer"].roleAssignments[].role] | sort) == [
+              "AcrPull",
+              "Azure Service Bus Data Sender",
+              "Storage Blob Data Contributor",
+              "Storage Blob Data Reader", "Storage Blob Data Reader",
+              "Storage Table Data Contributor", "Storage Table Data Contributor", "Storage Table Data Contributor"
+            ]
+            and (.lanes["funded-intent-producer"].positiveChecks | length) == 9
+            and any(.lanes["funded-intent-producer"].positiveChecks[];
+              .operation == "workloadIdentityTokenExchange"
+              and .target == "https://storage.azure.com/.default"
+              and .statusCode == 200
+              and .clientIdMatch and .principalIdMatch and .tenantIdMatch and .audienceMatch
+              and .tokenCaptured == false and .result == "success")
+            and ([.lanes["funded-intent-producer"].positiveChecks[]
+              | select(.operation == "blobContainer.getProperties")
+              | {operation, target, statusCode, result}] | sort_by(.target)) == [
+              {operation:"blobContainer.getProperties", target:"polyedge-funded-evidence", statusCode:200, result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-models", statusCode:200, result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-shadow-events", statusCode:200, result:"success"}
+            ]
+            and ([.lanes["funded-intent-producer"].positiveChecks[]
+              | select(.operation == "table.query")
+              | {operation, target, statusCode, result}] | sort_by(.target)) == [
+              {operation:"table.query", target:"ShadowBotChartSeries", statusCode:200, result:"success"},
+              {operation:"table.query", target:"ShadowBotEventIndex", statusCode:200, result:"success"},
+              {operation:"table.query", target:"ShadowBotMarketCatalog", statusCode:200, result:"success"}
+            ]
+            and any(.lanes["funded-intent-producer"].positiveChecks[];
+              .operation == "serviceBus.sendMessage"
+              and .target == "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+              and (.decisionId | test("^[0-9a-f]{64}$"))
+              and .messageBodyCaptured == false and .result == "success")
+            and any(.lanes["funded-intent-producer"].positiveChecks[];
+              .operation == "acr.manifestHead"
+              and .target == "crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend@sha256:6398418916a60793d5c8d28cbf10592edcfd5203f4f2b700014c1b27a5e815fc"
+              and .statusCode == 200 and .result == "success")
+            and .lanes["funded-intent-producer"].negativeChecks == [
+              {target:"bot-events", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"polyedge-research-qset", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"polyedge-research", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"BotMarketCatalog", operation:"table.query", statusCode:403, result:"denied"},
+              {target:"ShadowQsetMarketCatalog", operation:"table.query", statusCode:403, result:"denied"},
+              {target:"kvpolyedge6urdjr5nmwx7w/secrets", operation:"secretList", statusCode:403, result:"denied"},
+              {target:"kvpolyedge6urdjr5nmwx7w/secrets/dashboard-auth-password", operation:"secretGet", statusCode:403, result:"denied"},
+              {target:"sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents", operation:"serviceBus.peekMessages", errorCode:"UnauthorizedAccess", consumed:false, result:"denied"},
+              {target:"rg-polyedge-dev", operation:"resourceGroup.get", statusCode:403, result:"denied"},
+              {target:"stpolyedge6urdjr5nmwx7w", operation:"storageAccount.get", statusCode:403, result:"denied"},
+              {target:"sb-polyedge-funded-cl-6urdjr5nmwx7w", operation:"serviceBusNamespace.get", statusCode:403, result:"denied"},
+              {target:"rg-polyedge-dev/providers/Microsoft.Authorization/roleAssignments", operation:"roleAssignments.list", statusCode:403, result:"denied"},
+              {target:"crpolyedge6urdjr5nmwx7w.azurecr.io/polyedge-rust-backend", operation:"acr.pushScopeRequest", statusCode:200, pushGranted:false, result:"denied"}
+            ]
+            and .lanes["funded-signer"].assignmentCount == 10
+            and (.lanes["funded-signer"].roleAssignments | length) == 10
+            and ([.lanes["funded-signer"].roleAssignments[].id] | length) ==
+              ([.lanes["funded-signer"].roleAssignments[].id] | unique | length)
+            and ([.lanes["funded-signer"].roleAssignments[].role] | sort) == [
+              "Azure Service Bus Data Receiver",
+              "Key Vault Secrets User", "Key Vault Secrets User", "Key Vault Secrets User",
+              "Key Vault Secrets User", "Key Vault Secrets User",
+              "Storage Blob Data Contributor",
+              "Storage Blob Data Reader", "Storage Blob Data Reader", "Storage Blob Data Reader"
+            ]
+            and ([.lanes["funded-signer"].roleAssignments[]
+              | select(.role == "Key Vault Secrets User") | .scope] | sort) == [
+              "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-key",
+              "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-passphrase",
+              "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-secret",
+              "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-private-key",
+              "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-relayer-api-key"
+            ]
+            and any(.lanes["funded-signer"].roleAssignments[];
+              .id == "fa593ab9-fa6a-58d8-b1ca-696b38843edf"
+              and .role == "Azure Service Bus Data Receiver"
+              and .scope == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.ServiceBus/namespaces/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents")
+            and (.lanes["funded-signer"].positiveChecks | length) == 9
+            and ([.lanes["funded-signer"].positiveChecks[]
+              | select(.operation == "blobContainer.getProperties")
+              | {operation, target, result}] | sort_by(.target)) == [
+              {operation:"blobContainer.getProperties", target:"polyedge-funded-evidence", result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-models", result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-research", result:"success"},
+              {operation:"blobContainer.getProperties", target:"polyedge-shadow-events", result:"success"}
+            ]
+            and any(.lanes["funded-signer"].positiveChecks[];
+              .operation == "workloadIdentityTokenExchange"
+              and .target == "https://servicebus.azure.net/.default"
+              and .tokenCaptured == false and .result == "success")
+            and any(.lanes["funded-signer"].positiveChecks[];
+              .operation == "jwtSvidAtomicRotation"
+              and .target == "/run/polyedge-federated-funded-signer/azure-federated-token"
+              and .sameContainerObservedReplacement and .lifetimeSeconds == 300
+              and .algorithm == "RS256"
+              and .issuer == "https://oidc.jupiterlabs.dev"
+              and .subject == "spiffe://polyedge.local/conduit/funded-signer"
+              and .audiences == ["api://AzureADTokenExchange"]
+              and .tokenCaptured == false and .result == "success")
+            and any(.lanes["funded-signer"].positiveChecks[];
+              .operation == "keyVault.secretGet"
+              and .target == "kvpolyedge6urdjr5nmwx7w"
+              and .secrets == ["polymarket-api-key", "polymarket-api-passphrase", "polymarket-api-secret", "polymarket-private-key", "polymarket-relayer-api-key"]
+              and .valuesCaptured == false and .result == "success")
+            and any(.lanes["funded-signer"].positiveChecks[];
+              .operation == "podmanSecrets.bootstrap"
+              and .target == "rootful funded signer store"
+              and .secrets == ["polyedge-polymarket-api-key", "polyedge-polymarket-api-passphrase", "polyedge-polymarket-api-secret", "polyedge-polymarket-private-key", "polyedge-polymarket-relayer-api-key"]
+              and .valuesCaptured == false and .result == "success")
+            and any(.lanes["funded-signer"].positiveChecks[];
+              .operation == "serviceBus.peekMessages"
+              and .target == "sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+              and .activePeekedMessageCount == 0
+              and .consumed == false and .result == "success")
+            and .lanes["funded-signer"].negativeChecks == [
+              {target:"bot-events", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"polyedge-research-qset", operation:"blobContainer.getProperties", statusCode:403, result:"denied"},
+              {target:"kvpolyedge6urdjr5nmwx7w/secrets", operation:"secretList", statusCode:403, result:"denied"},
+              {target:"kvpolyedge6urdjr5nmwx7w/secrets/dashboard-auth-password", operation:"secretGet", statusCode:403, result:"denied"},
+              {target:"rootful funded signer Podman secret store", operation:"nonRootRead", result:"denied"}
+            ]
+            and .lanes["shadow-qset"].assignmentCount == 6
+            and (.lanes["shadow-qset"].roleAssignments | length) == 6
+            and any(.lanes["shadow-qset"].roleAssignments[];
+              .id == "0458fb58-08c4-48dc-9ca3-492d33a61113"
+              and .role == "Storage Blob Data Reader"
+              and .roleDefinitionId == "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1"
+              and .scope == "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control")
+            and (.lanes.research.positiveChecks[] | select(
+              .operation == "Microsoft.App/jobs/executions/read"
+              and .assignmentId == "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
+              and .result == "success"
+            ))
+            and .githubDeployment.assignment.id == "839dda8c-f69d-4f3c-8fb5-052ddcaaa9fd"
+            and .githubDeployment.assignment.role == "Storage Blob Data Reader"
+            and .githubDeployment.scopeOfThisDataPlaneProof == "only the new Storage Blob Data Reader assignment on polyedge-shadow-events"
+            and all(.githubDeployment.negativeAssertions[]; .passed)
+            and (.githubDeployment.legacyDeploymentPlaneExceptions | length) == 10
+            and all(.githubDeployment.legacyDeploymentPlaneExceptions[]; .preexisting and .outsideFiveWorkloadUamiProof)
+            and ([.githubDeployment.legacyDeploymentPlaneExceptions[].role] | sort == ["AcrPush", "Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Contributor", "Storage Blob Data Reader", "Storage Blob Data Reader", "Storage Blob Data Reader", "User Access Administrator"])
+          ' ops/conduit/identity-rbac-proof.json
+          jq -e -s '
+            .[0] as $plan
+            | .[1] as $proof
+            | ([ $plan.lanes["funded-signer"].assignments[] as $assignment
+                | ($assignment.scope | split("/")) as $parts
+                | {
+                    id: $assignment.id,
+                    roleDefinitionId: $plan.roles[$assignment.role],
+                    scope: (($plan.scopePrefixes[$parts[0]] + ($parts[1:] | join("/"))) | ascii_downcase)
+                  }
+              ] | sort_by(.id)) as $expected
+            | ([ $proof.lanes["funded-signer"].roleAssignments[]
+                | {id, roleDefinitionId, scope: (.scope | ascii_downcase)}
+              ] | sort_by(.id)) as $observed
+            | ([ $plan.lanes["funded-intent-producer"].assignments[] as $assignment
+                | ($assignment.scope | split("/")) as $parts
+                | {
+                    id: $assignment.id,
+                    roleDefinitionId: $plan.roles[$assignment.role],
+                    scope: (($plan.scopePrefixes[$parts[0]] + ($parts[1:] | join("/"))) | ascii_downcase)
+                  }
+              ] | sort_by(.id)) as $producerExpected
+            | ([ $proof.lanes["funded-intent-producer"].roleAssignments[]
+                | {id, roleDefinitionId, scope: (.scope | ascii_downcase)}
+              ] | sort_by(.id)) as $producerObserved
+            | ($expected | length) == 10
+              and ($observed | length) == 10
+              and $observed == $expected
+              and ($producerExpected | length) == 8
+              and ($producerObserved | length) == 8
+              and $producerObserved == $producerExpected
+          ' ops/conduit/identity-rbac-plan.json ops/conduit/identity-rbac-proof.json
+      - name: Validate isolated UAMI federation template
+        run: |
+          set -euo pipefail
+          az bicep build \
+            --file infra/conduit-federated-identity.bicep \
+            --stdout > conduit-federated-identity.json
+          jq -e '
+            ([.resources[] | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities")] | length) == 1
+            and ([.resources[] | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials")] | length) == 1
+            and ([.resources[] | select(.type == "Microsoft.Authorization/roleAssignments")] | length) == 0
+            and ([.resources[] | select(.type | test("KeyVault|ServiceBus|Storage"; "i"))] | length) == 0
+          ' conduit-federated-identity.json
+          jq -e '
+            .variables.audience == "api://AzureADTokenExchange"
+            and .parameters.lane.allowedValues == [
+              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "shadow-qset-v5-writer", "shadow-qset-v5-processor", "shadow-qset-v6-writer", "shadow-qset-v6-processor", "shadow-qset-v7-writer", "shadow-qset-v7-processor", "funded-signer", "funded-intent-producer"
+            ]
+            and .variables.lanes["shadow-qset-v4-writer"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v4-writer",
+              ficName: "fic-spire-conduit-shadow-qset-v4-writer",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v4-writer"
+            }
+            and .variables.lanes["shadow-qset-v4-processor"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v4-processor",
+              ficName: "fic-spire-conduit-shadow-qset-v4-processor",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v4-processor"
+            }
+            and .variables.lanes["shadow-qset-v6-writer"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v6-writer",
+              ficName: "fic-spire-conduit-shadow-qset-v6-writer",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v6-writer"
+            }
+            and .variables.lanes["shadow-qset-v6-processor"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v6-processor",
+              ficName: "fic-spire-conduit-shadow-qset-v6-processor",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v6-processor"
+            }
+            and .variables.lanes["shadow-qset-v7-writer"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v7-writer",
+              ficName: "fic-spire-conduit-shadow-qset-v7-writer",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v7-writer"
+            }
+            and .variables.lanes["shadow-qset-v7-processor"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v7-processor",
+              ficName: "fic-spire-conduit-shadow-qset-v7-processor",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v7-processor"
+            }
+            and .variables.lanes["funded-intent-producer"] == {
+              identityName: "id-polyedge-conduit-funded-intent-producer",
+              ficName: "fic-spire-conduit-funded-intent-producer",
+              subject: "spiffe://polyedge.local/conduit/funded-intent-producer"
+            }
+            and ([.resources[]
+              | select(.type == "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials")
+              | .properties.audiences
+              | length]
+            == [1])
+          ' conduit-federated-identity.json
+          az bicep build --file infra/conduit-data-roles.bicep --stdout > conduit-data-roles.json
+          jq -e '
+            ([.resources[] | select(.type == "Microsoft.Authorization/roleDefinitions")] | length) == 3
+            and (.resources[] | select(
+              .name == "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+              and .properties.roleName == "PolyEdge ACA Job Execution Reader"
+              and .properties.permissions == [{
+                actions: ["Microsoft.App/jobs/executions/read"],
+                notActions: [],
+                dataActions: [],
+                notDataActions: []
+              }]
+              and .properties.assignableScopes == ["[subscription().id]"]
+            ))
+          ' conduit-data-roles.json
+          az bicep build --file infra/conduit-funded-access.bicep --stdout > conduit-funded-access.json
+          jq -e '
+            (.resources | length) == 6
+            and all(.resources[];
+              .type == "Microsoft.Authorization/roleAssignments"
+              and .properties.principalType == "ServicePrincipal")
+            and ([.resources[] | select(.scope | contains("Microsoft.KeyVault/vaults/secrets"))] | length) == 5
+            and ([.resources[] | select(.scope | contains("Microsoft.ServiceBus/namespaces/queues"))] | length) == 1
+            and ([.resources[] | select(.properties.roleDefinitionId == "[variables(\u0027keyVaultSecretsUserRoleId\u0027)]")] | length) == 5
+            and ([.resources[] | select(.properties.roleDefinitionId == "[variables(\u0027serviceBusReceiverRoleId\u0027)]")] | length) == 1
+            and .variables.keyVaultSecretsUserRoleId == "[subscriptionResourceId(\u0027Microsoft.Authorization/roleDefinitions\u0027, \u00274633458b-17de-408a-b874-0445c86b69e6\u0027)]"
+            and .variables.serviceBusReceiverRoleId == "[subscriptionResourceId(\u0027Microsoft.Authorization/roleDefinitions\u0027, \u00274f6d3b9b-027b-4f4c-9142-0e5a2a2247e0\u0027)]"
+          ' conduit-funded-access.json
+          az bicep build --file infra/main.bicep --stdout > main.json
+          jq -e '
+            [.resources[]
+              | select(.type == "Microsoft.App/containerApps"
+                and .name == "[variables(\u0027apiContainerAppName\u0027)]")
+              | .properties.template.containers[]
+              | .env[]
+              | select(.name == "LOCAL_JSONL_RECORDER_ENABLED" and .value == "false")]
+            | length == 1
+          ' main.json

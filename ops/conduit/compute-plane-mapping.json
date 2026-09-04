@@ -1,0 +1,672 @@
+{
+  "schemaVersion": 2,
+  "capturedAtUtc": "2026-08-22T01:07:44Z",
+  "azureJobCount": 19,
+  "liveOciEquivalentCount": 14,
+  "azureDeletionAllowed": false,
+  "azureLiveInventory": {
+    "containerAppCount": 4,
+    "containerAppJobCount": 19,
+    "managedEnvironmentCount": 3,
+    "natGatewayCount": 2,
+    "vnetCount": 2,
+    "publicIpCount": 4,
+    "managedLoadBalancerCount": 2,
+    "allContainerAppsRunningWithMinimumReplica": true,
+    "networkDeletionCandidateCount": 0,
+    "costManagement": {
+      "periodStartUtc": "2026-08-01T00:00:00Z",
+      "usageAvailableThroughUtc": "2026-08-16T23:59:59Z",
+      "resourceGroupPretaxUsd": 226.2,
+      "containerAppsUsd": 89.69,
+      "natGatewayUsd": 54.36,
+      "virtualNetworkUsd": 3.78,
+      "directComputeNetworkSubtotalUsd": 147.83,
+      "simpleRunRateEstimate": {
+        "observedDays": 16,
+        "projectionDays": 30.4375,
+        "resourceGroupMonthlyUsd": 430.31,
+        "directComputeNetworkMonthlyUsd": 281.22,
+        "ociVolumeIncrementMonthlyUsd": 1.28,
+        "netMonthlySavingsUsd": 279.94,
+        "remainingAzureMonthlyUsd": 149.09,
+        "targetMonthlyRangeUsd": [
+          15,
+          35
+        ],
+        "targetMetByComputeNetworkMigrationAlone": false,
+        "method": "straight-line extrapolation, not an Azure forecast",
+        "acceptedRetainedHotStorageCapacityFloorMonthlyUsdApprox": 38.84,
+        "originalTargetSupersededByRetainedEvidenceDecision": true
+      }
+    }
+  },
+  "apps": [
+    {
+      "azureApp": "polyedge-dev",
+      "status": "running",
+      "ociUnits": [
+        "polyedge-api.service",
+        "polyedge-frontend.service"
+      ],
+      "classification": "oci_candidate_azure_authoritative",
+      "azureDeletionAllowed": false,
+      "requiredProof": [
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureApp": "polyedge-shadow-neu",
+      "status": "running",
+      "classification": "historical_ineligible_retirement_candidate",
+      "azureDeletionAllowed": false,
+      "historicalCampaign": "shadow-2026-07-23-through-2026-07-23",
+      "historicalDisposition": "preserve unchanged as incomplete and ineligible; never force-complete or use for promotion",
+      "requiredProof": [
+        "historical_evidence_retained",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureApp": "polyedge-shadow-qset-neu",
+      "status": "running",
+      "classification": "oci_qset_v2_preflight_azure_authoritative",
+      "azureDeletionAllowed": false,
+      "ociUnit": "polyedge-shadow-qset.service",
+      "historicalCampaign": "campaign-2026-07-28-qset-v1",
+      "historicalDisposition": "preserved_unchanged_ineligible",
+      "successorCampaign": "campaign-2026-08-22-qset-v2",
+      "requiredProof": [
+        "first_complete_day_closed_sealed_capture",
+        "qset_acceptance",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureApp": "polyedge-funded-direct-cl",
+      "status": "running",
+      "classification": "oci_funded_active_parity_pending",
+      "azureDeletionAllowed": false,
+      "requiredProof": [
+        "funded_lifecycle",
+        "settlement",
+        "queue_and_dlq",
+        "identity",
+        "origin",
+        "parity",
+        "rollback"
+      ],
+      "ociUnits": [
+        "polyedge-funded-intent-producer.service",
+        "polyedge-funded-signer.service"
+      ]
+    }
+  ],
+  "networkDependencies": [
+    {
+      "managedEnvironment": "polyedge-dev-env",
+      "occupancy": "polyedge-dev plus 8 jobs",
+      "network": "platform_managed",
+      "azureDeletionAllowed": false
+    },
+    {
+      "managedEnvironment": "polyedge-venue-neu-env",
+      "occupancy": "2 apps plus 8 jobs",
+      "vnet": "vnet-polyedge-venue-neu",
+      "natGateway": "nat-polyedge-venue-neu",
+      "natSubnetAttached": true,
+      "managedLoadBalancerBackendPoolCount": 1,
+      "azureDeletionAllowed": false
+    },
+    {
+      "managedEnvironment": "polyedge-execution-cl-env",
+      "occupancy": "polyedge-funded-direct-cl plus 3 jobs",
+      "vnet": "vnet-polyedge-execution-cl",
+      "natGateway": "nat-polyedge-execution-cl",
+      "natSubnetAttached": true,
+      "managedLoadBalancerBackendPoolCount": 1,
+      "azureDeletionAllowed": false
+    }
+  ],
+  "jobs": [
+    {
+      "azureJob": "polyedge-data-freshness-job",
+      "classification": "live_oci_equivalent",
+      "ociUnit": "polyedge-freshness.timer",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-hourly-quality-job",
+      "classification": "live_oci_equivalent",
+      "ociUnit": "polyedge-hourly.timer",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-daily-research-job",
+      "classification": "live_oci_equivalent",
+      "ociUnit": "polyedge-daily.timer",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-replay-index-job",
+      "classification": "live_oci_equivalent",
+      "ociUnit": "polyedge-replay.timer",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-prospective-job",
+      "classification": "live_oci_manual_equivalent",
+      "ociUnit": "polyedge-job@prospective.service",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-chart-backfill-job",
+      "classification": "live_oci_manual_equivalent",
+      "ociUnit": "polyedge-job@chart-backfill.service",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-backfill-job",
+      "classification": "live_oci_manual_equivalent",
+      "ociUnit": "polyedge-job@backfill.service",
+      "lane": "research",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-origin-check-cl-job",
+      "classification": "live_oci_manual_equivalent",
+      "ociUnit": "polyedge-job@origin-check.service",
+      "lane": "credential_free",
+      "publicationDisabled": true
+    },
+    {
+      "azureJob": "polyedge-shadow-qset-neu-job",
+      "classification": "oci_qset_v2_first_day_closed_seal_scheduled",
+      "ociUnit": "polyedge-job@shadow-qset.service",
+      "lane": "shadow-qset",
+      "azureDeletionAllowed": false,
+      "requiredProof": [
+        "first_complete_day_closed_sealed_capture",
+        "qset_acceptance",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "firstSealScheduledUtc": "2026-08-24T02:15:00Z"
+    },
+    {
+      "azureJob": "polyedge-shadow-daily-neu-job",
+      "classification": "historical_ineligible_retirement_candidate",
+      "lane": null,
+      "azureDeletionAllowed": false,
+      "historicalCampaign": "shadow-2026-07-23-through-2026-07-23",
+      "historicalDisposition": "preserve unchanged as incomplete and ineligible; do not retry the failed schedule to manufacture closure",
+      "requiredProof": [
+        "historical_evidence_retained",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "replacementRequired": false,
+      "ociUnit": null,
+      "azureTrigger": "Manual",
+      "retiredAtUtc": "2026-08-22T01:02:21Z",
+      "priorSchedule": "15 2 * * *",
+      "azureResourceRetained": true,
+      "historicalEvidenceChanged": false,
+      "rollbackArtifact": "/srv/polyedge-ring/migration/azure-retirement/20260822T010221Z-shadow-daily-schedule/job-before.json"
+    },
+    {
+      "azureJob": "polyedge-shadow-val-neu-job",
+      "classification": "historical_validation_retirement_candidate",
+      "lane": null,
+      "azureDeletionAllowed": false,
+      "historicalDisposition": "retain prior validation outputs; no new validation execution is required for the clean qset-v2 successor",
+      "requiredProof": [
+        "historical_evidence_retained",
+        "qset_acceptance",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
+    },
+    {
+      "azureJob": "polyedge-promotion-neu-job",
+      "classification": "oci_manual_equivalent_disabled_fail_closed",
+      "lane": "promotion-controller",
+      "ociUnit": "polyedge-azure-promotion.service",
+      "azureDeletionAllowed": false,
+      "requiredProof": [
+        "isolated_promotion_identity",
+        "controller_transaction_and_rollback",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureJob": "polyedge-venue-model-job",
+      "classification": "disabled_never_executed_retirement_candidate",
+      "lane": null,
+      "azureDeletionAllowed": false,
+      "historicalDisposition": "retain model artifacts and immutable funded-session model binding; do not grant model-writer access to API or funded-signer",
+      "requiredProof": [
+        "model_artifacts_retained",
+        "funded_model_binding",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
+    },
+    {
+      "azureJob": "polyedge-venue-probe-neu-job",
+      "classification": "retirement_candidate_after_funded_signer_proof",
+      "lane": "funded-signer",
+      "ociUnit": "polyedge-funded-signer.service",
+      "azureDeletionAllowed": false,
+      "requiredProof": [
+        "funded_lifecycle",
+        "identity",
+        "origin",
+        "72_hour_parity",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureJob": "polyedge-redeem-neu-job",
+      "classification": "retirement_candidate_after_funded_signer_proof",
+      "lane": "funded-signer",
+      "ociUnit": "polyedge-funded-signer.service",
+      "azureDeletionAllowed": false,
+      "requiredProof": [
+        "redemption_settlement",
+        "funded_lifecycle",
+        "identity",
+        "origin",
+        "72_hour_parity",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureJob": "polyedge-strategy-canary-neu-job",
+      "classification": "disabled_never_executed_retirement_candidate",
+      "lane": null,
+      "azureDeletionAllowed": false,
+      "historicalDisposition": "manual and ALLOW_LIVE=false with no executions returned; retire after global gates without granting or activating a funded lane",
+      "requiredProof": [
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
+    },
+    {
+      "azureJob": "polyedge-funded-ladder-neu-job",
+      "classification": "disabled_historical_retirement_candidate",
+      "lane": null,
+      "azureDeletionAllowed": false,
+      "historicalDisposition": "manual and ALLOW_LIVE=false; retain the 2026-07-28 historical executions and retire compute after global gates without reactivation",
+      "requiredProof": [
+        "historical_evidence_retained",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "replacementRequired": false,
+      "ociUnit": null
+    },
+    {
+      "azureJob": "polyedge-funded-direct-cl-job",
+      "classification": "retirement_candidate_after_funded_cutover",
+      "lane": "funded-signer",
+      "azureDeletionAllowed": false,
+      "replacementRequired": true,
+      "ociUnit": "polyedge-funded-signer.service",
+      "requiredProof": [
+        "funded_lifecycle",
+        "settlement",
+        "queue_and_dlq",
+        "72_hour_parity",
+        "two_daily_cycles",
+        "reboot_recovery",
+        "rollback"
+      ]
+    },
+    {
+      "azureJob": "polyedge-funded-warmup-cl",
+      "classification": "retirement_candidate_after_funded_producer_parity",
+      "azureDeletionAllowed": false,
+      "candidateLane": "funded-intent-producer",
+      "requiredProof": [
+        "72_hour_parity",
+        "two_daily_cycles",
+        "funded_lifecycle",
+        "queue_and_dlq",
+        "reboot_recovery",
+        "rollback"
+      ],
+      "replacementRequired": true,
+      "ociUnit": "polyedge-funded-intent-producer.service"
+    }
+  ],
+  "protectedTrustRules": {
+    "api": "No qset or funded data, wallet, Key Vault, or Service Bus receiver access.",
+    "research": "No qset or funded writer access.",
+    "shadowQset": "Only qset event and research container access plus the three exact ShadowQset writer tables; no primary, funded, non-qset table, Service Bus, or control access.",
+    "fundedSigner": "Only exact funded evidence dependencies and receiver direction; no qset, primary bot-events, table, broad scope, or sender role.",
+    "arc": "Retain the existing no-delete bot-events ring uploader assignment only.",
+    "fundedIntentProducer": "Only exact model/funded reads, shadow event/table writes, ACR pull, and sender direction; no receiver, qset, Key Vault, wallet, broad scope, or live execution access.",
+    "shadowQsetV4Processor": "Only exact qset-v4 raw read plus qset-v4 research/control access through the shadow-qset-v4-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access.",
+    "shadowQsetV5Processor": "Only exact qset-v5 raw read plus qset-v5 research/control access through the shadow-qset-v5-processor federated lane; no funded, qset-v1/v2/v3, Key Vault, Service Bus, wallet, or client-secret access.",
+    "shadowQsetV6Processor": "Only exact qset-v6 raw read plus qset-v6 research/control access through the shadow-qset-v6-processor federated lane; no funded, qset-v1/v2/v3/v4/v5, Key Vault, Service Bus, wallet, or client-secret access.",
+    "shadowQsetV7Processor": "Only exact qset-v7 raw read plus qset-v7 research/control access through the shadow-qset-v7-processor federated lane; no funded, qset-v1/v2/v3/v4/v5/v6, Key Vault, Service Bus, wallet, or client-secret access."
+  },
+  "lastReadOnlyRecheck": {
+    "capturedAtUtc": "2026-08-21T16:30:00Z",
+    "azureDeletionAllowed": false,
+    "networkDeletionCandidateCount": 0,
+    "immediateSafeSavingsMonthlyUsd": 0,
+    "cost": {
+      "periodStartUtc": "2026-08-01T00:00:00Z",
+      "usageAvailableThroughUtc": "2026-08-19T23:59:59Z",
+      "polyedgeResourceGroupsPretaxUsd": 278.508948,
+      "normalizedMonthlyRunRateUsdApprox": 440,
+      "postGateComputeNetworkSavingsMonthlyUsd": [
+        300,
+        330
+      ],
+      "method": "Usage Details actual pretax; 30-day straight-line normalization, not an Azure forecast"
+    },
+    "fundedQueue": {
+      "name": "funded-dynamic-quote-intents",
+      "activeMessageCount": 0,
+      "deadLetterMessageCount": 937,
+      "scheduledMessageCount": 0,
+      "deletionBlocked": true
+    },
+    "qset": {
+      "dailyScheduleEnabled": false,
+      "blocked": true,
+      "historicalCampaign": "campaign-2026-07-28-qset-v1",
+      "historicalDisposition": "preserved unchanged and ineligible; no retro-seal or waiver",
+      "successorCampaign": "campaign-2026-08-22-qset-v2",
+      "sourceCommit": "3195c8a9bc85cbce55491a502cae2857c0154a32",
+      "sourceFreezeSha256": "sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1",
+      "image": "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd",
+      "blocker": "successor campaign awaits its first complete day-closed sealed capture and qset acceptance; the recurring timer remains disabled",
+      "firstSealTimerActive": true,
+      "firstSealScheduledUtc": "2026-08-24T02:15:00Z",
+      "firstSealTargetDate": "2026-08-22"
+    },
+    "resolvedRetirementOrMappingResources": [
+      {
+        "resource": "polyedge-shadow-neu",
+        "kind": "containerApp",
+        "state": "Running, minReplicas=1",
+        "disposition": "Retire compute only after global gates; preserve the incomplete historical campaign and all evidence unchanged."
+      },
+      {
+        "resource": "polyedge-shadow-daily-neu-job",
+        "kind": "containerAppJob",
+        "state": "Schedule 15 2 * * *; five latest executions Failed",
+        "disposition": "Retire after global gates without retrying or force-completing the ineligible historical campaign."
+      },
+      {
+        "resource": "polyedge-shadow-val-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual; last execution 2026-07-24; four latest retained executions Failed after one Succeeded",
+        "disposition": "Retire after qset-v2 and global gates; retain prior validation outputs."
+      },
+      {
+        "resource": "polyedge-promotion-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual, PROMOTION_TRANSITION_ENABLED=false, no executions returned",
+        "disposition": "OCI equivalent is the disabled fail-closed polyedge-azure-promotion.service with a separate promotion-controller identity."
+      },
+      {
+        "resource": "polyedge-venue-model-job",
+        "kind": "containerAppJob",
+        "state": "Manual, ALLOW_LIVE=false, QUEUE_MODEL_TRAINING_ENABLED=false, no executions returned",
+        "disposition": "Retire after global gates; retain all model artifacts and the immutable funded-session model binding."
+      },
+      {
+        "resource": "polyedge-strategy-canary-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual, ALLOW_LIVE=false, no executions returned",
+        "disposition": "Retire after global gates without activation or new funded grants."
+      },
+      {
+        "resource": "polyedge-funded-ladder-neu-job",
+        "kind": "containerAppJob",
+        "state": "Manual, ALLOW_LIVE=false, latest retained executions are from 2026-07-28",
+        "disposition": "Retire after global gates; retain historical execution evidence and do not reactivate the geoblocked ladder."
+      }
+    ],
+    "fundedIntentProducer": {
+      "service": "polyedge-funded-intent-producer.service",
+      "mode": "paper_intent_only",
+      "image": "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd",
+      "user": "984:980",
+      "warmupSuccessCount": 2,
+      "publicationFailureCount": 0,
+      "signerNaturalHandoffObserved": true
+    },
+    "parity": {
+      "windowStartUtc": "2026-08-21T17:00:00Z",
+      "ledgerPath": "/srv/polyedge-ring/parity/20260821T170000Z-funded-active.json",
+      "acceptedCleanLiveHours": 0,
+      "completedDailyCycles": 0,
+      "rebootRecoveryPassed": false,
+      "azureDeletionAllowed": false,
+      "scheduledPreWindowRunPassed": true
+    },
+    "fundedOverlapRetirementCandidates": [
+      {
+        "resource": "polyedge-venue-probe-neu-job",
+        "ociEquivalent": "polyedge-funded-signer.service",
+        "remainingProof": [
+          "funded_lifecycle",
+          "identity",
+          "origin",
+          "72_hour_parity",
+          "reboot_recovery",
+          "rollback"
+        ]
+      },
+      {
+        "resource": "polyedge-redeem-neu-job",
+        "ociEquivalent": "polyedge-funded-signer.service",
+        "remainingProof": [
+          "redemption_settlement",
+          "funded_lifecycle",
+          "identity",
+          "origin",
+          "72_hour_parity",
+          "reboot_recovery",
+          "rollback"
+        ]
+      }
+    ]
+  },
+  "retirementOnlyJobCount": 5,
+  "unresolvedJobMappingCount": 0,
+  "ociOnlyJobs": [
+    {
+      "name": "qset-v4-processor",
+      "classification": "configured_manual_only_not_executed",
+      "ociUnit": "polyedge-qset-v4-processor.service",
+      "identityLane": "shadow-qset-v4-processor",
+      "azureContainerAppsJob": null,
+      "azureProcessorJobDeploymentAllowed": false,
+      "manualFirstExecution": true,
+      "recurringEnabled": false,
+      "timerUnit": null,
+      "imagePullPolicy": "never",
+      "minimumDiskHeadroomBytes": 16106127360,
+      "resources": {
+        "cpu": 4,
+        "memory": "8GiB",
+        "pids": 1024
+      },
+      "requiredInputs": {
+        "sourceFreezeReceipt": "/srv/polyedge-ring/migration/qset-v4/source-freeze/source-<final-sha256>.json",
+        "sealedDayReceipts": [
+          "/srv/polyedge-ring/migration/qset-v4-seal/2026-08-24.json",
+          "/srv/polyedge-ring/migration/qset-v4-seal/2026-08-25.json"
+        ]
+      },
+      "requiredProofBeforeFirstExecution": [
+        "final_source_freeze_receipt_hash_image_revision_binding",
+        "two_exact_closed_day_receipt_and_inventory_hashes",
+        "local_linux_arm64_image_revision",
+        "dedicated_federated_token"
+      ],
+      "requiredProofBeforeRecurringEnablement": [
+        "manual_processor_success",
+        "verified_output_hash_and_readback",
+        "negative_access_probe",
+        "resource_and_disk_guard_evidence"
+      ]
+    },
+    {
+      "name": "qset-v5-processor",
+      "classification": "configured_manual_only_not_executed",
+      "ociUnit": "polyedge-qset-v5-processor.service",
+      "identityLane": "shadow-qset-v5-processor",
+      "azureContainerAppsJob": null,
+      "azureProcessorJobDeploymentAllowed": false,
+      "manualFirstExecution": true,
+      "recurringEnabled": false,
+      "timerUnit": null,
+      "imagePullPolicy": "never",
+      "minimumDiskHeadroomBytes": 16106127360,
+      "resources": {
+        "cpu": 4,
+        "memory": "8GiB",
+        "pids": 1024
+      },
+      "requiredInputs": {
+        "sourceFreezeReceipt": "/srv/polyedge-ring/migration/qset-v5/source-freeze/source-<final-sha256>.json",
+        "sealedDayReceipts": [
+          "/srv/polyedge-ring/migration/qset-v5-seal/2026-08-26.json",
+          "/srv/polyedge-ring/migration/qset-v5-seal/2026-08-27.json"
+        ]
+      },
+      "requiredProofBeforeFirstExecution": [
+        "final_source_freeze_receipt_hash_image_revision_binding",
+        "two_exact_closed_day_receipt_and_inventory_hashes",
+        "local_linux_arm64_image_revision",
+        "dedicated_federated_token"
+      ],
+      "requiredProofBeforeRecurringEnablement": [
+        "manual_processor_success",
+        "verified_output_hash_and_readback",
+        "negative_access_probe",
+        "resource_and_disk_guard_evidence"
+      ]
+    },
+    {
+      "name": "qset-v6-processor",
+      "classification": "configured_manual_only_not_executed",
+      "ociUnit": "polyedge-qset-v6-processor.service",
+      "identityLane": "shadow-qset-v6-processor",
+      "azureContainerAppsJob": null,
+      "azureProcessorJobDeploymentAllowed": false,
+      "manualFirstExecution": true,
+      "recurringEnabled": false,
+      "timerUnit": null,
+      "imagePullPolicy": "never",
+      "minimumDiskHeadroomBytes": 16106127360,
+      "resources": {
+        "cpu": 4,
+        "memory": "8GiB",
+        "pids": 1024
+      },
+      "requiredInputs": {
+        "sourceFreezeReceipt": "/srv/polyedge-ring/migration/qset-v6/source-freeze/source-<final-sha256>.json",
+        "sealedDayReceipts": [
+          "/srv/polyedge-ring/migration/qset-v6-seal/2026-09-01.json",
+          "/srv/polyedge-ring/migration/qset-v6-seal/2026-09-02.json"
+        ]
+      },
+      "requiredProofBeforeFirstExecution": [
+        "final_source_freeze_receipt_hash_image_revision_binding",
+        "two_exact_closed_day_receipt_and_inventory_hashes",
+        "local_linux_arm64_image_revision",
+        "dedicated_federated_token"
+      ],
+      "requiredProofBeforeRecurringEnablement": [
+        "manual_processor_success",
+        "verified_output_hash_and_readback",
+        "negative_access_probe",
+        "resource_and_disk_guard_evidence"
+      ]
+    },
+    {
+      "name": "qset-v7-processor",
+      "classification": "configured_manual_only_not_executed",
+      "ociUnit": "polyedge-qset-v7-processor.service",
+      "identityLane": "shadow-qset-v7-processor",
+      "azureContainerAppsJob": null,
+      "azureProcessorJobDeploymentAllowed": false,
+      "manualFirstExecution": true,
+      "recurringEnabled": false,
+      "timerUnit": null,
+      "imagePullPolicy": "never",
+      "minimumDiskHeadroomBytes": 16106127360,
+      "resources": {
+        "cpu": 4,
+        "memory": "8GiB",
+        "pids": 1024
+      },
+      "requiredInputs": {
+        "sourceFreezeReceipt": "/srv/polyedge-ring/migration/qset-v7/source-freeze/source-<final-sha256>.json",
+        "sealedDayReceipts": [
+          "/srv/polyedge-ring/migration/qset-v7-seal/2026-09-02.json",
+          "/srv/polyedge-ring/migration/qset-v7-seal/2026-09-03.json"
+        ]
+      },
+      "requiredProofBeforeFirstExecution": [
+        "final_source_freeze_receipt_hash_image_revision_binding",
+        "two_exact_closed_day_receipt_and_inventory_hashes",
+        "local_linux_arm64_image_revision",
+        "dedicated_federated_token"
+      ],
+      "requiredProofBeforeRecurringEnablement": [
+        "manual_processor_success",
+        "verified_output_hash_and_readback",
+        "negative_access_probe",
+        "resource_and_disk_guard_evidence"
+      ]
+    }
+  ]
+}

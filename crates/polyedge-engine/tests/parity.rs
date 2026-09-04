@@ -1,12 +1,13 @@
 use chrono::{DateTime, Utc};
 use polyedge_config::{ExecutionMode, RuntimeSettings};
 use polyedge_domain::{
-    BookState, ExecutionReport, FairValue, MarketId, MarketSpec, OrderId, ReferencePrice, TokenId,
-    TradeDecision,
+    BookState, ExecutionReport, FairValue, MarketId, MarketSpec, OrderId, ReferencePrice,
+    RiskAssessment, TokenId, TradeDecision,
 };
 use polyedge_engine::{
-    evaluate_decision_pipeline_v3, DecisionPipelineInputV3, FrozenStrategyMode,
-    LogReturnFairValueModel, MakerFirstStrategy, MarketStartEvidenceV1, OrderManager,
+    evaluate_decision_pipeline_v3, final_decision_evidence_v1, DecisionPipelineInputV3,
+    DecisionPipelineOutputV3, FrozenStrategyMode, LogReturnFairValueModel, MakerFirstStrategy,
+    ManagedQuoteSnapshot, MarketStartEvidenceV1, OrderManager, OrderManagerSnapshot,
     PaperFillEngine, RegimeBookSnapshot, RegimeClassifier, RegimeFeatureInput,
     RegimeReferencePoint, RestingMakerOrder, RiskManager,
 };
@@ -86,6 +87,101 @@ fn order_manager_matches_fixture_golden_master() {
         );
         assert_eq!(serde_json::to_value(actual).unwrap(), case["expected"]);
     }
+}
+
+#[test]
+fn expired_quote_from_prior_market_is_cancelled_before_current_market_actions() {
+    let placed_ts = parse_ts("2026-09-04T15:16:49Z");
+    let expired_market_id = MarketId::new("expired-market");
+    let resting: TradeDecision = serde_json::from_value(serde_json::json!({
+        "action": "place",
+        "market_id": expired_market_id,
+        "condition_id": "expired-condition",
+        "token_id": "expired-token",
+        "outcome": "down",
+        "side": "buy",
+        "price": "0.37",
+        "size": "1",
+        "quote_amount": null,
+        "order_kind": "post_only_gtc",
+        "reason": "maker edge exceeds threshold",
+        "ttl_ms": 10000,
+        "expected_edge": "0.039783",
+        "post_only": true,
+        "tick_size": "0.01",
+        "neg_risk": false
+    }))
+    .unwrap();
+    let manager = OrderManager::from_snapshot(OrderManagerSnapshot {
+        quotes: vec![ManagedQuoteSnapshot {
+            market_id: expired_market_id.clone(),
+            token_id: TokenId::new("expired-token"),
+            side: polyedge_domain::Side::Buy,
+            decision: resting,
+            placed_ts,
+            expires_at: Some(placed_ts + chrono::Duration::seconds(10)),
+            order_id: Some(OrderId::new("paper-expired")),
+        }],
+    });
+    let current_market_id = MarketId::new("current-market");
+    let risk_cancel: TradeDecision = serde_json::from_value(serde_json::json!({
+        "action": "cancel_all",
+        "market_id": current_market_id,
+        "condition_id": "current-condition",
+        "token_id": null,
+        "outcome": null,
+        "side": null,
+        "price": null,
+        "size": null,
+        "quote_amount": null,
+        "order_kind": null,
+        "reason": "max open orders reached",
+        "ttl_ms": null,
+        "expected_edge": null,
+        "post_only": false,
+        "tick_size": null,
+        "neg_risk": false
+    }))
+    .unwrap();
+
+    let actions = manager.reconcile(
+        &current_market_id,
+        &[risk_cancel],
+        None,
+        placed_ts + chrono::Duration::seconds(11),
+    );
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        actions[0].action,
+        polyedge_domain::DecisionAction::CancelAll
+    );
+    assert_eq!(actions[0].market_id, expired_market_id);
+    assert_eq!(actions[0].reason, "expired maker quote from a prior market");
+}
+
+#[test]
+fn final_place_without_strategy_lineage_is_reconciliation_evidence() {
+    let decision = serde_json::from_value::<TradeDecision>(
+        fixture()["strategy_cases"][0]["expected"][0].clone(),
+    )
+    .unwrap();
+    let output = DecisionPipelineOutputV3 {
+        raw_decisions: vec![decision.clone()],
+        strategy_evaluations: Vec::new(),
+        strategy_decisions: vec![decision.clone()],
+        risk_assessment: RiskAssessment::allow(),
+        risk_decisions: vec![decision.clone()],
+        final_decisions: vec![decision],
+        classifier_after: None,
+    };
+
+    let evidence = final_decision_evidence_v1(&output).unwrap();
+    assert_eq!(
+        evidence[0].payload["final_decision_metadata"]["source"],
+        "risk_or_order_reconciliation"
+    );
+    assert_eq!(evidence[0].strategy_evaluation_index, None);
 }
 
 #[test]

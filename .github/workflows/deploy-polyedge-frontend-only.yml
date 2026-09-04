@@ -14,6 +14,7 @@ concurrency:
 env:
   AZURE_RESOURCE_GROUP: rg-polyedge-dev
   APP_NAME: polyedge-dev
+  API_APP: polyedge-dev-api
   SHADOW_APP: polyedge-shadow-neu
   ACR_NAME: crpolyedge6urdjr5nmwx7w
   ACR_LOGIN_SERVER: crpolyedge6urdjr5nmwx7w.azurecr.io
@@ -75,16 +76,26 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$APP_NAME" \
             -o json)
+          api_json=$(az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$API_APP" \
+            -o json)
           active_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$app_json")
-          bot_image=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$app_json")
+          api_revision=$(jq -r '.properties.latestReadyRevisionName' <<<"$api_json")
+          bot_image=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$api_json")
           frontend_image=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")
           frontend_count=$(jq -r '[.properties.template.containers[] | select(.name == "frontend")] | length' <<<"$app_json")
           test -n "$active_revision"
+          test -n "$api_revision"
           test -n "$bot_image"
           test -n "$frontend_image"
           test "$frontend_count" = "1"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$app_json")" = "paper"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$app_json")" = "false"
+          test "$(jq -r '[.properties.template.containers[] | select(.name == "bot")] | length' <<<"$app_json")" = "0"
+          test "$(jq -r '.properties.template.scale.minReplicas' <<<"$app_json")" = "0"
+          test "$(jq -r '.properties.configuration.ingress.external' <<<"$api_json")" = "false"
+          test "$(jq -r '.properties.template.scale.minReplicas' <<<"$api_json")" = "1"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$api_json")" = "paper"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$api_json")" = "false"
 
           shadow_json=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -123,6 +134,7 @@ jobs:
           check_manual_job polyedge-venue-model-job QUEUE_MODEL_TRAINING_ENABLED false
 
           echo "active_revision=$active_revision" >> "$GITHUB_OUTPUT"
+          echo "api_revision=$api_revision" >> "$GITHUB_OUTPUT"
           echo "bot_image=$bot_image" >> "$GITHUB_OUTPUT"
           echo "frontend_image=$frontend_image" >> "$GITHUB_OUTPUT"
           echo "shadow_revision=$shadow_revision" >> "$GITHUB_OUTPUT"
@@ -147,13 +159,17 @@ jobs:
       - name: Update only the frontend container
         env:
           EXPECTED_BOT_IMAGE: ${{ steps.safety.outputs.bot_image }}
+          EXPECTED_API_REVISION: ${{ steps.safety.outputs.api_revision }}
         run: |
           set -euo pipefail
           app_json=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$APP_NAME" \
             -o json)
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$app_json")" = "$EXPECTED_BOT_IMAGE"
+          api_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$API_APP" -o json)
+          test "$(jq -r '.properties.latestReadyRevisionName' <<<"$api_json")" = "$EXPECTED_API_REVISION"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$api_json")" = "$EXPECTED_BOT_IMAGE"
+          test "$(jq -r '[.properties.template.containers[] | select(.name == "bot")] | length' <<<"$app_json")" = "0"
           check_manual_job() {
             local job="$1"
             local enabled_name="$2"
@@ -191,6 +207,7 @@ jobs:
       - name: Verify runtime and campaign were not changed
         env:
           EXPECTED_ACTIVE_REVISION: ${{ steps.safety.outputs.active_revision }}
+          EXPECTED_API_REVISION: ${{ steps.safety.outputs.api_revision }}
           EXPECTED_BOT_IMAGE: ${{ steps.safety.outputs.bot_image }}
           EXPECTED_FRONTEND_IMAGE: ${{ steps.safety.outputs.frontend_image }}
           EXPECTED_SHADOW_REVISION: ${{ steps.safety.outputs.shadow_revision }}
@@ -215,10 +232,13 @@ jobs:
           done
           test "$rollout_ready" = true
           test -n "$active_revision"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$app_json")" = "$EXPECTED_BOT_IMAGE"
           test "$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .image' <<<"$app_json")" = "$FRONTEND_IMAGE"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$app_json")" = "paper"
-          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$app_json")" = "false"
+          test "$(jq -r '[.properties.template.containers[] | select(.name == "bot")] | length' <<<"$app_json")" = "0"
+          api_json=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$API_APP" -o json)
+          test "$(jq -r '.properties.latestReadyRevisionName' <<<"$api_json")" = "$EXPECTED_API_REVISION"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .image' <<<"$api_json")" = "$EXPECTED_BOT_IMAGE"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "EXECUTION_MODE") | .value' <<<"$api_json")" = "paper"
+          test "$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "ALLOW_LIVE") | .value' <<<"$api_json")" = "false"
 
           shadow_json=$(az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -292,8 +312,14 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$APP_NAME" \
             --revision "$active_revision" \
-            -o json > replicas.json
-          jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' replicas.json
+            -o json > frontend-replicas.json
+          az containerapp replica list \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$API_APP" \
+            --revision "$EXPECTED_API_REVISION" \
+            -o json > api-replicas.json
+          jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' frontend-replicas.json
+          jq -e 'length == 1 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' api-replicas.json
 
       - name: Publish deployment summary
         env:
@@ -303,7 +329,7 @@ jobs:
             echo "## PolyEdge frontend-only deployment"
             echo
             echo "- Frontend image: \`$FRONTEND_IMAGE\`"
-            echo "- Active backend image: unchanged; app-wide revision rolled and passed recorder health checks"
+            echo "- Active backend image and revision: unchanged; recorder health checks passed"
             echo "- Frozen shadow revision: \`$SHADOW_REVISION\` (unchanged)"
             echo "- Funded execution: not targeted"
           } >> "$GITHUB_STEP_SUMMARY"

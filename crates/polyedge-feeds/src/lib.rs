@@ -9,11 +9,17 @@ use tokio::sync::mpsc;
 
 pub use discovery::discover_markets;
 pub use streams::{
-    fetch_chainlink_reference, run_binance_book_ticker_feed, run_market_feed, run_rtds_feed,
+    fetch_chainlink_reference, run_binance_book_ticker_feed, run_market_feed,
+    run_market_feed_generation, run_market_feed_generation_with_lease, run_rtds_feed,
 };
 
-use polyedge_domain::{BookState, ReferencePrice};
+use polyedge_domain::{BookState, ReferencePrice, TokenId};
 use serde_json::Value;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,11 +34,11 @@ pub enum FeedName {
     Mock,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[derive(Debug)]
 pub enum FeedEvent {
     Reference(ReferencePrice),
     Book(BookState),
+    BookInvalidated(TokenId),
     RawMarketEvent(MarketChannelEvent),
     Error {
         source: FeedName,
@@ -43,6 +49,67 @@ pub enum FeedEvent {
         source: FeedName,
         ts: DateTime<Utc>,
     },
+    /// A market socket has collected its first valid full-book snapshot batch
+    /// and is stopped at its producer barrier. The runtime must durably clear
+    /// every subscribed token from the prior generation and authorize this one
+    /// before the socket may forward any later snapshots or deltas.
+    ClobResyncBarrier(ClobResyncBarrier),
+    ClobRawMarketEvent {
+        generation: u64,
+        sequence: u64,
+        event: MarketChannelEvent,
+    },
+    ClobBook {
+        generation: u64,
+        sequence: u64,
+        book: BookState,
+    },
+    ClobBookInvalidated {
+        generation: u64,
+        sequence: u64,
+        token_id: TokenId,
+    },
+}
+
+#[derive(Debug)]
+pub struct ClobResyncBarrier {
+    pub generation: u64,
+    pub sequence: u64,
+    pub token_set_digest: String,
+    pub token_count: usize,
+    pub anchors: Vec<BookState>,
+    pub pre_ready_events: Vec<MarketChannelEvent>,
+    pub lease: ClobGenerationLease,
+    pub ready_ack: oneshot::Sender<Result<(), String>>,
+}
+
+impl ClobResyncBarrier {
+    pub fn token_ids(&self) -> impl Iterator<Item = &TokenId> {
+        self.anchors.iter().map(|book| &book.token_id)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ClobGenerationLease(Arc<AtomicBool>);
+
+impl ClobGenerationLease {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn terminate(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for ClobGenerationLease {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +157,8 @@ pub enum FeedError {
     WebSocket(#[source] Box<tokio_tungstenite::tungstenite::Error>),
     #[error("source stalled: {0}")]
     SourceStalled(String),
+    #[error("market protocol error: {0}")]
+    MarketProtocol(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for FeedError {

@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect previous-hour PolyEdge parity evidence at :18 UTC
+
+[Timer]
+OnCalendar=*-*-* *:18:00 UTC
+Persistent=true
+AccuracySec=1s
+Unit=polyedge-parity-hourly.service
+
+[Install]
+WantedBy=timers.target
