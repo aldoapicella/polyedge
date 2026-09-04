@@ -110,7 +110,7 @@ main() {
       "CONTAINER_ID_FULL=$(jq -r '.container.id' <<<"$identity")")
     candidate=$(jq -r '
       select(._SYSTEMD_INVOCATION_ID==$invocation and .CONTAINER_ID_FULL==$container) |
-      select(try (.MESSAGE|fromjson|.schema=="polyedge.qset_v7_writer_retirement_receipt.v1") catch false) | .MESSAGE
+      select(try (.MESSAGE|fromjson|.schema=="polyedge.qset_v7_writer_retirement_receipt.v1") catch false) | (.MESSAGE | rtrimstr("\n"))
     ' --arg invocation "$(jq -r '.service.invocationId' <<<"$identity")" --arg container "$(jq -r '.container.id' <<<"$identity")" <<<"$records" | tail -n 1)
     test -z "$candidate" || break
     sleep 1

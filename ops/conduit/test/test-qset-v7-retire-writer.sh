@@ -37,7 +37,7 @@ run_helper() {
       *--sync*) return ;;
       *--show-cursor*) echo '-- cursor: qset-v7-before' ;;
       *--after-cursor*)
-        jq -nc --arg invocation "$(cat "$QSET_V7_RETIRE_TEST_ROOT/invocation")" --arg container "$(cat "$QSET_V7_RETIRE_TEST_ROOT/container")" --arg message "$(cat "$QSET_V7_RETIRE_TEST_ROOT/journal-message")" \
+        jq -nc --arg invocation "$(cat "$QSET_V7_RETIRE_TEST_ROOT/invocation")" --arg container "$(cat "$QSET_V7_RETIRE_TEST_ROOT/container")" --arg message "$(cat "$QSET_V7_RETIRE_TEST_ROOT/journal-message")"$'\n' \
           '{_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}' ;;
       *) return 2 ;;
     esac
