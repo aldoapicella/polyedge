@@ -70,6 +70,7 @@ printf '%s\n' \
   'POLYEDGE_RING_IMAGE=ghcr.io/test/polyedge-rust-backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'POLYEDGE_RING_BLOB_PREFIX=events-oci-test' \
   'RECORDER_SEGMENT_SECONDS=600' \
+  'POLYEDGE_RING_RETENTION_HOURS=8760' \
   'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=0' \
   'POLYEDGE_RING_SEAL_ONLY=0' \
   'POLYEDGE_RING_LEGACY_CUTOFF_EPOCH=1785960600' \
@@ -360,5 +361,49 @@ grep -F '/usr/bin/timeout --signal=TERM --kill-after=60s 3h' ops/conduit/bin/pol
 grep -F -- '-v "$segments:/srv/polyedge-ring/segments:ro,Z"' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
 grep -F 'ring-quarantine-resolve' ops/conduit/bin/polyedge-ring-quarantine >/dev/null
 grep -F 'events-oci-quarantine-v1/invalid-recorder-sequence-proof' crates/polyedge-cli/src/main.rs >/dev/null
+
+retention_root=$root/retention
+retention_segment=$retention_root/segments/2026/08/05/20/1785960600.jsonl
+retention_archive=$retention_root/archive/2026/08/05/20/1785960600.jsonl.gz
+retention_manifest=$retention_archive.manifest.json
+retention_receipt=$retention_manifest.oci-uploaded.json
+retention_env=$retention_root/ring.env
+install -d -m 0750 "${retention_segment%/*}" "$retention_root/oci-state"
+printf '%s\n' '{"test":1,"recorder_instance_id":"123e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}' >"$retention_segment"
+printf '%s\n' \
+  "POLYEDGE_RING_ROOT=$retention_root" \
+  "POLYEDGE_RING_MOUNT_ROOT=${root%/*}" \
+  'POLYEDGE_RING_BLOB_PREFIX=events-oci-retention-test' \
+  'RECORDER_SEGMENT_SECONDS=600' \
+  'POLYEDGE_RING_RETENTION_HOURS=48' \
+  'POLYEDGE_AZURE_RING_UPLOAD_ENABLED=0' \
+  'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED=1' \
+  "POLYEDGE_OCI_CLI=$fake/oci" \
+  'OCI_OBJECT_STORAGE_NAMESPACE=testnamespace' \
+  'OCI_OBJECT_STORAGE_BUCKET=bot-events' \
+  'OCI_OBJECT_STORAGE_REGION=sa-bogota-1' \
+  "POLYEDGE_TEST_OCI_LOG=$retention_root/oci.log" \
+  "POLYEDGE_TEST_OCI_STATE=$retention_root/oci-state" >"$retention_env"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$retention_env "$sync"
+[ ! -e "$retention_segment" ]
+[ ! -e "$retention_archive" ]
+[ ! -e "$retention_manifest" ]
+[ -e "$retention_receipt" ]
+[ "$(tail -4 "$retention_root/oci.log" | cut -d' ' -f1 | paste -sd, -)" = 'put,put,head,head' ]
+
+guard_segment=$retention_root/segments/2026/08/05/20/1785961200.jsonl
+guard_archive=$retention_root/archive/2026/08/05/20/1785961200.jsonl.gz
+guard_manifest=$guard_archive.manifest.json
+guard_receipt=$guard_manifest.oci-uploaded.json
+printf '%s\n' '{"test":2,"recorder_instance_id":"223e4567-e89b-42d3-a456-426614174000","recorder_sequence":1}' >"$guard_segment"
+printf '%s\n' 'POLYEDGE_RING_RETENTION_HOURS=8760' >>"$retention_env"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$retention_env "$sync"
+[ -e "$guard_segment" ] && [ -e "$guard_archive" ] && [ -e "$guard_manifest" ] && [ -e "$guard_receipt" ]
+printf '%s\n' 'POLYEDGE_RING_RETENTION_HOURS=48' >>"$retention_env"
+if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$retention_env POLYEDGE_TEST_OCI_MODE=bad-head "$sync" >/dev/null 2>&1; then
+  echo 'OCI retention accepted a changed remote object' >&2
+  exit 1
+fi
+[ -e "$guard_segment" ] && [ -e "$guard_archive" ] && [ -e "$guard_manifest" ] && [ -e "$guard_receipt" ]
 
 echo 'ring sealer self-test passed'

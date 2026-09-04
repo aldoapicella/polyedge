@@ -514,6 +514,35 @@ oci_put_immutable() {
   trap - EXIT HUP INT TERM
 }
 
+oci_verify_remote() {
+  _oci_name=$1
+  _oci_sha256=$2
+  _oci_etag=$3
+  _oci_checksum=$(printf '%s' "${_oci_sha256#sha256:}" | xxd -r -p | base64 -w0)
+  _oci_response=$(mktemp "$root/.oci-response.XXXXXX") || return 1
+  trap 'rm -f "$_oci_response"' EXIT HUP INT TERM
+  if ! "$oci_cli" os object head \
+    --auth instance_principal \
+    --region "$oci_region" \
+    --namespace-name "$oci_namespace" \
+    --bucket-name "$oci_bucket" \
+    --name "$_oci_name" \
+    --output json >"$_oci_response"; then
+    rm -f "$_oci_response"
+    trap - EXIT HUP INT TERM
+    return 1
+  fi
+  jq -e --arg checksum "$_oci_checksum" --arg etag "$_oci_etag" \
+    '.["opc-content-sha256"] == $checksum and .etag == $etag' "$_oci_response" >/dev/null || {
+    echo "OCI object changed after upload: $_oci_name" >&2
+    rm -f "$_oci_response"
+    trap - EXIT HUP INT TERM
+    return 1
+  }
+  rm -f "$_oci_response"
+  trap - EXIT HUP INT TERM
+}
+
 oci_sync() {
   : "${OCI_OBJECT_STORAGE_NAMESPACE:?set OCI_OBJECT_STORAGE_NAMESPACE}"
   : "${OCI_OBJECT_STORAGE_BUCKET:?set OCI_OBJECT_STORAGE_BUCKET}"
@@ -528,6 +557,15 @@ oci_sync() {
   printf '%s' "$oci_namespace" | grep -Eq '^[A-Za-z0-9_-]+$' || { echo 'invalid OCI namespace' >&2; return 64; }
   printf '%s' "$oci_bucket" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo 'invalid OCI bucket' >&2; return 64; }
   printf '%s' "$oci_region" | grep -Eq '^[a-z0-9-]+$' || { echo 'invalid OCI region' >&2; return 64; }
+  _oci_retention_hours=${POLYEDGE_RING_RETENTION_HOURS:-48}
+  printf '%s' "$_oci_retention_hours" | grep -Eq '^[1-9][0-9]*$' &&
+    [ "$_oci_retention_hours" -ge 48 ] && [ "$_oci_retention_hours" -le 876000 ] || {
+    echo 'POLYEDGE_RING_RETENTION_HOURS must be from 48 through 876000' >&2
+    return 64
+  }
+  _oci_retention_seconds=$((_oci_retention_hours * 3600))
+  _oci_now=$(date -u +%s)
+  _oci_deleted=0
 
   _oci_manifest_list=$(mktemp "$root/.oci-manifests.XXXXXX") || return 1
   trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
@@ -546,6 +584,8 @@ oci_sync() {
         (.schema_version == 2 or .schema_version == 3 or .schema_version == 4) and
         .compression == "gzip" and
         .archive_path == $archive_path and
+        (.segment_path | type == "string" and startswith("segments/") and endswith(".jsonl")) and
+        (.segment_end_epoch | type == "number" and floor == . and . > 0 and . <= 4102444800) and
         (.blob_name | type == "string" and startswith($prefix) and endswith(".jsonl.gz")) and
         (.sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$"))
       ) | .blob_name
@@ -575,37 +615,62 @@ oci_sync() {
         echo "invalid OCI ring upload receipt: $_oci_receipt" >&2
         return 1
       }
-      continue
+    else
+      [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
+        echo "OCI ring payload changed: $_oci_payload" >&2
+        return 1
+      }
+      _oci_blob_etag=$(oci_put_immutable "$_oci_payload" "$_oci_blob" "$_oci_payload_sha" application/gzip) || return 1
+      _oci_manifest_etag=$(oci_put_immutable "$_oci_manifest" "$_oci_manifest_blob" "$_oci_manifest_sha" application/json) || return 1
+      _oci_temporary=$(mktemp "$_oci_receipt.XXXXXX") || return 1
+      trap 'rm -f "$_oci_temporary" "$_oci_manifest_list"' EXIT HUP INT TERM
+      jq -n \
+        --arg namespace "$oci_namespace" \
+        --arg bucket "$oci_bucket" \
+        --arg region "$oci_region" \
+        --arg blob "$_oci_blob" \
+        --arg blob_sha "$_oci_payload_sha" \
+        --arg blob_etag "$_oci_blob_etag" \
+        --arg manifest_blob "$_oci_manifest_blob" \
+        --arg manifest_sha "$_oci_manifest_sha" \
+        --arg manifest_etag "$_oci_manifest_etag" \
+        --arg verified_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{schema:"polyedge_oci_ring_upload.v1",namespace:$namespace,bucket_name:$bucket,region:$region,blob_name:$blob,blob_sha256:$blob_sha,blob_etag:$blob_etag,manifest_blob_name:$manifest_blob,manifest_sha256:$manifest_sha,manifest_blob_etag:$manifest_etag,verified_ts:$verified_ts}' \
+        >"$_oci_temporary"
+      chmod 0640 "$_oci_temporary"
+      sync -f "$_oci_temporary"
+      mv "$_oci_temporary" "$_oci_receipt"
+      sync -f "$_oci_receipt"
+      trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
     fi
-    [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
-      echo "OCI ring payload changed: $_oci_payload" >&2
-      return 1
-    }
-    _oci_blob_etag=$(oci_put_immutable "$_oci_payload" "$_oci_blob" "$_oci_payload_sha" application/gzip) || return 1
-    _oci_manifest_etag=$(oci_put_immutable "$_oci_manifest" "$_oci_manifest_blob" "$_oci_manifest_sha" application/json) || return 1
-    _oci_temporary=$(mktemp "$_oci_receipt.XXXXXX") || return 1
-    trap 'rm -f "$_oci_temporary" "$_oci_manifest_list"' EXIT HUP INT TERM
-    jq -n \
-      --arg namespace "$oci_namespace" \
-      --arg bucket "$oci_bucket" \
-      --arg region "$oci_region" \
-      --arg blob "$_oci_blob" \
-      --arg blob_sha "$_oci_payload_sha" \
-      --arg blob_etag "$_oci_blob_etag" \
-      --arg manifest_blob "$_oci_manifest_blob" \
-      --arg manifest_sha "$_oci_manifest_sha" \
-      --arg manifest_etag "$_oci_manifest_etag" \
-      --arg verified_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '{schema:"polyedge_oci_ring_upload.v1",namespace:$namespace,bucket_name:$bucket,region:$region,blob_name:$blob,blob_sha256:$blob_sha,blob_etag:$blob_etag,manifest_blob_name:$manifest_blob,manifest_sha256:$manifest_sha,manifest_blob_etag:$manifest_etag,verified_ts:$verified_ts}' \
-      >"$_oci_temporary"
-    chmod 0640 "$_oci_temporary"
-    sync -f "$_oci_temporary"
-    mv "$_oci_temporary" "$_oci_receipt"
-    sync -f "$_oci_receipt"
-    trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
+
+    _oci_segment_end=$(jq -r '.segment_end_epoch' "$_oci_manifest")
+    if [ "$_oci_now" -ge $((_oci_segment_end + _oci_retention_seconds)) ]; then
+      _oci_source_relative=$(jq -r '.segment_path' "$_oci_manifest")
+      case "$_oci_source_relative" in segments/*/*.jsonl) ;; *) echo "invalid OCI ring source path: $_oci_manifest" >&2; return 1 ;; esac
+      case "/$_oci_source_relative/" in *'/./'*|*'/../'*|*'//'*) echo "non-canonical OCI ring source path: $_oci_manifest" >&2; return 1 ;; esac
+      _oci_source=$root/$_oci_source_relative
+      if [ -e "$_oci_source" ] || [ -L "$_oci_source" ]; then
+        [ ! -L "$_oci_source" ] && [ -f "$_oci_source" ] || { echo "invalid OCI ring source: $_oci_source" >&2; return 1; }
+        [ "$(stat -c %s "$_oci_source")" = "$(jq -r '.source_bytes' "$_oci_manifest")" ] &&
+          [ "sha256:$(sha256sum "$_oci_source" | awk '{print $1}')" = "$(jq -r '.source_sha256' "$_oci_manifest")" ] || {
+          echo "OCI ring source changed before retention: $_oci_source" >&2
+          return 1
+        }
+      fi
+      [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
+        echo "OCI ring payload changed before retention: $_oci_payload" >&2
+        return 1
+      }
+      oci_verify_remote "$_oci_blob" "$_oci_payload_sha" "$(jq -r '.blob_etag' "$_oci_receipt")" || return 1
+      oci_verify_remote "$_oci_manifest_blob" "$_oci_manifest_sha" "$(jq -r '.manifest_blob_etag' "$_oci_receipt")" || return 1
+      rm -f "$_oci_source" "$_oci_payload" "$_oci_manifest"
+      _oci_deleted=$((_oci_deleted + 1))
+    fi
   done <"$_oci_manifest_list"
   rm -f "$_oci_manifest_list"
   trap - EXIT HUP INT TERM
+  [ "$_oci_deleted" -eq 0 ] || echo "OCI ring retention deleted $_oci_deleted verified local segments"
 }
 
 case "${POLYEDGE_AZURE_RING_UPLOAD_ENABLED:-1}" in
