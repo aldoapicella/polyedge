@@ -37,6 +37,20 @@ if PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$low_space_env POLYEDGE_RING_HEALTH
 fi
 jq -e '.free_ok == false and .seal_only == true and .retention_hours == 48' "$status_file" >/dev/null
 
+printf '{"test":"uploaded"}\n' >"$source_file"
+uploaded_manifest=$root/archive/2026/08/16/17/1786900200.jsonl.gz.manifest.json
+uploaded_receipt=$uploaded_manifest.oci-uploaded.json
+printf '{}\n' >"$uploaded_manifest"
+touch -d '1 hour ago' "$uploaded_manifest"
+printf '{}\n' >"$uploaded_receipt"
+oci_env=$root/ring-oci.env
+sed 's/POLYEDGE_RING_SEAL_ONLY=1/POLYEDGE_RING_SEAL_ONLY=0/' "$env_file" >"$oci_env"
+printf '%s\n' 'POLYEDGE_AZURE_RING_UPLOAD_ENABLED=0' >>"$oci_env"
+PATH="$fake:$PATH" POLYEDGE_RING_ENV_FILE=$oci_env POLYEDGE_RING_HEALTH_TEST=1 \
+  ops/conduit/bin/polyedge-ring-health
+jq -e '.unuploaded_count == 0 and .upload_fresh == true' "$status_file" >/dev/null
+rm -f "$source_file" "$uploaded_manifest" "$uploaded_receipt"
+
 printf '%s\n' \
   '{"recorder_instance_id":"7c66d77b-a911-4f9b-95f2-98ca9395255e","recorder_sequence":1}' \
   '{"recorder_instance_id":"7c66d77b-a911-4f9b-95f2-98ca9395255e","recorder_sequence":3}' > "$source_file"

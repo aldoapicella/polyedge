@@ -24,7 +24,10 @@ grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
 retention_hours=${POLYEDGE_RING_RETENTION_HOURS:-48}
 minimum_free=${POLYEDGE_RING_MIN_FREE_BYTES:-34359738368}
 maximum_unuploaded_age=${POLYEDGE_RING_MAX_UNUPLOADED_SECONDS:-1200}
+azure_upload_enabled=${POLYEDGE_AZURE_RING_UPLOAD_ENABLED:-1}
 max_quarantine_source_bytes=536870912
+
+case "$azure_upload_enabled" in 0|1) ;; *) echo 'POLYEDGE_AZURE_RING_UPLOAD_ENABLED must equal 0 or 1' >&2; exit 64 ;; esac
 
 for ring_dir in "$segments" "$archive" "$quarantine_parent" "$quarantine" "$resolved_quarantine"; do
   [ ! -L "$ring_dir" ] && [ -d "$ring_dir" ] || { echo "unsafe or missing ring directory: $ring_dir" >&2; exit 1; }
@@ -210,7 +213,7 @@ for segment in $(find "$segments" -type f -name '*.jsonl' -print); do
   fi
   if [ -n "$manifest" ]; then
     sealed_count=$((sealed_count + 1))
-    receipt=$manifest.uploaded.json
+    if [ "$azure_upload_enabled" = 1 ]; then receipt=$manifest.uploaded.json; else receipt=$manifest.oci-uploaded.json; fi
     if [ ! -e "$receipt" ]; then
       unuploaded_count=$((unuploaded_count + 1))
       age=$((now - $(stat -c %Y "$manifest")))
