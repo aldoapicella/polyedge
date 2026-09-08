@@ -22,7 +22,7 @@ grep -F 'credential=shadow-qset-v6-processor' "$runner" >/dev/null
 grep -F 'qset processor federated token is missing or unsafe' "$runner" >/dev/null
 grep -F -- '--user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --entrypoint='"'"'["/usr/bin/setpriv","--no-new-privs"]'"'"'' "$runner" >/dev/null
 grep -F -- '--pull=never --log-driver=journald' "$runner" >/dev/null
-grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor|qset-v6-processor|qset-v7-processor)' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor|qset-v6-processor|qset-v7-processor|qset-v8-processor)' "$runner" >/dev/null
 grep -F '2026-09-01 --source-freeze-blob' "$runner" >/dev/null
 grep -F '2026-09-02 --source-freeze-blob' "$runner" >/dev/null
 grep -F '/app/research/run_shadow_daily_v6.sh' "$runner" >/dev/null
@@ -69,7 +69,7 @@ grep -Fx 'TasksMax=1024' "$service" >/dev/null
 jq -e '
   .azureJobCount == (.jobs | length)
   and ([.ociOnlyJobs[] | select(.name == "qset-v6-processor")] == [{
-    name:"qset-v6-processor",classification:"configured_manual_only_not_executed",
+    name:"qset-v6-processor",classification:"historical_inactive",
     ociUnit:"polyedge-qset-v6-processor.service",identityLane:"shadow-qset-v6-processor",
     azureContainerAppsJob:null,azureProcessorJobDeploymentAllowed:false,
     manualFirstExecution:true,recurringEnabled:false,timerUnit:null,imagePullPolicy:"never",

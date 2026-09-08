@@ -22,7 +22,7 @@ grep -F 'credential=shadow-qset-v7-processor' "$runner" >/dev/null
 grep -F 'qset processor federated token is missing or unsafe' "$runner" >/dev/null
 grep -F -- '--user "$token_uid:$token_gid" --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --entrypoint='"'"'["/usr/bin/setpriv","--no-new-privs"]'"'"'' "$runner" >/dev/null
 grep -F -- '--pull=never --log-driver=journald' "$runner" >/dev/null
-grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor|qset-v6-processor|qset-v7-processor)' "$runner" >/dev/null
+grep -F 'daily|replay|prospective|chart-backfill|backfill|shadow-qset|qset-v4-processor|qset-v5-processor|qset-v6-processor|qset-v7-processor|qset-v8-processor)' "$runner" >/dev/null
 grep -F '2026-09-02 --source-freeze-blob' "$runner" >/dev/null
 grep -F '2026-09-03 --source-freeze-blob' "$runner" >/dev/null
 grep -F '/app/research/run_shadow_daily_v7.sh' "$runner" >/dev/null
@@ -69,7 +69,7 @@ grep -Fx 'TasksMax=1024' "$service" >/dev/null
 jq -e '
   .azureJobCount == (.jobs | length)
   and ([.ociOnlyJobs[] | select(.name == "qset-v7-processor")] == [{
-    name:"qset-v7-processor",classification:"configured_manual_only_not_executed",
+    name:"qset-v7-processor",classification:"terminal_inactive_retry_prohibited",
     ociUnit:"polyedge-qset-v7-processor.service",identityLane:"shadow-qset-v7-processor",
     azureContainerAppsJob:null,azureProcessorJobDeploymentAllowed:false,
     manualFirstExecution:true,recurringEnabled:false,timerUnit:null,imagePullPolicy:"never",
@@ -79,6 +79,6 @@ jq -e '
     requiredProofBeforeFirstExecution:["final_source_freeze_receipt_hash_image_revision_binding","two_exact_closed_day_receipt_and_inventory_hashes","local_linux_arm64_image_revision","dedicated_federated_token"],
     requiredProofBeforeRecurringEnablement:["manual_processor_success","verified_output_hash_and_readback","negative_access_probe","resource_and_disk_guard_evidence"]
   }])
-  and (.protectedTrustRules.shadowQsetV7Processor | contains("no funded, qset-v1/v2/v3/v4/v5/v6, Key Vault, Service Bus"))
+  and .protectedTrustRules.shadowQsetV7Processor == "Historical terminal lane; runtime and recurrence remain disabled and its retained evidence is diagnostic-only."
 ' "$mapping" >/dev/null
 "$root/test/test-qset-v7-processor-handoff.sh"
