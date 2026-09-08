@@ -223,6 +223,10 @@ require_no_azure_processor_job() {
   az containerapp job list --resource-group "$AZURE_RESOURCE_GROUP" -o json | jq -e --arg name "$forbidden_azure_job" 'all(.[];.name!=$name)' >/dev/null
 }
 
+require_no_service_bus_namespace() {
+  az servicebus namespace list -o json | jq -e 'length==0' >/dev/null
+}
+
 validate_template() {
   local compiled
   compiled=$(mktemp)
@@ -318,17 +322,15 @@ probe_denials() {
   token_header "$token_file" "$client_id" https://vault.azure.net/.default "$response" "$header" || { rm -f "$response" "$header"; return 1; }
   code=$(curl --silent --show-error -o /dev/null -w '%{http_code}' -H "@$header" "https://${AZURE_KEY_VAULT_NAME:-kvpolyedge6urdjr5nmwx7w}.vault.azure.net/secrets?api-version=7.4")
   expect_denied "$code" "$lane Key Vault" || { rm -f "$response" "$header"; return 1; }
-  token_header "$token_file" "$client_id" https://servicebus.azure.net/.default "$response" "$header" || { rm -f "$response" "$header"; return 1; }
-  code=$(curl --silent --show-error -o /dev/null -w '%{http_code}' -H "@$header" "https://${AZURE_SERVICE_BUS_NAMESPACE:-sb-polyedge-funded-cl-6urdjr5nmwx7w}.servicebus.windows.net/${AZURE_SERVICE_BUS_QUEUE:-funded-dynamic-quote-intents}?api-version=2017-04")
-  expect_denied "$code" "$lane Service Bus" || { rm -f "$response" "$header"; return 1; }
   rm -f "$response" "$header"
-  jq -nc --arg lane "$lane" '{lane:$lane,v1ThroughV7AndFundedStorageDenied:true,keyVaultDenied:true,serviceBusDenied:true}'
+  jq -nc --arg lane "$lane" '{lane:$lane,v1ThroughV7AndFundedStorageDenied:true,keyVaultDenied:true,serviceBusNamespaceAbsent:true}'
 }
 
 resolve_ids
 require_exact_federation
 if test "$mode" != rollback; then assert_custom_roles; fi
 require_no_azure_processor_job
+require_no_service_bus_namespace
 v5_before=$(mktemp); v6_before=$(mktemp); trap 'rm -f "$v5_before" "$v6_before" "${v8_current:-}" "${api_current:-}" "${positive_receipts:-}" "${negative_receipts:-}" "${after_expected:-}" "${after_api:-}"' EXIT HUP INT TERM
 capture_v5_state >"$v5_before"
 capture_v6_state >"$v6_before"
@@ -354,10 +356,10 @@ if test "$mode" = verify-live; then
     if { probe_denials writer "$writer_token" "$writer_client_id"; probe_denials processor "$processor_token" "$processor_client_id"; } >"$negative_receipts"; then break; fi
     sleep 10
   done
-  jq -s -e 'length==2 and all(.[];.v1ThroughV7AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)' "$negative_receipts" >/dev/null
+  jq -s -e 'length==2 and all(.[];.v1ThroughV7AndFundedStorageDenied and .keyVaultDenied and .serviceBusNamespaceAbsent)' "$negative_receipts" >/dev/null
   assert_v5_unchanged "$v5_before"; assert_v6_unchanged "$v6_before"
   require_no_azure_processor_job
-  jq -n --slurpfile denials "$negative_receipts" '{schema:"polyedge.qset_v8_rbac_verify_live.v1",writerAssignments:5,processorAssignments:3,apiReaderAssignments:1,v1ThroughV7FundedKeyVaultAndServiceBusDenied:$denials,v5InactiveAssignmentsUnchanged:true,v6InactiveAssignmentsUnchanged:true,azureProcessorJobAbsent:true}'
+  jq -n --slurpfile denials "$negative_receipts" '{schema:"polyedge.qset_v8_rbac_verify_live.v1",writerAssignments:5,processorAssignments:3,apiReaderAssignments:1,v1ThroughV7FundedAndKeyVaultDeniedServiceBusAbsent:$denials,v5InactiveAssignmentsUnchanged:true,v6InactiveAssignmentsUnchanged:true,azureProcessorJobAbsent:true}'
   exit 0
 fi
 
@@ -434,7 +436,7 @@ for _ in 1 2 3 4 5 6; do
   if { probe_denials writer "$writer_token" "$writer_client_id"; probe_denials processor "$processor_token" "$processor_client_id"; } >"$negative_receipts"; then break; fi
   sleep 10
 done
-jq -s -e 'length==2 and all(.[];.v1ThroughV7AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)' "$negative_receipts" >/dev/null
+jq -s -e 'length==2 and all(.[];.v1ThroughV7AndFundedStorageDenied and .keyVaultDenied and .serviceBusNamespaceAbsent)' "$negative_receipts" >/dev/null
 
 if test ! -e "$after_receipt"; then
   temporary=$(mktemp "$receipt_root/.assignments.XXXXXX")

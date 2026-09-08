@@ -105,6 +105,7 @@ case "$args" in
     jq -nc --arg name "fic-spire-conduit-shadow-qset-v8-$lane" --arg subject "$subject" '[{name:$name,issuer:"https://oidc.jupiterlabs.dev",subject:$subject,audiences:["api://AzureADTokenExchange"]}]' |
       if test "${EXTRA_FIC:-}" = "$lane"; then jq '.+[{name:"extra",issuer:"https://evil.invalid",subject:"extra",audiences:["api://AzureADTokenExchange"]}]'; else cat; fi ;;
   'containerapp job list'*) echo '[]' ;;
+  'servicebus namespace list'*) if test "${SERVICE_BUS_PRESENT:-}" = 1; then echo '[{"name":"funded"}]'; else echo '[]'; fi ;;
   'role definition list'*)
     name=$(arg_after --name "$@")
     if test "$name" = 44fd8b56-84f7-403c-a44a-7aabab1d28b1; then
@@ -173,7 +174,7 @@ setup_case() {
 run_handoff() {
   env PATH="$FAKE:$PATH" AZURE_RESOURCE_GROUP=rg AZURE_STORAGE_ACCOUNT_NAME=acct AZURE_TENANT_ID=tenant \
     QSET_V8_RBAC_RECEIPT_ROOT_TEST_ONLY="$RECEIPTS" QSET_V8_RBAC_WRITER_TOKEN_TEST_ONLY="$WRITER_TOKEN" QSET_V8_RBAC_PROCESSOR_TOKEN_TEST_ONLY="$PROCESSOR_TOKEN" \
-    EXTRA_FIC="${EXTRA_FIC:-}" DRIFT_ROLE="${DRIFT_ROLE:-}" DENY_POSITIVE="${DENY_POSITIVE:-}" "$handoff" "$1"
+    EXTRA_FIC="${EXTRA_FIC:-}" DRIFT_ROLE="${DRIFT_ROLE:-}" DENY_POSITIVE="${DENY_POSITIVE:-}" SERVICE_BUS_PRESENT="${SERVICE_BUS_PRESENT:-}" "$handoff" "$1"
 }
 
 casefold_live_resource_ids() {
@@ -226,9 +227,9 @@ cp "$STATE/full-api.json" "$STATE/assign-api-pid.json"
 run_handoff verify-live | jq -e '
   .schema=="polyedge.qset_v8_rbac_verify_live.v1"
   and .writerAssignments==5 and .processorAssignments==3 and .apiReaderAssignments==1
-  and (.v1ThroughV7FundedKeyVaultAndServiceBusDenied|length==2)
-  and ([.v1ThroughV7FundedKeyVaultAndServiceBusDenied[].lane]|sort==["processor","writer"])
-  and all(.v1ThroughV7FundedKeyVaultAndServiceBusDenied[]; .v1ThroughV7AndFundedStorageDenied and .keyVaultDenied and .serviceBusDenied)
+  and (.v1ThroughV7FundedAndKeyVaultDeniedServiceBusAbsent|length==2)
+  and ([.v1ThroughV7FundedAndKeyVaultDeniedServiceBusAbsent[].lane]|sort==["processor","writer"])
+  and all(.v1ThroughV7FundedAndKeyVaultDeniedServiceBusAbsent[]; .v1ThroughV7AndFundedStorageDenied and .keyVaultDenied and .serviceBusNamespaceAbsent)
 ' >/dev/null
 jq '[.[0]]' "$STATE/full-writer.json" >"$STATE/assign-writer-pid.json"
 if run_handoff verify-live >/dev/null 2>&1; then echo 'verify-live accepted missing assignment' >&2; exit 1; fi
@@ -244,6 +245,10 @@ setup_case drift-role; DRIFT_ROLE=blob
 if run_handoff apply >/dev/null 2>&1; then echo 'drifted custom role accepted' >&2; exit 1; fi
 test ! -e "$RECEIPTS/before.json"; test ! -e "$STATE/deployment.log"
 unset DRIFT_ROLE
+
+setup_case service-bus-present; SERVICE_BUS_PRESENT=1
+if run_handoff check >/dev/null 2>&1; then echo 'existing Service Bus namespace was accepted' >&2; exit 1; fi
+unset SERVICE_BUS_PRESENT
 
 setup_case denied-positive; DENY_POSITIVE=writer-preflight
 if run_handoff apply >/dev/null 2>&1; then echo 'denied positive data-plane operation accepted' >&2; exit 1; fi

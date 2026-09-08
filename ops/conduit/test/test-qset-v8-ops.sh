@@ -61,7 +61,7 @@ grep -F 'polyedge-shadow-qset-v6-events' "$handoff" >/dev/null
 grep -F 'assert_campaign_assignments 6' "$handoff" >/dev/null
 grep -F 'assert_v6_unchanged' "$handoff" >/dev/null
 grep -F 'polyedge-funded-evidence' "$handoff" >/dev/null
-grep -F 'vault.azure.net' "$handoff" >/dev/null; grep -F 'servicebus.windows.net' "$handoff" >/dev/null
+grep -F 'vault.azure.net' "$handoff" >/dev/null; grep -F 'servicebus namespace list' "$handoff" >/dev/null
 grep -F 'v5AssignmentsRemoved:0' "$handoff" >/dev/null; grep -F 'v6AssignmentsRemoved:0' "$handoff" >/dev/null; grep -F 'v8WriterStarted:false' "$handoff" >/dev/null
 grep -F 'containersTablesAndEvidenceRetained:true' "$handoff" >/dev/null
 ! grep -F 'az role assignment delete' "$handoff" | grep -F 'qset-v3'

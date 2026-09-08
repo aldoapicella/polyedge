@@ -81,7 +81,7 @@ Accept only 16 creates: three containers, one immutability policy, three v8
 tables, and nine assignments. Reject modifications, deletions, compute, or
 `Microsoft.App`. Apply must prove exact 5/3/1 assignments, positive qset-v8
 read/write probes, and denial against qset-v1 through v7, funded Storage, Key
-Vault, and Service Bus.
+Vault, plus current subscription-level absence of Service Bus.
 
 Build, upload, lock, and bind the final source manifest only after the reviewed
 commit's ARM64 image is available:
