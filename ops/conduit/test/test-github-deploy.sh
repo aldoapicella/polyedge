@@ -8,10 +8,18 @@ command="sudo -n /usr/local/sbin/polyedge-quadlet-deploy polyedge-api $digest"
 output=$(SSH_ORIGINAL_COMMAND="$command" POLYEDGE_GITHUB_DEPLOY_TEST=1 "$root/bin/polyedge-github-deploy")
 [ "$output" = "polyedge-api $digest" ]
 
-for unit in polyedge-shadow-qset polyedge-shadow-qset-v5 polyedge-shadow-qset-v7 polyedge-funded-intent-producer; do
+for unit in polyedge-shadow-qset-v8 polyedge-funded-intent-producer; do
   command="sudo -n /usr/local/sbin/polyedge-quadlet-deploy $unit $digest"
   output=$(SSH_ORIGINAL_COMMAND="$command" POLYEDGE_GITHUB_DEPLOY_TEST=1 "$root/bin/polyedge-github-deploy")
   [ "$output" = "$unit $digest" ]
+done
+
+for unit in polyedge-shadow-qset polyedge-shadow-qset-v5 polyedge-shadow-qset-v7; do
+  command="sudo -n /usr/local/sbin/polyedge-quadlet-deploy $unit $digest"
+  if SSH_ORIGINAL_COMMAND="$command" POLYEDGE_GITHUB_DEPLOY_TEST=1 "$root/bin/polyedge-github-deploy"; then
+    echo "retired qset deployment was accepted: $unit" >&2
+    exit 1
+  fi
 done
 
 frontend=ghcr.io/example/polyedge-frontend@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

@@ -10,8 +10,10 @@ on:
       - 'infra/conduit-federated-identity.bicep'
       - 'infra/conduit-data-roles.bicep'
       - 'infra/conduit-funded-access.bicep'
+      - 'infra/shadow-profitability-qset-v8.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
+      - 'research/**'
       - '.github/workflows/deploy-conduit-oci.yml'
       - '.github/workflows/validate-conduit-federation.yml'
   push:
@@ -24,8 +26,10 @@ on:
       - 'infra/conduit-federated-identity.bicep'
       - 'infra/conduit-data-roles.bicep'
       - 'infra/conduit-funded-access.bicep'
+      - 'infra/shadow-profitability-qset-v8.bicep'
       - 'infra/main.bicep'
       - 'ops/conduit/**'
+      - 'research/**'
       - '.github/workflows/deploy-conduit-oci.yml'
       - '.github/workflows/validate-conduit-federation.yml'
   workflow_dispatch:
@@ -120,6 +124,14 @@ jobs:
           ops/conduit/test/test-qset-v7-rbac-proof.sh
           ops/conduit/test/test-qset-v7-retire-writer.sh
           ops/conduit/test/test-qset-v7-source-freeze-upload-interruption-recovery.sh
+          ops/conduit/test/test-qset-v8-ops.sh
+          ops/conduit/test/test-qset-v8-processor.sh
+          ops/conduit/test/test-qset-v8-processor-handoff.sh
+          ops/conduit/test/test-qset-v8-rbac-proof.sh
+          ops/conduit/test/test-qset-v8-retire-writer.sh
+          ops/conduit/test/test-qset-v8-source-freeze-upload-interruption-recovery.sh
+          bash research/test_run_shadow_daily_v8.sh
+          bash research/test_verify_shadow_daily_v8_bundle.sh
           bash research/test_run_shadow_daily_v7.sh
           bash research/test_verify_shadow_daily_v7_bundle.sh
           bash research/test_run_shadow_daily_v6.sh
@@ -448,7 +460,7 @@ jobs:
           jq -e '
             .variables.audience == "api://AzureADTokenExchange"
             and .parameters.lane.allowedValues == [
-              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "shadow-qset-v5-writer", "shadow-qset-v5-processor", "shadow-qset-v6-writer", "shadow-qset-v6-processor", "shadow-qset-v7-writer", "shadow-qset-v7-processor", "funded-signer", "funded-intent-producer"
+              "api", "research", "shadow-qset", "shadow-qset-v4-writer", "shadow-qset-v4-processor", "shadow-qset-v5-writer", "shadow-qset-v5-processor", "shadow-qset-v6-writer", "shadow-qset-v6-processor", "shadow-qset-v7-writer", "shadow-qset-v7-processor", "shadow-qset-v8-writer", "shadow-qset-v8-processor", "funded-signer", "funded-intent-producer"
             ]
             and .variables.lanes["shadow-qset-v4-writer"] == {
               identityName: "id-polyedge-conduit-shadow-qset-v4-writer",
@@ -479,6 +491,16 @@ jobs:
               identityName: "id-polyedge-conduit-shadow-qset-v7-processor",
               ficName: "fic-spire-conduit-shadow-qset-v7-processor",
               subject: "spiffe://polyedge.local/conduit/shadow-qset-v7-processor"
+            }
+            and .variables.lanes["shadow-qset-v8-writer"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v8-writer",
+              ficName: "fic-spire-conduit-shadow-qset-v8-writer",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v8-writer"
+            }
+            and .variables.lanes["shadow-qset-v8-processor"] == {
+              identityName: "id-polyedge-conduit-shadow-qset-v8-processor",
+              ficName: "fic-spire-conduit-shadow-qset-v8-processor",
+              subject: "spiffe://polyedge.local/conduit/shadow-qset-v8-processor"
             }
             and .variables.lanes["funded-intent-producer"] == {
               identityName: "id-polyedge-conduit-funded-intent-producer",

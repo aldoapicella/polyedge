@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_campaign_id:
-        description: Type campaign-2026-08-22-qset-v2
+        description: Type campaign-2026-09-09-qset-v8
         required: true
         type: string
       research_image:
@@ -30,16 +30,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: polyedge-shadow-qset-v2-validation
+  group: polyedge-shadow-qset-v8-validation
   cancel-in-progress: false
 
 env:
-  CAMPAIGN_ID: campaign-2026-08-22-qset-v2
-  CAMPAIGN_START: "2026-08-22"
-  EVIDENCE_VERSION: protocol-v3-qset-v2
-  CAMPAIGN_CONTRACT: research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml
-  FREEZE_POLICY: research/configs/campaign_freeze_2026-08-22_qset_v2.json
-  DISPOSITION: research/configs/protocol-v3-campaign-disposition-2026-08-22-qset-v2.json
+  CAMPAIGN_ID: campaign-2026-09-09-qset-v8
+  CAMPAIGN_START: "2026-09-09"
+  EVIDENCE_VERSION: protocol-v3-qset-v8
+  CAMPAIGN_CONTRACT: research/configs/profitability_gate_v3_2026-09-09_qset_v8.yaml
+  FREEZE_POLICY: research/configs/campaign_freeze_2026-09-09_qset_v8.json
+  DISPOSITION: research/configs/protocol-v3-campaign-disposition-2026-09-09-qset-v8.json
 
 jobs:
   validate:
@@ -61,6 +61,7 @@ jobs:
           test "$(jq -r '.active_campaign.campaign_id' "$DISPOSITION")" = "$CAMPAIGN_ID"
           test "$(jq -r '.active_campaign.code_frozen' "$DISPOSITION")" = false
           jq -e '.archived_campaigns[] | select(.campaign_id == "campaign-2026-07-28-qset-v1") | .promotion_eligible == false and .artifacts_mutable == false' "$DISPOSITION"
+          jq -e '([.active_campaign] + .archived_campaigns | map(select(.campaign_id == "campaign-2026-09-09-qset-v8")) | length) == 1 and ([.archived_campaigns[] | select(.campaign_id == "campaign-2026-09-02-qset-v7" and .promotion_eligible == false and .artifacts_mutable == false and .disposition == "terminal_diagnostic_ineligible_retry_prohibited")] | length) == 1' "$DISPOSITION"
           grep -Fx "  id: $CAMPAIGN_ID" "$CAMPAIGN_CONTRACT"
           grep -Fx "  start_date: $CAMPAIGN_START" "$CAMPAIGN_CONTRACT"
           grep -Fx "  event_blob_prefix: shadow-events/$CAMPAIGN_ID" "$CAMPAIGN_CONTRACT"
@@ -102,7 +103,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: qset-v2-source-freeze-${{ github.sha }}
+          name: qset-v8-source-freeze-${{ github.sha }}
           path: source-freeze.json
           if-no-files-found: error
           retention-days: 7

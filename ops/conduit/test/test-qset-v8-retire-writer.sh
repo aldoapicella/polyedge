@@ -2,42 +2,42 @@
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-helper=$root/bin/polyedge-qset-v4-retire-writer
+helper=$root/bin/polyedge-qset-v8-retire-writer
 
 run_helper() {
   source "$helper"
-  receipt_root=$QSET_V4_RETIRE_TEST_ROOT/receipts
-  receipt=$receipt_root/campaign-2026-08-24-qset-v4-writer.json
-  lock_file=$QSET_V4_RETIRE_TEST_ROOT/retirement.lock
+  receipt_root=$QSET_V8_RETIRE_TEST_ROOT/receipts
+  receipt=$receipt_root/campaign-2026-09-09-qset-v8-writer.json
+  lock_file=$QSET_V8_RETIRE_TEST_ROOT/retirement.lock
   wait_seconds=2
 
   systemctl() {
     case "$1" in
-      is-active) test -e "$QSET_V4_RETIRE_TEST_ROOT/active" ;;
+      is-active) test -e "$QSET_V8_RETIRE_TEST_ROOT/active" ;;
       show)
-        case "$*" in *InvocationID*) cat "$QSET_V4_RETIRE_TEST_ROOT/invocation" ;; *MainPID*) echo 4321 ;; *) return 2 ;; esac ;;
+        case "$*" in *InvocationID*) cat "$QSET_V8_RETIRE_TEST_ROOT/invocation" ;; *MainPID*) echo 4321 ;; *) return 2 ;; esac ;;
       stop)
-        echo stop >>"$QSET_V4_RETIRE_TEST_ROOT/actions"
-        if test ! -e "$QSET_V4_RETIRE_TEST_ROOT/stop-failed"; then touch "$QSET_V4_RETIRE_TEST_ROOT/stop-failed"; return 75; fi
-        rm -f "$QSET_V4_RETIRE_TEST_ROOT/active" ;;
+        echo stop >>"$QSET_V8_RETIRE_TEST_ROOT/actions"
+        if test ! -e "$QSET_V8_RETIRE_TEST_ROOT/stop-failed"; then touch "$QSET_V8_RETIRE_TEST_ROOT/stop-failed"; return 75; fi
+        rm -f "$QSET_V8_RETIRE_TEST_ROOT/active" ;;
       *) return 2 ;;
     esac
   }
   podman() {
     case "$1" in
       inspect)
-        jq -nc --arg id "$(cat "$QSET_V4_RETIRE_TEST_ROOT/container")" --arg image "$(cat "$QSET_V4_RETIRE_TEST_ROOT/image")" --arg digest "$(cat "$QSET_V4_RETIRE_TEST_ROOT/digest")" '[{Id:$id,Config:{Image:$image},ImageDigest:$digest,State:{Status:"running"}}]' ;;
-      image) cat "$QSET_V4_RETIRE_TEST_ROOT/revision" ;;
-      kill) echo USR1 >>"$QSET_V4_RETIRE_TEST_ROOT/actions" ;;
+        jq -nc --arg id "$(cat "$QSET_V8_RETIRE_TEST_ROOT/container")" --arg image "$(cat "$QSET_V8_RETIRE_TEST_ROOT/image")" --arg digest "$(cat "$QSET_V8_RETIRE_TEST_ROOT/digest")" '[{Id:$id,Config:{Image:$image},ImageDigest:$digest,State:{Status:"running"}}]' ;;
+      image) cat "$QSET_V8_RETIRE_TEST_ROOT/revision" ;;
+      kill) echo USR1 >>"$QSET_V8_RETIRE_TEST_ROOT/actions" ;;
       *) return 2 ;;
     esac
   }
   journalctl() {
     case "$*" in
       *--sync*) return ;;
-      *--show-cursor*) echo '-- cursor: qset-v4-before' ;;
+      *--show-cursor*) echo '-- cursor: qset-v8-before' ;;
       *--after-cursor*)
-        jq -nc --arg invocation "$(cat "$QSET_V4_RETIRE_TEST_ROOT/invocation")" --arg container "$(cat "$QSET_V4_RETIRE_TEST_ROOT/container")" --arg message "$(cat "$QSET_V4_RETIRE_TEST_ROOT/journal-message")"$'\n' \
+        jq -nc --arg invocation "$(cat "$QSET_V8_RETIRE_TEST_ROOT/invocation")" --arg container "$(cat "$QSET_V8_RETIRE_TEST_ROOT/container")" --arg message "$(cat "$QSET_V8_RETIRE_TEST_ROOT/journal-message")"$'\n' \
           '{_SYSTEMD_INVOCATION_ID:$invocation,CONTAINER_ID_FULL:$container,MESSAGE:$message}' ;;
       *) return 2 ;;
     esac
@@ -48,7 +48,7 @@ run_helper() {
 if test "${1:-}" = run; then run_helper; exit; fi
 
 test_root=$(mktemp -d); trap 'rm -rf "$test_root"' EXIT HUP INT TERM
-export QSET_V4_RETIRE_TEST_ROOT=$test_root
+export QSET_V8_RETIRE_TEST_ROOT=$test_root
 state=$test_root/fakeroot.state
 fake_root() {
   if test -n "${FAKEROOTKEY:-}"; then bash "$0" run
@@ -63,10 +63,10 @@ printf '%s\n' "$revision" >"$test_root/revision"
 printf '%s\n' "$container_id" >"$test_root/container"
 printf '%s\n' "$invocation" >"$test_root/invocation"
 touch "$test_root/active" "$test_root/actions"
-jq -nc --arg digest "$digest" --arg revision "$revision" '{schema:"polyedge.qset_v4_writer_retirement_receipt.v1",status:"prepared_for_retirement",retired_at:"2026-08-22T10:00:00Z",campaign_id:"campaign-2026-08-24-qset-v4",app_name:"polyedge-shadow-qset-v4",image_digest:$digest,source_revision:$revision,recorder_instance_id:"11111111-2222-4333-8444-555555555555",final_assigned_sequence:9,final_enqueued_sequence:9,final_enqueued_total:9,final_persisted_sequence:9,final_persisted_total:9,final_queued:0,flush_success:true}' >"$test_root/journal-message"
+jq -nc --arg digest "$digest" --arg revision "$revision" '{schema:"polyedge.qset_v8_writer_retirement_receipt.v1",status:"prepared_for_retirement",retired_at:"2026-08-22T10:00:00Z",campaign_id:"campaign-2026-09-09-qset-v8",app_name:"polyedge-shadow-qset-v8",image_digest:$digest,source_revision:$revision,recorder_instance_id:"11111111-2222-4333-8444-555555555555",final_assigned_sequence:9,final_enqueued_sequence:9,final_enqueued_total:9,final_persisted_sequence:9,final_persisted_total:9,final_queued:0,flush_success:true}' >"$test_root/journal-message"
 
 if fake_root; then echo 'first stop failure was accepted' >&2; exit 1; fi
-evidence=$test_root/receipts/campaign-2026-08-24-qset-v4-writer.json
+evidence=$test_root/receipts/campaign-2026-09-09-qset-v8-writer.json
 test -s "$evidence"
 test "$(grep -c '^USR1$' "$test_root/actions")" = 1
 test "$(grep -c '^stop$' "$test_root/actions")" = 1

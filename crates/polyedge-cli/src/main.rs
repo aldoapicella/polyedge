@@ -81,13 +81,78 @@ const QSET_V7_CONTAINER: &str = "polyedge-shadow-qset-v7-events";
 const QSET_V7_PREFIX: &str = "shadow-events/campaign-2026-09-02-qset-v7";
 const QSET_V7_DATES: [&str; 2] = ["2026-09-02", "2026-09-03"];
 const QSET_V7_FREEZE_CONTAINER: &str = "polyedge-qset-v7-control";
+const QSET_V8_CONTAINER: &str = "polyedge-shadow-qset-v8-events";
+const QSET_V8_PREFIX: &str = "shadow-events/campaign-2026-09-09-qset-v8";
+const QSET_V8_DATES: &[&str] = &[
+    "2026-09-09",
+    "2026-09-10",
+    "2026-09-11",
+    "2026-09-12",
+    "2026-09-13",
+    "2026-09-14",
+    "2026-09-15",
+    "2026-09-16",
+    "2026-09-17",
+    "2026-09-18",
+    "2026-09-19",
+    "2026-09-20",
+    "2026-09-21",
+    "2026-09-22",
+    "2026-09-23",
+    "2026-09-24",
+    "2026-09-25",
+    "2026-09-26",
+    "2026-09-27",
+    "2026-09-28",
+    "2026-09-29",
+    "2026-09-30",
+    "2026-10-01",
+    "2026-10-02",
+    "2026-10-03",
+    "2026-10-04",
+    "2026-10-05",
+    "2026-10-06",
+    "2026-10-07",
+    "2026-10-08",
+    "2026-10-09",
+    "2026-10-10",
+    "2026-10-11",
+    "2026-10-12",
+    "2026-10-13",
+    "2026-10-14",
+    "2026-10-15",
+    "2026-10-16",
+    "2026-10-17",
+    "2026-10-18",
+    "2026-10-19",
+    "2026-10-20",
+    "2026-10-21",
+    "2026-10-22",
+    "2026-10-23",
+    "2026-10-24",
+    "2026-10-25",
+    "2026-10-26",
+    "2026-10-27",
+    "2026-10-28",
+    "2026-10-29",
+    "2026-10-30",
+    "2026-10-31",
+    "2026-11-01",
+    "2026-11-02",
+    "2026-11-03",
+    "2026-11-04",
+    "2026-11-05",
+    "2026-11-06",
+    "2026-11-07",
+];
+const QSET_V8_FREEZE_CONTAINER: &str = "polyedge-qset-v8-control";
 
 struct QsetSealConfig {
     name: &'static str,
     campaign_id: &'static str,
     container: &'static str,
     prefix: &'static str,
-    dates: &'static [&'static str; 2],
+    dates: &'static [&'static str],
     freeze_container: &'static str,
     freeze_blob_prefix: &'static str,
     validation_schema: &'static str,
@@ -156,6 +221,18 @@ const QSET_V7_SEAL_CONFIG: QsetSealConfig = QsetSealConfig {
         "reports/research/shadow/campaigns/campaign-2026-09-02-qset-v7/control/code-freeze/source-",
     validation_schema: "polyedge.qset_v7_closed_day_validation.v1",
     seal_schema: "polyedge.qset_v7_closed_day_seal.v1",
+};
+const QSET_V8_SEAL_CONFIG: QsetSealConfig = QsetSealConfig {
+    name: "qset-v8",
+    campaign_id: "campaign-2026-09-09-qset-v8",
+    container: QSET_V8_CONTAINER,
+    prefix: QSET_V8_PREFIX,
+    dates: QSET_V8_DATES,
+    freeze_container: QSET_V8_FREEZE_CONTAINER,
+    freeze_blob_prefix:
+        "reports/research/shadow/campaigns/campaign-2026-09-09-qset-v8/control/code-freeze/source-",
+    validation_schema: "polyedge.qset_v8_closed_day_validation.v1",
+    seal_schema: "polyedge.qset_v8_closed_day_seal.v1",
 };
 #[derive(Parser)]
 #[command(name = "polyedge-rs")]
@@ -339,6 +416,23 @@ enum Command {
         #[arg(long)]
         date: String,
         /// Exact reviewed source-freeze blob in polyedge-qset-v7-control.
+        #[arg(long)]
+        source_freeze_blob: String,
+        /// SHA-256 of --source-freeze-blob, prefixed with sha256:.
+        #[arg(long)]
+        source_freeze_sha256: String,
+        #[arg(long)]
+        validate_only: bool,
+        #[arg(long, env = "AZURE_CLIENT_ID")]
+        client_id: Option<String>,
+    },
+    /// Seal one approved closed UTC day from the isolated qset-v8 campaign.
+    SealQsetV8Day {
+        #[arg(long, env = "AZURE_STORAGE_ACCOUNT_NAME")]
+        account: String,
+        #[arg(long)]
+        date: String,
+        /// Exact reviewed source-freeze blob in polyedge-qset-v8-control.
         #[arg(long)]
         source_freeze_blob: String,
         /// SHA-256 of --source-freeze-blob, prefixed with sha256:.
@@ -1120,6 +1214,22 @@ async fn main() -> Result<()> {
             client_id,
         } => print_json(run_seal_qset_day(
             &QSET_V7_SEAL_CONFIG,
+            account,
+            parse_date_arg(&date)?,
+            &source_freeze_blob,
+            &source_freeze_sha256,
+            validate_only,
+            client_id,
+        )?),
+        Command::SealQsetV8Day {
+            account,
+            date,
+            source_freeze_blob,
+            source_freeze_sha256,
+            validate_only,
+            client_id,
+        } => print_json(run_seal_qset_day(
+            &QSET_V8_SEAL_CONFIG,
             account,
             parse_date_arg(&date)?,
             &source_freeze_blob,
@@ -2144,11 +2254,18 @@ fn validate_qset_seal_date(
     if config.dates.iter().any(|allowed| *allowed == date_value) && date < today {
         return Ok(());
     }
+    let allowed = if config.dates.len() == 2 {
+        format!("exactly {} or {}", config.dates[0], config.dates[1])
+    } else {
+        format!(
+            "between {} and {}",
+            config.dates[0],
+            config.dates[config.dates.len() - 1]
+        )
+    };
     bail!(
-        "{} seal date must be exactly {} or {} and before {today}; received {date}",
-        config.name,
-        config.dates[0],
-        config.dates[1]
+        "{} seal date must be {allowed} and before {today}; received {date}",
+        config.name
     );
 }
 
@@ -2435,11 +2552,14 @@ async fn serve(settings: RuntimeSettings, bind: String) -> Result<()> {
     let qset_v5_writer = settings.deploy.app_name == "polyedge-shadow-qset-v5";
     let qset_v6_writer = settings.deploy.app_name == "polyedge-shadow-qset-v6";
     let qset_v7_writer = settings.deploy.app_name == "polyedge-shadow-qset-v7";
+    let qset_v8_writer = settings.deploy.app_name == "polyedge-shadow-qset-v8";
     let (app, shutdown) = app_with_shutdown(settings);
     let (shutdown_result_tx, shutdown_result_rx) = tokio::sync::oneshot::channel();
     let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let result = if qset_v7_writer {
+            let result = if qset_v8_writer {
+                shutdown_protocol_qset_v8(shutdown).await
+            } else if qset_v7_writer {
                 shutdown_protocol_qset_v7(shutdown).await
             } else if qset_v6_writer {
                 shutdown_protocol_qset_v6(shutdown).await
@@ -2607,6 +2727,33 @@ async fn shutdown_protocol_qset_v7(shutdown: polyedge_api::ApiShutdown) -> Resul
     }
 }
 
+async fn shutdown_protocol_qset_v8(shutdown: polyedge_api::ApiShutdown) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("installing SIGTERM handler");
+        let mut prepare =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("installing SIGUSR1 handler");
+        let mut prepared = false;
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return terminate_qset_v8_writer(&shutdown, prepared).await,
+                _ = terminate.recv() => return terminate_qset_v8_writer(&shutdown, prepared).await,
+                _ = prepare.recv() => match shutdown.prepare_qset_v8_retirement().await {
+                    Ok(receipt) => { println!("{}", serde_json::to_string(&receipt).map_err(|error| format!("serializing qset-v8 retirement receipt: {error}"))?); prepared = true; }
+                    Err(error) => eprintln!("qset-v8 prepare-retirement failed; writer remains fenced: {error}"),
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        terminate_qset_v8_writer(&shutdown, false).await
+    }
+}
+
 async fn terminate_qset_v4_writer(
     shutdown: &polyedge_api::ApiShutdown,
     prepared: bool,
@@ -2667,6 +2814,22 @@ async fn terminate_qset_v7_writer(
     }
 
     let not_prepared = "qset-v7 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM";
+    match shutdown.drain().await {
+        Ok(()) => Err(format!(
+            "{not_prepared}; recorder drained without issuing a retirement receipt"
+        )),
+        Err(error) => Err(format!("{not_prepared}; lossless drain failed: {error}")),
+    }
+}
+
+async fn terminate_qset_v8_writer(
+    shutdown: &polyedge_api::ApiShutdown,
+    prepared: bool,
+) -> Result<(), String> {
+    if prepared {
+        return Ok(());
+    }
+    let not_prepared = "qset-v8 writer is not prepared for retirement; send SIGUSR1 and require a valid receipt before TERM";
     match shutdown.drain().await {
         Ok(()) => Err(format!(
             "{not_prepared}; recorder drained without issuing a retirement receipt"
@@ -4541,6 +4704,66 @@ mod tests {
         assert_eq!(seal["sealed_blob_count"], 1);
         assert!(seal.get("generated_ts").is_none());
         assert!(seal.get("sealed_at").is_none());
+    }
+
+    #[test]
+    fn qset_v8_sealer_covers_the_full_campaign_range() {
+        const SHA: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const BLOB: &str =
+            "reports/research/shadow/campaigns/campaign-2026-09-09-qset-v8/control/code-freeze/source-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+        assert_eq!(super::QSET_V8_DATES.first(), Some(&"2026-09-09"));
+        assert_eq!(super::QSET_V8_DATES.last(), Some(&"2026-11-07"));
+        for (date, valid) in [
+            ("2026-09-08", false),
+            ("2026-09-09", true),
+            ("2026-10-31", true),
+            ("2026-11-07", true),
+            ("2026-11-08", false),
+        ] {
+            let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+            let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+            assert_eq!(
+                super::validate_qset_seal_date(&super::QSET_V8_SEAL_CONFIG, date, today).is_ok(),
+                valid
+            );
+        }
+        assert!(super::valid_qset_source_freeze_binding(
+            &super::QSET_V8_SEAL_CONFIG,
+            BLOB,
+            SHA
+        ));
+        let cli = try_parse_cli([
+            "polyedge-rs",
+            "seal-qset-v8-day",
+            "--account",
+            "storage",
+            "--date",
+            "2026-09-09",
+            "--source-freeze-blob",
+            BLOB,
+            "--source-freeze-sha256",
+            SHA,
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::SealQsetV8Day { .. }));
+        let receipt = super::qset_closed_day_receipt(
+            &super::QSET_V8_SEAL_CONFIG,
+            "storage",
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
+            "shadow-events/campaign-2026-09-09-qset-v8/2026/09/09/",
+            &[],
+            "sha256:inventory",
+            BLOB,
+            SHA,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt["schema"],
+            "polyedge.qset_v8_closed_day_validation.v1"
+        );
+        assert_eq!(receipt["campaign_id"], "campaign-2026-09-09-qset-v8");
+        assert_eq!(receipt["container"], "polyedge-shadow-qset-v8-events");
     }
     fn quarantine_fixture() -> (PathBuf, String) {
         let root = std::env::temp_dir().join(format!(

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run qset-v8 pre-boundary guard
+
+[Timer]
+OnCalendar=2026-09-08 23:59:30 UTC
+AccuracySec=1s
+Persistent=false
+Unit=polyedge-qset-v8-boundary@pre.service
+
+[Install]
+WantedBy=timers.target
