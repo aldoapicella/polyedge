@@ -9,6 +9,7 @@ COPY venue-probe/package.json venue-probe/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY --chown=node:node venue-probe/src ./src
+RUN chmod -R a+rX ./src
 
 USER node
 
