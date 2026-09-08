@@ -5,6 +5,7 @@ import {
   acknowledgedNoFillConfig,
   ambiguousNoOrderConfig,
   observeAcknowledgedNoFill,
+  observeCancellationFailedEvictedNoFill,
   observeEvictedAcknowledgedNoFill,
   runAcknowledgedNoFillReconciliation,
   runAmbiguousNoOrderReconciliation,
@@ -267,6 +268,8 @@ function acknowledgedFixture(environment = acknowledgedEnv()) {
   const config = acknowledgedNoFillConfig(environment, {
     reason: environment.FUNDED_DIRECT_RECONCILIATION_REASON
   });
+  const cancellationFailed = environment.FUNDED_DIRECT_RECONCILIATION_REASON ===
+    "cancellation_failed_evicted_order_no_fill";
   const reservation = {
     schema_version: 1,
     evidence_protocol_version: 3,
@@ -280,7 +283,7 @@ function acknowledgedFixture(environment = acknowledgedEnv()) {
     order_id: config.orderId,
     matched_notional: 0,
     reconciliation_complete: false,
-    zero_open_orders_confirmed: true,
+    zero_open_orders_confirmed: !cancellationFailed,
     market_id: "3750997",
     condition_id: "0x" + "3".repeat(64),
     token_id: "123456789",
@@ -300,9 +303,11 @@ function acknowledgedFixture(environment = acknowledgedEnv()) {
     order_id: config.orderId,
     matched_notional: 0,
     reconciliation_complete: false,
-    zero_open_orders_confirmed: true,
+    zero_open_orders_confirmed: !cancellationFailed,
     post_submission_error:
-      "fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (user channel did not reconcile)"
+      cancellationFailed
+        ? "fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved (user channel did not reconcile)"
+        : "fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved (user channel did not reconcile)"
   };
   return {
     config,
@@ -335,8 +340,17 @@ function evictedAcknowledgedEnv() {
   };
 }
 
-function evictedAcknowledgedFixture() {
-  const value = acknowledgedFixture(evictedAcknowledgedEnv());
+function cancellationFailedEvictedEnv() {
+  return {
+    ...evictedAcknowledgedEnv(),
+    FUNDED_DIRECT_RECONCILIATION_REASON: "cancellation_failed_evicted_order_no_fill"
+  };
+}
+
+function evictedAcknowledgedFixture(environment = evictedAcknowledgedEnv()) {
+  const value = acknowledgedFixture(environment);
+  const cancellationFailed = environment.FUNDED_DIRECT_RECONCILIATION_REASON ===
+    "cancellation_failed_evicted_order_no_fill";
   const market = {
     id: value.record.reservation.market_id,
     conditionId: value.record.reservation.condition_id,
@@ -361,9 +375,9 @@ function evictedAcknowledgedFixture() {
     actual_matched_size: 0,
     related_trade_ids: [],
     reconciliation_complete: false,
-    zero_open_orders_confirmed: true,
+    zero_open_orders_confirmed: !cancellationFailed,
     data_gap_detected: true,
-    cancellation_failure: false
+    cancellation_failure: cancellationFailed
   };
   const modelObservations = [{ horizon_seconds: 1, eligible: false }];
   const probe = {
@@ -421,6 +435,38 @@ function evictedAcknowledgedSnapshot(value = evictedAcknowledgedFixture()) {
     authenticatedTrades: [],
     positions: [{ conditionId: "other", asset: "9", size: "1", redeemable: true }],
     observedAtMs: Date.parse("2026-08-22T20:00:00Z")
+  };
+}
+
+function cancellationFailedEvictedSnapshot(
+  value = evictedAcknowledgedFixture(cancellationFailedEvictedEnv())
+) {
+  return {
+    ...evictedAcknowledgedSnapshot(value),
+    observedAtMs: Date.parse("2026-08-22T02:02:00Z"),
+    settlementActivity: [],
+    clobMarket: {
+      condition_id: value.record.reservation.condition_id,
+      closed: true,
+      accepting_orders: false,
+      tokens: [
+        { token_id: value.record.reservation.token_id },
+        { token_id: "987654321" }
+      ]
+    },
+    gammaMarket: {
+      id: value.record.reservation.market_id,
+      conditionId: value.record.reservation.condition_id,
+      closed: true,
+      acceptingOrders: false,
+      automaticallyResolved: true,
+      umaResolutionStatus: "resolved",
+      endDate: "2026-08-21T20:00:00Z",
+      closedTime: "2026-08-21 20:01:00+00",
+      umaEndDate: "2026-08-21T20:01:00Z",
+      outcomePrices: "[\"0\",\"1\"]",
+      clobTokenIds: JSON.stringify([value.record.reservation.token_id, "987654321"])
+    }
   };
 }
 
@@ -894,6 +940,51 @@ test("evicted-order venue proof accepts only literal null plus total zero exposu
       sleep: async () => {}
     }), /lookup failed|pagination incomplete/);
   }
+});
+
+test("cancellation-failed recovery requires settled-market and zero-activity proof", async () => {
+  const value = evictedAcknowledgedFixture(cancellationFailedEvictedEnv());
+  value.nowMs = Date.parse("2026-08-22T02:02:00Z");
+  assert.equal(validateEvictedAcknowledgedNoFillBinding(value).etag, '"etag-known-1"');
+  const base = cancellationFailedEvictedSnapshot(value);
+  assert.equal(
+    validateEvictedAcknowledgedNoFillSnapshot(base).terminal_order_status,
+    "NOT_RETAINED_AFTER_FAILED_CANCEL_AND_RESOLUTION"
+  );
+
+  const badBinding = evictedAcknowledgedFixture(cancellationFailedEvictedEnv());
+  badBinding.summaryDocument.value.lifecycle.cancellation_failure = false;
+  assert.throws(() => validateEvictedAcknowledgedNoFillBinding(badBinding), /fail closed/);
+  for (const mutate of [
+    (row) => { row.authenticatedTrades.push({ id: "trade" }); },
+    (row) => { row.settlementActivity.push({ type: "TRADE" }); },
+    (row) => { row.clobMarket.closed = false; },
+    (row) => { row.gammaMarket.acceptingOrders = true; },
+    (row) => { row.gammaMarket.outcomePrices = "[\"0.5\",\"0.5\"]"; }
+  ]) {
+    const row = structuredClone(base);
+    mutate(row);
+    assert.throws(() => validateEvictedAcknowledgedNoFillSnapshot(row), /fail closed/);
+  }
+
+  let clock = value.nowMs;
+  const evidence = await observeCancellationFailedEvictedNoFill({
+    client: {
+      getOrder: async () => null,
+      getOpenOrders: async () => [],
+      getTrades: async () => [],
+      getMarket: async () => base.clobMarket
+    },
+    reservation: value.record.reservation,
+    config: value.config,
+    fetchImpl: async (url) => ({
+      ok: true,
+      json: async () => String(url).includes("gamma-api") ? base.gammaMarket : []
+    }),
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; }
+  });
+  assert.equal(evidence.observation_ms, 10_000);
 });
 
 test("evicted-order recovery binds the summary and preserves the known order through CAS", async () => {

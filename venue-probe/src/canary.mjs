@@ -734,7 +734,10 @@ export async function reconcilePersistentChannels(resources, market, {
     return sha256(Buffer.from(JSON.stringify(trades)));
   };
   const tradesBefore = tradeSnapshot(
-    await resources.client.getTrades({ market: market.condition_id })
+    await runBoundedPreflightComponent(
+      "reconciliation_trades_before",
+      () => resources.client.getTrades({ market: market.condition_id })
+    )
   );
   const runtime = await capture(
     resources.client,
@@ -750,7 +753,10 @@ export async function reconcilePersistentChannels(resources, market, {
     }
   );
   const tradesAfter = tradeSnapshot(
-    await resources.client.getTrades({ market: market.condition_id })
+    await runBoundedPreflightComponent(
+      "reconciliation_trades_after",
+      () => resources.client.getTrades({ market: market.condition_id })
+    )
   );
   const after = channels.map(counters);
   if (!channels.every((channel) => channel.isOpen() === true) ||

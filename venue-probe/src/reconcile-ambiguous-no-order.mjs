@@ -13,7 +13,8 @@ import {
   venueClient
 } from "./reconcile-rejected-no-order.mjs";
 import { orderIds } from "./canary-lifecycle-lib.mjs";
-import { loadAccountPositions } from "./canary.mjs";
+import { loadAccountPositions, loadSettlementActivity } from "./canary.mjs";
+import { fetchGammaMarket } from "./redeem.mjs";
 import { validateTerminalSettlementFederatedTokenFile } from "./funded-terminal-settlement.mjs";
 
 const TENANT_ID = "9767f0dc-e83f-4cc1-94e1-0d5f9d287d32";
@@ -25,10 +26,13 @@ const FUNDER_ADDRESS = "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8";
 const AMBIGUOUS_REASON = "ambiguous_submission_no_fill";
 const ACKNOWLEDGED_REASON = "acknowledged_terminal_no_fill";
 const EVICTED_ACKNOWLEDGED_REASON = "acknowledged_evicted_order_no_fill";
+const CANCELLATION_FAILED_EVICTED_REASON = "cancellation_failed_evicted_order_no_fill";
 const FAILED_POST_ACK_ERROR =
   "canary lifecycle did not reconcile across REST and authenticated user channel";
 const MINIMUM_COMPLETION_AGE_MS = 24 * 60 * 60 * 1_000;
+const MINIMUM_CANCELLATION_FAILED_AGE_MS = 6 * 60 * 60 * 1_000;
 const MINIMUM_SNAPSHOT_INTERVAL_MS = 10_000;
+const MINIMUM_RESOLVED_MARKET_AGE_MS = 6 * 60 * 60 * 1_000;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
 const ORDER_ID = /^0x[0-9a-f]{64}$/i;
 const TERMINAL_NO_FILL_STATES = new Set(["CANCELED", "CANCELLED", "EXPIRED"]);
@@ -45,7 +49,8 @@ export function acknowledgedNoFillConfig(
   env = process.env,
   { requireFederatedToken = false, reason = ACKNOWLEDGED_REASON } = {}
 ) {
-  if (![ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON].includes(reason)) {
+  if (![ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON,
+    CANCELLATION_FAILED_EVICTED_REASON].includes(reason)) {
     failAcknowledged("reconciliation reason is not exact");
   }
   const config = recoveryConfig(env, reason, failAcknowledged);
@@ -239,6 +244,7 @@ export function validateAcknowledgedNoFillBinding({
   const createdMs = Date.parse(reservation?.created_ts);
   const updatedMs = Date.parse(reservation?.updated_ts);
   const completedMs = Date.parse(completion?.completed_at);
+  const cancellationFailed = config.reconciliationReason === CANCELLATION_FAILED_EVICTED_REASON;
   const date = Number.isFinite(createdMs) ? new Date(createdMs).toISOString().slice(0, 10) : "";
   const expectedReservationPath =
     `reports/research/venue-probe/risk-reservations/${date}/${config.probeId}.json`;
@@ -261,7 +267,7 @@ export function validateAcknowledgedNoFillBinding({
       reservation?.order_id !== config.orderId ||
       !exactZero(reservation?.matched_notional) ||
       reservation?.reconciliation_complete !== false ||
-      reservation?.zero_open_orders_confirmed !== true ||
+      reservation?.zero_open_orders_confirmed !== !cancellationFailed ||
       !/^0x[0-9a-f]{64}$/i.test(String(reservation?.condition_id || "")) ||
       !/^[1-9]\d{0,77}$/.test(String(reservation?.token_id || "")) ||
       !Number.isFinite(createdMs) || !Number.isFinite(updatedMs)) {
@@ -280,12 +286,17 @@ export function validateAcknowledgedNoFillBinding({
       completion?.order_id !== config.orderId ||
       !exactZero(completion?.matched_notional) ||
       completion?.reconciliation_complete !== false ||
-      completion?.zero_open_orders_confirmed !== true ||
+      completion?.zero_open_orders_confirmed !== !cancellationFailed ||
       !String(completion?.post_submission_error || "").startsWith(
-        "fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved ("
+        cancellationFailed
+          ? "fail closed: post-ack error and emergency zero-open confirmation failed; unresolved risk preserved ("
+          : "fail closed: post-ack error; tracked order canceled, zero open orders confirmed, unresolved risk preserved ("
       ) ||
       !Number.isFinite(completedMs) || completedMs < updatedMs ||
-      !Number.isFinite(nowMs) || nowMs - completedMs < MINIMUM_COMPLETION_AGE_MS) {
+      !Number.isFinite(nowMs) || nowMs < completedMs ||
+      nowMs - completedMs < (cancellationFailed
+        ? MINIMUM_CANCELLATION_FAILED_AGE_MS
+        : MINIMUM_COMPLETION_AGE_MS)) {
     failAcknowledged("completion binding is invalid");
   }
   return { reservation, completion, etag: record.etag };
@@ -354,6 +365,7 @@ export function validateEvictedAcknowledgedNoFillBinding(value) {
   const finishedMs = Date.parse(summary?.finished_ts);
   const submittedMs = Date.parse(lifecycle?.submitted_ts);
   const acknowledgedMs = Date.parse(lifecycle?.acknowledged_ts);
+  const cancellationFailed = config.reconciliationReason === CANCELLATION_FAILED_EVICTED_REASON;
   if (summaryDocument?.blobName !== config.summaryBlobName ||
       summaryDocument?.sha256 !== config.summarySha256 ||
       summary?.schema_version !== 3 ||
@@ -393,9 +405,9 @@ export function validateEvictedAcknowledgedNoFillBinding(value) {
       !exactZero(lifecycle?.actual_matched_size) ||
       !Array.isArray(lifecycle?.related_trade_ids) || lifecycle.related_trade_ids.length !== 0 ||
       lifecycle?.reconciliation_complete !== false ||
-      lifecycle?.zero_open_orders_confirmed !== true ||
+      lifecycle?.zero_open_orders_confirmed !== !cancellationFailed ||
       lifecycle?.data_gap_detected !== true ||
-      lifecycle?.cancellation_failure !== false ||
+      lifecycle?.cancellation_failure !== cancellationFailed ||
       !Number.isFinite(startedMs) || !Number.isFinite(finishedMs) ||
       !Number.isFinite(submittedMs) || !Number.isFinite(acknowledgedMs) ||
       summary.started_ts !== probe.started_ts || summary.finished_ts !== probe.finished_ts ||
@@ -418,8 +430,12 @@ export function validateEvictedAcknowledgedNoFillSnapshot({
   openOrders,
   authenticatedTrades,
   positions,
+  settlementActivity,
+  clobMarket,
+  gammaMarket,
   observedAtMs
 }) {
+  const cancellationFailed = config.reconciliationReason === CANCELLATION_FAILED_EVICTED_REASON;
   const positionsValid = Array.isArray(positions) && positions.every((position) =>
     finiteNumeric(position?.size) && Number(position.size) >= 0
   );
@@ -436,17 +452,57 @@ export function validateEvictedAcknowledgedNoFillSnapshot({
       !Array.isArray(authenticatedTrades) || authenticatedTrades.length !== 0 ||
       unresolvedPositions.length !== 0 || exactPositions.length !== 0 ||
       !Number.isFinite(observedAtMs) ||
-      config.reconciliationReason !== EVICTED_ACKNOWLEDGED_REASON) {
+      ![EVICTED_ACKNOWLEDGED_REASON, CANCELLATION_FAILED_EVICTED_REASON]
+        .includes(config.reconciliationReason)) {
     failAcknowledged("venue snapshot did not prove an evicted order with zero exposure");
+  }
+  let resolvedMarketEvidence = {};
+  if (cancellationFailed) {
+    const prices = jsonArray(gammaMarket?.outcomePrices).map(Number);
+    const gammaTokens = jsonArray(gammaMarket?.clobTokenIds).map(String);
+    const endMs = Date.parse(gammaMarket?.endDate);
+    const closedMs = Date.parse(gammaMarket?.closedTime);
+    const resolvedMs = Date.parse(gammaMarket?.umaEndDate);
+    const clobTokens = Array.isArray(clobMarket?.tokens) ? clobMarket.tokens : [];
+    if (!Array.isArray(settlementActivity) || settlementActivity.length !== 0 ||
+        String(clobMarket?.condition_id || "").toLowerCase() !==
+          String(reservation?.condition_id || "").toLowerCase() ||
+        clobMarket?.closed !== true || clobMarket?.accepting_orders !== false ||
+        clobTokens.length !== 2 ||
+        !clobTokens.some((token) => String(token?.token_id || "") === String(reservation?.token_id || "")) ||
+        String(gammaMarket?.id || "") !== String(reservation?.market_id || "") ||
+        String(gammaMarket?.conditionId || "").toLowerCase() !==
+          String(reservation?.condition_id || "").toLowerCase() ||
+        gammaMarket?.closed !== true || gammaMarket?.acceptingOrders !== false ||
+        gammaMarket?.automaticallyResolved !== true ||
+        gammaMarket?.umaResolutionStatus !== "resolved" ||
+        gammaTokens.length !== 2 || !gammaTokens.includes(String(reservation?.token_id || "")) ||
+        prices.length !== 2 || !prices.every((price) => [0, 1].includes(price)) ||
+        prices[0] === prices[1] || !Number.isFinite(endMs) ||
+        !Number.isFinite(closedMs) || !Number.isFinite(resolvedMs) ||
+        closedMs !== resolvedMs || resolvedMs < endMs ||
+        observedAtMs - resolvedMs < MINIMUM_RESOLVED_MARKET_AGE_MS) {
+      failAcknowledged("settled market evidence did not prove cancellation-failed zero exposure");
+    }
+    resolvedMarketEvidence = {
+      settlement_activity_count: 0,
+      clob_market_closed: true,
+      gamma_market_resolved: true,
+      market_end_at: new Date(endMs).toISOString(),
+      market_resolved_at: new Date(resolvedMs).toISOString()
+    };
   }
   return {
     observed_at: new Date(observedAtMs).toISOString(),
-    terminal_order_status: "NOT_RETAINED_AFTER_DURABLE_CANCEL",
+    terminal_order_status: cancellationFailed
+      ? "NOT_RETAINED_AFTER_FAILED_CANCEL_AND_RESOLUTION"
+      : "NOT_RETAINED_AFTER_DURABLE_CANCEL",
     rest_order_matched_size: 0,
     authenticated_open_order_count: 0,
     authenticated_trade_count: 0,
     unresolved_position_count: 0,
-    exact_position_count: 0
+    exact_position_count: 0,
+    ...resolvedMarketEvidence
   };
 }
 
@@ -476,6 +532,31 @@ export async function observeEvictedAcknowledgedNoFill(options) {
   });
 }
 
+export async function observeCancellationFailedEvictedNoFill(options) {
+  return observeAcknowledgedSnapshots({
+    ...options,
+    validateSnapshot: validateEvictedAcknowledgedNoFillSnapshot,
+    loadAdditionalEvidence: async ({ client, reservation, config, fetchImpl }) => {
+      const fetchJson = async (url) => {
+        const response = await fetchImpl(url, { signal: AbortSignal.timeout(10_000) });
+        if (!response?.ok) failAcknowledged("settlement activity endpoint failed");
+        return response.json();
+      };
+      const [settlementActivity, clobMarket, gammaMarket] = await Promise.all([
+        loadSettlementActivity({
+          user: config.funderAddress,
+          conditionIds: [reservation.condition_id],
+          sessionStartedAt: reservation.created_ts,
+          fetcher: fetchJson
+        }),
+        client.getMarket(reservation.condition_id),
+        fetchGammaMarket(reservation.market_id, { fetchImpl })
+      ]);
+      return { settlementActivity, clobMarket, gammaMarket };
+    }
+  });
+}
+
 async function observeAcknowledgedSnapshots({
   client,
   reservation,
@@ -483,10 +564,12 @@ async function observeAcknowledgedSnapshots({
   fetchImpl = fetch,
   now = () => Date.now(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  validateSnapshot
+  validateSnapshot,
+  loadAdditionalEvidence = async () => ({})
 }) {
   const snapshot = async () => {
-    const [order, openOrders, authenticatedTrades, positions] = await Promise.all([
+    const [order, openOrders, authenticatedTrades, positions, additionalEvidence] =
+      await Promise.all([
       client.getOrder(config.orderId),
       client.getOpenOrders(),
       client.getTrades({ market: reservation.condition_id }),
@@ -497,7 +580,8 @@ async function observeAcknowledgedSnapshots({
           if (!response?.ok) failAcknowledged("position reconciliation endpoint failed");
           return response.json();
         }
-      })
+      }),
+      loadAdditionalEvidence({ client, reservation, config, fetchImpl })
     ]);
     return validateSnapshot({
       reservation,
@@ -506,6 +590,7 @@ async function observeAcknowledgedSnapshots({
       openOrders,
       authenticatedTrades,
       positions,
+      ...additionalEvidence,
       observedAtMs: now()
     });
   };
@@ -532,9 +617,12 @@ export async function runAcknowledgedNoFillReconciliation({
     requireFederatedToken: containerFactory === storageContainer,
     reason
   });
-  const evicted = reason === EVICTED_ACKNOWLEDGED_REASON;
+  const evicted = [EVICTED_ACKNOWLEDGED_REASON, CANCELLATION_FAILED_EVICTED_REASON]
+    .includes(reason);
   const observeBound = observe || (evicted
-    ? observeEvictedAcknowledgedNoFill
+    ? reason === CANCELLATION_FAILED_EVICTED_REASON
+      ? observeCancellationFailedEvictedNoFill
+      : observeEvictedAcknowledgedNoFill
     : observeAcknowledgedNoFill);
   const container = containerFactory(config);
   if (!container) failAcknowledged("storage is unavailable");
@@ -650,7 +738,8 @@ function validateAcknowledgedTerminalReadback(config, document, finalized) {
   const expectedSha = "sha256:" + createHash("sha256")
     .update(Buffer.from(JSON.stringify(finalized, null, 2)))
     .digest("hex");
-  const summaryBindingValid = config.reconciliationReason === EVICTED_ACKNOWLEDGED_REASON
+  const summaryBindingValid = [EVICTED_ACKNOWLEDGED_REASON,
+    CANCELLATION_FAILED_EVICTED_REASON].includes(config.reconciliationReason)
     ? source?.failed_summary_blob_name === config.summaryBlobName &&
       source?.failed_summary_sha256 === config.summarySha256
     : source?.failed_summary_blob_name === undefined &&
@@ -767,10 +856,21 @@ async function downloadBlobDocument(container, blobName) {
   };
 }
 
+function jsonArray(value) {
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value || "[]"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   const recoveryReason = process.env.FUNDED_DIRECT_RECONCILIATION_REASON;
-  const acknowledged = [ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON]
+  const acknowledged = [ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON,
+    CANCELLATION_FAILED_EVICTED_REASON]
     .includes(recoveryReason);
   const run = acknowledged
     ? runAcknowledgedNoFillReconciliation

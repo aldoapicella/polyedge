@@ -1000,6 +1000,20 @@ test("persistent reconnect clears only after full account and fresh-book reconci
   }
 });
 
+test("persistent reconnect bounds authenticated trade-history reads", async () => {
+  const value = reconnectReconciliationFixture();
+  value.resources.client.getTrades = () => new Promise(() => {});
+  await assert.rejects(
+    reconcilePersistentChannels(value.resources, value.market, {
+      capture: async () => value.runtime,
+      intent: value.intent
+    }),
+    /reconciliation_trades_before preflight timed out after 2000ms/
+  );
+  assert.equal(value.userChannel.markCount(), 0);
+  assert.equal(value.marketChannel.markCount(), 0);
+});
+
 test("safety cache autonomously reconciles a recovered same-market channel", async () => {
   const value = reconnectReconciliationFixture();
   value.resources.safetyCache = {
