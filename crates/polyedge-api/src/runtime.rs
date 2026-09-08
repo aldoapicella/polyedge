@@ -3938,7 +3938,7 @@ impl RuntimeController {
                 ));
                 return;
             }
-            data.books.retain(|token, _| !expected.contains(token));
+            data.books.clear();
             for book in barrier.anchors {
                 data.books.insert(book.token_id.clone(), book);
             }
@@ -5576,6 +5576,8 @@ mod tests {
         {
             let mut data = controller.inner.data.write().await;
             data.books.insert(TokenId::new("no"), clob_test_book("no"));
+            data.books
+                .insert(TokenId::new("stale"), clob_test_book("stale"));
         }
         let tokens = expected.iter().cloned().collect::<Vec<_>>();
         let lease = controller.begin_clob_generation(431, &tokens).await;
@@ -5600,6 +5602,7 @@ mod tests {
             assert_eq!(data.clob_tokens, expected);
             assert!(data.books.contains_key(&TokenId::new("yes")));
             assert!(!data.books.contains_key(&TokenId::new("no")));
+            assert!(!data.books.contains_key(&TokenId::new("stale")));
             assert_eq!(data.feed_status["PolymarketClobMarket"]["status"], "ok");
         }
 

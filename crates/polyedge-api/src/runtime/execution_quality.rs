@@ -373,7 +373,7 @@ impl ExecutionQualityTracker {
                     .unwrap_or((Side::Buy, report.market_id.clone()));
                 self.schedule_markouts(
                     "touch_fill",
-                    order_id,
+                    order_id.clone(),
                     market_id,
                     token_id,
                     side,
@@ -386,6 +386,12 @@ impl ExecutionQualityTracker {
                     },
                     report.local_ts,
                 );
+                if matches!(
+                    report.status.as_str(),
+                    "paper_filled" | "paper_filled_maker"
+                ) {
+                    self.orders.remove(&order_id);
+                }
             }
         }
         if report.status == "paper_cancelled" {
@@ -1211,6 +1217,7 @@ mod tests {
         let mut filled = report("paper_filled", dec("5"), Some(dec("0.50")), ts(2));
         filled.fee = dec("0.05");
         tracker.observe_execution_report(&filled);
+        assert!(tracker.orders.is_empty());
 
         let markouts = tracker.observe_book(&book("0.52", "4", "0.53", "4", ts(33)));
         let thirty = markouts
