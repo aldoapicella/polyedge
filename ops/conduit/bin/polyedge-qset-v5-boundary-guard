@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+readonly mode=${1:-}
+readonly boundary=2026-08-26T00:00:00Z
+readonly boundary_epoch=1787702400
+readonly v5_service=polyedge-shadow-qset-v5.service
+readonly v5_container=polyedge-shadow-qset-v5
+readonly v3_service=polyedge-shadow-qset-v3.service
+readonly v3_container=polyedge-shadow-qset-v3
+readonly v2_service=polyedge-shadow-qset.service
+readonly v2_container=polyedge-shadow-qset
+readonly v2_seal_timer=polyedge-qset-v2-first-seal.timer
+readonly v5_env=/etc/polyedge/shadow-qset-v5.env
+readonly v5_sealer_env=/etc/polyedge/qset-v5-sealer.env
+readonly freeze_receipt_root=/srv/polyedge-ring/migration/qset-v5/source-freeze
+readonly receipt_root=/srv/polyedge-ring/migration/qset-v5/boundary
+readonly pre_receipt=$receipt_root/20260826T000000Z-pre.json
+readonly post_receipt=$receipt_root/20260826T000000Z-post.json
+
+case "$mode" in check|pre|post) ;; *) echo "usage: ${0##*/} check|pre|post" >&2; exit 64 ;; esac
+
+temporary=()
+cleanup() { local path; trap - EXIT HUP INT TERM; for path in "${temporary[@]:-}"; do test -z "$path" || rm -f -- "$path"; done; }
+trap cleanup EXIT HUP INT TERM
+
+secure_file() {
+  local path=$1 expected_mode=$2 max=$3
+  test ! -L "$path" && test -f "$path"
+  test "$(stat -c '%u:%g:%a:%h' "$path")" = "0:0:$expected_mode:1"
+  test "$(stat -c '%s' "$path")" -gt 0 && test "$(stat -c '%s' "$path")" -le "$max"
+}
+
+disabled() {
+  local state
+  ! systemctl is-active --quiet "$1"
+  state=$(systemctl is-enabled "$1" 2>/dev/null || true)
+  case "$state" in disabled|masked) ;; *) echo "$1 must be disabled and inactive, got ${state:-unknown}" >&2; return 1 ;; esac
+}
+
+load_final_v5_binding() {
+  local sealer binding receipt digest
+  secure_file "$v5_env" 600 65536; secure_file "$v5_sealer_env" 640 65536
+  set -a; . "$v5_env"; set +a
+  test "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-08-26-qset-v5
+  test "${SHADOW_EVIDENCE_VERSION:-}" = protocol-v3-qset-v5
+  test "${SHADOW_CODE_FREEZE_FINALIZED:-}" = true
+  printf '%s' "${SHADOW_CODE_FREEZE_SHA256:-}" | grep -Eq '^sha256:[0-9a-f]{64}$'
+  test "${EXECUTION_FREEZE_SHA256:-}" = "$SHADOW_CODE_FREEZE_SHA256"
+  case "${EXECUTION_FREEZE_ARTIFACT_PATH:-}" in reports/research/shadow/campaigns/campaign-2026-08-26-qset-v5/control/code-freeze/source-${SHADOW_CODE_FREEZE_SHA256#sha256:}.json) ;; *) return 64 ;; esac
+  test "${SHADOW_CODE_FREEZE_MANIFEST:-}" = "azure://${AZURE_STORAGE_ACCOUNT_NAME:?}/polyedge-qset-v5-control/$EXECUTION_FREEZE_ARTIFACT_PATH"
+  printf '%s' "${POLYEDGE_QSET_V5_WRITER_IMAGE:-}" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$'
+  printf '%s' "${POLYEDGE_QSET_V5_WRITER_GIT_SHA:-}" | grep -Eq '^[0-9a-f]{40}$'
+  sealer=$(set -a; . "$v5_sealer_env"; set +a; jq -nc --arg sealImage "${POLYEDGE_QSET_V5_SEAL_IMAGE:-}" --arg sealCommit "${POLYEDGE_QSET_V5_SEAL_GIT_SHA:-}" --arg writerImage "${POLYEDGE_QSET_V5_WRITER_IMAGE:-}" --arg writerCommit "${POLYEDGE_QSET_V5_WRITER_GIT_SHA:-}" '{sealImage:$sealImage,sealCommit:$sealCommit,writerImage:$writerImage,writerCommit:$writerCommit}')
+  digest=${SHADOW_CODE_FREEZE_SHA256#sha256:}; receipt=$freeze_receipt_root/source-$digest.json; secure_file "$receipt" 640 1048576
+  jq -e --arg uri "$SHADOW_CODE_FREEZE_MANIFEST" --arg hash "$SHADOW_CODE_FREEZE_SHA256" --arg writerImage "$POLYEDGE_QSET_V5_WRITER_IMAGE" --arg writerCommit "$POLYEDGE_QSET_V5_WRITER_GIT_SHA" --argjson sealer "$sealer" '
+    .schema=="polyedge.qset_v5_source_freeze_upload_receipt.v2" and .manifest.uri==$uri and .manifest.sha256==$hash and
+    .researchImage==$writerImage and .researchImage==$sealer.sealImage and .researchImage==$sealer.writerImage and
+    .sourceCommit==$writerCommit and .sourceCommit==$sealer.sealCommit and .sourceCommit==$sealer.writerCommit and
+    (.gitTree|test("^[0-9a-f]{40}$")) and .immutabilityPolicy.state=="Locked" and .immutabilityPolicy.days>=90
+  ' "$receipt" >/dev/null
+  binding=$(jq -c '{manifest,researchImage,sourceCommit,gitTree}' "$receipt")
+  freeze_receipt=$receipt; freeze_binding=$binding
+}
+
+runtime_status() { timeout 30 podman exec "$v5_container" /usr/bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8081; printf "GET /api/v1/status HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3; cat <&3' | tr -d '\r' | sed '1,/^$/d'; }
+container_env_is() { timeout 20 podman inspect "$v5_container" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -Fx -- "$1" >/dev/null; }
+validate_v5_recorder() { jq -e '.app=="polyedge-shadow-qset-v5" and .execution_mode=="paper" and .intent_publisher=={configured:true,prepared:true,pointer_only_preflight:true} and .task_health=={api:"ok",runtime_loop:"running",feeds:"running"} and (.recorder_metrics.recorder_instance_id|type=="string" and length>0) and .recorder_metrics.last_assigned_sequence>0 and .recorder_metrics.persisted_total>0 and .recorder_metrics.queued==0 and .recorder_metrics.failed_total==0 and .recorder_metrics.unrecovered_durable_events==0 and .recorder_metrics.flush_failed_total==0 and .recorder_metrics.flush_unrecovered==false and .recorder_status.busy==false and .recorder_status.error_count==0 and .recorder_status.dropped_count==0' >/dev/null; }
+
+capture_v3() {
+  local inspect
+  systemctl is-active --quiet "$v3_service"
+  for timer in polyedge-qset-v3-boundary-pre.timer polyedge-qset-v3-boundary-post.timer polyedge-qset-v3-first-seal.timer; do disabled "$timer"; done
+  inspect=$(podman inspect --format '{{.Id}}|{{.Config.Image}}|{{.State.Status}}|{{.State.Health.Status}}' "$v3_container")
+  case "$inspect" in *'|running|healthy') ;; *) return 1 ;; esac
+  jq -nc --arg pid "$(systemctl show "$v3_service" -p MainPID --value)" --arg invocation "$(systemctl show "$v3_service" -p InvocationID --value)" --arg inspect "$inspect" '{mainPid:($pid|tonumber),invocationId:$invocation,container:$inspect,activeHealthy:true,timersDisabled:true}'
+}
+
+validate_v2() {
+  disabled "$v2_seal_timer"
+  systemctl is-active --quiet "$v2_service"
+  test "$(podman inspect --format '{{.State.Status}}|{{.State.Health.Status}}' "$v2_container")" = 'running|healthy'
+}
+
+common_guard() {
+  timeout 30 /usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
+  test ! -e /run/polyedge/image-pulls-paused
+  load_final_v5_binding
+  v3_state=$(capture_v3); validate_v2
+  systemctl is-active --quiet "$v5_service"
+  test "$(podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}|{{.State.Health.Status}}' "$v5_container")" = "$POLYEDGE_QSET_V5_WRITER_IMAGE|976:976|running|healthy"
+  test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$POLYEDGE_QSET_V5_WRITER_IMAGE")" = "linux/arm64|$POLYEDGE_QSET_V5_WRITER_GIT_SHA"
+  container_env_is 'SHADOW_CAMPAIGN_ID=campaign-2026-08-26-qset-v5'; container_env_is 'SHADOW_EVIDENCE_VERSION=protocol-v3-qset-v5'; container_env_is 'SHADOW_CODE_FREEZE_FINALIZED=true'
+  container_env_is "SHADOW_CODE_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; container_env_is "EXECUTION_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; container_env_is "EXECUTION_FREEZE_ARTIFACT_PATH=$EXECUTION_FREEZE_ARTIFACT_PATH"
+  container_env_is 'AZURE_STORAGE_CONTAINER_NAME=polyedge-shadow-qset-v5-events'; container_env_is 'AZURE_RESEARCH_STORAGE_CONTAINER_NAME=polyedge-research-qset-v5'; container_env_is 'POLYEDGE_QSET_V5_CONTROL_CONTAINER_NAME=polyedge-qset-v5-control'
+  container_env_is 'AZURE_EVENT_BLOB_PREFIX=shadow-events/preflight/campaign-2026-08-26-qset-v5'; container_env_is 'AZURE_EVENT_BLOB_PREFIX_AFTER_CUTOVER=shadow-events/campaign-2026-08-26-qset-v5'; container_env_is 'AZURE_EVENT_BLOB_PREFIX_CUTOVER_UTC=2026-08-26T00:00:00Z'
+  runtime_status | validate_v5_recorder
+}
+
+commit_receipt() {
+  local temporary_receipt=$1 final_receipt=$2
+  chown root:root "$temporary_receipt" && chmod 0640 "$temporary_receipt"; test ! -e "$final_receipt"; sync -f "$temporary_receipt"; sync -d "$(dirname "$final_receipt")"; ln "$temporary_receipt" "$final_receipt"; sync -f "$final_receipt"; sync -d "$(dirname "$final_receipt")"
+}
+
+validate_post_receipt() {
+  local pre=$1 post=$2 pre_sha
+  pre_sha="sha256:$(sha256sum "$pre"|cut -d' ' -f1)"
+  jq -e --arg pre_sha "$pre_sha" '.schema=="polyedge.qset_v5_boundary_post.v2" and .boundaryUtc=="2026-08-26T00:00:00Z" and .preReceiptSha256==$pre_sha and .writerContinued==true and .qsetV3.activeHealthyUnchanged==true and .qsetV3.timersDisabled==true and .qsetV2=={activeHealthy:true,firstSealTimerDisabled:true} and .stateMutationPerformed==false and .azureEvidenceMutationPerformed==false' "$post" >/dev/null
+}
+
+if test "${QSET_V5_BOUNDARY_RECEIPT_TEST_ONLY:-false}" = true; then test "$#" = 3; validate_post_receipt "$2" "$3"; exit 0; fi
+if test "$mode" = check; then common_guard; printf '%s\n' 'qset-v5 boundary guard check passed; v2/v3 and all timers were unchanged'; exit 0; fi
+
+exec 9>/run/polyedge/qset-v5-boundary.lock; flock -n 9 || { echo 'qset-v5 boundary guard is already running' >&2; exit 75; }
+install -d -o root -g root -m 0750 "$receipt_root"
+
+if test "$mode" = pre; then
+  now=$(date -u +%s); test "$now" -ge $((boundary_epoch-120)) && test "$now" -lt "$boundary_epoch"
+  common_guard; test ! -e "$pre_receipt"
+  status_tmp=$(mktemp /run/polyedge/qset-v5-pre-status.XXXXXX); receipt_tmp=$(mktemp "$receipt_root/.pre.XXXXXX"); temporary+=("$status_tmp" "$receipt_tmp")
+  runtime_status >"$status_tmp"; validate_v5_recorder <"$status_tmp"
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg pid "$(systemctl show "$v5_service" -p MainPID --value)" --arg invocation "$(systemctl show "$v5_service" -p InvocationID --value)" --arg container "$(podman inspect --format '{{.Id}}' "$v5_container")" --argjson v3 "$v3_state" --argjson freeze "$freeze_binding" --slurpfile status "$status_tmp" '{schema:"polyedge.qset_v5_boundary_pre.v2",generatedAtUtc:$generated,boundaryUtc:"2026-08-26T00:00:00Z",writer:{mainPid:($pid|tonumber),invocationId:$invocation,containerId:$container,status:$status[0]},freeze:$freeze,qsetV3:$v3,qsetV2:{activeHealthy:true,firstSealTimerDisabled:true},stateMutationPerformed:false,azureEvidenceMutationPerformed:false}' >"$receipt_tmp"
+  test "$(date -u +%s)" -lt "$boundary_epoch"; commit_receipt "$receipt_tmp" "$pre_receipt"; exit 0
+fi
+
+if test -e "$post_receipt"; then secure_file "$pre_receipt" 640 1048576; secure_file "$post_receipt" 640 1048576; validate_post_receipt "$pre_receipt" "$post_receipt"; common_guard; jq -e --argjson current "$v3_state" '.qsetV3==$current' "$pre_receipt" >/dev/null; exit 0; fi
+now=$(date -u +%s); test "$now" -ge "$boundary_epoch" && test "$now" -le $((boundary_epoch+900))
+common_guard; secure_file "$pre_receipt" 640 1048576
+test "$(systemctl show "$v5_service" -p MainPID --value)" = "$(jq -er .writer.mainPid "$pre_receipt")"; test "$(systemctl show "$v5_service" -p InvocationID --value)" = "$(jq -er .writer.invocationId "$pre_receipt")"; test "$(podman inspect --format '{{.Id}}' "$v5_container")" = "$(jq -er .writer.containerId "$pre_receipt")"
+jq -e --argjson current "$v3_state" '.qsetV3==$current' "$pre_receipt" >/dev/null
+status_tmp=$(mktemp /run/polyedge/qset-v5-post-status.XXXXXX); receipt_tmp=$(mktemp "$receipt_root/.post.XXXXXX"); temporary+=("$status_tmp" "$receipt_tmp")
+runtime_status >"$status_tmp"; validate_v5_recorder <"$status_tmp"
+jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg pre_sha "sha256:$(sha256sum "$pre_receipt"|cut -d' ' -f1)" --slurpfile status "$status_tmp" '{schema:"polyedge.qset_v5_boundary_post.v2",generatedAtUtc:$generated,boundaryUtc:"2026-08-26T00:00:00Z",preReceiptSha256:$pre_sha,writerContinued:true,writerPostStatus:$status[0],qsetV3:{activeHealthyUnchanged:true,timersDisabled:true},qsetV2:{activeHealthy:true,firstSealTimerDisabled:true},stateMutationPerformed:false,azureEvidenceMutationPerformed:false}' >"$receipt_tmp"
+commit_receipt "$receipt_tmp" "$post_receipt"
+logger -p daemon.info -t polyedge-qset-v5-boundary 'qset-v5 boundary receipt committed; v2 and v3 remained active/healthy and no state was changed'

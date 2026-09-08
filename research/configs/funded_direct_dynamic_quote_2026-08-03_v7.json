@@ -1,0 +1,68 @@
+{
+  "schema_version": "polyedge.operator_funded_session.v3",
+  "session_id": "dynamic-quote-funded-2026-08-03-v7",
+  "authorization_mode": "operator_direct",
+  "authorized_by_user_reference": "Codex task 2026-08-03 continue funded trading after losses",
+  "source_simulated_pnl": 379.19,
+  "research_promotion_bypassed": true,
+  "research_lane_isolated": true,
+  "maker_only": true,
+  "no_deposits": true,
+  "allow_automatic_replenishment": false,
+  "allow_compounding": true,
+  "continue_after_loss": true,
+  "external_cash_flows": [],
+  "max_open_orders": 1,
+  "target_order_notional": 10.5,
+  "max_order_notional": 10.5,
+  "max_account_loss": 11.09862,
+  "starting_collateral": 11.09862,
+  "max_reconciliation_discrepancy": 0.01,
+  "capital_policy": {
+    "reserve_ratio": 0.3,
+    "operating_buffer_ratio": 0.01,
+    "minimum_order_notional": 1,
+    "reserve_basis": "fully_reconciled_current_equity",
+    "loss_response": "resize_from_fully_reconciled_current_equity",
+    "prior_state_session_id": "dynamic-quote-funded-2026-07-29-v5",
+    "prior_state_blob_name": "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-07-29-v5/capital-reserve-state.json",
+    "minimum_historical_high_water_equity": 41.34362,
+    "high_water_update": "full_reconciliation_only",
+    "reserve_monotonic": false,
+    "state_blob_name": "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-03-v7/capital-reserve-state.json"
+  },
+  "internal_settlements": [
+    {
+      "id": "manual-redeem-2026-07-29-1530-et",
+      "type": "internal_manual_settlement",
+      "transaction_hash": "0xf6f077d05c7c33c1ef2805068fcda419193df73def03c9b1fe0b4f8f67fbf456",
+      "condition_id": "0x149de2cb1654309be96c6cf9f88335c9145933495bb984189ec72288c5be6f5c",
+      "payout": 17.015,
+      "principal": 10.209,
+      "realized_pnl": 6.806,
+      "fill_transaction_hashes": [
+        "0x4fc7efe02f51500a87a745b817d8edf757d63b25b7a89cd53e00b742d8bbb7f9",
+        "0xb14e05e1c492fb822398c89e1d57bd05d7342ed4340594cd15962c75f9f0475a",
+        "0xd8bc94e30b01c3ebf66cb44078a5ef5fae83b55e1304b3c17b692cf273a0bb62"
+      ],
+      "settled_at": "2026-07-29T19:47:17Z"
+    }
+  ],
+  "evidence_trust_boundary_ready": false,
+  "execution_window_seconds_to_expiry": {
+    "minimum": 360,
+    "maximum": 900
+  },
+  "candidate": {
+    "name": "dynamic_quote_style",
+    "candidate_version": "dynamic_quote_style@2026-06-14",
+    "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+  },
+  "execution_model": {
+    "model_version": "conservative-execution-prior-v1",
+    "blob_uri": "azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    "sha256": "sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4"
+  },
+  "created_at": "2026-08-03T15:53:48Z",
+  "expires_at": "2026-09-03T15:53:48Z"
+}

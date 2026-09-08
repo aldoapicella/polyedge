@@ -1,0 +1,12 @@
+[Unit]
+Description=Upload sealed PolyEdge recorder segments for %i
+
+[Timer]
+OnCalendar=*-*-* *:01/5:00 UTC
+Persistent=true
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=polyedge-ring-sync@%i.service
+
+[Install]
+WantedBy=timers.target

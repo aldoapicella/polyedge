@@ -1,0 +1,32 @@
+[Unit]
+Description=PolyEdge isolated funded intent producer
+Wants=network-online.target polyedge-federated-token@funded-intent-producer.service
+After=network-online.target polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-federated-token@funded-intent-producer.service polyedge-oci-queue-bridge.service
+Requires=polyedge-network.service polyedge-funded-intent-producer-egress.service polyedge-oci-queue-bridge.service
+
+[Container]
+# Replace the all-zero digest with the reviewed ARM64 image digest.
+Image=registry.example.invalid/polyedge-rust-backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+ContainerName=polyedge-funded-intent-producer
+Network=polyedge.network
+IP=10.89.0.248
+User=984:980
+EnvironmentFile=/etc/polyedge/funded-intent-producer.env
+EnvironmentFile=/etc/polyedge/ring-funded-intent-producer.env
+Volume=/run/polyedge-federated-funded-intent-producer:/run/credentials:ro,Z
+Volume=/srv/polyedge-ring/domains/funded-intent-producer:/srv/polyedge-ring:Z
+HealthCmd=/usr/bin/bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8081; printf "GET /api/v1/health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3; head -n 1 <&3 | grep -q " 200 "'
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=20s
+HealthOnFailure=kill
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --pull=never --log-driver=journald
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

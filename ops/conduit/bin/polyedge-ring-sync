@@ -1,0 +1,747 @@
+#!/bin/sh
+set -eu
+
+env_file=${POLYEDGE_RING_ENV_FILE:-/etc/polyedge/ring.env}
+test -r "$env_file" || { echo "missing $env_file" >&2; exit 64; }
+set -a
+. "$env_file"
+set +a
+
+if [ "${POLYEDGE_RING_POST_UPLOAD_SEAL:-0}" = 1 ]; then
+  POLYEDGE_RING_SEAL_ONLY=1
+fi
+
+root=${POLYEDGE_RING_ROOT:-/srv/polyedge-ring}
+[ ! -L "$root" ] && [ -d "$root" ] || { echo "ring root is not a regular directory: $root" >&2; exit 1; }
+root_requested=$root
+root=$(realpath -e -- "$root") || exit 1
+[ "$root_requested" = "$root" ] || { echo "ring root path contains a symlink or is non-canonical: $root_requested" >&2; exit 1; }
+mount_root=${POLYEDGE_RING_MOUNT_ROOT:-$root}
+[ ! -L "$mount_root" ] && [ -d "$mount_root" ] || { echo "ring mount root is not a regular directory: $mount_root" >&2; exit 1; }
+mount_root_requested=$mount_root
+mount_root=$(realpath -e -- "$mount_root") || exit 1
+[ "$mount_root_requested" = "$mount_root" ] || { echo "ring mount root path contains a symlink or is non-canonical: $mount_root_requested" >&2; exit 1; }
+mountpoint -q "$mount_root" || { echo "$mount_root is not a mount point" >&2; exit 1; }
+case "$root" in "$mount_root"|"$mount_root"/*) ;; *) echo "$root is outside ring mount $mount_root" >&2; exit 1 ;; esac
+segments=$root/segments
+archive=$root/archive
+quarantine_parent=$root/quarantine
+quarantine=$root/quarantine/recorder-sequence-proof-v1
+resolved_quarantine=$root/quarantine/resolved-recorder-sequence-proof-v1
+max_quarantine_source_bytes=536870912
+segment_seconds=${RECORDER_SEGMENT_SECONDS:-600}
+grace_seconds=${POLYEDGE_RING_SEAL_GRACE_SECONDS:-60}
+prefix=${POLYEDGE_RING_BLOB_PREFIX:-events-oci-hot7-v1}
+legacy_cutoff=${POLYEDGE_RING_LEGACY_CUTOFF_EPOCH:-}
+if [ -n "$legacy_cutoff" ]; then
+  printf '%s' "$legacy_cutoff" | grep -Eq '^(0|[1-9][0-9]*)$' && [ "$((legacy_cutoff % 600))" -eq 0 ] || {
+    echo 'POLYEDGE_RING_LEGACY_CUTOFF_EPOCH must be a canonical 10-minute epoch' >&2
+    exit 64
+  }
+fi
+printf '%s' "$segment_seconds" | grep -Eq '^[0-9]+$'
+[ "$segment_seconds" -ge 300 ] && [ "$segment_seconds" -le 900 ] || {
+  echo 'RECORDER_SEGMENT_SECONDS must be from 300 through 900' >&2
+  exit 64
+}
+printf '%s' "$prefix" | grep -Eq '^[a-z0-9][a-z0-9._/-]*$' || {
+  echo 'POLYEDGE_RING_BLOB_PREFIX is invalid' >&2
+  exit 64
+}
+command -v gzip >/dev/null || { echo 'gzip is required' >&2; exit 1; }
+for ring_dir in "$segments" "$archive" "$quarantine_parent" "$quarantine" "$resolved_quarantine"; do
+  if [ -e "$ring_dir" ] || [ -L "$ring_dir" ]; then
+    [ ! -L "$ring_dir" ] && [ -d "$ring_dir" ] || { echo "unsafe ring directory: $ring_dir" >&2; exit 1; }
+  fi
+done
+install -d -m 0750 "$segments" "$archive" "$quarantine" "$resolved_quarantine"
+for ring_dir in "$segments" "$archive" "$quarantine_parent" "$quarantine" "$resolved_quarantine"; do
+  ring_dir_real=$(realpath -e -- "$ring_dir") || exit 1
+  case "$ring_dir_real" in "$root"/*) ;; *) echo "ring directory escapes mount root: $ring_dir" >&2; exit 1 ;; esac
+done
+segments_real=$(realpath -e -- "$segments") || exit 1
+
+receipt_id() {
+  # Length-prefixing makes the content address unambiguous without trusting paths.
+  printf '%s:%s:%s' "${#1}" "$1" "$2" | sha256sum | awk '{print $1}'
+}
+
+source_state() {
+  [ ! -L "$1" ] && [ -f "$1" ] || return 1
+  stat -c '%d:%i:%s:%y:%z' "$1"
+}
+
+validate_quarantine_receipt_entry() {
+  receipt_candidate=$1
+    [ ! -L "$receipt_candidate" ] && [ -f "$receipt_candidate" ] || {
+      echo "non-regular quarantine entry: $receipt_candidate" >&2
+      return 1
+    }
+    case "$receipt_candidate" in
+      *.json) ;;
+      *) echo "invalid quarantine receipt name: $receipt_candidate" >&2; return 1 ;;
+    esac
+    if ! jq -e '
+      type == "object" and
+      keys == ["reason_code","schema","source_bytes","source_lines","source_segment_path","source_sha256","type"] and
+      .schema == "polyedge_ring_quarantine.v1" and
+      .type == "quarantine_receipt" and
+      (.source_segment_path | type == "string") and
+      (.source_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      (.source_bytes | type == "number" and floor == . and . >= 0) and
+      (.source_lines | type == "number" and floor == . and . >= 0) and
+      .reason_code == "invalid_recorder_sequence_proof"
+    ' "$receipt_candidate" >/dev/null; then
+      echo "invalid quarantine receipt: $receipt_candidate" >&2
+      return 1
+    fi
+    receipt_candidate_path=$(jq -r '.source_segment_path' "$receipt_candidate")
+    case "/$receipt_candidate_path/" in
+      /segments/*/) ;;
+      *) echo "invalid quarantine receipt path: $receipt_candidate" >&2; return 1 ;;
+    esac
+    case "/$receipt_candidate_path/" in
+      *'/./'*|*'/../'*|*'//'*) echo "non-canonical quarantine receipt path: $receipt_candidate" >&2; return 1 ;;
+    esac
+    case "$receipt_candidate_path" in
+      *[!A-Za-z0-9._/-]*) echo "invalid quarantine receipt path characters: $receipt_candidate" >&2; return 1 ;;
+    esac
+    receipt_candidate_sha=$(jq -r '.source_sha256' "$receipt_candidate")
+    receipt_candidate_id=$(receipt_id "$receipt_candidate_path" "$receipt_candidate_sha")
+    [ "$receipt_candidate" = "$quarantine/$receipt_candidate_id.json" ] || {
+      echo "quarantine receipt content address disagrees: $receipt_candidate" >&2
+      return 1
+    }
+    receipt_source=$root/$receipt_candidate_path
+    receipt_source_real=$(realpath -e -- "$receipt_source") || {
+      echo "quarantine receipt source is missing: $receipt_candidate" >&2
+      return 1
+    }
+    case "$receipt_source_real" in
+      "$segments_real"/*) ;;
+      *) echo "quarantine receipt source escapes segments: $receipt_candidate" >&2; return 1 ;;
+    esac
+    receipt_source_state=$(source_state "$receipt_source") || {
+      echo "quarantine receipt source is not a regular file: $receipt_candidate" >&2
+      return 1
+    }
+    [ "$(stat -c %s "$receipt_source")" -le "$max_quarantine_source_bytes" ] || {
+      echo "quarantine source exceeds 512 MiB: $receipt_candidate" >&2
+      return 1
+    }
+    receipt_source_sha=sha256:$(sha256sum "$receipt_source" | awk '{print $1}')
+    receipt_source_bytes=$(wc -c < "$receipt_source")
+    receipt_source_lines=$(wc -l < "$receipt_source")
+    [ "$receipt_source_state" = "$(source_state "$receipt_source")" ] || {
+      echo "quarantine receipt source changed while validating: $receipt_candidate" >&2
+      return 1
+    }
+    receipt_sha=$(jq -r '.source_sha256' "$receipt_candidate")
+    receipt_bytes=$(jq -r '.source_bytes' "$receipt_candidate")
+    receipt_lines=$(jq -r '.source_lines' "$receipt_candidate")
+    [ "$receipt_sha" = "$receipt_source_sha" ] &&
+      [ "$receipt_bytes" = "$receipt_source_bytes" ] &&
+      [ "$receipt_lines" = "$receipt_source_lines" ] || {
+      echo "quarantined source changed: $receipt_candidate_path" >&2
+      return 1
+    }
+    receipt_expected=$(mktemp "$root/.ring-receipt.XXXXXX") || return 1
+    jq -cn \
+      --arg source_segment_path "$receipt_candidate_path" \
+      --arg source_sha256 "$receipt_source_sha" \
+      --argjson source_bytes "$receipt_source_bytes" \
+      --argjson source_lines "$receipt_source_lines" \
+      '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:$source_bytes,source_lines:$source_lines,reason_code:"invalid_recorder_sequence_proof"}' \
+      > "$receipt_expected" || { rm -f "$receipt_expected"; return 1; }
+    cmp -s "$receipt_expected" "$receipt_candidate" || {
+      echo "quarantine receipt differs from source: $receipt_candidate" >&2
+      rm -f "$receipt_expected"
+      return 1
+    }
+    rm -f "$receipt_expected"
+    receipt_archive=$archive/${receipt_candidate_path#segments/}.gz
+    for receipt_sidecar in "$receipt_source.manifest.json" "$receipt_archive" "$receipt_archive.manifest.json"; do
+      [ ! -e "$receipt_sidecar" ] && [ ! -L "$receipt_sidecar" ] || {
+        echo "quarantined segment has a sealed sidecar: $receipt_candidate_path" >&2
+        return 1
+      }
+    done
+}
+
+validate_resolved_quarantine_entry() {
+  resolved_candidate=$resolved_quarantine/$receipt_candidate_id
+  [ ! -L "$resolved_candidate" ] && [ -d "$resolved_candidate" ] || {
+    echo "invalid resolved quarantine directory: $resolved_candidate" >&2
+    return 1
+  }
+  [ "$(stat -c %a "$resolved_candidate")" = 750 ] || {
+    echo "resolved quarantine directory mode is not 0750: $resolved_candidate" >&2
+    return 1
+  }
+  [ "$(find "$resolved_candidate" -mindepth 1 -maxdepth 1 -printf . | wc -c)" -eq 4 ] || {
+    echo "partial resolved quarantine bundle: $resolved_candidate" >&2
+    return 1
+  }
+  resolved_source=$resolved_candidate/source.jsonl
+  resolved_receipt=$resolved_candidate/quarantine-receipt.json
+  resolution=$resolved_candidate/resolution.json
+  resolution_uploaded=$resolved_candidate/resolution.uploaded.json
+  for resolved_file in "$resolved_source" "$resolved_receipt" "$resolution" "$resolution_uploaded"; do
+    [ ! -L "$resolved_file" ] && [ -f "$resolved_file" ] || {
+      echo "invalid resolved quarantine file: $resolved_file" >&2
+      return 1
+    }
+    [ "$(stat -c %a "$resolved_file")" = 640 ] || {
+      echo "resolved quarantine file mode is not 0640: $resolved_file" >&2
+      return 1
+    }
+  done
+  cmp -s "$receipt_candidate" "$resolved_receipt" || {
+    echo "resolved quarantine receipt disagrees: $resolved_candidate" >&2
+    return 1
+  }
+  [ "sha256:$(sha256sum "$resolved_source" | awk '{print $1}')" = "$receipt_source_sha" ] &&
+    [ "$(wc -c < "$resolved_source")" = "$receipt_source_bytes" ] &&
+    [ "$(wc -l < "$resolved_source")" = "$receipt_source_lines" ] || {
+      echo "resolved quarantine source disagrees: $resolved_candidate" >&2
+      return 1
+    }
+  receipt_hash=sha256:$(sha256sum "$resolved_receipt" | awk '{print $1}')
+  source_name=${receipt_candidate_path##*/}
+  segment_start=${source_name%.jsonl}
+  printf '%s' "$segment_start" | grep -Eq '^[0-9]+$' || {
+    echo "resolved quarantine source epoch is invalid: $resolved_candidate" >&2
+    return 1
+  }
+  source_hour=$(date -u -d "@$segment_start" +%Y/%m/%d/%H) || return 1
+  [ "$receipt_candidate_path" = "segments/$source_hour/$segment_start.jsonl" ] || {
+    echo "resolved quarantine source path is not UTC-bound: $resolved_candidate" >&2
+    return 1
+  }
+  segment_end=$((segment_start + 600))
+  remote_prefix=events-oci-quarantine-v1/invalid-recorder-sequence-proof/$receipt_candidate_id
+  source_blob=$remote_prefix/source.jsonl
+  receipt_blob=$remote_prefix/quarantine-receipt.json
+  resolution_blob=$remote_prefix/resolution.json
+  jq -e \
+    --arg receipt_id "$receipt_candidate_id" \
+    --arg source_path "$receipt_candidate_path" \
+    --arg source_sha "$receipt_source_sha" \
+    --argjson source_bytes "$receipt_source_bytes" \
+    --argjson source_lines "$receipt_source_lines" \
+    --arg receipt_hash "$receipt_hash" \
+    --arg remote_prefix "$remote_prefix" \
+    --arg source_blob "$source_blob" \
+    --arg receipt_blob "$receipt_blob" \
+    --arg resolution_blob "$resolution_blob" \
+    --argjson segment_start "$segment_start" \
+    --argjson segment_end "$segment_end" '
+      type == "object" and
+      keys == ["active_ring","approval_reference","disposition","formal_boundary_epoch","parity_eligible","quarantine_receipt_blob_name","quarantine_receipt_sha256","receipt_id","remote_prefix","resolution_blob_name","retention_policy","schema","segment_end_epoch","segment_start_epoch","source_blob_name","source_bytes","source_lines","source_segment_path","source_sha256","type"] and
+      .schema == "polyedge_ring_quarantine_resolution.v1" and
+      .type == "invalid_recorder_sequence_proof_resolution" and
+      .disposition == "preserved_historical_pre_boundary_non_parity" and
+      .active_ring == false and .parity_eligible == false and
+      .retention_policy == "indefinite_outside_lifecycle" and
+      .receipt_id == $receipt_id and
+      (.approval_reference | type == "string" and length > 0 and length <= 256 and (explode | all(.[]; . >= 32 and . != 127))) and
+      (.formal_boundary_epoch | type == "number" and floor == . and . > 0 and (. % 600) == 0) and
+      .segment_start_epoch == $segment_start and .segment_end_epoch == $segment_end and
+      .segment_end_epoch <= .formal_boundary_epoch and
+      .source_segment_path == $source_path and .source_sha256 == $source_sha and
+      .source_bytes == $source_bytes and .source_lines == $source_lines and
+      .quarantine_receipt_sha256 == $receipt_hash and .remote_prefix == $remote_prefix and
+      .source_blob_name == $source_blob and
+      .quarantine_receipt_blob_name == $receipt_blob and .resolution_blob_name == $resolution_blob
+    ' "$resolution" >/dev/null || {
+      echo "invalid resolved quarantine resolution: $resolved_candidate" >&2
+      return 1
+    }
+  resolution_hash=sha256:$(sha256sum "$resolution" | awk '{print $1}')
+  verified_ts=$(jq -r '.verified_ts // empty' "$resolution_uploaded")
+  jq -e \
+    --arg receipt_id "$receipt_candidate_id" \
+    --arg source_blob "$source_blob" \
+    --arg receipt_blob "$receipt_blob" \
+    --arg resolution_blob "$resolution_blob" \
+    --arg source_sha "$receipt_source_sha" \
+    --arg receipt_hash "$receipt_hash" \
+    --arg resolution_hash "$resolution_hash" '
+      type == "object" and
+      keys == ["quarantine_receipt_blob_name","quarantine_receipt_sha256","receipt_id","resolution_blob_name","resolution_sha256","schema","source_blob_name","source_sha256","verified_ts"] and
+      .schema == "polyedge_ring_quarantine_resolution_upload.v1" and
+      .receipt_id == $receipt_id and .source_blob_name == $source_blob and
+      .quarantine_receipt_blob_name == $receipt_blob and .resolution_blob_name == $resolution_blob and
+      .source_sha256 == $source_sha and .quarantine_receipt_sha256 == $receipt_hash and
+      .resolution_sha256 == $resolution_hash and
+      (.verified_ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"))
+    ' "$resolution_uploaded" >/dev/null && date -d "$verified_ts" +%s >/dev/null 2>&1 || {
+      echo "invalid resolved quarantine upload receipt: $resolved_candidate" >&2
+      return 1
+    }
+}
+
+quarantine_preflight() {
+  quarantine_found=0
+  for receipt_candidate in "$quarantine"/* "$quarantine"/.[!.]* "$quarantine"/..?*; do
+    [ -e "$receipt_candidate" ] || [ -L "$receipt_candidate" ] || continue
+    validate_quarantine_receipt_entry "$receipt_candidate" || return 1
+    if [ -e "$resolved_quarantine/$receipt_candidate_id" ] || [ -L "$resolved_quarantine/$receipt_candidate_id" ]; then
+      validate_resolved_quarantine_entry || return 1
+    else
+      quarantine_found=1
+    fi
+  done
+  for resolved_candidate in "$resolved_quarantine"/* "$resolved_quarantine"/.[!.]* "$resolved_quarantine"/..?*; do
+    [ -e "$resolved_candidate" ] || [ -L "$resolved_candidate" ] || continue
+    resolved_id=${resolved_candidate##*/}
+    printf '%s' "$resolved_id" | grep -Eq '^[0-9a-f]{64}$' &&
+      [ -f "$quarantine/$resolved_id.json" ] && [ ! -L "$quarantine/$resolved_id.json" ] || {
+        echo "orphan or malformed resolved quarantine entry: $resolved_candidate" >&2
+        return 1
+      }
+  done
+}
+
+create_quarantine_receipt() {
+  receipt_expected=$(mktemp "$quarantine/.receipt.XXXXXX") || return 1
+  chmod 0640 "$receipt_expected"
+  jq -cn \
+    --arg source_segment_path "$source_relative" \
+    --arg source_sha256 "$source_sha" \
+    --argjson source_bytes "$source_bytes" \
+    --argjson source_lines "$lines" \
+    '{schema:"polyedge_ring_quarantine.v1",type:"quarantine_receipt",source_segment_path:$source_segment_path,source_sha256:$source_sha256,source_bytes:$source_bytes,source_lines:$source_lines,reason_code:"invalid_recorder_sequence_proof"}' \
+    > "$receipt_expected" || { rm -f "$receipt_expected"; return 1; }
+  receipt=$quarantine/$(receipt_id "$source_relative" "$source_sha").json
+  sync -f "$receipt_expected"
+  [ "$source_state_before" = "$(source_state "$segment")" ] || {
+    echo "source changed before quarantine receipt: $segment" >&2
+    rm -f "$receipt_expected"
+    return 1
+  }
+  if ln "$receipt_expected" "$receipt" 2>/dev/null; then
+    sync -f "$receipt"
+  fi
+  rm -f "$receipt_expected"
+  validate_quarantine_receipt_entry "$receipt"
+}
+
+sequence_summary() {
+  segment=$1
+  sequence_tmp=$(mktemp "$segment.sequence.XXXXXX") || return 1
+  trap 'rm -f "$sequence_tmp"' EXIT HUP INT TERM
+  chmod 0600 "$sequence_tmp"
+  if ! jq -cer '
+    if type == "object" and
+      (.recorder_instance_id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+      (.recorder_sequence | type == "number" and floor == . and . >= 1)
+    then "\(.recorder_instance_id)\t\(.recorder_sequence)"
+    else error("invalid recorder sequence fields")
+    end
+  ' "$segment" >"$sequence_tmp"; then
+    rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
+  fi
+  if ! recorder=$(awk -F '\t' '
+    function emit() {
+      out = out comma "{\"recorder_instance_id\":\"" instance "\",\"recorder_first_sequence\":" first ",\"recorder_last_sequence\":" previous ",\"recorder_event_count\":" count "}"
+      comma=","
+    }
+    NR == 1 { instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next }
+    $1 != instance {
+      if ($2 != 1 || seen[$1]) exit 1
+      emit(); instance=$1; first=$2; previous=$2; count=1; seen[instance]=1; next
+    }
+    $2 != previous + 1 { exit 1 }
+    { previous=$2; count++ }
+    END { if (NR == 0) exit 1; emit(); print "{\"recorder_runs\":[" out "]}" }
+  ' "$sequence_tmp"); then
+    rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM; return 1
+  fi
+  rm -f "$sequence_tmp"; sequence_tmp=; trap - EXIT HUP INT TERM
+  printf '%s\n' "$recorder"
+}
+
+now=$(date -u +%s)
+cutoff=$((now - grace_seconds))
+segment_list=$(mktemp "$root/.ring-sync-segments.XXXXXX")
+trap 'rm -f "$segment_list"' EXIT HUP INT TERM
+find "$segments" -type f -name '*.jsonl' -print | LC_ALL=C sort > "$segment_list"
+quarantine_found=0
+quarantine_preflight
+while IFS= read -r segment; do
+  name=${segment##*/}
+  start=${name%.jsonl}
+  printf '%s' "$start" | grep -Eq '^[0-9]+$' || { echo "invalid segment name: $segment" >&2; exit 1; }
+  end=$((start + segment_seconds))
+  [ "$end" -le "$cutoff" ] || continue
+  source_relative=${segment#"$root"/}
+  archive_relative=archive/${source_relative#segments/}.gz
+  archive_segment=$root/$archive_relative
+  manifest=$archive_segment.manifest.json
+  legacy_manifest=$segment.manifest.json
+  if [ -e "$legacy_manifest" ] || [ -e "$manifest" ]; then
+    continue
+  fi
+  source_state_before=$(source_state "$segment") || {
+    echo "segment is not a regular source: $segment" >&2
+    exit 1
+  }
+  source_sha=sha256:$(sha256sum "$segment" | awk '{print $1}')
+  source_bytes=$(wc -c < "$segment")
+  lines=$(wc -l < "$segment")
+  [ "$source_state_before" = "$(source_state "$segment")" ] || {
+    echo "source changed while reading: $segment" >&2
+    exit 1
+  }
+  receipt=$quarantine/$(receipt_id "$source_relative" "$source_sha").json
+  if [ -e "$receipt" ]; then
+    continue
+  fi
+  [ "$(tail -c 1 "$segment" | od -An -t u1 | tr -d ' ')" = 10 ] || {
+    echo "sealed segment lacks a final newline: $segment" >&2
+    exit 1
+  }
+  hour=$(date -u -d "@$start" +%Y/%m/%d/%H)
+  blob=$prefix/$hour/$start.jsonl.gz
+  if [ -n "$legacy_cutoff" ] && [ "$start" -lt "$legacy_cutoff" ]; then
+    schema_version=2
+    recorder='{}'
+  else
+    schema_version=4
+    recorder=$(sequence_summary "$segment") || {
+      echo "invalid recorder sequence proof: $segment" >&2
+      create_quarantine_receipt || exit 1
+      quarantine_found=1
+      continue
+    }
+  fi
+  install -d -m 0750 "${archive_segment%/*}"
+  if [ -e "$archive_segment" ]; then
+    gzip -t "$archive_segment"
+    archived_source_sha=sha256:$(gzip -dc "$archive_segment" | sha256sum | awk '{print $1}')
+    [ "$archived_source_sha" = "$source_sha" ] || {
+      echo "existing gzip sidecar disagrees with $segment" >&2
+      exit 1
+    }
+  else
+    temporary=$(mktemp "$archive_segment.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT HUP INT TERM
+    gzip -1 -n -c "$segment" > "$temporary"
+    chmod 0640 "$temporary"
+    gzip -t "$temporary"
+    sync -f "$temporary"
+    mv "$temporary" "$archive_segment"
+    trap - EXIT HUP INT TERM
+  fi
+  sha=sha256:$(sha256sum "$archive_segment" | awk '{print $1}')
+  bytes=$(wc -c < "$archive_segment")
+  temporary=$(mktemp "$manifest.XXXXXX")
+  trap 'rm -f "$temporary"' EXIT HUP INT TERM
+  jq -n \
+    --arg segment_path "$source_relative" \
+    --arg archive_path "$archive_relative" \
+    --arg blob_name "$blob" \
+    --arg sha256 "$sha" \
+    --arg source_sha256 "$source_sha" \
+    --argjson bytes "$bytes" \
+    --argjson source_bytes "$source_bytes" \
+    --argjson lines "$lines" \
+    --argjson segment_start_epoch "$start" \
+    --argjson segment_end_epoch "$end" \
+    --argjson schema_version "$schema_version" \
+    --argjson recorder "$recorder" \
+    '{schema_version:$schema_version,segment_path:$segment_path,archive_path:$archive_path,blob_name:$blob_name,compression:"gzip",sha256:$sha256,source_sha256:$source_sha256,bytes:$bytes,source_bytes:$source_bytes,lines:$lines,segment_start_epoch:$segment_start_epoch,segment_end_epoch:$segment_end_epoch} + $recorder' \
+    > "$temporary"
+  chmod 0640 "$temporary"
+  sync -f "$segment"
+  mv "$temporary" "$manifest"
+  trap - EXIT HUP INT TERM
+done < "$segment_list"
+rm -f "$segment_list"
+trap - EXIT HUP INT TERM
+quarantine_preflight
+
+if [ "${POLYEDGE_RING_SEAL_ONLY:-}" = 1 ]; then
+  [ "$quarantine_found" -eq 0 ] || exit 1
+  exit 0
+fi
+
+oci_put_immutable() {
+  _oci_file=$1
+  _oci_name=$2
+  _oci_sha256=$3
+  _oci_content_type=$4
+  _oci_checksum=$(printf '%s' "${_oci_sha256#sha256:}" | xxd -r -p | base64 -w0)
+  _oci_response=$(mktemp "$root/.oci-response.XXXXXX") || return 1
+  trap 'rm -f "$_oci_response"' EXIT HUP INT TERM
+  if ! "$oci_cli" os object put \
+      --auth instance_principal \
+      --region "$oci_region" \
+      --namespace-name "$oci_namespace" \
+      --bucket-name "$oci_bucket" \
+      --name "$_oci_name" \
+      --file "$_oci_file" \
+      --content-type "$_oci_content_type" \
+      --no-overwrite \
+      --no-multipart \
+      --opc-checksum-algorithm SHA256 \
+      --opc-content-sha256 "$_oci_checksum" \
+      --verify-checksum \
+      --output json >"$_oci_response"; then
+    "$oci_cli" os object head \
+      --auth instance_principal \
+      --region "$oci_region" \
+      --namespace-name "$oci_namespace" \
+      --bucket-name "$oci_bucket" \
+      --name "$_oci_name" \
+      --output json >"$_oci_response" || {
+        rm -f "$_oci_response"
+        trap - EXIT HUP INT TERM
+        return 1
+      }
+  fi
+  jq -er --arg checksum "$_oci_checksum" '
+    select(.["opc-content-sha256"] == $checksum) |
+    .etag | select(type == "string" and length > 0)
+  ' "$_oci_response" || {
+    echo "OCI object checksum disagrees: $_oci_name" >&2
+    rm -f "$_oci_response"
+    trap - EXIT HUP INT TERM
+    return 1
+  }
+  rm -f "$_oci_response"
+  trap - EXIT HUP INT TERM
+}
+
+oci_verify_remote() {
+  _oci_name=$1
+  _oci_sha256=$2
+  _oci_etag=$3
+  _oci_checksum=$(printf '%s' "${_oci_sha256#sha256:}" | xxd -r -p | base64 -w0)
+  _oci_response=$(mktemp "$root/.oci-response.XXXXXX") || return 1
+  trap 'rm -f "$_oci_response"' EXIT HUP INT TERM
+  if ! "$oci_cli" os object head \
+    --auth instance_principal \
+    --region "$oci_region" \
+    --namespace-name "$oci_namespace" \
+    --bucket-name "$oci_bucket" \
+    --name "$_oci_name" \
+    --output json >"$_oci_response"; then
+    rm -f "$_oci_response"
+    trap - EXIT HUP INT TERM
+    return 1
+  fi
+  jq -e --arg checksum "$_oci_checksum" --arg etag "$_oci_etag" \
+    '.["opc-content-sha256"] == $checksum and .etag == $etag' "$_oci_response" >/dev/null || {
+    echo "OCI object changed after upload: $_oci_name" >&2
+    rm -f "$_oci_response"
+    trap - EXIT HUP INT TERM
+    return 1
+  }
+  rm -f "$_oci_response"
+  trap - EXIT HUP INT TERM
+}
+
+oci_sync() {
+  : "${OCI_OBJECT_STORAGE_NAMESPACE:?set OCI_OBJECT_STORAGE_NAMESPACE}"
+  : "${OCI_OBJECT_STORAGE_BUCKET:?set OCI_OBJECT_STORAGE_BUCKET}"
+  : "${OCI_OBJECT_STORAGE_REGION:?set OCI_OBJECT_STORAGE_REGION}"
+  oci_cli=${POLYEDGE_OCI_CLI:-/home/ubuntu/.local/bin/oci}
+  oci_namespace=$OCI_OBJECT_STORAGE_NAMESPACE
+  oci_bucket=$OCI_OBJECT_STORAGE_BUCKET
+  oci_region=$OCI_OBJECT_STORAGE_REGION
+  case "$oci_cli" in /*) ;; *) echo 'POLYEDGE_OCI_CLI must be absolute' >&2; return 64 ;; esac
+  [ -x "$oci_cli" ] || { echo "OCI CLI is not executable: $oci_cli" >&2; return 1; }
+  command -v xxd >/dev/null && command -v base64 >/dev/null || { echo 'xxd and base64 are required' >&2; return 1; }
+  printf '%s' "$oci_namespace" | grep -Eq '^[A-Za-z0-9_-]+$' || { echo 'invalid OCI namespace' >&2; return 64; }
+  printf '%s' "$oci_bucket" | grep -Eq '^[A-Za-z0-9._-]+$' || { echo 'invalid OCI bucket' >&2; return 64; }
+  printf '%s' "$oci_region" | grep -Eq '^[a-z0-9-]+$' || { echo 'invalid OCI region' >&2; return 64; }
+  _oci_retention_hours=${POLYEDGE_RING_RETENTION_HOURS:-48}
+  printf '%s' "$_oci_retention_hours" | grep -Eq '^[1-9][0-9]*$' &&
+    [ "$_oci_retention_hours" -ge 48 ] && [ "$_oci_retention_hours" -le 876000 ] || {
+    echo 'POLYEDGE_RING_RETENTION_HOURS must be from 48 through 876000' >&2
+    return 64
+  }
+  _oci_retention_seconds=$((_oci_retention_hours * 3600))
+  _oci_now=$(date -u +%s)
+  _oci_deleted=0
+
+  _oci_manifest_list=$(mktemp "$root/.oci-manifests.XXXXXX") || return 1
+  trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
+  find "$archive" -type f -name '*.jsonl.gz.manifest.json' -print | LC_ALL=C sort >"$_oci_manifest_list"
+  while IFS= read -r _oci_manifest; do
+    _oci_payload=${_oci_manifest%.manifest.json}
+    _oci_receipt=$_oci_manifest.oci-uploaded.json
+    [ ! -L "$_oci_manifest" ] && [ -f "$_oci_manifest" ] &&
+      [ ! -L "$_oci_payload" ] && [ -f "$_oci_payload" ] || {
+      echo "invalid OCI ring upload input: $_oci_manifest" >&2
+      return 1
+    }
+    _oci_archive_path=${_oci_payload#"$root"/}
+    _oci_blob=$(jq -er --arg archive_path "$_oci_archive_path" --arg prefix "$prefix/" '
+      select(
+        (.schema_version == 2 or .schema_version == 3 or .schema_version == 4) and
+        .compression == "gzip" and
+        .archive_path == $archive_path and
+        (.segment_path | type == "string" and startswith("segments/") and endswith(".jsonl")) and
+        (.segment_end_epoch | type == "number" and floor == . and . > 0 and . <= 4102444800) and
+        (.blob_name | type == "string" and startswith($prefix) and endswith(".jsonl.gz")) and
+        (.sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+      ) | .blob_name
+    ' "$_oci_manifest") || { echo "invalid OCI ring manifest: $_oci_manifest" >&2; return 1; }
+    _oci_payload_sha=$(jq -r '.sha256' "$_oci_manifest")
+    _oci_manifest_sha=sha256:$(sha256sum "$_oci_manifest" | awk '{print $1}')
+    _oci_manifest_blob=$_oci_blob.manifest.json
+    if [ -e "$_oci_receipt" ] || [ -L "$_oci_receipt" ]; then
+      [ ! -L "$_oci_receipt" ] && [ -f "$_oci_receipt" ] && jq -e \
+        --arg namespace "$oci_namespace" \
+        --arg bucket "$oci_bucket" \
+        --arg region "$oci_region" \
+        --arg blob "$_oci_blob" \
+        --arg blob_sha "$_oci_payload_sha" \
+        --arg manifest_blob "$_oci_manifest_blob" \
+        --arg manifest_sha "$_oci_manifest_sha" '
+          type == "object" and
+          keys == ["blob_etag","blob_name","blob_sha256","bucket_name","manifest_blob_etag","manifest_blob_name","manifest_sha256","namespace","region","schema","verified_ts"] and
+          .schema == "polyedge_oci_ring_upload.v1" and
+          .namespace == $namespace and .bucket_name == $bucket and .region == $region and
+          .blob_name == $blob and .blob_sha256 == $blob_sha and
+          .manifest_blob_name == $manifest_blob and .manifest_sha256 == $manifest_sha and
+          (.blob_etag | type == "string" and length > 0) and
+          (.manifest_blob_etag | type == "string" and length > 0) and
+          (.verified_ts | type == "string" and length > 0)
+        ' "$_oci_receipt" >/dev/null || {
+        echo "invalid OCI ring upload receipt: $_oci_receipt" >&2
+        return 1
+      }
+    else
+      [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
+        echo "OCI ring payload changed: $_oci_payload" >&2
+        return 1
+      }
+      _oci_blob_etag=$(oci_put_immutable "$_oci_payload" "$_oci_blob" "$_oci_payload_sha" application/gzip) || return 1
+      _oci_manifest_etag=$(oci_put_immutable "$_oci_manifest" "$_oci_manifest_blob" "$_oci_manifest_sha" application/json) || return 1
+      _oci_temporary=$(mktemp "$_oci_receipt.XXXXXX") || return 1
+      trap 'rm -f "$_oci_temporary" "$_oci_manifest_list"' EXIT HUP INT TERM
+      jq -n \
+        --arg namespace "$oci_namespace" \
+        --arg bucket "$oci_bucket" \
+        --arg region "$oci_region" \
+        --arg blob "$_oci_blob" \
+        --arg blob_sha "$_oci_payload_sha" \
+        --arg blob_etag "$_oci_blob_etag" \
+        --arg manifest_blob "$_oci_manifest_blob" \
+        --arg manifest_sha "$_oci_manifest_sha" \
+        --arg manifest_etag "$_oci_manifest_etag" \
+        --arg verified_ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{schema:"polyedge_oci_ring_upload.v1",namespace:$namespace,bucket_name:$bucket,region:$region,blob_name:$blob,blob_sha256:$blob_sha,blob_etag:$blob_etag,manifest_blob_name:$manifest_blob,manifest_sha256:$manifest_sha,manifest_blob_etag:$manifest_etag,verified_ts:$verified_ts}' \
+        >"$_oci_temporary"
+      chmod 0640 "$_oci_temporary"
+      sync -f "$_oci_temporary"
+      mv "$_oci_temporary" "$_oci_receipt"
+      sync -f "$_oci_receipt"
+      trap 'rm -f "$_oci_manifest_list"' EXIT HUP INT TERM
+    fi
+
+    _oci_segment_end=$(jq -r '.segment_end_epoch' "$_oci_manifest")
+    if [ "$_oci_now" -ge $((_oci_segment_end + _oci_retention_seconds)) ]; then
+      _oci_source_relative=$(jq -r '.segment_path' "$_oci_manifest")
+      case "$_oci_source_relative" in segments/*/*.jsonl) ;; *) echo "invalid OCI ring source path: $_oci_manifest" >&2; return 1 ;; esac
+      case "/$_oci_source_relative/" in *'/./'*|*'/../'*|*'//'*) echo "non-canonical OCI ring source path: $_oci_manifest" >&2; return 1 ;; esac
+      _oci_source=$root/$_oci_source_relative
+      if [ -e "$_oci_source" ] || [ -L "$_oci_source" ]; then
+        [ ! -L "$_oci_source" ] && [ -f "$_oci_source" ] || { echo "invalid OCI ring source: $_oci_source" >&2; return 1; }
+        [ "$(stat -c %s "$_oci_source")" = "$(jq -r '.source_bytes' "$_oci_manifest")" ] &&
+          [ "sha256:$(sha256sum "$_oci_source" | awk '{print $1}')" = "$(jq -r '.source_sha256' "$_oci_manifest")" ] || {
+          echo "OCI ring source changed before retention: $_oci_source" >&2
+          return 1
+        }
+      fi
+      [ "$_oci_payload_sha" = "sha256:$(sha256sum "$_oci_payload" | awk '{print $1}')" ] || {
+        echo "OCI ring payload changed before retention: $_oci_payload" >&2
+        return 1
+      }
+      oci_verify_remote "$_oci_blob" "$_oci_payload_sha" "$(jq -r '.blob_etag' "$_oci_receipt")" || return 1
+      oci_verify_remote "$_oci_manifest_blob" "$_oci_manifest_sha" "$(jq -r '.manifest_blob_etag' "$_oci_receipt")" || return 1
+      rm -f "$_oci_source" "$_oci_payload" "$_oci_manifest"
+      _oci_deleted=$((_oci_deleted + 1))
+    fi
+  done <"$_oci_manifest_list"
+  rm -f "$_oci_manifest_list"
+  trap - EXIT HUP INT TERM
+  [ "$_oci_deleted" -eq 0 ] || echo "OCI ring retention deleted $_oci_deleted verified local segments"
+}
+
+case "${POLYEDGE_AZURE_RING_UPLOAD_ENABLED:-1}" in
+1)
+: "${POLYEDGE_RING_IMAGE:?set an immutable POLYEDGE_RING_IMAGE}"
+: "${AZURE_STORAGE_ACCOUNT_NAME:?set AZURE_STORAGE_ACCOUNT_NAME}"
+: "${AZURE_STORAGE_CONTAINER_NAME:?set AZURE_STORAGE_CONTAINER_NAME}"
+printf '%s' "$POLYEDGE_RING_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' || {
+  echo 'POLYEDGE_RING_IMAGE must be an immutable GHCR digest' >&2
+  exit 64
+}
+set -- /usr/bin/podman run --rm --pull=never --log-driver=journald --name polyedge-ring-upload \
+  --cpus 0.5 --memory 1g --pids-limit 256 \
+  --read-only --cap-drop=all --cap-add=DAC_OVERRIDE \
+  --env AZURE_STORAGE_ACCOUNT_NAME \
+  --env AZURE_STORAGE_CONTAINER_NAME \
+  -v "$segments:/srv/polyedge-ring/segments:Z" \
+  -v "$archive:/srv/polyedge-ring/archive:Z"
+
+case "${POLYEDGE_AZURE_ARC_IDENTITY:-0}" in
+  1)
+    test -d /var/opt/azcmagent/tokens || {
+      echo 'Azure Arc identity token directory is unavailable' >&2
+      exit 1
+    }
+    himds_gid=$(getent group himds | cut -d: -f3)
+    printf '%s' "$himds_gid" | grep -Eq '^[0-9]+$' || {
+      echo 'Azure Arc himds group is unavailable' >&2
+      exit 1
+    }
+    set -- "$@" \
+      --network host \
+      --group-add "$himds_gid" \
+      --env IDENTITY_ENDPOINT=http://127.0.0.1:40342/metadata/identity/oauth2/token \
+      --env IMDS_ENDPOINT=http://127.0.0.1:40342 \
+      -v /var/opt/azcmagent/tokens:/var/opt/azcmagent/tokens:ro
+    ;;
+  0)
+    : "${AZURE_TENANT_ID:?set AZURE_TENANT_ID}"
+    : "${AZURE_CLIENT_ID:?set AZURE_CLIENT_ID}"
+    set -- "$@" \
+      --network polyedge \
+      --env AZURE_TENANT_ID \
+      --env AZURE_CLIENT_ID \
+      --env AZURE_CLIENT_SECRET_FILE=/run/credentials/azure-client-secret \
+      -v /etc/polyedge/credentials/research:/run/credentials:ro,Z
+    ;;
+  *)
+    echo 'POLYEDGE_AZURE_ARC_IDENTITY must equal 0 or 1' >&2
+    exit 64
+    ;;
+esac
+
+"$@" "$POLYEDGE_RING_IMAGE" polyedge-rs ring-upload \
+    --root /srv/polyedge-ring \
+    --blob-prefix "$prefix" \
+    --retention-hours "${POLYEDGE_RING_RETENTION_HOURS:-48}"
+;;
+0)
+  [ "${POLYEDGE_OCI_OBJECT_STORAGE_ENABLED:-0}" = 1 ] || {
+    echo 'OCI Object Storage must be enabled when Azure ring upload is disabled' >&2
+    exit 64
+  }
+;;
+*) echo 'POLYEDGE_AZURE_RING_UPLOAD_ENABLED must equal 0 or 1' >&2; exit 64 ;;
+esac
+
+case "${POLYEDGE_OCI_OBJECT_STORAGE_ENABLED:-0}" in
+  1) oci_sync ;;
+  0) ;;
+  *) echo 'POLYEDGE_OCI_OBJECT_STORAGE_ENABLED must equal 0 or 1' >&2; exit 64 ;;
+esac
+
+POLYEDGE_RING_POST_UPLOAD_SEAL=1 "$0"

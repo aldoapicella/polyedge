@@ -1,0 +1,31 @@
+[Unit]
+Description=PolyEdge dashboard frontend
+Wants=network-online.target
+After=network-online.target polyedge-network.service polyedge-api.service
+Requires=polyedge-network.service
+
+[Container]
+# Replace the all-zero digest with the reviewed ARM64 image digest.
+Image=registry.example.invalid/polyedge-frontend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+ContainerName=polyedge-frontend
+Network=polyedge.network
+PublishPort=127.0.0.1:3000:3000
+EnvironmentFile=/etc/polyedge/frontend.env
+Secret=polyedge-api-bearer-token,type=env,target=BACKEND_API_BEARER_TOKEN
+Secret=polyedge-dashboard-auth-password,type=env,target=DASHBOARD_AUTH_PASSWORD
+Secret=polyedge-dashboard-session-secret,type=env,target=DASHBOARD_SESSION_SECRET
+HealthCmd=node -e "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=30s
+HealthOnFailure=kill
+PodmanArgs=--cpus=0.5 --memory=1g --pids-limit=512 --stop-timeout=30 --pull=never --log-driver=journald
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PolyEdge previous-hour quality audit (UTC)
+
+[Timer]
+OnCalendar=*-*-* *:12:00 UTC
+Persistent=true
+Unit=polyedge-job@hourly.service
+
+[Install]
+WantedBy=timers.target

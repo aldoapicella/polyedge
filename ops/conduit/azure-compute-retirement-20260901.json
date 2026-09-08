@@ -1,0 +1,64 @@
+{
+  "schema": "polyedge.azure_compute_retirement.v1",
+  "capturedAtUtc": "2026-09-01T02:05:35Z",
+  "scope": "compute_and_network_only",
+  "oci": {
+    "host": "conduit-dev",
+    "publicFrontend": "https://polyedge.149.130.186.60.nip.io",
+    "publicFrontendStatus": 200,
+    "oidcIssuer": "https://oidc.jupiterlabs.dev",
+    "servicesHealthy": [
+      "polyedge-api.service",
+      "polyedge-frontend.service",
+      "polyedge-funded-intent-producer.service",
+      "polyedge-funded-signer.service",
+      "polyedge-shadow-qset-v7.service"
+    ]
+  },
+  "deleted": {
+    "containerApps": 4,
+    "containerAppJobs": 19,
+    "managedEnvironments": 3,
+    "managedInfrastructureResourceGroups": 2,
+    "natGateways": 2,
+    "egressPublicIps": 2,
+    "virtualNetworks": 2,
+    "computeScheduledQueryRules": 11,
+    "computeMetricAlerts": 1,
+    "legacyManagedIdentities": 10,
+    "legacyRoleAssignments": 65
+  },
+  "remainingComputeNetworkCounts": {
+    "containerApps": 0,
+    "containerAppJobs": 0,
+    "managedEnvironments": 0,
+    "managedLoadBalancers": 0,
+    "natGateways": 0,
+    "publicIps": 0,
+    "virtualNetworks": 0
+  },
+  "retainedAzure": {
+    "storageAccount": "stpolyedge6urdjr5nmwx7w",
+    "keyVault": "kvpolyedge6urdjr5nmwx7w",
+    "serviceBusNamespace": "sb-polyedge-funded-cl-6urdjr5nmwx7w",
+    "containerRegistry": "crpolyedge6urdjr5nmwx7w",
+    "logAnalyticsWorkspace": "log-polyedge-dev-6urdjr5nmwx7w",
+    "arcMachine": "conduit-dev",
+    "managedIdentityCount": 17,
+    "metricAlerts": [
+      "polyedge-dev-blob-ingress-zero-10m",
+      "polyedge-dev-blob-transactions-zero-10m",
+      "polyedge-funded-direct-dead-letters"
+    ]
+  },
+  "fundedQueue": {
+    "name": "funded-dynamic-quote-intents",
+    "status": "Active",
+    "activeMessageCount": 0,
+    "scheduledMessageCount": 0,
+    "deadLetterMessageCount": 1346,
+    "transferDeadLetterMessageCount": 0
+  },
+  "credentialsRotated": false,
+  "campaignRepairDeferred": true
+}

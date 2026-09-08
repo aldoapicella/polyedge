@@ -1,0 +1,11 @@
+[Unit]
+Description=Run qset-v5 post-boundary guard at the exact UTC handoff window
+
+[Timer]
+OnCalendar=2026-08-26 00:01:30 UTC
+AccuracySec=1s
+Persistent=false
+Unit=polyedge-qset-v5-boundary@post.service
+
+[Install]
+WantedBy=timers.target

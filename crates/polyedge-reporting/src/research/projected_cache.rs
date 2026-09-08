@@ -902,7 +902,7 @@ impl RawSourceInventoryCanonical {
             !blob.name.starts_with(&self.prefix)
                 || !blob.name.ends_with(".jsonl")
                 || blob.blob_type.as_deref() != Some("AppendBlob")
-                || blob.sealed.is_none()
+                || blob.sealed != Some(true)
                 || blob
                     .last_modified
                     .as_deref()
@@ -1718,7 +1718,13 @@ mod tests {
         )
         .unwrap();
         let original_identity = inventory.canonical_sha256.clone();
+        assert!(!inventory
+            .canonical
+            .canonical_blob_names_invalid_for_prefix());
         let mut mutated = inventory;
+        mutated.canonical.blobs[0].sealed = Some(false);
+        assert!(mutated.canonical.canonical_blob_names_invalid_for_prefix());
+        mutated.canonical.blobs[0].sealed = Some(true);
         mutated.canonical.blobs[0].etag = Some("source-etag-b".to_owned());
 
         let stale_hash_error = validate_raw_source_inventory(&mutated).unwrap_err();

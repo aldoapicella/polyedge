@@ -1,0 +1,581 @@
+#!/bin/sh
+set -eu
+
+die() { echo "polyedge-parity-record-daily: $*" >&2; exit 1; }
+sha_raw() { sha256sum "$1" | awk '{print $1}'; }
+sha() { printf 'sha256:%s\n' "$(sha_raw "$1")"; }
+
+expected_uid=${POLYEDGE_PARITY_EXPECTED_UID:-0}
+expected_gid=${POLYEDGE_PARITY_EXPECTED_GID:-0}
+secure_file() {
+  file=$1
+  [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c %h "$file")" = 1 ] || die "unsafe or missing file: $file"
+}
+secure_owned_file() {
+  file=$1 mode=$2
+  secure_file "$file"
+  set -- $(stat -c '%u %g %a' "$file")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] && [ "$3" = "$mode" ] \
+    || die "wrong owner or mode: $file"
+}
+secure_dir() {
+  dir=$1
+  [ ! -L "$dir" ] && [ -d "$dir" ] || die "unsafe or missing directory: $dir"
+  set -- $(stat -c '%u %g %a' "$dir")
+  [ "$1" = "$expected_uid" ] && [ "$2" = "$expected_gid" ] || die "wrong directory owner: $dir"
+  case "$3" in 700|750|755) ;; *) die "unsafe directory mode: $dir" ;; esac
+}
+
+env_file=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
+if [ "${POLYEDGE_PARITY_BINDINGS_FROZEN:-}" != 1 ]; then
+  secure_owned_file "$env_file" 640
+  set -a
+  . "$env_file"
+  set +a
+fi
+
+lock_file=${POLYEDGE_PARITY_LOCK_FILE:-/run/polyedge/parity-ledger.lock}
+lock_ledger() {
+  lock_dir=${lock_file%/*}
+  secure_dir "$lock_dir"
+  if [ ! -e "$lock_file" ]; then
+    (umask 027; : >"$lock_file")
+  fi
+  secure_owned_file "$lock_file" 640
+  exec 9<>"$lock_file"
+  /usr/bin/flock -w 300 9 || die 'timed out waiting for the parity ledger lock'
+}
+
+: "${POLYEDGE_PARITY_WINDOW_START_UTC:?set the exact formal window start}"
+: "${POLYEDGE_PARITY_LEDGER:?set the formal ledger path}"
+: "${POLYEDGE_PARITY_EXPECTED_GIT_SHA:?set the approved formal-window source commit}"
+: "${POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE:?set the approved formal-window image digest}"
+funded_mode=${POLYEDGE_PARITY_FUNDED_MODE:-disabled}
+case "$funded_mode" in
+  disabled)
+    funded_enabled=false
+    funded_image= funded_revision= funded_rollout_receipt= funded_rollout_sha= funded_user= funded_session= funded_session_sha= funded_config_sha=
+    funded_service_bus_dlq=null
+    funded_producer_image= funded_producer_user= funded_producer_config_sha=
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:-}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:-}
+    [ -z "$parity_collector_sha$reboot_validator_sha" ] || {
+      [ -n "$parity_collector_sha" ] && [ -n "$reboot_validator_sha" ] || die 'disabled parity helper hashes must be supplied together'
+      for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'; done
+    }
+    ;;
+  active)
+    funded_enabled=true
+    funded_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE:?set the approved funded image}
+    funded_revision=${POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION:?set the approved funded revision}
+    funded_rollout_receipt=${POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT:?set the funded rollout receipt}
+    funded_rollout_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256:?set the funded rollout receipt hash}
+    funded_service_bus_dlq=${POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ:?set the funded DLQ baseline}
+    funded_user=${POLYEDGE_PARITY_FUNDED_UID:?set the funded UID}:${POLYEDGE_PARITY_FUNDED_GID:?set the funded GID}
+    funded_session=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID:?set the funded session}
+    funded_session_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256:?set the funded session hash}
+    funded_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256:?set the funded config hash}
+    parity_collector_sha=${POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256:?set the approved parity collector hash}
+    reboot_validator_sha=${POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256:?set the approved reboot validator hash}
+    printf '%s' "$funded_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-venue-probe@sha256:[0-9a-f]{64}$' || die 'expected funded image is malformed'
+    printf '%s' "$funded_revision" | grep -Eq '^[0-9a-f]{40}$' || die 'expected funded revision is malformed'
+    printf '%s' "$funded_rollout_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded rollout receipt hash is malformed'
+    printf '%s' "$funded_service_bus_dlq" | grep -Eq '^[0-9]+$' || die 'expected funded DLQ baseline is malformed'
+    printf '%s' "$funded_user" | grep -Eq '^[0-9]+:[0-9]+$' || die 'expected funded user is malformed'
+    printf '%s' "$funded_session" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$' || die 'expected funded session is malformed'
+    for funded_hash in "$funded_session_sha" "$funded_config_sha"; do
+      printf '%s' "$funded_hash" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'expected funded binding hash is malformed'
+    done
+    for helper_sha in "$parity_collector_sha" "$reboot_validator_sha"; do
+      printf '%s' "$helper_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' || die 'approved parity helper hash is malformed'
+    done
+    funded_producer_image=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE:?set the approved funded producer image}
+    funded_producer_user=984:980
+    funded_producer_config_sha=${POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256:?set the funded producer config hash}
+    printf '%s' "$funded_producer_image" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+      || die 'expected funded producer image is malformed'
+    printf '%s' "$funded_producer_config_sha" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+      || die 'expected funded producer config hash is malformed'
+    ;;
+  *) die 'formal funded mode must equal disabled or active' ;;
+esac
+collector_bin=${POLYEDGE_PARITY_COLLECTOR_BIN:-/usr/local/libexec/polyedge-parity-hourly}
+reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+if [ -n "$parity_collector_sha$reboot_validator_sha" ]; then
+  secure_owned_file "$collector_bin" 755
+  secure_owned_file "$reboot_validator" 755
+  [ "$(sha "$collector_bin")" = "$parity_collector_sha" ] || die 'installed parity collector hash differs from the formal binding'
+  [ "$(sha "$reboot_validator")" = "$reboot_validator_sha" ] || die 'installed reboot validator hash differs from the formal binding'
+fi
+
+subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+resource_group=rg-polyedge-dev
+service_bus_namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+service_bus_queue=funded-dynamic-quote-intents
+runuser_bin=${POLYEDGE_RUNUSER_BIN:-/usr/sbin/runuser}
+az_bin=${POLYEDGE_AZ_BIN:-/usr/bin/az}
+validate_service_bus_snapshot() {
+  queue_json=$("$runuser_bin" -u ubuntu -- "$az_bin" servicebus queue show \
+    --subscription "$subscription" --resource-group "$resource_group" \
+    --namespace-name "$service_bus_namespace" --name "$service_bus_queue" --only-show-errors -o json) \
+    || die 'funded Service Bus queue snapshot is unreadable'
+  printf '%s' "$queue_json" | jq -e --argjson dlq "$funded_service_bus_dlq" '
+    .status == "Active" and .countDetails.activeMessageCount == 0 and
+    .countDetails.scheduledMessageCount == 0 and .countDetails.deadLetterMessageCount == $dlq
+  ' >/dev/null || die 'funded Service Bus queue differs from the immutable DLQ baseline'
+  unset queue_json
+}
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || die 'expected source commit is malformed'
+printf '%s' "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$' \
+  || die 'expected research image is malformed'
+[ "${POLYEDGE_RESEARCH_IMAGE:-}" = "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" ] || die 'daily job image differs from the formal-window image'
+target=${1:?usage: polyedge-parity-record-daily YYYY-MM-DD}
+printf '%s' "$target" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die 'cycle date is malformed'
+target_epoch=$(date -u -d "$target 00:00:00Z" +%s) || die 'cycle date is invalid'
+[ "$(date -u -d "@$target_epoch" +%Y-%m-%d)" = "$target" ] || die 'cycle date is not canonical UTC'
+window_epoch=$(date -u -d "$POLYEDGE_PARITY_WINDOW_START_UTC" +%s) || die 'formal window start is invalid'
+[ "$(date -u -d "@$window_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$POLYEDGE_PARITY_WINDOW_START_UTC" ] \
+  || die 'formal window start is not canonical UTC'
+first_date=$(date -u -d "@$window_epoch" +%Y-%m-%d)
+first_epoch=$(date -u -d "$first_date 00:00:00Z" +%s)
+if [ "$window_epoch" -ne "$first_epoch" ]; then
+  first_epoch=$((first_epoch + 86400))
+fi
+if [ "$target_epoch" -lt "$first_epoch" ]; then
+  echo "daily cycle $target excluded before first full UTC day; ledger unchanged"
+  exit 0
+fi
+
+ring=${POLYEDGE_PARITY_RING_ROOT:-/srv/polyedge-ring}
+parity_root=$ring/parity
+daily_root=$parity_root/daily
+report_root=${POLYEDGE_PARITY_DAILY_REPORT_ROOT:-$ring/jobs/research/reports/research/daily}
+normalized_root=${POLYEDGE_PARITY_DAILY_DATA_ROOT:-$ring/jobs/research/data/research/daily}
+ring_status=${POLYEDGE_PARITY_RING_STATUS:-$ring/status.json}
+boot_root=${POLYEDGE_PARITY_BOOT_ROOT:-/}
+boot_floor=${POLYEDGE_PARITY_BOOT_MIN_FREE_BYTES:-16106127360}
+ring_floor=${POLYEDGE_JOB_MIN_FREE_BYTES:-42949672960}
+pause_file=${POLYEDGE_PARITY_PAUSE_FILE:-/run/polyedge/image-pulls-paused}
+
+mountpoint -q "$ring" || die 'ring root is not a mount point'
+ledger_dir=${POLYEDGE_PARITY_LEDGER%/*}
+ledger_name=${POLYEDGE_PARITY_LEDGER##*/}
+[ "$ledger_dir" = "$parity_root" ] && printf '%s' "$ledger_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.json$' \
+  || die 'formal ledger must be a direct .json child of the parity root'
+if [ "$funded_mode" = active ]; then
+  printf '%s' "$ledger_name" | grep -Eq '^[0-9]{8}T[0-9]{6}Z-funded-active\.json$' \
+    || die 'active funded parity requires a distinct funded-active ledger'
+fi
+if [ "$funded_enabled" = true ]; then
+  [ "$funded_rollout_receipt" = "$parity_root/activation/20260826T185115Z-approved-automatic-redemption-restore/post-redemption-venue-redemption-20260826185822229-5506e167-attestation.json" ] \
+    || die 'funded rollout receipt path differs from the approved activation receipt'
+  if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
+    [ "$funded_rollout_sha" = sha256:b36e20b5aef7463f539c4dd613d6f85748f9bb3e872121767bbd164a6c962faf ] \
+      || die 'funded rollout receipt hash differs from the approved post-redemption attestation'
+    [ "$funded_service_bus_dlq" = 1346 ] || die 'funded Service Bus baseline differs from the live attestation'
+  fi
+  secure_owned_file "$funded_rollout_receipt" 640
+  [ "$(sha "$funded_rollout_receipt")" = "$funded_rollout_sha" ] || die 'funded rollout receipt hash mismatch'
+  jq -e --arg image "$funded_image" --arg revision "$funded_revision" --arg producer_image "$funded_producer_image" \
+    --argjson dlq "$funded_service_bus_dlq" '
+    .schema == "polyedge.funded_signer_post_redemption_attestation.v1" and .status == "attested" and
+    (.createdAtUtc | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    (.helperSha256 | test("^sha256:[0-9a-f]{64}$")) and .authorizedDeadLetterBaseline == $dlq and
+    .runtime.signer.image == $image and .runtime.signer.revision == $revision and
+    (.runtime.signer.invocationId | test("^[0-9a-f]{32}$")) and (.runtime.signer.containerId | test("^[0-9a-f]{64}$")) and
+    .runtime.signer.restartCount == 0 and .runtime.signer.user == "986:982" and
+    .runtime.producer.image == $producer_image and (.runtime.producer.revision | test("^[0-9a-f]{40}$")) and
+    (.runtime.producer.invocationId | test("^[0-9a-f]{32}$")) and (.runtime.producer.containerId | test("^[0-9a-f]{64}$")) and
+    .runtime.producer.restartCount == 0 and .runtime.producer.user == "984:980" and
+    .runtime.producer.status == "running" and .runtime.producer.health == "healthy" and
+    (.redemption.transactionHash | test("^0x[0-9a-f]{64}$")) and (.redemption.settlementBlob | type == "string" and length > 0) and
+    .heartbeat.failedMessages == 0 and .heartbeat.failedAttempts == 0 and
+    .heartbeat.executor.busy == false and .heartbeat.executor.user_channel_ready == true and
+    .heartbeat.executor.market_channel_ready == true and .heartbeat.executor.user_channel_gaps == 0 and
+    .heartbeat.executor.market_channel_gaps == 0 and .heartbeat.executor.user_channel_unparsed == 0 and
+    .heartbeat.executor.market_channel_unparsed == 0 and .heartbeat.executor.reconnect_reconciliation_required == false and
+    .heartbeat.executor.safety_snapshot_cache_ready == true and .heartbeat.executor.safety_snapshot_open_order_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_position_count == 0 and
+    .heartbeat.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+    .heartbeat.executor.safety_snapshot_cache_error == null and .heartbeat.executor.risk_reservation_index_ready == true and
+    .queue.after == {status:"Active",activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq} and
+    .queue.deadLetterNonGrowth == true and .servicesMutated == false and .staleRecoveryReceiptsAccepted == false and
+    .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
+  ' "$funded_rollout_receipt" >/dev/null || die 'funded rollout receipt differs from the formal binding'
+  if [ "$parity_root" = /srv/polyedge-ring/parity ]; then
+    jq -e '.helperSha256 == "sha256:9014e37eb1c731233789521648368fad0219b2b569aa75eeabebd7d739ccf51b" and
+      .runtime.signer.image == "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:6fa635f016811b7a0506ddcc40a6b273435c8e619de09b6b7aae116b21544ea4" and .runtime.signer.revision == "c37ab84c3abb49be024e8489fa078eeaef0bbf42" and
+      .runtime.signer.invocationId == "767d7aa472744206975680575cb94527" and .runtime.signer.containerId == "95f6fa69fc0827e2e6db3c505d40944b400425c64625aabb6d7cebc973f284ec" and
+      .runtime.producer.image == "ghcr.io/aldoapicella/polyedge-rust-backend@sha256:9eb1b04b01b131bd440bb956c8784e8e493a6e03fe4f03aeb27142284c6fcba8" and .runtime.producer.revision == "72224c12d0790c02d98be7ece8fbcb781b6412e4" and
+      .runtime.producer.invocationId == "44dc5970872d4811977c20a030fc0a68" and .runtime.producer.containerId == "331908a3afdfc213970928516cd90e7d2973ee790fb2e6d9e8c3271b14d3da6c"' "$funded_rollout_receipt" >/dev/null \
+      || die 'live attestation runtime identity differs from the approved values'
+  fi
+  validate_service_bus_snapshot
+fi
+
+secure_owned_file "$POLYEDGE_PARITY_LEDGER" 640
+validate_ledger() {
+  jq -e --arg start "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg mode "$funded_mode" --arg image "$funded_image" \
+    --arg user "$funded_user" --arg session "$funded_session" --arg session_sha "$funded_session_sha" \
+    --arg revision "$funded_revision" --arg rollout "$funded_rollout_receipt" --arg rollout_sha "$funded_rollout_sha" \
+    --arg config_sha "$funded_config_sha" --arg producer_image "$funded_producer_image" --argjson dlq "$funded_service_bus_dlq" \
+    --arg producer_user "$funded_producer_user" --arg producer_config_sha "$funded_producer_config_sha" \
+    --arg collector_sha "$parity_collector_sha" --arg validator_sha "$reboot_validator_sha" \
+    --argjson funded "$funded_enabled" '
+    .schemaVersion == 1 and .status == "in_progress" and .windowStartUtc == $start and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    (.acceptedCleanLiveHours | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedHourlyEvidence? // []) | type == "array") and
+    ((.completedDailyCycles? // 0) | type == "number" and . >= 0 and floor == .) and
+    ((.acceptedDailyEvidence? // []) | type == "array") and
+    (.rebootRecoveryPassed | type == "boolean") and .shadowQsetEnabled == false and .fundedSignerEnabled == $funded and
+    (if $funded then .fundedSignerMode == $mode and .fundedSignerImage == $image and .fundedSignerUser == $user and
+      .fundedSignerRevision == $revision and .fundedRolloutReceiptPath == $rollout and
+      .fundedRolloutReceiptSha256 == $rollout_sha and .fundedServiceBusDlqBaseline == $dlq and
+      .parityCollectorSha256 == $collector_sha and .rebootValidatorSha256 == $validator_sha and
+      .fundedSessionId == $session and .fundedSessionManifestSha256 == $session_sha and .fundedConfigSha256 == $config_sha and
+      .fundedIntentProducerEnabled == true and .fundedIntentProducerImage == $producer_image and
+      .fundedIntentProducerUser == $producer_user and .fundedIntentProducerConfigSha256 == $producer_config_sha
+     else (.fundedSignerMode? // "disabled") == "disabled" and (.fundedSignerImage? // null) == null and
+      (.fundedSignerRevision? // null) == null and (.fundedRolloutReceiptPath? // null) == null and
+      (.fundedRolloutReceiptSha256? // null) == null and (.fundedServiceBusDlqBaseline? // null) == null and
+      (($collector_sha == "" and (.parityCollectorSha256? // null) == null and (.rebootValidatorSha256? // null) == null) or
+       ($collector_sha != "" and .parityCollectorSha256 == $collector_sha and .rebootValidatorSha256 == $validator_sha)) and
+      (.fundedSignerUser? // null) == null and (.fundedSessionId? // null) == null and
+      (.fundedSessionManifestSha256? // null) == null and (.fundedConfigSha256? // null) == null and
+      (.fundedIntentProducerEnabled? // false) == false and (.fundedIntentProducerImage? // null) == null and
+      (.fundedIntentProducerUser? // null) == null and (.fundedIntentProducerConfigSha256? // null) == null end)
+  ' "$POLYEDGE_PARITY_LEDGER" >/dev/null || die 'formal ledger is malformed or a protected gate changed'
+  reboot_validator=${POLYEDGE_REBOOT_ATTESTATION_BIN:-/usr/local/libexec/polyedge-reboot-attestation}
+  [ ! -L "$reboot_validator" ] && [ -x "$reboot_validator" ] || die 'reboot attestation validator is missing or unsafe'
+  "$reboot_validator" validate-ledger || die 'reboot recovery evidence is invalid'
+}
+validate_daily_producer_binding() {
+  jq -e --arg image "$funded_producer_image" --arg user "$funded_producer_user" \
+    --arg config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" '
+    .fundedIntentProducerEnabled == $funded and
+    (if $funded then .fundedIntentProducerImage == $image and .fundedIntentProducerUser == $user and
+      .fundedIntentProducerConfigSha256 == $config_sha
+     else .fundedIntentProducerImage == null and .fundedIntentProducerUser == null and
+      .fundedIntentProducerConfigSha256 == null end)
+  ' "$1" >/dev/null
+}
+validate_daily_funded_binding() {
+  jq -e --arg revision "$funded_revision" --arg receipt "$funded_rollout_receipt" \
+    --arg receipt_sha "$funded_rollout_sha" --arg collector_sha "$parity_collector_sha" \
+    --arg validator_sha "$reboot_validator_sha" --argjson dlq "$funded_service_bus_dlq" --argjson funded "$funded_enabled" '
+    if $funded then
+      .fundedSignerRevision == $revision and .fundedRolloutReceipt == {path:$receipt,sha256:$receipt_sha} and
+      .fundedServiceBusDlqBaseline == $dlq and .parityCollectorSha256 == $collector_sha and
+      .rebootValidatorSha256 == $validator_sha
+    else
+      .fundedSignerRevision == null and .fundedRolloutReceipt == null and .fundedServiceBusDlqBaseline == null and
+      (.parityCollectorSha256 // null) == (if $collector_sha == "" then null else $collector_sha end) and
+      (.rebootValidatorSha256 // null) == (if $validator_sha == "" then null else $validator_sha end)
+    end
+  ' "$1" >/dev/null
+}
+
+validate_ledger
+
+[ ! -e "$pause_file" ] || die 'image pulls are paused'
+boot_available=$(df -P -B1 "$boot_root" | awk 'NR == 2 {print $4}')
+ring_available=$(df -P -B1 "$ring" | awk 'NR == 2 {print $4}')
+[ "$boot_available" -ge "$boot_floor" ] || die 'boot disk is below the parity floor'
+[ "$ring_available" -ge "$ring_floor" ] || die 'ring is below the job floor'
+secure_owned_file "$ring_status" 640
+jq -e '.capacity_ok == true and .free_ok == true and .upload_fresh == true and .unsealed_closed_count == 0 and .unuploaded_count == 0' \
+  "$ring_status" >/dev/null || die 'ring is unhealthy'
+
+date_dir=$report_root/$target
+latest=$date_dir/latest.json
+secure_dir "$report_root"
+secure_dir "$date_dir"
+secure_file "$latest"
+run_id=$(jq -er '.run_id | select(type == "string")' "$latest") || die 'daily pointer has no run ID'
+printf '%s' "$run_id" | grep -Eq "^daily-$target-[0-9]{8}T[0-9]{6}Z$" || die 'daily run ID is malformed'
+manifest_rel="runs/$run_id/run_manifest.json"
+jq -e --arg date "$target" --arg run "$run_id" --arg path "$manifest_rel" '
+  .schema_version == 1 and .date == $date and .run_id == $run and .manifest_path == $path and
+  (.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+  (.promoted_at | type == "string" and length > 0)
+' "$latest" >/dev/null || die 'daily pointer is malformed'
+manifest=$date_dir/$manifest_rel
+bundle_dir=${manifest%/*}
+secure_dir "$date_dir/runs"
+secure_dir "$bundle_dir"
+secure_file "$manifest"
+[ "$(sha_raw "$manifest")" = "$(jq -r '.manifest_sha256' "$latest")" ] || die 'daily manifest hash mismatch'
+jq -e --arg date "$target" --arg run "$run_id" --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" '
+  def complete: ((type == "string" or type == "number") and (tonumber >= 0.95));
+  def decimal_or_null: (. == null or ((type == "string" or type == "number") and (try tonumber catch null) != null));
+  def complete_or_na($value; $applicable): if $applicable == false then $value == null else ($value | complete) end;
+  .schema_version == 2 and .runtime_role == "primary" and .date == $date and .run_id == $run and
+  .status == "COMPLETE" and .git_sha == $expected_git and
+  (.completed_at | type == "string" and length > 0) and
+  (.input_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+  (.artifacts | type == "object" and length > 0) and
+  (["baseline_json","calibration_json","data_audit_json","execution_quality_json","final_report_json","markets_summary_json","raw_data_audit_json","regimes_json","sample_size_json"] - (.artifacts | keys) | length == 0) and
+  ([.artifacts[].relative_path] | length == (unique | length)) and
+  all(.artifacts | to_entries[];
+    .key == .value.name and
+    (.value.name | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) and
+    (.value.relative_path | test("^[A-Za-z0-9][A-Za-z0-9._-]*$")) and
+    (.value.sha256 | test("^[0-9a-f]{64}$")) and
+    (.value.bytes | type == "number" and . >= 0 and floor == .)) and
+  .data_quality.registry_version == "research-data-quality-v5" and
+  (.data_quality.total_events | type == "number" and . > 0 and floor == .) and
+  (.data_quality.coverage_breakdown.decision_grade_applicable == null or
+    (.data_quality.coverage_breakdown.decision_grade_applicable | type == "boolean")) and
+  (if .data_quality.coverage_breakdown.decision_grade_applicable == false
+    then (.data_quality.decision_grade_coverage | tonumber) == 0
+    else (.data_quality.decision_grade_coverage | complete)
+  end) and
+  (.data_quality.coverage_breakdown.start_price_capture_rate | complete) and
+  (.data_quality.coverage_breakdown.settlement_rate | complete) and
+  (.data_quality.coverage_breakdown.exact_reference_hour_coverage | complete) and
+  (.data_quality.coverage_breakdown.decision_metadata_coverage | complete) and
+  complete_or_na(.data_quality.coverage_breakdown.decision_grade_coverage; .data_quality.coverage_breakdown.decision_grade_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.final_decision_grade_coverage; .data_quality.coverage_breakdown.decision_grade_applicable) and
+  (.data_quality.coverage_breakdown.execution_field_coverage | complete) and
+  (.data_quality.coverage_breakdown.decision_parity_rate | tonumber) == 1 and
+  (.data_quality.coverage_breakdown.queue_snapshot_coverage | decimal_or_null) and
+  (.data_quality.coverage_breakdown.queue_snapshot_applicable == null or (.data_quality.coverage_breakdown.queue_snapshot_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.queue_position_applicable == null or (.data_quality.coverage_breakdown.queue_position_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.markout_1s_applicable == null or (.data_quality.coverage_breakdown.markout_1s_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.markout_5s_applicable == null or (.data_quality.coverage_breakdown.markout_5s_applicable | type == "boolean")) and
+  (.data_quality.coverage_breakdown.markout_30s_applicable == null or (.data_quality.coverage_breakdown.markout_30s_applicable | type == "boolean")) and
+  complete_or_na(.data_quality.coverage_breakdown.queue_position_coverage; .data_quality.coverage_breakdown.queue_position_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.markout_1s_completion; .data_quality.coverage_breakdown.markout_1s_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.markout_5s_completion; .data_quality.coverage_breakdown.markout_5s_applicable) and
+  complete_or_na(.data_quality.coverage_breakdown.markout_30s_completion; .data_quality.coverage_breakdown.markout_30s_applicable) and
+  (.data_quality.fatal_issues | type == "array" and all(.[]; type == "string") and length == 0) and
+  .data_quality.event_time_ordering_restored == true and
+  (.data_quality.out_of_order_events | type == "number" and . >= 0 and floor == .) and
+  ((.data_quality.out_of_order_events / .data_quality.total_events) <= 0.0001) and
+  (.data_quality.warnings | type == "array" and all(.[];
+    (.message | type == "string") and (.rule_id | type == "string") and
+    .severity == "informational" and (.known | type == "boolean")))
+' "$manifest" >/dev/null || die 'daily manifest is incomplete or malformed'
+completed_at=$(jq -r '.completed_at' "$manifest")
+completed_epoch=$(date -u -d "$completed_at" +%s) || die 'daily completion timestamp is invalid'
+[ "$completed_epoch" -ge "$window_epoch" ] || die 'daily run completed before the formal window'
+git_sha=$(jq -r '.git_sha' "$manifest")
+input_sha=$(jq -r '.input_sha256' "$manifest")
+artifact_count=$(jq '.artifacts | length' "$manifest")
+jq -r '.artifacts | to_entries[] | [.value.relative_path,.value.sha256,(.value.bytes|tostring)] | @tsv' "$manifest" |
+while IFS="$(printf '\t')" read -r relative expected_sha expected_bytes; do
+  artifact=$bundle_dir/$relative
+  secure_file "$artifact"
+  [ "$(stat -c %s "$artifact")" = "$expected_bytes" ] || die "daily artifact size mismatch: $relative"
+  [ "$(sha_raw "$artifact")" = "$expected_sha" ] || die "daily artifact hash mismatch: $relative"
+done
+
+if [ "$(jq -r '.data_quality.coverage_breakdown.decision_grade_applicable' "$manifest")" = false ]; then
+  data_audit_rel=$(jq -er '.artifacts.data_audit_json.relative_path' "$manifest") \
+    || die 'decision-grade N/A has no bound data audit'
+  data_audit=$bundle_dir/$data_audit_rel
+  secure_file "$data_audit"
+  jq -e '
+    (.result // .) as $result |
+    $result.decision_grade_applicable == false and
+    $result.strategy_evaluations == 0 and
+    $result.decision_grade_evaluations == 0 and
+    $result.decision_grade_coverage == null and
+    $result.final_decision_grade_coverage == null and
+    ($result.runtime_provenance.observations | type == "number" and . > 0 and floor == .) and
+    $result.runtime_provenance.valid_observations == $result.runtime_provenance.observations and
+    $result.runtime_provenance.distinct_identity_count == 1 and
+    $result.runtime_provenance.invalid_observations == 0 and
+    ($result.runtime_provenance.invalid_reasons | type == "array" and length == 0) and
+    ($result.runtime_provenance.first_timestamp | type == "string" and length > 0) and
+    ($result.runtime_provenance.last_timestamp | type == "string" and length > 0) and
+    ($result.runtime_provenance.max_gap_ms | type == "number" and . >= 0 and . <= 300000) and
+    ($result.runtime_provenance.identities | length) == 1 and
+    ($result.runtime_provenance.identities[0] as $identity |
+      $identity.schema_version == 1 and
+      $identity.backend_impl == "rust" and
+      ($identity.git_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+      ($identity.runtime_config_hash | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      $identity.app_name == "polyedge" and
+      $identity.runtime_role == "primary" and
+      $identity.shadow_only == false and
+      $identity.execution_mode == "paper" and
+      $identity.allow_live == false and
+      $identity.enable_taker_orders == false and
+      $identity.allow_emergency_account_cancel == false and
+      $identity.paper_maker_fill_policy == "touch_after_quote_was_live" and
+      $identity.adaptive_regime_enabled == false and
+      $identity.adaptive_regime_mode == "paper_only" and
+      $identity.decision_pipeline_schema == "polyedge.strategy_decision_batch.v4" and
+      $identity.decision_pipeline_parity_scope == "full_decision_pipeline_recomputation" and
+      $identity.decision_config_schema == "polyedge.decision_config.v1" and
+      ($identity.decision_config_sha256 | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      $identity.candidate == null and
+      $identity.publish_strategy_canary_intents == false and
+      $identity.research_only == true and
+      (($identity.authoritative_recorder_backend == "local_jsonl" and $identity.storage_account == null) or
+       ($identity.authoritative_recorder_backend == "azure_append_blob" and
+        ($identity.storage_account | type == "string" and length > 0))) and
+      $identity.storage_container == "bot-events" and
+      $identity.event_blob_prefix == "events")
+  ' "$data_audit" >/dev/null || die 'decision-grade N/A is not proven by the bound primary audit'
+  provenance_first=$(jq -er '(.result // .).runtime_provenance.first_timestamp' "$data_audit")
+  provenance_last=$(jq -er '(.result // .).runtime_provenance.last_timestamp' "$data_audit")
+  timestamp_pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+  printf '%s\n' "$provenance_first" | grep -Eq "$timestamp_pattern" \
+    || die 'decision-grade N/A provenance start is not RFC3339'
+  printf '%s\n' "$provenance_last" | grep -Eq "$timestamp_pattern" \
+    || die 'decision-grade N/A provenance end is not RFC3339'
+  provenance_first_ns=$(date -u -d "$provenance_first" +%s%N) \
+    || die 'decision-grade N/A provenance start is invalid'
+  provenance_last_ns=$(date -u -d "$provenance_last" +%s%N) \
+    || die 'decision-grade N/A provenance end is invalid'
+  day_start_ns=${target_epoch}000000000
+  day_end_ns=$(( (target_epoch + 86400) * 1000000000 ))
+  tolerance_ns=300000000000
+  [ "$provenance_first_ns" -ge "$day_start_ns" ] \
+    && [ "$provenance_first_ns" -le "$((day_start_ns + tolerance_ns))" ] \
+    && [ "$provenance_last_ns" -ge "$((day_end_ns - tolerance_ns))" ] \
+    && [ "$provenance_last_ns" -lt "$day_end_ns" ] \
+    || die 'decision-grade N/A provenance does not span the UTC day'
+fi
+
+marker=$normalized_root/$target/normalized/.polyedge-daily-complete.json
+secure_dir "$normalized_root"
+secure_dir "$normalized_root/$target"
+secure_dir "$normalized_root/$target/normalized"
+secure_file "$marker"
+jq -e --arg date "$target" --arg git "$git_sha" --arg input "$input_sha" '
+  .schema_version == 1 and .date == $date and .git_sha == $git and .events_manifest_sha256 == $input
+' "$marker" >/dev/null || die 'normalized completion marker disagrees with the daily manifest'
+
+secure_dir "$parity_root"
+install -d -m 0750 "$daily_root" "$daily_root/$target"
+secure_dir "$daily_root"
+secure_dir "$daily_root/$target"
+evidence=$daily_root/$target/evidence.json
+lock_ledger
+validate_ledger
+if [ -e "$evidence" ]; then
+  secure_owned_file "$evidence" 640
+  jq -e --arg date "$target" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg latest "$latest" --arg latest_sha "$(sha "$latest")" --arg manifest "$manifest" --arg manifest_sha "$(sha "$manifest")" \
+    --arg marker "$marker" --arg marker_sha "$(sha "$marker")" \
+    --arg expected_git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg expected_image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" \
+    --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" '
+    .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
+    .cycleDate == $date and .windowStartUtc == $window and .ledgerPath == $ledger and
+    .azureAuthoritative == true and .azureDeletionAllowed == false and
+    .fundedSignerMode == $funded_mode and .fundedSignerEnabled == $funded and
+    (if $funded then .fundedSignerImage == $funded_image and .fundedSignerUser == $funded_user and
+      .fundedSessionId == $funded_session and .fundedSessionManifestSha256 == $funded_session_sha and
+      .fundedConfigSha256 == $funded_config_sha
+     else .fundedSignerImage == null and .fundedSignerUser == null and .fundedSessionId == null and
+      .fundedSessionManifestSha256 == null and .fundedConfigSha256 == null end) and
+    .gitSha == $expected_git and .researchImage == $expected_image and
+    .dailyBundle.latest.path == $latest and .dailyBundle.latest.sha256 == $latest_sha and
+    .dailyBundle.manifest.path == $manifest and .dailyBundle.manifest.sha256 == $manifest_sha and
+    .normalizedCompletion.path == $marker and .normalizedCompletion.sha256 == $marker_sha
+  ' "$evidence" >/dev/null \
+    || die 'existing daily evidence is invalid or changed'
+  validate_daily_producer_binding "$evidence" || die 'existing daily evidence lacks funded producer binding'
+  validate_daily_funded_binding "$evidence" || die 'existing daily evidence lacks funded rollout binding'
+else
+  tmp=$(mktemp "$daily_root/$target/.evidence.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  jq -n --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$POLYEDGE_PARITY_WINDOW_START_UTC" \
+    --arg date "$target" --arg completed "$completed_at" --arg ledger "$POLYEDGE_PARITY_LEDGER" \
+    --arg run "$run_id" --arg git "$git_sha" --arg image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" --arg input "$input_sha" \
+    --arg latest "$latest" --arg latest_sha "$(sha "$latest")" --arg manifest "$manifest" --arg manifest_sha "$(sha "$manifest")" \
+    --arg marker "$marker" --arg marker_sha "$(sha "$marker")" --argjson artifacts "$artifact_count" \
+    --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_revision "$funded_revision" --arg funded_rollout "$funded_rollout_receipt" \
+    --arg funded_rollout_sha "$funded_rollout_sha" --arg collector_sha "$parity_collector_sha" \
+    --arg validator_sha "$reboot_validator_sha" --argjson funded_dlq "$funded_service_bus_dlq" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --arg funded_producer_image "$funded_producer_image" --arg funded_producer_user "$funded_producer_user" \
+    --arg funded_producer_config_sha "$funded_producer_config_sha" --argjson funded "$funded_enabled" \
+    --argjson boot "$boot_available" --argjson boot_floor "$boot_floor" --argjson ring "$ring_available" --argjson ring_floor "$ring_floor" \
+    '{schemaVersion:1,generatedAtUtc:$generated,windowStartUtc:$window,cycleDate:$date,completedAtUtc:$completed,status:"validated",acceptedForParityWindow:true,azureAuthoritative:true,azureDeletionAllowed:false,fundedSignerMode:$funded_mode,fundedSignerEnabled:$funded,
+      fundedSignerImage:(if $funded then $funded_image else null end),fundedSignerUser:(if $funded then $funded_user else null end),
+      fundedSignerRevision:(if $funded then $funded_revision else null end),
+      fundedRolloutReceipt:(if $funded then {path:$funded_rollout,sha256:$funded_rollout_sha} else null end),
+      fundedServiceBusDlqBaseline:(if $funded then $funded_dlq else null end),
+      parityCollectorSha256:(if $collector_sha != "" then $collector_sha else null end),
+      rebootValidatorSha256:(if $validator_sha != "" then $validator_sha else null end),
+      fundedSessionId:(if $funded then $funded_session else null end),fundedSessionManifestSha256:(if $funded then $funded_session_sha else null end),
+      fundedConfigSha256:(if $funded then $funded_config_sha else null end),
+      fundedIntentProducerEnabled:$funded,fundedIntentProducerImage:(if $funded then $funded_producer_image else null end),
+      fundedIntentProducerUser:(if $funded then $funded_producer_user else null end),
+      fundedIntentProducerConfigSha256:(if $funded then $funded_producer_config_sha else null end),ledgerPath:$ledger,runId:$run,gitSha:$git,researchImage:$image,inputSha256:$input,artifactCount:$artifacts,dailyBundle:{latest:{path:$latest,sha256:$latest_sha},manifest:{path:$manifest,sha256:$manifest_sha}},normalizedCompletion:{path:$marker,sha256:$marker_sha},disk:{bootAvailableBytes:$boot,bootMinimumFreeBytes:$boot_floor,ringAvailableBytes:$ring,ringMinimumFreeBytes:$ring_floor,imagePullsPaused:false},ring:{capacityOk:true,freeOk:true,uploadFresh:true,unsealedClosedCount:0,unuploadedCount:0}}' >"$tmp"
+  chmod 0640 "$tmp"
+  sync -f "$tmp"
+  mv "$tmp" "$evidence"
+  trap - EXIT HUP INT TERM
+fi
+
+refs_tmp=$(mktemp "$daily_root/.refs.XXXXXX")
+trap 'rm -f "$refs_tmp"' EXIT HUP INT TERM
+: >"$refs_tmp"
+find "$daily_root" -mindepth 2 -maxdepth 2 -name evidence.json -print | sort | while IFS= read -r file; do
+  secure_owned_file "$file" 640
+  evidence_window=$(jq -r '.windowStartUtc // ""' "$file")
+  evidence_ledger=$(jq -r '.ledgerPath // ""' "$file")
+  if [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] || [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ]; then
+    [ "$evidence_window" != "$POLYEDGE_PARITY_WINDOW_START_UTC" ] && [ "$evidence_ledger" != "$POLYEDGE_PARITY_LEDGER" ] \
+      || die "accepted daily evidence has mixed parity provenance: $file"
+    continue
+  fi
+  date_value=$(jq -r '.cycleDate' "$file")
+  epoch=$(date -u -d "$date_value 00:00:00Z" +%s) || die "invalid accepted daily date: $file"
+  [ "$(date -u -d "@$epoch" +%Y-%m-%d)" = "$date_value" ] || die "non-canonical accepted daily date: $file"
+  [ "$file" = "$daily_root/$date_value/evidence.json" ] || die "accepted daily evidence is stored under the wrong date: $file"
+  jq -e --arg git "$POLYEDGE_PARITY_EXPECTED_GIT_SHA" --arg image "$POLYEDGE_PARITY_EXPECTED_RESEARCH_IMAGE" \
+    --arg funded_mode "$funded_mode" --arg funded_image "$funded_image" --arg funded_user "$funded_user" \
+    --arg funded_session "$funded_session" --arg funded_session_sha "$funded_session_sha" --arg funded_config_sha "$funded_config_sha" \
+    --argjson funded "$funded_enabled" \
+    '.schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and .azureAuthoritative == true and .azureDeletionAllowed == false and .gitSha == $git and .researchImage == $image and .fundedSignerMode == $funded_mode and .fundedSignerEnabled == $funded and
+      (if $funded then .fundedSignerImage == $funded_image and .fundedSignerUser == $funded_user and
+        .fundedSessionId == $funded_session and .fundedSessionManifestSha256 == $funded_session_sha and .fundedConfigSha256 == $funded_config_sha
+       else .fundedSignerImage == null and .fundedSignerUser == null and .fundedSessionId == null and
+        .fundedSessionManifestSha256 == null and .fundedConfigSha256 == null end)' "$file" >/dev/null \
+    || die "accepted daily evidence failed its invariant: $file"
+  validate_daily_producer_binding "$file" || die "accepted daily evidence lacks funded producer binding: $file"
+  validate_daily_funded_binding "$file" || die "accepted daily evidence lacks funded rollout binding: $file"
+  [ "$epoch" -le "$target_epoch" ] || continue
+  jq -nc --argjson epoch "$epoch" --arg date "$date_value" --arg path "$file" --arg sha "$(sha "$file")" \
+    '{cycleDateEpoch:$epoch,cycleDate:$date,path:$path,sha256:$sha}' >>"$refs_tmp"
+done
+refs=$(jq -sc 'sort_by(.cycleDateEpoch)' "$refs_tmp")
+count=$(printf '%s' "$refs" | jq 'length')
+[ "$count" -eq $(( (target_epoch - first_epoch) / 86400 + 1 )) ] || die 'accepted daily evidence has a gap'
+printf '%s' "$refs" | jq -e --argjson first "$first_epoch" --arg target "$target" '
+  (to_entries | all(.value.cycleDateEpoch == ($first + (.key * 86400)))) and
+  ([.[].cycleDateEpoch] | length == (unique | length)) and .[-1].cycleDate == $target
+' >/dev/null || die 'accepted daily evidence is duplicate or non-sequential'
+
+ledger_count=$(jq -r '.completedDailyCycles // 0' "$POLYEDGE_PARITY_LEDGER")
+if [ "$ledger_count" -eq "$count" ]; then
+  jq -e --argjson refs "$refs" '(.acceptedDailyEvidence // []) == $refs' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+    || die 'ledger daily references disagree with accepted evidence'
+  exit 0
+fi
+[ "$ledger_count" -eq $((count - 1)) ] || die 'ledger daily count was not at the strictly previous count'
+jq -e --argjson refs "$refs" '(.acceptedDailyEvidence // []) == ($refs[0:-1])' "$POLYEDGE_PARITY_LEDGER" >/dev/null \
+  || die 'ledger daily references are incomplete or divergent'
+protected_before=$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerRevision,fundedRolloutReceiptPath,fundedRolloutReceiptSha256,fundedServiceBusDlqBaseline,parityCollectorSha256,rebootValidatorSha256,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$POLYEDGE_PARITY_LEDGER")
+ledger_tmp=$(mktemp "${POLYEDGE_PARITY_LEDGER}.XXXXXX")
+trap 'rm -f "$refs_tmp" "$ledger_tmp"' EXIT HUP INT TERM
+jq --argjson count "$count" --argjson refs "$refs" '.completedDailyCycles = $count | .acceptedDailyEvidence = $refs' \
+  "$POLYEDGE_PARITY_LEDGER" >"$ledger_tmp"
+chmod 0640 "$ledger_tmp"
+[ "$(jq -cS '{status,azureAuthoritative,azureDeletionAllowed,rebootRecoveryPassed,rebootRecovery,shadowQsetEnabled,fundedSignerEnabled,fundedSignerMode,fundedSignerImage,fundedSignerRevision,fundedRolloutReceiptPath,fundedRolloutReceiptSha256,fundedServiceBusDlqBaseline,parityCollectorSha256,rebootValidatorSha256,fundedSignerUser,fundedSessionId,fundedSessionManifestSha256,fundedConfigSha256,fundedIntentProducerEnabled,fundedIntentProducerImage,fundedIntentProducerUser,fundedIntentProducerConfigSha256,acceptedCleanLiveHours,acceptedHourlyEvidence}' "$ledger_tmp")" = "$protected_before" ] \
+  || die 'protected ledger fields changed'
+sync -f "$ledger_tmp"
+mv "$ledger_tmp" "$POLYEDGE_PARITY_LEDGER"
+trap 'rm -f "$refs_tmp"' EXIT HUP INT TERM
+
+echo "validated daily cycle $target; completedDailyCycles=$count"

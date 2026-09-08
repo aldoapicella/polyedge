@@ -33,11 +33,11 @@ if [ "$(date -u -d "$CASCADE_THROUGH" +%Y-%m-%d 2>/dev/null || true)" != "$CASCA
   echo "SHADOW_CASCADE_THROUGH must be a sealed UTC date on or after SHADOW_REPORT_DATE" >&2
   exit 1
 fi
-CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:-campaign-2026-07-28-qset-v1}"
-CAMPAIGN_START="${SHADOW_CAMPAIGN_START:-2026-07-28}"
+CAMPAIGN_ID="${SHADOW_CAMPAIGN_ID:?SHADOW_CAMPAIGN_ID is required}"
+CAMPAIGN_START="${SHADOW_CAMPAIGN_START:?SHADOW_CAMPAIGN_START is required}"
 CAMPAIGN_PREFIX="${SHADOW_CAMPAIGN_PREFIX:-shadow-events/$CAMPAIGN_ID}"
 CAMPAIGN_ROOT="${SHADOW_CAMPAIGN_REPORT_ROOT:-reports/research/shadow/campaigns/$CAMPAIGN_ID}"
-CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:-research/configs/profitability_gate_v3_2026-07-28_qset_v1.yaml}"
+CAMPAIGN_CONTRACT="${SHADOW_CAMPAIGN_CONTRACT:?SHADOW_CAMPAIGN_CONTRACT is required}"
 CORRECTION_ROOT="${SHADOW_CORRECTION_ROOT:-$CAMPAIGN_ROOT/corrections}"
 DAILY_ROOT="$CAMPAIGN_ROOT/daily"
 PROSPECTIVE_ROOT="$CAMPAIGN_ROOT/prospective"
@@ -45,19 +45,36 @@ PROFITABILITY_ROOT="$CAMPAIGN_ROOT/profitability"
 CODE_FREEZE_SHA256="${SHADOW_CODE_FREEZE_SHA256:-}"
 CODE_FREEZE_MANIFEST="${SHADOW_CODE_FREEZE_MANIFEST:-}"
 
-if [ "$CAMPAIGN_ID" = "campaign-2026-07-28-qset-v1" ]; then
-  if ! printf '%s\n' "$CODE_FREEZE_SHA256" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
-    echo "SHADOW_CODE_FREEZE_SHA256 must bind qset-v1 to an immutable source manifest" >&2
+EVIDENCE_VERSION="${SHADOW_EVIDENCE_VERSION:-protocol-v3}"
+case "$CAMPAIGN_ID" in
+  campaign-2026-07-28-qset-v1)
+    echo "qset-v1 is retired and cannot produce new evidence" >&2
     exit 1
-  fi
-  case "$CODE_FREEZE_MANIFEST" in
-    azure://*/polyedge-qset-control/reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/control/code-freeze/source-*.json) ;;
-    *)
-      echo "SHADOW_CODE_FREEZE_MANIFEST must stay in the isolated qset-v1 freeze-control container" >&2
+    ;;
+  campaign-2026-08-22-qset-v2)
+    test "$CAMPAIGN_START" = "2026-08-22" \
+      && test "$CAMPAIGN_PREFIX" = "shadow-events/$CAMPAIGN_ID" \
+      && test "$CAMPAIGN_ROOT" = "reports/research/shadow/campaigns/$CAMPAIGN_ID" \
+      && test "$CORRECTION_ROOT" = "$CAMPAIGN_ROOT/corrections" \
+      && test "$CAMPAIGN_CONTRACT" = "research/configs/profitability_gate_v3_2026-08-22_qset_v2.yaml" \
+      && test "$EVIDENCE_VERSION" = "protocol-v3-qset-v2" || {
+        echo "qset-v2 campaign binding is inexact" >&2
+        exit 1
+      }
+    printf '%s\n' "$CODE_FREEZE_SHA256" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+      echo "SHADOW_CODE_FREEZE_SHA256 must bind qset-v2 to an immutable source manifest" >&2
       exit 1
-      ;;
-  esac
-fi
+    }
+    case "$CODE_FREEZE_MANIFEST" in
+      azure://"$AZURE_STORAGE_ACCOUNT_NAME"/polyedge-qset-control/reports/research/shadow/campaigns/"$CAMPAIGN_ID"/control/code-freeze/source-*.json) ;;
+      *) echo "SHADOW_CODE_FREEZE_MANIFEST must stay in the isolated qset-v2 freeze-control path" >&2; exit 1 ;;
+    esac
+    test "$POLYEDGE_CAMPAIGN_LEASE_BLOB" = "data/research/shadow/$CAMPAIGN_ID/control/replay.lock" || {
+      echo "qset-v2 writer lease is outside its campaign control path" >&2
+      exit 1
+    }
+    ;;
+esac
 
 if [ "$(date -u -d "$CAMPAIGN_START" +%Y-%m-%d 2>/dev/null || true)" != "$CAMPAIGN_START" ]; then
   echo "SHADOW_CAMPAIGN_START must be a valid YYYY-MM-DD UTC date" >&2
@@ -77,7 +94,7 @@ fi
 # DATE == CASCADE_THROUGH and therefore execute exactly once.
 if [ "${POLYEDGE_SHADOW_CASCADE_CHILD:-false}" != "true" ]; then
   CORRECTION_ID="${SHADOW_CORRECTION_ID:-shadow-$DATE-through-$CASCADE_THROUGH}"
-  CORRECTION_REASON="${SHADOW_CORRECTION_REASON:-chronological protocol-v3 qset-v1 evidence build}"
+  CORRECTION_REASON="${SHADOW_CORRECTION_REASON:-chronological protocol-v3 shadow evidence build}"
   polyedge-rs research begin-shadow-correction \
     --campaign-id "$CAMPAIGN_ID" \
     --correction-id "$CORRECTION_ID" \
@@ -138,7 +155,7 @@ mkdir -p "$STAGING" "$NORMALIZED" "$CARRY_NORMALIZED" "$CUMULATIVE_NORMALIZED"
 if [ -n "$CODE_FREEZE_SHA256" ]; then
   jq -n \
     --arg campaign_id "$CAMPAIGN_ID" \
-    --arg evidence_version "${SHADOW_EVIDENCE_VERSION:-protocol-v3}" \
+    --arg evidence_version "$EVIDENCE_VERSION" \
     --arg manifest_path "$CODE_FREEZE_MANIFEST" \
     --arg manifest_sha256 "$CODE_FREEZE_SHA256" \
     '{

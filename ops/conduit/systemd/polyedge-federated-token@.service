@@ -1,0 +1,30 @@
+[Unit]
+Description=Rotate the %i PolyEdge JWT-SVID token file
+After=spire-agent.service
+Requires=spire-agent.service
+
+[Service]
+Type=oneshot
+User=polyedge-identity-%i
+Group=polyedge-identity-%i
+SupplementaryGroups=spire-workload
+EnvironmentFile=/etc/polyedge/spire.env
+RuntimeDirectory=polyedge-federated-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+ExecStart=/usr/local/libexec/polyedge-federated-token-refresh %i /run/polyedge-federated-%i/azure-federated-token ${POLYEDGE_OIDC_ISSUER}
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=

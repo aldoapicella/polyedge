@@ -1,0 +1,137 @@
+name: Deploy PolyEdge storage service endpoints
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_maintenance_window:
+        description: Confirm a reviewed maintenance window for the two storage route changes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: polyedge-azure-control-plane
+  cancel-in-progress: false
+
+env:
+  AZURE_RESOURCE_GROUP: rg-polyedge-dev
+  EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require maintenance-window acknowledgement
+        env:
+          CONFIRMED: ${{ inputs.confirm_maintenance_window }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMED" = "true"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate isolated subnet template
+        run: |
+          set -euo pipefail
+          test "$(az account show --query id -o tsv)" = "$EXPECTED_SUBSCRIPTION_ID"
+          az bicep build --file infra/storage-service-endpoints.bicep --outfile storage-service-endpoints.json
+          test "$(jq '[.resources[] | select(.type == "Microsoft.Network/virtualNetworks/subnets")] | length' storage-service-endpoints.json)" = "2"
+          test "$(jq '[.resources[] | select(.type != "Microsoft.Network/virtualNetworks/subnets")] | length' storage-service-endpoints.json)" = "0"
+          test "$(jq '[.resources[] | select(.properties.serviceEndpoints == [{service:"Microsoft.Storage.Global"}])] | length' storage-service-endpoints.json)" = "2"
+
+      - name: Snapshot protected runtime definitions
+        run: |
+          set -euo pipefail
+          printf '%s\n' polyedge-shadow-neu polyedge-shadow-qset-neu polyedge-funded-direct-cl > protected-apps.txt
+          printf '%s\n' \
+            polyedge-venue-probe-neu-job \
+            polyedge-redeem-neu-job \
+            polyedge-strategy-canary-neu-job \
+            polyedge-funded-ladder-neu-job \
+            polyedge-shadow-daily-neu-job \
+            polyedge-shadow-val-neu-job \
+            polyedge-shadow-qset-neu-job \
+            polyedge-funded-direct-cl-job \
+            polyedge-funded-warmup-cl \
+            > protected-jobs.txt
+          while IFS= read -r app; do
+            az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
+              > "before-$app.json"
+          done < protected-apps.txt
+          while IFS= read -r job; do
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
+              > "before-$job.json"
+          done < protected-jobs.txt
+
+      - name: Prove the plan is limited to exact subnets
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/storage-service-endpoints.bicep \
+            --result-format ResourceIdOnly \
+            --no-pretty-print \
+            -o json > storage-endpoints-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore")
+              | (.resourceId | ascii_downcase)
+              | select(. != "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/microsoft.network/virtualnetworks/vnet-polyedge-venue-neu/subnets/container-apps-infrastructure"
+                and . != "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/microsoft.network/virtualnetworks/vnet-polyedge-execution-cl/subnets/container-apps-infrastructure")
+            ] | length == 0
+          ' storage-endpoints-what-if.json
+
+      - name: Deploy storage service endpoints
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --name polyedge-storage-service-endpoints \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --template-file infra/storage-service-endpoints.bicep \
+            --output none
+
+      - name: Verify routes and unchanged runtimes
+        run: |
+          set -euo pipefail
+          verify_subnet() {
+            local vnet=$1
+            local nat=$2
+            local prefix=$3
+            subnet=$(az network vnet subnet show \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --vnet-name "$vnet" \
+              --name container-apps-infrastructure \
+              -o json)
+            test "$(jq -r '.addressPrefix' <<<"$subnet")" = "$prefix"
+            test "$(jq -r '.natGateway.id | ascii_downcase | endswith("/natgateways/'"$nat"'")' <<<"$subnet")" = "true"
+            test "$(jq '[.delegations[] | select(.serviceName == "Microsoft.App/environments")] | length' <<<"$subnet")" = "1"
+            test "$(jq '[.serviceEndpoints[] | select(.service == "Microsoft.Storage.Global")] | length' <<<"$subnet")" = "1"
+          }
+          verify_subnet vnet-polyedge-venue-neu nat-polyedge-venue-neu 10.42.0.0/23
+          verify_subnet vnet-polyedge-execution-cl nat-polyedge-execution-cl 10.43.0.0/23
+          while IFS= read -r app; do
+            az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
+              > "after-$app.json"
+            cmp -s "before-$app.json" "after-$app.json"
+          done < protected-apps.txt
+          while IFS= read -r job; do
+            az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
+              | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
+              > "after-$job.json"
+            cmp -s "before-$job.json" "after-$job.json"
+          done < protected-jobs.txt

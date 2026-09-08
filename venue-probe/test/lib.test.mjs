@@ -1,28 +1,50 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 import {
   assertEligibleOrigin,
   buildQueueCalibrationArtifact,
   campaignRestSchedule,
+  createCampaignLeaseRenewalGuard,
   evaluateCampaignRiskGate,
   evaluateDailyRiskGate,
+  EventLedger,
   fitEffectiveQueueModel,
   isEvidenceProtocolVersionEligible,
   isRiskReservationResolved,
   isTransientUnsafeMarket,
+  finalizeProbeRisk,
+  loadCampaignRiskControl,
+  loadCampaignUnresolvedRiskReservationRecords,
   loadProbeConfig,
   modelObservations,
   normalizeStoredObservation,
   publishTerminalRiskPortfolioEvidence,
   queueModelArtifactUri,
+  rebuildCampaignRiskReservationIndex,
   reservationAuditObservation,
+  reserveProbeRisk,
   sanitize,
   selectMakerOrder,
+  settleProbeRiskReservations,
   summarizeCampaignRisk,
   summarizeDailyRiskRecords,
   validateFillMarkouts,
   summarizePortfolio
 } from "../src/lib.mjs";
+
+test("async event-ledger serialization preserves bytes and yields to heartbeats", async () => {
+  const ledger = new EventLedger("serialization-test");
+  for (let index = 0; index < 257; index += 1) ledger.record("market", { index });
+  let yielded = false;
+  setImmediate(() => { yielded = true; });
+
+  const serialized = await ledger.jsonlAsync();
+
+  assert.equal(yielded, true);
+  assert.equal(serialized, ledger.jsonl());
+});
 
 const safeEnv = {
   EXECUTION_MODE: "venue_probe",
@@ -41,6 +63,33 @@ const safeEnv = {
   POLYMARKET_FUNDER_ADDRESS: "0x123",
   AZURE_STORAGE_ACCOUNT_NAME: "storage"
 };
+
+test("transient campaign lease renewal errors retry within the freshness window", () => {
+  let now = 0;
+  const guard = createCampaignLeaseRenewalGuard({ now: () => now });
+
+  now = 20_000;
+  guard.recordFailure(new Error("The operation was aborted while making request"));
+  assert.equal(guard.canRenew(), true);
+  assert.doesNotThrow(() => guard.assertHealthy());
+
+  now = 40_000;
+  guard.recordSuccess();
+  assert.equal(guard.hasError(), false);
+
+  now = 86_000;
+  assert.throws(() => guard.assertHealthy(), /campaign lease freshness exceeded 45 seconds/);
+});
+
+test("non-transient campaign lease loss fails immediately and stops renewal", () => {
+  const guard = createCampaignLeaseRenewalGuard({ now: () => 0 });
+  const error = new Error("lease id no longer owns the blob");
+  error.statusCode = 409;
+  guard.recordFailure(error);
+
+  assert.equal(guard.canRenew(), false);
+  assert.throws(() => guard.assertHealthy(), /campaign lease renewal failed/);
+});
 
 test("safe venue probe gates load", () => {
   const config = loadProbeConfig(safeEnv);
@@ -77,6 +126,46 @@ test("funded campaign risk does not reset at UTC midnight or process restart", (
   assert.equal(evaluateCampaignRiskGate(beforeMidnight, true).diagnostics_only, true);
 });
 
+test("existing campaign baseline is read without a guaranteed-conflict write", async () => {
+  let downloads = 0;
+  let uploads = 0;
+  const baseline = {
+    schema_version: 1,
+    campaign_id: "campaign-1",
+    baseline_equity: 5,
+    equity_floor: 4,
+    max_campaign_drawdown: 1,
+    max_order_notional: 1,
+    max_open_orders: 1,
+    max_unresolved_positions: 1,
+    max_reconciliation_discrepancy: 0.01
+  };
+  const blob = {
+    async download() {
+      downloads += 1;
+      return { readableStreamBody: Readable.from([JSON.stringify(baseline)]) };
+    },
+    async uploadData() { uploads += 1; }
+  };
+  const control = await loadCampaignRiskControl({
+    campaignId: "campaign-1",
+    campaignBaselineEquity: 5,
+    campaignEquityFloor: 4,
+    maxCampaignDrawdown: 1,
+    maxOrderNotional: 1,
+    maxReconciliationDiscrepancy: 0.01,
+    campaignCashFlows: []
+  }, {
+    container: {
+      getBlockBlobClient: () => blob,
+      async *listBlobsFlat() {}
+    }
+  });
+  assert.equal(control.cash_flow_count, 0);
+  assert.equal(downloads, 1);
+  assert.equal(uploads, 0);
+});
+
 test("campaign risk is cash-flow aware and blocks discrepancies above one cent", () => {
   const risk = summarizeCampaignRisk({
     control: {
@@ -99,6 +188,151 @@ test("campaign risk is cash-flow aware and blocks discrepancies above one cent",
   assert.equal(risk.account_reconciliation_discrepancy, 0.02);
   assert.equal(risk.passed, false);
   assert.ok(risk.blockers.includes("account_reconciliation_discrepancy"));
+});
+
+test("operator-funded risk rejects unexpected deposit or profit above the authorized boundary", () => {
+  const control = {
+    campaign_id: "dynamic-quote-funded-2026-07-28-v3",
+    baseline_equity: 11.09862,
+    equity_floor: 0,
+    max_campaign_drawdown: 11.09862,
+    max_order_notional: 10.5,
+    max_reconciliation_discrepancy: 0.01,
+    net_external_cash_flow: 0,
+    cash_flow_count: 0,
+    cash_flow_ids: []
+  };
+  const boundary = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 11.10862,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true
+  });
+  assert.equal(boundary.passed, true);
+  assert.equal(boundary.no_replenishment, true);
+  assert.equal(boundary.no_compounding, true);
+
+  const unexpectedCapital = summarizeCampaignRisk({
+    control,
+    liquidCollateral: 11.108622,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true
+  });
+  assert.equal(unexpectedCapital.passed, false);
+  assert.ok(unexpectedCapital.blockers.includes("authorized_starting_collateral_exceeded"));
+});
+
+test("operator-funded risk rejects any durable cash-flow record even when net flow is zero", () => {
+  const risk = summarizeCampaignRisk({
+    control: {
+      campaign_id: "dynamic-quote-funded-2026-07-28-v3",
+      baseline_equity: 11.09862,
+      equity_floor: 0,
+      max_campaign_drawdown: 11.09862,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 2,
+      cash_flow_ids: ["deposit-1", "withdrawal-1"]
+    },
+    liquidCollateral: 11.09862,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true
+  });
+  assert.equal(risk.passed, false);
+  assert.ok(risk.blockers.includes("external_cash_flow_record_present"));
+});
+
+test("protected compounding uses current equity only above the monotonic reserve", () => {
+  const risk = summarizeCampaignRisk({
+    control: {
+      campaign_id: "dynamic-quote-funded-2026-07-29-v5",
+      baseline_equity: 11.09862,
+      equity_floor: 0,
+      max_campaign_drawdown: 11.09862,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 0,
+      cash_flow_ids: []
+    },
+    liquidCollateral: 7.57122,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    proposedNotional: 2.124,
+    orderNotional: 2.124,
+    authorizedStartingCollateral: 11.09862,
+    requireZeroExternalCashFlows: true,
+    protectedCompoundingState: {
+      high_water_equity: 17.90462,
+      protected_reserve: 5.371386,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      authorized_equity_ceiling: 17.90462
+    }
+  });
+  assert.equal(risk.passed, true);
+  assert.equal(risk.no_compounding, false);
+  assert.equal(risk.allow_compounding, true);
+  assert.equal(risk.protected_reserve, 5.371386);
+  assert.equal(risk.operable_capital, 2.124122);
+  assert.equal(risk.projected_equity, 5.44722);
+});
+
+test("loss-tolerant protected capital keeps trading through drawdown but preserves hard blockers", () => {
+  const input = {
+    control: {
+      campaign_id: "dynamic-quote-funded-loss-tolerant",
+      baseline_equity: 31.655501,
+      equity_floor: 30,
+      max_campaign_drawdown: 1,
+      max_order_notional: 10.5,
+      max_reconciliation_discrepancy: 0.01,
+      net_external_cash_flow: 0,
+      cash_flow_count: 0,
+      cash_flow_ids: []
+    },
+    liquidCollateral: 5,
+    summedPositionValue: 0,
+    reportedPositionValue: 0,
+    proposedNotional: 1.697627,
+    orderNotional: 1.612367,
+    authorizedStartingCollateral: 31.655501,
+    requireZeroExternalCashFlows: true,
+    protectedCompoundingState: {
+      high_water_equity: 31.655501,
+      protected_reserve: 2,
+      operating_buffer_ratio: 0.01,
+      minimum_order_notional: 1,
+      minimum_reserve: 2,
+      target_order_ratio: 0.05,
+      authorized_equity_ceiling: 31.655501,
+      continue_after_loss: true,
+      reserve_monotonic: false
+    }
+  };
+  const risk = summarizeCampaignRisk(input);
+  assert.equal(risk.passed, true);
+  assert.equal(risk.loss_tolerant, true);
+  assert.equal(risk.minimum_reserve, 2);
+  assert.equal(risk.target_order_ratio, 0.05);
+  assert.equal(risk.blockers.includes("equity_floor_breached"), false);
+  assert.equal(risk.blockers.includes("campaign_drawdown_exhausted"), false);
+  assert.equal(risk.blockers.includes("projected_equity_floor_breach"), false);
+  assert.equal(risk.blockers.includes("projected_campaign_drawdown_breach"), false);
+
+  const unresolved = summarizeCampaignRisk({
+    ...input,
+    unresolvedReservationCount: 1
+  });
+  assert.equal(unresolved.passed, false);
+  assert.ok(unresolved.blockers.includes("unresolved_risk_reservation"));
 });
 
 test("one unresolved position is tolerated for reconciliation but blocks another submission", () => {
@@ -271,10 +505,53 @@ test("normal unsafe market transitions stop a campaign safely instead of failing
 });
 
 test("secret fields are recursively redacted", () => {
-  assert.deepEqual(sanitize({ apiSecret: "x", apiKey: "k", nested: { passphrase: "y", owner: "o", order_owner: "oo", value: 1 } }), {
+  assert.deepEqual(sanitize({
+    apiSecret: "x",
+    apiKey: "k",
+    authorization: "Bearer secret",
+    nested: {
+      passphrase: "y",
+      owner: "o",
+      order_owner: "oo",
+      authorization_kind: "operator_direct",
+      authorization_blob_name: "control/authorization.json",
+      authorization_container_name: "evidence",
+      authorization_sha256: `sha256:${"a".repeat(64)}`,
+      value: 1
+    }
+  }), {
     apiSecret: "[REDACTED]",
     apiKey: "[REDACTED]",
-    nested: { passphrase: "[REDACTED]", owner: "[REDACTED]", order_owner: "[REDACTED]", value: 1 }
+    authorization: "[REDACTED]",
+    nested: {
+      passphrase: "[REDACTED]",
+      owner: "[REDACTED]",
+      order_owner: "[REDACTED]",
+      authorization_kind: "operator_direct",
+      authorization_blob_name: "control/authorization.json",
+      authorization_container_name: "evidence",
+      authorization_sha256: `sha256:${"a".repeat(64)}`,
+      value: 1
+    }
+  });
+  for (const key of [
+    "authorization_kind",
+    "authorization_blob_name",
+    "authorization_container_name",
+    "authorization_sha256"
+  ]) {
+    assert.equal(sanitize({ [key]: "Bearer token-value" })[key], "[REDACTED]");
+  }
+  assert.deepEqual(sanitize({
+    authorization_kind: "operator_direct\nBearer token-value",
+    authorization_blob_name: "../authorization.json",
+    authorization_container_name: "Evidence",
+    authorization_sha256: `sha256:${"g".repeat(64)}`
+  }), {
+    authorization_kind: "[REDACTED]",
+    authorization_blob_name: "[REDACTED]",
+    authorization_container_name: "[REDACTED]",
+    authorization_sha256: "[REDACTED]"
   });
 });
 
@@ -675,46 +952,498 @@ test("risk reservations resolve only with explicit reconciliation and zero-open 
   assert.equal(isRiskReservationResolved({ state: "released_no_order", order_submitted: false, reconciliation_complete: true, zero_open_orders_confirmed: true }), true);
 });
 
-function recordingContainer(reservations = []) {
-  const uploads = [];
-  const reservationBlobs = new Map(reservations.map((reservation, index) => [
-    `reports/research/venue-probe/risk-reservations/2026-07-13/reservation-${index}.json`,
-    reservation
-  ]));
-  const blobClient = (name) => ({
-    async uploadData(bytes, options) {
-      uploads.push({ name, bytes: Buffer.from(bytes), options });
-    },
-    async download() {
-      const value = reservationBlobs.get(name);
-      if (value === undefined) throw new Error(`missing test blob ${name}`);
-      return {
-        readableStreamBody: (async function* stream() {
-          yield Buffer.from(JSON.stringify(value));
-        }())
-      };
-    }
-  });
-  return {
-    uploads,
-    async *listBlobsFlat({ prefix }) {
-      for (const name of reservationBlobs.keys()) {
-        if (name.startsWith(prefix)) yield { name };
+class RiskIndexContainer {
+  constructor(values = new Map()) {
+    this.values = new Map([...values].map(([name, value]) => [
+      name,
+      Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(JSON.stringify(value, null, 2))
+    ]));
+    this.etags = new Map([...this.values.keys()].map((name, index) => [name, `"v${index + 1}"`]));
+    this.sequence = this.values.size + 1;
+    this.downloads = [];
+    this.listCalls = [];
+    this.uploads = [];
+    this.uploadOptions = [];
+    this.failUploads = new Set();
+  }
+
+  setJson(name, value) {
+    this.values.set(name, Buffer.from(JSON.stringify(value, null, 2)));
+    this.etags.set(name, `"v${this.sequence++}"`);
+  }
+
+  json(name) {
+    return JSON.parse(this.values.get(name).toString("utf8"));
+  }
+
+  client(name) {
+    return {
+      download: async () => {
+        this.downloads.push(name);
+        if (!this.values.has(name)) {
+          throw Object.assign(new Error(`missing blob ${name}`), { statusCode: 404 });
+        }
+        return {
+          readableStreamBody: Readable.from([Buffer.from(this.values.get(name))]),
+          etag: this.etags.get(name)
+        };
+      },
+      uploadData: async (bytes, options = {}) => {
+        this.uploads.push(name);
+        this.uploadOptions.push(options);
+        if (this.failUploads.has(name)) throw new Error(`injected upload failure ${name}`);
+        const conditions = options.conditions || {};
+        if (conditions.ifNoneMatch === "*" && this.values.has(name)) {
+          throw Object.assign(new Error("blob already exists"), { statusCode: 412 });
+        }
+        if (conditions.ifMatch && conditions.ifMatch !== this.etags.get(name)) {
+          throw Object.assign(new Error("stale index etag"), { statusCode: 412 });
+        }
+        this.values.set(name, Buffer.from(bytes));
+        const etag = `"v${this.sequence++}"`;
+        this.etags.set(name, etag);
+        return { etag };
       }
-    },
-    getBlobClient: blobClient,
-    getBlockBlobClient: blobClient
+    };
+  }
+
+  getBlobClient(name) {
+    return this.client(name);
+  }
+
+  getBlockBlobClient(name) {
+    return this.client(name);
+  }
+
+  async *listBlobsFlat({ prefix }) {
+    this.listCalls.push(prefix);
+    for (const name of [...this.values.keys()].sort()) {
+      if (name.startsWith(prefix)) yield { name };
+    }
+  }
+}
+
+const fundedRiskIndexConfig = {
+  campaignId: "dynamic-quote-funded-2026-07-29-v5",
+  operatorDirect: true,
+  dryRun: false
+};
+const riskIndexBlobName =
+  `reports/research/venue-probe/control/campaign-risk/${fundedRiskIndexConfig.campaignId}/unresolved-reservations-index.json`;
+
+function terminalReservation(probeId) {
+  return {
+    schema_version: 1,
+    campaign_id: fundedRiskIndexConfig.campaignId,
+    probe_id: probeId,
+    state: "finalized_no_fill",
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
   };
 }
 
+test("funded unresolved index makes preflight O(unresolved), not O(history)", async () => {
+  const values = new Map();
+  for (let index = 0; index < 1_000; index += 1) {
+    values.set(
+      `reports/research/venue-probe/risk-reservations/2026-07-30/terminal-${index}.json`,
+      terminalReservation(`terminal-${index}`)
+    );
+  }
+  const unresolvedName =
+    "reports/research/venue-probe/risk-reservations/2026-07-31/funded-direct-live.json";
+  values.set(unresolvedName, {
+    schema_version: 1,
+    campaign_id: fundedRiskIndexConfig.campaignId,
+    probe_id: "funded-direct-live",
+    state: "position_unresolved",
+    matched_notional: 10.5
+  });
+  const container = new RiskIndexContainer(values);
+  const rebuilt = await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  assert.equal(rebuilt.rebuild_scanned_record_count, 1_001);
+  assert.equal(rebuilt.unresolved_count, 1);
+
+  container.downloads.length = 0;
+  container.listCalls.length = 0;
+  const records = await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  );
+  assert.equal(records.length, 1);
+  assert.equal(records[0].blob_name, unresolvedName);
+  assert.deepEqual(container.downloads.sort(), [riskIndexBlobName, unresolvedName].sort());
+  assert.deepEqual(container.listCalls, []);
+});
+
+test("funded dry-run unresolved scan binds each reservation to its exact bytes", async () => {
+  const unresolvedName =
+    "reports/research/venue-probe/risk-reservations/2026-08-24/funded-direct-dry-run.json";
+  const unresolved = {
+    schema_version: 1,
+    campaign_id: fundedRiskIndexConfig.campaignId,
+    probe_id: "funded-direct-dry-run",
+    state: "position_unresolved",
+    matched_notional: 0.01564794
+  };
+  const container = new RiskIndexContainer(new Map([[unresolvedName, unresolved]]));
+  const bytes = container.values.get(unresolvedName);
+
+  const records = await loadCampaignUnresolvedRiskReservationRecords({
+    ...fundedRiskIndexConfig,
+    dryRun: true
+  }, { container });
+
+  assert.equal(records.length, 1);
+  assert.equal(records[0].blob_name, unresolvedName);
+  assert.equal(records[0].etag, container.etags.get(unresolvedName));
+  assert.match(records[0].reservation_sha256, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(records[0].reservation_sha256,
+    `sha256:${createHash("sha256").update(bytes).digest("hex")}`);
+  assert.deepEqual(records[0].reservation, unresolved);
+});
+
+test("funded unresolved index follows reserve, unresolved finalize, and settlement", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  container.uploads.length = 0;
+  const reservation = await reserveProbeRisk(fundedRiskIndexConfig, {
+    date: "2026-07-31",
+    run_id: "run-index",
+    probe_id: "probe-index",
+    reserved_notional: 10.5,
+    principal_notional: 10.5,
+    condition_id: "condition-index"
+  }, { container });
+  const reservationName =
+    "reports/research/venue-probe/risk-reservations/2026-07-31/probe-index.json";
+  assert.deepEqual(container.uploads, [riskIndexBlobName, reservationName]);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 1);
+
+  container.uploads.length = 0;
+  await finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "position_unresolved",
+    order_submitted: true,
+    order_id: "order-index",
+    matched_notional: 10.5,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
+  }, { container });
+  assert.deepEqual(container.uploads, [reservationName, riskIndexBlobName]);
+  const records = await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  );
+  assert.equal(records[0].reservation.state, "position_unresolved");
+
+  container.uploads.length = 0;
+  assert.equal(await settleProbeRiskReservations(fundedRiskIndexConfig, {
+    condition_ids: ["condition-index"],
+    settlement_verified: true,
+    transaction_hash: `0x${"a".repeat(64)}`,
+    run_id: "settlement-index"
+  }, { container, reservationRecords: records }), 1);
+  assert.deepEqual(container.uploads, [reservationName, riskIndexBlobName]);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 0);
+});
+
+test("verified redemption atomically settles an exact zero-matched full fill", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const conditionId = `0x${"b".repeat(64)}`;
+  const orderId = `0x${"c".repeat(64)}`;
+  const tokenId = "123456789";
+  const reservation = await reserveProbeRisk(fundedRiskIndexConfig, {
+    date: "2026-09-02",
+    run_id: "run-recovered-full-fill",
+    probe_id: "probe-recovered-full-fill",
+    reserved_notional: 2.1,
+    principal_notional: 2,
+    fee_risk_upper_bound: 0.1,
+    condition_id: conditionId,
+    token_id: tokenId
+  }, { container });
+  await finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "unresolved_reconciliation",
+    order_submitted: true,
+    order_id: orderId,
+    matched_notional: 0,
+    reconciliation_complete: false,
+    zero_open_orders_confirmed: true
+  }, { container });
+  const records = await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  );
+  const transactionHash = `0x${"d".repeat(64)}`;
+  assert.equal(await settleProbeRiskReservations(fundedRiskIndexConfig, {
+    condition_ids: [conditionId],
+    settlement_verified: true,
+    trust_boundary_ready: true,
+    transaction_hash: transactionHash,
+    polygon_chain_id: 137,
+    transaction_receipt_status: "success",
+    transaction_block_number: "12345678",
+    transaction_receipt_confirmations: 2,
+    settlement_wallet: `0x${"e".repeat(40)}`,
+    settlement_signer: `0x${"f".repeat(40)}`,
+    run_id: "settlement-recovered-full-fill",
+    zero_open_orders_confirmed: true,
+    evidence_source: "polymarket_data_api_plus_onchain_redemption"
+  }, {
+    container,
+    reservationRecords: records,
+    matchedNotionalRecoveries: [{
+      run_id: "run-recovered-full-fill",
+      probe_id: "probe-recovered-full-fill",
+      order_id: orderId,
+      condition_id: conditionId,
+      token_id: tokenId,
+      prior_matched_notional: 0,
+      matched_notional: 2.1
+    }]
+  }), 1);
+  const settled = container.json(
+    "reports/research/venue-probe/risk-reservations/2026-09-02/probe-recovered-full-fill.json"
+  );
+  assert.equal(settled.state, "position_settled");
+  assert.equal(settled.matched_notional, 2.1);
+  assert.equal(settled.reconciliation_complete, true);
+  assert.equal(settled.settlement_transaction_hash, transactionHash);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 0);
+});
+
+test("funded risk finalization honors an exact reservation ETag", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const reservation = await reserveProbeRisk(fundedRiskIndexConfig, {
+    date: "2026-07-31",
+    run_id: "run-cas",
+    probe_id: "probe-cas",
+    reserved_notional: 1,
+    principal_notional: 1,
+    condition_id: "condition-cas"
+  }, { container });
+  const reservationName =
+    "reports/research/venue-probe/risk-reservations/2026-07-31/probe-cas.json";
+  const etag = container.etags.get(reservationName);
+  await assert.rejects(finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "finalized_no_fill",
+    order_submitted: true,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
+  }, { container, ifMatch: '"stale"' }), (error) => error?.statusCode === 412);
+  assert.equal(container.etags.get(reservationName), etag);
+  assert.equal(container.json(reservationName).state, "reserved");
+  await finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+    state: "finalized_no_fill",
+    order_submitted: true,
+    matched_notional: 0,
+    reconciliation_complete: true,
+    zero_open_orders_confirmed: true
+  }, { container, ifMatch: etag });
+  assert.equal(container.json(reservationName).state, "finalized_no_fill");
+});
+
+test("funded unresolved index fails closed on stale blobs and internal count drift", async () => {
+  const unresolvedName =
+    "reports/research/venue-probe/risk-reservations/2026-07-31/probe-stale.json";
+  const reservation = {
+    schema_version: 1,
+    campaign_id: fundedRiskIndexConfig.campaignId,
+    probe_id: "probe-stale",
+    state: "position_unresolved",
+    matched_notional: 1
+  };
+  const staleContainer = new RiskIndexContainer(new Map([[unresolvedName, reservation]]));
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, {
+    container: staleContainer
+  });
+  staleContainer.setJson(unresolvedName, { ...reservation, matched_notional: 2 });
+  await assert.rejects(
+    loadCampaignUnresolvedRiskReservationRecords(fundedRiskIndexConfig, {
+      container: staleContainer
+    }),
+    /index disagrees with durable reservation state/
+  );
+
+  const countContainer = new RiskIndexContainer(new Map([[unresolvedName, reservation]]));
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, {
+    container: countContainer
+  });
+  const corrupt = countContainer.json(riskIndexBlobName);
+  countContainer.setJson(riskIndexBlobName, {
+    ...corrupt,
+    unresolved_count: corrupt.unresolved_count + 1
+  });
+  await assert.rejects(
+    loadCampaignUnresolvedRiskReservationRecords(fundedRiskIndexConfig, {
+      container: countContainer
+    }),
+    /index hash or count disagrees/
+  );
+  const repaired = await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, {
+    container: countContainer
+  });
+  assert.equal(repaired.unresolved_count, 1);
+});
+
+test("startup rebuild repairs an unreadable unresolved index under CAS", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  container.values.set(riskIndexBlobName, Buffer.from("{not-json"));
+  container.etags.set(riskIndexBlobName, `"v${container.sequence++}"`);
+  await assert.rejects(
+    loadCampaignUnresolvedRiskReservationRecords(fundedRiskIndexConfig, {
+      container
+    }),
+    /risk control blob is not valid JSON/
+  );
+  const rebuilt = await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, {
+    container
+  });
+  assert.equal(rebuilt.unresolved_count, 0);
+});
+
+test("funded unresolved index CAS rejects concurrent reservation creation", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const input = {
+    date: "2026-07-31",
+    run_id: "run-cas",
+    probe_id: "probe-cas",
+    reserved_notional: 1,
+    principal_notional: 1,
+    condition_id: "condition-cas"
+  };
+  const results = await Promise.allSettled([
+    reserveProbeRisk(fundedRiskIndexConfig, input, { container }),
+    reserveProbeRisk(fundedRiskIndexConfig, input, { container })
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 1);
+});
+
+test("startup rebuild repairs a crash after index-first reservation persistence", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const reservationName =
+    "reports/research/venue-probe/risk-reservations/2026-07-31/probe-crash.json";
+  container.failUploads.add(reservationName);
+  await assert.rejects(
+    reserveProbeRisk(fundedRiskIndexConfig, {
+      date: "2026-07-31",
+      run_id: "run-crash",
+      probe_id: "probe-crash",
+      reserved_notional: 1,
+      principal_notional: 1,
+      condition_id: "condition-crash"
+    }, { container }),
+    /injected upload failure/
+  );
+  await assert.rejects(
+    loadCampaignUnresolvedRiskReservationRecords(fundedRiskIndexConfig, {
+      container
+    }),
+    /points to an unavailable blob/
+  );
+  container.failUploads.clear();
+  const rebuilt = await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, {
+    container
+  });
+  assert.equal(rebuilt.unresolved_count, 0);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 0);
+});
+
+test("startup rebuild repairs a crash after blob-first terminal finalization", async () => {
+  const container = new RiskIndexContainer();
+  await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, { container });
+  const reservation = await reserveProbeRisk(fundedRiskIndexConfig, {
+    date: "2026-07-31",
+    run_id: "run-finalize-crash",
+    probe_id: "probe-finalize-crash",
+    reserved_notional: 1,
+    principal_notional: 1,
+    condition_id: "condition-finalize-crash"
+  }, { container });
+  container.failUploads.add(riskIndexBlobName);
+  await assert.rejects(
+    finalizeProbeRisk(fundedRiskIndexConfig, reservation, {
+      state: "finalized_no_fill",
+      order_submitted: true,
+      order_id: "order-finalize-crash",
+      matched_notional: 0,
+      reconciliation_complete: true,
+      zero_open_orders_confirmed: true
+    }, { container }),
+    /injected upload failure/
+  );
+  await assert.rejects(
+    loadCampaignUnresolvedRiskReservationRecords(fundedRiskIndexConfig, {
+      container
+    }),
+    /index disagrees with durable reservation state/
+  );
+  container.failUploads.clear();
+  const rebuilt = await rebuildCampaignRiskReservationIndex(fundedRiskIndexConfig, {
+    container
+  });
+  assert.equal(rebuilt.unresolved_count, 0);
+  assert.equal((await loadCampaignUnresolvedRiskReservationRecords(
+    fundedRiskIndexConfig,
+    { container }
+  )).length, 0);
+});
+
 const terminalCampaign = {
+  campaign_id: "dynamic-quote-funded-terminal-test",
   baseline_equity: 5.030521,
   net_external_cash_flow: 0,
   cash_flow_ids: []
 };
 
+async function recordingContainer(reservations = []) {
+  const values = new Map(reservations.map((reservation, index) => [
+    `reports/research/venue-probe/risk-reservations/2026-07-13/reservation-${index}.json`,
+    {
+      schema_version: 1,
+      campaign_id: terminalCampaign.campaign_id,
+      probe_id: `reservation-${index}`,
+      ...reservation
+    }
+  ]));
+  const container = new RiskIndexContainer(values);
+  await rebuildCampaignRiskReservationIndex({
+    campaignId: terminalCampaign.campaign_id,
+    operatorDirect: true,
+    dryRun: false
+  }, { container });
+  container.uploads.length = 0;
+  container.uploadOptions.length = 0;
+  container.listCalls.length = 0;
+  return container;
+}
+
 test("terminal producer publishes immutable no-fill evidence with an exact SHA", async () => {
-  const container = recordingContainer();
+  const container = await recordingContainer();
   const result = await publishTerminalRiskPortfolioEvidence(container, {
     reservation: {
       run_id: "run-1",
@@ -741,15 +1470,16 @@ test("terminal producer publishes immutable no-fill evidence with an exact SHA",
   assert.equal(result.blob_name, "reports/research/venue-probe/terminal-risk-portfolio/2026-07-13/probe-1.json");
   assert.match(result.sha256, /^sha256:[0-9a-f]{64}$/);
   assert.equal(container.uploads.length, 1);
-  assert.deepEqual(container.uploads[0].options.conditions, { ifNoneMatch: "*" });
-  const stored = JSON.parse(container.uploads[0].bytes);
+  assert.deepEqual(container.uploadOptions[0].conditions, { ifNoneMatch: "*" });
+  const stored = container.json(result.blob_name);
   assert.equal(stored.source, "authenticated_no_fill");
   assert.equal(stored.unresolved_risk_reservations, 0);
+  assert.deepEqual(container.listCalls, []);
 });
 
 test("terminal producer derives durable zero-unresolved proof and fails closed otherwise", async () => {
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer([{
+    publishTerminalRiskPortfolioEvidence(await recordingContainer([{
       state: "submitted_pending_reconciliation",
       matched_notional: 0,
       reserved_notional: 1
@@ -781,7 +1511,7 @@ test("terminal producer derives durable zero-unresolved proof and fails closed o
 });
 
 test("terminal producer accepts an already-settled fill only with on-chain proof", async () => {
-  const container = recordingContainer();
+  const container = await recordingContainer();
   const input = {
     reservation: {
       run_id: "run-2",
@@ -819,21 +1549,21 @@ test("terminal producer accepts an already-settled fill only with on-chain proof
   assert.equal(result.evidence.transaction_receipt_status, "success");
   assert.equal(result.evidence.transaction_block_number, "12345678");
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, transaction_hash: null }
     }),
     /fills also require a transaction hash/
   );
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, transaction_receipt_confirmations: undefined }
     }),
     /confirmed Polygon receipt/
   );
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       ...input,
       settlement: { ...input.settlement, condition_ids: ["condition-other"] }
     }),
@@ -843,7 +1573,7 @@ test("terminal producer accepts an already-settled fill only with on-chain proof
 
 test("terminal producer rejects portfolio discrepancies above one cent", async () => {
   await assert.rejects(
-    publishTerminalRiskPortfolioEvidence(recordingContainer(), {
+    publishTerminalRiskPortfolioEvidence(await recordingContainer(), {
       reservation: {
         run_id: "run-3", probe_id: "probe-3", order_id: "order-3",
         state: "finalized_no_fill", matched_notional: 0
